@@ -141,7 +141,10 @@ impl Stylesheet {
             let NodeKind::Text { value, .. } = &node.kind else {
                 return true;
             };
-            if !value.chars().all(char::is_whitespace) {
+            if !value
+                .chars()
+                .all(|character| matches!(character, '\t' | '\n' | '\r' | ' '))
+            {
                 return true;
             }
             let Some(parent) = node.parent.and_then(|parent| original.node(parent)) else {
@@ -241,6 +244,26 @@ enum TemplateTask {
     PopScope,
 }
 
+fn push_scoped_sequence(
+    tasks: &mut Vec<TemplateTask>,
+    instructions: Arc<[Instruction]>,
+    node: SourceNode,
+    frame: ApplyFrame,
+    precedence: Option<usize>,
+) {
+    tasks.push(TemplateTask::PopScope);
+    tasks.push(TemplateTask::Sequence {
+        instructions,
+        index: 0,
+        node,
+        position: frame.position,
+        size: frame.size,
+        depth: frame.depth,
+        precedence,
+    });
+    tasks.push(TemplateTask::PushScope);
+}
+
 impl ApplyFrame {
     const fn new(position: usize, size: usize, depth: usize) -> Self {
         Self {
@@ -274,7 +297,7 @@ impl<'a> Execution<'a> {
             evaluator,
             result: Document::empty(None),
             output_stack: vec![NodeId(0)],
-            scopes: vec![parameters.clone()],
+            scopes: vec![HashMap::new()],
             meter,
             messages: vec![],
             secondary_outputs: vec![],
@@ -419,7 +442,10 @@ impl<'a> Execution<'a> {
             let mut deferred = Vec::new();
             let mut progressed = false;
             for global in pending {
-                if global.is_parameter && parameters.contains_key(&global.variable.name) {
+                if global.is_parameter
+                    && let Some(value) = parameters.get(&global.variable.name)
+                {
+                    self.scopes[0].insert(global.variable.name.clone(), value.clone());
                     progressed = true;
                     continue;
                 }
@@ -700,15 +726,13 @@ impl<'a> Execution<'a> {
                                 })?;
                             }
                             tasks.push(TemplateTask::PopOutput);
-                            tasks.push(TemplateTask::Sequence {
-                                instructions: children.into(),
-                                index: 0,
+                            push_scoped_sequence(
+                                &mut tasks,
+                                children.into(),
                                 node,
-                                position,
-                                size,
-                                depth: depth + 1,
+                                ApplyFrame::new(position, size, depth + 1),
                                 precedence,
-                            });
+                            );
                         }
                         Instruction::Copy {
                             body,
@@ -749,25 +773,21 @@ impl<'a> Execution<'a> {
                                             )?;
                                         }
                                         tasks.push(TemplateTask::PopOutput);
-                                        tasks.push(TemplateTask::Sequence {
-                                            instructions: body.into(),
-                                            index: 0,
+                                        push_scoped_sequence(
+                                            &mut tasks,
+                                            body.into(),
                                             node,
-                                            position,
-                                            size,
-                                            depth: depth + 1,
+                                            ApplyFrame::new(position, size, depth + 1),
                                             precedence,
-                                        });
+                                        );
                                     }
-                                    NodeKind::Root => tasks.push(TemplateTask::Sequence {
-                                        instructions: body.into(),
-                                        index: 0,
+                                    NodeKind::Root => push_scoped_sequence(
+                                        &mut tasks,
+                                        body.into(),
                                         node,
-                                        position,
-                                        size,
-                                        depth: depth + 1,
+                                        ApplyFrame::new(position, size, depth + 1),
                                         precedence,
-                                    }),
+                                    ),
                                     NodeKind::Text { value, .. } => {
                                         self.append_text(&value, false)?
                                     }
@@ -813,15 +833,13 @@ impl<'a> Execution<'a> {
                         }
                         Instruction::If { test, body } => {
                             if self.evaluate(&test, &node, position, size)?.boolean() {
-                                tasks.push(TemplateTask::Sequence {
-                                    instructions: body.into(),
-                                    index: 0,
+                                push_scoped_sequence(
+                                    &mut tasks,
+                                    body.into(),
                                     node,
-                                    position,
-                                    size,
-                                    depth: depth + 1,
+                                    ApplyFrame::new(position, size, depth + 1),
                                     precedence,
-                                });
+                                );
                             }
                         }
                         Instruction::Choose {
@@ -835,15 +853,13 @@ impl<'a> Execution<'a> {
                                     break;
                                 }
                             }
-                            tasks.push(TemplateTask::Sequence {
-                                instructions: selected.into(),
-                                index: 0,
+                            push_scoped_sequence(
+                                &mut tasks,
+                                selected.into(),
                                 node,
-                                position,
-                                size,
-                                depth: depth + 1,
+                                ApplyFrame::new(position, size, depth + 1),
                                 precedence,
-                            });
+                            );
                         }
                         Instruction::ExtensionFallback {
                             name,
@@ -855,15 +871,13 @@ impl<'a> Execution<'a> {
                                     "extension element {name} has no xsl:fallback"
                                 )));
                             }
-                            tasks.push(TemplateTask::Sequence {
-                                instructions: body.into(),
-                                index: 0,
+                            push_scoped_sequence(
+                                &mut tasks,
+                                body.into(),
                                 node,
-                                position,
-                                size,
-                                depth: depth + 1,
+                                ApplyFrame::new(position, size, depth + 1),
                                 precedence,
-                            });
+                            );
                         }
                         instruction => self.execute_instruction(
                             &instruction,
@@ -1056,6 +1070,28 @@ impl<'a> Execution<'a> {
         Ok(())
     }
 
+    fn execute_scoped_sequence(
+        &mut self,
+        instructions: &[Instruction],
+        node: &SourceNode,
+        position: usize,
+        size: usize,
+        depth: usize,
+        current_precedence: Option<usize>,
+    ) -> Result<()> {
+        self.scopes.push(HashMap::new());
+        let result = self.execute_sequence(
+            instructions,
+            node,
+            position,
+            size,
+            depth,
+            current_precedence,
+        );
+        self.scopes.pop();
+        result
+    }
+
     fn execute_instruction(
         &mut self,
         instruction: &Instruction,
@@ -1112,7 +1148,7 @@ impl<'a> Execution<'a> {
                         value,
                     })?;
                 }
-                let result = self.execute_sequence(
+                let result = self.execute_scoped_sequence(
                     children,
                     node,
                     position,
@@ -1188,7 +1224,7 @@ impl<'a> Execution<'a> {
             }
             Instruction::If { test, body } => {
                 if self.evaluate(test, node, position, size)?.boolean() {
-                    self.execute_sequence(
+                    self.execute_scoped_sequence(
                         body,
                         node,
                         position,
@@ -1205,7 +1241,7 @@ impl<'a> Execution<'a> {
             } => {
                 for (test, body) in branches {
                     if self.evaluate(test, node, position, size)?.boolean() {
-                        return self.execute_sequence(
+                        return self.execute_scoped_sequence(
                             body,
                             node,
                             position,
@@ -1215,7 +1251,7 @@ impl<'a> Execution<'a> {
                         );
                     }
                 }
-                self.execute_sequence(
+                self.execute_scoped_sequence(
                     otherwise,
                     node,
                     position,
@@ -1289,7 +1325,7 @@ impl<'a> Execution<'a> {
                                             &mut Vec::new(),
                                         )?;
                                     }
-                                    let result = self.execute_sequence(
+                                    let result = self.execute_scoped_sequence(
                                         body,
                                         node,
                                         position,
@@ -1310,7 +1346,7 @@ impl<'a> Execution<'a> {
                                         NodeKind::ProcessingInstruction { target, value },
                                     )?;
                                 }
-                                NodeKind::Root => self.execute_sequence(
+                                NodeKind::Root => self.execute_scoped_sequence(
                                     body,
                                     node,
                                     position,
@@ -1368,7 +1404,7 @@ impl<'a> Execution<'a> {
                 for set in attribute_sets {
                     self.apply_attribute_set(set, node, position, size, depth, &mut Vec::new())?;
                 }
-                let result = self.execute_sequence(
+                let result = self.execute_scoped_sequence(
                     body,
                     node,
                     position,
@@ -1417,7 +1453,7 @@ impl<'a> Execution<'a> {
             }
             Instruction::Processing { name, body } => {
                 let target = self.evaluate_avt(name, node, position, size)?;
-                if target.eq_ignore_ascii_case("xml") || target.contains(':') {
+                if target.eq_ignore_ascii_case("xml") || !crate::compiler::is_ncname(&target) {
                     return Err(Error::Dynamic(
                         "invalid processing-instruction target".into(),
                     ));
@@ -1557,7 +1593,14 @@ impl<'a> Execution<'a> {
                         "extension element {name} has no xsl:fallback"
                     )));
                 }
-                self.execute_sequence(body, node, position, size, depth + 1, current_precedence)
+                self.execute_scoped_sequence(
+                    body,
+                    node,
+                    position,
+                    size,
+                    depth + 1,
+                    current_precedence,
+                )
             }
             Instruction::CompatibilityComment(value) => {
                 self.push_node(self.parent(), NodeKind::Comment(value.clone()))?;
@@ -1906,10 +1949,7 @@ impl<'a> Execution<'a> {
             let mut arguments = Vec::with_capacity(call.arguments.len());
             for argument in &call.arguments {
                 arguments.push(xpath_to_public(self.evaluate(
-                    &Expression {
-                        source: argument.clone(),
-                        namespaces: expression.namespaces.clone(),
-                    },
+                    &expression.derived(argument.clone()),
                     node,
                     position,
                     size,
@@ -1926,7 +1966,9 @@ impl<'a> Execution<'a> {
         }
         let mut namespaces = expression.namespaces.clone();
         namespaces.push(("__xml_sec_func".into(), PRIVATE_NS.into()));
-        Ok((Expression { source, namespaces }, variables, None))
+        let mut rewritten = expression.derived(source);
+        rewritten.namespaces = namespaces;
+        Ok((rewritten, variables, None))
     }
 
     fn call_exslt_function(
@@ -2184,30 +2226,33 @@ impl<'a> Execution<'a> {
                 let key = if spec.data_type == "number" {
                     SortKey::Number(value.number(&self.evaluator))
                 } else {
-                    SortKey::text(value.string(&self.evaluator))
+                    let key = SortKey::text(value.string(&self.evaluator));
+                    self.meter
+                        .charge(BudgetKind::OwnedBytes, key.owned_bytes())?;
+                    key
                 };
                 keys.push(key);
             }
             keyed.push((node.clone(), keys, index));
         }
-        let mut comparisons = 0usize;
-        keyed.sort_by(|left, right| {
-            comparisons = comparisons.saturating_add(1);
+        let mut order = (0..keyed.len()).collect::<Vec<_>>();
+        try_stable_sort_by(&mut order, |left, right| {
+            let left = &keyed[*left];
+            let right = &keyed[*right];
+            self.meter.charge(BudgetKind::SortComparisons, 1)?;
             for ((l, r), spec) in left.1.iter().zip(&right.1).zip(&specs) {
                 let mut ordering = l.compare(r, spec.case_order.as_deref(), spec.collator.as_ref());
                 if spec.order == "descending" {
                     ordering = ordering.reverse()
                 }
                 if ordering != Ordering::Equal {
-                    return ordering;
+                    return Ok(ordering);
                 }
             }
-            left.2.cmp(&right.2)
-        });
-        self.meter
-            .charge(BudgetKind::SortComparisons, comparisons)?;
-        for (target, (node, _, _)) in nodes.iter_mut().zip(keyed) {
-            *target = node
+            Ok(left.2.cmp(&right.2))
+        })?;
+        for (target, index) in nodes.iter_mut().zip(order) {
+            *target = keyed[index].0.clone()
         }
         Ok(())
     }
@@ -2222,7 +2267,8 @@ impl<'a> Execution<'a> {
     ) -> Result<String> {
         let previous = std::mem::replace(&mut self.result, Document::empty(None));
         let stack = std::mem::replace(&mut self.output_stack, vec![NodeId(0)]);
-        let result = self.execute_sequence(body, node, position, size, depth + 1, precedence);
+        let result =
+            self.execute_scoped_sequence(body, node, position, size, depth + 1, precedence);
         let captured = self.result.string_value(self.result.root());
         self.result = previous;
         self.output_stack = stack;
@@ -2240,7 +2286,8 @@ impl<'a> Execution<'a> {
     ) -> Result<Document> {
         let previous = std::mem::replace(&mut self.result, Document::empty(None));
         let stack = std::mem::replace(&mut self.output_stack, vec![NodeId(0)]);
-        let result = self.execute_sequence(body, node, position, size, depth + 1, precedence);
+        let result =
+            self.execute_scoped_sequence(body, node, position, size, depth + 1, precedence);
         let captured = std::mem::replace(&mut self.result, previous);
         self.output_stack = stack;
         result?;
@@ -2362,6 +2409,8 @@ impl<'a> Execution<'a> {
         *self.output_stack.last().unwrap_or(&NodeId(0))
     }
     fn push_node(&mut self, parent: NodeId, kind: NodeKind) -> Result<NodeId> {
+        self.meter
+            .charge(BudgetKind::OwnedBytes, node_kind_owned_bytes(&kind))?;
         self.meter.charge(BudgetKind::ResultNodes, 1)?;
         Ok(self.result.push(parent, kind, None))
     }
@@ -2370,7 +2419,6 @@ impl<'a> Execution<'a> {
         if value.is_empty() {
             return Ok(());
         }
-        self.meter.charge(BudgetKind::OwnedBytes, value.len())?;
         self.push_node(
             self.parent(),
             NodeKind::Text {
@@ -2410,7 +2458,14 @@ impl<'a> Execution<'a> {
                 "attribute cannot be added after result children".into(),
             ));
         }
-        fixup_attribute_namespace(&mut attribute, namespaces);
+        let generated_namespace = fixup_attribute_namespace(&mut attribute, namespaces);
+        let owned_bytes = attribute_owned_bytes(&attribute).saturating_add(
+            generated_namespace
+                .as_ref()
+                .map_or(0, namespace_owned_bytes),
+        );
+        self.meter.charge(BudgetKind::OwnedBytes, owned_bytes)?;
+        namespaces.extend(generated_namespace);
         if let Some(existing) = attributes
             .iter_mut()
             .find(|existing| existing.name == attribute.name)
@@ -2446,6 +2501,8 @@ impl<'a> Execution<'a> {
         Ok(attributes.len())
     }
     fn add_namespace(&mut self, namespace: Namespace) -> Result<()> {
+        self.meter
+            .charge(BudgetKind::OwnedBytes, namespace_owned_bytes(&namespace))?;
         let node = self
             .result
             .node_mut(self.parent())
@@ -2688,6 +2745,47 @@ impl<'a> Execution<'a> {
     }
 }
 
+fn try_stable_sort_by<T: Copy>(
+    values: &mut [T],
+    mut compare: impl FnMut(&T, &T) -> Result<Ordering>,
+) -> Result<()> {
+    let mut width = 1usize;
+    let mut source = values.to_vec();
+    let mut target = source.clone();
+    while width < source.len() {
+        let step = width.saturating_mul(2);
+        for start in (0..source.len()).step_by(step) {
+            let middle = start.saturating_add(width).min(source.len());
+            let end = start.saturating_add(step).min(source.len());
+            let (mut left, mut right, mut output) = (start, middle, start);
+            while left < middle && right < end {
+                if compare(&source[left], &source[right])? != Ordering::Greater {
+                    target[output] = source[left];
+                    left += 1;
+                } else {
+                    target[output] = source[right];
+                    right += 1;
+                }
+                output += 1;
+            }
+            while left < middle {
+                target[output] = source[left];
+                left += 1;
+                output += 1;
+            }
+            while right < end {
+                target[output] = source[right];
+                right += 1;
+                output += 1;
+            }
+        }
+        std::mem::swap(&mut source, &mut target);
+        width = width.saturating_mul(2);
+    }
+    values.copy_from_slice(&source);
+    Ok(())
+}
+
 fn xpath_number(value: &str) -> f64 {
     value.trim().parse().unwrap_or(f64::NAN)
 }
@@ -2750,16 +2848,19 @@ fn literal_key_names(
     Ok(Some(names))
 }
 
-fn fixup_attribute_namespace(attribute: &mut Attribute, namespaces: &mut Vec<Namespace>) {
+fn fixup_attribute_namespace(
+    attribute: &mut Attribute,
+    namespaces: &[Namespace],
+) -> Option<Namespace> {
     const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
 
     let Some(uri) = attribute.name.namespace.as_deref() else {
         attribute.prefix = None;
-        return;
+        return None;
     };
     if uri == XML_NAMESPACE {
         attribute.prefix = Some("xml".into());
-        return;
+        return None;
     }
     let requested = attribute.prefix.as_deref().filter(|prefix| {
         !matches!(*prefix, "xml" | "xmlns")
@@ -2785,12 +2886,15 @@ fn fixup_attribute_namespace(attribute: &mut Attribute, namespaces: &mut Vec<Nam
         .iter()
         .all(|namespace| namespace.prefix.as_deref() != Some(&prefix))
     {
-        namespaces.push(Namespace {
+        let namespace = Namespace {
             prefix: Some(prefix.clone()),
             uri: uri.to_owned(),
-        });
+        };
+        attribute.prefix = Some(prefix);
+        return Some(namespace);
     }
     attribute.prefix = Some(prefix);
+    None
 }
 
 fn unused_namespace_prefix(namespaces: &[Namespace]) -> String {
@@ -2807,6 +2911,7 @@ fn unused_namespace_prefix(namespaces: &[Namespace]) -> String {
     }
 }
 
+#[derive(Clone)]
 enum SortKey {
     Text { value: String, default_key: String },
     Number(f64),
@@ -2822,6 +2927,13 @@ impl SortKey {
     fn text(value: String) -> Self {
         let default_key = default_collation_key(&value);
         Self::Text { value, default_key }
+    }
+
+    fn owned_bytes(&self) -> usize {
+        match self {
+            Self::Text { value, default_key } => value.len().saturating_add(default_key.len()),
+            Self::Number(_) => 0,
+        }
     }
 
     fn compare(
@@ -3099,6 +3211,52 @@ struct NumberFormatTokens {
     formats: Vec<String>,
     separators: Vec<String>,
     suffix: String,
+}
+
+fn expanded_name_owned_bytes(name: &ExpandedName) -> usize {
+    name.namespace
+        .as_ref()
+        .map_or(0, String::len)
+        .saturating_add(name.local.len())
+}
+
+fn attribute_owned_bytes(attribute: &Attribute) -> usize {
+    expanded_name_owned_bytes(&attribute.name)
+        .saturating_add(attribute.prefix.as_ref().map_or(0, String::len))
+        .saturating_add(attribute.value.len())
+}
+
+fn namespace_owned_bytes(namespace: &Namespace) -> usize {
+    namespace
+        .prefix
+        .as_ref()
+        .map_or(0, String::len)
+        .saturating_add(namespace.uri.len())
+}
+
+fn node_kind_owned_bytes(kind: &NodeKind) -> usize {
+    match kind {
+        NodeKind::Root => 0,
+        NodeKind::Text { value, .. } | NodeKind::Comment(value) => value.len(),
+        NodeKind::ProcessingInstruction { target, value } => target
+            .len()
+            .saturating_add(value.as_ref().map_or(0, String::len)),
+        NodeKind::Element {
+            name,
+            prefix,
+            attributes,
+            namespaces,
+        } => attributes
+            .iter()
+            .fold(
+                expanded_name_owned_bytes(name)
+                    .saturating_add(prefix.as_ref().map_or(0, String::len)),
+                |total, attribute| total.saturating_add(attribute_owned_bytes(attribute)),
+            )
+            .saturating_add(namespaces.iter().fold(0usize, |total, namespace| {
+                total.saturating_add(namespace_owned_bytes(namespace))
+            })),
+    }
 }
 
 fn tokenize_number_format(format: &str) -> NumberFormatTokens {

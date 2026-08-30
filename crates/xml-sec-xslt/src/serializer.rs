@@ -385,7 +385,11 @@ fn serialize_node(
     let mut tasks = vec![RenderTask::Node(id, context)];
     while let Some(task) = tasks.pop() {
         if let RenderTask::Cdata(value) = task {
-            push_cdata(&value, output);
+            push_cdata(
+                &value,
+                definition.version.as_deref().unwrap_or("1.0"),
+                output,
+            );
             continue;
         }
         if let RenderTask::CloseElement {
@@ -426,7 +430,6 @@ fn serialize_node(
                 disable_output_escaping,
             } => {
                 if definition.method == OutputMethod::Text
-                    || *disable_output_escaping
                     || context.parent_name.as_ref().is_some_and(|name| {
                         definition.method == OutputMethod::Html
                             && matches!(
@@ -436,17 +439,32 @@ fn serialize_node(
                     })
                 {
                     output.push_str(value);
+                } else if *disable_output_escaping {
+                    push_xml_raw_text(
+                        value,
+                        definition.version.as_deref().unwrap_or("1.0"),
+                        output,
+                    );
                 } else if context
                     .parent_name
                     .as_ref()
                     .is_some_and(|name| definition.cdata_section_elements.contains(name))
                 {
-                    push_cdata(value, output);
+                    push_cdata(
+                        value,
+                        definition.version.as_deref().unwrap_or("1.0"),
+                        output,
+                    );
                 } else {
-                    escape_text(value, output);
+                    escape_text(
+                        value,
+                        definition.version.as_deref().unwrap_or("1.0"),
+                        output,
+                    );
                 }
             }
             NodeKind::Comment(value) if definition.method != OutputMethod::Text => {
+                reject_xml11_restricted_markup(value, definition, "comment")?;
                 output.push_str("<!--");
                 output.push_str(value);
                 output.push_str("-->");
@@ -454,6 +472,9 @@ fn serialize_node(
             NodeKind::ProcessingInstruction { target, value }
                 if definition.method != OutputMethod::Text =>
             {
+                if let Some(value) = value {
+                    reject_xml11_restricted_markup(value, definition, "processing instruction")?;
+                }
                 output.push_str("<?");
                 output.push_str(target);
                 if let Some(value) = value {
@@ -550,7 +571,11 @@ fn serialize_node(
                         output.push_str(prefix);
                     }
                     output.push_str("=\"");
-                    escape_attribute(&namespace.uri, output);
+                    escape_attribute(
+                        &namespace.uri,
+                        definition.version.as_deref().unwrap_or("1.0"),
+                        output,
+                    );
                     output.push('"');
                     if let Some(existing) = current_namespaces
                         .iter_mut()
@@ -564,6 +589,12 @@ fn serialize_node(
                 for attribute in attributes {
                     output.push(' ');
                     push_name(attribute.prefix.as_deref(), &attribute.name.local, output);
+                    if definition.method == OutputMethod::Html
+                        && is_html_boolean_attribute(&name.local, &attribute.name.local)
+                        && attribute.value.eq_ignore_ascii_case(&attribute.name.local)
+                    {
+                        continue;
+                    }
                     output.push_str("=\"");
                     if definition.method == OutputMethod::Html
                         && is_html_uri_attribute(&attribute.name.local)
@@ -572,7 +603,11 @@ fn serialize_node(
                     } else if definition.method == OutputMethod::Html {
                         escape_html_attribute(&attribute.value, output);
                     } else {
-                        escape_attribute(&attribute.value, output);
+                        escape_attribute(
+                            &attribute.value,
+                            definition.version.as_deref().unwrap_or("1.0"),
+                            output,
+                        );
                     }
                     output.push('"');
                 }
@@ -606,13 +641,21 @@ fn serialize_node(
                     }
                     if definition.method == OutputMethod::Html {
                         output.push_str("<meta charset=\"");
-                        escape_attribute(&definition.encoding, output);
+                        escape_attribute(
+                            &definition.encoding,
+                            definition.version.as_deref().unwrap_or("1.0"),
+                            output,
+                        );
                         output.push_str("\">");
                     } else {
                         output.push_str(
                             "<meta http-equiv=\"Content-Type\" content=\"text/html; charset=",
                         );
-                        escape_attribute(&definition.encoding, output);
+                        escape_attribute(
+                            &definition.encoding,
+                            definition.version.as_deref().unwrap_or("1.0"),
+                            output,
+                        );
                         output.push_str("\" />");
                     }
                 }
@@ -695,12 +738,52 @@ fn serialize_node(
     Ok(())
 }
 
-fn push_cdata(value: &str, output: &mut RenderBuffer) {
+fn push_cdata(value: &str, version: &str, output: &mut RenderBuffer) {
     output.push_str("<![CDATA[");
+    let mut start = 0usize;
+    for (offset, character) in value.char_indices() {
+        if version == "1.1" && is_xml11_restricted(character) {
+            push_cdata_segment(&value[start..offset], output);
+            output.push_str("]]>");
+            output.push_str(&format!("&#x{:X};", u32::from(character)));
+            output.push_str("<![CDATA[");
+            start = offset + character.len_utf8();
+        }
+    }
+    push_cdata_segment(&value[start..], output);
+    output.push_str("]]>");
+}
+
+fn push_cdata_segment(value: &str, output: &mut RenderBuffer) {
     // Preserve the two closing brackets as character data before opening a
     // new section; `]]><![CDATA[>` would silently delete them.
     output.push_str(&value.replace("]]>", "]]]]><![CDATA[>"));
-    output.push_str("]]>");
+}
+
+fn push_xml_raw_text(value: &str, version: &str, output: &mut RenderBuffer) {
+    for character in value.chars() {
+        if version == "1.1" && is_xml11_restricted(character) {
+            output.push_str(&format!("&#x{:X};", u32::from(character)));
+        } else {
+            output.push(character);
+        }
+    }
+}
+
+fn reject_xml11_restricted_markup(
+    value: &str,
+    definition: &OutputDefinition,
+    kind: &str,
+) -> Result<()> {
+    if definition.method == OutputMethod::Xml
+        && definition.version.as_deref() == Some("1.1")
+        && value.chars().any(is_xml11_restricted)
+    {
+        return Err(Error::Serialization(format!(
+            "XML 1.1 {kind} cannot contain restricted control characters"
+        )));
+    }
+    Ok(())
 }
 
 fn is_html_uri_attribute(local: &str) -> bool {
@@ -752,8 +835,12 @@ fn push_name(prefix: Option<&str>, local: &str, output: &mut RenderBuffer) {
     output.push_str(local);
 }
 
-fn escape_text(value: &str, output: &mut RenderBuffer) {
+fn escape_text(value: &str, version: &str, output: &mut RenderBuffer) {
     for character in value.chars() {
+        if version == "1.1" && is_xml11_restricted(character) {
+            output.push_str(&format!("&#x{:X};", u32::from(character)));
+            continue;
+        }
         match character {
             '&' => output.push_str("&amp;"),
             '<' => output.push_str("&lt;"),
@@ -764,8 +851,12 @@ fn escape_text(value: &str, output: &mut RenderBuffer) {
     }
 }
 
-fn escape_attribute(value: &str, output: &mut RenderBuffer) {
+fn escape_attribute(value: &str, version: &str, output: &mut RenderBuffer) {
     for character in value.chars() {
+        if version == "1.1" && is_xml11_restricted(character) {
+            output.push_str(&format!("&#x{:X};", u32::from(character)));
+            continue;
+        }
         match character {
             '&' => output.push_str("&amp;"),
             '<' => output.push_str("&lt;"),
@@ -776,6 +867,36 @@ fn escape_attribute(value: &str, output: &mut RenderBuffer) {
             _ => output.push(character),
         }
     }
+}
+
+fn is_xml11_restricted(character: char) -> bool {
+    matches!(
+        u32::from(character),
+        0x1..=0x8 | 0xB..=0xC | 0xE..=0x1F | 0x7F..=0x84 | 0x86..=0x9F
+    )
+}
+
+fn is_html_boolean_attribute(element: &str, attribute: &str) -> bool {
+    let element = element.to_ascii_lowercase();
+    let attribute = attribute.to_ascii_lowercase();
+    matches!(
+        (element.as_str(), attribute.as_str()),
+        ("area", "nohref")
+            | ("button", "disabled")
+            | ("dir" | "menu" | "ol" | "ul", "compact")
+            | ("dl", "compact")
+            | ("frame", "noresize")
+            | ("hr", "noshade")
+            | ("img" | "input", "ismap")
+            | ("input", "checked" | "disabled" | "readonly")
+            | ("object", "declare")
+            | ("optgroup", "disabled")
+            | ("option", "selected" | "disabled")
+            | ("script", "defer")
+            | ("select", "multiple" | "disabled")
+            | ("td" | "th", "nowrap")
+            | ("textarea", "disabled" | "readonly")
+    )
 }
 
 fn escape_html_attribute(value: &str, output: &mut RenderBuffer) {

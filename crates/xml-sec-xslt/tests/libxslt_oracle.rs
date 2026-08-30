@@ -1619,6 +1619,16 @@ fn normalize_case_specific_oracle_output(case: &Case, bytes: Vec<u8>) -> Vec<u8>
     } else {
         bytes
     };
+    let stylesheet = case.stylesheet.to_string_lossy();
+    let bytes = if case.suite == "runtest"
+        && matches!(
+            stylesheet.as_ref(),
+            "exslt/date/seconds.1.xsl" | "exslt/math/power.1.xsl"
+        ) {
+        normalize_libxslt_scientific_xpath_numbers(bytes)
+    } else {
+        bytes
+    };
     if case.kind != "xmlspec-review" {
         return bytes;
     }
@@ -1643,6 +1653,31 @@ fn normalize_case_specific_oracle_output(case: &Case, bytes: Vec<u8>) -> Vec<u8>
         cursor += 1;
     }
     output
+}
+
+fn normalize_libxslt_scientific_xpath_numbers(mut bytes: Vec<u8>) -> Vec<u8> {
+    // XPath 1.0 number-to-string conversion forbids exponent notation. These
+    // two libxslt extension fixtures expose C formatter output instead, so
+    // normalize only their known values rather than reproducing that deviation.
+    for (scientific, decimal) in [
+        (b"-6.21355968e+10".as_slice(), b"-62135596800".as_slice()),
+        (b"-6.21672192e+10".as_slice(), b"-62167219200".as_slice()),
+        (b"2.85311670611e+11".as_slice(), b"285311670611".as_slice()),
+    ] {
+        let mut normalized = Vec::with_capacity(bytes.len());
+        let mut remainder = bytes.as_slice();
+        while let Some(offset) = remainder
+            .windows(scientific.len())
+            .position(|window| window == scientific)
+        {
+            normalized.extend_from_slice(&remainder[..offset]);
+            normalized.extend_from_slice(decimal);
+            remainder = &remainder[offset + scientific.len()..];
+        }
+        normalized.extend_from_slice(remainder);
+        bytes = normalized;
+    }
+    bytes
 }
 
 fn normalize_stale_docbook_quotes(mut bytes: Vec<u8>) -> Vec<u8> {

@@ -97,18 +97,43 @@ pub(crate) fn format_xpath_number(value: f64) -> String {
     } else {
         value
     };
-    if exponent >= 10 {
-        let rendered = format!("{value:.11e}");
-        let (mantissa, exponent) = rendered
-            .split_once('e')
-            .expect("scientific formatting includes an exponent");
-        let mantissa = mantissa.trim_end_matches('0').trim_end_matches('.');
-        let exponent = exponent
-            .parse::<i32>()
-            .expect("formatted exponent is numeric");
-        return format!("{mantissa}e{exponent:+}");
+    expand_decimal_exponent(&value.to_string())
+}
+
+fn expand_decimal_exponent(value: &str) -> String {
+    let Some((mantissa, exponent)) = value.split_once(['e', 'E']) else {
+        return value.to_owned();
+    };
+    let exponent = exponent.parse::<i32>().unwrap_or_default();
+    let negative = mantissa.starts_with('-');
+    let digits = mantissa
+        .trim_start_matches('-')
+        .chars()
+        .filter(|character| *character != '.')
+        .collect::<String>();
+    let decimal = mantissa
+        .trim_start_matches('-')
+        .find('.')
+        .map_or_else(|| digits.len() as i32, |index| index as i32);
+    let target = decimal + exponent;
+    let mut output = String::new();
+    if negative {
+        output.push('-');
     }
-    value.to_string()
+    if target <= 0 {
+        output.push_str("0.");
+        output.extend(std::iter::repeat_n('0', target.unsigned_abs() as usize));
+        output.push_str(&digits);
+    } else if target as usize >= digits.len() {
+        output.push_str(&digits);
+        output.extend(std::iter::repeat_n('0', target as usize - digits.len()));
+    } else {
+        let target = target as usize;
+        output.push_str(&digits[..target]);
+        output.push('.');
+        output.push_str(&digits[target..]);
+    }
+    output
 }
 
 #[cfg(test)]
@@ -128,5 +153,6 @@ mod tests {
         assert_eq!(format_xpath_number(0.000_01), "0.00001");
         assert_eq!(format_xpath_number(0.640_000_000_000_000_1), "0.64");
         assert_eq!(format_xpath_number(95_012.388_419_899_99), "95012.3884199");
+        assert_eq!(format_xpath_number(285_311_670_611.0), "285311670611");
     }
 }

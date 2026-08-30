@@ -57,12 +57,14 @@ impl<R: Resolver> Compiler<R> {
         )?;
         let document =
             roxmltree::Document::parse(xml).map_err(|error| Error::Xml(error.to_string()))?;
+        state.charge_owned(estimate_compiled_owned_bytes(&document))?;
         let root = document.root_element();
         if root.tag_name().namespace() != Some(XSLT_NS)
             || !matches!(root.tag_name().name(), "stylesheet" | "transform")
         {
             let precedence = inherited_precedence.unwrap_or_else(|| state.next_precedence());
-            return self.compile_literal_result_stylesheet(root, precedence, state, depth);
+            return self
+                .compile_literal_result_stylesheet(root, base_uri, precedence, state, depth);
         }
         let forward = module_forward_compatible(root)?;
         let mut saw_non_import = false;
@@ -168,7 +170,7 @@ impl<R: Resolver> Compiler<R> {
                 })?;
                 continue;
             }
-            self.compile_top_level(child, precedence, forward, state, depth)?;
+            self.compile_top_level(child, base_uri, precedence, forward, state, depth)?;
         }
         Ok(())
     }
@@ -247,6 +249,7 @@ impl<R: Resolver> Compiler<R> {
     fn compile_literal_result_stylesheet(
         &self,
         root: roxmltree::Node<'_, '_>,
+        base_uri: Option<&str>,
         precedence: usize,
         state: &mut CompileState,
         depth: usize,
@@ -268,7 +271,12 @@ impl<R: Resolver> Compiler<R> {
             params: Vec::new(),
             body: vec![compile_literal_element(
                 root,
-                CompileContext::new(version != "1.0", depth, state.budget.recursion_depth)?,
+                CompileContext::new(
+                    version != "1.0",
+                    depth,
+                    state.budget.recursion_depth,
+                    base_uri,
+                )?,
             )?]
             .into(),
         });
@@ -278,19 +286,21 @@ impl<R: Resolver> Compiler<R> {
     fn compile_top_level(
         &self,
         node: roxmltree::Node<'_, '_>,
+        base_uri: Option<&str>,
         precedence: usize,
         forward: bool,
         state: &mut CompileState,
         depth: usize,
     ) -> Result<()> {
         if node.has_tag_name((EXSLT_FUNCTIONS_NS, "function")) {
-            let context = CompileContext::new(forward, depth, state.budget.recursion_depth)?
-                .inside_function();
+            let context =
+                CompileContext::new(forward, depth, state.budget.recursion_depth, base_uri)?
+                    .inside_function();
             let mut children = node.children().peekable();
             let mut params = Vec::new();
             while let Some(child) = children.peek().copied() {
                 if child.has_tag_name((XSLT_NS, "param")) {
-                    params.push(compile_variable(child, context)?);
+                    params.push(compile_variable(child, context.clone())?);
                     children.next();
                 } else if (child.is_text() && child.text().is_none_or(is_xml_whitespace_only))
                     || child.is_comment()
@@ -343,7 +353,12 @@ impl<R: Resolver> Compiler<R> {
                     if child.has_tag_name((XSLT_NS, "param")) {
                         params.push(compile_variable(
                             child,
-                            CompileContext::new(forward, depth, state.budget.recursion_depth)?,
+                            CompileContext::new(
+                                forward,
+                                depth,
+                                state.budget.recursion_depth,
+                                base_uri,
+                            )?,
                         )?);
                         children.next();
                     } else if (child.is_text() && child.text().is_none_or(is_xml_whitespace_only))
@@ -357,7 +372,7 @@ impl<R: Resolver> Compiler<R> {
                 }
                 let body: Arc<[Instruction]> = compile_sequence(
                     children,
-                    CompileContext::new(forward, depth, state.budget.recursion_depth)?,
+                    CompileContext::new(forward, depth, state.budget.recursion_depth, base_uri)?,
                 )?
                 .into();
                 let order = state.next_order();
@@ -391,7 +406,7 @@ impl<R: Resolver> Compiler<R> {
             "variable" | "param" => {
                 let variable = compile_variable(
                     node,
-                    CompileContext::new(forward, depth, state.budget.recursion_depth)?,
+                    CompileContext::new(forward, depth, state.budget.recursion_depth, base_uri)?,
                 )?;
                 let order = state.next_order();
                 state.globals.push(GlobalVariable {
@@ -417,7 +432,7 @@ impl<R: Resolver> Compiler<R> {
             "key" => state.keys.push(KeyDeclaration {
                 name: required_qname_attr(node, "name")?,
                 match_pattern: Pattern::new(required_attr(node, "match")?, node)?,
-                use_expression: Expression::new(required_attr(node, "use")?, node)?,
+                use_expression: Expression::new(required_attr(node, "use")?, node, base_uri)?,
             }),
             "decimal-format" => {
                 let format = DecimalFormat::parse(node, precedence)?;
@@ -442,7 +457,7 @@ impl<R: Resolver> Compiler<R> {
                 let order = state.next_order();
                 state.attribute_sets.push(AttributeSet::parse(
                     node,
-                    CompileContext::new(forward, depth, state.budget.recursion_depth)?,
+                    CompileContext::new(forward, depth, state.budget.recursion_depth, base_uri)?,
                     precedence,
                     order,
                 )?)
@@ -518,6 +533,8 @@ pub(crate) struct Variable {
 pub(crate) struct Expression {
     pub source: String,
     pub namespaces: Vec<(String, String)>,
+    /// Static base of the stylesheet module that owns this expression.
+    pub static_base_uri: Option<String>,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct Pattern {
@@ -695,7 +712,11 @@ pub(crate) enum NamespaceTest {
 }
 
 impl Expression {
-    fn new(source: &str, node: roxmltree::Node<'_, '_>) -> Result<Self> {
+    fn new(
+        source: &str,
+        node: roxmltree::Node<'_, '_>,
+        static_base_uri: Option<&str>,
+    ) -> Result<Self> {
         let namespaces = namespaces(node);
         validate_xpath_prefixes(source, &namespaces)?;
         let normalized = normalize_xpath_for_sxd(source);
@@ -708,7 +729,24 @@ impl Expression {
         Ok(Self {
             source: source.to_owned(),
             namespaces,
+            static_base_uri: effective_base_uri(node, static_base_uri)?,
         })
+    }
+
+    pub(crate) fn derived(&self, source: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            namespaces: self.namespaces.clone(),
+            static_base_uri: self.static_base_uri.clone(),
+        }
+    }
+
+    pub(crate) fn generated(source: impl Into<String>, namespaces: Vec<(String, String)>) -> Self {
+        Self {
+            source: source.into(),
+            namespaces,
+            static_base_uri: None,
+        }
     }
 }
 impl Pattern {
@@ -1029,6 +1067,18 @@ impl CompileState {
         self.order += 1;
         self.order
     }
+    fn charge_owned(&mut self, amount: usize) -> Result<()> {
+        self.owned_bytes = self.owned_bytes.checked_add(amount).ok_or(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            limit: self.budget.owned_bytes,
+            actual: usize::MAX,
+        })?;
+        ensure(
+            BudgetKind::OwnedBytes,
+            self.budget.owned_bytes,
+            self.owned_bytes,
+        )
+    }
     fn finish(mut self) -> Result<Stylesheet> {
         self.templates
             .sort_by_key(|template| (template.precedence, template.order));
@@ -1079,6 +1129,33 @@ impl CompileState {
     }
 }
 
+fn estimate_compiled_owned_bytes(document: &roxmltree::Document<'_>) -> usize {
+    document.descendants().fold(0usize, |total, node| {
+        let node_bytes = if node.is_element() {
+            let tag = node.tag_name();
+            let name_bytes = tag
+                .namespace()
+                .map_or(0, str::len)
+                .saturating_add(tag.name().len());
+            let attribute_bytes = node.attributes().fold(0usize, |sum, attribute| {
+                sum.saturating_add(attribute.namespace().map_or(0, str::len))
+                    .saturating_add(attribute.name().len())
+                    .saturating_add(attribute.value().len())
+            });
+            let namespace_bytes = node.namespaces().fold(0usize, |sum, namespace| {
+                sum.saturating_add(namespace.name().map_or(0, str::len))
+                    .saturating_add(namespace.uri().len())
+            });
+            name_bytes
+                .saturating_add(attribute_bytes)
+                .saturating_add(namespace_bytes)
+        } else {
+            node.text().map_or(0, str::len)
+        };
+        total.saturating_add(node_bytes)
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ResolveRequest {
     href: String,
@@ -1086,27 +1163,39 @@ struct ResolveRequest {
     purpose: ResolvePurpose,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct CompileContext {
     forward: bool,
     depth: usize,
     max_depth: usize,
     inside_function: bool,
+    static_base_uri: Option<String>,
 }
 
 impl CompileContext {
-    fn new(forward: bool, depth: usize, max_depth: usize) -> Result<Self> {
+    fn new(
+        forward: bool,
+        depth: usize,
+        max_depth: usize,
+        static_base_uri: Option<&str>,
+    ) -> Result<Self> {
         ensure(BudgetKind::RecursionDepth, max_depth, depth)?;
         Ok(Self {
             forward,
             depth,
             max_depth,
             inside_function: false,
+            static_base_uri: static_base_uri.map(str::to_owned),
         })
     }
 
-    fn descend(self) -> Result<Self> {
-        let mut descended = Self::new(self.forward, self.depth.saturating_add(1), self.max_depth)?;
+    fn descend(&self) -> Result<Self> {
+        let mut descended = Self::new(
+            self.forward,
+            self.depth.saturating_add(1),
+            self.max_depth,
+            self.static_base_uri.as_deref(),
+        )?;
         descended.inside_function = self.inside_function;
         Ok(descended)
     }
@@ -1114,6 +1203,10 @@ impl CompileContext {
     fn inside_function(mut self) -> Self {
         self.inside_function = true;
         self
+    }
+
+    fn expression(&self, source: &str, node: roxmltree::Node<'_, '_>) -> Result<Expression> {
+        Expression::new(source, node, self.static_base_uri.as_deref())
     }
 
     fn with_literal_version(mut self, node: roxmltree::Node<'_, '_>) -> Result<Self> {
@@ -1231,7 +1324,7 @@ fn compile_instruction(
         }
         let select = node
             .attribute("select")
-            .map(|value| Expression::new(value, node))
+            .map(|value| context.expression(value, node))
             .transpose()?;
         let content = compile_sequence(node.children(), context)?;
         if select.is_some() && !content.is_empty() {
@@ -1249,7 +1342,7 @@ fn compile_instruction(
                 _ => None,
             };
             if let Some(locator) = locator {
-                let uri = parse_avt(required_attr(node, locator)?, node)?;
+                let uri = parse_avt(required_attr(node, locator)?, node, &context)?;
                 let properties = node
                     .attributes()
                     .filter(|attribute| attribute.name() != locator)
@@ -1262,7 +1355,7 @@ fn compile_instruction(
                         }
                         Ok((
                             attribute.name().to_owned(),
-                            parse_avt(attribute.value(), node)?,
+                            parse_avt(attribute.value(), node, &context)?,
                         ))
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -1299,7 +1392,7 @@ fn compile_instruction(
         }
         return compile_literal_element(node, context);
     }
-    let sequence = || compile_sequence(node.children(), context);
+    let sequence = || compile_sequence(node.children(), context.clone());
     Ok(match node.tag_name().name() {
         "apply-templates" => {
             reject_known_attributes(node, &["select", "mode", "name"])?;
@@ -1308,7 +1401,7 @@ fn compile_instruction(
             let mut saw_parameter = false;
             for child in node.children().filter(roxmltree::Node::is_element) {
                 if child.has_tag_name((XSLT_NS, "sort")) && !saw_parameter {
-                    sorts.push(compile_sort(child)?)
+                    sorts.push(compile_sort(child, &context)?)
                 } else if child.has_tag_name((XSLT_NS, "with-param")) {
                     saw_parameter = true;
                     parameters.push(WithParam {
@@ -1321,7 +1414,7 @@ fn compile_instruction(
                 }
             }
             Instruction::ApplyTemplates {
-                select: Expression::new(node.attribute("select").unwrap_or("node()"), node)?,
+                select: context.expression(node.attribute("select").unwrap_or("node()"), node)?,
                 mode: optional_qname_attr(node, "mode")?,
                 sorts,
                 parameters,
@@ -1363,7 +1456,7 @@ fn compile_instruction(
             let mut sorting = true;
             for child in node.children() {
                 if child.has_tag_name((XSLT_NS, "sort")) && sorting {
-                    sorts.push(compile_sort(child)?)
+                    sorts.push(compile_sort(child, &context)?)
                 } else if (child.is_text() && child.text().is_none_or(is_xml_whitespace_only))
                     || (!child.is_element() && !child.is_text())
                 {
@@ -1382,13 +1475,13 @@ fn compile_instruction(
                 }
             }
             Instruction::ForEach {
-                select: Expression::new(required_attr(node, "select")?, node)?,
+                select: context.expression(required_attr(node, "select")?, node)?,
                 sorts,
                 body,
             }
         }
         "if" => Instruction::If {
-            test: Expression::new(required_attr(node, "test")?, node)?,
+            test: context.expression(required_attr(node, "test")?, node)?,
             body: sequence()?,
         },
         "choose" => {
@@ -1398,7 +1491,7 @@ fn compile_instruction(
             for child in node.children().filter(roxmltree::Node::is_element) {
                 if child.has_tag_name((XSLT_NS, "when")) && !saw_otherwise {
                     branches.push((
-                        Expression::new(required_attr(child, "test")?, child)?,
+                        context.expression(required_attr(child, "test")?, child)?,
                         compile_sequence(child.children(), context.descend()?)?,
                     ));
                 } else if child.has_tag_name((XSLT_NS, "otherwise")) {
@@ -1424,43 +1517,48 @@ fn compile_instruction(
             }
         }
         "value-of" => Instruction::ValueOf {
-            select: Expression::new(required_attr(node, "select")?, node)?,
+            select: context.expression(required_attr(node, "select")?, node)?,
             disable_output_escaping: yes_no(node.attribute("disable-output-escaping"))?,
         },
-        "copy-of" => Instruction::CopyOf(Expression::new(required_attr(node, "select")?, node)?),
+        "copy-of" => Instruction::CopyOf(context.expression(required_attr(node, "select")?, node)?),
         "copy" => Instruction::Copy {
             body: sequence()?,
             attribute_sets: qname_list_attr(node, "use-attribute-sets")?,
         },
         "element" => Instruction::Element {
-            name: parse_avt(required_attr(node, "name")?, node)?,
+            name: parse_avt(required_attr(node, "name")?, node, &context)?,
             namespace: node
                 .attribute("namespace")
-                .map(|v| parse_avt(v, node))
+                .map(|v| parse_avt(v, node, &context))
                 .transpose()?,
             body: sequence()?,
             attribute_sets: qname_list_attr(node, "use-attribute-sets")?,
             namespaces: computed_element_namespaces(node),
         },
         "attribute" => Instruction::Attribute {
-            name: parse_avt(required_attr(node, "name")?, node)?,
+            name: parse_avt(required_attr(node, "name")?, node, &context)?,
             namespace: node
                 .attribute("namespace")
-                .map(|v| parse_avt(v, node))
+                .map(|v| parse_avt(v, node, &context))
                 .transpose()?,
             body: sequence()?,
             namespaces: namespaces(node),
         },
-        "text" => Instruction::Text(
-            node.text().unwrap_or_default().into(),
-            yes_no(node.attribute("disable-output-escaping"))?,
-        ),
+        "text" => {
+            if node.children().any(|child| !child.is_text()) {
+                return Err(Error::Static("xsl:text may contain only text".into()));
+            }
+            Instruction::Text(
+                node.children().filter_map(|child| child.text()).collect(),
+                yes_no(node.attribute("disable-output-escaping"))?,
+            )
+        }
         "comment" => Instruction::Comment(sequence()?),
         "processing-instruction" => Instruction::Processing {
-            name: parse_avt(required_attr(node, "name")?, node)?,
+            name: parse_avt(required_attr(node, "name")?, node, &context)?,
             body: sequence()?,
         },
-        "number" => Instruction::Number(compile_number(node)?),
+        "number" => Instruction::Number(compile_number(node, &context)?),
         "variable" => Instruction::Variable(compile_variable(node, context)?),
         "param" => {
             return Err(Error::Static(
@@ -1619,7 +1717,7 @@ fn compile_literal_element(
             Ok(LiteralAttribute {
                 name: ExpandedName::new(a.namespace(), a.name()),
                 prefix: attribute_prefix(node, a),
-                value: parse_avt(a.value(), node)?,
+                value: parse_avt(a.value(), node, &context)?,
             })
         })
         .collect::<Result<_>>()?;
@@ -1727,7 +1825,7 @@ fn excluded_result_namespaces(node: roxmltree::Node<'_, '_>) -> Result<(bool, Ha
 fn compile_variable(node: roxmltree::Node<'_, '_>, context: CompileContext) -> Result<Variable> {
     let select = node
         .attribute("select")
-        .map(|value| Expression::new(value, node))
+        .map(|value| context.expression(value, node))
         .transpose()?;
     let content = compile_sequence(node.children(), context)?;
     if select.is_some() && !content.is_empty() {
@@ -1741,26 +1839,33 @@ fn compile_variable(node: roxmltree::Node<'_, '_>, context: CompileContext) -> R
         content,
     })
 }
-fn compile_sort(node: roxmltree::Node<'_, '_>) -> Result<Sort> {
+fn compile_sort(node: roxmltree::Node<'_, '_>, context: &CompileContext) -> Result<Sort> {
     Ok(Sort {
-        select: Expression::new(node.attribute("select").unwrap_or("."), node)?,
-        data_type: parse_avt(node.attribute("data-type").unwrap_or("text"), node)?,
-        order: parse_avt(node.attribute("order").unwrap_or("ascending"), node)?,
+        select: context.expression(node.attribute("select").unwrap_or("."), node)?,
+        data_type: parse_avt(node.attribute("data-type").unwrap_or("text"), node, context)?,
+        order: parse_avt(
+            node.attribute("order").unwrap_or("ascending"),
+            node,
+            context,
+        )?,
         case_order: node
             .attribute("case-order")
-            .map(|value| parse_avt(value, node))
+            .map(|value| parse_avt(value, node, context))
             .transpose()?,
         lang: node
             .attribute("lang")
-            .map(|value| parse_avt(value, node))
+            .map(|value| parse_avt(value, node, context))
             .transpose()?,
     })
 }
-fn compile_number(node: roxmltree::Node<'_, '_>) -> Result<NumberInstruction> {
+fn compile_number(
+    node: roxmltree::Node<'_, '_>,
+    context: &CompileContext,
+) -> Result<NumberInstruction> {
     Ok(NumberInstruction {
         value: node
             .attribute("value")
-            .map(|value| Expression::new(value, node))
+            .map(|value| context.expression(value, node))
             .transpose()?,
         count: node
             .attribute("count")
@@ -1771,26 +1876,30 @@ fn compile_number(node: roxmltree::Node<'_, '_>) -> Result<NumberInstruction> {
             .map(|v| Pattern::new(v, node))
             .transpose()?,
         level: node.attribute("level").unwrap_or("single").into(),
-        format: parse_avt(node.attribute("format").unwrap_or("1"), node)?,
+        format: parse_avt(node.attribute("format").unwrap_or("1"), node, context)?,
         lang: node
             .attribute("lang")
-            .map(|value| parse_avt(value, node))
+            .map(|value| parse_avt(value, node, context))
             .transpose()?,
         letter_value: node
             .attribute("letter-value")
-            .map(|value| parse_avt(value, node))
+            .map(|value| parse_avt(value, node, context))
             .transpose()?,
         grouping_separator: node
             .attribute("grouping-separator")
-            .map(|value| parse_avt(value, node))
+            .map(|value| parse_avt(value, node, context))
             .transpose()?,
         grouping_size: node
             .attribute("grouping-size")
-            .map(|value| parse_avt(value, node))
+            .map(|value| parse_avt(value, node, context))
             .transpose()?,
     })
 }
-fn parse_avt(value: &str, node: roxmltree::Node<'_, '_>) -> Result<AttributeValueTemplate> {
+fn parse_avt(
+    value: &str,
+    node: roxmltree::Node<'_, '_>,
+    context: &CompileContext,
+) -> Result<AttributeValueTemplate> {
     let mut parts = vec![];
     let mut literal = String::new();
     let mut chars = value.char_indices().peekable();
@@ -1828,10 +1937,9 @@ fn parse_avt(value: &str, node: roxmltree::Node<'_, '_>) -> Result<AttributeValu
                     }
                     expression.push(c)
                 }
-                parts.push(AvtPart::Expression(Expression::new(
-                    expression.trim(),
-                    node,
-                )?));
+                parts.push(AvtPart::Expression(
+                    context.expression(expression.trim(), node)?,
+                ));
             }
             '}' => {
                 return Err(Error::Static(
@@ -2052,7 +2160,7 @@ fn required_output_qname(node: roxmltree::Node<'_, '_>, value: &str) -> Result<E
     Ok(name)
 }
 
-fn is_ncname(value: &str) -> bool {
+pub(crate) fn is_ncname(value: &str) -> bool {
     let mut chars = value.chars();
     let Some(first) = chars.next() else {
         return false;

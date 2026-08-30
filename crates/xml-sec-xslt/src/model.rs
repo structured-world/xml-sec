@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{Error, Result};
 
+const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
+
 /// Stable index of a node inside one owned document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub usize);
@@ -139,7 +141,7 @@ impl Document {
                     .attributes()
                     .map(|attribute| Attribute {
                         name: ExpandedName::new(attribute.namespace(), attribute.name()),
-                        prefix: attribute_prefix(source, attribute),
+                        prefix: attribute_prefix(xml, source, attribute),
                         value: attribute.value().to_owned(),
                     })
                     .collect();
@@ -187,7 +189,16 @@ impl Document {
                 continue;
             };
             let inherited_base = document.node(parent).and_then(|node| node.base_uri.clone());
-            let id = document.push(parent, kind, inherited_base);
+            let effective_base = if let Some(reference) = source
+                .is_element()
+                .then(|| source.attribute((XML_NS, "base")))
+                .flatten()
+            {
+                Some(resolve_base_uri(inherited_base.as_deref(), reference)?)
+            } else {
+                inherited_base
+            };
+            let id = document.push(parent, kind, effective_base);
             if let Some(projected) = document.node_mut(id) {
                 projected.source_line =
                     Some(line_starts.partition_point(|offset| *offset <= source.range().start));
@@ -717,6 +728,11 @@ fn push_stream_element(
     let lexical_name = binding.as_ref();
     let (prefix, local) = split_lexical_name(lexical_name);
     let namespace = namespace_for(&namespaces, prefix.as_deref());
+    if prefix.is_some() && namespace.is_none() {
+        return Err(Error::Xml(format!(
+            "undeclared namespace prefix in element {lexical_name}"
+        )));
+    }
     let attributes = raw_attributes
         .into_iter()
         .map(|(lexical, value)| {
@@ -724,14 +740,29 @@ fn push_stream_element(
             let namespace = prefix
                 .as_deref()
                 .and_then(|prefix| namespace_for(&namespaces, Some(prefix)));
-            Attribute {
+            if prefix.is_some() && namespace.is_none() {
+                return Err(Error::Xml(format!(
+                    "undeclared namespace prefix in attribute {lexical}"
+                )));
+            }
+            Ok(Attribute {
                 name: ExpandedName::new(namespace, local),
                 prefix,
                 value,
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     let inherited_base = document.node(parent).and_then(|node| node.base_uri.clone());
+    let effective_base = if let Some(attribute) = attributes.iter().find(|attribute| {
+        attribute.name.namespace.as_deref() == Some(XML_NS) && attribute.name.local == "base"
+    }) {
+        Some(resolve_base_uri(
+            inherited_base.as_deref(),
+            &attribute.value,
+        )?)
+    } else {
+        inherited_base
+    };
     let projected = document.push(
         parent,
         NodeKind::Element {
@@ -740,7 +771,7 @@ fn push_stream_element(
             attributes,
             namespaces: namespaces.clone(),
         },
-        inherited_base,
+        effective_base,
     );
     if !empty {
         elements.push((projected, namespaces));
@@ -844,6 +875,7 @@ fn lexical_prefix(xml: &str, offset: usize, local: &str) -> Option<String> {
 }
 
 fn attribute_prefix(
+    xml: &str,
     node: roxmltree::Node<'_, '_>,
     attribute: roxmltree::Attribute<'_, '_>,
 ) -> Option<String> {
@@ -851,8 +883,36 @@ fn attribute_prefix(
     if namespace == "http://www.w3.org/XML/1998/namespace" {
         return Some("xml".into());
     }
-    node.namespaces()
-        .find(|entry| entry.uri() == namespace && entry.name().is_some())
-        .and_then(|entry| entry.name())
+    lexical_attribute_prefix(xml, attribute.range().start, attribute.name()).or_else(|| {
+        node.namespaces()
+            .find(|entry| entry.uri() == namespace && entry.name().is_some())
+            .and_then(|entry| entry.name())
+            .map(str::to_owned)
+    })
+}
+
+fn lexical_attribute_prefix(xml: &str, offset: usize, local: &str) -> Option<String> {
+    let lexical = xml
+        .get(offset..)?
+        .split(|character: char| character.is_whitespace() || character == '=')
+        .next()?;
+    lexical
+        .strip_suffix(local)?
+        .strip_suffix(':')
         .map(str::to_owned)
+}
+
+fn resolve_base_uri(base: Option<&str>, reference: &str) -> Result<String> {
+    if let Ok(absolute) = url::Url::parse(reference) {
+        return Ok(absolute.to_string());
+    }
+    if let Some(base) = base {
+        if let Ok(joined) = url::Url::parse(base).and_then(|base| base.join(reference)) {
+            return Ok(joined.to_string());
+        }
+        if let Some((directory, _)) = base.rsplit_once('/') {
+            return Ok(format!("{directory}/{reference}"));
+        }
+    }
+    Ok(reference.to_owned())
 }

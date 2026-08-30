@@ -33,12 +33,38 @@ const LIBXSLT_NS: &str = "http://xmlsoft.org/XSLT/namespace";
 const XT_NS: &str = "http://www.jclark.com/xt";
 const XALAN_REDIRECT_NS: &str = "org.apache.xalan.xslt.extensions.Redirect";
 
+fn source_node_owner(node: &SourceNode) -> NodeId {
+    match node {
+        SourceNode::Node(node) => *node,
+        SourceNode::Attribute { owner, .. } | SourceNode::Namespace { owner, .. } => *owner,
+    }
+}
+
+fn source_base_uri(source: &Document, node: &SourceNode) -> Option<String> {
+    source
+        .node(source_node_owner(node))
+        .and_then(|node| node.base_uri.clone())
+}
+
 type PatternCacheKey = (String, Vec<(String, String)>, NodeId);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DocumentRequest {
+    href: String,
+    base_uri: Option<String>,
+}
+
+#[derive(Debug)]
+struct DocumentCall {
+    uri: String,
+    base: Option<String>,
+}
 
 pub(crate) struct Evaluator {
     pub(crate) source: Document,
     package: Package,
     maps: NodeMaps,
+    node_base_uris: Rc<RefCell<HashMap<NodePath, Option<String>>>>,
     expressions: RefCell<HashMap<String, XPath>>,
     pattern_matches: HashMap<PatternCacheKey, HashSet<SourceNode>>,
     generated_ids: Rc<RefCell<HashMap<NodePath, usize>>>,
@@ -46,8 +72,7 @@ pub(crate) struct Evaluator {
     decimal_formats: Vec<DecimalFormat>,
     extension_functions: HashSet<ExpandedName>,
     resolver: Arc<dyn Resolver>,
-    principal_base_uri: Option<String>,
-    documents: HashMap<String, Vec<SourceNode>>,
+    documents: HashMap<DocumentRequest, Vec<SourceNode>>,
     resource_identities: HashMap<ResourceIdentity, Vec<u8>>,
     result_tree_fragments: HashMap<u64, SourceNode>,
     dynamic_evaluation_depth: usize,
@@ -55,6 +80,10 @@ pub(crate) struct Evaluator {
 }
 
 impl Evaluator {
+    fn source_base_uri(&self, node: &SourceNode) -> Option<String> {
+        source_base_uri(&self.source, node)
+    }
+
     pub(crate) fn new<R: Resolver + 'static>(
         source: &Document,
         principal_stylesheet: &Document,
@@ -82,10 +111,17 @@ impl Evaluator {
         let package = project_semantic_document(&source, meter)?;
         let root: nodeset::Node<'_> = package.as_document().root().into();
         let maps = NodeMaps::new(&source, root)?;
+        let node_base_uris = Rc::new(RefCell::new(
+            maps.reverse
+                .iter()
+                .map(|(path, node)| (path.clone(), source_base_uri(&source, node)))
+                .collect(),
+        ));
         Ok(Self {
             source,
             package,
             maps,
+            node_base_uris,
             expressions: RefCell::new(HashMap::new()),
             pattern_matches: HashMap::new(),
             generated_ids: Rc::new(RefCell::new(HashMap::new())),
@@ -93,8 +129,13 @@ impl Evaluator {
             decimal_formats: Vec::new(),
             extension_functions: HashSet::new(),
             resolver,
-            principal_base_uri,
-            documents: HashMap::from([(String::new(), vec![SourceNode::Node(stylesheet_root)])]),
+            documents: HashMap::from([(
+                DocumentRequest {
+                    href: String::new(),
+                    base_uri: principal_base_uri.clone(),
+                },
+                vec![SourceNode::Node(stylesheet_root)],
+            )]),
             resource_identities,
             result_tree_fragments: HashMap::new(),
             dynamic_evaluation_depth: 0,
@@ -229,6 +270,13 @@ impl Evaluator {
         project_logical_root(&self.source, logical_root, sxd_document, documents)?;
         let root: nodeset::Node<'_> = sxd_document.root().into();
         self.maps.extend(&self.source, root, first_new_node)?;
+        self.node_base_uris.borrow_mut().extend(
+            self.maps
+                .reverse
+                .iter()
+                .filter(|(_, node)| source_node_owner(node).0 >= first_new_node)
+                .map(|(path, node)| (path.clone(), source_base_uri(&self.source, node))),
+        );
         self.pattern_matches.clear();
         Ok(SourceNode::Node(logical_root))
     }
@@ -296,10 +344,7 @@ impl Evaluator {
                         Value::NodeSet(vec![self.import_result_tree_fragment(&fragment, meter)?])
                     } else {
                         let value = self.evaluate_core(
-                            &Expression {
-                                source: argument.to_owned(),
-                                namespaces: expression.namespaces.clone(),
-                            },
+                            &expression.derived(argument),
                             node,
                             position,
                             size,
@@ -339,10 +384,7 @@ impl Evaluator {
                             Some(Value::String(_)) => "string",
                             Some(Value::StoredExpression(_)) => "external",
                             None => match self.evaluate_core(
-                                &Expression {
-                                    source: argument.to_owned(),
-                                    namespaces: expression.namespaces.clone(),
-                                },
+                                &expression.derived(argument),
                                 node,
                                 position,
                                 size,
@@ -368,10 +410,7 @@ impl Evaluator {
                     }
                     let input = self
                         .evaluate_core(
-                            &Expression {
-                                source: call.arguments[0].clone(),
-                                namespaces: expression.namespaces.clone(),
-                            },
+                            &expression.derived(call.arguments[0].clone()),
                             node,
                             position,
                             size,
@@ -380,10 +419,7 @@ impl Evaluator {
                         .string(self);
                     let delimiter = if let Some(argument) = call.arguments.get(1) {
                         self.evaluate_core(
-                            &Expression {
-                                source: argument.clone(),
-                                namespaces: expression.namespaces.clone(),
-                            },
+                            &expression.derived(argument.clone()),
                             node,
                             position,
                             size,
@@ -419,10 +455,7 @@ impl Evaluator {
                     }
                     let input = self
                         .evaluate_core(
-                            &Expression {
-                                source: call.arguments[0].clone(),
-                                namespaces: expression.namespaces.clone(),
-                            },
+                            &expression.derived(call.arguments[0].clone()),
                             node,
                             position,
                             size,
@@ -460,10 +493,7 @@ impl Evaluator {
                     }
                     let dynamic_source = self
                         .evaluate_core(
-                            &Expression {
-                                source: call.arguments[0].clone(),
-                                namespaces: expression.namespaces.clone(),
-                            },
+                            &expression.derived(call.arguments[0].clone()),
                             node,
                             position,
                             size,
@@ -474,10 +504,7 @@ impl Evaluator {
                         Value::NodeSet(Vec::new())
                     } else {
                         match self.evaluate_dynamic(
-                            &Expression {
-                                source: dynamic_source,
-                                namespaces: expression.namespaces.clone(),
-                            },
+                            &expression.derived(dynamic_source),
                             node,
                             position,
                             size,
@@ -500,10 +527,7 @@ impl Evaluator {
                     }
                     let stored = self
                         .evaluate_core(
-                            &Expression {
-                                source: call.arguments[0].clone(),
-                                namespaces: expression.namespaces.clone(),
-                            },
+                            &expression.derived(call.arguments[0].clone()),
                             node,
                             position,
                             size,
@@ -528,10 +552,7 @@ impl Evaluator {
                         return Err(Error::Dynamic("stored XPath expression is missing".into()));
                     };
                     xpath_value_to_public(self.evaluate_dynamic(
-                        &Expression {
-                            source: dynamic_source.clone(),
-                            namespaces: expression.namespaces.clone(),
-                        },
+                        &expression.derived(dynamic_source.clone()),
                         node,
                         position,
                         size,
@@ -546,10 +567,7 @@ impl Evaluator {
                         ));
                     }
                     let value = self.evaluate_core(
-                        &Expression {
-                            source: call.arguments[0].clone(),
-                            namespaces: expression.namespaces.clone(),
-                        },
+                        &expression.derived(call.arguments[0].clone()),
                         node,
                         position,
                         size,
@@ -569,10 +587,7 @@ impl Evaluator {
                         return Err(Error::Dynamic("dyn:map() requires two arguments".into()));
                     }
                     let XPathValue::NodeSet(nodes) = self.evaluate_core(
-                        &Expression {
-                            source: call.arguments[0].clone(),
-                            namespaces: expression.namespaces.clone(),
-                        },
+                        &expression.derived(call.arguments[0].clone()),
                         node,
                         position,
                         size,
@@ -583,10 +598,7 @@ impl Evaluator {
                     };
                     let dynamic_source = self
                         .evaluate_core(
-                            &Expression {
-                                source: call.arguments[1].clone(),
-                                namespaces: expression.namespaces.clone(),
-                            },
+                            &expression.derived(call.arguments[1].clone()),
                             node,
                             position,
                             size,
@@ -599,10 +611,7 @@ impl Evaluator {
                     let total = nodes.len();
                     for (index, mapped_node) in nodes.iter().enumerate() {
                         let Ok(value) = self.evaluate_dynamic(
-                            &Expression {
-                                source: dynamic_source.clone(),
-                                namespaces: expression.namespaces.clone(),
-                            },
+                            &expression.derived(dynamic_source.clone()),
                             mapped_node,
                             index + 1,
                             total,
@@ -654,7 +663,9 @@ impl Evaluator {
         }
         let mut namespaces = expression.namespaces.clone();
         namespaces.push(("__xml_sec_ext".into(), EXTENSION_CONTEXT_NS.into()));
-        Ok((Expression { source, namespaces }, augmented))
+        let mut rewritten = expression.derived(source);
+        rewritten.namespaces = namespaces;
+        Ok((rewritten, augmented))
     }
 
     fn evaluate_extension_strings(
@@ -666,16 +677,8 @@ impl Evaluator {
         size: usize,
         variables: &HashMap<ExpandedName, Value>,
     ) -> Result<Vec<String>> {
-        let value = self.evaluate_core(
-            &Expression {
-                source: source.to_owned(),
-                namespaces: expression.namespaces.clone(),
-            },
-            node,
-            position,
-            size,
-            variables,
-        )?;
+        let value =
+            self.evaluate_core(&expression.derived(source), node, position, size, variables)?;
         Ok(match value {
             XPathValue::NodeSet(nodes) => {
                 nodes.iter().map(|node| self.string_value(node)).collect()
@@ -832,12 +835,13 @@ impl Evaluator {
         context.set_function(
             "document",
             DocumentFunction {
+                static_base_uri: expression.static_base_uri.clone(),
                 roots: self
                     .documents
                     .iter()
-                    .map(|(uri, nodes)| {
+                    .map(|(request, nodes)| {
                         (
-                            uri.clone(),
+                            request.clone(),
                             nodes
                                 .iter()
                                 .filter_map(|node| self.maps.forward.get(node).cloned())
@@ -845,6 +849,7 @@ impl Evaluator {
                         )
                     })
                     .collect(),
+                node_base_uris: Rc::clone(&self.node_base_uris),
             },
         );
         for (name, value) in variables {
@@ -905,51 +910,80 @@ impl Evaluator {
         variables: &HashMap<ExpandedName, Value>,
         meter: &mut Meter,
     ) -> Result<()> {
-        let arguments = document_call_arguments(&expression.source);
-        if arguments.is_empty() {
+        let calls = document_calls(&expression.source);
+        if calls.is_empty() {
             return Ok(());
         }
         let mut requested = Vec::new();
-        for argument in arguments {
+        for (uri_expression, base_expression) in calls {
+            let explicit_base = if let Some(base_expression) = base_expression {
+                let base = self.evaluate_core(
+                    &expression.derived(base_expression),
+                    node,
+                    position,
+                    size,
+                    variables,
+                )?;
+                let XPathValue::NodeSet(nodes) = base else {
+                    return Err(Error::Dynamic(
+                        "document() second argument must be a node-set".into(),
+                    ));
+                };
+                let Some(base_node) = nodes.first() else {
+                    continue;
+                };
+                Some(self.source_base_uri(base_node))
+            } else {
+                None
+            };
             let value = self.evaluate_core(
-                &Expression {
-                    source: argument,
-                    namespaces: expression.namespaces.clone(),
-                },
+                &expression.derived(uri_expression),
                 node,
                 position,
                 size,
                 variables,
             )?;
             match value {
-                XPathValue::NodeSet(nodes) => requested.extend(
-                    nodes
-                        .iter()
-                        .map(|node| self.string_value(node))
-                        .filter(|uri| !uri.is_empty()),
-                ),
-                value => requested.push(value.string(self)),
+                XPathValue::NodeSet(nodes) => requested.extend(nodes.iter().map(|uri_node| {
+                    DocumentCall {
+                        uri: self.string_value(uri_node),
+                        base: explicit_base
+                            .clone()
+                            .unwrap_or_else(|| self.source_base_uri(uri_node)),
+                    }
+                })),
+                value => requested.push(DocumentCall {
+                    uri: value.string(self),
+                    base: explicit_base
+                        .flatten()
+                        .or_else(|| expression.static_base_uri.clone()),
+                }),
             }
         }
         let mut fragments = Vec::new();
-        for uri in requested {
-            if self.documents.contains_key(&uri) {
+        for call in requested {
+            let request = DocumentRequest {
+                href: call.uri,
+                base_uri: call.base,
+            };
+            if self.documents.contains_key(&request) {
                 continue;
             }
-            let (resource_uri, fragment) = uri
+            let (resource_uri, fragment) = request
+                .href
                 .split_once('#')
-                .map_or((uri.as_str(), None), |(resource, fragment)| {
+                .map_or((request.href.as_str(), None), |(resource, fragment)| {
                     (resource, Some(fragment))
                 });
             let fragment = fragment.map(str::to_owned);
             let resource = match self.resolver.resolve(
                 resource_uri,
-                self.principal_base_uri.as_deref(),
+                request.base_uri.as_deref(),
                 ResolvePurpose::Document,
             ) {
                 Ok(resource) => resource,
                 Err(Error::ResourceNotFound { .. }) => {
-                    self.documents.insert(uri, Vec::new());
+                    self.documents.insert(request, Vec::new());
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -983,21 +1017,18 @@ impl Evaluator {
             let root = self.import_document(&document, meter)?;
             self.resource_identities
                 .insert(resource.identity, resource.bytes);
-            self.documents.insert(uri.clone(), vec![root.clone()]);
+            self.documents.insert(request.clone(), vec![root.clone()]);
             if let Some(fragment) = fragment {
-                fragments.push((uri, root, fragment));
+                fragments.push((request, root, fragment));
             }
         }
-        for (uri, root, fragment) in fragments {
+        for (request, root, fragment) in fragments {
             let expression = fragment
                 .strip_prefix("xpointer(")
                 .and_then(|fragment| fragment.strip_suffix(')'))
                 .ok_or_else(|| Error::Unsupported(format!("document fragment `{fragment}`")))?;
             let selected = self.evaluate_core(
-                &Expression {
-                    source: expression.to_owned(),
-                    namespaces: Vec::new(),
-                },
+                &Expression::generated(expression, Vec::new()),
                 &root,
                 1,
                 1,
@@ -1008,7 +1039,7 @@ impl Evaluator {
                     "document fragment `{fragment}` did not select nodes"
                 )));
             };
-            self.documents.insert(uri, nodes);
+            self.documents.insert(request, nodes);
         }
         Ok(())
     }
@@ -1069,10 +1100,7 @@ impl Evaluator {
                 continue;
             }
             let value = self.evaluate(
-                &Expression {
-                    source: expression,
-                    namespaces: pattern.namespaces.clone(),
-                },
+                &Expression::generated(expression, pattern.namespaces.clone()),
                 &SourceNode::Node(logical_root),
                 1,
                 1,
@@ -1872,6 +1900,9 @@ fn expand_xinclude_document(
                 );
             }
             Err(error) => {
+                if matches!(error, Error::Budget { .. } | Error::StaleResource { .. }) {
+                    return Err(error);
+                }
                 let fallback = node.children.iter().find(|child| {
                     source.node(**child).is_some_and(|node| {
                         matches!(
@@ -2308,8 +2339,8 @@ pub(crate) fn rewrite_absolute_paths_for_validation(source: &str) -> String {
     rewrite_absolute_paths(source, 0)
 }
 
-fn document_call_arguments(source: &str) -> Vec<String> {
-    let mut arguments = Vec::new();
+fn document_calls(source: &str) -> Vec<(String, Option<String>)> {
+    let mut calls = Vec::new();
     let mut cursor = 0;
     while let Some(relative) = source[cursor..].find("document") {
         let start = cursor + relative;
@@ -2361,10 +2392,38 @@ fn document_call_arguments(source: &str) -> Vec<String> {
         let Some(end) = end else {
             break;
         };
-        arguments.push(source[argument_start..end].trim().to_owned());
+        let content = &source[argument_start..end];
+        let mut depth = 0usize;
+        let mut quote = None;
+        let mut separator = None;
+        for (offset, character) in content.char_indices() {
+            if let Some(active) = quote {
+                if character == active {
+                    quote = None;
+                }
+                continue;
+            }
+            match character {
+                '\'' | '"' => quote = Some(character),
+                '(' | '[' => depth = depth.saturating_add(1),
+                ')' | ']' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    separator = Some(offset);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let (uri, base) = separator.map_or((content, None), |separator| {
+            (&content[..separator], Some(&content[separator + 1..]))
+        });
+        calls.push((
+            uri.trim().to_owned(),
+            base.map(str::trim).map(str::to_owned),
+        ));
         cursor = end + 1;
     }
-    arguments
+    calls
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2912,7 +2971,9 @@ impl function::Function for UnparsedEntityUriFunction {
 }
 
 struct DocumentFunction {
-    roots: HashMap<String, Vec<NodePath>>,
+    roots: HashMap<DocumentRequest, Vec<NodePath>>,
+    node_base_uris: Rc<RefCell<HashMap<NodePath, Option<String>>>>,
+    static_base_uri: Option<String>,
 }
 
 fn register_exslt_functions(context: &mut Context<'_>) {
@@ -3363,29 +3424,68 @@ impl function::Function for DocumentFunction {
         context: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
         args: Vec<SxdValue<'d>>,
     ) -> std::result::Result<SxdValue<'d>, function::Error> {
-        if args.len() != 1 {
+        if !(1..=2).contains(&args.len()) {
             return Err(function::Error::Other {
-                what: "document() requires one argument".into(),
+                what: "document() requires one or two arguments".into(),
             });
         }
-        let uris = match &args[0] {
+        let explicit_base = if let Some(base) = args.get(1) {
+            let SxdValue::Nodeset(nodes) = base else {
+                return Err(function::Error::Other {
+                    what: "document() second argument must be a node-set".into(),
+                });
+            };
+            let Some(node) = nodes.document_order().into_iter().next() else {
+                return Ok(SxdValue::Nodeset(nodeset::Nodeset::new()));
+            };
+            Some(
+                self.node_base_uris
+                    .borrow()
+                    .get(&typed_path_to(&node))
+                    .cloned()
+                    .flatten(),
+            )
+        } else {
+            None
+        };
+        let requests = match &args[0] {
             SxdValue::Nodeset(nodes) => nodes
                 .document_order()
                 .into_iter()
-                .map(|node| node.string_value())
+                .map(|node| DocumentRequest {
+                    href: node.string_value(),
+                    base_uri: explicit_base.clone().unwrap_or_else(|| {
+                        self.node_base_uris
+                            .borrow()
+                            .get(&typed_path_to(&node))
+                            .cloned()
+                            .flatten()
+                    }),
+                })
                 .collect::<Vec<_>>(),
-            value => vec![value.string()],
+            value => vec![DocumentRequest {
+                href: value.string(),
+                base_uri: explicit_base
+                    .flatten()
+                    .or_else(|| self.static_base_uri.clone()),
+            }],
         };
         let root: nodeset::Node<'d> = context.node.document().root().into();
         let mut result = nodeset::Nodeset::new();
-        for uri in uris {
-            let paths = self.roots.get(&uri).ok_or_else(|| function::Error::Other {
-                what: format!("document resource `{uri}` was not prepared"),
-            })?;
+        for request in requests {
+            let paths = self
+                .roots
+                .get(&request)
+                .ok_or_else(|| function::Error::Other {
+                    what: format!(
+                        "document resource `{}` with base {:?} was not prepared",
+                        request.href, request.base_uri
+                    ),
+                })?;
             for path in paths {
                 let node = resolve_node_path(root.clone(), path).ok_or_else(|| {
                     function::Error::Other {
-                        what: format!("document resource `{uri}` is stale"),
+                        what: format!("document resource `{}` is stale", request.href),
                     }
                 })?;
                 result.add(node);

@@ -304,6 +304,116 @@ fn document_function_resolves_dynamic_uris_without_cross_document_leaks() {
 }
 
 #[test]
+fn document_function_uses_node_module_and_explicit_base_uris() {
+    // XSLT 1.0 assigns node-set URI references their originating node base,
+    // scalar references their stylesheet module base, and the optional second
+    // argument overrides either without collapsing equal hrefs in the cache.
+    let resolver = Arc::new(ContextResolver::default());
+    let mut resources = resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned");
+    let imported = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template name="imported"><xsl:value-of select="document('module.xml')/doc"/></xsl:template></xsl:stylesheet>"#;
+    for (href, base, canonical, identity, body) in [
+        (
+            "imported.xsl",
+            "https://example.test/styles/main.xsl",
+            "https://example.test/modules/imported.xsl",
+            "imported",
+            imported,
+        ),
+        (
+            "module.xml",
+            "https://example.test/modules/imported.xsl",
+            "https://example.test/modules/module.xml",
+            "module-doc",
+            "<doc>module</doc>",
+        ),
+        (
+            "same.xml",
+            "https://example.test/source/a/",
+            "https://example.test/source/a/same.xml",
+            "same-a",
+            "<doc>A</doc>",
+        ),
+        (
+            "same.xml",
+            "https://example.test/source/b/",
+            "https://example.test/source/b/same.xml",
+            "same-b",
+            "<doc>B</doc>",
+        ),
+        (
+            "override.xml",
+            "https://example.test/source/b/",
+            "https://example.test/source/b/override.xml",
+            "override-b",
+            "<doc>override</doc>",
+        ),
+    ] {
+        resources.insert(
+            (href.into(), Some(base.into())),
+            ResolvedResource {
+                canonical_uri: canonical.into(),
+                identity: ResourceIdentity(identity.into()),
+                bytes: body.as_bytes().to_vec(),
+                media_type: None,
+                encoding: Some("UTF-8".into()),
+            },
+        );
+    }
+    drop(resources);
+
+    let stylesheet = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:import href="imported.xsl"/><xsl:output method="text"/><xsl:template match="/"><xsl:for-each select="root/item"><xsl:value-of select="document(@href)/doc"/></xsl:for-each><xsl:text>|</xsl:text><xsl:value-of select="document('override.xml', root/item[2])/doc"/><xsl:text>|</xsl:text><xsl:call-template name="imported"/></xsl:template></xsl:stylesheet>"#,
+        Some("https://example.test/styles/main.xsl"),
+    )
+    .expect("stylesheet graph compiles");
+    let source = Document::parse(
+        r#"<root xml:base="https://example.test/source/"><item xml:base="a/" href="same.xml"/><item xml:base="b/" href="same.xml"/></root>"#,
+        Some("https://example.test/source/input.xml"),
+    )
+    .expect("source parses");
+    let result = stylesheet
+        .execute(
+            &source,
+            &Parameters::new(),
+            resolver.clone(),
+            ExecutionOptions {
+                budget: execution_budget(1 << 20),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("all document bases resolve");
+    assert_eq!(result.serialized.bytes, b"AB|override|module");
+
+    let calls = resolver
+        .calls
+        .lock()
+        .expect("test resolver mutex is not poisoned");
+    assert!(calls.iter().any(|(href, base, purpose)| {
+        href == "same.xml"
+            && base.as_deref() == Some("https://example.test/source/a/")
+            && *purpose == ResolvePurpose::Document
+    }));
+    assert!(calls.iter().any(|(href, base, purpose)| {
+        href == "same.xml"
+            && base.as_deref() == Some("https://example.test/source/b/")
+            && *purpose == ResolvePurpose::Document
+    }));
+    assert!(calls.iter().any(|(href, base, purpose)| {
+        href == "module.xml"
+            && base.as_deref() == Some("https://example.test/modules/imported.xsl")
+            && *purpose == ResolvePurpose::Document
+    }));
+}
+
+#[test]
 fn import_precedence_overrides_but_include_keeps_equal_precedence() {
     // Imports are weaker than the importing module; includes are textual and therefore equal.
     let resolver = Arc::new(MemoryResolver::default());
@@ -620,7 +730,7 @@ fn numbering_parses_tokens_widths_and_unicode_decimal_patterns() {
     let lexical_numbers = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="285311670611"/><xsl:text>|</xsl:text><xsl:value-of select="95012.38841989999"/></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(lexical_numbers, "<source/>"),
-        "2.85311670611e+11|95012.3884199"
+        "285311670611|95012.3884199"
     );
 }
 
@@ -1133,4 +1243,360 @@ fn imported_predicate_templates_override_base_templates() {
         result.serialized.bytes,
         b"<out><root><kept>here</kept></root></out>\n"
     );
+}
+
+#[test]
+fn include_keeps_equal_precedence_and_document_order() {
+    // Includes are textual expansion: the later local declaration wins at equal precedence.
+    let resolver = Arc::new(MemoryResolver::default());
+    resolver.resources.lock().expect("test resolver mutex is not poisoned").insert(
+        "base.xsl".into(),
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><base/></xsl:template></xsl:stylesheet>"#.into(),
+    );
+    let stylesheet = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:include href="base.xsl"/><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><local/></xsl:template></xsl:stylesheet>"#,
+        Some("memory:main.xsl"),
+    )
+    .expect("included stylesheet compiles");
+    let output = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("included stylesheet executes");
+    assert_eq!(output.serialized.bytes, b"<local/>\n");
+}
+
+#[test]
+fn whitespace_and_variable_scopes_follow_xslt_lexical_rules() {
+    // NBSP is character data, nested variables do not leak, and undeclared caller values are ignored.
+    let whitespace = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:strip-space elements="*"/><xsl:template match="/"><xsl:value-of select="string-length(root)"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(whitespace, "<root>\u{a0}</root>"), "1");
+
+    let scope = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:if test="true()"><xsl:variable name="v" select="'inner'"/></xsl:if><xsl:value-of select="$v"/></xsl:template></xsl:stylesheet>"#;
+    let scope_error = compile(scope)
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect_err("out-of-scope variable must not resolve to the nested binding");
+    assert!(
+        matches!(scope_error, Error::Dynamic(ref message) if message.contains("unknown variable")),
+        "{scope_error:?}"
+    );
+
+    let globals = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:variable name="y" select="$x"/><xsl:variable name="x" select="'fixed'"/><xsl:template match="/"><xsl:value-of select="$y"/></xsl:template></xsl:stylesheet>"#;
+    let mut parameters = Parameters::new();
+    parameters.insert(
+        xml_sec_xslt::ExpandedName::new(None::<String>, "x"),
+        Value::String("caller".into()),
+    );
+    let output = compile(globals)
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &parameters,
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("undeclared caller parameter is ignored");
+    assert_eq!(output.serialized.bytes, b"fixed");
+}
+
+#[test]
+fn compiler_rejects_invalid_instruction_content_and_accounts_for_ir() {
+    // Static content models fail during compilation, and retained IR consumes owned-byte budget.
+    let invalid_text = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:text>before<xsl:value-of select="."/>after</xsl:text></xsl:template></xsl:stylesheet>"#;
+    assert!(matches!(
+        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+            .compile(invalid_text, None),
+        Err(Error::Static(_))
+    ));
+
+    let retained = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:a="urn:a" xmlns:b="urn:b"><xsl:template match="/"><out><xsl:value-of select="concat('retained-expression-', name(/*))"/></out></xsl:template></xsl:stylesheet>"#;
+    assert!(matches!(
+        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 8))
+            .compile(retained, None),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn parser_preserves_base_and_lexical_names_across_depths() {
+    // Semantic projection must apply xml:base, retain attribute prefixes, and reject unbound names.
+    let document = Document::parse(
+        r#"<root xml:base="sub/"><item xmlns:a="urn:x" xmlns:b="urn:x" b:value="1"/></root>"#,
+        Some("https://example.test/source.xml"),
+    )
+    .expect("source parses");
+    let item = document.node(xml_sec_xslt::NodeId(2)).expect("item exists");
+    assert_eq!(item.base_uri.as_deref(), Some("https://example.test/sub/"));
+    let xml_sec_xslt::NodeKind::Element { attributes, .. } = &item.kind else {
+        panic!("item is an element");
+    };
+    assert_eq!(attributes[0].prefix.as_deref(), Some("b"));
+
+    let mut malformed = String::new();
+    for _ in 0..129 {
+        malformed.push_str("<n>");
+    }
+    malformed.push_str("<p:item/>");
+    for _ in 0..129 {
+        malformed.push_str("</n>");
+    }
+    assert!(matches!(
+        Document::parse(&malformed, None),
+        Err(Error::Xml(_))
+    ));
+}
+
+#[test]
+fn serializer_applies_html_and_xml11_output_rules() {
+    // HTML boolean attributes are minimized and XML 1.1 restricted controls use references.
+    let html = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="html" omit-xml-declaration="yes"/><xsl:template match="/"><input checked="checked"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(html, "<source/>"), "<input checked>\n");
+
+    let xml11 = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output version="1.1" omit-xml-declaration="yes"/><xsl:param name="value"/><xsl:template match="/"><out><xsl:value-of select="$value"/></out></xsl:template></xsl:stylesheet>"#;
+    let mut parameters = Parameters::new();
+    parameters.insert(
+        xml_sec_xslt::ExpandedName::new(None::<String>, "value"),
+        Value::String("\u{1}".into()),
+    );
+    let output = compile(xml11)
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &parameters,
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("restricted XML 1.1 character serializes as a reference");
+    assert_eq!(output.serialized.bytes, b"<out>&#x1;</out>\n");
+
+    for stylesheet in [
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output version="1.1" omit-xml-declaration="yes" cdata-section-elements="out"/><xsl:param name="value"/><xsl:template match="/"><out><xsl:value-of select="$value"/></out></xsl:template></xsl:stylesheet>"#,
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output version="1.1" omit-xml-declaration="yes"/><xsl:param name="value"/><xsl:template match="/"><out><xsl:value-of select="$value" disable-output-escaping="yes"/></out></xsl:template></xsl:stylesheet>"#,
+    ] {
+        let output = compile(stylesheet)
+            .execute(
+                &Document::parse("<source/>", None).expect("source parses"),
+                &parameters,
+                Arc::new(NoResolver),
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            )
+            .expect("all XML text serialization paths preserve restricted controls");
+        assert!(
+            String::from_utf8(output.serialized.bytes)
+                .expect("UTF-8 output")
+                .contains("&#x1;")
+        );
+    }
+
+    let comment = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output version="1.1"/><xsl:param name="value"/><xsl:template match="/"><xsl:comment><xsl:value-of select="$value"/></xsl:comment></xsl:template></xsl:stylesheet>"#;
+    assert!(matches!(
+        compile(comment).execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &parameters,
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Serialization(_))
+    ));
+}
+
+#[test]
+fn computed_processing_instruction_targets_are_ncnames() {
+    // A PI target is an NCName, not merely a string without a colon.
+    for target in ["1invalid", "a b"] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:processing-instruction name="{target}">value</xsl:processing-instruction></xsl:template></xsl:stylesheet>"#
+        );
+        assert!(matches!(
+            compile(&stylesheet).execute(
+                &Document::parse("<source/>", None).expect("source parses"),
+                &Parameters::new(),
+                Arc::new(NoResolver),
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            ),
+            Err(Error::Dynamic(_))
+        ));
+    }
+}
+
+#[test]
+fn xpath_numbers_use_decimal_not_exponent_notation() {
+    // XPath 1.0 string conversion never emits scientific notation for finite values.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="285311670611"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "285311670611");
+}
+
+#[test]
+fn execution_budgets_abort_sorting_and_charge_result_payloads() {
+    // Comparison and owned-byte ceilings gate work while it is performed, not after allocation.
+    let sorter = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><out><xsl:for-each select="root/item"><xsl:sort select="@v"/><xsl:value-of select="@v"/></xsl:for-each></out></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse(
+        "<root><item v=\"c\"/><item v=\"b\"/><item v=\"a\"/></root>",
+        None,
+    )
+    .expect("source parses");
+    let mut budget = execution_budget(1024);
+    budget.sort_comparisons = 0;
+    assert!(matches!(
+        sorter.execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::SortComparisons,
+            ..
+        })
+    ));
+
+    let payload = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:param name="name"/><xsl:template match="/"><xsl:element name="{$name}"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse("<s/>", None).expect("source parses");
+    let mut parameters = Parameters::new();
+    parameters.insert(
+        xml_sec_xslt::ExpandedName::new(None::<String>, "name"),
+        Value::String(format!("n{}", "x".repeat(512))),
+    );
+    let mut budget = execution_budget(1024);
+    budget.owned_bytes = 128;
+    assert!(matches!(
+        payload.execute(
+            &source,
+            &parameters,
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn xinclude_fallback_never_swallows_security_budget_failures() {
+    // Fallback handles resource availability, not operation-wide budget exhaustion.
+    let resolver = Arc::new(MemoryResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert("included.xml".into(), "<included/>".into());
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:copy-of select="."/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="included.xml"><xi:fallback><fallback/></xi:fallback></xi:include></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("source parses");
+    let mut budget = execution_budget(1024);
+    budget.external_documents = 0;
+    assert!(matches!(
+        stylesheet.execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+            xml_sec_xslt::SourceProcessing::XInclude,
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::ExternalDocuments,
+            ..
+        })
+    ));
+
+    let stale = Arc::new(ContextResolver::default());
+    for (href, body) in [("a.xml", "<a/>"), ("b.xml", "<b/>")] {
+        stale
+            .resources
+            .lock()
+            .expect("test resolver mutex is not poisoned")
+            .insert(
+                (href.into(), Some("memory:source.xml".into())),
+                ResolvedResource {
+                    canonical_uri: format!("memory:{href}"),
+                    identity: ResourceIdentity("changing-xinclude".into()),
+                    bytes: body.as_bytes().to_vec(),
+                    media_type: Some("application/xml".into()),
+                    encoding: Some("UTF-8".into()),
+                },
+            );
+    }
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="a.xml"><xi:fallback><fallback-a/></xi:fallback></xi:include><xi:include href="b.xml"><xi:fallback><fallback-b/></xi:fallback></xi:include></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("source parses");
+    assert!(matches!(
+        stylesheet.execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            stale,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+            xml_sec_xslt::SourceProcessing::XInclude,
+        ),
+        Err(Error::StaleResource { .. })
+    ));
 }
