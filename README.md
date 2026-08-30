@@ -140,6 +140,9 @@ libxmlsec1 parity work explicit.
 stylesheet compilation, XPath/XSLT value semantics, template execution,
 result-tree construction, deterministic budgets, and XML/HTML/text serialization
 without depending on XMLDSig, XMLEnc, cryptography, or system libraries.
+Its `ExecutionEnvironment` makes resolver access, operation time, and extension
+permissions explicit; callers can inject a fixed clock or reject nondeterministic
+EXSLT date functions for reproducible security transforms.
 
 The engine remains a separate architectural boundary. Runtime external-document
 resolution and the `xml-sec` XMLDSig transform adapter are subsequent integration

@@ -1,10 +1,20 @@
+use std::sync::Arc;
+
 use sxd_xpath_no_unsafe::{Context, Value, function};
-use time::OffsetDateTime;
+
+use crate::{Clock, ExtensionPolicy};
 
 pub(crate) const NAMESPACE: &str = "http://exslt.org/dates-and-times";
-pub(crate) fn register(context: &mut Context<'_>) {
+pub(crate) fn register(
+    context: &mut Context<'_>,
+    clock: Arc<dyn Clock>,
+    extension_policy: ExtensionPolicy,
+) {
     for &(name, operation) in FUNCTIONS {
-        context.set_function((NAMESPACE, name), DateFunction(operation));
+        context.set_function(
+            (NAMESPACE, name),
+            DateFunction(operation, Arc::clone(&clock), extension_policy),
+        );
     }
 }
 
@@ -63,7 +73,7 @@ enum Operation {
     Difference,
 }
 
-struct DateFunction(Operation);
+struct DateFunction(Operation, Arc<dyn Clock>, ExtensionPolicy);
 
 impl function::Function for DateFunction {
     fn evaluate<'c, 'd>(
@@ -159,7 +169,12 @@ impl function::Function for DateFunction {
                 let input = if let Some(input) = input.as_deref() {
                     input
                 } else {
-                    current = current_datetime()?;
+                    if self.2 == ExtensionPolicy::Deterministic {
+                        return argument_error(
+                            "zero-argument EXSLT date functions are disabled by the execution extension policy",
+                        );
+                    }
+                    current = current_datetime(self.1.as_ref())?;
                     &current
                 };
                 evaluate_component(operation, Some(input))
@@ -168,9 +183,9 @@ impl function::Function for DateFunction {
     }
 }
 
-fn current_datetime() -> std::result::Result<String, function::Error> {
-    let current = OffsetDateTime::now_local().map_err(|error| function::Error::Other {
-        what: format!("EXSLT current local datetime is unavailable: {error}"),
+fn current_datetime(clock: &dyn Clock) -> std::result::Result<String, function::Error> {
+    let current = clock.now_local().map_err(|error| function::Error::Other {
+        what: error.to_string(),
     })?;
     let offset = current.offset().whole_seconds();
     let sign = if offset < 0 { '-' } else { '+' };

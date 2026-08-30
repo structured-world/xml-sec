@@ -4,9 +4,9 @@ use std::{collections::HashMap, sync::Mutex};
 
 use pretty_assertions::assert_eq;
 use xml_sec_xslt::{
-    BudgetKind, CompileBudget, Compiler, Document, Error, ExecutionBudget, ExecutionOptions,
-    ExpandedName, NoResolver, NodeReference, Parameters, ResolvePurpose, ResolvedResource,
-    Resolver, ResourceIdentity, Value,
+    BudgetKind, CompileBudget, Compiler, Document, Error, ExecutionBudget, ExecutionEnvironment,
+    ExecutionOptions, ExpandedName, ExtensionPolicy, FixedClock, NoResolver, NodeReference,
+    Parameters, ResolvePurpose, ResolvedResource, Resolver, ResourceIdentity, Value,
 };
 
 fn compile(source: &str) -> xml_sec_xslt::Stylesheet {
@@ -439,6 +439,48 @@ fn document_function_resolves_dynamic_uris_without_cross_document_leaks() {
 }
 
 #[test]
+fn document_function_uses_the_actual_predicate_candidate_context() {
+    // Each predicate candidate supplies its own @href to document(), not the outer root context.
+    let resolver = Arc::new(MemoryResolver::default());
+    let mut resources = resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned");
+    resources.insert("empty.xml".into(), "<empty/>".into());
+    resources.insert("match.xml".into(), "<doc/>".into());
+    drop(resources);
+    let stylesheet = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(root/item[document(@href)/doc])"/></xsl:template></xsl:stylesheet>"#,
+        Some("memory:main.xsl"),
+    )
+    .expect("stylesheet compiles");
+    let result = stylesheet
+        .execute(
+            &Document::parse(
+                r#"<root><item href="empty.xml"/><item href="match.xml"/></root>"#,
+                Some("memory:source.xml"),
+            )
+            .expect("source parses"),
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("predicate document calls resolve");
+    assert_eq!(
+        String::from_utf8(result.serialized.bytes).expect("UTF-8 output"),
+        "1"
+    );
+}
+
+#[test]
 fn document_function_uses_node_module_and_explicit_base_uris() {
     // XSLT 1.0 assigns node-set URI references their originating node base,
     // scalar references their stylesheet module base, and the optional second
@@ -708,6 +750,162 @@ fn control_flow_computed_nodes_and_messages_share_the_current_context() {
             .map(|message| message.content.as_str())
             .collect::<Vec<_>>(),
         ["seen:a", "seen:b"]
+    );
+}
+
+#[test]
+fn scalar_arithmetic_fast_path_preserves_variable_types() {
+    // XPath number(boolean) is 1 or 0; converting through "true" would incorrectly produce NaN.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:param name="flag"/><xsl:template match="/"><xsl:value-of select="$flag + 1"/></xsl:template></xsl:stylesheet>"#,
+    );
+    for (flag, expected) in [(true, "2"), (false, "1")] {
+        let mut parameters = Parameters::new();
+        parameters.insert(
+            ExpandedName::new(None::<String>, "flag"),
+            Value::Boolean(flag),
+        );
+        let result = stylesheet
+            .execute(
+                &Document::parse("<source/>", None).expect("source parses"),
+                &parameters,
+                Arc::new(NoResolver),
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            )
+            .expect("typed arithmetic succeeds");
+        assert_eq!(
+            String::from_utf8(result.serialized.bytes).expect("UTF-8 output"),
+            expected
+        );
+    }
+}
+
+#[test]
+fn result_tree_fragment_preceding_sibling_count_uses_the_full_node_set() {
+    // The union of preceding siblings for repeated matches is determined by the last match.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:exsl="http://exslt.org/common"><xsl:output method="text"/><xsl:template match="/"><xsl:variable name="fragment"><a/><b/><a/></xsl:variable><xsl:value-of select="count(exsl:node-set($fragment)/*[name() = 'a']/preceding-sibling::*)"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "2");
+}
+
+#[test]
+fn empty_result_tree_fragment_remains_truthy_in_generic_xpath() {
+    // XSLT 1.0 RTF boolean conversion is true even when its constructed root has no children.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:variable name="fragment"><xsl:if test="false()">unreachable</xsl:if></xsl:variable><xsl:value-of select="not($fragment)"/><xsl:text>|</xsl:text><xsl:value-of select="string($fragment)"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "false|");
+}
+
+#[test]
+fn exslt_padding_uses_each_predicate_candidate_context() {
+    // Extension arguments inside predicates must be evaluated for each candidate node.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(root/item[str:padding(@width, 'x') = 'xx'])"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(
+            stylesheet,
+            "<root><item width=\"1\"/><item width=\"2\"/></root>"
+        ),
+        "1"
+    );
+}
+
+#[test]
+fn execution_environment_controls_exslt_current_time() {
+    // Ambient clock access is explicit and can be fixed or prohibited for security transforms.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:date="http://exslt.org/dates-and-times"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="date:year()"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let fixed = time::OffsetDateTime::from_unix_timestamp(0).expect("Unix epoch is valid");
+    let result = stylesheet
+        .execute_with_environment(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            ExecutionEnvironment::new(Arc::new(NoResolver))
+                .with_clock(Arc::new(FixedClock::new(fixed))),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("fixed operation time is available");
+    assert_eq!(
+        String::from_utf8(result.serialized.bytes).expect("UTF-8 output"),
+        "1970"
+    );
+
+    let error = stylesheet
+        .execute_with_environment(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            ExecutionEnvironment::new(Arc::new(NoResolver))
+                .with_extension_policy(ExtensionPolicy::Deterministic),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect_err("deterministic policy rejects ambient current time");
+    assert!(matches!(
+        error,
+        Error::Dynamic(message) if message.contains("disabled") && message.contains("extension policy")
+    ));
+}
+
+#[test]
+fn named_templates_consume_template_application_budget() {
+    // Initial and nested named-template calls are executable template applications.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template name="entry"><xsl:call-template name="nested"/></xsl:template><xsl:template name="nested"/></xsl:stylesheet>"#,
+    );
+    let mut budget = execution_budget(1024);
+    budget.template_applications = 1;
+    let error = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: Some(ExpandedName::new(None::<String>, "entry")),
+            },
+        )
+        .expect_err("the second named-template application exceeds the budget");
+    assert!(matches!(
+        error,
+        Error::Budget {
+            kind: BudgetKind::TemplateApplications,
+            limit: 1,
+            actual: 2,
+        }
+    ));
+}
+
+#[test]
+fn message_content_preserves_constructed_xml_fragments() {
+    // xsl:message instantiates a template into a fragment rather than accepting text only.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:message><detail code="E"><xsl:text>failed</xsl:text><xsl:comment>kept</xsl:comment><xsl:processing-instruction name="hint">retry</xsl:processing-instruction></detail></xsl:message></xsl:template></xsl:stylesheet>"#,
+    );
+    let result = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("constructed message succeeds");
+    assert_eq!(
+        result.messages[0].content,
+        r#"<detail code="E">failed<!--kept--><?hint retry?></detail>"#
     );
 }
 
@@ -1726,6 +1924,40 @@ fn parser_preserves_base_and_lexical_names_across_depths() {
 }
 
 #[test]
+fn parser_threshold_preserves_xpath_namespace_and_id_behavior() {
+    // Public parsing across the depth-based switch must feed XPath the same leaf semantics.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:p="urn:leaf"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(//p:leaf)"/><xsl:text>|</xsl:text><xsl:value-of select="count(id('target'))"/><xsl:text>|</xsl:text><xsl:value-of select="//p:leaf/@p:value"/></xsl:template></xsl:stylesheet>"#,
+    );
+    for depth in (62..=66).chain(126..=130) {
+        let source = format!(
+            "{}{}{}",
+            "<n>".repeat(depth),
+            r#"<p:leaf xmlns:p="urn:leaf" xml:id="target" p:value="ok"/>"#,
+            "</n>".repeat(depth)
+        );
+        let result = stylesheet
+            .execute(
+                &Document::parse(&source, Some("memory:source.xml"))
+                    .expect("boundary source parses"),
+                &Parameters::new(),
+                Arc::new(NoResolver),
+                ExecutionOptions {
+                    budget: execution_budget(source.len()),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            )
+            .expect("boundary source transforms");
+        assert_eq!(
+            String::from_utf8(result.serialized.bytes).expect("UTF-8 output"),
+            "1|1|ok",
+            "XPath behavior differs at depth {depth}"
+        );
+    }
+}
+
+#[test]
 fn serializer_applies_html_and_xml11_output_rules() {
     // HTML boolean attributes are minimized and XML 1.1 restricted controls use references.
     let html = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="html" omit-xml-declaration="yes"/><xsl:template match="/"><input checked="checked"/></xsl:template></xsl:stylesheet>"#;
@@ -2579,6 +2811,34 @@ fn core_concat_maps_preallocation_rejection_to_the_owned_bytes_budget() {
 }
 
 #[test]
+fn attribute_value_templates_preflight_transient_growth() {
+    // Repeating source-derived text in an AVT must be bounded before the combined allocation.
+    let value = "x".repeat(32 * 1024);
+    let source_xml = format!("<source value=\"{value}\"/>");
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><out value="{/*/@value}{/*/@value}"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let mut budget = execution_budget(source_xml.len());
+    budget.owned_bytes = source_xml.len() + value.len() + 4096;
+    assert!(matches!(
+        stylesheet.execute(
+            &Document::parse(&source_xml, None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn supported_secondary_output_does_not_execute_fallback() {
     // xsl:fallback belongs only to unsupported extension execution.
     let stylesheet = compile(
@@ -3124,9 +3384,9 @@ fn literal_result_elements_honor_local_excluded_prefixes() {
 
 #[test]
 fn logical_document_roots_hide_projection_parents_for_every_axis_form() {
-    // The private package wrapper is never an XPath parent or ancestor of a document root.
-    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(parent::node())"/><xsl:text>|</xsl:text><xsl:value-of select="count(ancestor::node())"/><xsl:text>|</xsl:text><xsl:value-of select="count(..)"/></xsl:template></xsl:stylesheet>"#;
-    assert_eq!(execute(stylesheet, "<source/>"), "0|0|0");
+    // The private package wrapper is never a relative of a logical document root.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(parent::node())"/><xsl:text>|</xsl:text><xsl:value-of select="count(ancestor::node())"/><xsl:text>|</xsl:text><xsl:value-of select="count(..)"/><xsl:text>|</xsl:text><xsl:value-of select="count(following-sibling::node())"/><xsl:text>|</xsl:text><xsl:value-of select="count(preceding-sibling::node())"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "0|0|0|0|0");
 }
 
 #[test]
@@ -3670,5 +3930,51 @@ fn empty_xslt_instructions_reject_content() {
     compile(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:value-of select="1">
         </xsl:value-of><xsl:copy-of select="."> </xsl:copy-of><xsl:number> </xsl:number><xsl:apply-templates><xsl:sort select="."> </xsl:sort></xsl:apply-templates></xsl:template></xsl:stylesheet>"#,
+    );
+}
+
+#[test]
+fn apply_templates_rejects_non_whitespace_character_data() {
+    // Character data is not part of the xsl:apply-templates content model and must not vanish.
+    let invalid = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:apply-templates>unexpected</xsl:apply-templates></xsl:template></xsl:stylesheet>"#;
+    assert!(matches!(
+        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+            .compile(invalid, None),
+        Err(Error::Static(message)) if message.contains("apply-templates")
+    ));
+
+    compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:apply-templates>
+            <xsl:sort select="."/>
+            <xsl:with-param name="value" select="1"/>
+        </xsl:apply-templates></xsl:template></xsl:stylesheet>"#,
+    );
+}
+
+#[test]
+fn xslt_10_patterns_reject_variable_references_statically() {
+    // XSLT 1.0 forbids VariableReference in match patterns; it is not a runtime scope lookup.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:variable name="kind" select="'item'"/><xsl:template match="*[$kind = name()]"/></xsl:stylesheet>"#;
+    assert!(matches!(
+        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+            .compile(stylesheet, None),
+        Err(Error::Static(message)) if message.contains("variable") && message.contains("match")
+    ));
+}
+
+#[test]
+fn instruction_attributes_follow_strict_and_forward_compatible_rules() {
+    // Strict XSLT 1.0 rejects unqualified typos but ignores foreign extension attributes.
+    let typo = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:value-of selct="."/></xsl:template></xsl:stylesheet>"#;
+    assert!(matches!(
+        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+            .compile(typo, None),
+        Err(Error::Static(message)) if message.contains("selct")
+    ));
+    compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:vendor="urn:vendor"><xsl:template match="/"><xsl:value-of select="." vendor:hint="yes"/></xsl:template></xsl:stylesheet>"#,
+    );
+    compile(
+        r#"<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:value-of select="." future-option="yes"/></xsl:template></xsl:stylesheet>"#,
     );
 }

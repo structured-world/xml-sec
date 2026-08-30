@@ -29,6 +29,7 @@ pub enum ArgumentType {
     Boolean,
     Number,
     String,
+    ResultTreeFragment,
     Nodeset,
 }
 
@@ -38,6 +39,7 @@ impl<'a> From<&'a Value<'a>> for ArgumentType {
             Value::Boolean(..) => ArgumentType::Boolean,
             Value::Number(..) => ArgumentType::Number,
             Value::String(..) => ArgumentType::String,
+            Value::ResultTreeFragment(..) => ArgumentType::ResultTreeFragment,
             Value::Nodeset(..) => ArgumentType::Nodeset,
         }
     }

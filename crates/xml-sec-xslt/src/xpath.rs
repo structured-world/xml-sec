@@ -15,8 +15,8 @@ use crate::expression::innermost_namespaced_call;
 use crate::resolver::decode_resource;
 use crate::runtime::{SourceProcessing, apply_whitespace_rules};
 use crate::{
-    BudgetKind, Document, Error, ErrorKind, ExpandedName, NodeId, NodeKind, NodeReference,
-    ResolvePurpose, Resolver, ResourceIdentity, Result, Value,
+    BudgetKind, Clock, Document, Error, ErrorKind, ExpandedName, ExtensionPolicy, NodeId, NodeKind,
+    NodeReference, ResolvePurpose, Resolver, ResourceIdentity, Result, Value,
 };
 
 pub(crate) type SourceNode = NodeReference;
@@ -39,6 +39,8 @@ const XALAN_REDIRECT_NS: &str = "org.apache.xalan.xslt.extensions.Redirect";
 pub(crate) struct EvaluatorSourceOptions {
     pub(crate) processing: SourceProcessing,
     pub(crate) whitespace: Arc<[(NameTest, bool, usize, usize)]>,
+    pub(crate) clock: Arc<dyn Clock>,
+    pub(crate) extension_policy: ExtensionPolicy,
 }
 
 fn source_node_owner(node: &SourceNode) -> NodeId {
@@ -80,12 +82,6 @@ struct DocumentRequest {
     base_uri: Option<String>,
 }
 
-#[derive(Debug)]
-struct DocumentCall {
-    uri: String,
-    base: Option<String>,
-}
-
 pub(crate) struct Evaluator {
     pub(crate) source: Document,
     package: Package,
@@ -100,19 +96,18 @@ pub(crate) struct Evaluator {
     resolver: Arc<dyn Resolver>,
     documents: HashMap<DocumentRequest, Vec<SourceNode>>,
     document_roots: Rc<RefCell<HashMap<DocumentRequest, Vec<NodePath>>>>,
+    pending_document_requests: Rc<RefCell<HashSet<DocumentRequest>>>,
     resource_identities: HashMap<ResourceIdentity, Vec<u8>>,
     resource_documents: HashMap<ResourceIdentity, SourceNode>,
     result_tree_fragments: HashMap<u64, SourceNode>,
     dynamic_evaluation_depth: usize,
     source_processing: SourceProcessing,
     whitespace: Arc<[(NameTest, bool, usize, usize)]>,
+    clock: Arc<dyn Clock>,
+    extension_policy: ExtensionPolicy,
 }
 
 impl Evaluator {
-    fn source_base_uri(&self, node: &SourceNode) -> Option<String> {
-        source_base_uri(&self.source, node)
-    }
-
     pub(crate) fn new<R: Resolver + 'static>(
         source: &Document,
         principal_stylesheet: &Document,
@@ -179,6 +174,7 @@ impl Evaluator {
             documents.insert(request, vec![root]);
         }
         let document_roots = Rc::new(RefCell::new(document_root_entries));
+        let pending_document_requests = Rc::new(RefCell::new(HashSet::new()));
         Ok(Self {
             source,
             package,
@@ -193,12 +189,15 @@ impl Evaluator {
             resolver,
             documents,
             document_roots,
+            pending_document_requests,
             resource_identities,
             resource_documents: HashMap::new(),
             result_tree_fragments: HashMap::new(),
             dynamic_evaluation_depth: 0,
             source_processing: source_options.processing,
             whitespace: source_options.whitespace,
+            clock: source_options.clock,
+            extension_policy: source_options.extension_policy,
         })
     }
 
@@ -285,16 +284,34 @@ impl Evaluator {
         variables: &HashMap<ExpandedName, Value>,
         meter: &mut Meter,
     ) -> Result<XPathValue> {
-        self.prepare_document_calls(expression, node, position, size, variables, meter)?;
-        let (expression, variables) =
-            self.prepare_extension_calls(expression, node, position, size, variables, meter)?;
-        if let Some(name) =
-            variable_reference_name(expression.source.trim(), &expression.namespaces)
-            && let Some(Value::StoredExpression(source)) = variables.get(&name)
-        {
-            return Ok(XPathValue::StoredExpression(source.clone()));
+        loop {
+            self.pending_document_requests.borrow_mut().clear();
+            let (prepared, augmented) =
+                self.prepare_extension_calls(expression, node, position, size, variables, meter)?;
+            let value = if let Some(name) =
+                variable_reference_name(prepared.source.trim(), &prepared.namespaces)
+                && let Some(Value::StoredExpression(source)) = augmented.get(&name)
+            {
+                XPathValue::StoredExpression(source.clone())
+            } else {
+                self.evaluate_core(&prepared, node, position, size, &augmented, meter)?
+            };
+            let requested = self
+                .pending_document_requests
+                .borrow_mut()
+                .drain()
+                .collect::<Vec<_>>();
+            if requested.is_empty() {
+                return Ok(value);
+            }
+            let prepared_count = self.documents.len();
+            self.prepare_document_requests(requested, &augmented, meter)?;
+            if self.documents.len() == prepared_count {
+                return Err(Error::Dynamic(
+                    "document() resolution made no progress".into(),
+                ));
+            }
         }
-        self.evaluate_core(&expression, node, position, size, &variables, meter)
     }
 
     pub(crate) fn document_order(&self, mut nodes: Vec<SourceNode>) -> Vec<SourceNode> {
@@ -385,7 +402,6 @@ impl Evaluator {
                         | (EXSLT_STRINGS_NS, "split")
                         | (EXSLT_STRINGS_NS, "tokenize")
                         | (EXSLT_STRINGS_NS, "replace")
-                        | (EXSLT_STRINGS_NS, "padding")
                         | (EXSLT_DYNAMIC_NS, "evaluate")
                         | (EXSLT_DYNAMIC_NS, "map")
                         | (SAXON_NS, "expression")
@@ -403,7 +419,6 @@ impl Evaluator {
                 (EXSLT_STRINGS_NS, "split") => ExtensionCallKind::Split,
                 (EXSLT_STRINGS_NS, "tokenize") => ExtensionCallKind::Tokenize,
                 (EXSLT_STRINGS_NS, "replace") => ExtensionCallKind::Replace,
-                (EXSLT_STRINGS_NS, "padding") => ExtensionCallKind::Padding,
                 (EXSLT_DYNAMIC_NS, "evaluate") => ExtensionCallKind::DynamicEvaluate,
                 (EXSLT_DYNAMIC_NS, "map") => ExtensionCallKind::DynamicMap,
                 (SAXON_NS, "expression") => ExtensionCallKind::SaxonExpression,
@@ -523,7 +538,6 @@ impl Evaluator {
                         ExtensionCallKind::NodeSet => unreachable!(),
                         ExtensionCallKind::ObjectType => unreachable!(),
                         ExtensionCallKind::Replace => unreachable!(),
-                        ExtensionCallKind::Padding => unreachable!(),
                         ExtensionCallKind::DynamicEvaluate
                         | ExtensionCallKind::DynamicMap
                         | ExtensionCallKind::SaxonExpression
@@ -573,37 +587,6 @@ impl Evaluator {
                     let root = self.import_document(&fragment, meter)?;
                     let nodes = self.children(&root);
                     Value::NodeSet(nodes)
-                }
-                ExtensionCallKind::Padding => {
-                    if !(1..=2).contains(&call.arguments.len()) {
-                        return Err(Error::Dynamic(
-                            "str:padding() requires one or two arguments".into(),
-                        ));
-                    }
-                    let length = self
-                        .evaluate_core(
-                            &expression.derived(call.arguments[0].clone()),
-                            node,
-                            position,
-                            size,
-                            &augmented,
-                            meter,
-                        )?
-                        .number(self);
-                    let pattern = if let Some(argument) = call.arguments.get(1) {
-                        self.evaluate_core(
-                            &expression.derived(argument.clone()),
-                            node,
-                            position,
-                            size,
-                            &augmented,
-                            meter,
-                        )?
-                        .string(self)
-                    } else {
-                        " ".into()
-                    };
-                    Value::String(meter_exslt_padding(length, &pattern, meter)?)
                 }
                 ExtensionCallKind::DynamicEvaluate | ExtensionCallKind::SaxonEvaluate => {
                     if call.arguments.len() != 1 {
@@ -968,7 +951,11 @@ impl Evaluator {
         );
         context.set_function("lang", LangFunction);
         let mut extension_functions = self.extension_functions.clone();
-        extension_functions.extend(register_exslt_functions(&mut context));
+        extension_functions.extend(register_exslt_functions(
+            &mut context,
+            Arc::clone(&self.clock),
+            self.extension_policy,
+        ));
         context.set_function(
             "function-available",
             FunctionAvailable {
@@ -981,6 +968,7 @@ impl Evaluator {
             DocumentFunction {
                 static_base_uri: expression.static_base_uri.clone(),
                 roots: Rc::clone(&self.document_roots),
+                pending: Rc::clone(&self.pending_document_requests),
                 node_base_uris: Rc::clone(&self.node_base_uris),
             },
         );
@@ -996,9 +984,13 @@ impl Evaluator {
                 Value::StoredExpression(value) => {
                     context.set_variable(qname.clone(), value.clone())
                 }
-                Value::ResultTreeFragment(document) => {
-                    context.set_variable(qname.clone(), document.string_value(document.root()))
-                }
+                Value::ResultTreeFragment(document) => context.set_variable(
+                    qname.clone(),
+                    SxdValue::ResultTreeFragment(
+                        document.identity(),
+                        document.string_value(document.root()),
+                    ),
+                ),
                 Value::NodeSet(nodes) => {
                     let mut set = nodeset::Nodeset::new();
                     for reference in nodes {
@@ -1042,77 +1034,29 @@ impl Evaluator {
                 );
             }
         };
+        if let SxdValue::ResultTreeFragment(identity, _) = value {
+            return variables
+                .values()
+                .find_map(|value| match value {
+                    Value::ResultTreeFragment(document) if document.identity() == identity => {
+                        Some(XPathValue::ResultTreeFragment(document.clone()))
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| Error::Dynamic("stale result-tree-fragment identity".into()));
+        }
         self.maps
             .project_value(self.package.as_document().root().into(), value)
     }
 
-    fn prepare_document_calls(
+    fn prepare_document_requests(
         &mut self,
-        expression: &Expression,
-        node: &SourceNode,
-        position: usize,
-        size: usize,
+        requested: Vec<DocumentRequest>,
         variables: &HashMap<ExpandedName, Value>,
         meter: &mut Meter,
     ) -> Result<()> {
-        let calls = document_calls(&expression.source);
-        if calls.is_empty() {
-            return Ok(());
-        }
-        let mut requested = Vec::new();
-        for (uri_expression, base_expression) in calls {
-            let explicit_base = if let Some(base_expression) = base_expression {
-                let base = self.evaluate_core(
-                    &expression.derived(base_expression),
-                    node,
-                    position,
-                    size,
-                    variables,
-                    meter,
-                )?;
-                let XPathValue::NodeSet(nodes) = base else {
-                    return Err(Error::Dynamic(
-                        "document() second argument must be a node-set".into(),
-                    ));
-                };
-                let Some(base_node) = nodes.first() else {
-                    continue;
-                };
-                Some(self.source_base_uri(base_node))
-            } else {
-                None
-            };
-            let value = self.evaluate_core(
-                &expression.derived(uri_expression),
-                node,
-                position,
-                size,
-                variables,
-                meter,
-            )?;
-            match value {
-                XPathValue::NodeSet(nodes) => requested.extend(nodes.iter().map(|uri_node| {
-                    DocumentCall {
-                        uri: self.string_value(uri_node),
-                        base: explicit_base
-                            .clone()
-                            .unwrap_or_else(|| self.source_base_uri(uri_node)),
-                    }
-                })),
-                value => requested.push(DocumentCall {
-                    uri: value.string(self),
-                    base: explicit_base
-                        .flatten()
-                        .or_else(|| expression.static_base_uri.clone()),
-                }),
-            }
-        }
         let mut fragments = Vec::new();
-        for call in requested {
-            let request = DocumentRequest {
-                href: call.uri,
-                base_uri: call.base,
-            };
+        for request in requested {
             if self.documents.contains_key(&request) {
                 continue;
             }
@@ -2368,6 +2312,11 @@ impl NodeMaps {
             SxdValue::Boolean(value) => XPathValue::Boolean(value),
             SxdValue::Number(value) => XPathValue::Number(value),
             SxdValue::String(value) => XPathValue::String(value),
+            SxdValue::ResultTreeFragment(_, _) => {
+                return Err(Error::Dynamic(
+                    "result-tree fragment escaped without its owning document".into(),
+                ));
+            }
             SxdValue::Nodeset(nodes) => {
                 let node_count = nodes.size();
                 if node_count <= 64 {
@@ -2621,120 +2570,11 @@ pub(crate) fn rewrite_absolute_paths_for_validation(source: &str) -> String {
     rewrite_absolute_paths(source, 0)
 }
 
-fn document_calls(source: &str) -> Vec<(String, Option<String>)> {
-    let mut calls = Vec::new();
-    let mut cursor = 0;
-    let mut quote = None;
-    while cursor < source.len() {
-        let character = source[cursor..]
-            .chars()
-            .next()
-            .expect("cursor is in bounds");
-        if let Some(active) = quote {
-            cursor += character.len_utf8();
-            if character == active {
-                quote = None;
-            }
-            continue;
-        }
-        if matches!(character, '\'' | '"') {
-            quote = Some(character);
-            cursor += character.len_utf8();
-            continue;
-        }
-        if !source[cursor..].starts_with("document") {
-            cursor += character.len_utf8();
-            continue;
-        }
-        let start = cursor;
-        let before = source[..start].chars().next_back();
-        if before.is_some_and(is_xpath_name_character) {
-            cursor = start + "document".len();
-            continue;
-        }
-        let mut open = start + "document".len();
-        while source[open..]
-            .chars()
-            .next()
-            .is_some_and(char::is_whitespace)
-        {
-            open += source[open..]
-                .chars()
-                .next()
-                .expect("character exists")
-                .len_utf8();
-        }
-        if !source[open..].starts_with('(') {
-            cursor = open;
-            continue;
-        }
-        let argument_start = open + 1;
-        let mut depth = 1usize;
-        let mut quote = None;
-        let mut end = None;
-        for (offset, character) in source[argument_start..].char_indices() {
-            if let Some(active) = quote {
-                if character == active {
-                    quote = None;
-                }
-                continue;
-            }
-            match character {
-                '\'' | '"' => quote = Some(character),
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = Some(argument_start + offset);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let Some(end) = end else {
-            break;
-        };
-        let content = &source[argument_start..end];
-        let mut depth = 0usize;
-        let mut quote = None;
-        let mut separator = None;
-        for (offset, character) in content.char_indices() {
-            if let Some(active) = quote {
-                if character == active {
-                    quote = None;
-                }
-                continue;
-            }
-            match character {
-                '\'' | '"' => quote = Some(character),
-                '(' | '[' => depth = depth.saturating_add(1),
-                ')' | ']' => depth = depth.saturating_sub(1),
-                ',' if depth == 0 => {
-                    separator = Some(offset);
-                    break;
-                }
-                _ => {}
-            }
-        }
-        let (uri, base) = separator.map_or((content, None), |separator| {
-            (&content[..separator], Some(&content[separator + 1..]))
-        });
-        calls.push((
-            uri.trim().to_owned(),
-            base.map(str::trim).map(str::to_owned),
-        ));
-        cursor = end + 1;
-    }
-    calls
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ExtensionCallKind {
     NodeSet,
     ObjectType,
     Replace,
-    Padding,
     Split,
     Tokenize,
     DynamicEvaluate,
@@ -2838,37 +2678,6 @@ fn split_exslt_string(input: &str, delimiter: &str) -> Vec<String> {
             .map(str::to_owned)
             .collect()
     }
-}
-
-fn meter_exslt_padding(length: f64, pattern: &str, meter: &mut Meter) -> Result<String> {
-    let requested = length.floor().max(0.0);
-    let length = if requested.is_finite() && requested <= usize::MAX as f64 {
-        requested as usize
-    } else {
-        usize::MAX
-    };
-    let pattern_characters = pattern.chars().count();
-    if pattern_characters == 0 || length == 0 {
-        return Ok(String::new());
-    }
-    let complete = length / pattern_characters;
-    let remainder = length % pattern_characters;
-    let retained_bytes = pattern
-        .len()
-        .checked_mul(complete)
-        .and_then(|bytes| {
-            pattern
-                .chars()
-                .take(remainder)
-                .try_fold(bytes, |total, character| {
-                    total.checked_add(character.len_utf8())
-                })
-        })
-        .unwrap_or(usize::MAX);
-    meter.charge(BudgetKind::OwnedBytes, retained_bytes)?;
-    let mut output = pattern.repeat(complete);
-    output.extend(pattern.chars().take(remainder));
-    Ok(output)
 }
 
 fn tokenize_exslt_string(input: &str, delimiters: &str) -> Vec<String> {
@@ -3301,11 +3110,16 @@ impl function::Function for UnparsedEntityUriFunction {
 
 struct DocumentFunction {
     roots: Rc<RefCell<HashMap<DocumentRequest, Vec<NodePath>>>>,
+    pending: Rc<RefCell<HashSet<DocumentRequest>>>,
     node_base_uris: Rc<RefCell<HashMap<NodePath, Option<String>>>>,
     static_base_uri: Option<String>,
 }
 
-fn register_exslt_functions(context: &mut Context<'_>) -> HashSet<ExpandedName> {
+fn register_exslt_functions(
+    context: &mut Context<'_>,
+    clock: Arc<dyn Clock>,
+    extension_policy: ExtensionPolicy,
+) -> HashSet<ExpandedName> {
     let mut registered = HashSet::new();
     macro_rules! register {
         ($namespace:expr, $name:expr, $function:expr) => {{
@@ -3313,7 +3127,7 @@ fn register_exslt_functions(context: &mut Context<'_>) -> HashSet<ExpandedName> 
             registered.insert(ExpandedName::new(Some($namespace), $name));
         }};
     }
-    crate::exslt_date::register(context);
+    crate::exslt_date::register(context, clock, extension_policy);
     registered.extend(
         crate::exslt_date::function_names()
             .map(|name| ExpandedName::new(Some(crate::exslt_date::NAMESPACE), name)),
@@ -3651,7 +3465,7 @@ enum ExsltStringFunction {
 impl function::Function for ExsltStringFunction {
     fn evaluate<'c, 'd>(
         &self,
-        _: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
+        context: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
         args: Vec<SxdValue<'d>>,
     ) -> std::result::Result<SxdValue<'d>, function::Error> {
         match self {
@@ -3682,10 +3496,41 @@ impl function::Function for ExsltStringFunction {
                 Ok(SxdValue::String(result))
             }
             Self::Padding => {
-                let _ = args;
-                extension_argument_error(
-                    "str:padding() must be evaluated through the metered extension context",
-                )
+                if !(1..=2).contains(&args.len()) {
+                    return extension_argument_error("str:padding() requires one or two arguments");
+                }
+                let requested = args[0].number().floor().max(0.0);
+                let length = if requested.is_finite() && requested <= usize::MAX as f64 {
+                    requested as usize
+                } else {
+                    usize::MAX
+                };
+                let pattern = args
+                    .get(1)
+                    .map(SxdValue::string)
+                    .unwrap_or_else(|| " ".into());
+                let pattern_characters = pattern.chars().count();
+                if pattern_characters == 0 || length == 0 {
+                    return Ok(SxdValue::String(String::new()));
+                }
+                let complete = length / pattern_characters;
+                let remainder = length % pattern_characters;
+                let bytes = pattern
+                    .len()
+                    .checked_mul(complete)
+                    .and_then(|bytes| {
+                        pattern
+                            .chars()
+                            .take(remainder)
+                            .try_fold(bytes, |total, character| {
+                                total.checked_add(character.len_utf8())
+                            })
+                    })
+                    .unwrap_or(usize::MAX);
+                context.reserve_string_allocation(bytes)?;
+                let mut output = pattern.repeat(complete);
+                output.extend(pattern.chars().take(remainder));
+                Ok(SxdValue::String(output))
             }
             Self::EncodeUri => {
                 if args.len() != 2 {
@@ -3835,12 +3680,10 @@ impl function::Function for DocumentFunction {
         let mut result = nodeset::Nodeset::new();
         let roots = self.roots.borrow();
         for request in requests {
-            let paths = roots.get(&request).ok_or_else(|| function::Error::Other {
-                what: format!(
-                    "document resource `{}` with base {:?} was not prepared",
-                    request.href, request.base_uri
-                ),
-            })?;
+            let Some(paths) = roots.get(&request) else {
+                self.pending.borrow_mut().insert(request);
+                continue;
+            };
             for path in paths {
                 let node = resolve_node_path(root.clone(), path).ok_or_else(|| {
                     function::Error::Other {
@@ -3936,7 +3779,9 @@ fn hide_projection_elements_from_axes(source: &str, logical_root_index: usize) -
         "ancestor-or-self",
         "ancestor",
         "following",
+        "following-sibling",
         "preceding",
+        "preceding-sibling",
         "parent",
         "self",
     ];
@@ -3988,7 +3833,9 @@ fn hide_projection_elements_from_axes(source: &str, logical_root_index: usize) -
             // A per-document wrapper represents the XPath root node and remains visible only
             // to node(), never to element principal-node tests.
             output.push_str("[not(self::__xml_sec_docs:documents)]");
-            if xpath_test_matches_root(node_test) {
+            if matches!(*axis, "following-sibling" | "preceding-sibling") {
+                output.push_str("[not(self::__xml_sec_docs:document)]");
+            } else if xpath_test_matches_root(node_test) {
                 output.push_str("[parent::node()]");
             } else {
                 output.push_str("[not(self::__xml_sec_docs:document)]");

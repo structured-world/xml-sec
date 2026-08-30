@@ -7,6 +7,7 @@ const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
 // Keep the streaming fallback aligned with roxmltree's entity-expansion safety ceilings.
 const MAX_ENTITY_EXPANSION_DEPTH: usize = 10;
+const TREE_PARSER_DEPTH_LIMIT: usize = 64;
 const MAX_NESTED_ENTITY_REFERENCES: usize = 255;
 
 /// Stable index of a node inside one owned document.
@@ -118,9 +119,13 @@ impl Eq for Document {}
 impl Document {
     /// Parse caller-supplied XML into the engine semantic model.
     pub fn parse(xml: &str, base_uri: Option<&str>) -> Result<Self> {
-        if lexical_nesting_depth(xml) > 128 {
+        if lexical_nesting_depth(xml) > TREE_PARSER_DEPTH_LIMIT {
             return Self::parse_deep_streaming(xml, base_uri);
         }
+        Self::parse_tree(xml, base_uri)
+    }
+
+    fn parse_tree(xml: &str, base_uri: Option<&str>) -> Result<Self> {
         let parsed =
             roxmltree::Document::parse(xml).map_err(|error| Error::Xml(error.to_string()))?;
         let mut document = Self::empty(base_uri.map(str::to_owned));
@@ -222,6 +227,14 @@ impl Document {
         let entities = internal_general_entities(xml)?;
         let expanded_xml = expand_document_entities(xml, &entities)?;
         let mut reader = Reader::from_str(&expanded_xml);
+        let line_starts = std::iter::once(0)
+            .chain(
+                expanded_xml
+                    .bytes()
+                    .enumerate()
+                    .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+            )
+            .collect::<Vec<_>>();
         let mut saw_document_element = false;
         let mut elements = vec![(
             document.root,
@@ -231,10 +244,12 @@ impl Document {
             }],
         )];
         loop {
-            match reader
+            let event_offset = reader.buffer_position() as usize;
+            let event = reader
                 .read_event()
-                .map_err(|error| Error::Xml(error.to_string()))?
-            {
+                .map_err(|error| Error::Xml(error.to_string()))?;
+            let source_line = line_starts.partition_point(|offset| *offset <= event_offset);
+            match event {
                 Event::Start(start) => {
                     if elements.len() == 1 {
                         if saw_document_element {
@@ -242,7 +257,8 @@ impl Document {
                         }
                         saw_document_element = true;
                     }
-                    push_stream_element(&mut document, &mut elements, &start, false)?
+                    let id = push_stream_element(&mut document, &mut elements, &start, false)?;
+                    document.nodes[id.0].source_line = Some(source_line);
                 }
                 Event::Empty(start) => {
                     if elements.len() == 1 {
@@ -251,7 +267,8 @@ impl Document {
                         }
                         saw_document_element = true;
                     }
-                    push_stream_element(&mut document, &mut elements, &start, true)?
+                    let id = push_stream_element(&mut document, &mut elements, &start, true)?;
+                    document.nodes[id.0].source_line = Some(source_line);
                 }
                 Event::End(_) => {
                     if elements.len() == 1 {
@@ -269,7 +286,8 @@ impl Document {
                         ));
                     }
                     if elements.len() > 1 && !value.is_empty() {
-                        push_parsed_text(&mut document, &elements, value);
+                        let id = push_parsed_text(&mut document, &elements, value);
+                        document.nodes[id.0].source_line = Some(source_line);
                     }
                 }
                 Event::CData(text) => {
@@ -278,23 +296,29 @@ impl Document {
                             "CDATA is not allowed outside the document element".into(),
                         ));
                     }
-                    push_parsed_text(&mut document, &elements, text.xml10_content().into_owned());
+                    let id = push_parsed_text(
+                        &mut document,
+                        &elements,
+                        text.xml10_content().into_owned(),
+                    );
+                    document.nodes[id.0].source_line = Some(source_line);
                 }
                 Event::Comment(comment) => {
                     let parent = elements.last().expect("document frame remains present").0;
                     let inherited_base =
                         document.node(parent).and_then(|node| node.base_uri.clone());
-                    document.push(
+                    let id = document.push(
                         parent,
                         NodeKind::Comment(comment.xml10_content().into_owned()),
                         inherited_base,
                     );
+                    document.nodes[id.0].source_line = Some(source_line);
                 }
                 Event::PI(pi) => {
                     let parent = elements.last().expect("document frame remains present").0;
                     let inherited_base =
                         document.node(parent).and_then(|node| node.base_uri.clone());
-                    document.push(
+                    let id = document.push(
                         parent,
                         NodeKind::ProcessingInstruction {
                             target: pi.target().to_owned(),
@@ -302,6 +326,7 @@ impl Document {
                         },
                         inherited_base,
                     );
+                    document.nodes[id.0].source_line = Some(source_line);
                 }
                 Event::GeneralRef(reference) => {
                     if elements.len() == 1 {
@@ -334,7 +359,8 @@ impl Document {
                             )));
                         }
                     };
-                    push_parsed_text(&mut document, &elements, value);
+                    let id = push_parsed_text(&mut document, &elements, value);
+                    document.nodes[id.0].source_line = Some(source_line);
                 }
                 Event::Eof => break,
                 Event::Decl(_) | Event::DocType(_) => {}
@@ -765,7 +791,7 @@ fn push_stream_element(
     elements: &mut Vec<(NodeId, Vec<Namespace>)>,
     start: &quick_xml::events::BytesStart<'_>,
     empty: bool,
-) -> Result<()> {
+) -> Result<NodeId> {
     let parent = elements
         .last()
         .map(|(parent, _)| *parent)
@@ -855,10 +881,14 @@ fn push_stream_element(
     if !empty {
         elements.push((projected, namespaces));
     }
-    Ok(())
+    Ok(projected)
 }
 
-fn push_parsed_text(document: &mut Document, elements: &[(NodeId, Vec<Namespace>)], value: String) {
+fn push_parsed_text(
+    document: &mut Document,
+    elements: &[(NodeId, Vec<Namespace>)],
+    value: String,
+) -> NodeId {
     let parent = elements.last().expect("document frame remains present").0;
     let inherited_base = document.node(parent).and_then(|node| node.base_uri.clone());
     document.push(
@@ -868,7 +898,7 @@ fn push_parsed_text(document: &mut Document, elements: &[(NodeId, Vec<Namespace>
             disable_output_escaping: false,
         },
         inherited_base,
-    );
+    )
 }
 
 fn split_lexical_name(name: &str) -> (Option<String>, String) {
@@ -1245,4 +1275,59 @@ fn resolve_base_uri(base: Option<&str>, reference: &str) -> Result<String> {
         }
     }
     Ok(reference.to_owned())
+}
+
+#[cfg(test)]
+mod parser_boundary_tests {
+    use super::{Document, Result};
+
+    fn nested_xml(depth: usize, leaf: &str) -> String {
+        format!("{}{}{}", "<n>".repeat(depth), leaf, "</n>".repeat(depth))
+    }
+
+    fn parse_tree_with_oracle_stack(xml: &str, base_uri: Option<&str>) -> Result<Document> {
+        let xml = xml.to_owned();
+        let base_uri = base_uri.map(str::to_owned);
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || Document::parse_tree(&xml, base_uri.as_deref()))
+            .expect("parser oracle thread starts")
+            .join()
+            .expect("parser oracle thread does not panic")
+    }
+
+    #[test]
+    fn tree_and_streaming_parsers_have_identical_boundary_semantics() {
+        // Attacker-controlled depth must not select a different namespace, ID, or node model.
+        for depth in (62..=66).chain(126..=130) {
+            let xml = nested_xml(
+                depth,
+                r#"<p:leaf xmlns:p="urn:leaf" xml:id="target" p:value="ok">text</p:leaf>"#,
+            );
+            let tree = parse_tree_with_oracle_stack(&xml, Some("memory:source.xml"))
+                .expect("tree parser accepts boundary document");
+            let streaming = Document::parse_deep_streaming(&xml, Some("memory:source.xml"))
+                .expect("streaming parser accepts boundary document");
+            assert_eq!(tree, streaming, "parser models differ at depth {depth}");
+        }
+    }
+
+    #[test]
+    fn tree_and_streaming_parsers_reject_the_same_boundary_malformations() {
+        // Namespace and document-well-formedness failures cannot depend on the depth threshold.
+        for depth in (62..=66).chain(126..=130) {
+            for leaf in [
+                "<p:leaf/>",
+                "<leaf xmlns:a=\"urn:u\" xmlns:b=\"urn:u\" a:x=\"1\" b:x=\"2\"/>",
+                "<leaf xmlns:xml=\"urn:wrong\"/>",
+            ] {
+                let xml = nested_xml(depth, leaf);
+                assert_eq!(
+                    parse_tree_with_oracle_stack(&xml, None).is_ok(),
+                    Document::parse_deep_streaming(&xml, None).is_ok(),
+                    "parser acceptance differs at depth {depth} for {leaf}"
+                );
+            }
+        }
+    }
 }

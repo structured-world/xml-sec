@@ -68,6 +68,28 @@ pub(crate) fn serialize(
     serialize_charged(document, definition, meter, BudgetKind::SerializedBytes)
 }
 
+pub(crate) fn serialize_fragment(document: &Document, meter: &mut Meter) -> Result<String> {
+    let mut definition = OutputDefinition {
+        omit_xml_declaration: true,
+        ..OutputDefinition::default()
+    };
+    definition.method_explicit = true;
+    definition.indent_explicit = true;
+    let (used, limit) = meter.usage(BudgetKind::OwnedBytes)?;
+    let mut counter = RenderBuffer::counting(
+        EncodingCounter::new("UTF-8")?,
+        BudgetKind::OwnedBytes,
+        used,
+        limit,
+    );
+    render(document, &definition, &mut counter)?;
+    let bytes = counter.len();
+    meter.charge(BudgetKind::OwnedBytes, bytes)?;
+    let mut text = RenderBuffer::Text(String::with_capacity(bytes));
+    render(document, &definition, &mut text)?;
+    Ok(text.into_string())
+}
+
 fn serialize_charged(
     document: &Document,
     definition: &OutputDefinition,

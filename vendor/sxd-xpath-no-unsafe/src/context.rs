@@ -221,7 +221,8 @@ impl<'c, 'd> Evaluation<'c, 'd> {
         self.namespaces.get(prefix).map(String::as_str)
     }
 
-    pub(crate) fn reserve_string_allocation(&self, bytes: usize) -> Result<(), function::Error> {
+    /// Reserve bytes before an extension function allocates an XPath string result.
+    pub fn reserve_string_allocation(&self, bytes: usize) -> Result<(), function::Error> {
         let actual = self.string_allocations.used.get().saturating_add(bytes);
         if self
             .string_allocations

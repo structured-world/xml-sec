@@ -225,6 +225,8 @@ pub enum Value<'d> {
     Number(f64),
     /// A string
     String(string::String),
+    /// An XSLT 1.0 result-tree fragment. It is truthy but is not navigable as a node-set.
+    ResultTreeFragment(u64, string::String),
     /// A collection of unique nodes
     Nodeset(nodeset::Nodeset<'d>),
 }
@@ -255,6 +257,7 @@ impl<'d> Value<'d> {
             Boolean(val) => val,
             Number(n) => n != 0.0 && !n.is_nan(),
             String(ref s) => !s.is_empty(),
+            ResultTreeFragment(..) => true,
             Nodeset(ref nodeset) => nodeset.size() > 0,
         }
     }
@@ -275,6 +278,7 @@ impl<'d> Value<'d> {
             }
             Number(val) => val,
             String(ref s) => str_to_num(s),
+            ResultTreeFragment(_, ref s) => str_to_num(s),
             Nodeset(..) => str_to_num(&self.string()),
         }
     }
@@ -302,6 +306,7 @@ impl<'d> Value<'d> {
                 }
             }
             String(ref val) => val.clone(),
+            ResultTreeFragment(_, ref val) => val.clone(),
             Nodeset(ref ns) => match ns.document_order_first() {
                 Some(n) => n.string_value(),
                 None => "".to_owned(),
@@ -313,6 +318,7 @@ impl<'d> Value<'d> {
         use crate::Value::*;
         match self {
             String(val) => val,
+            ResultTreeFragment(_, val) => val,
             other => other.string(),
         }
     }

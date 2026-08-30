@@ -28,6 +28,7 @@
 
 mod budget;
 mod compiler;
+mod environment;
 mod error;
 mod expression;
 mod exslt_date;
@@ -40,6 +41,7 @@ mod xpath;
 
 pub use budget::{BudgetKind, CompileBudget, ExecutionBudget};
 pub use compiler::{Compiler, Stylesheet};
+pub use environment::{Clock, ExecutionEnvironment, ExtensionPolicy, FixedClock, SystemClock};
 pub use error::{Error, ErrorKind, Result};
 pub use model::{
     Attribute, Document, ExpandedName, Namespace, Node, NodeId, NodeKind, NodeReference,

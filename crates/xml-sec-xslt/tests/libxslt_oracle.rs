@@ -1329,7 +1329,12 @@ fn is_expected_strict_xslt_error(case: &Case, error: &Error) -> bool {
         // This historical libxslt regression fixture relies on silently ignoring a misplaced
         // name attribute. Strict compilation rejects the instruction-specific attribute.
         ("general/bug-48-.xsl", Error::Static(message)) => {
-            message.contains("xsl:apply-templates does not permit XSLT attribute name")
+            message.contains("xsl:apply-templates does not permit unqualified attribute name")
+        }
+        // This donor fixture exercises libxslt's recovery extension for a variable reference in
+        // match. XSLT 1.0 forbids VariableReference in patterns, so strict compilation rejects it.
+        ("general/bug-214.xsl", Error::Static(message)) => {
+            message.contains("match pattern") && message.contains("variable reference")
         }
         // count() requires a node-set; libxslt historically exposed an RTF as one implicitly.
         ("general/bug-56.xsl", Error::Dynamic(message)) => {

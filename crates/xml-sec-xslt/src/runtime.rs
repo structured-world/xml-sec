@@ -13,11 +13,11 @@ use crate::compiler::{
     Stylesheet, Template, Variable,
 };
 use crate::expression::innermost_namespaced_call;
-use crate::serializer::serialize;
+use crate::serializer::{serialize, serialize_fragment};
 use crate::xpath::{Evaluator, EvaluatorSourceOptions, SourceNode, XPathValue};
 use crate::{
-    Attribute, BudgetKind, Document, Error, ExecutionBudget, ExpandedName, Namespace, NodeId,
-    NodeKind, NodeReference, Resolver, Result, SerializedOutput, Value,
+    Attribute, BudgetKind, Document, Error, ExecutionBudget, ExecutionEnvironment, ExpandedName,
+    Namespace, NodeId, NodeKind, NodeReference, Resolver, Result, SerializedOutput, Value,
 };
 
 /// Top-level stylesheet parameters supplied by the caller.
@@ -76,10 +76,27 @@ impl Stylesheet {
         resolver: Arc<R>,
         options: ExecutionOptions,
     ) -> Result<TransformResult> {
-        self.execute_with_source_processing(
+        self.execute_with_environment_and_source_processing(
             source,
             parameters,
-            resolver,
+            ExecutionEnvironment::new(resolver),
+            options,
+            SourceProcessing::Xml,
+        )
+    }
+
+    /// Execute with explicit resolver, clock, and extension permissions.
+    pub fn execute_with_environment<R: Resolver + 'static>(
+        &self,
+        source: &Document,
+        parameters: &Parameters,
+        environment: ExecutionEnvironment<R>,
+        options: ExecutionOptions,
+    ) -> Result<TransformResult> {
+        self.execute_with_environment_and_source_processing(
+            source,
+            parameters,
+            environment,
             options,
             SourceProcessing::Xml,
         )
@@ -94,6 +111,24 @@ impl Stylesheet {
         options: ExecutionOptions,
         source_processing: SourceProcessing,
     ) -> Result<TransformResult> {
+        self.execute_with_environment_and_source_processing(
+            source,
+            parameters,
+            ExecutionEnvironment::new(resolver),
+            options,
+            source_processing,
+        )
+    }
+
+    /// Execute with explicit environment and source preprocessing semantics.
+    pub fn execute_with_environment_and_source_processing<R: Resolver + 'static>(
+        &self,
+        source: &Document,
+        parameters: &Parameters,
+        environment: ExecutionEnvironment<R>,
+        options: ExecutionOptions,
+        source_processing: SourceProcessing,
+    ) -> Result<TransformResult> {
         let source_bytes = source.source_xml().map_or(0, str::len);
         let mut meter = Meter::new(options.budget, source_bytes)?;
         let prepared = self.prepare_source(source, source_bytes, &mut meter)?;
@@ -101,7 +136,7 @@ impl Stylesheet {
             self,
             prepared.as_ref(),
             parameters,
-            resolver,
+            environment,
             meter,
             source_processing,
         )?;
@@ -299,7 +334,7 @@ impl<'a> Execution<'a> {
         stylesheet: &'a Stylesheet,
         source: &'a Document,
         parameters: &Parameters,
-        resolver: Arc<R>,
+        environment: ExecutionEnvironment<R>,
         mut meter: Meter,
         source_processing: SourceProcessing,
     ) -> Result<Self> {
@@ -308,11 +343,13 @@ impl<'a> Execution<'a> {
             &stylesheet.principal_document,
             stylesheet.principal_base_uri.clone(),
             &stylesheet.module_documents,
-            resolver,
+            environment.resolver,
             &mut meter,
             EvaluatorSourceOptions {
                 processing: source_processing,
                 whitespace: Arc::clone(&stylesheet.whitespace),
+                clock: environment.clock,
+                extension_policy: environment.extension_policy,
             },
         )?;
         let mut state = Self {
@@ -658,6 +695,7 @@ impl<'a> Execution<'a> {
                     });
                     match instruction {
                         Instruction::CallTemplate { name, parameters } => {
+                            self.meter.charge(BudgetKind::TemplateApplications, 1)?;
                             let supplied = self.evaluate_with_params(
                                 &parameters,
                                 &node,
@@ -1614,8 +1652,9 @@ impl<'a> Execution<'a> {
             }
             Instruction::Message { terminate, body } => {
                 self.meter.charge(BudgetKind::Messages, 1)?;
-                let content =
-                    self.capture_text(body, node, position, size, depth, current_precedence)?;
+                let fragment =
+                    self.capture_fragment(body, node, position, size, depth, current_precedence)?;
+                let content = serialize_fragment(&fragment, &mut self.meter)?;
                 self.messages.push(Message {
                     content: content.clone(),
                     terminate: *terminate,
@@ -1832,6 +1871,7 @@ impl<'a> Execution<'a> {
             return Ok(Some(0.0));
         };
         let mut preceding = 0usize;
+        let mut union_count = 0usize;
         for child in &root.children {
             let Some(candidate) = fragment.node(*child) else {
                 continue;
@@ -1842,12 +1882,14 @@ impl<'a> Execution<'a> {
                     |prefix| format!("{prefix}:{}", name.local),
                 );
                 if qualified == target {
-                    return Ok(Some(preceding as f64));
+                    // Preceding sibling sets are nested in document order, so the last
+                    // matching element contributes the complete union.
+                    union_count = preceding;
                 }
                 preceding += 1;
             }
         }
-        Ok(Some(0.0))
+        Ok(Some(union_count as f64))
     }
 
     fn evaluate_scalar_fast(
@@ -1900,8 +1942,16 @@ impl<'a> Execution<'a> {
             && is_lexical_variable_name(variable.trim())
             && let Ok(increment) = increment.trim().parse::<f64>()
         {
-            let value = self.variable_string(variable.trim(), &expression.namespaces)?;
-            return Ok(Some(XPathValue::Number(xpath_number(&value) + increment)));
+            let value = self.variable_value(variable.trim(), &expression.namespaces)?;
+            let number = match value {
+                Value::Boolean(value) => f64::from(u8::from(*value)),
+                Value::Number(value) => *value,
+                Value::String(value) | Value::StoredExpression(value) => xpath_number(value),
+                Value::NodeSet(_) | Value::ResultTreeFragment(_) => {
+                    xpath_number(&value.clone().into_string(&self.evaluator.source))
+                }
+            };
+            return Ok(Some(XPathValue::Number(number + increment)));
         }
         if let Some(arguments) = source
             .strip_prefix("translate(")
@@ -2247,6 +2297,8 @@ impl<'a> Execution<'a> {
         frame: ApplyFrame,
         current_rule_precedence: Option<usize>,
     ) -> Result<()> {
+        self.meter.recursion(frame.depth)?;
+        self.meter.charge(BudgetKind::TemplateApplications, 1)?;
         let template = self
             .stylesheet
             .templates
@@ -2272,11 +2324,21 @@ impl<'a> Execution<'a> {
         let mut output = String::new();
         for part in &avt.0 {
             match part {
-                AvtPart::Literal(value) => output.push_str(value),
+                AvtPart::Literal(value) => {
+                    self.meter.check_additional(
+                        BudgetKind::OwnedBytes,
+                        output.len().saturating_add(value.len()),
+                    )?;
+                    output.push_str(value);
+                }
                 AvtPart::Expression(expression) => {
                     let value = self
                         .evaluate(expression, node, position, size)?
                         .string(&self.evaluator);
+                    self.meter.check_additional(
+                        BudgetKind::OwnedBytes,
+                        output.len().saturating_add(value.len()),
+                    )?;
                     output.push_str(&value)
                 }
             }

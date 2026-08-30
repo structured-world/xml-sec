@@ -8,6 +8,13 @@ Compilation produces an immutable `Stylesheet` that can be shared and executed
 repeatedly. Callers provide explicit compile/execution budgets and a resolver
 contract; `NoResolver` denies external access.
 
+Execution capabilities are explicit through `ExecutionEnvironment`: a caller-owned
+resolver, clock, and typed extension policy. The compatibility entry point uses the
+host local clock. Security-sensitive or reproducible transforms can inject
+`FixedClock`, while `ExtensionPolicy::Deterministic` rejects zero-argument EXSLT date
+functions that depend on ambient time. Extension capability therefore does not imply
+permission to use nondeterministic behavior.
+
 The engine implements template matching and precedence, modes, named templates,
 variables and parameters, keys, whitespace declarations, decimal formats,
 namespace aliases, attribute sets, XSLT instruction execution, result-tree
