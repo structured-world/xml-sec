@@ -5,6 +5,9 @@
 //! Compilation and execution are separate: [`Compiler`] produces an immutable
 //! [`Stylesheet`] which can be shared between threads and applied repeatedly.
 //! The crate performs no implicit filesystem, network, or environment access.
+//! Resolver-provided stylesheet and XML resource bytes honor declarations, BOMs,
+//! UTF-16 initial patterns, and explicit encoding metadata. [`Document::parse`]
+//! accepts caller-decoded Rust text rather than raw encoded bytes.
 //!
 //! ```
 //! use std::sync::Arc;

@@ -1413,13 +1413,7 @@ fn parse_namespace_alias(node: roxmltree::Node<'_, '_>) -> Result<NamespaceAlias
     let stylesheet_prefix = required_attr(node, "stylesheet-prefix")?;
     let result_prefix = required_attr(node, "result-prefix")?;
     let stylesheet_namespace = alias_namespace(node, stylesheet_prefix)?;
-    let result_namespace = if result_prefix == "#default" {
-        node.lookup_namespace_uri(None)
-            .map(str::to_owned)
-            .or_else(|| stylesheet_namespace.clone())
-    } else {
-        alias_namespace(node, result_prefix)?
-    };
+    let result_namespace = alias_namespace(node, result_prefix)?;
     Ok(NamespaceAlias {
         stylesheet_namespace,
         output_prefix: (result_prefix != "#default").then(|| result_prefix.to_owned()),

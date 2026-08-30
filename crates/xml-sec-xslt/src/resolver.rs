@@ -35,11 +35,7 @@ pub trait Resolver: Send + Sync {
 }
 
 pub(crate) fn decode_resource(bytes: &[u8], explicit: Option<&str>) -> Result<String> {
-    let (encoding, bom_len) = if let Some(label) = explicit {
-        (resource_encoding(label)?, 0)
-    } else {
-        detect_xml_encoding(bytes)?
-    };
+    let (encoding, bom_len) = resource_decode_parameters(bytes, explicit)?;
     let (decoded, _, had_errors) = encoding.decode(&bytes[bom_len..]);
     if had_errors {
         return Err(Error::Xml(format!(
@@ -48,6 +44,46 @@ pub(crate) fn decode_resource(bytes: &[u8], explicit: Option<&str>) -> Result<St
         )));
     }
     Ok(decoded.into_owned())
+}
+
+pub(crate) fn decoded_resource_len(bytes: &[u8], explicit: Option<&str>) -> Result<usize> {
+    let (encoding, bom_len) = resource_decode_parameters(bytes, explicit)?;
+    let mut decoder = encoding.new_decoder_without_bom_handling();
+    let mut remaining = &bytes[bom_len..];
+    let mut decoded_len = 0usize;
+    let mut buffer = [0u8; 4096];
+    loop {
+        let (result, read, written) =
+            decoder.decode_to_utf8_without_replacement(remaining, &mut buffer, true);
+        decoded_len = decoded_len.checked_add(written).ok_or_else(|| {
+            Error::Xml(format!(
+                "decoded {} resource length overflows usize",
+                encoding.name()
+            ))
+        })?;
+        remaining = &remaining[read..];
+        match result {
+            encoding_rs::DecoderResult::InputEmpty => return Ok(decoded_len),
+            encoding_rs::DecoderResult::OutputFull => {}
+            encoding_rs::DecoderResult::Malformed(_, _) => {
+                return Err(Error::Xml(format!(
+                    "external resource contains invalid {} bytes",
+                    encoding.name()
+                )));
+            }
+        }
+    }
+}
+
+fn resource_decode_parameters(
+    bytes: &[u8],
+    explicit: Option<&str>,
+) -> Result<(&'static encoding_rs::Encoding, usize)> {
+    if let Some(label) = explicit {
+        Ok((resource_encoding(label)?, 0))
+    } else {
+        detect_xml_encoding(bytes)
+    }
 }
 
 fn detect_xml_encoding(bytes: &[u8]) -> Result<(&'static encoding_rs::Encoding, usize)> {

@@ -1242,6 +1242,16 @@ fn assert_strict_xslt_output_deviation(case: &Case, actual: &[u8], expected: &[u
             assert!(!actual.contains("<axsl:"));
             true
         }
+        // XSLT 1.0 section 7.1.1 maps #default to the default namespace bound at the
+        // namespace-alias declaration. This fixture has no such binding; libxslt instead keeps
+        // the stylesheet namespace URI while dropping its prefix.
+        "namespaces/tst7.xsl" => {
+            assert!(actual.contains("<html>"));
+            assert!(actual.contains("<head>"));
+            assert!(!actual.contains("xmlns=\"http://www.w3.org/1999/xhtml\""));
+            assert!(!actual.contains("http-equiv=\"Content-Type\""));
+            true
+        }
         // XPath document order places attributes of preceding elements before attributes of the
         // current element. libxslt restarts level-any attribute numbering for each owner.
         "general/bug-197.xsl" => {

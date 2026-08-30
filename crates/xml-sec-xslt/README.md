@@ -29,6 +29,16 @@ resolver contract with purpose, base URI, stable resource identity, and byte
 budgeting. The XMLDSig transform adapter remains outside this crate so no
 XML-security types enter the reusable engine.
 
+Resolver resources are byte-oriented. XML declarations, BOMs, UTF-16 initial
+patterns, and explicit resolver encoding metadata are honored without lossy
+fallback; unsupported labels and malformed byte sequences are rejected. XML,
+HTML, and text output supports registered `encoding_rs` labels, including UTF-8,
+UTF-16LE/BE, and ISO-8859-1, with the method-specific escaping or rejection
+required for unrepresentable characters.
+`Document::parse` accepts already-decoded Rust text; callers that own raw principal
+document bytes remain responsible for decoding them before constructing a
+`Document`.
+
 ## Compatibility oracle
 
 The repository vendors the complete libxslt 1.1.45 test tree and registers all

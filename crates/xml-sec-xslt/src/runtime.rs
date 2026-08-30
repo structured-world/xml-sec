@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -14,7 +13,10 @@ use crate::compiler::{
 };
 use crate::expression::innermost_namespaced_call;
 use crate::serializer::{serialize, serialize_fragment};
-use crate::xpath::{Evaluator, EvaluatorSourceOptions, SourceNode, XPathValue, xpath_number};
+use crate::xpath::{
+    Evaluator, EvaluatorSourceOptions, PreparedEvaluatorSource, SourceNode, XPathValue,
+    prepare_evaluator_source, xpath_number,
+};
 use crate::{
     Attribute, BudgetKind, Document, Error, ExecutionBudget, ExecutionEnvironment, ExpandedName,
     Namespace, NodeId, NodeKind, NodeReference, Resolver, Result, SerializedOutput, Value,
@@ -65,11 +67,6 @@ pub struct TransformResult {
 pub struct SecondaryOutput {
     pub uri: String,
     pub serialized: SerializedOutput,
-}
-
-struct PreparedSource<'a> {
-    document: Cow<'a, Document>,
-    remap: Option<HashMap<NodeId, NodeId>>,
 }
 
 impl Stylesheet {
@@ -136,17 +133,29 @@ impl Stylesheet {
     ) -> Result<TransformResult> {
         let source_bytes = source.source_xml().map_or(0, str::len);
         let mut meter = Meter::new(options.budget, source_bytes)?;
-        let prepared = self.prepare_source(source, source_bytes, &mut meter)?;
+        let source_options = EvaluatorSourceOptions {
+            processing: source_processing,
+            whitespace: Arc::clone(&self.whitespace),
+            clock: Arc::clone(&environment.clock),
+            extension_policy: environment.extension_policy,
+        };
+        let mut prepared = prepare_evaluator_source(
+            source,
+            environment.resolver.as_ref(),
+            &mut meter,
+            &source_options,
+        )?;
+        let source_remap = prepared.remap.take();
         let mut state = Execution::new(
             self,
-            prepared.document.as_ref(),
+            prepared,
             parameters,
-            prepared.remap.as_ref(),
+            source_remap.as_ref(),
             environment,
             meter,
-            source_processing,
+            source_options,
         )?;
-        let root = SourceNode::Node(prepared.document.root());
+        let root = SourceNode::Node(state.evaluator.source.root());
         if let Some(name) = options.initial_template {
             state.call_named(
                 &name,
@@ -169,27 +178,6 @@ impl Stylesheet {
             serialized,
             secondary_outputs: state.secondary_outputs,
             messages: state.messages,
-        })
-    }
-
-    fn prepare_source<'a>(
-        &self,
-        source: &'a Document,
-        source_bytes: usize,
-        meter: &mut Meter,
-    ) -> Result<PreparedSource<'a>> {
-        if self.whitespace.is_empty() {
-            return Ok(PreparedSource {
-                document: Cow::Borrowed(source),
-                remap: None,
-            });
-        }
-        meter.charge(BudgetKind::OwnedBytes, source_bytes)?;
-        let mut prepared = source.clone();
-        let remap = apply_whitespace_rules(&mut prepared, &self.whitespace);
-        Ok(PreparedSource {
-            document: Cow::Owned(prepared),
-            remap,
         })
     }
 }
@@ -345,12 +333,12 @@ impl ApplyFrame {
 impl<'a> Execution<'a> {
     fn new<R: Resolver + 'static>(
         stylesheet: &'a Stylesheet,
-        source: &'a Document,
+        source: PreparedEvaluatorSource,
         parameters: &Parameters,
         source_remap: Option<&HashMap<NodeId, NodeId>>,
         environment: ExecutionEnvironment<R>,
         mut meter: Meter,
-        source_processing: SourceProcessing,
+        source_options: EvaluatorSourceOptions,
     ) -> Result<Self> {
         let evaluator = Evaluator::new(
             source,
@@ -359,12 +347,7 @@ impl<'a> Execution<'a> {
             &stylesheet.module_documents,
             environment.resolver,
             &mut meter,
-            EvaluatorSourceOptions {
-                processing: source_processing,
-                whitespace: Arc::clone(&stylesheet.whitespace),
-                clock: environment.clock,
-                extension_policy: environment.extension_policy,
-            },
+            source_options,
         )?;
         let mut state = Self {
             stylesheet,
@@ -941,7 +924,7 @@ impl<'a> Execution<'a> {
                                     position: index + 1,
                                     size: total,
                                     depth: depth + 1,
-                                    precedence,
+                                    precedence: None,
                                 });
                                 tasks.push(TemplateTask::PushScope);
                             }

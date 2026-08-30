@@ -12,7 +12,7 @@ use crate::compiler::{
     DecimalFormat, Expression, NameTest, Pattern, is_ncname, normalize_xpath_for_sxd,
 };
 use crate::expression::innermost_namespaced_call;
-use crate::resolver::decode_resource;
+use crate::resolver::{decode_resource, decoded_resource_len};
 use crate::runtime::{SourceProcessing, apply_whitespace_rules};
 use crate::{
     BudgetKind, Clock, Document, Error, ErrorKind, ExpandedName, ExtensionPolicy, NodeId, NodeKind,
@@ -41,6 +41,61 @@ pub(crate) struct EvaluatorSourceOptions {
     pub(crate) whitespace: Arc<[(NameTest, bool, usize, usize)]>,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) extension_policy: ExtensionPolicy,
+}
+
+pub(crate) struct PreparedEvaluatorSource {
+    pub(crate) document: Document,
+    pub(crate) remap: Option<HashMap<NodeId, NodeId>>,
+    resource_identities: HashMap<ResourceIdentity, Vec<u8>>,
+}
+
+pub(crate) fn prepare_evaluator_source(
+    source: &Document,
+    resolver: &dyn Resolver,
+    meter: &mut Meter,
+    options: &EvaluatorSourceOptions,
+) -> Result<PreparedEvaluatorSource> {
+    let mut resource_identities = HashMap::new();
+    let (mut document, include_remap) = if options.processing == SourceProcessing::XInclude {
+        expand_xinclude_document(
+            source,
+            resolver,
+            meter,
+            &mut resource_identities,
+            &mut Vec::new(),
+            0,
+        )?
+    } else {
+        (source.clone(), None)
+    };
+    let whitespace_remap = apply_whitespace_rules(&mut document, &options.whitespace);
+    let remap = compose_node_remaps(include_remap, whitespace_remap);
+    Ok(PreparedEvaluatorSource {
+        document,
+        remap,
+        resource_identities,
+    })
+}
+
+fn compose_node_remaps(
+    first: Option<HashMap<NodeId, NodeId>>,
+    second: Option<HashMap<NodeId, NodeId>>,
+) -> Option<HashMap<NodeId, NodeId>> {
+    match (first, second) {
+        (None, None) => None,
+        (Some(remap), None) | (None, Some(remap)) => Some(remap),
+        (Some(first), Some(second)) => Some(
+            first
+                .into_iter()
+                .filter_map(|(original, intermediate)| {
+                    second
+                        .get(&intermediate)
+                        .copied()
+                        .map(|final_id| (original, final_id))
+                })
+                .collect(),
+        ),
+    }
 }
 
 fn source_node_owner(node: &SourceNode) -> NodeId {
@@ -109,7 +164,7 @@ pub(crate) struct Evaluator {
 
 impl Evaluator {
     pub(crate) fn new<R: Resolver + 'static>(
-        source: &Document,
+        prepared_source: PreparedEvaluatorSource,
         principal_stylesheet: &Document,
         principal_base_uri: Option<String>,
         module_documents: &[(String, Document)],
@@ -119,20 +174,12 @@ impl Evaluator {
     ) -> Result<Self> {
         // SXD receives the normalized semantic tree, not the caller's parser-specific
         // lexical node layout. Typed paths then make every cross-model identity explicit.
-        let mut resource_identities = HashMap::new();
-        let mut source = if source_options.processing == SourceProcessing::XInclude {
-            expand_xinclude_document(
-                source,
-                resolver.as_ref(),
-                meter,
-                &mut resource_identities,
-                &mut Vec::new(),
-                0,
-            )?
-        } else {
-            source.clone()
-        };
-        let _ = apply_whitespace_rules(&mut source, &source_options.whitespace);
+        let PreparedEvaluatorSource {
+            document,
+            remap: _,
+            resource_identities,
+        } = prepared_source;
+        let mut source = document;
         let stylesheet_root = source.import(principal_stylesheet);
         let module_roots = module_documents
             .iter()
@@ -1098,10 +1145,12 @@ impl Evaluator {
                     self.cache_document(resource_request.clone(), vec![root.clone()]);
                     Some(root)
                 } else {
-                    meter.check_additional(BudgetKind::OwnedBytes, resource.bytes.len())?;
-                    let xml = decode_resource(&resource.bytes, resource.encoding.as_deref())?;
+                    let xml = decode_resource_for_xml_parse(
+                        &resource.bytes,
+                        resource.encoding.as_deref(),
+                        meter,
+                    )?;
                     let document = Document::parse(&xml, Some(&resource.canonical_uri))?;
-                    meter.charge(BudgetKind::OwnedBytes, resource.bytes.len())?;
                     let mut document = if self.source_processing == SourceProcessing::XInclude {
                         let mut stack = vec![resource.identity.clone()];
                         expand_xinclude_document(
@@ -1112,6 +1161,7 @@ impl Evaluator {
                             &mut stack,
                             1,
                         )?
+                        .0
                     } else {
                         document
                     };
@@ -2002,7 +2052,7 @@ fn expand_xinclude_document(
     identities: &mut HashMap<ResourceIdentity, Vec<u8>>,
     include_stack: &mut Vec<ResourceIdentity>,
     depth: usize,
-) -> Result<Document> {
+) -> Result<(Document, Option<HashMap<NodeId, NodeId>>)> {
     meter.recursion(depth)?;
     let base_uri = source
         .node(source.root())
@@ -2101,7 +2151,7 @@ fn expand_xinclude_document(
         }
     }
     output.remap_ids_from(source, &principal_mapping)?;
-    Ok(output)
+    Ok((output, Some(principal_mapping)))
 }
 
 enum XIncludeContent {
@@ -2154,24 +2204,21 @@ fn resolve_xinclude(
             identity: resource.identity,
         });
     }
-    meter.check_additional(BudgetKind::OwnedBytes, resource.bytes.len())?;
-    meter.charge(BudgetKind::OwnedBytes, resource.bytes.len())?;
-    identities.insert(resource.identity.clone(), resource.bytes.clone());
     let parse = attribute("parse").unwrap_or("xml");
     if parse == "text" {
         let encoding = attribute("encoding").or(resource.encoding.as_deref());
-        return Ok(XIncludeContent::Text(
-            decode_resource(&resource.bytes, encoding)?,
-            resource.canonical_uri,
-        ));
+        let value = decode_resource_metered(&resource.bytes, encoding, meter, false)?;
+        identities.insert(resource.identity, resource.bytes);
+        return Ok(XIncludeContent::Text(value, resource.canonical_uri));
     }
     if parse != "xml" {
         return Err(Error::Xml(format!(
             "unsupported XInclude parse mode {parse}"
         )));
     }
-    let xml = decode_resource(&resource.bytes, resource.encoding.as_deref())?;
+    let xml = decode_resource_for_xml_parse(&resource.bytes, resource.encoding.as_deref(), meter)?;
     let document = Document::parse(&xml, Some(&resource.canonical_uri))?;
+    identities.insert(resource.identity.clone(), resource.bytes);
     include_stack.push(resource.identity);
     let expanded = expand_xinclude_document(
         &document,
@@ -2182,7 +2229,31 @@ fn resolve_xinclude(
         depth.saturating_add(1),
     );
     include_stack.pop();
-    expanded.map(XIncludeContent::Xml)
+    expanded.map(|(document, _)| XIncludeContent::Xml(document))
+}
+
+fn decode_resource_for_xml_parse(
+    bytes: &[u8],
+    encoding: Option<&str>,
+    meter: &mut Meter,
+) -> Result<String> {
+    decode_resource_metered(bytes, encoding, meter, true)
+}
+
+fn decode_resource_metered(
+    bytes: &[u8],
+    encoding: Option<&str>,
+    meter: &mut Meter,
+    parsed_xml: bool,
+) -> Result<String> {
+    let decoded_len = decoded_resource_len(bytes, encoding)?;
+    // XML parsing retains one decoded source copy while the decoder's output is still live.
+    let decoded_copies = if parsed_xml { 2 } else { 1 };
+    let retained = bytes
+        .len()
+        .saturating_add(decoded_len.saturating_mul(decoded_copies));
+    meter.charge(BudgetKind::OwnedBytes, retained)?;
+    decode_resource(bytes, encoding)
 }
 
 struct NodeMaps {
@@ -2554,6 +2625,9 @@ fn absolute_path_can_start(output: &str, previous: Option<char>) -> bool {
     }) {
         return true;
     }
+    if previous == Some('*') && multiplication_operator_ends(output) {
+        return true;
+    }
     let trimmed = output.trim_end();
     ["and", "or", "div", "mod"].iter().any(|operator| {
         trimmed.strip_suffix(operator).is_some_and(|prefix| {
@@ -2563,6 +2637,19 @@ fn absolute_path_can_start(output: &str, previous: Option<char>) -> bool {
                 .is_none_or(|character| !is_xpath_name_character(character))
         })
     })
+}
+
+fn multiplication_operator_ends(output: &str) -> bool {
+    let Some(prefix) = output.trim_end().strip_suffix('*') else {
+        return false;
+    };
+    let Some(previous) = prefix.trim_end().chars().next_back() else {
+        return false;
+    };
+    !matches!(
+        previous,
+        '/' | ':' | '@' | '(' | '[' | ',' | '|' | '=' | '<' | '>' | '+' | '-' | '*'
+    )
 }
 
 pub(crate) fn rewrite_absolute_paths_for_validation(source: &str) -> String {

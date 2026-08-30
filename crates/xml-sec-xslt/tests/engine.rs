@@ -5,8 +5,9 @@ use std::{collections::HashMap, sync::Mutex};
 use pretty_assertions::assert_eq;
 use xml_sec_xslt::{
     BudgetKind, CompileBudget, Compiler, Document, Error, ExecutionBudget, ExecutionEnvironment,
-    ExecutionOptions, ExpandedName, ExtensionPolicy, FixedClock, NoResolver, NodeReference,
-    Parameters, ResolvePurpose, ResolvedResource, Resolver, ResourceIdentity, Value,
+    ExecutionOptions, ExpandedName, ExtensionPolicy, FixedClock, NoResolver, NodeKind,
+    NodeReference, Parameters, ResolvePurpose, ResolvedResource, Resolver, ResourceIdentity,
+    SourceProcessing, Value,
 };
 
 fn compile(source: &str) -> xml_sec_xslt::Stylesheet {
@@ -4257,4 +4258,279 @@ fn literal_extension_attributes_do_not_change_instruction_semantics() {
         "{output}"
     );
     assert!(output.contains("<e:item"), "{output}");
+}
+
+#[test]
+fn unbound_default_namespace_alias_produces_an_unqualified_name() {
+    // The result prefix has its own namespace lookup; it must not inherit the source alias URI.
+    let stylesheet = r##"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:old="urn:old"><xsl:namespace-alias stylesheet-prefix="old" result-prefix="#default"/><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><old:result/></xsl:template></xsl:stylesheet>"##;
+    assert_eq!(execute(stylesheet, "<source/>"), "<result/>\n");
+}
+
+#[test]
+fn for_each_clears_the_current_template_rule() {
+    // XSLT 1.0 makes apply-imports an error while a for-each body is instantiated.
+    let resolver = Arc::new(MemoryResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            "base.xsl".into(),
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="item">wrong</xsl:template></xsl:stylesheet>"#.into(),
+        );
+    let stylesheet = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:import href="base.xsl"/><xsl:template match="/"><xsl:for-each select="root/item"><xsl:apply-imports/></xsl:for-each></xsl:template></xsl:stylesheet>"#,
+        Some("memory:main.xsl"),
+    )
+    .expect("stylesheet compiles");
+    assert!(matches!(
+        stylesheet.execute(
+            &Document::parse("<root><item/></root>", None).expect("source parses"),
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Dynamic(message)) if message.contains("current template rule")
+    ));
+}
+
+#[test]
+fn multiplication_can_precede_an_absolute_location_path() {
+    // Multiplication is an operator here, while the star in the second expression is a node test.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="2 * /root/n"/><xsl:text>|</xsl:text><xsl:value-of select="count(/root/*/leaf)"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<root><n>3</n><branch><leaf/></branch></root>"),
+        "6|1"
+    );
+}
+
+#[test]
+fn xinclude_expansion_precedes_whitespace_classification() {
+    // Fallback children are classified under their post-expansion parent, not xi:fallback.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:xi="http://www.w3.org/2001/XInclude"><xsl:strip-space elements="xi:fallback"/><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="string-length(destination/text())"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let result = stylesheet
+        .execute_with_source_processing(
+            &Document::parse(
+                r#"<destination xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="missing.xml"><xi:fallback> </xi:fallback></xi:include></destination>"#,
+                Some("memory:source.xml"),
+            )
+            .expect("source parses"),
+            &Parameters::new(),
+            Arc::new(MemoryResolver::default()),
+            ExecutionOptions {
+                budget: execution_budget(4096),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        )
+        .expect("fallback executes");
+    assert_eq!(result.serialized.bytes, b"1");
+}
+
+#[test]
+fn xinclude_remaps_caller_nodeset_parameters() {
+    // Caller handles identify the principal source before XInclude inserts the resolved subtree.
+    let resolver = Arc::new(MemoryResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            "included.xml".into(),
+            "<included><extra/></included>".into(),
+        );
+    let source = Document::parse(
+        r#"<root xmlns:p="urn:p" xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="included.xml"/><target id="v">ok</target></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("source parses");
+    let target = source
+        .nodes()
+        .find_map(|(id, node)| match &node.kind {
+            NodeKind::Element { name, .. } if name.local == "target" => Some(id),
+            _ => None,
+        })
+        .expect("target exists");
+    let namespace_index = match &source.node(target).expect("target exists").kind {
+        NodeKind::Element { namespaces, .. } => namespaces
+            .iter()
+            .position(|namespace| namespace.prefix.as_deref() == Some("p"))
+            .expect("p namespace is in scope"),
+        _ => unreachable!("target is an element"),
+    };
+    let mut parameters = Parameters::new();
+    parameters.insert(
+        ExpandedName::new(None::<String>, "node"),
+        Value::NodeSet(vec![NodeReference::Node(target)]),
+    );
+    parameters.insert(
+        ExpandedName::new(None::<String>, "attribute"),
+        Value::NodeSet(vec![NodeReference::Attribute {
+            owner: target,
+            index: 0,
+        }]),
+    );
+    parameters.insert(
+        ExpandedName::new(None::<String>, "namespace"),
+        Value::NodeSet(vec![NodeReference::Namespace {
+            owner: target,
+            index: namespace_index,
+        }]),
+    );
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:param name="node"/><xsl:param name="attribute"/><xsl:param name="namespace"/><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="$node"/><xsl:text>|</xsl:text><xsl:value-of select="$attribute"/><xsl:text>|</xsl:text><xsl:value-of select="$namespace"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let result = stylesheet
+        .execute_with_source_processing(
+            &source,
+            &parameters,
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(4096),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        )
+        .expect("XInclude parameter remapping executes");
+    assert_eq!(result.serialized.bytes, b"ok|v|urn:p");
+}
+
+struct EncodedDocumentResolver {
+    bytes: Vec<u8>,
+    encoding: Option<String>,
+}
+
+impl Resolver for EncodedDocumentResolver {
+    fn resolve(
+        &self,
+        uri: &str,
+        _base_uri: Option<&str>,
+        purpose: ResolvePurpose,
+    ) -> xml_sec_xslt::Result<ResolvedResource> {
+        assert_eq!(uri, "encoded.xml");
+        assert_eq!(purpose, ResolvePurpose::Document);
+        Ok(ResolvedResource {
+            canonical_uri: "memory:encoded.xml".into(),
+            identity: ResourceIdentity("encoded.xml".into()),
+            bytes: self.bytes.clone(),
+            media_type: Some("application/xml".into()),
+            encoding: self.encoding.clone(),
+        })
+    }
+}
+
+#[test]
+fn document_function_decodes_non_utf8_resources() {
+    // document() follows resolver metadata, XML declarations, BOMs and UTF-16 initial patterns.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="document('encoded.xml')/root"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let latin1 = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><root>caf\xe9</root>".to_vec();
+    let utf16le = "<?xml version=\"1.0\"?><root>λ</root>"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    let utf16be = [0xfe, 0xff]
+        .into_iter()
+        .chain(
+            "<?xml version=\"1.0\"?><root>Ж</root>"
+                .encode_utf16()
+                .flat_map(u16::to_be_bytes),
+        )
+        .collect::<Vec<_>>();
+    for (bytes, encoding, expected) in [
+        (latin1, None, "café"),
+        (utf16le, None, "λ"),
+        (utf16be, None, "Ж"),
+        (
+            b"<root>caf\xe9</root>".to_vec(),
+            Some("ISO-8859-1".into()),
+            "café",
+        ),
+    ] {
+        let result = stylesheet
+            .execute(
+                &Document::parse("<source/>", None).expect("source parses"),
+                &Parameters::new(),
+                Arc::new(EncodedDocumentResolver { bytes, encoding }),
+                ExecutionOptions {
+                    budget: execution_budget(4096),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            )
+            .expect("encoded document executes");
+        assert_eq!(result.serialized.bytes, expected.as_bytes());
+    }
+}
+
+#[test]
+fn document_function_rejects_invalid_resource_encodings() {
+    // Resolver metadata is authoritative, but unsupported labels and malformed bytes never decode
+    // lossily or fall back to UTF-8.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:value-of select="document('encoded.xml')"/></xsl:template></xsl:stylesheet>"#,
+    );
+    for (bytes, encoding) in [
+        (b"<root>\xff</root>".to_vec(), Some("UTF-8".into())),
+        (b"<root/>".to_vec(), Some("X-UNKNOWN".into())),
+    ] {
+        assert!(matches!(
+            stylesheet.execute(
+                &Document::parse("<source/>", None).expect("source parses"),
+                &Parameters::new(),
+                Arc::new(EncodedDocumentResolver { bytes, encoding }),
+                ExecutionOptions {
+                    budget: execution_budget(4096),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            ),
+            Err(Error::Xml(_))
+        ));
+    }
+}
+
+#[test]
+fn decoded_external_document_is_bounded_before_xml_parsing() {
+    // Latin-1 can expand when retained as UTF-8; budget exhaustion must win before XML parsing.
+    let mut bytes = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><root>".to_vec();
+    bytes.extend(std::iter::repeat_n(0xe9, 65_536));
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:value-of select="document('encoded.xml')"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let mut budget = execution_budget(4096);
+    budget.owned_bytes = 100_000;
+    assert!(matches!(
+        stylesheet.execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(EncodedDocumentResolver {
+                bytes,
+                encoding: None,
+            }),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
 }
