@@ -5949,3 +5949,61 @@ fn decoded_external_document_is_bounded_before_xml_parsing() {
         })
     ));
 }
+
+#[test]
+fn equal_precedence_global_bindings_are_static_errors() {
+    // Imported declarations may be overridden, but declarations in one precedence stratum may
+    // not silently select either value.
+    for declarations in [
+        r#"<xsl:variable name="value" select="'old'"/><xsl:variable name="value" select="'new'"/>"#,
+        r#"<xsl:param name="value" select="'old'"/><xsl:variable name="value" select="'new'"/>"#,
+        r#"<xsl:variable name="value" select="'old'"/><xsl:param name="value" select="'new'"/>"#,
+    ] {
+        let source = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">{declarations}<xsl:template match="/"/></xsl:stylesheet>"#
+        );
+        assert!(matches!(
+            Compiler::new(
+                Arc::new(NoResolver),
+                CompileBudget::new(4096, 0, 256, 4096),
+            )
+            .compile(&source, None),
+            Err(Error::Static(message)) if message.contains("duplicate global variable")
+        ));
+    }
+}
+
+#[test]
+fn undefined_attribute_sets_fail_on_every_consumer() {
+    // Literal, computed, and copied elements must share the same static missing-definition
+    // contract, even when their containing instruction would be unreachable at execution time.
+    for body in [
+        r#"<out xsl:use-attribute-sets="missing"/>"#,
+        r#"<xsl:element name="out" use-attribute-sets="missing"/>"#,
+        r#"<xsl:for-each select="/*"><xsl:copy use-attribute-sets="missing"/></xsl:for-each>"#,
+    ] {
+        let source = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/">{body}</xsl:template></xsl:stylesheet>"#
+        );
+        let error = Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(1 << 20, 16, 256, 4 << 20),
+        )
+        .compile(&source, Some("memory:main.xsl"))
+        .expect_err("undefined attribute-set must fail during compilation");
+        assert!(
+            matches!(error, Error::Static(message) if message.contains("undefined attribute-set") && message.contains("missing"))
+        );
+    }
+}
+
+#[test]
+fn cdata_output_names_use_the_default_namespace_only_when_bound() {
+    // Unlike ordinary XSLT QName attributes, cdata-section-elements explicitly inherits the
+    // xsl:output default namespace. Prefixed names still use their own bindings.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns="urn:default" xmlns:p="urn:prefixed"><xsl:output omit-xml-declaration="yes" indent="no" cdata-section-elements="out p:out"/><xsl:template match="/"><wrapper><xsl:element name="out" namespace="">plain</xsl:element><out>default</out><p:out>prefixed</p:out></wrapper></xsl:template></xsl:stylesheet>"#;
+    let output = execute(stylesheet, "<source/>");
+    assert!(output.contains(r#"<out xmlns="">plain</out>"#));
+    assert!(output.contains("<out><![CDATA[default]]></out>"));
+    assert!(output.contains("<p:out><![CDATA[prefixed]]></p:out>"));
+}

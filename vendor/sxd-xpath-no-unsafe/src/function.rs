@@ -507,17 +507,40 @@ struct Translate;
 impl Function for Translate {
     fn evaluate<'c, 'd>(
         &self,
-        _context: &context::Evaluation<'c, 'd>,
+        context: &context::Evaluation<'c, 'd>,
         args: Vec<Value<'d>>,
     ) -> Result<Value<'d>, Error> {
         let mut args = Args(args);
         args.exactly(3)?;
 
+        let conversion_bytes = args.0.iter().fold(0usize, |total, value| {
+            let bytes = match value {
+                Value::String(_) | Value::ResultTreeFragment(..) => 0,
+                value => value.string_len(),
+            };
+            total.saturating_add(bytes)
+        });
+        let source_bytes = args.0[0].string_len();
+        let map_capacity = args.0[1]
+            .string_len()
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX);
+        let map_bytes = map_capacity.saturating_mul(
+            std::mem::size_of::<(char, Option<char>)>()
+                .saturating_add(std::mem::size_of::<usize>()),
+        );
+        let result_bytes = source_bytes.saturating_mul(char::MAX.len_utf8());
+        context.reserve_string_allocation(
+            conversion_bytes
+                .saturating_add(map_bytes)
+                .saturating_add(result_bytes),
+        )?;
+
         let to = args.pop_string()?;
         let from = args.pop_string()?;
         let s = args.pop_string()?;
 
-        let mut replacements = HashMap::new();
+        let mut replacements = HashMap::with_capacity(from.chars().count());
         let pairs = from
             .chars()
             .zip(to.chars().map(Some).chain(iter::repeat(None)));
@@ -1017,6 +1040,20 @@ mod test {
     #[test]
     fn translate_replaces_characters() {
         assert_eq!("イエ", translate_test("いえ", "あいうえお", "アイウエオ"));
+    }
+
+    #[test]
+    fn translate_reserves_workspace_before_allocating() {
+        // All translate inputs and its output are attacker-controlled. The call must fail before
+        // constructing conversion strings, the replacement index, or the result.
+        let package = Package::new();
+        let document = package.as_document();
+        let mut setup = Setup::new();
+        setup.context.set_string_allocation_limit(3);
+        let error = setup
+            .evaluate(document.root(), Translate, args!["abcd", "a", ""])
+            .expect_err("translate workspace must exceed the three-byte allocation budget");
+        assert!(error.to_string().contains("string allocation budget"));
     }
 
     #[test]

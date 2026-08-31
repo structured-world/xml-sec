@@ -517,11 +517,22 @@ impl<'a> Execution<'a> {
         parameters: &Parameters,
         source_remap: Option<&HashMap<NodeId, NodeId>>,
     ) -> Result<()> {
-        let mut effective = HashMap::new();
+        let mut effective: HashMap<_, &crate::compiler::GlobalVariable> = HashMap::new();
         for global in self.stylesheet.globals.iter() {
-            if effective.get(&global.variable.name).is_none_or(
-                |current: &&crate::compiler::GlobalVariable| global.precedence > current.precedence,
-            ) {
+            if let Some(current) = effective.get(&global.variable.name) {
+                match global.precedence.cmp(&current.precedence) {
+                    Ordering::Greater => {
+                        effective.insert(global.variable.name.clone(), global);
+                    }
+                    Ordering::Equal => {
+                        return Err(Error::Static(format!(
+                            "duplicate global variable {} at equal import precedence",
+                            global.variable.name.local
+                        )));
+                    }
+                    Ordering::Less => {}
+                }
+            } else {
                 effective.insert(global.variable.name.clone(), global);
             }
         }
@@ -890,12 +901,11 @@ impl<'a> Execution<'a> {
                             attribute_sets,
                         } => match &node {
                             SourceNode::Node(source_id) => {
-                                let kind = self
-                                    .evaluator
-                                    .source
-                                    .node(*source_id)
-                                    .map(|source| source.kind.clone())
-                                    .ok_or_else(|| Error::Dynamic("stale source node".into()))?;
+                                let source =
+                                    self.evaluator.source.node(*source_id).ok_or_else(|| {
+                                        Error::Dynamic("stale source node".into())
+                                    })?;
+                                let kind = clone_for_xsl_copy(&source.kind, &self.meter)?;
                                 match kind {
                                     NodeKind::Element {
                                         name,
@@ -1450,12 +1460,8 @@ impl<'a> Execution<'a> {
             } => {
                 match node {
                     SourceNode::Node(id) => {
-                        if let Some(kind) = self
-                            .evaluator
-                            .source
-                            .node(*id)
-                            .map(|source| source.kind.clone())
-                        {
+                        if let Some(source) = self.evaluator.source.node(*id) {
+                            let kind = clone_for_xsl_copy(&source.kind, &self.meter)?;
                             match kind {
                                 NodeKind::Element {
                                     name,
@@ -2765,6 +2771,13 @@ impl<'a> Execution<'a> {
             .iter()
             .filter(|set| &set.name == name)
             .collect::<Vec<_>>();
+        if sets.is_empty() {
+            active.pop();
+            return Err(Error::Static(format!(
+                "undefined attribute-set {}",
+                name.local
+            )));
+        }
         sets.sort_by_key(|set| (std::cmp::Reverse(set.precedence), set.order));
         let previous_protected = self.attribute_protected_names.take();
         let result = (|| {
@@ -3952,6 +3965,40 @@ fn node_kind_owned_bytes(kind: &NodeKind) -> usize {
                 total.saturating_add(namespace_owned_bytes(namespace))
             })),
     }
+}
+
+fn clone_for_xsl_copy(kind: &NodeKind, meter: &Meter) -> Result<NodeKind> {
+    let copied_bytes = match kind {
+        NodeKind::Element {
+            name,
+            prefix,
+            namespaces,
+            ..
+        } => expanded_name_owned_bytes(name)
+            .saturating_add(prefix.as_ref().map_or(0, String::len))
+            .saturating_add(namespaces.iter().fold(0usize, |total, namespace| {
+                total.saturating_add(namespace_owned_bytes(namespace))
+            })),
+        kind => node_kind_owned_bytes(kind),
+    };
+    meter.check_additional(BudgetKind::OwnedBytes, copied_bytes)?;
+    Ok(match kind {
+        // xsl:copy copies an element's expanded name and namespace nodes, but attributes are
+        // selected only by the sequence constructor. Never clone source attributes just to drop
+        // them before constructing the result element.
+        NodeKind::Element {
+            name,
+            prefix,
+            namespaces,
+            ..
+        } => NodeKind::Element {
+            name: name.clone(),
+            prefix: prefix.clone(),
+            attributes: Vec::new(),
+            namespaces: namespaces.clone(),
+        },
+        kind => kind.clone(),
+    })
 }
 
 fn value_owned_bytes(value: &Value) -> usize {

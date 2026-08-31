@@ -1521,6 +1521,12 @@ impl CompileState {
                 )));
             }
         }
+        validate_attribute_set_references(
+            &self.attribute_sets,
+            &self.templates,
+            &self.globals,
+            &self.functions,
+        )?;
         Ok(Stylesheet {
             principal_document: Document::empty(None),
             principal_base_uri: None,
@@ -1537,6 +1543,120 @@ impl CompileState {
             resource_identities: self.resources.into(),
         })
     }
+}
+
+fn validate_attribute_set_references(
+    sets: &[AttributeSet],
+    templates: &[Template],
+    globals: &[GlobalVariable],
+    functions: &[ExsltFunction],
+) -> Result<()> {
+    let declarations = sets.iter().map(|set| &set.name).collect::<HashSet<_>>();
+    let validate_name = |name: &ExpandedName| {
+        if declarations.contains(name) {
+            Ok(())
+        } else {
+            Err(Error::Static(format!(
+                "undefined attribute-set {}",
+                name.local
+            )))
+        }
+    };
+
+    for set in sets {
+        for name in &set.uses {
+            validate_name(name)?;
+        }
+        validate_attribute_sets_in_sequence(&set.attributes, &validate_name)?;
+    }
+    for template in templates {
+        for parameter in &template.params {
+            validate_attribute_sets_in_sequence(&parameter.content, &validate_name)?;
+        }
+        validate_attribute_sets_in_sequence(&template.body, &validate_name)?;
+    }
+    for global in globals {
+        validate_attribute_sets_in_sequence(&global.variable.content, &validate_name)?;
+    }
+    for function in functions {
+        for parameter in &function.params {
+            validate_attribute_sets_in_sequence(&parameter.content, &validate_name)?;
+        }
+        validate_attribute_sets_in_sequence(&function.body, &validate_name)?;
+    }
+    Ok(())
+}
+
+fn validate_attribute_sets_in_sequence(
+    instructions: &[Instruction],
+    validate_name: &impl Fn(&ExpandedName) -> Result<()>,
+) -> Result<()> {
+    for instruction in instructions {
+        match instruction {
+            Instruction::LiteralElement {
+                children,
+                attribute_sets,
+                ..
+            }
+            | Instruction::Copy {
+                body: children,
+                attribute_sets,
+            }
+            | Instruction::Element {
+                body: children,
+                attribute_sets,
+                ..
+            } => {
+                for name in attribute_sets {
+                    validate_name(name)?;
+                }
+                validate_attribute_sets_in_sequence(children, validate_name)?;
+            }
+            Instruction::ApplyTemplates { parameters, .. }
+            | Instruction::CallTemplate { parameters, .. } => {
+                for parameter in parameters {
+                    validate_attribute_sets_in_sequence(
+                        &parameter.variable.content,
+                        validate_name,
+                    )?;
+                }
+            }
+            Instruction::ForEach { body, .. }
+            | Instruction::If { body, .. }
+            | Instruction::Attribute { body, .. }
+            | Instruction::Processing { body, .. }
+            | Instruction::Message { body, .. }
+            | Instruction::SecondaryOutput { body, .. }
+            | Instruction::ExtensionFallback { body, .. } => {
+                validate_attribute_sets_in_sequence(body, validate_name)?;
+            }
+            Instruction::Choose {
+                branches,
+                otherwise,
+            } => {
+                for (_, branch) in branches {
+                    validate_attribute_sets_in_sequence(branch, validate_name)?;
+                }
+                validate_attribute_sets_in_sequence(otherwise, validate_name)?;
+            }
+            Instruction::Comment(body) => {
+                validate_attribute_sets_in_sequence(body, validate_name)?;
+            }
+            Instruction::Variable(variable) => {
+                validate_attribute_sets_in_sequence(&variable.content, validate_name)?;
+            }
+            Instruction::FunctionResult { content, .. } => {
+                validate_attribute_sets_in_sequence(content, validate_name)?;
+            }
+            Instruction::Text(..)
+            | Instruction::ApplyImports
+            | Instruction::ValueOf { .. }
+            | Instruction::CopyOf(_)
+            | Instruction::Number(_)
+            | Instruction::CompatibilityComment(_) => {}
+        }
+    }
+    Ok(())
 }
 
 fn estimate_compiled_owned_bytes(document: &roxmltree::Document<'_>) -> usize {
@@ -2574,7 +2694,7 @@ fn merge_output(out: &mut OutputDefinition, node: roxmltree::Node<'_, '_>) -> Re
     if let Some(v) = node.attribute("cdata-section-elements") {
         for name in v.split_ascii_whitespace() {
             out.cdata_section_elements
-                .insert(required_output_qname(node, name)?);
+                .insert(required_cdata_output_qname(node, name)?);
         }
     }
     Ok(())
@@ -2782,8 +2902,10 @@ fn required_qname(node: roxmltree::Node<'_, '_>, value: &str) -> Result<Expanded
     }
 }
 
-fn required_output_qname(node: roxmltree::Node<'_, '_>, value: &str) -> Result<ExpandedName> {
+fn required_cdata_output_qname(node: roxmltree::Node<'_, '_>, value: &str) -> Result<ExpandedName> {
     let mut name = required_qname(node, value)?;
+    // XSLT 1.0 section 16.1 makes cdata-section-elements the explicit exception to the
+    // stylesheet QName rule: its unprefixed names use the xsl:output default namespace.
     if !value.contains(':') {
         name.namespace = node.lookup_namespace_uri(None).map(str::to_owned);
     }
