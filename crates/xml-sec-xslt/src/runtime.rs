@@ -530,14 +530,14 @@ impl<'a> Execution<'a> {
                 if global.is_parameter
                     && let Some(value) = parameters.get(&global.variable.name)
                 {
+                    let owned_bytes = expanded_name_owned_bytes(&global.variable.name)
+                        .saturating_add(parameter_value_owned_bytes(value, source_remap));
+                    self.meter
+                        .check_additional(BudgetKind::OwnedBytes, owned_bytes)?;
                     let value = source_remap.map_or_else(
                         || value.clone(),
                         |remap| remap_parameter_value(value, remap),
                     );
-                    let owned_bytes = expanded_name_owned_bytes(&global.variable.name)
-                        .saturating_add(value_owned_bytes(&value));
-                    self.meter
-                        .check_additional(BudgetKind::OwnedBytes, owned_bytes)?;
                     let name = global.variable.name.clone();
                     self.meter.charge(BudgetKind::OwnedBytes, owned_bytes)?;
                     self.scopes[0].insert(name, value);
@@ -3217,29 +3217,47 @@ fn remap_parameter_value(value: &Value, remap: &HashMap<NodeId, NodeId>) -> Valu
     Value::NodeSet(
         nodes
             .iter()
-            .filter_map(|node| match node {
-                NodeReference::Node(id) => remap.get(id).copied().map(NodeReference::Node),
-                NodeReference::Attribute { owner, index } => {
-                    remap
-                        .get(owner)
-                        .copied()
-                        .map(|owner| NodeReference::Attribute {
-                            owner,
-                            index: *index,
-                        })
-                }
-                NodeReference::Namespace { owner, index } => {
-                    remap
-                        .get(owner)
-                        .copied()
-                        .map(|owner| NodeReference::Namespace {
-                            owner,
-                            index: *index,
-                        })
-                }
-            })
+            .filter_map(|node| remap_parameter_node(node, remap))
             .collect(),
     )
+}
+
+fn parameter_value_owned_bytes(value: &Value, remap: Option<&HashMap<NodeId, NodeId>>) -> usize {
+    match (value, remap) {
+        (Value::NodeSet(nodes), Some(remap)) => nodes
+            .iter()
+            .filter(|node| remap_parameter_node(node, remap).is_some())
+            .count()
+            .saturating_mul(std::mem::size_of::<NodeReference>()),
+        _ => value_owned_bytes(value),
+    }
+}
+
+fn remap_parameter_node(
+    node: &NodeReference,
+    remap: &HashMap<NodeId, NodeId>,
+) -> Option<NodeReference> {
+    match node {
+        NodeReference::Node(id) => remap.get(id).copied().map(NodeReference::Node),
+        NodeReference::Attribute { owner, index } => {
+            remap
+                .get(owner)
+                .copied()
+                .map(|owner| NodeReference::Attribute {
+                    owner,
+                    index: *index,
+                })
+        }
+        NodeReference::Namespace { owner, index } => {
+            remap
+                .get(owner)
+                .copied()
+                .map(|owner| NodeReference::Namespace {
+                    owner,
+                    index: *index,
+                })
+        }
+    }
 }
 
 fn normalize_xpath_space(value: &str) -> String {

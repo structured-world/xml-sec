@@ -797,41 +797,33 @@ impl Expression {
 
     fn referenced_variables(&self, output: &mut HashSet<ExpandedName>) {
         let mut quote = None;
-        let characters = self.source.char_indices().collect::<Vec<_>>();
-        let mut index = 0usize;
-        while index < characters.len() {
-            let (_, character) = characters[index];
+        let mut characters = self.source.char_indices().peekable();
+        while let Some((_, character)) = characters.next() {
             if let Some(active) = quote {
                 if character == active {
                     quote = None;
                 }
-                index += 1;
                 continue;
             }
             if matches!(character, '\'' | '"') {
                 quote = Some(character);
-                index += 1;
                 continue;
             }
             if character != '$' {
-                index += 1;
                 continue;
             }
-            let start = index + 1;
-            let mut end = start;
-            while end < characters.len()
-                && (characters[end].1.is_alphanumeric()
-                    || matches!(characters[end].1, '_' | '-' | '.' | ':'))
-            {
-                end += 1;
-            }
-            let Some((byte_start, _)) = characters.get(start) else {
+            let Some(&(byte_start, _)) = characters.peek() else {
                 break;
             };
-            let byte_end = characters
-                .get(end)
-                .map_or(self.source.len(), |(offset, _)| *offset);
-            let lexical = &self.source[*byte_start..byte_end];
+            let mut byte_end = byte_start;
+            while let Some(&(offset, character)) = characters.peek() {
+                if !crate::lexical::is_ncname_char(character) && character != ':' {
+                    break;
+                }
+                byte_end = offset + character.len_utf8();
+                characters.next();
+            }
+            let lexical = &self.source[byte_start..byte_end];
             if is_lexical_qname(lexical) {
                 let (prefix, local) = lexical
                     .split_once(':')
@@ -844,7 +836,6 @@ impl Expression {
                 });
                 output.insert(ExpandedName::new(namespace, local));
             }
-            index = end.max(index + 1);
         }
     }
 }

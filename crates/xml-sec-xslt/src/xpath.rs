@@ -2099,17 +2099,27 @@ fn expand_xinclude_document(
     depth: usize,
 ) -> Result<(Document, Option<HashMap<NodeId, NodeId>>)> {
     meter.recursion(depth)?;
+    let source_nodes = source.node_count();
+    meter.charge(
+        BudgetKind::OwnedBytes,
+        source
+            .estimated_clone_bytes()
+            .saturating_add(xinclude_workspace_bytes(source_nodes)),
+    )?;
     let base_uri = source
         .node(source.root())
         .and_then(|node| node.base_uri.clone());
     let mut output = Document::empty(base_uri);
-    let mut principal_mapping = HashMap::from([(source.root(), output.root())]);
-    let mut pending = source
-        .node(source.root())
-        .into_iter()
-        .flat_map(|root| root.children.iter().rev())
-        .map(|child| (*child, output.root()))
-        .collect::<Vec<_>>();
+    let mut principal_mapping = HashMap::with_capacity(source_nodes);
+    principal_mapping.insert(source.root(), output.root());
+    let mut pending = Vec::with_capacity(source_nodes.saturating_sub(1));
+    pending.extend(
+        source
+            .node(source.root())
+            .into_iter()
+            .flat_map(|root| root.children.iter().rev())
+            .map(|child| (*child, output.root())),
+    );
     while let Some((source_id, target_parent)) = pending.pop() {
         let node = source
             .node(source_id)
@@ -2140,18 +2150,23 @@ fn expand_xinclude_document(
         );
         match result {
             Ok(XIncludeContent::Xml(included)) => {
-                let mut included_mapping = HashMap::new();
-                let children = included
-                    .node(included.root())
-                    .map(|root| root.children.clone())
-                    .unwrap_or_default();
-                for child in children {
-                    output.append_subtree_from(
-                        target_parent,
-                        &included,
-                        child,
-                        &mut included_mapping,
-                    );
+                let included_nodes = included.node_count();
+                meter.charge(
+                    BudgetKind::OwnedBytes,
+                    included
+                        .estimated_clone_bytes()
+                        .saturating_add(xinclude_remap_bytes(included_nodes)),
+                )?;
+                let mut included_mapping = HashMap::with_capacity(included_nodes);
+                if let Some(root) = included.node(included.root()) {
+                    for child in root.children.iter().copied() {
+                        output.append_subtree_from(
+                            target_parent,
+                            &included,
+                            child,
+                            &mut included_mapping,
+                        );
+                    }
                 }
                 output.remap_ids_from(&included, &included_mapping)?;
             }
@@ -2180,21 +2195,31 @@ fn expand_xinclude_document(
                 let Some(fallback) = fallback else {
                     return Err(error);
                 };
-                let fallback_children = source
-                    .node(*fallback)
-                    .map(|node| node.children.clone())
-                    .unwrap_or_default();
-                pending.extend(
-                    fallback_children
-                        .into_iter()
-                        .rev()
-                        .map(|child| (child, target_parent)),
-                );
+                if let Some(fallback) = source.node(*fallback) {
+                    pending.extend(
+                        fallback
+                            .children
+                            .iter()
+                            .rev()
+                            .map(|child| (*child, target_parent)),
+                    );
+                }
             }
         }
     }
     output.remap_ids_from(source, &principal_mapping)?;
     Ok((output, Some(principal_mapping)))
+}
+
+fn xinclude_workspace_bytes(node_count: usize) -> usize {
+    xinclude_remap_bytes(node_count)
+        .saturating_add(node_count.saturating_mul(std::mem::size_of::<(NodeId, NodeId)>()))
+}
+
+fn xinclude_remap_bytes(node_count: usize) -> usize {
+    node_count.saturating_mul(
+        std::mem::size_of::<(NodeId, NodeId)>().saturating_add(std::mem::size_of::<usize>()),
+    )
 }
 
 enum XIncludeContent {

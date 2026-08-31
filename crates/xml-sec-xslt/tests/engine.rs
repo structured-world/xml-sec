@@ -799,6 +799,18 @@ fn serializer_honors_doctype_cdata_html_and_text_contracts() {
         r#"<html><head><meta charset="UTF-8"></head></html>"#
     );
 
+    let foreign_head = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:f="urn:foreign"><xsl:output method="html" indent="no"/><xsl:template match="/"><f:head><f:meta charset="kept"/></f:head></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(foreign_head, "<source/>"),
+        r#"<f:head xmlns:f="urn:foreign"><f:meta charset="kept"></f:meta></f:head>"#
+    );
+
+    let legacy_html_namespace = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="html" indent="no"/><xsl:template match="/"><head xmlns="http://www.w3.org/TR/REC-html40"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(legacy_html_namespace, "<source/>"),
+        r#"<head xmlns="http://www.w3.org/TR/REC-html40"><meta charset="UTF-8"></head>"#
+    );
+
     let xhtml = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns="http://www.w3.org/1999/xhtml"><xsl:output method="xml" omit-xml-declaration="yes" indent="no"/><xsl:template match="/"><html><link/></html></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(xhtml, "<source/>"),
@@ -2176,6 +2188,12 @@ fn whitespace_and_variable_scopes_follow_xslt_lexical_rules() {
         )
         .expect("undeclared caller parameter is ignored");
     assert_eq!(output.serialized.bytes, b"fixed");
+
+    let combining_name = "a\u{0300}";
+    let unicode_dependency = format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:variable name="dependent" select="${combining_name}"/><xsl:variable name="{combining_name}" select="'combined'"/><xsl:template match="/"><xsl:value-of select="$dependent"/></xsl:template></xsl:stylesheet>"#
+    );
+    assert_eq!(execute(&unicode_dependency, "<source/>"), "combined");
 }
 
 #[test]
@@ -3111,6 +3129,81 @@ fn xinclude_budget_is_checked_before_resolver_access() {
 }
 
 #[test]
+fn xinclude_clone_budget_is_checked_before_resolver_access() {
+    // The principal XInclude projection and its remap workspace are retained allocations. A
+    // budget that cannot hold them must fail before any include crosses the resolver boundary.
+    let resolver = Arc::new(CountingResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("resolver mutex")
+        .insert("included.xml".into(), "<included/>".into());
+    let payload = "x".repeat(8 * 1024);
+    let source_xml = format!(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><payload>{payload}</payload><xi:include href="included.xml"/></root>"#
+    );
+    let source = Document::parse(&source_xml, Some("memory:source.xml")).expect("source parses");
+    let mut budget = execution_budget(source_xml.len());
+    budget.owned_bytes = source_xml.len() + 1024;
+    let error = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#,
+    )
+    .execute_with_source_processing(
+        &source,
+        &Parameters::new(),
+        resolver.clone(),
+        ExecutionOptions {
+            budget,
+            initial_mode: None,
+            initial_template: None,
+        },
+        SourceProcessing::XInclude,
+    )
+    .expect_err("XInclude projection exceeds retained-memory budget");
+    assert!(matches!(
+        error,
+        Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        }
+    ));
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn supplied_global_parameter_respects_the_preallocation_budget() {
+    // Caller values are already owned by Parameters. Retaining a global binding must reject its
+    // second copy against OwnedBytes before the execution path duplicates the payload.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:param name="payload"/><xsl:template match="/"/></xsl:stylesheet>"#,
+    );
+    let source = Document::parse("<source/>", None).expect("source parses");
+    let mut parameters = Parameters::new();
+    parameters.insert(
+        ExpandedName::new(None::<String>, "payload"),
+        Value::String("x".repeat(16 * 1024)),
+    );
+    let mut budget = execution_budget(1024);
+    budget.owned_bytes = 8 * 1024;
+    assert!(matches!(
+        stylesheet.execute(
+            &source,
+            &parameters,
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn document_fragments_share_one_physical_resource_cache_entry() {
     // Fragment selectors identify views of one fetched document, not separate resources.
     let resolver = Arc::new(CountingResolver::default());
@@ -3799,6 +3892,54 @@ fn xinclude_preserves_principal_and_included_id_metadata() {
         )
         .expect("XInclude transform succeeds");
     assert_eq!(result.serialized.bytes, b"1|1");
+}
+
+#[test]
+fn rejected_duplicate_typed_id_preserves_the_registered_owner() {
+    // Duplicate registration must not replace the accepted owner before returning its error;
+    // subsequent XPath id() lookup must retain the document's last valid ID index state.
+    let mut source = Document::parse(
+        r#"<root><first custom-id="same"/><second custom-id="same"/></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("source parses");
+    let first = source
+        .nodes()
+        .find_map(|(id, node)| match &node.kind {
+            NodeKind::Element { name, .. } if name.local == "first" => Some(id),
+            _ => None,
+        })
+        .expect("first ID owner exists");
+    let second = source
+        .nodes()
+        .find_map(|(id, node)| match &node.kind {
+            NodeKind::Element { name, .. } if name.local == "second" => Some(id),
+            _ => None,
+        })
+        .expect("second ID owner exists");
+    source
+        .mark_id_attribute(first, 0)
+        .expect("first typed ID is accepted");
+    let error = source
+        .mark_id_attribute(second, 0)
+        .expect_err("duplicate typed ID is rejected");
+    assert!(matches!(error, Error::Xml(message) if message.contains("duplicate XML ID")));
+
+    let result = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="name(id('same'))"/></xsl:template></xsl:stylesheet>"#,
+    )
+    .execute(
+        &source,
+        &Parameters::new(),
+        Arc::new(NoResolver),
+        ExecutionOptions {
+            budget: execution_budget(1024),
+            initial_mode: None,
+            initial_template: None,
+        },
+    )
+    .expect("lookup after rejected registration succeeds");
+    assert_eq!(result.serialized.bytes, b"first");
 }
 
 #[derive(Default)]

@@ -954,7 +954,8 @@ fn serialize_node(
                 }
                 output.push('>');
                 let html_head = name.local.eq_ignore_ascii_case("head")
-                    && (definition.method == OutputMethod::Html
+                    && ((definition.method == OutputMethod::Html
+                        && is_html_output_namespace(name.namespace.as_deref()))
                         || (name.namespace.as_deref() == Some("http://www.w3.org/1999/xhtml")
                             && definition
                                 .doctype_public
@@ -1065,9 +1066,13 @@ fn serialize_node(
     Ok(())
 }
 
+fn is_html_output_namespace(namespace: Option<&str>) -> bool {
+    matches!(namespace, None | Some("http://www.w3.org/TR/REC-html40"))
+}
+
 fn push_cdata(value: &str, version: &str, encoding: &OutputEncoding, output: &mut RenderBuffer) {
     output.push_str("<![CDATA[");
-    push_cdata_content(value, version, encoding, output);
+    CdataWriter::new(version, encoding, output).write_and_finish(value);
     output.push_str("]]>");
 }
 
@@ -1088,6 +1093,7 @@ fn push_cdata_range(
         .get(start..end)
         .ok_or_else(|| Error::Serialization("CDATA text range is stale".into()))?;
     output.push_str("<![CDATA[");
+    let mut writer = CdataWriter::new(version, encoding, output);
     for child in children {
         let Some(NodeKind::Text {
             value,
@@ -1098,35 +1104,115 @@ fn push_cdata_range(
                 "CDATA text run changed during serialization".into(),
             ));
         };
-        push_cdata_content(value, version, encoding, output);
+        writer.write(value);
     }
+    writer.finish();
     output.push_str("]]>");
     Ok(())
 }
 
-fn push_cdata_content(
-    value: &str,
-    version: &str,
-    encoding: &OutputEncoding,
-    output: &mut RenderBuffer,
-) {
-    let mut start = 0usize;
-    for (offset, character) in value.char_indices() {
-        if version == "1.1" && is_xml11_restricted(character) {
-            push_cdata_segment(&value[start..offset], output);
-            output.push_str("]]>");
-            push_hex_reference(output, character);
-            output.push_str("<![CDATA[");
-            start = offset + character.len_utf8();
-        } else if !encoding.represents(character) {
-            push_cdata_segment(&value[start..offset], output);
-            output.push_str("]]>");
-            push_decimal_reference(output, character);
-            output.push_str("<![CDATA[");
-            start = offset + character.len_utf8();
+struct CdataWriter<'a> {
+    version: &'a str,
+    encoding: &'a OutputEncoding,
+    output: &'a mut RenderBuffer,
+    trailing_brackets: usize,
+}
+
+impl<'a> CdataWriter<'a> {
+    fn new(version: &'a str, encoding: &'a OutputEncoding, output: &'a mut RenderBuffer) -> Self {
+        Self {
+            version,
+            encoding,
+            output,
+            trailing_brackets: 0,
         }
     }
-    push_cdata_segment(&value[start..], output);
+
+    fn write_and_finish(mut self, value: &str) {
+        self.write(value);
+        self.finish();
+    }
+
+    fn write(&mut self, value: &str) {
+        let mut start = 0usize;
+        for (offset, character) in value.char_indices() {
+            let reference = if self.version == "1.1" && is_xml11_restricted(character) {
+                Some(true)
+            } else if !self.encoding.represents(character) {
+                Some(false)
+            } else {
+                None
+            };
+            let Some(hexadecimal) = reference else {
+                continue;
+            };
+            self.push_segment(&value[start..offset]);
+            self.flush_trailing_brackets();
+            self.output.push_str("]]>");
+            if hexadecimal {
+                push_hex_reference(self.output, character);
+            } else {
+                push_decimal_reference(self.output, character);
+            }
+            self.output.push_str("<![CDATA[");
+            start = offset + character.len_utf8();
+        }
+        self.push_segment(&value[start..]);
+    }
+
+    fn finish(mut self) {
+        self.flush_trailing_brackets();
+    }
+
+    fn push_segment(&mut self, value: &str) {
+        let trailing_brackets = value
+            .as_bytes()
+            .iter()
+            .rev()
+            .take(2)
+            .take_while(|byte| **byte == b']')
+            .count();
+        let body_end = value.len() - trailing_brackets;
+        let body = &value[..body_end];
+        if body.is_empty() {
+            let total = self.trailing_brackets + trailing_brackets;
+            self.push_brackets(total.saturating_sub(2));
+            self.trailing_brackets = total.min(2);
+            return;
+        }
+
+        let leading_brackets = body
+            .as_bytes()
+            .iter()
+            .take_while(|byte| **byte == b']')
+            .count();
+        if body.as_bytes().get(leading_brackets) == Some(&b'>')
+            && self.trailing_brackets + leading_brackets >= 2
+        {
+            let excess = self.trailing_brackets + leading_brackets - 2;
+            let pending_excess = excess.min(self.trailing_brackets);
+            self.push_brackets(pending_excess);
+            let body_excess = excess - pending_excess;
+            self.output.push_str(&body[..body_excess]);
+            self.output.push_str("]]]]><![CDATA[>");
+            push_cdata_segment(&body[leading_brackets + 1..], self.output);
+        } else {
+            self.flush_trailing_brackets();
+            push_cdata_segment(body, self.output);
+        }
+        self.trailing_brackets = trailing_brackets;
+    }
+
+    fn flush_trailing_brackets(&mut self) {
+        self.push_brackets(self.trailing_brackets);
+        self.trailing_brackets = 0;
+    }
+
+    fn push_brackets(&mut self, count: usize) {
+        for _ in 0..count {
+            self.output.push(']');
+        }
+    }
 }
 
 fn push_cdata_segment(value: &str, output: &mut RenderBuffer) {
@@ -1499,7 +1585,8 @@ fn validate_xml_characters(value: &str, version: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EncodingCounter, OutputEncoding, RenderBuffer};
+    use super::{EncodingCounter, OutputEncoding, RenderBuffer, push_cdata_range};
+    use crate::{Document, NodeKind};
 
     #[test]
     fn counting_buffer_rejects_repeated_indentation_beyond_the_encoded_limit() {
@@ -1524,5 +1611,47 @@ mod tests {
             panic!("windows-1252 uses the cached encoding path");
         };
         assert_eq!(representable.into_inner().len(), 1);
+    }
+
+    #[test]
+    fn cdata_range_preserves_terminators_split_across_text_nodes() {
+        // A result tree may retain adjacent text nodes. CDATA serialization must treat their
+        // concatenation as one stream so a cross-node `]]>` cannot escape into XML markup.
+        let mut document = Document::parse("<out/>", None).expect("result document parses");
+        let parent = document
+            .nodes()
+            .find_map(|(id, node)| matches!(node.kind, NodeKind::Element { .. }).then_some(id))
+            .expect("result element exists");
+        document.push(
+            parent,
+            NodeKind::Text {
+                value: "left]]".into(),
+                disable_output_escaping: false,
+            },
+            None,
+        );
+        document.push(
+            parent,
+            NodeKind::Text {
+                value: "><tag/>right".into(),
+                disable_output_escaping: false,
+            },
+            None,
+        );
+        let mut output = RenderBuffer::Text(String::new());
+        push_cdata_range(
+            &document,
+            parent,
+            0,
+            2,
+            "1.0",
+            &OutputEncoding::Utf8,
+            &mut output,
+        )
+        .expect("CDATA range serializes");
+
+        let serialized = format!("<out>{}</out>", output.into_string());
+        let reparsed = Document::parse(&serialized, None).expect("serialized CDATA reparses");
+        assert_eq!(reparsed.string_value(reparsed.root()), "left]]><tag/>right");
     }
 }

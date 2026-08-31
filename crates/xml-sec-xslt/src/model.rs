@@ -605,6 +605,10 @@ impl Document {
         self.source_bytes
     }
 
+    pub(crate) fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
     pub(crate) const fn identity(&self) -> u64 {
         self.identity
     }
@@ -712,14 +716,24 @@ impl Document {
         let logical_root = self
             .logical_root_for(&NodeReference::Node(owner))
             .ok_or_else(|| Error::Xml("ID attribute is outside a logical document".into()))?;
-        if self
-            .ids
-            .insert((logical_root, value.clone()), owner)
-            .is_some()
-        {
-            return Err(Error::Xml(format!("duplicate XML ID `{value}`")));
+        self.register_id_for_root(logical_root, owner, value)
+    }
+
+    fn register_id_for_root(
+        &mut self,
+        logical_root: NodeId,
+        owner: NodeId,
+        value: String,
+    ) -> Result<()> {
+        match self.ids.entry((logical_root, value)) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                Err(Error::Xml(format!("duplicate XML ID `{}`", entry.key().1)))
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(owner);
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     /// Apply XML's whitespace collapsing rule to an attribute declared with a
@@ -928,13 +942,7 @@ impl Document {
             let logical_root = self
                 .logical_root_for(&NodeReference::Node(owner))
                 .ok_or_else(|| Error::Xml("remapped ID is outside a logical document".into()))?;
-            if self
-                .ids
-                .insert((logical_root, value.to_owned()), owner)
-                .is_some()
-            {
-                return Err(Error::Xml(format!("duplicate XML ID `{value}`")));
-            }
+            self.register_id_for_root(logical_root, owner, value.to_owned())?;
         }
         Ok(())
     }
@@ -1113,13 +1121,13 @@ fn push_stream_element(
                 "attribute `{name}` entity replacement contains a literal `<`"
             )));
         }
+        let value = normalize_xml_attribute_value(value);
         let value = match xml_sec_xml_input::lexical::decode_references(&value)
             .map_err(|error| Error::Xml(error.to_string()))?
         {
             Cow::Borrowed(_) => value,
             Cow::Owned(value) => Cow::Owned(value),
         };
-        let value = normalize_xml_attribute_value(value);
         if name == "xmlns" {
             validate_namespace_binding(None, &value)?;
             set_namespace(&mut namespaces, None, value.into_owned());
@@ -1359,6 +1367,14 @@ fn internal_general_entities(xml: &str) -> Result<HashMap<String, String>> {
             cursor += length;
             continue;
         }
+        if subset[cursor..].starts_with("<?") {
+            let length = subset[cursor + 2..]
+                .find("?>")
+                .map(|offset| offset + 4)
+                .ok_or_else(|| Error::Xml("unterminated DTD processing instruction".into()))?;
+            cursor += length;
+            continue;
+        }
         if !subset[cursor..].starts_with("<!ENTITY") {
             cursor += subset[cursor..].chars().next().map_or(1, char::len_utf8);
             continue;
@@ -1407,10 +1423,8 @@ fn internal_general_entities(xml: &str) -> Result<HashMap<String, String>> {
         let value = subset[value_start..cursor].to_owned();
         cursor += 1;
         cursor = declaration_end(subset, cursor)?;
-        if entities.insert(name.to_owned(), value).is_some() {
-            return Err(Error::Xml(format!(
-                "duplicate internal entity declaration `{name}`"
-            )));
+        if let std::collections::hash_map::Entry::Vacant(entry) = entities.entry(name.to_owned()) {
+            entry.insert(value);
         }
     }
     Ok(entities)
@@ -1930,6 +1944,44 @@ mod parser_boundary_tests {
             assert_eq!(doctype_span(xml).expect("doctype scan succeeds"), None);
             Document::parse_iterative(xml, None).expect("document parses without a doctype");
         }
+    }
+
+    #[test]
+    fn dtd_processing_instructions_cannot_declare_entities() {
+        // Processing-instruction content is a protected DTD region. Markup-shaped text inside it
+        // must not become a declaration consumed by the entity-expansion pass.
+        let xml = r#"<!DOCTYPE r [<?pi <!ENTITY e "evil">?>]><r>&e;</r>"#;
+        assert!(Document::parse_iterative(xml, None).is_err());
+    }
+
+    #[test]
+    fn duplicate_entity_declarations_retain_the_first_binding() {
+        // XML binds the first declaration of an entity; later declarations neither replace it
+        // nor make an otherwise well-formed document invalid.
+        let document = Document::parse_iterative(
+            r#"<!DOCTYPE r [<!ENTITY e "first"><!ENTITY e "second">]><r>&e;</r>"#,
+            None,
+        )
+        .expect("duplicate entity declarations are well-formed");
+        assert_eq!(document.string_value(document.root()), "first");
+    }
+
+    #[test]
+    fn attribute_normalization_preserves_referenced_whitespace() {
+        // Literal XML whitespace normalizes to spaces, while character references append their
+        // referenced scalar after normalization and therefore retain tab/newline characters.
+        let document = Document::parse_iterative("<r a=\"\t&#x9;&#xA;&#xD;\"/>", None)
+            .expect("attribute whitespace parses");
+        let value = document
+            .nodes()
+            .find_map(|(_, node)| match &node.kind {
+                super::NodeKind::Element { attributes, .. } => {
+                    attributes.first().map(|attribute| attribute.value.as_str())
+                }
+                _ => None,
+            })
+            .expect("attribute exists");
+        assert_eq!(value, " \t\n\r");
     }
 
     #[test]
