@@ -2,13 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use xml_sec_xml_input::lexical::{Event, Scanner};
 
+use crate::budget::{
+    ENTITY_EXPANSION_BYTE_CEILING, ENTITY_EXPANSION_DEPTH_CEILING, ENTITY_REFERENCE_CEILING,
+};
 use crate::{Error, Result};
 
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
-// Keep the iterative parser aligned with roxmltree's entity-expansion safety ceilings.
-const MAX_ENTITY_EXPANSION_DEPTH: usize = 10;
-const MAX_NESTED_ENTITY_REFERENCES: usize = 255;
 
 /// Stable index of a node inside one owned document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -350,7 +350,13 @@ impl Document {
         document.source_xml = Some(xml.to_owned());
         let entities = internal_general_entities(xml)?;
         let mut entity_references = 0;
-        let expanded_xml = expand_document_entities(xml, &entities, &mut entity_references)?;
+        let mut entity_expansion = EntityExpansionMeter::new(ENTITY_EXPANSION_BYTE_CEILING);
+        let expanded_xml = expand_document_entities(
+            xml,
+            &entities,
+            &mut entity_references,
+            &mut entity_expansion,
+        )?;
         let mut reader = Scanner::new(&expanded_xml);
         let line_starts = std::iter::once(0)
             .chain(
@@ -391,6 +397,7 @@ impl Document {
                         false,
                         &entities,
                         &mut entity_references,
+                        &mut entity_expansion,
                     )?;
                     document.nodes[id.0].source_line = Some(source_line);
                 }
@@ -408,6 +415,7 @@ impl Document {
                         true,
                         &entities,
                         &mut entity_references,
+                        &mut entity_expansion,
                     )?;
                     document.nodes[id.0].source_line = Some(source_line);
                 }
@@ -1057,6 +1065,7 @@ fn push_stream_element(
     empty: bool,
     entities: &HashMap<String, String>,
     entity_references: &mut usize,
+    entity_expansion: &mut EntityExpansionMeter,
 ) -> Result<NodeId> {
     let parent = elements
         .last()
@@ -1069,7 +1078,13 @@ fn push_stream_element(
     let mut raw_attributes = Vec::new();
     for attribute in &start.attributes {
         let name = attribute.name.qualified();
-        let value = expand_entity_references(attribute.value, entities, 0, entity_references)?;
+        let value = expand_entity_references(
+            attribute.value,
+            entities,
+            0,
+            entity_references,
+            entity_expansion,
+        )?;
         if value.contains('<') {
             return Err(Error::Xml(format!(
                 "attribute `{name}` entity replacement contains a literal `<`"
@@ -1402,6 +1417,7 @@ fn expand_document_entities(
     xml: &str,
     entities: &HashMap<String, String>,
     references: &mut usize,
+    meter: &mut EntityExpansionMeter,
 ) -> Result<String> {
     if entities.is_empty() {
         return Ok(xml.to_owned());
@@ -1410,13 +1426,15 @@ fn expand_document_entities(
         return Ok(xml.to_owned());
     };
     let mut expanded = String::with_capacity(xml.len());
-    expanded.push_str(&xml[..doctype_end]);
-    expanded.push_str(&expand_entity_references(
+    meter.append(&mut expanded, &xml[..doctype_end])?;
+    expand_entity_references_into(
         &xml[doctype_end..],
         entities,
         0,
         references,
-    )?);
+        meter,
+        &mut expanded,
+    )?;
     Ok(expanded)
 }
 
@@ -1425,9 +1443,25 @@ fn expand_entity_references(
     entities: &HashMap<String, String>,
     depth: usize,
     references: &mut usize,
+    meter: &mut EntityExpansionMeter,
 ) -> Result<String> {
-    const MAX_ENTITY_NAME_SCAN_BYTES: usize = 1_024;
+    if entities.is_empty() {
+        return Ok(value.to_owned());
+    }
     let mut output = String::with_capacity(value.len());
+    expand_entity_references_into(value, entities, depth, references, meter, &mut output)?;
+    Ok(output)
+}
+
+fn expand_entity_references_into(
+    value: &str,
+    entities: &HashMap<String, String>,
+    depth: usize,
+    references: &mut usize,
+    meter: &mut EntityExpansionMeter,
+    output: &mut String,
+) -> Result<()> {
+    const MAX_ENTITY_NAME_SCAN_BYTES: usize = 1_024;
     let mut cursor = 0;
     while cursor < value.len() {
         let tail = &value[cursor..];
@@ -1441,14 +1475,14 @@ fn expand_entity_references(
             None
         };
         if let Some(length) = protected_end {
-            output.push_str(&tail[..length]);
+            meter.append(output, &tail[..length])?;
             cursor += length;
             continue;
         }
         if tail.starts_with('<')
             && let Some(length) = xml_markup_len(tail)
         {
-            output.push_str(&tail[..length]);
+            meter.append(output, &tail[..length])?;
             cursor += length;
             continue;
         }
@@ -1460,28 +1494,64 @@ fn expand_entity_references(
             && let Some(replacement) = entities.get(name)
         {
             *references += 1;
-            if depth >= MAX_ENTITY_EXPANSION_DEPTH || *references > MAX_NESTED_ENTITY_REFERENCES {
+            if depth >= ENTITY_EXPANSION_DEPTH_CEILING || *references > ENTITY_REFERENCE_CEILING {
                 return Err(Error::Xml(format!(
                     "entity reference expansion limit exceeded at `{name}`"
                 )));
             }
-            output.push_str(&expand_entity_references(
+            expand_entity_references_into(
                 replacement,
                 entities,
                 depth + 1,
                 references,
-            )?);
+                meter,
+                output,
+            )?;
             cursor += end + 1;
             continue;
         }
-        let ch = tail
-            .chars()
-            .next()
-            .expect("cursor remains before the string end");
-        output.push(ch);
-        cursor += ch.len_utf8();
+        let plain_end = tail
+            .char_indices()
+            .find_map(|(offset, ch)| matches!(ch, '<' | '&').then_some(offset))
+            .filter(|offset| *offset > 0)
+            .unwrap_or_else(|| {
+                if matches!(tail.as_bytes().first(), Some(b'<' | b'&')) {
+                    tail.chars()
+                        .next()
+                        .expect("cursor remains before the string end")
+                        .len_utf8()
+                } else {
+                    tail.len()
+                }
+            });
+        meter.append(output, &tail[..plain_end])?;
+        cursor += plain_end;
     }
-    Ok(output)
+    Ok(())
+}
+
+struct EntityExpansionMeter {
+    limit: usize,
+    used: usize,
+}
+
+impl EntityExpansionMeter {
+    const fn new(limit: usize) -> Self {
+        Self { limit, used: 0 }
+    }
+
+    fn append(&mut self, output: &mut String, value: &str) -> Result<()> {
+        self.charge(value.len())?;
+        output.push_str(value);
+        Ok(())
+    }
+
+    fn charge(&mut self, amount: usize) -> Result<()> {
+        let actual = self.used.saturating_add(amount);
+        crate::budget::ensure(crate::BudgetKind::OwnedBytes, self.limit, actual)?;
+        self.used = actual;
+        Ok(())
+    }
 }
 
 fn xml_markup_len(source: &str) -> Option<usize> {
@@ -1544,7 +1614,8 @@ fn lexical_attribute_prefix(xml: &str, offset: usize, local: &str) -> Option<Str
 mod parser_boundary_tests {
     use std::collections::HashMap;
 
-    use super::{Document, Result, doctype_span, expand_entity_references};
+    use super::{Document, EntityExpansionMeter, Result, doctype_span, expand_entity_references};
+    use crate::budget::ENTITY_EXPANSION_BYTE_CEILING;
 
     fn nested_xml(depth: usize, leaf: &str) -> String {
         format!("{}{}{}", "<n>".repeat(depth), leaf, "</n>".repeat(depth))
@@ -1636,6 +1707,34 @@ mod parser_boundary_tests {
                 .to_string()
                 .contains("entity reference expansion limit")
         );
+    }
+
+    #[test]
+    fn iterative_parser_bounds_aggregate_text_entity_expansion_bytes() {
+        // A bounded reference count is insufficient when each permitted
+        // reference materializes a large replacement into document text.
+        let replacement = "x".repeat(70_000);
+        let body = "&large;".repeat(255);
+        let xml = format!("<!DOCTYPE root [<!ENTITY large \"{replacement}\">]><root>{body}</root>");
+
+        let error = Document::parse_iterative(&xml, None)
+            .expect_err("aggregate expanded text must remain bounded");
+        assert!(matches!(error, crate::Error::Budget { .. }));
+    }
+
+    #[test]
+    fn iterative_parser_bounds_aggregate_attribute_entity_expansion_bytes() {
+        // Attribute expansion happens after the document-level lexical pass
+        // and must consume the same document-wide materialization budget.
+        let replacement = "x".repeat(70_000);
+        let attributes = (0..255)
+            .map(|index| format!(" a{index}=\"&large;\""))
+            .collect::<String>();
+        let xml = format!("<!DOCTYPE root [<!ENTITY large \"{replacement}\">]><root{attributes}/>");
+
+        let error = Document::parse_iterative(&xml, None)
+            .expect_err("aggregate expanded attributes must remain bounded");
+        assert!(matches!(error, crate::Error::Budget { .. }));
     }
 
     #[test]
@@ -1736,8 +1835,14 @@ mod parser_boundary_tests {
         let source = format!("&{name};");
         let entities = HashMap::from([(name, "expanded".into())]);
         assert_eq!(
-            expand_entity_references(&source, &entities, 0, &mut 0)
-                .expect("bounded entity scan succeeds"),
+            expand_entity_references(
+                &source,
+                &entities,
+                0,
+                &mut 0,
+                &mut EntityExpansionMeter::new(ENTITY_EXPANSION_BYTE_CEILING),
+            )
+            .expect("bounded entity scan succeeds"),
             source
         );
     }
@@ -1749,8 +1854,14 @@ mod parser_boundary_tests {
         let source = format!("&{}é", "a".repeat(1_022));
         let entities = HashMap::from([("x".to_owned(), "expanded".to_owned())]);
         assert_eq!(
-            expand_entity_references(&source, &entities, 0, &mut 0)
-                .expect("bounded entity scan succeeds"),
+            expand_entity_references(
+                &source,
+                &entities,
+                0,
+                &mut 0,
+                &mut EntityExpansionMeter::new(ENTITY_EXPANSION_BYTE_CEILING),
+            )
+            .expect("bounded entity scan succeeds"),
             source
         );
     }

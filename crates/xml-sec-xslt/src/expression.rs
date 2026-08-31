@@ -73,18 +73,18 @@ fn first_namespaced_call(
             continue;
         }
         let start = cursor;
-        cursor += character.len_utf8();
-        while cursor < source.len() {
-            let next = source[cursor..].chars().next()?;
-            if next != ':' && !is_ncname_char(next) {
-                break;
-            }
-            cursor += next.len_utf8();
+        let (end, qualified) = lexical_name_end(source, start)?;
+        cursor = end;
+        if !qualified {
+            continue;
         }
         let lexical = &source[start..cursor];
         let Some((prefix, local)) = lexical.split_once(':') else {
             continue;
         };
+        if local.contains(':') {
+            continue;
+        }
         let Some(namespace) = namespaces
             .iter()
             .find_map(|(candidate, namespace)| (candidate == prefix).then_some(namespace))
@@ -139,15 +139,12 @@ pub(crate) fn unprefixed_function_calls(source: &str, name: &str) -> Vec<Functio
             continue;
         }
         let start = cursor;
-        cursor += character.len_utf8();
-        while cursor < source.len() {
-            let Some(next) = source[cursor..].chars().next() else {
-                break;
-            };
-            if !is_ncname_char(next) {
-                break;
-            }
-            cursor += next.len_utf8();
+        let Some((end, qualified)) = lexical_name_end(source, start) else {
+            break;
+        };
+        cursor = end;
+        if qualified {
+            continue;
         }
         if &source[start..cursor] != name {
             continue;
@@ -176,6 +173,42 @@ pub(crate) fn unprefixed_function_calls(source: &str, name: &str) -> Vec<Functio
         });
     }
     calls
+}
+
+fn lexical_name_end(source: &str, start: usize) -> Option<(usize, bool)> {
+    let first = source[start..].chars().next()?;
+    if !is_ncname_start(first) {
+        return None;
+    }
+    let mut cursor = start + first.len_utf8();
+    while cursor < source.len() {
+        let next = source[cursor..].chars().next()?;
+        if !is_ncname_char(next) {
+            break;
+        }
+        cursor += next.len_utf8();
+    }
+
+    let mut qualified = false;
+    while source[cursor..].starts_with(':') {
+        qualified = true;
+        cursor += 1;
+        let Some(local_start) = source[cursor..].chars().next() else {
+            break;
+        };
+        if !is_ncname_start(local_start) {
+            continue;
+        }
+        cursor += local_start.len_utf8();
+        while cursor < source.len() {
+            let next = source[cursor..].chars().next()?;
+            if !is_ncname_char(next) {
+                break;
+            }
+            cursor += next.len_utf8();
+        }
+    }
+    Some((cursor, qualified))
 }
 
 fn is_xpath_space(character: char) -> bool {
@@ -239,7 +272,7 @@ fn split_function_arguments(source: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::innermost_namespaced_call;
+    use super::{innermost_namespaced_call, unprefixed_function_calls};
 
     #[test]
     fn namespaced_call_discovery_is_iterative_at_extreme_depth() {
@@ -266,5 +299,13 @@ mod tests {
         )
         .expect("valid Unicode-prefixed call is discovered");
         assert_eq!(&source[call.start..call.end], source);
+    }
+
+    #[test]
+    fn unprefixed_call_discovery_excludes_qualified_names() {
+        // A prefixed extension function whose local name matches a core function
+        // must not activate the core function's compile-time or runtime behavior.
+        assert!(unprefixed_function_calls("x:key()", "key").is_empty());
+        assert_eq!(unprefixed_function_calls("key()", "key").len(), 1);
     }
 }

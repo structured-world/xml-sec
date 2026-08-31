@@ -1,5 +1,11 @@
 use crate::{Error, Result};
 
+pub(crate) const ENTITY_EXPANSION_DEPTH_CEILING: usize = 10;
+pub(crate) const ENTITY_REFERENCE_CEILING: usize = 255;
+// This is an absolute parser safety ceiling, not a deployment policy default.
+// Caller budgets may reject smaller documents at the compile/execution boundary.
+pub(crate) const ENTITY_EXPANSION_BYTE_CEILING: usize = 16 * 1024 * 1024;
+
 /// Independently metered XSLT resource dimensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
