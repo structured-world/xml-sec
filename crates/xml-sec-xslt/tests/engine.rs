@@ -4778,9 +4778,25 @@ fn apply_templates_rejects_non_whitespace_character_data() {
 
     compile(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:apply-templates>
+            <!-- inert stylesheet annotation -->
+            <?annotation retained-by-source?>
             <xsl:sort select="."/>
             <xsl:with-param name="value" select="1"/>
         </xsl:apply-templates></xsl:template></xsl:stylesheet>"#,
+    );
+}
+
+#[test]
+fn match_pattern_current_uses_the_candidate_as_outer_context() {
+    // current() in a match predicate is bound to the node being tested, not the logical root used
+    // to search for pattern candidates.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:apply-templates select="root/group/item"/></xsl:template><xsl:template match="item[@id = current()/../@ref]"><xsl:value-of select="@id"/></xsl:template><xsl:template match="item">miss</xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(
+            stylesheet,
+            r#"<root><group ref="selected"><item id="other"/><item id="selected"/></group></root>"#,
+        ),
+        "missselected"
     );
 }
 

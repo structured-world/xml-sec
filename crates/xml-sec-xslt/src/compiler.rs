@@ -2211,7 +2211,9 @@ fn compile_instruction(
             let mut parameter_names = HashSet::new();
             let mut saw_parameter = false;
             for child in node.children() {
-                if child.is_text() && child.text().is_none_or(is_xml_whitespace_only) {
+                if !child.is_element()
+                    && (!child.is_text() || child.text().is_none_or(is_xml_whitespace_only))
+                {
                     continue;
                 }
                 if child.has_tag_name((XSLT_NS, "sort")) && !saw_parameter {

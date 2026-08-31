@@ -116,6 +116,29 @@ fn first_namespaced_call(
 
 pub(crate) fn unprefixed_function_calls(source: &str, name: &str) -> Vec<FunctionCall> {
     let mut calls = Vec::new();
+    scan_unprefixed_function_calls(source, name, |start, open, close| {
+        calls.push(FunctionCall {
+            start,
+            end: close + 1,
+            arguments: split_function_arguments(&source[open + 1..close]),
+            namespace: String::new(),
+            local: name.to_owned(),
+            display_name: name.to_owned(),
+        });
+        false
+    });
+    calls
+}
+
+pub(crate) fn has_unprefixed_function_call(source: &str, name: &str) -> bool {
+    scan_unprefixed_function_calls(source, name, |_, _, _| true)
+}
+
+fn scan_unprefixed_function_calls(
+    source: &str,
+    name: &str,
+    mut visit: impl FnMut(usize, usize, usize) -> bool,
+) -> bool {
     let mut quote = None;
     let mut cursor = 0;
     while cursor < source.len() {
@@ -163,16 +186,11 @@ pub(crate) fn unprefixed_function_calls(source: &str, name: &str) -> Vec<Functio
         let Some(close) = matching_parenthesis(source, open) else {
             continue;
         };
-        calls.push(FunctionCall {
-            start,
-            end: close + 1,
-            arguments: split_function_arguments(&source[open + 1..close]),
-            namespace: String::new(),
-            local: name.to_owned(),
-            display_name: name.to_owned(),
-        });
+        if visit(start, open, close) {
+            return true;
+        }
     }
-    calls
+    false
 }
 
 fn lexical_name_end(source: &str, start: usize) -> Option<(usize, bool)> {
@@ -272,7 +290,9 @@ fn split_function_arguments(source: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{innermost_namespaced_call, unprefixed_function_calls};
+    use super::{
+        has_unprefixed_function_call, innermost_namespaced_call, unprefixed_function_calls,
+    };
 
     #[test]
     fn namespaced_call_discovery_is_iterative_at_extreme_depth() {
@@ -307,5 +327,13 @@ mod tests {
         // must not activate the core function's compile-time or runtime behavior.
         assert!(unprefixed_function_calls("x:key()", "key").is_empty());
         assert_eq!(unprefixed_function_calls("key()", "key").len(), 1);
+    }
+
+    #[test]
+    fn unprefixed_call_detection_ignores_literals_and_qualified_names() {
+        // Pattern context selection must react only to an actual unprefixed function call.
+        assert!(has_unprefixed_function_call("current ()/item", "current"));
+        assert!(!has_unprefixed_function_call("'current()'", "current"));
+        assert!(!has_unprefixed_function_call("x:current()", "current"));
     }
 }

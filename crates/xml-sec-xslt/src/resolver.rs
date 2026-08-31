@@ -53,6 +53,14 @@ pub(crate) fn resolve_uri_reference(base: Option<&str>, reference: &str) -> Resu
                 .map_or(base, |(document, _)| document)
                 .to_owned());
         }
+        if reference.starts_with('#') {
+            let document = base.split_once('#').map_or(base, |(document, _)| document);
+            return Ok(format!("{document}{reference}"));
+        }
+        if reference.starts_with('?') {
+            let document = base.split(['?', '#']).next().unwrap_or(base);
+            return Ok(format!("{document}{reference}"));
+        }
         if reference.starts_with('/') {
             return Ok(reference.to_owned());
         }
@@ -110,6 +118,27 @@ mod tests {
             resolve_uri_reference(Some("tmp/styles/main.xsl"), "/shared/base.xsl")
                 .expect("path resolution succeeds"),
             "/shared/base.xsl"
+        );
+    }
+
+    #[test]
+    fn path_like_resolution_preserves_document_for_same_document_references() {
+        // Fragment- and query-only references address the current document. Directory fallback
+        // must not replace its filename when the base is not parseable as an absolute URL.
+        assert_eq!(
+            resolve_uri_reference(Some("styles/main.xsl"), "#part")
+                .expect("fragment resolution succeeds"),
+            "styles/main.xsl#part"
+        );
+        assert_eq!(
+            resolve_uri_reference(Some("main.xsl#old"), "?mode=compact")
+                .expect("query resolution succeeds"),
+            "main.xsl?mode=compact"
+        );
+        assert_eq!(
+            resolve_uri_reference(Some("main.xsl?old=yes#part"), "#new")
+                .expect("fragment replacement succeeds"),
+            "main.xsl?old=yes#new"
         );
     }
 

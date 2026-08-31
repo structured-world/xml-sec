@@ -1321,7 +1321,8 @@ impl Evaluator {
             } else {
                 format!("//{branch}")
             };
-            let cache_key = (!branch.contains('$') && !branch.contains("current("))
+            let uses_current = crate::expression::has_unprefixed_function_call(branch, "current");
+            let cache_key = (!branch.contains('$') && !uses_current)
                 .then(|| (expression.clone(), pattern.namespaces.clone(), logical_root));
             if let Some(cached) = cache_key
                 .as_ref()
@@ -1332,9 +1333,11 @@ impl Evaluator {
                 }
                 continue;
             }
+            let root_node = SourceNode::Node(logical_root);
+            let evaluation_node = if uses_current { node } else { &root_node };
             let value = self.evaluate(
                 &Expression::generated(expression, pattern.namespaces.clone()),
-                &SourceNode::Node(logical_root),
+                evaluation_node,
                 1,
                 1,
                 variables,
@@ -4571,7 +4574,7 @@ struct FormatNumberFunction {
 impl function::Function for FormatNumberFunction {
     fn evaluate<'c, 'd>(
         &self,
-        _: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
+        context: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
         args: Vec<SxdValue<'d>>,
     ) -> std::result::Result<SxdValue<'d>, function::Error> {
         if !(2..=3).contains(&args.len()) {
@@ -4594,12 +4597,26 @@ impl function::Function for FormatNumberFunction {
             .ok_or_else(|| function::Error::Other {
                 what: "unknown decimal-format".into(),
             })?;
+        let pattern = args[1].string();
+        context.reserve_string_allocation(decimal_render_workspace_bytes(&pattern))?;
         Ok(SxdValue::String(render_decimal(
             args[0].number(),
-            &args[1].string(),
+            &pattern,
             &format,
         )?))
     }
+}
+
+fn decimal_render_workspace_bytes(pattern: &str) -> usize {
+    let characters = pattern.chars().count();
+    let token_storage = characters.saturating_mul(
+        std::mem::size_of::<DecimalPatternToken>()
+            .saturating_add(std::mem::size_of::<Vec<DecimalPatternToken>>()),
+    );
+    // Rendering can retain formatted, localized, grouped, and final strings concurrently.
+    token_storage
+        .saturating_add(pattern.len().saturating_mul(8))
+        .saturating_add(2_048)
 }
 
 fn resolve_lexical_name(
@@ -5158,5 +5175,29 @@ mod tests {
                 .expect_err("math workspace must cross the allocation gate");
             assert!(error.to_string().contains("allocation budget"));
         }
+    }
+
+    #[test]
+    fn format_number_reserves_dynamic_pattern_workspace_before_rendering() {
+        // The decimal pattern may come from untrusted XPath data. Token and precision buffers
+        // must cross the operation allocation gate before the renderer materializes them.
+        let package = Package::new();
+        let document = package.as_document();
+        let mut context = Context::new();
+        context.set_string_allocation_limit(1);
+        let evaluation =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+        let function = FormatNumberFunction {
+            formats: Rc::new(Vec::new()),
+            namespaces: Rc::new(Vec::new()),
+        };
+
+        let error = function
+            .evaluate(
+                &evaluation,
+                vec![SxdValue::Number(1.25), SxdValue::String("0.0000".into())],
+            )
+            .expect_err("decimal rendering workspace must cross the allocation gate");
+        assert!(error.to_string().contains("allocation budget"));
     }
 }

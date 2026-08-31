@@ -349,11 +349,12 @@ impl Document {
 
         let mut document = Self::empty(base_uri.map(str::to_owned));
         document.source_bytes = xml.len();
-        let entities = internal_general_entities(xml)?;
         let mut entity_references = 0;
         let mut entity_expansion = EntityExpansionMeter::new(ENTITY_EXPANSION_BYTE_CEILING);
+        let (parameter_expanded_xml, entities) =
+            internal_general_entities(xml, &mut entity_references, &mut entity_expansion)?;
         let expanded_xml = expand_document_entities(
-            xml,
+            parameter_expanded_xml.as_ref(),
             &entities,
             &mut entity_references,
             &mut entity_expansion,
@@ -1342,21 +1343,63 @@ fn validate_namespace_binding(prefix: Option<&str>, uri: &str) -> Result<()> {
     Ok(())
 }
 
-fn internal_general_entities(xml: &str) -> Result<HashMap<String, String>> {
+fn internal_general_entities<'a>(
+    xml: &'a str,
+    references: &mut usize,
+    meter: &mut EntityExpansionMeter,
+) -> Result<(Cow<'a, str>, HashMap<String, String>)> {
     let Some((start, end)) = doctype_span(xml)? else {
-        return Ok(HashMap::new());
+        return Ok((Cow::Borrowed(xml), HashMap::new()));
     };
     let doctype = &xml[start..end];
     let Some(subset_start) = doctype.find('[') else {
-        return Ok(HashMap::new());
+        return Ok((Cow::Borrowed(xml), HashMap::new()));
     };
     let Some(subset_end) = doctype.rfind(']') else {
         return Err(Error::Xml(
             "unterminated document type internal subset".into(),
         ));
     };
-    let subset = &doctype[subset_start + 1..subset_end];
-    let mut entities = HashMap::new();
+    let subset_start = start + subset_start + 1;
+    let subset_end = start + subset_end;
+    let subset = &xml[subset_start..subset_end];
+    let declarations = collect_internal_entity_declarations(subset)?;
+    let expanded_subset = expand_parameter_entity_references(
+        subset,
+        &declarations.parameter,
+        &declarations.parameter_spans,
+        0,
+        references,
+        meter,
+    )?;
+    let entities = if matches!(expanded_subset, Cow::Borrowed(_)) {
+        declarations.general
+    } else {
+        collect_internal_entity_declarations(expanded_subset.as_ref())?.general
+    };
+    if matches!(expanded_subset, Cow::Borrowed(_)) {
+        return Ok((Cow::Borrowed(xml), entities));
+    }
+    let mut expanded_xml = String::with_capacity(
+        xml.len()
+            .saturating_sub(subset.len())
+            .saturating_add(expanded_subset.len()),
+    );
+    expanded_xml.push_str(&xml[..subset_start]);
+    expanded_xml.push_str(expanded_subset.as_ref());
+    expanded_xml.push_str(&xml[subset_end..]);
+    Ok((Cow::Owned(expanded_xml), entities))
+}
+
+#[derive(Default)]
+struct InternalEntityDeclarations {
+    general: HashMap<String, String>,
+    parameter: HashMap<String, String>,
+    parameter_spans: Vec<(usize, usize)>,
+}
+
+fn collect_internal_entity_declarations(subset: &str) -> Result<InternalEntityDeclarations> {
+    let mut declarations = InternalEntityDeclarations::default();
     let mut cursor = 0;
     while cursor < subset.len() {
         if subset[cursor..].starts_with("<!--") {
@@ -1379,11 +1422,13 @@ fn internal_general_entities(xml: &str) -> Result<HashMap<String, String>> {
             cursor += subset[cursor..].chars().next().map_or(1, char::len_utf8);
             continue;
         }
+        let declaration_start = cursor;
         cursor += "<!ENTITY".len();
         skip_xml_whitespace(subset, &mut cursor);
-        if subset[cursor..].starts_with('%') {
-            cursor = declaration_end(subset, cursor)?;
-            continue;
+        let parameter = subset[cursor..].starts_with('%');
+        if parameter {
+            cursor += 1;
+            skip_xml_whitespace(subset, &mut cursor);
         }
         let name_start = cursor;
         while cursor < subset.len()
@@ -1423,33 +1468,196 @@ fn internal_general_entities(xml: &str) -> Result<HashMap<String, String>> {
         let value = subset[value_start..cursor].to_owned();
         cursor += 1;
         cursor = declaration_end(subset, cursor)?;
+        if parameter {
+            declarations
+                .parameter_spans
+                .push((declaration_start, cursor));
+        }
+        let entities = if parameter {
+            &mut declarations.parameter
+        } else {
+            &mut declarations.general
+        };
         if let std::collections::hash_map::Entry::Vacant(entry) = entities.entry(name.to_owned()) {
             entry.insert(value);
         }
     }
-    Ok(entities)
+    Ok(declarations)
+}
+
+fn expand_parameter_entity_references<'a>(
+    value: &'a str,
+    entities: &HashMap<String, String>,
+    excluded_declarations: &[(usize, usize)],
+    depth: usize,
+    references: &mut usize,
+    meter: &mut EntityExpansionMeter,
+) -> Result<Cow<'a, str>> {
+    if excluded_declarations.is_empty()
+        && (entities.is_empty() || !value.as_bytes().contains(&b'%'))
+    {
+        return Ok(Cow::Borrowed(value));
+    }
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0;
+    for &(start, end) in excluded_declarations {
+        expand_parameter_entity_references_into(
+            &value[cursor..start],
+            entities,
+            depth,
+            references,
+            meter,
+            &mut output,
+        )?;
+        cursor = end;
+    }
+    expand_parameter_entity_references_into(
+        &value[cursor..],
+        entities,
+        depth,
+        references,
+        meter,
+        &mut output,
+    )?;
+    Ok(Cow::Owned(output))
+}
+
+fn expand_parameter_entity_references_into(
+    value: &str,
+    entities: &HashMap<String, String>,
+    depth: usize,
+    references: &mut usize,
+    meter: &mut EntityExpansionMeter,
+    output: &mut String,
+) -> Result<()> {
+    const MAX_ENTITY_NAME_SCAN_BYTES: usize = 1_024;
+    let mut cursor = 0usize;
+    while cursor < value.len() {
+        let tail = &value[cursor..];
+        let protected_end = if tail.starts_with("<!--") {
+            tail.find("-->").map(|offset| offset + 3)
+        } else if tail.starts_with("<?") {
+            tail.find("?>").map(|offset| offset + 2)
+        } else {
+            None
+        };
+        if let Some(length) = protected_end {
+            meter.append(output, &tail[..length])?;
+            cursor += length;
+            continue;
+        }
+        if tail.starts_with('%')
+            && let Some(end) = tail.as_bytes()[..tail.len().min(MAX_ENTITY_NAME_SCAN_BYTES)]
+                .iter()
+                .position(|byte| *byte == b';')
+            && let name = &tail[1..end]
+            && let Some(replacement) = entities.get(name)
+        {
+            *references += 1;
+            if depth >= ENTITY_EXPANSION_DEPTH_CEILING || *references > ENTITY_REFERENCE_CEILING {
+                return Err(Error::Xml(format!(
+                    "entity reference expansion limit exceeded at `%{name};`"
+                )));
+            }
+            expand_parameter_entity_references_into(
+                replacement,
+                entities,
+                depth + 1,
+                references,
+                meter,
+                output,
+            )?;
+            cursor += end + 1;
+            continue;
+        }
+        let plain_end = tail
+            .char_indices()
+            .find_map(|(offset, character)| matches!(character, '<' | '%').then_some(offset))
+            .filter(|offset| *offset > 0)
+            .unwrap_or_else(|| {
+                if matches!(tail.as_bytes().first(), Some(b'<' | b'%')) {
+                    tail.chars()
+                        .next()
+                        .expect("cursor remains before the string end")
+                        .len_utf8()
+                } else {
+                    tail.len()
+                }
+            });
+        meter.append(output, &tail[..plain_end])?;
+        cursor += plain_end;
+    }
+    Ok(())
 }
 
 fn doctype_span(xml: &str) -> Result<Option<(usize, usize)>> {
-    let mut scanner = Scanner::new(xml);
-    while let Some(event) = scanner
-        .next_event()
-        .map_err(|error| Error::Xml(error.to_string()))?
-    {
-        match event {
-            Event::DocType { range, .. } => return Ok(Some((range.start, range.end))),
-            Event::Declaration { .. }
-            | Event::ProcessingInstruction { .. }
-            | Event::Comment { .. } => {}
-            Event::Text { text, .. }
-                if text
-                    .chars()
-                    .all(|character| matches!(character, ' ' | '\t' | '\r' | '\n')) => {}
-            Event::Start(_) | Event::Empty(_) => return Ok(None),
-            _ => return Ok(None),
+    let mut cursor = usize::from(xml.starts_with('\u{feff}')) * '\u{feff}'.len_utf8();
+    loop {
+        skip_xml_whitespace(xml, &mut cursor);
+        let tail = &xml[cursor..];
+        if tail.starts_with("<!--") {
+            cursor += tail
+                .find("-->")
+                .map(|offset| offset + 3)
+                .ok_or_else(|| Error::Xml("unterminated XML comment".into()))?;
+            continue;
+        }
+        if tail.starts_with("<?") {
+            cursor += tail
+                .find("?>")
+                .map(|offset| offset + 2)
+                .ok_or_else(|| Error::Xml("unterminated XML processing instruction".into()))?;
+            continue;
+        }
+        if !tail.starts_with("<!DOCTYPE") {
+            return Ok(None);
+        }
+        return scan_doctype_end(tail).map(|length| Some((cursor, cursor + length)));
+    }
+}
+
+fn scan_doctype_end(doctype: &str) -> Result<usize> {
+    let mut cursor = "<!DOCTYPE".len();
+    let mut quote = None;
+    let mut internal_subset_depth = 0usize;
+    while cursor < doctype.len() {
+        let tail = &doctype[cursor..];
+        if quote.is_none() && tail.starts_with("<!--") {
+            cursor += tail
+                .find("-->")
+                .map(|offset| offset + 3)
+                .ok_or_else(|| Error::Xml("unterminated DTD comment".into()))?;
+            continue;
+        }
+        if quote.is_none() && tail.starts_with("<?") {
+            cursor += tail
+                .find("?>")
+                .map(|offset| offset + 2)
+                .ok_or_else(|| Error::Xml("unterminated DTD processing instruction".into()))?;
+            continue;
+        }
+        let character = tail
+            .chars()
+            .next()
+            .expect("cursor remains before the string end");
+        cursor += character.len_utf8();
+        if let Some(active) = quote {
+            if character == active {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '[' => internal_subset_depth += 1,
+            ']' => {
+                internal_subset_depth = internal_subset_depth.saturating_sub(1);
+            }
+            '>' if internal_subset_depth == 0 => return Ok(cursor),
+            _ => {}
         }
     }
-    Ok(None)
+    Err(Error::Xml("unterminated document type declaration".into()))
 }
 
 fn declaration_end(subset: &str, mut cursor: usize) -> Result<usize> {
@@ -1717,7 +1925,7 @@ mod parser_boundary_tests {
 
     use super::{
         Document, EntityExpansionMeter, Result, doctype_span, expand_document_entities,
-        expand_entity_references,
+        expand_entity_references, expand_parameter_entity_references, internal_general_entities,
     };
     use crate::budget::ENTITY_EXPANSION_BYTE_CEILING;
 
@@ -1964,6 +2172,66 @@ mod parser_boundary_tests {
         )
         .expect("duplicate entity declarations are well-formed");
         assert_eq!(document.string_value(document.root()), "first");
+    }
+
+    #[test]
+    fn internal_parameter_entities_contribute_markup_declarations() {
+        // Parameter entities in the internal subset can expand to declarations consumed by the
+        // document. The parser must process that declaration before resolving general entities.
+        let xml = r#"<!DOCTYPE r [<!ENTITY % defs '<!ENTITY e "ok">'> %defs;]><r>&e;</r>"#;
+        let mut references = 0;
+        let mut meter = EntityExpansionMeter::new(ENTITY_EXPANSION_BYTE_CEILING);
+        let (prepared, entities) = internal_general_entities(xml, &mut references, &mut meter)
+            .expect("parameter entity subset is prepared");
+        assert_eq!(prepared, r#"<!DOCTYPE r [ <!ENTITY e "ok">]><r>&e;</r>"#);
+        assert_eq!(entities.get("e").map(String::as_str), Some("ok"));
+
+        let document =
+            Document::parse_iterative(xml, None).expect("parameter entity declaration expands");
+        assert_eq!(document.string_value(document.root()), "ok");
+    }
+
+    #[test]
+    fn parameter_entity_expansion_enforces_recursive_aggregate_limits() {
+        // Parameter entities share the bounded expansion path used by document entities: cycles,
+        // aggregate references, and materialized bytes must all fail before parser allocation.
+        let recursive = HashMap::from([("loop".into(), "%loop;".into())]);
+        assert!(
+            expand_parameter_entity_references(
+                "%loop;",
+                &recursive,
+                &[],
+                0,
+                &mut 0,
+                &mut EntityExpansionMeter::new(ENTITY_EXPANSION_BYTE_CEILING),
+            )
+            .is_err()
+        );
+
+        let leaf = HashMap::from([("leaf".into(), "x".into())]);
+        let references = "%leaf;".repeat(256);
+        assert!(
+            expand_parameter_entity_references(
+                &references,
+                &leaf,
+                &[],
+                0,
+                &mut 0,
+                &mut EntityExpansionMeter::new(ENTITY_EXPANSION_BYTE_CEILING),
+            )
+            .is_err()
+        );
+        assert!(
+            expand_parameter_entity_references(
+                "%leaf;",
+                &leaf,
+                &[],
+                0,
+                &mut 0,
+                &mut EntityExpansionMeter::new(0),
+            )
+            .is_err()
+        );
     }
 
     #[test]
