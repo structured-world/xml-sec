@@ -35,6 +35,7 @@ mod environment;
 mod error;
 mod expression;
 mod exslt_date;
+mod lexical;
 mod model;
 mod resolver;
 mod runtime;

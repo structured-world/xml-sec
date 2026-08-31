@@ -146,16 +146,39 @@ impl Document {
                 .ok_or_else(|| Error::Xml("parsed node has no projected parent".into()))?;
             let kind = if source.is_element() {
                 let prefix = lexical_prefix(xml, source.range().start, source.tag_name().name());
+                if !crate::lexical::is_ncname(source.tag_name().name())
+                    || prefix
+                        .as_deref()
+                        .is_some_and(|prefix| !crate::lexical::is_ncname(prefix))
+                {
+                    return Err(Error::Xml("invalid element QName".into()));
+                }
                 let attributes = source
                     .attributes()
-                    .map(|attribute| Attribute {
-                        name: ExpandedName::new(attribute.namespace(), attribute.name()),
-                        prefix: attribute_prefix(xml, source, attribute),
-                        value: attribute.value().to_owned(),
+                    .map(|attribute| {
+                        let prefix = attribute_prefix(xml, source, attribute);
+                        if !crate::lexical::is_ncname(attribute.name())
+                            || prefix
+                                .as_deref()
+                                .is_some_and(|prefix| !crate::lexical::is_ncname(prefix))
+                        {
+                            return Err(Error::Xml("invalid attribute QName".into()));
+                        }
+                        Ok(Attribute {
+                            name: ExpandedName::new(attribute.namespace(), attribute.name()),
+                            prefix,
+                            value: attribute.value().to_owned(),
+                        })
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>>>()?;
                 let mut namespaces = Vec::new();
                 for namespace in source.namespaces() {
+                    if namespace
+                        .name()
+                        .is_some_and(|prefix| !crate::lexical::is_ncname(prefix))
+                    {
+                        return Err(Error::Xml("invalid namespace prefix".into()));
+                    }
                     validate_namespace_binding(namespace.name(), namespace.uri())?;
                     namespaces.push(Namespace {
                         prefix: namespace.name().map(str::to_owned),
@@ -300,7 +323,7 @@ impl Document {
                     }
                     if elements.len() > 1 && !value.is_empty() {
                         let id = push_parsed_text(&mut document, &elements, value);
-                        document.nodes[id.0].source_line = Some(source_line);
+                        document.nodes[id.0].source_line.get_or_insert(source_line);
                     } else if phase == DocumentPhase::Start {
                         phase = DocumentPhase::Prolog;
                     }
@@ -316,7 +339,7 @@ impl Document {
                         &elements,
                         text.xml10_content().into_owned(),
                     );
-                    document.nodes[id.0].source_line = Some(source_line);
+                    document.nodes[id.0].source_line.get_or_insert(source_line);
                 }
                 Event::Comment(comment) => {
                     if phase == DocumentPhase::Start {
@@ -376,7 +399,7 @@ impl Document {
                         }
                     };
                     let id = push_parsed_text(&mut document, &elements, value);
-                    document.nodes[id.0].source_line = Some(source_line);
+                    document.nodes[id.0].source_line.get_or_insert(source_line);
                 }
                 Event::Eof => break,
                 Event::Decl(_) => {
@@ -892,6 +915,9 @@ fn push_stream_element(
             validate_namespace_binding(None, &value)?;
             set_namespace(&mut namespaces, None, value);
         } else if let Some(prefix) = name.strip_prefix("xmlns:") {
+            if !crate::lexical::is_ncname(prefix) {
+                return Err(Error::Xml(format!("invalid namespace prefix {prefix}")));
+            }
             validate_namespace_binding(Some(prefix), &value)?;
             set_namespace(&mut namespaces, Some(prefix.into()), value);
         } else {
@@ -900,7 +926,7 @@ fn push_stream_element(
     }
     let binding = start.name();
     let lexical_name = binding.as_ref();
-    let (prefix, local) = split_lexical_name(lexical_name);
+    let (prefix, local) = split_lexical_name(lexical_name)?;
     let namespace = namespace_for(&namespaces, prefix.as_deref());
     if prefix.is_some() && namespace.is_none() {
         return Err(Error::Xml(format!(
@@ -910,7 +936,7 @@ fn push_stream_element(
     let attributes = raw_attributes
         .into_iter()
         .map(|(lexical, value)| {
-            let (prefix, local) = split_lexical_name(&lexical);
+            let (prefix, local) = split_lexical_name(&lexical)?;
             let namespace = prefix
                 .as_deref()
                 .and_then(|prefix| namespace_for(&namespaces, Some(prefix)));
@@ -970,6 +996,18 @@ fn push_parsed_text(
     value: String,
 ) -> NodeId {
     let parent = elements.last().expect("document frame remains present").0;
+    if let Some(last_child) = document
+        .node(parent)
+        .and_then(|node| node.children.last())
+        .copied()
+        && let NodeKind::Text {
+            value: existing,
+            disable_output_escaping: false,
+        } = &mut document.nodes[last_child.0].kind
+    {
+        existing.push_str(&value);
+        return last_child;
+    }
     let inherited_base = document.node(parent).and_then(|node| node.base_uri.clone());
     document.push(
         parent,
@@ -981,11 +1019,17 @@ fn push_parsed_text(
     )
 }
 
-fn split_lexical_name(name: &str) -> (Option<String>, String) {
-    name.split_once(':').map_or_else(
-        || (None, name.to_owned()),
-        |(prefix, local)| (Some(prefix.to_owned()), local.to_owned()),
-    )
+fn split_lexical_name(name: &str) -> Result<(Option<String>, String)> {
+    let (prefix, local) = name
+        .split_once(':')
+        .map_or((None, name), |(prefix, local)| (Some(prefix), local));
+    if !crate::lexical::is_ncname(local)
+        || prefix.is_some_and(|prefix| !crate::lexical::is_ncname(prefix))
+        || local.contains(':')
+    {
+        return Err(Error::Xml(format!("invalid XML QName {name}")));
+    }
+    Ok((prefix.map(str::to_owned), local.to_owned()))
 }
 
 fn namespace_for(namespaces: &[Namespace], prefix: Option<&str>) -> Option<String> {
@@ -1398,11 +1442,29 @@ mod parser_boundary_tests {
     }
 
     #[test]
+    fn tree_and_streaming_parsers_coalesce_adjacent_character_data() {
+        // Tokenizer event boundaries are not XPath text-node boundaries: text, references and
+        // CDATA in one character-data run must project as one semantic text node.
+        for depth in 126..=130 {
+            let xml = nested_xml(depth, "<leaf>a&amp;b&#x21;<![CDATA[c]]>d</leaf>");
+            let tree = parse_tree_with_oracle_stack(&xml, None)
+                .expect("tree parser accepts adjacent character data");
+            let streaming = Document::parse_deep_streaming(&xml, None)
+                .expect("streaming parser accepts adjacent character data");
+            assert_eq!(tree, streaming, "text projection differs at depth {depth}");
+        }
+    }
+
+    #[test]
     fn tree_and_streaming_parsers_reject_the_same_boundary_malformations() {
         // Namespace and document-well-formedness failures cannot depend on the depth threshold.
         for depth in (62..=66).chain(126..=130) {
             for leaf in [
                 "<p:leaf/>",
+                "<p:a:b xmlns:p=\"urn:p\"/>",
+                "<:leaf/>",
+                "<leaf:/>",
+                "<leaf p:a:b=\"x\" xmlns:p=\"urn:p\"/>",
                 "<leaf xmlns:a=\"urn:u\" xmlns:b=\"urn:u\" a:x=\"1\" b:x=\"2\"/>",
                 "<leaf xmlns:xml=\"urn:wrong\"/>",
                 "<leaf xmlns:p=\"\"/>",

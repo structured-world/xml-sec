@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::budget::ensure;
+use crate::lexical::{is_ncname, unicode_decimal_value};
 use crate::resolver::{decode_resource, decoded_resource_len};
 use crate::{
     BudgetKind, CompileBudget, Document, Error, ExpandedName, Namespace, OutputDefinition,
@@ -359,9 +360,13 @@ impl<R: Resolver> Compiler<R> {
                 }
                 let explicit_priority = node
                     .attribute("priority")
-                    .map(str::parse::<f64>)
-                    .transpose()
-                    .map_err(|_| Error::Static("template priority must be a number".into()))?;
+                    .map(|value| {
+                        let priority = crate::xpath::xpath_number(value);
+                        priority.is_finite().then_some(priority).ok_or_else(|| {
+                            Error::Static("template priority must be a finite XPath number".into())
+                        })
+                    })
+                    .transpose()?;
                 let mode = optional_qname_attr(node, "mode")?;
                 let mut children = node.children().peekable();
                 let mut params = Vec::new();
@@ -446,11 +451,17 @@ impl<R: Resolver> Compiler<R> {
                     ));
                 }
             }
-            "key" => state.keys.push(KeyDeclaration {
-                name: required_qname_attr(node, "name")?,
-                match_pattern: Pattern::new(required_attr(node, "match")?, node)?,
-                use_expression: Expression::new(required_attr(node, "use")?, node, base_uri)?,
-            }),
+            "key" => {
+                let match_pattern = required_attr(node, "match")?;
+                let use_expression = required_attr(node, "use")?;
+                validate_key_dependency_expression("match", match_pattern)?;
+                validate_key_dependency_expression("use", use_expression)?;
+                state.keys.push(KeyDeclaration {
+                    name: required_qname_attr(node, "name")?,
+                    match_pattern: Pattern::new(match_pattern, node)?,
+                    use_expression: Expression::new(use_expression, node, base_uri)?,
+                });
+            }
             "decimal-format" => {
                 let format = DecimalFormat::parse(node, precedence)?;
                 if let Some(existing) = state.decimal_formats.iter().find(|existing| {
@@ -2815,7 +2826,7 @@ impl DecimalFormat {
                 Ok(first)
             })
         }
-        Ok(Self {
+        let format = Self {
             name: optional_qname_attr(node, "name")?,
             precedence,
             decimal_separator: one(node, "decimal-separator", '.')?,
@@ -2828,8 +2839,47 @@ impl DecimalFormat {
             zero_digit: one(node, "zero-digit", '0')?,
             digit: one(node, "digit", '#')?,
             pattern_separator: one(node, "pattern-separator", ';')?,
-        })
+        };
+        if unicode_decimal_value(format.zero_digit) != Some(0) {
+            return Err(Error::Static(
+                "xsl:decimal-format zero-digit must have Unicode decimal value zero".into(),
+            ));
+        }
+        let syntax = [
+            ("decimal-separator", format.decimal_separator),
+            ("grouping-separator", format.grouping_separator),
+            ("percent", format.percent),
+            ("per-mille", format.per_mille),
+            ("zero-digit", format.zero_digit),
+            ("digit", format.digit),
+            ("pattern-separator", format.pattern_separator),
+        ];
+        for (index, (name, value)) in syntax.iter().enumerate() {
+            if let Some((other, _)) = syntax[index + 1..]
+                .iter()
+                .find(|(_, candidate)| candidate == value)
+            {
+                return Err(Error::Static(format!(
+                    "xsl:decimal-format {name} and {other} must be distinct"
+                )));
+            }
+        }
+        Ok(format)
     }
+}
+
+fn validate_key_dependency_expression(attribute: &str, source: &str) -> Result<()> {
+    if contains_variable_reference(source) {
+        return Err(Error::Static(format!(
+            "xsl:key {attribute} must not contain a variable reference"
+        )));
+    }
+    if !crate::expression::unprefixed_function_calls(source, "key").is_empty() {
+        return Err(Error::Static(format!(
+            "xsl:key {attribute} must not call key()"
+        )));
+    }
+    Ok(())
 }
 impl AttributeSet {
     fn parse(
@@ -2939,42 +2989,6 @@ fn required_output_qname(node: roxmltree::Node<'_, '_>, value: &str) -> Result<E
     Ok(name)
 }
 
-pub(crate) fn is_ncname(value: &str) -> bool {
-    let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    is_ncname_start(first) && chars.all(is_ncname_char)
-}
-
-fn is_ncname_start(ch: char) -> bool {
-    matches!(
-        ch,
-        'A'..='Z'
-            | '_'
-            | 'a'..='z'
-            | '\u{C0}'..='\u{D6}'
-            | '\u{D8}'..='\u{F6}'
-            | '\u{F8}'..='\u{2FF}'
-            | '\u{370}'..='\u{37D}'
-            | '\u{37F}'..='\u{1FFF}'
-            | '\u{200C}'..='\u{200D}'
-            | '\u{2070}'..='\u{218F}'
-            | '\u{2C00}'..='\u{2FEF}'
-            | '\u{3001}'..='\u{D7FF}'
-            | '\u{F900}'..='\u{FDCF}'
-            | '\u{FDF0}'..='\u{FFFD}'
-            | '\u{10000}'..='\u{EFFFF}'
-    )
-}
-
-fn is_ncname_char(ch: char) -> bool {
-    is_ncname_start(ch)
-        || matches!(
-            ch,
-            '-' | '.' | '0'..='9' | '\u{B7}' | '\u{0300}'..='\u{036F}' | '\u{203F}'..='\u{2040}'
-        )
-}
 fn attribute_prefix(
     node: roxmltree::Node<'_, '_>,
     attribute: roxmltree::Attribute<'_, '_>,

@@ -8,10 +8,9 @@ use sxd_document_no_unsafe::{Package, QName};
 use sxd_xpath_no_unsafe::{Context, Factory, Value as SxdValue, XPath, function, nodeset};
 
 use crate::budget::Meter;
-use crate::compiler::{
-    DecimalFormat, Expression, NameTest, Pattern, is_ncname, normalize_xpath_for_sxd,
-};
+use crate::compiler::{DecimalFormat, Expression, NameTest, Pattern, normalize_xpath_for_sxd};
 use crate::expression::innermost_namespaced_call;
+use crate::lexical::is_ncname;
 use crate::resolver::{decode_resource, decoded_resource_len};
 use crate::runtime::{SourceProcessing, apply_whitespace_rules};
 use crate::{
@@ -666,12 +665,7 @@ impl Evaluator {
                             Ok(value) => xpath_value_to_public(value),
                             Err(error)
                                 if kind == ExtensionCallKind::DynamicEvaluate
-                                    && !matches!(
-                                        error.kind(),
-                                        ErrorKind::Budget
-                                            | ErrorKind::Resource
-                                            | ErrorKind::Resolver
-                                    ) =>
+                                    && dynamic_expression_error_is_recoverable(&error) =>
                             {
                                 Value::NodeSet(Vec::new())
                             }
@@ -769,20 +763,25 @@ impl Evaluator {
                             meter,
                         )?
                         .string(self);
+                    let nodes = self.document_order(nodes);
                     let mut result_nodes = Vec::new();
                     let mut seen = HashSet::new();
                     let mut scalars = Vec::new();
                     let total = nodes.len();
                     for (index, mapped_node) in nodes.iter().enumerate() {
-                        let Ok(value) = self.evaluate_dynamic(
+                        let value = match self.evaluate_dynamic(
                             &expression.derived(dynamic_source.clone()),
                             mapped_node,
                             index + 1,
                             total,
                             &augmented,
                             meter,
-                        ) else {
-                            continue;
+                        ) {
+                            Ok(value) => value,
+                            Err(error) if dynamic_expression_error_is_recoverable(&error) => {
+                                continue;
+                            }
+                            Err(error) => return Err(error),
                         };
                         match value {
                             XPathValue::NodeSet(nodes) => {
@@ -1385,7 +1384,7 @@ impl Evaluator {
             (!predicate.contains(['[', ']'])).then_some((lexical, predicate))
         }) && let Some((attribute_name, expected)) = predicate.split_once('=')
             && let attribute_name = attribute_name.trim()
-            && crate::compiler::is_ncname(attribute_name)
+            && is_ncname(attribute_name)
             && let Some(expected) = quoted_pattern_literal(expected.trim())
         {
             let NodeKind::Element {
@@ -2033,7 +2032,7 @@ pub(crate) fn xpath_number(value: &str) -> f64 {
                 },
                 |(integer, fraction)| {
                     (integer.is_empty() || integer.chars().all(|c| c.is_ascii_digit()))
-                        && !fraction.is_empty()
+                        && !(integer.is_empty() && fraction.is_empty())
                         && fraction.chars().all(|c| c.is_ascii_digit())
                 },
             );
@@ -3687,20 +3686,19 @@ fn extension_argument_error<T>(message: &str) -> std::result::Result<T, function
     })
 }
 
+fn dynamic_expression_error_is_recoverable(error: &Error) -> bool {
+    !matches!(
+        error.kind(),
+        ErrorKind::Budget | ErrorKind::Resource | ErrorKind::Resolver
+    )
+}
+
 fn percent_encode_uri(value: &str, escape_reserved: bool, encoded_len: usize) -> String {
-    const RESERVED: &str = ";/?:@&=+$,[]#";
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut output = String::with_capacity(encoded_len);
     for byte in value.as_bytes() {
         let character = char::from(*byte);
-        if character.is_ascii_alphanumeric()
-            || matches!(
-                character,
-                '-' | '_' | '.' | '!' | '~' | '*' | '\'' | '(' | ')'
-            )
-            || character == '@'
-            || (!escape_reserved && RESERVED.contains(character))
-        {
+        if uri_byte_is_unescaped(character, escape_reserved) {
             output.push(character);
         } else {
             output.push('%');
@@ -3715,22 +3713,25 @@ fn percent_encoded_uri_len(
     value: &str,
     escape_reserved: bool,
 ) -> std::result::Result<usize, function::Error> {
-    const RESERVED: &str = ";/?:@&=+$,[]#";
     value.as_bytes().iter().try_fold(0usize, |length, byte| {
         let character = char::from(*byte);
-        let encoded = !(character.is_ascii_alphanumeric()
-            || matches!(
-                character,
-                '-' | '_' | '.' | '!' | '~' | '*' | '\'' | '(' | ')'
-            )
-            || character == '@'
-            || (!escape_reserved && RESERVED.contains(character)));
+        let encoded = !uri_byte_is_unescaped(character, escape_reserved);
         length
             .checked_add(if encoded { 3 } else { 1 })
             .ok_or_else(|| function::Error::Other {
                 what: "str:encode-uri() result length overflow".into(),
             })
     })
+}
+
+fn uri_byte_is_unescaped(character: char, escape_reserved: bool) -> bool {
+    const RESERVED: &str = ";/?:@&=+$,[]#";
+    character.is_ascii_alphanumeric()
+        || matches!(
+            character,
+            '-' | '_' | '.' | '!' | '~' | '*' | '\'' | '(' | ')'
+        )
+        || (!escape_reserved && RESERVED.contains(character))
 }
 
 fn percent_decode_uri(
@@ -3945,7 +3946,6 @@ impl function::Function for ElementAvailable {
                 (Some(SAXON_NS), "output")
                     | (Some(XALAN_REDIRECT_NS), "write")
                     | (Some(XT_NS), "document")
-                    | (Some(LIBXSLT_NS), "debug")
             );
         Ok(SxdValue::Boolean(available))
     }
@@ -4335,10 +4335,7 @@ fn resolve_lexical_name(
     namespaces: &[(String, String)],
 ) -> std::result::Result<ExpandedName, function::Error> {
     if let Some((prefix, local)) = lexical.split_once(':') {
-        if !crate::compiler::is_ncname(prefix)
-            || !crate::compiler::is_ncname(local)
-            || local.contains(':')
-        {
+        if !is_ncname(prefix) || !is_ncname(local) || local.contains(':') {
             return Err(function::Error::Other {
                 what: format!("invalid QName {lexical}"),
             });
@@ -4351,7 +4348,7 @@ fn resolve_lexical_name(
                 what: format!("unbound QName prefix {prefix}"),
             })?;
         Ok(ExpandedName::new(Some(namespace), local))
-    } else if crate::compiler::is_ncname(lexical) {
+    } else if is_ncname(lexical) {
         Ok(ExpandedName::new(None::<String>, lexical))
     } else {
         Err(function::Error::Other {

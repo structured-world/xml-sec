@@ -4332,6 +4332,177 @@ fn dynamic_map_preserves_boolean_lexical_values() {
 }
 
 #[test]
+fn exslt_functions_do_not_inherit_a_current_template_rule() {
+    // A function call has no current template rule, so apply-imports in its body is a dynamic
+    // error rather than a dispatch into an unrelated lower-precedence template.
+    let resolver = Arc::new(MemoryResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            "base.xsl".into(),
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><base/></xsl:template></xsl:stylesheet>"#.into(),
+        );
+    let stylesheet = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" xmlns:f="urn:functions" extension-element-prefixes="func"><xsl:import href="base.xsl"/><func:function name="f:test"><xsl:apply-imports/><func:result select="'done'"/></func:function><xsl:template match="/"><xsl:value-of select="f:test()"/></xsl:template></xsl:stylesheet>"#,
+        Some("memory:main.xsl"),
+    )
+    .expect("function stylesheet compiles");
+    assert!(matches!(
+        stylesheet.execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Dynamic(message)) if message.contains("current template rule")
+    ));
+}
+
+#[test]
+fn xpath_numbers_accept_a_trailing_decimal_point() {
+    // XPath Number admits a decimal point with no following digits when integer digits exist.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:param name="value" select="'5.'"/><xsl:template match="/"><xsl:value-of select="number($value)"/><xsl:text>|</xsl:text><xsl:value-of select="$value + 1"/><xsl:text>|</xsl:text><xsl:value-of select="number('.5')"/><xsl:text>|</xsl:text><xsl:value-of select="number('-.5')"/><xsl:text>|</xsl:text><xsl:value-of select="number('5..')"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "5|6|0.5|-0.5|NaN");
+}
+
+#[test]
+fn capability_queries_do_not_advertise_unimplemented_debug_instruction() {
+    // Conditional stylesheets must not select an extension instruction the engine cannot run.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:libxslt="http://xmlsoft.org/XSLT/namespace"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="element-available('libxslt:debug')"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "false");
+}
+
+#[test]
+fn key_declarations_reject_forbidden_static_dependencies() {
+    // Invalid key declarations are static errors even when no key() call ever builds the index.
+    for (match_pattern, use_expression) in [
+        ("item", "$value"),
+        ("item", "key('other', @id)"),
+        ("item[key('other', @id)]", "@id"),
+    ] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:key name="invalid" match="{match_pattern}" use="{use_expression}"/><xsl:template match="/"/></xsl:stylesheet>"#
+        );
+        assert!(matches!(
+            Compiler::new(
+                Arc::new(NoResolver),
+                CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+            )
+            .compile(&stylesheet, Some("memory:key.xsl")),
+            Err(Error::Static(_))
+        ));
+    }
+}
+
+#[test]
+fn template_priority_uses_the_xpath_number_grammar() {
+    // Host-language float extensions and non-finite values are not XSLT Priority values.
+    for value in ["1e2", "NaN", "inf", "+1"] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="*" priority="{value}"/></xsl:stylesheet>"#
+        );
+        assert!(matches!(
+            Compiler::new(
+                Arc::new(NoResolver),
+                CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+            )
+            .compile(&stylesheet, Some("memory:priority.xsl")),
+            Err(Error::Static(_))
+        ));
+    }
+    compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="*" priority="5."/><xsl:template match="item" priority="-.5"/></xsl:stylesheet>"#,
+    );
+}
+
+#[test]
+fn decimal_formats_enforce_character_invariants() {
+    // Syntax characters must be distinct and zero-digit must identify value zero in a Unicode
+    // decimal digit family.
+    for attributes in [
+        "decimal-separator=\".\" grouping-separator=\".\"",
+        "zero-digit=\"A\"",
+        "zero-digit=\"١\"",
+    ] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:decimal-format {attributes}/></xsl:stylesheet>"#
+        );
+        assert!(matches!(
+            Compiler::new(
+                Arc::new(NoResolver),
+                CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+            )
+            .compile(&stylesheet, Some("memory:decimal-format.xsl")),
+            Err(Error::Static(_))
+        ));
+    }
+    compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:decimal-format zero-digit="٠"/></xsl:stylesheet>"#,
+    );
+}
+
+#[test]
+fn encode_uri_escapes_every_reserved_character_when_requested() {
+    // The true flag escapes the complete RFC 2396 reserved set; false preserves that set.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="str:encode-uri(';/?:@&amp;=+$,[]#', true())"/><xsl:text>|</xsl:text><xsl:value-of select="str:encode-uri(';/?:@&amp;=+$,[]#', false())"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<source/>"),
+        "%3B%2F%3F%3A%40%26%3D%2B%24%2C%5B%5D%23|;/?:@&=+$,[]#"
+    );
+}
+
+#[test]
+fn dynamic_map_propagates_resource_budget_failures() {
+    // Per-node dynamic-expression recovery must never turn an exceeded resource boundary into a
+    // successful transformation or retry it for the remaining input nodes.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:dyn="http://exslt.org/dynamic"><xsl:param name="expression"/><xsl:template match="/"><xsl:value-of select="dyn:map(root/item, $expression)"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let mut parameters = Parameters::new();
+    parameters.insert(
+        ExpandedName::new(None::<String>, "expression"),
+        Value::String(format!("'{}'", "x".repeat(70_000))),
+    );
+    let budget = execution_budget(1024);
+    assert!(matches!(
+        stylesheet.execute(
+            &Document::parse("<root><item/><item/><item/></root>", None).expect("source parses"),
+            &parameters,
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget { .. })
+    ));
+}
+
+#[test]
+fn dynamic_map_assigns_positions_in_document_order() {
+    // Union operand/hash order cannot affect the dynamic context position or scalar result order.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:dyn="http://exslt.org/dynamic"><xsl:output method="text"/><xsl:template match="/"><xsl:for-each select="dyn:map(root/item[@id='c'] | root/item[@id='a'] | root/item[@id='b'], 'concat(@id, position())')"><xsl:value-of select="."/><xsl:text>|</xsl:text></xsl:for-each></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(
+            stylesheet,
+            "<root><item id=\"a\"/><item id=\"b\"/><item id=\"c\"/></root>"
+        ),
+        "a1|b2|c3|"
+    );
+}
+
+#[test]
 fn dynamic_qnames_require_complete_qname_grammar() {
     // Runtime key and decimal-format names must reject extra colons and invalid NCNames.
     for select in [

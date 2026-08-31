@@ -12,6 +12,7 @@ use crate::compiler::{
     Stylesheet, Template, Variable,
 };
 use crate::expression::innermost_namespaced_call;
+use crate::lexical::{is_ncname, unicode_decimal_value};
 use crate::serializer::{serialize, serialize_fragment};
 use crate::xpath::{
     Evaluator, EvaluatorSourceOptions, PreparedEvaluatorSource, SourceNode, XPathValue,
@@ -1575,7 +1576,7 @@ impl<'a> Execution<'a> {
             }
             Instruction::Processing { name, body } => {
                 let target = self.evaluate_avt(name, node, position, size)?;
-                if target.eq_ignore_ascii_case("xml") || !crate::compiler::is_ncname(&target) {
+                if target.eq_ignore_ascii_case("xml") || !is_ncname(&target) {
                     return Err(Error::Dynamic(
                         "invalid processing-instruction target".into(),
                     ));
@@ -2190,14 +2191,7 @@ impl<'a> Execution<'a> {
             self.binding_function_defaults.pop();
         }
         let execution = parameters.and_then(|()| {
-            self.execute_sequence(
-                &function.body,
-                node,
-                position,
-                size,
-                depth + 1,
-                Some(function.precedence),
-            )
+            self.execute_sequence(&function.body, node, position, size, depth + 1, None)
         });
         let value = self.function_results.pop().flatten();
         self.result = previous_result;
@@ -3469,9 +3463,7 @@ fn is_lexical_variable_name(value: &str) -> bool {
     let Some(first) = parts.next() else {
         return false;
     };
-    crate::compiler::is_ncname(first)
-        && parts.next().is_none_or(crate::compiler::is_ncname)
-        && parts.next().is_none()
+    is_ncname(first) && parts.next().is_none_or(is_ncname) && parts.next().is_none()
 }
 
 fn quoted_literal(value: &str) -> Option<&str> {
@@ -3484,14 +3476,11 @@ fn quoted_literal(value: &str) -> Option<&str> {
 
 fn split_name(value: &str) -> Result<(Option<String>, String)> {
     if let Some((prefix, local)) = value.split_once(':') {
-        if local.contains(':')
-            || !crate::compiler::is_ncname(prefix)
-            || !crate::compiler::is_ncname(local)
-        {
+        if local.contains(':') || !is_ncname(prefix) || !is_ncname(local) {
             return Err(Error::Dynamic(format!("invalid computed QName {value}")));
         }
         Ok((Some(prefix.into()), local.into()))
-    } else if !crate::compiler::is_ncname(value) {
+    } else if !is_ncname(value) {
         Err(Error::Dynamic(format!("invalid computed QName {value}")))
     } else {
         Ok((None, value.into()))
@@ -3802,17 +3791,6 @@ fn localize_decimal_digits(value: &str, token: &str) -> String {
                 .unwrap_or(character)
         })
         .collect()
-}
-
-fn unicode_decimal_value(character: char) -> Option<u32> {
-    const ZEROES: &[char] = &[
-        '0', '٠', '۰', '०', '০', '੦', '૦', '୦', '௦', '౦', '೦', '൦', '๐', '໐', '༠', '၀', '០', '᠐',
-        'ᥐ', '᭐', '᮰', '᱀', '꘠', '꣐', '꩐', '０',
-    ];
-    ZEROES.iter().find_map(|zero| {
-        let offset = u32::from(character).checked_sub(u32::from(*zero))?;
-        (offset <= 9).then_some(offset)
-    })
 }
 
 fn same_node_kind_and_name(document: &Document, left: &SourceNode, right: &SourceNode) -> bool {

@@ -1194,37 +1194,34 @@ fn assert_strict_xslt_output_deviation(case: &Case, actual: &[u8], expected: &[u
             );
             true
         }
-        // libxslt treats `?` as an undeclared per-mille symbol. XSLT 1.0 assigns
-        // scaling only to the active decimal-format symbols, so `?` stays literal.
-        "XSLTMark/number.xsl" => {
-            for expected in [
-                "FOUR ?22.00",
-                "FOUR ?22.22",
-                "FOUR ?123.46",
-                "FOUR -?77777.78",
-                "FOUR -?6123.03",
-            ] {
-                assert!(
-                    actual.contains(expected),
-                    "missing strict output `{expected}`"
-                );
-            }
-            assert_eq!(actual.matches("FOUR ").count(), 7);
+        // libxslt leaves `@` unescaped despite the true escape-reserved argument. EXSLT defines
+        // that mode to percent-encode every reserved URI character.
+        "exslt/strings/uri.xsl" => {
+            let expected = String::from_utf8_lossy(expected);
+            assert_eq!(
+                actual.as_ref(),
+                expected.replace("<all>@</all>", "<all>%40</all>")
+            );
             true
         }
+        // libxslt treats `?` as an undeclared per-mille symbol. XSLT 1.0 assigns
+        // scaling only to the active decimal-format symbols, so `?` stays literal.
         // libxslt resolves an unprefixed QName as an XSLT instruction here. XSLT 1.0
         // requires the argument to expand into the XSLT namespace, so no text is emitted.
         "general/bug-200.xsl" => {
             assert!(!actual.contains("found"));
             true
         }
-        // element-available() reports instructions. xsl:decimal-format is a top-level
-        // declaration, although libxslt advertises it as an executable instruction.
+        // element-available() reports executable instructions. xsl:decimal-format is a top-level
+        // declaration and libxslt:debug has no executable engine implementation, although
+        // libxslt advertises both names.
         "extensions/list.xsl" => {
             let expected = String::from_utf8_lossy(expected);
             assert_eq!(
                 actual.as_ref(),
-                expected.replace("xsl:decimal-format available\n", "")
+                expected
+                    .replace("xsl:decimal-format available\n", "")
+                    .replace("libxslt:debug available\n", "")
             );
             true
         }
@@ -1355,6 +1352,19 @@ fn is_expected_strict_xslt_error(case: &Case, error: &Error) -> bool {
         // match. XSLT 1.0 forbids VariableReference in patterns, so strict compilation rejects it.
         ("general/bug-214.xsl", Error::Static(message)) => {
             message.contains("match pattern") && message.contains("variable reference")
+        }
+        // This cleanup fixture uses key() recursively from an xsl:key match. XSLT 1.0 forbids
+        // key() in both match and use, while libxslt accepts the extension.
+        ("general/bug-166.xsl", Error::Static(message)) => {
+            message.contains("xsl:key match") && message.contains("key()")
+        }
+        // These donor fixtures rely on DecimalFormat symbols that XSLT 1.0 defines as a static
+        // error: duplicate separators and a zero-digit whose decimal value is not zero.
+        ("general/bug-205.xsl", Error::Static(message)) => {
+            message.contains("xsl:decimal-format") && message.contains("distinct")
+        }
+        ("XSLTMark/number.xsl", Error::Static(message)) => {
+            message.contains("zero-digit") && message.contains("decimal value zero")
         }
         // count() requires a node-set; libxslt historically exposed an RTF as one implicitly.
         ("general/bug-56.xsl", Error::Dynamic(message)) => {
