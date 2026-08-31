@@ -1,8 +1,10 @@
 # xml-sec-xslt
 
 Safe-Rust XSLT 1.0 compiler and runtime for parser-independent XML processing.
-The crate is an independent engine: it has no XMLDSig, XMLEnc, crypto, filesystem,
-network, environment, or global registry coupling.
+The crate is an independent engine: it has no XMLDSig, XMLEnc, key-provider,
+filesystem, network, environment, or global registry coupling. Pure EXSLT digest
+functions are implemented locally and do not expose or depend on XML-security key
+handling.
 
 Compilation produces an immutable `Stylesheet` that can be shared and executed
 repeatedly. Callers provide explicit compile/execution budgets and a resolver
@@ -37,10 +39,13 @@ UTF-16LE/BE, and ISO-8859-1, with the method-specific escaping or rejection
 required for unrepresentable characters.
 `Document::parse` accepts already-decoded Rust text; `Document::parse_bytes` and
 `Compiler::compile_bytes` apply the same strict XML byte-decoding boundary used by
-resolver resources. The production semantic tree always uses one iterative lexical-event path,
-so attacker-controlled document depth cannot select a different parser implementation. The
-event tokenizer is a private implementation detail and does not define the engine's semantic or
-encoding contract.
+resolver resources. The production semantic tree always uses one iterative
+lexical-event path, so attacker-controlled document depth cannot select a different
+parser implementation. Stylesheet compilation uses a `roxmltree` frontend and
+immediately projects it into the engine's owned compiler IR; source documents and
+runtime trees do not retain that DOM. The event tokenizer and compiler frontend are
+private implementation details and do not define the engine's semantic or encoding
+contract.
 
 ## Compatibility oracle
 

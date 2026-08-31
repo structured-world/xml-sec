@@ -1,3 +1,5 @@
+use crate::lexical::{is_ncname_char, is_ncname_start};
+
 pub(crate) struct FunctionCall {
     pub start: usize,
     pub end: usize,
@@ -66,7 +68,7 @@ fn first_namespaced_call(
             cursor += character.len_utf8();
             continue;
         }
-        if !is_name_start(character) {
+        if !is_ncname_start(character) {
             cursor += character.len_utf8();
             continue;
         }
@@ -74,7 +76,7 @@ fn first_namespaced_call(
         cursor += character.len_utf8();
         while cursor < source.len() {
             let next = source[cursor..].chars().next()?;
-            if !is_name_character(next) {
+            if next != ':' && !is_ncname_char(next) {
                 break;
             }
             cursor += next.len_utf8();
@@ -93,12 +95,7 @@ fn first_namespaced_call(
             continue;
         }
         let mut open = cursor;
-        while open < source.len()
-            && source[open..]
-                .chars()
-                .next()
-                .is_some_and(char::is_whitespace)
-        {
+        while open < source.len() && source[open..].chars().next().is_some_and(is_xpath_space) {
             open += source[open..].chars().next()?.len_utf8();
         }
         if !source[open..].starts_with('(') {
@@ -137,7 +134,7 @@ pub(crate) fn unprefixed_function_calls(source: &str, name: &str) -> Vec<Functio
             cursor += character.len_utf8();
             continue;
         }
-        if !is_name_start(character) {
+        if !is_ncname_start(character) {
             cursor += character.len_utf8();
             continue;
         }
@@ -147,7 +144,7 @@ pub(crate) fn unprefixed_function_calls(source: &str, name: &str) -> Vec<Functio
             let Some(next) = source[cursor..].chars().next() else {
                 break;
             };
-            if !is_name_character(next) {
+            if !is_ncname_char(next) {
                 break;
             }
             cursor += next.len_utf8();
@@ -156,12 +153,7 @@ pub(crate) fn unprefixed_function_calls(source: &str, name: &str) -> Vec<Functio
             continue;
         }
         let mut open = cursor;
-        while open < source.len()
-            && source[open..]
-                .chars()
-                .next()
-                .is_some_and(char::is_whitespace)
-        {
+        while open < source.len() && source[open..].chars().next().is_some_and(is_xpath_space) {
             open += source[open..]
                 .chars()
                 .next()
@@ -184,6 +176,10 @@ pub(crate) fn unprefixed_function_calls(source: &str, name: &str) -> Vec<Functio
         });
     }
     calls
+}
+
+fn is_xpath_space(character: char) -> bool {
+    matches!(character, ' ' | '\t' | '\r' | '\n')
 }
 
 fn matching_parenthesis(source: &str, open: usize) -> Option<usize> {
@@ -241,14 +237,6 @@ fn split_function_arguments(source: &str) -> Vec<String> {
     arguments
 }
 
-fn is_name_start(character: char) -> bool {
-    character.is_alphabetic() || character == '_'
-}
-
-fn is_name_character(character: char) -> bool {
-    is_name_start(character) || character.is_ascii_digit() || matches!(character, '-' | '.' | ':')
-}
-
 #[cfg(test)]
 mod tests {
     use super::innermost_namespaced_call;
@@ -263,5 +251,20 @@ mod tests {
         )
         .expect("nested call is discovered");
         assert_eq!(&source[call.start..call.end], "x:f(1)");
+    }
+
+    #[test]
+    fn namespaced_call_discovery_accepts_complete_ncname_grammar() {
+        // XML NameStartChar includes U+200C; extension discovery must share
+        // the same QName grammar as stylesheet compilation.
+        let prefix = "\u{200c}";
+        let source = format!("{prefix}:function()");
+        let call = innermost_namespaced_call(
+            &source,
+            &[(prefix.into(), "urn:test".into())],
+            |namespace, local| namespace == "urn:test" && local == "function",
+        )
+        .expect("valid Unicode-prefixed call is discovered");
+        assert_eq!(&source[call.start..call.end], source);
     }
 }

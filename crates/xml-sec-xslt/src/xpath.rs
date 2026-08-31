@@ -2952,20 +2952,22 @@ fn rewrite_outer_context_functions(source: &str) -> String {
         }
         if predicate_depth == 0 {
             let replacement = [
-                ("position()", "$__xml_sec_ctx:position"),
-                ("last()", "$__xml_sec_ctx:last"),
+                ("position", "$__xml_sec_ctx:position"),
+                ("last", "$__xml_sec_ctx:last"),
             ]
             .into_iter()
-            .find(|(function, _)| {
-                tail.starts_with(function)
-                    && source[..cursor]
+            .find_map(|(function, variable)| {
+                outer_context_call_len(tail, function).and_then(|length| {
+                    source[..cursor]
                         .chars()
                         .next_back()
                         .is_none_or(|before| !is_xpath_name_character(before))
+                        .then_some((length, variable))
+                })
             });
-            if let Some((function, variable)) = replacement {
+            if let Some((length, variable)) = replacement {
                 output.push_str(variable);
-                cursor += function.len();
+                cursor += length;
                 continue;
             }
         }
@@ -2973,6 +2975,33 @@ fn rewrite_outer_context_functions(source: &str) -> String {
         cursor += character.len_utf8();
     }
     output
+}
+
+fn outer_context_call_len(source: &str, function: &str) -> Option<usize> {
+    let mut cursor = function.len();
+    if !source.starts_with(function)
+        || source[cursor..]
+            .chars()
+            .next()
+            .is_some_and(is_xpath_name_character)
+    {
+        return None;
+    }
+    cursor += source[cursor..]
+        .find(|character: char| !is_xpath_whitespace(character))
+        .unwrap_or(source.len() - cursor);
+    if source.as_bytes().get(cursor) != Some(&b'(') {
+        return None;
+    }
+    cursor += 1;
+    cursor += source[cursor..]
+        .find(|character: char| !is_xpath_whitespace(character))
+        .unwrap_or(source.len() - cursor);
+    (source.as_bytes().get(cursor) == Some(&b')')).then_some(cursor + 1)
+}
+
+fn is_xpath_whitespace(character: char) -> bool {
+    matches!(character, ' ' | '\t' | '\r' | '\n')
 }
 
 fn is_xpath_name_character(character: char) -> bool {
@@ -4802,6 +4831,16 @@ mod tests {
     use super::*;
     use crate::ExecutionBudget;
     use sxd_xpath_no_unsafe::function::Function;
+
+    #[test]
+    fn outer_context_functions_accept_xpath_whitespace() {
+        // XPath allows whitespace between a function name and its empty
+        // argument list; rewriting must not depend on one lexical spelling.
+        assert_eq!(
+            rewrite_outer_context_functions("position \t( ) + last\n(\r)"),
+            "$__xml_sec_ctx:position + $__xml_sec_ctx:last"
+        );
+    }
 
     #[test]
     fn source_clone_is_reserved_even_without_retained_source_xml() {

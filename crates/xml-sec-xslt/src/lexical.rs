@@ -17,7 +17,7 @@ pub(crate) fn unicode_decimal_value(character: char) -> Option<u32> {
     })
 }
 
-fn is_ncname_start(ch: char) -> bool {
+pub(crate) fn is_ncname_start(ch: char) -> bool {
     matches!(
         ch,
         'A'..='Z'
@@ -38,7 +38,7 @@ fn is_ncname_start(ch: char) -> bool {
     )
 }
 
-fn is_ncname_char(ch: char) -> bool {
+pub(crate) fn is_ncname_char(ch: char) -> bool {
     is_ncname_start(ch)
         || matches!(
             ch,

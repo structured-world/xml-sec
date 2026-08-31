@@ -26,6 +26,11 @@ pub struct ResolvedResource {
 
 /// Explicit resource boundary used by compilation and execution.
 pub trait Resolver: Send + Sync {
+    /// Resolve one URI reference and return stable provenance with its bytes.
+    ///
+    /// Path-like fallback resolution preserves lexical `..` segments. A resolver
+    /// that maps the result onto a filesystem must canonicalize it and enforce its
+    /// configured root boundary before reading any bytes.
     fn resolve(
         &self,
         uri: &str,

@@ -39,6 +39,7 @@ pub enum Error {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SelectedEncoding {
     Standard(&'static encoding_rs::Encoding),
+    Ascii,
     Latin1,
 }
 
@@ -46,6 +47,7 @@ impl SelectedEncoding {
     fn name(self) -> &'static str {
         match self {
             Self::Standard(encoding) => encoding.name(),
+            Self::Ascii => "US-ASCII",
             Self::Latin1 => "ISO-8859-1",
         }
     }
@@ -192,6 +194,9 @@ fn physical_encoding(bytes: &[u8]) -> Result<Option<(SelectedEncoding, usize)>, 
 }
 
 fn parse_encoding(label: &str) -> Result<SelectedEncoding, Error> {
+    if matches_ascii_case(label, &["us-ascii", "ascii"]) {
+        return Ok(SelectedEncoding::Ascii);
+    }
     if matches_ascii_case(label, &["iso-8859-1", "latin1", "latin-1"]) {
         return Ok(SelectedEncoding::Latin1);
     }
@@ -205,6 +210,19 @@ fn decode_selected<'a>(
     encoding: SelectedEncoding,
     maximum: usize,
 ) -> Result<Cow<'a, str>, Error> {
+    if encoding == SelectedEncoding::Ascii {
+        if bytes.iter().any(|byte| !byte.is_ascii()) {
+            return Err(Error::InvalidBytes("US-ASCII"));
+        }
+        let decoded = std::str::from_utf8(bytes).expect("seven-bit US-ASCII is always valid UTF-8");
+        if decoded.len() > maximum {
+            return Err(Error::DecodedLimit {
+                maximum,
+                actual: decoded.len(),
+            });
+        }
+        return Ok(Cow::Borrowed(decoded));
+    }
     if encoding == SelectedEncoding::Latin1 {
         let mut decoded = String::with_capacity(bytes.len().min(maximum));
         for byte in bytes {
@@ -218,7 +236,7 @@ fn decode_selected<'a>(
         return Ok(Cow::Owned(decoded));
     }
     let SelectedEncoding::Standard(encoding) = encoding else {
-        unreachable!("Latin-1 returned above")
+        unreachable!("special-case encodings returned above")
     };
     if encoding == encoding_rs::UTF_8 {
         let decoded = std::str::from_utf8(bytes).map_err(|_| Error::InvalidBytes("UTF-8"))?;
@@ -433,6 +451,20 @@ mod tests {
     fn latin1_and_windows_1252_keep_distinct_c1_semantics() {
         assert_eq!(decode_text(&[0x80], "ISO-8859-1").unwrap(), "\u{80}");
         assert_eq!(decode_text(&[0x80], "windows-1252").unwrap(), "€");
+    }
+
+    #[test]
+    fn us_ascii_rejects_non_ascii_bytes() {
+        // WHATWG aliases US-ASCII to Windows-1252, but XML's declared encoding
+        // contract permits only seven-bit bytes for this label.
+        assert!(matches!(
+            decode_text(&[0x80], "US-ASCII"),
+            Err(Error::InvalidBytes("US-ASCII"))
+        ));
+        assert_eq!(
+            decode_text(b"plain ASCII", "US-ASCII").unwrap(),
+            "plain ASCII"
+        );
     }
 
     #[test]

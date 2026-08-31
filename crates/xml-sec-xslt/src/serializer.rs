@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use crate::budget::Meter;
 use crate::{BudgetKind, Document, Error, NodeId, NodeKind, Result};
@@ -604,7 +605,7 @@ struct RenderContext {
     depth: usize,
     parent_name: Option<crate::ExpandedName>,
     parent_mixed: bool,
-    in_scope_namespaces: Vec<(Option<String>, String)>,
+    in_scope_namespaces: Rc<Vec<(Option<String>, String)>>,
 }
 
 impl RenderContext {
@@ -613,7 +614,7 @@ impl RenderContext {
             depth: 0,
             parent_name: None,
             parent_mixed: false,
-            in_scope_namespaces: vec![],
+            in_scope_namespaces: Rc::new(vec![]),
         }
     }
 }
@@ -795,6 +796,7 @@ fn serialize_node(
                         .any(|namespace| namespace.prefix.is_none() && namespace.uri.is_empty())
                 {
                     output.push_str(" xmlns=\"\"");
+                    let current_namespaces = Rc::make_mut(&mut current_namespaces);
                     if let Some(existing) = current_namespaces
                         .iter_mut()
                         .find(|(prefix, _)| prefix.is_none())
@@ -849,6 +851,7 @@ fn serialize_node(
                         output,
                     );
                     output.push('"');
+                    let current_namespaces = Rc::make_mut(&mut current_namespaces);
                     if let Some(existing) = current_namespaces
                         .iter_mut()
                         .find(|(prefix, _)| prefix == &namespace.prefix)

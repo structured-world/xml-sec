@@ -282,11 +282,22 @@ impl<'a> Scanner<'a> {
                         .pending_start
                         .as_mut()
                         .ok_or_else(|| Error::malformed("attribute outside a start tag"))?;
+                    let name = Name {
+                        prefix: prefix.as_str(),
+                        local: local.as_str(),
+                    };
+                    if start
+                        .attributes
+                        .iter()
+                        .any(|attribute| attribute.name == name)
+                    {
+                        return Err(Error::malformed(format!(
+                            "duplicate attribute `{}`",
+                            name.qualified()
+                        )));
+                    }
                     start.attributes.push(Attribute {
-                        name: Name {
-                            prefix: prefix.as_str(),
-                            local: local.as_str(),
-                        },
+                        name,
                         value: value.as_str(),
                         range: span.range(),
                     });
@@ -452,10 +463,10 @@ pub fn escape_attribute(value: &str) -> Cow<'_, str> {
 }
 
 fn escape(value: &str, attribute: bool) -> Cow<'_, str> {
-    if !value
-        .bytes()
-        .any(|byte| matches!(byte, b'&' | b'<' | b'>' | b'"') && (attribute || byte != b'"'))
-    {
+    if !value.bytes().any(|byte| {
+        matches!(byte, b'&' | b'<' | b'>' | b'\r')
+            || (attribute && matches!(byte, b'"' | b'\n' | b'\t'))
+    }) {
         return Cow::Borrowed(value);
     }
     let mut output = String::with_capacity(value.len());
@@ -465,6 +476,9 @@ fn escape(value: &str, attribute: bool) -> Cow<'_, str> {
             '<' => output.push_str("&lt;"),
             '>' => output.push_str("&gt;"),
             '"' if attribute => output.push_str("&quot;"),
+            '\t' if attribute => output.push_str("&#9;"),
+            '\n' if attribute => output.push_str("&#10;"),
+            '\r' => output.push_str("&#13;"),
             _ => output.push(character),
         }
     }
@@ -582,6 +596,19 @@ mod tests {
     }
 
     #[test]
+    fn scanner_rejects_duplicate_lexical_attributes() {
+        // Namespace declarations are attributes under XML Namespaces 1.0 and
+        // may not be repeated even though they do not enter the XPath axis.
+        for xml in [
+            "<root xmlns='urn:first' xmlns='urn:second'/>",
+            "<root xmlns:p='urn:first' xmlns:p='urn:second'/>",
+            "<root value='first' value='second'/>",
+        ] {
+            assert!(Scanner::new(xml).next_event().is_err(), "accepted {xml}");
+        }
+    }
+
+    #[test]
     fn writer_escapes_text_and_attributes_by_context() {
         let mut writer = Writer::new(Vec::new());
         writer
@@ -592,6 +619,27 @@ mod tests {
         assert_eq!(
             String::from_utf8(writer.into_inner()).expect("writer emits UTF-8"),
             "<p a=\"&lt;&amp;&quot;\">&lt;&amp;\"</p>"
+        );
+    }
+
+    #[test]
+    fn writer_preserves_normalized_whitespace_across_reparse() {
+        // Literal XML whitespace is normalized differently in character data
+        // and attributes, so numeric references preserve the semantic value.
+        let mut writer = Writer::new(Vec::new());
+        writer
+            .empty("root", [("value", "tab\tline\nreturn\r")])
+            .expect("empty tag must serialize");
+        assert_eq!(
+            String::from_utf8(writer.into_inner()).expect("writer emits UTF-8"),
+            "<root value=\"tab&#9;line&#10;return&#13;\"/>"
+        );
+
+        let mut writer = Writer::new(Vec::new());
+        writer.text("line\rbreak\n").expect("text must serialize");
+        assert_eq!(
+            String::from_utf8(writer.into_inner()).expect("writer emits UTF-8"),
+            "line&#13;break\n"
         );
     }
 }

@@ -332,15 +332,15 @@ impl Function for Concat {
     ) -> Result<Value<'d>, Error> {
         let args = Args(args);
         args.at_least(2)?;
-        let args = args.into_strings();
         let length = args
+            .0
             .iter()
-            .try_fold(0usize, |total, value| total.checked_add(value.len()))
+            .try_fold(0usize, |total, value| total.checked_add(value.string_len()))
             .unwrap_or(usize::MAX);
         context.reserve_string_allocation(length)?;
         let mut output = String::with_capacity(length);
-        for value in args {
-            output.push_str(&value);
+        for value in args.0 {
+            value.append_string(&mut output);
         }
         Ok(Value::String(output))
     }
@@ -701,7 +701,7 @@ mod test {
     use sxd_document_no_unsafe::Package;
 
     use crate::context;
-    use crate::nodeset::Node;
+    use crate::nodeset::{Node, Nodeset};
     use crate::{LiteralValue, Value};
 
     use super::{
@@ -855,6 +855,29 @@ mod test {
         let error = setup
             .evaluate(document.root(), Concat, args!["ab", "cd"])
             .expect_err("four-byte concat must exceed the three-byte allocation budget");
+        assert!(error.to_string().contains("string allocation budget"));
+    }
+
+    #[test]
+    fn concat_bounds_nodeset_string_values_before_output_allocation() {
+        // A node-set string value is attacker-controlled and must remain under
+        // the same reservation that gates the final concat allocation.
+        let package = Package::new();
+        let document = package.as_document();
+        let root = document.create_element("root");
+        root.append_child(document.create_text("oversized"));
+        document.root().append_child(root);
+        let mut nodes = Nodeset::new();
+        nodes.add(root);
+        let mut setup = Setup::new();
+        setup.context.set_string_allocation_limit(4);
+        let error = setup
+            .evaluate(
+                document.root(),
+                Concat,
+                vec![Value::Nodeset(nodes), "x".into()],
+            )
+            .expect_err("node-set concat must be bounded before output allocation");
         assert!(error.to_string().contains("string allocation budget"));
     }
 

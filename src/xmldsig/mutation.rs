@@ -221,9 +221,8 @@ where
         values,
         policy,
         budget,
-        |document, node| {
-            signature_node(document, target_signature)
-                .is_some_and(|signature| is_direct_signed_info_reference_digest(node, signature))
+        DsigReplacementScope::SignedInfoReferenceDigest {
+            signature_index: target_signature,
         },
     )
 }
@@ -283,9 +282,8 @@ pub(super) fn fill_signature_value_at_index_with_budget(
         vec![value.to_owned()],
         policy,
         budget,
-        |document, node| {
-            signature_node(document, target_signature)
-                .is_some_and(|signature| node.parent().is_some_and(|parent| parent == signature))
+        DsigReplacementScope::DirectSignatureChild {
+            signature_index: target_signature,
         },
     )
 }
@@ -429,9 +427,8 @@ pub(super) fn fill_key_info_at_index_with_options(
         key_info_content,
         policy,
         None,
-        |document, node| {
-            signature_node(document, target_signature)
-                .is_some_and(|signature| node.parent().is_some_and(|parent| parent == signature))
+        DsigReplacementScope::DirectSignatureChild {
+            signature_index: target_signature,
         },
     )
 }
@@ -1079,7 +1076,45 @@ where
         .into_iter()
         .map(|value| value.as_ref().to_owned())
         .collect();
-    fill_dsig_text_values_matching(xml, local_name, values, None, None, |_, _| true)
+    fill_dsig_text_values_matching(
+        xml,
+        local_name,
+        values,
+        None,
+        None,
+        DsigReplacementScope::Any,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum DsigReplacementScope {
+    Any,
+    SignedInfoReferenceDigest { signature_index: usize },
+    DirectSignatureChild { signature_index: usize },
+}
+
+impl DsigReplacementScope {
+    const fn signature_index(self) -> Option<usize> {
+        match self {
+            Self::Any => None,
+            Self::SignedInfoReferenceDigest { signature_index }
+            | Self::DirectSignatureChild { signature_index } => Some(signature_index),
+        }
+    }
+
+    fn includes(
+        self,
+        node: crate::xml::dom::Node<'_, '_>,
+        signature: Option<crate::xml::dom::Node<'_, '_>>,
+    ) -> bool {
+        match self {
+            Self::Any => true,
+            Self::SignedInfoReferenceDigest { .. } => signature
+                .is_some_and(|signature| is_direct_signed_info_reference_digest(node, signature)),
+            Self::DirectSignatureChild { .. } => signature
+                .is_some_and(|signature| node.parent().is_some_and(|parent| parent == signature)),
+        }
+    }
 }
 
 fn fill_dsig_text_values_matching(
@@ -1088,16 +1123,13 @@ fn fill_dsig_text_values_matching(
     values: Vec<String>,
     policy: Option<&crate::policy::SigningPolicy>,
     budget: Option<&XmlParseWorkBudget>,
-    should_replace: impl for<'a> FnMut(
-        &crate::xml::dom::Document<'a>,
-        crate::xml::dom::Node<'a, 'a>,
-    ) -> bool,
+    scope: DsigReplacementScope,
 ) -> Result<String, XmlMutationError> {
     let escaped = values
         .iter()
         .map(|value| escape_text(value).into_owned())
         .collect::<Vec<_>>();
-    fill_dsig_contents_matching(xml, local_name, &escaped, policy, budget, should_replace)
+    fill_dsig_contents_matching(xml, local_name, &escaped, policy, budget, scope)
 }
 
 fn fill_dsig_raw_value_matching(
@@ -1106,10 +1138,7 @@ fn fill_dsig_raw_value_matching(
     content: &str,
     policy: Option<&crate::policy::SigningPolicy>,
     budget: Option<&XmlParseWorkBudget>,
-    should_replace: impl for<'a> FnMut(
-        &crate::xml::dom::Document<'a>,
-        crate::xml::dom::Node<'a, 'a>,
-    ) -> bool,
+    scope: DsigReplacementScope,
 ) -> Result<String, XmlMutationError> {
     fill_dsig_contents_matching(
         xml,
@@ -1117,7 +1146,7 @@ fn fill_dsig_raw_value_matching(
         &[content.to_owned()],
         policy,
         budget,
-        should_replace,
+        scope,
     )
 }
 
@@ -1127,15 +1156,15 @@ fn fill_dsig_contents_matching(
     contents: &[String],
     policy: Option<&crate::policy::SigningPolicy>,
     budget: Option<&XmlParseWorkBudget>,
-    mut should_replace: impl for<'a> FnMut(
-        &crate::xml::dom::Document<'a>,
-        crate::xml::dom::Node<'a, 'a>,
-    ) -> bool,
+    scope: DsigReplacementScope,
 ) -> Result<String, XmlMutationError> {
     let document = parse_mutation_xml_with_budget(xml, policy, budget)?;
+    let signature = scope
+        .signature_index()
+        .and_then(|index| signature_node(&document, index));
     let ranges = document
         .descendants()
-        .filter(|node| is_dsig_node(*node, local_name) && should_replace(&document, *node))
+        .filter(|node| is_dsig_node(*node, local_name) && scope.includes(*node, signature))
         .map(|node| node.range())
         .collect::<Vec<_>>();
     if ranges.len() != contents.len() {

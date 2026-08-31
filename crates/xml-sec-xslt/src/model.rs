@@ -349,7 +349,8 @@ impl Document {
         let mut document = Self::empty(base_uri.map(str::to_owned));
         document.source_xml = Some(xml.to_owned());
         let entities = internal_general_entities(xml)?;
-        let expanded_xml = expand_document_entities(xml, &entities)?;
+        let mut entity_references = 0;
+        let expanded_xml = expand_document_entities(xml, &entities, &mut entity_references)?;
         let mut reader = Scanner::new(&expanded_xml);
         let line_starts = std::iter::once(0)
             .chain(
@@ -361,13 +362,14 @@ impl Document {
             .collect::<Vec<_>>();
         let mut phase = DocumentPhase::Start;
         let mut saw_doctype = false;
-        let mut elements = vec![(
-            document.root,
-            vec![Namespace {
+        let mut elements = vec![StreamElementFrame {
+            node: document.root,
+            lexical_name: None,
+            namespaces: vec![Namespace {
                 prefix: Some("xml".into()),
                 uri: "http://www.w3.org/XML/1998/namespace".into(),
             }],
-        )];
+        }];
         while let Some(event) = reader
             .next_event()
             .map_err(|error| Error::Xml(error.to_string()))?
@@ -382,7 +384,14 @@ impl Document {
                         }
                         phase = DocumentPhase::Content;
                     }
-                    let id = push_stream_element(&mut document, &mut elements, &start, false)?;
+                    let id = push_stream_element(
+                        &mut document,
+                        &mut elements,
+                        &start,
+                        false,
+                        &entities,
+                        &mut entity_references,
+                    )?;
                     document.nodes[id.0].source_line = Some(source_line);
                 }
                 Event::Empty(start) => {
@@ -392,12 +401,29 @@ impl Document {
                         }
                         phase = DocumentPhase::Epilog;
                     }
-                    let id = push_stream_element(&mut document, &mut elements, &start, true)?;
+                    let id = push_stream_element(
+                        &mut document,
+                        &mut elements,
+                        &start,
+                        true,
+                        &entities,
+                        &mut entity_references,
+                    )?;
                     document.nodes[id.0].source_line = Some(source_line);
                 }
-                Event::End { .. } => {
+                Event::End { name, .. } => {
                     if elements.len() == 1 {
                         return Err(Error::Xml("unmatched closing element".into()));
+                    }
+                    let closing_name = name.qualified();
+                    let opening_name = elements
+                        .last()
+                        .and_then(|frame| frame.lexical_name.as_deref())
+                        .expect("non-root element frames retain their lexical name");
+                    if closing_name != opening_name {
+                        return Err(Error::Xml(format!(
+                            "closing element `{closing_name}` does not match `{opening_name}`"
+                        )));
                     }
                     elements.pop();
                     if elements.len() == 1 {
@@ -437,7 +463,10 @@ impl Document {
                     if phase == DocumentPhase::Start {
                         phase = DocumentPhase::Prolog;
                     }
-                    let parent = elements.last().expect("document frame remains present").0;
+                    let parent = elements
+                        .last()
+                        .expect("document frame remains present")
+                        .node;
                     let inherited_base =
                         document.node(parent).and_then(|node| node.base_uri.clone());
                     let id = document.push(
@@ -453,7 +482,10 @@ impl Document {
                     if phase == DocumentPhase::Start {
                         phase = DocumentPhase::Prolog;
                     }
-                    let parent = elements.last().expect("document frame remains present").0;
+                    let parent = elements
+                        .last()
+                        .expect("document frame remains present")
+                        .node;
                     let inherited_base =
                         document.node(parent).and_then(|node| node.base_uri.clone());
                     let id = document.push(
@@ -1012,24 +1044,38 @@ fn normalize_xml_attribute_value(value: &str) -> String {
         .collect()
 }
 
+struct StreamElementFrame {
+    node: NodeId,
+    lexical_name: Option<String>,
+    namespaces: Vec<Namespace>,
+}
+
 fn push_stream_element(
     document: &mut Document,
-    elements: &mut Vec<(NodeId, Vec<Namespace>)>,
+    elements: &mut Vec<StreamElementFrame>,
     start: &xml_sec_xml_input::lexical::StartTag<'_>,
     empty: bool,
+    entities: &HashMap<String, String>,
+    entity_references: &mut usize,
 ) -> Result<NodeId> {
     let parent = elements
         .last()
-        .map(|(parent, _)| *parent)
+        .map(|frame| frame.node)
         .expect("document frame remains present");
     let mut namespaces = elements
         .last()
-        .map(|(_, namespaces)| namespaces.clone())
+        .map(|frame| frame.namespaces.clone())
         .expect("document frame remains present");
     let mut raw_attributes = Vec::new();
     for attribute in &start.attributes {
         let name = attribute.name.qualified();
-        let value = xml_sec_xml_input::lexical::decode_references(attribute.value)
+        let value = expand_entity_references(attribute.value, entities, 0, entity_references)?;
+        if value.contains('<') {
+            return Err(Error::Xml(format!(
+                "attribute `{name}` entity replacement contains a literal `<`"
+            )));
+        }
+        let value = xml_sec_xml_input::lexical::decode_references(&value)
             .map_err(|error| Error::Xml(error.to_string()))?
             .into_owned();
         let value = normalize_xml_attribute_value(&value);
@@ -1107,7 +1153,11 @@ fn push_stream_element(
         effective_base,
     );
     if !empty {
-        elements.push((projected, namespaces));
+        elements.push(StreamElementFrame {
+            node: projected,
+            lexical_name: Some(lexical_name.into_owned()),
+            namespaces,
+        });
     }
     Ok(projected)
 }
@@ -1129,10 +1179,13 @@ fn event_range_start(event: &xml_sec_xml_input::lexical::Event<'_>) -> usize {
 
 fn push_parsed_text(
     document: &mut Document,
-    elements: &[(NodeId, Vec<Namespace>)],
+    elements: &[StreamElementFrame],
     value: String,
 ) -> NodeId {
-    let parent = elements.last().expect("document frame remains present").0;
+    let parent = elements
+        .last()
+        .expect("document frame remains present")
+        .node;
     if let Some(last_child) = document
         .node(parent)
         .and_then(|node| node.children.last())
@@ -1345,7 +1398,11 @@ fn skip_xml_whitespace(value: &str, cursor: &mut usize) {
     }
 }
 
-fn expand_document_entities(xml: &str, entities: &HashMap<String, String>) -> Result<String> {
+fn expand_document_entities(
+    xml: &str,
+    entities: &HashMap<String, String>,
+    references: &mut usize,
+) -> Result<String> {
     if entities.is_empty() {
         return Ok(xml.to_owned());
     }
@@ -1353,13 +1410,12 @@ fn expand_document_entities(xml: &str, entities: &HashMap<String, String>) -> Re
         return Ok(xml.to_owned());
     };
     let mut expanded = String::with_capacity(xml.len());
-    let mut references = 0;
     expanded.push_str(&xml[..doctype_end]);
     expanded.push_str(&expand_entity_references(
         &xml[doctype_end..],
         entities,
         0,
-        &mut references,
+        references,
     )?);
     Ok(expanded)
 }
@@ -1389,8 +1445,17 @@ fn expand_entity_references(
             cursor += length;
             continue;
         }
+        if tail.starts_with('<')
+            && let Some(length) = xml_markup_len(tail)
+        {
+            output.push_str(&tail[..length]);
+            cursor += length;
+            continue;
+        }
         if tail.starts_with('&')
-            && let Some(end) = tail[..tail.len().min(MAX_ENTITY_NAME_SCAN_BYTES)].find(';')
+            && let Some(end) = tail.as_bytes()[..tail.len().min(MAX_ENTITY_NAME_SCAN_BYTES)]
+                .iter()
+                .position(|byte| *byte == b';')
             && let name = &tail[1..end]
             && let Some(replacement) = entities.get(name)
         {
@@ -1417,6 +1482,19 @@ fn expand_entity_references(
         cursor += ch.len_utf8();
     }
     Ok(output)
+}
+
+fn xml_markup_len(source: &str) -> Option<usize> {
+    let mut quote = None;
+    for (offset, byte) in source.bytes().enumerate().skip(1) {
+        match (quote, byte) {
+            (None, b'\'' | b'"') => quote = Some(byte),
+            (Some(delimiter), current) if delimiter == current => quote = None,
+            (None, b'>') => return Some(offset + 1),
+            _ => {}
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1592,6 +1670,35 @@ mod parser_boundary_tests {
     }
 
     #[test]
+    fn iterative_parser_rejects_mismatched_closing_names() {
+        // Deep documents select the iterative parser, which must enforce the
+        // same lexical element nesting invariant as the regular parser.
+        let xml = nested_xml(65, "<expected></different>");
+        assert!(parse_tree_with_oracle_stack(&xml, None).is_err());
+        assert!(
+            Document::parse_iterative(&xml, None).is_err(),
+            "iterative parser accepted a mismatched closing element"
+        );
+    }
+
+    #[test]
+    fn iterative_parser_expands_entities_inside_attribute_value_context() {
+        // Entity replacement text is interpreted inside the attribute value;
+        // a quote in that text must not terminate the source-level delimiter.
+        let xml = r#"<!DOCTYPE root [<!ENTITY quote "'">]><root value='&quote;'/>"#;
+        let iterative = Document::parse_iterative(xml, None)
+            .expect("iterative parser must preserve attribute quoting");
+        let value = iterative.nodes().find_map(|(_, node)| match &node.kind {
+            super::NodeKind::Element { attributes, .. } => attributes
+                .iter()
+                .find(|attribute| attribute.name.local == "value")
+                .map(|attribute| attribute.value.as_str()),
+            _ => None,
+        });
+        assert_eq!(value, Some("'"));
+    }
+
+    #[test]
     fn oracle_and_iterative_parsers_reject_misplaced_and_duplicate_doctypes() {
         // Document depth must not make invalid prolog structure acceptable.
         let deep_document = nested_xml(65, "<leaf/>");
@@ -1628,6 +1735,19 @@ mod parser_boundary_tests {
         let name = "a".repeat(1_100);
         let source = format!("&{name};");
         let entities = HashMap::from([(name, "expanded".into())]);
+        assert_eq!(
+            expand_entity_references(&source, &entities, 0, &mut 0)
+                .expect("bounded entity scan succeeds"),
+            source
+        );
+    }
+
+    #[test]
+    fn entity_name_window_never_slices_inside_utf8() {
+        // The byte-bounded semicolon search must not turn a multibyte scalar
+        // crossing the ceiling into a char-boundary panic.
+        let source = format!("&{}é", "a".repeat(1_022));
+        let entities = HashMap::from([("x".to_owned(), "expanded".to_owned())]);
         assert_eq!(
             expand_entity_references(&source, &entities, 0, &mut 0)
                 .expect("bounded entity scan succeeds"),

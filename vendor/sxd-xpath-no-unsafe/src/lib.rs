@@ -215,6 +215,29 @@ impl OwnedQName {
 
 type LiteralValue = Value<'static>;
 
+struct FormattedLength(usize);
+
+impl std::fmt::Write for FormattedLength {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        self.0 = self.0.saturating_add(value.len());
+        Ok(())
+    }
+}
+
+fn write_xpath_number(output: &mut impl std::fmt::Write, number: f64) -> std::fmt::Result {
+    if number.is_infinite() {
+        output.write_str(if number.signum() < 0.0 {
+            "-Infinity"
+        } else {
+            "Infinity"
+        })
+    } else if number == 0.0 {
+        output.write_char('0')
+    } else {
+        write!(output, "{number}")
+    }
+}
+
 /// The primary types of values that an XPath expression accepts
 /// as an argument or returns as a result.
 #[derive(Debug, Clone, PartialEq)]
@@ -232,7 +255,7 @@ pub enum Value<'d> {
 }
 
 fn str_to_num(s: &str) -> f64 {
-    let lexical = s.trim();
+    let lexical = s.trim_matches(|character| matches!(character, ' ' | '\t' | '\r' | '\n'));
     let unsigned = lexical.strip_prefix('-').unwrap_or(lexical);
     let mut parts = unsigned.split('.');
     let integer = parts.next().unwrap_or_default();
@@ -251,6 +274,37 @@ fn str_to_num(s: &str) -> f64 {
 }
 
 impl<'d> Value<'d> {
+    pub(crate) fn string_len(&self) -> usize {
+        match self {
+            Value::Boolean(true) => 4,
+            Value::Boolean(false) => 5,
+            Value::Number(number) => {
+                let mut length = FormattedLength(0);
+                write_xpath_number(&mut length, *number).expect("length sink cannot fail");
+                length.0
+            }
+            Value::String(value) | Value::ResultTreeFragment(_, value) => value.len(),
+            Value::Nodeset(nodes) => nodes
+                .document_order_first()
+                .map_or(0, |node| node.string_value_len()),
+        }
+    }
+
+    pub(crate) fn append_string(self, output: &mut String) {
+        match self {
+            Value::Boolean(value) => output.push_str(if value { "true" } else { "false" }),
+            Value::Number(number) => {
+                write_xpath_number(output, number).expect("String formatting cannot fail");
+            }
+            Value::String(value) | Value::ResultTreeFragment(_, value) => output.push_str(&value),
+            Value::Nodeset(nodes) => {
+                if let Some(node) = nodes.document_order_first() {
+                    node.append_string_value(output);
+                }
+            }
+        }
+    }
+
     pub fn boolean(&self) -> bool {
         use crate::Value::*;
         match *self {
@@ -292,18 +346,9 @@ impl<'d> Value<'d> {
         match *self {
             Boolean(v) => v.to_string(),
             Number(n) => {
-                if n.is_infinite() {
-                    if n.signum() < 0.0 {
-                        "-Infinity".to_owned()
-                    } else {
-                        "Infinity".to_owned()
-                    }
-                } else if n == 0.0 {
-                    // Covers both negative and positive zero
-                    "0".to_owned()
-                } else {
-                    n.to_string()
-                }
+                let mut value = std::string::String::with_capacity(self.string_len());
+                write_xpath_number(&mut value, n).expect("String formatting cannot fail");
+                value
             }
             String(ref val) => val.clone(),
             ResultTreeFragment(_, ref val) => val.clone(),
@@ -528,6 +573,14 @@ mod test {
     fn number_of_string_with_surrounding_whitespace_is_number_without_whitespace() {
         let v = Value::String("\r\n1.5 \t".to_owned());
         assert_eq!(1.5, v.number());
+    }
+
+    #[test]
+    fn number_of_string_rejects_non_xml_unicode_whitespace() {
+        // XPath 1.0 refers to XML S, not Unicode White_Space; NBSP therefore
+        // remains part of the lexical value and makes conversion return NaN.
+        assert!(Value::String("\u{a0}1".into()).number().is_nan());
+        assert!(Value::String("1\u{a0}".into()).number().is_nan());
     }
 
     #[test]

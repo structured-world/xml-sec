@@ -2454,7 +2454,24 @@ fn is_character_reference(name: &str) -> bool {
 fn find_doctype_end(doctype: &str) -> Option<usize> {
     let mut quote = None;
     let mut subset_depth = 0usize;
-    for (offset, byte) in doctype.bytes().enumerate() {
+    let bytes = doctype.as_bytes();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if quote.is_none() && bytes[offset..].starts_with(b"<!--") {
+            let end = bytes[offset + 4..]
+                .windows(3)
+                .position(|window| window == b"-->")?;
+            offset += 4 + end + 3;
+            continue;
+        }
+        if quote.is_none() && bytes[offset..].starts_with(b"<?") {
+            let end = bytes[offset + 2..]
+                .windows(2)
+                .position(|window| window == b"?>")?;
+            offset += 2 + end + 2;
+            continue;
+        }
+        let byte = bytes[offset];
         match (quote, byte) {
             (None, b'\'' | b'"') => quote = Some(byte),
             (Some(delimiter), current) if delimiter == current => quote = None,
@@ -2463,6 +2480,7 @@ fn find_doctype_end(doctype: &str) -> Option<usize> {
             (None, b'>') if subset_depth == 0 => return Some(offset + 1),
             _ => {}
         }
+        offset += 1;
     }
     None
 }
@@ -3378,6 +3396,21 @@ mod tests {
             .expect("comment contents must not participate in entity expansion");
         build_cell(xml.to_owned(), settings, None)
             .expect("the real declaration contains only character data");
+    }
+
+    #[test]
+    fn doctype_protected_regions_cannot_hide_document_nodes_from_preflight() {
+        // Brackets inside DTD comments and processing instructions do not
+        // change internal-subset depth. Scanning must resume at the root.
+        for protected in ["<!-- [ -->", "<?target [ ?>"] {
+            let xml = format!("<!DOCTYPE root [{protected}]><root><child/></root>");
+            let settings = DocumentParseSettings::new_with_depth(true, 1, 4, xml.len());
+
+            assert!(matches!(
+                preflight_document_limits(&xml, settings, None),
+                Err(XmlDocumentError::Parse(ParseError::NodesLimitReached))
+            ));
+        }
     }
 
     #[test]

@@ -1823,6 +1823,17 @@ fn xpath_accepts_whitespace_before_function_arguments() {
 }
 
 #[test]
+fn for_each_context_functions_accept_xpath_whitespace() {
+    // The XSLT outer iteration context must be preserved for every legal
+    // whitespace spelling of the zero-argument XPath context functions.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:for-each select="source/item"><xsl:value-of select="position &#x9;( )"/><xsl:text>/</xsl:text><xsl:value-of select="last&#xA;(&#xD;)"/><xsl:text>;</xsl:text></xsl:for-each></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<source><item/><item/></source>"),
+        "1/2;2/2;"
+    );
+}
+
+#[test]
 fn xpath_document_root_and_inherited_language_use_xslt_context() {
     // A root-only path inside a function call must address the current logical
     // document, and lang() must walk inherited xml:lang declarations.

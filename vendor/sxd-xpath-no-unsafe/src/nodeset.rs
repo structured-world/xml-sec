@@ -276,35 +276,9 @@ impl<'d> Node<'d> {
     ///
     /// [string value]: https://www.w3.org/TR/xpath/#dt-string-value
     pub fn string_value(&self) -> String {
-        use self::Node::*;
-
-        fn document_order_text_nodes(node: &Node<'_>, result: &mut String) {
-            for child in node.children() {
-                match &child {
-                    Node::Element(_) => document_order_text_nodes(&child, result),
-                    Node::Text(n) => result.push_str(sxd_document_no_unsafe::as_str!(n.text())),
-                    _ => {}
-                }
-            }
-        }
-
-        fn text_descendants_string_value(node: &Node<'_>) -> String {
-            let mut result = String::new();
-            document_order_text_nodes(node, &mut result);
-            result
-        }
-
-        match self {
-            Root(_) => text_descendants_string_value(self),
-            Element(_) => text_descendants_string_value(self),
-            Attribute(n) => sxd_document_no_unsafe::as_str!(n.value()).to_owned(),
-            ProcessingInstruction(n) => sxd_document_no_unsafe::as_opt_str!(n.value())
-                .unwrap_or("")
-                .to_owned(),
-            Comment(n) => sxd_document_no_unsafe::as_str!(n.text()).to_owned(),
-            Text(n) => sxd_document_no_unsafe::as_str!(n.text()).to_owned(),
-            Namespace(n) => n.uri().to_owned(),
-        }
+        let mut result = String::with_capacity(self.string_value_len());
+        self.append_string_value(&mut result);
+        result
     }
 
     /// Returns the UTF-8 byte length of this node's string value without building the value.
@@ -332,6 +306,35 @@ impl<'d> Node<'d> {
             Comment(comment) => sxd_document_no_unsafe::as_str!(comment.text()).len(),
             Text(text) => sxd_document_no_unsafe::as_str!(text.text()).len(),
             Namespace(namespace) => namespace.uri().len(),
+        }
+    }
+
+    /// Append this node's string value without allocating an intermediate string.
+    pub(crate) fn append_string_value(&self, output: &mut String) {
+        use self::Node::*;
+
+        fn append_descendant_text(node: &Node<'_>, output: &mut String) {
+            for child in node.children() {
+                match &child {
+                    Node::Element(_) => append_descendant_text(&child, output),
+                    Node::Text(text) => {
+                        output.push_str(sxd_document_no_unsafe::as_str!(text.text()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        match self {
+            Root(_) | Element(_) => append_descendant_text(self, output),
+            Attribute(attribute) => {
+                output.push_str(sxd_document_no_unsafe::as_str!(attribute.value()));
+            }
+            ProcessingInstruction(instruction) => output
+                .push_str(sxd_document_no_unsafe::as_opt_str!(instruction.value()).unwrap_or("")),
+            Comment(comment) => output.push_str(sxd_document_no_unsafe::as_str!(comment.text())),
+            Text(text) => output.push_str(sxd_document_no_unsafe::as_str!(text.text())),
+            Namespace(namespace) => output.push_str(namespace.uri()),
         }
     }
 

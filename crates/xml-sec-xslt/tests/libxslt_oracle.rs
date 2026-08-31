@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use std::{collections::HashSet, ops::Range};
 
 use xml_sec_xslt::{
-    Attribute, BudgetKind, CompileBudget, Compiler, Document, Error, ExecutionBudget,
+    Attribute, BudgetKind, CompileBudget, Compiler, Document, Error, ErrorKind, ExecutionBudget,
     ExecutionOptions, ExpandedName, Parameters, ResolvePurpose, ResolvedResource, Resolver,
     ResourceIdentity, SourceProcessing, Value,
 };
@@ -1127,7 +1127,11 @@ fn assert_case(case: &Case) {
         // The upstream runner has two negative cases that intentionally produce
         // neither a result file nor a diagnostic golden. Absence of both files is
         // still an expected failure, not permission to accept successful output.
-        (Err(_), None) => {}
+        (Err(error), None)
+            if matches!(
+                error.kind(),
+                ErrorKind::Xml | ErrorKind::Static | ErrorKind::Dynamic | ErrorKind::Unsupported
+            ) => {}
         (Err(error), Some(_)) if is_expected_strict_xslt_error(case, &error) => {}
         (Err(error), _) => panic!("{}: {error}", case_name(case)),
     }
