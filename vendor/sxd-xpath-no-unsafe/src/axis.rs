@@ -1,6 +1,7 @@
 use std::fmt;
 
 use crate::context;
+use crate::expression::Error;
 use crate::node_test::NodeTest;
 use crate::nodeset::{self, Node, OrderedNodes};
 
@@ -19,7 +20,7 @@ pub trait AxisLike: fmt::Debug {
         &self,
         context: &context::Evaluation<'c, 'd>,
         node_test: &dyn NodeTest,
-    ) -> OrderedNodes<'d>;
+    ) -> Result<OrderedNodes<'d>, Error>;
 
     /// Describes what node type is naturally selected by this axis.
     fn principal_node_type(&self) -> PrincipalNodeType {
@@ -49,6 +50,7 @@ struct CompleteNodeTest<'c, 'd> {
     context: &'c context::Evaluation<'c, 'd>,
     node_test: &'c dyn NodeTest,
     result: OrderedNodes<'d>,
+    error: Option<Error>,
 }
 
 impl<'c, 'd> CompleteNodeTest<'c, 'd> {
@@ -57,12 +59,18 @@ impl<'c, 'd> CompleteNodeTest<'c, 'd> {
             context,
             node_test,
             result: OrderedNodes::new(),
+            error: None,
         }
     }
 
     fn run(&mut self, node: Node<'d>) {
+        if self.error.is_some() {
+            return;
+        }
         let new_context = self.context.new_context_for(node);
-        self.node_test.test(&new_context, &mut self.result);
+        if let Err(error) = self.node_test.test(&new_context, &mut self.result) {
+            self.error = Some(error);
+        }
     }
 }
 
@@ -71,7 +79,7 @@ impl AxisLike for Axis {
         &self,
         context: &context::Evaluation<'c, 'd>,
         node_test: &dyn NodeTest,
-    ) -> OrderedNodes<'d> {
+    ) -> Result<OrderedNodes<'d>, Error> {
         use self::Axis::*;
 
         let mut node_test = CompleteNodeTest::new(context, node_test);
@@ -138,7 +146,7 @@ impl AxisLike for Axis {
             SelfAxis => node_test.run(context.node.clone()),
         }
 
-        node_test.result
+        node_test.error.map_or(Ok(node_test.result), Err)
     }
 
     fn principal_node_type(&self) -> PrincipalNodeType {
@@ -226,8 +234,9 @@ mod test {
             &self,
             context: &context::Evaluation<'c, 'd>,
             result: &mut OrderedNodes<'d>,
-        ) {
-            result.add(context.node.clone())
+        ) -> Result<(), Error> {
+            result.add(context.node.clone());
+            Ok(())
         }
     }
 
@@ -240,6 +249,7 @@ mod test {
         let node_test = &DummyNodeTest;
 
         axis.select_nodes(&context, node_test)
+            .expect("test node selection succeeds")
     }
 
     #[test]

@@ -75,7 +75,7 @@ impl Token {
 
     pub fn precedes_expression(&self) -> bool {
         match *self {
-            Token::LeftParen | Token::LeftBracket => true,
+            Token::LeftParen | Token::LeftBracket | Token::Comma => true,
             _ => false,
         }
     }

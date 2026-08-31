@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use time::OffsetDateTime;
 
-use crate::{Error, Resolver, Result};
+use crate::{Resolver, Result};
 
 /// Time source used by zero-argument EXSLT date functions during one execution.
 pub trait Clock: Send + Sync {
@@ -10,16 +10,18 @@ pub trait Clock: Send + Sync {
 }
 
 /// Host local time, matching conventional EXSLT compatibility behavior.
+///
+/// On platforms where the process-local offset cannot be read soundly after threads start,
+/// compatibility mode uses UTC rather than making zero-argument EXSLT functions unavailable.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemClock;
 
 impl Clock for SystemClock {
     fn now_local(&self) -> Result<OffsetDateTime> {
-        OffsetDateTime::now_local().map_err(|error| {
-            Error::Dynamic(format!(
-                "EXSLT current local datetime is unavailable: {error}"
-            ))
-        })
+        match OffsetDateTime::now_local() {
+            Ok(now) => Ok(now),
+            Err(time::error::IndeterminateOffset) => Ok(OffsetDateTime::now_utc()),
+        }
     }
 }
 
@@ -77,5 +79,20 @@ impl<R: Resolver + 'static> ExecutionEnvironment<R> {
     pub const fn with_extension_policy(mut self, policy: ExtensionPolicy) -> Self {
         self.extension_policy = policy;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Clock, SystemClock};
+
+    #[test]
+    fn system_clock_remains_available_after_threads_start() {
+        // Unix local-offset discovery may become indeterminate once the process is multithreaded;
+        // compatibility mode must still provide an operation time.
+        std::thread::spawn(|| SystemClock.now_local())
+            .join()
+            .expect("clock thread does not panic")
+            .expect("system clock falls back to UTC when local offset is unavailable");
     }
 }

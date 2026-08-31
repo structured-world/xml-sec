@@ -105,17 +105,18 @@ impl<'d> Context<'d> {
         }
     }
 
-    /// Limit cumulative core-function string allocations during one evaluation.
+    /// Limit cumulative core-function string allocations on this context.
     ///
-    /// The counter is reset when the limit is set. This allows an embedding runtime to enforce
-    /// its own memory policy before core XPath functions reserve result buffers.
+    /// The counter and the first exceeded total persist across evaluations that reuse this
+    /// context. Calling this method sets a new limit and resets both values, allowing an embedding
+    /// runtime to establish a fresh operation budget explicitly.
     pub fn set_string_allocation_limit(&mut self, limit: usize) {
         self.string_allocations.limit = Some(limit);
         self.string_allocations.used.set(0);
         self.string_allocations.exceeded.set(None);
     }
 
-    /// Return the attempted allocation total when a core function exceeded the configured limit.
+    /// Return the first attempted total that exceeded the current context-scoped limit.
     pub fn string_allocation_exceeded(&self) -> Option<usize> {
         self.string_allocations.exceeded.get()
     }

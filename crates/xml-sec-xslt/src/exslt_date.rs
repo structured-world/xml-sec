@@ -378,22 +378,39 @@ impl DurationValue {
                 return None;
             }
             match rank {
-                1 => result.months = result.months.checked_add((value as i64).checked_mul(12)?)?,
-                2 => result.months = result.months.checked_add(value as i64)?,
-                3 => result.seconds += value * 86_400.0,
-                4 => result.seconds += value * 3_600.0,
-                5 => result.seconds += value * 60.0,
-                6 => result.seconds += value,
+                1 | 2 => {
+                    if value >= i64::MAX as f64 {
+                        return None;
+                    }
+                    let months = (value as i64).checked_mul(if rank == 1 { 12 } else { 1 })?;
+                    result.months = result.months.checked_add(months)?;
+                }
+                3..=6 => {
+                    let scale = match rank {
+                        3 => 86_400.0,
+                        4 => 3_600.0,
+                        5 => 60.0,
+                        6 => 1.0,
+                        _ => unreachable!(),
+                    };
+                    result.seconds += value * scale;
+                    if !result.seconds.is_finite() {
+                        return None;
+                    }
+                }
                 _ => unreachable!(),
             }
             saw = true;
             last_rank = rank;
             rest = &rest[end + designator.len_utf8()..];
         }
-        saw.then_some(Self {
-            months: (result.months as f64 * sign) as i64,
-            seconds: result.seconds * sign,
-        })
+        let months = if sign < 0.0 {
+            result.months.checked_neg()?
+        } else {
+            result.months
+        };
+        let seconds = result.seconds * sign;
+        (saw && seconds.is_finite()).then_some(Self { months, seconds })
     }
 
     fn from_seconds(seconds: f64) -> Self {
@@ -532,7 +549,7 @@ impl DateValue {
             }
             let (month, day) = value.split_once('-')?;
             let (month, day) = (parse_two(month)?, parse_two(day)?);
-            return valid_day(2000, month, day).then_some(Self {
+            return ((1..=12).contains(&month) && valid_day(2000, month, day)).then_some(Self {
                 month: Some(month),
                 day: Some(day),
                 kind: DateKind::MonthDay,
@@ -625,7 +642,8 @@ impl DateValue {
         let time = f64::from(self.hour.unwrap_or(0)) * 3600.0
             + f64::from(self.minute.unwrap_or(0)) * 60.0
             + self.second.unwrap_or(0.0);
-        Some(days as f64 * 86_400.0 + time - f64::from(self.timezone.unwrap_or(0)))
+        let seconds = days as f64 * 86_400.0 + time - f64::from(self.timezone.unwrap_or(0));
+        seconds.is_finite().then_some(seconds)
     }
     fn difference(self, other: Self) -> Option<DurationValue> {
         let specificity = |kind| match kind {
@@ -690,9 +708,18 @@ impl DateValue {
             let base = self.clone().unix_seconds()? + duration.seconds;
             let timezone = f64::from(self.timezone.unwrap_or(0));
             let local = base + timezone;
-            let days = (local / 86_400.0).floor() as i64;
+            if !local.is_finite() {
+                return None;
+            }
+            let days = (local / 86_400.0).floor();
+            let minimum = days_from_civil(i64::MIN, 1, 1) as f64;
+            let maximum = days_from_civil(i64::MAX, 12, 31) as f64;
+            if days < minimum || days > maximum {
+                return None;
+            }
+            let days = days as i128;
             let mut seconds = local - days as f64 * 86_400.0;
-            let (year, month, day) = civil_from_days(days + days_from_civil(1970, 1, 1));
+            let (year, month, day) = civil_from_days(days + days_from_civil(1970, 1, 1))?;
             self.year = Some(year);
             self.month = Some(month);
             self.day = Some(day);
@@ -775,7 +802,9 @@ fn split_timezone(input: &str) -> Option<(&str, Option<i32>)> {
     }
     if input.len() >= 6 {
         let split = input.len() - 6;
-        let suffix = &input[split..];
+        let Some(suffix) = input.get(split..) else {
+            return Some((input, None));
+        };
         if matches!(suffix.as_bytes()[0], b'+' | b'-') && suffix.as_bytes()[3] == b':' {
             let hours = suffix[1..3].parse::<i32>().ok()?;
             let minutes = suffix[4..6].parse::<i32>().ok()?;
@@ -783,7 +812,10 @@ fn split_timezone(input: &str) -> Option<(&str, Option<i32>)> {
                 return None;
             }
             let sign = if suffix.starts_with('-') { -1 } else { 1 };
-            return Some((&input[..split], Some(sign * (hours * 3600 + minutes * 60))));
+            return Some((
+                input.get(..split)?,
+                Some(sign * (hours * 3600 + minutes * 60)),
+            ));
         }
     }
     Some((input, None))
@@ -855,14 +887,21 @@ fn iso_week(year: i64, month: u8, day: u8) -> u8 {
     let monday = i32::from((weekday(year, month, day) + 6) % 7);
     let mut week = (ordinal - monday + 9) / 7;
     if week < 1 {
-        week = i32::from(weeks_in_year(year - 1));
+        week = i32::from(weeks_in_astronomical_year(
+            i128::from(astronomical_year(year)) - 1,
+        ));
     } else if week > i32::from(weeks_in_year(year)) {
         week = 1;
     }
     week as u8
 }
 fn weeks_in_year(year: i64) -> u8 {
-    if weekday(year, 1, 1) == 4 || (weekday(year, 1, 1) == 3 && is_leap(year)) {
+    weeks_in_astronomical_year(i128::from(astronomical_year(year)))
+}
+fn weeks_in_astronomical_year(year: i128) -> u8 {
+    let weekday = (days_from_civil_i128(year, 1, 1) + 3).rem_euclid(7) as u8;
+    let leap = year.rem_euclid(4) == 0 && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0);
+    if weekday == 4 || (weekday == 3 && leap) {
         53
     } else {
         52
@@ -874,16 +913,18 @@ fn astronomical_year(year: i64) -> i64 {
 fn schema_year(year: i64) -> i64 {
     if year <= 0 { year - 1 } else { year }
 }
-fn days_from_civil(year: i64, month: u8, day: u8) -> i64 {
-    let mut y = astronomical_year(year);
-    y -= i64::from(month <= 2);
+fn days_from_civil(year: i64, month: u8, day: u8) -> i128 {
+    days_from_civil_i128(i128::from(astronomical_year(year)), month, day)
+}
+fn days_from_civil_i128(mut y: i128, month: u8, day: u8) -> i128 {
+    y -= i128::from(month <= 2);
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
-    let mp = i64::from(month) + if month > 2 { -3 } else { 9 };
-    let doy = (153 * mp + 2) / 5 + i64::from(day) - 1;
+    let mp = i128::from(month) + if month > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + i128::from(day) - 1;
     era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy
 }
-fn civil_from_days(days: i64) -> (i64, u8, u8) {
+fn civil_from_days(days: i128) -> Option<(i64, u8, u8)> {
     let era = days.div_euclid(146097);
     let doe = days - era * 146097;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
@@ -892,8 +933,13 @@ fn civil_from_days(days: i64) -> (i64, u8, u8) {
     let mp = (5 * doy + 2) / 153;
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = mp + if mp < 10 { 3 } else { -9 };
-    year += i64::from(month <= 2);
-    (schema_year(year), month as u8, day as u8)
+    year += i128::from(month <= 2);
+    let year = if year <= 0 {
+        year.checked_sub(1)?
+    } else {
+        year
+    };
+    Some((year.try_into().ok()?, month as u8, day as u8))
 }
 fn month_name(month: u8) -> &'static str {
     [
@@ -941,6 +987,7 @@ fn render_timezone(timezone: Option<i32>) -> String {
         None => String::new(),
     }
 }
+
 fn format_second(second: f64) -> String {
     if second.fract() == 0.0 {
         format!("{:02}", second as u8)
@@ -968,4 +1015,28 @@ fn argument_error<T>(message: &str) -> std::result::Result<T, function::Error> {
     Err(function::Error::Other {
         what: format!("EXSLT date function {message}"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DateValue, DurationValue, split_timezone};
+
+    #[test]
+    fn month_day_rejects_out_of_range_months() {
+        assert!(DateValue::parse("--50-15").is_none());
+        assert!(DateValue::parse("--02-29").is_some());
+    }
+
+    #[test]
+    fn timezone_probe_never_slices_inside_utf8() {
+        assert_eq!(split_timezone("é12345"), Some(("é12345", None)));
+    }
+
+    #[test]
+    fn extreme_duration_and_date_arithmetic_fail_closed() {
+        assert!(DurationValue::parse("P999999999999999999999Y").is_none());
+        let maximum =
+            DateValue::parse("9223372036854775807-12-31").expect("maximum schema year parses");
+        assert!(maximum.add(DurationValue::from_seconds(86_400.0)).is_none());
+    }
 }

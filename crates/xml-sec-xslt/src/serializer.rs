@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 
 use crate::budget::Meter;
 use crate::{BudgetKind, Document, Error, NodeId, NodeKind, Result};
@@ -60,11 +61,13 @@ pub struct SerializedOutput {
     pub media_type: Option<String>,
 }
 
-#[derive(Clone, Copy)]
 enum OutputEncoding {
     Unicode,
     Latin1,
-    Other(&'static encoding_rs::Encoding),
+    Other {
+        encoding: &'static encoding_rs::Encoding,
+        representable: RefCell<HashMap<char, bool>>,
+    },
 }
 
 impl OutputEncoding {
@@ -79,18 +82,29 @@ impl OutputEncoding {
             Ok(Self::Latin1)
         } else {
             encoding_rs::Encoding::for_label(label.as_bytes())
-                .map(Self::Other)
+                .map(|encoding| Self::Other {
+                    encoding,
+                    representable: RefCell::new(HashMap::new()),
+                })
                 .ok_or_else(|| Error::Serialization(format!("unsupported output encoding {label}")))
         }
     }
 
-    fn represents(self, character: char) -> bool {
+    fn represents(&self, character: char) -> bool {
         match self {
             Self::Unicode => true,
             Self::Latin1 => u32::from(character) <= 0xff,
-            Self::Other(encoding) => {
+            Self::Other {
+                encoding,
+                representable,
+            } => {
+                if let Some(value) = representable.borrow().get(&character) {
+                    return *value;
+                }
                 let mut bytes = [0_u8; 4];
-                !encoding.encode(character.encode_utf8(&mut bytes)).2
+                let value = !encoding.encode(character.encode_utf8(&mut bytes)).2;
+                representable.borrow_mut().insert(character, value);
+                value
             }
         }
     }
@@ -118,11 +132,16 @@ pub(crate) fn serialize_fragment(document: &Document, meter: &mut Meter) -> Resu
         used,
         limit,
     );
-    render(document, &definition, OutputEncoding::Unicode, &mut counter)?;
+    render(
+        document,
+        &definition,
+        &OutputEncoding::Unicode,
+        &mut counter,
+    )?;
     let bytes = counter.len();
     meter.charge(BudgetKind::OwnedBytes, bytes)?;
     let mut text = RenderBuffer::Text(String::with_capacity(bytes));
-    render(document, &definition, OutputEncoding::Unicode, &mut text)?;
+    render(document, &definition, &OutputEncoding::Unicode, &mut text)?;
     Ok(text.into_string())
 }
 
@@ -158,13 +177,13 @@ fn serialize_charged(
         used,
         limit,
     );
-    render(document, &definition, encoding, &mut counter)?;
+    render(document, &definition, &encoding, &mut counter)?;
     let text_bytes = counter.len();
     let encoded_bytes = counter.encoded_len()?;
     meter.check_additional(budget_kind, encoded_bytes)?;
     meter.charge(BudgetKind::OwnedBytes, text_bytes)?;
     let mut text = RenderBuffer::Text(String::with_capacity(text_bytes));
-    render(document, &definition, encoding, &mut text)?;
+    render(document, &definition, &encoding, &mut text)?;
     let text = text.into_string();
     if definition.method == OutputMethod::Xml {
         validate_xml_characters(&text, definition.version.as_deref().unwrap_or("1.0"))?;
@@ -172,7 +191,7 @@ fn serialize_charged(
     if definition.method == OutputMethod::Text {
         validate_text_encoding(&text, &definition.encoding)?;
     } else {
-        reject_unrepresentable_markup(&text, encoding, "serialized output")?;
+        reject_unrepresentable_markup(&text, &encoding, "serialized output")?;
     }
     let bytes = encode(&text, &definition.encoding, meter, budget_kind)?;
     Ok(SerializedOutput {
@@ -194,7 +213,7 @@ fn serialize_charged(
 fn render(
     document: &Document,
     definition: &OutputDefinition,
-    encoding: OutputEncoding,
+    encoding: &OutputEncoding,
     text: &mut RenderBuffer,
 ) -> Result<()> {
     if definition.method == OutputMethod::Xml && !definition.omit_xml_declaration {
@@ -259,7 +278,7 @@ fn render_doctype(
     document: &Document,
     element: NodeId,
     definition: &OutputDefinition,
-    encoding: OutputEncoding,
+    encoding: &OutputEncoding,
     text: &mut RenderBuffer,
 ) -> Result<()> {
     if definition.doctype_system.is_none()
@@ -344,7 +363,7 @@ fn validate_xml_public_identifier(value: &str) -> Result<()> {
 fn push_external_identifier_literal(
     value: &str,
     kind: &str,
-    encoding: OutputEncoding,
+    encoding: &OutputEncoding,
     output: &mut RenderBuffer,
 ) -> Result<()> {
     reject_unrepresentable_markup(value, encoding, kind)?;
@@ -617,7 +636,7 @@ fn serialize_node(
     document: &Document,
     id: NodeId,
     definition: &OutputDefinition,
-    encoding: OutputEncoding,
+    encoding: &OutputEncoding,
     output: &mut RenderBuffer,
     context: RenderContext,
 ) -> Result<()> {
@@ -1010,7 +1029,7 @@ fn serialize_node(
     Ok(())
 }
 
-fn push_cdata(value: &str, version: &str, encoding: OutputEncoding, output: &mut RenderBuffer) {
+fn push_cdata(value: &str, version: &str, encoding: &OutputEncoding, output: &mut RenderBuffer) {
     output.push_str("<![CDATA[");
     let mut start = 0usize;
     for (offset, character) in value.char_indices() {
@@ -1041,7 +1060,7 @@ fn push_cdata_segment(value: &str, output: &mut RenderBuffer) {
 fn push_xml_raw_text(
     value: &str,
     version: &str,
-    encoding: OutputEncoding,
+    encoding: &OutputEncoding,
     output: &mut RenderBuffer,
 ) {
     for character in value.chars() {
@@ -1123,7 +1142,7 @@ fn is_html_encoding_meta(node: &crate::Node) -> bool {
 fn push_name(
     prefix: Option<&str>,
     local: &str,
-    encoding: OutputEncoding,
+    encoding: &OutputEncoding,
     output: &mut RenderBuffer,
 ) -> Result<()> {
     if let Some(prefix) = prefix {
@@ -1136,7 +1155,7 @@ fn push_name(
     Ok(())
 }
 
-fn escape_text(value: &str, version: &str, encoding: OutputEncoding, output: &mut RenderBuffer) {
+fn escape_text(value: &str, version: &str, encoding: &OutputEncoding, output: &mut RenderBuffer) {
     for character in value.chars() {
         if version == "1.1" && is_xml11_restricted(character) {
             output.push_str(&format!("&#x{:X};", u32::from(character)));
@@ -1158,7 +1177,7 @@ fn escape_text(value: &str, version: &str, encoding: OutputEncoding, output: &mu
 fn escape_attribute(
     value: &str,
     version: &str,
-    encoding: OutputEncoding,
+    encoding: &OutputEncoding,
     output: &mut RenderBuffer,
 ) {
     for character in value.chars() {
@@ -1211,7 +1230,7 @@ fn is_html_boolean_attribute(element: &str, attribute: &str) -> bool {
     )
 }
 
-fn escape_html_attribute(value: &str, encoding: OutputEncoding, output: &mut RenderBuffer) {
+fn escape_html_attribute(value: &str, encoding: &OutputEncoding, output: &mut RenderBuffer) {
     for character in value.chars() {
         if !encoding.represents(character) {
             output.push_str(&format!("&#{};", u32::from(character)));
@@ -1225,7 +1244,7 @@ fn escape_html_attribute(value: &str, encoding: OutputEncoding, output: &mut Ren
     }
 }
 
-fn reject_unrepresentable_markup(value: &str, encoding: OutputEncoding, kind: &str) -> Result<()> {
+fn reject_unrepresentable_markup(value: &str, encoding: &OutputEncoding, kind: &str) -> Result<()> {
     if let Some(character) = value
         .chars()
         .find(|character| !encoding.represents(*character))
@@ -1363,7 +1382,7 @@ fn validate_xml_characters(value: &str, version: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EncodingCounter, RenderBuffer};
+    use super::{EncodingCounter, OutputEncoding, RenderBuffer};
 
     #[test]
     fn counting_buffer_rejects_repeated_indentation_beyond_the_encoded_limit() {
@@ -1377,5 +1396,16 @@ mod tests {
         );
         output.push_str("<a>");
         assert!(output.push_repeated(b' ', 4).is_err());
+    }
+
+    #[test]
+    fn legacy_encoding_reuses_character_representability_results() {
+        let encoding = OutputEncoding::new("windows-1252").expect("encoding is registered");
+        assert!(encoding.represents('€'));
+        assert!(encoding.represents('€'));
+        let OutputEncoding::Other { representable, .. } = encoding else {
+            panic!("windows-1252 uses the cached encoding path");
+        };
+        assert_eq!(representable.into_inner().len(), 1);
     }
 }

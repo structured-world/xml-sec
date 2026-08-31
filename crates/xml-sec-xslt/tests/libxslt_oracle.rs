@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2117,6 +2118,16 @@ fn run_case_process(executable: &Path, index: usize, case: &Case) -> Option<Stri
         .stderr(Stdio::piped())
         .spawn()
         .unwrap_or_else(|error| panic!("{}: worker failed to start: {error}", case_name(case)));
+    let mut stdout = child.stdout.take().expect("worker stdout is piped");
+    let mut stderr = child.stderr.take().expect("worker stderr is piped");
+    let stdout_drain = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let stderr_drain = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
     let deadline = Instant::now() + Duration::from_secs(60);
     let timed_out = loop {
         if child
@@ -2134,16 +2145,24 @@ fn run_case_process(executable: &Path, index: usize, case: &Case) -> Option<Stri
         }
         std::thread::sleep(Duration::from_millis(10));
     };
-    let output = child
-        .wait_with_output()
-        .unwrap_or_else(|error| panic!("{}: worker output failed: {error}", case_name(case)));
+    let status = child
+        .wait()
+        .unwrap_or_else(|error| panic!("{}: worker wait failed: {error}", case_name(case)));
+    let stdout = stdout_drain
+        .join()
+        .expect("worker stdout drainer did not panic")
+        .unwrap_or_else(|error| panic!("{}: worker stdout failed: {error}", case_name(case)));
+    let stderr = stderr_drain
+        .join()
+        .expect("worker stderr drainer did not panic")
+        .unwrap_or_else(|error| panic!("{}: worker stderr failed: {error}", case_name(case)));
     if timed_out {
         return Some(format!("{}: exceeded 60 second deadline", case_name(case)));
     }
-    if output.status.success() {
+    if status.success() {
         return None;
     }
-    let diagnostics = [output.stdout, output.stderr].concat();
+    let diagnostics = [stdout, stderr].concat();
     let diagnostics = String::from_utf8_lossy(&diagnostics);
     let diagnostics = diagnostics
         .lines()
@@ -2157,7 +2176,7 @@ fn run_case_process(executable: &Path, index: usize, case: &Case) -> Option<Stri
     Some(format!(
         "{}: worker {}\n{}",
         case_name(case),
-        output.status,
+        status,
         diagnostics,
     ))
 }

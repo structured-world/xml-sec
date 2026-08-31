@@ -2,7 +2,7 @@
 
 use std::ops::Range;
 
-use quick_xml::{Reader, events::Event};
+use xml_sec_xml_input::lexical::{Event, Scanner, StartTag};
 
 use super::ParseError;
 
@@ -29,20 +29,17 @@ pub(super) struct LexicalPreflight {
 
 impl LexicalPreflight {
     pub(super) fn scan(input: &str, allow_dtd: bool) -> Result<Self, ParseError> {
-        let mut reader = Reader::from_str(input);
+        let mut reader = Scanner::new(input);
         let mut nodes: Vec<SourceNode> = Vec::new();
         let mut elements = Vec::new();
         let mut namespace_scopes = Vec::new();
         let mut active_namespace_bindings = 0usize;
         #[cfg(feature = "xml-backend-roxmltree")]
         let mut doctype = None;
-        loop {
-            let start = source_offset(reader.buffer_position())?;
-            let event = reader.read_event().map_err(|error| ParseError::Backend {
-                backend: "xml-preflight",
-                message: error.to_string(),
-            })?;
-            let end = source_offset(reader.buffer_position())?;
+        while let Some(event) = reader.next_event().map_err(|error| ParseError::Backend {
+            backend: "xml-preflight",
+            message: error.to_string(),
+        })? {
             match event {
                 Event::Start(element) => {
                     let depth = elements.len() + 1;
@@ -58,7 +55,7 @@ impl LexicalPreflight {
                     let index = nodes.len();
                     nodes.push(SourceNode {
                         kind: SourceKind::Element,
-                        range: start..end,
+                        range: element.range.clone(),
                     });
                     elements.push(index);
                     namespace_scopes.push(declarations);
@@ -75,12 +72,12 @@ impl LexicalPreflight {
                     enforce_namespace_bindings(active)?;
                     nodes.push(SourceNode {
                         kind: SourceKind::Element,
-                        range: start..end,
+                        range: element.range,
                     });
                 }
-                Event::End(_) => {
+                Event::End { range, .. } => {
                     if let Some(index) = elements.pop() {
-                        nodes[index].range.end = end;
+                        nodes[index].range.end = range.end;
                     }
                     if let Some(declarations) = namespace_scopes.pop() {
                         active_namespace_bindings -= declarations;
@@ -88,35 +85,32 @@ impl LexicalPreflight {
                 }
                 // Both supported DOMs omit whitespace outside the document
                 // element, so it must not shift the semantic sidecar.
-                Event::Text(_) if !elements.is_empty() => {
-                    push_text_position(&mut nodes, start..end);
+                Event::Text { range, .. } if !elements.is_empty() => {
+                    push_text_position(&mut nodes, range);
                 }
-                Event::Text(_) => {}
-                Event::CData(_) => nodes.push(SourceNode {
+                Event::Text { .. } => {}
+                Event::CData { range, .. } => nodes.push(SourceNode {
                     kind: SourceKind::CData,
-                    range: start..end,
+                    range,
                 }),
-                Event::GeneralRef(reference)
-                    if is_builtin_or_character_reference(reference.as_ref()) =>
-                {
-                    push_text_position(&mut nodes, start..end);
+                Event::Reference { name, range } if is_builtin_or_character_reference(name) => {
+                    push_text_position(&mut nodes, range);
                 }
-                Event::GeneralRef(_) => nodes.push(SourceNode {
+                Event::Reference { range, .. } => nodes.push(SourceNode {
                     kind: SourceKind::EntityRef,
-                    range: start..end,
+                    range,
                 }),
-                Event::Comment(_) => nodes.push(SourceNode {
+                Event::Comment { range, .. } => nodes.push(SourceNode {
                     kind: SourceKind::Comment,
-                    range: start..end,
+                    range,
                 }),
-                Event::PI(_) => nodes.push(SourceNode {
+                Event::ProcessingInstruction { range, .. } => nodes.push(SourceNode {
                     kind: SourceKind::Pi,
-                    range: start..end,
+                    range,
                 }),
-                Event::DocType(_) if !allow_dtd => return Err(ParseError::DtdDetected),
+                Event::DocType { .. } if !allow_dtd => return Err(ParseError::DtdDetected),
                 #[cfg(feature = "xml-backend-roxmltree")]
-                Event::DocType(_) => doctype = Some(start..end),
-                Event::Eof => break,
+                Event::DocType { range } => doctype = Some(range),
                 _ => {}
             }
             let actual = nodes.len();
@@ -196,31 +190,23 @@ fn enforce_namespace_bindings(actual: usize) -> Result<(), ParseError> {
     }
 }
 
-fn namespace_declaration_count(
-    element: &quick_xml::events::BytesStart<'_>,
-) -> Result<usize, ParseError> {
+fn namespace_declaration_count(element: &StartTag<'_>) -> Result<usize, ParseError> {
     element
-        .attributes()
+        .attributes
+        .iter()
         .map(|attribute| {
-            attribute
-                .map(|attribute| {
-                    let name = attribute.key.as_ref();
-                    usize::from(name == "xmlns" || name.starts_with("xmlns:"))
-                })
-                .map_err(|error| ParseError::Backend {
-                    backend: "xml-preflight",
-                    message: error.to_string(),
-                })
+            usize::from(
+                (attribute.name.prefix().is_none() && attribute.name.local() == "xmlns")
+                    || attribute.name.prefix() == Some("xmlns"),
+            )
         })
         .try_fold(0usize, |count, declaration| {
-            declaration.and_then(|declaration| {
-                count
-                    .checked_add(declaration)
-                    .ok_or(ParseError::NamespaceBindingLimitReached {
-                        maximum: crate::hard_limits::XML_NAMESPACE_BINDING_CEILING,
-                        actual: usize::MAX,
-                    })
-            })
+            count
+                .checked_add(declaration)
+                .ok_or(ParseError::NamespaceBindingLimitReached {
+                    maximum: crate::hard_limits::XML_NAMESPACE_BINDING_CEILING,
+                    actual: usize::MAX,
+                })
         })
 }
 
@@ -240,13 +226,6 @@ fn push_text_position(nodes: &mut Vec<SourceNode>, range: Range<usize>) {
 
 fn is_builtin_or_character_reference(reference: &str) -> bool {
     reference.starts_with('#') || matches!(reference, "amp" | "lt" | "gt" | "apos" | "quot")
-}
-
-fn source_offset(offset: u64) -> Result<usize, ParseError> {
-    usize::try_from(offset).map_err(|_| ParseError::Backend {
-        backend: "xml-preflight",
-        message: "XML source offset exceeds the platform address space".to_owned(),
-    })
 }
 
 #[cfg(feature = "xml-backend-xmloxide")]

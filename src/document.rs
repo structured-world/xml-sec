@@ -11,10 +11,6 @@ use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::xml::dom::{Document, Node, NodeId, ParseError, ParsingOptions, XmlBackend};
-use quick_xml::{
-    Reader as QuickXmlReader,
-    events::{BytesStart as QuickXmlBytesStart, Event as QuickXmlEvent},
-};
 use self_cell::self_cell;
 
 use crate::IdAttributeRegistration;
@@ -1256,8 +1252,8 @@ impl XmlDocument {
         settings: DocumentParseSettings,
         budget: &XmlParseWorkBudget,
     ) -> Result<(), XmlDocumentError> {
-        // SignatureBuilder serializes this fragment with quick-xml. Parsing the
-        // final candidate once validates both the generated child and its
+        // SignatureBuilder emits this fragment through the shared lexical writer.
+        // Parsing the final candidate once validates both the generated child and its
         // document context without a redundant wrapper-document pass.
         self.append_child_inner(
             target,
@@ -2110,6 +2106,29 @@ struct InternalAttributeDefault {
     value: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FragmentContext {
+    Content,
+    Attribute,
+}
+
+enum PreflightEvent {
+    DocType(Option<String>),
+    GeneralRef {
+        name: Option<String>,
+        is_character_reference: bool,
+    },
+    CharacterData {
+        xml_whitespace: bool,
+    },
+    Start(Vec<u8>),
+    Empty(Vec<u8>),
+    End,
+    Node,
+    Markup,
+    Done,
+}
+
 fn preflight_xml_fragment(
     xml: &str,
     settings: DocumentParseSettings,
@@ -2124,12 +2143,6 @@ fn preflight_xml_fragment(
         Entity(String),
     }
 
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum FragmentContext {
-        Content,
-        Attribute,
-    }
-
     struct FragmentFrame {
         source: FragmentSource,
         offset: usize,
@@ -2137,23 +2150,6 @@ fn preflight_xml_fragment(
         context: FragmentContext,
         pending_attribute_source: Vec<u8>,
         pending_attribute_offset: usize,
-    }
-
-    enum PreflightEvent {
-        DocType(Option<String>),
-        GeneralRef {
-            name: Option<String>,
-            is_character_reference: bool,
-        },
-        CharacterData {
-            xml_whitespace: bool,
-        },
-        Start(Vec<u8>),
-        Empty(Vec<u8>),
-        End,
-        Node,
-        Other,
-        Done,
     }
 
     if state.nodes == 0 {
@@ -2199,63 +2195,8 @@ fn preflight_xml_fragment(
                         .expect("active entity replacement remains registered"),
                 };
                 let remaining = &source[frame.offset..];
-                let mut reader = QuickXmlReader::from_str(remaining);
-                // This pass observes lexical events one at a time and deliberately
-                // leaves structural diagnostics to the selected DOM parser.
-                reader.config_mut().check_end_names = false;
-                // A fresh reader has no opening-tag state for an End event at
-                // this slice boundary. Emit it so our manual depth state and all
-                // later events remain visible; the DOM still rejects bad pairs.
-                reader.config_mut().allow_unmatched_ends = true;
-                let event = match reader.read_event() {
-                    Ok(QuickXmlEvent::DocType(doctype)) => {
-                        PreflightEvent::DocType(Some(doctype.as_ref().to_owned()))
-                    }
-                    Ok(QuickXmlEvent::GeneralRef(reference)) => {
-                        let name = Some(reference.as_ref().to_owned());
-                        let is_character_reference =
-                            reference.resolve_char_ref().ok().flatten().is_some()
-                                || name.as_deref().is_some_and(|name| {
-                                    matches!(name, "amp" | "apos" | "gt" | "lt" | "quot")
-                                });
-                        PreflightEvent::GeneralRef {
-                            name,
-                            is_character_reference,
-                        }
-                    }
-                    Ok(QuickXmlEvent::Text(text)) => PreflightEvent::CharacterData {
-                        xml_whitespace: text
-                            .as_ref()
-                            .chars()
-                            .all(|character| matches!(character, ' ' | '\t' | '\r' | '\n')),
-                    },
-                    Ok(QuickXmlEvent::CData(_)) => PreflightEvent::CharacterData {
-                        xml_whitespace: false,
-                    },
-                    Ok(QuickXmlEvent::Start(element)) => {
-                        let source = if frame.context == FragmentContext::Content {
-                            element_attribute_reference_source(&element, dtd)
-                        } else {
-                            Vec::new()
-                        };
-                        PreflightEvent::Start(source)
-                    }
-                    Ok(QuickXmlEvent::Empty(element)) => {
-                        let source = if frame.context == FragmentContext::Content {
-                            element_attribute_reference_source(&element, dtd)
-                        } else {
-                            Vec::new()
-                        };
-                        PreflightEvent::Empty(source)
-                    }
-                    Ok(QuickXmlEvent::End(_)) => PreflightEvent::End,
-                    Ok(QuickXmlEvent::Comment(_) | QuickXmlEvent::PI(_)) => PreflightEvent::Node,
-                    Ok(QuickXmlEvent::Eof) | Err(_) => PreflightEvent::Done,
-                    Ok(_) => PreflightEvent::Other,
-                };
-                frame.offset = frame.offset.saturating_add(
-                    usize::try_from(reader.buffer_position()).unwrap_or(remaining.len()),
-                );
+                let (event, consumed) = scan_preflight_event(remaining, frame.context, dtd);
+                frame.offset = frame.offset.saturating_add(consumed);
                 (event, frame.collect_doctype, frame.context)
             }
         };
@@ -2338,7 +2279,7 @@ fn preflight_xml_fragment(
                 observe_preflight_node(state, settings, false)?;
                 continue;
             }
-            PreflightEvent::Other => {
+            PreflightEvent::Markup => {
                 state.in_character_data = false;
                 continue;
             }
@@ -2387,13 +2328,148 @@ fn preflight_xml_fragment(
     Ok(())
 }
 
-fn element_attribute_reference_source(
-    element: &QuickXmlBytesStart<'_>,
+fn scan_preflight_event(
+    remaining: &str,
+    context: FragmentContext,
     dtd: &InternalDtd,
-) -> Vec<u8> {
-    let lexical = element.as_ref();
-    let mut source = if lexical.contains('&') {
-        lexical.as_bytes().to_vec()
+) -> (PreflightEvent, usize) {
+    if remaining.is_empty() {
+        return (PreflightEvent::Done, 0);
+    }
+    if context == FragmentContext::Attribute {
+        let mut references = general_references(remaining.as_bytes());
+        return references
+            .next()
+            .map_or((PreflightEvent::Done, remaining.len()), |name| {
+                let consumed = references.consumed();
+                (
+                    PreflightEvent::GeneralRef {
+                        is_character_reference: is_character_reference(name),
+                        name: Some(name.to_owned()),
+                    },
+                    consumed,
+                )
+            });
+    }
+    if remaining.starts_with("<!--") {
+        return find_bytes(&remaining.as_bytes()[4..], b"-->")
+            .map_or((PreflightEvent::Done, remaining.len()), |end| {
+                (PreflightEvent::Node, 4 + end + 3)
+            });
+    }
+    if remaining.starts_with("<![CDATA[") {
+        return find_bytes(&remaining.as_bytes()[9..], b"]]>").map_or(
+            (PreflightEvent::Done, remaining.len()),
+            |end| {
+                (
+                    PreflightEvent::CharacterData {
+                        xml_whitespace: false,
+                    },
+                    9 + end + 3,
+                )
+            },
+        );
+    }
+    if remaining.starts_with("<?") {
+        return find_bytes(&remaining.as_bytes()[2..], b"?>").map_or(
+            (PreflightEvent::Done, remaining.len()),
+            |end| {
+                let event = if remaining
+                    .get(2..5)
+                    .is_some_and(|target| target.eq_ignore_ascii_case("xml"))
+                    && remaining
+                        .as_bytes()
+                        .get(5)
+                        .is_some_and(u8::is_ascii_whitespace)
+                {
+                    PreflightEvent::Markup
+                } else {
+                    PreflightEvent::Node
+                };
+                (event, 2 + end + 2)
+            },
+        );
+    }
+    if remaining.starts_with("<!DOCTYPE") {
+        return find_doctype_end(remaining).map_or(
+            (PreflightEvent::Done, remaining.len()),
+            |end| {
+                (
+                    PreflightEvent::DocType(Some(remaining[..end].to_owned())),
+                    end,
+                )
+            },
+        );
+    }
+    if remaining.starts_with("</") {
+        return find_unquoted_byte(remaining.as_bytes(), b'>', 2)
+            .map_or((PreflightEvent::Done, remaining.len()), |end| {
+                (PreflightEvent::End, end + 1)
+            });
+    }
+    if remaining.starts_with('<') {
+        return find_unquoted_byte(remaining.as_bytes(), b'>', 1).map_or(
+            (PreflightEvent::Done, remaining.len()),
+            |end| {
+                let opening = &remaining[..=end];
+                let attributes = element_attribute_reference_source(opening, dtd);
+                if opening[..opening.len() - 1].trim_end().ends_with('/') {
+                    (PreflightEvent::Empty(attributes), end + 1)
+                } else {
+                    (PreflightEvent::Start(attributes), end + 1)
+                }
+            },
+        );
+    }
+    if let Some(reference) = remaining.strip_prefix('&') {
+        return reference
+            .find(';')
+            .map_or((PreflightEvent::Done, remaining.len()), |end| {
+                let name = &reference[..end];
+                (
+                    PreflightEvent::GeneralRef {
+                        name: Some(name.to_owned()),
+                        is_character_reference: is_character_reference(name),
+                    },
+                    end + 2,
+                )
+            });
+    }
+    let end = remaining.find(['<', '&']).unwrap_or(remaining.len());
+    let text = &remaining[..end];
+    (
+        PreflightEvent::CharacterData {
+            xml_whitespace: text
+                .chars()
+                .all(|character| matches!(character, ' ' | '\t' | '\r' | '\n')),
+        },
+        end,
+    )
+}
+
+fn is_character_reference(name: &str) -> bool {
+    name.starts_with('#') || matches!(name, "amp" | "apos" | "gt" | "lt" | "quot")
+}
+
+fn find_doctype_end(doctype: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut subset_depth = 0usize;
+    for (offset, byte) in doctype.bytes().enumerate() {
+        match (quote, byte) {
+            (None, b'\'' | b'"') => quote = Some(byte),
+            (Some(delimiter), current) if delimiter == current => quote = None,
+            (None, b'[') => subset_depth = subset_depth.saturating_add(1),
+            (None, b']') => subset_depth = subset_depth.saturating_sub(1),
+            (None, b'>') if subset_depth == 0 => return Some(offset + 1),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn element_attribute_reference_source(opening: &str, dtd: &InternalDtd) -> Vec<u8> {
+    let mut source = if opening.contains('&') {
+        opening.as_bytes().to_vec()
     } else {
         Vec::new()
     };
@@ -2401,14 +2477,9 @@ fn element_attribute_reference_source(
         return source;
     }
 
-    let element_name = element.name();
-    let element_name = element_name.as_ref();
+    let (element_name, present) = opening_tag_names(opening);
     if let Some(defaults) = dtd.attribute_defaults.get(element_name) {
-        let mut present_attributes: HashSet<_> = element
-            .attributes()
-            .flatten()
-            .map(|attribute| attribute.key.as_ref().to_owned())
-            .collect();
+        let mut present_attributes: HashSet<_> = present.into_iter().collect();
         for default in defaults {
             if present_attributes.insert(default.attribute_name.clone())
                 && default.value.contains('&')
@@ -2419,6 +2490,70 @@ fn element_attribute_reference_source(
         }
     }
     source
+}
+
+fn opening_tag_names(opening: &str) -> (&str, Vec<String>) {
+    let bytes = opening.as_bytes();
+    let mut offset = 1usize;
+    let name_start = offset;
+    while bytes
+        .get(offset)
+        .is_some_and(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n' | b'/' | b'>'))
+    {
+        offset += 1;
+    }
+    let element_name = &opening[name_start..offset];
+    let mut attributes = Vec::new();
+    while offset < bytes.len() {
+        while bytes
+            .get(offset)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            offset += 1;
+        }
+        if bytes
+            .get(offset)
+            .is_none_or(|byte| matches!(byte, b'/' | b'>'))
+        {
+            break;
+        }
+        let start = offset;
+        while bytes
+            .get(offset)
+            .is_some_and(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n' | b'='))
+        {
+            offset += 1;
+        }
+        if start == offset {
+            break;
+        }
+        attributes.push(opening[start..offset].to_owned());
+        while bytes
+            .get(offset)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            offset += 1;
+        }
+        if bytes.get(offset) != Some(&b'=') {
+            break;
+        }
+        offset += 1;
+        while bytes
+            .get(offset)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            offset += 1;
+        }
+        let Some(delimiter @ (b'\'' | b'"')) = bytes.get(offset).copied() else {
+            break;
+        };
+        offset += 1;
+        while bytes.get(offset).is_some_and(|byte| *byte != delimiter) {
+            offset += 1;
+        }
+        offset = offset.saturating_add(1);
+    }
+    (element_name, attributes)
 }
 
 struct GeneralReferences<'a> {

@@ -4,6 +4,8 @@
 
 use std::{borrow::Cow, ops::Range};
 
+pub mod lexical;
+
 /// Failure while converting external bytes into the Unicode XML parser contract.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

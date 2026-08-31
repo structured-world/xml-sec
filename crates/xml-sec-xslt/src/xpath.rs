@@ -15,7 +15,7 @@ use crate::resolver::decode_resource;
 use crate::runtime::{SourceProcessing, apply_whitespace_rules};
 use crate::{
     BudgetKind, Clock, Document, Error, ErrorKind, ExpandedName, ExtensionPolicy, NodeId, NodeKind,
-    NodeReference, ResolvePurpose, Resolver, ResourceIdentity, Result, Value,
+    NodeReference, ResolvePurpose, ResolvedResource, Resolver, ResourceIdentity, Result, Value,
 };
 
 pub(crate) type SourceNode = NodeReference;
@@ -45,7 +45,7 @@ pub(crate) struct EvaluatorSourceOptions {
 pub(crate) struct PreparedEvaluatorSource {
     pub(crate) document: Document,
     pub(crate) remap: Option<HashMap<NodeId, NodeId>>,
-    resource_identities: HashMap<ResourceIdentity, Vec<u8>>,
+    resource_identities: HashMap<ResourceIdentity, ResolvedResource>,
 }
 
 pub(crate) fn prepare_evaluator_source(
@@ -152,7 +152,7 @@ pub(crate) struct Evaluator {
     documents: HashMap<DocumentRequest, Vec<SourceNode>>,
     document_roots: Rc<RefCell<HashMap<DocumentRequest, Vec<NodePath>>>>,
     pending_document_requests: Rc<RefCell<HashSet<DocumentRequest>>>,
-    resource_identities: HashMap<ResourceIdentity, Vec<u8>>,
+    resource_identities: HashMap<ResourceIdentity, ResolvedResource>,
     resource_documents: HashMap<ResourceIdentity, SourceNode>,
     result_tree_fragments: HashMap<u64, SourceNode>,
     dynamic_evaluation_depth: usize,
@@ -1135,7 +1135,7 @@ impl Evaluator {
                     Err(error) => return Err(error),
                 };
                 if let Some(previous) = self.resource_identities.get(&resource.identity)
-                    && previous != &resource.bytes
+                    && previous != &resource
                 {
                     return Err(Error::StaleResource {
                         identity: resource.identity,
@@ -1168,7 +1168,7 @@ impl Evaluator {
                     let _ = apply_whitespace_rules(&mut document, &self.whitespace);
                     let root = self.import_document(&document, meter)?;
                     self.resource_identities
-                        .insert(resource.identity.clone(), resource.bytes);
+                        .insert(resource.identity.clone(), resource.clone());
                     self.resource_documents
                         .insert(resource.identity, root.clone());
                     self.cache_document(resource_request.clone(), vec![root.clone()]);
@@ -2050,7 +2050,7 @@ fn expand_xinclude_document(
     source: &Document,
     resolver: &dyn Resolver,
     meter: &mut Meter,
-    identities: &mut HashMap<ResourceIdentity, Vec<u8>>,
+    identities: &mut HashMap<ResourceIdentity, ResolvedResource>,
     include_stack: &mut Vec<ResourceIdentity>,
     depth: usize,
 ) -> Result<(Document, Option<HashMap<NodeId, NodeId>>)> {
@@ -2165,7 +2165,7 @@ fn resolve_xinclude(
     include: NodeId,
     resolver: &dyn Resolver,
     meter: &mut Meter,
-    identities: &mut HashMap<ResourceIdentity, Vec<u8>>,
+    identities: &mut HashMap<ResourceIdentity, ResolvedResource>,
     include_stack: &mut Vec<ResourceIdentity>,
     depth: usize,
 ) -> Result<XIncludeContent> {
@@ -2199,7 +2199,7 @@ fn resolve_xinclude(
         });
     }
     if let Some(previous) = identities.get(&resource.identity)
-        && previous != &resource.bytes
+        && previous != &resource
     {
         return Err(Error::StaleResource {
             identity: resource.identity,
@@ -2209,7 +2209,7 @@ fn resolve_xinclude(
     if parse == "text" {
         let encoding = attribute("encoding").or(resource.encoding.as_deref());
         let value = decode_resource_metered(&resource.bytes, encoding, meter, false)?;
-        identities.insert(resource.identity, resource.bytes);
+        identities.insert(resource.identity.clone(), resource.clone());
         return Ok(XIncludeContent::Text(value, resource.canonical_uri));
     }
     if parse != "xml" {
@@ -2219,7 +2219,7 @@ fn resolve_xinclude(
     }
     let xml = decode_resource_for_xml_parse(&resource.bytes, resource.encoding.as_deref(), meter)?;
     let document = Document::parse(&xml, Some(&resource.canonical_uri))?;
-    identities.insert(resource.identity.clone(), resource.bytes);
+    identities.insert(resource.identity.clone(), resource.clone());
     include_stack.push(resource.identity);
     let expanded = expand_xinclude_document(
         &document,

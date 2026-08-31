@@ -10,3 +10,4 @@ repository = "https://github.com/structured-world/xml-sec"
 [dependencies]
 encoding_rs = "0.8"
 thiserror = "2"
+xmlparser = "0.13.6"

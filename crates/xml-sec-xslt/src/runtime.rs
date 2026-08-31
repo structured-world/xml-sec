@@ -254,14 +254,14 @@ struct Execution<'a> {
     built_keys: HashSet<(ExpandedName, NodeId)>,
     building_keys: HashSet<(ExpandedName, NodeId)>,
     attribute_insert_position: Option<usize>,
-    attribute_overwrite_existing: bool,
+    attribute_protected_names: Option<HashSet<ExpandedName>>,
 }
 
 struct ResultTreeState {
     document: Document,
     output_stack: Vec<NodeId>,
     attribute_insert_position: Option<usize>,
-    attribute_overwrite_existing: bool,
+    attribute_protected_names: Option<HashSet<ExpandedName>>,
 }
 
 #[derive(Clone, Copy)]
@@ -373,7 +373,7 @@ impl<'a> Execution<'a> {
             built_keys: HashSet::new(),
             building_keys: HashSet::new(),
             attribute_insert_position: None,
-            attribute_overwrite_existing: true,
+            attribute_protected_names: None,
         };
         state.evaluator.initialize_xslt(
             &stylesheet.decimal_formats,
@@ -1613,11 +1613,23 @@ impl<'a> Execution<'a> {
                     .as_ref()
                     .map(|value| self.evaluate_avt(value, node, position, size))
                     .transpose()?
-                    .and_then(|value| {
+                    .map(|value| {
                         let mut characters = value.chars();
-                        let first = characters.next()?;
-                        characters.next().is_none().then_some(first)
-                    });
+                        let Some(first) = characters.next() else {
+                            // libxslt REC/test-7.7-6 classifies an explicit empty value as
+                            // disabling grouping, distinct from malformed multi-character input.
+                            return Ok(None);
+                        };
+                        if characters.next().is_some() {
+                            return Err(Error::Dynamic(
+                                "xsl:number grouping-separator must evaluate to at most one character"
+                                    .into(),
+                            ));
+                        }
+                        Ok(Some(first))
+                    })
+                    .transpose()?
+                    .flatten();
                 let grouping_size = number
                     .grouping_size
                     .as_ref()
@@ -2368,6 +2380,13 @@ impl<'a> Execution<'a> {
                         self.evaluate_avt(value, context_node, context_position, context_size)
                     })
                     .transpose()?;
+                if let Some(case_order) = case_order.as_deref()
+                    && !matches!(case_order, "upper-first" | "lower-first")
+                {
+                    return Err(Error::Dynamic(format!(
+                        "xsl:sort case-order must evaluate to `upper-first` or `lower-first`, got `{case_order}`"
+                    )));
+                }
                 let lang = sort
                     .lang
                     .as_ref()
@@ -2507,10 +2526,7 @@ impl<'a> Execution<'a> {
             document: std::mem::replace(&mut self.result, Document::empty(None)),
             output_stack: std::mem::replace(&mut self.output_stack, vec![NodeId(0)]),
             attribute_insert_position: self.attribute_insert_position.take(),
-            attribute_overwrite_existing: std::mem::replace(
-                &mut self.attribute_overwrite_existing,
-                true,
-            ),
+            attribute_protected_names: self.attribute_protected_names.take(),
         }
     }
 
@@ -2518,7 +2534,7 @@ impl<'a> Execution<'a> {
         let captured = std::mem::replace(&mut self.result, previous.document);
         self.output_stack = previous.output_stack;
         self.attribute_insert_position = previous.attribute_insert_position;
-        self.attribute_overwrite_existing = previous.attribute_overwrite_existing;
+        self.attribute_protected_names = previous.attribute_protected_names;
         captured
     }
     fn copy_document(
@@ -2614,23 +2630,41 @@ impl<'a> Execution<'a> {
             .filter(|set| &set.name == name)
             .collect::<Vec<_>>();
         sets.sort_by_key(|set| (std::cmp::Reverse(set.precedence), set.order));
-        let highest_precedence = sets.first().map(|set| set.precedence);
-        for set in sets {
-            let previous_overwrite = self.attribute_overwrite_existing;
-            self.attribute_overwrite_existing =
-                previous_overwrite && Some(set.precedence) == highest_precedence;
-            let set_start = self.current_attribute_count()?;
-            for used in &set.uses {
-                self.meter.recursion(depth + 1)?;
-                self.apply_attribute_set(used, node, position, size, depth + 1, active)?
+        let previous_protected = self.attribute_protected_names.take();
+        let result = (|| {
+            let mut cursor = 0;
+            while cursor < sets.len() {
+                let precedence = sets[cursor].precedence;
+                if cursor == 0 {
+                    self.attribute_protected_names = previous_protected.clone();
+                } else {
+                    self.attribute_protected_names = Some(self.current_attribute_names()?);
+                }
+                while cursor < sets.len() && sets[cursor].precedence == precedence {
+                    let set = sets[cursor];
+                    let set_start = self.current_attribute_count()?;
+                    for used in &set.uses {
+                        self.meter.recursion(depth + 1)?;
+                        self.apply_attribute_set(used, node, position, size, depth + 1, active)?
+                    }
+                    let previous_position = self.attribute_insert_position.replace(set_start);
+                    let execution = self.execute_sequence(
+                        &set.attributes,
+                        node,
+                        position,
+                        size,
+                        depth + 1,
+                        None,
+                    );
+                    self.attribute_insert_position = previous_position;
+                    execution?;
+                    cursor += 1;
+                }
             }
-            let previous_position = self.attribute_insert_position.replace(set_start);
-            let result =
-                self.execute_sequence(&set.attributes, node, position, size, depth + 1, None);
-            self.attribute_insert_position = previous_position;
-            self.attribute_overwrite_existing = previous_overwrite;
-            result?;
-        }
+            Ok(())
+        })();
+        self.attribute_protected_names = previous_protected;
+        result?;
         active.pop();
         Ok(())
     }
@@ -2723,7 +2757,11 @@ impl<'a> Execution<'a> {
             .iter_mut()
             .find(|existing| existing.name == attribute.name)
         {
-            if self.attribute_overwrite_existing {
+            if !self
+                .attribute_protected_names
+                .as_ref()
+                .is_some_and(|protected| protected.contains(&attribute.name))
+            {
                 *existing = attribute;
             }
         } else {
@@ -2752,6 +2790,22 @@ impl<'a> Execution<'a> {
             ));
         };
         Ok(attributes.len())
+    }
+
+    fn current_attribute_names(&self) -> Result<HashSet<ExpandedName>> {
+        let node = self
+            .result
+            .node(self.parent())
+            .ok_or_else(|| Error::Dynamic("attribute has no result parent".into()))?;
+        let NodeKind::Element { attributes, .. } = &node.kind else {
+            return Err(Error::Dynamic(
+                "attribute requires an element result".into(),
+            ));
+        };
+        Ok(attributes
+            .iter()
+            .map(|attribute| attribute.name.clone())
+            .collect())
     }
     fn add_namespace(&mut self, mut namespace: Namespace) -> Result<()> {
         let node = self

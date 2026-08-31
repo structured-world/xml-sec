@@ -426,7 +426,11 @@ impl Iterator for Tokenizer {
 
     fn next(&mut self) -> Option<TokenResult> {
         if self.has_more_tokens() {
-            Some(self.next_token())
+            let token = self.next_token();
+            if token.is_err() {
+                self.start = self.xpath.len();
+            }
+            Some(token)
         } else {
             None
         }

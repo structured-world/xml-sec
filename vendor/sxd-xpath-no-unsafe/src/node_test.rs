@@ -3,17 +3,26 @@ use std::fmt;
 use sxd_document_no_unsafe::QName;
 
 use crate::context;
+use crate::expression::Error;
 use crate::nodeset::{self, OrderedNodes};
 
 pub trait NodeTest: fmt::Debug {
-    fn test<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>, result: &mut OrderedNodes<'d>);
+    fn test<'c, 'd>(
+        &self,
+        context: &context::Evaluation<'c, 'd>,
+        result: &mut OrderedNodes<'d>,
+    ) -> Result<(), Error>;
 }
 
 impl<T: ?Sized> NodeTest for Box<T>
 where
     T: NodeTest,
 {
-    fn test<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>, result: &mut OrderedNodes<'d>) {
+    fn test<'c, 'd>(
+        &self,
+        context: &context::Evaluation<'c, 'd>,
+        result: &mut OrderedNodes<'d>,
+    ) -> Result<(), Error> {
         (**self).test(context, result)
     }
 }
@@ -27,19 +36,30 @@ pub struct NameTest {
 }
 
 impl NameTest {
-    fn matches(&self, context: &context::Evaluation<'_, '_>, node_name: QName<'_>) -> bool {
+    fn matches(
+        &self,
+        context: &context::Evaluation<'_, '_>,
+        node_name: QName<'_>,
+    ) -> Result<bool, Error> {
         let is_wildcard = self.local_part == "*";
 
-        let test_uri = self.prefix.as_ref().map(|p| {
-            // TODO: Error for undefined prefix
-            context.namespace_for(p).expect("No namespace for prefix")
-        });
+        let test_uri = self
+            .prefix
+            .as_ref()
+            .map(|prefix| {
+                context
+                    .namespace_for(prefix)
+                    .ok_or_else(|| Error::UnknownNamespace {
+                        prefix: prefix.clone(),
+                    })
+            })
+            .transpose()?;
 
-        match (is_wildcard, test_uri) {
+        Ok(match (is_wildcard, test_uri) {
             (true, None) => true,
             (true, Some(..)) => test_uri == node_name.namespace_uri(),
             _ => test_uri == node_name.namespace_uri() && self.local_part == node_name.local_part(),
-        }
+        })
     }
 }
 
@@ -55,14 +75,19 @@ impl Attribute {
 }
 
 impl NodeTest for Attribute {
-    fn test<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>, result: &mut OrderedNodes<'d>) {
+    fn test<'c, 'd>(
+        &self,
+        context: &context::Evaluation<'c, 'd>,
+        result: &mut OrderedNodes<'d>,
+    ) -> Result<(), Error> {
         if let nodeset::Node::Attribute(ref a) = context.node
             && self
                 .name_test
-                .matches(context, sxd_document_no_unsafe::as_qname!(a.name()))
+                .matches(context, sxd_document_no_unsafe::as_qname!(a.name()))?
         {
             result.add(context.node.clone());
         }
+        Ok(())
     }
 }
 
@@ -78,12 +103,17 @@ impl Namespace {
 }
 
 impl NodeTest for Namespace {
-    fn test<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>, result: &mut OrderedNodes<'d>) {
+    fn test<'c, 'd>(
+        &self,
+        context: &context::Evaluation<'c, 'd>,
+        result: &mut OrderedNodes<'d>,
+    ) -> Result<(), Error> {
         if let nodeset::Node::Namespace(ref ns) = context.node
-            && self.name_test.matches(context, QName::new(ns.prefix()))
+            && self.name_test.matches(context, QName::new(ns.prefix()))?
         {
             result.add(context.node.clone());
         }
+        Ok(())
     }
 }
 
@@ -99,14 +129,19 @@ impl Element {
 }
 
 impl NodeTest for Element {
-    fn test<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>, result: &mut OrderedNodes<'d>) {
+    fn test<'c, 'd>(
+        &self,
+        context: &context::Evaluation<'c, 'd>,
+        result: &mut OrderedNodes<'d>,
+    ) -> Result<(), Error> {
         if let nodeset::Node::Element(ref e) = context.node
             && self
                 .name_test
-                .matches(context, sxd_document_no_unsafe::as_qname!(e.name()))
+                .matches(context, sxd_document_no_unsafe::as_qname!(e.name()))?
         {
             result.add(context.node.clone());
         }
+        Ok(())
     }
 }
 
@@ -115,8 +150,13 @@ impl NodeTest for Element {
 pub struct Node;
 
 impl NodeTest for Node {
-    fn test<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>, result: &mut OrderedNodes<'d>) {
+    fn test<'c, 'd>(
+        &self,
+        context: &context::Evaluation<'c, 'd>,
+        result: &mut OrderedNodes<'d>,
+    ) -> Result<(), Error> {
         result.add(context.node.clone());
+        Ok(())
     }
 }
 
@@ -125,10 +165,15 @@ impl NodeTest for Node {
 pub struct Text;
 
 impl NodeTest for Text {
-    fn test<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>, result: &mut OrderedNodes<'d>) {
+    fn test<'c, 'd>(
+        &self,
+        context: &context::Evaluation<'c, 'd>,
+        result: &mut OrderedNodes<'d>,
+    ) -> Result<(), Error> {
         if let nodeset::Node::Text(_) = context.node {
             result.add(context.node.clone());
         }
+        Ok(())
     }
 }
 
@@ -137,10 +182,15 @@ impl NodeTest for Text {
 pub struct Comment;
 
 impl NodeTest for Comment {
-    fn test<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>, result: &mut OrderedNodes<'d>) {
+    fn test<'c, 'd>(
+        &self,
+        context: &context::Evaluation<'c, 'd>,
+        result: &mut OrderedNodes<'d>,
+    ) -> Result<(), Error> {
         if let nodeset::Node::Comment(_) = context.node {
             result.add(context.node.clone());
         }
+        Ok(())
     }
 }
 
@@ -156,7 +206,11 @@ impl ProcessingInstruction {
 }
 
 impl NodeTest for ProcessingInstruction {
-    fn test<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>, result: &mut OrderedNodes<'d>) {
+    fn test<'c, 'd>(
+        &self,
+        context: &context::Evaluation<'c, 'd>,
+        result: &mut OrderedNodes<'d>,
+    ) -> Result<(), Error> {
         if let nodeset::Node::ProcessingInstruction(pi) = &context.node {
             match self.target {
                 Some(ref name) if name == sxd_document_no_unsafe::as_str!(pi.target()) => {
@@ -166,6 +220,7 @@ impl NodeTest for ProcessingInstruction {
                 None => result.add(context.node.clone()),
             }
         }
+        Ok(())
     }
 }
 
@@ -257,7 +312,8 @@ mod test {
             local_part: local.to_owned(),
         };
         let test = Attribute::new(name);
-        test.test(context, &mut result);
+        test.test(context, &mut result)
+            .expect("node test evaluates");
         result
     }
 
@@ -356,7 +412,8 @@ mod test {
             local_part: local.to_owned(),
         };
         let test = Element::new(name);
-        test.test(context, &mut result);
+        test.test(context, &mut result)
+            .expect("node test evaluates");
         result
     }
 

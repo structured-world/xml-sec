@@ -672,4 +672,40 @@ mod test {
             assert_eq!(expected_error, result);
         });
     }
+
+    #[test]
+    fn malformed_token_stream_is_fused_after_the_first_error() {
+        let mut tokens = TokenDeabbreviator::new(Tokenizer::new("\u{0}"));
+        assert!(tokens.next().expect("one tokenizer result").is_err());
+        assert!(tokens.next().is_none());
+    }
+
+    #[test]
+    fn parser_rejects_expression_nesting_above_its_safety_ceiling() {
+        let expression = format!("{}1", "-".repeat(300));
+        assert!(Factory::new().build(&expression).is_err());
+    }
+
+    #[test]
+    fn comma_forces_a_following_operator_name_to_be_a_node_test() {
+        with_document("<root><div>ok</div></root>", |doc| {
+            let xpath = Factory::new()
+                .build("concat('x', /root/div/text())")
+                .expect("name after comma parses");
+            let value = xpath
+                .evaluate(&Context::new(), doc.root())
+                .expect("XPath evaluates");
+            assert_eq!(value.string(), "xok");
+        });
+    }
+
+    #[test]
+    fn undeclared_node_test_prefix_returns_an_execution_error() {
+        with_document("<root><item/></root>", |doc| {
+            let xpath = Factory::new()
+                .build("//missing:item")
+                .expect("XPath syntax parses");
+            assert!(xpath.evaluate(&Context::new(), doc.root()).is_err());
+        });
+    }
 }

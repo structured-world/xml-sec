@@ -48,6 +48,9 @@ pub(crate) fn resolve_uri_reference(base: Option<&str>, reference: &str) -> Resu
                 .map_or(base, |(document, _)| document)
                 .to_owned());
         }
+        if reference.starts_with('/') {
+            return Ok(reference.to_owned());
+        }
         if let Some((directory, _)) = base.rsplit_once('/') {
             return Ok(format!("{directory}/{reference}"));
         }
@@ -93,7 +96,17 @@ impl Resolver for NoResolver {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_resource;
+    use super::{decode_resource, resolve_uri_reference};
+
+    #[test]
+    fn path_like_resolution_preserves_root_absolute_references() {
+        // URL joining and filesystem-like fallback both preserve an absolute target.
+        assert_eq!(
+            resolve_uri_reference(Some("tmp/styles/main.xsl"), "/shared/base.xsl")
+                .expect("path resolution succeeds"),
+            "/shared/base.xsl"
+        );
+    }
 
     #[test]
     fn explicit_encoding_cannot_be_overridden_by_a_conflicting_bom() {

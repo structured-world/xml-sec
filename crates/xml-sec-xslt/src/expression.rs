@@ -12,6 +12,44 @@ pub(crate) fn innermost_namespaced_call(
     namespaces: &[(String, String)],
     accepts: impl Fn(&str, &str) -> bool + Copy,
 ) -> Option<FunctionCall> {
+    let mut source = source;
+    let mut source_offset = 0;
+    loop {
+        let call = first_namespaced_call(source, namespaces, accepts)?;
+        let arguments_start = call.arguments_start;
+        let arguments_end = call.end - 1;
+        if first_namespaced_call(&source[arguments_start..arguments_end], namespaces, accepts)
+            .is_some()
+        {
+            source_offset += arguments_start;
+            source = &source[arguments_start..arguments_end];
+            continue;
+        }
+        return Some(FunctionCall {
+            start: source_offset + call.start,
+            end: source_offset + call.end,
+            arguments: split_function_arguments(&source[arguments_start..arguments_end]),
+            namespace: call.namespace,
+            local: call.local,
+            display_name: call.display_name,
+        });
+    }
+}
+
+struct LexicalFunctionCall {
+    start: usize,
+    arguments_start: usize,
+    end: usize,
+    namespace: String,
+    local: String,
+    display_name: String,
+}
+
+fn first_namespaced_call(
+    source: &str,
+    namespaces: &[(String, String)],
+    accepts: impl Fn(&str, &str) -> bool + Copy,
+) -> Option<LexicalFunctionCall> {
     let mut quote = None;
     let mut cursor = 0;
     while cursor < source.len() {
@@ -67,16 +105,10 @@ pub(crate) fn innermost_namespaced_call(
             continue;
         }
         let close = matching_parenthesis(source, open)?;
-        let arguments_source = &source[open + 1..close];
-        if let Some(mut nested) = innermost_namespaced_call(arguments_source, namespaces, accepts) {
-            nested.start += open + 1;
-            nested.end += open + 1;
-            return Some(nested);
-        }
-        return Some(FunctionCall {
+        return Some(LexicalFunctionCall {
             start,
+            arguments_start: open + 1,
             end: close + 1,
-            arguments: split_function_arguments(arguments_source),
             namespace: namespace.clone(),
             local: local.to_owned(),
             display_name: lexical.to_owned(),
@@ -215,4 +247,21 @@ fn is_name_start(character: char) -> bool {
 
 fn is_name_character(character: char) -> bool {
     is_name_start(character) || character.is_ascii_digit() || matches!(character, '-' | '.' | ':')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::innermost_namespaced_call;
+
+    #[test]
+    fn namespaced_call_discovery_is_iterative_at_extreme_depth() {
+        let source = format!("{}1{}", "x:f(".repeat(1_000), ")".repeat(1_000));
+        let call = innermost_namespaced_call(
+            &source,
+            &[("x".into(), "urn:test".into())],
+            |namespace, local| namespace == "urn:test" && local == "f",
+        )
+        .expect("nested call is discovered");
+        assert_eq!(&source[call.start..call.end], "x:f(1)");
+    }
 }

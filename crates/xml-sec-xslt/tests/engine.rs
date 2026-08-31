@@ -1324,6 +1324,50 @@ fn sorting_uses_avts_case_order_and_xpath_number_grammar() {
 }
 
 #[test]
+fn sorting_rejects_unknown_case_order_values() {
+    // case-order is an AVT, but every evaluated value still has the XSLT two-value contract.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:for-each select="root/item"><xsl:sort case-order="sideways"/><xsl:value-of select="."/></xsl:for-each></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse("<root><item>a</item></root>", None).expect("source parses");
+    let error = stylesheet
+        .execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect_err("unknown case-order must fail");
+    assert!(matches!(error, Error::Dynamic(message) if message.contains("case-order")));
+}
+
+#[test]
+fn number_rejects_multi_character_grouping_separator() {
+    // Empty disables grouping in the pinned libxslt contract; multiple characters are malformed.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:number value="1234" grouping-separator=".." grouping-size="3"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse("<root/>", None).expect("source parses");
+    let error = stylesheet
+        .execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect_err("malformed grouping-separator must fail");
+    assert!(matches!(error, Error::Dynamic(message) if message.contains("grouping-separator")));
+}
+
+#[test]
 fn numbering_parses_tokens_widths_and_unicode_decimal_patterns() {
     // Number formatting must preserve token separators, widths, and UTF-8 boundaries.
     let stylesheet = r##"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:decimal-format name="arabic" zero-digit="٠" digit="#"/><xsl:template match="/"><xsl:number value="1" format="001"/><xsl:text>|</xsl:text><xsl:number value="2" format="1."/><xsl:text>|</xsl:text><xsl:apply-templates select="book/chapter/section"/></xsl:template><xsl:template match="section"><xsl:number level="multiple" count="chapter|section" format="A.1"/><xsl:text>|</xsl:text><xsl:value-of select="format-number(12, '٠٠', 'arabic')"/></xsl:template></xsl:stylesheet>"##;
@@ -1553,6 +1597,99 @@ fn module_resolution_honors_xml_base_and_resource_identity() {
             Some("https://example.test/main.xsl"),
         )
         .expect_err("one resource identity cannot resolve to different bytes");
+    assert!(matches!(error, Error::StaleResource { .. }), "{error:?}");
+}
+
+#[test]
+fn lower_precedence_attribute_sets_keep_equal_precedence_ordering() {
+    // A principal declaration protects only the attributes it defines; later imported
+    // declarations at the same precedence still override earlier imported declarations.
+    let resolver = Arc::new(ContextResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            (
+                "imported.xsl".into(),
+                Some("memory:principal.xsl".into()),
+            ),
+            ResolvedResource {
+                canonical_uri: "memory:imported.xsl".into(),
+                identity: ResourceIdentity("imported-attribute-sets".into()),
+                bytes: br#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:attribute-set name="shared"><xsl:attribute name="x">old</xsl:attribute></xsl:attribute-set><xsl:attribute-set name="shared"><xsl:attribute name="x">new</xsl:attribute></xsl:attribute-set></xsl:stylesheet>"#.to_vec(),
+                media_type: Some("application/xml".into()),
+                encoding: Some("UTF-8".into()),
+            },
+        );
+    let stylesheet = Compiler::new(resolver, CompileBudget::new(1 << 20, 8, 32, 1 << 20))
+        .compile(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:import href="imported.xsl"/><xsl:output omit-xml-declaration="yes"/><xsl:attribute-set name="shared"><xsl:attribute name="y">principal</xsl:attribute></xsl:attribute-set><xsl:template match="/"><out xsl:use-attribute-sets="shared"/></xsl:template></xsl:stylesheet>"#,
+            Some("memory:principal.xsl"),
+        )
+        .expect("stylesheet compiles");
+    let result = stylesheet
+        .execute(
+            &Document::parse("<root/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("stylesheet executes");
+    assert_eq!(
+        String::from_utf8(result.serialized.bytes).expect("UTF-8 output"),
+        "<out y=\"principal\" x=\"new\"/>\n"
+    );
+}
+
+#[test]
+fn document_cache_identity_includes_parse_provenance() {
+    // Caller identities are stable only when bytes, decoding metadata, and canonical base agree.
+    let resolver = Arc::new(ContextResolver::default());
+    for (href, canonical_uri, encoding) in [
+        ("a.xml", "memory:first.xml", "UTF-8"),
+        ("b.xml", "memory:second.xml", "windows-1252"),
+    ] {
+        resolver
+            .resources
+            .lock()
+            .expect("test resolver mutex is not poisoned")
+            .insert(
+                (href.into(), Some("memory:principal.xsl".into())),
+                ResolvedResource {
+                    canonical_uri: canonical_uri.into(),
+                    identity: ResourceIdentity("shared-document-identity".into()),
+                    bytes: b"<doc/>".to_vec(),
+                    media_type: Some("application/xml".into()),
+                    encoding: Some(encoding.into()),
+                },
+            );
+    }
+    let stylesheet = Compiler::new(
+        Arc::new(NoResolver),
+        CompileBudget::new(1 << 20, 8, 32, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><out><xsl:copy-of select="document('a.xml')"/><xsl:copy-of select="document('b.xml')"/></out></xsl:template></xsl:stylesheet>"#,
+        Some("memory:principal.xsl"),
+    )
+    .expect("stylesheet compiles");
+    let error = stylesheet
+        .execute(
+            &Document::parse("<root/>", None).expect("source parses"),
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect_err("changed parse provenance must invalidate a resource identity");
     assert!(matches!(error, Error::StaleResource { .. }), "{error:?}");
 }
 

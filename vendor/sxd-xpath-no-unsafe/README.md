@@ -8,6 +8,11 @@ An XML XPath library in Rust, modified to use a `no-unsafe` flag which uses the 
 
 ## Overview
 
+This vendored fork carries bounded, panic-free XPath evaluation changes required by xml-sec,
+including string-allocation accounting, tokenizer failure fusion, namespace-error propagation,
+parser nesting limits, result-tree-fragment comparisons, and XPath 1.0 comma disambiguation.
+Keep these changes when refreshing the upstream source.
+
 The project is broken into two crates:
 
 1. [`document`][sxd-document] - Basic DOM manipulation and reading/writing XML from strings.

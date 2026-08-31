@@ -234,8 +234,7 @@ impl<R: Resolver> Compiler<R> {
                 .resolve(href, effective_base.as_deref(), purpose)?,
         );
         if let Some(previous) = state.resolved_identities.get(&resource.identity)
-            && (previous.canonical_uri != resource.canonical_uri
-                || previous.bytes != resource.bytes)
+            && previous.as_ref() != resource.as_ref()
         {
             return Err(Error::StaleResource {
                 identity: resource.identity.clone(),

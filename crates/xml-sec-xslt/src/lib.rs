@@ -41,7 +41,6 @@ mod resolver;
 mod runtime;
 mod serializer;
 mod value;
-mod xml_events;
 mod xpath;
 
 pub use budget::{BudgetKind, CompileBudget, ExecutionBudget};

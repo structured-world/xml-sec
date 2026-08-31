@@ -199,6 +199,10 @@ fn compare_equality_values(left: &Value<'_>, right: &Value<'_>, comparison: Equa
         | (Value::String(value), Value::Nodeset(nodes)) => nodes
             .iter()
             .any(|node| comparison.strings(&node.string_value(), value)),
+        (Value::Nodeset(nodes), Value::ResultTreeFragment(_, value))
+        | (Value::ResultTreeFragment(_, value), Value::Nodeset(nodes)) => nodes
+            .iter()
+            .any(|node| comparison.strings(&node.string_value(), value)),
         (Boolean(_), _) | (_, Boolean(_)) => comparison.booleans(left.boolean(), right.boolean()),
         (Number(_), _) | (_, Number(_)) => comparison.numbers(left.number(), right.number()),
         _ => comparison.strings(&left.string(), &right.string()),
@@ -590,7 +594,7 @@ where
 
         for node in starting_nodes.iter() {
             let child_context = context.new_context_for(node);
-            let mut nodes = self.axis.select_nodes(&child_context, &self.node_test);
+            let mut nodes = self.axis.select_nodes(&child_context, &self.node_test)?;
 
             for predicate in &self.predicates {
                 nodes = predicate.select(context, nodes)?;
@@ -813,6 +817,18 @@ mod test {
         let res = expr.evaluate(&context);
 
         assert_eq!(res, Ok(Boolean(true)));
+    }
+
+    #[test]
+    fn result_tree_fragment_equality_checks_every_nodeset_value_symmetrically() {
+        let package = Package::new();
+        let setup = Setup::new(&package);
+        let first = setup.doc.create_text("first");
+        let matching = setup.doc.create_text("matching");
+        let nodes = Value::Nodeset(nodeset![first, matching]);
+        let fragment = Value::ResultTreeFragment(1, "matching".into());
+        assert!(compare_equality_values(&nodes, &fragment, Equality::Equal));
+        assert!(compare_equality_values(&fragment, &nodes, Equality::Equal));
     }
 
     #[test]
@@ -1132,16 +1148,22 @@ mod test {
             &self,
             _context: &context::Evaluation<'c, 'd>,
             _node_test: &dyn NodeTest,
-        ) -> OrderedNodes<'d> {
+        ) -> Result<OrderedNodes<'d>, Error> {
             *self.calls.borrow_mut() += 1;
-            OrderedNodes::new()
+            Ok(OrderedNodes::new())
         }
     }
 
     #[derive(Debug)]
     struct DummyNodeTest;
     impl NodeTest for DummyNodeTest {
-        fn test(&self, _context: &context::Evaluation<'_, '_>, _result: &mut OrderedNodes<'_>) {}
+        fn test(
+            &self,
+            _context: &context::Evaluation<'_, '_>,
+            _result: &mut OrderedNodes<'_>,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
     }
 
     #[test]

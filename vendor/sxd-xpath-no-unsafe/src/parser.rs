@@ -1,4 +1,5 @@
 use snafu::{OptionExt, ResultExt, Snafu, ensure};
+use std::cell::Cell;
 use std::iter::Peekable;
 
 use crate::Value;
@@ -9,11 +10,26 @@ use crate::token::{AxisName, NodeTestName, Token};
 use crate::tokenizer::{self, TokenResult};
 
 #[allow(missing_copy_implementations)]
-pub struct Parser;
+pub struct Parser {
+    nesting: Cell<usize>,
+}
+
+const MAX_EXPRESSION_NESTING: usize = 256;
 
 impl Parser {
     pub fn new() -> Parser {
-        Parser
+        Parser {
+            nesting: Cell::new(0),
+        }
+    }
+
+    fn with_nesting<T>(&self, parse: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+        let depth = self.nesting.get();
+        ensure!(depth < MAX_EXPRESSION_NESTING, NestingLimit);
+        self.nesting.set(depth + 1);
+        let result = parse();
+        self.nesting.set(depth);
+        result
     }
 }
 
@@ -27,6 +43,8 @@ pub enum Error {
     EmptyPredicate,
     /// extra unparsed tokens
     ExtraUnparsedTokens,
+    /// expression grammar nesting exceeded the parser safety ceiling
+    NestingLimit,
     /// ran out of input
     RanOutOfInput,
     /// right hand side of expression is missing
@@ -536,7 +554,7 @@ impl Parser {
             source.consume(&Token::MinusSign)?;
 
             let expression = self
-                .parse_unary_expression(source)?
+                .with_nesting(|| self.parse_unary_expression(source))?
                 .context(RightHandSideExpressionMissing)?;
             let expression: SubExpression = Box::new(expression::Negation { expression });
             Ok(Some(expression))
@@ -665,7 +683,7 @@ impl Parser {
     where
         I: Iterator<Item = TokenResult>,
     {
-        self.parse_or_expression(source)
+        self.with_nesting(|| self.parse_or_expression(source))
     }
 
     pub fn parse<I>(&self, source: I) -> ParseResult<SubExpression>
