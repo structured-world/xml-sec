@@ -3201,6 +3201,11 @@ struct DocumentFunction {
     static_base_uri: Option<String>,
 }
 
+enum DocumentBaseSelection {
+    Omitted,
+    Explicit(Option<String>),
+}
+
 fn register_exslt_functions(
     context: &mut Context<'_>,
     clock: Arc<dyn Clock>,
@@ -3751,7 +3756,7 @@ impl function::Function for DocumentFunction {
                 what: "document() requires one or two arguments".into(),
             });
         }
-        let explicit_base = if let Some(base) = args.get(1) {
+        let base_selection = if let Some(base) = args.get(1) {
             let SxdValue::Nodeset(nodes) = base else {
                 return Err(function::Error::Other {
                     what: "document() second argument must be a node-set".into(),
@@ -3760,7 +3765,7 @@ impl function::Function for DocumentFunction {
             let Some(node) = nodes.document_order().into_iter().next() else {
                 return Ok(SxdValue::Nodeset(nodeset::Nodeset::new()));
             };
-            Some(
+            DocumentBaseSelection::Explicit(
                 self.node_base_uris
                     .borrow()
                     .get(&typed_path_to(&node))
@@ -3768,7 +3773,7 @@ impl function::Function for DocumentFunction {
                     .flatten(),
             )
         } else {
-            None
+            DocumentBaseSelection::Omitted
         };
         let requests = match &args[0] {
             SxdValue::Nodeset(nodes) => nodes
@@ -3776,20 +3781,23 @@ impl function::Function for DocumentFunction {
                 .into_iter()
                 .map(|node| DocumentRequest {
                     href: node.string_value(),
-                    base_uri: explicit_base.clone().unwrap_or_else(|| {
-                        self.node_base_uris
+                    base_uri: match &base_selection {
+                        DocumentBaseSelection::Explicit(base) => base.clone(),
+                        DocumentBaseSelection::Omitted => self
+                            .node_base_uris
                             .borrow()
                             .get(&typed_path_to(&node))
                             .cloned()
-                            .flatten()
-                    }),
+                            .flatten(),
+                    },
                 })
                 .collect::<Vec<_>>(),
             value => vec![DocumentRequest {
                 href: value.string(),
-                base_uri: explicit_base
-                    .flatten()
-                    .or_else(|| self.static_base_uri.clone()),
+                base_uri: match &base_selection {
+                    DocumentBaseSelection::Explicit(base) => base.clone(),
+                    DocumentBaseSelection::Omitted => self.static_base_uri.clone(),
+                },
             }],
         };
         let root: nodeset::Node<'d> = context.node.document().root().into();

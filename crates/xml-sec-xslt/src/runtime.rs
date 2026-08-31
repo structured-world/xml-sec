@@ -256,6 +256,13 @@ struct Execution<'a> {
     attribute_overwrite_existing: bool,
 }
 
+struct ResultTreeState {
+    document: Document,
+    output_stack: Vec<NodeId>,
+    attribute_insert_position: Option<usize>,
+    attribute_overwrite_existing: bool,
+}
+
 #[derive(Clone, Copy)]
 enum AttributePosition {
     Back,
@@ -1973,9 +1980,8 @@ impl<'a> Execution<'a> {
             let mut target = to.chars();
             let mut replacements = HashMap::new();
             for character in from.chars() {
-                replacements
-                    .entry(character)
-                    .or_insert_with(|| target.next());
+                let replacement = target.next();
+                replacements.entry(character).or_insert(replacement);
             }
             return Ok(Some(XPathValue::String(
                 input
@@ -2360,6 +2366,10 @@ impl<'a> Execution<'a> {
         if sorts.is_empty() {
             return Ok(());
         }
+        self.meter.charge(
+            BudgetKind::OwnedBytes,
+            sort_workspace_bytes(nodes.len(), sorts.len()),
+        )?;
         let specs = sorts
             .iter()
             .map(|sort| {
@@ -2454,8 +2464,7 @@ impl<'a> Execution<'a> {
         depth: usize,
         precedence: Option<usize>,
     ) -> Result<String> {
-        let previous = std::mem::replace(&mut self.result, Document::empty(None));
-        let stack = std::mem::replace(&mut self.output_stack, vec![NodeId(0)]);
+        let previous = self.enter_temporary_result_tree();
         let result =
             self.execute_scoped_sequence(body, node, position, size, depth + 1, precedence);
         let captured = result.and_then(|()| {
@@ -2485,8 +2494,7 @@ impl<'a> Execution<'a> {
             }
             Ok(captured)
         });
-        self.result = previous;
-        self.output_stack = stack;
+        self.restore_result_tree(previous);
         captured
     }
     fn capture_fragment(
@@ -2498,14 +2506,32 @@ impl<'a> Execution<'a> {
         depth: usize,
         precedence: Option<usize>,
     ) -> Result<Document> {
-        let previous = std::mem::replace(&mut self.result, Document::empty(None));
-        let stack = std::mem::replace(&mut self.output_stack, vec![NodeId(0)]);
+        let previous = self.enter_temporary_result_tree();
         let result =
             self.execute_scoped_sequence(body, node, position, size, depth + 1, precedence);
-        let captured = std::mem::replace(&mut self.result, previous);
-        self.output_stack = stack;
+        let captured = self.restore_result_tree(previous);
         result?;
         Ok(captured)
+    }
+
+    fn enter_temporary_result_tree(&mut self) -> ResultTreeState {
+        ResultTreeState {
+            document: std::mem::replace(&mut self.result, Document::empty(None)),
+            output_stack: std::mem::replace(&mut self.output_stack, vec![NodeId(0)]),
+            attribute_insert_position: self.attribute_insert_position.take(),
+            attribute_overwrite_existing: std::mem::replace(
+                &mut self.attribute_overwrite_existing,
+                true,
+            ),
+        }
+    }
+
+    fn restore_result_tree(&mut self, previous: ResultTreeState) -> Document {
+        let captured = std::mem::replace(&mut self.result, previous.document);
+        self.output_stack = previous.output_stack;
+        self.attribute_insert_position = previous.attribute_insert_position;
+        self.attribute_overwrite_existing = previous.attribute_overwrite_existing;
+        captured
     }
     fn copy_document(
         &mut self,
@@ -3099,6 +3125,22 @@ fn try_stable_sort_by<T: Copy>(
     }
     values.copy_from_slice(&source);
     Ok(())
+}
+
+fn sort_workspace_bytes(node_count: usize, sort_count: usize) -> usize {
+    let specs = sort_count.saturating_mul(std::mem::size_of::<EvaluatedSort>());
+    let keyed = node_count.saturating_mul(std::mem::size_of::<(SourceNode, Vec<SortKey>, usize)>());
+    let keys = node_count
+        .saturating_mul(sort_count)
+        .saturating_mul(std::mem::size_of::<SortKey>());
+    // The index order plus source and target merge buffers coexist during stable sorting.
+    let order = node_count
+        .saturating_mul(std::mem::size_of::<usize>())
+        .saturating_mul(3);
+    specs
+        .saturating_add(keyed)
+        .saturating_add(keys)
+        .saturating_add(order)
 }
 
 fn xpath_calls_key(source: &str) -> bool {

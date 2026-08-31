@@ -38,21 +38,23 @@ impl Value {
     pub fn into_string(self, document: &Document) -> String {
         match self {
             Self::NodeSet(nodes) => nodes
-                .first()
-                .map(|node| match node {
-                    NodeReference::Node(id) => document.string_value(*id),
+                .into_iter()
+                .filter_map(|node| document.document_order_key(&node).map(|key| (key, node)))
+                .min_by_key(|(key, _)| *key)
+                .map(|(_, node)| match node {
+                    NodeReference::Node(id) => document.string_value(id),
                     NodeReference::Attribute { owner, index } => document
-                        .node(*owner)
+                        .node(owner)
                         .and_then(|node| match &node.kind {
-                            crate::NodeKind::Element { attributes, .. } => attributes.get(*index),
+                            crate::NodeKind::Element { attributes, .. } => attributes.get(index),
                             _ => None,
                         })
                         .map(|attribute| attribute.value.clone())
                         .unwrap_or_default(),
                     NodeReference::Namespace { owner, index } => document
-                        .node(*owner)
+                        .node(owner)
                         .and_then(|node| match &node.kind {
-                            crate::NodeKind::Element { namespaces, .. } => namespaces.get(*index),
+                            crate::NodeKind::Element { namespaces, .. } => namespaces.get(index),
                             _ => None,
                         })
                         .map(|namespace| namespace.uri.clone())
@@ -127,7 +129,25 @@ fn expand_decimal_exponent(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::format_xpath_number;
+    use super::{Value, format_xpath_number};
+    use crate::{Document, NodeKind, NodeReference};
+
+    #[test]
+    fn public_node_set_string_conversion_uses_document_order() {
+        // Public callers may construct node sets in any vector order; XPath conversion must not
+        // let that storage order override the document's first node.
+        let document = Document::parse("<root><first>one</first><second>two</second></root>", None)
+            .expect("document parses");
+        let elements = document
+            .nodes()
+            .filter_map(|(id, node)| matches!(node.kind, NodeKind::Element { .. }).then_some(id))
+            .collect::<Vec<_>>();
+        let value = Value::NodeSet(vec![
+            NodeReference::Node(elements[2]),
+            NodeReference::Node(elements[1]),
+        ]);
+        assert_eq!(value.into_string(&document), "one");
+    }
 
     #[test]
     fn xpath_non_finite_numbers_keep_their_lexical_forms() {

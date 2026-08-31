@@ -440,6 +440,31 @@ impl Document {
         self.logical_roots.contains(&current).then_some(current)
     }
 
+    pub(crate) fn document_order_key(
+        &self,
+        reference: &NodeReference,
+    ) -> Option<(usize, u8, usize)> {
+        match reference {
+            NodeReference::Node(id) => self.node(*id).map(|_| (id.0, 0, 0)),
+            NodeReference::Namespace { owner, index } => {
+                self.node(*owner).and_then(|node| match &node.kind {
+                    NodeKind::Element { namespaces, .. } if *index < namespaces.len() => {
+                        Some((owner.0, 1, *index))
+                    }
+                    _ => None,
+                })
+            }
+            NodeReference::Attribute { owner, index } => {
+                self.node(*owner).and_then(|node| match &node.kind {
+                    NodeKind::Element { attributes, .. } if *index < attributes.len() => {
+                        Some((owner.0, 2, *index))
+                    }
+                    _ => None,
+                })
+            }
+        }
+    }
+
     pub(crate) fn import(&mut self, source: &Self) -> NodeId {
         let offset = self.nodes.len();
         let remap = |id: NodeId| NodeId(offset + id.0);

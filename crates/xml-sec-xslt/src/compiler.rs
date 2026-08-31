@@ -1140,16 +1140,17 @@ impl Pattern {
         }
         for branch in split_pattern_branches(source) {
             let branch = branch.trim();
+            validate_xslt_pattern_branch(branch)?;
             validate_xpath_prefixes(branch, &namespaces(node))?;
-            let expression = if branch.starts_with('/')
-                || branch.starts_with("id(")
-                || branch.starts_with("key(")
+            let normalized = normalize_xpath_for_sxd(branch);
+            let expression = if normalized.starts_with('/')
+                || normalized.starts_with("id(")
+                || normalized.starts_with("key(")
             {
-                branch.to_owned()
+                normalized
             } else {
-                format!("//{branch}")
+                format!("//{normalized}")
             };
-            let expression = normalize_xpath_for_sxd(&expression);
             let expression = crate::xpath::rewrite_absolute_paths_for_validation(&expression);
             sxd_xpath_no_unsafe::Factory::new()
                 .build(&expression)
@@ -1376,6 +1377,238 @@ fn split_pattern_branches(source: &str) -> Vec<&str> {
     }
     branches.push(&source[start..]);
     branches
+}
+
+fn validate_xslt_pattern_branch(branch: &str) -> Result<()> {
+    let normalized = normalize_xpath_for_sxd(branch);
+    let branch = normalized.as_str();
+    if branch == "/" {
+        return Ok(());
+    }
+    let relative = if let Some(relative) = strip_id_key_pattern(branch)? {
+        if relative.is_empty() {
+            return Ok(());
+        }
+        relative
+            .strip_prefix("//")
+            .or_else(|| relative.strip_prefix('/'))
+            .ok_or_else(|| invalid_match_pattern(branch))?
+    } else {
+        branch
+            .strip_prefix("//")
+            .or_else(|| branch.strip_prefix('/'))
+            .unwrap_or(branch)
+    };
+    let steps = split_pattern_steps(relative).ok_or_else(|| invalid_match_pattern(branch))?;
+    if steps.is_empty() || steps.iter().any(|step| !valid_pattern_step(step)) {
+        return Err(invalid_match_pattern(branch));
+    }
+    Ok(())
+}
+
+fn strip_id_key_pattern(branch: &str) -> Result<Option<&str>> {
+    let (name, expected_arguments) = if branch.starts_with("id(") {
+        ("id", 1)
+    } else if branch.starts_with("key(") {
+        ("key", 2)
+    } else {
+        return Ok(None);
+    };
+    let open = name.len();
+    let Some(close) = matching_delimiter(branch, open, '(', ')') else {
+        return Err(invalid_match_pattern(branch));
+    };
+    let arguments = split_top_level(&branch[open + 1..close], ',');
+    if arguments.len() != expected_arguments
+        || arguments.iter().any(|value| !is_xpath_literal(value))
+    {
+        return Err(invalid_match_pattern(branch));
+    }
+    Ok(Some(branch[close + 1..].trim()))
+}
+
+fn split_pattern_steps(source: &str) -> Option<Vec<&str>> {
+    if source.trim().is_empty() {
+        return None;
+    }
+    let mut steps = Vec::new();
+    let mut start = 0usize;
+    let mut brackets = 0usize;
+    let mut parentheses = 0usize;
+    let mut quote = None;
+    let mut characters = source.char_indices().peekable();
+    while let Some((index, character)) = characters.next() {
+        if let Some(active) = quote {
+            if character == active {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '[' => brackets = brackets.checked_add(1)?,
+            ']' => brackets = brackets.checked_sub(1)?,
+            '(' => parentheses = parentheses.checked_add(1)?,
+            ')' => parentheses = parentheses.checked_sub(1)?,
+            '/' if brackets == 0 && parentheses == 0 => {
+                let step = source[start..index].trim();
+                if step.is_empty() {
+                    return None;
+                }
+                steps.push(step);
+                if characters.peek().is_some_and(|(_, next)| *next == '/') {
+                    let (second, _) = characters.next().expect("peeked path separator exists");
+                    start = second + 1;
+                } else {
+                    start = index + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    if quote.is_some() || brackets != 0 || parentheses != 0 {
+        return None;
+    }
+    let final_step = source[start..].trim();
+    if final_step.is_empty() {
+        return None;
+    }
+    steps.push(final_step);
+    Some(steps)
+}
+
+fn valid_pattern_step(step: &str) -> bool {
+    let predicate_start = first_top_level_character(step, '[').unwrap_or(step.len());
+    let node_test = step[..predicate_start].trim();
+    if !valid_pattern_node_test(node_test) {
+        return false;
+    }
+    let mut remainder = step[predicate_start..].trim();
+    while !remainder.is_empty() {
+        if !remainder.starts_with('[') {
+            return false;
+        }
+        let Some(close) = matching_delimiter(remainder, 0, '[', ']') else {
+            return false;
+        };
+        if remainder[1..close].trim().is_empty() {
+            return false;
+        }
+        remainder = remainder[close + 1..].trim();
+    }
+    true
+}
+
+fn valid_pattern_node_test(node_test: &str) -> bool {
+    let normalized = normalize_xpath_for_sxd(node_test);
+    let node_test = normalized.as_str();
+    let (node_test, explicit_axis) = match node_test.split_once("::") {
+        Some((axis, test)) if matches!(axis.trim(), "child" | "attribute") => (test.trim(), true),
+        Some(_) => return false,
+        None => (node_test, false),
+    };
+    if explicit_axis && node_test.starts_with('@') {
+        return false;
+    }
+    let node_test = node_test.strip_prefix('@').unwrap_or(node_test);
+    if node_test == "*" || is_lexical_qname(node_test) {
+        return true;
+    }
+    if node_test.strip_suffix(":*").is_some_and(is_ncname) {
+        return true;
+    }
+    ["node()", "text()", "comment()"].contains(&node_test)
+        || node_test == "processing-instruction()"
+        || node_test
+            .strip_prefix("processing-instruction(")
+            .and_then(|value| value.strip_suffix(')'))
+            .is_some_and(is_xpath_literal)
+}
+
+fn first_top_level_character(source: &str, needle: char) -> Option<usize> {
+    let mut parentheses = 0usize;
+    let mut quote = None;
+    for (index, character) in source.char_indices() {
+        if let Some(active) = quote {
+            if character == active {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '(' => parentheses += 1,
+            ')' => parentheses = parentheses.saturating_sub(1),
+            _ if character == needle && parentheses == 0 => return Some(index),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn matching_delimiter(source: &str, open: usize, left: char, right: char) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote = None;
+    for (index, character) in source.char_indices().filter(|(index, _)| *index >= open) {
+        if let Some(active) = quote {
+            if character == active {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            value if value == left => depth += 1,
+            value if value == right => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level(source: &str, separator: char) -> Vec<&str> {
+    let mut output = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut quote = None;
+    for (index, character) in source.char_indices() {
+        if let Some(active) = quote {
+            if character == active {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = depth.saturating_sub(1),
+            value if value == separator && depth == 0 => {
+                output.push(source[start..index].trim());
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    output.push(source[start..].trim());
+    output
+}
+
+fn is_xpath_literal(value: &str) -> bool {
+    let value = value.trim();
+    value.len() >= 2
+        && ((value.starts_with('\'') && value.ends_with('\''))
+            || (value.starts_with('"') && value.ends_with('"')))
+}
+
+fn invalid_match_pattern(pattern: &str) -> Error {
+    Error::Static(format!(
+        "invalid XSLT 1.0 match pattern `{pattern}`: expected a Pattern location path"
+    ))
 }
 
 impl NameTest {

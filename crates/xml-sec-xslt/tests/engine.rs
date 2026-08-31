@@ -592,6 +592,59 @@ fn document_function_uses_node_module_and_explicit_base_uris() {
 }
 
 #[test]
+fn document_function_preserves_an_explicitly_missing_base_uri() {
+    // Supplying a second-argument node with no base is distinct from omitting that argument;
+    // the stylesheet module base must not silently replace the explicit absence.
+    let resolver = Arc::new(ContextResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            ("relative.xml".into(), None),
+            ResolvedResource {
+                canonical_uri: "memory:relative.xml".into(),
+                identity: ResourceIdentity("relative-without-base".into()),
+                bytes: b"<doc>resolved without base</doc>".to_vec(),
+                media_type: Some("application/xml".into()),
+                encoding: Some("UTF-8".into()),
+            },
+        );
+    let stylesheet = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="document('relative.xml', root/base)/doc"/></xsl:template></xsl:stylesheet>"#,
+        Some("memory:main.xsl"),
+    )
+    .expect("stylesheet compiles");
+    let output = stylesheet
+        .execute(
+            &Document::parse("<root><base/></root>", None).expect("source parses"),
+            &Parameters::new(),
+            resolver.clone(),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("explicitly absent base resolves without fallback");
+    assert_eq!(output.serialized.bytes, b"resolved without base");
+    assert!(
+        resolver
+            .calls
+            .lock()
+            .expect("test resolver mutex is not poisoned")
+            .iter()
+            .any(|(href, base, purpose)| href == "relative.xml"
+                && base.is_none()
+                && *purpose == ResolvePurpose::Document)
+    );
+}
+
+#[test]
 fn import_precedence_overrides_but_include_keeps_equal_precedence() {
     // Imports are weaker than the importing module; includes are textual and therefore equal.
     let resolver = Arc::new(MemoryResolver::default());
@@ -2113,6 +2166,40 @@ fn execution_budgets_abort_sorting_and_charge_result_payloads() {
 }
 
 #[test]
+fn numeric_sort_workspace_is_metered_before_allocation() {
+    // Numeric keys have no string payload, but their structural vectors and merge buffers are
+    // still attacker-sized execution-owned allocations.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:for-each select="root/item"><xsl:sort select="@a" data-type="number"/><xsl:sort select="@b" data-type="number"/><xsl:value-of select="@a"/></xsl:for-each></xsl:template></xsl:stylesheet>"#,
+    );
+    let xml = format!(
+        "<root>{}</root>",
+        (0..1024)
+            .map(|index| format!(r#"<item a="{index}" b="{}"/>"#, 1024 - index))
+            .collect::<String>()
+    );
+    let source = Document::parse(&xml, None).expect("source parses");
+    let mut budget = execution_budget(xml.len());
+    budget.owned_bytes = 2_200_000;
+    assert!(matches!(
+        stylesheet.execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn xinclude_fallback_never_swallows_security_budget_failures() {
     // Fallback handles resource availability, not operation-wide budget exhaustion.
     let resolver = Arc::new(MemoryResolver::default());
@@ -3069,9 +3156,21 @@ fn text_output_rejects_characters_unrepresentable_in_its_encoding() {
 
 #[test]
 fn optimized_translate_uses_the_first_duplicate_mapping() {
-    // XPath translate() assigns each source character by its first position in the map string.
-    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:param name="from" select="'aa'"/><xsl:param name="to" select="'xy'"/><xsl:template match="/"><xsl:apply-templates select="root/item"/></xsl:template><xsl:template match="item"><xsl:value-of select="translate(., $from, $to)"/></xsl:template></xsl:stylesheet>"#;
-    assert_eq!(execute(stylesheet, "<root><item>a</item></root>"), "x");
+    // XPath translate() assigns by source position, then keeps only the first mapping for a
+    // duplicate source character; the duplicate still consumes its target position.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:param name="from" select="'abac'"/><xsl:param name="to" select="'WXYZ'"/><xsl:template match="/"><xsl:apply-templates select="root/item"/></xsl:template><xsl:template match="item"><xsl:value-of select="translate(., $from, $to)"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<root><item>ac</item></root>"), "WZ");
+}
+
+#[test]
+fn temporary_result_trees_isolate_attribute_insertion_state() {
+    // An attribute-set insertion cursor belongs to the outer element; nested variable trees start
+    // with an independent empty attribute sequence and must not inherit that cursor.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:attribute-set name="attrs"><xsl:attribute name="first">one</xsl:attribute><xsl:attribute name="second"><xsl:variable name="fragment"><tmp><xsl:attribute name="nested">x</xsl:attribute></tmp></xsl:variable><xsl:value-of select="$fragment"/></xsl:attribute></xsl:attribute-set><xsl:template match="/"><out existing="yes" xsl:use-attribute-sets="attrs"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<source/>"),
+        "<out first=\"one\" second=\"\" existing=\"yes\"/>\n"
+    );
 }
 
 #[test]
@@ -3960,6 +4059,32 @@ fn xslt_10_patterns_reject_variable_references_statically() {
         Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
             .compile(stylesheet, None),
         Err(Error::Static(message)) if message.contains("variable") && message.contains("match")
+    ));
+}
+
+#[test]
+fn xslt_10_patterns_reject_general_xpath_expressions_statically() {
+    // A match attribute uses the restricted Pattern grammar, not the general XPath Expr grammar.
+    for pattern in ["item + 1", "count(item)", "item and other", "(item)"] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="{pattern}"/></xsl:stylesheet>"#
+        );
+        assert!(matches!(
+            Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+                .compile(&stylesheet, None),
+            Err(Error::Static(message)) if message.contains("match pattern")
+        ));
+    }
+
+    compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="item | @id | child :: branch/leaf[@active='yes'] | id ('root')//value | key ('kind', 'x')/entry | processing-instruction ('target')"/></xsl:stylesheet>"#,
+    );
+
+    let invalid_axis = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="child::@id"/></xsl:stylesheet>"#;
+    assert!(matches!(
+        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+            .compile(invalid_axis, None),
+        Err(Error::Static(message)) if message.contains("match pattern")
     ));
 }
 
