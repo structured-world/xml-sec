@@ -1978,8 +1978,8 @@ fn parser_preserves_base_and_lexical_names_across_depths() {
 }
 
 #[test]
-fn parser_threshold_preserves_xpath_namespace_and_id_behavior() {
-    // Public parsing across the depth-based switch must feed XPath the same leaf semantics.
+fn iterative_parser_preserves_xpath_namespace_and_id_behavior_at_depth_boundaries() {
+    // Historically significant depth boundaries must feed XPath identical leaf semantics.
     let stylesheet = compile(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:p="urn:leaf"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(//p:leaf)"/><xsl:text>|</xsl:text><xsl:value-of select="count(id('target'))"/><xsl:text>|</xsl:text><xsl:value-of select="//p:leaf/@p:value"/></xsl:template></xsl:stylesheet>"#,
     );
@@ -4747,6 +4747,31 @@ fn literal_result_stylesheet_versions_use_numeric_xslt_semantics() {
 }
 
 #[test]
+fn byte_entry_points_share_strict_non_utf8_xml_decoding() {
+    // Stylesheet and source byte APIs use one decoder before their distinct
+    // compiler and runtime semantic paths.
+    let stylesheet = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><xsl:stylesheet version=\"1.0\" xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\"><xsl:output method=\"text\"/><xsl:template match=\"/\"><xsl:value-of select=\"root\"/></xsl:template></xsl:stylesheet>";
+    let compiled = Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+        .compile_bytes(stylesheet, None)
+        .expect("Latin-1 stylesheet bytes compile");
+    let source = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><root>caf\xe9</root>";
+    let document = Document::parse_bytes(source, None).expect("Latin-1 source bytes parse");
+    let result = compiled
+        .execute(
+            &document,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(4096),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("decoded source transforms");
+    assert_eq!(result.serialized.bytes, b"caf\xc3\xa9");
+}
+
+#[test]
 fn literal_extension_attributes_do_not_change_instruction_semantics() {
     // An unqualified attribute on a literal result element is copied, not interpreted as XSLT.
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:e="urn:extension"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><out extension-element-prefixes="e"><e:item/></out></xsl:template></xsl:stylesheet>"#;
@@ -4783,6 +4808,42 @@ fn for_each_clears_the_current_template_rule() {
     )
     .compile(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:import href="base.xsl"/><xsl:template match="/"><xsl:for-each select="root/item"><xsl:apply-imports/></xsl:for-each></xsl:template></xsl:stylesheet>"#,
+        Some("memory:main.xsl"),
+    )
+    .expect("stylesheet compiles");
+    assert!(matches!(
+        stylesheet.execute(
+            &Document::parse("<root><item/></root>", None).expect("source parses"),
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Dynamic(message)) if message.contains("current template rule")
+    ));
+}
+
+#[test]
+fn captured_for_each_clears_the_current_template_rule() {
+    // Captured instruction bodies must enforce the same current-rule semantics as normal output.
+    let resolver = Arc::new(MemoryResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            "base.xsl".into(),
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="item">wrong</xsl:template></xsl:stylesheet>"#.into(),
+        );
+    let stylesheet = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:import href="base.xsl"/><xsl:template match="/"><xsl:message><xsl:for-each select="root/item"><xsl:apply-imports/></xsl:for-each></xsl:message></xsl:template></xsl:stylesheet>"#,
         Some("memory:main.xsl"),
     )
     .expect("stylesheet compiles");
@@ -4870,6 +4931,10 @@ fn xinclude_remaps_caller_nodeset_parameters() {
     };
     let mut parameters = Parameters::new();
     parameters.insert(
+        ExpandedName::new(None::<String>, "root"),
+        Value::NodeSet(vec![NodeReference::Node(source.root())]),
+    );
+    parameters.insert(
         ExpandedName::new(None::<String>, "node"),
         Value::NodeSet(vec![NodeReference::Node(target)]),
     );
@@ -4888,7 +4953,7 @@ fn xinclude_remaps_caller_nodeset_parameters() {
         }]),
     );
     let stylesheet = compile(
-        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:param name="node"/><xsl:param name="attribute"/><xsl:param name="namespace"/><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="$node"/><xsl:text>|</xsl:text><xsl:value-of select="$attribute"/><xsl:text>|</xsl:text><xsl:value-of select="$namespace"/></xsl:template></xsl:stylesheet>"#,
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:param name="root"/><xsl:param name="node"/><xsl:param name="attribute"/><xsl:param name="namespace"/><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count($root)"/><xsl:text>|</xsl:text><xsl:value-of select="$node"/><xsl:text>|</xsl:text><xsl:value-of select="$attribute"/><xsl:text>|</xsl:text><xsl:value-of select="$namespace"/></xsl:template></xsl:stylesheet>"#,
     );
     let result = stylesheet
         .execute_with_source_processing(
@@ -4903,7 +4968,7 @@ fn xinclude_remaps_caller_nodeset_parameters() {
             SourceProcessing::XInclude,
         )
         .expect("XInclude parameter remapping executes");
-    assert_eq!(result.serialized.bytes, b"ok|v|urn:p");
+    assert_eq!(result.serialized.bytes, b"1|ok|v|urn:p");
 }
 
 struct EncodedDocumentResolver {
@@ -4937,9 +5002,13 @@ fn document_function_decodes_non_utf8_resources() {
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="document('encoded.xml')/root"/></xsl:template></xsl:stylesheet>"#,
     );
     let latin1 = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><root>caf\xe9</root>".to_vec();
-    let utf16le = "<?xml version=\"1.0\"?><root>λ</root>"
-        .encode_utf16()
-        .flat_map(u16::to_le_bytes)
+    let utf16le = [0xff, 0xfe]
+        .into_iter()
+        .chain(
+            "<?xml version=\"1.0\"?><root>λ</root>"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes),
+        )
         .collect::<Vec<_>>();
     let utf16be = [0xfe, 0xff]
         .into_iter()

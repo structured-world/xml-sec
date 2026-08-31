@@ -21,6 +21,7 @@ sxd-xpath-no-unsafe = { version = "0.5.1", default-features = false, features = 
 thiserror = "2"
 time = { version = "0.3.55", features = ["local-offset"] }
 url = "2"
+xml-sec-xml-input = { version = "0.1.0", path = "../xml-sec-xml-input" }
 
 [dev-dependencies]
 pretty_assertions = "1"

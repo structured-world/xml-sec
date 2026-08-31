@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{collections::HashSet, ops::Range};
 
-use encoding_rs::Encoding;
 use xml_sec_xslt::{
     Attribute, BudgetKind, CompileBudget, Compiler, Document, Error, ExecutionBudget,
     ExecutionOptions, ExpandedName, Parameters, ResolvePurpose, ResolvedResource, Resolver,
@@ -158,7 +157,10 @@ impl Resolver for CorpusResolver {
             )),
             bytes,
             media_type: None,
-            encoding: Some("UTF-8".into()),
+            // Donor modules use non-standard extensions such as `.imp` while
+            // remaining XML entities. Their declarations, not the path suffix,
+            // select the original byte encoding.
+            encoding: None,
         })
     }
 }
@@ -201,27 +203,9 @@ fn execution_budget() -> ExecutionBudget {
 
 fn read_xml(path: &Path) -> xml_sec_xslt::Result<String> {
     let bytes = std::fs::read(path).map_err(|error| Error::Xml(format!("input: {error}")))?;
-    let encoding = Encoding::for_bom(&bytes)
-        .map(|(encoding, _)| encoding)
-        .or_else(|| {
-            let prefix = String::from_utf8_lossy(&bytes[..bytes.len().min(256)]);
-            let declaration = prefix.strip_prefix("<?xml")?.split_once("?>")?.0;
-            let value = declaration.split_once("encoding")?.1.trim_start();
-            let value = value.strip_prefix('=')?.trim_start();
-            let quote = value.chars().next()?;
-            let label = value.strip_prefix(quote)?.split_once(quote)?.0;
-            Encoding::for_label(label.as_bytes())
-        })
-        .unwrap_or(encoding_rs::UTF_8);
-    let (decoded, _, had_errors) = encoding.decode(&bytes);
-    if had_errors {
-        return Err(Error::Xml(format!(
-            "{} contains invalid {} bytes",
-            path.display(),
-            encoding.name()
-        )));
-    }
-    Ok(decoded.into_owned())
+    xml_sec_xml_input::decode_xml(&bytes, None)
+        .map(|xml| xml.into_owned())
+        .map_err(|error| Error::Xml(format!("{}: {error}", path.display())))
 }
 
 fn execute(case: &Case) -> xml_sec_xslt::Result<xml_sec_xslt::TransformResult> {

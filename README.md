@@ -32,10 +32,12 @@ XML Security in pure Rust, built to replace libxmlsec1.
 libxmlsec1 is the established XML Security implementation, but its native dependency stack adds
 libxml2, a crypto backend, platform packages, and cross-compilation work to every deployment.
 
-`xml-sec` rebuilds that functionality on memory-safe Rust foundations: a bounded `quick-xml`
-preflight before DOM allocation, one feature-selected XML parser projected into a shared semantic
-arena for C14N/XPath/mutation, `quick-xml` for writing, RustCrypto for cryptography, and
-`x509-parser` for certificates. One Cargo dependency, no system XML or crypto libraries.
+`xml-sec` rebuilds that functionality on memory-safe Rust foundations: one strict, bounded XML
+byte-decoding boundary; a feature-selected semantic parser projected into a shared arena for
+C14N, XPath, and mutation; RustCrypto for cryptography; and `x509-parser` for certificates.
+`quick-xml` is an internal lexical tokenizer/writer only: its types, encoding limitations, and
+tree semantics do not define the public XML contract. One Cargo dependency, no system XML or
+crypto libraries.
 
 ## Install
 
@@ -62,6 +64,12 @@ rejects byte, node, and depth limits before either backend allocates its DOM; st
 internal-entity traversal consumes the same cumulative parse-work budget. The `xmloxide` adapter
 adds a lexical position sidecar because its native tree does not retain the source ranges required
 for namespace-correct mutation.
+
+Raw-byte entry points accept XML encodings selected by BOM, XML byte signature, declaration, or
+trusted resolver metadata. UTF-8 stays borrowed when possible; supported non-UTF-8 input is
+strictly transcoded under the same materialization ceiling and normalized before either semantic
+backend runs. Conflicting declarations, malformed byte sequences, ambiguous BOM-less UTF-16,
+UTF-32, and EBCDIC fail explicitly rather than falling back to lossy text.
 
 ```toml
 xml-sec = { version = "0.1", default-features = false, features = ["xmldsig", "c14n", "xml-backend-roxmltree"] }
@@ -143,6 +151,11 @@ without depending on XMLDSig, XMLEnc, cryptography, or system libraries.
 Its `ExecutionEnvironment` makes resolver access, operation time, and extension
 permissions explicit; callers can inject a fixed clock or reject nondeterministic
 EXSLT date functions for reproducible security transforms.
+
+[`xml-sec-xml-input`](crates/xml-sec-xml-input) is the small shared byte-to-Unicode trust
+boundary used by the core and XSLT resolver paths. Keeping detection and strict transcoding in
+one crate prevents parser-specific encoding behavior from diverging while preserving independent
+semantic parser implementations.
 
 The engine remains a separate architectural boundary. Runtime external-document
 resolution and the `xml-sec` XMLDSig transform adapter are subsequent integration

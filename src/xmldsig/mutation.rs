@@ -69,7 +69,7 @@ pub enum XmlMutationError {
     Document(#[from] XmlDocumentError),
     /// The streaming XML reader failed.
     #[error("XML read error: {0}")]
-    Read(#[from] quick_xml::Error),
+    Read(String),
     /// The streaming XML writer failed.
     #[error("XML write error: {0}")]
     Write(#[from] std::io::Error),
@@ -110,6 +110,12 @@ pub enum XmlMutationError {
         /// The expanded-name local component of the conflicting attribute.
         name: String,
     },
+}
+
+impl From<quick_xml::Error> for XmlMutationError {
+    fn from(error: quick_xml::Error) -> Self {
+        Self::Read(error.to_string())
+    }
 }
 
 /// Append a generated XMLDSig `<Signature>` template as the last child of the
@@ -1155,7 +1161,7 @@ fn fill_dsig_values_matching(
     if let Some(budget) = budget {
         budget.charge_policy(xml.len())?;
     }
-    let mut reader = NsReader::from_str(xml);
+    let mut reader = mutation_namespace_reader(xml);
     let mut writer = Writer::new(Vec::new());
     let mut buf = Vec::new();
     let mut value_index = 0usize;
@@ -1266,7 +1272,7 @@ fn fill_dsig_element_raw_matching(
     policy: Option<&crate::policy::SigningPolicy>,
     mut should_replace: impl FnMut(&[(bool, String, Option<usize>)], &ResolveResult<'_>) -> bool,
 ) -> Result<String, XmlMutationError> {
-    let mut reader = NsReader::from_str(xml);
+    let mut reader = mutation_namespace_reader(xml);
     let mut writer = Writer::new(Vec::new());
     let mut buf = Vec::new();
     let mut replacing_depth: Option<usize> = None;
@@ -1357,6 +1363,17 @@ fn fill_dsig_element_raw_matching(
     let output = String::from_utf8(writer.into_inner())?;
     parse_mutation_xml_with_options(&output, policy)?;
     Ok(output)
+}
+
+fn mutation_namespace_reader(xml: &str) -> NsReader<&[u8]> {
+    let mut reader = NsReader::from_str(xml);
+    // Shared lexical preflight already enforces this absolute ceiling. Match
+    // quick-xml's secondary resolver guard to that contract instead of its
+    // stricter library default, which would make mutation backend-dependent.
+    reader
+        .resolver_mut()
+        .set_max_namespace_bindings(crate::hard_limits::XML_NAMESPACE_BINDING_CEILING);
+    reader
 }
 
 fn validate_signature_template(
@@ -1790,6 +1807,42 @@ mod tests {
             .find(|node| node.has_tag_name((XMLDSIG_NS, "DigestValue")))
             .expect("DigestValue");
         assert_eq!(digest_value.text(), None);
+    }
+
+    #[test]
+    fn mutation_enforces_the_backend_neutral_namespace_ceiling() {
+        // The shared preflight and quick-xml's streaming resolver must enforce
+        // the same active-binding ceiling rather than diverging after parse.
+        let declarations = (0..1_023)
+            .map(|index| format!(r#" xmlns:n{index}="urn:namespace:{index}""#))
+            .collect::<String>();
+        let xml = format!(
+            r#"<root{declarations}><ds:Signature xmlns:ds="{XMLDSIG_NS}"><ds:SignedInfo/><ds:SignatureValue/></ds:Signature></root>"#
+        );
+
+        let filled = fill_signature_value(&xml, "signature")
+            .expect("validated namespace bindings must remain mutable");
+        let document = dom::Document::parse(&filled).expect("parse output");
+        let signature_value = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "SignatureValue")))
+            .expect("SignatureValue");
+        assert_eq!(signature_value.text(), Some("signature"));
+
+        let excessive_declarations =
+            format!(r#"{declarations} xmlns:overflow="urn:namespace:overflow""#);
+        let excessive = format!(
+            r#"<root{excessive_declarations}><ds:Signature xmlns:ds="{XMLDSIG_NS}"><ds:SignedInfo/><ds:SignatureValue/></ds:Signature></root>"#
+        );
+        let error = fill_signature_value(&excessive, "signature")
+            .expect_err("1025 active namespace bindings must fail during shared preflight");
+        assert!(matches!(
+            error,
+            XmlMutationError::XmlParse(dom::ParseError::NamespaceBindingLimitReached {
+                maximum: 1_024,
+                actual: 1_025,
+            })
+        ));
     }
 
     #[test]

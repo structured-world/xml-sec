@@ -11,7 +11,7 @@ use crate::budget::Meter;
 use crate::compiler::{DecimalFormat, Expression, NameTest, Pattern, normalize_xpath_for_sxd};
 use crate::expression::innermost_namespaced_call;
 use crate::lexical::is_ncname;
-use crate::resolver::{decode_resource, decoded_resource_len};
+use crate::resolver::decode_resource;
 use crate::runtime::{SourceProcessing, apply_whitespace_rules};
 use crate::{
     BudgetKind, Clock, Document, Error, ErrorKind, ExpandedName, ExtensionPolicy, NodeId, NodeKind,
@@ -2059,7 +2059,7 @@ fn expand_xinclude_document(
         .node(source.root())
         .and_then(|node| node.base_uri.clone());
     let mut output = Document::empty(base_uri);
-    let mut principal_mapping = HashMap::new();
+    let mut principal_mapping = HashMap::from([(source.root(), output.root())]);
     let mut pending = source
         .node(source.root())
         .into_iter()
@@ -2247,14 +2247,28 @@ fn decode_resource_metered(
     meter: &mut Meter,
     parsed_xml: bool,
 ) -> Result<String> {
-    let decoded_len = decoded_resource_len(bytes, encoding)?;
     // XML parsing retains one decoded source copy while the decoder's output is still live.
     let decoded_copies = if parsed_xml { 2 } else { 1 };
+    let (used, limit) = meter.usage(BudgetKind::OwnedBytes)?;
+    let available = limit.saturating_sub(used).saturating_sub(bytes.len());
+    let maximum_decoded = available / decoded_copies;
+    let decoded = decode_resource(bytes, encoding, parsed_xml, maximum_decoded).map_err(
+        |error| match error {
+            xml_sec_xml_input::Error::DecodedLimit { actual, .. } => Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                limit,
+                actual: used
+                    .saturating_add(bytes.len())
+                    .saturating_add(actual.saturating_mul(decoded_copies)),
+            },
+            error => Error::Xml(error.to_string()),
+        },
+    )?;
     let retained = bytes
         .len()
-        .saturating_add(decoded_len.saturating_mul(decoded_copies));
+        .saturating_add(decoded.len().saturating_mul(decoded_copies));
     meter.charge(BudgetKind::OwnedBytes, retained)?;
-    decode_resource(bytes, encoding)
+    Ok(decoded)
 }
 
 struct NodeMaps {

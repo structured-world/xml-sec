@@ -32,6 +32,8 @@ impl LexicalPreflight {
         let mut reader = Reader::from_str(input);
         let mut nodes: Vec<SourceNode> = Vec::new();
         let mut elements = Vec::new();
+        let mut namespace_scopes = Vec::new();
+        let mut active_namespace_bindings = 0usize;
         #[cfg(feature = "xml-backend-roxmltree")]
         let mut doctype = None;
         loop {
@@ -42,18 +44,35 @@ impl LexicalPreflight {
             })?;
             let end = source_offset(reader.buffer_position())?;
             match event {
-                Event::Start(_) => {
+                Event::Start(element) => {
                     let depth = elements.len() + 1;
                     enforce_depth(depth)?;
+                    let declarations = namespace_declaration_count(&element)?;
+                    active_namespace_bindings = active_namespace_bindings
+                        .checked_add(declarations)
+                        .ok_or(ParseError::NamespaceBindingLimitReached {
+                            maximum: crate::hard_limits::XML_NAMESPACE_BINDING_CEILING,
+                            actual: usize::MAX,
+                        })?;
+                    enforce_namespace_bindings(active_namespace_bindings)?;
                     let index = nodes.len();
                     nodes.push(SourceNode {
                         kind: SourceKind::Element,
                         range: start..end,
                     });
                     elements.push(index);
+                    namespace_scopes.push(declarations);
                 }
-                Event::Empty(_) => {
+                Event::Empty(element) => {
                     enforce_depth(elements.len() + 1)?;
+                    let declarations = namespace_declaration_count(&element)?;
+                    let active = active_namespace_bindings.checked_add(declarations).ok_or(
+                        ParseError::NamespaceBindingLimitReached {
+                            maximum: crate::hard_limits::XML_NAMESPACE_BINDING_CEILING,
+                            actual: usize::MAX,
+                        },
+                    )?;
+                    enforce_namespace_bindings(active)?;
                     nodes.push(SourceNode {
                         kind: SourceKind::Element,
                         range: start..end,
@@ -62,6 +81,9 @@ impl LexicalPreflight {
                 Event::End(_) => {
                     if let Some(index) = elements.pop() {
                         nodes[index].range.end = end;
+                    }
+                    if let Some(declarations) = namespace_scopes.pop() {
+                        active_namespace_bindings -= declarations;
                     }
                 }
                 // Both supported DOMs omit whitespace outside the document
@@ -163,6 +185,43 @@ fn enforce_depth(actual: usize) -> Result<(), ParseError> {
     } else {
         Ok(())
     }
+}
+
+fn enforce_namespace_bindings(actual: usize) -> Result<(), ParseError> {
+    let maximum = crate::hard_limits::XML_NAMESPACE_BINDING_CEILING;
+    if actual > maximum {
+        Err(ParseError::NamespaceBindingLimitReached { maximum, actual })
+    } else {
+        Ok(())
+    }
+}
+
+fn namespace_declaration_count(
+    element: &quick_xml::events::BytesStart<'_>,
+) -> Result<usize, ParseError> {
+    element
+        .attributes()
+        .map(|attribute| {
+            attribute
+                .map(|attribute| {
+                    let name = attribute.key.as_ref();
+                    usize::from(name == "xmlns" || name.starts_with("xmlns:"))
+                })
+                .map_err(|error| ParseError::Backend {
+                    backend: "xml-preflight",
+                    message: error.to_string(),
+                })
+        })
+        .try_fold(0usize, |count, declaration| {
+            declaration.and_then(|declaration| {
+                count
+                    .checked_add(declaration)
+                    .ok_or(ParseError::NamespaceBindingLimitReached {
+                        maximum: crate::hard_limits::XML_NAMESPACE_BINDING_CEILING,
+                        actual: usize::MAX,
+                    })
+            })
+        })
 }
 
 fn push_text_position(nodes: &mut Vec<SourceNode>, range: Range<usize>) {

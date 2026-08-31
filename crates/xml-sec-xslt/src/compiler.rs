@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::budget::ensure;
 use crate::expression::innermost_namespaced_call;
 use crate::lexical::{is_ncname, unicode_decimal_value};
-use crate::resolver::{decode_resource, decoded_resource_len};
+use crate::resolver::decode_resource;
 use crate::{
     BudgetKind, CompileBudget, Document, Error, ExpandedName, Namespace, OutputDefinition,
     OutputMethod, ResolvePurpose, ResolvedResource, Resolver, ResourceIdentity, Result,
@@ -44,6 +44,18 @@ impl<R: Resolver> Compiler<R> {
         stylesheet.principal_document = principal_document;
         stylesheet.principal_base_uri = base_uri.map(str::to_owned);
         Ok(stylesheet)
+    }
+
+    /// Decode and compile a complete stylesheet graph from external XML bytes.
+    pub fn compile_bytes(&self, bytes: &[u8], base_uri: Option<&str>) -> Result<Stylesheet> {
+        ensure(
+            BudgetKind::StylesheetBytes,
+            self.budget.stylesheet_bytes,
+            bytes.len(),
+        )?;
+        let xml = xml_sec_xml_input::decode_xml_bounded(bytes, None, self.budget.stylesheet_bytes)
+            .map_err(|error| Error::Xml(error.to_string()))?;
+        self.compile(&xml, base_uri)
     }
 
     fn compile_module(
@@ -1990,9 +2002,18 @@ impl CompileContext {
 }
 
 fn resource_source(resource: &ResolvedResource, state: &mut CompileState) -> Result<String> {
-    let decoded_len = decoded_resource_len(&resource.bytes, resource.encoding.as_deref())?;
-    state.charge_owned(decoded_len)?;
-    decode_resource(&resource.bytes, resource.encoding.as_deref())
+    let maximum = state.budget.owned_bytes.saturating_sub(state.owned_bytes);
+    let decoded = decode_resource(&resource.bytes, resource.encoding.as_deref(), true, maximum)
+        .map_err(|error| match error {
+            xml_sec_xml_input::Error::DecodedLimit { actual, .. } => Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                limit: state.budget.owned_bytes,
+                actual: state.owned_bytes.saturating_add(actual),
+            },
+            error => Error::Xml(error.to_string()),
+        })?;
+    state.charge_owned(decoded.len())?;
+    Ok(decoded)
 }
 
 fn parse_semantic_document_metered(
@@ -2053,27 +2074,13 @@ fn effective_base_uri(
     ancestors.reverse();
     for ancestor in ancestors {
         if let Some(reference) = ancestor.attribute((XML_NS, "base")) {
-            base = Some(resolve_uri_reference(base.as_deref(), reference)?);
+            base = Some(crate::resolver::resolve_uri_reference(
+                base.as_deref(),
+                reference,
+            )?);
         }
     }
     Ok(base)
-}
-
-fn resolve_uri_reference(base: Option<&str>, reference: &str) -> Result<String> {
-    if let Ok(absolute) = url::Url::parse(reference) {
-        return Ok(absolute.to_string());
-    }
-    if let Some(base) = base {
-        if let Ok(base) = url::Url::parse(base)
-            && let Ok(joined) = base.join(reference)
-        {
-            return Ok(joined.to_string());
-        }
-        if let Some((directory, _)) = base.rsplit_once('/') {
-            return Ok(format!("{directory}/{reference}"));
-        }
-    }
-    Ok(reference.to_owned())
 }
 
 fn compile_sequence<'a>(

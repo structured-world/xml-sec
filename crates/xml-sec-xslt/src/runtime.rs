@@ -1327,14 +1327,8 @@ impl<'a> Execution<'a> {
                 let total = nodes.len();
                 for (index, selected) in nodes.iter().enumerate() {
                     self.scopes.push(HashMap::new());
-                    let result = self.execute_sequence(
-                        body,
-                        selected,
-                        index + 1,
-                        total,
-                        depth + 1,
-                        current_precedence,
-                    );
+                    let result =
+                        self.execute_sequence(body, selected, index + 1, total, depth + 1, None);
                     self.scopes.pop();
                     result?
                 }

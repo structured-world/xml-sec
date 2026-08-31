@@ -5,9 +5,8 @@ use crate::{Error, Result};
 
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
-// Keep the streaming fallback aligned with roxmltree's entity-expansion safety ceilings.
+// Keep the iterative parser aligned with roxmltree's entity-expansion safety ceilings.
 const MAX_ENTITY_EXPANSION_DEPTH: usize = 10;
-const TREE_PARSER_DEPTH_LIMIT: usize = 64;
 const MAX_NESTED_ENTITY_REFERENCES: usize = 255;
 
 /// Stable index of a node inside one owned document.
@@ -119,10 +118,14 @@ impl Eq for Document {}
 impl Document {
     /// Parse caller-supplied XML into the engine semantic model.
     pub fn parse(xml: &str, base_uri: Option<&str>) -> Result<Self> {
-        if lexical_nesting_depth(xml) > TREE_PARSER_DEPTH_LIMIT {
-            return Self::parse_deep_streaming(xml, base_uri);
-        }
-        Self::parse_tree(xml, base_uri)
+        Self::parse_iterative(xml, base_uri)
+    }
+
+    /// Decode and parse caller-supplied XML bytes into the semantic model.
+    pub fn parse_bytes(bytes: &[u8], base_uri: Option<&str>) -> Result<Self> {
+        let xml = xml_sec_xml_input::decode_xml(bytes, None)
+            .map_err(|error| Error::Xml(error.to_string()))?;
+        Self::parse_iterative(&xml, base_uri)
     }
 
     // Account for heap storage materialized by Clone before duplicating the source document.
@@ -212,6 +215,7 @@ impl Document {
         bytes
     }
 
+    #[cfg(test)]
     fn parse_tree(xml: &str, base_uri: Option<&str>) -> Result<Self> {
         let parsed =
             roxmltree::Document::parse(xml).map_err(|error| Error::Xml(error.to_string()))?;
@@ -314,7 +318,10 @@ impl Document {
                 .then(|| source.attribute((XML_NS, "base")))
                 .flatten()
             {
-                Some(resolve_base_uri(inherited_base.as_deref(), reference)?)
+                Some(crate::resolver::resolve_uri_reference(
+                    inherited_base.as_deref(),
+                    reference,
+                )?)
             } else {
                 inherited_base
             };
@@ -329,9 +336,8 @@ impl Document {
         Ok(document)
     }
 
-    fn parse_deep_streaming(xml: &str, base_uri: Option<&str>) -> Result<Self> {
-        use quick_xml::Reader;
-        use quick_xml::events::Event;
+    fn parse_iterative(xml: &str, base_uri: Option<&str>) -> Result<Self> {
+        use crate::xml_events::{Event, Reader};
 
         #[derive(Clone, Copy, PartialEq, Eq)]
         enum DocumentPhase {
@@ -449,11 +455,12 @@ impl Document {
                     let parent = elements.last().expect("document frame remains present").0;
                     let inherited_base =
                         document.node(parent).and_then(|node| node.base_uri.clone());
+                    let content = pi.content().trim_start_matches([' ', '\t', '\r', '\n']);
                     let id = document.push(
                         parent,
                         NodeKind::ProcessingInstruction {
                             target: pi.target().to_owned(),
-                            value: (!pi.content().is_empty()).then(|| pi.content().to_owned()),
+                            value: (!content.is_empty()).then(|| content.to_owned()),
                         },
                         inherited_base,
                     );
@@ -979,7 +986,7 @@ fn is_xml10_character(character: char) -> bool {
 fn push_stream_element(
     document: &mut Document,
     elements: &mut Vec<(NodeId, Vec<Namespace>)>,
-    start: &quick_xml::events::BytesStart<'_>,
+    start: &crate::xml_events::BytesStart<'_>,
     empty: bool,
 ) -> Result<NodeId> {
     let parent = elements
@@ -995,7 +1002,7 @@ fn push_stream_element(
         let attribute = attribute.map_err(|error| Error::Xml(error.to_string()))?;
         let name = attribute.key.as_ref();
         let value = attribute
-            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+            .normalized_value(crate::xml_events::XmlVersion::Implicit1_0)
             .map_err(|error| Error::Xml(error.to_string()))?
             .into_owned();
         if name == "xmlns" {
@@ -1054,7 +1061,7 @@ fn push_stream_element(
     let effective_base = if let Some(attribute) = attributes.iter().find(|attribute| {
         attribute.name.namespace.as_deref() == Some(XML_NS) && attribute.name.local == "base"
     }) {
-        Some(resolve_base_uri(
+        Some(crate::resolver::resolve_uri_reference(
             inherited_base.as_deref(),
             &attribute.value,
         )?)
@@ -1364,12 +1371,6 @@ fn expand_entity_references(
             && let name = &tail[1..end]
             && let Some(replacement) = entities.get(name)
         {
-            let mut top_level_references = 0;
-            let references = if depth == 0 {
-                &mut top_level_references
-            } else {
-                &mut *references
-            };
             *references += 1;
             if depth >= MAX_ENTITY_EXPANSION_DEPTH || *references > MAX_NESTED_ENTITY_REFERENCES {
                 return Err(Error::Xml(format!(
@@ -1395,49 +1396,7 @@ fn expand_entity_references(
     Ok(output)
 }
 
-fn lexical_nesting_depth(xml: &str) -> usize {
-    let bytes = xml.as_bytes();
-    let mut cursor = 0usize;
-    let mut depth = 0usize;
-    let mut maximum = 0usize;
-    while let Some(relative) = xml[cursor..].find('<') {
-        let start = cursor + relative;
-        if bytes.get(start + 1) == Some(&b'/') {
-            depth = depth.saturating_sub(1);
-        }
-        let mut end = start + 1;
-        let mut quote = None;
-        while end < bytes.len() {
-            let byte = bytes[end];
-            if let Some(active) = quote {
-                if byte == active {
-                    quote = None;
-                }
-            } else if matches!(byte, b'\'' | b'"') {
-                quote = Some(byte);
-            } else if byte == b'>' {
-                break;
-            }
-            end += 1;
-        }
-        if end == bytes.len() {
-            break;
-        }
-        let marker = bytes.get(start + 1).copied();
-        let self_closing = bytes[start + 1..end]
-            .iter()
-            .rev()
-            .find(|byte| !byte.is_ascii_whitespace())
-            == Some(&b'/');
-        if !matches!(marker, Some(b'/' | b'!' | b'?')) && !self_closing {
-            depth = depth.saturating_add(1);
-            maximum = maximum.max(depth);
-        }
-        cursor = end + 1;
-    }
-    maximum
-}
-
+#[cfg(test)]
 fn lexical_prefix(xml: &str, offset: usize, local: &str) -> Option<String> {
     let tail = xml.get(offset..)?;
     let start = tail.find('<')? + 1;
@@ -1450,6 +1409,7 @@ fn lexical_prefix(xml: &str, offset: usize, local: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+#[cfg(test)]
 fn attribute_prefix(
     xml: &str,
     node: roxmltree::Node<'_, '_>,
@@ -1467,6 +1427,7 @@ fn attribute_prefix(
     })
 }
 
+#[cfg(test)]
 fn lexical_attribute_prefix(xml: &str, offset: usize, local: &str) -> Option<String> {
     let lexical = xml
         .get(offset..)?
@@ -1476,21 +1437,6 @@ fn lexical_attribute_prefix(xml: &str, offset: usize, local: &str) -> Option<Str
         .strip_suffix(local)?
         .strip_suffix(':')
         .map(str::to_owned)
-}
-
-fn resolve_base_uri(base: Option<&str>, reference: &str) -> Result<String> {
-    if let Ok(absolute) = url::Url::parse(reference) {
-        return Ok(absolute.to_string());
-    }
-    if let Some(base) = base {
-        if let Ok(joined) = url::Url::parse(base).and_then(|base| base.join(reference)) {
-            return Ok(joined.to_string());
-        }
-        if let Some((directory, _)) = base.rsplit_once('/') {
-            return Ok(format!("{directory}/{reference}"));
-        }
-    }
-    Ok(reference.to_owned())
 }
 
 #[cfg(test)]
@@ -1513,7 +1459,7 @@ mod parser_boundary_tests {
     }
 
     #[test]
-    fn tree_and_streaming_parsers_have_identical_boundary_semantics() {
+    fn oracle_and_iterative_parsers_have_identical_boundary_semantics() {
         // Attacker-controlled depth must not select a different namespace, ID, or node model.
         for depth in (62..=66).chain(126..=130) {
             let xml = nested_xml(
@@ -1522,29 +1468,76 @@ mod parser_boundary_tests {
             );
             let tree = parse_tree_with_oracle_stack(&xml, Some("memory:source.xml"))
                 .expect("tree parser accepts boundary document");
-            let streaming = Document::parse_deep_streaming(&xml, Some("memory:source.xml"))
-                .expect("streaming parser accepts boundary document");
-            assert_eq!(tree, streaming, "parser models differ at depth {depth}");
+            let iterative = Document::parse_iterative(&xml, Some("memory:source.xml"))
+                .expect("iterative parser accepts boundary document");
+            assert_eq!(tree, iterative, "parser models differ at depth {depth}");
         }
     }
 
     #[test]
-    fn tree_and_streaming_parsers_coalesce_adjacent_character_data() {
+    fn empty_xml_base_preserves_a_path_like_document_uri() {
+        // RFC 3986 empty references retain the current document path while
+        // removing its fragment; treating the base as a directory moves it.
+        let document = Document::parse(
+            r#"<root xml:base=""><child/></root>"#,
+            Some("/tmp/styles/main.xml#source"),
+        )
+        .expect("path-like base parses");
+        let root = document
+            .nodes()
+            .find_map(|(_, node)| {
+                matches!(node.kind, super::NodeKind::Element { .. }).then_some(node)
+            })
+            .expect("document element exists");
+        assert_eq!(root.base_uri.as_deref(), Some("/tmp/styles/main.xml"));
+    }
+
+    #[test]
+    fn oracle_and_iterative_parsers_coalesce_adjacent_character_data() {
         // Tokenizer event boundaries are not XPath text-node boundaries: text, references and
         // CDATA in one character-data run must project as one semantic text node.
         for depth in 126..=130 {
             let xml = nested_xml(depth, "<leaf>a&amp;b&#x21;<![CDATA[c]]>d</leaf>");
             let tree = parse_tree_with_oracle_stack(&xml, None)
                 .expect("tree parser accepts adjacent character data");
-            let streaming = Document::parse_deep_streaming(&xml, None)
-                .expect("streaming parser accepts adjacent character data");
-            assert_eq!(tree, streaming, "text projection differs at depth {depth}");
+            let iterative = Document::parse_iterative(&xml, None)
+                .expect("iterative parser accepts adjacent character data");
+            assert_eq!(tree, iterative, "text projection differs at depth {depth}");
         }
     }
 
     #[test]
-    fn tree_and_streaming_parsers_reject_the_same_boundary_malformations() {
-        // Namespace and document-well-formedness failures cannot depend on the depth threshold.
+    fn iterative_parser_excludes_the_pi_separator_from_data() {
+        // XML's mandatory S between PITarget and data is syntax, not part of
+        // the processing-instruction value exposed by the semantic model.
+        let document = Document::parse_iterative("<root><?target   value ?></root>", None)
+            .expect("processing instruction parses");
+        let value = document.nodes().find_map(|(_, node)| match &node.kind {
+            super::NodeKind::ProcessingInstruction { value, .. } => value.as_deref(),
+            _ => None,
+        });
+        assert_eq!(value, Some("value "));
+    }
+
+    #[test]
+    fn iterative_parser_bounds_entity_references_across_the_document() {
+        // Sibling references share one expansion allowance; resetting the
+        // counter per sibling makes total expanded output attacker-controlled.
+        let body = format!("<leaf>{}</leaf>", "&e;".repeat(256));
+        let xml = format!(r#"<!DOCTYPE n [<!ENTITY e "x">]>{}"#, nested_xml(65, &body));
+
+        let error = Document::parse_iterative(&xml, None)
+            .expect_err("the document-wide entity-reference ceiling must reject sibling fanout");
+        assert!(
+            error
+                .to_string()
+                .contains("entity reference expansion limit")
+        );
+    }
+
+    #[test]
+    fn oracle_and_iterative_parsers_reject_the_same_boundary_malformations() {
+        // Namespace and document-well-formedness failures cannot depend on document depth.
         for depth in (62..=66).chain(126..=130) {
             for leaf in [
                 "<p:leaf/>",
@@ -1560,13 +1553,13 @@ mod parser_boundary_tests {
             ] {
                 let xml = nested_xml(depth, leaf);
                 let tree_ok = parse_tree_with_oracle_stack(&xml, None).is_ok();
-                let streaming_ok = Document::parse_deep_streaming(&xml, None).is_ok();
+                let iterative_ok = Document::parse_iterative(&xml, None).is_ok();
                 assert!(
                     !tree_ok,
                     "tree parser accepted malformed input at depth {depth}: {leaf}"
                 );
                 assert_eq!(
-                    tree_ok, streaming_ok,
+                    tree_ok, iterative_ok,
                     "parser acceptance differs at depth {depth} for {leaf}"
                 );
             }
@@ -1574,7 +1567,7 @@ mod parser_boundary_tests {
     }
 
     #[test]
-    fn tree_and_streaming_parsers_reject_misplaced_and_duplicate_doctypes() {
+    fn oracle_and_iterative_parsers_reject_misplaced_and_duplicate_doctypes() {
         // Document depth must not make invalid prolog structure acceptable.
         let deep_document = nested_xml(65, "<leaf/>");
         for xml in [
@@ -1586,8 +1579,8 @@ mod parser_boundary_tests {
                 "tree parser accepted malformed doctype placement"
             );
             assert!(
-                Document::parse_deep_streaming(&xml, None).is_err(),
-                "streaming parser accepted malformed doctype placement"
+                Document::parse_iterative(&xml, None).is_err(),
+                "iterative parser accepted malformed doctype placement"
             );
         }
     }

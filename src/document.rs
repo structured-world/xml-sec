@@ -436,6 +436,9 @@ pub enum XmlDocumentError {
         /// Actual byte length.
         actual: usize,
     },
+    /// External XML bytes could not be decoded under the XML encoding contract.
+    #[error("XML encoding error: {0}")]
+    Encoding(#[from] xml_sec_xml_input::Error),
     /// The input exceeds the active XML element nesting limit.
     #[error("XML document exceeds the maximum element depth of {maximum}: {actual}")]
     DocumentTooDeep {
@@ -562,6 +565,24 @@ impl XmlDocument {
         Self::parse_with_settings(xml, settings)
     }
 
+    /// Decode, parse, and own XML bytes using conservative input defaults.
+    ///
+    /// BOMs and XML declarations select the source encoding. Decoding is
+    /// strict and bounded before the normalized UTF-8 document is retained.
+    pub fn parse_bytes(bytes: &[u8]) -> Result<Self, XmlDocumentError> {
+        let settings = DocumentParseSettings::default();
+        Self::parse_with_settings(decode_owned_xml(bytes, settings.max_bytes)?, settings)
+    }
+
+    /// Decode and parse XML bytes with an explicitly selected semantic backend.
+    pub fn parse_bytes_with_backend(
+        bytes: &[u8],
+        backend: XmlBackend,
+    ) -> Result<Self, XmlDocumentError> {
+        let settings = DocumentParseSettings::default().with_backend(backend);
+        Self::parse_with_settings(decode_owned_xml(bytes, settings.max_bytes)?, settings)
+    }
+
     /// Parse and own XML with an explicitly selected compiled parser backend.
     pub fn parse_with_backend(
         xml: impl AsRef<str> + Into<String>,
@@ -590,6 +611,23 @@ impl XmlDocument {
         )
     }
 
+    /// Decode and parse XML bytes under the operation's immutable policy.
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    pub fn parse_bytes_with_policy(
+        bytes: &[u8],
+        policy: &impl XmlDocumentPolicy,
+    ) -> Result<Self, XmlDocumentError> {
+        let resources = policy.resource_policy();
+        resources.validate()?;
+        let budget = XmlParseWorkBudget::from_resources(resources);
+        let xml = decode_owned_xml(bytes, resources.max_xml_document_bytes)?;
+        Self::parse_with_settings_and_optional_budget(
+            xml,
+            DocumentParseSettings::from_policy(policy.xml_input_policy(), resources),
+            Some(&budget),
+        )
+    }
+
     /// Parse and own XML under an operation policy and explicit parser backend.
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     pub fn parse_with_policy_and_backend(
@@ -601,6 +639,25 @@ impl XmlDocument {
         resources.validate()?;
         let budget = XmlParseWorkBudget::from_resources(resources);
         let xml = own_bounded_xml(xml, resources.max_xml_document_bytes)?;
+        Self::parse_with_settings_and_optional_budget(
+            xml,
+            DocumentParseSettings::from_policy(policy.xml_input_policy(), resources)
+                .with_backend(backend),
+            Some(&budget),
+        )
+    }
+
+    /// Decode and parse XML bytes under policy with an explicit semantic backend.
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    pub fn parse_bytes_with_policy_and_backend(
+        bytes: &[u8],
+        policy: &impl XmlDocumentPolicy,
+        backend: XmlBackend,
+    ) -> Result<Self, XmlDocumentError> {
+        let resources = policy.resource_policy();
+        resources.validate()?;
+        let budget = XmlParseWorkBudget::from_resources(resources);
+        let xml = decode_owned_xml(bytes, resources.max_xml_document_bytes)?;
         Self::parse_with_settings_and_optional_budget(
             xml,
             DocumentParseSettings::from_policy(policy.xml_input_policy(), resources)
@@ -2817,6 +2874,23 @@ fn own_bounded_xml(
     Ok(xml.into())
 }
 
+fn decode_owned_xml(bytes: &[u8], maximum: usize) -> Result<String, XmlDocumentError> {
+    if bytes.len() > maximum {
+        return Err(XmlDocumentError::DocumentTooLarge {
+            maximum,
+            actual: bytes.len(),
+        });
+    }
+    xml_sec_xml_input::decode_xml_bounded(bytes, None, maximum)
+        .map(|xml| xml.into_owned())
+        .map_err(|error| match error {
+            xml_sec_xml_input::Error::DecodedLimit { actual, .. } => {
+                XmlDocumentError::DocumentTooLarge { maximum, actual }
+            }
+            error => XmlDocumentError::Encoding(error),
+        })
+}
+
 fn allocate_document_identity(counter: &AtomicU64) -> Result<DocumentIdentity, XmlDocumentError> {
     let mut current = counter.load(Ordering::Relaxed);
     loop {
@@ -2983,6 +3057,41 @@ fn element_opening_end(element: &str) -> Result<usize, XmlDocumentError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byte_input_decoding_is_identical_for_every_semantic_backend() {
+        // Encoding is resolved before backend selection, so parser choice cannot
+        // change which external XML byte sequences are accepted or interpreted.
+        let latin1 = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><root>caf\xe9</root>";
+        for backend in XmlBackend::available() {
+            let document = XmlDocument::parse_bytes_with_backend(latin1, backend)
+                .expect("declared Latin-1 XML must parse with every backend");
+            assert!(document.as_xml().contains("encoding=\"UTF-8\""));
+            document.with_view(|view| {
+                assert_eq!(view.document().root_element().text(), Some("café"));
+            });
+        }
+    }
+
+    #[test]
+    fn every_semantic_backend_rejects_the_same_encoding_conflict() {
+        // Encoding validation happens before backend dispatch, so a parser
+        // implementation cannot reinterpret contradictory external bytes.
+        let mut bytes = vec![0xff, 0xfe];
+        bytes.extend(
+            "<?xml version=\"1.0\" encoding=\"UTF-16BE\"?><root/>"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes),
+        );
+        for backend in XmlBackend::available() {
+            assert!(matches!(
+                XmlDocument::parse_bytes_with_backend(&bytes, backend),
+                Err(XmlDocumentError::Encoding(
+                    xml_sec_xml_input::Error::ConflictingEncoding(_)
+                ))
+            ));
+        }
+    }
 
     #[test]
     fn selected_backend_builds_the_retained_semantic_projection() {
