@@ -307,6 +307,34 @@ impl<'d> Node<'d> {
         }
     }
 
+    /// Returns the UTF-8 byte length of this node's string value without building the value.
+    pub fn string_value_len(&self) -> usize {
+        use self::Node::*;
+
+        fn descendant_text_len(node: &Node<'_>) -> usize {
+            node.children().iter().fold(0usize, |length, child| {
+                length.saturating_add(match child {
+                    Node::Element(_) => descendant_text_len(child),
+                    Node::Text(text) => sxd_document_no_unsafe::as_str!(text.text()).len(),
+                    _ => 0,
+                })
+            })
+        }
+
+        match self {
+            Root(_) | Element(_) => descendant_text_len(self),
+            Attribute(attribute) => sxd_document_no_unsafe::as_str!(attribute.value()).len(),
+            ProcessingInstruction(instruction) => {
+                sxd_document_no_unsafe::as_opt_str!(instruction.value())
+                    .unwrap_or("")
+                    .len()
+            }
+            Comment(comment) => sxd_document_no_unsafe::as_str!(comment.text()).len(),
+            Text(text) => sxd_document_no_unsafe::as_str!(text.text()).len(),
+            Namespace(namespace) => namespace.uri().len(),
+        }
+    }
+
     unpack!(Node, {
         root, Root, dom::Root,
         element, Element, dom::Element,

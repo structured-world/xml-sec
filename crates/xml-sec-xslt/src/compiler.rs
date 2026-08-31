@@ -1,9 +1,8 @@
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::budget::ensure;
-use crate::resolver::decode_resource;
+use crate::resolver::{decode_resource, decoded_resource_len};
 use crate::{
     BudgetKind, CompileBudget, Document, Error, ExpandedName, Namespace, OutputDefinition,
     OutputMethod, ResolvePurpose, ResolvedResource, Resolver, ResourceIdentity, Result,
@@ -38,8 +37,9 @@ impl<R: Resolver> Compiler<R> {
         )?;
         let mut state = CompileState::new(self.budget, xml.len());
         self.compile_module(xml, base_uri, None, &mut state, 1)?;
+        let principal_document = parse_semantic_document_metered(xml, base_uri, &mut state)?;
         let mut stylesheet = state.finish()?;
-        stylesheet.principal_document = Document::parse(xml, base_uri)?;
+        stylesheet.principal_document = principal_document;
         stylesheet.principal_base_uri = base_uri.map(str::to_owned);
         Ok(stylesheet)
     }
@@ -109,7 +109,7 @@ impl<R: Resolver> Compiler<R> {
                 let resource =
                     self.resolve_module(child, base_uri, ResolvePurpose::Import, state)?;
                 self.enter_resource(&resource, state, |state| {
-                    let source = resource_source(&resource)?;
+                    let source = resource_source(&resource, state)?;
                     self.compile_module(
                         &source,
                         Some(&resource.canonical_uri),
@@ -127,7 +127,7 @@ impl<R: Resolver> Compiler<R> {
                 let resource =
                     self.resolve_module(child, base_uri, ResolvePurpose::Include, state)?;
                 self.enter_resource(&resource, state, |state| {
-                    let source = resource_source(&resource)?;
+                    let source = resource_source(&resource, state)?;
                     let document = roxmltree::Document::parse(&source)
                         .map_err(|error| Error::Xml(error.to_string()))?;
                     let included_root = document.root_element();
@@ -170,7 +170,7 @@ impl<R: Resolver> Compiler<R> {
                 let resource =
                     self.resolve_module(child, base_uri, ResolvePurpose::Include, state)?;
                 self.enter_resource(&resource, state, |state| {
-                    let source = resource_source(&resource)?;
+                    let source = resource_source(&resource, state)?;
                     let document = roxmltree::Document::parse(&source)
                         .map_err(|error| Error::Xml(error.to_string()))?;
                     let included_root = document.root_element();
@@ -230,16 +230,11 @@ impl<R: Resolver> Compiler<R> {
         if !state.resolved_identities.contains_key(&resource.identity) {
             state.charge_stylesheet(resource.bytes.len())?;
         }
-        state.owned_bytes = state.owned_bytes.saturating_add(resource.bytes.len());
-        ensure(
-            BudgetKind::OwnedBytes,
-            state.budget.owned_bytes,
-            state.owned_bytes,
-        )?;
+        state.charge_owned(resource.bytes.len())?;
         if !state.module_documents.contains_key(&resource.canonical_uri) {
-            let source = resource_source(&resource)?;
-            let document = Document::parse(&source, Some(&resource.canonical_uri))?;
-            state.charge_owned(source.len())?;
+            let source = resource_source(&resource, state)?;
+            let document =
+                parse_semantic_document_metered(&source, Some(&resource.canonical_uri), state)?;
             state
                 .module_documents
                 .insert(resource.canonical_uri.clone(), document);
@@ -1902,8 +1897,28 @@ impl CompileContext {
     }
 }
 
-fn resource_source(resource: &ResolvedResource) -> Result<Cow<'_, str>> {
-    decode_resource(&resource.bytes, resource.encoding.as_deref()).map(Cow::Owned)
+fn resource_source(resource: &ResolvedResource, state: &mut CompileState) -> Result<String> {
+    let decoded_len = decoded_resource_len(&resource.bytes, resource.encoding.as_deref())?;
+    state.charge_owned(decoded_len)?;
+    decode_resource(&resource.bytes, resource.encoding.as_deref())
+}
+
+fn parse_semantic_document_metered(
+    xml: &str,
+    base_uri: Option<&str>,
+    state: &mut CompileState,
+) -> Result<Document> {
+    let parsed = roxmltree::Document::parse(xml).map_err(|error| Error::Xml(error.to_string()))?;
+    let projected_bytes = xml
+        .len()
+        .saturating_add(estimate_compiled_owned_bytes(&parsed))
+        .saturating_add(
+            base_uri
+                .map_or(0, str::len)
+                .saturating_mul(parsed.descendants().count()),
+        );
+    state.charge_owned(projected_bytes)?;
+    Document::parse(xml, base_uri)
 }
 
 fn require_stylesheet_module(root: roxmltree::Node<'_, '_>) -> Result<()> {
@@ -2187,7 +2202,18 @@ fn compile_instruction(
             let mut branches = vec![];
             let mut otherwise = vec![];
             let mut saw_otherwise = false;
-            for child in node.children().filter(roxmltree::Node::is_element) {
+            for child in node.children() {
+                if child.is_text() {
+                    if child.text().is_none_or(is_xml_whitespace_only) {
+                        continue;
+                    }
+                    return Err(Error::Static(
+                        "xsl:choose does not permit character data".into(),
+                    ));
+                }
+                if !child.is_element() {
+                    continue;
+                }
                 if child.has_tag_name((XSLT_NS, "when")) && !saw_otherwise {
                     validate_instruction_attributes(child, context.forward)?;
                     branches.push((

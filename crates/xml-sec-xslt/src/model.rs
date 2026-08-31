@@ -154,13 +154,14 @@ impl Document {
                         value: attribute.value().to_owned(),
                     })
                     .collect();
-                let mut namespaces = source
-                    .namespaces()
-                    .map(|namespace| Namespace {
+                let mut namespaces = Vec::new();
+                for namespace in source.namespaces() {
+                    validate_namespace_binding(namespace.name(), namespace.uri())?;
+                    namespaces.push(Namespace {
                         prefix: namespace.name().map(str::to_owned),
                         uri: namespace.uri().to_owned(),
-                    })
-                    .collect::<Vec<_>>();
+                    });
+                }
                 if !namespaces.iter().any(|namespace| {
                     namespace.prefix.as_deref() == Some("xml")
                         && namespace.uri == "http://www.w3.org/XML/1998/namespace"
@@ -969,6 +970,11 @@ fn set_namespace(namespaces: &mut Vec<Namespace>, prefix: Option<String>, uri: S
 }
 
 fn validate_namespace_binding(prefix: Option<&str>, uri: &str) -> Result<()> {
+    if prefix.is_some() && uri.is_empty() {
+        return Err(Error::Xml(
+            "prefixed namespace bindings cannot have an empty namespace URI".into(),
+        ));
+    }
     if prefix == Some("xmlns") || uri == XMLNS_NS {
         return Err(Error::Xml(
             "the xmlns prefix and namespace URI are reserved".into(),
@@ -1360,13 +1366,19 @@ mod parser_boundary_tests {
                 "<p:leaf/>",
                 "<leaf xmlns:a=\"urn:u\" xmlns:b=\"urn:u\" a:x=\"1\" b:x=\"2\"/>",
                 "<leaf xmlns:xml=\"urn:wrong\"/>",
+                "<leaf xmlns:p=\"\"/>",
                 "<leaf>&#0;</leaf>",
                 "<leaf>&#x1;</leaf>",
             ] {
                 let xml = nested_xml(depth, leaf);
+                let tree_ok = parse_tree_with_oracle_stack(&xml, None).is_ok();
+                let streaming_ok = Document::parse_deep_streaming(&xml, None).is_ok();
+                assert!(
+                    !tree_ok,
+                    "tree parser accepted malformed input at depth {depth}: {leaf}"
+                );
                 assert_eq!(
-                    parse_tree_with_oracle_stack(&xml, None).is_ok(),
-                    Document::parse_deep_streaming(&xml, None).is_ok(),
+                    tree_ok, streaming_ok,
                     "parser acceptance differs at depth {depth} for {leaf}"
                 );
             }

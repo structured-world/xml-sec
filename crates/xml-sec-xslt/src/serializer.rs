@@ -142,6 +142,14 @@ fn serialize_charged(
     if definition.method == OutputMethod::Html && !definition.indent_explicit {
         definition.indent = true;
     }
+    if definition.method == OutputMethod::Xml {
+        let version = definition.version.as_deref().unwrap_or("1.0");
+        if !matches!(version, "1.0" | "1.1") {
+            return Err(Error::Serialization(format!(
+                "unsupported XML output version `{version}`; supported versions are 1.0 and 1.1"
+            )));
+        }
+    }
     let encoding = OutputEncoding::new(&definition.encoding)?;
     let (used, limit) = meter.usage(budget_kind)?;
     let mut counter = RenderBuffer::counting(

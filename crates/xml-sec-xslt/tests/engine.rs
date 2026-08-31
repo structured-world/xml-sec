@@ -2348,6 +2348,14 @@ fn format_number_treats_question_mark_as_an_ordinary_literal() {
     assert_eq!(execute(stylesheet, "<source/>"), "?1");
 }
 
+#[test]
+fn format_number_localizes_generated_digits_without_rewriting_literals() {
+    // zero-digit localizes numeric output only; quoted affix digits and a digit-shaped grouping
+    // separator are literal decimal-format characters and must remain byte-for-byte unchanged.
+    let stylesheet = r##"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:decimal-format name="arabic" zero-digit="٠" digit="#" grouping-separator="2"/><xsl:template match="/"><xsl:value-of select="format-number(1, &quot;'2'٠'3'&quot;, 'arabic')"/><xsl:text>|</xsl:text><xsl:value-of select="format-number(1234, '٠2٠٠٠', 'arabic')"/></xsl:template></xsl:stylesheet>"##;
+    assert_eq!(execute(stylesheet, "<source/>"), "2١3|١2٢٣٤");
+}
+
 struct EncodedStylesheetResolver;
 
 impl Resolver for EncodedStylesheetResolver {
@@ -2768,6 +2776,31 @@ fn imported_stylesheets_share_the_cumulative_stylesheet_byte_budget() {
 }
 
 #[test]
+fn imported_stylesheets_charge_retained_semantic_documents_before_projection() {
+    // Imported bytes, decoded source, and the retained parser-neutral document are distinct
+    // allocations; a budget covering only the byte and source copies must reject the module.
+    let resolver = Arc::new(CountingResolver::default());
+    let payload = "x".repeat(8 * 1024);
+    resolver.resources.lock().expect("resolver mutex").insert(
+        "included.xsl".into(),
+        format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:variable name="payload" select="'{payload}'"/></xsl:stylesheet>"#
+        ),
+    );
+    let principal = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:include href="included.xsl"/></xsl:stylesheet>"#;
+    let error = Compiler::new(resolver, CompileBudget::new(1 << 20, 8, 256, 20 * 1024))
+        .compile(principal, Some("memory:main.xsl"))
+        .expect_err("retained imported document exceeds owned-byte budget");
+    assert!(matches!(
+        error,
+        Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn xinclude_budget_is_checked_before_resolver_access() {
     // A denied external-document operation must not cross the resolver trust boundary.
     let resolver = Arc::new(CountingResolver::default());
@@ -3155,11 +3188,50 @@ fn text_output_rejects_characters_unrepresentable_in_its_encoding() {
 }
 
 #[test]
+fn xml_output_rejects_unsupported_declaration_versions() {
+    // The serializer implements XML 1.0 and 1.1 character rules only; it must not emit a
+    // declaration for an unknown version while silently validating the result as XML 1.0.
+    for version in ["", "2.0"] {
+        let stylesheet = compile(&format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="xml" version="{version}"/><xsl:template match="/"><out/></xsl:template></xsl:stylesheet>"#
+        ));
+        assert!(matches!(
+            stylesheet.execute(
+                &Document::parse("<source/>", None).expect("source parses"),
+                &Parameters::new(),
+                Arc::new(NoResolver),
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            ),
+            Err(Error::Serialization(message))
+                if message.contains("XML output version") && message.contains(version)
+        ));
+    }
+}
+
+#[test]
 fn optimized_translate_uses_the_first_duplicate_mapping() {
     // XPath translate() assigns by source position, then keeps only the first mapping for a
     // duplicate source character; the duplicate still consumes its target position.
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:param name="from" select="'abac'"/><xsl:param name="to" select="'WXYZ'"/><xsl:template match="/"><xsl:apply-templates select="root/item"/></xsl:template><xsl:template match="item"><xsl:value-of select="translate(., $from, $to)"/></xsl:template></xsl:stylesheet>"#;
     assert_eq!(execute(stylesheet, "<root><item>ac</item></root>"), "WZ");
+}
+
+#[test]
+fn optimized_relative_paths_return_an_attribute_owner_for_parent_axis() {
+    // XPath defines an attribute's parent as its owner element; the optimized translate path
+    // must not skip to the owner's parent and include ancestor text in the string value.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:param name="from" select="'owner'"/><xsl:param name="to" select="'OWNER'"/><xsl:template match="/"><xsl:apply-templates select="root/item"/></xsl:template><xsl:template match="item"><xsl:value-of select="translate(@code/.., $from, $to)"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(
+            stylesheet,
+            "<root>ancestor<item code=\"x\">owner</item></root>"
+        ),
+        "OWNER"
+    );
 }
 
 #[test]
@@ -4034,6 +4106,21 @@ fn empty_xslt_instructions_reject_content() {
 }
 
 #[test]
+fn choose_rejects_non_whitespace_character_data_between_branches() {
+    // xsl:choose has an element-only content model; text cannot be ignored just because valid
+    // xsl:when children are also present.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:choose>unexpected<xsl:when test="true()"><out/></xsl:when></xsl:choose></xsl:template></xsl:stylesheet>"#;
+    assert!(matches!(
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+        )
+        .compile(stylesheet, None),
+        Err(Error::Static(message)) if message.contains("xsl:choose")
+    ));
+}
+
+#[test]
 fn apply_templates_rejects_non_whitespace_character_data() {
     // Character data is not part of the xsl:apply-templates content model and must not vanish.
     let invalid = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:apply-templates>unexpected</xsl:apply-templates></xsl:template></xsl:stylesheet>"#;
@@ -4154,6 +4241,38 @@ fn encode_uri_charges_expansion_before_constructing_it() {
     );
     let mut budget = execution_budget(1024);
     budget.owned_bytes = 64 * 1024;
+    assert!(matches!(
+        stylesheet.execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &parameters,
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn decode_uri_charges_octets_and_transcoded_output_before_allocating() {
+    // Decoding retains both the percent-decoded octets and transcoded UTF-8 output during the
+    // call, so a tight budget must reject the operation before either large buffer is built.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:output method="text"/><xsl:param name="value"/><xsl:template match="/"><xsl:value-of select="str:decode-uri($value)"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let mut parameters = Parameters::new();
+    parameters.insert(
+        ExpandedName::new(None::<String>, "value"),
+        Value::String("%41".repeat(16 * 1024)),
+    );
+    let mut budget = execution_budget(1024);
+    budget.owned_bytes = 104 * 1024;
     assert!(matches!(
         stylesheet.execute(
             &Document::parse("<source/>", None).expect("source parses"),

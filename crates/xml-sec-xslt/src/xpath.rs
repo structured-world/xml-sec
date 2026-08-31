@@ -1738,11 +1738,12 @@ impl Evaluator {
     }
 
     fn parent_node(&self, node: &SourceNode) -> Option<SourceNode> {
-        let owner = match node {
-            SourceNode::Node(id) => *id,
-            SourceNode::Attribute { owner, .. } | SourceNode::Namespace { owner, .. } => *owner,
-        };
-        self.source.node(owner)?.parent.map(SourceNode::Node)
+        match node {
+            SourceNode::Node(id) => self.source.node(*id)?.parent.map(SourceNode::Node),
+            SourceNode::Attribute { owner, .. } | SourceNode::Namespace { owner, .. } => {
+                self.source.node(*owner).map(|_| SourceNode::Node(*owner))
+            }
+        }
     }
 
     fn attribute_name_matches(
@@ -3476,16 +3477,26 @@ enum ExsltSetFunction {
 impl function::Function for ExsltSetFunction {
     fn evaluate<'c, 'd>(
         &self,
-        _: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
+        context: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
         args: Vec<SxdValue<'d>>,
     ) -> std::result::Result<SxdValue<'d>, function::Error> {
         if matches!(self, Self::Distinct) {
             let [SxdValue::Nodeset(nodes)] = args.as_slice() else {
                 return extension_argument_error("set:distinct() requires one node-set");
             };
-            let mut seen = std::collections::HashSet::new();
+            let ordered = nodes.document_order();
+            let value_bytes = ordered.iter().fold(0usize, |total, node| {
+                total.saturating_add(node.string_value_len())
+            });
+            // Reserve conservatively for the strings plus hash buckets at the standard maximum
+            // load. This keeps both allocations behind the same XPath owned-byte gate.
+            let bucket_bytes = ordered.len().saturating_mul(2).saturating_mul(
+                std::mem::size_of::<String>().saturating_add(std::mem::size_of::<usize>()),
+            );
+            context.reserve_string_allocation(value_bytes.saturating_add(bucket_bytes))?;
+            let mut seen = std::collections::HashSet::with_capacity(ordered.len());
             let mut result = nodeset::Nodeset::new();
-            for node in nodes.document_order() {
+            for node in ordered {
                 if seen.insert(node.string_value()) {
                     result.add(node);
                 }
@@ -3643,10 +3654,27 @@ impl function::Function for ExsltStringFunction {
                         "str:decode-uri() requires one or two arguments",
                     );
                 }
-                let encoding = args.get(1).map(SxdValue::string);
+                let encoding_label = args.get(1).map(SxdValue::string);
+                let encoding = uri_encoding(encoding_label.as_deref())?;
+                let value = args[0].string();
+                let decoded_len = percent_decoded_uri_len(&value)?;
+                let transcoded_len = encoding
+                    .new_decoder()
+                    .max_utf8_buffer_length_without_replacement(decoded_len)
+                    .ok_or_else(|| function::Error::Other {
+                        what: "str:decode-uri() result length overflow".into(),
+                    })?;
+                context.reserve_string_allocation(
+                    decoded_len.checked_add(transcoded_len).ok_or_else(|| {
+                        function::Error::Other {
+                            what: "str:decode-uri() allocation length overflow".into(),
+                        }
+                    })?,
+                )?;
                 Ok(SxdValue::String(percent_decode_uri(
-                    &args[0].string(),
-                    encoding.as_deref(),
+                    &value,
+                    encoding,
+                    decoded_len,
                 )?))
             }
         }
@@ -3707,10 +3735,11 @@ fn percent_encoded_uri_len(
 
 fn percent_decode_uri(
     value: &str,
-    encoding: Option<&str>,
+    encoding: &'static encoding_rs::Encoding,
+    decoded_len: usize,
 ) -> std::result::Result<String, function::Error> {
     let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut decoded = Vec::with_capacity(decoded_len);
     let mut cursor = 0;
     while cursor < bytes.len() {
         if bytes[cursor] == b'%'
@@ -3725,16 +3754,6 @@ fn percent_decode_uri(
             cursor += 1;
         }
     }
-    let encoding = encoding
-        .map(|label| {
-            encoding_rs::Encoding::for_label(label.as_bytes()).ok_or_else(|| {
-                function::Error::Other {
-                    what: format!("str:decode-uri() has unknown encoding `{label}`"),
-                }
-            })
-        })
-        .transpose()?
-        .unwrap_or(encoding_rs::UTF_8);
     let (value, _, had_errors) = encoding.decode(&decoded);
     if had_errors {
         return extension_argument_error(&format!(
@@ -3743,6 +3762,40 @@ fn percent_decode_uri(
         ));
     }
     Ok(value.into_owned())
+}
+
+fn uri_encoding(
+    label: Option<&str>,
+) -> std::result::Result<&'static encoding_rs::Encoding, function::Error> {
+    label.map_or(Ok(encoding_rs::UTF_8), |label| {
+        encoding_rs::Encoding::for_label(label.as_bytes()).ok_or_else(|| function::Error::Other {
+            what: format!("str:decode-uri() has unknown encoding `{label}`"),
+        })
+    })
+}
+
+fn percent_decoded_uri_len(value: &str) -> std::result::Result<usize, function::Error> {
+    let bytes = value.as_bytes();
+    let mut cursor = 0usize;
+    let mut decoded_len = 0usize;
+    while cursor < bytes.len() {
+        let encoded = bytes[cursor] == b'%'
+            && bytes
+                .get(cursor + 1..cursor + 3)
+                .and_then(|digits| std::str::from_utf8(digits).ok())
+                .is_some_and(|digits| u8::from_str_radix(digits, 16).is_ok());
+        cursor = cursor
+            .checked_add(if encoded { 3 } else { 1 })
+            .ok_or_else(|| function::Error::Other {
+                what: "str:decode-uri() input length overflow".into(),
+            })?;
+        decoded_len = decoded_len
+            .checked_add(1)
+            .ok_or_else(|| function::Error::Other {
+                what: "str:decode-uri() result length overflow".into(),
+            })?;
+    }
+    Ok(decoded_len)
 }
 
 impl function::Function for DocumentFunction {
@@ -4492,6 +4545,12 @@ fn render_decimal(
     if minimum_integer == 0 && minimum_fraction > 0 && scaled < 1.0 {
         integer.clear();
     }
+    if format.zero_digit != '0' {
+        integer = localize_generated_decimal_digits(&integer, format.zero_digit);
+    }
+    let localized_fraction = (format.zero_digit != '0')
+        .then(|| localize_generated_decimal_digits(fraction, format.zero_digit));
+    let fraction = localized_fraction.as_deref().unwrap_or(fraction);
     if let Some(group) = integer_pattern
         .iter()
         .rposition(|token| token.syntax && token.value == format.grouping_separator)
@@ -4532,17 +4591,20 @@ fn render_decimal(
         }
     }
     output.extend(selected[last..].iter().map(|token| token.value));
-    if format.zero_digit != '0' {
-        output = output
-            .chars()
-            .map(|c| {
-                c.to_digit(10)
-                    .and_then(|digit| char::from_u32(u32::from(format.zero_digit) + digit))
-                    .unwrap_or(c)
-            })
-            .collect();
-    }
     Ok(output)
+}
+
+fn localize_generated_decimal_digits(value: &str, zero_digit: char) -> String {
+    value
+        .chars()
+        .map(|character| {
+            character
+                .to_digit(10)
+                .filter(|_| character.is_ascii_digit())
+                .and_then(|digit| char::from_u32(u32::from(zero_digit) + digit))
+                .unwrap_or(character)
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4705,5 +4767,35 @@ impl function::Function for CurrentNode {
         let mut set = nodeset::Nodeset::new();
         set.add(node);
         Ok(SxdValue::Nodeset(set))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sxd_xpath_no_unsafe::function::Function;
+
+    #[test]
+    fn set_distinct_reserves_string_values_before_allocating_them() {
+        let package = Package::new();
+        let document = package.as_document();
+        let root = document.create_element("root");
+        document.root().append_child(root);
+        let mut nodes = nodeset::Nodeset::new();
+        for value in ["first retained value", "second retained value"] {
+            let child = document.create_element("item");
+            child.append_child(document.create_text(value));
+            root.append_child(child);
+            nodes.add(child);
+        }
+        let mut context = Context::new();
+        context.set_string_allocation_limit(1);
+        let evaluation =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+
+        let error = ExsltSetFunction::Distinct
+            .evaluate(&evaluation, vec![SxdValue::Nodeset(nodes)])
+            .expect_err("distinct storage must cross the allocation gate");
+        assert!(error.to_string().contains("allocation budget"));
     }
 }
