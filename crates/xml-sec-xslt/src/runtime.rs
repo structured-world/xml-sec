@@ -16,7 +16,7 @@ use crate::lexical::{is_ncname, unicode_decimal_value};
 use crate::serializer::{serialize, serialize_fragment};
 use crate::xpath::{
     Evaluator, EvaluatorSourceOptions, PreparedEvaluatorSource, SourceNode, XPathValue,
-    prepare_evaluator_source, xpath_number,
+    parse_xpath_number, prepare_evaluator_source, xpath_number,
 };
 use crate::{
     Attribute, BudgetKind, Document, Error, ExecutionBudget, ExecutionEnvironment, ExpandedName,
@@ -745,9 +745,6 @@ impl<'a> Execution<'a> {
                     precedence,
                 } => {
                     self.meter.recursion(depth)?;
-                    if self.function_results.last().is_some_and(Option::is_some) {
-                        continue;
-                    }
                     let Some(instruction) = instructions.get(index).cloned() else {
                         continue;
                     };
@@ -1228,9 +1225,6 @@ impl<'a> Execution<'a> {
         self.meter.recursion(depth)?;
         for instruction in instructions {
             self.execute_instruction(instruction, node, position, size, depth, current_precedence)?;
-            if self.function_results.last().is_some_and(Option::is_some) {
-                break;
-            }
         }
         Ok(())
     }
@@ -1807,16 +1801,7 @@ impl<'a> Execution<'a> {
                 content,
                 base_uri,
             } => {
-                if self.function_results.is_empty() {
-                    return Err(Error::Dynamic(
-                        "func:result executed outside an EXSLT function".into(),
-                    ));
-                }
-                if self.function_results.last().is_some_and(Option::is_some) {
-                    return Err(Error::Dynamic(
-                        "EXSLT function produced more than one result".into(),
-                    ));
-                }
+                self.ensure_function_result_is_pending()?;
                 let value = if let Some(select) = select {
                     xpath_to_public(self.evaluate(select, node, position, size)?)
                 } else {
@@ -1828,6 +1813,7 @@ impl<'a> Execution<'a> {
                         base_uri.as_deref(),
                     )?)
                 };
+                self.ensure_function_result_is_pending()?;
                 *self
                     .function_results
                     .last_mut()
@@ -1835,6 +1821,20 @@ impl<'a> Execution<'a> {
                 Ok(())
             }
         }
+    }
+
+    fn ensure_function_result_is_pending(&self) -> Result<()> {
+        let Some(result) = self.function_results.last() else {
+            return Err(Error::Dynamic(
+                "func:result executed outside an EXSLT function".into(),
+            ));
+        };
+        if result.is_some() {
+            return Err(Error::Dynamic(
+                "EXSLT function produced more than one result".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn evaluate(
@@ -2050,7 +2050,7 @@ impl<'a> Execution<'a> {
             .strip_prefix('$')
             .and_then(|value| value.split_once('+'))
             && is_lexical_variable_name(variable.trim())
-            && let Ok(increment) = increment.trim().parse::<f64>()
+            && let Some(increment) = parse_xpath_number(increment)
         {
             let value = self.variable_value(variable.trim(), &expression.namespaces)?;
             let number = match value {
@@ -2104,7 +2104,7 @@ impl<'a> Execution<'a> {
                 .trim()
                 .strip_prefix('$')
                 .and_then(|value| value.split_once('*'))
-            && let Ok(factor) = factor.trim().parse::<f64>()
+            && let Some(factor) = parse_xpath_number(factor)
         {
             let length =
                 xpath_number(&self.variable_string(variable.trim(), &expression.namespaces)?)
@@ -2326,18 +2326,23 @@ impl<'a> Execution<'a> {
             self.execute_sequence(&function.body, node, position, size, depth + 1, None)
         });
         let value = self.function_results.pop().flatten();
+        let generated_result_nodes = self.result.node_count() > 1;
         self.result = previous_result;
         self.output_stack = previous_stack;
         self.scopes.pop();
         self.scopes.extend(caller_scopes);
         self.function_depth = self.function_depth.saturating_sub(1);
         execution?;
-        value.ok_or_else(|| {
-            Error::Dynamic(format!(
-                "EXSLT function {} completed without func:result",
+        // EXSLT func:function, "Function Results", makes generated result nodes an error and
+        // defines an absent func:result as an empty string:
+        // https://exslt.github.io/func/elements/function/index.html
+        if generated_result_nodes {
+            return Err(Error::Dynamic(format!(
+                "EXSLT function {} generated result nodes outside func:result",
                 function.name.local
-            ))
-        })
+            )));
+        }
+        Ok(value.unwrap_or_else(|| Value::String(String::new())))
     }
     fn select_nodes(
         &mut self,

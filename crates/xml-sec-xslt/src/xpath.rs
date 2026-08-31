@@ -2096,6 +2096,12 @@ impl XPathValue {
 }
 
 pub(crate) fn xpath_number(value: &str) -> f64 {
+    parse_xpath_number(value).unwrap_or(f64::NAN)
+}
+
+pub(crate) fn parse_xpath_number(value: &str) -> Option<f64> {
+    // XPath 1.0 §§3.5 and 3.7 permit only decimal Number tokens, not host-language
+    // spellings such as NaN or infinity: https://www.w3.org/TR/1999/REC-xpath-19991116/#numbers
     let trimmed = value.trim_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n'));
     let valid = !trimmed.is_empty()
         && !trimmed.starts_with('+')
@@ -2118,11 +2124,7 @@ pub(crate) fn xpath_number(value: &str) -> f64 {
                         && fraction.chars().all(|c| c.is_ascii_digit())
                 },
             );
-    if !valid {
-        f64::NAN
-    } else {
-        trimmed.parse().unwrap_or(f64::NAN)
-    }
+    valid.then(|| trimmed.parse().ok()).flatten()
 }
 
 const XINCLUDE_NS: &str = "http://www.w3.org/2001/XInclude";

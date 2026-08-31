@@ -80,6 +80,7 @@ impl<R: Resolver> Compiler<R> {
             return self
                 .compile_literal_result_stylesheet(root, base_uri, precedence, state, depth);
         };
+        validate_top_level_declaration_attributes(root, forward)?;
         let mut saw_non_import = false;
         self.compile_effective_imports(root, base_uri, state, depth, &mut saw_non_import)?;
         let local_precedence = inherited_precedence.unwrap_or_else(|| state.next_precedence());
@@ -143,13 +144,16 @@ impl<R: Resolver> Compiler<R> {
                         .map_err(|error| Error::Xml(error.to_string()))?;
                     let included_root = document.root_element();
                     match stylesheet_module_kind(included_root)? {
-                        StylesheetModuleKind::Standard { .. } => self.compile_effective_imports(
-                            included_root,
-                            Some(&resource.canonical_uri),
-                            state,
-                            depth + 1,
-                            saw_non_import,
-                        ),
+                        StylesheetModuleKind::Standard { forward } => {
+                            validate_top_level_declaration_attributes(included_root, forward)?;
+                            self.compile_effective_imports(
+                                included_root,
+                                Some(&resource.canonical_uri),
+                                state,
+                                depth + 1,
+                                saw_non_import,
+                            )
+                        }
                         StylesheetModuleKind::Simplified => Ok(()),
                     }
                 })?;
@@ -329,6 +333,7 @@ impl<R: Resolver> Compiler<R> {
         depth: usize,
     ) -> Result<()> {
         if node.has_tag_name((EXSLT_FUNCTIONS_NS, "function")) {
+            validate_exslt_function_result_structure(node)?;
             let context =
                 CompileContext::new(forward, depth, state.budget.recursion_depth, base_uri)?
                     .inside_function();
@@ -348,11 +353,6 @@ impl<R: Resolver> Compiler<R> {
                 }
             }
             let body = compile_sequence(children, context)?;
-            if count_function_results(&body) > 1 {
-                return Err(Error::Static(
-                    "func:function may contain only one func:result".into(),
-                ));
-            }
             let order = state.next_order();
             state.functions.push(ExsltFunction {
                 name: required_qname_attr(node, "name")?,
@@ -1021,7 +1021,9 @@ fn is_xpath_ncname_character(character: char) -> bool {
 }
 
 pub(crate) fn normalize_xpath_for_sxd(source: &str) -> Cow<'_, str> {
-    if !source.chars().any(char::is_whitespace) && !source.contains('*') {
+    // XPath 1.0 §3.7 defines whitespace as only XML S characters:
+    // https://www.w3.org/TR/1999/REC-xpath-19991116/#exprlex
+    if !source.chars().any(crate::lexical::is_xml_whitespace) && !source.contains('*') {
         return Cow::Borrowed(source);
     }
     let characters = source.chars().collect::<Vec<_>>();
@@ -1044,14 +1046,14 @@ pub(crate) fn normalize_xpath_for_sxd(source: &str) -> Cow<'_, str> {
             index += 1;
             continue;
         }
-        if character.is_whitespace()
+        if crate::lexical::is_xml_whitespace(character)
             && output
                 .chars()
                 .next_back()
                 .is_some_and(is_xpath_name_character)
         {
             let mut next = index + 1;
-            while next < characters.len() && characters[next].is_whitespace() {
+            while next < characters.len() && crate::lexical::is_xml_whitespace(characters[next]) {
                 next += 1;
             }
             if next < characters.len() && characters[next] == '(' {
@@ -1066,7 +1068,7 @@ pub(crate) fn normalize_xpath_for_sxd(source: &str) -> Cow<'_, str> {
         if character == ':' && characters.get(index + 1) == Some(&':') {
             output.push_str("::");
             index += 2;
-            while index < characters.len() && characters[index].is_whitespace() {
+            while index < characters.len() && crate::lexical::is_xml_whitespace(characters[index]) {
                 index += 1;
             }
             continue;
@@ -1075,13 +1077,13 @@ pub(crate) fn normalize_xpath_for_sxd(source: &str) -> Cow<'_, str> {
             && output
                 .chars()
                 .rev()
-                .find(|candidate| !candidate.is_whitespace())
+                .find(|candidate| !crate::lexical::is_xml_whitespace(*candidate))
                 .is_some_and(|previous| matches!(previous, '(' | ','))
         {
             let next = characters[index + 1..]
                 .iter()
                 .copied()
-                .find(|candidate| !candidate.is_whitespace());
+                .find(|candidate| !crate::lexical::is_xml_whitespace(*candidate));
             if next.is_some_and(|next| matches!(next, ')' | ',')) {
                 output.push_str("child::*");
                 index += 1;
@@ -1841,6 +1843,7 @@ fn compile_sequence<'a>(
     context: CompileContext,
 ) -> Result<Vec<Instruction>> {
     let mut out = Vec::new();
+    let mut follows_function_result = false;
     for node in nodes {
         if node.is_text() {
             if let Some(text) = node.text() {
@@ -1851,6 +1854,13 @@ fn compile_sequence<'a>(
                 }
             }
         } else if node.is_element() {
+            if context.inside_function
+                && follows_function_result
+                && node.has_tag_name((XSLT_NS, "fallback"))
+            {
+                continue;
+            }
+            follows_function_result = node.has_tag_name((EXSLT_FUNCTIONS_NS, "result"));
             out.push(compile_instruction(node, context.descend()?)?);
         }
     }
@@ -2281,34 +2291,110 @@ fn reject_unknown_attributes(
     Ok(())
 }
 
-fn count_function_results(instructions: &[Instruction]) -> usize {
-    instructions
-        .iter()
-        .map(|instruction| match instruction {
-            Instruction::LiteralElement { children, .. }
-            | Instruction::ForEach { body: children, .. }
-            | Instruction::If { body: children, .. }
-            | Instruction::Copy { body: children, .. }
-            | Instruction::Element { body: children, .. }
-            | Instruction::Attribute { body: children, .. }
-            | Instruction::Processing { body: children, .. }
-            | Instruction::Message { body: children, .. }
-            | Instruction::ExtensionFallback { body: children, .. }
-            | Instruction::Comment(children) => count_function_results(children),
-            Instruction::Choose {
-                branches,
-                otherwise,
-            } => branches
-                .iter()
-                .map(|(_, body)| count_function_results(body))
-                .chain(std::iter::once(count_function_results(otherwise)))
-                .max()
-                .unwrap_or(0),
-            Instruction::Variable(variable) => count_function_results(&variable.content),
-            Instruction::FunctionResult { content, .. } => 1 + count_function_results(content),
-            _ => 0,
-        })
-        .sum()
+fn validate_top_level_declaration_attributes(
+    root: roxmltree::Node<'_, '_>,
+    forward: bool,
+) -> Result<()> {
+    // XSLT 1.0 §2.2 and each declaration's Element Syntax define closed unqualified
+    // attribute sets; forward-compatible behavior is specified by §2.5:
+    // https://www.w3.org/TR/1999/REC-xslt-19991116
+    reject_unknown_attributes(
+        root,
+        &[
+            "version",
+            "id",
+            "extension-element-prefixes",
+            "exclude-result-prefixes",
+        ],
+        forward,
+    )?;
+    for node in root.children().filter(roxmltree::Node::is_element) {
+        let allowed: Option<&[&str]> = if node.has_tag_name((EXSLT_FUNCTIONS_NS, "function")) {
+            Some(&["name"])
+        } else if node.tag_name().namespace() == Some(XSLT_NS) {
+            match node.tag_name().name() {
+                "import" | "include" => Some(&["href"]),
+                "template" => Some(&["match", "name", "priority", "mode"]),
+                "variable" | "param" => Some(&["name", "select"]),
+                "output" => Some(&[
+                    "method",
+                    "version",
+                    "encoding",
+                    "omit-xml-declaration",
+                    "standalone",
+                    "doctype-public",
+                    "doctype-system",
+                    "cdata-section-elements",
+                    "indent",
+                    "media-type",
+                ]),
+                "strip-space" | "preserve-space" => Some(&["elements"]),
+                "key" => Some(&["name", "match", "use"]),
+                "decimal-format" => Some(&[
+                    "name",
+                    "decimal-separator",
+                    "grouping-separator",
+                    "infinity",
+                    "minus-sign",
+                    "NaN",
+                    "percent",
+                    "per-mille",
+                    "zero-digit",
+                    "digit",
+                    "pattern-separator",
+                ]),
+                "namespace-alias" => Some(&["stylesheet-prefix", "result-prefix"]),
+                "attribute-set" => Some(&["name", "use-attribute-sets"]),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(allowed) = allowed {
+            reject_unknown_attributes(node, allowed, forward)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_exslt_function_result_structure(function: roxmltree::Node<'_, '_>) -> Result<()> {
+    // EXSLT func:result v3, paragraphs after "Element Syntax", require no following element
+    // except xsl:fallback and forbid nesting in func:result or variable bindings:
+    // https://exslt.github.io/func/result/
+    for result in function
+        .descendants()
+        .filter(|node| node.has_tag_name((EXSLT_FUNCTIONS_NS, "result")))
+    {
+        if result
+            .next_siblings()
+            .skip(1)
+            .filter(roxmltree::Node::is_element)
+            .any(|sibling| !sibling.has_tag_name((XSLT_NS, "fallback")))
+        {
+            return Err(Error::Static(
+                "func:result may only be followed by xsl:fallback elements".into(),
+            ));
+        }
+        for ancestor in result
+            .ancestors()
+            .skip(1)
+            .take_while(|ancestor| ancestor.id() != function.id())
+        {
+            if ancestor.has_tag_name((EXSLT_FUNCTIONS_NS, "result")) {
+                return Err(Error::Static(
+                    "func:result cannot occur inside another func:result".into(),
+                ));
+            }
+            if ancestor.has_tag_name((XSLT_NS, "variable"))
+                || ancestor.has_tag_name((XSLT_NS, "param"))
+            {
+                return Err(Error::Static(
+                    "func:result cannot occur inside an xsl:variable or xsl:param binding".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn is_extension_element(node: roxmltree::Node<'_, '_>) -> Result<bool> {

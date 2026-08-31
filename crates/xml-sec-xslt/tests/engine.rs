@@ -1047,6 +1047,163 @@ fn exslt_current_date_functions_share_the_execution_clock_and_policy() {
 }
 
 #[test]
+fn exslt_clock_years_use_xml_schema_numbering() {
+    // `time` exposes astronomical years, while XML Schema has no year zero.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:date="http://exslt.org/dates-and-times"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="date:date-time()"/><xsl:text>|</xsl:text><xsl:value-of select="date:date()"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse("<source/>", None).expect("source parses");
+    for (astronomical_year, schema_year) in [(0, "-0001"), (-1, "-0002")] {
+        let fixed = time::Date::from_calendar_date(astronomical_year, time::Month::January, 1)
+            .expect("test year is representable")
+            .midnight()
+            .assume_utc();
+        let result = stylesheet
+            .execute_with_environment(
+                &source,
+                &Parameters::new(),
+                ExecutionEnvironment::new(Arc::new(NoResolver))
+                    .with_clock(Arc::new(FixedClock::new(fixed))),
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            )
+            .expect("fixed pre-Common-Era time executes");
+        assert_eq!(
+            String::from_utf8(result.serialized.bytes).expect("UTF-8 output"),
+            format!("{schema_year}-01-01T00:00:00+00:00|{schema_year}-01-01Z")
+        );
+    }
+}
+
+#[test]
+fn optimized_addition_distinguishes_xpath_names_from_numbers() {
+    // Rust accepts `NaN` as a float, but XPath parses it as a child-name test.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:apply-templates select="root"/></xsl:template><xsl:template match="root"><xsl:variable name="x" select="1"/><xsl:value-of select="$x + NaN"/><xsl:text>|</xsl:text><xsl:value-of select="substring ('abcdef', 0, $x * NaN)"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<root><NaN>5</NaN></root>"), "6|abcd");
+}
+
+#[test]
+fn xpath_normalization_rejects_non_xml_whitespace() {
+    // NBSP is an XML character but not XPath whitespace and must not repair invalid syntax.
+    let stylesheet = "<xsl:stylesheet version=\"1.0\" xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\"><xsl:template match=\"/\"><xsl:value-of select=\"count\u{a0}(*)\"/></xsl:template></xsl:stylesheet>";
+    assert!(matches!(
+        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+            .compile(stylesheet, None),
+        Err(Error::Static(message)) if message.contains("invalid XPath")
+    ));
+}
+
+#[test]
+fn top_level_declarations_reject_unknown_unqualified_attributes() {
+    // Every standard declaration has a closed XSLT 1.0 attribute contract.
+    let declarations = [
+        r#"<xsl:template match="/" bogus="yes"/>"#,
+        r#"<xsl:variable name="value" bogus="yes"/>"#,
+        r#"<xsl:output bogus="yes"/>"#,
+        r#"<xsl:strip-space elements="*" bogus="yes"/>"#,
+        r#"<xsl:key name="key" match="*" use="." bogus="yes"/>"#,
+        r#"<xsl:decimal-format bogus="yes"/>"#,
+        r##"<xsl:namespace-alias stylesheet-prefix="#default" result-prefix="#default" bogus="yes"/>"##,
+        r#"<xsl:attribute-set name="set" bogus="yes"/>"#,
+        r#"<func:function name="f:test" bogus="yes"><func:result select="1"/></func:function>"#,
+        r#"<xsl:include href="memory:included.xsl" bogus="yes"/>"#,
+        r#"<xsl:import href="memory:imported.xsl" bogus="yes"/>"#,
+    ];
+    for declaration in declarations {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" xmlns:f="urn:functions" extension-element-prefixes="func">{declaration}</xsl:stylesheet>"#
+        );
+        assert!(matches!(
+            Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+                .compile(&stylesheet, None),
+            Err(Error::Static(message)) if message.contains("bogus")
+        ));
+    }
+
+    let root_typo = r#"<xsl:stylesheet version="1.0" bogus="yes" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"/>"#;
+    assert!(matches!(
+        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+            .compile(root_typo, None),
+        Err(Error::Static(message)) if message.contains("bogus")
+    ));
+
+    compile(
+        r#"<xsl:stylesheet version="2.0" bogus="yes" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/" future-option="yes"/></xsl:stylesheet>"#,
+    );
+}
+
+#[test]
+fn exslt_function_results_are_enforced_on_executed_paths() {
+    // EXSLT func:result v3 distinguishes static placement rules from the number of results
+    // instantiated at runtime: https://exslt.github.io/func/result/
+    let conditional = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" xmlns:f="urn:functions" extension-element-prefixes="func"><xsl:output method="text"/><func:function name="f:choose"><xsl:param name="condition"/><xsl:if test="$condition"><func:result select="'yes'"/></xsl:if><xsl:if test="not($condition)"><func:result select="'no'"/></xsl:if></func:function><xsl:template match="/"><xsl:value-of select="f:choose(true())"/><xsl:text>|</xsl:text><xsl:value-of select="f:choose(false())"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(conditional, "<source/>"), "yes|no");
+
+    let duplicate = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" xmlns:f="urn:functions" extension-element-prefixes="func"><func:function name="f:bad"><xsl:param name="condition"/><xsl:if test="$condition"><func:result select="1"/></xsl:if><func:result select="2"/></func:function><xsl:template match="/"><xsl:value-of select="f:bad(true())"/></xsl:template></xsl:stylesheet>"#,
+    );
+    assert!(matches!(
+        duplicate.execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Dynamic(message)) if message.contains("more than one result")
+    ));
+
+    let trailing_result = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" xmlns:f="urn:functions" extension-element-prefixes="func"><func:function name="f:bad"><func:result select="1"/><func:result select="2"/></func:function></xsl:stylesheet>"#;
+    assert!(matches!(
+        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+            .compile(trailing_result, None),
+        Err(Error::Static(message)) if message.contains("only be followed")
+    ));
+
+    for invalid in [
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" xmlns:f="urn:functions" extension-element-prefixes="func"><func:function name="f:bad"><func:result><func:result select="2"/></func:result></func:function></xsl:stylesheet>"#,
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" xmlns:f="urn:functions" extension-element-prefixes="func"><func:function name="f:bad"><xsl:variable name="value"><func:result select="2"/></xsl:variable></func:function></xsl:stylesheet>"#,
+    ] {
+        assert!(matches!(
+            Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+                .compile(invalid, None),
+            Err(Error::Static(_))
+        ));
+    }
+
+    let fallback = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" xmlns:f="urn:functions" extension-element-prefixes="func"><xsl:output method="text"/><func:function name="f:value"><func:result select="'ok'"/><xsl:fallback><xsl:text>ignored</xsl:text></xsl:fallback></func:function><xsl:template match="/"><xsl:value-of select="f:value()"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(fallback, "<source/>"), "ok");
+
+    // EXSLT func:function "Function Results" defines no result as the empty string and generated
+    // result nodes as errors: https://exslt.github.io/func/elements/function/index.html
+    let no_result = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" xmlns:f="urn:functions" extension-element-prefixes="func"><xsl:output method="text"/><func:function name="f:empty"/><xsl:template match="/"><xsl:value-of select="concat('[', f:empty(), ']')"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(no_result, "<source/>"), "[]");
+
+    let generated_nodes = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" xmlns:f="urn:functions" extension-element-prefixes="func"><func:function name="f:bad"><generated/></func:function><xsl:template match="/"><xsl:value-of select="f:bad()"/></xsl:template></xsl:stylesheet>"#,
+    );
+    assert!(matches!(
+        generated_nodes.execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Dynamic(message)) if message.contains("generated result nodes")
+    ));
+}
+
+#[test]
 fn built_in_template_rule_ignores_namespace_nodes() {
     // XSLT's built-in text rule copies attributes and text only; selected namespace nodes are
     // silent unless an explicit template handles them.
@@ -1228,7 +1385,7 @@ fn static_xpath_and_template_conflicts_are_resolved_during_compilation() {
 #[test]
 fn stylesheet_static_context_is_module_and_instruction_local() {
     // Comments do not end the parameter prologue, and computed names use stylesheet bindings.
-    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:p="urn:p"><xsl:output omit-xml-declaration="yes" exclude-result-prefixes="p"/><xsl:template match="/"><!--documented--><xsl:param name="v" select="'ok'"/><xsl:element name="p:out"><xsl:attribute name="p:value"><xsl:value-of select="$v"/></xsl:attribute></xsl:element></xsl:template></xsl:stylesheet>"#;
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:p="urn:p" exclude-result-prefixes="p"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><!--documented--><xsl:param name="v" select="'ok'"/><xsl:element name="p:out"><xsl:attribute name="p:value"><xsl:value-of select="$v"/></xsl:attribute></xsl:element></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(stylesheet, "<source/>"),
         "<p:out xmlns:p=\"urn:p\" p:value=\"ok\"/>\n"

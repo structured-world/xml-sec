@@ -801,10 +801,15 @@ impl Document {
             ));
         }
         let key = (self.root, name.clone());
-        if self.unparsed_entities.insert(key, uri).is_some() {
-            return Err(Error::Xml(format!("duplicate unparsed entity `{name}`")));
+        match self.unparsed_entities.entry(key) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                Err(Error::Xml(format!("duplicate unparsed entity `{name}`")))
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(uri);
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     pub(crate) fn unparsed_entities(&self) -> impl Iterator<Item = (&str, &str, NodeId)> {
@@ -2228,6 +2233,26 @@ mod parser_boundary_tests {
         )
         .expect("duplicate entity declarations are well-formed");
         assert_eq!(document.string_value(document.root()), "first");
+    }
+
+    #[test]
+    fn rejected_unparsed_entity_registration_preserves_the_first_binding() {
+        // A failed public mutation must leave the accepted document metadata unchanged.
+        let mut document = Document::parse_iterative("<root/>", None).expect("document parses");
+        document
+            .register_unparsed_entity("logo", "memory:first")
+            .expect("first entity is accepted");
+        let error = document
+            .register_unparsed_entity("logo", "memory:rejected")
+            .expect_err("duplicate entity is rejected");
+        assert!(matches!(error, super::Error::Xml(message) if message.contains("duplicate")));
+        assert_eq!(
+            document
+                .unparsed_entities()
+                .map(|(name, uri, _)| (name, uri))
+                .collect::<Vec<_>>(),
+            vec![("logo", "memory:first")]
+        );
     }
 
     #[test]

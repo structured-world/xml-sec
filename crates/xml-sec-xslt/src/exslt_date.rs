@@ -223,12 +223,14 @@ fn current_datetime(clock: &dyn Clock) -> std::result::Result<String, function::
     let current = clock.now_local().map_err(|error| function::Error::Other {
         what: error.to_string(),
     })?;
+    // EXSLT date:date-time uses XSD 1.0 §3.2.7, whose Appendix D.3.2 forbids year zero:
+    // https://www.w3.org/TR/xmlschema-2/#noYearZero
+    let year = render_year(schema_year(i64::from(current.year())));
     let offset = current.offset().whole_seconds();
     let sign = if offset < 0 { '-' } else { '+' };
     let offset = offset.unsigned_abs();
     Ok(format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{sign}{:02}:{:02}",
-        current.year(),
+        "{year}-{:02}-{:02}T{:02}:{:02}:{:02}{sign}{:02}:{:02}",
         u8::from(current.month()),
         current.day(),
         current.hour(),
