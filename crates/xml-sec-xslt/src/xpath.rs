@@ -1691,6 +1691,32 @@ impl Evaluator {
         }
     }
 
+    pub(crate) fn visit_string_value(&self, node: &SourceNode, mut visit: impl FnMut(&str)) {
+        match node {
+            SourceNode::Node(id) => self.source.visit_string_value(*id, visit),
+            SourceNode::Attribute { owner, index } => {
+                if let Some(value) = self.source.node(*owner).and_then(|node| match &node.kind {
+                    NodeKind::Element { attributes, .. } => attributes
+                        .get(*index)
+                        .map(|attribute| attribute.value.as_str()),
+                    _ => None,
+                }) {
+                    visit(value);
+                }
+            }
+            SourceNode::Namespace { owner, index } => {
+                if let Some(value) = self.source.node(*owner).and_then(|node| match &node.kind {
+                    NodeKind::Element { namespaces, .. } => namespaces
+                        .get(*index)
+                        .map(|namespace| namespace.uri.as_str()),
+                    _ => None,
+                }) {
+                    visit(value);
+                }
+            }
+        }
+    }
+
     pub(crate) fn is_text_node(&self, node: &SourceNode) -> bool {
         matches!(node, SourceNode::Node(id) if self.source.node(*id).is_some_and(|node| matches!(node.kind, NodeKind::Text { .. })))
     }

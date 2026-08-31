@@ -244,6 +244,10 @@ struct Execution<'a> {
     result: Document,
     output_stack: Vec<NodeId>,
     scopes: Vec<HashMap<ExpandedName, Value>>,
+    // A global leaves this map before evaluation, so recursive access is detected without
+    // replaying side effects or retrying a failed initializer.
+    pending_globals: HashMap<ExpandedName, &'a crate::compiler::GlobalVariable>,
+    initializing_globals: Vec<ExpandedName>,
     meter: Meter,
     messages: Vec<Message>,
     secondary_outputs: Vec<SecondaryOutput>,
@@ -375,6 +379,8 @@ impl<'a> Execution<'a> {
             result: Document::empty(None),
             output_stack: vec![NodeId(0)],
             scopes: vec![HashMap::new()],
+            pending_globals: HashMap::new(),
+            initializing_globals: Vec::new(),
             meter,
             messages: vec![],
             secondary_outputs: vec![],
@@ -517,63 +523,80 @@ impl<'a> Execution<'a> {
                 effective.insert(global.variable.name.clone(), global);
             }
         }
-        let mut pending = effective.into_values().collect::<Vec<_>>();
-        pending.sort_by_key(|global| global.order);
-        let global_names = pending
+        let mut order = effective.values().copied().collect::<Vec<_>>();
+        order.sort_by_key(|global| global.order);
+        for global in &order {
+            let name = &global.variable.name;
+            if global.is_parameter
+                && let Some(value) = parameters.get(name)
+            {
+                let owned_bytes = expanded_name_owned_bytes(name)
+                    .saturating_add(parameter_value_owned_bytes(value, source_remap));
+                self.meter
+                    .check_additional(BudgetKind::OwnedBytes, owned_bytes)?;
+                let value = source_remap.map_or_else(
+                    || value.clone(),
+                    |remap| remap_parameter_value(value, remap),
+                );
+                self.meter.charge(BudgetKind::OwnedBytes, owned_bytes)?;
+                self.scopes[0].insert(name.clone(), value);
+                effective.remove(name);
+            }
+        }
+        self.pending_globals = effective;
+        for global in order {
+            self.ensure_global(&global.variable.name)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_global(&mut self, name: &ExpandedName) -> Result<()> {
+        if self.scopes[0].contains_key(name) {
+            return Ok(());
+        }
+        if self
+            .initializing_globals
             .iter()
-            .map(|global| global.variable.name.clone())
-            .collect::<HashSet<_>>();
-        while !pending.is_empty() {
-            let mut deferred = Vec::new();
-            let mut progressed = false;
-            for global in pending {
-                if global.is_parameter
-                    && let Some(value) = parameters.get(&global.variable.name)
-                {
-                    let owned_bytes = expanded_name_owned_bytes(&global.variable.name)
-                        .saturating_add(parameter_value_owned_bytes(value, source_remap));
-                    self.meter
-                        .check_additional(BudgetKind::OwnedBytes, owned_bytes)?;
-                    let value = source_remap.map_or_else(
-                        || value.clone(),
-                        |remap| remap_parameter_value(value, remap),
-                    );
-                    let name = global.variable.name.clone();
-                    self.meter.charge(BudgetKind::OwnedBytes, owned_bytes)?;
-                    self.scopes[0].insert(name, value);
-                    progressed = true;
-                    continue;
-                }
-                if global
-                    .dependencies
-                    .iter()
-                    .filter(|name| global_names.contains(*name))
-                    .any(|name| !self.scopes[0].contains_key(name))
-                {
-                    deferred.push(global);
-                    continue;
-                }
-                let value = self.evaluate_variable(
-                    &global.variable,
-                    &SourceNode::Node(self.evaluator.source.root()),
-                    1,
-                    1,
-                    1,
-                )?;
-                self.scopes[0].insert(global.variable.name.clone(), value);
-                progressed = true;
+            .any(|active| active == name)
+        {
+            let mut names = self
+                .initializing_globals
+                .iter()
+                .map(|active| active.local.as_str())
+                .collect::<Vec<_>>();
+            names.push(name.local.as_str());
+            return Err(Error::Dynamic(format!(
+                "circular global variable dependency: {}",
+                names.join(" -> ")
+            )));
+        }
+        let Some(global) = self.pending_globals.remove(name) else {
+            return Ok(());
+        };
+        self.initializing_globals.push(name.clone());
+        let value = self.evaluate_variable(
+            &global.variable,
+            &SourceNode::Node(self.evaluator.source.root()),
+            1,
+            1,
+            1,
+        );
+        self.initializing_globals.pop();
+        let value = value?;
+        self.scopes[0].insert(name.clone(), value);
+        Ok(())
+    }
+
+    fn ensure_expression_globals(&mut self, expression: &Expression) -> Result<()> {
+        for name in expression.variable_references.iter() {
+            if !self
+                .scopes
+                .iter()
+                .rev()
+                .any(|scope| scope.contains_key(name))
+            {
+                self.ensure_global(name)?;
             }
-            if !progressed {
-                let names = deferred
-                    .iter()
-                    .map(|global| global.variable.name.local.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(Error::Dynamic(format!(
-                    "circular or unresolved global variable dependency: {names}"
-                )));
-            }
-            pending = deferred;
         }
         Ok(())
     }
@@ -1811,6 +1834,7 @@ impl<'a> Execution<'a> {
         size: usize,
     ) -> Result<XPathValue> {
         self.meter.charge(BudgetKind::XPathEvaluations, 1)?;
+        self.ensure_expression_globals(expression)?;
         if xpath_calls_key(&expression.source) {
             self.ensure_key_index(&expression.source, &expression.namespaces, node)?;
         }
@@ -1974,9 +1998,19 @@ impl<'a> Execution<'a> {
                 )));
             }
             "normalize-space(.)" => {
-                return Ok(Some(XPathValue::String(normalize_xpath_space(
-                    &self.evaluator.string_value(node),
-                ))));
+                let mut capacity = 0usize;
+                let mut pending_space = false;
+                self.evaluator.visit_string_value(node, |value| {
+                    measure_normalized_xpath_space(value, &mut capacity, &mut pending_space);
+                });
+                self.meter
+                    .check_additional(BudgetKind::OwnedBytes, capacity)?;
+                let mut output = String::with_capacity(capacity);
+                let mut pending_space = false;
+                self.evaluator.visit_string_value(node, |value| {
+                    append_normalized_xpath_space(value, &mut output, &mut pending_space);
+                });
+                return Ok(Some(XPathValue::String(output)));
             }
             "concat('<',name(.),'>')" => {
                 return Ok(Some(XPathValue::String(format!(
@@ -3096,15 +3130,6 @@ impl<'a> Execution<'a> {
                 Ok(values)
             }
             "any" => {
-                let mut boundary = None::<NodeId>;
-                for candidate in &lineage {
-                    if from(self, candidate)? {
-                        if let SourceNode::Node(id) = candidate {
-                            boundary = Some(*id);
-                        }
-                        break;
-                    }
-                }
                 let mut count = 0usize;
                 let logical_root = self
                     .evaluator
@@ -3121,7 +3146,7 @@ impl<'a> Execution<'a> {
                         .chain(self.evaluator.attributes(&element))
                         .chain(self.evaluator.namespaces(&element));
                     for candidate in candidates {
-                        if candidate == element && Some(id) == boundary {
+                        if from(self, &candidate)? {
                             count = 0;
                         } else if matches(self, &candidate)? {
                             count += 1;
@@ -3260,21 +3285,32 @@ fn remap_parameter_node(
     }
 }
 
-fn normalize_xpath_space(value: &str) -> String {
-    let mut output = String::with_capacity(value.len());
-    let mut pending_space = false;
+fn append_normalized_xpath_space(value: &str, output: &mut String, pending_space: &mut bool) {
     for character in value.chars() {
         if matches!(character, ' ' | '\t' | '\r' | '\n') {
-            pending_space = !output.is_empty();
+            *pending_space = !output.is_empty();
         } else {
-            if pending_space {
+            if *pending_space {
                 output.push(' ');
-                pending_space = false;
+                *pending_space = false;
             }
             output.push(character);
         }
     }
-    output
+}
+
+fn measure_normalized_xpath_space(value: &str, bytes: &mut usize, pending_space: &mut bool) {
+    for character in value.chars() {
+        if matches!(character, ' ' | '\t' | '\r' | '\n') {
+            *pending_space = *bytes != 0;
+        } else {
+            if *pending_space {
+                *bytes = bytes.saturating_add(1);
+                *pending_space = false;
+            }
+            *bytes = bytes.saturating_add(character.len_utf8());
+        }
+    }
 }
 
 fn try_stable_sort_by<T: Copy>(

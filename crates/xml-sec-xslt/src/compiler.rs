@@ -3,7 +3,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::budget::ensure;
-use crate::expression::innermost_namespaced_call;
 use crate::lexical::{is_ncname, unicode_decimal_value};
 use crate::resolver::decode_resource;
 use crate::{
@@ -76,14 +75,11 @@ impl<R: Resolver> Compiler<R> {
             roxmltree::Document::parse(xml).map_err(|error| Error::Xml(error.to_string()))?;
         state.charge_owned(estimate_compiled_owned_bytes(&document))?;
         let root = document.root_element();
-        if root.tag_name().namespace() != Some(XSLT_NS)
-            || !matches!(root.tag_name().name(), "stylesheet" | "transform")
-        {
+        let StylesheetModuleKind::Standard { forward } = stylesheet_module_kind(root)? else {
             let precedence = inherited_precedence.unwrap_or_else(|| state.next_precedence());
             return self
                 .compile_literal_result_stylesheet(root, base_uri, precedence, state, depth);
-        }
-        let forward = module_forward_compatible(root)?;
+        };
         let mut saw_non_import = false;
         self.compile_effective_imports(root, base_uri, state, depth, &mut saw_non_import)?;
         let local_precedence = inherited_precedence.unwrap_or_else(|| state.next_precedence());
@@ -146,15 +142,16 @@ impl<R: Resolver> Compiler<R> {
                     let document = roxmltree::Document::parse(&source)
                         .map_err(|error| Error::Xml(error.to_string()))?;
                     let included_root = document.root_element();
-                    require_stylesheet_module(included_root)?;
-                    module_forward_compatible(included_root)?;
-                    self.compile_effective_imports(
-                        included_root,
-                        Some(&resource.canonical_uri),
-                        state,
-                        depth + 1,
-                        saw_non_import,
-                    )
+                    match stylesheet_module_kind(included_root)? {
+                        StylesheetModuleKind::Standard { .. } => self.compile_effective_imports(
+                            included_root,
+                            Some(&resource.canonical_uri),
+                            state,
+                            depth + 1,
+                            saw_non_import,
+                        ),
+                        StylesheetModuleKind::Simplified => Ok(()),
+                    }
                 })?;
             } else {
                 *saw_non_import = true;
@@ -189,16 +186,25 @@ impl<R: Resolver> Compiler<R> {
                     let document = roxmltree::Document::parse(&source)
                         .map_err(|error| Error::Xml(error.to_string()))?;
                     let included_root = document.root_element();
-                    require_stylesheet_module(included_root)?;
-                    let included_forward = module_forward_compatible(included_root)?;
-                    self.compile_effective_declarations(
-                        included_root,
-                        Some(&resource.canonical_uri),
-                        precedence,
-                        included_forward,
-                        state,
-                        depth + 1,
-                    )
+                    match stylesheet_module_kind(included_root)? {
+                        StylesheetModuleKind::Standard {
+                            forward: included_forward,
+                        } => self.compile_effective_declarations(
+                            included_root,
+                            Some(&resource.canonical_uri),
+                            precedence,
+                            included_forward,
+                            state,
+                            depth + 1,
+                        ),
+                        StylesheetModuleKind::Simplified => self.compile_literal_result_stylesheet(
+                            included_root,
+                            Some(&resource.canonical_uri),
+                            precedence,
+                            state,
+                            depth + 1,
+                        ),
+                    }
                 })?;
                 continue;
             }
@@ -448,7 +454,6 @@ impl<R: Resolver> Compiler<R> {
                     precedence,
                     order,
                     is_parameter: node.tag_name().name() == "param",
-                    dependencies: Arc::from([]),
                 });
             }
             "output" => merge_output(&mut state.output, node)?,
@@ -556,7 +561,6 @@ pub(crate) struct GlobalVariable {
     pub precedence: usize,
     pub order: usize,
     pub is_parameter: bool,
-    pub dependencies: Arc<[ExpandedName]>,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct ExsltFunction {
@@ -577,6 +581,8 @@ pub(crate) struct Variable {
 pub(crate) struct Expression {
     pub source: String,
     pub namespaces: Vec<(String, String)>,
+    /// Expanded references let execution initialize only globals on the reached XPath path.
+    pub variable_references: Arc<[ExpandedName]>,
     /// Static base of the stylesheet module that owns this expression.
     pub static_base_uri: Option<String>,
 }
@@ -772,447 +778,90 @@ impl Expression {
             .map_err(|error| {
                 Error::Static(format!("invalid XPath expression `{source}`: {error}"))
             })?;
-        Ok(Self {
-            source: source.to_owned(),
+        Ok(Self::from_parts(
+            source.to_owned(),
             namespaces,
-            static_base_uri: effective_base_uri(node, static_base_uri)?,
-        })
+            effective_base_uri(node, static_base_uri)?,
+        ))
     }
 
     pub(crate) fn derived(&self, source: impl Into<String>) -> Self {
-        Self {
-            source: source.into(),
-            namespaces: self.namespaces.clone(),
-            static_base_uri: self.static_base_uri.clone(),
-        }
+        Self::from_parts(
+            source.into(),
+            self.namespaces.clone(),
+            self.static_base_uri.clone(),
+        )
     }
 
     pub(crate) fn generated(source: impl Into<String>, namespaces: Vec<(String, String)>) -> Self {
-        Self {
-            source: source.into(),
-            namespaces,
-            static_base_uri: None,
-        }
+        Self::from_parts(source.into(), namespaces, None)
     }
 
-    fn referenced_variables(&self, output: &mut HashSet<ExpandedName>) {
-        let mut quote = None;
-        let mut characters = self.source.char_indices().peekable();
-        while let Some((_, character)) = characters.next() {
-            if let Some(active) = quote {
-                if character == active {
-                    quote = None;
-                }
-                continue;
-            }
-            if matches!(character, '\'' | '"') {
-                quote = Some(character);
-                continue;
-            }
-            if character != '$' {
-                continue;
-            }
-            let Some(&(byte_start, _)) = characters.peek() else {
-                break;
-            };
-            let mut byte_end = byte_start;
-            while let Some(&(offset, character)) = characters.peek() {
-                if !crate::lexical::is_ncname_char(character) && character != ':' {
-                    break;
-                }
-                byte_end = offset + character.len_utf8();
-                characters.next();
-            }
-            let lexical = &self.source[byte_start..byte_end];
-            if is_lexical_qname(lexical) {
-                let (prefix, local) = lexical
-                    .split_once(':')
-                    .map_or((None, lexical), |(prefix, local)| (Some(prefix), local));
-                let namespace = prefix.and_then(|prefix| {
-                    self.namespaces
-                        .iter()
-                        .find(|(candidate, _)| candidate == prefix)
-                        .map(|(_, namespace)| namespace.clone())
-                });
-                output.insert(ExpandedName::new(namespace, local));
-            }
-        }
-    }
-}
-
-impl Variable {
-    pub(crate) fn global_dependencies(
-        &self,
-        templates: &[Template],
-        attribute_sets: &[AttributeSet],
-        functions: &[ExsltFunction],
-    ) -> HashSet<ExpandedName> {
-        let mut output = HashSet::new();
-        DependencyCollector::new(templates, attribute_sets, functions).variable(
-            self,
-            &HashSet::new(),
-            &mut output,
-        );
-        output
-    }
-}
-
-struct DependencyCollector<'a> {
-    templates: &'a [Template],
-    attribute_sets: &'a [AttributeSet],
-    functions: &'a [ExsltFunction],
-    traversed_templates: HashSet<(usize, Vec<ExpandedName>)>,
-    traversed_attribute_sets: HashSet<usize>,
-    traversed_functions: HashSet<(usize, usize)>,
-}
-
-impl<'a> DependencyCollector<'a> {
-    fn new(
-        templates: &'a [Template],
-        attribute_sets: &'a [AttributeSet],
-        functions: &'a [ExsltFunction],
+    fn from_parts(
+        source: String,
+        namespaces: Vec<(String, String)>,
+        static_base_uri: Option<String>,
     ) -> Self {
+        let variable_references = referenced_variables(&source, &namespaces).into();
         Self {
-            templates,
-            attribute_sets,
-            functions,
-            traversed_templates: HashSet::new(),
-            traversed_attribute_sets: HashSet::new(),
-            traversed_functions: HashSet::new(),
-        }
-    }
-
-    fn variable(
-        &mut self,
-        variable: &Variable,
-        locals: &HashSet<ExpandedName>,
-        output: &mut HashSet<ExpandedName>,
-    ) {
-        if let Some(select) = &variable.select {
-            self.expression(select, locals, output);
-        }
-        self.sequence(&variable.content, locals.clone(), output);
-    }
-
-    fn expression(
-        &mut self,
-        expression: &Expression,
-        locals: &HashSet<ExpandedName>,
-        output: &mut HashSet<ExpandedName>,
-    ) {
-        collect_expression_dependencies(expression, locals, output);
-        let mut source = expression.source.clone();
-        while let Some(call) =
-            innermost_namespaced_call(&source, &expression.namespaces, |namespace, local| {
-                self.functions.iter().any(|function| {
-                    function.name.namespace.as_deref() == Some(namespace)
-                        && function.name.local == local
-                })
-            })
-        {
-            let name = ExpandedName::new(Some(call.namespace), call.local);
-            if let Some(function) = self
-                .functions
-                .iter()
-                .filter(|function| function.name == name)
-                .max_by_key(|function| (function.precedence, function.order))
-                .cloned()
-            {
-                self.function(&function, call.arguments.len(), output);
-            }
-            source.replace_range(call.start..call.end, "0");
-        }
-    }
-
-    fn function(
-        &mut self,
-        function: &ExsltFunction,
-        supplied_count: usize,
-        output: &mut HashSet<ExpandedName>,
-    ) {
-        if !self
-            .traversed_functions
-            .insert((function.order, supplied_count.min(function.params.len())))
-        {
-            return;
-        }
-        let mut locals = HashSet::new();
-        for (index, parameter) in function.params.iter().enumerate() {
-            if index >= supplied_count {
-                self.variable(parameter, &locals, output);
-            }
-            locals.insert(parameter.name.clone());
-        }
-        self.sequence(&function.body, locals, output);
-    }
-
-    fn avt(
-        &mut self,
-        value: &AttributeValueTemplate,
-        locals: &HashSet<ExpandedName>,
-        output: &mut HashSet<ExpandedName>,
-    ) {
-        for part in &value.0 {
-            if let AvtPart::Expression(expression) = part {
-                self.expression(expression, locals, output);
-            }
-        }
-    }
-
-    fn sort(
-        &mut self,
-        sort: &Sort,
-        locals: &HashSet<ExpandedName>,
-        output: &mut HashSet<ExpandedName>,
-    ) {
-        self.expression(&sort.select, locals, output);
-        self.avt(&sort.data_type, locals, output);
-        self.avt(&sort.order, locals, output);
-        if let Some(value) = &sort.case_order {
-            self.avt(value, locals, output);
-        }
-        if let Some(value) = &sort.lang {
-            self.avt(value, locals, output);
-        }
-    }
-
-    fn template(
-        &mut self,
-        template: &Template,
-        supplied: &HashSet<ExpandedName>,
-        output: &mut HashSet<ExpandedName>,
-    ) {
-        let mut supplied_key = supplied.iter().cloned().collect::<Vec<_>>();
-        supplied_key.sort_by(|left, right| {
-            left.namespace
-                .cmp(&right.namespace)
-                .then_with(|| left.local.cmp(&right.local))
-        });
-        if !self
-            .traversed_templates
-            .insert((template.order, supplied_key))
-        {
-            return;
-        }
-        let mut locals = HashSet::new();
-        for parameter in &template.params {
-            if !supplied.contains(&parameter.name) {
-                self.variable(parameter, &locals, output);
-            }
-            locals.insert(parameter.name.clone());
-        }
-        self.sequence(&template.body, locals, output);
-    }
-
-    fn attribute_sets(&mut self, names: &[ExpandedName], output: &mut HashSet<ExpandedName>) {
-        let declarations = names
-            .iter()
-            .flat_map(|name| {
-                self.attribute_sets
-                    .iter()
-                    .filter(move |set| &set.name == name)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        for set in declarations {
-            if !self.traversed_attribute_sets.insert(set.order) {
-                continue;
-            }
-            self.attribute_sets(&set.uses, output);
-            self.sequence(&set.attributes, HashSet::new(), output);
-        }
-    }
-
-    fn sequence(
-        &mut self,
-        instructions: &[Instruction],
-        mut locals: HashSet<ExpandedName>,
-        output: &mut HashSet<ExpandedName>,
-    ) {
-        for instruction in instructions {
-            match instruction {
-                Instruction::Text(..)
-                | Instruction::ApplyImports
-                | Instruction::CompatibilityComment(_) => {}
-                Instruction::LiteralElement {
-                    attributes,
-                    children,
-                    attribute_sets,
-                    ..
-                } => {
-                    for attribute in attributes {
-                        self.avt(&attribute.value, &locals, output);
-                    }
-                    self.attribute_sets(attribute_sets, output);
-                    self.sequence(children, locals.clone(), output);
-                }
-                Instruction::ApplyTemplates {
-                    select,
-                    mode,
-                    sorts,
-                    parameters,
-                } => {
-                    self.expression(select, &locals, output);
-                    for sort in sorts {
-                        self.sort(sort, &locals, output);
-                    }
-                    for parameter in parameters {
-                        self.variable(&parameter.variable, &locals, output);
-                    }
-                    let supplied = parameters
-                        .iter()
-                        .map(|parameter| parameter.variable.name.clone())
-                        .collect::<HashSet<_>>();
-                    let selectable = self
-                        .templates
-                        .iter()
-                        .filter(|template| template.pattern.is_some() && template.mode == *mode)
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    for template in selectable {
-                        self.template(&template, &supplied, output);
-                    }
-                }
-                Instruction::CallTemplate { name, parameters } => {
-                    for parameter in parameters {
-                        self.variable(&parameter.variable, &locals, output);
-                    }
-                    let supplied = parameters
-                        .iter()
-                        .map(|parameter| parameter.variable.name.clone())
-                        .collect::<HashSet<_>>();
-                    if let Some(template) = self
-                        .templates
-                        .iter()
-                        .filter(|template| template.name.as_ref() == Some(name))
-                        .max_by_key(|template| (template.precedence, template.order))
-                    {
-                        self.template(template, &supplied, output);
-                    }
-                }
-                Instruction::ForEach {
-                    select,
-                    sorts,
-                    body,
-                } => {
-                    self.expression(select, &locals, output);
-                    for sort in sorts {
-                        self.sort(sort, &locals, output);
-                    }
-                    self.sequence(body, locals.clone(), output);
-                }
-                Instruction::If { test, body } => {
-                    self.expression(test, &locals, output);
-                    self.sequence(body, locals.clone(), output);
-                }
-                Instruction::Choose {
-                    branches,
-                    otherwise,
-                } => {
-                    for (test, body) in branches {
-                        self.expression(test, &locals, output);
-                        self.sequence(body, locals.clone(), output);
-                    }
-                    self.sequence(otherwise, locals.clone(), output);
-                }
-                Instruction::ValueOf { select, .. } | Instruction::CopyOf(select) => {
-                    self.expression(select, &locals, output);
-                }
-                Instruction::Copy {
-                    body,
-                    attribute_sets,
-                } => {
-                    self.attribute_sets(attribute_sets, output);
-                    self.sequence(body, locals.clone(), output);
-                }
-                Instruction::Comment(body)
-                | Instruction::ExtensionFallback { body, .. }
-                | Instruction::Message { body, .. } => {
-                    self.sequence(body, locals.clone(), output);
-                }
-                Instruction::Element {
-                    name,
-                    namespace,
-                    body,
-                    attribute_sets,
-                    ..
-                } => {
-                    self.avt(name, &locals, output);
-                    if let Some(namespace) = namespace {
-                        self.avt(namespace, &locals, output);
-                    }
-                    self.attribute_sets(attribute_sets, output);
-                    self.sequence(body, locals.clone(), output);
-                }
-                Instruction::Attribute {
-                    name,
-                    namespace,
-                    body,
-                    ..
-                } => {
-                    self.avt(name, &locals, output);
-                    if let Some(namespace) = namespace {
-                        self.avt(namespace, &locals, output);
-                    }
-                    self.sequence(body, locals.clone(), output);
-                }
-                Instruction::Processing { name, body } => {
-                    self.avt(name, &locals, output);
-                    self.sequence(body, locals.clone(), output);
-                }
-                Instruction::Number(number) => {
-                    if let Some(value) = &number.value {
-                        self.expression(value, &locals, output);
-                    }
-                    for value in [
-                        Some(&number.format),
-                        number.lang.as_ref(),
-                        number.letter_value.as_ref(),
-                        number.grouping_separator.as_ref(),
-                        number.grouping_size.as_ref(),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    {
-                        self.avt(value, &locals, output);
-                    }
-                }
-                Instruction::Variable(variable) => {
-                    self.variable(variable, &locals, output);
-                    locals.insert(variable.name.clone());
-                }
-                Instruction::SecondaryOutput {
-                    uri,
-                    properties,
-                    body,
-                } => {
-                    self.avt(uri, &locals, output);
-                    for (_, value) in properties {
-                        self.avt(value, &locals, output);
-                    }
-                    self.sequence(body, locals.clone(), output);
-                }
-                Instruction::FunctionResult {
-                    select, content, ..
-                } => {
-                    if let Some(select) = select {
-                        self.expression(select, &locals, output);
-                    }
-                    self.sequence(content, locals.clone(), output);
-                }
-            }
+            source,
+            namespaces,
+            variable_references,
+            static_base_uri,
         }
     }
 }
 
-fn collect_expression_dependencies(
-    expression: &Expression,
-    locals: &HashSet<ExpandedName>,
-    output: &mut HashSet<ExpandedName>,
-) {
-    let mut references = HashSet::new();
-    expression.referenced_variables(&mut references);
-    output.extend(references.into_iter().filter(|name| !locals.contains(name)));
+fn referenced_variables(source: &str, namespaces: &[(String, String)]) -> Vec<ExpandedName> {
+    let mut output = Vec::new();
+    let mut quote = None;
+    let mut characters = source.char_indices().peekable();
+    while let Some((_, character)) = characters.next() {
+        if let Some(active) = quote {
+            if character == active {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            continue;
+        }
+        if character != '$' {
+            continue;
+        }
+        let Some(&(byte_start, _)) = characters.peek() else {
+            break;
+        };
+        let mut byte_end = byte_start;
+        while let Some(&(offset, character)) = characters.peek() {
+            if !crate::lexical::is_ncname_char(character) && character != ':' {
+                break;
+            }
+            byte_end = offset + character.len_utf8();
+            characters.next();
+        }
+        let lexical = &source[byte_start..byte_end];
+        if is_lexical_qname(lexical) {
+            let (prefix, local) = lexical
+                .split_once(':')
+                .map_or((None, lexical), |(prefix, local)| (Some(prefix), local));
+            let namespace = prefix.and_then(|prefix| {
+                namespaces
+                    .iter()
+                    .find(|(candidate, _)| candidate == prefix)
+                    .map(|(_, namespace)| namespace.clone())
+            });
+            output.push(ExpandedName::new(namespace, local));
+        }
+    }
+    output.sort_by(|left, right| {
+        left.namespace
+            .cmp(&right.namespace)
+            .then_with(|| left.local.cmp(&right.local))
+    });
+    output.dedup();
+    output
 }
 
 fn is_lexical_qname(value: &str) -> bool {
@@ -1863,31 +1512,6 @@ impl CompileState {
                 )));
             }
         }
-        let mut dependency_bytes = 0usize;
-        for global in &mut self.globals {
-            let mut dependencies = global
-                .variable
-                .global_dependencies(&self.templates, &self.attribute_sets, &self.functions)
-                .into_iter()
-                .collect::<Vec<_>>();
-            dependencies.sort_by(|left, right| {
-                left.namespace
-                    .cmp(&right.namespace)
-                    .then_with(|| left.local.cmp(&right.local))
-            });
-            dependency_bytes = dependency_bytes.saturating_add(
-                dependencies
-                    .iter()
-                    .map(|name| {
-                        name.local
-                            .len()
-                            .saturating_add(name.namespace.as_ref().map_or(0, String::len))
-                    })
-                    .sum(),
-            );
-            global.dependencies = dependencies.into();
-        }
-        self.charge_owned(dependency_bytes)?;
         let mut functions = HashSet::new();
         for function in &self.functions {
             if !functions.insert((&function.name, function.precedence)) {
@@ -2036,16 +1660,23 @@ fn parse_semantic_document_metered(
     Document::parse(xml, base_uri)
 }
 
-fn require_stylesheet_module(root: roxmltree::Node<'_, '_>) -> Result<()> {
+enum StylesheetModuleKind {
+    Standard { forward: bool },
+    Simplified,
+}
+
+fn stylesheet_module_kind(root: roxmltree::Node<'_, '_>) -> Result<StylesheetModuleKind> {
     if root.tag_name().namespace() == Some(XSLT_NS)
         && matches!(root.tag_name().name(), "stylesheet" | "transform")
     {
-        Ok(())
-    } else {
-        Err(Error::Static(
-            "included stylesheet must have an xsl:stylesheet root".into(),
-        ))
+        return Ok(StylesheetModuleKind::Standard {
+            forward: module_forward_compatible(root)?,
+        });
     }
+    root.attribute((XSLT_NS, "version"))
+        .ok_or_else(|| Error::Static("literal result stylesheet requires xsl:version".into()))
+        .and_then(parse_stylesheet_version)?;
+    Ok(StylesheetModuleKind::Simplified)
 }
 
 fn module_forward_compatible(root: roxmltree::Node<'_, '_>) -> Result<bool> {
@@ -2386,11 +2017,17 @@ fn compile_instruction(
             namespaces: namespaces(node),
         },
         "text" => {
-            if node.children().any(|child| !child.is_text()) {
+            if node
+                .children()
+                .any(|child| !child.is_text() && !child.is_comment() && !child.is_pi())
+            {
                 return Err(Error::Static("xsl:text may contain only text".into()));
             }
             Instruction::Text(
-                node.children().filter_map(|child| child.text()).collect(),
+                node.children()
+                    .filter(roxmltree::Node::is_text)
+                    .filter_map(|child| child.text())
+                    .collect(),
                 yes_no(node.attribute("disable-output-escaping"))?,
             )
         }
@@ -3042,6 +2679,16 @@ impl AttributeSet {
         precedence: usize,
         order: usize,
     ) -> Result<Self> {
+        if node.children().any(|child| {
+            child.is_text()
+                && child
+                    .text()
+                    .is_some_and(|text| !is_xml_whitespace_only(text))
+        }) {
+            return Err(Error::Static(
+                "xsl:attribute-set may contain only xsl:attribute".into(),
+            ));
+        }
         let uses = node
             .attribute("use-attribute-sets")
             .map(|v| {

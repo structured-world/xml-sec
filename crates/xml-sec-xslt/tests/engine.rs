@@ -335,6 +335,18 @@ fn number_empty_boundary_and_exceptional_values_follow_xslt() {
 }
 
 #[test]
+fn level_any_numbering_resets_at_preceding_non_ancestor_boundary() {
+    // The `from` boundary for level-any numbering is the most recent matching node in document
+    // order, not only a matching ancestor of the node being numbered.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:apply-templates select="root/item[last()]"/></xsl:template><xsl:template match="item"><xsl:number level="any" count="item" from="reset"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<root><item/><reset/><item/></root>"),
+        "1"
+    );
+    assert_eq!(execute(stylesheet, "<root><item/><item/></root>"), "2");
+}
+
+#[test]
 fn whitespace_aliases_and_decimal_formats_affect_results() {
     // Top-level declarations must be execution semantics rather than compiler metadata.
     let stylesheet = r#"
@@ -1107,6 +1119,14 @@ fn result_tree_fragments_preserve_nodes_and_global_dependencies_are_order_indepe
         },
     );
     assert!(matches!(result, Err(Error::Dynamic(_))));
+}
+
+#[test]
+fn unreachable_global_content_does_not_create_a_dependency_cycle() {
+    // Global dependencies arise only from expressions that execution reaches. A variable in a
+    // false instruction branch must not form a cycle with the global being initialized.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:variable name="a"><xsl:if test="false()"><xsl:value-of select="$b"/></xsl:if><xsl:text>ok</xsl:text></xsl:variable><xsl:variable name="b" select="$a"/><xsl:template match="/"><xsl:value-of select="$b"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "ok");
 }
 
 #[test]
@@ -2146,6 +2166,43 @@ fn include_keeps_equal_precedence_and_document_order() {
 }
 
 #[test]
+fn include_accepts_a_simplified_stylesheet_module() {
+    // XSLT 1.0 permits a literal result element carrying xsl:version to act as a stylesheet
+    // module, including when that module is reached through xsl:include.
+    let resolver = Arc::new(MemoryResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            "literal.xsl".into(),
+            r#"<included xsl:version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:value-of select="/*/@value"/></included>"#.into(),
+        );
+    let stylesheet = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:include href="literal.xsl"/></xsl:stylesheet>"#,
+        Some("memory:main.xsl"),
+    )
+    .expect("simplified included stylesheet compiles");
+    let output = stylesheet
+        .execute(
+            &Document::parse("<source value=\"ok\"/>", None).expect("source parses"),
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("simplified included stylesheet executes");
+    assert_eq!(output.serialized.bytes, b"<included>ok</included>\n");
+}
+
+#[test]
 fn whitespace_and_variable_scopes_follow_xslt_lexical_rules() {
     // NBSP is character data, nested variables do not leak, and undeclared caller values are ignored.
     let whitespace = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:strip-space elements="*"/><xsl:template match="/"><xsl:value-of select="string-length(root)"/></xsl:template></xsl:stylesheet>"#;
@@ -2215,6 +2272,25 @@ fn compiler_rejects_invalid_instruction_content_and_accounts_for_ir() {
             ..
         })
     ));
+}
+
+#[test]
+fn stylesheet_content_models_distinguish_ignorable_nodes_from_character_data() {
+    // Comments and processing instructions are absent from the stylesheet's sequence
+    // constructor, while child instructions in xsl:text and character data in an attribute set
+    // remain static errors.
+    let text = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:text>a<!-- note --><?trace ignored?>b</xsl:text></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(text, "<source/>"), "ab");
+
+    let invalid_attribute_set = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:attribute-set name="attrs">invalid<xsl:attribute name="a">v</xsl:attribute></xsl:attribute-set></xsl:stylesheet>"#;
+    assert!(matches!(
+        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+            .compile(invalid_attribute_set, None),
+        Err(Error::Static(_))
+    ));
+
+    let ignorable_attribute_set = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:attribute-set name="attrs"> <!-- note --> <?trace ignored?> <xsl:attribute name="a">v</xsl:attribute> </xsl:attribute-set><xsl:template match="/"><out xsl:use-attribute-sets="attrs"/></xsl:template></xsl:stylesheet>"#;
+    compile(ignorable_attribute_set);
 }
 
 #[test]
@@ -3286,6 +3362,54 @@ fn core_concat_maps_preallocation_rejection_to_the_owned_bytes_budget() {
     let source_xml = format!("<source>{}</source>", "x".repeat(16 * 1024));
     let mut budget = execution_budget(source_xml.len());
     budget.owned_bytes = source_xml.len() + (128 * 1024);
+    assert!(matches!(
+        stylesheet.execute(
+            &Document::parse(&source_xml, None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn normalize_space_fast_path_preflights_its_output_allocation() {
+    // The optimized normalize-space path consumes attacker-controlled source text. It must honor
+    // the same OwnedBytes preallocation contract as the general XPath implementation without
+    // reserving discarded whitespace. This mostly-whitespace value therefore fits the budget.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="source"><xsl:value-of select="normalize-space(.)"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let payload = format!("{}word{}", " ".repeat(64 * 1024), " ".repeat(64 * 1024));
+    let source_xml = format!("<source>{payload}</source>");
+    let mut budget = execution_budget(source_xml.len());
+    budget.owned_bytes = source_xml.len().saturating_mul(4);
+    let output = stylesheet
+        .execute(
+            &Document::parse(&source_xml, None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("discarded whitespace is not reserved as result storage");
+    assert_eq!(output.serialized.bytes, b"word");
+
+    // A result that retains the attacker-controlled payload must fail before reserving it.
+    let source_xml = format!("<source>{}</source>", "x".repeat(128 * 1024));
+    let mut budget = execution_budget(source_xml.len());
+    budget.owned_bytes = source_xml.len().saturating_mul(4);
     assert!(matches!(
         stylesheet.execute(
             &Document::parse(&source_xml, None).expect("source parses"),

@@ -973,6 +973,32 @@ impl Document {
         }
     }
 
+    pub(crate) fn visit_string_value(&self, id: NodeId, mut visit: impl FnMut(&str)) {
+        let Some(node) = self.node(id) else {
+            return;
+        };
+        match &node.kind {
+            NodeKind::Text { value, .. } | NodeKind::Comment(value) => visit(value),
+            NodeKind::ProcessingInstruction { value, .. } => {
+                if let Some(value) = value {
+                    visit(value);
+                }
+            }
+            NodeKind::Root | NodeKind::Element { .. } => {
+                let mut pending = node.children.iter().rev().copied().collect::<Vec<_>>();
+                while let Some(current) = pending.pop() {
+                    let Some(current) = self.node(current) else {
+                        continue;
+                    };
+                    if let NodeKind::Text { value, .. } = &current.kind {
+                        visit(value);
+                    }
+                    pending.extend(current.children.iter().rev().copied());
+                }
+            }
+        }
+    }
+
     pub(crate) fn retain_nodes(
         &mut self,
         mut keep: impl FnMut(NodeId, &Node) -> bool,
@@ -1465,7 +1491,7 @@ fn collect_internal_entity_declarations(subset: &str) -> Result<InternalEntityDe
                 "unterminated value for internal entity `{name}`"
             )));
         }
-        let value = subset[value_start..cursor].to_owned();
+        let mut value = subset[value_start..cursor].to_owned();
         cursor += 1;
         cursor = declaration_end(subset, cursor)?;
         if parameter {
@@ -1478,11 +1504,35 @@ fn collect_internal_entity_declarations(subset: &str) -> Result<InternalEntityDe
         } else {
             &mut declarations.general
         };
+        if !parameter {
+            value = normalize_predefined_entity_declaration(name, value)?;
+        }
         if let std::collections::hash_map::Entry::Vacant(entry) = entities.entry(name.to_owned()) {
             entry.insert(value);
         }
     }
     Ok(declarations)
+}
+
+fn normalize_predefined_entity_declaration(name: &str, value: String) -> Result<String> {
+    let expected = match name {
+        "amp" => '&',
+        "apos" => '\'',
+        "gt" => '>',
+        "lt" => '<',
+        "quot" => '"',
+        _ => return Ok(value),
+    };
+    let first = xml_sec_xml_input::lexical::decode_references(&value)
+        .map_err(|error| Error::Xml(error.to_string()))?;
+    let second = xml_sec_xml_input::lexical::decode_references(&first)
+        .map_err(|_| Error::Xml(format!("invalid predefined entity declaration `{name}`")))?;
+    if second.as_ref() != expected.to_string() {
+        return Err(Error::Xml(format!(
+            "invalid predefined entity declaration `{name}`"
+        )));
+    }
+    Ok(first.into_owned())
 }
 
 fn expand_parameter_entity_references<'a>(
@@ -2172,6 +2222,25 @@ mod parser_boundary_tests {
         )
         .expect("duplicate entity declarations are well-formed");
         assert_eq!(document.string_value(document.root()), "first");
+    }
+
+    #[test]
+    fn predefined_entity_redeclarations_preserve_xml_builtins() {
+        // XML permits only the normative replacement forms for predefined entities. A malformed
+        // declaration must not replace a builtin before the document reaches the XML parser.
+        let invalid = r#"<!DOCTYPE r [<!ENTITY amp "evil">]><r>&amp;</r>"#;
+        assert!(Document::parse_iterative(invalid, None).is_err());
+
+        let valid = r#"<!DOCTYPE r [
+            <!ENTITY amp "&#38;#38;">
+            <!ENTITY apos "&#39;">
+            <!ENTITY gt "&#62;">
+            <!ENTITY lt "&#38;#60;">
+            <!ENTITY quot "&#34;">
+        ]><r>&amp;&lt;&gt;&apos;&quot;</r>"#;
+        let document = Document::parse_iterative(valid, None)
+            .expect("normative predefined-entity redeclarations remain well-formed");
+        assert_eq!(document.string_value(document.root()), "&<>'\"");
     }
 
     #[test]
