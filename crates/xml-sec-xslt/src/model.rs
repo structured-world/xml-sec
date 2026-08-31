@@ -1061,16 +1061,9 @@ fn decode_xml_character_reference(digits: &str, radix: u32) -> Result<String> {
     u32::from_str_radix(digits, radix)
         .ok()
         .and_then(char::from_u32)
-        .filter(|character| is_xml10_character(*character))
+        .filter(|character| crate::lexical::is_xml10_character(*character))
         .map(String::from)
         .ok_or_else(|| Error::Xml("invalid character reference".into()))
-}
-
-fn is_xml10_character(character: char) -> bool {
-    matches!(
-        u32::from(character),
-        0x9 | 0xA | 0xD | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF
-    )
 }
 
 fn normalize_xml_line_endings(value: &str) -> String {
@@ -1455,24 +1448,43 @@ fn collect_internal_entity_declarations(subset: &str) -> Result<InternalEntityDe
         }
         let declaration_start = cursor;
         cursor += "<!ENTITY".len();
+        let spacing_start = cursor;
         skip_xml_whitespace(subset, &mut cursor);
+        if cursor == spacing_start {
+            return Err(Error::Xml(
+                "internal entity declaration requires XML whitespace after <!ENTITY".into(),
+            ));
+        }
         let parameter = subset[cursor..].starts_with('%');
         if parameter {
             cursor += 1;
+            let spacing_start = cursor;
             skip_xml_whitespace(subset, &mut cursor);
+            if cursor == spacing_start {
+                return Err(Error::Xml(
+                    "parameter entity declaration requires XML whitespace after %".into(),
+                ));
+            }
         }
         let name_start = cursor;
-        while cursor < subset.len()
-            && !subset.as_bytes()[cursor].is_ascii_whitespace()
-            && subset.as_bytes()[cursor] != b'>'
+        while let Some(character) = subset[cursor..].chars().next()
+            && (character == ':' || crate::lexical::is_ncname_char(character))
         {
-            cursor += 1;
+            cursor += character.len_utf8();
         }
         let name = &subset[name_start..cursor];
-        if name.is_empty() {
-            return Err(Error::Xml("internal entity declaration has no name".into()));
+        if !crate::lexical::is_xml_name(name) {
+            return Err(Error::Xml(
+                "internal entity declaration has an invalid XML Name".into(),
+            ));
         }
+        let spacing_start = cursor;
         skip_xml_whitespace(subset, &mut cursor);
+        if cursor == spacing_start {
+            return Err(Error::Xml(format!(
+                "internal entity declaration `{name}` requires XML whitespace before its definition"
+            )));
+        }
         let Some(quote) = subset.as_bytes().get(cursor).copied() else {
             return Err(Error::Xml(
                 "unterminated internal entity declaration".into(),
@@ -1498,7 +1510,20 @@ fn collect_internal_entity_declarations(subset: &str) -> Result<InternalEntityDe
         }
         let mut value = subset[value_start..cursor].to_owned();
         cursor += 1;
-        cursor = declaration_end(subset, cursor)?;
+        if parameter {
+            validate_parameter_entity_value(name, &value)?;
+            // XML 1.0 Fifth Edition section 4.2, production [72], permits only optional XML S
+            // between PEDef and `>`: https://www.w3.org/TR/xml/#sec-entity-decl
+            skip_xml_whitespace(subset, &mut cursor);
+            if subset.as_bytes().get(cursor) != Some(&b'>') {
+                return Err(Error::Xml(format!(
+                    "parameter entity declaration `{name}` has content after its definition"
+                )));
+            }
+            cursor += 1;
+        } else {
+            cursor = declaration_end(subset, cursor)?;
+        }
         if parameter {
             declarations
                 .parameter_spans
@@ -1517,6 +1542,60 @@ fn collect_internal_entity_declarations(subset: &str) -> Result<InternalEntityDe
         }
     }
     Ok(declarations)
+}
+
+fn validate_parameter_entity_value(name: &str, value: &str) -> Result<()> {
+    // Validate production [9] before the declaration is removed from the internal subset; the
+    // downstream tokenizer cannot diagnose syntax that preprocessing has erased:
+    // https://www.w3.org/TR/xml/#NT-EntityValue
+    let mut cursor = 0usize;
+    while cursor < value.len() {
+        let character = value[cursor..]
+            .chars()
+            .next()
+            .expect("cursor is before the end of the entity value");
+        if !crate::lexical::is_xml10_character(character) {
+            return Err(Error::Xml(format!(
+                "parameter entity declaration `{name}` has an invalid EntityValue"
+            )));
+        }
+        if matches!(character, '&' | '%') {
+            let end = value[cursor + 1..]
+                .find(';')
+                .map(|offset| cursor + 1 + offset)
+                .ok_or_else(|| {
+                    Error::Xml(format!(
+                        "parameter entity declaration `{name}` has an unterminated reference"
+                    ))
+                })?;
+            let reference = &value[cursor + 1..end];
+            let valid = if character == '%' {
+                crate::lexical::is_xml_name(reference)
+            } else if let Some(digits) = reference.strip_prefix("#x") {
+                valid_xml_character_reference(digits, 16)
+            } else if let Some(digits) = reference.strip_prefix('#') {
+                valid_xml_character_reference(digits, 10)
+            } else {
+                crate::lexical::is_xml_name(reference)
+            };
+            if !valid {
+                return Err(Error::Xml(format!(
+                    "parameter entity declaration `{name}` has an invalid reference"
+                )));
+            }
+            cursor = end + 1;
+            continue;
+        }
+        cursor += character.len_utf8();
+    }
+    Ok(())
+}
+
+fn valid_xml_character_reference(digits: &str, radix: u32) -> bool {
+    u32::from_str_radix(digits, radix)
+        .ok()
+        .and_then(char::from_u32)
+        .is_some_and(crate::lexical::is_xml10_character)
 }
 
 fn normalize_predefined_entity_declaration(name: &str, value: String) -> Result<String> {
@@ -1744,12 +1823,10 @@ fn declaration_end(subset: &str, mut cursor: usize) -> Result<usize> {
 }
 
 fn skip_xml_whitespace(value: &str, cursor: &mut usize) {
-    while value
-        .as_bytes()
-        .get(*cursor)
-        .is_some_and(u8::is_ascii_whitespace)
+    while let Some(character) = value[*cursor..].chars().next()
+        && crate::lexical::is_xml_whitespace(character)
     {
-        *cursor += 1;
+        *cursor += character.len_utf8();
     }
 }
 
@@ -2312,6 +2389,25 @@ mod parser_boundary_tests {
         let document =
             Document::parse_iterative(xml, None).expect("parameter entity declaration expands");
         assert_eq!(document.string_value(document.root()), "ok");
+    }
+
+    #[test]
+    fn malformed_parameter_entity_declarations_are_not_stripped() {
+        // A declaration may be removed from the subset only after the complete PEDecl grammar
+        // has been recognized; otherwise preprocessing can hide malformed XML from the parser.
+        for malformed in [
+            r#"<!DOCTYPE r [<!ENTITY % p "x" BOGUS>]><r/>"#,
+            r#"<!DOCTYPE r [<!ENTITY % p "x &broken">]><r/>"#,
+            r#"<!DOCTYPE r [<!ENTITY % p "x %broken">]><r/>"#,
+            r#"<!DOCTYPE r [<!ENTITY % p "&#0;">]><r/>"#,
+            "<!DOCTYPE r [<!ENTITY % p \"x\"\u{000b}>]><r/>",
+            "<!DOCTYPE r [<!ENTITY % p \"x\"\u{000c}>]><r/>",
+        ] {
+            assert!(Document::parse_iterative(malformed, None).is_err());
+        }
+
+        Document::parse_iterative("<!DOCTYPE r [<!ENTITY % p \"x\" \t\r\n>]><r/>", None)
+            .expect("XML S before the declaration terminator remains valid");
     }
 
     #[test]

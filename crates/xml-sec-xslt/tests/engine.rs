@@ -6164,3 +6164,157 @@ fn cdata_output_names_use_the_default_namespace_only_when_bound() {
     assert!(output.contains("<out><![CDATA[default]]></out>"));
     assert!(output.contains("<p:out><![CDATA[prefixed]]></p:out>"));
 }
+
+#[test]
+fn grouped_numbering_is_rejected_before_exceeding_owned_memory() {
+    // An untrusted dynamic format can make the formatted integer much wider than its value. The
+    // operation must reject the final grouped width before allocating that result.
+    let format = "0".repeat(4096);
+    let stylesheet = compile(&format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:number value="1" format="{format}" grouping-separator="," grouping-size="1"/></xsl:template></xsl:stylesheet>"#
+    ));
+    let mut budget = execution_budget(1024);
+    budget.owned_bytes = 4096;
+    let error = stylesheet
+        .execute(
+            &Document::parse("<root/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect_err("grouped output must cross the allocation gate");
+    assert!(matches!(
+        error,
+        Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn content_created_bindings_preserve_the_current_template_rule() {
+    // Binding sequence constructors execute in their containing template context, so each legal
+    // form must preserve the current rule used by xsl:apply-imports.
+    for main in [
+        r#"<xsl:template match="/"><xsl:variable name="value"><xsl:apply-imports/></xsl:variable><xsl:value-of select="$value"/></xsl:template>"#,
+        r#"<xsl:template match="/"><xsl:param name="value"><xsl:apply-imports/></xsl:param><xsl:value-of select="$value"/></xsl:template>"#,
+        r#"<xsl:template match="/"><xsl:call-template name="bridge"><xsl:with-param name="value"><xsl:apply-imports/></xsl:with-param></xsl:call-template></xsl:template><xsl:template name="bridge"><xsl:param name="value"/><xsl:value-of select="$value"/></xsl:template>"#,
+    ] {
+        let resolver = Arc::new(MemoryResolver::default());
+        resolver
+            .resources
+            .lock()
+            .expect("test resolver mutex is not poisoned")
+            .insert(
+                "base.xsl".into(),
+                r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/">base</xsl:template></xsl:stylesheet>"#.into(),
+            );
+        let stylesheet = Compiler::new(
+            Arc::clone(&resolver),
+            CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+        )
+        .compile(
+            &format!(
+                r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:import href="base.xsl"/><xsl:output method="text"/>{main}</xsl:stylesheet>"#
+            ),
+            Some("memory:main.xsl"),
+        )
+        .expect("binding stylesheet compiles");
+        let result = stylesheet
+            .execute(
+                &Document::parse("<source/>", None).expect("source parses"),
+                &Parameters::new(),
+                resolver,
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            )
+            .expect("binding content preserves the current matched rule");
+        assert_eq!(result.serialized.bytes, b"base");
+    }
+}
+
+#[test]
+fn xinclude_text_rejects_characters_forbidden_by_xml() {
+    // Successful byte decoding is not sufficient: parse="text" still contributes XML character
+    // information items and must reject U+0000 before mutating the semantic document.
+    let resolver = Arc::new(MemoryResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert("invalid.txt".into(), "left\0right".into());
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="."/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="invalid.txt" parse="text"/></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("source parses");
+    let error = stylesheet
+        .execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        )
+        .expect_err("forbidden XML characters must fail inclusion");
+    assert!(matches!(error, Error::Xml(message) if message.contains("XML character")));
+}
+
+#[test]
+fn xinclude_text_validates_after_non_utf8_decoding() {
+    // Character validation applies to decoded Unicode, not raw octets; a valid Latin-1 resource
+    // must remain usable while forbidden decoded scalar values fail in the companion test.
+    let resolver = Arc::new(ByteResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert("latin1.txt".into(), b"caf\xe9".to_vec());
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="."/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="latin1.txt" parse="text" encoding="ISO-8859-1"/></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("source parses");
+    let result = stylesheet
+        .execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        )
+        .expect("valid decoded XInclude text transforms");
+    assert_eq!(result.serialized.bytes, "café".as_bytes());
+}
+
+#[test]
+fn html_output_ignores_xml_cdata_section_settings() {
+    // cdata-section-elements belongs to the XML output method; HTML must escape text according
+    // to HTML syntax instead of emitting a bogus CDATA construct.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="html" indent="no" cdata-section-elements="div"/><xsl:template match="/"><div>a&lt;b</div></xsl:template></xsl:stylesheet>"#;
+    let output = execute(stylesheet, "<source/>");
+    assert_eq!(output, "<div>a&lt;b</div>");
+    assert!(!output.contains("<![CDATA["));
+}

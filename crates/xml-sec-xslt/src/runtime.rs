@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -593,6 +594,7 @@ impl<'a> Execution<'a> {
             1,
             1,
             1,
+            None,
         );
         self.initializing_globals.pop();
         let value = value?;
@@ -766,6 +768,7 @@ impl<'a> Execution<'a> {
                                 position,
                                 size,
                                 depth,
+                                precedence,
                             )?;
                             let target = self
                                 .stylesheet
@@ -802,6 +805,7 @@ impl<'a> Execution<'a> {
                                 position,
                                 size,
                                 depth,
+                                precedence,
                             )?);
                             let total = nodes.len();
                             for (index, selected) in nodes.into_iter().enumerate().rev() {
@@ -1156,7 +1160,16 @@ impl<'a> Execution<'a> {
         self.scopes.push(HashMap::new());
         for parameter in &template.params {
             let value = params.get(&parameter.name).cloned().map_or_else(
-                || self.evaluate_variable(parameter, &node, position, size, depth),
+                || {
+                    self.evaluate_variable(
+                        parameter,
+                        &node,
+                        position,
+                        size,
+                        depth,
+                        current_rule_precedence,
+                    )
+                },
                 Ok,
             )?;
             self.scopes
@@ -1326,8 +1339,14 @@ impl<'a> Execution<'a> {
             } => {
                 let mut nodes = self.select_nodes(select, node, position, size)?;
                 self.sort_nodes(&mut nodes, sorts, node, position, size)?;
-                let supplied =
-                    self.evaluate_with_params(parameters, node, position, size, depth)?;
+                let supplied = self.evaluate_with_params(
+                    parameters,
+                    node,
+                    position,
+                    size,
+                    depth,
+                    current_precedence,
+                )?;
                 let total = nodes.len();
                 for (index, selected) in nodes.into_iter().enumerate() {
                     self.apply_one(
@@ -1357,8 +1376,14 @@ impl<'a> Execution<'a> {
                 )
             }
             Instruction::CallTemplate { name, parameters } => {
-                let supplied =
-                    self.evaluate_with_params(parameters, node, position, size, depth)?;
+                let supplied = self.evaluate_with_params(
+                    parameters,
+                    node,
+                    position,
+                    size,
+                    depth,
+                    current_precedence,
+                )?;
                 self.call_named(
                     name,
                     &supplied,
@@ -1694,20 +1719,26 @@ impl<'a> Execution<'a> {
                     .as_ref()
                     .map(|value| self.evaluate_avt(value, node, position, size))
                     .transpose()?;
-                self.append_text(
-                    &format_number_sequence(
-                        &values,
-                        &format,
-                        lang.as_deref(),
-                        letter_value.as_deref(),
-                        grouping_separator,
-                        grouping_size,
-                    ),
-                    false,
-                )
+                let formatted = format_number_sequence(
+                    &values,
+                    &format,
+                    lang.as_deref(),
+                    letter_value.as_deref(),
+                    grouping_separator,
+                    grouping_size,
+                    &self.meter,
+                )?;
+                self.append_owned_text(formatted, false)
             }
             Instruction::Variable(variable) => {
-                let value = self.evaluate_variable(variable, node, position, size, depth)?;
+                let value = self.evaluate_variable(
+                    variable,
+                    node,
+                    position,
+                    size,
+                    depth,
+                    current_precedence,
+                )?;
                 self.scopes
                     .last_mut()
                     .ok_or_else(|| Error::Dynamic("missing variable scope".into()))?
@@ -2310,7 +2341,7 @@ impl<'a> Execution<'a> {
                 let value = if let Some(value) = arguments.get(index) {
                     value.clone()
                 } else {
-                    self.evaluate_variable(parameter, node, position, size, depth + 1)?
+                    self.evaluate_variable(parameter, node, position, size, depth + 1, None)?
                 };
                 self.scopes
                     .last_mut()
@@ -2387,17 +2418,21 @@ impl<'a> Execution<'a> {
         position: usize,
         size: usize,
         depth: usize,
+        current_rule_precedence: Option<usize>,
     ) -> Result<Value> {
         let value = if let Some(select) = &variable.select {
             xpath_to_public(self.evaluate(select, node, position, size)?)
         } else if variable.content.is_empty() {
             Value::String(String::new())
         } else {
+            // XSLT 1.0 section 5.6 keeps the current template rule while evaluating sequence
+            // constructors in that rule; callers such as xsl:for-each explicitly pass None:
+            // https://www.w3.org/TR/1999/REC-xslt-19991116#apply-imports
             Value::ResultTreeFragment(self.capture_fragment(
                 &variable.content,
                 node,
                 ApplyFrame::new(position, size, depth),
-                None,
+                current_rule_precedence,
                 variable.base_uri.as_deref(),
             )?)
         };
@@ -2420,12 +2455,20 @@ impl<'a> Execution<'a> {
         position: usize,
         size: usize,
         depth: usize,
+        current_rule_precedence: Option<usize>,
     ) -> Result<HashMap<ExpandedName, Value>> {
         parameters
             .iter()
             .map(|parameter| {
-                self.evaluate_variable(&parameter.variable, node, position, size, depth)
-                    .map(|value| (parameter.variable.name.clone(), value))
+                self.evaluate_variable(
+                    &parameter.variable,
+                    node,
+                    position,
+                    size,
+                    depth,
+                    current_rule_precedence,
+                )
+                .map(|value| (parameter.variable.name.clone(), value))
             })
             .collect()
     }
@@ -2849,6 +2892,12 @@ impl<'a> Execution<'a> {
         Ok(self.result.push(parent, kind, base_uri))
     }
     fn append_text(&mut self, value: &str, disable: bool) -> Result<()> {
+        self.append_text_value(Cow::Borrowed(value), disable)
+    }
+    fn append_owned_text(&mut self, value: String, disable: bool) -> Result<()> {
+        self.append_text_value(Cow::Owned(value), disable)
+    }
+    fn append_text_value(&mut self, value: Cow<'_, str>, disable: bool) -> Result<()> {
         // XSLT's result tree never retains zero-length text nodes.
         if value.is_empty() {
             return Ok(());
@@ -2873,14 +2922,16 @@ impl<'a> Execution<'a> {
             if let Some(NodeKind::Text { value: current, .. }) =
                 self.result.node_mut(previous).map(|node| &mut node.kind)
             {
-                current.push_str(value);
+                current.push_str(&value);
             }
             return Ok(());
         }
+        self.meter
+            .check_additional(BudgetKind::OwnedBytes, value.len())?;
         self.push_node(
             parent,
             NodeKind::Text {
-                value: value.into(),
+                value: value.into_owned(),
                 disable_output_escaping: disable,
             },
         )?;
@@ -3885,45 +3936,82 @@ fn format_number_sequence(
     letter_value: Option<&str>,
     separator: Option<char>,
     size: Option<usize>,
-) -> String {
+    meter: &Meter,
+) -> Result<String> {
     if values.is_empty() {
-        return String::new();
+        return Ok(String::new());
     }
+    let (runs, formats, separators) = number_format_run_counts(format);
+    let token_workspace = runs
+        .saturating_mul(std::mem::size_of::<(bool, &str)>())
+        .saturating_add(formats.saturating_mul(std::mem::size_of::<&str>()))
+        .saturating_add(separators.saturating_mul(std::mem::size_of::<&str>()));
+    meter.check_additional(BudgetKind::OwnedBytes, token_workspace)?;
     let tokens = tokenize_number_format(format);
     if tokens.formats.is_empty() {
-        return values
-            .iter()
-            .map(|value| format_number(*value, "1", letter_value, separator, size))
-            .collect::<Vec<_>>()
-            .join(".");
+        let mut output = String::new();
+        for (index, value) in values.iter().enumerate() {
+            if index > 0 {
+                append_metered(&mut output, ".", meter)?;
+            }
+            format_number_into(
+                &mut output,
+                *value,
+                "1",
+                letter_value,
+                separator,
+                size,
+                meter,
+            )?;
+        }
+        return Ok(output);
     }
-    let mut output = tokens.prefix;
+    let mut output = String::new();
+    append_metered(&mut output, tokens.prefix, meter)?;
     for (index, value) in values.iter().enumerate() {
         if index > 0 {
-            output.push_str(
-                tokens
-                    .separators
-                    .get(index - 1)
-                    .or_else(|| tokens.separators.last())
-                    .map_or(".", String::as_str),
-            );
+            let separator = tokens
+                .separators
+                .get(index - 1)
+                .or_else(|| tokens.separators.last())
+                .copied()
+                .unwrap_or(".");
+            append_metered(&mut output, separator, meter)?;
         }
         let token = tokens
             .formats
             .get(index)
             .or_else(|| tokens.formats.last())
-            .map_or("1", String::as_str);
-        output.push_str(&format_number(*value, token, letter_value, separator, size));
+            .copied()
+            .unwrap_or("1");
+        format_number_into(
+            &mut output,
+            *value,
+            token,
+            letter_value,
+            separator,
+            size,
+            meter,
+        )?;
     }
-    output.push_str(&tokens.suffix);
-    output
+    append_metered(&mut output, tokens.suffix, meter)?;
+    Ok(output)
 }
 
-struct NumberFormatTokens {
-    prefix: String,
-    formats: Vec<String>,
-    separators: Vec<String>,
-    suffix: String,
+fn append_metered(output: &mut String, value: &str, meter: &Meter) -> Result<()> {
+    meter.check_additional(
+        BudgetKind::OwnedBytes,
+        output.len().saturating_add(value.len()),
+    )?;
+    output.push_str(value);
+    Ok(())
+}
+
+struct NumberFormatTokens<'a> {
+    prefix: &'a str,
+    formats: Vec<&'a str>,
+    separators: Vec<&'a str>,
+    suffix: &'a str,
 }
 
 fn expanded_name_owned_bytes(name: &ExpandedName) -> usize {
@@ -4051,40 +4139,50 @@ fn visible_variable_snapshot_size(scopes: &[HashMap<ExpandedName, Value>]) -> (u
     (count, payload.saturating_add(table))
 }
 
-fn tokenize_number_format(format: &str) -> NumberFormatTokens {
-    let mut runs = Vec::<(bool, String)>::new();
-    for character in format.chars() {
+fn tokenize_number_format(format: &str) -> NumberFormatTokens<'_> {
+    let (run_count, format_count, separator_count) = number_format_run_counts(format);
+    let mut runs = Vec::<(bool, &str)>::with_capacity(run_count);
+    let mut run_start = 0usize;
+    let mut run_kind = None;
+    for (index, character) in format.char_indices() {
         let alphanumeric = character.is_alphanumeric();
-        if runs.last().is_some_and(|(kind, _)| *kind == alphanumeric) {
-            runs.last_mut().expect("run exists").1.push(character);
-        } else {
-            runs.push((alphanumeric, character.to_string()));
+        if let Some(kind) = run_kind
+            && kind != alphanumeric
+        {
+            runs.push((kind, &format[run_start..index]));
+            run_start = index;
         }
+        run_kind = Some(alphanumeric);
+    }
+    if let Some(kind) = run_kind {
+        runs.push((kind, &format[run_start..]));
     }
     let prefix = runs
         .first()
         .filter(|(alphanumeric, _)| !*alphanumeric)
-        .map(|(_, value)| value.clone())
+        .map(|(_, value)| *value)
         .unwrap_or_default();
     let suffix = runs
         .last()
         .filter(|(alphanumeric, _)| !*alphanumeric)
-        .map(|(_, value)| value.clone())
+        .map(|(_, value)| *value)
         .unwrap_or_default();
-    let formats = runs
-        .iter()
-        .filter(|(alphanumeric, _)| *alphanumeric)
-        .map(|(_, value)| value.clone())
-        .collect::<Vec<_>>();
-    let separators = runs
-        .iter()
-        .skip_while(|(alphanumeric, _)| !*alphanumeric)
-        .skip(1)
-        .take_while(|_| true)
-        .filter(|(alphanumeric, _)| !*alphanumeric)
-        .map(|(_, value)| value.clone())
-        .take(formats.len().saturating_sub(1))
-        .collect();
+    let mut formats = Vec::with_capacity(format_count);
+    formats.extend(
+        runs.iter()
+            .filter(|(alphanumeric, _)| *alphanumeric)
+            .map(|(_, value)| *value),
+    );
+    let mut separators = Vec::with_capacity(separator_count);
+    separators.extend(
+        runs.iter()
+            .skip_while(|(alphanumeric, _)| !*alphanumeric)
+            .skip(1)
+            .take_while(|_| true)
+            .filter(|(alphanumeric, _)| !*alphanumeric)
+            .map(|(_, value)| *value)
+            .take(format_count.saturating_sub(1)),
+    );
     NumberFormatTokens {
         prefix,
         formats,
@@ -4092,15 +4190,37 @@ fn tokenize_number_format(format: &str) -> NumberFormatTokens {
         suffix,
     }
 }
-fn format_number(
+
+fn number_format_run_counts(format: &str) -> (usize, usize, usize) {
+    let mut previous = None;
+    let mut runs = 0usize;
+    let mut formats = 0usize;
+    let mut separators = 0usize;
+    for character in format.chars() {
+        let alphanumeric = character.is_alphanumeric();
+        if previous != Some(alphanumeric) {
+            runs = runs.saturating_add(1);
+            if alphanumeric {
+                formats = formats.saturating_add(1);
+            } else {
+                separators = separators.saturating_add(1);
+            }
+            previous = Some(alphanumeric);
+        }
+    }
+    (runs, formats, separators)
+}
+fn format_number_into(
+    output: &mut String,
     value: f64,
     format: &str,
     letter_value: Option<&str>,
     separator: Option<char>,
     size: Option<usize>,
-) -> String {
+    meter: &Meter,
+) -> Result<()> {
     if value.is_nan() {
-        return "NaN".into();
+        return append_metered(output, "NaN", meter);
     }
     let rounded = value.round();
     if rounded <= 0.0 {
@@ -4109,42 +4229,39 @@ fn format_number(
             .filter(|character| unicode_decimal_value(*character).is_some())
             .count()
             .max(1);
-        return localize_decimal_digits(&"0".repeat(width), format);
+        let zero = decimal_zero(format);
+        return append_localized_decimal(output, "0", width, zero, None, None, meter);
     }
-    let mut output = match format {
+    match format {
         "A" | "a" if letter_value != Some("traditional") => {
-            alphabetic(rounded as usize, format == "A")
+            let value = alphabetic(rounded as usize, format == "A");
+            append_grouped(output, &value, separator, size, meter)
         }
-        "I" | "i" => roman(rounded as usize, format == "I"),
+        "I" | "i" => {
+            let value = roman(rounded as usize, format == "I");
+            append_grouped(output, &value, separator, size, meter)
+        }
         _ => {
             let width = format
                 .chars()
                 .filter(|character| unicode_decimal_value(*character).is_some())
                 .count();
-            let ascii = if width > 1 {
-                format!("{rounded:0width$.0}")
-            } else {
-                format!("{rounded:.0}")
-            };
-            localize_decimal_digits(&ascii, format)
+            let ascii = format!("{rounded:.0}");
+            append_localized_decimal(
+                output,
+                &ascii,
+                width,
+                decimal_zero(format),
+                separator,
+                size,
+                meter,
+            )
         }
-    };
-    if let (Some(separator), Some(size)) = (separator, size)
-        && size > 0
-    {
-        let mut chars = output.chars().rev().collect::<Vec<_>>();
-        let mut index = size;
-        while index < chars.len() {
-            chars.insert(index, separator);
-            index += size + 1
-        }
-        output = chars.into_iter().rev().collect()
     }
-    output
 }
 
-fn localize_decimal_digits(value: &str, token: &str) -> String {
-    let zero = token
+fn decimal_zero(token: &str) -> char {
+    token
         .chars()
         .filter_map(|character| {
             unicode_decimal_value(character).and_then(|digit| {
@@ -4154,16 +4271,90 @@ fn localize_decimal_digits(value: &str, token: &str) -> String {
             })
         })
         .next_back()
-        .unwrap_or('0');
-    value
-        .chars()
-        .map(|character| {
-            character
-                .to_digit(10)
-                .and_then(|digit| char::from_u32(u32::from(zero) + digit))
-                .unwrap_or(character)
-        })
-        .collect()
+        .unwrap_or('0')
+}
+
+fn append_localized_decimal(
+    output: &mut String,
+    ascii: &str,
+    width: usize,
+    zero: char,
+    separator: Option<char>,
+    size: Option<usize>,
+    meter: &Meter,
+) -> Result<()> {
+    let ascii_digits = ascii.chars().count();
+    let digits = width.max(ascii_digits);
+    let padding = digits.saturating_sub(ascii_digits);
+    let grouping_size = size.filter(|size| *size > 0);
+    let groups = grouping_size.map_or(0, |size| digits.saturating_sub(1) / size);
+    let separator_bytes = separator.zip(grouping_size).map_or(0, |(separator, _)| {
+        groups.saturating_mul(separator.len_utf8())
+    });
+    let digit_bytes = padding
+        .saturating_mul(zero.len_utf8())
+        .saturating_add(ascii.chars().fold(0usize, |total, character| {
+            total.saturating_add(
+                character
+                    .to_digit(10)
+                    .and_then(|digit| char::from_u32(u32::from(zero) + digit))
+                    .unwrap_or(character)
+                    .len_utf8(),
+            )
+        }));
+    let additional = digit_bytes.saturating_add(separator_bytes);
+    meter.check_additional(
+        BudgetKind::OwnedBytes,
+        output.len().saturating_add(additional),
+    )?;
+    output.reserve(additional);
+    let mut characters = std::iter::repeat_n(zero, padding).chain(ascii.chars().map(|character| {
+        character
+            .to_digit(10)
+            .and_then(|digit| char::from_u32(u32::from(zero) + digit))
+            .unwrap_or(character)
+    }));
+    for index in 0..digits {
+        if index > 0
+            && let Some((separator, size)) = separator.zip(grouping_size)
+            && (digits - index).is_multiple_of(size)
+        {
+            output.push(separator);
+        }
+        output.push(characters.next().expect("decimal width matches iterator"));
+    }
+    Ok(())
+}
+
+fn append_grouped(
+    output: &mut String,
+    value: &str,
+    separator: Option<char>,
+    size: Option<usize>,
+    meter: &Meter,
+) -> Result<()> {
+    let characters = value.chars().count();
+    let grouping_size = size.filter(|size| *size > 0);
+    let groups = grouping_size.map_or(0, |size| characters.saturating_sub(1) / size);
+    let separator_bytes = separator.zip(grouping_size).map_or(0, |(separator, _)| {
+        groups.saturating_mul(separator.len_utf8())
+    });
+    let additional = value.len().saturating_add(separator_bytes);
+    meter.check_additional(
+        BudgetKind::OwnedBytes,
+        output.len().saturating_add(additional),
+    )?;
+    output.reserve(additional);
+    for (index, character) in value.chars().enumerate() {
+        if index > 0
+            && let Some((separator, size)) = separator.zip(grouping_size)
+            && (characters - index).is_multiple_of(size)
+        {
+            output.push(separator);
+        }
+        output.push(character);
+    }
+    Ok(())
 }
 
 fn same_node_kind_and_name(document: &Document, left: &SourceNode, right: &SourceNode) -> bool {
@@ -4267,4 +4458,59 @@ fn roman(mut value: usize, upper: bool) -> String {
         }
     }
     if upper { output } else { output.to_lowercase() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{append_grouped, append_localized_decimal};
+    use crate::budget::Meter;
+    use crate::{BudgetKind, Error, ExecutionBudget};
+
+    fn meter(owned_bytes: usize) -> Meter {
+        Meter::new(
+            ExecutionBudget {
+                source_bytes: usize::MAX,
+                external_documents: usize::MAX,
+                recursion_depth: usize::MAX,
+                xpath_evaluations: usize::MAX,
+                template_applications: usize::MAX,
+                sort_comparisons: usize::MAX,
+                key_entries: usize::MAX,
+                result_nodes: usize::MAX,
+                serialized_bytes: usize::MAX,
+                messages: usize::MAX,
+                owned_bytes,
+            },
+            0,
+        )
+        .expect("empty source fits")
+    }
+
+    #[test]
+    fn grouped_number_writer_is_linear_and_checks_before_writing() {
+        let mut output = String::new();
+        append_grouped(&mut output, "١٢٣٤", Some('·'), Some(1), &meter(64))
+            .expect("grouped number fits");
+        assert_eq!(output, "١·٢·٣·٤");
+
+        let mut rejected = String::new();
+        let error = append_localized_decimal(
+            &mut rejected,
+            "1",
+            4096,
+            '0',
+            Some(','),
+            Some(1),
+            &meter(4096),
+        )
+        .expect_err("wide grouped number exceeds its allocation budget");
+        assert!(matches!(
+            error,
+            Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            }
+        ));
+        assert!(rejected.is_empty(), "budget rejection precedes all writes");
+    }
 }

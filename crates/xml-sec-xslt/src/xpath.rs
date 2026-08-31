@@ -2338,6 +2338,17 @@ fn resolve_xinclude(
     if parse == "text" {
         let encoding = attribute("encoding").or(resource.encoding.as_deref());
         let value = decode_xinclude_resource(&resource.bytes, encoding, meter, false)?;
+        // XInclude 1.0 section 4.3 makes every character forbidden in XML documents a fatal
+        // error, even after successful decoding: https://www.w3.org/TR/xinclude/#text_included
+        if let Some(character) = value
+            .chars()
+            .find(|character| !crate::lexical::is_xml10_character(*character))
+        {
+            return Err(XIncludeFailure::Fatal(Error::Xml(format!(
+                "XInclude text resource contains forbidden XML character U+{:04X}",
+                u32::from(character)
+            ))));
+        }
         identities.insert(resource.identity.clone(), resource.clone());
         return Ok(XIncludeContent::Text(value, resource.canonical_uri));
     }

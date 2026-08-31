@@ -747,8 +747,12 @@ fn serialize_node(
                         encoding,
                         output,
                     );
-                } else if parent_name
-                    .is_some_and(|name| definition.cdata_section_elements.contains(name))
+                // XSLT 1.0 section 16.1 defines cdata-section-elements only for XML output;
+                // HTML has separate escaping rules in section 16.2:
+                // https://www.w3.org/TR/1999/REC-xslt-19991116#output
+                } else if definition.method == OutputMethod::Xml
+                    && parent_name
+                        .is_some_and(|name| definition.cdata_section_elements.contains(name))
                 {
                     push_cdata(
                         value,
@@ -991,7 +995,8 @@ fn serialize_node(
                         output.push_str("\" />");
                     }
                 }
-                let cdata = definition.cdata_section_elements.contains(name);
+                let cdata = definition.method == OutputMethod::Xml
+                    && definition.cdata_section_elements.contains(name);
                 let child_context = RenderContext {
                     depth: context.depth + 1,
                     parent: Some(id),
@@ -1572,7 +1577,7 @@ fn validate_xml_characters(value: &str, version: &str) -> Result<()> {
         let valid = if version == "1.1" {
             matches!(code, 0x1..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF)
         } else {
-            matches!(code, 0x9 | 0xA | 0xD | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF)
+            crate::lexical::is_xml10_character(character)
         };
         if !valid {
             return Err(Error::Serialization(format!(
