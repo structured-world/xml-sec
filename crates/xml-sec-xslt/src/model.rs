@@ -223,6 +223,14 @@ impl Document {
         use quick_xml::Reader;
         use quick_xml::events::Event;
 
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum DocumentPhase {
+            Start,
+            Prolog,
+            Content,
+            Epilog,
+        }
+
         let mut document = Self::empty(base_uri.map(str::to_owned));
         document.source_xml = Some(xml.to_owned());
         let entities = internal_general_entities(xml)?;
@@ -236,7 +244,8 @@ impl Document {
                     .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
             )
             .collect::<Vec<_>>();
-        let mut saw_document_element = false;
+        let mut phase = DocumentPhase::Start;
+        let mut saw_doctype = false;
         let mut elements = vec![(
             document.root,
             vec![Namespace {
@@ -253,20 +262,20 @@ impl Document {
             match event {
                 Event::Start(start) => {
                     if elements.len() == 1 {
-                        if saw_document_element {
+                        if phase == DocumentPhase::Epilog {
                             return Err(Error::Xml("multiple document elements".into()));
                         }
-                        saw_document_element = true;
+                        phase = DocumentPhase::Content;
                     }
                     let id = push_stream_element(&mut document, &mut elements, &start, false)?;
                     document.nodes[id.0].source_line = Some(source_line);
                 }
                 Event::Empty(start) => {
                     if elements.len() == 1 {
-                        if saw_document_element {
+                        if phase == DocumentPhase::Epilog {
                             return Err(Error::Xml("multiple document elements".into()));
                         }
-                        saw_document_element = true;
+                        phase = DocumentPhase::Epilog;
                     }
                     let id = push_stream_element(&mut document, &mut elements, &start, true)?;
                     document.nodes[id.0].source_line = Some(source_line);
@@ -276,6 +285,9 @@ impl Document {
                         return Err(Error::Xml("unmatched closing element".into()));
                     }
                     elements.pop();
+                    if elements.len() == 1 {
+                        phase = DocumentPhase::Epilog;
+                    }
                 }
                 Event::Text(text) => {
                     let value = text.xml10_content().into_owned();
@@ -289,6 +301,8 @@ impl Document {
                     if elements.len() > 1 && !value.is_empty() {
                         let id = push_parsed_text(&mut document, &elements, value);
                         document.nodes[id.0].source_line = Some(source_line);
+                    } else if phase == DocumentPhase::Start {
+                        phase = DocumentPhase::Prolog;
                     }
                 }
                 Event::CData(text) => {
@@ -305,6 +319,9 @@ impl Document {
                     document.nodes[id.0].source_line = Some(source_line);
                 }
                 Event::Comment(comment) => {
+                    if phase == DocumentPhase::Start {
+                        phase = DocumentPhase::Prolog;
+                    }
                     let parent = elements.last().expect("document frame remains present").0;
                     let inherited_base =
                         document.node(parent).and_then(|node| node.base_uri.clone());
@@ -316,6 +333,9 @@ impl Document {
                     document.nodes[id.0].source_line = Some(source_line);
                 }
                 Event::PI(pi) => {
+                    if phase == DocumentPhase::Start {
+                        phase = DocumentPhase::Prolog;
+                    }
                     let parent = elements.last().expect("document frame remains present").0;
                     let inherited_base =
                         document.node(parent).and_then(|node| node.base_uri.clone());
@@ -359,13 +379,32 @@ impl Document {
                     document.nodes[id.0].source_line = Some(source_line);
                 }
                 Event::Eof => break,
-                Event::Decl(_) | Event::DocType(_) => {}
+                Event::Decl(_) => {
+                    if phase != DocumentPhase::Start {
+                        return Err(Error::Xml(
+                            "XML declaration is permitted only at the start of the document".into(),
+                        ));
+                    }
+                    phase = DocumentPhase::Prolog;
+                }
+                Event::DocType(_) => {
+                    if matches!(phase, DocumentPhase::Content | DocumentPhase::Epilog) {
+                        return Err(Error::Xml(
+                            "document type declaration is permitted only in the prolog".into(),
+                        ));
+                    }
+                    if saw_doctype {
+                        return Err(Error::Xml("duplicate document type declaration".into()));
+                    }
+                    saw_doctype = true;
+                    phase = DocumentPhase::Prolog;
+                }
             }
         }
         if elements.len() != 1 {
             return Err(Error::Xml("unclosed element".into()));
         }
-        if !saw_document_element {
+        if phase != DocumentPhase::Epilog {
             return Err(Error::Xml("document element is missing".into()));
         }
         document.register_xml_ids()?;
@@ -1382,6 +1421,25 @@ mod parser_boundary_tests {
                     "parser acceptance differs at depth {depth} for {leaf}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn tree_and_streaming_parsers_reject_misplaced_and_duplicate_doctypes() {
+        // Document depth must not make invalid prolog structure acceptable.
+        let deep_document = nested_xml(65, "<leaf/>");
+        for xml in [
+            format!("<!DOCTYPE n><!DOCTYPE n>{deep_document}"),
+            nested_xml(65, "<!DOCTYPE leaf><leaf/>"),
+        ] {
+            assert!(
+                parse_tree_with_oracle_stack(&xml, None).is_err(),
+                "tree parser accepted malformed doctype placement"
+            );
+            assert!(
+                Document::parse_deep_streaming(&xml, None).is_err(),
+                "streaming parser accepted malformed doctype placement"
+            );
         }
     }
 }

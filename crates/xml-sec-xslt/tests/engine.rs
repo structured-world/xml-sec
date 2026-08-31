@@ -4493,6 +4493,17 @@ fn stylesheet_versions_use_numeric_xslt_semantics() {
 }
 
 #[test]
+fn literal_result_stylesheet_versions_use_numeric_xslt_semantics() {
+    // Equivalent lexical forms of XSLT 1.0 must not enable forward-compatible processing.
+    let stylesheet = r#"<out xsl:version="1.00" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:future><xsl:fallback>fallback</xsl:fallback></xsl:future></out>"#;
+    assert!(matches!(
+        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+            .compile(stylesheet, None),
+        Err(Error::Static(message)) if message.contains("unknown XSLT instruction")
+    ));
+}
+
+#[test]
 fn literal_extension_attributes_do_not_change_instruction_semantics() {
     // An unqualified attribute on a literal result element is copied, not interpreted as XSLT.
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:e="urn:extension"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><out extension-element-prefixes="e"><e:item/></out></xsl:template></xsl:stylesheet>"#;

@@ -280,9 +280,7 @@ impl<R: Resolver> Compiler<R> {
         let version = root.attribute((XSLT_NS, "version")).ok_or_else(|| {
             Error::Static("literal result stylesheet requires xsl:version".into())
         })?;
-        if version != "1.0" && version.parse::<f64>().map_or(true, |value| value < 1.0) {
-            return Err(Error::Static(format!("unsupported XSLT version {version}")));
-        }
+        let forward = parse_stylesheet_version(version)? > 1.0;
         let order = state.next_order();
         state.templates.push(Template {
             name: None,
@@ -294,12 +292,7 @@ impl<R: Resolver> Compiler<R> {
             params: Vec::new(),
             body: vec![compile_literal_element(
                 root,
-                CompileContext::new(
-                    version != "1.0",
-                    depth,
-                    state.budget.recursion_depth,
-                    base_uri,
-                )?,
+                CompileContext::new(forward, depth, state.budget.recursion_depth, base_uri)?,
             )?]
             .into(),
         });
