@@ -23,6 +23,8 @@ pub(crate) fn function_names() -> impl Iterator<Item = &'static str> {
 }
 
 const FUNCTIONS: &[(&str, Operation)] = &[
+    ("date-time", Operation::DateTime),
+    ("date", Operation::Date),
     ("year", Operation::Year),
     ("leap-year", Operation::LeapYear),
     ("month-in-year", Operation::MonthInYear),
@@ -49,6 +51,8 @@ const FUNCTIONS: &[(&str, Operation)] = &[
 
 #[derive(Clone, Copy)]
 enum Operation {
+    DateTime,
+    Date,
     Year,
     LeapYear,
     MonthInYear,
@@ -83,6 +87,9 @@ impl function::Function for DateFunction {
     ) -> std::result::Result<Value<'d>, function::Error> {
         use Operation::*;
         match self.0 {
+            DateTime if !args.is_empty() => {
+                return argument_error("date:date-time() requires no arguments");
+            }
             AddDuration | Add | Difference if args.len() != 2 => {
                 return argument_error("requires two arguments");
             }
@@ -92,6 +99,28 @@ impl function::Function for DateFunction {
             _ => {}
         }
         match self.0 {
+            DateTime => Ok(Value::String(current_datetime_for_operation(
+                self.1.as_ref(),
+                self.2,
+            )?)),
+            Date => {
+                let current;
+                let input = if let Some(input) = args.first().map(Value::string) {
+                    current = input;
+                    current.as_str()
+                } else {
+                    current = current_datetime_for_operation(self.1.as_ref(), self.2)?;
+                    current.as_str()
+                };
+                let Some(mut date) = DateValue::parse(input) else {
+                    return Ok(Value::String(String::new()));
+                };
+                if !DateKind::COMPLETE_DATE.contains(&date.kind) {
+                    return Ok(Value::String(String::new()));
+                }
+                date.kind = DateKind::Date;
+                Ok(Value::String(date.render()))
+            }
             Sum => {
                 let Value::Nodeset(nodes) = &args[0] else {
                     return argument_error("date:sum() requires a node-set");
@@ -169,18 +198,25 @@ impl function::Function for DateFunction {
                 let input = if let Some(input) = input.as_deref() {
                     input
                 } else {
-                    if self.2 == ExtensionPolicy::Deterministic {
-                        return argument_error(
-                            "zero-argument EXSLT date functions are disabled by the execution extension policy",
-                        );
-                    }
-                    current = current_datetime(self.1.as_ref())?;
+                    current = current_datetime_for_operation(self.1.as_ref(), self.2)?;
                     &current
                 };
                 evaluate_component(operation, Some(input))
             }
         }
     }
+}
+
+fn current_datetime_for_operation(
+    clock: &dyn Clock,
+    extension_policy: ExtensionPolicy,
+) -> std::result::Result<String, function::Error> {
+    if extension_policy == ExtensionPolicy::Deterministic {
+        return argument_error(
+            "zero-argument EXSLT date functions are disabled by the execution extension policy",
+        );
+    }
+    current_datetime(clock)
 }
 
 fn current_datetime(clock: &dyn Clock) -> std::result::Result<String, function::Error> {

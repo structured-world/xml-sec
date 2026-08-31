@@ -145,6 +145,13 @@ impl Meter {
         ensure(kind, limit, used.saturating_add(amount))
     }
 
+    pub(crate) fn release_owned_bytes(&mut self, amount: usize) {
+        self.owned_bytes = self
+            .owned_bytes
+            .checked_sub(amount)
+            .expect("released owned-byte reservation was previously charged");
+    }
+
     pub(crate) fn usage(&self, kind: BudgetKind) -> Result<(usize, usize)> {
         match kind {
             BudgetKind::ExternalDocuments => {

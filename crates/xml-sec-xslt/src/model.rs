@@ -1515,19 +1515,24 @@ fn collect_internal_entity_declarations(subset: &str) -> Result<InternalEntityDe
 }
 
 fn normalize_predefined_entity_declaration(name: &str, value: String) -> Result<String> {
-    let expected = match name {
-        "amp" => '&',
-        "apos" => '\'',
-        "gt" => '>',
-        "lt" => '<',
-        "quot" => '"',
+    let (expected, required_replacement) = match name {
+        "amp" => ('&', Some("&#38;")),
+        "apos" => ('\'', None),
+        "gt" => ('>', None),
+        "lt" => ('<', Some("&#60;")),
+        "quot" => ('"', None),
         _ => return Ok(value),
     };
     let first = xml_sec_xml_input::lexical::decode_references(&value)
         .map_err(|error| Error::Xml(error.to_string()))?;
+    if required_replacement.is_some_and(|required| first.as_ref() != required) {
+        return Err(Error::Xml(format!(
+            "invalid predefined entity declaration `{name}`"
+        )));
+    }
     let second = xml_sec_xml_input::lexical::decode_references(&first)
         .map_err(|_| Error::Xml(format!("invalid predefined entity declaration `{name}`")))?;
-    if second.as_ref() != expected.to_string() {
+    if !second.chars().eq(std::iter::once(expected)) {
         return Err(Error::Xml(format!(
             "invalid predefined entity declaration `{name}`"
         )));
@@ -1976,6 +1981,7 @@ mod parser_boundary_tests {
     use super::{
         Document, EntityExpansionMeter, Result, doctype_span, expand_document_entities,
         expand_entity_references, expand_parameter_entity_references, internal_general_entities,
+        normalize_predefined_entity_declaration,
     };
     use crate::budget::ENTITY_EXPANSION_BYTE_CEILING;
 
@@ -2228,8 +2234,13 @@ mod parser_boundary_tests {
     fn predefined_entity_redeclarations_preserve_xml_builtins() {
         // XML permits only the normative replacement forms for predefined entities. A malformed
         // declaration must not replace a builtin before the document reaches the XML parser.
-        let invalid = r#"<!DOCTYPE r [<!ENTITY amp "evil">]><r>&amp;</r>"#;
-        assert!(Document::parse_iterative(invalid, None).is_err());
+        for invalid in [
+            r#"<!DOCTYPE r [<!ENTITY amp "evil">]><r>&amp;</r>"#,
+            r#"<!DOCTYPE r [<!ENTITY amp "&#38;">]><r>&amp;</r>"#,
+            r#"<!DOCTYPE r [<!ENTITY lt "&#60;">]><r>&lt;</r>"#,
+        ] {
+            assert!(Document::parse_iterative(invalid, None).is_err());
+        }
 
         let valid = r#"<!DOCTYPE r [
             <!ENTITY amp "&#38;#38;">
@@ -2241,6 +2252,24 @@ mod parser_boundary_tests {
         let document = Document::parse_iterative(valid, None)
             .expect("normative predefined-entity redeclarations remain well-formed");
         assert_eq!(document.string_value(document.root()), "&<>'\"");
+    }
+
+    #[test]
+    fn predefined_amp_and_lt_require_double_escaped_declarations() {
+        // XML 1.0 requires the replacement text for amp and lt to remain a character reference
+        // after the declaration's first entity-replacement pass.
+        assert!(normalize_predefined_entity_declaration("amp", "&#38;".into()).is_err());
+        assert!(normalize_predefined_entity_declaration("lt", "&#60;".into()).is_err());
+        assert_eq!(
+            normalize_predefined_entity_declaration("amp", "&#38;#38;".into())
+                .expect("normative amp declaration"),
+            "&#38;"
+        );
+        assert_eq!(
+            normalize_predefined_entity_declaration("lt", "&#38;#60;".into())
+                .expect("normative lt declaration"),
+            "&#60;"
+        );
     }
 
     #[test]

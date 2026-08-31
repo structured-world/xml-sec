@@ -1002,6 +1002,70 @@ fn execution_environment_controls_exslt_current_time() {
 }
 
 #[test]
+fn exslt_current_date_functions_share_the_execution_clock_and_policy() {
+    // Core EXSLT current-date functions must be discoverable and use the same controlled clock
+    // as zero-argument component functions; deterministic execution rejects ambient time access.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:date="http://exslt.org/dates-and-times"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="function-available('date:date-time')"/><xsl:text>|</xsl:text><xsl:value-of select="function-available('date:date')"/><xsl:text>|</xsl:text><xsl:value-of select="date:date-time()"/><xsl:text>|</xsl:text><xsl:value-of select="date:date()"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let fixed = time::OffsetDateTime::from_unix_timestamp(0).expect("Unix epoch is valid");
+    let source = Document::parse("<source/>", None).expect("source parses");
+    let result = stylesheet
+        .execute_with_environment(
+            &source,
+            &Parameters::new(),
+            ExecutionEnvironment::new(Arc::new(NoResolver))
+                .with_clock(Arc::new(FixedClock::new(fixed))),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("fixed current-date functions execute");
+    assert_eq!(
+        String::from_utf8(result.serialized.bytes).expect("UTF-8 output"),
+        "true|true|1970-01-01T00:00:00+00:00|1970-01-01Z"
+    );
+
+    let error = stylesheet
+        .execute_with_environment(
+            &source,
+            &Parameters::new(),
+            ExecutionEnvironment::new(Arc::new(NoResolver))
+                .with_extension_policy(ExtensionPolicy::Deterministic),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect_err("deterministic execution rejects current-date functions");
+    assert!(
+        matches!(error, Error::Dynamic(message) if message.contains("execution extension policy"))
+    );
+}
+
+#[test]
+fn built_in_template_rule_ignores_namespace_nodes() {
+    // XSLT's built-in text rule copies attributes and text only; selected namespace nodes are
+    // silent unless an explicit template handles them.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:apply-templates select="/*/namespace::*"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, r#"<root xmlns:p="urn:visible"/>"#), "");
+}
+
+#[test]
+fn exslt_set_boundaries_must_belong_to_the_first_node_set() {
+    // EXSLT explicitly returns an empty set when the first node in the boundary set is absent
+    // from the first argument; an empty boundary set instead returns the complete first set.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:set="http://exslt.org/sets"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(set:leading(/root/a | /root/b | /root/c, /root/h))"/><xsl:text>|</xsl:text><xsl:value-of select="count(set:trailing(/root/d | /root/e | /root/f, /root/a))"/><xsl:text>|</xsl:text><xsl:value-of select="count(set:leading(/root/*, /root/missing))"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<root><a/><b/><c/><d/><e/><f/><h/></root>"),
+        "0|0|7"
+    );
+}
+
+#[test]
 fn named_templates_consume_template_application_budget() {
     // Initial and nested named-template calls are executable template applications.
     let stylesheet = compile(
@@ -3272,6 +3336,76 @@ fn supplied_global_parameter_respects_the_preallocation_budget() {
                 initial_template: None,
             },
         ),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn xpath_scope_snapshot_counts_toward_peak_owned_memory() {
+    // Generic XPath evaluation temporarily owns both its visible-variable snapshot and the
+    // evaluator's value copy. Their simultaneous peak must be rejected before either copy can
+    // move the operation above its OwnedBytes ceiling.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:param name="payload"/><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="concat($payload, '')"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse("<source/>", None).expect("source parses");
+    let mut parameters = Parameters::new();
+    parameters.insert(
+        ExpandedName::new(None::<String>, "payload"),
+        Value::String("x".repeat(256 * 1024)),
+    );
+    let mut budget = execution_budget(1024);
+    budget.owned_bytes = 700 * 1024;
+    assert!(matches!(
+        stylesheet.execute(
+            &source,
+            &parameters,
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn generate_id_cache_is_charged_to_retained_owned_memory() {
+    // Deep node paths make generate-id's retained identity cache grow quadratically even when
+    // the XPath result is one number; the cache must remain inside the operation memory budget.
+    let mut source_xml = String::new();
+    for _ in 0..192 {
+        source_xml.push_str("<n>");
+    }
+    for _ in 0..192 {
+        source_xml.push_str("</n>");
+    }
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(//*[generate-id(.)])"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let mut budget = execution_budget(source_xml.len());
+    budget.recursion_depth = 512;
+    budget.owned_bytes = 1408 * 1024;
+    let result = stylesheet.execute(
+        &Document::parse(&source_xml, None).expect("deep source parses"),
+        &Parameters::new(),
+        Arc::new(NoResolver),
+        ExecutionOptions {
+            budget,
+            initial_mode: None,
+            initial_template: None,
+        },
+    );
+    assert!(matches!(
+        result,
         Err(Error::Budget {
             kind: BudgetKind::OwnedBytes,
             ..

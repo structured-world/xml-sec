@@ -188,7 +188,7 @@ pub(crate) struct Evaluator {
     node_base_uris: Rc<RefCell<HashMap<NodePath, Option<String>>>>,
     expressions: RefCell<HashMap<String, XPath>>,
     pattern_matches: HashMap<PatternCacheKey, HashSet<SourceNode>>,
-    generated_ids: Rc<RefCell<HashMap<NodePath, usize>>>,
+    generated_ids: Rc<RefCell<GeneratedIdCache>>,
     key_index: Rc<RefCell<KeyIndex>>,
     decimal_formats: Rc<Vec<DecimalFormat>>,
     extension_functions: HashSet<ExpandedName>,
@@ -273,7 +273,7 @@ impl Evaluator {
             node_base_uris,
             expressions: RefCell::new(HashMap::new()),
             pattern_matches: HashMap::new(),
-            generated_ids: Rc::new(RefCell::new(HashMap::new())),
+            generated_ids: Rc::new(RefCell::new(GeneratedIdCache::default())),
             key_index: Rc::new(RefCell::new(HashMap::new())),
             decimal_formats: Rc::new(Vec::new()),
             extension_functions: HashSet::new(),
@@ -1099,7 +1099,15 @@ impl Evaluator {
         let xpath = expressions
             .get(rewritten.as_ref())
             .expect("compiled XPath was inserted into the execution cache");
-        let value = match xpath.evaluate(&context, context_node) {
+        let generated_id_bytes_before = self.generated_ids.borrow().owned_bytes;
+        let evaluation = xpath.evaluate(&context, context_node);
+        let generated_id_bytes = self
+            .generated_ids
+            .borrow()
+            .owned_bytes
+            .saturating_sub(generated_id_bytes_before);
+        meter.charge(BudgetKind::OwnedBytes, generated_id_bytes)?;
+        let value = match evaluation {
             Ok(value) => value,
             Err(error) => {
                 if let Some(attempted) = context.string_allocation_exceeded() {
@@ -3239,13 +3247,19 @@ fn is_lexical_qname(value: &str) -> bool {
     valid_part(first) && parts.next().is_none_or(valid_part) && parts.next().is_none()
 }
 
+#[derive(Default)]
+struct GeneratedIdCache {
+    assigned: HashMap<NodePath, usize>,
+    owned_bytes: usize,
+}
+
 struct GenerateId {
-    assigned: Rc<RefCell<HashMap<NodePath, usize>>>,
+    assigned: Rc<RefCell<GeneratedIdCache>>,
 }
 impl function::Function for GenerateId {
     fn evaluate<'c, 'd>(
         &self,
-        _: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
+        context: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
         args: Vec<SxdValue<'d>>,
     ) -> std::result::Result<SxdValue<'d>, function::Error> {
         if args.len() != 1 {
@@ -3261,15 +3275,28 @@ impl function::Function for GenerateId {
         let Some(node) = nodes.document_order().first().cloned() else {
             return Ok(SxdValue::String(String::new()));
         };
-        let id = assign_generated_id(&self.assigned, typed_path_to(&node));
+        let id = assign_generated_id(context, &self.assigned, typed_path_to(&node))?;
         Ok(SxdValue::String(format!("id{id}")))
     }
 }
 
-fn assign_generated_id(assigned: &RefCell<HashMap<NodePath, usize>>, path: NodePath) -> usize {
-    let mut assigned = assigned.borrow_mut();
-    let next = assigned.len() + 1;
-    *assigned.entry(path).or_insert(next)
+fn assign_generated_id(
+    context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
+    assigned: &RefCell<GeneratedIdCache>,
+    path: NodePath,
+) -> std::result::Result<usize, function::Error> {
+    let mut cache = assigned.borrow_mut();
+    if let Some(id) = cache.assigned.get(&path) {
+        return Ok(*id);
+    }
+    let entry_bytes = path
+        .owned_bytes()
+        .saturating_add(std::mem::size_of::<(NodePath, usize)>());
+    context.reserve_string_allocation(entry_bytes)?;
+    let id = cache.assigned.len() + 1;
+    cache.assigned.insert(path, id);
+    cache.owned_bytes = cache.owned_bytes.saturating_add(entry_bytes);
+    Ok(id)
 }
 
 enum NodeNameFunction {
@@ -3816,6 +3843,9 @@ impl function::Function for ExsltSetFunction {
                 let Some(boundary) = right.document_order_first() else {
                     return Ok(SxdValue::Nodeset(left.clone()));
                 };
+                // EXSLT Sets defines a non-member boundary as an empty result, even when nodes
+                // from the first set precede it in document order. This membership condition is
+                // intentionally stricter than a plain document-order partition.
                 if !left.contains(boundary.clone()) {
                     return Ok(SxdValue::Nodeset(nodeset::Nodeset::new()));
                 }

@@ -266,10 +266,12 @@ enum PreparedCustomCalls<'a> {
     Borrowed {
         expression: &'a Expression,
         variables: HashMap<ExpandedName, Value>,
+        reserved_owned_bytes: usize,
     },
     Rewritten {
         expression: Expression,
         variables: HashMap<ExpandedName, Value>,
+        reserved_owned_bytes: usize,
     },
 }
 
@@ -601,8 +603,10 @@ impl<'a> Execution<'a> {
         Ok(())
     }
 
-    fn variables(&self) -> HashMap<ExpandedName, Value> {
-        let capacity = self.scopes.iter().map(HashMap::len).sum();
+    fn variables(&mut self) -> Result<(HashMap<ExpandedName, Value>, usize)> {
+        let (capacity, reserved_owned_bytes) = visible_variable_snapshot_size(&self.scopes);
+        self.meter
+            .charge(BudgetKind::OwnedBytes, reserved_owned_bytes)?;
         let mut variables = HashMap::with_capacity(capacity);
         for scope in &self.scopes {
             variables.extend(
@@ -611,7 +615,7 @@ impl<'a> Execution<'a> {
                     .map(|(name, value)| (name.clone(), value.clone())),
             );
         }
-        variables
+        Ok((variables, reserved_owned_bytes))
     }
 
     fn apply_one(
@@ -1117,10 +1121,11 @@ impl<'a> Execution<'a> {
                 Some(NodeKind::Text { value, .. }) => self.append_text(&value, false),
                 _ => Ok(()),
             },
-            SourceNode::Attribute { .. } | SourceNode::Namespace { .. } => {
+            SourceNode::Attribute { .. } => {
                 let value = self.evaluator.string_value(&node);
                 self.append_text(&value, false)
             }
+            SourceNode::Namespace { .. } => Ok(()),
         }
     }
 
@@ -1862,32 +1867,41 @@ impl<'a> Execution<'a> {
             return Ok(XPathValue::Number(value));
         }
         let prepared = self.prepare_custom_function_calls(expression, node, position, size)?;
-        let value = match prepared {
+        let (value, reserved_owned_bytes) = match prepared {
             PreparedCustomCalls::Direct(value) => return Ok(public_to_xpath(value)),
             PreparedCustomCalls::Borrowed {
                 expression,
                 variables,
-            } => self.evaluator.evaluate(
-                expression,
-                node,
-                position,
-                size,
-                &variables,
-                &mut self.meter,
-            )?,
+                reserved_owned_bytes,
+            } => (
+                self.evaluator.evaluate(
+                    expression,
+                    node,
+                    position,
+                    size,
+                    &variables,
+                    &mut self.meter,
+                ),
+                reserved_owned_bytes,
+            ),
             PreparedCustomCalls::Rewritten {
                 expression,
                 variables,
-            } => self.evaluator.evaluate(
-                &expression,
-                node,
-                position,
-                size,
-                &variables,
-                &mut self.meter,
-            )?,
+                reserved_owned_bytes,
+            } => (
+                self.evaluator.evaluate(
+                    &expression,
+                    node,
+                    position,
+                    size,
+                    &variables,
+                    &mut self.meter,
+                ),
+                reserved_owned_bytes,
+            ),
         };
-        Ok(value)
+        self.meter.release_owned_bytes(reserved_owned_bytes);
+        value
     }
 
     fn evaluate_rtf_order(
@@ -2179,9 +2193,11 @@ impl<'a> Execution<'a> {
         )
         .is_some();
         if !has_custom_call {
+            let (variables, reserved_owned_bytes) = self.variables()?;
             return Ok(PreparedCustomCalls::Borrowed {
                 expression,
-                variables: self.variables(),
+                variables,
+                reserved_owned_bytes,
             });
         }
         let mut source = expression.source.clone();
@@ -2219,8 +2235,13 @@ impl<'a> Execution<'a> {
             }
             let local = format!("result{index}");
             index += 1;
+            if variables.is_none() {
+                variables = Some(self.variables()?);
+            }
             variables
-                .get_or_insert_with(|| self.variables())
+                .as_mut()
+                .expect("variable snapshot was initialized")
+                .0
                 .insert(ExpandedName::new(Some(PRIVATE_NS), local.clone()), value);
             source.replace_range(call.start..call.end, &format!("$__xml_sec_func:{local}"));
         }
@@ -2228,9 +2249,14 @@ impl<'a> Execution<'a> {
         namespaces.push(("__xml_sec_func".into(), PRIVATE_NS.into()));
         let mut rewritten = expression.derived(source);
         rewritten.namespaces = namespaces;
+        let (variables, reserved_owned_bytes) = match variables {
+            Some(snapshot) => snapshot,
+            None => self.variables()?,
+        };
         Ok(PreparedCustomCalls::Rewritten {
             expression: rewritten,
-            variables: variables.unwrap_or_else(|| self.variables()),
+            variables,
+            reserved_owned_bytes,
         })
     }
 
@@ -3087,7 +3113,7 @@ impl<'a> Execution<'a> {
             lineage.push(SourceNode::Node(id));
             cursor = self.evaluator.source.node(id).and_then(|node| node.parent);
         }
-        let variables = self.variables();
+        let (variables, reserved_owned_bytes) = self.variables()?;
         let mut matches = |this: &mut Self, candidate: &SourceNode| -> Result<bool> {
             if let Some(pattern) = &instruction.count {
                 this.matches_pattern(pattern, candidate, &variables)
@@ -3104,7 +3130,7 @@ impl<'a> Execution<'a> {
                 this.matches_pattern(pattern, candidate, &variables)
             })
         };
-        match instruction.level.as_str() {
+        let result = (|| match instruction.level.as_str() {
             "single" => {
                 for candidate in lineage {
                     if from(self, &candidate)? {
@@ -3163,7 +3189,9 @@ impl<'a> Execution<'a> {
             level => Err(Error::Static(format!(
                 "unsupported xsl:number level {level}"
             ))),
-        }
+        })();
+        self.meter.release_owned_bytes(reserved_owned_bytes);
+        result
     }
 
     fn sibling_number(
@@ -3944,6 +3972,31 @@ fn value_owned_bytes(value: &Value) -> usize {
                 )
         }),
     }
+}
+
+fn visible_variable_snapshot_size(scopes: &[HashMap<ExpandedName, Value>]) -> (usize, usize) {
+    let mut count = 0usize;
+    let mut payload = 0usize;
+    for (scope_index, scope) in scopes.iter().enumerate() {
+        for (name, value) in scope {
+            if scopes[scope_index + 1..]
+                .iter()
+                .any(|inner| inner.contains_key(name))
+            {
+                continue;
+            }
+            count = count.saturating_add(1);
+            payload = payload
+                .saturating_add(expanded_name_owned_bytes(name))
+                .saturating_add(value_owned_bytes(value));
+        }
+    }
+    // Account conservatively for hash-table control bytes and spare capacity in addition to
+    // cloned key/value payloads. The reservation is transient and released after XPath returns.
+    let table = count
+        .saturating_mul(std::mem::size_of::<(ExpandedName, Value)>())
+        .saturating_mul(2);
+    (count, payload.saturating_add(table))
 }
 
 fn tokenize_number_format(format: &str) -> NumberFormatTokens {
