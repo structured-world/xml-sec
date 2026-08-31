@@ -1372,20 +1372,12 @@ fn internal_general_entities<'a>(
     references: &mut usize,
     meter: &mut EntityExpansionMeter,
 ) -> Result<(Cow<'a, str>, HashMap<String, String>)> {
-    let Some((start, end)) = doctype_span(xml)? else {
+    let Some(doctype) = doctype_span(xml)? else {
         return Ok((Cow::Borrowed(xml), HashMap::new()));
     };
-    let doctype = &xml[start..end];
-    let Some(subset_start) = doctype.find('[') else {
+    let Some((subset_start, subset_end)) = doctype.internal_subset else {
         return Ok((Cow::Borrowed(xml), HashMap::new()));
     };
-    let Some(subset_end) = doctype.rfind(']') else {
-        return Err(Error::Xml(
-            "unterminated document type internal subset".into(),
-        ));
-    };
-    let subset_start = start + subset_start + 1;
-    let subset_end = start + subset_end;
     let subset = &xml[subset_start..subset_end];
     let declarations = collect_internal_entity_declarations(subset)?;
     let expanded_subset = expand_parameter_entity_references(
@@ -1729,7 +1721,13 @@ fn expand_parameter_entity_references_into(
     Ok(())
 }
 
-fn doctype_span(xml: &str) -> Result<Option<(usize, usize)>> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DoctypeSpan {
+    end: usize,
+    internal_subset: Option<(usize, usize)>,
+}
+
+fn doctype_span(xml: &str) -> Result<Option<DoctypeSpan>> {
     let mut cursor = usize::from(xml.starts_with('\u{feff}')) * '\u{feff}'.len_utf8();
     loop {
         skip_xml_whitespace(xml, &mut cursor);
@@ -1751,14 +1749,20 @@ fn doctype_span(xml: &str) -> Result<Option<(usize, usize)>> {
         if !tail.starts_with("<!DOCTYPE") {
             return Ok(None);
         }
-        return scan_doctype_end(tail).map(|length| Some((cursor, cursor + length)));
+        let (length, internal_subset) = scan_doctype_end(tail)?;
+        return Ok(Some(DoctypeSpan {
+            end: cursor + length,
+            internal_subset: internal_subset.map(|(start, end)| (cursor + start, cursor + end)),
+        }));
     }
 }
 
-fn scan_doctype_end(doctype: &str) -> Result<usize> {
+fn scan_doctype_end(doctype: &str) -> Result<(usize, Option<(usize, usize)>)> {
     let mut cursor = "<!DOCTYPE".len();
     let mut quote = None;
     let mut internal_subset_depth = 0usize;
+    let mut internal_subset_start = None;
+    let mut internal_subset_end = None;
     while cursor < doctype.len() {
         let tail = &doctype[cursor..];
         if quote.is_none() && tail.starts_with("<!--") {
@@ -1788,11 +1792,23 @@ fn scan_doctype_end(doctype: &str) -> Result<usize> {
         }
         match character {
             '\'' | '"' => quote = Some(character),
-            '[' => internal_subset_depth += 1,
-            ']' => {
-                internal_subset_depth = internal_subset_depth.saturating_sub(1);
+            '[' => {
+                if internal_subset_depth == 0 && internal_subset_start.is_none() {
+                    internal_subset_start = Some(cursor);
+                }
+                internal_subset_depth += 1;
             }
-            '>' if internal_subset_depth == 0 => return Ok(cursor),
+            ']' => {
+                if internal_subset_depth > 0 {
+                    internal_subset_depth -= 1;
+                    if internal_subset_depth == 0 {
+                        internal_subset_end = Some(cursor - character.len_utf8());
+                    }
+                }
+            }
+            '>' if internal_subset_depth == 0 => {
+                return Ok((cursor, internal_subset_start.zip(internal_subset_end)));
+            }
             _ => {}
         }
     }
@@ -1839,9 +1855,10 @@ fn expand_document_entities<'a>(
     if entities.is_empty() {
         return Ok(Cow::Borrowed(xml));
     }
-    let Some((_, doctype_end)) = doctype_span(xml)? else {
+    let Some(doctype) = doctype_span(xml)? else {
         return Ok(Cow::Borrowed(xml));
     };
+    let doctype_end = doctype.end;
     if !contains_expandable_entity_reference(&xml[doctype_end..], entities) {
         return Ok(Cow::Borrowed(xml));
     }
@@ -2297,6 +2314,14 @@ mod parser_boundary_tests {
         // Processing-instruction content is a protected DTD region. Markup-shaped text inside it
         // must not become a declaration consumed by the entity-expansion pass.
         let xml = r#"<!DOCTYPE r [<?pi <!ENTITY e "evil">?>]><r>&e;</r>"#;
+        assert!(Document::parse_iterative(xml, None).is_err());
+    }
+
+    #[test]
+    fn external_identifier_brackets_do_not_form_an_internal_subset() {
+        // XML 1.0 only permits the internal subset after the external identifier, outside its
+        // quoted SystemLiteral: https://www.w3.org/TR/xml/#NT-doctypedecl
+        let xml = r#"<!DOCTYPE r SYSTEM "[<!ENTITY e 'ok'>]"><r>&e;</r>"#;
         assert!(Document::parse_iterative(xml, None).is_err());
     }
 

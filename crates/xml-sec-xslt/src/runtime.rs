@@ -2605,10 +2605,7 @@ impl<'a> Execution<'a> {
                 let key = if spec.data_type == "number" {
                     SortKey::Number(value.number(&self.evaluator))
                 } else {
-                    let key = SortKey::text(value.string(&self.evaluator));
-                    self.meter
-                        .charge(BudgetKind::OwnedBytes, key.owned_bytes())?;
-                    key
+                    SortKey::text(value.into_string(&self.evaluator), &mut self.meter)?
                 };
                 keys.push(key);
             }
@@ -3624,16 +3621,14 @@ struct EvaluatedSort {
     collator: Option<CollatorBorrowed<'static>>,
 }
 impl SortKey {
-    fn text(value: String) -> Self {
-        let default_key = default_collation_key(&value);
-        Self::Text { value, default_key }
-    }
-
-    fn owned_bytes(&self) -> usize {
-        match self {
-            Self::Text { value, default_key } => value.len().saturating_add(default_key.len()),
-            Self::Number(_) => 0,
-        }
+    fn text(value: String, meter: &mut Meter) -> Result<Self> {
+        let key_bytes = default_collation_key_bytes(&value);
+        meter.charge(
+            BudgetKind::OwnedBytes,
+            value.len().saturating_add(key_bytes),
+        )?;
+        let default_key = default_collation_key(&value, key_bytes);
+        Ok(Self::Text { value, default_key })
     }
 
     fn compare(
@@ -3660,7 +3655,10 @@ impl SortKey {
                 if primary != Ordering::Equal {
                     return primary;
                 }
-                let secondary = left.to_lowercase().cmp(&right.to_lowercase());
+                let secondary = left
+                    .chars()
+                    .flat_map(char::to_lowercase)
+                    .cmp(right.chars().flat_map(char::to_lowercase));
                 if secondary != Ordering::Equal {
                     return secondary;
                 }
@@ -3686,8 +3684,22 @@ impl SortKey {
     }
 }
 
-fn default_collation_key(value: &str) -> String {
-    let mut key = String::with_capacity(value.len());
+fn default_collation_key_bytes(value: &str) -> usize {
+    value
+        .chars()
+        .flat_map(char::to_lowercase)
+        .try_fold(0usize, |bytes, character| {
+            bytes.checked_add(if character == '_' {
+                char::MAX.len_utf8()
+            } else {
+                character.len_utf8()
+            })
+        })
+        .unwrap_or(usize::MAX)
+}
+
+fn default_collation_key(value: &str, key_bytes: usize) -> String {
+    let mut key = String::with_capacity(key_bytes);
     for character in value.chars().flat_map(char::to_lowercase) {
         // libxslt's default collation orders an underscore after letters,
         // while punctuation such as a leading minus sign remains significant.
@@ -4462,7 +4474,9 @@ fn roman(mut value: usize, upper: bool) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_grouped, append_localized_decimal};
+    use std::cmp::Ordering;
+
+    use super::{SortKey, append_grouped, append_localized_decimal};
     use crate::budget::Meter;
     use crate::{BudgetKind, Error, ExecutionBudget};
 
@@ -4512,5 +4526,31 @@ mod tests {
             }
         ));
         assert!(rejected.is_empty(), "budget rejection precedes all writes");
+    }
+
+    #[test]
+    fn text_sort_key_reserves_its_exact_retained_payload() {
+        // The underscore sentinel expands from one to four UTF-8 bytes, so the pre-allocation
+        // accounting must use the produced collation key rather than the source byte length.
+        let value = "A_".to_owned();
+        assert!(matches!(
+            SortKey::text(value.clone(), &mut meter(value.len() + 4)),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            })
+        ));
+        SortKey::text(value.clone(), &mut meter(value.len() + 5))
+            .expect("the exact retained sort-key payload fits");
+    }
+
+    #[test]
+    fn text_sort_key_resolves_internal_sentinel_collisions_without_allocation() {
+        let left = SortKey::text("_".into(), &mut meter(64)).expect("left key fits");
+        let right = SortKey::text(char::MAX.to_string(), &mut meter(64)).expect("right key fits");
+        assert_eq!(
+            left.compare(&right, Some("lower-first"), None),
+            Ordering::Less
+        );
     }
 }

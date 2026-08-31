@@ -958,6 +958,13 @@ fn exslt_padding_uses_each_predicate_candidate_context() {
 }
 
 #[test]
+fn exslt_tokenize_defaults_to_all_xml_whitespace() {
+    // Omitted str:tokenize delimiters are XML S; str:split retains its separate space default.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(str:tokenize(concat('a', '&#10;', 'b', '&#9;', 'c', '&#13;', 'd')))"/><xsl:text>|</xsl:text><xsl:value-of select="count(str:split(concat('a', '&#10;', 'b')))"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "4|1");
+}
+
+#[test]
 fn execution_environment_controls_exslt_current_time() {
     // Ambient clock access is explicit and can be fixed or prohibited for security transforms.
     let stylesheet = compile(
@@ -4307,6 +4314,39 @@ fn xinclude_preserves_principal_and_included_id_metadata() {
         )
         .expect("XInclude transform succeeds");
     assert_eq!(result.serialized.bytes, b"1|1");
+}
+
+#[test]
+fn xpath_id_splits_arguments_only_on_xml_whitespace() {
+    // VT and FF are ASCII whitespace but not XML S, so they remain part of an unmatched ID token.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:param name="ids"/><xsl:template match="/"><xsl:value-of select="count(id($ids))"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse(r#"<root xml:id="known-id"/>"#, None).expect("source parses");
+    for (value, expected) in [
+        ("\u{000b}known-id", b"0".as_slice()),
+        ("\u{000c}known-id", b"0".as_slice()),
+        ("\tknown-id\r\n", b"1".as_slice()),
+    ] {
+        let mut parameters = Parameters::new();
+        parameters.insert(
+            ExpandedName::new(None::<String>, "ids"),
+            Value::String(value.into()),
+        );
+        let result = stylesheet
+            .execute(
+                &source,
+                &parameters,
+                Arc::new(NoResolver),
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            )
+            .expect("id lookup executes");
+        assert_eq!(result.serialized.bytes, expected, "argument {value:?}");
+    }
 }
 
 #[test]

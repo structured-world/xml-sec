@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -609,17 +610,26 @@ impl Evaluator {
                         )?
                         .string(self);
                     let delimiter = if let Some(argument) = call.arguments.get(1) {
-                        self.evaluate_core(
-                            &expression.derived(argument.clone()),
-                            node,
-                            position,
-                            size,
-                            &augmented,
-                            meter,
-                        )?
-                        .string(self)
+                        Cow::Owned(
+                            self.evaluate_core(
+                                &expression.derived(argument.clone()),
+                                node,
+                                position,
+                                size,
+                                &augmented,
+                                meter,
+                            )?
+                            .string(self),
+                        )
                     } else {
-                        " ".into()
+                        // EXSLT gives tokenize() all four XML whitespace delimiters by default,
+                        // while split() defaults to one space character:
+                        // https://exslt.github.io/str/functions/tokenize/index.html
+                        Cow::Borrowed(match kind {
+                            ExtensionCallKind::Tokenize => " \t\r\n",
+                            ExtensionCallKind::Split => " ",
+                            _ => unreachable!(),
+                        })
                     };
                     let tokens = match kind {
                         ExtensionCallKind::Split => split_exslt_string(&input, &delimiter),
@@ -2080,6 +2090,12 @@ impl XPathValue {
             Self::StoredExpression(value) => value.clone(),
         }
     }
+    pub(crate) fn into_string(self, evaluator: &Evaluator) -> String {
+        match self {
+            Self::String(value) | Self::StoredExpression(value) => value,
+            value => value.string(evaluator),
+        }
+    }
     pub(crate) fn number(&self, evaluator: &Evaluator) -> f64 {
         match self {
             Self::Number(value) => *value,
@@ -2991,36 +3007,34 @@ fn xpath_value_to_public(value: XPathValue) -> Value {
     }
 }
 
-fn split_exslt_string(input: &str, delimiter: &str) -> Vec<String> {
+fn split_exslt_string<'a>(input: &'a str, delimiter: &str) -> Vec<&'a str> {
     if delimiter.is_empty() {
         input
-            .chars()
-            .map(|character| character.to_string())
+            .char_indices()
+            .map(|(offset, character)| &input[offset..offset + character.len_utf8()])
             .collect()
     } else {
         input
             .split(delimiter)
             .filter(|token| !token.is_empty())
-            .map(str::to_owned)
             .collect()
     }
 }
 
-fn tokenize_exslt_string(input: &str, delimiters: &str) -> Vec<String> {
+fn tokenize_exslt_string<'a>(input: &'a str, delimiters: &str) -> Vec<&'a str> {
     if delimiters.is_empty() {
         return input
-            .chars()
-            .map(|character| character.to_string())
+            .char_indices()
+            .map(|(offset, character)| &input[offset..offset + character.len_utf8()])
             .collect();
     }
     input
         .split(|character| delimiters.contains(character))
         .filter(|token| !token.is_empty())
-        .map(str::to_owned)
         .collect()
 }
 
-fn token_document(tokens: &[String], meter: &mut Meter) -> Result<Document> {
+fn token_document(tokens: &[&str], meter: &mut Meter) -> Result<Document> {
     let mut document = Document::empty(None);
     for token in tokens {
         meter.charge(BudgetKind::ResultNodes, 2)?;
@@ -3038,7 +3052,7 @@ fn token_document(tokens: &[String], meter: &mut Meter) -> Result<Document> {
         document.push(
             element,
             NodeKind::Text {
-                value: token.clone(),
+                value: (*token).to_owned(),
                 disable_output_escaping: false,
             },
             None,
@@ -3468,7 +3482,12 @@ impl function::Function for IdFunction {
         };
         let mut result = nodeset::Nodeset::new();
         for value in values {
-            for token in value.split_ascii_whitespace() {
+            // XPath 1.0 id() splits on XML's four S characters, not the host language's wider
+            // ASCII whitespace class: https://www.w3.org/TR/1999/REC-xpath-19991116/#function-id
+            for token in value
+                .split(crate::lexical::is_xml_whitespace)
+                .filter(|token| !token.is_empty())
+            {
                 if let Some(path) = self.nodes.get(token)
                     && let Some(node) =
                         resolve_node_path(context.node.document().root().into(), path)
@@ -3885,6 +3904,13 @@ impl function::Function for ExsltSetFunction {
     }
 }
 
+fn utf8_prefix_bytes(value: &str, characters: usize) -> usize {
+    value
+        .char_indices()
+        .nth(characters)
+        .map_or(value.len(), |(offset, _)| offset)
+}
+
 enum ExsltStringFunction {
     Align,
     Padding,
@@ -3909,7 +3935,9 @@ impl function::Function for ExsltStringFunction {
                 let width = padding.chars().count();
                 let value_width = value.chars().count();
                 if value_width >= width {
-                    return Ok(SxdValue::String(value.chars().take(width).collect()));
+                    let output_bytes = utf8_prefix_bytes(&value, width);
+                    context.reserve_string_allocation(output_bytes)?;
+                    return Ok(SxdValue::String(value[..output_bytes].to_owned()));
                 }
                 let missing = width - value_width;
                 let left = match alignment.as_str() {
@@ -3918,11 +3946,21 @@ impl function::Function for ExsltStringFunction {
                     _ => 0,
                 };
                 let right = missing - left;
-                let padding = padding.chars().collect::<Vec<_>>();
-                let mut result = String::with_capacity(padding.len());
-                result.extend(padding.iter().take(left));
+                // EXSLT overlays the value on the padding string by character position. Retain
+                // borrowed UTF-8 slices and meter the exact output before its sole allocation:
+                // https://exslt.github.io/str/functions/align/index.html
+                let left_end = utf8_prefix_bytes(&padding, left);
+                let right_start = utf8_prefix_bytes(&padding, left + value_width);
+                let output_bytes = left_end
+                    .checked_add(value.len())
+                    .and_then(|bytes| bytes.checked_add(padding.len() - right_start))
+                    .unwrap_or(usize::MAX);
+                context.reserve_string_allocation(output_bytes)?;
+                let mut result = String::with_capacity(output_bytes);
+                result.push_str(&padding[..left_end]);
                 result.push_str(&value);
-                result.extend(padding.iter().skip(left + value_width).take(right));
+                debug_assert_eq!(padding[right_start..].chars().count(), right);
+                result.push_str(&padding[right_start..]);
                 Ok(SxdValue::String(result))
             }
             Self::Padding => {
@@ -5244,6 +5282,28 @@ mod tests {
                 .expect_err("math workspace must cross the allocation gate");
             assert!(error.to_string().contains("allocation budget"));
         }
+    }
+
+    #[test]
+    fn string_align_reserves_output_before_constructing_it() {
+        let package = Package::new();
+        let document = package.as_document();
+        let mut context = Context::new();
+        context.set_string_allocation_limit(1);
+        let evaluation =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+
+        let error = ExsltStringFunction::Align
+            .evaluate(
+                &evaluation,
+                vec![
+                    SxdValue::String("λ".into()),
+                    SxdValue::String("........".into()),
+                    SxdValue::String("center".into()),
+                ],
+            )
+            .expect_err("aligned output must cross the allocation gate");
+        assert!(error.to_string().contains("allocation budget"));
     }
 
     #[test]
