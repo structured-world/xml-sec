@@ -96,7 +96,11 @@ impl AxisLike for Axis {
             }
             Namespace => {
                 if let Node::Element(ref e) = context.node {
-                    for ns in e.namespaces_in_scope() {
+                    for ns in e
+                        .namespaces_in_scope()
+                        .into_iter()
+                        .filter(|namespace| !namespace.uri().is_empty())
+                    {
                         let ns = Node::Namespace(nodeset::Namespace {
                             parent: *e,
                             prefix: sxd_document_no_unsafe::to_ns_str!(ns.prefix()),
@@ -318,6 +322,22 @@ mod test {
         let result = execute(DescendantOrSelf, level0);
 
         assert_eq!(result, ordered_nodes![level0, level1, level2]);
+    }
+
+    #[test]
+    fn namespace_axis_excludes_empty_uri_undeclarations() {
+        // An empty binding shadows an inherited prefix but is not itself an XPath namespace node.
+        let package = Package::new();
+        let doc = package.as_document();
+        let parent = doc.create_element("parent");
+        parent.register_prefix("", "urn:outer");
+        let child = doc.create_element("child");
+        child.register_prefix("", "");
+        child.register_prefix("p", "urn:visible");
+        parent.append_child(child);
+        doc.root().append_child(parent);
+
+        assert_eq!(execute(Namespace, child).size(), 2);
     }
 
     #[test]

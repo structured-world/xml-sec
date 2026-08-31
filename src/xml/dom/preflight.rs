@@ -110,7 +110,7 @@ impl LexicalPreflight {
                 }),
                 Event::DocType { .. } if !allow_dtd => return Err(ParseError::DtdDetected),
                 #[cfg(feature = "xml-backend-roxmltree")]
-                Event::DocType { range } => doctype = Some(range),
+                Event::DocType { range, .. } => doctype = Some(range),
                 _ => {}
             }
             let actual = nodes.len();

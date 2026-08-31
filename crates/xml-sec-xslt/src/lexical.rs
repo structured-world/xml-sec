@@ -6,6 +6,10 @@ pub(crate) fn is_ncname(value: &str) -> bool {
     is_ncname_start(first) && chars.all(is_ncname_char)
 }
 
+pub(crate) const fn is_xml_whitespace(character: char) -> bool {
+    matches!(character, ' ' | '\t' | '\r' | '\n')
+}
+
 pub(crate) fn unicode_decimal_value(character: char) -> Option<u32> {
     const ZEROES: &[char] = &[
         '0', '٠', '۰', '०', '০', '੦', '૦', '୦', '௦', '౦', '೦', '൦', '๐', '໐', '༠', '၀', '០', '᠐',

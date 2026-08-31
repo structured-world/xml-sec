@@ -132,7 +132,7 @@ impl Stylesheet {
         options: ExecutionOptions,
         source_processing: SourceProcessing,
     ) -> Result<TransformResult> {
-        let source_bytes = source.source_xml().map_or(0, str::len);
+        let source_bytes = source.source_bytes();
         let mut meter = Meter::new(options.budget, source_bytes)?;
         let source_options = EvaluatorSourceOptions {
             processing: source_processing,
@@ -255,6 +255,18 @@ struct Execution<'a> {
     building_keys: HashSet<(ExpandedName, NodeId)>,
     attribute_insert_position: Option<usize>,
     attribute_protected_names: Option<HashSet<ExpandedName>>,
+}
+
+enum PreparedCustomCalls<'a> {
+    Direct(Value),
+    Borrowed {
+        expression: &'a Expression,
+        variables: HashMap<ExpandedName, Value>,
+    },
+    Rewritten {
+        expression: Expression,
+        variables: HashMap<ExpandedName, Value>,
+    },
 }
 
 struct ResultTreeState {
@@ -567,9 +579,14 @@ impl<'a> Execution<'a> {
     }
 
     fn variables(&self) -> HashMap<ExpandedName, Value> {
-        let mut variables = HashMap::new();
+        let capacity = self.scopes.iter().map(HashMap::len).sum();
+        let mut variables = HashMap::with_capacity(capacity);
         for scope in &self.scopes {
-            variables.extend(scope.clone())
+            variables.extend(
+                scope
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone())),
+            );
         }
         variables
     }
@@ -787,7 +804,7 @@ impl<'a> Execution<'a> {
                             children,
                             attribute_sets,
                         } => {
-                            let (name, prefix) = self.alias_name(&name, prefix.as_deref());
+                            let (name, mut prefix) = self.alias_name(&name, prefix.as_deref());
                             let mut result_namespaces = Vec::<Namespace>::new();
                             for namespace in &namespaces {
                                 let mapped = self.alias_namespace(namespace);
@@ -800,6 +817,7 @@ impl<'a> Execution<'a> {
                                     result_namespaces.push(mapped);
                                 }
                             }
+                            fixup_element_namespace(&name, &mut prefix, &mut result_namespaces);
                             let id = self.push_node(
                                 self.parent(),
                                 NodeKind::Element {
@@ -1670,8 +1688,13 @@ impl<'a> Execution<'a> {
             }
             Instruction::Message { terminate, body } => {
                 self.meter.charge(BudgetKind::Messages, 1)?;
-                let fragment =
-                    self.capture_fragment(body, node, position, size, depth, current_precedence)?;
+                let fragment = self.capture_fragment(
+                    body,
+                    node,
+                    ApplyFrame::new(position, size, depth),
+                    current_precedence,
+                    None,
+                )?;
                 let content = serialize_fragment(&fragment, &mut self.meter)?;
                 self.messages.push(Message {
                     content: content.clone(),
@@ -1713,10 +1736,9 @@ impl<'a> Execution<'a> {
                 let fragment = self.capture_fragment(
                     body,
                     node,
-                    position,
-                    size,
-                    depth + 1,
+                    ApplyFrame::new(position, size, depth + 1),
                     current_precedence,
+                    None,
                 )?;
                 let serialized = serialize(&fragment, &definition, &mut self.meter)?;
                 self.secondary_outputs
@@ -1746,7 +1768,11 @@ impl<'a> Execution<'a> {
                 self.push_node(self.parent(), NodeKind::Comment(value.clone()))?;
                 Ok(())
             }
-            Instruction::FunctionResult { select, content } => {
+            Instruction::FunctionResult {
+                select,
+                content,
+                base_uri,
+            } => {
                 if self.function_results.is_empty() {
                     return Err(Error::Dynamic(
                         "func:result executed outside an EXSLT function".into(),
@@ -1763,10 +1789,9 @@ impl<'a> Execution<'a> {
                     Value::ResultTreeFragment(self.capture_fragment(
                         content,
                         node,
-                        position,
-                        size,
-                        depth + 1,
+                        ApplyFrame::new(position, size, depth + 1),
                         current_precedence,
+                        base_uri.as_deref(),
                     )?)
                 };
                 *self
@@ -1812,19 +1837,32 @@ impl<'a> Execution<'a> {
         if let Some(value) = self.evaluate_rtf_order(expression, node)? {
             return Ok(XPathValue::Number(value));
         }
-        let (prepared, variables, direct) =
-            self.prepare_custom_function_calls(expression, node, position, size)?;
-        if let Some(value) = direct {
-            return Ok(public_to_xpath(value));
-        }
-        let value = self.evaluator.evaluate(
-            &prepared,
-            node,
-            position,
-            size,
-            &variables,
-            &mut self.meter,
-        )?;
+        let prepared = self.prepare_custom_function_calls(expression, node, position, size)?;
+        let value = match prepared {
+            PreparedCustomCalls::Direct(value) => return Ok(public_to_xpath(value)),
+            PreparedCustomCalls::Borrowed {
+                expression,
+                variables,
+            } => self.evaluator.evaluate(
+                expression,
+                node,
+                position,
+                size,
+                &variables,
+                &mut self.meter,
+            )?,
+            PreparedCustomCalls::Rewritten {
+                expression,
+                variables,
+            } => self.evaluator.evaluate(
+                &expression,
+                node,
+                position,
+                size,
+                &variables,
+                &mut self.meter,
+            )?,
+        };
         Ok(value)
     }
 
@@ -2087,16 +2125,33 @@ impl<'a> Execution<'a> {
             .map(|value| value.into_string(&self.evaluator.source))
     }
 
-    fn prepare_custom_function_calls(
+    fn prepare_custom_function_calls<'b>(
         &mut self,
-        expression: &Expression,
+        expression: &'b Expression,
         node: &SourceNode,
         position: usize,
         size: usize,
-    ) -> Result<(Expression, HashMap<ExpandedName, Value>, Option<Value>)> {
+    ) -> Result<PreparedCustomCalls<'b>> {
         const PRIVATE_NS: &str = "urn:structured-world:xml-sec:xslt:user-functions";
+        let has_custom_call = innermost_namespaced_call(
+            &expression.source,
+            &expression.namespaces,
+            |namespace, local| {
+                self.stylesheet.functions.iter().any(|function| {
+                    function.name.namespace.as_deref() == Some(namespace)
+                        && function.name.local == local
+                })
+            },
+        )
+        .is_some();
+        if !has_custom_call {
+            return Ok(PreparedCustomCalls::Borrowed {
+                expression,
+                variables: self.variables(),
+            });
+        }
         let mut source = expression.source.clone();
-        let mut variables = self.variables();
+        let mut variables = None;
         let mut index = 0usize;
         while let Some(call) =
             innermost_namespaced_call(&source, &expression.namespaces, |namespace, local| {
@@ -2126,18 +2181,23 @@ impl<'a> Execution<'a> {
             }
             let value = self.call_exslt_function(&function, arguments, node, position, size)?;
             if source[..call.start].trim().is_empty() && source[call.end..].trim().is_empty() {
-                return Ok((expression.clone(), variables, Some(value)));
+                return Ok(PreparedCustomCalls::Direct(value));
             }
             let local = format!("result{index}");
             index += 1;
-            variables.insert(ExpandedName::new(Some(PRIVATE_NS), local.clone()), value);
+            variables
+                .get_or_insert_with(|| self.variables())
+                .insert(ExpandedName::new(Some(PRIVATE_NS), local.clone()), value);
             source.replace_range(call.start..call.end, &format!("$__xml_sec_func:{local}"));
         }
         let mut namespaces = expression.namespaces.clone();
         namespaces.push(("__xml_sec_func".into(), PRIVATE_NS.into()));
         let mut rewritten = expression.derived(source);
         rewritten.namespaces = namespaces;
-        Ok((rewritten, variables, None))
+        Ok(PreparedCustomCalls::Rewritten {
+            expression: rewritten,
+            variables: variables.unwrap_or_else(|| self.variables()),
+        })
     }
 
     fn call_exslt_function(
@@ -2265,10 +2325,9 @@ impl<'a> Execution<'a> {
             Value::ResultTreeFragment(self.capture_fragment(
                 &variable.content,
                 node,
-                position,
-                size,
-                depth,
+                ApplyFrame::new(position, size, depth),
                 None,
+                variable.base_uri.as_deref(),
             )?)
         };
         // Selected XPath values become owned by a persistent lexical scope. Result-tree
@@ -2471,7 +2530,7 @@ impl<'a> Execution<'a> {
         depth: usize,
         precedence: Option<usize>,
     ) -> Result<String> {
-        let previous = self.enter_temporary_result_tree();
+        let previous = self.enter_temporary_result_tree(None);
         let result =
             self.execute_scoped_sequence(body, node, position, size, depth + 1, precedence);
         let captured = result.and_then(|()| {
@@ -2508,22 +2567,32 @@ impl<'a> Execution<'a> {
         &mut self,
         body: &[Instruction],
         node: &SourceNode,
-        position: usize,
-        size: usize,
-        depth: usize,
+        frame: ApplyFrame,
         precedence: Option<usize>,
+        base_uri: Option<&str>,
     ) -> Result<Document> {
-        let previous = self.enter_temporary_result_tree();
-        let result =
-            self.execute_scoped_sequence(body, node, position, size, depth + 1, precedence);
+        self.meter
+            .charge(BudgetKind::OwnedBytes, base_uri.map_or(0, str::len))?;
+        let previous = self.enter_temporary_result_tree(base_uri);
+        let result = self.execute_scoped_sequence(
+            body,
+            node,
+            frame.position,
+            frame.size,
+            frame.depth + 1,
+            precedence,
+        );
         let captured = self.restore_result_tree(previous);
         result?;
         Ok(captured)
     }
 
-    fn enter_temporary_result_tree(&mut self) -> ResultTreeState {
+    fn enter_temporary_result_tree(&mut self, base_uri: Option<&str>) -> ResultTreeState {
         ResultTreeState {
-            document: std::mem::replace(&mut self.result, Document::empty(None)),
+            document: std::mem::replace(
+                &mut self.result,
+                Document::empty(base_uri.map(str::to_owned)),
+            ),
             output_stack: std::mem::replace(&mut self.output_stack, vec![NodeId(0)]),
             attribute_insert_position: self.attribute_insert_position.take(),
             attribute_protected_names: self.attribute_protected_names.take(),
@@ -2554,7 +2623,8 @@ impl<'a> Execution<'a> {
             }
             return Ok(());
         }
-        let target = self.push_node(parent, source.kind.clone())?;
+        let target =
+            self.push_node_with_base(parent, source.kind.clone(), source.base_uri.clone())?;
         for child in &source.children {
             self.copy_document(document, *child, target, depth + 1)?;
         }
@@ -2564,11 +2634,17 @@ impl<'a> Execution<'a> {
         self.meter.recursion(depth)?;
         match node {
             SourceNode::Node(id) => {
-                let (kind, children) = self
+                let (kind, children, base_uri) = self
                     .evaluator
                     .source
                     .node(*id)
-                    .map(|source| (source.kind.clone(), source.children.clone()))
+                    .map(|source| {
+                        (
+                            source.kind.clone(),
+                            source.children.clone(),
+                            source.base_uri.clone(),
+                        )
+                    })
                     .ok_or_else(|| Error::Dynamic("stale source node".into()))?;
                 if matches!(kind, NodeKind::Root) {
                     for child in children {
@@ -2576,7 +2652,7 @@ impl<'a> Execution<'a> {
                     }
                     return Ok(());
                 }
-                let target = self.push_node(parent, kind)?;
+                let target = self.push_node_with_base(parent, kind, base_uri)?;
                 for child in children {
                     self.copy_source(&SourceNode::Node(child), target, depth + 1)?
                 }
@@ -2672,10 +2748,27 @@ impl<'a> Execution<'a> {
         *self.output_stack.last().unwrap_or(&NodeId(0))
     }
     fn push_node(&mut self, parent: NodeId, kind: NodeKind) -> Result<NodeId> {
+        let base_uri = self
+            .result
+            .node(parent)
+            .and_then(|node| node.base_uri.clone());
+        self.push_node_with_base(parent, kind, base_uri)
+    }
+
+    fn push_node_with_base(
+        &mut self,
+        parent: NodeId,
+        kind: NodeKind,
+        base_uri: Option<String>,
+    ) -> Result<NodeId> {
         self.meter
             .charge(BudgetKind::OwnedBytes, node_kind_owned_bytes(&kind))?;
+        self.meter.charge(
+            BudgetKind::OwnedBytes,
+            base_uri.as_deref().map_or(0, str::len),
+        )?;
         self.meter.charge(BudgetKind::ResultNodes, 1)?;
-        Ok(self.result.push(parent, kind, None))
+        Ok(self.result.push(parent, kind, base_uri))
     }
     fn append_text(&mut self, value: &str, disable: bool) -> Result<()> {
         // XSLT's result tree never retains zero-length text nodes.
@@ -2726,6 +2819,38 @@ impl<'a> Execution<'a> {
         position: AttributePosition,
     ) -> Result<()> {
         let parent = self.parent();
+        let protected = self
+            .attribute_protected_names
+            .as_ref()
+            .is_some_and(|protected| protected.contains(&attribute.name));
+        if protected
+            && self.result.node(parent).is_some_and(|node| {
+                matches!(
+                    &node.kind,
+                    NodeKind::Element { attributes, .. }
+                        if attributes.iter().any(|existing| existing.name == attribute.name)
+                )
+            })
+        {
+            return Ok(());
+        }
+        const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
+        let effective_base = if attribute.name.namespace.as_deref() == Some(XML_NS)
+            && attribute.name.local == "base"
+        {
+            let inherited = self
+                .result
+                .node(parent)
+                .and_then(|node| node.parent)
+                .and_then(|parent| self.result.node(parent))
+                .and_then(|node| node.base_uri.as_deref());
+            Some(crate::resolver::resolve_uri_reference(
+                inherited,
+                &attribute.value,
+            )?)
+        } else {
+            None
+        };
         let node = self
             .result
             .node_mut(parent)
@@ -2752,6 +2877,9 @@ impl<'a> Execution<'a> {
                 .map_or(0, namespace_owned_bytes),
         );
         self.meter.charge(BudgetKind::OwnedBytes, owned_bytes)?;
+        if let Some(base_uri) = &effective_base {
+            self.meter.charge(BudgetKind::OwnedBytes, base_uri.len())?;
+        }
         namespaces.extend(generated_namespace);
         if let Some(existing) = attributes
             .iter_mut()
@@ -2775,6 +2903,9 @@ impl<'a> Execution<'a> {
                     }
                 }
             }
+        }
+        if let Some(base_uri) = effective_base {
+            node.base_uri = Some(base_uri);
         }
         Ok(())
     }
@@ -3277,6 +3408,44 @@ fn fixup_attribute_namespace(
     None
 }
 
+fn fixup_element_namespace(
+    name: &ExpandedName,
+    prefix: &mut Option<String>,
+    namespaces: &mut Vec<Namespace>,
+) {
+    const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
+
+    let Some(uri) = name.namespace.as_deref() else {
+        *prefix = None;
+        return;
+    };
+    if uri == XML_NAMESPACE {
+        *prefix = Some("xml".into());
+        return;
+    }
+    if matches!(prefix.as_deref(), Some("xml" | "xmlns")) {
+        *prefix = Some(unused_namespace_prefix(namespaces));
+    }
+    let binding = namespaces
+        .iter()
+        .position(|namespace| namespace.prefix == *prefix);
+    match binding {
+        Some(index) if namespaces[index].uri == uri => {}
+        Some(index) => {
+            let replacement = unused_namespace_prefix(namespaces);
+            namespaces[index].prefix = Some(replacement);
+            namespaces.push(Namespace {
+                prefix: prefix.clone(),
+                uri: uri.to_owned(),
+            });
+        }
+        None => namespaces.push(Namespace {
+            prefix: prefix.clone(),
+            uri: uri.to_owned(),
+        }),
+    }
+}
+
 fn unused_namespace_prefix(namespaces: &[Namespace]) -> String {
     let mut index = 1usize;
     loop {
@@ -3710,19 +3879,16 @@ fn value_owned_bytes(value: &Value) -> usize {
             .saturating_mul(std::mem::size_of::<NodeReference>()),
         Value::Boolean(_) | Value::Number(_) => 0,
         Value::String(value) | Value::StoredExpression(value) => value.len(),
-        Value::ResultTreeFragment(document) => document
-            .source_xml()
-            .map_or(0, str::len)
-            .saturating_add(document.nodes().fold(0usize, |total, (_, node)| {
-                total
-                    .saturating_add(node_kind_owned_bytes(&node.kind))
-                    .saturating_add(node.base_uri.as_ref().map_or(0, String::len))
-                    .saturating_add(
-                        node.children
-                            .len()
-                            .saturating_mul(std::mem::size_of::<NodeId>()),
-                    )
-            })),
+        Value::ResultTreeFragment(document) => document.nodes().fold(0usize, |total, (_, node)| {
+            total
+                .saturating_add(node_kind_owned_bytes(&node.kind))
+                .saturating_add(node.base_uri.as_ref().map_or(0, String::len))
+                .saturating_add(
+                    node.children
+                        .len()
+                        .saturating_mul(std::mem::size_of::<NodeId>()),
+                )
+        }),
     }
 }
 

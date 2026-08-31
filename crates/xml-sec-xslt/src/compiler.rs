@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -570,6 +571,7 @@ pub(crate) struct Variable {
     pub name: ExpandedName,
     pub select: Option<Expression>,
     pub content: Vec<Instruction>,
+    pub base_uri: Option<String>,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct Expression {
@@ -678,6 +680,7 @@ pub(crate) enum Instruction {
     FunctionResult {
         select: Option<Expression>,
         content: Vec<Instruction>,
+        base_uri: Option<String>,
     },
 }
 
@@ -1198,7 +1201,9 @@ impl<'a> DependencyCollector<'a> {
                     }
                     self.sequence(body, locals.clone(), output);
                 }
-                Instruction::FunctionResult { select, content } => {
+                Instruction::FunctionResult {
+                    select, content, ..
+                } => {
                     if let Some(select) = select {
                         self.expression(select, &locals, output);
                     }
@@ -1247,7 +1252,7 @@ impl Pattern {
             {
                 normalized
             } else {
-                format!("//{normalized}")
+                Cow::Owned(format!("//{normalized}"))
             };
             let expression = crate::xpath::rewrite_absolute_paths_for_validation(&expression);
             sxd_xpath_no_unsafe::Factory::new()
@@ -1352,7 +1357,7 @@ fn validate_xpath_prefixes(source: &str, namespaces: &[(String, String)]) -> Res
             || !characters
                 .get(cursor + 1)
                 .copied()
-                .is_some_and(is_xpath_name_start)
+                .is_some_and(|character| character == '*' || is_xpath_name_start(character))
         {
             continue;
         }
@@ -1375,7 +1380,10 @@ fn is_xpath_ncname_character(character: char) -> bool {
     is_xpath_name_start(character) || character.is_ascii_digit() || matches!(character, '-' | '.')
 }
 
-pub(crate) fn normalize_xpath_for_sxd(source: &str) -> String {
+pub(crate) fn normalize_xpath_for_sxd(source: &str) -> Cow<'_, str> {
+    if !source.chars().any(char::is_whitespace) && !source.contains('*') {
+        return Cow::Borrowed(source);
+    }
     let characters = source.chars().collect::<Vec<_>>();
     let mut output = String::with_capacity(source.len());
     let mut quote = None;
@@ -1443,7 +1451,11 @@ pub(crate) fn normalize_xpath_for_sxd(source: &str) -> String {
         output.push(character);
         index += 1;
     }
-    output
+    if output == source {
+        Cow::Borrowed(source)
+    } else {
+        Cow::Owned(output)
+    }
 }
 
 fn is_xpath_name_character(character: char) -> bool {
@@ -1479,7 +1491,7 @@ fn split_pattern_branches(source: &str) -> Vec<&str> {
 
 fn validate_xslt_pattern_branch(branch: &str) -> Result<()> {
     let normalized = normalize_xpath_for_sxd(branch);
-    let branch = normalized.as_str();
+    let branch = normalized.as_ref();
     if branch == "/" {
         return Ok(());
     }
@@ -1599,7 +1611,7 @@ fn valid_pattern_step(step: &str) -> bool {
 
 fn valid_pattern_node_test(node_test: &str) -> bool {
     let normalized = normalize_xpath_for_sxd(node_test);
-    let node_test = normalized.as_str();
+    let node_test = normalized.as_ref();
     let (node_test, explicit_axis) = match node_test.split_once("::") {
         Some((axis, test)) if matches!(axis.trim(), "child" | "attribute") => (test.trim(), true),
         Some(_) => return false,
@@ -2124,13 +2136,18 @@ fn compile_instruction(
             .attribute("select")
             .map(|value| context.expression(value, node))
             .transpose()?;
+        let base_uri = effective_base_uri(node, context.static_base_uri.as_deref())?;
         let content = compile_sequence(node.children(), context)?;
         if select.is_some() && !content.is_empty() {
             return Err(Error::Static(
                 "func:result with select cannot have content".into(),
             ));
         }
-        return Ok(Instruction::FunctionResult { select, content });
+        return Ok(Instruction::FunctionResult {
+            select,
+            content,
+            base_uri,
+        });
     }
     if node.tag_name().namespace() != Some(XSLT_NS) {
         if is_extension_element(node)? {
@@ -2749,6 +2766,7 @@ fn compile_variable(node: roxmltree::Node<'_, '_>, context: CompileContext) -> R
         .attribute("select")
         .map(|value| context.expression(value, node))
         .transpose()?;
+    let base_uri = effective_base_uri(node, context.static_base_uri.as_deref())?;
     let content = compile_sequence(node.children(), context)?;
     if select.is_some() && !content.is_empty() {
         return Err(Error::Static(
@@ -2759,6 +2777,7 @@ fn compile_variable(node: roxmltree::Node<'_, '_>, context: CompileContext) -> R
         name,
         select,
         content,
+        base_uri,
     })
 }
 fn compile_sort(node: roxmltree::Node<'_, '_>, context: &CompileContext) -> Result<Sort> {

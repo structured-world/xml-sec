@@ -196,6 +196,74 @@ fn result_tree_fragments_require_explicit_nodeset_conversion() {
 }
 
 #[test]
+fn result_tree_fragments_preserve_binding_and_xml_base_uris() {
+    // XSLT 1.0 assigns a temporary tree the variable-binding element's base URI, while xml:base
+    // on a constructed descendant refines that inherited base for document() resolution.
+    let resolver = Arc::new(ContextResolver::default());
+    let imported = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:exsl="http://exslt.org/common"><xsl:template name="read"><xsl:variable name="fragment" xml:base="fragments/"><item xml:base="nested/"/></xsl:variable><xsl:value-of select="document('root.xml', exsl:node-set($fragment))/doc"/><xsl:text>|</xsl:text><xsl:value-of select="document('item.xml', exsl:node-set($fragment)/item)/doc"/></xsl:template></xsl:stylesheet>"#;
+    for (href, base, canonical, identity, body) in [
+        (
+            "imported.xsl",
+            "https://example.test/styles/main.xsl",
+            "https://example.test/modules/imported.xsl",
+            "imported-rtf-base",
+            imported,
+        ),
+        (
+            "root.xml",
+            "https://example.test/modules/fragments/",
+            "https://example.test/modules/fragments/root.xml",
+            "rtf-root-document",
+            "<doc>root</doc>",
+        ),
+        (
+            "item.xml",
+            "https://example.test/modules/fragments/nested/",
+            "https://example.test/modules/fragments/nested/item.xml",
+            "rtf-item-document",
+            "<doc>item</doc>",
+        ),
+    ] {
+        resolver
+            .resources
+            .lock()
+            .expect("test resolver mutex is not poisoned")
+            .insert(
+                (href.into(), Some(base.into())),
+                ResolvedResource {
+                    canonical_uri: canonical.into(),
+                    identity: ResourceIdentity(identity.into()),
+                    bytes: body.as_bytes().to_vec(),
+                    media_type: None,
+                    encoding: Some("UTF-8".into()),
+                },
+            );
+    }
+    let stylesheet = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:import href="imported.xsl"/><xsl:output method="text"/><xsl:template match="/"><xsl:call-template name="read"/></xsl:template></xsl:stylesheet>"#,
+        Some("https://example.test/styles/main.xsl"),
+    )
+    .expect("stylesheet graph compiles");
+    let result = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("fragment-relative documents resolve");
+    assert_eq!(result.serialized.bytes, b"root|item");
+}
+
+#[test]
 fn doctype_uses_the_first_element_qualified_name() {
     // Prolog nodes do not replace the document element, and a prefixed root requires the same
     // qualified name in both the DOCTYPE and serialized start tag.
@@ -1046,6 +1114,17 @@ fn static_xpath_and_template_conflicts_are_resolved_during_compilation() {
         Err(Error::Static(_))
     ));
 
+    for wildcard in [
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:value-of select="missing:*"/></xsl:template></xsl:stylesheet>"#,
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="missing:*"/></xsl:stylesheet>"#,
+    ] {
+        assert!(matches!(
+            Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 256, 4096),)
+                .compile(wildcard, None),
+            Err(Error::Static(_))
+        ));
+    }
+
     let union = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><xsl:apply-templates select="bar"/></xsl:template><xsl:template match="foo|*"><wild/></xsl:template><xsl:template match="bar"><specific/></xsl:template></xsl:stylesheet>"#;
     assert_eq!(execute(union, "<bar/>"), "<specific/>\n");
 }
@@ -1438,6 +1517,30 @@ fn serializer_encodes_xml_fallbacks_and_utf16_consistently() {
     )
     .expect("UTF-16 output must decode");
     assert!(decoded.contains("encoding=\"UTF-16\""));
+}
+
+#[test]
+fn us_ascii_output_is_strict_for_markup_and_text() {
+    // WHATWG label aliases must not silently widen XSLT's declared US-ASCII output contract.
+    let xml = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output encoding="US-ASCII" omit-xml-declaration="yes"/><xsl:template match="/"><root>€</root></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(xml, "<source/>"), "<root>&#8364;</root>\n");
+
+    let text = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text" encoding="US-ASCII"/><xsl:template match="/">€</xsl:template></xsl:stylesheet>"#,
+    );
+    let error = text
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect_err("non-ASCII text cannot be emitted as US-ASCII");
+    assert!(matches!(error, Error::Serialization(message) if message.contains("US-ASCII")));
 }
 
 #[test]
@@ -2423,6 +2526,34 @@ fn xinclude_fallback_never_swallows_security_budget_failures() {
 }
 
 #[test]
+fn xinclude_fallback_handles_only_resource_errors() {
+    // XInclude 1.0 makes invalid syntax and unsupported selection fatal; fallback is reserved for
+    // failures to acquire a resource and must not turn malformed include instructions into data.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:copy-of select="."/></xsl:template></xsl:stylesheet>"#,
+    );
+    for source in [
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="missing.xml" parse="invalid"><xi:fallback><wrong/></xi:fallback></xi:include></root>"#,
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="missing.xml" xpointer="element(/1)"><xi:fallback><wrong/></xi:fallback></xi:include></root>"#,
+    ] {
+        let error = stylesheet
+            .execute_with_source_processing(
+                &Document::parse(source, Some("memory:source.xml")).expect("source parses"),
+                &Parameters::new(),
+                Arc::new(NoResolver),
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+                SourceProcessing::XInclude,
+            )
+            .expect_err("fatal XInclude errors must bypass fallback");
+        assert!(matches!(error, Error::Xml(_) | Error::Unsupported(_)));
+    }
+}
+
+#[test]
 fn missing_document_resolution_consumes_the_external_document_budget() {
     // A failed resolver attempt is still attacker-controlled external work.
     struct MissingResolver;
@@ -3184,6 +3315,52 @@ fn following_and_preceding_axes_stay_inside_the_logical_document() {
 }
 
 #[test]
+fn optimized_preceding_comment_uses_xpath_xml_whitespace() {
+    // normalize-space() removes only XML S characters; NBSP remains non-empty and therefore
+    // prevents an earlier comment from satisfying the optimized sibling expression.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:apply-templates select="root/target"/></xsl:template><xsl:template match="target"><xsl:apply-templates select="preceding-sibling::node()[normalize-space()][1][self::comment()]"/></xsl:template><xsl:template match="comment()">found</xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<root><!--kept-->   <target/></root>"),
+        "found"
+    );
+    assert_eq!(
+        execute(stylesheet, "<root><!--older-->\u{a0}<target/></root>"),
+        ""
+    );
+}
+
+#[test]
+fn namespace_axis_excludes_default_namespace_undeclarations() {
+    // xmlns="" is retained in the semantic tree for serialization, but XPath 1.0 exposes no
+    // namespace node for a prefix whose in-scope namespace URI is empty.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(/*/*/namespace::*)"/></xsl:template></xsl:stylesheet>"#;
+    let source = Document::parse(r#"<root xmlns="urn:outer"><child xmlns=""/></root>"#, None)
+        .expect("source parses");
+    let NodeKind::Element { namespaces, .. } = &source
+        .node(xml_sec_xslt::NodeId(2))
+        .expect("child exists")
+        .kind
+    else {
+        panic!("child is an element");
+    };
+    assert_eq!(
+        namespaces
+            .iter()
+            .filter(|namespace| !namespace.uri.is_empty())
+            .map(|namespace| (namespace.prefix.as_deref(), namespace.uri.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(Some("xml"), "http://www.w3.org/XML/1998/namespace")]
+    );
+    assert_eq!(
+        execute(
+            stylesheet,
+            r#"<root xmlns="urn:outer"><child xmlns=""/></root>"#
+        ),
+        "1"
+    );
+}
+
+#[test]
 fn whitespace_rules_apply_to_every_loaded_source_document() {
     // strip-space is a stylesheet-wide rule and must run after both document() loading and
     // XInclude expansion, not only on the principal source passed to execute().
@@ -3939,6 +4116,114 @@ fn namespace_alias_uses_the_declared_result_prefix() {
     let output = execute(stylesheet, "<source/>");
     assert!(output.starts_with("<new:result"), "{output}");
     assert!(output.contains("xmlns:new=\"urn:new\""), "{output}");
+}
+
+#[test]
+fn namespace_alias_preserves_the_element_binding_across_import_conflicts() {
+    // The aliased element QName owns its chosen prefix. A same-prefix namespace copied from the
+    // importing module must be renamed rather than changing the element's expanded name.
+    let resolver = Arc::new(ContextResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            (
+                "imported.xsl".into(),
+                Some("https://example.test/main.xsl".into()),
+            ),
+            ResolvedResource {
+                canonical_uri: "https://example.test/imported.xsl".into(),
+                identity: ResourceIdentity("namespace-alias-import".into()),
+                bytes: br#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:old="urn:old" xmlns:new="urn:aliased"><xsl:namespace-alias stylesheet-prefix="old" result-prefix="new"/></xsl:stylesheet>"#.to_vec(),
+                media_type: None,
+                encoding: Some("UTF-8".into()),
+            },
+        );
+    let stylesheet = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:old="urn:old" xmlns:new="urn:principal"><xsl:import href="imported.xsl"/><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><old:item/></xsl:template></xsl:stylesheet>"#,
+        Some("https://example.test/main.xsl"),
+    )
+    .expect("stylesheet graph compiles");
+    let output = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("namespace alias executes");
+    let text = String::from_utf8(output.serialized.bytes).expect("result is UTF-8");
+    assert!(text.starts_with("<new:item"), "{text}");
+    assert!(text.contains("xmlns:new=\"urn:aliased\""), "{text}");
+    assert!(text.contains("urn:principal"), "{text}");
+}
+
+#[test]
+fn protected_attribute_sets_do_not_leak_losing_namespaces() {
+    // A lower-precedence declaration with the same expanded name is ignored atomically, including
+    // namespace fixup that would otherwise leave an observable namespace node behind.
+    let resolver = Arc::new(ContextResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            (
+                "imported.xsl".into(),
+                Some("https://example.test/main.xsl".into()),
+            ),
+            ResolvedResource {
+                canonical_uri: "https://example.test/imported.xsl".into(),
+                identity: ResourceIdentity("attribute-set-import".into()),
+                bytes: br#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:q="urn:value"><xsl:attribute-set name="attrs"><xsl:attribute name="q:value">loser</xsl:attribute></xsl:attribute-set></xsl:stylesheet>"#.to_vec(),
+                media_type: None,
+                encoding: Some("UTF-8".into()),
+            },
+        );
+    let stylesheet = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:p="urn:value" xmlns:exsl="http://exslt.org/common"><xsl:import href="imported.xsl"/><xsl:output method="text"/><xsl:attribute-set name="attrs"><xsl:attribute name="p:value">winner</xsl:attribute></xsl:attribute-set><xsl:template match="/"><xsl:variable name="tree"><item xsl:use-attribute-sets="attrs"/></xsl:variable><xsl:value-of select="count(exsl:node-set($tree)/item/namespace::*[name()='q'])"/><xsl:text>|</xsl:text><xsl:value-of select="exsl:node-set($tree)/item/@p:value"/></xsl:template></xsl:stylesheet>"#,
+        Some("https://example.test/main.xsl"),
+    )
+    .expect("stylesheet graph compiles");
+    let output = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("attribute sets execute");
+    assert_eq!(output.serialized.bytes, b"0|winner");
+}
+
+#[test]
+fn automatic_xml_id_registration_normalizes_the_attribute_value() {
+    // xml:id normalization must update both the ID index and the XPath-visible attribute value.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="id('target')/@xml:id"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(
+            stylesheet,
+            r#"<root><item xml:id="  target&#x20; "/></root>"#
+        ),
+        "target"
+    );
 }
 
 #[test]

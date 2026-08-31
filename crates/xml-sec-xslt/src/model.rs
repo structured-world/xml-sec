@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use xml_sec_xml_input::lexical::{Event, Scanner};
@@ -98,7 +99,7 @@ pub struct Document {
     nodes: Vec<Node>,
     root: NodeId,
     logical_roots: Vec<NodeId>,
-    source_xml: Option<String>,
+    source_bytes: usize,
     ids: HashMap<(NodeId, String), NodeId>,
     unparsed_entities: HashMap<(NodeId, String), String>,
 }
@@ -108,7 +109,7 @@ impl PartialEq for Document {
         self.nodes == other.nodes
             && self.root == other.root
             && self.logical_roots == other.logical_roots
-            && self.source_xml == other.source_xml
+            && self.source_bytes == other.source_bytes
             && self.ids == other.ids
             && self.unparsed_entities == other.unparsed_entities
     }
@@ -139,8 +140,7 @@ impl Document {
                 self.logical_roots
                     .len()
                     .saturating_mul(std::mem::size_of::<NodeId>()),
-            )
-            .saturating_add(self.source_xml.as_deref().map_or(0, str::len));
+            );
         for node in &self.nodes {
             bytes = bytes
                 .saturating_add(
@@ -221,7 +221,7 @@ impl Document {
         let parsed =
             roxmltree::Document::parse(xml).map_err(|error| Error::Xml(error.to_string()))?;
         let mut document = Self::empty(base_uri.map(str::to_owned));
-        document.source_xml = Some(xml.to_owned());
+        document.source_bytes = xml.len();
         let line_starts = std::iter::once(0)
             .chain(
                 xml.bytes()
@@ -272,10 +272,11 @@ impl Document {
                         return Err(Error::Xml("invalid namespace prefix".into()));
                     }
                     validate_namespace_binding(namespace.name(), namespace.uri())?;
-                    namespaces.push(Namespace {
-                        prefix: namespace.name().map(str::to_owned),
-                        uri: namespace.uri().to_owned(),
-                    });
+                    set_namespace(
+                        &mut namespaces,
+                        namespace.name().map(str::to_owned),
+                        namespace.uri().to_owned(),
+                    );
                 }
                 if !namespaces.iter().any(|namespace| {
                     namespace.prefix.as_deref() == Some("xml")
@@ -347,7 +348,7 @@ impl Document {
         }
 
         let mut document = Self::empty(base_uri.map(str::to_owned));
-        document.source_xml = Some(xml.to_owned());
+        document.source_bytes = xml.len();
         let entities = internal_general_entities(xml)?;
         let mut entity_references = 0;
         let mut entity_expansion = EntityExpansionMeter::new(ENTITY_EXPANSION_BYTE_CEILING);
@@ -357,37 +358,34 @@ impl Document {
             &mut entity_references,
             &mut entity_expansion,
         )?;
-        let mut reader = Scanner::new(&expanded_xml);
-        let line_starts = std::iter::once(0)
-            .chain(
-                expanded_xml
-                    .bytes()
-                    .enumerate()
-                    .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
-            )
-            .collect::<Vec<_>>();
+        let mut reader = Scanner::new(expanded_xml.as_ref());
+        let mut previous_event_offset = 0usize;
+        let mut source_line = 1usize;
         let mut phase = DocumentPhase::Start;
-        let mut saw_doctype = false;
+        let mut doctype_name = None::<&str>;
         let mut elements = vec![StreamElementFrame {
             node: document.root,
             lexical_name: None,
-            namespaces: vec![Namespace {
-                prefix: Some("xml".into()),
-                uri: "http://www.w3.org/XML/1998/namespace".into(),
-            }],
         }];
         while let Some(event) = reader
             .next_event()
             .map_err(|error| Error::Xml(error.to_string()))?
         {
             let event_offset = event_range_start(&event);
-            let source_line = line_starts.partition_point(|offset| *offset <= event_offset);
+            source_line = source_line.saturating_add(
+                expanded_xml.as_bytes()[previous_event_offset..event_offset]
+                    .iter()
+                    .filter(|byte| **byte == b'\n')
+                    .count(),
+            );
+            previous_event_offset = event_offset;
             match event {
                 Event::Start(start) => {
                     if elements.len() == 1 {
                         if phase == DocumentPhase::Epilog {
                             return Err(Error::Xml("multiple document elements".into()));
                         }
+                        validate_doctype_root(doctype_name, start.name)?;
                         phase = DocumentPhase::Content;
                     }
                     let id = push_stream_element(
@@ -406,6 +404,7 @@ impl Document {
                         if phase == DocumentPhase::Epilog {
                             return Err(Error::Xml("multiple document elements".into()));
                         }
+                        validate_doctype_root(doctype_name, start.name)?;
                         phase = DocumentPhase::Epilog;
                     }
                     let id = push_stream_element(
@@ -544,16 +543,16 @@ impl Document {
                     }
                     phase = DocumentPhase::Prolog;
                 }
-                Event::DocType { .. } => {
+                Event::DocType { name, .. } => {
                     if matches!(phase, DocumentPhase::Content | DocumentPhase::Epilog) {
                         return Err(Error::Xml(
                             "document type declaration is permitted only in the prolog".into(),
                         ));
                     }
-                    if saw_doctype {
+                    if doctype_name.is_some() {
                         return Err(Error::Xml("duplicate document type declaration".into()));
                     }
-                    saw_doctype = true;
+                    doctype_name = Some(name);
                     phase = DocumentPhase::Prolog;
                 }
             }
@@ -582,7 +581,7 @@ impl Document {
             }],
             root: NodeId(0),
             logical_roots: vec![NodeId(0)],
-            source_xml: None,
+            source_bytes: 0,
             ids: HashMap::new(),
             unparsed_entities: HashMap::new(),
         }
@@ -602,8 +601,8 @@ impl Document {
         self.nodes.get_mut(id.0)
     }
 
-    pub(crate) fn source_xml(&self) -> Option<&str> {
-        self.source_xml.as_deref()
+    pub(crate) const fn source_bytes(&self) -> usize {
+        self.source_bytes
     }
 
     pub(crate) const fn identity(&self) -> u64 {
@@ -694,17 +693,19 @@ impl Document {
     /// This lets a caller that parsed trusted DTD/schema metadata preserve the
     /// typed ID information without enabling DTD processing in this crate.
     pub fn mark_id_attribute(&mut self, owner: NodeId, attribute_index: usize) -> Result<()> {
-        let value = self
+        let value = &self
             .node(owner)
             .and_then(|node| match &node.kind {
                 NodeKind::Element { attributes, .. } => attributes.get(attribute_index),
                 _ => None,
             })
             .ok_or_else(|| Error::Xml("ID attribute reference is stale".into()))?
-            .value
-            .split_ascii_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+            .value;
+        let value = collapse_xml_whitespace(value).into_owned();
+        self.register_id_value(owner, value)
+    }
+
+    fn register_id_value(&mut self, owner: NodeId, value: String) -> Result<()> {
         if value.is_empty() {
             return Err(Error::Xml("ID attribute value is empty".into()));
         }
@@ -736,11 +737,9 @@ impl Document {
                 _ => None,
             })
             .ok_or_else(|| Error::Xml("tokenized attribute reference is stale".into()))?;
-        attribute.value = attribute
-            .value
-            .split_ascii_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+        if let Cow::Owned(normalized) = collapse_xml_whitespace(&attribute.value) {
+            attribute.value = normalized;
+        }
         Ok(())
     }
 
@@ -815,7 +814,18 @@ impl Document {
             })
             .collect::<Vec<_>>();
         for (owner, index) in attributes {
-            self.mark_id_attribute(owner, index)?;
+            let value = self
+                .node_mut(owner)
+                .and_then(|node| match &mut node.kind {
+                    NodeKind::Element { attributes, .. } => attributes.get_mut(index),
+                    _ => None,
+                })
+                .ok_or_else(|| Error::Xml("xml:id attribute reference is stale".into()))?;
+            let normalized = collapse_xml_whitespace(&value.value).into_owned();
+            if value.value != normalized {
+                value.value.clone_from(&normalized);
+            }
+            self.register_id_value(owner, normalized)?;
         }
         Ok(())
     }
@@ -1002,7 +1012,7 @@ impl Document {
             .collect();
         self.root = NodeId(0);
         self.logical_roots = vec![self.root];
-        self.source_xml = None;
+        self.source_bytes = 0;
         remap
     }
 }
@@ -1042,20 +1052,30 @@ fn normalize_xml_line_endings(value: &str) -> String {
     output
 }
 
-fn normalize_xml_attribute_value(value: &str) -> String {
-    normalize_xml_line_endings(value)
-        .chars()
-        .map(|character| match character {
-            '\n' | '\t' => ' ',
-            other => other,
-        })
-        .collect()
+fn normalize_xml_attribute_value(value: Cow<'_, str>) -> Cow<'_, str> {
+    if !value.contains(['\r', '\n', '\t']) {
+        return value;
+    }
+    let mut normalized = String::with_capacity(value.len());
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\r' => {
+                if characters.peek() == Some(&'\n') {
+                    characters.next();
+                }
+                normalized.push(' ');
+            }
+            '\n' | '\t' => normalized.push(' '),
+            other => normalized.push(other),
+        }
+    }
+    Cow::Owned(normalized)
 }
 
 struct StreamElementFrame {
     node: NodeId,
     lexical_name: Option<String>,
-    namespaces: Vec<Namespace>,
 }
 
 fn push_stream_element(
@@ -1071,10 +1091,13 @@ fn push_stream_element(
         .last()
         .map(|frame| frame.node)
         .expect("document frame remains present");
-    let mut namespaces = elements
-        .last()
-        .map(|frame| frame.namespaces.clone())
-        .expect("document frame remains present");
+    let mut namespaces = match document.node(parent).map(|node| &node.kind) {
+        Some(NodeKind::Element { namespaces, .. }) => namespaces.clone(),
+        _ => vec![Namespace {
+            prefix: Some("xml".into()),
+            uri: "http://www.w3.org/XML/1998/namespace".into(),
+        }],
+    };
     let mut raw_attributes = Vec::new();
     for attribute in &start.attributes {
         let name = attribute.name.qualified();
@@ -1090,21 +1113,24 @@ fn push_stream_element(
                 "attribute `{name}` entity replacement contains a literal `<`"
             )));
         }
-        let value = xml_sec_xml_input::lexical::decode_references(&value)
+        let value = match xml_sec_xml_input::lexical::decode_references(&value)
             .map_err(|error| Error::Xml(error.to_string()))?
-            .into_owned();
-        let value = normalize_xml_attribute_value(&value);
+        {
+            Cow::Borrowed(_) => value,
+            Cow::Owned(value) => Cow::Owned(value),
+        };
+        let value = normalize_xml_attribute_value(value);
         if name == "xmlns" {
             validate_namespace_binding(None, &value)?;
-            set_namespace(&mut namespaces, None, value);
+            set_namespace(&mut namespaces, None, value.into_owned());
         } else if let Some(prefix) = name.strip_prefix("xmlns:") {
             if !crate::lexical::is_ncname(prefix) {
                 return Err(Error::Xml(format!("invalid namespace prefix {prefix}")));
             }
             validate_namespace_binding(Some(prefix), &value)?;
-            set_namespace(&mut namespaces, Some(prefix.into()), value);
+            set_namespace(&mut namespaces, Some(prefix.into()), value.into_owned());
         } else {
-            raw_attributes.push((name.into_owned(), value));
+            raw_attributes.push((name.into_owned(), value.into_owned()));
         }
     }
     let lexical_name = start.name.qualified();
@@ -1163,7 +1189,7 @@ fn push_stream_element(
             name: ExpandedName::new(namespace, local),
             prefix,
             attributes,
-            namespaces: namespaces.clone(),
+            namespaces,
         },
         effective_base,
     );
@@ -1171,7 +1197,6 @@ fn push_stream_element(
         elements.push(StreamElementFrame {
             node: projected,
             lexical_name: Some(lexical_name.into_owned()),
-            namespaces,
         });
     }
     Ok(projected)
@@ -1183,13 +1208,46 @@ fn event_range_start(event: &xml_sec_xml_input::lexical::Event<'_>) -> usize {
         Event::Declaration { range, .. }
         | Event::ProcessingInstruction { range, .. }
         | Event::Comment { range, .. }
-        | Event::DocType { range }
+        | Event::DocType { range, .. }
         | Event::End { range, .. }
         | Event::Text { range, .. }
         | Event::CData { range, .. }
         | Event::Reference { range, .. } => range.start,
         Event::Start(tag) | Event::Empty(tag) => tag.range.start,
     }
+}
+
+fn validate_doctype_root(
+    doctype_name: Option<&str>,
+    element_name: xml_sec_xml_input::lexical::Name<'_>,
+) -> Result<()> {
+    if let Some(doctype_name) = doctype_name
+        && !element_name.is_qualified(doctype_name)
+    {
+        return Err(Error::Xml(format!(
+            "document type name `{doctype_name}` does not match the document element"
+        )));
+    }
+    Ok(())
+}
+
+fn collapse_xml_whitespace(value: &str) -> Cow<'_, str> {
+    let mut parts = value
+        .split(crate::lexical::is_xml_whitespace)
+        .filter(|part| !part.is_empty());
+    let Some(first) = parts.next() else {
+        return Cow::Owned(String::new());
+    };
+    if value == first {
+        return Cow::Borrowed(value);
+    }
+    let mut normalized = String::with_capacity(value.len());
+    normalized.push_str(first);
+    for part in parts {
+        normalized.push(' ');
+        normalized.push_str(part);
+    }
+    Cow::Owned(normalized)
 }
 
 fn push_parsed_text(
@@ -1365,7 +1423,7 @@ fn doctype_span(xml: &str) -> Result<Option<(usize, usize)>> {
         .map_err(|error| Error::Xml(error.to_string()))?
     {
         match event {
-            Event::DocType { range } => return Ok(Some((range.start, range.end))),
+            Event::DocType { range, .. } => return Ok(Some((range.start, range.end))),
             Event::Declaration { .. }
             | Event::ProcessingInstruction { .. }
             | Event::Comment { .. } => {}
@@ -1413,18 +1471,21 @@ fn skip_xml_whitespace(value: &str, cursor: &mut usize) {
     }
 }
 
-fn expand_document_entities(
-    xml: &str,
+fn expand_document_entities<'a>(
+    xml: &'a str,
     entities: &HashMap<String, String>,
     references: &mut usize,
     meter: &mut EntityExpansionMeter,
-) -> Result<String> {
+) -> Result<Cow<'a, str>> {
     if entities.is_empty() {
-        return Ok(xml.to_owned());
+        return Ok(Cow::Borrowed(xml));
     }
     let Some((_, doctype_end)) = doctype_span(xml)? else {
-        return Ok(xml.to_owned());
+        return Ok(Cow::Borrowed(xml));
     };
+    if !contains_expandable_entity_reference(&xml[doctype_end..], entities) {
+        return Ok(Cow::Borrowed(xml));
+    }
     let mut expanded = String::with_capacity(xml.len());
     meter.append(&mut expanded, &xml[..doctype_end])?;
     expand_entity_references_into(
@@ -1435,22 +1496,47 @@ fn expand_document_entities(
         meter,
         &mut expanded,
     )?;
-    Ok(expanded)
+    Ok(Cow::Owned(expanded))
 }
 
-fn expand_entity_references(
-    value: &str,
+fn expand_entity_references<'a>(
+    value: &'a str,
     entities: &HashMap<String, String>,
     depth: usize,
     references: &mut usize,
     meter: &mut EntityExpansionMeter,
-) -> Result<String> {
-    if entities.is_empty() {
-        return Ok(value.to_owned());
+) -> Result<Cow<'a, str>> {
+    if entities.is_empty() || !contains_expandable_entity_reference(value, entities) {
+        return Ok(Cow::Borrowed(value));
     }
     let mut output = String::with_capacity(value.len());
     expand_entity_references_into(value, entities, depth, references, meter, &mut output)?;
-    Ok(output)
+    Ok(Cow::Owned(output))
+}
+
+fn contains_expandable_entity_reference(value: &str, entities: &HashMap<String, String>) -> bool {
+    const MAX_ENTITY_NAME_SCAN_BYTES: usize = 1_024;
+    let bytes = value.as_bytes();
+    let mut cursor = 0usize;
+    while let Some(relative) = bytes[cursor..].iter().position(|byte| *byte == b'&') {
+        let name_start = cursor + relative + 1;
+        let scan_end = name_start
+            .saturating_add(MAX_ENTITY_NAME_SCAN_BYTES)
+            .min(bytes.len());
+        if let Some(relative_end) = bytes[name_start..scan_end]
+            .iter()
+            .position(|byte| *byte == b';')
+        {
+            let name_end = name_start + relative_end;
+            if entities.contains_key(&value[name_start..name_end]) {
+                return true;
+            }
+            cursor = name_end + 1;
+        } else {
+            cursor = name_start;
+        }
+    }
+    false
 }
 
 fn expand_entity_references_into(
@@ -1613,8 +1699,12 @@ fn lexical_attribute_prefix(xml: &str, offset: usize, local: &str) -> Option<Str
 #[cfg(test)]
 mod parser_boundary_tests {
     use std::collections::HashMap;
+    use std::fmt::Write as _;
 
-    use super::{Document, EntityExpansionMeter, Result, doctype_span, expand_entity_references};
+    use super::{
+        Document, EntityExpansionMeter, Result, doctype_span, expand_document_entities,
+        expand_entity_references,
+    };
     use crate::budget::ENTITY_EXPANSION_BYTE_CEILING;
 
     fn nested_xml(depth: usize, leaf: &str) -> String {
@@ -1727,9 +1817,11 @@ mod parser_boundary_tests {
         // Attribute expansion happens after the document-level lexical pass
         // and must consume the same document-wide materialization budget.
         let replacement = "x".repeat(70_000);
-        let attributes = (0..255)
-            .map(|index| format!(" a{index}=\"&large;\""))
-            .collect::<String>();
+        let mut attributes = String::new();
+        for index in 0..255 {
+            write!(attributes, " a{index}=\"&large;\"")
+                .expect("writing attributes to String cannot fail");
+        }
         let xml = format!("<!DOCTYPE root [<!ENTITY large \"{replacement}\">]><root{attributes}/>");
 
         let error = Document::parse_iterative(&xml, None)
@@ -1817,6 +1909,18 @@ mod parser_boundary_tests {
     }
 
     #[test]
+    fn every_parser_rejects_a_doctype_for_another_document_element() {
+        // Document depth must not select a parser with weaker DOCTYPE well-formedness checks.
+        let shallow = "<!DOCTYPE expected><actual/>";
+        assert!(Document::parse(shallow, None).is_err());
+        assert!(Document::parse_iterative(shallow, None).is_err());
+
+        let deep = format!("<!DOCTYPE expected>{}", nested_xml(130, "<actual/>"));
+        assert!(Document::parse(&deep, None).is_err());
+        assert!(Document::parse_iterative(&deep, None).is_err());
+    }
+
+    #[test]
     fn doctype_discovery_is_limited_to_the_document_prolog() {
         // Lexical lookalikes in comments and character data are not declarations.
         for xml in [
@@ -1845,6 +1949,26 @@ mod parser_boundary_tests {
             .expect("bounded entity scan succeeds"),
             source
         );
+    }
+
+    #[test]
+    fn unused_entity_declarations_keep_the_source_borrowed() {
+        // Declaring an entity must not force a full document or attribute copy when no
+        // replacement is required on the parsed path.
+        let xml = "<!DOCTYPE root [<!ENTITY unused 'value'>]><root plain='text'/>";
+        let entities = HashMap::from([("unused".to_owned(), "value".to_owned())]);
+        let mut references = 0;
+        let mut meter = EntityExpansionMeter::new(ENTITY_EXPANSION_BYTE_CEILING);
+        assert!(matches!(
+            expand_document_entities(xml, &entities, &mut references, &mut meter)
+                .expect("unused declaration is accepted"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            expand_entity_references("text", &entities, 0, &mut references, &mut meter,)
+                .expect("plain attribute is accepted"),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]

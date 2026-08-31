@@ -122,6 +122,8 @@ pub enum Event<'a> {
     },
     /// Complete document type declaration.
     DocType {
+        /// Declared document element lexical qualified name.
+        name: &'a str,
         /// Complete source range.
         range: Range<usize>,
     },
@@ -165,7 +167,7 @@ pub struct Scanner<'a> {
     tokenizer: xmlparser::Tokenizer<'a>,
     pending: VecDeque<Event<'a>>,
     pending_start: Option<PendingStart<'a>>,
-    dtd_start: Option<usize>,
+    dtd_start: Option<(usize, &'a str)>,
 }
 
 struct PendingStart<'a> {
@@ -202,13 +204,14 @@ impl<'a> Scanner<'a> {
             let token = token.map_err(Error::tokenizer)?;
             use xmlparser::{ElementEnd, Token};
             match &token {
-                Token::DtdStart { span, .. } => {
-                    self.dtd_start = Some(span.range().start);
+                Token::DtdStart { name, span, .. } => {
+                    self.dtd_start = Some((span.range().start, name.as_str()));
                     continue;
                 }
                 Token::DtdEnd { span } if self.dtd_start.is_some() => {
-                    let start = self.dtd_start.take().expect("DTD start is present");
+                    let (start, name) = self.dtd_start.take().expect("DTD start is present");
                     return Ok(Some(Event::DocType {
+                        name,
                         range: start..span.range().end,
                     }));
                 }
@@ -244,8 +247,9 @@ impl<'a> Scanner<'a> {
                     }));
                 }
                 Token::DtdStart { .. } => unreachable!("DTD start is handled above"),
-                Token::EmptyDtd { span, .. } => {
+                Token::EmptyDtd { name, span, .. } => {
                     return Ok(Some(Event::DocType {
+                        name: name.as_str(),
                         range: span.range(),
                     }));
                 }

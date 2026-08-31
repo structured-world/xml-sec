@@ -19,8 +19,35 @@ use crate::{
 };
 
 pub(crate) type SourceNode = NodeReference;
+
+enum PreparedExtensionCalls<'a> {
+    Borrowed {
+        expression: &'a Expression,
+        variables: &'a HashMap<ExpandedName, Value>,
+    },
+    Rewritten {
+        expression: Expression,
+        variables: HashMap<ExpandedName, Value>,
+    },
+}
+
+impl<'a> PreparedExtensionCalls<'a> {
+    fn parts(&'a self) -> (&'a Expression, &'a HashMap<ExpandedName, Value>) {
+        match self {
+            Self::Borrowed {
+                expression,
+                variables,
+            } => (expression, variables),
+            Self::Rewritten {
+                expression,
+                variables,
+            } => (expression, variables),
+        }
+    }
+}
 const CONTEXT_NS: &str = "urn:structured-world:xml-sec:xslt:context";
-const DOCUMENTS_NS: &str = "urn:structured-world:xml-sec:xslt:documents";
+const DOCUMENTS_ELEMENT: &str = "__xml_sec_documents";
+const DOCUMENT_ELEMENT: &str = "__xml_sec_document";
 const EXTENSION_CONTEXT_NS: &str = "urn:structured-world:xml-sec:xslt:extensions";
 const EXSLT_COMMON_NS: &str = "http://exslt.org/common";
 const EXSLT_STRINGS_NS: &str = "http://exslt.org/strings";
@@ -34,6 +61,23 @@ const SAXON_NS: &str = "http://icl.com/saxon";
 const LIBXSLT_NS: &str = "http://xmlsoft.org/XSLT/namespace";
 const XT_NS: &str = "http://www.jclark.com/xt";
 const XALAN_REDIRECT_NS: &str = "org.apache.xalan.xslt.extensions.Redirect";
+
+fn is_prepared_extension_call(namespace: &str, local: &str) -> bool {
+    matches!(
+        (namespace, local),
+        (EXSLT_COMMON_NS | LIBXSLT_NS | SAXON_NS | XT_NS, "node-set")
+            | (EXSLT_COMMON_NS, "object-type")
+            | (EXSLT_STRINGS_NS, "split")
+            | (EXSLT_STRINGS_NS, "tokenize")
+            | (EXSLT_STRINGS_NS, "replace")
+            | (EXSLT_DYNAMIC_NS, "evaluate")
+            | (EXSLT_DYNAMIC_NS, "map")
+            | (SAXON_NS, "expression")
+            | (SAXON_NS, "eval")
+            | (SAXON_NS, "evaluate")
+            | (SAXON_NS, "line-number")
+    )
+}
 
 pub(crate) struct EvaluatorSourceOptions {
     pub(crate) processing: SourceProcessing,
@@ -146,7 +190,7 @@ pub(crate) struct Evaluator {
     pattern_matches: HashMap<PatternCacheKey, HashSet<SourceNode>>,
     generated_ids: Rc<RefCell<HashMap<NodePath, usize>>>,
     key_index: Rc<RefCell<KeyIndex>>,
-    decimal_formats: Vec<DecimalFormat>,
+    decimal_formats: Rc<Vec<DecimalFormat>>,
     extension_functions: HashSet<ExpandedName>,
     resolver: Arc<dyn Resolver>,
     documents: HashMap<DocumentRequest, Vec<SourceNode>>,
@@ -231,7 +275,7 @@ impl Evaluator {
             pattern_matches: HashMap::new(),
             generated_ids: Rc::new(RefCell::new(HashMap::new())),
             key_index: Rc::new(RefCell::new(HashMap::new())),
-            decimal_formats: Vec::new(),
+            decimal_formats: Rc::new(Vec::new()),
             extension_functions: HashSet::new(),
             resolver,
             documents,
@@ -253,7 +297,7 @@ impl Evaluator {
         decimal_formats: &[DecimalFormat],
         extension_functions: impl IntoIterator<Item = ExpandedName>,
     ) {
-        self.decimal_formats = decimal_formats.to_vec();
+        self.decimal_formats = Rc::new(decimal_formats.to_vec());
         self.extension_functions = extension_functions.into_iter().collect();
         self.extension_functions.extend([
             ExpandedName::new(Some(EXSLT_COMMON_NS), "node-set"),
@@ -333,15 +377,16 @@ impl Evaluator {
     ) -> Result<XPathValue> {
         loop {
             self.pending_document_requests.borrow_mut().clear();
-            let (prepared, augmented) =
+            let prepared =
                 self.prepare_extension_calls(expression, node, position, size, variables, meter)?;
+            let (prepared, augmented) = prepared.parts();
             let value = if let Some(name) =
                 variable_reference_name(prepared.source.trim(), &prepared.namespaces)
                 && let Some(Value::StoredExpression(source)) = augmented.get(&name)
             {
                 XPathValue::StoredExpression(source.clone())
             } else {
-                self.evaluate_core(&prepared, node, position, size, &augmented, meter)?
+                self.evaluate_core(prepared, node, position, size, augmented, meter)?
             };
             let requested = self
                 .pending_document_requests
@@ -352,7 +397,7 @@ impl Evaluator {
                 return Ok(value);
             }
             let prepared_count = self.documents.len();
-            self.prepare_document_requests(requested, &augmented, meter)?;
+            self.prepare_document_requests(requested, augmented, meter)?;
             if self.documents.len() == prepared_count {
                 return Err(Error::Dynamic(
                     "document() resolution made no progress".into(),
@@ -427,36 +472,33 @@ impl Evaluator {
         self.documents.insert(request, nodes);
     }
 
-    fn prepare_extension_calls(
+    fn prepare_extension_calls<'a>(
         &mut self,
-        expression: &Expression,
+        expression: &'a Expression,
         node: &SourceNode,
         position: usize,
         size: usize,
-        variables: &HashMap<ExpandedName, Value>,
+        variables: &'a HashMap<ExpandedName, Value>,
         meter: &mut Meter,
-    ) -> Result<(Expression, HashMap<ExpandedName, Value>)> {
+    ) -> Result<PreparedExtensionCalls<'a>> {
+        if innermost_namespaced_call(
+            &expression.source,
+            &expression.namespaces,
+            is_prepared_extension_call,
+        )
+        .is_none()
+        {
+            return Ok(PreparedExtensionCalls::Borrowed {
+                expression,
+                variables,
+            });
+        }
         let mut source = expression.source.clone();
         let mut augmented = variables.clone();
         let mut stored_expressions = HashSet::new();
         let mut variable_index = 0usize;
         while let Some(call) =
-            innermost_namespaced_call(&source, &expression.namespaces, |namespace, local| {
-                matches!(
-                    (namespace, local),
-                    (EXSLT_COMMON_NS | LIBXSLT_NS | SAXON_NS | XT_NS, "node-set")
-                        | (EXSLT_COMMON_NS, "object-type")
-                        | (EXSLT_STRINGS_NS, "split")
-                        | (EXSLT_STRINGS_NS, "tokenize")
-                        | (EXSLT_STRINGS_NS, "replace")
-                        | (EXSLT_DYNAMIC_NS, "evaluate")
-                        | (EXSLT_DYNAMIC_NS, "map")
-                        | (SAXON_NS, "expression")
-                        | (SAXON_NS, "eval")
-                        | (SAXON_NS, "evaluate")
-                        | (SAXON_NS, "line-number")
-                )
-            })
+            innermost_namespaced_call(&source, &expression.namespaces, is_prepared_extension_call)
         {
             let kind = match (call.namespace.as_str(), call.local.as_str()) {
                 (EXSLT_COMMON_NS | LIBXSLT_NS | SAXON_NS | XT_NS, "node-set") => {
@@ -828,7 +870,10 @@ impl Evaluator {
         namespaces.push(("__xml_sec_ext".into(), EXTENSION_CONTEXT_NS.into()));
         let mut rewritten = expression.derived(source);
         rewritten.namespaces = namespaces;
-        Ok((rewritten, augmented))
+        Ok(PreparedExtensionCalls::Rewritten {
+            expression: rewritten,
+            variables: augmented,
+        })
     }
 
     fn evaluate_extension_strings(
@@ -896,7 +941,7 @@ impl Evaluator {
         let rooted = rewrite_absolute_paths(&normalized, logical_root_index);
         let isolated = hide_projection_elements_from_axes(&rooted, logical_root_index);
         let rewritten = rewrite_outer_context_functions(&isolated);
-        if !self.expressions.borrow().contains_key(&rewritten) {
+        if !self.expressions.borrow().contains_key(rewritten.as_ref()) {
             // One input byte can produce at most one parser token. This conservative
             // node-sized allowance bounds the retained AST and cache key before insertion.
             let retained_bytes = rewritten
@@ -912,7 +957,7 @@ impl Evaluator {
             })?;
             self.expressions
                 .borrow_mut()
-                .insert(rewritten.clone(), xpath);
+                .insert(rewritten.as_ref().to_owned(), xpath);
         }
         let mut context = Context::new();
         let (owned_bytes, owned_bytes_limit) = meter.usage(BudgetKind::OwnedBytes)?;
@@ -921,7 +966,6 @@ impl Evaluator {
             context.set_namespace(prefix, uri);
         }
         context.set_namespace("xml", "http://www.w3.org/XML/1998/namespace");
-        context.set_namespace("__xml_sec_docs", DOCUMENTS_NS);
         context.set_namespace("__xml_sec_ctx", CONTEXT_NS);
         context.set_namespace("__xml_sec_ext", EXTENSION_CONTEXT_NS);
         context.set_variable((CONTEXT_NS, "position"), position as f64);
@@ -932,18 +976,21 @@ impl Evaluator {
                 path: typed_path_to(&context_node),
             },
         );
+        // XPath function objects must own their static namespace context. Share one
+        // materialization across all functions registered for this evaluation.
+        let function_namespaces = Rc::new(expression.namespaces.clone());
         context.set_function(
             "key",
             KeyFunction {
                 index: Rc::clone(&self.key_index),
-                namespaces: expression.namespaces.clone(),
+                namespaces: Rc::clone(&function_namespaces),
             },
         );
         context.set_function(
             "format-number",
             FormatNumberFunction {
-                formats: self.decimal_formats.clone(),
-                namespaces: expression.namespaces.clone(),
+                formats: Rc::clone(&self.decimal_formats),
+                namespaces: Rc::clone(&function_namespaces),
             },
         );
         context.set_function(
@@ -975,13 +1022,13 @@ impl Evaluator {
         context.set_function(
             "system-property",
             SystemProperty {
-                namespaces: expression.namespaces.clone(),
+                namespaces: Rc::clone(&function_namespaces),
             },
         );
         context.set_function(
             "element-available",
             ElementAvailable {
-                namespaces: expression.namespaces.clone(),
+                namespaces: Rc::clone(&function_namespaces),
             },
         );
         context.set_function(
@@ -1005,7 +1052,7 @@ impl Evaluator {
         context.set_function(
             "function-available",
             FunctionAvailable {
-                namespaces: expression.namespaces.clone(),
+                namespaces: function_namespaces,
                 extension_functions,
             },
         );
@@ -1050,7 +1097,7 @@ impl Evaluator {
         }
         let expressions = self.expressions.borrow();
         let xpath = expressions
-            .get(&rewritten)
+            .get(rewritten.as_ref())
             .expect("compiled XPath was inserted into the execution cache");
         let value = match xpath.evaluate(&context, context_node) {
             Ok(value) => value,
@@ -1354,10 +1401,6 @@ impl Evaluator {
             .node(*id)
             .ok_or_else(|| Error::Dynamic("template node candidate is stale".into()))?
             .kind;
-        if matches!(kind, NodeKind::Element { name, .. } if name.namespace.as_deref() == Some(DOCUMENTS_NS))
-        {
-            return Ok(Some(false));
-        }
         if let Some(segments) = absolute_element_pattern_segments(pattern) {
             let mut current = Some(*id);
             for segment in segments.iter().rev() {
@@ -1509,16 +1552,16 @@ impl Evaluator {
         let SourceNode::Node(owner) = node else {
             return Vec::new();
         };
-        let count = self
-            .source
-            .node(*owner)
-            .and_then(|node| match &node.kind {
-                NodeKind::Element { namespaces, .. } => Some(namespaces.len()),
-                _ => None,
-            })
-            .unwrap_or_default();
-        (0..count)
-            .map(|index| SourceNode::Namespace {
+        let namespaces = self.source.node(*owner).and_then(|node| match &node.kind {
+            NodeKind::Element { namespaces, .. } => Some(namespaces),
+            _ => None,
+        });
+        namespaces
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .filter(|(_, namespace)| xpath_namespace_is_visible(namespace))
+            .map(|(index, _)| SourceNode::Namespace {
                 owner: *owner,
                 index,
             })
@@ -1541,7 +1584,13 @@ impl Evaluator {
         parent.children[..position]
             .iter()
             .rev()
-            .find(|candidate| !self.source.string_value(**candidate).trim().is_empty())
+            .find(|candidate| {
+                !self
+                    .source
+                    .string_value(**candidate)
+                    .trim_matches(crate::lexical::is_xml_whitespace)
+                    .is_empty()
+            })
             .filter(|candidate| {
                 self.source
                     .node(**candidate)
@@ -1820,10 +1869,7 @@ fn project_semantic_document(source: &Document, meter: &mut Meter) -> Result<Pac
     meter.charge(BudgetKind::OwnedBytes, semantic_projection_size(source))?;
     let package = Package::new();
     let document = package.as_document();
-    let documents =
-        document.create_element(QName::with_namespace_uri(Some(DOCUMENTS_NS), "documents"));
-    documents.set_preferred_prefix(Some("xmlsec"));
-    documents.register_prefix("xmlsec", DOCUMENTS_NS);
+    let documents = document.create_element(QName::new(DOCUMENTS_ELEMENT));
     document.root().append_child(documents);
 
     for logical_root in source.logical_roots() {
@@ -1838,9 +1884,7 @@ fn project_logical_root<'d>(
     document: SxdDocument<'d>,
     documents: SxdElement<'d>,
 ) -> Result<()> {
-    let wrapper =
-        document.create_element(QName::with_namespace_uri(Some(DOCUMENTS_NS), "document"));
-    wrapper.set_preferred_prefix(Some("xmlsec"));
+    let wrapper = document.create_element(QName::new(DOCUMENT_ELEMENT));
     documents.append_child(wrapper);
     let root = source
         .node(logical_root)
@@ -2121,10 +2165,8 @@ fn expand_xinclude_document(
                     Some(base_uri),
                 );
             }
-            Err(error) => {
-                if matches!(error, Error::Budget { .. } | Error::StaleResource { .. }) {
-                    return Err(error);
-                }
+            Err(XIncludeFailure::Fatal(error)) => return Err(error),
+            Err(XIncludeFailure::Resource(error)) => {
                 let fallback = node.children.iter().find(|child| {
                     source.node(**child).is_some_and(|node| {
                         matches!(
@@ -2160,6 +2202,11 @@ enum XIncludeContent {
     Text(String, String),
 }
 
+enum XIncludeFailure {
+    Resource(Error),
+    Fatal(Error),
+}
+
 fn resolve_xinclude(
     source: &Document,
     include: NodeId,
@@ -2168,13 +2215,17 @@ fn resolve_xinclude(
     identities: &mut HashMap<ResourceIdentity, ResolvedResource>,
     include_stack: &mut Vec<ResourceIdentity>,
     depth: usize,
-) -> Result<XIncludeContent> {
+) -> std::result::Result<XIncludeContent, XIncludeFailure> {
     let node = source
         .node(include)
-        .ok_or_else(|| Error::Xml("XInclude node is stale".into()))?;
+        .ok_or_else(|| XIncludeFailure::Fatal(Error::Xml("XInclude node is stale".into())))?;
     let attributes = match &node.kind {
         NodeKind::Element { attributes, .. } => attributes,
-        _ => return Err(Error::Xml("XInclude node is not an element".into())),
+        _ => {
+            return Err(XIncludeFailure::Fatal(Error::Xml(
+                "XInclude node is not an element".into(),
+            )));
+        }
     };
     let attribute = |local: &str| {
         attributes
@@ -2183,42 +2234,52 @@ fn resolve_xinclude(
             .map(|attribute| attribute.value.as_str())
     };
     let href = attribute("href").unwrap_or_default();
+    let parse = attribute("parse").unwrap_or("xml");
+    if !matches!(parse, "xml" | "text") {
+        return Err(XIncludeFailure::Fatal(Error::Xml(format!(
+            "unsupported XInclude parse mode {parse}"
+        ))));
+    }
     if attribute("xpointer").is_some() {
-        return Err(Error::Unsupported(
+        return Err(XIncludeFailure::Fatal(Error::Unsupported(
             "XInclude xpointer selection is not implemented".into(),
-        ));
+        )));
     }
     // Denied operations must not cross the resolver boundary. Charging before resolution also
     // bounds repeated failed attempts that are handled by xi:fallback.
-    meter.charge(BudgetKind::ExternalDocuments, 1)?;
-    let resource = resolver.resolve(href, node.base_uri.as_deref(), ResolvePurpose::XInclude)?;
+    meter
+        .charge(BudgetKind::ExternalDocuments, 1)
+        .map_err(XIncludeFailure::Fatal)?;
+    let resource = resolver
+        .resolve(href, node.base_uri.as_deref(), ResolvePurpose::XInclude)
+        .map_err(|error| match error {
+            Error::ResourceNotFound { .. } | Error::Resolver { .. } => {
+                XIncludeFailure::Resource(error)
+            }
+            error => XIncludeFailure::Fatal(error),
+        })?;
     if include_stack.contains(&resource.identity) {
-        return Err(Error::Resolver {
+        return Err(XIncludeFailure::Fatal(Error::Resolver {
             uri: resource.canonical_uri,
             message: "XInclude cycle detected".into(),
-        });
+        }));
     }
     if let Some(previous) = identities.get(&resource.identity)
         && previous != &resource
     {
-        return Err(Error::StaleResource {
+        return Err(XIncludeFailure::Fatal(Error::StaleResource {
             identity: resource.identity,
-        });
+        }));
     }
-    let parse = attribute("parse").unwrap_or("xml");
     if parse == "text" {
         let encoding = attribute("encoding").or(resource.encoding.as_deref());
-        let value = decode_resource_metered(&resource.bytes, encoding, meter, false)?;
+        let value = decode_xinclude_resource(&resource.bytes, encoding, meter, false)?;
         identities.insert(resource.identity.clone(), resource.clone());
         return Ok(XIncludeContent::Text(value, resource.canonical_uri));
     }
-    if parse != "xml" {
-        return Err(Error::Xml(format!(
-            "unsupported XInclude parse mode {parse}"
-        )));
-    }
-    let xml = decode_resource_for_xml_parse(&resource.bytes, resource.encoding.as_deref(), meter)?;
-    let document = Document::parse(&xml, Some(&resource.canonical_uri))?;
+    let xml = decode_xinclude_resource(&resource.bytes, resource.encoding.as_deref(), meter, true)?;
+    let document =
+        Document::parse(&xml, Some(&resource.canonical_uri)).map_err(XIncludeFailure::Fatal)?;
     identities.insert(resource.identity.clone(), resource.clone());
     include_stack.push(resource.identity);
     let expanded = expand_xinclude_document(
@@ -2230,7 +2291,33 @@ fn resolve_xinclude(
         depth.saturating_add(1),
     );
     include_stack.pop();
-    expanded.map(|(document, _)| XIncludeContent::Xml(document))
+    expanded
+        .map(|(document, _)| XIncludeContent::Xml(document))
+        .map_err(XIncludeFailure::Fatal)
+}
+
+fn decode_xinclude_resource(
+    bytes: &[u8],
+    encoding: Option<&str>,
+    meter: &mut Meter,
+    parsed_xml: bool,
+) -> std::result::Result<String, XIncludeFailure> {
+    decode_resource_metered_inner(bytes, encoding, meter, parsed_xml).map_err(|error| match error {
+        MeteredDecodeError::Budget(error) => XIncludeFailure::Fatal(error),
+        MeteredDecodeError::Decode(error) => {
+            let recoverable = matches!(
+                error,
+                xml_sec_xml_input::Error::UnsupportedByteEncoding(_)
+                    | xml_sec_xml_input::Error::UnsupportedEncoding(_)
+            );
+            let error = Error::Xml(error.to_string());
+            if recoverable {
+                XIncludeFailure::Resource(error)
+            } else {
+                XIncludeFailure::Fatal(error)
+            }
+        }
+    })
 }
 
 fn decode_resource_for_xml_parse(
@@ -2247,27 +2334,50 @@ fn decode_resource_metered(
     meter: &mut Meter,
     parsed_xml: bool,
 ) -> Result<String> {
+    decode_resource_metered_inner(bytes, encoding, meter, parsed_xml).map_err(|error| match error {
+        MeteredDecodeError::Budget(error) => error,
+        MeteredDecodeError::Decode(error) => Error::Xml(error.to_string()),
+    })
+}
+
+enum MeteredDecodeError {
+    Budget(Error),
+    Decode(xml_sec_xml_input::Error),
+}
+
+fn decode_resource_metered_inner(
+    bytes: &[u8],
+    encoding: Option<&str>,
+    meter: &mut Meter,
+    parsed_xml: bool,
+) -> std::result::Result<String, MeteredDecodeError> {
     // XML parsing retains one decoded source copy while the decoder's output is still live.
     let decoded_copies = if parsed_xml { 2 } else { 1 };
-    let (used, limit) = meter.usage(BudgetKind::OwnedBytes)?;
+    let (used, limit) = meter
+        .usage(BudgetKind::OwnedBytes)
+        .map_err(MeteredDecodeError::Budget)?;
     let available = limit.saturating_sub(used).saturating_sub(bytes.len());
     let maximum_decoded = available / decoded_copies;
     let decoded = decode_resource(bytes, encoding, parsed_xml, maximum_decoded).map_err(
         |error| match error {
-            xml_sec_xml_input::Error::DecodedLimit { actual, .. } => Error::Budget {
-                kind: BudgetKind::OwnedBytes,
-                limit,
-                actual: used
-                    .saturating_add(bytes.len())
-                    .saturating_add(actual.saturating_mul(decoded_copies)),
-            },
-            error => Error::Xml(error.to_string()),
+            xml_sec_xml_input::Error::DecodedLimit { actual, .. } => {
+                MeteredDecodeError::Budget(Error::Budget {
+                    kind: BudgetKind::OwnedBytes,
+                    limit,
+                    actual: used
+                        .saturating_add(bytes.len())
+                        .saturating_add(actual.saturating_mul(decoded_copies)),
+                })
+            }
+            error => MeteredDecodeError::Decode(error),
         },
     )?;
     let retained = bytes
         .len()
         .saturating_add(decoded.len().saturating_mul(decoded_copies));
-    meter.charge(BudgetKind::OwnedBytes, retained)?;
+    meter
+        .charge(BudgetKind::OwnedBytes, retained)
+        .map_err(MeteredDecodeError::Budget)?;
     Ok(decoded)
 }
 
@@ -2334,7 +2444,11 @@ impl NodeMaps {
                     self.order
                         .insert(key.clone(), NodeOrder(rank.saturating_mul(3), 2, index));
                 }
-                for (index, namespace) in namespaces.iter().enumerate() {
+                for (index, namespace) in namespaces
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, namespace)| xpath_namespace_is_visible(namespace))
+                {
                     meter.check_additional(
                         BudgetKind::OwnedBytes,
                         path.ordinary()
@@ -2469,6 +2583,10 @@ impl NodeMaps {
     }
 }
 
+fn xpath_namespace_is_visible(namespace: &crate::Namespace) -> bool {
+    !namespace.uri.is_empty()
+}
+
 fn semantic_node_paths_from(
     source: &Document,
     first_node: usize,
@@ -2584,13 +2702,16 @@ fn path_to(node: &nodeset::Node<'_>) -> Vec<usize> {
     path
 }
 
-fn rewrite_absolute_paths(source: &str, logical_root_index: usize) -> String {
+fn rewrite_absolute_paths(source: &str, logical_root_index: usize) -> std::borrow::Cow<'_, str> {
+    if !contains_absolute_path(source) {
+        return std::borrow::Cow::Borrowed(source);
+    }
     let logical_root = format!(
-        "/__xml_sec_docs:documents/__xml_sec_docs:document[{}]",
+        "/{DOCUMENTS_ELEMENT}/{DOCUMENT_ELEMENT}[{}]",
         logical_root_index + 1
     );
     if source.trim() == "/" {
-        return logical_root;
+        return std::borrow::Cow::Owned(logical_root);
     }
     let mut output = String::with_capacity(source.len());
     let mut quote = None;
@@ -2628,7 +2749,36 @@ fn rewrite_absolute_paths(source: &str, logical_root_index: usize) -> String {
             previous_non_whitespace = Some(character);
         }
     }
-    output
+    if output == source {
+        std::borrow::Cow::Borrowed(source)
+    } else {
+        std::borrow::Cow::Owned(output)
+    }
+}
+
+fn contains_absolute_path(source: &str) -> bool {
+    let mut quote = None;
+    let mut previous_non_whitespace = None;
+    for (offset, character) in source.char_indices() {
+        if let Some(active) = quote {
+            if character == active {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            previous_non_whitespace = Some(character);
+            continue;
+        }
+        if character == '/' && absolute_path_can_start(&source[..offset], previous_non_whitespace) {
+            return true;
+        }
+        if !character.is_whitespace() {
+            previous_non_whitespace = Some(character);
+        }
+    }
+    false
 }
 
 fn absolute_path_can_start(output: &str, previous: Option<char>) -> bool {
@@ -2668,7 +2818,7 @@ fn multiplication_operator_ends(output: &str) -> bool {
 }
 
 pub(crate) fn rewrite_absolute_paths_for_validation(source: &str) -> String {
-    rewrite_absolute_paths(source, 0)
+    rewrite_absolute_paths(source, 0).into_owned()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2923,7 +3073,10 @@ fn for_each_exslt_replacement_segment(
     }
 }
 
-fn rewrite_outer_context_functions(source: &str) -> String {
+fn rewrite_outer_context_functions(source: &str) -> std::borrow::Cow<'_, str> {
+    if !source.contains("position") && !source.contains("last") {
+        return std::borrow::Cow::Borrowed(source);
+    }
     // XSLT supplies the outer position and size, while predicates must retain XPath's
     // native dynamic context. Only calls outside predicates become private variables.
     let mut output = String::with_capacity(source.len());
@@ -2974,7 +3127,11 @@ fn rewrite_outer_context_functions(source: &str) -> String {
         output.push(character);
         cursor += character.len_utf8();
     }
-    output
+    if output == source {
+        std::borrow::Cow::Borrowed(source)
+    } else {
+        std::borrow::Cow::Owned(output)
+    }
 }
 
 fn outer_context_call_len(source: &str, function: &str) -> Option<usize> {
@@ -3067,6 +3224,24 @@ enum NodeNameFunction {
     NamespaceUri,
 }
 
+fn is_projection_document_wrapper(node: &nodeset::Node<'_>) -> bool {
+    let Some(name) = node.expanded_name() else {
+        return false;
+    };
+    if name.namespace_uri().is_some() || name.local_part() != DOCUMENT_ELEMENT {
+        return false;
+    }
+    let Some(container) = node.parent().and_then(|parent| parent.element()) else {
+        return false;
+    };
+    let container_node = nodeset::Node::Element(container);
+    container_node.expanded_name().is_some_and(|name| {
+        name.namespace_uri().is_none() && name.local_part() == DOCUMENTS_ELEMENT
+    }) && container
+        .parent()
+        .is_some_and(|parent| parent.root().is_some())
+}
+
 impl function::Function for NodeNameFunction {
     fn evaluate<'c, 'd>(
         &self,
@@ -3090,9 +3265,7 @@ impl function::Function for NodeNameFunction {
         let Some(node) = node else {
             return Ok(SxdValue::String(String::new()));
         };
-        if node.expanded_name().is_some_and(|name| {
-            name.namespace_uri() == Some(DOCUMENTS_NS) && name.local_part() == "document"
-        }) {
+        if is_projection_document_wrapper(&node) {
             // Projection wrappers represent XPath document nodes. Their implementation
             // QName must never leak through the XSLT node-name functions.
             return Ok(SxdValue::String(String::new()));
@@ -3935,7 +4108,7 @@ impl function::Function for DocumentFunction {
 }
 
 struct SystemProperty {
-    namespaces: Vec<(String, String)>,
+    namespaces: Rc<Vec<(String, String)>>,
 }
 impl function::Function for SystemProperty {
     fn evaluate<'c, 'd>(
@@ -3962,7 +4135,7 @@ impl function::Function for SystemProperty {
 }
 
 struct ElementAvailable {
-    namespaces: Vec<(String, String)>,
+    namespaces: Rc<Vec<(String, String)>>,
 }
 impl function::Function for ElementAvailable {
     fn evaluate<'c, 'd>(
@@ -4010,7 +4183,10 @@ impl function::Function for ElementAvailable {
     }
 }
 
-fn hide_projection_elements_from_axes(source: &str, logical_root_index: usize) -> String {
+fn hide_projection_elements_from_axes(
+    source: &str,
+    logical_root_index: usize,
+) -> std::borrow::Cow<'_, str> {
     const AXES: &[&str] = &[
         "ancestor-or-self",
         "ancestor",
@@ -4021,6 +4197,13 @@ fn hide_projection_elements_from_axes(source: &str, logical_root_index: usize) -
         "parent",
         "self",
     ];
+    if !source.contains("..")
+        && !AXES
+            .iter()
+            .any(|axis| source.split("::").any(|prefix| prefix.ends_with(axis)))
+    {
+        return std::borrow::Cow::Borrowed(source);
+    }
     let mut output = String::with_capacity(source.len());
     let mut quote = None;
     let mut cursor = 0;
@@ -4053,7 +4236,8 @@ fn hide_projection_elements_from_axes(source: &str, logical_root_index: usize) -
                 .next()
                 .is_none_or(|next| next != '.' && !next.is_ascii_digit())
         {
-            output.push_str("..[parent::node()][not(self::__xml_sec_docs:documents)]");
+            output
+                .push_str("..[parent::node()][not(self::__xml_sec_documents and not(parent::*))]");
             cursor += 2;
             continue;
         }
@@ -4068,19 +4252,19 @@ fn hide_projection_elements_from_axes(source: &str, logical_root_index: usize) -
             // The package root and its `documents` container are implementation nodes.
             // A per-document wrapper represents the XPath root node and remains visible only
             // to node(), never to element principal-node tests.
-            output.push_str("[not(self::__xml_sec_docs:documents)]");
+            output.push_str("[not(self::__xml_sec_documents and not(parent::*))]");
             if matches!(*axis, "following-sibling" | "preceding-sibling") {
-                output.push_str("[not(self::__xml_sec_docs:document)]");
+                output.push_str("[not(self::__xml_sec_document and parent::__xml_sec_documents[not(parent::*)])]");
             } else if xpath_test_matches_root(node_test) {
                 output.push_str("[parent::node()]");
             } else {
-                output.push_str("[not(self::__xml_sec_docs:document)]");
+                output.push_str("[not(self::__xml_sec_document and parent::__xml_sec_documents[not(parent::*)])]");
             }
             if matches!(*axis, "following" | "preceding") {
                 // Every logical document is a sibling wrapper in the projection. Filtering by
                 // that wrapper's ordinal keeps these otherwise package-wide axes document-local.
                 output.push_str(&format!(
-                    "[count(ancestor::__xml_sec_docs:document/preceding-sibling::__xml_sec_docs:document) = {logical_root_index}]"
+                    "[count(ancestor::__xml_sec_document[parent::__xml_sec_documents[not(parent::*)]]/preceding-sibling::__xml_sec_document) = {logical_root_index}]"
                 ));
             }
             cursor = end;
@@ -4089,7 +4273,11 @@ fn hide_projection_elements_from_axes(source: &str, logical_root_index: usize) -
         output.push(character);
         cursor += character.len_utf8();
     }
-    output
+    if output == source {
+        std::borrow::Cow::Borrowed(source)
+    } else {
+        std::borrow::Cow::Owned(output)
+    }
 }
 
 fn xpath_axis_node_test_end(source: &str, mut cursor: usize) -> Option<usize> {
@@ -4159,7 +4347,7 @@ fn xpath_test_matches_root(node_test: &str) -> bool {
 }
 
 struct FunctionAvailable {
-    namespaces: Vec<(String, String)>,
+    namespaces: Rc<Vec<(String, String)>>,
     extension_functions: HashSet<ExpandedName>,
 }
 impl function::Function for FunctionAvailable {
@@ -4305,7 +4493,7 @@ type KeyIndex = HashMap<(ExpandedName, String, usize), Vec<NodePath>>;
 
 struct KeyFunction {
     index: Rc<RefCell<KeyIndex>>,
-    namespaces: Vec<(String, String)>,
+    namespaces: Rc<Vec<(String, String)>>,
 }
 impl function::Function for KeyFunction {
     fn evaluate<'c, 'd>(
@@ -4352,8 +4540,8 @@ impl function::Function for KeyFunction {
 }
 
 struct FormatNumberFunction {
-    formats: Vec<DecimalFormat>,
-    namespaces: Vec<(String, String)>,
+    formats: Rc<Vec<DecimalFormat>>,
+    namespaces: Rc<Vec<(String, String)>>,
 }
 impl function::Function for FormatNumberFunction {
     fn evaluate<'c, 'd>(
@@ -4840,6 +5028,21 @@ mod tests {
             rewrite_outer_context_functions("position \t( ) + last\n(\r)"),
             "$__xml_sec_ctx:position + $__xml_sec_ctx:last"
         );
+    }
+
+    #[test]
+    fn ordinary_xpath_rewrite_pipeline_keeps_borrowed_storage() {
+        // Repeated evaluation of a cached relative XPath must not allocate intermediate
+        // normalization strings when none of the internal rewrites apply.
+        let source = "item/@name";
+        let normalized = normalize_xpath_for_sxd(source);
+        assert!(matches!(&normalized, std::borrow::Cow::Borrowed(_)));
+        let rooted = rewrite_absolute_paths(&normalized, 0);
+        assert!(matches!(&rooted, std::borrow::Cow::Borrowed(_)));
+        let isolated = hide_projection_elements_from_axes(&rooted, 0);
+        assert!(matches!(&isolated, std::borrow::Cow::Borrowed(_)));
+        let context = rewrite_outer_context_functions(&isolated);
+        assert!(matches!(context, std::borrow::Cow::Borrowed(_)));
     }
 
     #[test]
