@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::budget::ensure;
@@ -139,6 +139,7 @@ impl<R: Resolver> Compiler<R> {
                         StylesheetModuleKind::Standard { forward } => {
                             validate_standard_stylesheet_content(included_root)?;
                             validate_top_level_declaration_attributes(included_root, forward)?;
+                            validate_namespace_prefix_attributes(included_root, forward)?;
                             self.compile_effective_imports(
                                 included_root,
                                 Some(&resource.canonical_uri),
@@ -1634,6 +1635,7 @@ fn validate_attribute_set_references(
         }
         validate_attribute_sets_in_sequence(&set.attributes, &validate_name)?;
     }
+    validate_attribute_set_cycles(sets)?;
     for template in templates {
         for parameter in &template.params {
             validate_attribute_sets_in_sequence(&parameter.content, &validate_name)?;
@@ -1648,6 +1650,46 @@ fn validate_attribute_set_references(
             validate_attribute_sets_in_sequence(&parameter.content, &validate_name)?;
         }
         validate_attribute_sets_in_sequence(&function.body, &validate_name)?;
+    }
+    Ok(())
+}
+
+fn validate_attribute_set_cycles(sets: &[AttributeSet]) -> Result<()> {
+    let mut indices = HashMap::<&ExpandedName, usize>::new();
+    for set in sets {
+        let next = indices.len();
+        indices.entry(&set.name).or_insert(next);
+    }
+    let mut edges = vec![Vec::new(); indices.len()];
+    let mut incoming = vec![0usize; indices.len()];
+    for set in sets {
+        let source = indices[&set.name];
+        for used in &set.uses {
+            let target = indices[used];
+            edges[source].push(target);
+            incoming[target] = incoming[target].saturating_add(1);
+        }
+    }
+    let mut ready = incoming
+        .iter()
+        .enumerate()
+        .filter_map(|(index, count)| (*count == 0).then_some(index))
+        .collect::<VecDeque<_>>();
+    let mut visited = 0usize;
+    while let Some(source) = ready.pop_front() {
+        visited += 1;
+        for &target in &edges[source] {
+            incoming[target] -= 1;
+            if incoming[target] == 0 {
+                ready.push_back(target);
+            }
+        }
+    }
+    if visited != indices.len() {
+        // XSLT 1.0 section 7.1.4 makes direct and indirect self-use erroneous even when the
+        // attribute set is never reached at runtime.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#attribute-sets
+        return Err(Error::Static("attribute-set cycle".into()));
     }
     Ok(())
 }
@@ -2478,7 +2520,7 @@ fn is_extension_element(node: roxmltree::Node<'_, '_>) -> Result<bool> {
         return Ok(false);
     };
     for ancestor in node.ancestors().filter(roxmltree::Node::is_element) {
-        let Some(prefixes) = ancestor
+        let Some(_) = ancestor
             .attribute((XSLT_NS, "extension-element-prefixes"))
             .or_else(|| {
                 (ancestor.tag_name().namespace() == Some(XSLT_NS))
@@ -2488,20 +2530,31 @@ fn is_extension_element(node: roxmltree::Node<'_, '_>) -> Result<bool> {
         else {
             continue;
         };
-        for prefix in prefixes.split_ascii_whitespace() {
-            let resolved = if prefix == "#default" {
-                ancestor.lookup_namespace_uri(None)
-            } else {
-                ancestor.lookup_namespace_uri(Some(prefix))
-            };
-            if resolved == Some(namespace) {
-                return Ok(true);
-            }
-            if resolved.is_none() {
-                return Err(Error::Static(format!(
-                    "unbound extension-element-prefixes prefix {prefix}"
-                )));
-            }
+        let mut extension = false;
+        visit_namespace_prefix_attribute(
+            ancestor,
+            "extension-element-prefixes",
+            forward_compatible_at(ancestor)?,
+            |resolved| extension |= resolved == namespace,
+        )?;
+        if extension {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn forward_compatible_at(node: roxmltree::Node<'_, '_>) -> Result<bool> {
+    for ancestor in node.ancestors().filter(roxmltree::Node::is_element) {
+        let version = if ancestor.has_tag_name((XSLT_NS, "stylesheet"))
+            || ancestor.has_tag_name((XSLT_NS, "transform"))
+        {
+            ancestor.attribute("version")
+        } else {
+            ancestor.attribute((XSLT_NS, "version"))
+        };
+        if let Some(version) = version {
+            return Ok(parse_stylesheet_version(version)? > 1.0);
         }
     }
     Ok(false)
@@ -2691,6 +2744,9 @@ fn visit_namespace_prefix_attribute(
     Ok(())
 }
 fn validate_local_binding_scope(node: roxmltree::Node<'_, '_>, name: &ExpandedName) -> Result<()> {
+    // This also rejects duplicate leading xsl:param declarations: the first parameter is visible
+    // to the second under XSLT 1.0 section 11.5, even when different prefixes expand to one name.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#local-variables
     if !node.has_tag_name((XSLT_NS, "variable")) && !node.has_tag_name((XSLT_NS, "param")) {
         return Ok(());
     }
@@ -2758,6 +2814,7 @@ fn compile_variable(node: roxmltree::Node<'_, '_>, context: CompileContext) -> R
         base_uri,
     })
 }
+
 fn compile_sort(node: roxmltree::Node<'_, '_>, context: &CompileContext) -> Result<Sort> {
     validate_instruction_attributes(node, context.forward)?;
     require_empty_instruction(node)?;

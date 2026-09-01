@@ -201,7 +201,21 @@ fn parse_encoding(label: &str) -> Result<SelectedEncoding, Error> {
     // WHATWG-style lookup would incorrectly map them to Windows-1252. `latin-1`
     // is retained as the already-supported punctuation variant.
     // https://www.iana.org/assignments/character-sets/character-sets.xhtml
-    if matches_ascii_case(
+    if is_latin1_encoding_label(label) {
+        return Ok(SelectedEncoding::Latin1);
+    }
+    encoding_rs::Encoding::for_label(label.as_bytes())
+        .map(SelectedEncoding::Standard)
+        .ok_or_else(|| Error::UnsupportedEncoding(label.into()))
+}
+
+/// Return whether `label` selects strict ISO-8859-1 semantics.
+///
+/// This intentionally does not use WHATWG label matching, which maps these
+/// XML encoding names to Windows-1252 instead of the registered repertoire.
+#[must_use]
+pub fn is_latin1_encoding_label(label: &str) -> bool {
+    matches_ascii_case(
         label,
         &[
             "iso_8859-1:1987",
@@ -215,12 +229,7 @@ fn parse_encoding(label: &str) -> Result<SelectedEncoding, Error> {
             "cp819",
             "csisolatin1",
         ],
-    ) {
-        return Ok(SelectedEncoding::Latin1);
-    }
-    encoding_rs::Encoding::for_label(label.as_bytes())
-        .map(SelectedEncoding::Standard)
-        .ok_or_else(|| Error::UnsupportedEncoding(label.into()))
+    )
 }
 
 fn decode_selected<'a>(

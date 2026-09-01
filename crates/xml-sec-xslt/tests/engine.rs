@@ -1470,16 +1470,11 @@ fn terminating_messages_and_attribute_set_cycles_are_typed_failures() {
     assert!(matches!(result, Err(Error::Dynamic(_))));
 
     let cycle = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:attribute-set name="a" use-attribute-sets="b"/><xsl:attribute-set name="b" use-attribute-sets="a"/><xsl:template match="/"><out xsl:use-attribute-sets="a"/></xsl:template></xsl:stylesheet>"#;
-    let result = compile(cycle).execute(
-        &Document::parse("<source/>", None).expect("source must parse"),
-        &Parameters::new(),
+    let result = Compiler::new(
         Arc::new(NoResolver),
-        ExecutionOptions {
-            budget: execution_budget(1024),
-            initial_mode: None,
-            initial_template: None,
-        },
-    );
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(cycle, None);
     assert!(matches!(result, Err(Error::Static(_))));
 }
 
@@ -1986,6 +1981,33 @@ fn serializer_encodes_xml_fallbacks_and_utf16_consistently() {
     )
     .expect("UTF-16 output must decode");
     assert!(decoded.contains("encoding=\"UTF-16\""));
+}
+
+#[test]
+fn serializer_preserves_iana_latin1_alias_semantics() {
+    // Every IANA alias names ISO-8859-1, so none may inherit encoding_rs's WHATWG
+    // Windows-1252 behavior and emit an undeclared 0x80 byte for U+20AC.
+    // https://www.iana.org/assignments/character-sets/character-sets.xhtml
+    for alias in [
+        "ISO_8859-1:1987",
+        "iso-ir-100",
+        "ISO_8859-1",
+        "ISO-8859-1",
+        "latin1",
+        "l1",
+        "IBM819",
+        "CP819",
+        "csISOLatin1",
+    ] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output encoding="{alias}" omit-xml-declaration="yes"/><xsl:template match="/"><out>€</out></xsl:template></xsl:stylesheet>"#,
+        );
+        assert_eq!(
+            execute(&stylesheet, "<source/>"),
+            "<out>&#8364;</out>\n",
+            "alias {alias} must retain ISO-8859-1 semantics",
+        );
+    }
 }
 
 #[test]
@@ -5464,6 +5486,80 @@ fn duplicate_with_param_bindings_are_static_errors() {
             )
             .compile(&stylesheet, None),
             Err(Error::Static(message)) if message.contains("duplicate xsl:with-param")
+        ));
+    }
+}
+
+#[test]
+fn duplicate_template_parameters_are_static_errors() {
+    // XSLT 1.0 section 11.5 forbids one local binding from shadowing another local binding;
+    // duplicate leading parameters therefore fail before either default can execute.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#local-variables
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:a="urn:param" xmlns:b="urn:param"><xsl:template match="/"><xsl:param name="a:value" select="1"/><xsl:param name="b:value" select="2"/></xsl:template></xsl:stylesheet>"#;
+    assert!(matches!(
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+        )
+        .compile(stylesheet, None),
+        Err(Error::Static(message)) if message.contains("shadows")
+    ));
+}
+
+#[test]
+fn forward_compatible_all_prefix_value_is_ignored_consistently() {
+    // XSLT 1.0 section 2.5 ignores an optional attribute whose value is not allowed by 1.0;
+    // extension classification must not reinterpret the ignored XSLT 2.0 #all token.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#forwards
+    let stylesheet = r##"<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:app="urn:app" extension-element-prefixes="#all"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><app:result/></xsl:template></xsl:stylesheet>"##;
+    assert_eq!(
+        execute(stylesheet, "<source/>"),
+        r#"<app:result xmlns:app="urn:app"/>"#.to_owned() + "\n",
+    );
+}
+
+#[test]
+fn included_modules_validate_namespace_prefix_attributes() {
+    // XSLT 1.0 section 2.6.1 treats an included module exactly like its declarations were
+    // written at the include site, so an unbound prefix cannot evade principal-root validation.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#include
+    let resolver = Arc::new(MemoryResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            "invalid.xsl".into(),
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" exclude-result-prefixes="missing"/>"#.into(),
+        );
+    let error = Compiler::new(resolver, CompileBudget::new(1 << 20, 8, 256, 1 << 20))
+        .compile(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:include href="invalid.xsl"/></xsl:stylesheet>"#,
+            Some("memory:main.xsl"),
+        )
+        .expect_err("unbound included-module prefix must be rejected");
+    assert!(matches!(error, Error::Static(message) if message.contains("not bound")));
+}
+
+#[test]
+fn unused_attribute_set_cycles_are_static_errors() {
+    // XSLT 1.0 section 7.1.4 makes direct or indirect self-use erroneous independently of
+    // runtime reachability, so the complete declaration graph must be checked at compile time.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#attribute-sets
+    for declarations in [
+        r#"<xsl:attribute-set name="a" use-attribute-sets="a"/>"#,
+        r#"<xsl:attribute-set name="a" use-attribute-sets="b"/><xsl:attribute-set name="b" use-attribute-sets="a"/>"#,
+    ] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">{declarations}<xsl:template match="/"><out/></xsl:template></xsl:stylesheet>"#,
+        );
+        assert!(matches!(
+            Compiler::new(
+                Arc::new(NoResolver),
+                CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+            )
+            .compile(&stylesheet, None),
+            Err(Error::Static(message)) if message.contains("attribute-set cycle")
         ));
     }
 }

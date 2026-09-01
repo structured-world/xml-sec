@@ -86,7 +86,7 @@ impl OutputEncoding {
             Ok(Self::Utf16Be)
         } else if is_ascii_encoding_label(label) {
             Ok(Self::Ascii)
-        } else if label.eq_ignore_ascii_case("iso-8859-1") || label.eq_ignore_ascii_case("latin1") {
+        } else if xml_sec_xml_input::is_latin1_encoding_label(label) {
             Ok(Self::Latin1)
         } else {
             encoding_rs::Encoding::for_label(label.as_bytes())
@@ -211,7 +211,14 @@ fn serialize_charged(
     } else {
         reject_unrepresentable_markup(&text, &encoding, "serialized output")?;
     }
-    let bytes = encode(text, &encoding, meter, budget_kind)?;
+    let bytes = encode(
+        text,
+        text_bytes,
+        encoded_bytes,
+        &encoding,
+        meter,
+        budget_kind,
+    )?;
     Ok(SerializedOutput {
         bytes,
         encoding: definition.encoding.clone(),
@@ -1452,58 +1459,51 @@ fn reject_unrepresentable_markup(value: &str, encoding: &OutputEncoding, kind: &
 
 fn encode(
     value: String,
+    utf8_bytes: usize,
+    encoded_bytes: usize,
     encoding: &OutputEncoding,
     meter: &mut Meter,
     budget_kind: BudgetKind,
 ) -> Result<Vec<u8>> {
+    meter.charge(budget_kind, encoded_bytes)?;
     if matches!(encoding, OutputEncoding::Utf8 | OutputEncoding::Ascii) {
         if matches!(encoding, OutputEncoding::Ascii) && !value.is_ascii() {
             return Err(Error::Serialization(
                 "non-ASCII character reached the US-ASCII encoder without escaping".into(),
             ));
         }
-        meter.charge(budget_kind, value.len())?;
         return Ok(value.into_bytes());
     }
+    meter.charge(BudgetKind::OwnedBytes, encoded_bytes)?;
     if matches!(encoding, OutputEncoding::Latin1) {
-        let mut bytes = Vec::with_capacity(value.chars().count());
+        let mut bytes = Vec::with_capacity(encoded_bytes);
         for character in value.chars() {
             let byte = u8::try_from(u32::from(character)).map_err(|_| {
                 Error::Serialization(format!(
                     "character `{character}` reached the Latin-1 encoder without escaping"
                 ))
             })?;
-            meter.charge(budget_kind, 1)?;
             bytes.push(byte);
         }
+        meter.release_owned_bytes(utf8_bytes);
         return Ok(bytes);
     }
     if matches!(encoding, OutputEncoding::Utf16Le) {
-        let units = value.encode_utf16().count();
-        let length = units
-            .checked_mul(2)
-            .and_then(|length| length.checked_add(2))
-            .unwrap_or(usize::MAX);
-        meter.charge(budget_kind, length)?;
-        let mut bytes = Vec::with_capacity(length);
+        let mut bytes = Vec::with_capacity(encoded_bytes);
         bytes.extend_from_slice(&[0xFF, 0xFE]);
         for unit in value.encode_utf16() {
             bytes.extend_from_slice(&unit.to_le_bytes());
         }
+        meter.release_owned_bytes(utf8_bytes);
         return Ok(bytes);
     }
     if matches!(encoding, OutputEncoding::Utf16Be) {
-        let units = value.encode_utf16().count();
-        let length = units
-            .checked_mul(2)
-            .and_then(|length| length.checked_add(2))
-            .unwrap_or(usize::MAX);
-        meter.charge(budget_kind, length)?;
-        let mut bytes = Vec::with_capacity(length);
+        let mut bytes = Vec::with_capacity(encoded_bytes);
         bytes.extend_from_slice(&[0xFE, 0xFF]);
         for unit in value.encode_utf16() {
             bytes.extend_from_slice(&unit.to_be_bytes());
         }
+        meter.release_owned_bytes(utf8_bytes);
         return Ok(bytes);
     }
     let OutputEncoding::Other { encoding, .. } = encoding else {
@@ -1511,11 +1511,10 @@ fn encode(
     };
     let mut encoder = encoding.new_encoder();
     let mut source = value.as_str();
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(encoded_bytes);
     let mut buffer = [0_u8; 4096];
     loop {
         let (result, read, written, _) = encoder.encode_from_utf8(source, &mut buffer, true);
-        meter.charge(budget_kind, written)?;
         bytes.extend_from_slice(&buffer[..written]);
         source = &source[read..];
         match result {
@@ -1523,6 +1522,7 @@ fn encode(
             encoding_rs::CoderResult::OutputFull => {}
         }
     }
+    meter.release_owned_bytes(utf8_bytes);
     Ok(bytes)
 }
 
@@ -1590,8 +1590,12 @@ fn validate_xml_characters(value: &str, version: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EncodingCounter, OutputEncoding, RenderBuffer, push_cdata_range};
-    use crate::{Document, NodeKind};
+    use super::{
+        EncodingCounter, OutputDefinition, OutputEncoding, OutputMethod, RenderBuffer,
+        push_cdata_range, serialize,
+    };
+    use crate::budget::Meter;
+    use crate::{BudgetKind, Document, ExecutionBudget, NodeKind};
 
     #[test]
     fn counting_buffer_rejects_repeated_indentation_beyond_the_encoded_limit() {
@@ -1658,5 +1662,52 @@ mod tests {
         let serialized = format!("<out>{}</out>", output.into_string());
         let reparsed = Document::parse(&serialized, None).expect("serialized CDATA reparses");
         assert_eq!(reparsed.string_value(reparsed.root()), "left]]><tag/>right");
+    }
+
+    #[test]
+    fn transcoding_reserves_utf8_and_encoded_buffers_concurrently() {
+        // UTF-16 allocation overlaps the rendered UTF-8 workspace; a peak-live-memory budget
+        // smaller than both buffers together must reject before allocating the second buffer.
+        let document = Document::parse("<root>abcdefgh</root>", None).expect("document parses");
+        let definition = OutputDefinition {
+            method: OutputMethod::Text,
+            encoding: "UTF-16".into(),
+            ..OutputDefinition::default()
+        };
+        let limits = ExecutionBudget {
+            source_bytes: 0,
+            external_documents: 0,
+            recursion_depth: 1,
+            xpath_evaluations: 0,
+            template_applications: 0,
+            sort_comparisons: 0,
+            key_entries: 0,
+            result_nodes: 0,
+            serialized_bytes: 64,
+            messages: 0,
+            owned_bytes: 25,
+        };
+        let mut meter = Meter::new(limits, 0).expect("zero source bytes fit");
+        assert!(matches!(
+            serialize(&document, &definition, &mut meter),
+            Err(crate::Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            })
+        ));
+
+        let mut limits = limits;
+        limits.owned_bytes = 26;
+        let mut meter = Meter::new(limits, 0).expect("zero source bytes fit");
+        let output = serialize(&document, &definition, &mut meter)
+            .expect("combined UTF-8 and UTF-16 buffers fit exactly");
+        assert_eq!(output.bytes.len(), 18);
+        assert_eq!(
+            meter
+                .usage(BudgetKind::OwnedBytes)
+                .expect("owned-byte usage is available")
+                .0,
+            18
+        );
     }
 }
