@@ -3875,6 +3875,9 @@ fn exslt_decode_uri_honors_the_requested_encoding() {
     </xsl:stylesheet>"#;
     assert_eq!(execute(stylesheet, "<source/>"), "\u{e9}");
 
+    let strict_iana = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="str:decode-uri('%80', 'ISO-8859-9')"/><xsl:text>|</xsl:text><xsl:value-of select="str:decode-uri('%80', 'windows-1254')"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(strict_iana, "<source/>"), "\u{80}|€");
+
     let unsupported = compile(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:template match="/"><xsl:value-of select="str:decode-uri('%E9', 'not-an-encoding')"/></xsl:template></xsl:stylesheet>"#,
     );
@@ -3891,6 +3894,28 @@ fn exslt_decode_uri_honors_the_requested_encoding() {
         ),
         Err(Error::Dynamic(message)) if message.contains("unknown encoding")
     ));
+}
+
+#[test]
+fn undeclared_unicode_ncname_prefix_is_a_static_error() {
+    // XML Names permits combining marks after the first prefix character; namespace validation
+    // must not defer such an unbound prefix until the expression happens to execute.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:value-of select="ṕ:item"/></xsl:template></xsl:stylesheet>"#;
+    let error = Compiler::new(
+        Arc::new(NoResolver),
+        CompileBudget::new(1 << 20, 16, 256, 4 << 20),
+    )
+    .compile(stylesheet, Some("memory:main.xsl"))
+    .expect_err("the Unicode prefix is not bound");
+    assert!(matches!(error, Error::Static(message) if message.contains("ṕ")));
+
+    let declared = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:ṕ="urn:unicode"><xsl:template match="/"><xsl:value-of select="ṕ:item"/></xsl:template></xsl:stylesheet>"#;
+    Compiler::new(
+        Arc::new(NoResolver),
+        CompileBudget::new(1 << 20, 16, 256, 4 << 20),
+    )
+    .compile(declared, Some("memory:main.xsl"))
+    .expect("the declared Unicode prefix is valid");
 }
 
 #[test]

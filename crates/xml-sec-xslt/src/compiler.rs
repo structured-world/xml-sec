@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::budget::ensure;
-use crate::lexical::{is_ncname, unicode_decimal_value};
+use crate::lexical::{is_ncname, is_ncname_char, is_ncname_start, unicode_decimal_value};
 use crate::resolver::decode_resource;
 use crate::{
     BudgetKind, CompileBudget, Document, Error, ExpandedName, Namespace, OutputDefinition,
@@ -1080,13 +1080,13 @@ fn validate_xpath_prefixes(source: &str, namespaces: &[(String, String)]) -> Res
             cursor += 1;
             continue;
         }
-        if !is_xpath_name_start(character) {
+        if !is_ncname_start(character) {
             cursor += 1;
             continue;
         }
         let start = cursor;
         cursor += 1;
-        while cursor < characters.len() && is_xpath_ncname_character(characters[cursor]) {
+        while cursor < characters.len() && is_ncname_char(characters[cursor]) {
             cursor += 1;
         }
         if cursor >= characters.len()
@@ -1095,7 +1095,7 @@ fn validate_xpath_prefixes(source: &str, namespaces: &[(String, String)]) -> Res
             || !characters
                 .get(cursor + 1)
                 .copied()
-                .is_some_and(|character| character == '*' || is_xpath_name_start(character))
+                .is_some_and(|character| character == '*' || is_ncname_start(character))
         {
             continue;
         }
@@ -1108,14 +1108,6 @@ fn validate_xpath_prefixes(source: &str, namespaces: &[(String, String)]) -> Res
         cursor += 1;
     }
     Ok(())
-}
-
-fn is_xpath_name_start(character: char) -> bool {
-    character.is_alphabetic() || character == '_'
-}
-
-fn is_xpath_ncname_character(character: char) -> bool {
-    is_xpath_name_start(character) || character.is_ascii_digit() || matches!(character, '-' | '.')
 }
 
 pub(crate) fn normalize_xpath_for_sxd(source: &str) -> Cow<'_, str> {

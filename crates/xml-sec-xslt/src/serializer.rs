@@ -94,10 +94,12 @@ impl OutputEncoding {
         } else {
             encoding_rs::Encoding::for_label(label.as_bytes())
                 .and_then(|encoding| {
-                    legacy_output_label_matches_encoding(label, encoding).then_some(Self::Other {
-                        encoding,
-                        representable: [const { Cell::new(None) }; 16],
-                    })
+                    xml_sec_xml_input::legacy_label_matches_encoding(label, encoding).then_some(
+                        Self::Other {
+                            encoding,
+                            representable: [const { Cell::new(None) }; 16],
+                        },
+                    )
                 })
                 .ok_or_else(|| Error::Serialization(format!("unsupported output encoding {label}")))
         }
@@ -124,23 +126,6 @@ impl OutputEncoding {
             }
         }
     }
-}
-
-fn legacy_output_label_matches_encoding(
-    label: &str,
-    encoding: &'static encoding_rs::Encoding,
-) -> bool {
-    let canonical = encoding.name();
-    let Some(code_page) = canonical.strip_prefix("windows-") else {
-        return true;
-    };
-    label.eq_ignore_ascii_case(canonical)
-        || label
-            .get(2..)
-            .is_some_and(|suffix| label[..2].eq_ignore_ascii_case("cp") && suffix == code_page)
-        || label
-            .get(4..)
-            .is_some_and(|suffix| label[..4].eq_ignore_ascii_case("x-cp") && suffix == code_page)
 }
 
 fn encoding_represents(encoding: &'static encoding_rs::Encoding, character: char) -> bool {

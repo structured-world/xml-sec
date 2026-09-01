@@ -11,7 +11,7 @@ use sxd_xpath_no_unsafe::{Context, Factory, Value as SxdValue, XPath, function, 
 use crate::budget::Meter;
 use crate::compiler::{DecimalFormat, Expression, NameTest, Pattern, normalize_xpath_for_sxd};
 use crate::expression::innermost_namespaced_call;
-use crate::lexical::is_ncname;
+use crate::lexical::{is_ncname, is_ncname_char};
 use crate::resolver::decode_resource;
 use crate::runtime::{SourceProcessing, apply_whitespace_rules};
 use crate::{
@@ -4054,27 +4054,15 @@ fn is_xpath_whitespace(character: char) -> bool {
 }
 
 fn is_xpath_name_character(character: char) -> bool {
-    character.is_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
+    character == ':' || is_ncname_char(character)
 }
 
 fn is_lexical_qname(value: &str) -> bool {
     let mut parts = value.split(':');
-    let valid_part = |part: &str| {
-        let mut characters = part.chars();
-        characters
-            .next()
-            .is_some_and(|first| first == '_' || first.is_alphabetic())
-            && characters.all(|character| {
-                character == '_'
-                    || character == '-'
-                    || character == '.'
-                    || character.is_alphanumeric()
-            })
-    };
     let Some(first) = parts.next() else {
         return false;
     };
-    valid_part(first) && parts.next().is_none_or(valid_part) && parts.next().is_none()
+    is_ncname(first) && parts.next().is_none_or(is_ncname) && parts.next().is_none()
 }
 
 #[derive(Default)]
@@ -4517,7 +4505,7 @@ enum ExsltCryptoFunction {
 impl function::Function for ExsltCryptoFunction {
     fn evaluate<'c, 'd>(
         &self,
-        _: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
+        context: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
         args: Vec<SxdValue<'d>>,
     ) -> std::result::Result<SxdValue<'d>, function::Error> {
         use sha1::Digest as _;
@@ -4541,19 +4529,50 @@ impl function::Function for ExsltCryptoFunction {
                 Ok(SxdValue::String(hex_encode(&bytes)))
             }
             Self::Rc4Encrypt | Self::Rc4Decrypt => {
-                if args.len() != 2 {
+                let Ok([key, input]) = <[SxdValue<'d>; 2]>::try_from(args) else {
                     return Err(function::Error::Other {
                         what: "EXSLT RC4 function requires key and data".into(),
                     });
-                }
-                let key = args[0].string();
-                if key.is_empty() {
+                };
+                let key_len = key.string_len();
+                if key_len == 0 {
                     return Ok(SxdValue::String(String::new()));
                 }
-                let input = if matches!(self, Self::Rc4Decrypt) {
-                    hex_decode(&args[1].string())?
+                let input_len = input.string_len();
+                let coercion_bytes = sxd_string_materialization_bytes(&key)
+                    .checked_add(sxd_string_materialization_bytes(&input))
+                    .ok_or_else(|| function::Error::Other {
+                        what: "EXSLT RC4 allocation length overflow".into(),
+                    })?;
+                let workspace_bytes = if matches!(self, Self::Rc4Decrypt) {
+                    if !input_len.is_multiple_of(2) {
+                        return Err(function::Error::Other {
+                            what: "EXSLT RC4 ciphertext must contain complete hex octets".into(),
+                        });
+                    }
+                    coercion_bytes
+                        .checked_add(input_len)
+                        .ok_or_else(|| function::Error::Other {
+                            what: "EXSLT RC4 allocation length overflow".into(),
+                        })?
                 } else {
-                    args[1].string().into_bytes()
+                    coercion_bytes
+                        .checked_add(input_len.checked_mul(3).ok_or_else(|| {
+                            function::Error::Other {
+                                what: "EXSLT RC4 allocation length overflow".into(),
+                            }
+                        })?)
+                        .ok_or_else(|| function::Error::Other {
+                            what: "EXSLT RC4 allocation length overflow".into(),
+                        })?
+                };
+                context.reserve_string_allocation(workspace_bytes)?;
+                let key = key.into_string();
+                let input = input.into_string();
+                let input = if matches!(self, Self::Rc4Decrypt) {
+                    hex_decode(&input)?
+                } else {
+                    input.into_bytes()
                 };
                 let mut padded_key = [0_u8; 128];
                 let key_bytes = key.as_bytes();
@@ -4571,6 +4590,13 @@ impl function::Function for ExsltCryptoFunction {
                 }
             }
         }
+    }
+}
+
+fn sxd_string_materialization_bytes(value: &SxdValue<'_>) -> usize {
+    match value {
+        SxdValue::String(_) | SxdValue::ResultTreeFragment(..) => 0,
+        value => value.string_len(),
     }
 }
 
@@ -4601,10 +4627,11 @@ fn rc4(key: &[u8], input: &[u8]) -> Vec<u8> {
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     output
 }
@@ -4913,23 +4940,35 @@ impl function::Function for ExsltStringFunction {
                 let encoding = uri_encoding(encoding_label.as_deref())?;
                 let value = args[0].string();
                 let decoded_len = percent_decoded_uri_len(&value)?;
-                let transcoded_len = encoding
-                    .new_decoder()
-                    .max_utf8_buffer_length_without_replacement(decoded_len)
-                    .ok_or_else(|| function::Error::Other {
-                        what: "str:decode-uri() result length overflow".into(),
-                    })?;
-                context.reserve_string_allocation(
-                    decoded_len.checked_add(transcoded_len).ok_or_else(|| {
-                        function::Error::Other {
-                            what: "str:decode-uri() allocation length overflow".into(),
-                        }
-                    })?,
-                )?;
+                let (transcoded_len, workspace_len) = match encoding {
+                    UriEncoding::Standard(encoding) => {
+                        let transcoded_len = encoding
+                            .new_decoder()
+                            .max_utf8_buffer_length_without_replacement(decoded_len)
+                            .ok_or_else(|| function::Error::Other {
+                                what: "str:decode-uri() result length overflow".into(),
+                            })?;
+                        let workspace_len =
+                            decoded_len.checked_add(transcoded_len).ok_or_else(|| {
+                                function::Error::Other {
+                                    what: "str:decode-uri() allocation length overflow".into(),
+                                }
+                            })?;
+                        (transcoded_len, workspace_len)
+                    }
+                    UriEncoding::Registered(encoding) => {
+                        let transcoded_len = registered_uri_decoded_len(&value, encoding)?;
+                        // Registered single-byte repertoires stream directly into UTF-8 and do
+                        // not require the intermediate decoded-octet vector used by encoding_rs.
+                        (transcoded_len, transcoded_len)
+                    }
+                };
+                context.reserve_string_allocation(workspace_len)?;
                 Ok(SxdValue::String(percent_decode_uri(
                     &value,
                     encoding,
                     decoded_len,
+                    transcoded_len,
                 )?))
             }
         }
@@ -4992,25 +5031,31 @@ fn uri_byte_is_unescaped(character: char, escape_reserved: bool) -> bool {
 
 fn percent_decode_uri(
     value: &str,
-    encoding: &'static encoding_rs::Encoding,
+    encoding: UriEncoding,
     decoded_len: usize,
+    transcoded_len: usize,
 ) -> std::result::Result<String, function::Error> {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(decoded_len);
-    let mut cursor = 0;
-    while cursor < bytes.len() {
-        if bytes[cursor] == b'%'
-            && let Some(encoded) = bytes.get(cursor + 1..cursor + 3)
-            && let Ok(encoded) = std::str::from_utf8(encoded)
-            && let Ok(byte) = u8::from_str_radix(encoded, 16)
-        {
-            decoded.push(byte);
-            cursor += 3;
-        } else {
-            decoded.push(bytes[cursor]);
-            cursor += 1;
-        }
+    if let UriEncoding::Registered(encoding) = encoding {
+        let mut output = String::with_capacity(transcoded_len);
+        visit_percent_decoded_bytes(value, |byte| {
+            let character = encoding
+                .decode_byte(byte)
+                .ok_or_else(|| function::Error::Other {
+                    what: format!("str:decode-uri() input is not valid {}", encoding.name()),
+                })?;
+            output.push(character);
+            Ok(())
+        })?;
+        return Ok(output);
     }
+    let UriEncoding::Standard(encoding) = encoding else {
+        unreachable!("registered encodings return above")
+    };
+    let mut decoded = Vec::with_capacity(decoded_len);
+    visit_percent_decoded_bytes(value, |byte| {
+        decoded.push(byte);
+        Ok(())
+    })?;
     let (value, _, had_errors) = encoding.decode(&decoded);
     if had_errors {
         return extension_argument_error(&format!(
@@ -5021,37 +5066,80 @@ fn percent_decode_uri(
     Ok(value.into_owned())
 }
 
-fn uri_encoding(
-    label: Option<&str>,
-) -> std::result::Result<&'static encoding_rs::Encoding, function::Error> {
-    label.map_or(Ok(encoding_rs::UTF_8), |label| {
-        encoding_rs::Encoding::for_label(label.as_bytes()).ok_or_else(|| function::Error::Other {
-            what: format!("str:decode-uri() has unknown encoding `{label}`"),
-        })
+#[derive(Clone, Copy)]
+enum UriEncoding {
+    Standard(&'static encoding_rs::Encoding),
+    Registered(xml_sec_xml_input::IanaSingleByteEncoding),
+}
+
+fn uri_encoding(label: Option<&str>) -> std::result::Result<UriEncoding, function::Error> {
+    label.map_or(Ok(UriEncoding::Standard(encoding_rs::UTF_8)), |label| {
+        if let Some(encoding) = xml_sec_xml_input::registered_single_byte_encoding(label) {
+            return Ok(UriEncoding::Registered(encoding));
+        }
+        encoding_rs::Encoding::for_label(label.as_bytes())
+            .filter(|encoding| xml_sec_xml_input::legacy_label_matches_encoding(label, encoding))
+            .map(UriEncoding::Standard)
+            .ok_or_else(|| function::Error::Other {
+                what: format!("str:decode-uri() has unknown encoding `{label}`"),
+            })
     })
 }
 
-fn percent_decoded_uri_len(value: &str) -> std::result::Result<usize, function::Error> {
-    let bytes = value.as_bytes();
-    let mut cursor = 0usize;
-    let mut decoded_len = 0usize;
-    while cursor < bytes.len() {
-        let encoded = bytes[cursor] == b'%'
-            && bytes
-                .get(cursor + 1..cursor + 3)
-                .and_then(|digits| std::str::from_utf8(digits).ok())
-                .is_some_and(|digits| u8::from_str_radix(digits, 16).is_ok());
-        cursor = cursor
-            .checked_add(if encoded { 3 } else { 1 })
+fn registered_uri_decoded_len(
+    value: &str,
+    encoding: xml_sec_xml_input::IanaSingleByteEncoding,
+) -> std::result::Result<usize, function::Error> {
+    let mut length = 0usize;
+    visit_percent_decoded_bytes(value, |byte| {
+        let character = encoding
+            .decode_byte(byte)
             .ok_or_else(|| function::Error::Other {
-                what: "str:decode-uri() input length overflow".into(),
+                what: format!("str:decode-uri() input is not valid {}", encoding.name()),
             })?;
+        length =
+            length
+                .checked_add(character.len_utf8())
+                .ok_or_else(|| function::Error::Other {
+                    what: "str:decode-uri() result length overflow".into(),
+                })?;
+        Ok(())
+    })?;
+    Ok(length)
+}
+
+fn visit_percent_decoded_bytes(
+    value: &str,
+    mut visit: impl FnMut(u8) -> std::result::Result<(), function::Error>,
+) -> std::result::Result<(), function::Error> {
+    let bytes = value.as_bytes();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'%'
+            && let Some(encoded) = bytes.get(cursor + 1..cursor + 3)
+            && let Ok(encoded) = std::str::from_utf8(encoded)
+            && let Ok(byte) = u8::from_str_radix(encoded, 16)
+        {
+            visit(byte)?;
+            cursor += 3;
+        } else {
+            visit(bytes[cursor])?;
+            cursor += 1;
+        }
+    }
+    Ok(())
+}
+
+fn percent_decoded_uri_len(value: &str) -> std::result::Result<usize, function::Error> {
+    let mut decoded_len = 0usize;
+    visit_percent_decoded_bytes(value, |_| {
         decoded_len = decoded_len
             .checked_add(1)
             .ok_or_else(|| function::Error::Other {
                 what: "str:decode-uri() result length overflow".into(),
             })?;
-    }
+        Ok(())
+    })?;
     Ok(decoded_len)
 }
 
@@ -6130,6 +6218,42 @@ mod tests {
             rewrite_outer_context_functions("position \t( ) + last\n(\r)"),
             "$__xml_sec_ctx:position + $__xml_sec_ctx:last"
         );
+    }
+
+    #[test]
+    fn outer_context_rewrite_respects_unicode_ncname_boundaries() {
+        // XML Names permits combining marks after the first NCName character. A built-in-looking
+        // suffix inside such a QName must remain a call to that QName, not become an outer-context
+        // variable reference.
+        let source = "f:a\u{0301}position() + position()";
+        assert_eq!(
+            rewrite_outer_context_functions(source),
+            "f:a\u{0301}position() + $__xml_sec_ctx:position"
+        );
+    }
+
+    #[test]
+    fn rc4_extensions_reserve_workspace_before_allocating() {
+        // The extension must preflight all key, input, cipher, and hexadecimal buffers against
+        // the evaluator's allocation budget before materializing attacker-controlled data.
+        let package = Package::new();
+        let document = package.as_document();
+        let mut context = Context::new();
+        context.set_string_allocation_limit(1024);
+        let evaluation =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+        for (function, input) in [
+            (ExsltCryptoFunction::Rc4Encrypt, "x".repeat(2048)),
+            (ExsltCryptoFunction::Rc4Decrypt, "00".repeat(2048)),
+        ] {
+            let error = function
+                .evaluate(
+                    &evaluation,
+                    vec![SxdValue::String("key".into()), SxdValue::String(input)],
+                )
+                .expect_err("workspace exceeds the evaluator budget");
+            assert!(matches!(error, function::Error::Other { what } if what.contains("budget")));
+        }
     }
 
     #[test]

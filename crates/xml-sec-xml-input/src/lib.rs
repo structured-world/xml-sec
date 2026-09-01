@@ -166,6 +166,28 @@ pub fn registered_single_byte_encoding(label: &str) -> Option<IanaSingleByteEnco
         .then_some(IanaSingleByteEncoding::Tis620)
 }
 
+/// Return whether a WHATWG label lookup preserves the caller's requested legacy encoding.
+///
+/// WHATWG redirects many ISO labels to Windows code pages. Callers that promise exact IANA
+/// semantics must either implement those repertoires explicitly or reject the redirected label.
+#[must_use]
+pub fn legacy_label_matches_encoding(
+    label: &str,
+    encoding: &'static encoding_rs::Encoding,
+) -> bool {
+    let canonical = encoding.name();
+    let Some(code_page) = canonical.strip_prefix("windows-") else {
+        return true;
+    };
+    label.eq_ignore_ascii_case(canonical)
+        || label
+            .get(2..)
+            .is_some_and(|suffix| label[..2].eq_ignore_ascii_case("cp") && suffix == code_page)
+        || label
+            .get(4..)
+            .is_some_and(|suffix| label[..4].eq_ignore_ascii_case("x-cp") && suffix == code_page)
+}
+
 /// Decode XML bytes according to XML 1.0 encoding detection rules.
 ///
 /// `explicit_encoding` is trusted resolver metadata. It is checked against the

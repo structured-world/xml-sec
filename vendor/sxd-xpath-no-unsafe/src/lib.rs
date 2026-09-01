@@ -274,7 +274,8 @@ fn str_to_num(s: &str) -> f64 {
 }
 
 impl<'d> Value<'d> {
-    pub(crate) fn string_len(&self) -> usize {
+    /// Return the UTF-8 byte length of this value's XPath string conversion without allocating it.
+    pub fn string_len(&self) -> usize {
         match self {
             Value::Boolean(true) => 4,
             Value::Boolean(false) => 5,
