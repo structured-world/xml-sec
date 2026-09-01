@@ -1627,11 +1627,24 @@ impl<'a> Execution<'a> {
                     .as_ref()
                     .map(|value| self.evaluate_avt(value, node, position, size))
                     .transpose()?;
+                // XSLT 1.0 section 7.7 permits only these two evaluated AVT values. Section 2.5
+                // requires an invalid optional value to be ignored in forwards-compatible mode.
+                // https://www.w3.org/TR/1999/REC-xslt-19991116#number
+                // https://www.w3.org/TR/1999/REC-xslt-19991116#forwards
+                let letter_value = match letter_value.as_deref() {
+                    None | Some("alphabetic" | "traditional") => letter_value.as_deref(),
+                    Some(_) if number.forward_compatible => None,
+                    Some(value) => {
+                        return Err(Error::Dynamic(format!(
+                            "xsl:number letter-value must evaluate to alphabetic or traditional, got `{value}`"
+                        )));
+                    }
+                };
                 let formatted = format_number_sequence(
                     &values,
                     &format,
                     lang.as_deref(),
-                    letter_value.as_deref(),
+                    letter_value,
                     grouping_separator,
                     grouping_size,
                     &self.meter,
@@ -2005,7 +2018,7 @@ impl<'a> Execution<'a> {
                 Value::Number(value) => *value,
                 Value::String(value) | Value::StoredExpression(value) => xpath_number(value),
                 Value::NodeSet(_) | Value::ResultTreeFragment(_) => {
-                    xpath_number(&value.clone().into_string(&self.evaluator.source))
+                    xpath_number(&self.value_string(value, 0)?)
                 }
             };
             return Ok(Some(XPathValue::Number(number + increment)));
@@ -2024,7 +2037,7 @@ impl<'a> Execution<'a> {
             && let Some(factor) = parse_xpath_number(factor)
         {
             let length =
-                xpath_number(&self.variable_string(variable.trim(), &expression.namespaces)?)
+                xpath_number(&self.variable_string(variable.trim(), &expression.namespaces, 0)?)
                     * factor;
             let take = length.round().max(1.0) as usize - 1;
             return Ok(Some(XPathValue::String(
@@ -2035,7 +2048,7 @@ impl<'a> Execution<'a> {
             .strip_prefix("string-length($")
             .and_then(|value| value.strip_suffix(") > 0"))
         {
-            let value = self.variable_string(variable, &expression.namespaces)?;
+            let value = self.variable_string(variable, &expression.namespaces, 0)?;
             return Ok(Some(XPathValue::Boolean(!value.is_empty())));
         }
         if let Some(arguments) = source
@@ -2044,13 +2057,18 @@ impl<'a> Execution<'a> {
             && let Some((variable, delimiter)) = arguments.split_once(',')
             && let Some(delimiter) = quoted_literal(delimiter.trim())
         {
-            let value = self.variable_string(variable.trim(), &expression.namespaces)?;
-            return Ok(Some(XPathValue::String(
-                value
-                    .split_once(delimiter)
-                    .map_or("", |(head, _)| head)
-                    .into(),
-            )));
+            let value = self.variable_string(variable.trim(), &expression.namespaces, 0)?;
+            let head = value.split_once(delimiter).map_or("", |(head, _)| head);
+            let value_workspace = if matches!(&value, Cow::Owned(_)) {
+                value.len()
+            } else {
+                0
+            };
+            self.meter.check_additional(
+                BudgetKind::OwnedBytes,
+                value_workspace.saturating_add(head.len()),
+            )?;
+            return Ok(Some(XPathValue::String(head.to_owned())));
         }
         if let Some(arguments) = source
             .strip_prefix("substring($")
@@ -2060,15 +2078,31 @@ impl<'a> Execution<'a> {
             && let Some((length_variable, increment)) = offset.split_once(")+")
             && let Ok(increment) = increment.trim().parse::<usize>()
         {
-            let value = self.variable_string(variable.trim(), &expression.namespaces)?;
+            let value = self.variable_string(variable.trim(), &expression.namespaces, 0)?;
+            let value_workspace = if matches!(&value, Cow::Owned(_)) {
+                value.len()
+            } else {
+                0
+            };
             let length = self
-                .variable_string(length_variable.trim(), &expression.namespaces)?
+                .variable_string(
+                    length_variable.trim(),
+                    &expression.namespaces,
+                    value_workspace,
+                )?
                 .chars()
                 .count();
             let start = length.saturating_add(increment).saturating_sub(1);
-            return Ok(Some(XPathValue::String(
-                value.chars().skip(start).collect(),
-            )));
+            let start = value
+                .char_indices()
+                .nth(start)
+                .map_or(value.len(), |(offset, _)| offset);
+            let result = &value[start..];
+            self.meter.check_additional(
+                BudgetKind::OwnedBytes,
+                value_workspace.saturating_add(result.len()),
+            )?;
+            return Ok(Some(XPathValue::String(result.to_owned())));
         }
         if let Some(variable) = source
             .strip_prefix("boolean($")
@@ -2076,7 +2110,7 @@ impl<'a> Execution<'a> {
             && is_lexical_variable_name(variable)
         {
             let value = self.variable_value(variable, &expression.namespaces)?;
-            return Ok(Some(XPathValue::Boolean(value.clone().into_boolean())));
+            return Ok(Some(XPathValue::Boolean(value.boolean())));
         }
         Ok(None)
     }
@@ -2090,10 +2124,27 @@ impl<'a> Execution<'a> {
             .ok_or_else(|| Error::Dynamic(format!("undefined variable ${lexical}")))
     }
 
-    fn variable_string(&self, lexical: &str, namespaces: &[(String, String)]) -> Result<String> {
-        self.variable_value(lexical, namespaces)
-            .cloned()
-            .map(|value| value.into_string(&self.evaluator.source))
+    fn variable_string<'value>(
+        &'value self,
+        lexical: &str,
+        namespaces: &[(String, String)],
+        concurrent_owned_bytes: usize,
+    ) -> Result<Cow<'value, str>> {
+        let value = self.variable_value(lexical, namespaces)?;
+        self.value_string(value, concurrent_owned_bytes)
+    }
+
+    fn value_string<'value>(
+        &'value self,
+        value: &'value Value,
+        concurrent_owned_bytes: usize,
+    ) -> Result<Cow<'value, str>> {
+        value_string(
+            value,
+            &self.evaluator.source,
+            &self.meter,
+            concurrent_owned_bytes,
+        )
     }
 
     fn call_exslt_function(
@@ -3871,6 +3922,99 @@ fn node_kind_owned_bytes(kind: &NodeKind) -> usize {
     }
 }
 
+fn value_string<'a>(
+    value: &'a Value,
+    source: &'a Document,
+    meter: &Meter,
+    concurrent_owned_bytes: usize,
+) -> Result<Cow<'a, str>> {
+    match value {
+        Value::NodeSet(nodes) => nodes
+            .iter()
+            .filter_map(|node| source.document_order_key(node).map(|key| (key, node)))
+            .min_by_key(|(key, _)| *key)
+            .map_or_else(
+                || Ok(Cow::Borrowed("")),
+                |(_, node)| node_reference_string(node, source, meter, concurrent_owned_bytes),
+            ),
+        Value::Boolean(true) => Ok(Cow::Borrowed("true")),
+        Value::Boolean(false) => Ok(Cow::Borrowed("false")),
+        Value::Number(value) => {
+            let value = crate::value::format_xpath_number(*value);
+            meter.check_additional(
+                BudgetKind::OwnedBytes,
+                concurrent_owned_bytes.saturating_add(value.len()),
+            )?;
+            Ok(Cow::Owned(value))
+        }
+        Value::String(value) | Value::StoredExpression(value) => Ok(Cow::Borrowed(value)),
+        Value::ResultTreeFragment(document) => {
+            metered_document_string(document, document.root(), meter, concurrent_owned_bytes)
+        }
+    }
+}
+
+fn node_reference_string<'a>(
+    node: &NodeReference,
+    document: &'a Document,
+    meter: &Meter,
+    concurrent_owned_bytes: usize,
+) -> Result<Cow<'a, str>> {
+    match node {
+        NodeReference::Node(id) => {
+            metered_document_string(document, *id, meter, concurrent_owned_bytes)
+        }
+        NodeReference::Attribute { owner, index } => Ok(document
+            .node(*owner)
+            .and_then(|node| match &node.kind {
+                NodeKind::Element { attributes, .. } => attributes.get(*index),
+                _ => None,
+            })
+            .map_or(Cow::Borrowed(""), |attribute| {
+                Cow::Borrowed(attribute.value.as_str())
+            })),
+        NodeReference::Namespace { owner, index } => Ok(document
+            .node(*owner)
+            .and_then(|node| match &node.kind {
+                NodeKind::Element { namespaces, .. } => namespaces.get(*index),
+                _ => None,
+            })
+            .map_or(Cow::Borrowed(""), |namespace| {
+                Cow::Borrowed(namespace.uri.as_str())
+            })),
+    }
+}
+
+fn metered_document_string<'a>(
+    document: &'a Document,
+    id: NodeId,
+    meter: &Meter,
+    concurrent_owned_bytes: usize,
+) -> Result<Cow<'a, str>> {
+    let Some(node) = document.node(id) else {
+        return Ok(Cow::Borrowed(""));
+    };
+    match &node.kind {
+        NodeKind::Text { value, .. } | NodeKind::Comment(value) => Ok(Cow::Borrowed(value)),
+        NodeKind::ProcessingInstruction { value, .. } => {
+            Ok(Cow::Borrowed(value.as_deref().unwrap_or("")))
+        }
+        NodeKind::Root | NodeKind::Element { .. } => {
+            let mut output_bytes = 0usize;
+            document.visit_string_value(id, |value| {
+                output_bytes = output_bytes.saturating_add(value.len());
+            });
+            meter.check_additional(
+                BudgetKind::OwnedBytes,
+                concurrent_owned_bytes.saturating_add(output_bytes),
+            )?;
+            let mut output = String::with_capacity(output_bytes);
+            document.visit_string_value(id, |value| output.push_str(value));
+            Ok(Cow::Owned(output))
+        }
+    }
+}
+
 fn clone_for_xsl_copy(kind: &NodeKind, meter: &Meter) -> Result<NodeKind> {
     let copied_bytes = match kind {
         NodeKind::Element {
@@ -4275,9 +4419,9 @@ fn roman(mut value: usize, upper: bool) -> String {
 mod tests {
     use std::cmp::Ordering;
 
-    use super::{SortKey, append_grouped, append_localized_decimal};
+    use super::{SortKey, append_grouped, append_localized_decimal, value_string};
     use crate::budget::Meter;
-    use crate::{BudgetKind, Error, ExecutionBudget};
+    use crate::{BudgetKind, Document, Error, ExecutionBudget, Value};
 
     fn meter(owned_bytes: usize) -> Meter {
         Meter::new(
@@ -4351,5 +4495,27 @@ mod tests {
             left.compare(&right, Some("lower-first"), None),
             Ordering::Less
         );
+    }
+
+    #[test]
+    fn value_string_preflights_owned_projection_but_borrows_existing_strings() {
+        let payload = "x".repeat(4096);
+        let fragment = Value::ResultTreeFragment(
+            Document::parse(&format!("<fragment>{payload}</fragment>"), None)
+                .expect("fragment parses"),
+        );
+        let source = Document::parse("<source/>", None).expect("source parses");
+        assert!(matches!(
+            value_string(&fragment, &source, &meter(payload.len() - 1), 0),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            })
+        ));
+
+        let retained = Value::String(payload);
+        let borrowed = value_string(&retained, &source, &meter(0), 0)
+            .expect("an existing string needs no projection allocation");
+        assert!(matches!(borrowed, std::borrow::Cow::Borrowed(_)));
     }
 }

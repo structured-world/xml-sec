@@ -21,10 +21,14 @@ pub enum Value {
 impl Value {
     #[must_use]
     pub fn into_boolean(self) -> bool {
+        self.boolean()
+    }
+
+    pub(crate) fn boolean(&self) -> bool {
         match self {
             Self::NodeSet(nodes) => !nodes.is_empty(),
-            Self::Boolean(value) => value,
-            Self::Number(value) => value != 0.0 && !value.is_nan(),
+            Self::Boolean(value) => *value,
+            Self::Number(value) => *value != 0.0 && !value.is_nan(),
             Self::String(value) => !value.is_empty(),
             Self::StoredExpression(value) => !value.is_empty(),
             // XSLT 1.0 defines every result-tree fragment as the equivalent node-set

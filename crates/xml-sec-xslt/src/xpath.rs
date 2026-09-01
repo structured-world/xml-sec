@@ -2611,28 +2611,25 @@ pub(crate) fn parse_xpath_number(value: &str) -> Option<f64> {
     // XPath 1.0 §§3.5 and 3.7 permit only decimal Number tokens, not host-language
     // spellings such as NaN or infinity: https://www.w3.org/TR/1999/REC-xpath-19991116/#numbers
     let trimmed = value.trim_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n'));
-    let valid = !trimmed.is_empty()
-        && !trimmed.starts_with('+')
-        && !trimmed.contains(['e', 'E'])
-        && trimmed
-            .strip_prefix('-')
-            .unwrap_or(trimmed)
-            .split_once('.')
-            .map_or_else(
-                || {
-                    trimmed
-                        .strip_prefix('-')
-                        .unwrap_or(trimmed)
-                        .chars()
-                        .all(|c| c.is_ascii_digit())
-                },
-                |(integer, fraction)| {
-                    (integer.is_empty() || integer.chars().all(|c| c.is_ascii_digit()))
-                        && !(integer.is_empty() && fraction.is_empty())
-                        && fraction.chars().all(|c| c.is_ascii_digit())
-                },
-            );
-    valid.then(|| trimmed.parse().ok()).flatten()
+    trimmed.strip_prefix('-').map_or_else(
+        || parse_xpath_number_token(trimmed),
+        |magnitude| parse_xpath_number_token(magnitude).map(|value| -value),
+    )
+}
+
+pub(crate) fn parse_xpath_number_token(value: &str) -> Option<f64> {
+    // XPath 1.0 section 3.7, productions 30-31, has no sign or exponent:
+    // https://www.w3.org/TR/1999/REC-xpath-19991116/#exprlex
+    let valid = !value.is_empty()
+        && value.split_once('.').map_or_else(
+            || value.chars().all(|character| character.is_ascii_digit()),
+            |(integer, fraction)| {
+                (integer.is_empty() || integer.chars().all(|c| c.is_ascii_digit()))
+                    && !(integer.is_empty() && fraction.is_empty())
+                    && fraction.chars().all(|c| c.is_ascii_digit())
+            },
+        );
+    valid.then(|| value.parse().ok()).flatten()
 }
 
 const XINCLUDE_NS: &str = "http://www.w3.org/2001/XInclude";

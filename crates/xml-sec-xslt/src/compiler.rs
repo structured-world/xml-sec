@@ -714,6 +714,7 @@ pub(crate) struct NumberInstruction {
     pub letter_value: Option<AttributeValueTemplate>,
     pub grouping_separator: Option<AttributeValueTemplate>,
     pub grouping_size: Option<AttributeValueTemplate>,
+    pub forward_compatible: bool,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct KeyDeclaration {
@@ -1818,9 +1819,9 @@ fn module_forward_compatible(root: roxmltree::Node<'_, '_>) -> Result<bool> {
 }
 
 fn parse_stylesheet_version(version: &str) -> Result<f64> {
-    version
-        .parse::<f64>()
-        .ok()
+    // XSLT 1.0 sections 2.2 and 2.3 define version as XPath's Number production;
+    // host float syntax is wider: https://www.w3.org/TR/1999/REC-xpath-19991116/#exprlex
+    crate::xpath::parse_xpath_number_token(version)
         .filter(|value| value.is_finite() && *value >= 1.0)
         .ok_or_else(|| Error::Static(format!("unsupported XSLT version {version}")))
 }
@@ -2689,6 +2690,7 @@ fn compile_number(
             .attribute("grouping-size")
             .map(|value| parse_avt(value, node, context))
             .transpose()?,
+        forward_compatible: context.forward,
     })
 }
 fn parse_avt(

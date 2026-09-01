@@ -3678,6 +3678,31 @@ fn xpath_scope_snapshot_counts_toward_peak_owned_memory() {
 }
 
 #[test]
+fn scalar_fast_path_does_not_clone_result_tree_fragments_for_string_conversion() {
+    // The retained RTF and its direct string projection fit together. Deep-cloning the whole tree
+    // before conversion would add a second tree allocation and cross this operation ceiling.
+    let payload = "x".repeat(128 * 1024);
+    let stylesheet = compile(&format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:variable name="payload"><xsl:text>{payload}</xsl:text></xsl:variable><xsl:value-of select="substring-before($payload, 'missing')"/></xsl:template></xsl:stylesheet>"#
+    ));
+    let mut budget = execution_budget(1024);
+    budget.owned_bytes = 448 * 1024;
+    let result = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("borrowed RTF conversion remains inside the allocation gate");
+    assert!(result.serialized.bytes.is_empty());
+}
+
+#[test]
 fn generate_id_cache_is_charged_to_retained_owned_memory() {
     // Deep node paths make generate-id's retained identity cache grow quadratically even when
     // the XPath result is one number; the cache must remain inside the operation memory budget.
@@ -5955,6 +5980,23 @@ fn stylesheet_versions_use_numeric_xslt_semantics() {
 }
 
 #[test]
+fn stylesheet_versions_reject_non_xpath_number_spellings() {
+    // XSLT 1.0 sections 2.2 and 2.3 use XPath's Number production for stylesheet versions;
+    // XPath 1.0 section 3.7 excludes signs, exponents, and surrounding whitespace.
+    // https://www.w3.org/TR/1999/REC-xpath-19991116/#exprlex
+    for version in ["+1.0", "1e1", " 1.0", "1.0 ", "1.0.0"] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="{version}" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#
+        );
+        assert!(matches!(
+            Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+                .compile(&stylesheet, None),
+            Err(Error::Static(message)) if message.contains("XSLT version")
+        ));
+    }
+}
+
+#[test]
 fn literal_result_stylesheet_versions_use_numeric_xslt_semantics() {
     // Equivalent lexical forms of XSLT 1.0 must not enable forward-compatible processing.
     let stylesheet = r#"<out xsl:version="1.00" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:future><xsl:fallback>fallback</xsl:fallback></xsl:future></out>"#;
@@ -6411,6 +6453,49 @@ fn grouped_numbering_is_rejected_before_exceeding_owned_memory() {
             ..
         }
     ));
+}
+
+#[test]
+fn number_letter_value_rejects_invalid_evaluated_values_in_strict_mode() {
+    // XSLT 1.0 section 7.7 permits only alphabetic and traditional after AVT evaluation.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#number
+    for letter_value in ["bogus", "{$choice}"] {
+        let stylesheet = compile(&format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:param name="choice" select="'bogus'"/><xsl:output method="text"/><xsl:template match="/"><xsl:number value="1" format="A" letter-value="{letter_value}"/></xsl:template></xsl:stylesheet>"#
+        ));
+        let error = stylesheet
+            .execute(
+                &Document::parse("<source/>", None).expect("source parses"),
+                &Parameters::new(),
+                Arc::new(NoResolver),
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            )
+            .expect_err("invalid letter-value must be rejected");
+        assert!(matches!(
+            error,
+            Error::Dynamic(message) if message.contains("letter-value") && message.contains("bogus")
+        ));
+    }
+
+    for letter_value in ["alphabetic", "traditional"] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:number value="1" format="A" letter-value="{letter_value}"/></xsl:template></xsl:stylesheet>"#
+        );
+        assert!(!execute(&stylesheet, "<source/>").is_empty());
+    }
+}
+
+#[test]
+fn number_letter_value_is_ignored_in_forward_compatible_mode() {
+    // XSLT 1.0 section 2.5 requires an invalid optional attribute value to be ignored while
+    // forwards-compatible processing is active.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#forwards
+    let stylesheet = r#"<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:number value="1" format="A" letter-value="bogus"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "A");
 }
 
 #[test]
