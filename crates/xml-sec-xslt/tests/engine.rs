@@ -3095,7 +3095,7 @@ fn xinclude_fallback_handles_only_resource_errors() {
 
 #[test]
 fn xinclude_rejects_multiple_fallback_children() {
-    // XInclude 1.0 section 4.2 permits at most one xi:fallback child. This is a syntax
+    // XInclude 1.0 section 3.1 permits at most one xi:fallback child. This is a syntax
     // constraint, so a resource failure must not turn a malformed include into a successful
     // fallback: https://www.w3.org/TR/xinclude/#syntax
     let stylesheet = compile(
@@ -3123,6 +3123,64 @@ fn xinclude_rejects_multiple_fallback_children() {
     assert!(matches!(
         error,
         Error::Xml(message) if message.contains("at most one xi:fallback")
+    ));
+}
+
+#[test]
+fn xinclude_distinguishes_extension_content_from_reserved_children() {
+    // XInclude 1.0 section 3.1 permits local and foreign-namespace extension children but
+    // reserves XInclude-namespace children other than xi:fallback.
+    // https://www.w3.org/TR/xinclude/#syntax
+    let resolver = Arc::new(MemoryResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert("included.xml".into(), "<included/>".into());
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><xsl:copy-of select="."/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="included.xml"><extension/><foreign:metadata xmlns:foreign="urn:extension"/></xi:include></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("extension-bearing source parses");
+    let result = stylesheet
+        .execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        )
+        .expect("permitted extension children do not invalidate inclusion");
+    assert_eq!(
+        String::from_utf8(result.serialized.bytes).unwrap(),
+        "<root xmlns:xi=\"http://www.w3.org/2001/XInclude\"><included/></root>\n"
+    );
+
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="missing.xml"><xi:include href="nested.xml"/></xi:include></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("reserved-child source parses before XInclude validation");
+    assert!(matches!(
+        stylesheet.execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        ),
+        Err(Error::Xml(message)) if message.contains("XInclude namespace child")
     ));
 }
 
@@ -5477,6 +5535,71 @@ fn document_function_resolves_xml_shorthand_pointers() {
         )
         .expect("shorthand pointers resolve through XML IDs");
     assert_eq!(result.serialized.bytes, b"selected|0");
+}
+
+#[test]
+fn document_function_decodes_uri_escaped_shorthand_pointers() {
+    // XPointer Framework appendix B encodes pointer characters as UTF-8 percent escapes;
+    // shorthand validation and ID lookup operate on the decoded pointer.
+    // https://www.w3.org/TR/xptr-framework/#escaping
+    let resolver = Arc::new(MemoryResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            "external.xml".into(),
+            r#"<doc><item xml:id="café">selected</item></doc>"#.into(),
+        );
+    let stylesheet = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="document('external.xml#caf%C3%A9')"/></xsl:template></xsl:stylesheet>"#,
+        Some("memory:main.xsl"),
+    )
+    .expect("escaped shorthand-pointer stylesheet compiles");
+    let result = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            resolver.clone(),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("escaped shorthand pointer resolves through the decoded XML ID");
+    assert_eq!(result.serialized.bytes, b"selected");
+
+    for fragment in ["bad%", "%GG", "%FF"] {
+        let stylesheet = Compiler::new(
+            resolver.clone(),
+            CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+        )
+        .compile(
+            &format!(
+                r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:value-of select="document('external.xml#{fragment}')"/></xsl:template></xsl:stylesheet>"#
+            ),
+            Some("memory:main.xsl"),
+        )
+        .expect("malformed fragment remains a runtime URI error");
+        assert!(matches!(
+            stylesheet.execute(
+                &Document::parse("<source/>", None).expect("source parses"),
+                &Parameters::new(),
+                resolver.clone(),
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            ),
+            Err(Error::Unsupported(message)) if message.contains("document fragment")
+        ));
+    }
 }
 
 #[test]

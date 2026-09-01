@@ -1155,6 +1155,40 @@ fn assert_strict_xslt_output_deviation(case: &Case, actual: &[u8], expected: &[u
     let stylesheet = case.stylesheet.to_string_lossy();
     let actual = String::from_utf8_lossy(actual);
     match stylesheet.as_ref() {
+        // libxslt rejects the XML Schema end-of-day lexical form in this fixture. XML Schema
+        // Part 2 sections 3.2.7.1 and 3.2.8.1 require 24:00:00 to normalize to midnight, so
+        // compare every other byte while accepting only that four-field normative delta.
+        // https://www.w3.org/TR/xmlschema-2/#time-lexical-representation
+        "exslt/date/time.2.xsl" => {
+            let expected = String::from_utf8_lossy(expected);
+            let marker = "Test Date : 24:00:00";
+            let (prefix, suffix) = actual
+                .split_once(marker)
+                .expect("end-of-day oracle case retains its source marker");
+            let suffix = suffix
+                .replacen(
+                    "    time                 : 00:00:00\n",
+                    "    time                 : \n",
+                    1,
+                )
+                .replacen(
+                    "    hour-in-day          : 0\n",
+                    "    hour-in-day          : NaN\n",
+                    1,
+                )
+                .replacen(
+                    "    minute-in-hour       : 0\n",
+                    "    minute-in-hour       : NaN\n",
+                    1,
+                )
+                .replacen(
+                    "    second-in-minute     : 0\n",
+                    "    second-in-minute     : NaN\n",
+                    1,
+                );
+            assert_eq!(format!("{prefix}{marker}{suffix}"), expected);
+            true
+        }
         // libxslt forwards parameters through built-in template rules. XSLT 1.0 defines the
         // built-in rule as an apply-templates without with-param, so the strict result must not
         // retain the forms carried by the original parameter.

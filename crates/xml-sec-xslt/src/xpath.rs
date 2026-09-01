@@ -1666,13 +1666,9 @@ impl Evaluator {
             if self.documents.contains_key(&request) {
                 continue;
             }
-            let (resource_uri, fragment) = request
-                .href
-                .split_once('#')
-                .map_or((request.href.as_str(), None), |(resource, fragment)| {
-                    (resource, Some(fragment))
-                });
-            let fragment = fragment.map(str::to_owned);
+            let fragment_offset = request.href.find('#').map(|index| index + 1);
+            let resource_uri =
+                fragment_offset.map_or(request.href.as_str(), |offset| &request.href[..offset - 1]);
             let resource_request = DocumentRequest {
                 href: resource_uri.to_owned(),
                 base_uri: request.base_uri.clone(),
@@ -1739,23 +1735,27 @@ impl Evaluator {
                 self.cache_document(request, Vec::new());
                 continue;
             };
-            if let Some(fragment) = fragment {
-                fragments.push((request, root, fragment));
+            if let Some(fragment_offset) = fragment_offset {
+                fragments.push((request, root, fragment_offset));
             } else if request != resource_request {
                 self.cache_document(request, vec![root]);
             }
         }
-        for (request, root, fragment) in fragments {
+        for (request, root, fragment_offset) in fragments {
+            let raw_fragment = &request.href[fragment_offset..];
+            let (fragment, reserved_bytes) = decode_document_fragment(raw_fragment, meter)?;
             let Some(expression) = fragment
                 .strip_prefix("xpointer(")
                 .and_then(|fragment| fragment.strip_suffix(')'))
             else {
                 if !is_ncname(&fragment) {
+                    meter.release_owned_bytes(reserved_bytes);
                     return Err(Error::Unsupported(format!(
                         "document fragment `{fragment}`"
                     )));
                 }
                 let SourceNode::Node(logical_root) = root else {
+                    meter.release_owned_bytes(reserved_bytes);
                     return Err(Error::Dynamic(
                         "document fragment root is not a document node".into(),
                     ));
@@ -1769,6 +1769,7 @@ impl Evaluator {
                     })
                     .into_iter()
                     .collect();
+                meter.release_owned_bytes(reserved_bytes);
                 self.cache_document(request, selected);
                 continue;
             };
@@ -1780,7 +1781,9 @@ impl Evaluator {
                 variables,
                 meter,
                 None,
-            )?;
+            );
+            meter.release_owned_bytes(reserved_bytes);
+            let selected = selected?;
             let XPathValue::NodeSet(nodes) = selected else {
                 return Err(Error::Dynamic(format!(
                     "document fragment `{fragment}` did not select nodes"
@@ -2688,7 +2691,7 @@ fn expand_xinclude_document(
             continue;
         }
 
-        let fallback = xinclude_fallback_child(source, node)?;
+        let fallback = validate_xinclude_children(source, node)?;
         let result = resolve_xinclude(
             source,
             source_id,
@@ -2751,26 +2754,99 @@ fn expand_xinclude_document(
     Ok((output, Some(principal_mapping)))
 }
 
-fn xinclude_fallback_child(source: &Document, include: &Node) -> Result<Option<NodeId>> {
+fn validate_xinclude_children(source: &Document, include: &Node) -> Result<Option<NodeId>> {
     let mut fallback = None;
     for child in &include.children {
-        let is_fallback = source.node(*child).is_some_and(|node| {
-            matches!(
-                &node.kind,
-                NodeKind::Element { name, .. }
-                    if name.namespace.as_deref() == Some(XINCLUDE_NS)
-                        && name.local == "fallback"
-            )
-        });
-        if is_fallback && fallback.replace(*child).is_some() {
-            // XInclude 1.0 section 4.2 defines xi:include as having at most one xi:fallback
-            // child: https://www.w3.org/TR/xinclude/#syntax
+        let Some(Node {
+            kind: NodeKind::Element { name, .. },
+            ..
+        }) = source.node(*child)
+        else {
+            continue;
+        };
+        if name.namespace.as_deref() != Some(XINCLUDE_NS) {
+            continue;
+        }
+        // XInclude 1.0 section 3.1 permits local/foreign extension children (which are
+        // ignored), but makes every XInclude-namespace child except one fallback fatal.
+        // https://www.w3.org/TR/xinclude/#syntax
+        if name.local != "fallback" {
+            return Err(Error::Xml(format!(
+                "XInclude namespace child xi:{} is not permitted in xi:include",
+                name.local
+            )));
+        }
+        if fallback.replace(*child).is_some() {
             return Err(Error::Xml(
                 "XInclude xi:include permits at most one xi:fallback child".into(),
             ));
         }
     }
     Ok(fallback)
+}
+
+fn decode_document_fragment<'a>(
+    fragment: &'a str,
+    meter: &mut Meter,
+) -> Result<(Cow<'a, str>, usize)> {
+    if !fragment.as_bytes().contains(&b'%') {
+        return Ok((Cow::Borrowed(fragment), 0));
+    }
+
+    let bytes = fragment.as_bytes();
+    let mut cursor = 0usize;
+    let mut decoded_len = 0usize;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'%' {
+            let encoded = bytes.get(cursor + 1..cursor + 3).ok_or_else(|| {
+                Error::Unsupported("document fragment has a truncated percent escape".into())
+            })?;
+            if !encoded.iter().all(u8::is_ascii_hexdigit) {
+                return Err(Error::Unsupported(
+                    "document fragment has an invalid percent escape".into(),
+                ));
+            }
+            cursor += 3;
+        } else {
+            cursor += 1;
+        }
+        decoded_len = decoded_len.checked_add(1).ok_or_else(|| {
+            Error::Unsupported("document fragment decoded length overflow".into())
+        })?;
+    }
+
+    meter.charge(BudgetKind::OwnedBytes, decoded_len)?;
+    let mut decoded = Vec::with_capacity(decoded_len);
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'%' {
+            let high = hex_value(bytes[cursor + 1]);
+            let low = hex_value(bytes[cursor + 2]);
+            decoded.push((high << 4) | low);
+            cursor += 3;
+        } else {
+            decoded.push(bytes[cursor]);
+            cursor += 1;
+        }
+    }
+    // XPointer Framework appendix B encodes pointer characters as UTF-8 octets;
+    // RFC 3986 section 2.1 defines each percent triplet as one encoded octet.
+    // https://www.w3.org/TR/xptr-framework/#escaping
+    // https://www.rfc-editor.org/rfc/rfc3986#section-2.1
+    let decoded = String::from_utf8(decoded).map_err(|_| {
+        meter.release_owned_bytes(decoded_len);
+        Error::Unsupported("document fragment percent escapes are not valid UTF-8".into())
+    })?;
+    Ok((Cow::Owned(decoded), decoded_len))
+}
+
+fn hex_value(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => unreachable!("percent escape was validated before decoding"),
+    }
 }
 
 fn xinclude_workspace_bytes(node_count: usize) -> usize {
@@ -5755,6 +5831,37 @@ mod tests {
         assert!(matches!(&isolated, std::borrow::Cow::Borrowed(_)));
         let context = rewrite_outer_context_functions(&isolated);
         assert!(matches!(context, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn document_fragment_decode_reserves_owned_output_before_allocation() {
+        // Percent decoding must cross the same operation-owned-memory gate as every other
+        // attacker-controlled temporary buffer, before capacity is allocated.
+        let mut meter = Meter::new(
+            ExecutionBudget {
+                source_bytes: 0,
+                external_documents: 0,
+                recursion_depth: 0,
+                xpath_evaluations: 0,
+                template_applications: 0,
+                sort_comparisons: 0,
+                key_entries: 0,
+                result_nodes: 0,
+                serialized_bytes: 0,
+                messages: 0,
+                owned_bytes: 1,
+            },
+            0,
+        )
+        .expect("empty source fits the test budget");
+        assert!(matches!(
+            decode_document_fragment("%C3%A9", &mut meter),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                limit: 1,
+                actual: 2,
+            })
+        ));
     }
 
     #[test]

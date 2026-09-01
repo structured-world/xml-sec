@@ -601,11 +601,11 @@ impl DateValue {
             });
         }
         if body.contains(':') && !body.contains('T') {
-            let (hour, minute, second) = parse_time(body)?;
+            let time = parse_time(body)?;
             return Some(Self {
-                hour: Some(hour),
-                minute: Some(minute),
-                second: Some(second),
+                hour: Some(time.hour),
+                minute: Some(time.minute),
+                second: Some(time.second),
                 kind: DateKind::Time,
                 ..empty
             });
@@ -637,19 +637,26 @@ impl DateValue {
                 ..empty
             });
         };
-        let day = parse_two(day)?;
+        let mut day = parse_two(day)?;
         if !valid_day(year, month, day) {
             return None;
         }
         if let Some(time) = time {
-            let (hour, minute, second) = parse_time(time)?;
+            let time = parse_time(time)?;
+            let (mut year, mut month) = (year, month);
+            if time.advances_day {
+                // XML Schema Part 2 section 3.2.7.1 defines hour 24 with zero minutes and
+                // seconds as the first instant of the following day.
+                // https://www.w3.org/TR/xmlschema-2/#dateTime-lexical-representation
+                (year, month, day) = civil_from_days(days_from_civil(year, month, day) + 1)?;
+            }
             Some(Self {
                 year: Some(year),
                 month: Some(month),
                 day: Some(day),
-                hour: Some(hour),
-                minute: Some(minute),
-                second: Some(second),
+                hour: Some(time.hour),
+                minute: Some(time.minute),
+                second: Some(time.second),
                 kind: DateKind::DateTime,
                 ..empty
             })
@@ -885,7 +892,14 @@ fn parse_two(input: &str) -> Option<u8> {
         .then(|| input.parse().ok())
         .flatten()
 }
-fn parse_time(input: &str) -> Option<(u8, u8, f64)> {
+struct ParsedTime {
+    hour: u8,
+    minute: u8,
+    second: f64,
+    advances_day: bool,
+}
+
+fn parse_time(input: &str) -> Option<ParsedTime> {
     let mut parts = input.split(':');
     let second_lexical = parts.next_back()?;
     let integer_digits = second_lexical
@@ -899,8 +913,30 @@ fn parse_time(input: &str) -> Option<(u8, u8, f64)> {
         parse_two(parts.next()?)?,
         second_lexical.parse::<f64>().ok()?,
     );
-    (parts.next().is_none() && hour < 24 && minute < 60 && (0.0..60.0).contains(&second))
-        .then_some((hour, minute, second))
+    if parts.next().is_some() || minute >= 60 || !(0.0..60.0).contains(&second) {
+        return None;
+    }
+    if hour < 24 {
+        return Some(ParsedTime {
+            hour,
+            minute,
+            second,
+            advances_day: false,
+        });
+    }
+    // XML Schema Part 2 sections 3.2.7.1 and 3.2.8.1 permit only the lexical
+    // end-of-day form 24:00:00(.0+); inspect digits rather than a rounded float.
+    // https://www.w3.org/TR/xmlschema-2/#time-lexical-representation
+    let end_second = second_lexical == "00"
+        || second_lexical.strip_prefix("00.").is_some_and(|fraction| {
+            !fraction.is_empty() && fraction.bytes().all(|byte| byte == b'0')
+        });
+    (hour == 24 && minute == 0 && end_second).then_some(ParsedTime {
+        hour: 0,
+        minute: 0,
+        second: 0.0,
+        advances_day: true,
+    })
 }
 fn is_leap(year: i64) -> bool {
     let year = astronomical_year(year);
@@ -1064,6 +1100,33 @@ fn argument_error<T>(message: &str) -> std::result::Result<T, function::Error> {
 #[cfg(test)]
 mod tests {
     use super::{DateValue, DurationValue, split_timezone};
+
+    #[test]
+    fn end_of_day_lexical_forms_normalize_without_accepting_later_times() {
+        // End-of-day advances a dateTime but is the same midnight value for standalone time;
+        // no non-zero minute or second spelling may enter that normalization path.
+        assert_eq!(
+            DateValue::parse("2000-12-31T24:00:00Z")
+                .expect("XML Schema end-of-day form parses")
+                .render(),
+            "2001-01-01T00:00:00Z"
+        );
+        assert_eq!(
+            DateValue::parse("24:00:00.000+02:00")
+                .expect("standalone end-of-day time parses")
+                .time_string()
+                .as_deref(),
+            Some("00:00:00+02:00")
+        );
+        for invalid in [
+            "24:00:00.1",
+            "24:00:00.0000000000000000000000001",
+            "24:00:01",
+            "24:01:00",
+        ] {
+            assert!(DateValue::parse(invalid).is_none(), "accepted {invalid}");
+        }
+    }
 
     #[test]
     fn month_day_rejects_out_of_range_months() {

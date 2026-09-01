@@ -197,7 +197,25 @@ fn parse_encoding(label: &str) -> Result<SelectedEncoding, Error> {
     if matches_ascii_case(label, &["us-ascii", "ascii"]) {
         return Ok(SelectedEncoding::Ascii);
     }
-    if matches_ascii_case(label, &["iso-8859-1", "latin1", "latin-1"]) {
+    // The IANA-registered labels below name the same ISO-8859-1 repertoire;
+    // WHATWG-style lookup would incorrectly map them to Windows-1252. `latin-1`
+    // is retained as the already-supported punctuation variant.
+    // https://www.iana.org/assignments/character-sets/character-sets.xhtml
+    if matches_ascii_case(
+        label,
+        &[
+            "iso_8859-1:1987",
+            "iso-ir-100",
+            "iso_8859-1",
+            "iso-8859-1",
+            "latin1",
+            "latin-1",
+            "l1",
+            "ibm819",
+            "cp819",
+            "csisolatin1",
+        ],
+    ) {
         return Ok(SelectedEncoding::Latin1);
     }
     encoding_rs::Encoding::for_label(label.as_bytes())
@@ -449,7 +467,25 @@ mod tests {
 
     #[test]
     fn latin1_and_windows_1252_keep_distinct_c1_semantics() {
-        assert_eq!(decode_text(&[0x80], "ISO-8859-1").unwrap(), "\u{80}");
+        // Every IANA label must select the exact registered repertoire rather than the
+        // WHATWG replacement decoder used for HTML compatibility.
+        for alias in [
+            "ISO_8859-1:1987",
+            "iso-ir-100",
+            "ISO_8859-1",
+            "ISO-8859-1",
+            "latin1",
+            "l1",
+            "IBM819",
+            "CP819",
+            "csISOLatin1",
+        ] {
+            assert_eq!(
+                decode_text(&[0x80], alias).unwrap(),
+                "\u{80}",
+                "IANA alias {alias} must retain ISO-8859-1 C1 semantics"
+            );
+        }
         assert_eq!(decode_text(&[0x80], "windows-1252").unwrap(), "€");
     }
 
