@@ -5488,6 +5488,20 @@ fn format_number_honors_apostrophe_quoted_literals() {
 }
 
 #[test]
+fn format_number_uses_negative_affixes_with_the_positive_numeric_shape() {
+    // XSLT 1.0 section 12.3 delegates picture semantics to DecimalFormat, whose negative
+    // subpattern contributes only affixes; its numeric shape is ignored.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#format-number
+    assert_eq!(
+        execute(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="format-number(-1, '0;(00)')"/></xsl:template></xsl:stylesheet>"#,
+            "<source/>",
+        ),
+        "(1)",
+    );
+}
+
+#[test]
 fn format_number_rejects_malformed_picture_grammar() {
     // XSLT 1.0 section 12.3 delegates the localized picture grammar to DecimalFormat: each
     // subpattern has at most one decimal separator and a picture has at most positive and
@@ -5685,6 +5699,26 @@ fn choose_rejects_non_whitespace_character_data_between_branches() {
         .compile(stylesheet, None),
         Err(Error::Static(message)) if message.contains("xsl:choose")
     ));
+}
+
+#[test]
+fn choose_rejects_whitespace_preserved_by_xml_space() {
+    // XSLT 1.0 sections 3.4 and 9.2 strip ordinary stylesheet whitespace, but xml:space keeps
+    // this text node and xsl:choose's element-only content model must then reject it.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#strip
+    let preserved = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:choose xml:space="preserve"> <xsl:when test="true()"/></xsl:choose></xsl:template></xsl:stylesheet>"#;
+    let error = Compiler::new(
+        Arc::new(NoResolver),
+        CompileBudget::new(1 << 20, 0, 32, 1 << 20),
+    )
+    .compile(preserved, None)
+    .expect_err("preserved character data must violate xsl:choose's content model");
+    assert!(
+        matches!(&error, Error::Static(message) if message.contains("xsl:choose")),
+        "{error:?}"
+    );
+
+    compile(&preserved.replace(" xml:space=\"preserve\"", ""));
 }
 
 #[test]
@@ -5923,6 +5957,15 @@ fn capability_queries_distinguish_instructions_and_declarations() {
     // XSLT 1.0 element-available reports executable instructions, not top-level declarations.
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:exsl="http://exslt.org/common"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="element-available('xsl:decimal-format')"/><xsl:text>|</xsl:text><xsl:value-of select="exsl:object-type(system-property('xsl:version'))"/></xsl:template></xsl:stylesheet>"#;
     assert_eq!(execute(stylesheet, "<source/>"), "false|number");
+}
+
+#[test]
+fn element_available_preserves_libxslt_structural_child_compatibility() {
+    // XSLT 1.0 section 15 describes instruction names, while libxslt also advertises these
+    // executable structural children. The compatibility engine intentionally matches libxslt.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#element-available
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="element-available('xsl:if')"/><xsl:text>|</xsl:text><xsl:value-of select="element-available('xsl:when')"/><xsl:text>|</xsl:text><xsl:value-of select="element-available('xsl:otherwise')"/><xsl:text>|</xsl:text><xsl:value-of select="element-available('xsl:sort')"/><xsl:text>|</xsl:text><xsl:value-of select="element-available('xsl:with-param')"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "true|true|true|true|true");
 }
 
 #[test]
@@ -6933,4 +6976,53 @@ fn html_output_ignores_xml_cdata_section_settings() {
     let output = execute(stylesheet, "<source/>");
     assert_eq!(output, "<div>a&lt;b</div>");
     assert!(!output.contains("<![CDATA["));
+}
+
+#[test]
+fn exslt_replace_preserves_libxslt_node_set_string_compatibility() {
+    // The current EXSLT text specifies replacement nodes, but libxslt implements the earlier
+    // contract by using each node's XPath string-value. Drop-in compatibility takes precedence.
+    // https://exslt.github.io/str/functions/replace/index.html
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings" exclude-result-prefixes="str"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><out><xsl:copy-of select="str:replace('abc', root/search, root/replacement/node())"/></out></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(
+            stylesheet,
+            "<root><search>a</search><search>b</search><search>c</search><replacement><mark id=\"kept\">R</mark><!--kept--><?kept value?></replacement></root>",
+        ),
+        "<out>Rkeptvalue</out>\n",
+    );
+}
+
+#[test]
+fn include_position_blocks_later_imports_but_not_earlier_imports() {
+    // XSLT 1.0 section 2.6.2 requires imports before every other element child, explicitly
+    // including xsl:include, after included imports have been hoisted.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#import
+    let resolver = Arc::new(MemoryResolver::default());
+    let mut resources = resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned");
+    resources.insert(
+        "empty.xsl".into(),
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"/>"#
+            .into(),
+    );
+    resources.insert(
+        "base.xsl".into(),
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#.into(),
+    );
+    drop(resources);
+
+    let compiler = Compiler::new(resolver, CompileBudget::new(1 << 20, 8, 256, 1 << 20));
+    let invalid = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:include href="empty.xsl"/><xsl:import href="base.xsl"/></xsl:stylesheet>"#;
+    assert!(matches!(
+        compiler.compile(invalid, Some("memory:main.xsl")),
+        Err(Error::Static(message)) if message.contains("xsl:import")
+    ));
+
+    let valid = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:import href="base.xsl"/><xsl:include href="empty.xsl"/></xsl:stylesheet>"#;
+    compiler
+        .compile(valid, Some("memory:main.xsl"))
+        .expect("leading import followed by include is valid");
 }

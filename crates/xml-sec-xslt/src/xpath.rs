@@ -1110,6 +1110,10 @@ impl Evaluator {
                         meter,
                         custom_calls,
                     )?;
+                    // libxslt implements the earlier str:replace contract by converting each
+                    // replacement node to its XPath string-value. The current EXSLT text instead
+                    // specifies node copies; preserving libxslt behavior is required for drop-in
+                    // compatibility. https://exslt.github.io/str/functions/replace/index.html
                     let replaced = replace_exslt_string(&input, &searches, &replacements, meter)?;
                     let fragment = text_document(&replaced, meter)?;
                     let root = self.import_document(&fragment, meter)?;
@@ -4807,6 +4811,9 @@ impl function::Function for ElementAvailable {
                     | "message"
                     | "number"
                     | "processing-instruction"
+                    // XSLT 1.0 section 15 limits this function to instructions, but libxslt
+                    // deliberately advertises these executable structural children as well.
+                    // https://www.w3.org/TR/1999/REC-xslt-19991116#element-available
                     | "sort"
                     | "text"
                     | "value-of"
@@ -5348,22 +5355,22 @@ fn render_decimal(
     }
     let alternatives = tokenize_decimal_pattern(pattern, format)?;
     let negative = value.is_sign_negative();
-    let negative_subpattern = negative
-        && alternatives.len() > 1
-        && alternatives[0] != alternatives[1]
-        && decimal_pattern_shape(&alternatives[0], format)
-            == decimal_pattern_shape(&alternatives[1], format);
-    let selected = if negative_subpattern {
+    // java.text.DecimalFormat defines the negative subpattern as an affix override only;
+    // digit counts, grouping, and all other numeric shape come from the positive subpattern.
+    // https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/text/DecimalFormat.html
+    let negative_subpattern = negative && alternatives.len() > 1;
+    let affix_pattern = if negative_subpattern {
         &alternatives[1]
     } else {
         &alternatives[0]
     };
-    let multiplier = if selected
+    let number_pattern = &alternatives[0];
+    let multiplier = if number_pattern
         .iter()
         .any(|token| token.syntax && token.value == format.percent)
     {
         100.0
-    } else if selected
+    } else if number_pattern
         .iter()
         .any(|token| token.syntax && token.value == format.per_mille)
     {
@@ -5371,39 +5378,24 @@ fn render_decimal(
     } else {
         1.0
     };
-    let first = selected
-        .iter()
-        .position(|token| {
-            token.syntax
-                && matches!(token.value, value if value == format.digit || value == format.zero_digit || value == format.decimal_separator)
-        })
-        .ok_or_else(|| function::Error::Other {
-            what: "format-number pattern has no digit".into(),
-        })?;
-    let last = selected
-        .iter()
-        .rposition(|token| {
-            token.syntax
-                && matches!(token.value, value if value == format.digit || value == format.zero_digit || value == format.decimal_separator)
-        })
-        .map(|index| index + 1)
-        .unwrap_or(first + 1);
+    let (number_first, number_last) = decimal_pattern_bounds(number_pattern, format)?;
+    let (affix_first, affix_last) = decimal_pattern_bounds(affix_pattern, format)?;
     if value.is_infinite() {
         let mut output = String::new();
         if negative && !negative_subpattern {
             output.push(format.minus_sign);
         }
-        output.extend(selected[..first].iter().map(|token| token.value));
+        output.extend(affix_pattern[..affix_first].iter().map(|token| token.value));
         output.push_str(&format.infinity);
-        output.extend(selected[last..].iter().map(|token| token.value));
+        output.extend(affix_pattern[affix_last..].iter().map(|token| token.value));
         return Ok(output);
     }
-    let number_pattern = &selected[first..last];
-    let decimal = number_pattern
+    let number = &number_pattern[number_first..number_last];
+    let decimal = number
         .iter()
         .position(|token| token.syntax && token.value == format.decimal_separator);
-    let (integer_pattern, fraction_pattern) = decimal.map_or((number_pattern, &[][..]), |index| {
-        (&number_pattern[..index], &number_pattern[index + 1..])
+    let (integer_pattern, fraction_pattern) = decimal.map_or((number, &[][..]), |index| {
+        (&number[..index], &number[index + 1..])
     });
     let minimum_integer = integer_pattern
         .iter()
@@ -5421,7 +5413,7 @@ fn render_decimal(
         .count();
     let mut minimum_fraction = minimum_fraction;
     if integer_pattern.is_empty()
-        && number_pattern
+        && number
             .first()
             .is_some_and(|token| token.syntax && token.value == format.decimal_separator)
         && maximum_fraction > 0
@@ -5481,10 +5473,10 @@ fn render_decimal(
     if negative && !negative_subpattern {
         output.push(format.minus_sign);
     }
-    output.extend(selected[..first].iter().map(|token| token.value));
+    output.extend(affix_pattern[..affix_first].iter().map(|token| token.value));
     output.push_str(&integer);
     if !fraction.is_empty()
-        || number_pattern
+        || number
             .last()
             .is_some_and(|token| token.syntax && token.value == format.decimal_separator)
     {
@@ -5493,7 +5485,7 @@ fn render_decimal(
             output.push_str(fraction);
         }
     }
-    output.extend(selected[last..].iter().map(|token| token.value));
+    output.extend(affix_pattern[affix_last..].iter().map(|token| token.value));
     Ok(output)
 }
 
@@ -5659,10 +5651,10 @@ fn invalid_decimal_pattern(reason: &str) -> function::Error {
     }
 }
 
-fn decimal_pattern_shape(
+fn decimal_pattern_bounds(
     pattern: &[DecimalPatternToken],
     format: &DecimalFormat,
-) -> (usize, usize, usize, usize) {
+) -> std::result::Result<(usize, usize), function::Error> {
     let first = pattern.iter().position(|token| {
         token.syntax
             && matches!(token.value, value if value == format.digit || value == format.zero_digit || value == format.decimal_separator)
@@ -5671,49 +5663,10 @@ fn decimal_pattern_shape(
         token.syntax
             && matches!(token.value, value if value == format.digit || value == format.zero_digit || value == format.decimal_separator)
     });
-    let Some((first, last)) = first.zip(last) else {
-        return (0, 0, 0, 0);
-    };
-    let number = &pattern[first..=last];
-    let decimal = number
-        .iter()
-        .position(|token| token.syntax && token.value == format.decimal_separator);
-    let (integer, fraction) = decimal.map_or((number, &[][..]), |index| {
-        (&number[..index], &number[index + 1..])
-    });
-    let minimum_integer = integer
-        .iter()
-        .filter(|token| token.syntax && token.value == format.zero_digit)
-        .count();
-    let minimum_fraction = fraction
-        .iter()
-        .filter(|token| token.syntax && token.value == format.zero_digit)
-        .count();
-    let maximum_fraction = fraction
-        .iter()
-        .filter(|token| {
-            token.syntax && matches!(token.value, value if value == format.zero_digit || value == format.digit)
-        })
-        .count();
-    let grouping = integer
-        .iter()
-        .rposition(|token| token.syntax && token.value == format.grouping_separator)
-        .map(|index| {
-            integer[index + 1..]
-                .iter()
-                .filter(|token| {
-                    token.syntax
-                        && matches!(token.value, value if value == format.zero_digit || value == format.digit)
-                })
-                .count()
-        })
-        .unwrap_or(0);
-    (
-        minimum_integer,
-        minimum_fraction,
-        maximum_fraction,
-        grouping,
-    )
+    first
+        .zip(last)
+        .map(|(first, last)| (first, last + 1))
+        .ok_or_else(|| invalid_decimal_pattern("subpattern has no digit"))
 }
 impl function::Function for CurrentNode {
     fn evaluate<'c, 'd>(

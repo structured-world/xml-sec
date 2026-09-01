@@ -150,6 +150,10 @@ impl<R: Resolver> Compiler<R> {
                         StylesheetModuleKind::Simplified => Ok(()),
                     }
                 })?;
+                // XSLT 1.0 section 2.6.2 requires imports to precede every other top-level
+                // element, explicitly including xsl:include after its imports are expanded.
+                // https://www.w3.org/TR/1999/REC-xslt-19991116#import
+                *saw_non_import = true;
             } else {
                 *saw_non_import = true;
             }
@@ -2093,7 +2097,9 @@ fn compile_instruction(
             let mut saw_otherwise = false;
             for child in node.children() {
                 if child.is_text() {
-                    if child.text().is_none_or(is_xml_whitespace_only) {
+                    if child.text().is_none_or(is_xml_whitespace_only)
+                        && !stylesheet_space_is_preserved(child)
+                    {
                         continue;
                     }
                     return Err(Error::Static(
