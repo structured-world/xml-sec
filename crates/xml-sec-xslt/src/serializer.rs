@@ -996,6 +996,9 @@ fn serialize_node(
                                 .doctype_public
                                 .as_deref()
                                 .is_some_and(|public| public.contains("XHTML"))));
+                // XSLT 1.0 section 16.2 requires generated content-type metadata immediately
+                // after HEAD; it does not suppress generation when the result tree has metadata.
+                // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
                 if definition.inject_content_type && html_head {
                     if definition.indent {
                         output.push('\n');
@@ -1038,9 +1041,14 @@ fn serialize_node(
                 let mut index = 0usize;
                 while index < node.children.len() {
                     let child = node.children[index];
+                    // The pinned libxslt oracle replaces legacy Content-Type metadata with the
+                    // generated declaration above. Restrict that compatibility behavior to the
+                    // XSLT 1.0 form; HTML5 `charset` metadata remains an ordinary result node.
                     if definition.inject_content_type
                         && html_head
-                        && document.node(child).is_some_and(is_html_encoding_meta)
+                        && document
+                            .node(child)
+                            .is_some_and(is_legacy_html_content_type_meta)
                     {
                         index += 1;
                         continue;
@@ -1340,7 +1348,7 @@ fn escape_html_uri(value: &str) -> Cow<'_, str> {
     Cow::Owned(escaped)
 }
 
-fn is_html_encoding_meta(node: &crate::Node) -> bool {
+fn is_legacy_html_content_type_meta(node: &crate::Node) -> bool {
     let NodeKind::Element {
         name, attributes, ..
     } = &node.kind
@@ -1351,9 +1359,8 @@ fn is_html_encoding_meta(node: &crate::Node) -> bool {
         && name.local.eq_ignore_ascii_case("meta")
         && attributes.iter().any(|attribute| {
             attribute.name.namespace.is_none()
-                && (attribute.name.local.eq_ignore_ascii_case("charset")
-                    || (attribute.name.local.eq_ignore_ascii_case("http-equiv")
-                        && attribute.value.eq_ignore_ascii_case("content-type")))
+                && attribute.name.local.eq_ignore_ascii_case("http-equiv")
+                && attribute.value.eq_ignore_ascii_case("content-type")
         })
 }
 

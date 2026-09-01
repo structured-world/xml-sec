@@ -2978,23 +2978,25 @@ fn resolve_xinclude(
                 u32::from(character)
             ))));
         }
+        let canonical_uri = resource.canonical_uri.clone();
         if identity_is_new {
-            identities.insert(resource.identity.clone(), resource.clone());
+            identities.insert(resource.identity.clone(), resource);
         } else {
             meter.release_owned_bytes(resource.bytes.len());
         }
-        return Ok(XIncludeContent::Text(value, resource.canonical_uri));
+        return Ok(XIncludeContent::Text(value, canonical_uri));
     }
     let xml = decode_xinclude_resource(&resource.bytes, resource.encoding.as_deref(), meter, true)?;
     let decoded_temporary_bytes = xml.len().saturating_mul(2);
     let document =
         Document::parse(&xml, Some(&resource.canonical_uri)).map_err(XIncludeFailure::Fatal)?;
+    let resource_identity = resource.identity.clone();
     if identity_is_new {
-        identities.insert(resource.identity.clone(), resource.clone());
+        identities.insert(resource_identity.clone(), resource);
     } else {
         meter.release_owned_bytes(resource.bytes.len());
     }
-    include_stack.push(resource.identity);
+    include_stack.push(resource_identity);
     let expanded = expand_xinclude_document(
         &document,
         resolver,
@@ -3016,6 +3018,12 @@ fn decode_xinclude_resource(
     meter: &mut Meter,
     parsed_xml: bool,
 ) -> std::result::Result<String, XIncludeFailure> {
+    let (bytes, encoding) = if !parsed_xml {
+        let (bytes, encoding) = xinclude_text_payload(bytes, encoding.unwrap_or("UTF-8"));
+        (bytes, Some(encoding))
+    } else {
+        (bytes, encoding)
+    };
     decode_resource_metered_inner(bytes, encoding, meter, parsed_xml).map_err(|error| match error {
         MeteredDecodeError::Budget(error) => XIncludeFailure::Fatal(error),
         MeteredDecodeError::Decode(error) => {
@@ -3032,6 +3040,55 @@ fn decode_xinclude_resource(
             }
         }
     })
+}
+
+fn xinclude_text_payload<'a>(bytes: &'a [u8], encoding: &'a str) -> (&'a [u8], &'a str) {
+    // XInclude 1.0 section 4.3.3 says an encoding signature is not part of the acquired text.
+    // Select generic UTF byte order from that signature, then borrow past it so neither decoding
+    // nor post-decode buffer shifting performs work for a character that must be discarded.
+    // https://www.w3.org/TR/xinclude/#text_included
+    if (encoding.eq_ignore_ascii_case("UTF-8") || encoding.eq_ignore_ascii_case("UTF8"))
+        && let Some(payload) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF])
+    {
+        return (payload, encoding);
+    }
+    if encoding.eq_ignore_ascii_case("UTF-16") || encoding.eq_ignore_ascii_case("UTF16") {
+        if let Some(payload) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+            return (payload, "UTF-16BE");
+        }
+        if let Some(payload) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+            return (payload, "UTF-16LE");
+        }
+    }
+    if (encoding.eq_ignore_ascii_case("UTF-16BE") || encoding.eq_ignore_ascii_case("UTF16BE"))
+        && let Some(payload) = bytes.strip_prefix(&[0xFE, 0xFF])
+    {
+        return (payload, encoding);
+    }
+    if (encoding.eq_ignore_ascii_case("UTF-16LE") || encoding.eq_ignore_ascii_case("UTF16LE"))
+        && let Some(payload) = bytes.strip_prefix(&[0xFF, 0xFE])
+    {
+        return (payload, encoding);
+    }
+    if encoding.eq_ignore_ascii_case("UTF-32") || encoding.eq_ignore_ascii_case("UTF32") {
+        if let Some(payload) = bytes.strip_prefix(&[0x00, 0x00, 0xFE, 0xFF]) {
+            return (payload, "UTF-32BE");
+        }
+        if let Some(payload) = bytes.strip_prefix(&[0xFF, 0xFE, 0x00, 0x00]) {
+            return (payload, "UTF-32LE");
+        }
+    }
+    if (encoding.eq_ignore_ascii_case("UTF-32BE") || encoding.eq_ignore_ascii_case("UTF32BE"))
+        && let Some(payload) = bytes.strip_prefix(&[0x00, 0x00, 0xFE, 0xFF])
+    {
+        return (payload, encoding);
+    }
+    if (encoding.eq_ignore_ascii_case("UTF-32LE") || encoding.eq_ignore_ascii_case("UTF32LE"))
+        && let Some(payload) = bytes.strip_prefix(&[0xFF, 0xFE, 0x00, 0x00])
+    {
+        return (payload, encoding);
+    }
+    (bytes, encoding)
 }
 
 fn decode_resource_for_xml_parse(
@@ -5600,7 +5657,7 @@ fn render_decimal(
     }
     let (integer, fraction) = rendered.split_once('.').unwrap_or((&rendered, ""));
     let mut integer = format!("{integer:0>minimum_integer$}");
-    if minimum_integer == 0 && minimum_fraction > 0 && scaled < 1.0 {
+    if minimum_integer == 0 && minimum_fraction > 0 && integer == "0" {
         integer.clear();
     }
     if format.zero_digit != '0' {

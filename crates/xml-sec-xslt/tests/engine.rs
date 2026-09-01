@@ -876,6 +876,20 @@ fn serializer_honors_doctype_cdata_html_and_text_contracts() {
         r#"<html><head><meta charset="UTF-8"></head></html>"#
     );
 
+    // XSLT 1.0 section 16.2 always generates content-type metadata. The pinned libxslt contract
+    // replaces its legacy equivalent, while unrelated HTML5 charset metadata remains intact.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
+    let existing_html_meta = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="html" indent="no"/><xsl:template match="/"><html><head><meta http-equiv="Content-Type" content="text/plain; charset=ISO-8859-1" data-owner="caller"/></head></html></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(existing_html_meta, "<source/>"),
+        r#"<html><head><meta charset="UTF-8"></head></html>"#,
+    );
+    let existing_charset_meta = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="html" indent="no"/><xsl:template match="/"><html><head><meta charset="ISO-8859-1" data-owner="caller"/></head></html></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(existing_charset_meta, "<source/>"),
+        r#"<html><head><meta charset="UTF-8"><meta charset="ISO-8859-1" data-owner="caller"></head></html>"#,
+    );
+
     let foreign_head = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:f="urn:foreign"><xsl:output method="html" indent="no"/><xsl:template match="/"><f:head><f:meta charset="kept"/></f:head></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(foreign_head, "<source/>"),
@@ -3232,6 +3246,84 @@ fn xinclude_fallback_handles_only_resource_errors() {
             )
             .expect_err("fatal XInclude errors must bypass fallback");
         assert!(matches!(error, Error::Xml(_) | Error::Unsupported(_)));
+    }
+}
+
+#[test]
+fn xinclude_text_strips_encoding_signatures() {
+    // XInclude 1.0 section 4.3.3 requires an encoding signature to be interpreted and removed
+    // before the text resource is included in the document.
+    // https://www.w3.org/TR/xinclude/#text_included
+    let resolver = Arc::new(ContextResolver::default());
+    for (href, encoding, bytes) in [
+        (
+            "utf8.txt",
+            "UTF-8",
+            [b"\xEF\xBB\xBF".as_slice(), "alpha".as_bytes()].concat(),
+        ),
+        (
+            "utf16le.txt",
+            "UTF-16LE",
+            [0xFEFF_u16]
+                .into_iter()
+                .chain("beta".encode_utf16())
+                .flat_map(u16::to_le_bytes)
+                .collect(),
+        ),
+        (
+            "utf16be.txt",
+            "UTF-16",
+            [0xFEFF_u16]
+                .into_iter()
+                .chain("gamma".encode_utf16())
+                .flat_map(u16::to_be_bytes)
+                .collect(),
+        ),
+    ] {
+        resolver
+            .resources
+            .lock()
+            .expect("test resolver mutex is not poisoned")
+            .insert(
+                (href.into(), Some("memory:source.xml".into())),
+                ResolvedResource {
+                    canonical_uri: format!("memory:{href}"),
+                    identity: ResourceIdentity(href.into()),
+                    bytes,
+                    media_type: Some("text/plain".into()),
+                    encoding: Some(encoding.into()),
+                },
+            );
+    }
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="root"/></xsl:template></xsl:stylesheet>"#,
+    );
+    for (href, expected) in [
+        ("utf8.txt", "alpha"),
+        ("utf16le.txt", "beta"),
+        ("utf16be.txt", "gamma"),
+    ] {
+        let source = Document::parse(
+            &format!(
+                r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="{href}" parse="text"/></root>"#
+            ),
+            Some("memory:source.xml"),
+        )
+        .expect("XInclude source parses");
+        let result = stylesheet
+            .execute_with_source_processing(
+                &source,
+                &Parameters::new(),
+                resolver.clone(),
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+                SourceProcessing::XInclude,
+            )
+            .expect("encoding signature is removed from included text");
+        assert_eq!(result.serialized.bytes, expected.as_bytes());
     }
 }
 
@@ -6020,6 +6112,19 @@ fn format_number_handles_fraction_precision_beyond_f64_decimal_exponents() {
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="format-number(1, '{picture}')"/></xsl:template></xsl:stylesheet>"#,
     );
     assert_eq!(execute(&stylesheet, "<source/>"), "1");
+}
+
+#[test]
+fn format_number_suppresses_only_a_rounded_zero_integer() {
+    // DecimalFormat applies the picture to the rounded result. Omitting the optional leading
+    // zero must not erase an integer produced when rounding crosses the unit boundary.
+    assert_eq!(
+        execute(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="format-number(0.999, '.00')"/><xsl:text>|</xsl:text><xsl:value-of select="format-number(0.125, '.00')"/></xsl:template></xsl:stylesheet>"#,
+            "<source/>",
+        ),
+        "1.00|.13",
+    );
 }
 
 #[test]
