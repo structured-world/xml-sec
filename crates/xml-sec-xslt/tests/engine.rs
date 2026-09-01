@@ -3149,6 +3149,7 @@ fn xinclude_fallback_handles_only_resource_errors() {
     for source in [
         r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="missing.xml" parse="invalid"><xi:fallback><wrong/></xi:fallback></xi:include></root>"#,
         r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="missing.xml" xpointer="element(/1)"><xi:fallback><wrong/></xi:fallback></xi:include></root>"#,
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="missing.xml#fragment"><xi:fallback><wrong/></xi:fallback></xi:include></root>"#,
     ] {
         let error = stylesheet
             .execute_with_source_processing(
@@ -3165,6 +3166,41 @@ fn xinclude_fallback_handles_only_resource_errors() {
             .expect_err("fatal XInclude errors must bypass fallback");
         assert!(matches!(error, Error::Xml(_) | Error::Unsupported(_)));
     }
+}
+
+#[test]
+fn xinclude_fragment_href_is_rejected_before_resolver_access() {
+    // XInclude 1.0 section 3.1 makes any fragment identifier in href a fatal error, including an
+    // empty fragment, and therefore it must not cross the resolver boundary.
+    // https://www.w3.org/TR/xinclude/#include_element
+    let resolver = Arc::new(CountingResolver::default());
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#,
+    );
+    for href in ["included.xml#fragment", "included.xml#"] {
+        let source = Document::parse(
+            &format!(
+                r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="{href}"/></root>"#
+            ),
+            Some("memory:source.xml"),
+        )
+        .expect("source parses before XInclude validation");
+        let error = stylesheet
+            .execute_with_source_processing(
+                &source,
+                &Parameters::new(),
+                resolver.clone(),
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+                SourceProcessing::XInclude,
+            )
+            .expect_err("fragment-bearing XInclude href must be fatal");
+        assert!(matches!(error, Error::Xml(message) if message.contains("fragment")));
+    }
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -3858,6 +3894,41 @@ fn xinclude_clone_budget_is_checked_before_resolver_access() {
 }
 
 #[test]
+fn sequential_xincludes_release_temporary_projection_memory() {
+    // OwnedBytes is a peak-live-memory ceiling. Included documents and remap workspaces die after
+    // each subtree is copied, so sequential inclusions must not accumulate their reservations.
+    let resolver = Arc::new(CountingResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("resolver mutex")
+        .insert("included.xml".into(), "<included/>".into());
+    let source_xml = format!(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude">{}</root>"#,
+        r#"<xi:include href="included.xml"/>"#.repeat(64)
+    );
+    let source = Document::parse(&source_xml, Some("memory:source.xml")).expect("source parses");
+    let mut budget = execution_budget(source_xml.len());
+    budget.external_documents = 64;
+    budget.owned_bytes = 176 * 1024;
+    compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#,
+    )
+    .execute_with_source_processing(
+        &source,
+        &Parameters::new(),
+        resolver,
+        ExecutionOptions {
+            budget,
+            initial_mode: None,
+            initial_template: None,
+        },
+        SourceProcessing::XInclude,
+    )
+    .expect("sequential XInclude temporaries remain below the peak-memory ceiling");
+}
+
+#[test]
 fn supplied_global_parameter_respects_the_preallocation_budget() {
     // Caller values are already owned by Parameters. Retaining a global binding must reject its
     // second copy against OwnedBytes before the execution path duplicates the payload.
@@ -3921,6 +3992,64 @@ fn xpath_scope_snapshot_counts_toward_peak_owned_memory() {
             kind: BudgetKind::OwnedBytes,
             ..
         })
+    ));
+}
+
+#[test]
+fn value_of_transfers_owned_xpath_string_without_transient_copies() {
+    // The evaluated concat result can move directly into a new text node. The execution must not
+    // require simultaneous source, conversion, and result-tree copies of the same string.
+    let payload = "x".repeat(256 * 1024);
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="concat(/source, '')"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source_xml = format!("<source>{payload}</source>");
+    let mut budget = execution_budget(source_xml.len());
+    budget.owned_bytes = 2 * 1024 * 1024;
+    let result = stylesheet
+        .execute(
+            &Document::parse(&source_xml, None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("owned XPath string transfers within the peak-memory ceiling");
+    assert_eq!(result.serialized.bytes.len(), payload.len());
+}
+
+#[test]
+fn adjacent_value_of_accounts_for_the_owned_string_while_coalescing_text() {
+    // Adjacent XSLT text nodes coalesce. The owned XPath string remains live while it is copied
+    // into the existing result node, so both allocations must fit the peak-memory ceiling.
+    let payload = "x".repeat(256 * 1024);
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:text>prefix</xsl:text><xsl:value-of select="concat(/source, '')"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source_xml = format!("<source>{payload}</source>");
+    let mut budget = execution_budget(source_xml.len());
+    budget.owned_bytes = 5 * 256 * 1024;
+    let error = stylesheet
+        .execute(
+            &Document::parse(&source_xml, None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect_err("coalescing must account for the live owned XPath buffer");
+    assert!(matches!(
+        error,
+        Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        }
     ));
 }
 
@@ -7311,6 +7440,19 @@ fn number_letter_value_rejects_invalid_evaluated_values_in_strict_mode() {
             r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:number value="1" format="A" letter-value="{letter_value}"/></xsl:template></xsl:stylesheet>"#
         );
         assert!(!execute(&stylesheet, "<source/>").is_empty());
+    }
+}
+
+#[test]
+fn explicit_latin_format_tokens_remain_alphabetic_with_traditional_letter_value() {
+    // XSLT 1.0 section 7.7.1 defines the exact A/a sequences; letter-value disambiguates other
+    // language-specific tokens and cannot turn these explicit tokens into decimal numbering.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#convert
+    for (format, expected) in [("A", "AA"), ("a", "aa")] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:number value="27" format="{format}" letter-value="traditional"/></xsl:template></xsl:stylesheet>"#
+        );
+        assert_eq!(execute(&stylesheet, "<source/>"), expected);
     }
 }
 

@@ -1453,8 +1453,8 @@ impl<'a> Execution<'a> {
             } => {
                 let value = self
                     .evaluate(select, node, position, size)?
-                    .string(&self.evaluator);
-                self.append_text(&value, *disable_output_escaping)
+                    .into_string(&self.evaluator);
+                self.append_owned_text(value, *disable_output_escaping)
             }
             Instruction::CopyOf(select) => {
                 match self.evaluate(select, node, position, size)? {
@@ -1467,8 +1467,8 @@ impl<'a> Execution<'a> {
                         self.copy_document(&fragment, fragment.root(), self.parent(), depth + 1)?;
                     }
                     value => {
-                        let text = value.string(&self.evaluator);
-                        self.append_text(&text, false)?
+                        let text = value.into_string(&self.evaluator);
+                        self.append_owned_text(text, false)?
                     }
                 }
                 Ok(())
@@ -2925,11 +2925,23 @@ impl<'a> Execution<'a> {
                 )
             })
         {
-            self.meter.charge(BudgetKind::OwnedBytes, value.len())?;
+            let temporary_bytes = matches!(&value, Cow::Owned(_)).then_some(value.len());
+            if let Some(bytes) = temporary_bytes {
+                self.meter.charge(BudgetKind::OwnedBytes, bytes)?;
+            }
+            if let Err(error) = self.meter.charge(BudgetKind::OwnedBytes, value.len()) {
+                if let Some(bytes) = temporary_bytes {
+                    self.meter.release_owned_bytes(bytes);
+                }
+                return Err(error);
+            }
             if let Some(NodeKind::Text { value: current, .. }) =
                 self.result.node_mut(previous).map(|node| &mut node.kind)
             {
                 current.push_str(&value);
+            }
+            if let Some(bytes) = temporary_bytes {
+                self.meter.release_owned_bytes(bytes);
             }
             return Ok(());
         }
@@ -3975,7 +3987,7 @@ fn format_number_sequence(
     values: &[f64],
     format: &str,
     _lang: Option<&str>,
-    letter_value: Option<&str>,
+    _letter_value: Option<&str>,
     separator: Option<char>,
     size: Option<usize>,
     meter: &Meter,
@@ -3997,15 +4009,7 @@ fn format_number_sequence(
             if index > 0 {
                 append_metered(&mut output, ".", meter)?;
             }
-            format_number_into(
-                &mut output,
-                *value,
-                "1",
-                letter_value,
-                separator,
-                size,
-                meter,
-            )?;
+            format_number_into(&mut output, *value, "1", separator, size, meter)?;
         }
         return Ok(output);
     }
@@ -4027,15 +4031,7 @@ fn format_number_sequence(
             .or_else(|| tokens.formats.last())
             .copied()
             .unwrap_or("1");
-        format_number_into(
-            &mut output,
-            *value,
-            token,
-            letter_value,
-            separator,
-            size,
-            meter,
-        )?;
+        format_number_into(&mut output, *value, token, separator, size, meter)?;
     }
     append_metered(&mut output, tokens.suffix, meter)?;
     Ok(output)
@@ -4353,7 +4349,6 @@ fn format_number_into(
     output: &mut String,
     value: f64,
     format: &str,
-    letter_value: Option<&str>,
     separator: Option<char>,
     size: Option<usize>,
     meter: &Meter,
@@ -4372,7 +4367,10 @@ fn format_number_into(
         return append_localized_decimal(output, "0", width, zero, None, None, meter);
     }
     match format {
-        "A" | "a" if letter_value != Some("traditional") => {
+        // XSLT 1.0 section 7.7.1 fixes the A/a sequences explicitly; letter-value only
+        // disambiguates language-specific letter tokens.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#convert
+        "A" | "a" => {
             let value = alphabetic(rounded as usize, format == "A");
             append_metered(output, &value, meter)
         }

@@ -102,14 +102,15 @@ pub(crate) fn prepare_evaluator_source(
 ) -> Result<PreparedEvaluatorSource> {
     let mut resource_identities = HashMap::new();
     let (mut document, include_remap) = if options.processing == SourceProcessing::XInclude {
-        expand_xinclude_document(
+        let expanded = expand_xinclude_document(
             source,
             resolver,
             meter,
             &mut resource_identities,
             &mut Vec::new(),
             0,
-        )?
+        )?;
+        (expanded.document, expanded.principal_mapping)
     } else {
         meter.charge(BudgetKind::OwnedBytes, source.estimated_clone_bytes())?;
         (source.clone(), None)
@@ -1681,13 +1682,15 @@ impl Evaluator {
                     }
                     Err(error) => return Err(error),
                 };
-                if let Some(previous) = self.resource_identities.get(&resource.identity)
-                    && previous != &resource
-                {
-                    return Err(Error::StaleResource {
-                        identity: resource.identity,
-                    });
-                }
+                let identity_is_new = match self.resource_identities.get(&resource.identity) {
+                    Some(previous) if previous != &resource => {
+                        return Err(Error::StaleResource {
+                            identity: resource.identity,
+                        });
+                    }
+                    Some(_) => false,
+                    None => true,
+                };
                 if let Some(root) = self.resource_documents.get(&resource.identity).cloned() {
                     self.cache_document(resource_request.clone(), vec![root.clone()]);
                     Some(root)
@@ -1698,24 +1701,33 @@ impl Evaluator {
                         meter,
                     )?;
                     let document = Document::parse(&xml, Some(&resource.canonical_uri))?;
-                    let mut document = if self.source_processing == SourceProcessing::XInclude {
-                        let mut stack = vec![resource.identity.clone()];
-                        expand_xinclude_document(
-                            &document,
-                            self.resolver.as_ref(),
-                            meter,
-                            &mut self.resource_identities,
-                            &mut stack,
-                            1,
-                        )?
-                        .0
-                    } else {
-                        document
-                    };
+                    let (mut document, expanded_reservation) =
+                        if self.source_processing == SourceProcessing::XInclude {
+                            let mut stack = vec![resource.identity.clone()];
+                            let expanded = expand_xinclude_document(
+                                &document,
+                                self.resolver.as_ref(),
+                                meter,
+                                &mut self.resource_identities,
+                                &mut stack,
+                                1,
+                            )?;
+                            (expanded.document, Some(expanded.retained_owned_bytes))
+                        } else {
+                            (document, None)
+                        };
                     let _ = apply_whitespace_rules(&mut document, &self.whitespace);
                     let root = self.import_document(&document, meter)?;
-                    self.resource_identities
-                        .insert(resource.identity.clone(), resource.clone());
+                    if let Some(reservation) = expanded_reservation {
+                        meter.release_owned_bytes(reservation);
+                    }
+                    meter.release_owned_bytes(xml.len().saturating_mul(2));
+                    if identity_is_new {
+                        self.resource_identities
+                            .insert(resource.identity.clone(), resource.clone());
+                    } else {
+                        meter.release_owned_bytes(resource.bytes.len());
+                    }
                     self.resource_documents
                         .insert(resource.identity, root.clone());
                     self.cache_document(resource_request.clone(), vec![root.clone()]);
@@ -2633,6 +2645,12 @@ pub(crate) fn parse_xpath_number_token(value: &str) -> Option<f64> {
 
 const XINCLUDE_NS: &str = "http://www.w3.org/2001/XInclude";
 
+struct ExpandedXIncludeDocument {
+    document: Document,
+    principal_mapping: Option<HashMap<NodeId, NodeId>>,
+    retained_owned_bytes: usize,
+}
+
 fn expand_xinclude_document(
     source: &Document,
     resolver: &dyn Resolver,
@@ -2640,15 +2658,19 @@ fn expand_xinclude_document(
     identities: &mut HashMap<ResourceIdentity, ResolvedResource>,
     include_stack: &mut Vec<ResourceIdentity>,
     depth: usize,
-) -> Result<(Document, Option<HashMap<NodeId, NodeId>>)> {
+) -> Result<ExpandedXIncludeDocument> {
     meter.recursion(depth)?;
     let source_nodes = source.node_count();
+    let source_clone_bytes = source.estimated_clone_bytes();
+    let mapping_bytes = xinclude_remap_bytes(source_nodes);
+    let pending_bytes = xinclude_pending_bytes(source_nodes);
     meter.charge(
         BudgetKind::OwnedBytes,
-        source
-            .estimated_clone_bytes()
-            .saturating_add(xinclude_workspace_bytes(source_nodes)),
+        source_clone_bytes
+            .saturating_add(mapping_bytes)
+            .saturating_add(pending_bytes),
     )?;
+    let mut retained_owned_bytes = source_clone_bytes.saturating_add(mapping_bytes);
     let base_uri = source
         .node(source.root())
         .and_then(|node| node.base_uri.clone());
@@ -2694,25 +2716,28 @@ fn expand_xinclude_document(
         );
         match result {
             Ok(XIncludeContent::Xml(included)) => {
-                let included_nodes = included.node_count();
+                let included_nodes = included.document.node_count();
+                let copied_bytes = included.document.estimated_clone_bytes();
+                let remap_bytes = xinclude_remap_bytes(included_nodes);
                 meter.charge(
                     BudgetKind::OwnedBytes,
-                    included
-                        .estimated_clone_bytes()
-                        .saturating_add(xinclude_remap_bytes(included_nodes)),
+                    copied_bytes.saturating_add(remap_bytes),
                 )?;
                 let mut included_mapping = HashMap::with_capacity(included_nodes);
-                if let Some(root) = included.node(included.root()) {
+                if let Some(root) = included.document.node(included.document.root()) {
                     for child in root.children.iter().copied() {
                         output.append_subtree_from(
                             target_parent,
-                            &included,
+                            &included.document,
                             child,
                             &mut included_mapping,
                         );
                     }
                 }
-                output.remap_ids_from(&included, &included_mapping)?;
+                output.remap_ids_from(&included.document, &included_mapping)?;
+                meter
+                    .release_owned_bytes(remap_bytes.saturating_add(included.retained_owned_bytes));
+                retained_owned_bytes = retained_owned_bytes.saturating_add(copied_bytes);
             }
             Ok(XIncludeContent::Text(value, base_uri)) => {
                 output.push(
@@ -2742,7 +2767,12 @@ fn expand_xinclude_document(
         }
     }
     output.remap_ids_from(source, &principal_mapping)?;
-    Ok((output, Some(principal_mapping)))
+    meter.release_owned_bytes(pending_bytes);
+    Ok(ExpandedXIncludeDocument {
+        document: output,
+        principal_mapping: Some(principal_mapping),
+        retained_owned_bytes,
+    })
 }
 
 fn validate_xinclude_children(source: &Document, include: &Node) -> Result<Option<NodeId>> {
@@ -2840,9 +2870,8 @@ fn hex_value(byte: u8) -> u8 {
     }
 }
 
-fn xinclude_workspace_bytes(node_count: usize) -> usize {
-    xinclude_remap_bytes(node_count)
-        .saturating_add(node_count.saturating_mul(std::mem::size_of::<(NodeId, NodeId)>()))
+fn xinclude_pending_bytes(node_count: usize) -> usize {
+    node_count.saturating_mul(std::mem::size_of::<(NodeId, NodeId)>())
 }
 
 fn xinclude_remap_bytes(node_count: usize) -> usize {
@@ -2852,7 +2881,7 @@ fn xinclude_remap_bytes(node_count: usize) -> usize {
 }
 
 enum XIncludeContent {
-    Xml(Document),
+    Xml(ExpandedXIncludeDocument),
     Text(String, String),
 }
 
@@ -2899,6 +2928,14 @@ fn resolve_xinclude(
             "XInclude xpointer selection is not implemented".into(),
         )));
     }
+    // XInclude 1.0 section 3.1 forbids fragment identifiers in href, including an empty
+    // fragment; subresources are selected through the separate xpointer attribute.
+    // https://www.w3.org/TR/xinclude/#include_element
+    if href.contains('#') {
+        return Err(XIncludeFailure::Fatal(Error::Xml(
+            "XInclude href must not contain a fragment identifier".into(),
+        )));
+    }
     // Denied operations must not cross the resolver boundary. Charging before resolution also
     // bounds repeated failed attempts that are handled by xi:fallback.
     meter
@@ -2918,13 +2955,15 @@ fn resolve_xinclude(
             message: "XInclude cycle detected".into(),
         }));
     }
-    if let Some(previous) = identities.get(&resource.identity)
-        && previous != &resource
-    {
-        return Err(XIncludeFailure::Fatal(Error::StaleResource {
-            identity: resource.identity,
-        }));
-    }
+    let identity_is_new = match identities.get(&resource.identity) {
+        Some(previous) if previous != &resource => {
+            return Err(XIncludeFailure::Fatal(Error::StaleResource {
+                identity: resource.identity,
+            }));
+        }
+        Some(_) => false,
+        None => true,
+    };
     if parse == "text" {
         let encoding = attribute("encoding").or(resource.encoding.as_deref());
         let value = decode_xinclude_resource(&resource.bytes, encoding, meter, false)?;
@@ -2939,13 +2978,22 @@ fn resolve_xinclude(
                 u32::from(character)
             ))));
         }
-        identities.insert(resource.identity.clone(), resource.clone());
+        if identity_is_new {
+            identities.insert(resource.identity.clone(), resource.clone());
+        } else {
+            meter.release_owned_bytes(resource.bytes.len());
+        }
         return Ok(XIncludeContent::Text(value, resource.canonical_uri));
     }
     let xml = decode_xinclude_resource(&resource.bytes, resource.encoding.as_deref(), meter, true)?;
+    let decoded_temporary_bytes = xml.len().saturating_mul(2);
     let document =
         Document::parse(&xml, Some(&resource.canonical_uri)).map_err(XIncludeFailure::Fatal)?;
-    identities.insert(resource.identity.clone(), resource.clone());
+    if identity_is_new {
+        identities.insert(resource.identity.clone(), resource.clone());
+    } else {
+        meter.release_owned_bytes(resource.bytes.len());
+    }
     include_stack.push(resource.identity);
     let expanded = expand_xinclude_document(
         &document,
@@ -2956,8 +3004,9 @@ fn resolve_xinclude(
         depth.saturating_add(1),
     );
     include_stack.pop();
+    meter.release_owned_bytes(decoded_temporary_bytes);
     expanded
-        .map(|(document, _)| XIncludeContent::Xml(document))
+        .map(XIncludeContent::Xml)
         .map_err(XIncludeFailure::Fatal)
 }
 

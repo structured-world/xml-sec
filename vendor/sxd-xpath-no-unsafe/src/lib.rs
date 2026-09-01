@@ -267,9 +267,9 @@ fn str_to_num(s: &str) -> f64 {
         && integer.bytes().all(|byte| byte.is_ascii_digit())
         && fraction.is_none_or(|value| value.bytes().all(|byte| byte.is_ascii_digit()));
     if valid {
-        lexical.parse().unwrap_or(::std::f64::NAN)
+        lexical.parse().unwrap_or(f64::NAN)
     } else {
-        ::std::f64::NAN
+        f64::NAN
     }
 }
 
@@ -629,7 +629,7 @@ mod test {
 
     #[test]
     fn string_of_nan_is_nan() {
-        let v = Value::Number(::std::f64::NAN);
+        let v = Value::Number(f64::NAN);
         assert_eq!("NaN", v.string());
     }
 
@@ -647,13 +647,13 @@ mod test {
 
     #[test]
     fn string_of_positive_infinity_is_infinity() {
-        let v = Value::Number(::std::f64::INFINITY);
+        let v = Value::Number(f64::INFINITY);
         assert_eq!("Infinity", v.string());
     }
 
     #[test]
     fn string_of_negative_infinity_is_minus_infinity() {
-        let v = Value::Number(::std::f64::NEG_INFINITY);
+        let v = Value::Number(f64::NEG_INFINITY);
         assert_eq!("-Infinity", v.string());
     }
 

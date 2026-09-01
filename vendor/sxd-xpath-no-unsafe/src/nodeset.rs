@@ -4,8 +4,6 @@ use std::borrow::ToOwned;
 use std::collections::HashSet;
 use std::collections::hash_set;
 use std::iter::{FromIterator, IntoIterator};
-use std::usize;
-
 use sxd_document_no_unsafe::NsStr;
 use sxd_document_no_unsafe::QName;
 use sxd_document_no_unsafe::dom;
