@@ -491,6 +491,9 @@ impl<R: Resolver> Compiler<R> {
                 forward,
             )?,
             "strip-space" | "preserve-space" => {
+                // XSLT 1.0 section 3.4 gives both declarations an EMPTY content model.
+                // https://www.w3.org/TR/1999/REC-xslt-19991116#strip
+                require_empty_instruction(node)?;
                 let preserve = node.tag_name().name() == "preserve-space";
                 for token in required_attr(node, "elements")?.split_ascii_whitespace() {
                     let order = state.next_order();
@@ -3073,19 +3076,29 @@ fn merge_output(
     {
         out.encoding_explicit = true;
     }
-    if let Some(v) = node.attribute("omit-xml-declaration") {
+    if let Some(value) = node
+        .attribute("omit-xml-declaration")
+        .map(|value| optional_yes_no(value, forward))
+        .transpose()?
+        .flatten()
+    {
         merge_output_property(
             &mut out.omit_xml_declaration,
             &mut properties.omit_xml_declaration,
-            yes_no(Some(v))?,
+            value,
             precedence,
         );
     }
-    if let Some(v) = node.attribute("standalone") {
+    if let Some(value) = node
+        .attribute("standalone")
+        .map(|value| optional_yes_no(value, forward))
+        .transpose()?
+        .flatten()
+    {
         merge_output_property(
             &mut out.standalone,
             &mut properties.standalone,
-            Some(yes_no(Some(v))?),
+            Some(value),
             precedence,
         );
     }
@@ -3105,13 +3118,12 @@ fn merge_output(
             precedence,
         );
     }
-    if let Some(v) = node.attribute("indent")
-        && merge_output_property(
-            &mut out.indent,
-            &mut properties.indent,
-            yes_no(Some(v))?,
-            precedence,
-        )
+    if let Some(value) = node
+        .attribute("indent")
+        .map(|value| optional_yes_no(value, forward))
+        .transpose()?
+        .flatten()
+        && merge_output_property(&mut out.indent, &mut properties.indent, value, precedence)
     {
         out.indent_explicit = true;
     }
@@ -3366,5 +3378,14 @@ fn yes_no(value: Option<&str>) -> Result<bool> {
         "yes" => Ok(true),
         "no" => Ok(false),
         other => Err(Error::Static(format!("expected yes or no, got {other}"))),
+    }
+}
+
+fn optional_yes_no(value: &str, forward_compatible: bool) -> Result<Option<bool>> {
+    match value {
+        "yes" => Ok(Some(true)),
+        "no" => Ok(Some(false)),
+        _ if forward_compatible => Ok(None),
+        _ => Err(Error::Static(format!("expected yes or no, got {value}"))),
     }
 }

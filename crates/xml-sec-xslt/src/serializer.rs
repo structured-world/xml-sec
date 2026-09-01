@@ -70,7 +70,7 @@ enum OutputEncoding {
     Utf16Le,
     Utf16Be,
     Ascii,
-    Latin1,
+    Registered(xml_sec_xml_input::IanaSingleByteEncoding),
     Other {
         encoding: &'static encoding_rs::Encoding,
         representable: [Cell<Option<(char, bool)>>; 16],
@@ -89,8 +89,8 @@ impl OutputEncoding {
             Ok(Self::Utf16Be)
         } else if is_ascii_encoding_label(label) {
             Ok(Self::Ascii)
-        } else if xml_sec_xml_input::is_latin1_encoding_label(label) {
-            Ok(Self::Latin1)
+        } else if let Some(encoding) = xml_sec_xml_input::registered_single_byte_encoding(label) {
+            Ok(Self::Registered(encoding))
         } else {
             encoding_rs::Encoding::for_label(label.as_bytes())
                 .map(|encoding| Self::Other {
@@ -105,7 +105,7 @@ impl OutputEncoding {
         match self {
             Self::Utf8 | Self::Utf16 | Self::Utf16Le | Self::Utf16Be => true,
             Self::Ascii => character.is_ascii(),
-            Self::Latin1 => u32::from(character) <= 0xff,
+            Self::Registered(encoding) => encoding.encode_char(character).is_some(),
             Self::Other {
                 encoding,
                 representable,
@@ -564,7 +564,7 @@ impl std::fmt::Write for RenderBuffer {
 enum EncodingCounterKind {
     Utf8,
     Ascii,
-    Latin1,
+    Registered,
     Utf16,
     Other(encoding_rs::Encoder),
 }
@@ -581,7 +581,7 @@ impl EncodingCounter {
         let kind = match encoding {
             OutputEncoding::Utf8 => EncodingCounterKind::Utf8,
             OutputEncoding::Ascii => EncodingCounterKind::Ascii,
-            OutputEncoding::Latin1 => EncodingCounterKind::Latin1,
+            OutputEncoding::Registered(_) => EncodingCounterKind::Registered,
             OutputEncoding::Utf16 | OutputEncoding::Utf16Le | OutputEncoding::Utf16Be => {
                 EncodingCounterKind::Utf16
             }
@@ -606,7 +606,7 @@ impl EncodingCounter {
             EncodingCounterKind::Utf8 => {
                 self.encoded_bytes = self.encoded_bytes.saturating_add(value.len())
             }
-            EncodingCounterKind::Ascii | EncodingCounterKind::Latin1 => {
+            EncodingCounterKind::Ascii | EncodingCounterKind::Registered => {
                 self.encoded_bytes = self.encoded_bytes.saturating_add(value.chars().count());
             }
             EncodingCounterKind::Utf16 => {
@@ -1532,12 +1532,13 @@ fn encode(
         return Ok(value.into_bytes());
     }
     meter.charge(BudgetKind::OwnedBytes, encoded_bytes)?;
-    if matches!(encoding, OutputEncoding::Latin1) {
+    if let OutputEncoding::Registered(encoding) = encoding {
         let mut bytes = Vec::with_capacity(encoded_bytes);
         for character in value.chars() {
-            let byte = u8::try_from(u32::from(character)).map_err(|_| {
+            let byte = encoding.encode_char(character).ok_or_else(|| {
                 Error::Serialization(format!(
-                    "character `{character}` reached the Latin-1 encoder without escaping"
+                    "character `{character}` reached the {} encoder without escaping",
+                    encoding.name()
                 ))
             })?;
             bytes.push(byte);
@@ -1601,8 +1602,11 @@ fn validate_text_encoding(value: &str, encoding: &OutputEncoding, label: &str) -
             }
             return Ok(());
         }
-        OutputEncoding::Latin1 => {
-            if let Some(character) = value.chars().find(|character| u32::from(*character) > 0xff) {
+        OutputEncoding::Registered(encoding) => {
+            if let Some(character) = value
+                .chars()
+                .find(|character| encoding.encode_char(*character).is_none())
+            {
                 return Err(Error::Serialization(format!(
                     "text output character `{character}` is not representable in {label}"
                 )));

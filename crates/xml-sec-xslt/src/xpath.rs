@@ -426,6 +426,7 @@ pub(crate) struct Evaluator {
     generated_ids: Rc<RefCell<GeneratedIdCache>>,
     id_index: Rc<RefCell<IdIndex>>,
     key_index: Rc<RefCell<KeyIndex>>,
+    unparsed_entity_index: Rc<RefCell<Vec<HashMap<String, String>>>>,
     decimal_formats: Rc<Vec<DecimalFormat>>,
     stylesheet_functions: HashSet<ExpandedName>,
     extension_functions: HashSet<ExpandedName>,
@@ -470,6 +471,7 @@ impl Evaluator {
         let maps = NodeMaps::new(&source, meter)?;
         let mut id_index = Vec::new();
         extend_id_index(&source, &maps, 0, &mut id_index, meter)?;
+        let unparsed_entity_index = build_unparsed_entity_index(&source, meter)?;
         meter_node_base_uri_entries(&source, maps.reverse.iter(), meter)?;
         let node_base_uris = Rc::new(RefCell::new(
             maps.reverse
@@ -515,6 +517,7 @@ impl Evaluator {
             generated_ids: Rc::new(RefCell::new(GeneratedIdCache::default())),
             id_index: Rc::new(RefCell::new(id_index)),
             key_index: Rc::new(RefCell::new(HashMap::new())),
+            unparsed_entity_index: Rc::new(RefCell::new(unparsed_entity_index)),
             decimal_formats: Rc::new(Vec::new()),
             stylesheet_functions: HashSet::new(),
             extension_functions: HashSet::new(),
@@ -861,6 +864,12 @@ impl Evaluator {
             &self.maps,
             first_new_node,
             &mut self.id_index.borrow_mut(),
+            meter,
+        )?;
+        append_unparsed_entity_document(
+            &self.source,
+            logical_root,
+            &mut self.unparsed_entity_index.borrow_mut(),
             meter,
         )?;
         meter_node_base_uri_entries(
@@ -1511,12 +1520,7 @@ impl Evaluator {
         context.set_function(
             "unparsed-entity-uri",
             UnparsedEntityUriFunction {
-                entities: self
-                    .source
-                    .unparsed_entities()
-                    .filter(|(_, _, root)| *root == logical_root_id)
-                    .map(|(name, uri, _)| (name.to_owned(), uri.to_owned()))
-                    .collect(),
+                documents: Rc::clone(&self.unparsed_entity_index),
             },
         );
         context.set_function("lang", LangFunction);
@@ -4229,14 +4233,48 @@ fn extend_id_index(
     Ok(())
 }
 
+fn build_unparsed_entity_index(
+    source: &Document,
+    meter: &mut Meter,
+) -> Result<Vec<HashMap<String, String>>> {
+    let mut index = Vec::with_capacity(source.logical_roots().len());
+    for &root in source.logical_roots() {
+        append_unparsed_entity_document(source, root, &mut index, meter)?;
+    }
+    Ok(index)
+}
+
+fn append_unparsed_entity_document(
+    source: &Document,
+    root: NodeId,
+    index: &mut Vec<HashMap<String, String>>,
+    meter: &mut Meter,
+) -> Result<()> {
+    let mut entities = HashMap::new();
+    for (name, uri, _) in source
+        .unparsed_entities()
+        .filter(|(_, _, candidate)| *candidate == root)
+    {
+        meter.charge(
+            BudgetKind::OwnedBytes,
+            name.len()
+                .saturating_add(uri.len())
+                .saturating_add(std::mem::size_of::<(String, String)>()),
+        )?;
+        entities.insert(name.to_owned(), uri.to_owned());
+    }
+    index.push(entities);
+    Ok(())
+}
+
 struct UnparsedEntityUriFunction {
-    entities: HashMap<String, String>,
+    documents: Rc<RefCell<Vec<HashMap<String, String>>>>,
 }
 
 impl function::Function for UnparsedEntityUriFunction {
     fn evaluate<'c, 'd>(
         &self,
-        _: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
+        context: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
         args: Vec<SxdValue<'d>>,
     ) -> std::result::Result<SxdValue<'d>, function::Error> {
         if args.len() != 1 {
@@ -4244,9 +4282,19 @@ impl function::Function for UnparsedEntityUriFunction {
                 what: "unparsed-entity-uri() requires one argument".into(),
             });
         }
+        let document_index =
+            path_to(&context.node)
+                .get(1)
+                .copied()
+                .ok_or_else(|| function::Error::Other {
+                    what: "unparsed-entity-uri() context has no logical document".into(),
+                })?;
+        let name = args[0].string();
         Ok(SxdValue::String(
-            self.entities
-                .get(&args[0].string())
+            self.documents
+                .borrow()
+                .get(document_index)
+                .and_then(|entities| entities.get(&name))
                 .cloned()
                 .unwrap_or_default(),
         ))
@@ -6068,6 +6116,41 @@ mod tests {
             .evaluate(&evaluation, vec![SxdValue::Nodeset(nodes)])
             .expect_err("distinct storage must cross the allocation gate");
         assert!(error.to_string().contains("allocation budget"));
+    }
+
+    #[test]
+    fn unparsed_entity_uri_uses_the_dynamic_context_document() {
+        // XSLT 1.0 section 12.4 resolves the entity in the document containing the context node,
+        // not in the principal document captured when the expression was compiled.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#misc-func
+        let package = Package::new();
+        let document = package.as_document();
+        let documents = document.create_element("documents");
+        document.root().append_child(documents);
+        let first = document.create_element("document");
+        let second = document.create_element("document");
+        documents.append_child(first);
+        documents.append_child(second);
+        let context_node = document.create_element("external");
+        second.append_child(context_node);
+        let context = Context::new();
+        let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(
+            &context,
+            nodeset::Node::Element(context_node),
+        );
+        let function = UnparsedEntityUriFunction {
+            documents: Rc::new(RefCell::new(vec![
+                HashMap::from([("logo".into(), "principal.png".into())]),
+                HashMap::from([("logo".into(), "external.png".into())]),
+            ])),
+        };
+
+        assert_eq!(
+            function
+                .evaluate(&evaluation, vec![SxdValue::String("logo".into())])
+                .expect("entity URI resolves"),
+            SxdValue::String("external.png".into())
+        );
     }
 
     #[test]

@@ -1386,21 +1386,39 @@ fn internal_general_entities<'a>(
         return Ok((Cow::Borrowed(xml), HashMap::new()));
     };
     let subset = &xml[subset_start..subset_end];
-    let declarations = collect_internal_entity_declarations(subset)?;
-    let expanded_subset = expand_parameter_entity_references(
-        subset,
-        &declarations.parameter,
-        &declarations.parameter_spans,
-        0,
-        references,
-        meter,
-    )?;
-    let entities = if matches!(expanded_subset, Cow::Borrowed(_)) {
-        declarations.general
-    } else {
-        collect_internal_entity_declarations(expanded_subset.as_ref())?.general
+    let mut expanded_subset = Cow::Borrowed(subset);
+    let mut changed = false;
+    let mut rounds = 0usize;
+    let entities = loop {
+        let declarations = collect_internal_entity_declarations(expanded_subset.as_ref())?;
+        let next = expand_parameter_entity_references(
+            expanded_subset.as_ref(),
+            &declarations.parameter,
+            &declarations.parameter_spans,
+            0,
+            references,
+            meter,
+        )?;
+        match next {
+            Cow::Borrowed(_) => break declarations.general,
+            Cow::Owned(next) => {
+                changed = true;
+                rounds += 1;
+                if rounds > ENTITY_EXPANSION_DEPTH_CEILING {
+                    return Err(Error::Xml(
+                        "parameter entity declaration depth limit exceeded".into(),
+                    ));
+                }
+                expanded_subset = Cow::Owned(next);
+                if *references > ENTITY_REFERENCE_CEILING {
+                    return Err(Error::Xml(
+                        "parameter entity expansion limit exceeded".into(),
+                    ));
+                }
+            }
+        }
     };
-    if matches!(expanded_subset, Cow::Borrowed(_)) {
+    if !changed {
         return Ok((Cow::Borrowed(xml), entities));
     }
     let mut expanded_xml = String::with_capacity(
@@ -1697,8 +1715,9 @@ fn expand_parameter_entity_references_into(
                     "entity reference expansion limit exceeded at `%{name};`"
                 )));
             }
+            let replacement = decode_parameter_character_references(replacement)?;
             expand_parameter_entity_references_into(
-                replacement,
+                replacement.as_ref(),
                 entities,
                 depth + 1,
                 references,
@@ -1726,6 +1745,37 @@ fn expand_parameter_entity_references_into(
         cursor += plain_end;
     }
     Ok(())
+}
+
+fn decode_parameter_character_references(value: &str) -> Result<Cow<'_, str>> {
+    if !value.as_bytes().windows(2).any(|bytes| bytes == b"&#") {
+        return Ok(Cow::Borrowed(value));
+    }
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0usize;
+    while let Some(relative) = value[cursor..].find("&#") {
+        let start = cursor + relative;
+        output.push_str(&value[cursor..start]);
+        let end = value[start + 2..]
+            .find(';')
+            .map(|relative| start + 2 + relative)
+            .ok_or_else(|| {
+                Error::Xml("unterminated parameter entity character reference".into())
+            })?;
+        let reference = &value[start + 2..end];
+        let (digits, radix) = reference
+            .strip_prefix('x')
+            .map_or((reference, 10), |digits| (digits, 16));
+        let character = u32::from_str_radix(digits, radix)
+            .ok()
+            .and_then(char::from_u32)
+            .filter(|character| crate::lexical::is_xml10_character(*character))
+            .ok_or_else(|| Error::Xml("invalid parameter entity character reference".into()))?;
+        output.push(character);
+        cursor = end + 1;
+    }
+    output.push_str(&value[cursor..]);
+    Ok(Cow::Owned(output))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2420,6 +2470,17 @@ mod parser_boundary_tests {
 
         let document =
             Document::parse_iterative(xml, None).expect("parameter entity declaration expands");
+        assert_eq!(document.string_value(document.root()), "ok");
+    }
+
+    #[test]
+    fn staged_parameter_entities_contribute_markup_declarations() {
+        // XML 1.0 sections 4.4.8 and 4.5 allow replacement text to contribute declarations;
+        // every newly exposed parameter declaration must therefore join the same bounded pass.
+        // https://www.w3.org/TR/xml/#included-in-literal
+        let xml = r#"<!DOCTYPE r [<!ENTITY % first '<!ENTITY &#37; second "<!ENTITY e &#39;ok&#39;>">'> %first; %second;]><r>&e;</r>"#;
+        let document = Document::parse_iterative(xml, None)
+            .expect("staged parameter entity declarations expand");
         assert_eq!(document.string_value(document.root()), "ok");
     }
 

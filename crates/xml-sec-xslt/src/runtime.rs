@@ -480,6 +480,27 @@ impl<'a> Execution<'a> {
         Ok(())
     }
 
+    fn ensure_key_indexes_for_all_documents(
+        &mut self,
+        source: &str,
+        namespaces: &[(String, String)],
+    ) -> Result<()> {
+        let requested = literal_key_names(source, namespaces)?.unwrap_or_else(|| {
+            self.stylesheet
+                .keys
+                .iter()
+                .map(|declaration| declaration.name.clone())
+                .collect()
+        });
+        let roots = self.evaluator.source.logical_roots().to_vec();
+        for root in roots {
+            for name in &requested {
+                self.build_key(name, root)?;
+            }
+        }
+        Ok(())
+    }
+
     fn build_key(&mut self, name: &ExpandedName, logical_root: NodeId) -> Result<()> {
         let identity = (name.clone(), logical_root);
         if self.built_keys.contains(&identity) {
@@ -1893,9 +1914,7 @@ impl<'a> Execution<'a> {
     ) -> Result<XPathValue> {
         self.meter.charge(BudgetKind::XPathEvaluations, 1)?;
         self.ensure_expression_globals(expression)?;
-        if xpath_calls_key(&expression.source) {
-            self.ensure_key_index(&expression.source, &expression.namespaces, node)?;
-        }
+        let uses_key = xpath_calls_key(&expression.source);
         if let Some(name) = direct_variable_reference(expression)?
             && let Some(value) = self.scopes.iter().rev().find_map(|scope| scope.get(&name))
         {
@@ -1922,6 +1941,13 @@ impl<'a> Execution<'a> {
         let (variables, reserved_owned_bytes) = self.variables()?;
         let custom_calls = CustomCallSession::default();
         loop {
+            if uses_key {
+                self.ensure_key_indexes_for_all_documents(
+                    &expression.source,
+                    &expression.namespaces,
+                )?;
+            }
+            let document_count = self.evaluator.source.logical_roots().len();
             let value = self.evaluator.evaluate(
                 expression,
                 node,
@@ -1931,6 +1957,13 @@ impl<'a> Execution<'a> {
                 &mut self.meter,
                 Some(&custom_calls),
             );
+            if uses_key && self.evaluator.source.logical_roots().len() != document_count {
+                // document() can import a logical document while evaluating the expression.
+                // XSLT 1.0 section 12.2 defines key() relative to the dynamic context document,
+                // so retry only after the new root has received the same key declarations.
+                // https://www.w3.org/TR/1999/REC-xslt-19991116#key
+                continue;
+            }
             let call = self.evaluator.take_custom_function_call(
                 &custom_calls,
                 &variables,

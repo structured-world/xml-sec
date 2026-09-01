@@ -48,10 +48,7 @@ enum SelectedEncoding {
     Utf32Le,
     Utf32Be,
     Ascii,
-    Latin1,
-    Latin5,
-    Iso8859_11,
-    Tis620,
+    Registered(IanaSingleByteEncoding),
 }
 
 impl SelectedEncoding {
@@ -61,6 +58,28 @@ impl SelectedEncoding {
             Self::Utf32Le => "UTF-32LE",
             Self::Utf32Be => "UTF-32BE",
             Self::Ascii => "US-ASCII",
+            Self::Registered(encoding) => encoding.name(),
+        }
+    }
+
+    fn is_utf8(self) -> bool {
+        matches!(self, Self::Standard(encoding) if encoding == encoding_rs::UTF_8)
+    }
+}
+
+/// Strict IANA single-byte repertoire shared by XML input and XSLT output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IanaSingleByteEncoding {
+    Latin1,
+    Latin5,
+    Iso8859_11,
+    Tis620,
+}
+
+impl IanaSingleByteEncoding {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
             Self::Latin1 => "ISO-8859-1",
             Self::Latin5 => "ISO-8859-9",
             Self::Iso8859_11 => "ISO-8859-11",
@@ -68,9 +87,83 @@ impl SelectedEncoding {
         }
     }
 
-    fn is_utf8(self) -> bool {
-        matches!(self, Self::Standard(encoding) if encoding == encoding_rs::UTF_8)
+    #[must_use]
+    pub fn decode_byte(self, byte: u8) -> Option<char> {
+        match self {
+            Self::Latin1 => Some(char::from(byte)),
+            Self::Latin5 => Some(match byte {
+                0xD0 => '\u{011E}',
+                0xDD => '\u{0130}',
+                0xDE => '\u{015E}',
+                0xF0 => '\u{011F}',
+                0xFD => '\u{0131}',
+                0xFE => '\u{015F}',
+                _ => char::from(byte),
+            }),
+            Self::Iso8859_11 | Self::Tis620 => match byte {
+                0x00..=0x7F => Some(char::from(byte)),
+                0xA0 if self == Self::Iso8859_11 => Some('\u{00A0}'),
+                0xA1..=0xDA | 0xE0..=0xFB => char::from_u32(u32::from(byte) + 0x0D60),
+                0xDF => Some('\u{0E3F}'),
+                _ => None,
+            },
+        }
     }
+
+    #[must_use]
+    pub fn encode_char(self, character: char) -> Option<u8> {
+        match self {
+            Self::Latin1 => u8::try_from(u32::from(character)).ok(),
+            Self::Latin5 => match character {
+                '\u{011E}' => Some(0xD0),
+                '\u{0130}' => Some(0xDD),
+                '\u{015E}' => Some(0xDE),
+                '\u{011F}' => Some(0xF0),
+                '\u{0131}' => Some(0xFD),
+                '\u{015F}' => Some(0xFE),
+                _ => u8::try_from(u32::from(character))
+                    .ok()
+                    .filter(|byte| !matches!(byte, 0xD0 | 0xDD | 0xDE | 0xF0 | 0xFD | 0xFE)),
+            },
+            Self::Iso8859_11 | Self::Tis620 => match u32::from(character) {
+                value @ 0x00..=0x7F => Some(value as u8),
+                0xA0 if self == Self::Iso8859_11 => Some(0xA0),
+                value @ 0x0E01..=0x0E3A | value @ 0x0E40..=0x0E5B => {
+                    u8::try_from(value - 0x0D60).ok()
+                }
+                0x0E3F => Some(0xDF),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// Resolve labels whose IANA meaning differs from WHATWG-compatible decoders.
+#[must_use]
+pub fn registered_single_byte_encoding(label: &str) -> Option<IanaSingleByteEncoding> {
+    if is_latin1_encoding_label(label) {
+        return Some(IanaSingleByteEncoding::Latin1);
+    }
+    if matches_ascii_case(
+        label,
+        &[
+            "iso-ir-148",
+            "iso88599",
+            "iso-8859-9",
+            "iso_8859-9",
+            "latin5",
+            "csisolatin5",
+            "iso_8859-9:1989",
+        ],
+    ) {
+        return Some(IanaSingleByteEncoding::Latin5);
+    }
+    if matches_ascii_case(label, &["iso8859-11", "iso-8859-11"]) {
+        return Some(IanaSingleByteEncoding::Iso8859_11);
+    }
+    label
+        .eq_ignore_ascii_case("tis-620")
+        .then_some(IanaSingleByteEncoding::Tis620)
 }
 
 /// Decode XML bytes according to XML 1.0 encoding detection rules.
@@ -194,6 +287,26 @@ pub fn decode_text_bounded<'a>(
     encoding: &str,
     maximum_decoded_bytes: usize,
 ) -> Result<Cow<'a, str>, Error> {
+    if is_generic_utf16(encoding) {
+        // RFC 2781 section 3.3 requires a byte-order signature when the generic UTF-16
+        // label is used. Consume that signature before exposing text to the caller.
+        // https://www.rfc-editor.org/rfc/rfc2781.html#section-3.3
+        if let Some(payload) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+            return decode_selected(
+                payload,
+                SelectedEncoding::Standard(encoding_rs::UTF_16LE),
+                maximum_decoded_bytes,
+            );
+        }
+        if let Some(payload) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+            return decode_selected(
+                payload,
+                SelectedEncoding::Standard(encoding_rs::UTF_16BE),
+                maximum_decoded_bytes,
+            );
+        }
+        return Err(Error::MissingUtf16ByteOrder);
+    }
     decode_selected(bytes, parse_encoding(encoding)?, maximum_decoded_bytes)
 }
 
@@ -242,32 +355,12 @@ fn parse_encoding(label: &str) -> Result<SelectedEncoding, Error> {
     // WHATWG-style lookup would incorrectly map them to Windows-1252. `latin-1`
     // is retained as the already-supported punctuation variant.
     // https://www.iana.org/assignments/character-sets/character-sets.xhtml
-    if is_latin1_encoding_label(label) {
-        return Ok(SelectedEncoding::Latin1);
+    if let Some(encoding) = registered_single_byte_encoding(label) {
+        return Ok(SelectedEncoding::Registered(encoding));
     }
     // WHATWG aliases these IANA encodings to Windows extensions with different C1 bytes.
     // XML 1.0 section 4.3.3 requires registered labels to retain their IANA meaning.
     // https://www.w3.org/TR/xml/#charencoding
-    if matches_ascii_case(
-        label,
-        &[
-            "iso-ir-148",
-            "iso88599",
-            "iso-8859-9",
-            "iso_8859-9",
-            "latin5",
-            "csisolatin5",
-            "iso_8859-9:1989",
-        ],
-    ) {
-        return Ok(SelectedEncoding::Latin5);
-    }
-    if matches_ascii_case(label, &["iso8859-11", "iso-8859-11"]) {
-        return Ok(SelectedEncoding::Iso8859_11);
-    }
-    if label.eq_ignore_ascii_case("tis-620") {
-        return Ok(SelectedEncoding::Tis620);
-    }
     encoding_rs::Encoding::for_label(label.as_bytes())
         .map(SelectedEncoding::Standard)
         .ok_or_else(|| Error::UnsupportedEncoding(label.into()))
@@ -320,13 +413,7 @@ fn decode_selected<'a>(
         }
         return Ok(Cow::Borrowed(decoded));
     }
-    if matches!(
-        encoding,
-        SelectedEncoding::Latin1
-            | SelectedEncoding::Latin5
-            | SelectedEncoding::Iso8859_11
-            | SelectedEncoding::Tis620
-    ) {
+    if matches!(encoding, SelectedEncoding::Registered(_)) {
         return decode_registered_single_byte(bytes, encoding, maximum).map(Cow::Owned);
     }
     let SelectedEncoding::Standard(encoding) = encoding else {
@@ -382,26 +469,9 @@ fn decode_registered_single_byte(
     let mut decoded = String::with_capacity(bytes.len().min(maximum));
     for &byte in bytes {
         let character = match encoding {
-            SelectedEncoding::Latin1 => char::from(byte),
-            SelectedEncoding::Latin5 => match byte {
-                0xD0 => '\u{011E}',
-                0xDD => '\u{0130}',
-                0xDE => '\u{015E}',
-                0xF0 => '\u{011F}',
-                0xFD => '\u{0131}',
-                0xFE => '\u{015F}',
-                _ => char::from(byte),
-            },
-            SelectedEncoding::Iso8859_11 | SelectedEncoding::Tis620 => match byte {
-                0x00..=0x7F => char::from(byte),
-                0xA0 if encoding == SelectedEncoding::Iso8859_11 => '\u{00A0}',
-                0xA1..=0xDA => char::from_u32(u32::from(byte) + 0x0D60)
-                    .expect("TIS-620 Thai range maps to Unicode scalars"),
-                0xDF => '\u{0E3F}',
-                0xE0..=0xFB => char::from_u32(u32::from(byte) + 0x0D60)
-                    .expect("TIS-620 Thai range maps to Unicode scalars"),
-                _ => return Err(Error::InvalidBytes(encoding.name())),
-            },
+            SelectedEncoding::Registered(encoding) => encoding
+                .decode_byte(byte)
+                .ok_or_else(|| Error::InvalidBytes(encoding.name()))?,
             _ => unreachable!("registered single-byte decoder receives a matching encoding"),
         };
         let actual = decoded.len().saturating_add(character.len_utf8());
@@ -674,6 +744,22 @@ mod tests {
             decode_xml(&bytes, Some("UTF-16LE")).unwrap(),
             "<root>lambda</root>"
         );
+    }
+
+    #[test]
+    fn generic_utf16_text_requires_and_consumes_a_byte_order_mark() {
+        let text = "lambda";
+        let mut little = vec![0xFF, 0xFE];
+        little.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+        let mut big = vec![0xFE, 0xFF];
+        big.extend(text.encode_utf16().flat_map(u16::to_be_bytes));
+
+        assert_eq!(decode_text(&little, "UTF-16").unwrap(), text);
+        assert_eq!(decode_text(&big, "UTF-16").unwrap(), text);
+        assert!(matches!(
+            decode_text(&little[2..], "UTF-16"),
+            Err(Error::MissingUtf16ByteOrder)
+        ));
     }
 
     #[test]

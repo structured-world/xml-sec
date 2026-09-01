@@ -543,6 +543,40 @@ fn document_function_resolves_dynamic_uris_without_cross_document_leaks() {
 }
 
 #[test]
+fn key_uses_the_dynamic_document_index() {
+    // XSLT 1.0 section 12.2 binds key() to the document containing the context node,
+    // including trees loaded by document().
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#key
+    let resolver = Arc::new(MemoryResolver::default());
+    resolver.resources.lock().expect("resolver mutex").insert(
+        "external.xml".into(),
+        r#"<external><item id="wanted">external</item></external>"#.into(),
+    );
+    let stylesheet = Compiler::new(
+        Arc::clone(&resolver),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:key name="by-id" match="item" use="@id"/><xsl:template match="/"><xsl:apply-templates select="document('external.xml')/external"/></xsl:template><xsl:template match="external"><xsl:value-of select="key('by-id', 'wanted')"/></xsl:template></xsl:stylesheet>"#,
+        Some("memory:main.xsl"),
+    )
+    .expect("stylesheet compiles");
+    let result = stylesheet
+        .execute(
+            &Document::parse("<source/>", Some("memory:source.xml")).expect("source parses"),
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("dynamic document functions evaluate");
+    assert_eq!(result.serialized.bytes, b"external");
+}
+
+#[test]
 fn document_function_uses_the_actual_predicate_candidate_context() {
     // Each predicate candidate supplies its own @href to document(), not the outer root context.
     let resolver = Arc::new(MemoryResolver::default());
@@ -1712,6 +1746,26 @@ fn whitespace_rules_reject_malformed_qname_name_tests() {
 }
 
 #[test]
+fn whitespace_declarations_reject_content() {
+    // XSLT 1.0 section 3.4 declares both whitespace instructions EMPTY; accepting content
+    // would silently discard stylesheet logic instead of reporting a static error.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#strip
+    for instruction in [
+        r#"<xsl:strip-space elements="*">text</xsl:strip-space>"#,
+        r#"<xsl:preserve-space elements="*"><foreign/></xsl:preserve-space>"#,
+    ] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">{instruction}</xsl:stylesheet>"#
+        );
+        assert!(
+            Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+                .compile(&stylesheet, None)
+                .is_err()
+        );
+    }
+}
+
+#[test]
 fn stylesheet_xml_space_controls_literal_whitespace() {
     // xml:space applies to stylesheet text nodes too; nested `default` resumes stripping.
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><out xml:space="preserve"> <kept> </kept><reset xml:space="default"> </reset> </out></xsl:template></xsl:stylesheet>"#;
@@ -2184,6 +2238,47 @@ fn serializer_preserves_iana_latin1_alias_semantics() {
             "alias {alias} must retain ISO-8859-1 semantics",
         );
     }
+}
+
+#[test]
+fn serializer_preserves_strict_iana_single_byte_semantics() {
+    // XML 1.0 section 4.3.3 requires registered charset names to retain their IANA
+    // repertoire rather than the wider WHATWG Windows mappings.
+    // https://www.w3.org/TR/xml/#charencoding
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text" encoding="ISO-8859-9"/><xsl:template match="/">Ğı</xsl:template></xsl:stylesheet>"#,
+    );
+    let output = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("registered repertoire serializes");
+    assert_eq!(output.serialized.bytes, [0xD0, 0xFD]);
+
+    let unrepresentable = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text" encoding="ISO-8859-9"/><xsl:template match="/">€</xsl:template></xsl:stylesheet>"#,
+    );
+    assert!(
+        unrepresentable
+            .execute(
+                &Document::parse("<source/>", None).expect("source parses"),
+                &Parameters::new(),
+                Arc::new(NoResolver),
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            )
+            .is_err()
+    );
 }
 
 #[test]
@@ -3394,6 +3489,44 @@ fn xinclude_text_strips_encoding_signatures() {
             .expect("encoding signature is removed from included text");
         assert_eq!(result.serialized.bytes, expected.as_bytes());
     }
+
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            ("bomless.txt".into(), Some("memory:source.xml".into())),
+            ResolvedResource {
+                canonical_uri: "memory:bomless.txt".into(),
+                identity: ResourceIdentity("bomless.txt".into()),
+                bytes: "ambiguous"
+                    .encode_utf16()
+                    .flat_map(u16::to_le_bytes)
+                    .collect(),
+                media_type: Some("text/plain".into()),
+                encoding: Some("UTF-16".into()),
+            },
+        );
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="bomless.txt" parse="text"/></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("XInclude source parses");
+    assert!(
+        stylesheet
+            .execute_with_source_processing(
+                &source,
+                &Parameters::new(),
+                resolver,
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+                SourceProcessing::XInclude,
+            )
+            .is_err()
+    );
 }
 
 #[test]
@@ -3928,6 +4061,34 @@ fn forward_compatible_sort_ignores_invalid_optional_values() {
         ),
         "ab|102|ab|ab"
     );
+}
+
+#[test]
+fn forward_compatible_output_ignores_invalid_optional_booleans() {
+    // XSLT 1.0 section 2.5 ignores unsupported optional attribute values in
+    // forward-compatible mode, while the same values remain errors in strict mode.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#forwards
+    for attribute in [
+        r#"omit-xml-declaration="future""#,
+        r#"standalone="future""#,
+        r#"indent="future""#,
+    ] {
+        let strict = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output {attribute}/></xsl:stylesheet>"#
+        );
+        let compiler = || {
+            Compiler::new(
+                Arc::new(NoResolver),
+                CompileBudget::new(16 * 1024, 0, 32, 16 * 1024),
+            )
+        };
+        assert!(compiler().compile(&strict, None).is_err());
+
+        let compatible = strict.replacen("version=\"1.0\"", "version=\"2.0\"", 1);
+        compiler()
+            .compile(&compatible, None)
+            .expect("forward-compatible optional output values are ignored");
+    }
 }
 
 #[test]
