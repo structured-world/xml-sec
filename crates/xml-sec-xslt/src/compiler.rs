@@ -467,6 +467,9 @@ impl<R: Resolver> Compiler<R> {
                 }
             }
             "key" => {
+                // XSLT 1.0 section 12.2 defines xsl:key with an EMPTY content model.
+                // https://www.w3.org/TR/1999/REC-xslt-19991116#key
+                require_empty_instruction(node)?;
                 let match_pattern = required_attr(node, "match")?;
                 let use_expression = required_attr(node, "use")?;
                 validate_key_dependency_expression("match", match_pattern)?;
@@ -2976,7 +2979,8 @@ fn merge_output(
     precedence: usize,
 ) -> Result<()> {
     // XSLT 1.0 section 16 selects each scalar output property at highest import precedence;
-    // equal-precedence recovery selects the last value, while CDATA element names form a union.
+    // equal-precedence recovery selects the last value. cdata-section-elements is the explicit
+    // exception: names from every xsl:output form one union, regardless of import precedence.
     // https://www.w3.org/TR/1999/REC-xslt-19991116#output
     if let Some(method) = node.attribute("method") {
         let method = match method {

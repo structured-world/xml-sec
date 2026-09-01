@@ -2048,6 +2048,22 @@ fn serializer_preserves_mixed_content_and_method_detection() {
 }
 
 #[test]
+fn html_indentation_preserves_preformatted_content() {
+    // XSLT 1.0 section 16.2 permits indentation only when it does not change rendering;
+    // whitespace inserted into preformatted or raw-text HTML content is therefore forbidden.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
+    for element in ["pre", "textarea", "script", "style"] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="html" indent="yes"/><xsl:template match="/"><{element}><span>x</span></{element}></xsl:template></xsl:stylesheet>"#
+        );
+        assert_eq!(
+            execute(&stylesheet, "<source/>"),
+            format!("<{element}><span>x</span></{element}>\n")
+        );
+    }
+}
+
+#[test]
 fn serializer_encodes_xml_fallbacks_and_utf16_consistently() {
     // Declared encodings must match bytes and preserve representable XML via character references.
     let latin = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output encoding="ISO-8859-1"/><xsl:template match="/"><root>€</root></xsl:template></xsl:stylesheet>"#;
@@ -6335,6 +6351,30 @@ fn empty_xslt_instructions_reject_content() {
 }
 
 #[test]
+fn key_declarations_reject_child_content() {
+    // XSLT 1.0 section 12.2 defines xsl:key with an EMPTY content model.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#key
+    for content in ["<bad/>", "preserved"] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:key name="key" match="*" use=".">{content}</xsl:key></xsl:stylesheet>"#
+        );
+        assert!(matches!(
+            Compiler::new(
+                Arc::new(NoResolver),
+                CompileBudget::new(4096, 0, 32, 4096),
+            )
+            .compile(&stylesheet, None),
+            Err(Error::Static(message)) if message.contains("xsl:key must be empty")
+        ));
+    }
+
+    compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:key name="key" match="*" use=".">
+        </xsl:key></xsl:stylesheet>"#,
+    );
+}
+
+#[test]
 fn choose_rejects_non_whitespace_character_data_between_branches() {
     // xsl:choose has an element-only content model; text cannot be ignored just because valid
     // xsl:when children are also present.
@@ -6461,6 +6501,50 @@ fn compiler_merges_output_and_namespace_alias_by_precedence() {
     assert_eq!(
         stylesheet.output_definition().method,
         xml_sec_xslt::OutputMethod::Xml
+    );
+}
+
+#[test]
+fn compiler_unions_cdata_output_names_across_import_precedence() {
+    // XSLT 1.0 section 16 explicitly unions cdata-section-elements across every xsl:output;
+    // unlike scalar output properties, lower-import-precedence values remain effective.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#output
+    let resolver = Arc::new(ContextResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            (
+                "lower.xsl".into(),
+                Some("https://example.test/main.xsl".into()),
+            ),
+            ResolvedResource {
+                canonical_uri: "https://example.test/lower.xsl".into(),
+                identity: ResourceIdentity("cdata-output-precedence".into()),
+                bytes: br#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output cdata-section-elements="low"/></xsl:stylesheet>"#.to_vec(),
+                media_type: None,
+                encoding: Some("UTF-8".into()),
+            },
+        );
+    let stylesheet = Compiler::new(
+        resolver,
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:import href="lower.xsl"/><xsl:output cdata-section-elements="high"/></xsl:stylesheet>"#,
+        Some("https://example.test/main.xsl"),
+    )
+    .expect("CDATA output names from imported stylesheets must remain effective");
+
+    assert_eq!(
+        stylesheet.output_definition().cdata_section_elements,
+        [
+            ExpandedName::new(None::<String>, "low"),
+            ExpandedName::new(None::<String>, "high"),
+        ]
+        .into_iter()
+        .collect()
     );
 }
 

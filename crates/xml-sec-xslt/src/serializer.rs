@@ -655,6 +655,7 @@ struct RenderContext {
     depth: usize,
     parent: Option<NodeId>,
     parent_mixed: bool,
+    html_whitespace_sensitive: bool,
     in_scope_namespaces: Rc<Vec<(Option<String>, String)>>,
 }
 
@@ -664,6 +665,7 @@ impl RenderContext {
             depth: 0,
             parent: None,
             parent_mixed: false,
+            html_whitespace_sensitive: false,
             in_scope_namespaces: Rc::new(vec![]),
         }
     }
@@ -681,6 +683,7 @@ enum RenderTask {
         depth: usize,
         mixed: bool,
         parent_mixed: bool,
+        html_whitespace_sensitive: bool,
         has_element_child: bool,
         html_void: bool,
     },
@@ -714,11 +717,17 @@ fn serialize_node(
             depth,
             mixed,
             parent_mixed,
+            html_whitespace_sensitive,
             has_element_child,
             html_void,
         } = task
         {
-            if definition.indent && !mixed && !parent_mixed && has_element_child {
+            if definition.indent
+                && !mixed
+                && !parent_mixed
+                && !html_whitespace_sensitive
+                && has_element_child
+            {
                 output.push('\n');
                 output.push_repeated(b' ', depth.saturating_mul(2))?;
             }
@@ -844,7 +853,11 @@ fn serialize_node(
                         Some(NodeKind::Text { value, .. }) if !value.is_empty()
                     )
                 });
-                if definition.indent && context.depth > 0 && !context.parent_mixed {
+                if definition.indent
+                    && context.depth > 0
+                    && !context.parent_mixed
+                    && !context.html_whitespace_sensitive
+                {
                     output.push('\n');
                     output.push_repeated(b' ', context.depth.saturating_mul(2))?;
                 }
@@ -1031,10 +1044,22 @@ fn serialize_node(
                 }
                 let cdata = definition.method == OutputMethod::Xml
                     && definition.cdata_section_elements.contains(name);
+                // XSLT 1.0 section 16.2 permits HTML indentation only when rendering is
+                // unchanged. Whitespace is content in these HTML elements, so descendants must
+                // inherit a no-indentation context.
+                // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
+                let html_whitespace_sensitive = context.html_whitespace_sensitive
+                    || (definition.indent
+                        && definition.method == OutputMethod::Html
+                        && name.namespace.is_none()
+                        && ["pre", "textarea", "script", "style"]
+                            .iter()
+                            .any(|candidate| name.local.eq_ignore_ascii_case(candidate)));
                 let child_context = RenderContext {
                     depth: context.depth + 1,
                     parent: Some(id),
                     parent_mixed: context.parent_mixed || mixed,
+                    html_whitespace_sensitive,
                     in_scope_namespaces: current_namespaces,
                 };
                 let mut child_tasks = Vec::new();
@@ -1092,6 +1117,7 @@ fn serialize_node(
                     depth: context.depth,
                     mixed,
                     parent_mixed: context.parent_mixed,
+                    html_whitespace_sensitive,
                     has_element_child: node.children.iter().any(|child| {
                         matches!(
                             document.node(*child).map(|node| &node.kind),
