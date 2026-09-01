@@ -262,6 +262,10 @@ impl<R: Resolver> Compiler<R> {
         purpose: ResolvePurpose,
         state: &mut CompileState,
     ) -> Result<Arc<ResolvedResource>> {
+        // XSLT 1.0 sections 2.6.1 and 2.6.2 define include/import as EMPTY. Validate the
+        // declaration before URI resolution so malformed syntax cannot cause external access.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#include
+        require_empty_instruction(node)?;
         let href = required_attr(node, "href")?;
         let effective_base = effective_base_uri(node, base_uri)?;
         let request = ResolveRequest {
@@ -402,7 +406,16 @@ impl<R: Resolver> Compiler<R> {
             return Ok(());
         }
         if node.tag_name().namespace() != Some(XSLT_NS) {
-            return Ok(());
+            if node.tag_name().namespace().is_some() || forward {
+                return Ok(());
+            }
+            // XSLT 1.0 section 2.2 permits extension top-level elements only when their
+            // expanded name has a non-null namespace URI. Section 2.5 separately requires
+            // unknown top-level elements to be ignored during forwards-compatible processing.
+            // https://www.w3.org/TR/1999/REC-xslt-19991116#stylesheet-element
+            return Err(Error::Static(
+                "non-XSLT top-level elements require a namespace".into(),
+            ));
         }
         match node.tag_name().name() {
             "template" => {
@@ -425,6 +438,13 @@ impl<R: Resolver> Compiler<R> {
                     })
                     .transpose()?;
                 let mode = optional_qname_attr(node, "mode")?;
+                // XSLT 1.0 section 5.7 forbids mode when the template has no match rule.
+                // https://www.w3.org/TR/1999/REC-xslt-19991116#modes
+                if patterns.is_empty() && mode.is_some() {
+                    return Err(Error::Static(
+                        "xsl:template mode requires a match attribute".into(),
+                    ));
+                }
                 let mut children = node.children().peekable();
                 let mut params = Vec::new();
                 while let Some(child) = children.peek().copied() {
@@ -548,11 +568,17 @@ impl<R: Resolver> Compiler<R> {
                     state.decimal_formats.push(format);
                 }
             }
-            "namespace-alias" => merge_namespace_alias(
-                &mut state.namespace_aliases,
-                &mut state.namespace_alias_index,
-                parse_namespace_alias(node, precedence)?,
-            )?,
+            "namespace-alias" => {
+                // XSLT 1.0 section 7.1.1 and its element syntax define this declaration as
+                // EMPTY. Validate before parsing and merging its namespace mapping.
+                // https://www.w3.org/TR/1999/REC-xslt-19991116#namespace-alias
+                require_empty_instruction(node)?;
+                merge_namespace_alias(
+                    &mut state.namespace_aliases,
+                    &mut state.namespace_alias_index,
+                    parse_namespace_alias(node, precedence)?,
+                )?;
+            }
             "attribute-set" => {
                 let order = state.next_order();
                 state.attribute_sets.push(AttributeSet::parse(

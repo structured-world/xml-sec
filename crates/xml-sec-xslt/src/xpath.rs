@@ -194,6 +194,24 @@ fn clear_pattern_cache(
 struct DocumentRequest {
     href: String,
     base_uri: Option<String>,
+    empty_document: Option<usize>,
+}
+
+impl DocumentRequest {
+    fn relative_to(
+        href: String,
+        base_uri: Option<String>,
+        logical_document: Option<usize>,
+    ) -> Self {
+        let empty_resource = href
+            .find('#')
+            .map_or(href.is_empty(), |fragment| fragment == 0);
+        Self {
+            href,
+            base_uri,
+            empty_document: empty_resource.then_some(logical_document).flatten(),
+        }
+    }
 }
 
 fn document_cache_key_owned_bytes(request: &DocumentRequest) -> usize {
@@ -213,6 +231,24 @@ fn charge_document_cache_keys(request: &DocumentRequest, meter: &mut Meter) -> R
         BudgetKind::OwnedBytes,
         document_cache_key_owned_bytes(request),
     )
+}
+
+fn seed_document_cache(
+    request: DocumentRequest,
+    root: NodeId,
+    maps: &NodeMaps,
+    documents: &mut HashMap<DocumentRequest, Vec<SourceNode>>,
+    document_roots: &mut HashMap<DocumentRequest, Vec<NodePath>>,
+    meter: &mut Meter,
+) -> Result<()> {
+    charge_document_cache_keys(&request, meter)?;
+    let root = SourceNode::Node(root);
+    document_roots.insert(
+        request.clone(),
+        maps.forward.get(&root).cloned().into_iter().collect(),
+    );
+    documents.insert(request, vec![root]);
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -514,30 +550,46 @@ impl Evaluator {
         let principal_request = DocumentRequest {
             href: String::new(),
             base_uri: principal_base_uri,
+            empty_document: None,
         };
-        charge_document_cache_keys(&principal_request, meter)?;
-        let principal_root = SourceNode::Node(stylesheet_root);
-        let mut document_root_entries = HashMap::from([(
-            principal_request.clone(),
-            maps.forward
-                .get(&principal_root)
-                .cloned()
-                .into_iter()
-                .collect(),
-        )]);
-        let mut documents = HashMap::from([(principal_request, vec![principal_root])]);
+        let mut document_root_entries = HashMap::new();
+        let mut documents = HashMap::new();
+        seed_document_cache(
+            principal_request,
+            stylesheet_root,
+            &maps,
+            &mut documents,
+            &mut document_root_entries,
+            meter,
+        )?;
+        let source_root = source.root();
+        let source_request = DocumentRequest {
+            href: String::new(),
+            base_uri: source_base_uri(&source, &SourceNode::Node(source_root)),
+            empty_document: source.logical_roots().binary_search(&source_root).ok(),
+        };
+        seed_document_cache(
+            source_request,
+            source_root,
+            &maps,
+            &mut documents,
+            &mut document_root_entries,
+            meter,
+        )?;
         for (uri, root) in module_roots {
             let request = DocumentRequest {
                 href: String::new(),
                 base_uri: Some(uri),
+                empty_document: None,
             };
-            charge_document_cache_keys(&request, meter)?;
-            let root = SourceNode::Node(root);
-            document_root_entries.insert(
-                request.clone(),
-                maps.forward.get(&root).cloned().into_iter().collect(),
-            );
-            documents.insert(request, vec![root]);
+            seed_document_cache(
+                request,
+                root,
+                &maps,
+                &mut documents,
+                &mut document_root_entries,
+                meter,
+            )?;
         }
         let document_roots = Rc::new(RefCell::new(document_root_entries));
         let pending_document_requests = Rc::new(RefCell::new(HashSet::new()));
@@ -1712,6 +1764,7 @@ impl Evaluator {
             let resource_request = DocumentRequest {
                 href: resource_uri.to_owned(),
                 base_uri: request.base_uri.clone(),
+                empty_document: request.empty_document.filter(|_| resource_uri.is_empty()),
             };
             let root = if let Some(nodes) = self.documents.get(&resource_request) {
                 nodes.first().cloned()
@@ -4366,7 +4419,10 @@ struct DocumentFunction {
 
 enum DocumentBaseSelection {
     Omitted,
-    Explicit(Option<String>),
+    Explicit {
+        base_uri: Option<String>,
+        logical_document: Option<usize>,
+    },
 }
 
 fn register_exslt_functions(
@@ -5019,13 +5075,11 @@ impl function::Function for DocumentFunction {
             let Some(node) = nodes.document_order().into_iter().next() else {
                 return Ok(SxdValue::Nodeset(nodeset::Nodeset::new()));
             };
-            DocumentBaseSelection::Explicit(
-                self.node_base_uris
-                    .borrow()
-                    .get(&typed_path_to(&node))
-                    .cloned()
-                    .flatten(),
-            )
+            let path = typed_path_to(&node);
+            DocumentBaseSelection::Explicit {
+                base_uri: self.node_base_uris.borrow().get(&path).cloned().flatten(),
+                logical_document: path.ordinary().get(1).copied(),
+            }
         } else {
             DocumentBaseSelection::Omitted
         };
@@ -5033,26 +5087,35 @@ impl function::Function for DocumentFunction {
             SxdValue::Nodeset(nodes) => nodes
                 .document_order()
                 .into_iter()
-                .map(|node| DocumentRequest {
-                    href: node.string_value(),
-                    base_uri: match &base_selection {
-                        DocumentBaseSelection::Explicit(base) => base.clone(),
-                        DocumentBaseSelection::Omitted => self
-                            .node_base_uris
-                            .borrow()
-                            .get(&typed_path_to(&node))
-                            .cloned()
-                            .flatten(),
-                    },
+                .map(|node| {
+                    let path = typed_path_to(&node);
+                    let (base_uri, logical_document) = match &base_selection {
+                        DocumentBaseSelection::Explicit {
+                            base_uri,
+                            logical_document,
+                        } => (base_uri.clone(), *logical_document),
+                        DocumentBaseSelection::Omitted => (
+                            self.node_base_uris.borrow().get(&path).cloned().flatten(),
+                            path.ordinary().get(1).copied(),
+                        ),
+                    };
+                    DocumentRequest::relative_to(node.string_value(), base_uri, logical_document)
                 })
                 .collect::<Vec<_>>(),
-            value => vec![DocumentRequest {
-                href: value.string(),
-                base_uri: match &base_selection {
-                    DocumentBaseSelection::Explicit(base) => base.clone(),
-                    DocumentBaseSelection::Omitted => self.static_base_uri.clone(),
-                },
-            }],
+            value => {
+                let (base_uri, logical_document) = match &base_selection {
+                    DocumentBaseSelection::Explicit {
+                        base_uri,
+                        logical_document,
+                    } => (base_uri.clone(), *logical_document),
+                    DocumentBaseSelection::Omitted => (self.static_base_uri.clone(), None),
+                };
+                vec![DocumentRequest::relative_to(
+                    value.string(),
+                    base_uri,
+                    logical_document,
+                )]
+            }
         };
         let root: nodeset::Node<'d> = context.node.document().root().into();
         let mut result = nodeset::Nodeset::new();
@@ -6165,6 +6228,7 @@ mod tests {
         let request = DocumentRequest {
             href: "relative/retained/document.xml".repeat(8),
             base_uri: Some("memory:retained/base/".repeat(8)),
+            empty_document: None,
         };
         let reserved = document_cache_key_owned_bytes(&request);
         let limits = |owned_bytes| ExecutionBudget {

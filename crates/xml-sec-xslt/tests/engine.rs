@@ -1888,7 +1888,7 @@ fn included_module_document_is_retained_for_document_empty_uri() {
             Ok(ResolvedResource {
                 canonical_uri: "memory:module.xsl".into(),
                 identity: ResourceIdentity("module".into()),
-                bytes: br#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><marker>module</marker><xsl:template name="read"><xsl:value-of select="document('')/*/marker"/></xsl:template></xsl:stylesheet>"#.to_vec(),
+                bytes: br#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:meta="urn:metadata"><meta:marker>module</meta:marker><xsl:template name="read"><xsl:value-of select="document('')/*/meta:marker"/></xsl:template></xsl:stylesheet>"#.to_vec(),
                 media_type: Some("application/xslt+xml".into()),
                 encoding: Some("UTF-8".into()),
             })
@@ -8427,4 +8427,143 @@ fn include_position_blocks_later_imports_but_not_earlier_imports() {
     compiler
         .compile(valid, Some("memory:main.xsl"))
         .expect("leading import followed by include is valid");
+}
+
+#[test]
+fn top_level_extensions_require_a_namespace() {
+    // XSLT 1.0 section 2.2 permits non-XSLT top-level elements only when their expanded name
+    // has a non-null namespace URI. Unqualified elements must not disappear silently.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#stylesheet-element
+    let invalid = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><bogus/></xsl:stylesheet>"#;
+    assert!(matches!(
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(1 << 20, 0, 32, 1 << 20),
+        )
+        .compile(invalid, Some("memory:main.xsl")),
+        Err(Error::Static(message)) if message.contains("namespace")
+    ));
+
+    let valid = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:ext="urn:extension"><ext:metadata/></xsl:stylesheet>"#;
+    Compiler::new(
+        Arc::new(NoResolver),
+        CompileBudget::new(1 << 20, 0, 32, 1 << 20),
+    )
+    .compile(valid, Some("memory:main.xsl"))
+    .expect("namespaced top-level extensions remain valid");
+
+    let forward = r#"<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><future-declaration/></xsl:stylesheet>"#;
+    Compiler::new(
+        Arc::new(NoResolver),
+        CompileBudget::new(1 << 20, 0, 32, 1 << 20),
+    )
+    .compile(forward, Some("memory:main.xsl"))
+    .expect("forward-compatible processing ignores unknown top-level elements");
+}
+
+#[test]
+fn empty_top_level_declarations_reject_child_content() {
+    // XSLT 1.0 element syntax gives namespace-alias an EMPTY content model. Both element
+    // children and whitespace preserved by xml:space violate that model.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#namespace-alias
+    for declaration in [
+        r#"<xsl:namespace-alias stylesheet-prefix="xsl" result-prefix="xsl"><child/></xsl:namespace-alias>"#,
+        r#"<xsl:namespace-alias stylesheet-prefix="xsl" result-prefix="xsl" xml:space="preserve"> </xsl:namespace-alias>"#,
+    ] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">{declaration}</xsl:stylesheet>"#
+        );
+        assert!(matches!(
+            Compiler::new(
+                Arc::new(NoResolver),
+                CompileBudget::new(1 << 20, 0, 32, 1 << 20),
+            )
+            .compile(&stylesheet, Some("memory:main.xsl")),
+            Err(Error::Static(message)) if message.contains("namespace-alias") && message.contains("empty")
+        ));
+    }
+}
+
+#[test]
+fn include_and_import_validate_content_before_resolving() {
+    struct CountingResolver(AtomicUsize);
+
+    impl Resolver for CountingResolver {
+        fn resolve(
+            &self,
+            uri: &str,
+            _base_uri: Option<&str>,
+            _purpose: ResolvePurpose,
+        ) -> xml_sec_xslt::Result<ResolvedResource> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(Error::Resolver {
+                uri: uri.into(),
+                message: "resolver must not be reached".into(),
+            })
+        }
+    }
+
+    // XSLT 1.0 sections 2.6.1, 2.6.2 and 18 define include/import as EMPTY. Static
+    // validation must precede external-resource side effects.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#include
+    let resolver = Arc::new(CountingResolver(AtomicUsize::new(0)));
+    for declaration in [
+        r#"<xsl:include href="module.xsl"><child/></xsl:include>"#,
+        r#"<xsl:import href="module.xsl"><child/></xsl:import>"#,
+    ] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">{declaration}</xsl:stylesheet>"#
+        );
+        assert!(matches!(
+            Compiler::new(
+                Arc::clone(&resolver),
+                CompileBudget::new(1 << 20, 8, 32, 1 << 20),
+            )
+            .compile(&stylesheet, Some("memory:main.xsl")),
+            Err(Error::Static(message)) if message.contains("empty")
+        ));
+    }
+    assert_eq!(resolver.0.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn named_only_templates_reject_mode() {
+    // XSLT 1.0 section 5.7 states that xsl:template without match must not have mode.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#modes
+    let invalid = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template name="named" mode="m"/></xsl:stylesheet>"#;
+    assert!(matches!(
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(1 << 20, 0, 32, 1 << 20),
+        )
+        .compile(invalid, Some("memory:main.xsl")),
+        Err(Error::Static(message)) if message.contains("mode") && message.contains("match")
+    ));
+}
+
+#[test]
+fn empty_document_uris_preserve_their_logical_document_origin() {
+    // XSLT 1.0 section 12.1 resolves a zero-length URI to the document that supplies its base.
+    // Source-relative requests and the omitted-argument stylesheet default must not collide.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#document
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:meta="urn:metadata"><meta:marker>stylesheet</meta:marker><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="document('', /)/source/@origin"/><xsl:text>|</xsl:text><xsl:value-of select="document(/source/uri)/source/@origin"/><xsl:text>|</xsl:text><xsl:value-of select="document('')/*/meta:marker"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let result = stylesheet
+        .execute(
+            &Document::parse(
+                r#"<source origin="source"><uri/></source>"#,
+                Some("memory:source.xml"),
+            )
+            .expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1 << 20),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("empty document URIs resolve without external access");
+    assert_eq!(result.serialized.bytes, b"source|source|stylesheet");
 }

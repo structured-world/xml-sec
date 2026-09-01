@@ -1377,6 +1377,12 @@ fn is_expected_strict_xslt_error(case: &Case, error: &Error) -> bool {
         ("general/bug-214.xsl", Error::Static(message)) => {
             message.contains("match pattern") && message.contains("variable reference")
         }
+        // This donor fixture gives a named-only template a mode. XSLT 1.0 section 5.7 says a
+        // template without match must not have mode; libxslt accepts the invalid declaration.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#modes
+        ("exslt/common/node-set.4.xsl", Error::Static(message)) => {
+            message.contains("mode") && message.contains("match")
+        }
         // This cleanup fixture uses key() recursively from an xsl:key match. XSLT 1.0 forbids
         // key() in both match and use, while libxslt accepts the extension.
         ("general/bug-166.xsl", Error::Static(message)) => {
