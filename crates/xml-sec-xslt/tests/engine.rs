@@ -585,6 +585,48 @@ fn document_function_uses_the_actual_predicate_candidate_context() {
 }
 
 #[test]
+fn id_function_uses_the_predicate_context_document() {
+    // XPath 1.0 section 4.1 resolves id() in the document containing the dynamic context node.
+    // https://www.w3.org/TR/1999/REC-xpath-19991116/#function-id
+    let resolver = Arc::new(MemoryResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            "external.xml".into(),
+            r#"<external xml:id="target" value="external"/>"#.into(),
+        );
+    let stylesheet = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="document('external.xml')/*[generate-id(id('target')) = generate-id(.)]/@value"/></xsl:template></xsl:stylesheet>"#,
+        Some("memory:main.xsl"),
+    )
+    .expect("stylesheet compiles");
+    let result = stylesheet
+        .execute(
+            &Document::parse(
+                r#"<source xml:id="target" value="principal"/>"#,
+                Some("memory:source.xml"),
+            )
+            .expect("source parses"),
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("external id lookup executes");
+
+    assert_eq!(result.serialized.bytes, b"external");
+}
+
+#[test]
 fn document_function_uses_node_module_and_explicit_base_uris() {
     // XSLT 1.0 assigns node-set URI references their originating node base,
     // scalar references their stylesheet module base, and the optional second
@@ -2033,6 +2075,31 @@ fn serializer_encodes_xml_fallbacks_and_utf16_consistently() {
     )
     .expect("UTF-16 output must decode");
     assert!(decoded.contains("encoding=\"UTF-16\""));
+}
+
+#[test]
+fn explicit_utf16_endianness_omits_the_byte_order_mark() {
+    // RFC 2781 section 3.3 forbids a BOM when the charset label fixes the byte order.
+    // https://www.rfc-editor.org/rfc/rfc2781.html#section-3.3
+    for (encoding, prefix) in [("UTF-16LE", [0x3c, 0x00]), ("UTF-16BE", [0x00, 0x3c])] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output encoding="{encoding}"/><xsl:template match="/"><root>ok</root></xsl:template></xsl:stylesheet>"#,
+        );
+        let output = compile(&stylesheet)
+            .execute(
+                &Document::parse("<source/>", None).expect("source must parse"),
+                &Parameters::new(),
+                Arc::new(NoResolver),
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            )
+            .expect("explicit-endian UTF-16 must serialize");
+
+        assert_eq!(&output.serialized.bytes[..2], &prefix, "{encoding}");
+    }
 }
 
 #[test]
@@ -3684,6 +3751,22 @@ fn evaluated_sort_order_rejects_unknown_values() {
         ),
         Err(Error::Dynamic(message)) if message.contains("xsl:sort") && message.contains("order")
     ));
+}
+
+#[test]
+fn forward_compatible_sort_ignores_invalid_optional_values() {
+    // XSLT 1.0 section 2.5 ignores optional attributes whose values are unknown to a 1.0
+    // processor when forwards-compatible processing is active.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#forwards
+    let stylesheet = r#"<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:for-each select="root/order"><xsl:sort order="future"/><xsl:value-of select="."/></xsl:for-each><xsl:text>|</xsl:text><xsl:for-each select="root/data"><xsl:sort data-type="future"/><xsl:value-of select="."/></xsl:for-each><xsl:text>|</xsl:text><xsl:for-each select="root/case"><xsl:sort case-order="future"/><xsl:value-of select="."/></xsl:for-each><xsl:text>|</xsl:text><xsl:for-each select="root/lang"><xsl:sort lang="!"/><xsl:value-of select="."/></xsl:for-each></xsl:template></xsl:stylesheet>"#;
+
+    assert_eq!(
+        execute(
+            stylesheet,
+            "<root><order>b</order><order>a</order><data>2</data><data>10</data><case>b</case><case>a</case><lang>b</lang><lang>a</lang></root>",
+        ),
+        "ab|102|ab|ab"
+    );
 }
 
 #[test]
@@ -5480,7 +5563,7 @@ fn namespace_alias_preserves_the_element_binding_across_import_conflicts() {
         CompileBudget::new(1 << 20, 8, 256, 1 << 20),
     )
     .compile(
-        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:old="urn:old" xmlns:new="urn:principal"><xsl:import href="imported.xsl"/><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><old:item/></xsl:template></xsl:stylesheet>"#,
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:old="urn:old" xmlns:new="urn:principal"><xsl:import href="imported.xsl"/><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><xsl:variable name="fragment"><old:item/></xsl:variable><xsl:copy-of select="$fragment"/></xsl:template></xsl:stylesheet>"#,
         Some("https://example.test/main.xsl"),
     )
     .expect("stylesheet graph compiles");

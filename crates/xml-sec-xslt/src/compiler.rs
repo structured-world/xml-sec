@@ -615,6 +615,7 @@ pub(crate) struct Sort {
     pub order: AttributeValueTemplate,
     pub case_order: Option<AttributeValueTemplate>,
     pub lang: Option<AttributeValueTemplate>,
+    pub forward_compatible: bool,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct WithParam {
@@ -2834,6 +2835,7 @@ fn compile_sort(node: roxmltree::Node<'_, '_>, context: &CompileContext) -> Resu
             .attribute("lang")
             .map(|value| parse_avt(value, node, context))
             .transpose()?,
+        forward_compatible: context.forward,
     })
 }
 fn compile_number(

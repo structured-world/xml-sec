@@ -868,20 +868,12 @@ impl<'a> Execution<'a> {
                             children,
                             attribute_sets,
                         } => {
-                            let (name, mut prefix) = self.alias_name(&name, prefix.as_deref());
-                            let mut result_namespaces = Vec::<Namespace>::new();
-                            for namespace in &namespaces {
-                                let mapped = self.alias_namespace(namespace);
-                                if let Some(existing) = result_namespaces
-                                    .iter_mut()
-                                    .find(|existing| existing.prefix == mapped.prefix)
-                                {
-                                    *existing = mapped;
-                                } else {
-                                    result_namespaces.push(mapped);
-                                }
-                            }
-                            fixup_element_namespace(&name, &mut prefix, &mut result_namespaces);
+                            let (name, prefix, result_namespaces) = self
+                                .alias_literal_name_and_namespaces(
+                                    &name,
+                                    prefix.as_deref(),
+                                    &namespaces,
+                                );
                             let id = self.push_node(
                                 self.parent(),
                                 NodeKind::Element {
@@ -1282,19 +1274,8 @@ impl<'a> Execution<'a> {
                 children,
                 attribute_sets,
             } => {
-                let (name, prefix) = self.alias_name(name, prefix.as_deref());
-                let mut result_namespaces = Vec::<Namespace>::new();
-                for namespace in namespaces {
-                    let mapped = self.alias_namespace(namespace);
-                    if let Some(existing) = result_namespaces
-                        .iter_mut()
-                        .find(|existing| existing.prefix == mapped.prefix)
-                    {
-                        *existing = mapped;
-                    } else {
-                        result_namespaces.push(mapped);
-                    }
-                }
+                let (name, prefix, result_namespaces) =
+                    self.alias_literal_name_and_namespaces(name, prefix.as_deref(), namespaces);
                 let parent = self.parent();
                 let id = self.push_node(
                     parent,
@@ -2544,13 +2525,18 @@ impl<'a> Execution<'a> {
                         self.evaluate_avt(value, context_node, context_position, context_size)
                     })
                     .transpose()?;
-                if let Some(case_order) = case_order.as_deref()
-                    && !matches!(case_order, "upper-first" | "lower-first")
-                {
-                    return Err(Error::Dynamic(format!(
-                        "xsl:sort case-order must evaluate to `upper-first` or `lower-first`, got `{case_order}`"
-                    )));
-                }
+                let case_order = match case_order {
+                    Some(value) if matches!(value.as_str(), "upper-first" | "lower-first") => {
+                        Some(value)
+                    }
+                    Some(_) if sort.forward_compatible => None,
+                    Some(value) => {
+                        return Err(Error::Dynamic(format!(
+                            "xsl:sort case-order must evaluate to `upper-first` or `lower-first`, got `{value}`"
+                        )));
+                    }
+                    None => None,
+                };
                 let lang = sort
                     .lang
                     .as_ref()
@@ -2558,27 +2544,41 @@ impl<'a> Execution<'a> {
                         self.evaluate_avt(value, context_node, context_position, context_size)
                     })
                     .transpose()?;
-                let data_type = self.evaluate_avt(
+                let mut data_type = self.evaluate_avt(
                     &sort.data_type,
                     context_node,
                     context_position,
                     context_size,
                 )?;
                 if !matches!(data_type.as_str(), "text" | "number") {
-                    return Err(Error::Dynamic(format!(
-                        "xsl:sort data-type must evaluate to `text` or `number`, got `{data_type}`"
-                    )));
+                    if sort.forward_compatible {
+                        data_type.clear();
+                        data_type.push_str("text");
+                    } else {
+                        return Err(Error::Dynamic(format!(
+                            "xsl:sort data-type must evaluate to `text` or `number`, got `{data_type}`"
+                        )));
+                    }
                 }
-                let collator = lang
-                    .as_deref()
-                    .map(|lang| locale_collator(lang, case_order.as_deref()))
-                    .transpose()?;
-                let order =
+                let collator = match lang.as_deref() {
+                    Some(lang) => match locale_collator(lang, case_order.as_deref()) {
+                        Ok(collator) => Some(collator),
+                        Err(_) if sort.forward_compatible => None,
+                        Err(error) => return Err(error),
+                    },
+                    None => None,
+                };
+                let mut order =
                     self.evaluate_avt(&sort.order, context_node, context_position, context_size)?;
                 if !matches!(order.as_str(), "ascending" | "descending") {
-                    return Err(Error::Dynamic(format!(
-                        "xsl:sort order must evaluate to `ascending` or `descending`, got `{order}`"
-                    )));
+                    if sort.forward_compatible {
+                        order.clear();
+                        order.push_str("ascending");
+                    } else {
+                        return Err(Error::Dynamic(format!(
+                            "xsl:sort order must evaluate to `ascending` or `descending`, got `{order}`"
+                        )));
+                    }
                 }
                 let spec = EvaluatedSort {
                     data_type,
@@ -3173,6 +3173,29 @@ impl<'a> Execution<'a> {
             ExpandedName::new(alias.result_namespace.clone(), name.local.clone()),
             alias.output_prefix.clone(),
         )
+    }
+
+    fn alias_literal_name_and_namespaces(
+        &self,
+        name: &ExpandedName,
+        prefix: Option<&str>,
+        namespaces: &[Namespace],
+    ) -> (ExpandedName, Option<String>, Vec<Namespace>) {
+        let (name, mut prefix) = self.alias_name(name, prefix);
+        let mut result_namespaces = Vec::<Namespace>::with_capacity(namespaces.len());
+        for namespace in namespaces {
+            let mapped = self.alias_namespace(namespace);
+            if let Some(existing) = result_namespaces
+                .iter_mut()
+                .find(|existing| existing.prefix == mapped.prefix)
+            {
+                *existing = mapped;
+            } else {
+                result_namespaces.push(mapped);
+            }
+        }
+        fixup_element_namespace(&name, &mut prefix, &mut result_namespaces);
+        (name, prefix, result_namespaces)
     }
 
     fn alias_namespace(&self, namespace: &Namespace) -> Namespace {

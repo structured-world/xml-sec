@@ -424,6 +424,7 @@ pub(crate) struct Evaluator {
     expressions: RefCell<HashMap<String, XPath>>,
     pattern_matches: HashMap<PatternCacheKey, HashSet<SourceNode>>,
     generated_ids: Rc<RefCell<GeneratedIdCache>>,
+    id_index: Rc<RefCell<IdIndex>>,
     key_index: Rc<RefCell<KeyIndex>>,
     decimal_formats: Rc<Vec<DecimalFormat>>,
     stylesheet_functions: HashSet<ExpandedName>,
@@ -467,6 +468,8 @@ impl Evaluator {
             .collect::<Vec<_>>();
         let package = project_semantic_document(&source, meter)?;
         let maps = NodeMaps::new(&source, meter)?;
+        let mut id_index = Vec::new();
+        extend_id_index(&source, &maps, 0, &mut id_index, meter)?;
         meter_node_base_uri_entries(&source, maps.reverse.iter(), meter)?;
         let node_base_uris = Rc::new(RefCell::new(
             maps.reverse
@@ -510,6 +513,7 @@ impl Evaluator {
             expressions: RefCell::new(HashMap::new()),
             pattern_matches: HashMap::new(),
             generated_ids: Rc::new(RefCell::new(GeneratedIdCache::default())),
+            id_index: Rc::new(RefCell::new(id_index)),
             key_index: Rc::new(RefCell::new(HashMap::new())),
             decimal_formats: Rc::new(Vec::new()),
             stylesheet_functions: HashSet::new(),
@@ -852,6 +856,13 @@ impl Evaluator {
             .ok_or_else(|| Error::Dynamic("semantic projection root is missing".into()))?;
         project_logical_root(&self.source, logical_root, sxd_document, documents)?;
         self.maps.extend(&self.source, first_new_node, meter)?;
+        extend_id_index(
+            &self.source,
+            &self.maps,
+            first_new_node,
+            &mut self.id_index.borrow_mut(),
+            meter,
+        )?;
         meter_node_base_uri_entries(
             &self.source,
             self.maps
@@ -1479,18 +1490,7 @@ impl Evaluator {
         context.set_function(
             "id",
             IdFunction {
-                nodes: self
-                    .source
-                    .ids()
-                    .filter(|(_, root, _)| *root == logical_root_id)
-                    .filter_map(|(value, _, owner)| {
-                        self.maps
-                            .forward
-                            .get(&SourceNode::Node(owner))
-                            .cloned()
-                            .map(|path| (value.to_owned(), path))
-                    })
-                    .collect(),
+                nodes_by_document: Rc::clone(&self.id_index),
             },
         );
         context.set_function("name", NodeNameFunction::Qualified);
@@ -4087,8 +4087,10 @@ impl function::Function for LangFunction {
     }
 }
 
+type IdIndex = Vec<HashMap<String, NodePath>>;
+
 struct IdFunction {
-    nodes: HashMap<String, NodePath>,
+    nodes_by_document: Rc<RefCell<IdIndex>>,
 }
 
 impl function::Function for IdFunction {
@@ -4110,6 +4112,18 @@ impl function::Function for IdFunction {
                 .collect::<Vec<_>>(),
             value => vec![value.string()],
         };
+        // XPath 1.0 section 4.1 binds id() to the document containing the dynamic context node.
+        // Every projected logical document occupies root/containers/document[index].
+        // https://www.w3.org/TR/1999/REC-xpath-19991116/#function-id
+        let context_path = typed_path_to(&context.node);
+        let nodes_by_document = self.nodes_by_document.borrow();
+        let Some(nodes) = context_path
+            .ordinary()
+            .get(1)
+            .and_then(|index| nodes_by_document.get(*index))
+        else {
+            return Ok(SxdValue::Nodeset(nodeset::Nodeset::new()));
+        };
         let mut result = nodeset::Nodeset::new();
         for value in values {
             // XPath 1.0 id() splits on XML's four S characters, not the host language's wider
@@ -4118,7 +4132,7 @@ impl function::Function for IdFunction {
                 .split(crate::lexical::is_xml_whitespace)
                 .filter(|token| !token.is_empty())
             {
-                if let Some(path) = self.nodes.get(token)
+                if let Some(path) = nodes.get(token)
                     && let Some(node) =
                         resolve_node_path(context.node.document().root().into(), path)
                 {
@@ -4128,6 +4142,31 @@ impl function::Function for IdFunction {
         }
         Ok(SxdValue::Nodeset(result))
     }
+}
+
+fn extend_id_index(
+    source: &Document,
+    maps: &NodeMaps,
+    first_node: usize,
+    index: &mut IdIndex,
+    meter: &mut Meter,
+) -> Result<()> {
+    index.resize_with(source.logical_roots().len(), HashMap::new);
+    for (value, root, owner) in source.ids().filter(|(_, _, owner)| owner.0 >= first_node) {
+        let Some(root_index) = source.logical_roots().binary_search(&root).ok() else {
+            continue;
+        };
+        let Some(path) = maps.forward.get(&SourceNode::Node(owner)).cloned() else {
+            continue;
+        };
+        let retained_bytes = value
+            .len()
+            .saturating_add(path.owned_bytes())
+            .saturating_add(std::mem::size_of::<(String, NodePath)>().saturating_mul(2));
+        meter.charge(BudgetKind::OwnedBytes, retained_bytes)?;
+        index[root_index].insert(value.to_owned(), path);
+    }
+    Ok(())
 }
 
 struct UnparsedEntityUriFunction {

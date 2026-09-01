@@ -66,6 +66,7 @@ pub struct SerializedOutput {
 
 enum OutputEncoding {
     Utf8,
+    Utf16,
     Utf16Le,
     Utf16Be,
     Ascii,
@@ -80,7 +81,9 @@ impl OutputEncoding {
     fn new(label: &str) -> Result<Self> {
         if label.eq_ignore_ascii_case("utf-8") {
             Ok(Self::Utf8)
-        } else if label.eq_ignore_ascii_case("utf-16") || label.eq_ignore_ascii_case("utf-16le") {
+        } else if label.eq_ignore_ascii_case("utf-16") {
+            Ok(Self::Utf16)
+        } else if label.eq_ignore_ascii_case("utf-16le") {
             Ok(Self::Utf16Le)
         } else if label.eq_ignore_ascii_case("utf-16be") {
             Ok(Self::Utf16Be)
@@ -100,7 +103,7 @@ impl OutputEncoding {
 
     fn represents(&self, character: char) -> bool {
         match self {
-            Self::Utf8 | Self::Utf16Le | Self::Utf16Be => true,
+            Self::Utf8 | Self::Utf16 | Self::Utf16Le | Self::Utf16Be => true,
             Self::Ascii => character.is_ascii(),
             Self::Latin1 => u32::from(character) <= 0xff,
             Self::Other {
@@ -579,12 +582,14 @@ impl EncodingCounter {
             OutputEncoding::Utf8 => EncodingCounterKind::Utf8,
             OutputEncoding::Ascii => EncodingCounterKind::Ascii,
             OutputEncoding::Latin1 => EncodingCounterKind::Latin1,
-            OutputEncoding::Utf16Le | OutputEncoding::Utf16Be => EncodingCounterKind::Utf16,
+            OutputEncoding::Utf16 | OutputEncoding::Utf16Le | OutputEncoding::Utf16Be => {
+                EncodingCounterKind::Utf16
+            }
             OutputEncoding::Other { encoding, .. } => {
                 EncodingCounterKind::Other(encoding.new_encoder())
             }
         };
-        let encoded_bytes = matches!(kind, EncodingCounterKind::Utf16)
+        let encoded_bytes = matches!(encoding, OutputEncoding::Utf16)
             .then_some(2)
             .unwrap_or(0);
         Self {
@@ -1507,9 +1512,14 @@ fn encode(
         meter.release_owned_bytes(utf8_bytes);
         return Ok(bytes);
     }
-    if matches!(encoding, OutputEncoding::Utf16Le) {
+    if matches!(encoding, OutputEncoding::Utf16 | OutputEncoding::Utf16Le) {
         let mut bytes = Vec::with_capacity(encoded_bytes);
-        bytes.extend_from_slice(&[0xFF, 0xFE]);
+        if matches!(encoding, OutputEncoding::Utf16) {
+            // RFC 2781 section 3.3 requires the generic UTF-16 label to carry byte-order
+            // information, while explicit UTF-16LE/BE labels must not prepend a BOM.
+            // https://www.rfc-editor.org/rfc/rfc2781.html#section-3.3
+            bytes.extend_from_slice(&[0xFF, 0xFE]);
+        }
         for unit in value.encode_utf16() {
             bytes.extend_from_slice(&unit.to_le_bytes());
         }
@@ -1518,7 +1528,6 @@ fn encode(
     }
     if matches!(encoding, OutputEncoding::Utf16Be) {
         let mut bytes = Vec::with_capacity(encoded_bytes);
-        bytes.extend_from_slice(&[0xFE, 0xFF]);
         for unit in value.encode_utf16() {
             bytes.extend_from_slice(&unit.to_be_bytes());
         }
@@ -1547,7 +1556,10 @@ fn encode(
 
 fn validate_text_encoding(value: &str, encoding: &OutputEncoding, label: &str) -> Result<()> {
     let legacy_encoding = match encoding {
-        OutputEncoding::Utf8 | OutputEncoding::Utf16Le | OutputEncoding::Utf16Be => return Ok(()),
+        OutputEncoding::Utf8
+        | OutputEncoding::Utf16
+        | OutputEncoding::Utf16Le
+        | OutputEncoding::Utf16Be => return Ok(()),
         OutputEncoding::Ascii => {
             if let Some(character) = value.chars().find(|character| !character.is_ascii()) {
                 return Err(Error::Serialization(format!(
