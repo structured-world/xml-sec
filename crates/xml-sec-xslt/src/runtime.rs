@@ -1762,7 +1762,7 @@ impl<'a> Execution<'a> {
                     current_precedence,
                     None,
                 )?;
-                let mut content = serialize_fragment(&fragment, &mut self.meter)?;
+                let mut content = self.consume_temporary_fragment(fragment, serialize_fragment)?;
                 if *terminate {
                     const PREFIX: &str = "xsl:message terminated transformation: ";
                     self.meter
@@ -1813,7 +1813,9 @@ impl<'a> Execution<'a> {
                     current_precedence,
                     None,
                 )?;
-                let serialized = serialize(&fragment, &definition, &mut self.meter)?;
+                let serialized = self.consume_temporary_fragment(fragment, |fragment, meter| {
+                    serialize(fragment, &definition, meter)
+                })?;
                 self.secondary_outputs
                     .push(SecondaryOutput { uri, serialized });
                 Ok(())
@@ -2684,6 +2686,17 @@ impl<'a> Execution<'a> {
             .release_owned_bytes(metered_document_owned_bytes(&temporary));
         captured
     }
+
+    fn consume_temporary_fragment<T>(
+        &mut self,
+        fragment: Document,
+        consume: impl FnOnce(&Document, &mut Meter) -> Result<T>,
+    ) -> Result<T> {
+        let fragment_owned_bytes = metered_document_owned_bytes(&fragment);
+        let result = consume(&fragment, &mut self.meter);
+        self.meter.release_owned_bytes(fragment_owned_bytes);
+        result
+    }
     fn capture_fragment(
         &mut self,
         body: &[Instruction],
@@ -2704,8 +2717,14 @@ impl<'a> Execution<'a> {
             precedence,
         );
         let captured = self.restore_result_tree(previous);
-        result?;
-        Ok(captured)
+        match result {
+            Ok(()) => Ok(captured),
+            Err(error) => {
+                self.meter
+                    .release_owned_bytes(metered_document_owned_bytes(&captured));
+                Err(error)
+            }
+        }
     }
 
     fn enter_temporary_result_tree(&mut self, base_uri: Option<&str>) -> ResultTreeState {

@@ -1540,6 +1540,33 @@ fn message_content_preserves_constructed_xml_fragments() {
 }
 
 #[test]
+fn sequential_messages_release_temporary_fragment_memory() {
+    // Message strings remain in TransformResult, but each constructed fragment dies after
+    // serialization and must not accumulate against the peak-live OwnedBytes ceiling.
+    let payload = "x".repeat(4096);
+    let messages = format!("<xsl:message><detail>{payload}</detail></xsl:message>").repeat(32);
+    let stylesheet = compile(&format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/">{messages}</xsl:template></xsl:stylesheet>"#
+    ));
+    let mut budget = execution_budget(1024);
+    budget.messages = 32;
+    budget.owned_bytes = 512 * 1024;
+    let result = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("temporary message fragments remain below the peak-memory ceiling");
+    assert_eq!(result.messages.len(), 32);
+}
+
+#[test]
 fn attribute_sets_variables_and_multiple_numbering_compose() {
     // Attribute-set expansion and multi-level numbering must use one variable scope.
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:attribute-set name="base"><xsl:attribute name="class">entry</xsl:attribute></xsl:attribute-set><xsl:template match="/"><out><xsl:apply-templates select="book/chapter/section"/></out></xsl:template><xsl:template match="section"><xsl:variable name="label">S<xsl:value-of select="@id"/></xsl:variable><xsl:element name="item" use-attribute-sets="base"><xsl:attribute name="label"><xsl:value-of select="$label"/></xsl:attribute><xsl:number level="multiple" count="chapter|section" format="1"/></xsl:element></xsl:template></xsl:stylesheet>"#;
@@ -3263,6 +3290,32 @@ fn xinclude_fallback_handles_only_resource_errors() {
             .expect_err("fatal XInclude errors must bypass fallback");
         assert!(matches!(error, Error::Xml(_) | Error::Unsupported(_)));
     }
+
+    let resolver = Arc::new(MemoryResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert("malformed.xml".into(), "<unclosed>".into());
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="malformed.xml"><xi:fallback><wrong/></xi:fallback></xi:include></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("source parses");
+    let error = stylesheet
+        .execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        )
+        .expect_err("non-well-formed included XML is fatal before fallback");
+    assert!(matches!(error, Error::Xml(_)));
 }
 
 #[test]
@@ -4013,6 +4066,24 @@ fn imported_stylesheets_charge_retained_semantic_documents_before_projection() {
 }
 
 #[test]
+fn included_stylesheets_decode_each_retained_source_once() {
+    // Import discovery and declaration compilation revisit an included module, but one retained
+    // decoded source must serve every pass instead of consuming the cumulative owned-byte budget.
+    let resolver = Arc::new(CountingResolver::default());
+    let payload = "x".repeat(64 * 1024);
+    resolver.resources.lock().expect("resolver mutex").insert(
+        "included.xsl".into(),
+        format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:variable name="payload" select="'{payload}'"/></xsl:stylesheet>"#
+        ),
+    );
+    let principal = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:include href="included.xsl"/></xsl:stylesheet>"#;
+    Compiler::new(resolver, CompileBudget::new(1 << 20, 8, 256, 350 * 1024))
+        .compile(principal, Some("memory:main.xsl"))
+        .expect("one retained module decode fits the owned-byte budget");
+}
+
+#[test]
 fn xinclude_budget_is_checked_before_resolver_access() {
     // A denied external-document operation must not cross the resolver trust boundary.
     let resolver = Arc::new(CountingResolver::default());
@@ -4664,6 +4735,38 @@ fn retained_secondary_output_uris_share_the_owned_byte_budget() {
 }
 
 #[test]
+fn sequential_secondary_outputs_release_temporary_fragment_memory() {
+    // Serialized secondary outputs remain live, but their source fragments are temporary and
+    // must not accumulate against the peak-live OwnedBytes ceiling.
+    let payload = "x".repeat(4096);
+    let outputs = (0..32)
+        .map(|index| {
+            format!(
+                r#"<xt:document href="memory:{index}.xml"><detail>{payload}</detail></xt:document>"#
+            )
+        })
+        .collect::<String>();
+    let stylesheet = compile(&format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:xt="http://www.jclark.com/xt" extension-element-prefixes="xt"><xsl:template match="/">{outputs}</xsl:template></xsl:stylesheet>"#
+    ));
+    let mut budget = execution_budget(1024);
+    budget.owned_bytes = 512 * 1024;
+    let result = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("temporary secondary-output fragments remain below the peak-memory ceiling");
+    assert_eq!(result.secondary_outputs.len(), 32);
+}
+
+#[test]
 fn supported_secondary_output_does_not_execute_fallback() {
     // xsl:fallback belongs only to unsupported extension execution.
     let stylesheet = compile(
@@ -4918,6 +5021,9 @@ fn xsl_number_level_is_validated_during_compilation() {
         .compile(&valid, None)
         .expect("defined xsl:number level compiles");
     }
+
+    let forward = r#"<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:apply-templates select="root/item[2]"/></xsl:template><xsl:template match="item"><xsl:number level="future-level"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(forward, "<root><item/><item/></root>"), "2");
 }
 
 #[test]

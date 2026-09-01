@@ -115,7 +115,7 @@ impl<R: Resolver> Compiler<R> {
                 self.enter_resource(&resource, state, |state| {
                     let source = resource_source(&resource, state)?;
                     self.compile_module(
-                        &source,
+                        source.as_str(),
                         Some(&resource.canonical_uri),
                         None,
                         state,
@@ -132,7 +132,7 @@ impl<R: Resolver> Compiler<R> {
                     self.resolve_module(child, base_uri, ResolvePurpose::Include, state)?;
                 self.enter_resource(&resource, state, |state| {
                     let source = resource_source(&resource, state)?;
-                    let document = roxmltree::Document::parse(&source)
+                    let document = roxmltree::Document::parse(source.as_str())
                         .map_err(|error| Error::Xml(error.to_string()))?;
                     let included_root = document.root_element();
                     match stylesheet_module_kind(included_root)? {
@@ -185,7 +185,7 @@ impl<R: Resolver> Compiler<R> {
                     self.resolve_module(child, base_uri, ResolvePurpose::Include, state)?;
                 self.enter_resource(&resource, state, |state| {
                     let source = resource_source(&resource, state)?;
-                    let document = roxmltree::Document::parse(&source)
+                    let document = roxmltree::Document::parse(source.as_str())
                         .map_err(|error| Error::Xml(error.to_string()))?;
                     let included_root = document.root_element();
                     match stylesheet_module_kind(included_root)? {
@@ -255,8 +255,11 @@ impl<R: Resolver> Compiler<R> {
         state.charge_owned(resource.bytes.len())?;
         if !state.module_documents.contains_key(&resource.canonical_uri) {
             let source = resource_source(&resource, state)?;
-            let document =
-                parse_semantic_document_metered(&source, Some(&resource.canonical_uri), state)?;
+            let document = parse_semantic_document_metered(
+                source.as_str(),
+                Some(&resource.canonical_uri),
+                state,
+            )?;
             state
                 .module_documents
                 .insert(resource.canonical_uri.clone(), document);
@@ -1488,6 +1491,7 @@ struct CompileState {
     active_resources: HashSet<ResourceIdentity>,
     resolved_requests: HashMap<ResolveRequest, Arc<ResolvedResource>>,
     resolved_identities: HashMap<ResourceIdentity, Arc<ResolvedResource>>,
+    module_sources: HashMap<ResourceIdentity, Arc<String>>,
     module_documents: HashMap<String, Document>,
     imported_modules: usize,
     stylesheet_bytes: usize,
@@ -1515,6 +1519,7 @@ impl CompileState {
             active_resources: HashSet::new(),
             resolved_requests: HashMap::new(),
             resolved_identities: HashMap::new(),
+            module_sources: HashMap::new(),
             module_documents: HashMap::new(),
             imported_modules: 0,
             stylesheet_bytes,
@@ -1867,7 +1872,10 @@ impl CompileContext {
     }
 }
 
-fn resource_source(resource: &ResolvedResource, state: &mut CompileState) -> Result<String> {
+fn resource_source(resource: &ResolvedResource, state: &mut CompileState) -> Result<Arc<String>> {
+    if let Some(source) = state.module_sources.get(&resource.identity) {
+        return Ok(Arc::clone(source));
+    }
     let maximum = state.budget.owned_bytes.saturating_sub(state.owned_bytes);
     let decoded = decode_resource(&resource.bytes, resource.encoding.as_deref(), true, maximum)
         .map_err(|error| match error {
@@ -1879,7 +1887,11 @@ fn resource_source(resource: &ResolvedResource, state: &mut CompileState) -> Res
             error => Error::Xml(error.to_string()),
         })?;
     state.charge_owned(decoded.len())?;
-    Ok(decoded)
+    let source = Arc::new(decoded);
+    state
+        .module_sources
+        .insert(resource.identity.clone(), Arc::clone(&source));
+    Ok(source)
 }
 
 fn parse_semantic_document_metered(
@@ -2847,12 +2859,19 @@ fn compile_number(
 ) -> Result<NumberInstruction> {
     validate_instruction_attributes(node, context.forward)?;
     require_empty_instruction(node)?;
-    let level = node.attribute("level").unwrap_or("single");
-    if !matches!(level, "single" | "multiple" | "any") {
-        return Err(Error::Static(format!(
-            "xsl:number level must be single, multiple, or any, got `{level}`"
-        )));
-    }
+    let level = match node.attribute("level") {
+        None | Some("single") => "single",
+        Some(level @ ("multiple" | "any")) => level,
+        // XSLT 1.0 section 2.5 requires unsupported values of optional attributes to be ignored
+        // during forward-compatible processing, restoring the omitted `level` default.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#forwards
+        Some(_) if context.forward => "single",
+        Some(level) => {
+            return Err(Error::Static(format!(
+                "xsl:number level must be single, multiple, or any, got `{level}`"
+            )));
+        }
+    };
     Ok(NumberInstruction {
         value: node
             .attribute("value")

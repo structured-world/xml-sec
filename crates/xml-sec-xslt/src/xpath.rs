@@ -2988,6 +2988,9 @@ fn resolve_xinclude(
     }
     let xml = decode_xinclude_resource(&resource.bytes, resource.encoding.as_deref(), meter, true)?;
     let decoded_temporary_bytes = xml.len().saturating_mul(2);
+    // XInclude 1.0 section 4.2 explicitly makes non-well-formed acquired XML a fatal error,
+    // unlike resource acquisition/encoding failures that may activate xi:fallback.
+    // https://www.w3.org/TR/xinclude/#xml
     let document =
         Document::parse(&xml, Some(&resource.canonical_uri)).map_err(XIncludeFailure::Fatal)?;
     let resource_identity = resource.identity.clone();
