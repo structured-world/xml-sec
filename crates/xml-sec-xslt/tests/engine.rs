@@ -5859,6 +5859,21 @@ fn automatic_xml_id_registration_normalizes_the_attribute_value() {
 }
 
 #[test]
+fn automatic_xml_id_registration_rejects_non_ncname_values() {
+    // xml:id 1.0 section 4 requires the normalized value to be an NCName before registration.
+    // https://www.w3.org/TR/xml-id/#processing
+    for value in ["two ids", "1leading", "prefix:name"] {
+        let source = format!(r#"<root xml:id="{value}"/>"#);
+        assert!(matches!(
+            Document::parse(&source, None),
+            Err(Error::Xml(message)) if message.contains("xml:id") && message.contains("NCName")
+        ));
+    }
+    Document::parse(r#"<root xml:id=" имя "/>"#, None)
+        .expect("a normalized Unicode NCName remains a valid xml:id");
+}
+
+#[test]
 fn explicit_axis_node_tests_keep_their_default_priority() {
     // Explicit child/attribute axes are priority-equivalent to their abbreviated node tests.
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:apply-templates select="root/foo | root/foo/@id"/></xsl:template><xsl:template match="foo">element-specific|</xsl:template><xsl:template match="child::node()">element-generic|</xsl:template><xsl:template match="@id">attribute-specific|</xsl:template><xsl:template match="attribute::node()">attribute-generic|</xsl:template></xsl:stylesheet>"#;
@@ -6608,6 +6623,36 @@ fn compiler_merges_output_and_namespace_alias_by_precedence() {
         stylesheet.output_definition().method,
         xml_sec_xslt::OutputMethod::Xml
     );
+}
+
+#[test]
+fn output_declarations_obey_content_and_forward_compatibility_rules() {
+    // XSLT 1.0 sections 2.5 and 16 require unsupported optional values to be ignored only
+    // during forward-compatible processing, while xsl:output itself has EMPTY content.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#forwards
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#output
+    let strict = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="future" omit-xml-declaration="yes"/></xsl:stylesheet>"#;
+    assert!(matches!(
+        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+            .compile(strict, None),
+        Err(Error::Static(message)) if message.contains("output method")
+    ));
+
+    let forward = strict.replace("version=\"1.0\"", "version=\"2.0\"");
+    let output = compile(&forward).output_definition().clone();
+    assert_eq!(output.method, xml_sec_xslt::OutputMethod::Xml);
+    assert!(output.omit_xml_declaration);
+
+    for content in ["unexpected", "<xsl:text>unexpected</xsl:text>"] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output>{content}</xsl:output></xsl:stylesheet>"#
+        );
+        assert!(matches!(
+            Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+                .compile(&stylesheet, None),
+            Err(Error::Static(message)) if message.contains("xsl:output") && message.contains("empty")
+        ));
+    }
 }
 
 #[test]
@@ -7365,6 +7410,22 @@ fn byte_entry_points_share_strict_non_utf8_xml_decoding() {
         )
         .expect("UTF-32 input transforms");
     assert_eq!(result.serialized.bytes, b"lambda");
+}
+
+#[test]
+fn decoded_stylesheet_workspace_is_bounded_before_parsing() {
+    // A transcoded stylesheet is live throughout compilation, so OwnedBytes must reject its
+    // materialization before parser work can observe malformed trailing content.
+    let mut stylesheet = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>".to_vec();
+    stylesheet.extend(std::iter::repeat_n(0xe9, 1024));
+    assert!(matches!(
+        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 128),)
+            .compile_bytes(&stylesheet, None),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
 }
 
 #[test]

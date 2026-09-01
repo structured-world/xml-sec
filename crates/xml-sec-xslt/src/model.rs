@@ -842,6 +842,13 @@ impl Document {
                 })
                 .ok_or_else(|| Error::Xml("xml:id attribute reference is stale".into()))?;
             let normalized = collapse_xml_whitespace(&value.value).into_owned();
+            // xml:id 1.0 section 4 requires validation after whitespace normalization.
+            // https://www.w3.org/TR/xml-id/#processing
+            if !crate::lexical::is_ncname(&normalized) {
+                return Err(Error::Xml(format!(
+                    "xml:id value `{normalized}` is not a valid NCName"
+                )));
+            }
             if value.value != normalized {
                 value.value.clone_from(&normalized);
             }

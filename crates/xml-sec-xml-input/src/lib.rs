@@ -49,6 +49,9 @@ enum SelectedEncoding {
     Utf32Be,
     Ascii,
     Latin1,
+    Latin5,
+    Iso8859_11,
+    Tis620,
 }
 
 impl SelectedEncoding {
@@ -59,6 +62,9 @@ impl SelectedEncoding {
             Self::Utf32Be => "UTF-32BE",
             Self::Ascii => "US-ASCII",
             Self::Latin1 => "ISO-8859-1",
+            Self::Latin5 => "ISO-8859-9",
+            Self::Iso8859_11 => "ISO-8859-11",
+            Self::Tis620 => "TIS-620",
         }
     }
 
@@ -239,6 +245,29 @@ fn parse_encoding(label: &str) -> Result<SelectedEncoding, Error> {
     if is_latin1_encoding_label(label) {
         return Ok(SelectedEncoding::Latin1);
     }
+    // WHATWG aliases these IANA encodings to Windows extensions with different C1 bytes.
+    // XML 1.0 section 4.3.3 requires registered labels to retain their IANA meaning.
+    // https://www.w3.org/TR/xml/#charencoding
+    if matches_ascii_case(
+        label,
+        &[
+            "iso-ir-148",
+            "iso88599",
+            "iso-8859-9",
+            "iso_8859-9",
+            "latin5",
+            "csisolatin5",
+            "iso_8859-9:1989",
+        ],
+    ) {
+        return Ok(SelectedEncoding::Latin5);
+    }
+    if matches_ascii_case(label, &["iso8859-11", "iso-8859-11"]) {
+        return Ok(SelectedEncoding::Iso8859_11);
+    }
+    if label.eq_ignore_ascii_case("tis-620") {
+        return Ok(SelectedEncoding::Tis620);
+    }
     encoding_rs::Encoding::for_label(label.as_bytes())
         .map(SelectedEncoding::Standard)
         .ok_or_else(|| Error::UnsupportedEncoding(label.into()))
@@ -291,17 +320,14 @@ fn decode_selected<'a>(
         }
         return Ok(Cow::Borrowed(decoded));
     }
-    if encoding == SelectedEncoding::Latin1 {
-        let mut decoded = String::with_capacity(bytes.len().min(maximum));
-        for byte in bytes {
-            let character = char::from(*byte);
-            let actual = decoded.len().saturating_add(character.len_utf8());
-            if actual > maximum {
-                return Err(Error::DecodedLimit { maximum, actual });
-            }
-            decoded.push(character);
-        }
-        return Ok(Cow::Owned(decoded));
+    if matches!(
+        encoding,
+        SelectedEncoding::Latin1
+            | SelectedEncoding::Latin5
+            | SelectedEncoding::Iso8859_11
+            | SelectedEncoding::Tis620
+    ) {
+        return decode_registered_single_byte(bytes, encoding, maximum).map(Cow::Owned);
     }
     let SelectedEncoding::Standard(encoding) = encoding else {
         unreachable!("special-case encodings returned above")
@@ -346,6 +372,45 @@ fn decode_selected<'a>(
             }
         }
     }
+}
+
+fn decode_registered_single_byte(
+    bytes: &[u8],
+    encoding: SelectedEncoding,
+    maximum: usize,
+) -> Result<String, Error> {
+    let mut decoded = String::with_capacity(bytes.len().min(maximum));
+    for &byte in bytes {
+        let character = match encoding {
+            SelectedEncoding::Latin1 => char::from(byte),
+            SelectedEncoding::Latin5 => match byte {
+                0xD0 => '\u{011E}',
+                0xDD => '\u{0130}',
+                0xDE => '\u{015E}',
+                0xF0 => '\u{011F}',
+                0xFD => '\u{0131}',
+                0xFE => '\u{015F}',
+                _ => char::from(byte),
+            },
+            SelectedEncoding::Iso8859_11 | SelectedEncoding::Tis620 => match byte {
+                0x00..=0x7F => char::from(byte),
+                0xA0 if encoding == SelectedEncoding::Iso8859_11 => '\u{00A0}',
+                0xA1..=0xDA => char::from_u32(u32::from(byte) + 0x0D60)
+                    .expect("TIS-620 Thai range maps to Unicode scalars"),
+                0xDF => '\u{0E3F}',
+                0xE0..=0xFB => char::from_u32(u32::from(byte) + 0x0D60)
+                    .expect("TIS-620 Thai range maps to Unicode scalars"),
+                _ => return Err(Error::InvalidBytes(encoding.name())),
+            },
+            _ => unreachable!("registered single-byte decoder receives a matching encoding"),
+        };
+        let actual = decoded.len().saturating_add(character.len_utf8());
+        if actual > maximum {
+            return Err(Error::DecodedLimit { maximum, actual });
+        }
+        decoded.push(character);
+    }
+    Ok(decoded)
 }
 
 fn decode_utf32(bytes: &[u8], encoding: SelectedEncoding, maximum: usize) -> Result<String, Error> {
@@ -641,6 +706,28 @@ mod tests {
             );
         }
         assert_eq!(decode_text(&[0x80], "windows-1252").unwrap(), "€");
+    }
+
+    #[test]
+    fn iana_single_byte_encodings_do_not_inherit_windows_extensions() {
+        // XML 1.0 section 4.3.3 requires IANA labels to retain their registered meaning.
+        // https://www.w3.org/TR/xml/#charencoding
+        assert_eq!(decode_text(&[0x80], "ISO-8859-9").unwrap(), "\u{80}");
+        assert_eq!(decode_text(&[0x80], "iso88599").unwrap(), "\u{80}");
+        assert_eq!(decode_text(&[0xD0, 0xFD], "ISO-8859-9").unwrap(), "Ğı");
+        assert_eq!(decode_text(&[0x80], "windows-1254").unwrap(), "€");
+
+        assert_eq!(decode_text(&[0xA0], "ISO-8859-11").unwrap(), "\u{A0}");
+        assert!(matches!(
+            decode_text(&[0x80], "TIS-620"),
+            Err(Error::InvalidBytes("TIS-620"))
+        ));
+        assert!(matches!(
+            decode_text(&[0xA0], "TIS-620"),
+            Err(Error::InvalidBytes("TIS-620"))
+        ));
+        assert_eq!(decode_text(&[0xA1, 0xFB], "TIS-620").unwrap(), "ก๛");
+        assert_eq!(decode_text(&[0x80], "windows-874").unwrap(), "€");
     }
 
     #[test]

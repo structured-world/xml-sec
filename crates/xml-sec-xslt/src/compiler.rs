@@ -32,12 +32,22 @@ impl<R: Resolver> Compiler<R> {
 
     /// Compile a complete stylesheet graph into immutable executable IR.
     pub fn compile(&self, xml: &str, base_uri: Option<&str>) -> Result<Stylesheet> {
+        self.compile_with_workspace(xml, base_uri, 0)
+    }
+
+    fn compile_with_workspace(
+        &self,
+        xml: &str,
+        base_uri: Option<&str>,
+        decoded_workspace: usize,
+    ) -> Result<Stylesheet> {
         ensure(
             BudgetKind::StylesheetBytes,
             self.budget.stylesheet_bytes,
             xml.len(),
         )?;
         let mut state = CompileState::new(self.budget, xml.len());
+        state.charge_owned(decoded_workspace)?;
         self.compile_module(xml, base_uri, None, &mut state, 1)?;
         let principal_document = parse_semantic_document_metered(xml, base_uri, &mut state)?;
         let mut stylesheet = state.finish()?;
@@ -53,9 +63,31 @@ impl<R: Resolver> Compiler<R> {
             self.budget.stylesheet_bytes,
             bytes.len(),
         )?;
-        let xml = xml_sec_xml_input::decode_xml_bounded(bytes, None, self.budget.stylesheet_bytes)
-            .map_err(|error| Error::Xml(error.to_string()))?;
-        self.compile(&xml, base_uri)
+        let decoded_limit = self.budget.stylesheet_bytes.min(self.budget.owned_bytes);
+        let xml =
+            xml_sec_xml_input::decode_xml_bounded(bytes, None, decoded_limit).map_err(|error| {
+                match error {
+                    xml_sec_xml_input::Error::DecodedLimit { actual, .. }
+                        if self.budget.owned_bytes <= self.budget.stylesheet_bytes =>
+                    {
+                        Error::Budget {
+                            kind: BudgetKind::OwnedBytes,
+                            limit: self.budget.owned_bytes,
+                            actual,
+                        }
+                    }
+                    xml_sec_xml_input::Error::DecodedLimit { actual, .. } => Error::Budget {
+                        kind: BudgetKind::StylesheetBytes,
+                        limit: self.budget.stylesheet_bytes,
+                        actual,
+                    },
+                    error => Error::Xml(error.to_string()),
+                }
+            })?;
+        let decoded_workspace = matches!(xml, Cow::Owned(_))
+            .then_some(xml.len())
+            .unwrap_or(0);
+        self.compile_with_workspace(&xml, base_uri, decoded_workspace)
     }
 
     fn compile_module(
@@ -456,6 +488,7 @@ impl<R: Resolver> Compiler<R> {
                 &mut state.output_precedence,
                 node,
                 precedence,
+                forward,
             )?,
             "strip-space" | "preserve-space" => {
                 let preserve = node.tag_name().name() == "preserve-space";
@@ -2996,19 +3029,29 @@ fn merge_output(
     properties: &mut OutputPropertyPrecedence,
     node: roxmltree::Node<'_, '_>,
     precedence: usize,
+    forward: bool,
 ) -> Result<()> {
+    // XSLT 1.0 section 16 defines xsl:output with EMPTY content.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#output
+    require_empty_instruction(node)?;
     // XSLT 1.0 section 16 selects each scalar output property at highest import precedence;
     // equal-precedence recovery selects the last value. cdata-section-elements is the explicit
     // exception: names from every xsl:output form one union, regardless of import precedence.
     // https://www.w3.org/TR/1999/REC-xslt-19991116#output
     if let Some(method) = node.attribute("method") {
         let method = match method {
-            "xml" => OutputMethod::Xml,
-            "html" => OutputMethod::Html,
-            "text" => OutputMethod::Text,
+            "xml" => Some(OutputMethod::Xml),
+            "html" => Some(OutputMethod::Html),
+            "text" => Some(OutputMethod::Text),
+            // Section 2.5 requires an unsupported optional attribute value to be ignored during
+            // forward-compatible processing, leaving the default output method unchanged.
+            // https://www.w3.org/TR/1999/REC-xslt-19991116#forwards
+            _ if forward => None,
             _ => return Err(Error::Static(format!("unsupported output method {method}"))),
         };
-        if merge_output_property(&mut out.method, &mut properties.method, method, precedence) {
+        if method.is_some_and(|method| {
+            merge_output_property(&mut out.method, &mut properties.method, method, precedence)
+        }) {
             out.method_explicit = true;
         }
     }
