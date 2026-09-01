@@ -902,9 +902,15 @@ struct ParsedTime {
 fn parse_time(input: &str) -> Option<ParsedTime> {
     let mut parts = input.split(':');
     let second_lexical = parts.next_back()?;
-    let integer_digits = second_lexical
-        .split_once('.')
-        .map_or(second_lexical, |(integer, _)| integer);
+    let integer_digits = match second_lexical.split_once('.') {
+        Some((integer, fraction))
+            if !fraction.is_empty() && fraction.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            integer
+        }
+        Some(_) => return None,
+        None => second_lexical,
+    };
     if integer_digits.len() != 2 || !integer_digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
@@ -1123,6 +1129,8 @@ mod tests {
             "24:00:00.0000000000000000000000001",
             "24:00:01",
             "24:01:00",
+            "12:34:56.",
+            "2000-01-01T12:34:56.",
         ] {
             assert!(DateValue::parse(invalid).is_none(), "accepted {invalid}");
         }

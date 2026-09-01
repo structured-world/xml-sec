@@ -340,10 +340,7 @@ impl<R: Resolver> Compiler<R> {
                 if child.has_tag_name((XSLT_NS, "param")) {
                     params.push(compile_variable(child, context.clone())?);
                     children.next();
-                } else if (child.is_text() && child.text().is_none_or(is_xml_whitespace_only))
-                    || child.is_comment()
-                    || child.is_pi()
-                {
+                } else if is_ignorable_stylesheet_child(child) {
                     children.next();
                 } else {
                     break;
@@ -398,10 +395,7 @@ impl<R: Resolver> Compiler<R> {
                             )?,
                         )?);
                         children.next();
-                    } else if (child.is_text() && child.text().is_none_or(is_xml_whitespace_only))
-                        || child.is_comment()
-                        || child.is_pi()
-                    {
+                    } else if is_ignorable_stylesheet_child(child) {
                         children.next();
                     } else {
                         break;
@@ -453,7 +447,12 @@ impl<R: Resolver> Compiler<R> {
                     is_parameter: node.tag_name().name() == "param",
                 });
             }
-            "output" => merge_output(&mut state.output, node)?,
+            "output" => merge_output(
+                &mut state.output,
+                &mut state.output_precedence,
+                node,
+                precedence,
+            )?,
             "strip-space" | "preserve-space" => {
                 let preserve = node.tag_name().name() == "preserve-space";
                 for token in required_attr(node, "elements")?.split_ascii_whitespace() {
@@ -495,7 +494,11 @@ impl<R: Resolver> Compiler<R> {
                     state.decimal_formats.push(format);
                 }
             }
-            "namespace-alias" => state.namespace_aliases.push(parse_namespace_alias(node)?),
+            "namespace-alias" => merge_namespace_alias(
+                &mut state.namespace_aliases,
+                &mut state.namespace_alias_index,
+                parse_namespace_alias(node, precedence)?,
+            )?,
             "attribute-set" => {
                 let order = state.next_order();
                 state.attribute_sets.push(AttributeSet::parse(
@@ -516,12 +519,10 @@ fn validate_standard_stylesheet_content(root: roxmltree::Node<'_, '_>) -> Result
     // XSLT 1.0 section 2.2 permits only template top-level declarations after stylesheet
     // whitespace stripping; other character data is a static error.
     // https://www.w3.org/TR/1999/REC-xslt-19991116#stylesheet-element
-    if root.children().any(|child| {
-        child.is_text()
-            && child
-                .text()
-                .is_some_and(|text| !is_xml_whitespace_only(text))
-    }) {
+    if root
+        .children()
+        .any(|child| child.is_text() && !is_ignorable_stylesheet_text(child))
+    {
         return Err(Error::Static(
             "non-whitespace character data is not allowed at stylesheet top level".into(),
         ));
@@ -738,9 +739,10 @@ pub(crate) struct KeyDeclaration {
 }
 #[derive(Debug, Clone)]
 pub(crate) struct NamespaceAlias {
-    pub stylesheet_namespace: Option<String>,
+    pub stylesheet_namespace: Option<Arc<str>>,
     pub output_prefix: Option<String>,
     pub result_namespace: Option<String>,
+    precedence: usize,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct AttributeSet {
@@ -1409,16 +1411,58 @@ fn alias_namespace(node: roxmltree::Node<'_, '_>, prefix: &str) -> Result<Option
         .ok_or_else(|| Error::Static(format!("namespace-alias prefix {prefix} is not bound")))
 }
 
-fn parse_namespace_alias(node: roxmltree::Node<'_, '_>) -> Result<NamespaceAlias> {
+fn parse_namespace_alias(
+    node: roxmltree::Node<'_, '_>,
+    precedence: usize,
+) -> Result<NamespaceAlias> {
     let stylesheet_prefix = required_attr(node, "stylesheet-prefix")?;
     let result_prefix = required_attr(node, "result-prefix")?;
     let stylesheet_namespace = alias_namespace(node, stylesheet_prefix)?;
     let result_namespace = alias_namespace(node, result_prefix)?;
     Ok(NamespaceAlias {
-        stylesheet_namespace,
+        stylesheet_namespace: stylesheet_namespace.map(Arc::from),
         output_prefix: (result_prefix != "#default").then(|| result_prefix.to_owned()),
         result_namespace,
+        precedence,
     })
+}
+
+fn merge_namespace_alias(
+    aliases: &mut Vec<NamespaceAlias>,
+    index: &mut HashMap<Option<Arc<str>>, usize>,
+    incoming: NamespaceAlias,
+) -> Result<()> {
+    let Some(existing_index) = index.get(&incoming.stylesheet_namespace).copied() else {
+        index.insert(incoming.stylesheet_namespace.clone(), aliases.len());
+        aliases.push(incoming);
+        return Ok(());
+    };
+    let existing = &aliases[existing_index];
+    if existing.precedence > incoming.precedence {
+        return Ok(());
+    }
+    if existing.precedence == incoming.precedence {
+        // XSLT 1.0 section 7.1.1 permits recovery from a highest-precedence conflict by choosing
+        // the declaration occurring last, which is the libxslt-compatible behavior.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#literal-result-element
+        aliases[existing_index] = incoming;
+        return Ok(());
+    }
+    aliases[existing_index] = incoming;
+    Ok(())
+}
+
+#[derive(Default)]
+struct OutputPropertyPrecedence {
+    method: Option<usize>,
+    version: Option<usize>,
+    encoding: Option<usize>,
+    omit_xml_declaration: Option<usize>,
+    standalone: Option<usize>,
+    doctype_public: Option<usize>,
+    doctype_system: Option<usize>,
+    indent: Option<usize>,
+    media_type: Option<usize>,
 }
 
 struct CompileState {
@@ -1426,10 +1470,12 @@ struct CompileState {
     templates: Vec<Template>,
     globals: Vec<GlobalVariable>,
     output: OutputDefinition,
+    output_precedence: OutputPropertyPrecedence,
     whitespace: Vec<(NameTest, bool, usize, usize)>,
     keys: Vec<KeyDeclaration>,
     decimal_formats: Vec<DecimalFormat>,
     namespace_aliases: Vec<NamespaceAlias>,
+    namespace_alias_index: HashMap<Option<Arc<str>>, usize>,
     attribute_sets: Vec<AttributeSet>,
     functions: Vec<ExsltFunction>,
     resources: Vec<ResourceIdentity>,
@@ -1451,10 +1497,12 @@ impl CompileState {
             templates: vec![],
             globals: vec![],
             output: OutputDefinition::default(),
+            output_precedence: OutputPropertyPrecedence::default(),
             whitespace: vec![],
             keys: vec![],
             decimal_formats: vec![],
             namespace_aliases: vec![],
+            namespace_alias_index: HashMap::new(),
             attribute_sets: vec![],
             functions: vec![],
             resources: vec![],
@@ -1977,6 +2025,7 @@ fn compile_instruction(
                 .filter(|child| child.has_tag_name((XSLT_NS, "fallback")))
                 .collect::<Vec<_>>();
             for child in &fallback_nodes {
+                validate_instruction_attributes(*child, context.forward)?;
                 fallback.extend(compile_sequence(child.children(), context.descend()?)?);
             }
             return Ok(Instruction::ExtensionFallback {
@@ -1996,9 +2045,7 @@ fn compile_instruction(
             let mut parameter_names = HashSet::new();
             let mut saw_parameter = false;
             for child in node.children() {
-                if !child.is_element()
-                    && (!child.is_text() || child.text().is_none_or(is_xml_whitespace_only))
-                {
+                if is_ignorable_stylesheet_child(child) {
                     continue;
                 }
                 if child.has_tag_name((XSLT_NS, "sort")) && !saw_parameter {
@@ -2032,9 +2079,7 @@ fn compile_instruction(
             let mut parameters = Vec::new();
             let mut parameter_names = HashSet::new();
             for child in node.children() {
-                if !child.is_element()
-                    && (!child.is_text() || child.text().is_none_or(is_xml_whitespace_only))
-                {
+                if is_ignorable_stylesheet_child(child) {
                     continue;
                 }
                 if !child.has_tag_name((XSLT_NS, "with-param")) {
@@ -2061,11 +2106,7 @@ fn compile_instruction(
             for child in node.children() {
                 if child.has_tag_name((XSLT_NS, "sort")) && sorting {
                     sorts.push(compile_sort(child, &context)?)
-                } else if (child.is_text()
-                    && child.text().is_none_or(is_xml_whitespace_only)
-                    && !stylesheet_space_is_preserved(child))
-                    || (!child.is_element() && !child.is_text())
-                {
+                } else if is_ignorable_stylesheet_child(child) {
                     continue;
                 } else {
                     sorting = false;
@@ -2097,9 +2138,7 @@ fn compile_instruction(
             let mut saw_otherwise = false;
             for child in node.children() {
                 if child.is_text() {
-                    if child.text().is_none_or(is_xml_whitespace_only)
-                        && !stylesheet_space_is_preserved(child)
-                    {
+                    if is_ignorable_stylesheet_text(child) {
                         continue;
                     }
                     return Err(Error::Static(
@@ -2262,6 +2301,10 @@ fn is_ignorable_stylesheet_text(node: roxmltree::Node<'_, '_>) -> bool {
     node.is_text()
         && node.text().is_some_and(is_xml_whitespace_only)
         && !stylesheet_space_is_preserved(node)
+}
+
+fn is_ignorable_stylesheet_child(node: roxmltree::Node<'_, '_>) -> bool {
+    !node.is_element() && (!node.is_text() || is_ignorable_stylesheet_text(node))
 }
 
 fn require_empty_instruction(node: roxmltree::Node<'_, '_>) -> Result<()> {
@@ -2824,8 +2867,11 @@ fn parse_avt(
                     }
                     expression.push(c)
                 }
+                // XPath 1.0 section 3.7 recognizes only XML S around tokens; Unicode trim
+                // would silently reinterpret NBSP and other expression characters as layout.
+                // https://www.w3.org/TR/1999/REC-xpath-19991116#exprlex
                 parts.push(AvtPart::Expression(
-                    context.expression(expression.trim(), node)?,
+                    context.expression(trim_xml_whitespace(&expression), node)?,
                 ));
             }
             '}' => {
@@ -2841,41 +2887,116 @@ fn parse_avt(
     }
     Ok(AttributeValueTemplate(parts))
 }
-fn merge_output(out: &mut OutputDefinition, node: roxmltree::Node<'_, '_>) -> Result<()> {
+fn merge_output_property<T>(
+    slot: &mut T,
+    slot_precedence: &mut Option<usize>,
+    incoming: T,
+    precedence: usize,
+) -> bool {
+    match *slot_precedence {
+        Some(existing) if existing > precedence => false,
+        Some(existing) if existing == precedence => {
+            // XSLT 1.0 section 16 permits recovery from a surviving conflict by selecting the
+            // value occurring last, matching libxslt's compatibility contract.
+            // https://www.w3.org/TR/1999/REC-xslt-19991116#output
+            *slot = incoming;
+            true
+        }
+        _ => {
+            *slot = incoming;
+            *slot_precedence = Some(precedence);
+            true
+        }
+    }
+}
+
+fn merge_output(
+    out: &mut OutputDefinition,
+    properties: &mut OutputPropertyPrecedence,
+    node: roxmltree::Node<'_, '_>,
+    precedence: usize,
+) -> Result<()> {
+    // XSLT 1.0 section 16 selects each scalar output property at highest import precedence;
+    // equal-precedence recovery selects the last value, while CDATA element names form a union.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#output
     if let Some(method) = node.attribute("method") {
-        out.method_explicit = true;
-        out.method = match method {
+        let method = match method {
             "xml" => OutputMethod::Xml,
             "html" => OutputMethod::Html,
             "text" => OutputMethod::Text,
             _ => return Err(Error::Static(format!("unsupported output method {method}"))),
+        };
+        if merge_output_property(&mut out.method, &mut properties.method, method, precedence) {
+            out.method_explicit = true;
         }
     }
     if let Some(v) = node.attribute("version") {
-        out.version = Some(v.into())
+        merge_output_property(
+            &mut out.version,
+            &mut properties.version,
+            Some(v.into()),
+            precedence,
+        );
     }
-    if let Some(v) = node.attribute("encoding") {
+    if let Some(v) = node.attribute("encoding")
+        && merge_output_property(
+            &mut out.encoding,
+            &mut properties.encoding,
+            v.into(),
+            precedence,
+        )
+    {
         out.encoding_explicit = true;
-        out.encoding = v.into()
     }
-    if node.attribute("omit-xml-declaration").is_some() {
-        out.omit_xml_declaration = yes_no(node.attribute("omit-xml-declaration"))?
+    if let Some(v) = node.attribute("omit-xml-declaration") {
+        merge_output_property(
+            &mut out.omit_xml_declaration,
+            &mut properties.omit_xml_declaration,
+            yes_no(Some(v))?,
+            precedence,
+        );
     }
     if let Some(v) = node.attribute("standalone") {
-        out.standalone = Some(yes_no(Some(v))?)
+        merge_output_property(
+            &mut out.standalone,
+            &mut properties.standalone,
+            Some(yes_no(Some(v))?),
+            precedence,
+        );
     }
     if let Some(v) = node.attribute("doctype-public") {
-        out.doctype_public = Some(v.into())
+        merge_output_property(
+            &mut out.doctype_public,
+            &mut properties.doctype_public,
+            Some(v.into()),
+            precedence,
+        );
     }
     if let Some(v) = node.attribute("doctype-system") {
-        out.doctype_system = Some(v.into())
+        merge_output_property(
+            &mut out.doctype_system,
+            &mut properties.doctype_system,
+            Some(v.into()),
+            precedence,
+        );
     }
-    if node.attribute("indent").is_some() {
+    if let Some(v) = node.attribute("indent")
+        && merge_output_property(
+            &mut out.indent,
+            &mut properties.indent,
+            yes_no(Some(v))?,
+            precedence,
+        )
+    {
         out.indent_explicit = true;
-        out.indent = yes_no(node.attribute("indent"))?
     }
     if let Some(v) = node.attribute("media-type") {
-        out.media_type = Some(v.into())
+        merge_output_property(
+            &mut out.media_type,
+            &mut properties.media_type,
+            Some(v.into()),
+            precedence,
+        );
     }
     if let Some(v) = node.attribute("cdata-section-elements") {
         for name in v.split_ascii_whitespace() {
@@ -2995,12 +3116,10 @@ impl AttributeSet {
         precedence: usize,
         order: usize,
     ) -> Result<Self> {
-        if node.children().any(|child| {
-            child.is_text()
-                && child
-                    .text()
-                    .is_some_and(|text| !is_xml_whitespace_only(text))
-        }) {
+        if node
+            .children()
+            .any(|child| child.is_text() && !is_ignorable_stylesheet_text(child))
+        {
             return Err(Error::Static(
                 "xsl:attribute-set may contain only xsl:attribute".into(),
             ));

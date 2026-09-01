@@ -5845,6 +5845,101 @@ fn choose_rejects_whitespace_preserved_by_xml_space() {
 }
 
 #[test]
+fn strict_compiler_preserves_xpath_and_stylesheet_whitespace_grammars() {
+    // XPath 1.0 section 3.7 admits only XML S around tokens; NBSP inside an AVT expression is
+    // therefore syntax, not trim-able layout: https://www.w3.org/TR/1999/REC-xpath-19991116#exprlex
+    let non_xml_xpath_space = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><out value="{&#160;/&#160;}"/></xsl:template></xsl:stylesheet>"#;
+    assert!(matches!(
+        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+            .compile(non_xml_xpath_space, None),
+        Err(Error::Static(_))
+    ));
+
+    // XSLT 1.0 sections 3.4 and 6 leave xml:space-preserved text in the stylesheet tree, where it
+    // violates call-template's `(xsl:with-param)*` content model.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#named-templates
+    let preserved_call = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template name="target"/><xsl:template match="/"><xsl:call-template name="target" xml:space="preserve"> </xsl:call-template></xsl:template></xsl:stylesheet>"#;
+    let error = Compiler::new(
+        Arc::new(NoResolver),
+        CompileBudget::new(4096, 0, 32, 64 * 1024),
+    )
+    .compile(preserved_call, None)
+    .expect_err("preserved call-template text must violate its content model");
+    assert!(
+        matches!(&error, Error::Static(message) if message.contains("call-template")),
+        "{error:?}"
+    );
+    compile(&preserved_call.replace(" xml:space=\"preserve\"", ""));
+}
+
+#[test]
+fn strict_compiler_validates_extension_fallback_attributes() {
+    // XSLT 1.0 sections 2.1 and 15 permit foreign namespaced attributes on XSLT elements but the
+    // xsl:fallback syntax declares no unqualified attributes.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#fallback
+    let invalid = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:ext="urn:missing" extension-element-prefixes="ext"><xsl:template match="/"><ext:instruction><xsl:fallback bogus="value"/></ext:instruction></xsl:template></xsl:stylesheet>"#;
+    assert!(matches!(
+        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+            .compile(invalid, None),
+        Err(Error::Static(message)) if message.contains("xsl:fallback") && message.contains("bogus")
+    ));
+
+    compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:ext="urn:missing" xmlns:meta="urn:meta" extension-element-prefixes="ext"><xsl:template match="/"><ext:instruction><xsl:fallback meta:hint="value"/></ext:instruction></xsl:template></xsl:stylesheet>"#,
+    );
+}
+
+#[test]
+fn compiler_merges_output_and_namespace_alias_by_precedence() {
+    // XSLT 1.0 sections 16 and 7.1.1 define highest-import-precedence selection and permit
+    // recovery from equal-precedence conflicts by selecting the last declaration.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#output
+    let output_conflict = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="xml"/><xsl:output method="html"/></xsl:stylesheet>"#;
+    assert_eq!(
+        compile(output_conflict).output_definition().method,
+        xml_sec_xslt::OutputMethod::Html
+    );
+    compile(&output_conflict.replace("method=\"html\"", "method=\"xml\""));
+
+    let alias_conflict = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:source="urn:source" xmlns:a="urn:a" xmlns:b="urn:b"><xsl:namespace-alias stylesheet-prefix="source" result-prefix="a"/><xsl:namespace-alias stylesheet-prefix="source" result-prefix="b"/></xsl:stylesheet>"#;
+    compile(alias_conflict);
+    compile(&alias_conflict.replace("result-prefix=\"b\"", "result-prefix=\"a\""));
+    compile(&alias_conflict.replace("urn:b", "urn:a"));
+
+    let resolver = Arc::new(ContextResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            (
+                "lower.xsl".into(),
+                Some("https://example.test/main.xsl".into()),
+            ),
+            ResolvedResource {
+                canonical_uri: "https://example.test/lower.xsl".into(),
+                identity: ResourceIdentity("output-alias-precedence".into()),
+                bytes: br#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:source="urn:source" xmlns:low="urn:low"><xsl:output method="html"/><xsl:namespace-alias stylesheet-prefix="source" result-prefix="low"/></xsl:stylesheet>"#.to_vec(),
+                media_type: None,
+                encoding: Some("UTF-8".into()),
+            },
+        );
+    let stylesheet = Compiler::new(
+        resolver,
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:source="urn:source" xmlns:high="urn:high"><xsl:import href="lower.xsl"/><xsl:output method="xml"/><xsl:namespace-alias stylesheet-prefix="source" result-prefix="high"/><xsl:template match="/"><source:result/></xsl:template></xsl:stylesheet>"#,
+        Some("https://example.test/main.xsl"),
+    )
+    .expect("higher-precedence output and alias declarations override imports");
+    assert_eq!(
+        stylesheet.output_definition().method,
+        xml_sec_xslt::OutputMethod::Xml
+    );
+}
+
+#[test]
 fn apply_templates_rejects_non_whitespace_character_data() {
     // Character data is not part of the xsl:apply-templates content model and must not vanish.
     let invalid = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:apply-templates>unexpected</xsl:apply-templates></xsl:template></xsl:stylesheet>"#;

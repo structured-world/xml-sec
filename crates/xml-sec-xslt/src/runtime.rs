@@ -3142,7 +3142,7 @@ impl<'a> Execution<'a> {
             .namespace_aliases
             .iter()
             .rev()
-            .find(|alias| alias.stylesheet_namespace == name.namespace)
+            .find(|alias| alias.stylesheet_namespace.as_deref() == name.namespace.as_deref())
         else {
             return (name.clone(), prefix.map(str::to_owned));
         };
