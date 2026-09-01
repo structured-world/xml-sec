@@ -103,22 +103,29 @@ impl<R: Resolver> Compiler<R> {
             state.budget.recursion_depth,
             depth,
         )?;
-        let document =
-            roxmltree::Document::parse(xml).map_err(|error| Error::Xml(error.to_string()))?;
-        state.charge_owned(estimate_compiled_owned_bytes(&document))?;
-        let root = document.root_element();
-        let StylesheetModuleKind::Standard { forward } = stylesheet_module_kind(root)? else {
-            let precedence = inherited_precedence.unwrap_or_else(|| state.next_precedence());
-            return self
-                .compile_literal_result_stylesheet(root, base_uri, precedence, state, depth);
-        };
-        validate_standard_stylesheet_content(root)?;
-        validate_top_level_declaration_attributes(root, forward)?;
-        validate_namespace_prefix_attributes(root, forward)?;
-        let mut saw_non_import = false;
-        self.compile_effective_imports(root, base_uri, state, depth, &mut saw_non_import)?;
-        let local_precedence = inherited_precedence.unwrap_or_else(|| state.next_precedence());
-        self.compile_effective_declarations(root, base_uri, local_precedence, forward, state, depth)
+        with_frontend_document(xml, state, |document, state| {
+            state.charge_owned(estimate_compiled_owned_bytes(document))?;
+            let root = document.root_element();
+            let StylesheetModuleKind::Standard { forward } = stylesheet_module_kind(root)? else {
+                let precedence = inherited_precedence.unwrap_or_else(|| state.next_precedence());
+                return self
+                    .compile_literal_result_stylesheet(root, base_uri, precedence, state, depth);
+            };
+            validate_standard_stylesheet_content(root)?;
+            validate_top_level_declaration_attributes(root, forward)?;
+            validate_namespace_prefix_attributes(root, forward)?;
+            let mut saw_non_import = false;
+            self.compile_effective_imports(root, base_uri, state, depth, &mut saw_non_import)?;
+            let local_precedence = inherited_precedence.unwrap_or_else(|| state.next_precedence());
+            self.compile_effective_declarations(
+                root,
+                base_uri,
+                local_precedence,
+                forward,
+                state,
+                depth,
+            )
+        })
     }
 
     fn compile_effective_imports(
@@ -164,24 +171,24 @@ impl<R: Resolver> Compiler<R> {
                     self.resolve_module(child, base_uri, ResolvePurpose::Include, state)?;
                 self.enter_resource(&resource, state, |state| {
                     let source = resource_source(&resource, state)?;
-                    let document = roxmltree::Document::parse(source.as_str())
-                        .map_err(|error| Error::Xml(error.to_string()))?;
-                    let included_root = document.root_element();
-                    match stylesheet_module_kind(included_root)? {
-                        StylesheetModuleKind::Standard { forward } => {
-                            validate_standard_stylesheet_content(included_root)?;
-                            validate_top_level_declaration_attributes(included_root, forward)?;
-                            validate_namespace_prefix_attributes(included_root, forward)?;
-                            self.compile_effective_imports(
-                                included_root,
-                                Some(&resource.canonical_uri),
-                                state,
-                                depth + 1,
-                                saw_non_import,
-                            )
+                    with_frontend_document(source.as_str(), state, |document, state| {
+                        let included_root = document.root_element();
+                        match stylesheet_module_kind(included_root)? {
+                            StylesheetModuleKind::Standard { forward } => {
+                                validate_standard_stylesheet_content(included_root)?;
+                                validate_top_level_declaration_attributes(included_root, forward)?;
+                                validate_namespace_prefix_attributes(included_root, forward)?;
+                                self.compile_effective_imports(
+                                    included_root,
+                                    Some(&resource.canonical_uri),
+                                    state,
+                                    depth + 1,
+                                    saw_non_import,
+                                )
+                            }
+                            StylesheetModuleKind::Simplified => Ok(()),
                         }
-                        StylesheetModuleKind::Simplified => Ok(()),
-                    }
+                    })
                 })?;
                 // XSLT 1.0 section 2.6.2 requires imports to precede every other top-level
                 // element, explicitly including xsl:include after its imports are expanded.
@@ -217,28 +224,29 @@ impl<R: Resolver> Compiler<R> {
                     self.resolve_module(child, base_uri, ResolvePurpose::Include, state)?;
                 self.enter_resource(&resource, state, |state| {
                     let source = resource_source(&resource, state)?;
-                    let document = roxmltree::Document::parse(source.as_str())
-                        .map_err(|error| Error::Xml(error.to_string()))?;
-                    let included_root = document.root_element();
-                    match stylesheet_module_kind(included_root)? {
-                        StylesheetModuleKind::Standard {
-                            forward: included_forward,
-                        } => self.compile_effective_declarations(
-                            included_root,
-                            Some(&resource.canonical_uri),
-                            precedence,
-                            included_forward,
-                            state,
-                            depth + 1,
-                        ),
-                        StylesheetModuleKind::Simplified => self.compile_literal_result_stylesheet(
-                            included_root,
-                            Some(&resource.canonical_uri),
-                            precedence,
-                            state,
-                            depth + 1,
-                        ),
-                    }
+                    with_frontend_document(source.as_str(), state, |document, state| {
+                        let included_root = document.root_element();
+                        match stylesheet_module_kind(included_root)? {
+                            StylesheetModuleKind::Standard {
+                                forward: included_forward,
+                            } => self.compile_effective_declarations(
+                                included_root,
+                                Some(&resource.canonical_uri),
+                                precedence,
+                                included_forward,
+                                state,
+                                depth + 1,
+                            ),
+                            StylesheetModuleKind::Simplified => self
+                                .compile_literal_result_stylesheet(
+                                    included_root,
+                                    Some(&resource.canonical_uri),
+                                    precedence,
+                                    state,
+                                    depth + 1,
+                                ),
+                        }
+                    })
                 })?;
                 continue;
             }
@@ -1587,6 +1595,12 @@ impl CompileState {
             self.owned_bytes,
         )
     }
+    fn release_owned(&mut self, amount: usize) {
+        self.owned_bytes = self
+            .owned_bytes
+            .checked_sub(amount)
+            .expect("released compiler workspace was previously charged");
+    }
     fn charge_stylesheet(&mut self, amount: usize) -> Result<()> {
         self.stylesheet_bytes = self
             .stylesheet_bytes
@@ -1850,6 +1864,49 @@ fn estimate_compiled_owned_bytes(document: &roxmltree::Document<'_>) -> usize {
     })
 }
 
+fn frontend_parser_workspace_bytes(xml: &str) -> usize {
+    let (node_slots, attribute_slots) =
+        xml.bytes()
+            .fold((0usize, 0usize), |(nodes, attributes), byte| {
+                (
+                    nodes.saturating_add(usize::from(byte == b'<')),
+                    attributes.saturating_add(usize::from(byte == b'=')),
+                )
+            });
+    let word = std::mem::size_of::<usize>();
+    let node_bytes = 12usize.saturating_mul(word);
+    let attribute_bytes = 10usize.saturating_mul(word);
+    let namespace_bytes = 6usize.saturating_mul(word);
+    let traversal_bytes = 3usize.saturating_mul(word);
+    let fixed_workspace = 16usize
+        .saturating_mul(attribute_bytes)
+        .saturating_add(8usize.saturating_mul(word));
+
+    // roxmltree derives its initial node and attribute capacities from these same delimiters.
+    // These machine-word bounds conservatively cover its private node/attribute/namespace arena
+    // entries and the per-depth traversal stacks without coupling this crate to private types.
+    xml.len()
+        .saturating_add(fixed_workspace)
+        .saturating_add(node_slots.saturating_mul(node_bytes.saturating_add(traversal_bytes)))
+        .saturating_add(
+            attribute_slots.saturating_mul(attribute_bytes.saturating_add(namespace_bytes)),
+        )
+}
+
+fn with_frontend_document<T>(
+    xml: &str,
+    state: &mut CompileState,
+    consume: impl FnOnce(&roxmltree::Document<'_>, &mut CompileState) -> Result<T>,
+) -> Result<T> {
+    let reserved = frontend_parser_workspace_bytes(xml);
+    state.charge_owned(reserved)?;
+    let result = roxmltree::Document::parse(xml)
+        .map_err(|error| Error::Xml(error.to_string()))
+        .and_then(|document| consume(&document, state));
+    state.release_owned(reserved);
+    result
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ResolveRequest {
     href: String,
@@ -1938,15 +1995,16 @@ fn parse_semantic_document_metered(
     base_uri: Option<&str>,
     state: &mut CompileState,
 ) -> Result<Document> {
-    let parsed = roxmltree::Document::parse(xml).map_err(|error| Error::Xml(error.to_string()))?;
-    let projected_bytes = xml
-        .len()
-        .saturating_add(estimate_compiled_owned_bytes(&parsed))
-        .saturating_add(
-            base_uri
-                .map_or(0, str::len)
-                .saturating_mul(parsed.descendants().count()),
-        );
+    let projected_bytes = with_frontend_document(xml, state, |parsed, _state| {
+        Ok(xml
+            .len()
+            .saturating_add(estimate_compiled_owned_bytes(parsed))
+            .saturating_add(
+                base_uri
+                    .map_or(0, str::len)
+                    .saturating_mul(parsed.descendants().count()),
+            ))
+    })?;
     state.charge_owned(projected_bytes)?;
     Document::parse(xml, base_uri)
 }
@@ -3388,6 +3446,7 @@ fn attribute_prefix(
         .and_then(|uri| node.lookup_prefix(uri))
         .map(str::to_owned)
 }
+
 fn instruction_yes_no(
     node: roxmltree::Node<'_, '_>,
     name: &str,
@@ -3408,5 +3467,43 @@ fn optional_yes_no(value: &str, forward_compatible: bool) -> Result<Option<bool>
         "no" => Ok(Some(false)),
         _ if forward_compatible => Ok(None),
         _ => Err(Error::Static(format!("expected yes or no, got {value}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frontend_workspace_accounts_for_every_parser_arena() {
+        // roxmltree preallocates node and attribute vectors from lexical delimiters and retains
+        // depth/namespace workspaces while parsing. The preflight must dominate all of them.
+        let xml = r#"<root xmlns:p="urn:test" a="value"><p:child/></root>"#;
+        let node_slots = xml.bytes().filter(|byte| *byte == b'<').count();
+        let attribute_slots = xml.bytes().filter(|byte| *byte == b'=').count();
+        let lexical_only = xml.len();
+        let nodes_only = lexical_only.saturating_add(node_slots);
+        let attributes_only = nodes_only.saturating_add(attribute_slots);
+
+        assert!(frontend_parser_workspace_bytes(xml) > attributes_only);
+    }
+
+    #[test]
+    fn frontend_workspace_is_rejected_before_parsing() {
+        // A malformed input must still report the exhausted allocation gate first: the frontend
+        // parser is not allowed to allocate merely to discover a later syntax error.
+        let xml = "<stylesheet>";
+        let required = frontend_parser_workspace_bytes(xml);
+        let mut state =
+            CompileState::new(CompileBudget::new(xml.len(), 0, 1, required - 1), xml.len());
+
+        assert!(matches!(
+            with_frontend_document(xml, &mut state, |_document, _state| Ok(())),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                actual,
+                ..
+            }) if actual == required
+        ));
     }
 }

@@ -493,6 +493,7 @@ impl Evaluator {
             resource_identities,
         } = prepared_source;
         let mut source = document;
+        reserve_stylesheet_imports(principal_stylesheet, module_documents, meter)?;
         let stylesheet_root = source.import(principal_stylesheet);
         let module_roots = module_documents
             .iter()
@@ -2409,6 +2410,18 @@ impl Evaluator {
         };
         element_pattern_name_matches(lexical, &attribute.name, namespaces)
     }
+}
+
+fn reserve_stylesheet_imports(
+    principal_stylesheet: &Document,
+    module_documents: &[(String, Document)],
+    meter: &mut Meter,
+) -> Result<()> {
+    let clone_bytes = module_documents.iter().fold(
+        principal_stylesheet.estimated_clone_bytes(),
+        |total, (_, document)| total.saturating_add(document.estimated_clone_bytes()),
+    );
+    meter.charge(BudgetKind::OwnedBytes, clone_bytes)
 }
 
 fn terminal_pattern_node_test(branch: &str) -> &str {
@@ -6220,6 +6233,46 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn stylesheet_imports_are_reserved_as_one_batch_before_copying() {
+        // Principal and module arenas are imported into one execution document. The complete
+        // clone footprint must cross OwnedBytes before the first import can allocate anything.
+        let principal = Document::parse("<stylesheet/>", None).expect("principal parses");
+        let module =
+            Document::parse("<stylesheet><node/></stylesheet>", None).expect("module parses");
+        let modules = [("memory:module.xsl".to_owned(), module)];
+        let required = principal
+            .estimated_clone_bytes()
+            .saturating_add(modules[0].1.estimated_clone_bytes());
+        let limits = ExecutionBudget {
+            source_bytes: usize::MAX,
+            external_documents: usize::MAX,
+            recursion_depth: usize::MAX,
+            xpath_evaluations: usize::MAX,
+            template_applications: usize::MAX,
+            sort_comparisons: usize::MAX,
+            key_entries: usize::MAX,
+            result_nodes: usize::MAX,
+            serialized_bytes: usize::MAX,
+            messages: usize::MAX,
+            owned_bytes: required - 1,
+        };
+        let mut meter = Meter::new(limits, 0).expect("empty source fits");
+
+        assert!(matches!(
+            reserve_stylesheet_imports(&principal, &modules, &mut meter),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                actual,
+                ..
+            }) if actual == required
+        ));
+        assert_eq!(
+            meter.usage(BudgetKind::OwnedBytes).expect("valid kind").0,
+            0
+        );
     }
 
     #[test]

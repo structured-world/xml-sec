@@ -958,8 +958,11 @@ fn invalid_instruction_order_and_late_attributes_fail_closed() {
     // Invalid sequence constructors must not be silently normalized by the engine.
     let invalid = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:value-of select="1"/><xsl:param name="late"/></xsl:template></xsl:stylesheet>"#;
     assert!(matches!(
-        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 256, 4096),)
-            .compile(invalid, None),
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 256, 64 * 1024),
+        )
+        .compile(invalid, None),
         Err(Error::Static(_))
     ));
 
@@ -1266,7 +1269,10 @@ fn xpath_normalization_rejects_non_xml_whitespace() {
         "<xsl:stylesheet version=\"1.0\" xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\"><xsl:template match=\"/\"><xsl:value-of select=\"/\u{a0}\"/></xsl:template></xsl:stylesheet>",
     ] {
         assert!(matches!(
-            Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+            Compiler::new(
+                Arc::new(NoResolver),
+                CompileBudget::new(4096, 0, 32, 64 * 1024),
+            )
                 .compile(stylesheet, None),
             Err(Error::Static(message)) if message.contains("invalid XPath")
         ));
@@ -1279,7 +1285,10 @@ fn standard_stylesheets_reject_top_level_character_data() {
     // data among declarations: https://www.w3.org/TR/1999/REC-xslt-19991116#stylesheet-element
     let malformed = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">payload<xsl:template match="/"/></xsl:stylesheet>"#;
     assert!(matches!(
-        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 32, 64 * 1024),
+        )
             .compile(malformed, None),
         Err(Error::Static(message)) if message.contains("stylesheet top level")
     ));
@@ -1310,7 +1319,10 @@ fn top_level_declarations_reject_unknown_unqualified_attributes() {
             r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" xmlns:f="urn:functions" extension-element-prefixes="func">{declaration}</xsl:stylesheet>"#
         );
         assert!(matches!(
-            Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+            Compiler::new(
+                Arc::new(NoResolver),
+                CompileBudget::new(4096, 0, 32, 64 * 1024),
+            )
                 .compile(&stylesheet, None),
             Err(Error::Static(message)) if message.contains("bogus")
         ));
@@ -1318,7 +1330,10 @@ fn top_level_declarations_reject_unknown_unqualified_attributes() {
 
     let root_typo = r#"<xsl:stylesheet version="1.0" bogus="yes" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"/>"#;
     assert!(matches!(
-        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 32, 64 * 1024),
+        )
             .compile(root_typo, None),
         Err(Error::Static(message)) if message.contains("bogus")
     ));
@@ -1584,7 +1599,7 @@ fn sequential_messages_release_temporary_fragment_memory() {
     ));
     let mut budget = execution_budget(1024);
     budget.messages = 32;
-    budget.owned_bytes = 512 * 1024;
+    budget.owned_bytes = 1 << 20;
     let result = stylesheet
         .execute(
             &Document::parse("<source/>", None).expect("source parses"),
@@ -1674,15 +1689,21 @@ fn static_xpath_and_template_conflicts_are_resolved_during_compilation() {
     // Invalid expressions are static errors and union branches retain their own priority.
     let malformed = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:value-of select="["/></xsl:template></xsl:stylesheet>"#;
     assert!(matches!(
-        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 256, 4096),)
-            .compile(malformed, None),
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 256, 64 * 1024),
+        )
+        .compile(malformed, None),
         Err(Error::Static(_))
     ));
 
     let unbound_prefix = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:value-of select="*[missing:name]"/></xsl:template></xsl:stylesheet>"#;
     assert!(matches!(
-        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 256, 4096),)
-            .compile(unbound_prefix, None),
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 256, 64 * 1024),
+        )
+        .compile(unbound_prefix, None),
         Err(Error::Static(_))
     ));
 
@@ -1691,8 +1712,11 @@ fn static_xpath_and_template_conflicts_are_resolved_during_compilation() {
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="missing:*"/></xsl:stylesheet>"#,
     ] {
         assert!(matches!(
-            Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 256, 4096),)
-                .compile(wildcard, None),
+            Compiler::new(
+                Arc::new(NoResolver),
+                CompileBudget::new(4096, 0, 256, 64 * 1024),
+            )
+            .compile(wildcard, None),
             Err(Error::Static(_))
         ));
     }
@@ -1734,7 +1758,10 @@ fn whitespace_rules_reject_malformed_qname_name_tests() {
             r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:p="urn:p"><xsl:strip-space elements="{token}"/></xsl:stylesheet>"#
         );
         assert!(matches!(
-            Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+            Compiler::new(
+                Arc::new(NoResolver),
+                CompileBudget::new(4096, 0, 32, 64 * 1024),
+            )
                 .compile(&stylesheet, None),
             Err(Error::Static(message)) if message.contains("whitespace") || message.contains("name test")
         ));
@@ -1783,7 +1810,10 @@ fn empty_instructions_honor_inherited_stylesheet_xml_space() {
     // https://www.w3.org/TR/1999/REC-xslt-19991116#value-of
     let preserved = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/" xml:space="preserve"><xsl:value-of select="." > </xsl:value-of></xsl:template></xsl:stylesheet>"#;
     assert!(matches!(
-        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 32, 64 * 1024),
+        )
             .compile(preserved, None),
         Err(Error::Static(message)) if message.contains("xsl:value-of must be empty")
     ));
@@ -2805,15 +2835,21 @@ fn exslt_function_contract_is_rejected_statically() {
     // extension fallback, and select/content are mutually exclusive.
     let outside = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" extension-element-prefixes="func"><xsl:template match="/"><func:result select="1"/></xsl:template></xsl:stylesheet>"#;
     assert!(matches!(
-        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
-            .compile(outside, None),
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 32, 64 * 1024),
+        )
+        .compile(outside, None),
         Err(Error::Static(_))
     ));
 
     let mixed = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" xmlns:f="urn:functions" extension-element-prefixes="func"><func:function name="f:bad"><func:result select="1">content</func:result></func:function></xsl:stylesheet>"#;
     assert!(matches!(
-        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
-            .compile(mixed, None),
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 32, 64 * 1024),
+        )
+        .compile(mixed, None),
         Err(Error::Static(_))
     ));
 }
@@ -3063,8 +3099,11 @@ fn stylesheet_content_models_distinguish_ignorable_nodes_from_character_data() {
 
     let invalid_attribute_set = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:attribute-set name="attrs">invalid<xsl:attribute name="a">v</xsl:attribute></xsl:attribute-set></xsl:stylesheet>"#;
     assert!(matches!(
-        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
-            .compile(invalid_attribute_set, None),
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 32, 64 * 1024),
+        )
+        .compile(invalid_attribute_set, None),
         Err(Error::Static(_))
     ));
 
@@ -4656,7 +4695,7 @@ fn repeated_namespace_overrides_release_replaced_storage() {
     let source_xml = format!("<root>{items}</root>");
     let source = Document::parse(&source_xml, None).expect("source parses");
     let mut budget = execution_budget(source_xml.len());
-    budget.owned_bytes = 1700 * 1024;
+    budget.owned_bytes = 2 << 20;
     let result = stylesheet
         .execute(
             &source,
@@ -4989,7 +5028,7 @@ fn sequential_secondary_outputs_release_temporary_fragment_memory() {
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:xt="http://www.jclark.com/xt" extension-element-prefixes="xt"><xsl:template match="/">{outputs}</xsl:template></xsl:stylesheet>"#
     ));
     let mut budget = execution_budget(1024);
-    budget.owned_bytes = 512 * 1024;
+    budget.owned_bytes = 1 << 20;
     let result = stylesheet
         .execute(
             &Document::parse("<source/>", None).expect("source parses"),
@@ -6722,7 +6761,7 @@ fn key_declarations_reject_child_content() {
         assert!(matches!(
             Compiler::new(
                 Arc::new(NoResolver),
-                CompileBudget::new(4096, 0, 32, 4096),
+                CompileBudget::new(4096, 0, 32, 64 * 1024),
             )
             .compile(&stylesheet, None),
             Err(Error::Static(message)) if message.contains("xsl:key must be empty")
@@ -6776,8 +6815,11 @@ fn strict_compiler_preserves_xpath_and_stylesheet_whitespace_grammars() {
     // therefore syntax, not trim-able layout: https://www.w3.org/TR/1999/REC-xpath-19991116#exprlex
     let non_xml_xpath_space = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><out value="{&#160;/&#160;}"/></xsl:template></xsl:stylesheet>"#;
     assert!(matches!(
-        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
-            .compile(non_xml_xpath_space, None),
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 32, 64 * 1024),
+        )
+        .compile(non_xml_xpath_space, None),
         Err(Error::Static(_))
     ));
 
@@ -6805,7 +6847,10 @@ fn strict_compiler_validates_extension_fallback_attributes() {
     // https://www.w3.org/TR/1999/REC-xslt-19991116#fallback
     let invalid = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:ext="urn:missing" extension-element-prefixes="ext"><xsl:template match="/"><ext:instruction><xsl:fallback bogus="value"/></ext:instruction></xsl:template></xsl:stylesheet>"#;
     assert!(matches!(
-        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 32, 64 * 1024),
+        )
             .compile(invalid, None),
         Err(Error::Static(message)) if message.contains("xsl:fallback") && message.contains("bogus")
     ));
@@ -6873,7 +6918,10 @@ fn output_declarations_obey_content_and_forward_compatibility_rules() {
     // https://www.w3.org/TR/1999/REC-xslt-19991116#output
     let strict = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="future" omit-xml-declaration="yes"/></xsl:stylesheet>"#;
     assert!(matches!(
-        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 32, 64 * 1024),
+        )
             .compile(strict, None),
         Err(Error::Static(message)) if message.contains("output method")
     ));
@@ -6888,7 +6936,10 @@ fn output_declarations_obey_content_and_forward_compatibility_rules() {
             r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output>{content}</xsl:output></xsl:stylesheet>"#
         );
         assert!(matches!(
-            Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+            Compiler::new(
+                Arc::new(NoResolver),
+                CompileBudget::new(4096, 0, 32, 64 * 1024),
+            )
                 .compile(&stylesheet, None),
             Err(Error::Static(message)) if message.contains("xsl:output") && message.contains("empty")
         ));
@@ -6944,7 +6995,10 @@ fn apply_templates_rejects_non_whitespace_character_data() {
     // Character data is not part of the xsl:apply-templates content model and must not vanish.
     let invalid = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:apply-templates>unexpected</xsl:apply-templates></xsl:template></xsl:stylesheet>"#;
     assert!(matches!(
-        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 32, 64 * 1024),
+        )
             .compile(invalid, None),
         Err(Error::Static(message)) if message.contains("apply-templates")
     ));
@@ -6978,7 +7032,10 @@ fn xslt_10_patterns_reject_variable_references_statically() {
     // XSLT 1.0 forbids VariableReference in match patterns; it is not a runtime scope lookup.
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:variable name="kind" select="'item'"/><xsl:template match="*[$kind = name()]"/></xsl:stylesheet>"#;
     assert!(matches!(
-        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 32, 64 * 1024),
+        )
             .compile(stylesheet, None),
         Err(Error::Static(message)) if message.contains("variable") && message.contains("match")
     ));
@@ -6992,7 +7049,10 @@ fn xslt_10_patterns_reject_general_xpath_expressions_statically() {
             r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="{pattern}"/></xsl:stylesheet>"#
         );
         assert!(matches!(
-            Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+            Compiler::new(
+                Arc::new(NoResolver),
+                CompileBudget::new(4096, 0, 32, 64 * 1024),
+            )
                 .compile(&stylesheet, None),
             Err(Error::Static(message)) if message.contains("match pattern")
         ));
@@ -7004,7 +7064,10 @@ fn xslt_10_patterns_reject_general_xpath_expressions_statically() {
 
     let invalid_axis = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="child::@id"/></xsl:stylesheet>"#;
     assert!(matches!(
-        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 32, 64 * 1024),
+        )
             .compile(invalid_axis, None),
         Err(Error::Static(message)) if message.contains("match pattern")
     ));
@@ -7016,7 +7079,10 @@ fn match_patterns_trim_only_xml_whitespace() {
     // https://www.w3.org/TR/1999/REC-xpath-19991116/#exprlex
     let invalid = "<xsl:stylesheet version=\"1.0\" xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\"><xsl:template match=\"\u{a0}/\u{a0}\"/></xsl:stylesheet>";
     assert!(matches!(
-        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 32, 64 * 1024),
+        )
             .compile(invalid, None),
         Err(Error::Static(message)) if message.contains("match pattern")
     ));
@@ -7032,7 +7098,10 @@ fn instruction_attributes_follow_strict_and_forward_compatible_rules() {
     // attributes; forward-compatible processing ignores unknown XSLT attributes.
     let typo = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:value-of selct="."/></xsl:template></xsl:stylesheet>"#;
     assert!(matches!(
-        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 32, 64 * 1024),
+        )
             .compile(typo, None),
         Err(Error::Static(message)) if message.contains("selct")
     ));
@@ -7045,7 +7114,10 @@ fn instruction_attributes_follow_strict_and_forward_compatible_rules() {
 
     let literal_typo = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><out xsl:bogus="yes"/></xsl:template></xsl:stylesheet>"#;
     assert!(matches!(
-        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 32, 64 * 1024),
+        )
             .compile(literal_typo, None),
         Err(Error::Static(message)) if message.contains("bogus")
     ));
@@ -7062,7 +7134,10 @@ fn exclude_result_prefixes_rejects_xslt_20_all_token_in_strict_mode() {
     // https://www.w3.org/TR/1999/REC-xslt-19991116#forwards
     let strict = r##"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:p="urn:p" exclude-result-prefixes="#all"><xsl:template match="/"/></xsl:stylesheet>"##;
     assert!(matches!(
-        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 32, 64 * 1024),
+        )
             .compile(strict, None),
         Err(Error::Static(message)) if message.contains("#all")
     ));
@@ -7596,7 +7671,10 @@ fn stylesheet_versions_reject_non_xpath_number_spellings() {
             r#"<xsl:stylesheet version="{version}" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#
         );
         assert!(matches!(
-            Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+            Compiler::new(
+                Arc::new(NoResolver),
+                CompileBudget::new(4096, 0, 32, 64 * 1024),
+            )
                 .compile(&stylesheet, None),
             Err(Error::Static(message)) if message.contains("XSLT version")
         ));
@@ -7608,7 +7686,10 @@ fn literal_result_stylesheet_versions_use_numeric_xslt_semantics() {
     // Equivalent lexical forms of XSLT 1.0 must not enable forward-compatible processing.
     let stylesheet = r#"<out xsl:version="1.00" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:future><xsl:fallback>fallback</xsl:fallback></xsl:future></out>"#;
     assert!(matches!(
-        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 32, 64 * 1024),
+        )
             .compile(stylesheet, None),
         Err(Error::Static(message)) if message.contains("unknown XSLT instruction")
     ));
