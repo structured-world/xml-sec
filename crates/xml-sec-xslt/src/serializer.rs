@@ -93,9 +93,11 @@ impl OutputEncoding {
             Ok(Self::Registered(encoding))
         } else {
             encoding_rs::Encoding::for_label(label.as_bytes())
-                .map(|encoding| Self::Other {
-                    encoding,
-                    representable: [const { Cell::new(None) }; 16],
+                .and_then(|encoding| {
+                    legacy_output_label_matches_encoding(label, encoding).then_some(Self::Other {
+                        encoding,
+                        representable: [const { Cell::new(None) }; 16],
+                    })
                 })
                 .ok_or_else(|| Error::Serialization(format!("unsupported output encoding {label}")))
         }
@@ -122,6 +124,23 @@ impl OutputEncoding {
             }
         }
     }
+}
+
+fn legacy_output_label_matches_encoding(
+    label: &str,
+    encoding: &'static encoding_rs::Encoding,
+) -> bool {
+    let canonical = encoding.name();
+    let Some(code_page) = canonical.strip_prefix("windows-") else {
+        return true;
+    };
+    label.eq_ignore_ascii_case(canonical)
+        || label
+            .get(2..)
+            .is_some_and(|suffix| label[..2].eq_ignore_ascii_case("cp") && suffix == code_page)
+        || label
+            .get(4..)
+            .is_some_and(|suffix| label[..4].eq_ignore_ascii_case("x-cp") && suffix == code_page)
 }
 
 fn encoding_represents(encoding: &'static encoding_rs::Encoding, character: char) -> bool {
@@ -967,12 +986,20 @@ fn serialize_node(
                         continue;
                     }
                     output.push_str("=\"");
-                    if definition.method == OutputMethod::Html
+                    let html_uri_escaping = if definition.method == OutputMethod::Html
                         && name.namespace.is_none()
                         && attribute.name.namespace.is_none()
-                        && is_html_uri_attribute(&name.local, &attribute.name.local)
                     {
-                        escape_html_attribute(&escape_html_uri(&attribute.value), encoding, output);
+                        html_uri_escaping(&name.local, &attribute.name.local)
+                    } else {
+                        None
+                    };
+                    if let Some(escaping) = html_uri_escaping {
+                        escape_html_attribute(
+                            &escape_html_uri(&attribute.value, escaping),
+                            encoding,
+                            output,
+                        );
                     } else if definition.method == OutputMethod::Html {
                         escape_html_attribute(&attribute.value, encoding, output);
                     } else {
@@ -1341,8 +1368,15 @@ fn reject_xml11_restricted_markup(
     Ok(())
 }
 
-fn is_html_uri_attribute(element: &str, attribute: &str) -> bool {
-    (attribute.eq_ignore_ascii_case("action") && element.eq_ignore_ascii_case("form"))
+#[derive(Clone, Copy)]
+enum HtmlUriEscaping {
+    NonAsciiAndSpaces,
+    NonAscii,
+}
+
+fn html_uri_escaping(element: &str, attribute: &str) -> Option<HtmlUriEscaping> {
+    let libxslt_pair = (attribute.eq_ignore_ascii_case("action")
+        && element.eq_ignore_ascii_case("form"))
         || (attribute.eq_ignore_ascii_case("cite")
             && ascii_eq_any(element, &["blockquote", "q", "del", "ins"]))
         || (attribute.eq_ignore_ascii_case("href")
@@ -1353,19 +1387,32 @@ fn is_html_uri_attribute(element: &str, attribute: &str) -> bool {
         || (attribute.eq_ignore_ascii_case("src")
             && ascii_eq_any(element, &["img", "input", "frame", "iframe", "script"]))
         || (attribute.eq_ignore_ascii_case("usemap")
-            && ascii_eq_any(element, &["img", "input", "object"]))
+            && ascii_eq_any(element, &["img", "input", "object"]));
+    if libxslt_pair {
+        return Some(HtmlUriEscaping::NonAsciiAndSpaces);
+    }
+    ((attribute.eq_ignore_ascii_case("background") && element.eq_ignore_ascii_case("body"))
+        || (attribute.eq_ignore_ascii_case("profile") && element.eq_ignore_ascii_case("head"))
+        || (ascii_eq_any(attribute, &["archive", "classid", "codebase", "data"])
+            && element.eq_ignore_ascii_case("object")))
+    .then_some(HtmlUriEscaping::NonAscii)
 }
 
-fn escape_html_uri(value: &str) -> Cow<'_, str> {
-    // libxslt's HTML serializer ignores leading XML whitespace in URI
-    // attributes, then percent-encodes spaces in the remaining value.
+fn escape_html_uri(value: &str, escaping: HtmlUriEscaping) -> Cow<'_, str> {
+    // XSLT 1.0 section 16.2 requires non-ASCII URI bytes to be escaped. libxslt also
+    // escapes ASCII spaces for its historical URI table, but not for all HTML URI pairs.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
     let value = value.trim_start_matches([' ', '\t', '\r', '\n']);
-    if value.bytes().all(|byte| byte != b' ' && byte.is_ascii()) {
+    let escape_spaces = matches!(escaping, HtmlUriEscaping::NonAsciiAndSpaces);
+    if value
+        .bytes()
+        .all(|byte| byte.is_ascii() && (!escape_spaces || byte != b' '))
+    {
         return Cow::Borrowed(value);
     }
     let mut escaped = String::with_capacity(value.len());
     for byte in value.bytes() {
-        if byte == b' ' || !byte.is_ascii() {
+        if !byte.is_ascii() || (escape_spaces && byte == b' ') {
             write!(&mut escaped, "%{byte:02X}").expect("writing to String cannot fail");
         } else {
             escaped.push(char::from(byte));

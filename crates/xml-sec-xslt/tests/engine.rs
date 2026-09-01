@@ -2282,6 +2282,46 @@ fn serializer_preserves_strict_iana_single_byte_semantics() {
 }
 
 #[test]
+fn serializer_rejects_iana_labels_redirected_to_windows_code_pages() {
+    // XML 1.0 section 4.3.3 requires an encoding declaration to name the actual
+    // character encoding; WHATWG aliases must not silently change IANA semantics.
+    // https://www.w3.org/TR/xml/#charencoding
+    let iana = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text" encoding="ISO-8859-2"/><xsl:template match="/">€</xsl:template></xsl:stylesheet>"#,
+    );
+    assert!(
+        iana.execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .is_err()
+    );
+
+    let windows = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text" encoding="Windows-1250"/><xsl:template match="/">€</xsl:template></xsl:stylesheet>"#,
+    );
+    let output = windows
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("explicit Windows encoding serializes");
+    assert_eq!(output.serialized.bytes, [0x80]);
+}
+
+#[test]
 fn us_ascii_output_is_strict_for_markup_and_text() {
     // WHATWG label aliases must not silently widen XSLT's declared US-ASCII output contract.
     let xml = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output encoding="US-ASCII" omit-xml-declaration="yes"/><xsl:template match="/"><root>€</root></xsl:template></xsl:stylesheet>"#;
@@ -4092,6 +4132,44 @@ fn forward_compatible_output_ignores_invalid_optional_booleans() {
 }
 
 #[test]
+fn forward_compatible_value_of_ignores_invalid_optional_boolean() {
+    // XSLT 1.0 section 2.5 ignores unsupported optional values in forward-compatible mode.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#forwards
+    let strict = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:value-of select="." disable-output-escaping="future"/></xsl:template></xsl:stylesheet>"#;
+    assert!(
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(16 * 1024, 0, 32, 16 * 1024),
+        )
+        .compile(strict, None)
+        .is_err()
+    );
+    assert_eq!(
+        execute(&strict.replacen("1.0", "2.0", 1), "<source>ok</source>"),
+        "<?xml version=\"1.0\"?>\nok\n"
+    );
+}
+
+#[test]
+fn decimal_format_rejects_child_content() {
+    // XSLT 1.0 section 12.3 declares xsl:decimal-format EMPTY.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#format-number
+    for content in ["<foreign/>", "text"] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:decimal-format>{content}</xsl:decimal-format></xsl:stylesheet>"#
+        );
+        assert!(
+            Compiler::new(
+                Arc::new(NoResolver),
+                CompileBudget::new(16 * 1024, 0, 32, 16 * 1024),
+            )
+            .compile(&stylesheet, None)
+            .is_err()
+        );
+    }
+}
+
+#[test]
 fn computed_names_normalize_an_explicit_empty_namespace() {
     // An empty namespace URI removes the lexical prefix; retaining it would serialize an
     // undeclarable `xmlns:p=""` binding and change the expanded-name contract.
@@ -5117,10 +5195,11 @@ fn built_in_template_rules_consume_supplied_parameters_in_fragments() {
 #[test]
 fn html_uri_escaping_uses_element_attribute_pairs_and_expanded_names() {
     // URI escaping applies only to the pairs listed by the XSLT HTML output contract.
-    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:x="urn:foreign"><xsl:output method="html" indent="no"/><xsl:template match="/"><html><div href="é"/><foo src="é"/><a href="é" x:href="é"/></html></xsl:template></xsl:stylesheet>"#;
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:x="urn:foreign"><xsl:output method="html" indent="no"/><xsl:template match="/"><html><head profile="é path"/><body background="é path"><div href="é"/><foo src="é"/><a href="é path" x:href="é"/><object archive="é" classid="é" codebase="é" data="é"/></body></html></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(stylesheet, "<source/>"),
-        "<html xmlns:x=\"urn:foreign\"><div href=\"é\"></div><foo src=\"é\"></foo><a href=\"%C3%A9\" x:href=\"é\"></a></html>"
+        "<html xmlns:x=\"urn:foreign\"><head profile=\"%C3%A9 path\"><meta charset=\"UTF-8\"></head><body background=\"%C3%A9 path\"><div href=\"é\"></div><foo src=\"é\"></foo><a href=\"%C3%A9%20path\" x:href=\"é\"></a><object archive=\"%C3%A9\" classid=\"%C3%A9\" codebase=\"%C3%A9\" data=\"%C3%A9\"></object></body></html>"
     );
 }
 

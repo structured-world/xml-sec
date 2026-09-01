@@ -520,6 +520,9 @@ impl<R: Resolver> Compiler<R> {
                 });
             }
             "decimal-format" => {
+                // XSLT 1.0 section 12.3 defines xsl:decimal-format as EMPTY.
+                // https://www.w3.org/TR/1999/REC-xslt-19991116#format-number
+                require_empty_instruction(node)?;
                 let format = DecimalFormat::parse(node, precedence)?;
                 if let Some(existing) = state.decimal_formats.iter().find(|existing| {
                     existing.name == format.name && existing.precedence == format.precedence
@@ -2275,7 +2278,11 @@ fn compile_instruction(
             require_empty_instruction(node)?;
             Instruction::ValueOf {
                 select: context.expression(required_attr(node, "select")?, node)?,
-                disable_output_escaping: yes_no(node.attribute("disable-output-escaping"))?,
+                disable_output_escaping: instruction_yes_no(
+                    node,
+                    "disable-output-escaping",
+                    context.forward,
+                )?,
             }
         }
         "copy-of" => {
@@ -2317,7 +2324,7 @@ fn compile_instruction(
                     .filter(roxmltree::Node::is_text)
                     .filter_map(|child| child.text())
                     .collect(),
-                yes_no(node.attribute("disable-output-escaping"))?,
+                instruction_yes_no(node, "disable-output-escaping", context.forward)?,
             )
         }
         "comment" => Instruction::Comment(sequence()?),
@@ -2333,7 +2340,7 @@ fn compile_instruction(
             ));
         }
         "message" => Instruction::Message {
-            terminate: yes_no(node.attribute("terminate"))?,
+            terminate: instruction_yes_no(node, "terminate", context.forward)?,
             body: sequence()?,
         },
         "fallback" => {
@@ -3373,12 +3380,18 @@ fn attribute_prefix(
         .and_then(|uri| node.lookup_prefix(uri))
         .map(str::to_owned)
 }
-fn yes_no(value: Option<&str>) -> Result<bool> {
-    match value.unwrap_or("no") {
-        "yes" => Ok(true),
-        "no" => Ok(false),
-        other => Err(Error::Static(format!("expected yes or no, got {other}"))),
-    }
+fn instruction_yes_no(
+    node: roxmltree::Node<'_, '_>,
+    name: &str,
+    forward_compatible: bool,
+) -> Result<bool> {
+    // XSLT 1.0 section 2.5 requires unsupported optional attribute values to be
+    // ignored in forward-compatible mode, which restores the attribute default.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#forwards
+    node.attribute(name)
+        .map(|value| optional_yes_no(value, forward_compatible))
+        .transpose()
+        .map(|value| value.flatten().unwrap_or(false))
 }
 
 fn optional_yes_no(value: &str, forward_compatible: bool) -> Result<Option<bool>> {

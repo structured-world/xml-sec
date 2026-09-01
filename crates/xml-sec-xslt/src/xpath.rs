@@ -178,6 +178,18 @@ fn pattern_cache_entry_owned_bytes(key: &PatternCacheKey, node_count: usize) -> 
         )
 }
 
+fn clear_pattern_cache(
+    cache: &mut HashMap<PatternCacheKey, HashSet<SourceNode>>,
+    meter: &mut Meter,
+) {
+    let retired = std::mem::take(cache);
+    let released = retired.iter().fold(0usize, |total, (key, nodes)| {
+        total.saturating_add(pattern_cache_entry_owned_bytes(key, nodes.len()))
+    });
+    drop(retired);
+    meter.release_owned_bytes(released);
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct DocumentRequest {
     href: String,
@@ -607,7 +619,7 @@ impl Evaluator {
             }
         }
         drop(index);
-        self.pattern_matches.clear();
+        clear_pattern_cache(&mut self.pattern_matches, meter);
         Ok(())
     }
 
@@ -6057,6 +6069,49 @@ mod tests {
                 actual: 2,
             })
         ));
+    }
+
+    #[test]
+    fn clear_pattern_cache_releases_owned_bytes() {
+        // Cache invalidation must return the exact reservation charged for keys and node sets;
+        // otherwise repeated key-index construction eventually exhausts a bounded operation.
+        let key: PatternCacheKey = (
+            "item[@kind='retained']".into(),
+            vec![("p".into(), "urn:retained".into())],
+            NodeId(0),
+        );
+        let nodes = HashSet::from([SourceNode::Node(NodeId(1)), SourceNode::Node(NodeId(2))]);
+        let reserved = pattern_cache_entry_owned_bytes(&key, nodes.len());
+        let mut cache = HashMap::from([(key, nodes)]);
+        let mut meter = Meter::new(
+            ExecutionBudget {
+                source_bytes: usize::MAX,
+                external_documents: usize::MAX,
+                recursion_depth: usize::MAX,
+                xpath_evaluations: usize::MAX,
+                template_applications: usize::MAX,
+                sort_comparisons: usize::MAX,
+                key_entries: usize::MAX,
+                result_nodes: usize::MAX,
+                serialized_bytes: usize::MAX,
+                messages: usize::MAX,
+                owned_bytes: usize::MAX,
+            },
+            0,
+        )
+        .expect("empty source fits the test budget");
+        meter
+            .charge(BudgetKind::OwnedBytes, reserved)
+            .expect("cache reservation fits");
+
+        clear_pattern_cache(&mut cache, &mut meter);
+
+        assert!(cache.is_empty());
+        assert_eq!(cache.capacity(), 0);
+        assert_eq!(
+            meter.usage(BudgetKind::OwnedBytes).expect("valid kind").0,
+            0
+        );
     }
 
     #[test]
