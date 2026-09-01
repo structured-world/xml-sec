@@ -1791,6 +1791,7 @@ impl<'a> Execution<'a> {
                     content.insert_str(0, PREFIX);
                     return Err(Error::Dynamic(content));
                 }
+                reserve_retained_vec_slot(&mut self.messages, &mut self.meter)?;
                 self.messages.push(Message {
                     content,
                     terminate: false,
@@ -1817,29 +1818,39 @@ impl<'a> Execution<'a> {
                         "secondary-output URI {uri:?} was produced more than once"
                     )));
                 }
-                self.meter.charge(
-                    BudgetKind::OwnedBytes,
-                    uri.len()
-                        .saturating_add(std::mem::size_of::<SecondaryOutput>()),
-                )?;
+                self.meter.charge(BudgetKind::OwnedBytes, uri.len())?;
+                let definition_owned_bytes = self.stylesheet.output.owned_bytes();
+                self.meter
+                    .charge(BudgetKind::OwnedBytes, definition_owned_bytes)?;
                 let mut definition = self.stylesheet.output.clone();
-                for (name, value) in properties {
-                    let value = self.evaluate_avt(value, node, position, size)?;
-                    apply_secondary_output_property(&mut definition, name, &value)?;
-                }
-                let fragment = self.capture_fragment(
-                    body,
-                    node,
-                    ApplyFrame::new(position, size, depth + 1),
-                    current_precedence,
-                    None,
-                )?;
-                let serialized = self.consume_temporary_fragment(fragment, |fragment, meter| {
-                    serialize(fragment, &definition, meter)
-                })?;
-                self.secondary_outputs
-                    .push(SecondaryOutput { uri, serialized });
-                Ok(())
+                let output = (|| {
+                    for (name, value) in properties {
+                        let value = self.evaluate_avt(value, node, position, size)?;
+                        apply_secondary_output_property(
+                            &mut definition,
+                            name,
+                            value,
+                            &mut self.meter,
+                        )?;
+                    }
+                    let fragment = self.capture_fragment(
+                        body,
+                        node,
+                        ApplyFrame::new(position, size, depth + 1),
+                        current_precedence,
+                        None,
+                    )?;
+                    let serialized = self
+                        .consume_temporary_fragment(fragment, |fragment, meter| {
+                            serialize(fragment, &definition, meter)
+                        })?;
+                    reserve_retained_vec_slot(&mut self.secondary_outputs, &mut self.meter)?;
+                    self.secondary_outputs
+                        .push(SecondaryOutput { uri, serialized });
+                    Ok(())
+                })();
+                self.meter.release_owned_bytes(definition.owned_bytes());
+                output
             }
             Instruction::ExtensionFallback {
                 name,
@@ -3836,7 +3847,33 @@ fn default_collation_key(value: &str, key_bytes: usize) -> String {
 fn apply_secondary_output_property(
     definition: &mut crate::OutputDefinition,
     name: &str,
-    value: &str,
+    value: String,
+    meter: &mut Meter,
+) -> Result<()> {
+    let replaced_owned_bytes = secondary_output_property_owned_bytes(definition, name)?;
+    let retains_value = secondary_output_property_retains_value(name)?;
+    let value_owned_bytes = value.len();
+    meter.charge(BudgetKind::OwnedBytes, value_owned_bytes)?;
+    let result = set_secondary_output_property(definition, name, value);
+    match result {
+        Ok(()) => {
+            meter.release_owned_bytes(replaced_owned_bytes);
+            if !retains_value {
+                meter.release_owned_bytes(value_owned_bytes);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            meter.release_owned_bytes(value_owned_bytes);
+            Err(error)
+        }
+    }
+}
+
+fn set_secondary_output_property(
+    definition: &mut crate::OutputDefinition,
+    name: &str,
+    value: String,
 ) -> Result<()> {
     let yes_no = |value: &str| match value {
         "yes" => Ok(true),
@@ -3847,8 +3884,7 @@ fn apply_secondary_output_property(
     };
     match name {
         "method" => {
-            definition.method_explicit = true;
-            definition.method = match value {
+            let method = match value.as_str() {
                 "xml" => crate::OutputMethod::Xml,
                 "html" => crate::OutputMethod::Html,
                 "text" => crate::OutputMethod::Text,
@@ -3858,26 +3894,81 @@ fn apply_secondary_output_property(
                     )));
                 }
             };
+            definition.method_explicit = true;
+            definition.method = method;
         }
-        "version" => definition.version = Some(value.to_owned()),
+        "version" => definition.version = Some(value),
         "encoding" => {
             definition.encoding_explicit = true;
-            definition.encoding = value.to_owned();
+            definition.encoding = value;
         }
-        "omit-xml-declaration" => definition.omit_xml_declaration = yes_no(value)?,
-        "standalone" => definition.standalone = Some(yes_no(value)?),
-        "doctype-public" => definition.doctype_public = Some(value.to_owned()),
-        "doctype-system" => definition.doctype_system = Some(value.to_owned()),
+        "omit-xml-declaration" => definition.omit_xml_declaration = yes_no(&value)?,
+        "standalone" => definition.standalone = Some(yes_no(&value)?),
+        "doctype-public" => definition.doctype_public = Some(value),
+        "doctype-system" => definition.doctype_system = Some(value),
         "indent" => {
             definition.indent_explicit = true;
-            definition.indent = yes_no(value)?;
+            definition.indent = yes_no(&value)?;
         }
-        "media-type" => definition.media_type = Some(value.to_owned()),
+        "media-type" => definition.media_type = Some(value),
         _ => {
             return Err(Error::Dynamic(format!(
                 "unsupported secondary-output property {name:?}"
             )));
         }
+    }
+    Ok(())
+}
+
+fn secondary_output_property_owned_bytes(
+    definition: &crate::OutputDefinition,
+    name: &str,
+) -> Result<usize> {
+    match name {
+        "method" | "omit-xml-declaration" | "standalone" | "indent" => Ok(0),
+        "version" => Ok(definition.version.as_ref().map_or(0, String::len)),
+        "encoding" => Ok(definition.encoding.len()),
+        "doctype-public" => Ok(definition.doctype_public.as_ref().map_or(0, String::len)),
+        "doctype-system" => Ok(definition.doctype_system.as_ref().map_or(0, String::len)),
+        "media-type" => Ok(definition.media_type.as_ref().map_or(0, String::len)),
+        _ => Err(Error::Dynamic(format!(
+            "unsupported secondary-output property {name:?}"
+        ))),
+    }
+}
+
+fn secondary_output_property_retains_value(name: &str) -> Result<bool> {
+    match name {
+        "version" | "encoding" | "doctype-public" | "doctype-system" | "media-type" => Ok(true),
+        "method" | "omit-xml-declaration" | "standalone" | "indent" => Ok(false),
+        _ => Err(Error::Dynamic(format!(
+            "unsupported secondary-output property {name:?}"
+        ))),
+    }
+}
+
+fn reserve_retained_vec_slot<T>(items: &mut Vec<T>, meter: &mut Meter) -> Result<()> {
+    if std::mem::size_of::<T>() == 0 || items.len() < items.capacity() {
+        return Ok(());
+    }
+    let old_capacity = items.capacity();
+    let requested_slots = old_capacity.max(4);
+    let requested_bytes = requested_slots.saturating_mul(std::mem::size_of::<T>());
+    meter.charge(BudgetKind::OwnedBytes, requested_bytes)?;
+    if let Err(error) = items.try_reserve_exact(requested_slots) {
+        meter.release_owned_bytes(requested_bytes);
+        return Err(Error::Dynamic(format!(
+            "failed to reserve retained result storage: {error}"
+        )));
+    }
+    let actual_bytes = items
+        .capacity()
+        .saturating_sub(old_capacity)
+        .saturating_mul(std::mem::size_of::<T>());
+    if actual_bytes < requested_bytes {
+        meter.release_owned_bytes(requested_bytes - actual_bytes);
+    } else if actual_bytes > requested_bytes {
+        meter.charge(BudgetKind::OwnedBytes, actual_bytes - requested_bytes)?;
     }
     Ok(())
 }

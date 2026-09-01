@@ -56,6 +56,28 @@ impl Default for OutputDefinition {
     }
 }
 
+impl OutputDefinition {
+    pub(crate) fn owned_bytes(&self) -> usize {
+        self.version
+            .as_ref()
+            .map_or(0, String::len)
+            .saturating_add(self.encoding.len())
+            .saturating_add(self.doctype_public.as_ref().map_or(0, String::len))
+            .saturating_add(self.doctype_system.as_ref().map_or(0, String::len))
+            .saturating_add(self.media_type.as_ref().map_or(0, String::len))
+            .saturating_add(
+                self.cdata_section_elements
+                    .iter()
+                    .fold(0usize, |total, name| {
+                        total
+                            .saturating_add(std::mem::size_of::<crate::ExpandedName>())
+                            .saturating_add(name.namespace.as_ref().map_or(0, String::len))
+                            .saturating_add(name.local.len())
+                    }),
+            )
+    }
+}
+
 /// Exact serialized result bytes and metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SerializedOutput {
@@ -199,16 +221,34 @@ fn serialize_charged(
     meter: &mut Meter,
     budget_kind: BudgetKind,
 ) -> Result<SerializedOutput> {
-    let mut definition = Cow::Borrowed(definition);
-    if !definition.method_explicit
+    let infer_html_method = !definition.method_explicit
         && first_element(document)
-            .is_some_and(|node| matches!(&node.kind, NodeKind::Element { name, .. } if name.namespace.is_none() && name.local.eq_ignore_ascii_case("html")))
-    {
-        definition.to_mut().method = OutputMethod::Html;
+            .is_some_and(|node| matches!(&node.kind, NodeKind::Element { name, .. } if name.namespace.is_none() && name.local.eq_ignore_ascii_case("html")));
+    let infer_indent = (infer_html_method || definition.method == OutputMethod::Html)
+        && !definition.indent_explicit;
+    if !infer_html_method && !infer_indent {
+        return serialize_with_definition(document, definition, meter, budget_kind);
     }
-    if definition.method == OutputMethod::Html && !definition.indent_explicit {
-        definition.to_mut().indent = true;
+    let definition_owned_bytes = definition.owned_bytes();
+    meter.charge(BudgetKind::OwnedBytes, definition_owned_bytes)?;
+    let mut effective = definition.clone();
+    if infer_html_method {
+        effective.method = OutputMethod::Html;
     }
+    if infer_indent {
+        effective.indent = true;
+    }
+    let result = serialize_with_definition(document, &effective, meter, budget_kind);
+    meter.release_owned_bytes(definition_owned_bytes);
+    result
+}
+
+fn serialize_with_definition(
+    document: &Document,
+    definition: &OutputDefinition,
+    meter: &mut Meter,
+    budget_kind: BudgetKind,
+) -> Result<SerializedOutput> {
     if definition.method == OutputMethod::Xml {
         let version = definition.version.as_deref().unwrap_or("1.0");
         if !matches!(version, "1.0" | "1.1") {
@@ -221,13 +261,13 @@ fn serialize_charged(
     let (used, limit) = meter.usage(budget_kind)?;
     let mut counter =
         RenderBuffer::counting(EncodingCounter::new(&encoding), budget_kind, used, limit);
-    render(document, &definition, &encoding, &mut counter)?;
+    render(document, definition, &encoding, &mut counter)?;
     let text_bytes = counter.len();
     let encoded_bytes = counter.encoded_len()?;
     meter.check_additional(budget_kind, encoded_bytes)?;
     meter.charge(BudgetKind::OwnedBytes, text_bytes)?;
     let mut text = RenderBuffer::Text(String::with_capacity(text_bytes));
-    render(document, &definition, &encoding, &mut text)?;
+    render(document, definition, &encoding, &mut text)?;
     let text = text.into_string();
     if definition.method == OutputMethod::Xml {
         validate_xml_characters(&text, definition.version.as_deref().unwrap_or("1.0"))?;
@@ -245,19 +285,22 @@ fn serialize_charged(
         meter,
         budget_kind,
     )?;
+    let media_type = definition
+        .media_type
+        .as_deref()
+        .unwrap_or(match definition.method {
+            OutputMethod::Xml => "text/xml",
+            OutputMethod::Html => "text/html",
+            OutputMethod::Text => "text/plain",
+        });
+    meter.charge(
+        BudgetKind::OwnedBytes,
+        definition.encoding.len().saturating_add(media_type.len()),
+    )?;
     Ok(SerializedOutput {
         bytes,
         encoding: definition.encoding.clone(),
-        media_type: definition.media_type.clone().or_else(|| {
-            Some(
-                match definition.method {
-                    OutputMethod::Xml => "text/xml",
-                    OutputMethod::Html => "text/html",
-                    OutputMethod::Text => "text/plain",
-                }
-                .into(),
-            )
-        }),
+        media_type: Some(media_type.into()),
     })
 }
 
@@ -1779,8 +1822,8 @@ mod tests {
 
     #[test]
     fn transcoding_reserves_utf8_and_encoded_buffers_concurrently() {
-        // UTF-16 allocation overlaps the rendered UTF-8 workspace; a peak-live-memory budget
-        // smaller than both buffers together must reject before allocating the second buffer.
+        // UTF-16 allocation overlaps the rendered UTF-8 workspace, and the returned encoding and
+        // media-type metadata remain live beside the encoded bytes in SerializedOutput.
         let document = Document::parse("<root>abcdefgh</root>", None).expect("document parses");
         let definition = OutputDefinition {
             method: OutputMethod::Text,
@@ -1798,7 +1841,7 @@ mod tests {
             result_nodes: 0,
             serialized_bytes: 64,
             messages: 0,
-            owned_bytes: 25,
+            owned_bytes: 33,
         };
         let mut meter = Meter::new(limits, 0).expect("zero source bytes fit");
         assert!(matches!(
@@ -1810,17 +1853,17 @@ mod tests {
         ));
 
         let mut limits = limits;
-        limits.owned_bytes = 26;
+        limits.owned_bytes = 34;
         let mut meter = Meter::new(limits, 0).expect("zero source bytes fit");
         let output = serialize(&document, &definition, &mut meter)
-            .expect("combined UTF-8 and UTF-16 buffers fit exactly");
+            .expect("encoded bytes and retained metadata fit exactly");
         assert_eq!(output.bytes.len(), 18);
         assert_eq!(
             meter
                 .usage(BudgetKind::OwnedBytes)
                 .expect("owned-byte usage is available")
                 .0,
-            18
+            34
         );
     }
 }

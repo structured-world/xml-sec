@@ -35,6 +35,45 @@ fn execution_budget(source_bytes: usize) -> ExecutionBudget {
     }
 }
 
+fn minimum_execution_owned_bytes(
+    stylesheet: &xml_sec_xslt::Stylesheet,
+    initial_template: &str,
+) -> usize {
+    let source = Document::parse("<source/>", None).expect("source parses");
+    let succeeds = |owned_bytes| {
+        let mut budget = execution_budget(1024);
+        budget.messages = usize::MAX;
+        budget.owned_bytes = owned_bytes;
+        stylesheet
+            .execute(
+                &source,
+                &Parameters::new(),
+                Arc::new(NoResolver),
+                ExecutionOptions {
+                    budget,
+                    initial_mode: None,
+                    initial_template: Some(ExpandedName::new(None::<String>, initial_template)),
+                },
+            )
+            .is_ok()
+    };
+    let mut rejected = 0;
+    let mut accepted = 1;
+    while !succeeds(accepted) {
+        rejected = accepted;
+        accepted *= 2;
+    }
+    while rejected + 1 < accepted {
+        let candidate = rejected + (accepted - rejected) / 2;
+        if succeeds(candidate) {
+            accepted = candidate;
+        } else {
+            rejected = candidate;
+        }
+    }
+    accepted
+}
+
 fn execute(stylesheet: &str, source: &str) -> String {
     let result = compile(stylesheet)
         .execute(
@@ -1613,6 +1652,21 @@ fn sequential_messages_release_temporary_fragment_memory() {
         )
         .expect("temporary message fragments remain below the peak-memory ceiling");
     assert_eq!(result.messages.len(), 32);
+}
+
+#[test]
+fn retained_empty_messages_consume_owned_bytes() {
+    // Empty message payloads still retain one Message entry apiece in TransformResult.
+    let count = 64;
+    let messages = "<xsl:message/>".repeat(count);
+    let stylesheet = compile(&format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template name="baseline"/><xsl:template name="messages">{messages}</xsl:template></xsl:stylesheet>"#
+    ));
+    assert!(
+        minimum_execution_owned_bytes(&stylesheet, "messages")
+            >= minimum_execution_owned_bytes(&stylesheet, "baseline")
+                + count * std::mem::size_of::<xml_sec_xslt::Message>()
+    );
 }
 
 #[test]
@@ -5035,6 +5089,23 @@ fn retained_secondary_output_uris_share_the_owned_byte_budget() {
             ..
         }
     ));
+}
+
+#[test]
+fn dynamic_secondary_output_metadata_consumes_owned_bytes() {
+    // The AVT result is copied into the transient output definition and then into the retained
+    // SerializedOutput metadata, so both simultaneously live copies belong to the peak budget.
+    let payload = "m".repeat(64 * 1024);
+    let stylesheet = compile(&format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:xt="http://www.jclark.com/xt" extension-element-prefixes="xt"><xsl:template name="baseline"><xt:document href="memory:out" method="text"/></xsl:template><xsl:template name="metadata"><xt:document href="memory:out" method="text" media-type="{payload}"/></xsl:template></xsl:stylesheet>"#
+    ));
+    let baseline_bytes = minimum_execution_owned_bytes(&stylesheet, "baseline");
+    let metadata_bytes = minimum_execution_owned_bytes(&stylesheet, "metadata");
+    assert!(
+        metadata_bytes >= baseline_bytes + payload.len() + payload.len() / 2,
+        "baseline={baseline_bytes}, metadata={metadata_bytes}, payload={}",
+        payload.len()
+    );
 }
 
 #[test]
