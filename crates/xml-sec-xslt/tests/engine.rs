@@ -1032,6 +1032,15 @@ fn execution_environment_controls_exslt_current_time() {
 }
 
 #[test]
+fn exslt_durations_allow_fractional_syntax_only_for_seconds() {
+    // XML Schema Part 2 defines the decimal production only for the seconds component of a
+    // duration; integral-valued decimals in every other field remain lexically invalid.
+    // https://www.w3.org/TR/xmlschema-2/#duration-lexical-representation
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:date="http://exslt.org/dates-and-times"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="date:add-duration('P1.0Y', 'P1Y')"/><xsl:text>|</xsl:text><xsl:value-of select="date:add-duration('P1.0M', 'P1M')"/><xsl:text>|</xsl:text><xsl:value-of select="date:add-duration('P1.0D', 'P1D')"/><xsl:text>|</xsl:text><xsl:value-of select="date:add-duration('PT1.0H', 'PT1H')"/><xsl:text>|</xsl:text><xsl:value-of select="date:add-duration('PT1.0M', 'PT1M')"/><xsl:text>|</xsl:text><xsl:value-of select="date:add-duration('PT0.5S', 'PT0.5S')"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "|||||PT1S");
+}
+
+#[test]
 fn exslt_current_date_functions_share_the_execution_clock_and_policy() {
     // Core EXSLT current-date functions must be discoverable and use the same controlled clock
     // as zero-argument component functions; deterministic execution rejects ambient time access.
@@ -1124,6 +1133,22 @@ fn xpath_normalization_rejects_non_xml_whitespace() {
             .compile(stylesheet, None),
         Err(Error::Static(message)) if message.contains("invalid XPath")
     ));
+}
+
+#[test]
+fn standard_stylesheets_reject_top_level_character_data() {
+    // XSLT 1.0 section 2.2 strips top-level XML whitespace but does not permit other character
+    // data among declarations: https://www.w3.org/TR/1999/REC-xslt-19991116#stylesheet-element
+    let malformed = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">payload<xsl:template match="/"/></xsl:stylesheet>"#;
+    assert!(matches!(
+        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+            .compile(malformed, None),
+        Err(Error::Static(message)) if message.contains("stylesheet top level")
+    ));
+
+    compile(
+        "<xsl:stylesheet version=\"1.0\" xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\">\n\t<xsl:template match=\"/\"/>\r\n</xsl:stylesheet>",
+    );
 }
 
 #[test]
@@ -3052,6 +3077,39 @@ fn xinclude_fallback_handles_only_resource_errors() {
             .expect_err("fatal XInclude errors must bypass fallback");
         assert!(matches!(error, Error::Xml(_) | Error::Unsupported(_)));
     }
+}
+
+#[test]
+fn xinclude_rejects_multiple_fallback_children() {
+    // XInclude 1.0 section 4.2 permits at most one xi:fallback child. This is a syntax
+    // constraint, so a resource failure must not turn a malformed include into a successful
+    // fallback: https://www.w3.org/TR/xinclude/#syntax
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:copy-of select="."/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="missing.xml"><xi:fallback><first/></xi:fallback><xi:fallback><second/></xi:fallback></xi:include></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("source parses before XInclude validation");
+
+    let error = stylesheet
+        .execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        )
+        .expect_err("multiple xi:fallback children are a fatal syntax error");
+    assert!(matches!(
+        error,
+        Error::Xml(message) if message.contains("at most one xi:fallback")
+    ));
 }
 
 #[test]
@@ -5355,6 +5413,42 @@ fn format_number_honors_apostrophe_quoted_literals() {
     // literal apostrophe without changing the active numeric subpattern.
     let stylesheet = r##"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="format-number(12, &quot;'#'0&quot;)"/><xsl:text>|</xsl:text><xsl:value-of select="format-number(12, &quot;'%'0&quot;)"/><xsl:text>|</xsl:text><xsl:value-of select="format-number(12, &quot;''0&quot;)"/></xsl:template></xsl:stylesheet>"##;
     assert_eq!(execute(stylesheet, "<source/>"), "#12|%12|'12");
+}
+
+#[test]
+fn format_number_rejects_malformed_picture_grammar() {
+    // XSLT 1.0 section 12.3 delegates the localized picture grammar to DecimalFormat: each
+    // subpattern has at most one decimal separator and a picture has at most positive and
+    // negative subpatterns. Quoted syntax remains literal.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#format-number
+    for picture in ["0.0.0", "0;0;0"] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:value-of select="format-number(1, '{picture}')"/></xsl:template></xsl:stylesheet>"#,
+        );
+        assert!(
+            compile(&stylesheet)
+                .execute(
+                    &Document::parse("<source/>", None).expect("source parses"),
+                    &Parameters::new(),
+                    Arc::new(NoResolver),
+                    ExecutionOptions {
+                        budget: execution_budget(1024),
+                        initial_mode: None,
+                        initial_template: None,
+                    },
+                )
+                .is_err(),
+            "malformed picture {picture:?} must fail",
+        );
+    }
+
+    assert_eq!(
+        execute(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="format-number(1, &quot;'0.0'0.0&quot;)"/><xsl:text>|</xsl:text><xsl:value-of select="format-number(1, '.')"/></xsl:template></xsl:stylesheet>"#,
+            "<source/>",
+        ),
+        "0.01.0|1.",
+    );
 }
 
 #[test]

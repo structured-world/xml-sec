@@ -15,8 +15,9 @@ use crate::lexical::is_ncname;
 use crate::resolver::decode_resource;
 use crate::runtime::{SourceProcessing, apply_whitespace_rules};
 use crate::{
-    BudgetKind, Clock, Document, Error, ErrorKind, ExpandedName, ExtensionPolicy, NodeId, NodeKind,
-    NodeReference, ResolvePurpose, ResolvedResource, Resolver, ResourceIdentity, Result, Value,
+    BudgetKind, Clock, Document, Error, ErrorKind, ExpandedName, ExtensionPolicy, Node, NodeId,
+    NodeKind, NodeReference, ResolvePurpose, ResolvedResource, Resolver, ResourceIdentity, Result,
+    Value,
 };
 
 pub(crate) type SourceNode = NodeReference;
@@ -2683,6 +2684,7 @@ fn expand_xinclude_document(
             continue;
         }
 
+        let fallback = xinclude_fallback_child(source, node)?;
         let result = resolve_xinclude(
             source,
             source_id,
@@ -2726,20 +2728,10 @@ fn expand_xinclude_document(
             }
             Err(XIncludeFailure::Fatal(error)) => return Err(error),
             Err(XIncludeFailure::Resource(error)) => {
-                let fallback = node.children.iter().find(|child| {
-                    source.node(**child).is_some_and(|node| {
-                        matches!(
-                            &node.kind,
-                            NodeKind::Element { name, .. }
-                                if name.namespace.as_deref() == Some(XINCLUDE_NS)
-                                    && name.local == "fallback"
-                        )
-                    })
-                });
                 let Some(fallback) = fallback else {
                     return Err(error);
                 };
-                if let Some(fallback) = source.node(*fallback) {
+                if let Some(fallback) = source.node(fallback) {
                     pending.extend(
                         fallback
                             .children
@@ -2753,6 +2745,28 @@ fn expand_xinclude_document(
     }
     output.remap_ids_from(source, &principal_mapping)?;
     Ok((output, Some(principal_mapping)))
+}
+
+fn xinclude_fallback_child(source: &Document, include: &Node) -> Result<Option<NodeId>> {
+    let mut fallback = None;
+    for child in &include.children {
+        let is_fallback = source.node(*child).is_some_and(|node| {
+            matches!(
+                &node.kind,
+                NodeKind::Element { name, .. }
+                    if name.namespace.as_deref() == Some(XINCLUDE_NS)
+                        && name.local == "fallback"
+            )
+        });
+        if is_fallback && fallback.replace(*child).is_some() {
+            // XInclude 1.0 section 4.2 defines xi:include as having at most one xi:fallback
+            // child: https://www.w3.org/TR/xinclude/#syntax
+            return Err(Error::Xml(
+                "XInclude xi:include permits at most one xi:fallback child".into(),
+            ));
+        }
+    }
+    Ok(fallback)
 }
 
 fn xinclude_workspace_bytes(node_count: usize) -> usize {
@@ -5535,7 +5549,107 @@ fn tokenize_decimal_pattern(
             what: "format-number pattern has an unterminated quoted literal".into(),
         });
     }
+    if alternatives.len() > 2 {
+        return Err(invalid_decimal_pattern("more than two subpatterns"));
+    }
+    for alternative in &alternatives {
+        validate_decimal_subpattern(alternative, format)?;
+    }
     Ok(alternatives)
+}
+
+fn validate_decimal_subpattern(
+    pattern: &[DecimalPatternToken],
+    format: &DecimalFormat,
+) -> std::result::Result<(), function::Error> {
+    let mut first = None;
+    let mut last = None;
+    let mut scaling_symbols = 0usize;
+    for (index, token) in pattern.iter().enumerate().filter(|(_, token)| token.syntax) {
+        if is_decimal_number_marker(token.value, format) {
+            first.get_or_insert(index);
+            last = Some(index);
+        }
+        if token.value == format.percent || token.value == format.per_mille {
+            scaling_symbols = scaling_symbols.saturating_add(1);
+        }
+    }
+    if scaling_symbols > 1 {
+        return Err(invalid_decimal_pattern(
+            "subpattern has more than one percent or per-mille symbol",
+        ));
+    }
+    let (first, last) = first
+        .zip(last)
+        .ok_or_else(|| invalid_decimal_pattern("subpattern has no digit"))?;
+    let number = &pattern[first..=last];
+    let mut has_digit = false;
+    let mut saw_decimal = false;
+    let mut saw_required_integer = false;
+    let mut saw_optional_fraction = false;
+    for token in number {
+        if !token.syntax {
+            return Err(invalid_decimal_pattern(
+                "numeric portion contains a quoted literal",
+            ));
+        }
+        if token.value == format.zero_digit {
+            has_digit = true;
+            if saw_decimal {
+                if saw_optional_fraction {
+                    return Err(invalid_decimal_pattern(
+                        "required fractional digit follows an optional digit",
+                    ));
+                }
+            } else {
+                saw_required_integer = true;
+            }
+        } else if token.value == format.digit {
+            has_digit = true;
+            if saw_decimal {
+                saw_optional_fraction = true;
+            } else if saw_required_integer {
+                return Err(invalid_decimal_pattern(
+                    "optional integer digit follows a required digit",
+                ));
+            }
+        } else if token.value == format.decimal_separator {
+            if saw_decimal {
+                return Err(invalid_decimal_pattern(
+                    "subpattern has more than one decimal separator",
+                ));
+            }
+            saw_decimal = true;
+        } else if token.value == format.grouping_separator {
+            if saw_decimal {
+                return Err(invalid_decimal_pattern(
+                    "grouping separator appears in the fractional portion",
+                ));
+            }
+        } else {
+            return Err(invalid_decimal_pattern(
+                "numeric portion contains an affix symbol",
+            ));
+        }
+    }
+    if !has_digit && !(number.len() == 1 && saw_decimal) {
+        return Err(invalid_decimal_pattern("subpattern has no digit"));
+    }
+    Ok(())
+}
+
+fn is_decimal_digit_symbol(value: char, format: &DecimalFormat) -> bool {
+    value == format.zero_digit || value == format.digit
+}
+
+fn is_decimal_number_marker(value: char, format: &DecimalFormat) -> bool {
+    is_decimal_digit_symbol(value, format) || value == format.decimal_separator
+}
+
+fn invalid_decimal_pattern(reason: &str) -> function::Error {
+    function::Error::Other {
+        what: format!("invalid format-number pattern: {reason}"),
+    }
 }
 
 fn decimal_pattern_shape(

@@ -80,6 +80,7 @@ impl<R: Resolver> Compiler<R> {
             return self
                 .compile_literal_result_stylesheet(root, base_uri, precedence, state, depth);
         };
+        validate_standard_stylesheet_content(root)?;
         validate_top_level_declaration_attributes(root, forward)?;
         validate_namespace_prefix_attributes(root, forward)?;
         let mut saw_non_import = false;
@@ -96,16 +97,6 @@ impl<R: Resolver> Compiler<R> {
         depth: usize,
         saw_non_import: &mut bool,
     ) -> Result<()> {
-        if root.children().any(|child| {
-            child.is_text()
-                && child
-                    .text()
-                    .is_some_and(|text| !is_xml_whitespace_only(text))
-        }) {
-            return Err(Error::Static(
-                "non-whitespace character data is not allowed at stylesheet top level".into(),
-            ));
-        }
         for child in root.children().filter(roxmltree::Node::is_element) {
             let is_import = child.has_tag_name((XSLT_NS, "import"));
             if is_import && *saw_non_import {
@@ -146,6 +137,7 @@ impl<R: Resolver> Compiler<R> {
                     let included_root = document.root_element();
                     match stylesheet_module_kind(included_root)? {
                         StylesheetModuleKind::Standard { forward } => {
+                            validate_standard_stylesheet_content(included_root)?;
                             validate_top_level_declaration_attributes(included_root, forward)?;
                             self.compile_effective_imports(
                                 included_root,
@@ -514,6 +506,23 @@ impl<R: Resolver> Compiler<R> {
         }
         Ok(())
     }
+}
+
+fn validate_standard_stylesheet_content(root: roxmltree::Node<'_, '_>) -> Result<()> {
+    // XSLT 1.0 section 2.2 permits only template top-level declarations after stylesheet
+    // whitespace stripping; other character data is a static error.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#stylesheet-element
+    if root.children().any(|child| {
+        child.is_text()
+            && child
+                .text()
+                .is_some_and(|text| !is_xml_whitespace_only(text))
+    }) {
+        return Err(Error::Static(
+            "non-whitespace character data is not allowed at stylesheet top level".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Immutable compiled XSLT stylesheet.

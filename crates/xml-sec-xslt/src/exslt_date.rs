@@ -398,7 +398,8 @@ impl DurationValue {
             if end == 0 {
                 return None;
             }
-            let value = rest[..end].parse::<f64>().ok()?;
+            let lexical_value = &rest[..end];
+            let value = lexical_value.parse::<f64>().ok()?;
             if !value.is_finite() {
                 return None;
             }
@@ -412,7 +413,11 @@ impl DurationValue {
                 (true, 'S') => 6,
                 _ => return None,
             };
-            if rank <= last_rank || (rank != 6 && value.fract() != 0.0) {
+            // XML Schema Part 2 permits the decimal production only for seconds. Checking the
+            // parsed number's fractional part is insufficient because it erases the distinction
+            // between `1` and the invalid non-seconds spelling `1.0`.
+            // https://www.w3.org/TR/xmlschema-2/#duration-lexical-representation
+            if rank <= last_rank || (rank != 6 && lexical_value.contains('.')) {
                 return None;
             }
             match rank {
