@@ -7072,6 +7072,19 @@ fn exclude_result_prefixes_rejects_xslt_20_all_token_in_strict_mode() {
 }
 
 #[test]
+fn inherited_prefix_lists_use_the_declaring_ancestors_compatibility_mode() {
+    // XSLT 1.0 section 2.5 applies forward-compatible processing where the unsupported
+    // attribute occurs; a strict descendant cannot reinterpret its ancestor's attribute.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#forwards
+    for attribute in ["exclude-result-prefixes", "extension-element-prefixes"] {
+        let stylesheet = format!(
+            r##"<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" {attribute}="#all"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><out xsl:version="1.0"/></xsl:template></xsl:stylesheet>"##
+        );
+        assert_eq!(execute(&stylesheet, "<source/>"), "<out/>\n");
+    }
+}
+
+#[test]
 fn latin1_xml_serialization_distinguishes_markup_from_character_data() {
     // Character references preserve text and attributes, while XML names cannot contain them.
     let data = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output encoding="ISO-8859-1" omit-xml-declaration="yes"/><xsl:template match="/"><out value="€">€</out></xsl:template></xsl:stylesheet>"#;
@@ -7104,6 +7117,25 @@ fn latin1_cdata_reopens_around_unrepresentable_characters() {
         execute(stylesheet, "<source/>"),
         "<out><![CDATA[a]]>&#8364;<![CDATA[b]]></out>\n"
     );
+}
+
+#[test]
+fn cdata_carriage_return_round_trips_as_a_character_reference() {
+    // XML 1.0 section 2.11 normalizes literal carriage returns even inside CDATA, so the
+    // serializer must leave CDATA to preserve the result-tree character across reparsing.
+    // https://www.w3.org/TR/xml/#sec-line-ends
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes" cdata-section-elements="out"/><xsl:template match="/"><out>a&#13;b</out></xsl:template></xsl:stylesheet>"#;
+    let serialized = execute(stylesheet, "<source/>");
+    assert_eq!(serialized, "<out><![CDATA[a]]>&#13;<![CDATA[b]]></out>\n");
+    let reparsed = Document::parse(&serialized, None).expect("CDATA result reparses");
+    let text = reparsed
+        .nodes()
+        .find_map(|(_, node)| match &node.kind {
+            NodeKind::Text { value, .. } => Some(value.as_str()),
+            _ => None,
+        })
+        .expect("result retains text");
+    assert_eq!(text, "a\rb");
 }
 
 #[test]

@@ -1233,7 +1233,12 @@ impl<'a> CdataWriter<'a> {
     fn write(&mut self, value: &str) {
         let mut start = 0usize;
         for (offset, character) in value.char_indices() {
-            let reference = if self.version == "1.1" && is_xml11_restricted(character) {
+            let reference = if character == '\r' {
+                // XML 1.0 section 2.11 normalizes literal CR even inside CDATA; markup is
+                // required to preserve the result-tree character across reparsing.
+                // https://www.w3.org/TR/xml/#sec-line-ends
+                Some(false)
+            } else if self.version == "1.1" && is_xml11_restricted(character) {
                 Some(true)
             } else if !self.encoding.represents(character) {
                 Some(false)

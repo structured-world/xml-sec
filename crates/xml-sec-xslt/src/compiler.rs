@@ -2605,18 +2605,25 @@ fn is_extension_element(node: roxmltree::Node<'_, '_>) -> Result<bool> {
 
 fn forward_compatible_at(node: roxmltree::Node<'_, '_>) -> Result<bool> {
     for ancestor in node.ancestors().filter(roxmltree::Node::is_element) {
-        let version = if ancestor.has_tag_name((XSLT_NS, "stylesheet"))
-            || ancestor.has_tag_name((XSLT_NS, "transform"))
-        {
-            ancestor.attribute("version")
-        } else {
-            ancestor.attribute((XSLT_NS, "version"))
-        };
-        if let Some(version) = version {
-            return Ok(parse_stylesheet_version(version)? > 1.0);
+        if let Some(forward) = local_forward_compatible(ancestor)? {
+            return Ok(forward);
         }
     }
     Ok(false)
+}
+
+fn local_forward_compatible(node: roxmltree::Node<'_, '_>) -> Result<Option<bool>> {
+    let version = if node.has_tag_name((XSLT_NS, "stylesheet"))
+        || node.has_tag_name((XSLT_NS, "transform"))
+    {
+        node.attribute("version")
+    } else {
+        node.attribute((XSLT_NS, "version"))
+    };
+    version
+        .map(parse_stylesheet_version)
+        .transpose()
+        .map(|version| version.map(|version| version > 1.0))
 }
 fn compile_literal_element(
     node: roxmltree::Node<'_, '_>,
@@ -2638,7 +2645,7 @@ fn compile_literal_element(
             })
         })
         .collect::<Result<_>>()?;
-    let excluded = excluded_result_namespaces(node, context.forward)?;
+    let excluded = excluded_result_namespaces(node)?;
     let used_namespaces = std::iter::once(node.tag_name().namespace())
         .chain(node.attributes().map(|attribute| attribute.namespace()))
         .flatten()
@@ -2702,10 +2709,7 @@ fn validate_literal_result_attributes(
     Ok(())
 }
 
-fn excluded_result_namespaces(
-    node: roxmltree::Node<'_, '_>,
-    forward_compatible: bool,
-) -> Result<HashSet<String>> {
+fn excluded_result_namespaces(node: roxmltree::Node<'_, '_>) -> Result<HashSet<String>> {
     let mut excluded = HashSet::new();
     if node.ancestors().any(|ancestor| {
         ancestor.has_tag_name((XSLT_NS, "variable")) || ancestor.has_tag_name((XSLT_NS, "param"))
@@ -2731,7 +2735,11 @@ fn excluded_result_namespaces(
         .filter(roxmltree::Node::is_element)
         .collect::<Vec<_>>();
     ancestors.reverse();
+    let mut forward_compatible = false;
     for ancestor in ancestors {
+        if let Some(local) = local_forward_compatible(ancestor)? {
+            forward_compatible = local;
+        }
         if ancestor.has_tag_name((EXSLT_FUNCTIONS_NS, "function"))
             && let Some((prefix, _)) = ancestor
                 .attribute("name")

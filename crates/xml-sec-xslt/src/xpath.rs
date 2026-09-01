@@ -196,6 +196,25 @@ struct DocumentRequest {
     base_uri: Option<String>,
 }
 
+fn document_cache_key_owned_bytes(request: &DocumentRequest) -> usize {
+    std::mem::size_of::<DocumentRequest>()
+        .saturating_mul(2)
+        .saturating_add(request.href.len().saturating_mul(2))
+        .saturating_add(
+            request
+                .base_uri
+                .as_ref()
+                .map_or(0, |base_uri| base_uri.len().saturating_mul(2)),
+        )
+}
+
+fn charge_document_cache_keys(request: &DocumentRequest, meter: &mut Meter) -> Result<()> {
+    meter.charge(
+        BudgetKind::OwnedBytes,
+        document_cache_key_owned_bytes(request),
+    )
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct CustomFunctionCall {
     pub(crate) name: ExpandedName,
@@ -495,6 +514,7 @@ impl Evaluator {
             href: String::new(),
             base_uri: principal_base_uri,
         };
+        charge_document_cache_keys(&principal_request, meter)?;
         let principal_root = SourceNode::Node(stylesheet_root);
         let mut document_root_entries = HashMap::from([(
             principal_request.clone(),
@@ -510,6 +530,7 @@ impl Evaluator {
                 href: String::new(),
                 base_uri: Some(uri),
             };
+            charge_document_cache_keys(&request, meter)?;
             let root = SourceNode::Node(root);
             document_root_entries.insert(
                 request.clone(),
@@ -906,7 +927,16 @@ impl Evaluator {
         Ok(SourceNode::Node(logical_root))
     }
 
-    fn cache_document(&mut self, request: DocumentRequest, nodes: Vec<SourceNode>) {
+    fn cache_document(
+        &mut self,
+        request: DocumentRequest,
+        nodes: Vec<SourceNode>,
+        meter: &mut Meter,
+    ) -> Result<()> {
+        if self.documents.contains_key(&request) {
+            return Ok(());
+        }
+        charge_document_cache_keys(&request, meter)?;
         let roots = nodes
             .iter()
             .filter_map(|node| self.maps.forward.get(node).cloned())
@@ -915,6 +945,7 @@ impl Evaluator {
             .borrow_mut()
             .insert(request.clone(), roots);
         self.documents.insert(request, nodes);
+        Ok(())
     }
 
     #[expect(
@@ -1692,8 +1723,8 @@ impl Evaluator {
                 ) {
                     Ok(resource) => resource,
                     Err(Error::ResourceNotFound { .. }) => {
-                        self.cache_document(resource_request.clone(), Vec::new());
-                        self.cache_document(request, Vec::new());
+                        self.cache_document(resource_request.clone(), Vec::new(), meter)?;
+                        self.cache_document(request, Vec::new(), meter)?;
                         continue;
                     }
                     Err(error) => return Err(error),
@@ -1708,7 +1739,7 @@ impl Evaluator {
                     None => true,
                 };
                 if let Some(root) = self.resource_documents.get(&resource.identity).cloned() {
-                    self.cache_document(resource_request.clone(), vec![root.clone()]);
+                    self.cache_document(resource_request.clone(), vec![root.clone()], meter)?;
                     Some(root)
                 } else {
                     let xml = decode_resource_for_xml_parse(
@@ -1746,18 +1777,18 @@ impl Evaluator {
                     }
                     self.resource_documents
                         .insert(resource.identity, root.clone());
-                    self.cache_document(resource_request.clone(), vec![root.clone()]);
+                    self.cache_document(resource_request.clone(), vec![root.clone()], meter)?;
                     Some(root)
                 }
             };
             let Some(root) = root else {
-                self.cache_document(request, Vec::new());
+                self.cache_document(request, Vec::new(), meter)?;
                 continue;
             };
             if let Some(fragment_offset) = fragment_offset {
                 fragments.push((request, root, fragment_offset));
             } else if request != resource_request {
-                self.cache_document(request, vec![root]);
+                self.cache_document(request, vec![root], meter)?;
             }
         }
         for (request, root, fragment_offset) in fragments {
@@ -1789,7 +1820,7 @@ impl Evaluator {
                     .into_iter()
                     .collect();
                 meter.release_owned_bytes(reserved_bytes);
-                self.cache_document(request, selected);
+                self.cache_document(request, selected, meter)?;
                 continue;
             };
             let selected = self.evaluate_core(
@@ -1808,7 +1839,7 @@ impl Evaluator {
                     "document fragment `{fragment}` did not select nodes"
                 )));
             };
-            self.cache_document(request, nodes);
+            self.cache_document(request, nodes, meter)?;
         }
         Ok(())
     }
@@ -6111,6 +6142,48 @@ mod tests {
         assert_eq!(
             meter.usage(BudgetKind::OwnedBytes).expect("valid kind").0,
             0
+        );
+    }
+
+    #[test]
+    fn document_cache_keys_reserve_both_owned_requests() {
+        // The request is cloned into document_roots and moved into documents, so both retained
+        // keys and both copies of their attacker-controlled strings must cross the same gate.
+        let request = DocumentRequest {
+            href: "relative/retained/document.xml".repeat(8),
+            base_uri: Some("memory:retained/base/".repeat(8)),
+        };
+        let reserved = document_cache_key_owned_bytes(&request);
+        let limits = |owned_bytes| ExecutionBudget {
+            source_bytes: usize::MAX,
+            external_documents: usize::MAX,
+            recursion_depth: usize::MAX,
+            xpath_evaluations: usize::MAX,
+            template_applications: usize::MAX,
+            sort_comparisons: usize::MAX,
+            key_entries: usize::MAX,
+            result_nodes: usize::MAX,
+            serialized_bytes: usize::MAX,
+            messages: usize::MAX,
+            owned_bytes,
+        };
+        let mut insufficient =
+            Meter::new(limits(reserved - 1), 0).expect("empty source fits the test budget");
+        assert!(matches!(
+            charge_document_cache_keys(&request, &mut insufficient),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                actual,
+                ..
+            }) if actual == reserved
+        ));
+
+        let mut exact =
+            Meter::new(limits(reserved), 0).expect("empty source fits the exact budget");
+        charge_document_cache_keys(&request, &mut exact).expect("exact reservation fits");
+        assert_eq!(
+            exact.usage(BudgetKind::OwnedBytes).expect("valid kind").0,
+            reserved
         );
     }
 
