@@ -1,6 +1,6 @@
 use std::borrow::Cow;
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::cell::Cell;
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::rc::Rc;
 
@@ -72,7 +72,7 @@ enum OutputEncoding {
     Latin1,
     Other {
         encoding: &'static encoding_rs::Encoding,
-        representable: RefCell<HashMap<char, bool>>,
+        representable: [Cell<Option<(char, bool)>>; 16],
     },
 }
 
@@ -92,7 +92,7 @@ impl OutputEncoding {
             encoding_rs::Encoding::for_label(label.as_bytes())
                 .map(|encoding| Self::Other {
                     encoding,
-                    representable: RefCell::new(HashMap::new()),
+                    representable: [const { Cell::new(None) }; 16],
                 })
                 .ok_or_else(|| Error::Serialization(format!("unsupported output encoding {label}")))
         }
@@ -107,14 +107,33 @@ impl OutputEncoding {
                 encoding,
                 representable,
             } => {
-                if let Some(value) = representable.borrow().get(&character) {
-                    return *value;
+                let slot = &representable[u32::from(character) as usize % representable.len()];
+                if let Some((cached, value)) = slot.get()
+                    && cached == character
+                {
+                    return value;
                 }
-                let mut bytes = [0_u8; 4];
-                let value = !encoding.encode(character.encode_utf8(&mut bytes)).2;
-                representable.borrow_mut().insert(character, value);
+                let value = encoding_represents(encoding, character);
+                slot.set(Some((character, value)));
                 value
             }
+        }
+    }
+}
+
+fn encoding_represents(encoding: &'static encoding_rs::Encoding, character: char) -> bool {
+    let mut utf8 = [0_u8; 4];
+    let mut source: &str = character.encode_utf8(&mut utf8);
+    let mut encoder = encoding.new_encoder();
+    let mut output = [0_u8; 32];
+    loop {
+        let (result, read, _) =
+            encoder.encode_from_utf8_without_replacement(source, &mut output, true);
+        source = &source[read..];
+        match result {
+            encoding_rs::EncoderResult::InputEmpty => return true,
+            encoding_rs::EncoderResult::OutputFull => {}
+            encoding_rs::EncoderResult::Unmappable(_) => return false,
         }
     }
 }
@@ -1612,14 +1631,22 @@ mod tests {
     }
 
     #[test]
-    fn legacy_encoding_reuses_character_representability_results() {
+    fn legacy_encoding_bounds_character_representability_cache() {
         let encoding = OutputEncoding::new("windows-1252").expect("encoding is registered");
-        assert!(encoding.represents('€'));
+        for character in (0x20..0x220).filter_map(char::from_u32) {
+            let _ = encoding.represents(character);
+        }
         assert!(encoding.represents('€'));
         let OutputEncoding::Other { representable, .. } = encoding else {
             panic!("windows-1252 uses the cached encoding path");
         };
-        assert_eq!(representable.into_inner().len(), 1);
+        assert_eq!(
+            representable
+                .iter()
+                .filter(|slot| slot.get().is_some())
+                .count(),
+            representable.len()
+        );
     }
 
     #[test]

@@ -4044,12 +4044,12 @@ fn repeated_namespace_overrides_release_replaced_storage() {
 }
 
 #[test]
-fn scalar_fast_path_does_not_clone_result_tree_fragments_for_string_conversion() {
-    // The retained RTF and its direct string projection fit together. Deep-cloning the whole tree
-    // before conversion would add a second tree allocation and cross this operation ceiling.
+fn xpath_sessions_do_not_clone_retained_result_tree_fragments() {
+    // The retained RTF and its XPath string projection fit together. Registering a second owned
+    // tree in the generic XPath session would cross this operation ceiling.
     let payload = "x".repeat(128 * 1024);
     let stylesheet = compile(&format!(
-        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:variable name="payload"><xsl:text>{payload}</xsl:text></xsl:variable><xsl:value-of select="substring-before($payload, 'missing')"/></xsl:template></xsl:stylesheet>"#
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:variable name="payload"><xsl:text>{payload}</xsl:text></xsl:variable><xsl:if test="contains($payload, 'missing')">unexpected</xsl:if></xsl:template></xsl:stylesheet>"#
     ));
     let mut budget = execution_budget(1024);
     budget.owned_bytes = 448 * 1024;
@@ -4064,7 +4064,7 @@ fn scalar_fast_path_does_not_clone_result_tree_fragments_for_string_conversion()
                 initial_template: None,
             },
         )
-        .expect("borrowed RTF conversion remains inside the allocation gate");
+        .expect("borrowed RTF session remains inside the allocation gate");
     assert!(result.serialized.bytes.is_empty());
 }
 
@@ -5154,7 +5154,22 @@ fn empty_result_tree_fragments_are_true_singleton_root_node_sets() {
     // XSLT boolean conversion observes the fragment root even when it has no children.
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:variable name="empty"><xsl:if test="false()"><never/></xsl:if></xsl:variable><xsl:template match="/"><xsl:if test="$empty">direct</xsl:if><xsl:text>|</xsl:text><xsl:value-of select="boolean($empty)"/></xsl:template></xsl:stylesheet>"#;
     assert_eq!(execute(stylesheet, "<source/>"), "direct|true");
-    assert!(Value::ResultTreeFragment(Document::empty(None)).into_boolean());
+    assert!(Value::ResultTreeFragment(Arc::new(Document::empty(None))).into_boolean());
+}
+
+#[test]
+fn result_tree_fragment_clones_share_document_storage() {
+    // Variable snapshots and XPath continuation sessions clone Value handles frequently; the
+    // immutable temporary tree itself must remain single-allocation shared storage.
+    let value = Value::ResultTreeFragment(Arc::new(
+        Document::parse("<temporary><payload/></temporary>", None).expect("fragment parses"),
+    ));
+    let cloned = value.clone();
+    let (Value::ResultTreeFragment(original), Value::ResultTreeFragment(cloned)) = (value, cloned)
+    else {
+        panic!("both values retain result-tree fragments");
+    };
+    assert!(Arc::ptr_eq(&original, &cloned));
 }
 
 #[test]
@@ -6801,6 +6816,48 @@ fn byte_entry_points_share_strict_non_utf8_xml_decoding() {
         )
         .expect("decoded source transforms");
     assert_eq!(result.serialized.bytes, b"caf\xc3\xa9");
+
+    let utf32 = |source: &str, little_endian: bool| {
+        let mut bytes = if little_endian {
+            vec![0xFF, 0xFE, 0x00, 0x00]
+        } else {
+            vec![0x00, 0x00, 0xFE, 0xFF]
+        };
+        bytes.extend(source.chars().flat_map(|character| {
+            let scalar = u32::from(character);
+            if little_endian {
+                scalar.to_le_bytes()
+            } else {
+                scalar.to_be_bytes()
+            }
+        }));
+        bytes
+    };
+    let stylesheet = utf32(
+        r#"<?xml version="1.0" encoding="UTF-32"?><xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="root"/></xsl:template></xsl:stylesheet>"#,
+        false,
+    );
+    let compiled = Compiler::new(
+        Arc::new(NoResolver),
+        CompileBudget::new(4096, 0, 32, 16 * 1024),
+    )
+    .compile_bytes(&stylesheet, None)
+    .expect("UTF-32BE stylesheet bytes compile");
+    let source = utf32("<root>lambda</root>", true);
+    let document = Document::parse_bytes(&source, None).expect("UTF-32LE source bytes parse");
+    let result = compiled
+        .execute(
+            &document,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(4096),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("UTF-32 input transforms");
+    assert_eq!(result.serialized.bytes, b"lambda");
 }
 
 #[test]

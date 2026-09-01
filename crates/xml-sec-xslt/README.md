@@ -31,7 +31,7 @@ resolver contract with purpose, base URI, stable resource identity, and byte
 budgeting. The XMLDSig transform adapter remains outside this crate so no
 XML-security types enter the reusable engine.
 
-Resolver resources are byte-oriented. XML declarations, BOMs, UTF-16 initial
+Resolver resources are byte-oriented. XML declarations, BOMs, UTF-16/UTF-32 initial
 patterns, and explicit resolver encoding metadata are honored without lossy
 fallback; unsupported labels and malformed byte sequences are rejected. XML,
 HTML, and text output supports registered `encoding_rs` labels, including UTF-8,

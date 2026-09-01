@@ -1,10 +1,9 @@
-# SXD-XPath
+# xml-sec SXD-XPath
 
 An XML XPath library in Rust, modified to use a `no-unsafe` flag which uses the modified sxd-document XML library.
 
-[![Build Status](https://github.com/shepmaster/sxd-xpath/workflows/Continuous%20integration/badge.svg)](https://github.com/shepmaster/sxd-xpath/actions?query=branch%3Amaster)
-[![Current Version](https://img.shields.io/crates/v/sxd-xpath.svg)](https://crates.io/crates/sxd-xpath)
-[![Documentation](https://docs.rs/sxd-xpath/badge.svg)](https://docs.rs/sxd-xpath/)
+[![Current Version](https://img.shields.io/crates/v/xml-sec-sxd-xpath.svg)](https://crates.io/crates/xml-sec-sxd-xpath)
+[![Documentation](https://docs.rs/xml-sec-sxd-xpath/badge.svg)](https://docs.rs/xml-sec-sxd-xpath/)
 
 ## Overview
 
@@ -21,8 +20,6 @@ The project is broken into two crates:
 There are also scattered utilities for playing around at the command
 line.
 
-In the future, I hope to add support for XSLT 1.0.
-
 [sxd-document]: https://github.com/shepmaster/sxd-document/
 
 ## Goals
@@ -34,7 +31,7 @@ This project has a lofty goal: replace [libxml] and [libxslt].
 
 ## Contributing
 
-1. Fork it ( https://github.com/shepmaster/sxd-xpath/fork )
+1. Fork the xml-sec repository.
 2. Create your feature branch (`git checkout -b my-new-feature`)
 3. Add a failing test.
 4. Add code to pass the test.

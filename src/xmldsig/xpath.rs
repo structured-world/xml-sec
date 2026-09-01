@@ -349,7 +349,7 @@ pub(super) fn xpath_string_scan_count(source: &str) -> usize {
         if !(byte.is_ascii_alphabetic() || byte == b'_') {
             match byte {
                 b',' | b'=' | b'<' | b'>' => {
-                    // This charge matches sxd-xpath-no-unsafe 0.5.1 rather than
+                    // This charge matches xml-sec-sxd-xpath 0.1.0 rather than
                     // XPath's abstract pairwise wording: node-set equality
                     // builds one HashSet<String> per operand and tests set
                     // intersection, while relational comparison coerces each
@@ -2535,7 +2535,7 @@ mod tests {
 
     #[test]
     fn xpath_string_profile_matches_pinned_nodeset_comparison_contract() {
-        // sxd-xpath-no-unsafe 0.5.1 hashes each node-set's string values before
+        // xml-sec-sxd-xpath 0.1.0 hashes each node-set's string values before
         // testing equality, so one comparison is two linear operand scans, not
         // a Cartesian product. The conservative full-source charge is one pass.
         assert_eq!(

@@ -203,7 +203,6 @@ struct CustomCallState {
     pending: Option<Rc<DeferredCustomCall>>,
     last_requested: Option<Rc<DeferredCustomCall>>,
     completed: Vec<CompletedCustomCall>,
-    fragments: HashMap<u64, Document>,
     retained_bytes: usize,
 }
 
@@ -219,7 +218,7 @@ struct DeferredCustomCall {
 struct CompletedCustomCall {
     call: Rc<DeferredCustomCall>,
     result: DeferredXPathValue,
-    fragment: Option<Document>,
+    fragment: Option<Arc<Document>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,28 +262,14 @@ impl CustomCallSession {
         state.pending = None;
     }
 
-    fn register_fragments(&self, variables: &HashMap<ExpandedName, Value>) {
-        let mut state = self.state.borrow_mut();
-        for value in variables.values() {
-            if let Value::ResultTreeFragment(document) = value {
-                state
-                    .fragments
-                    .entry(document.identity())
-                    .or_insert_with(|| document.clone());
-            }
-        }
-    }
-
-    fn fragment(&self, identity: u64) -> Option<Document> {
+    fn fragment(&self, identity: u64) -> Option<Arc<Document>> {
         let state = self.state.borrow();
-        state.fragments.get(&identity).cloned().or_else(|| {
-            state
-                .completed
-                .iter()
-                .filter_map(|completed| completed.fragment.as_ref())
-                .find(|document| document.identity() == identity)
-                .cloned()
-        })
+        state
+            .completed
+            .iter()
+            .filter_map(|completed| completed.fragment.as_ref())
+            .find(|document| document.identity() == identity)
+            .cloned()
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
@@ -761,7 +746,13 @@ impl Evaluator {
                 })?;
                 Ok::<_, Error>(total.saturating_add(path.owned_bytes()))
             })?,
-            Value::ResultTreeFragment(document) => semantic_projection_size(document),
+            Value::ResultTreeFragment(document) => {
+                let mut string_bytes = 0usize;
+                document.visit_string_value(document.root(), |value| {
+                    string_bytes = string_bytes.saturating_add(value.len());
+                });
+                std::mem::size_of::<Arc<Document>>().saturating_add(string_bytes)
+            }
         };
         Ok(std::mem::size_of::<DeferredXPathValue>().saturating_add(payload))
     }
@@ -800,7 +791,10 @@ impl Evaluator {
         })
     }
 
-    fn defer_public_value(&self, value: Value) -> Result<(DeferredXPathValue, Option<Document>)> {
+    fn defer_public_value(
+        &self,
+        value: Value,
+    ) -> Result<(DeferredXPathValue, Option<Arc<Document>>)> {
         Ok(match value {
             Value::Boolean(value) => (DeferredXPathValue::Boolean(value), None),
             Value::Number(value) => (DeferredXPathValue::Number(value.to_bits()), None),
@@ -1404,9 +1398,6 @@ impl Evaluator {
         meter: &mut Meter,
         custom_calls: Option<&CustomCallSession>,
     ) -> Result<XPathValue> {
-        if let Some(custom_calls) = custom_calls {
-            custom_calls.register_fragments(variables);
-        }
         let document = self.package.as_document();
         let context_node = self
             .maps
@@ -2559,7 +2550,7 @@ fn split_pattern_branches(source: &str) -> Vec<&str> {
 #[derive(Debug, Clone)]
 pub(crate) enum XPathValue {
     NodeSet(Vec<SourceNode>),
-    ResultTreeFragment(Document),
+    ResultTreeFragment(Arc<Document>),
     Boolean(bool),
     Number(f64),
     String(String),

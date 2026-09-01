@@ -28,9 +28,15 @@ pub enum Error {
     /// A BOM-less UTF-16 document did not identify its byte order.
     #[error("BOM-less UTF-16 XML input requires an explicit UTF-16LE or UTF-16BE declaration")]
     MissingUtf16ByteOrder,
+    /// A UTF-32 document did not identify its byte order through metadata or its signature.
+    #[error("UTF-32 XML input requires a UTF-32LE/UTF-32BE encoding or byte-order signature")]
+    MissingUtf32ByteOrder,
     /// A UTF-16 code unit was truncated.
     #[error("{0} XML input has an odd byte length")]
     InvalidUtf16Length(&'static str),
+    /// A UTF-32 code unit was truncated.
+    #[error("{0} XML input byte length is not divisible by four")]
+    InvalidUtf32Length(&'static str),
     /// Decoded UTF-8 would exceed the caller's materialization ceiling.
     #[error("decoded XML exceeds the maximum size of {maximum} bytes: at least {actual} bytes")]
     DecodedLimit { maximum: usize, actual: usize },
@@ -39,6 +45,8 @@ pub enum Error {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SelectedEncoding {
     Standard(&'static encoding_rs::Encoding),
+    Utf32Le,
+    Utf32Be,
     Ascii,
     Latin1,
 }
@@ -47,6 +55,8 @@ impl SelectedEncoding {
     fn name(self) -> &'static str {
         match self {
             Self::Standard(encoding) => encoding.name(),
+            Self::Utf32Le => "UTF-32LE",
+            Self::Utf32Be => "UTF-32BE",
             Self::Ascii => "US-ASCII",
             Self::Latin1 => "ISO-8859-1",
         }
@@ -84,12 +94,16 @@ pub fn decode_xml_bounded<'a>(
         None
     };
     let explicit_utf16 = explicit_encoding.is_some_and(is_generic_utf16);
+    let explicit_utf32 = explicit_encoding.is_some_and(is_generic_utf32);
     let explicit = explicit_encoding
-        .filter(|_| !explicit_utf16)
+        .filter(|_| !explicit_utf16 && !explicit_utf32)
         .map(parse_encoding)
         .transpose()?;
     if explicit_utf16 && !physical.is_some_and(|(encoding, _)| is_utf16_encoding(encoding)) {
         return Err(Error::MissingUtf16ByteOrder);
+    }
+    if explicit_utf32 && !physical.is_some_and(|(encoding, _)| is_utf32_encoding(encoding)) {
+        return Err(Error::MissingUtf32ByteOrder);
     }
     let declared_before_decode = ascii_declaration
         .as_ref()
@@ -124,6 +138,10 @@ pub fn decode_xml_bounded<'a>(
             });
             if !has_utf16_bom {
                 return Err(Error::MissingUtf16ByteOrder);
+            }
+        } else if is_generic_utf32(label) {
+            if !physical.is_some_and(|(encoding, _)| is_utf32_encoding(encoding)) {
+                return Err(Error::MissingUtf32ByteOrder);
             }
         } else {
             let declared = parse_encoding(label)?;
@@ -175,10 +193,21 @@ pub fn decode_text_bounded<'a>(
 
 fn physical_encoding(bytes: &[u8]) -> Result<Option<(SelectedEncoding, usize)>, Error> {
     let prefix = bytes.get(..4).unwrap_or(bytes);
-    if matches!(prefix, [0x00, 0x00, 0xFE, 0xFF] | [0xFF, 0xFE, 0x00, 0x00])
-        || matches!(prefix, [0x00, 0x00, 0x00, b'<'] | [b'<', 0x00, 0x00, 0x00])
-    {
-        return Err(Error::UnsupportedByteEncoding("UTF-32"));
+    // XML 1.0 Appendix F defines UCS-4 BOMs and initial `<` signatures. The two
+    // unusual octet orders are recognized but intentionally unsupported.
+    // https://www.w3.org/TR/xml/#sec-guessing
+    match prefix {
+        [0x00, 0x00, 0xFE, 0xFF] => return Ok(Some((SelectedEncoding::Utf32Be, 4))),
+        [0xFF, 0xFE, 0x00, 0x00] => return Ok(Some((SelectedEncoding::Utf32Le, 4))),
+        [0x00, 0x00, 0x00, b'<'] => return Ok(Some((SelectedEncoding::Utf32Be, 0))),
+        [b'<', 0x00, 0x00, 0x00] => return Ok(Some((SelectedEncoding::Utf32Le, 0))),
+        [0x00, 0x00, 0xFF, 0xFE]
+        | [0xFE, 0xFF, 0x00, 0x00]
+        | [0x00, 0x00, b'<', 0x00]
+        | [0x00, b'<', 0x00, 0x00] => {
+            return Err(Error::UnsupportedByteEncoding("UTF-32 unusual byte order"));
+        }
+        _ => {}
     }
     if prefix == [0x4C, 0x6F, 0xA7, 0x94] {
         return Err(Error::UnsupportedByteEncoding("EBCDIC"));
@@ -194,6 +223,12 @@ fn physical_encoding(bytes: &[u8]) -> Result<Option<(SelectedEncoding, usize)>, 
 }
 
 fn parse_encoding(label: &str) -> Result<SelectedEncoding, Error> {
+    if matches_ascii_case(label, &["utf-32le", "utf32le"]) {
+        return Ok(SelectedEncoding::Utf32Le);
+    }
+    if matches_ascii_case(label, &["utf-32be", "utf32be"]) {
+        return Ok(SelectedEncoding::Utf32Be);
+    }
     if matches_ascii_case(label, &["us-ascii", "ascii"]) {
         return Ok(SelectedEncoding::Ascii);
     }
@@ -237,6 +272,12 @@ fn decode_selected<'a>(
     encoding: SelectedEncoding,
     maximum: usize,
 ) -> Result<Cow<'a, str>, Error> {
+    if matches!(
+        encoding,
+        SelectedEncoding::Utf32Le | SelectedEncoding::Utf32Be
+    ) {
+        return decode_utf32(bytes, encoding, maximum).map(Cow::Owned);
+    }
     if encoding == SelectedEncoding::Ascii {
         if bytes.iter().any(|byte| !byte.is_ascii()) {
             return Err(Error::InvalidBytes("US-ASCII"));
@@ -307,6 +348,29 @@ fn decode_selected<'a>(
     }
 }
 
+fn decode_utf32(bytes: &[u8], encoding: SelectedEncoding, maximum: usize) -> Result<String, Error> {
+    if !bytes.len().is_multiple_of(4) {
+        return Err(Error::InvalidUtf32Length(encoding.name()));
+    }
+    let mut decoded = String::with_capacity(bytes.len().min(maximum));
+    let (units, remainder) = bytes.as_chunks::<4>();
+    debug_assert!(remainder.is_empty());
+    for &unit in units {
+        let scalar = match encoding {
+            SelectedEncoding::Utf32Le => u32::from_le_bytes(unit),
+            SelectedEncoding::Utf32Be => u32::from_be_bytes(unit),
+            _ => unreachable!("UTF-32 decoder receives an explicit byte order"),
+        };
+        let character = char::from_u32(scalar).ok_or(Error::InvalidBytes(encoding.name()))?;
+        let actual = decoded.len().saturating_add(character.len_utf8());
+        if actual > maximum {
+            return Err(Error::DecodedLimit { maximum, actual });
+        }
+        decoded.push(character);
+    }
+    Ok(decoded)
+}
+
 fn encodings_compatible(
     selected: SelectedEncoding,
     candidate: SelectedEncoding,
@@ -321,6 +385,13 @@ fn encodings_compatible(
 fn is_utf16_encoding(encoding: SelectedEncoding) -> bool {
     matches!(encoding, SelectedEncoding::Standard(value)
         if value == encoding_rs::UTF_16LE || value == encoding_rs::UTF_16BE)
+}
+
+fn is_utf32_encoding(encoding: SelectedEncoding) -> bool {
+    matches!(
+        encoding,
+        SelectedEncoding::Utf32Le | SelectedEncoding::Utf32Be
+    )
 }
 
 fn declaration_from_ascii_bytes(bytes: &[u8]) -> Result<Option<(Range<usize>, &str)>, Error> {
@@ -414,6 +485,10 @@ fn is_generic_utf16(label: &str) -> bool {
     label.eq_ignore_ascii_case("UTF-16") || label.eq_ignore_ascii_case("UTF16")
 }
 
+fn is_generic_utf32(label: &str) -> bool {
+    label.eq_ignore_ascii_case("UTF-32") || label.eq_ignore_ascii_case("UTF32")
+}
+
 fn matches_ascii_case(value: &str, candidates: &[&str]) -> bool {
     candidates
         .iter()
@@ -425,6 +500,20 @@ mod tests {
     use std::borrow::Cow;
 
     use super::{Error, decode_text, decode_xml, decode_xml_bounded};
+
+    fn encode_utf32(source: &str, little_endian: bool) -> Vec<u8> {
+        source
+            .chars()
+            .flat_map(|character| {
+                let value = u32::from(character);
+                if little_endian {
+                    value.to_le_bytes()
+                } else {
+                    value.to_be_bytes()
+                }
+            })
+            .collect()
+    }
 
     #[test]
     fn utf8_without_a_rewritten_declaration_stays_borrowed() {
@@ -440,6 +529,62 @@ mod tests {
         let decoded = decode_xml(&bytes, Some("UTF-16")).expect("BOM selects UTF-16BE");
         assert!(decoded.contains("encoding=\"UTF-8\""));
         assert!(decoded.contains("<root>lambda</root>"));
+    }
+
+    #[test]
+    fn utf32_bom_and_initial_signatures_select_byte_order() {
+        // XML 1.0 Appendix F defines both UCS-4 BOMs and the BOM-less `<` signatures.
+        // https://www.w3.org/TR/xml/#sec-guessing
+        let source = "<?xml version=\"1.0\" encoding=\"UTF-32\"?><root>lambda</root>";
+        for (little_endian, bom) in [
+            (false, [0x00, 0x00, 0xFE, 0xFF]),
+            (true, [0xFF, 0xFE, 0x00, 0x00]),
+        ] {
+            let mut bytes = bom.to_vec();
+            bytes.extend(encode_utf32(source, little_endian));
+            let decoded = decode_xml(&bytes, None).expect("UTF-32 BOM selects byte order");
+            assert!(decoded.contains("encoding=\"UTF-8\""));
+            assert!(decoded.contains("<root>lambda</root>"));
+        }
+
+        for little_endian in [false, true] {
+            let bytes = encode_utf32("<root>lambda</root>", little_endian);
+            assert_eq!(
+                decode_xml(&bytes, None).expect("initial signature selects UTF-32 byte order"),
+                "<root>lambda</root>"
+            );
+        }
+    }
+
+    #[test]
+    fn utf32_rejects_truncation_invalid_scalars_and_conflicting_metadata() {
+        let mut truncated = vec![0x00, 0x00, 0xFE, 0xFF];
+        truncated.extend([0x00, 0x00, 0x00]);
+        assert!(decode_xml(&truncated, None).is_err());
+
+        let mut surrogate = vec![0x00, 0x00, 0xFE, 0xFF];
+        surrogate.extend(0xD800_u32.to_be_bytes());
+        assert!(matches!(
+            decode_xml(&surrogate, None),
+            Err(Error::InvalidBytes("UTF-32BE"))
+        ));
+
+        let mut little_endian = vec![0xFF, 0xFE, 0x00, 0x00];
+        little_endian.extend(encode_utf32("<root/>", true));
+        assert!(matches!(
+            decode_xml(&little_endian, Some("UTF-32BE")),
+            Err(Error::ConflictingEncoding(_))
+        ));
+    }
+
+    #[test]
+    fn utf32_decoding_obeys_the_utf8_materialization_limit() {
+        let mut bytes = vec![0x00, 0x00, 0xFE, 0xFF];
+        bytes.extend(encode_utf32("<root>lambda</root>", false));
+        assert!(matches!(
+            decode_xml_bounded(&bytes, None, 8),
+            Err(Error::DecodedLimit { maximum: 8, .. })
+        ));
     }
 
     #[test]
@@ -542,10 +687,6 @@ mod tests {
 
     #[test]
     fn unsupported_xml_signatures_fail_explicitly() {
-        assert!(matches!(
-            decode_xml(&[0, 0, 0, b'<'], None),
-            Err(Error::UnsupportedByteEncoding("UTF-32"))
-        ));
         assert!(matches!(
             decode_xml(&[0x4C, 0x6F, 0xA7, 0x94], None),
             Err(Error::UnsupportedByteEncoding("EBCDIC"))

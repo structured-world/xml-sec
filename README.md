@@ -175,6 +175,10 @@ deterministic budgets, and XML/HTML/text serialization. Its `ExecutionEnvironmen
 access, operation time, and extensions explicit, allowing fixed clocks or disabled nondeterministic
 EXSLT date functions.
 
+```sh
+cargo add xml-sec-xslt
+```
+
 The engine remains a separate architectural boundary. The main crate continues to reject XMLDSig
 XSLT transforms until the policy, resource identity, and node-set adapter contracts are connected.
 [`xml-sec-xml-input`](crates/xml-sec-xml-input) supplies the shared strict byte-decoding and lexical

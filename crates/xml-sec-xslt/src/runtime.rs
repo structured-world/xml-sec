@@ -1869,13 +1869,13 @@ impl<'a> Execution<'a> {
                 let value = if let Some(select) = select {
                     xpath_to_public(self.evaluate(select, node, position, size)?)
                 } else {
-                    Value::ResultTreeFragment(self.capture_fragment(
+                    Value::ResultTreeFragment(Arc::new(self.capture_fragment(
                         content,
                         node,
                         ApplyFrame::new(position, size, depth + 1),
                         current_precedence,
                         base_uri.as_deref(),
-                    )?)
+                    )?))
                 };
                 self.ensure_function_result_is_pending()?;
                 *self
@@ -2403,13 +2403,13 @@ impl<'a> Execution<'a> {
             // XSLT 1.0 section 5.6 keeps the current template rule while evaluating sequence
             // constructors in that rule; callers such as xsl:for-each explicitly pass None:
             // https://www.w3.org/TR/1999/REC-xslt-19991116#apply-imports
-            Value::ResultTreeFragment(self.capture_fragment(
+            Value::ResultTreeFragment(Arc::new(self.capture_fragment(
                 &variable.content,
                 node,
                 ApplyFrame::new(position, size, depth),
                 current_rule_precedence,
                 variable.base_uri.as_deref(),
-            )?)
+            )?))
         };
         // Selected XPath values become owned by a persistent lexical scope. Result-tree
         // fragments are already metered while their document is built, so only their binding
@@ -4237,16 +4237,7 @@ fn value_owned_bytes(value: &Value) -> usize {
             .saturating_mul(std::mem::size_of::<NodeReference>()),
         Value::Boolean(_) | Value::Number(_) => 0,
         Value::String(value) | Value::StoredExpression(value) => value.len(),
-        Value::ResultTreeFragment(document) => document.nodes().fold(0usize, |total, (_, node)| {
-            total
-                .saturating_add(node_kind_owned_bytes(&node.kind))
-                .saturating_add(node.base_uri.as_ref().map_or(0, String::len))
-                .saturating_add(
-                    node.children
-                        .len()
-                        .saturating_mul(std::mem::size_of::<NodeId>()),
-                )
-        }),
+        Value::ResultTreeFragment(_) => std::mem::size_of::<Arc<Document>>(),
     }
 }
 
@@ -4580,6 +4571,7 @@ fn roman(mut value: usize, upper: bool) -> String {
 #[cfg(test)]
 mod tests {
     use std::cmp::Ordering;
+    use std::sync::Arc;
 
     use super::{SortKey, append_localized_decimal, value_string};
     use crate::budget::Meter;
@@ -4657,10 +4649,10 @@ mod tests {
     #[test]
     fn value_string_preflights_owned_projection_but_borrows_existing_strings() {
         let payload = "x".repeat(4096);
-        let fragment = Value::ResultTreeFragment(
+        let fragment = Value::ResultTreeFragment(Arc::new(
             Document::parse(&format!("<fragment>{payload}</fragment>"), None)
                 .expect("fragment parses"),
-        );
+        ));
         let source = Document::parse("<source/>", None).expect("source parses");
         assert!(matches!(
             value_string(&fragment, &source, &meter(payload.len() - 1), 0),

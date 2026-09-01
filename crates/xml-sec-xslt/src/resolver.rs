@@ -190,7 +190,12 @@ mod tests {
             )
             .is_err()
         );
-        assert!(decode_resource(&[0, 0, 0, b'<'], None, true, usize::MAX).is_err());
+        assert_eq!(
+            decode_resource(&[0, 0, 0, b'<'], None, true, usize::MAX)
+                .expect("UTF-32BE initial pattern is detected"),
+            "<"
+        );
+        assert!(decode_resource(&[0, 0, b'<', 0], None, true, usize::MAX).is_err());
     }
 
     #[test]

@@ -22,9 +22,6 @@ members = [
 ]
 resolver = "3"
 
-[patch.crates-io]
-sxd-xpath-no-unsafe = { path = "vendor/sxd-xpath-no-unsafe" }
-
 # The complete libxslt oracle includes multi-megabyte DocBook transforms. Keep
 # production-equivalent XSLT/XPath code generation in the test profile so the
 # per-case watchdog measures algorithmic stalls rather than debug arithmetic.
@@ -34,7 +31,7 @@ opt-level = 2
 [profile.test.package.sxd-document-no-unsafe]
 opt-level = 2
 
-[profile.test.package.sxd-xpath-no-unsafe]
+[profile.test.package.xml-sec-sxd-xpath]
 opt-level = 2
 
 [[bin]]
@@ -84,7 +81,7 @@ subtle = { version = "2", optional = true }
 getrandom = { version = "0.4", features = ["sys_rng"], optional = true }
 zeroize = { version = "1", optional = true }
 sxd-document-no-unsafe = { version = "0.4.1", default-features = false, features = ["no-unsafe"], optional = true }
-sxd-xpath-no-unsafe = { version = "0.5.1", default-features = false, features = ["no-unsafe"], optional = true }
+sxd-xpath-no-unsafe = { package = "xml-sec-sxd-xpath", version = "0.1.0", path = "vendor/sxd-xpath-no-unsafe", default-features = false, features = ["no-unsafe"], optional = true }
 aes = { version = "0.9.2", optional = true }
 aes-gcm = { version = "0.11.1", optional = true }
 aes-kw = { version = "0.3.1", optional = true }

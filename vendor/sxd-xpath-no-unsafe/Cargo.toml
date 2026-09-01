@@ -11,8 +11,8 @@
 
 [package]
 edition = "2024"
-name = "sxd-xpath-no-unsafe"
-version = "0.5.1"
+name = "xml-sec-sxd-xpath"
+version = "0.1.0"
 authors = [
     "Jake Goulding <jake.goulding@gmail.com>",
     "Neil Soiffer <soiffer@alum.mit.edu>",
@@ -23,15 +23,15 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "A Rust XML XPath library with an optional no-unsafe feature"
-documentation = "https://docs.rs/sxd-xpath/"
+description = "Maintained safe-Rust XPath 1.0 engine for xml-sec"
+documentation = "https://docs.rs/xml-sec-sxd-xpath"
 readme = "README.md"
 keywords = [
     "xml",
     "xpath",
 ]
 license = "MIT/Apache-2.0"
-repository = "https://github.com/nsoiffer/sxd-xpath"
+repository = "https://github.com/structured-world/xml-sec"
 
 [features]
 no-unsafe = ["sxd-document-no-unsafe/no-unsafe"]

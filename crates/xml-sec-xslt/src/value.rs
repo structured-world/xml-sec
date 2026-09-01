@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::{Document, NodeReference};
 
 /// XSLT 1.0 value space, including the distinct result-tree-fragment type.
@@ -15,7 +17,7 @@ pub enum Value {
     /// Compiled-expression handle produced by compatible dynamic XPath extensions.
     StoredExpression(String),
     /// XSLT 1.0 temporary tree retaining all constructed node kinds.
-    ResultTreeFragment(Document),
+    ResultTreeFragment(Arc<Document>),
 }
 
 impl Value {
