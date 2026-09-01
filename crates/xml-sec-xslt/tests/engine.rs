@@ -419,6 +419,29 @@ fn malformed_stylesheet_and_budget_exhaustion_are_typed() {
 }
 
 #[test]
+fn compile_owned_bytes_counts_empty_instruction_structure() {
+    // Empty literal-result elements retain DOM nodes, instruction variants, and child vectors even
+    // though their lexical payload is tiny. CompileBudget must bound that structure, not just text.
+    let elements = "<a/>".repeat(2_000);
+    let stylesheet = format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/">{elements}</xsl:template></xsl:stylesheet>"#
+    );
+    let error = Compiler::new(
+        Arc::new(NoResolver),
+        CompileBudget::new(stylesheet.len(), 0, 256, 256 * 1024),
+    )
+    .compile(&stylesheet, None)
+    .expect_err("retained instruction structure must exceed the owned-byte budget");
+    assert!(matches!(
+        error,
+        Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn namespace_name_validation_matches_xslt_1_0_compatibility() {
     // Legacy XSLT 1.0 stylesheets may use relative namespace names, while a
     // fragment-only name cannot identify an expanded XSLT QName.
@@ -1168,8 +1191,11 @@ fn exslt_function_results_are_enforced_on_executed_paths() {
 
     let trailing_result = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" xmlns:f="urn:functions" extension-element-prefixes="func"><func:function name="f:bad"><func:result select="1"/><func:result select="2"/></func:function></xsl:stylesheet>"#;
     assert!(matches!(
-        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
-            .compile(trailing_result, None),
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 32, 16 * 1024),
+        )
+        .compile(trailing_result, None),
         Err(Error::Static(message)) if message.contains("only be followed")
     ));
 
@@ -1178,8 +1204,11 @@ fn exslt_function_results_are_enforced_on_executed_paths() {
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" xmlns:f="urn:functions" extension-element-prefixes="func"><func:function name="f:bad"><xsl:variable name="value"><func:result select="2"/></xsl:variable></func:function></xsl:stylesheet>"#,
     ] {
         assert!(matches!(
-            Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
-                .compile(invalid, None),
+            Compiler::new(
+                Arc::new(NoResolver),
+                CompileBudget::new(4096, 0, 32, 16 * 1024),
+            )
+            .compile(invalid, None),
             Err(Error::Static(_))
         ));
     }
@@ -1216,6 +1245,104 @@ fn built_in_template_rule_ignores_namespace_nodes() {
     // silent unless an explicit template handles them.
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:apply-templates select="/*/namespace::*"/></xsl:template></xsl:stylesheet>"#;
     assert_eq!(execute(stylesheet, r#"<root xmlns:p="urn:visible"/>"#), "");
+}
+
+#[test]
+fn stylesheet_functions_use_each_predicate_candidate_context() {
+    // XPath 1.0 section 2.4 evaluates predicates with each candidate as the context node; a
+    // stylesheet-defined function call inside that predicate must observe the same dynamic node.
+    // https://www.w3.org/TR/1999/REC-xpath-19991116/#predicates
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" xmlns:f="urn:functions" extension-element-prefixes="func"><xsl:output method="text"/><func:function name="f:kept"><xsl:param name="candidate"/><func:result select="$candidate/@keep = 'yes'"/></func:function><xsl:template match="/"><xsl:for-each select="/*/item[f:kept(.)]"><xsl:value-of select="@id"/></xsl:for-each></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(
+            stylesheet,
+            r#"<root><item id="a" keep="no"/><item id="b" keep="yes"/></root>"#,
+        ),
+        "b"
+    );
+}
+
+#[test]
+fn stylesheet_functions_keep_context_inside_prepared_extension_arguments() {
+    // Extension-call preparation must use the same stylesheet-function continuation as the outer
+    // XPath evaluation; otherwise nesting changes the dynamic context or rejects a valid call.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" xmlns:exsl="http://exslt.org/common" xmlns:f="urn:functions" extension-element-prefixes="func"><xsl:output method="text"/><func:function name="f:value"><xsl:param name="candidate"/><func:result select="$candidate/@id"/></func:function><xsl:template match="/"><xsl:for-each select="/*/item"><xsl:value-of select="concat(exsl:object-type(f:value(.)), ':', f:value(.))"/><xsl:text>;</xsl:text></xsl:for-each></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, r#"<root><item id="a"/><item id="b"/></root>"#,),
+        "node-set:a;node-set:b;"
+    );
+}
+
+#[test]
+fn stylesheet_function_continuations_meter_retained_results() {
+    // Each suspended call result survives the next XPath replay. Aggregate retained values must
+    // consume OwnedBytes even when the final XPath result is only a boolean.
+    let calls = std::iter::repeat_n("string-length(f:value(.)) > 0", 16)
+        .collect::<Vec<_>>()
+        .join(" and ");
+    let stylesheet = compile(&format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" xmlns:f="urn:functions" extension-element-prefixes="func"><xsl:output method="text"/><func:function name="f:value"><xsl:param name="candidate"/><func:result select="string($candidate)"/></func:function><xsl:template match="/"><xsl:value-of select="{calls}"/></xsl:template></xsl:stylesheet>"#,
+    ));
+    let source = format!("<source>{}</source>", "x".repeat(32 * 1024));
+    let mut budget = execution_budget(source.len());
+    budget.owned_bytes = 512 * 1024;
+    assert!(matches!(
+        stylesheet.execute(
+            &Document::parse(&source, None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn built_in_template_rule_ignores_namespace_nodes_in_captured_fragments() {
+    // Capturing output must not select a separate built-in-rule implementation: XSLT 1.0 section
+    // 5.8 defines no built-in rule that emits namespace-node string values.
+    // https://www.w3.org/TR/xslt-10/#built-in-rule
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:variable name="captured"><xsl:apply-templates select="/*/namespace::*"/></xsl:variable><xsl:value-of select="$captured"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, r#"<root xmlns:p="urn:visible"/>"#), "");
+}
+
+#[test]
+fn built_in_template_traversal_does_not_use_the_native_stack() {
+    // Source depth is attacker-controlled and may legitimately exceed the native call stack when
+    // the caller explicitly grants a matching recursion budget. Built-in rules must use the same
+    // iterative task machine as explicit template rules.
+    let depth = 4_096usize;
+    let mut source = String::with_capacity(depth.saturating_mul(7).saturating_add(4));
+    source.extend(std::iter::repeat_n("<n>", depth));
+    source.push_str("text");
+    source.extend(std::iter::repeat_n("</n>", depth));
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/></xsl:stylesheet>"#,
+    );
+    let mut budget = execution_budget(source.len());
+    budget.recursion_depth = depth + 2;
+    budget.template_applications = depth + 2;
+    budget.owned_bytes = 512 * 1024 * 1024;
+    let output = stylesheet
+        .execute(
+            &Document::parse(&source, None).expect("deep source parses iteratively"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("built-in traversal remains iterative");
+    assert_eq!(output.serialized.bytes, b"text");
 }
 
 #[test]
@@ -2061,8 +2188,11 @@ fn recursion_and_output_budgets_gate_work_before_growth() {
     // Compile recursion, source copying, and rendered output each enforce their own ceiling.
     let nested = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:if test="true()"><xsl:if test="true()"><xsl:if test="true()"><out/></xsl:if></xsl:if></xsl:if></xsl:template></xsl:stylesheet>"#;
     assert!(matches!(
-        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 3, 4096))
-            .compile(nested, None),
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 3, 16 * 1024),
+        )
+        .compile(nested, None),
         Err(Error::Budget {
             kind: BudgetKind::RecursionDepth,
             ..
@@ -2149,8 +2279,11 @@ fn namespaces_fallbacks_and_xml_characters_fail_or_emit_by_contract() {
 
     let fallback = r#"<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:future><xsl:fallback><xsl:value-of select="["/></xsl:fallback></xsl:future></xsl:template></xsl:stylesheet>"#;
     assert!(matches!(
-        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
-            .compile(fallback, None),
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 32, 16 * 1024),
+        )
+        .compile(fallback, None),
         Err(Error::Static(_))
     ));
 
@@ -2486,8 +2619,11 @@ fn compiler_rejects_invalid_instruction_content_and_accounts_for_ir() {
     // Static content models fail during compilation, and retained IR consumes owned-byte budget.
     let invalid_text = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:text>before<xsl:value-of select="."/>after</xsl:text></xsl:template></xsl:stylesheet>"#;
     assert!(matches!(
-        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
-            .compile(invalid_text, None),
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 32, 16 * 1024),
+        )
+        .compile(invalid_text, None),
         Err(Error::Static(_))
     ));
 
@@ -3727,6 +3863,35 @@ fn normalize_space_fast_path_preflights_its_output_allocation() {
 }
 
 #[test]
+fn translate_preflights_all_transient_workspace() {
+    // The canonical XPath implementation must reserve its source conversion, replacement index,
+    // and worst-case UTF-8 result before any attacker-sized workspace is allocated.
+    let payload = "a".repeat(128 * 1024);
+    let source_xml = format!("<source><value>{payload}</value></source>");
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:param name="from" select="'a'"/><xsl:param name="to" select="'b'"/><xsl:template match="source"><xsl:value-of select="translate(value, $from, $to)"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let mut budget = execution_budget(source_xml.len());
+    budget.owned_bytes = 1024 * 1024;
+    assert!(matches!(
+        stylesheet.execute(
+            &Document::parse(&source_xml, None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn attribute_value_templates_preflight_transient_growth() {
     // Repeating source-derived text in an AVT must be bounded before the combined allocation.
     let value = "x".repeat(32 * 1024);
@@ -3993,15 +4158,21 @@ fn xsl_number_level_is_validated_during_compilation() {
     // Literal enum errors are static even when dynamic control flow never executes the node.
     let invalid = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:if test="false()"><xsl:number level="sideways"/></xsl:if></xsl:template></xsl:stylesheet>"#;
     assert!(matches!(
-        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
-            .compile(invalid, None),
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 32, 16 * 1024),
+        )
+        .compile(invalid, None),
         Err(Error::Static(message)) if message.contains("xsl:number") && message.contains("level")
     ));
     for level in ["single", "multiple", "any"] {
         let valid = invalid.replace("sideways", level);
-        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
-            .compile(&valid, None)
-            .expect("defined xsl:number level compiles");
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 32, 16 * 1024),
+        )
+        .compile(&valid, None)
+        .expect("defined xsl:number level compiles");
     }
 }
 
@@ -5753,7 +5924,10 @@ fn call_template_rejects_non_whitespace_character_data() {
     // call-template has a with-param-only content model; text must not disappear during filtering.
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:call-template name="target">unexpected</xsl:call-template></xsl:template><xsl:template name="target"/></xsl:stylesheet>"#;
     assert!(matches!(
-        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 32, 16 * 1024),
+        )
             .compile(stylesheet, None),
         Err(Error::Static(message)) if message.contains("call-template")
     ));
@@ -5796,9 +5970,12 @@ fn byte_entry_points_share_strict_non_utf8_xml_decoding() {
     // Stylesheet and source byte APIs use one decoder before their distinct
     // compiler and runtime semantic paths.
     let stylesheet = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><xsl:stylesheet version=\"1.0\" xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\"><xsl:output method=\"text\"/><xsl:template match=\"/\"><xsl:value-of select=\"root\"/></xsl:template></xsl:stylesheet>";
-    let compiled = Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
-        .compile_bytes(stylesheet, None)
-        .expect("Latin-1 stylesheet bytes compile");
+    let compiled = Compiler::new(
+        Arc::new(NoResolver),
+        CompileBudget::new(4096, 0, 32, 16 * 1024),
+    )
+    .compile_bytes(stylesheet, None)
+    .expect("Latin-1 stylesheet bytes compile");
     let source = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><root>caf\xe9</root>";
     let document = Document::parse_bytes(source, None).expect("Latin-1 source bytes parse");
     let result = compiled
@@ -6162,7 +6339,7 @@ fn equal_precedence_global_bindings_are_static_errors() {
         assert!(matches!(
             Compiler::new(
                 Arc::new(NoResolver),
-                CompileBudget::new(4096, 0, 256, 4096),
+                CompileBudget::new(4096, 0, 256, 16 * 1024),
             )
             .compile(&source, None),
             Err(Error::Static(message)) if message.contains("duplicate global variable")

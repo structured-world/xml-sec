@@ -1663,6 +1663,12 @@ fn validate_attribute_sets_in_sequence(
 
 fn estimate_compiled_owned_bytes(document: &roxmltree::Document<'_>) -> usize {
     document.descendants().fold(0usize, |total, node| {
+        // Compilation retains both a normalized semantic node and, conservatively, one IR
+        // instruction for each frontend node. Child IDs, attributes, and namespaces live in
+        // separately allocated containers and therefore need explicit structural accounting.
+        let structural_bytes = std::mem::size_of::<crate::Node>()
+            .saturating_add(std::mem::size_of::<Instruction>())
+            .saturating_add(std::mem::size_of::<crate::NodeId>());
         let node_bytes = if node.is_element() {
             let tag = node.tag_name();
             let name_bytes = tag
@@ -1670,19 +1676,22 @@ fn estimate_compiled_owned_bytes(document: &roxmltree::Document<'_>) -> usize {
                 .map_or(0, str::len)
                 .saturating_add(tag.name().len());
             let attribute_bytes = node.attributes().fold(0usize, |sum, attribute| {
-                sum.saturating_add(attribute.namespace().map_or(0, str::len))
+                sum.saturating_add(std::mem::size_of::<crate::Attribute>())
+                    .saturating_add(attribute.namespace().map_or(0, str::len))
                     .saturating_add(attribute.name().len())
                     .saturating_add(attribute.value().len())
             });
             let namespace_bytes = node.namespaces().fold(0usize, |sum, namespace| {
-                sum.saturating_add(namespace.name().map_or(0, str::len))
+                sum.saturating_add(std::mem::size_of::<crate::Namespace>())
+                    .saturating_add(namespace.name().map_or(0, str::len))
                     .saturating_add(namespace.uri().len())
             });
-            name_bytes
+            structural_bytes
+                .saturating_add(name_bytes)
                 .saturating_add(attribute_bytes)
                 .saturating_add(namespace_bytes)
         } else {
-            node.text().map_or(0, str::len)
+            structural_bytes.saturating_add(node.text().map_or(0, str::len))
         };
         total.saturating_add(node_bytes)
     })

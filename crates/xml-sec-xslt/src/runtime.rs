@@ -12,12 +12,11 @@ use crate::compiler::{
     AttributeValueTemplate, AvtPart, Expression, ExsltFunction, Instruction, NameTest, Sort,
     Stylesheet, Template, Variable,
 };
-use crate::expression::innermost_namespaced_call;
 use crate::lexical::{is_ncname, unicode_decimal_value};
 use crate::serializer::{serialize, serialize_fragment};
 use crate::xpath::{
-    Evaluator, EvaluatorSourceOptions, PreparedEvaluatorSource, SourceNode, XPathValue,
-    parse_xpath_number, prepare_evaluator_source, xpath_number,
+    CustomCallSession, Evaluator, EvaluatorSourceOptions, PreparedEvaluatorSource, SourceNode,
+    XPathValue, parse_xpath_number, prepare_evaluator_source, xpath_number,
 };
 use crate::{
     Attribute, BudgetKind, Document, Error, ExecutionBudget, ExecutionEnvironment, ExpandedName,
@@ -262,20 +261,6 @@ struct Execution<'a> {
     attribute_protected_names: Option<HashSet<ExpandedName>>,
 }
 
-enum PreparedCustomCalls<'a> {
-    Direct(Value),
-    Borrowed {
-        expression: &'a Expression,
-        variables: HashMap<ExpandedName, Value>,
-        reserved_owned_bytes: usize,
-    },
-    Rewritten {
-        expression: Expression,
-        variables: HashMap<ExpandedName, Value>,
-        reserved_owned_bytes: usize,
-    },
-}
-
 struct ResultTreeState {
     document: Document,
     output_stack: Vec<NodeId>,
@@ -299,7 +284,7 @@ struct ApplyFrame {
 enum TemplateTask {
     EnterTemplate {
         template: Box<Template>,
-        params: HashMap<ExpandedName, Value>,
+        params: Arc<HashMap<ExpandedName, Value>>,
         node: SourceNode,
         frame: ApplyFrame,
         current_rule_precedence: Option<usize>,
@@ -638,52 +623,12 @@ impl<'a> Execution<'a> {
         params: &HashMap<ExpandedName, Value>,
         frame: ApplyFrame,
     ) -> Result<()> {
-        let ApplyFrame {
-            max_precedence,
-            position,
-            size,
-            depth,
-        } = frame;
-        self.meter.recursion(depth)?;
-        self.meter.charge(BudgetKind::TemplateApplications, 1)?;
-        let variables = HashMap::new();
-        let mut selected = None::<&Template>;
-        for template in self.stylesheet.templates.iter() {
-            if template.pattern.is_none()
-                || template.mode.as_ref() != mode
-                || max_precedence.is_some_and(|max| template.precedence >= max)
-            {
-                continue;
-            }
-            let Some(pattern) = template.pattern.as_ref() else {
-                continue;
-            };
-            if self.matches_pattern(pattern, &node, &variables)?
-                && selected.is_none_or(|current| {
-                    template.precedence > current.precedence
-                        || (template.precedence == current.precedence
-                            && (template.priority > current.priority
-                                || (template.priority == current.priority
-                                    && template.order > current.order)))
-                })
-            {
-                selected = Some(template)
-            }
-        }
-        if let Some(template) = selected {
-            self.modes.push(mode.cloned());
-            let result = self.execute_template(
-                template,
-                node,
-                params,
-                ApplyFrame::new(position, size, depth),
-                Some(template.precedence),
-            );
-            self.modes.pop();
-            result
-        } else {
-            self.built_in(node, mode, depth)
-        }
+        self.run_template_tasks(vec![TemplateTask::ApplyOne {
+            node,
+            mode: mode.cloned(),
+            params: Arc::new(params.clone()),
+            frame,
+        }])
     }
 
     fn execute_template(
@@ -694,13 +639,16 @@ impl<'a> Execution<'a> {
         frame: ApplyFrame,
         current_rule_precedence: Option<usize>,
     ) -> Result<()> {
-        let mut tasks = vec![TemplateTask::EnterTemplate {
+        self.run_template_tasks(vec![TemplateTask::EnterTemplate {
             template: Box::new(template.clone()),
-            params: params.clone(),
+            params: Arc::new(params.clone()),
             node,
             frame,
             current_rule_precedence,
-        }];
+        }])
+    }
+
+    fn run_template_tasks(&mut self, mut tasks: Vec<TemplateTask>) -> Result<()> {
         while let Some(task) = tasks.pop() {
             match task {
                 TemplateTask::EnterTemplate {
@@ -785,7 +733,7 @@ impl<'a> Execution<'a> {
                                 })?;
                             tasks.push(TemplateTask::EnterTemplate {
                                 template: Box::new(target),
-                                params: supplied,
+                                params: Arc::new(supplied),
                                 node,
                                 frame: ApplyFrame::new(position, size, depth + 1),
                                 current_rule_precedence: precedence,
@@ -1067,41 +1015,37 @@ impl<'a> Execution<'a> {
         self.meter.recursion(frame.depth)?;
         self.meter.charge(BudgetKind::TemplateApplications, 1)?;
         let variables = HashMap::new();
-        let selected = self
-            .stylesheet
-            .templates
-            .iter()
-            .filter(|template| {
-                template.pattern.is_some()
-                    && template.mode == mode
-                    && frame
-                        .max_precedence
-                        .is_none_or(|max| template.precedence < max)
-            })
-            .filter_map(|template| {
-                let pattern = template.pattern.as_ref()?;
-                match self.matches_pattern(pattern, &node, &variables) {
-                    Ok(true) => Some(Ok(template)),
-                    Ok(false) => None,
-                    Err(error) => Some(Err(error)),
-                }
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .max_by(|left, right| {
-                left.precedence
-                    .cmp(&right.precedence)
-                    .then_with(|| left.priority.total_cmp(&right.priority))
-                    .then_with(|| left.order.cmp(&right.order))
-            })
-            .cloned();
+        let mut selected = None::<&Template>;
+        for template in self.stylesheet.templates.iter() {
+            if template.pattern.is_none()
+                || template.mode != mode
+                || frame
+                    .max_precedence
+                    .is_some_and(|max| template.precedence >= max)
+            {
+                continue;
+            }
+            let pattern = template.pattern.as_ref().expect("pattern was checked");
+            if self.matches_pattern(pattern, &node, &variables)?
+                && selected.is_none_or(|current| {
+                    template.precedence > current.precedence
+                        || (template.precedence == current.precedence
+                            && (template.priority > current.priority
+                                || (template.priority == current.priority
+                                    && template.order > current.order)))
+                })
+            {
+                selected = Some(template);
+            }
+        }
+        let selected = selected.cloned();
         if let Some(template) = selected {
             self.modes.push(mode);
             tasks.push(TemplateTask::RestoreMode);
             let current_rule_precedence = Some(template.precedence);
             tasks.push(TemplateTask::EnterTemplate {
                 template: Box::new(template),
-                params: (*params).clone(),
+                params,
                 node,
                 frame,
                 current_rule_precedence,
@@ -1188,42 +1132,6 @@ impl<'a> Execution<'a> {
             precedence: current_rule_precedence,
         });
         Ok(())
-    }
-
-    fn built_in(
-        &mut self,
-        node: SourceNode,
-        mode: Option<&ExpandedName>,
-        depth: usize,
-    ) -> Result<()> {
-        match &node {
-            SourceNode::Node(id) => match self
-                .evaluator
-                .source
-                .node(*id)
-                .map(|node| node.kind.clone())
-            {
-                Some(NodeKind::Root | NodeKind::Element { .. }) => {
-                    let children = self.evaluator.children(&node);
-                    let size = children.len();
-                    for (index, child) in children.into_iter().enumerate() {
-                        self.apply_one(
-                            child,
-                            mode,
-                            &HashMap::new(),
-                            ApplyFrame::new(index + 1, size, depth + 1),
-                        )?;
-                    }
-                    Ok(())
-                }
-                Some(NodeKind::Text { value, .. }) => self.append_text(&value, false),
-                _ => Ok(()),
-            },
-            SourceNode::Attribute { .. } | SourceNode::Namespace { .. } => {
-                let value = self.evaluator.string_value(&node);
-                self.append_text(&value, false)
-            }
-        }
     }
 
     fn execute_sequence(
@@ -1903,42 +1811,50 @@ impl<'a> Execution<'a> {
         if let Some(value) = self.evaluate_rtf_order(expression, node)? {
             return Ok(XPathValue::Number(value));
         }
-        let prepared = self.prepare_custom_function_calls(expression, node, position, size)?;
-        let (value, reserved_owned_bytes) = match prepared {
-            PreparedCustomCalls::Direct(value) => return Ok(public_to_xpath(value)),
-            PreparedCustomCalls::Borrowed {
+        let (variables, reserved_owned_bytes) = self.variables()?;
+        let custom_calls = CustomCallSession::default();
+        loop {
+            let value = self.evaluator.evaluate(
                 expression,
-                variables,
-                reserved_owned_bytes,
-            } => (
-                self.evaluator.evaluate(
-                    expression,
-                    node,
-                    position,
-                    size,
-                    &variables,
-                    &mut self.meter,
-                ),
-                reserved_owned_bytes,
-            ),
-            PreparedCustomCalls::Rewritten {
-                expression,
-                variables,
-                reserved_owned_bytes,
-            } => (
-                self.evaluator.evaluate(
-                    &expression,
-                    node,
-                    position,
-                    size,
-                    &variables,
-                    &mut self.meter,
-                ),
-                reserved_owned_bytes,
-            ),
-        };
-        self.meter.release_owned_bytes(reserved_owned_bytes);
-        value
+                node,
+                position,
+                size,
+                &variables,
+                &mut self.meter,
+                Some(&custom_calls),
+            );
+            let call = self.evaluator.take_custom_function_call(
+                &custom_calls,
+                &variables,
+                &mut self.meter,
+            )?;
+            let Some(call) = call else {
+                self.meter
+                    .release_owned_bytes(custom_calls.retained_bytes());
+                self.meter.release_owned_bytes(reserved_owned_bytes);
+                return value;
+            };
+            let function = self
+                .stylesheet
+                .functions
+                .iter()
+                .filter(|function| function.name == call.name)
+                .max_by_key(|function| (function.precedence, function.order))
+                .cloned()
+                .ok_or_else(|| Error::Dynamic(format!("unknown function {}", call.name.local)))?;
+            let result = self.call_exslt_function(
+                &function,
+                call.arguments,
+                &call.node,
+                call.position,
+                call.size,
+            )?;
+            self.evaluator
+                .complete_custom_function_call(&custom_calls, result, &mut self.meter)?;
+            // Resuming replays the expression from its root. Account for every replay rather than
+            // letting user-defined function count bypass the XPath evaluation budget.
+            self.meter.charge(BudgetKind::XPathEvaluations, 1)?;
+        }
     }
 
     fn evaluate_rtf_order(
@@ -2095,36 +2011,6 @@ impl<'a> Execution<'a> {
             return Ok(Some(XPathValue::Number(number + increment)));
         }
         if let Some(arguments) = source
-            .strip_prefix("translate(")
-            .and_then(|value| value.strip_suffix(')'))
-            && let Some((input, variables)) = arguments.split_once(',')
-            && let Some((from, to)) = variables.split_once(',')
-            && let (Some(from), Some(to)) =
-                (from.trim().strip_prefix('$'), to.trim().strip_prefix('$'))
-            && let Some(input) =
-                self.evaluator
-                    .relative_string(input.trim(), node, &expression.namespaces)?
-        {
-            let from = self.variable_string(from, &expression.namespaces)?;
-            let to = self.variable_string(to, &expression.namespaces)?;
-            let mut target = to.chars();
-            let mut replacements = HashMap::new();
-            for character in from.chars() {
-                let replacement = target.next();
-                replacements.entry(character).or_insert(replacement);
-            }
-            return Ok(Some(XPathValue::String(
-                input
-                    .chars()
-                    .filter_map(|character| {
-                        replacements
-                            .get(&character)
-                            .map_or(Some(character), |replacement| *replacement)
-                    })
-                    .collect(),
-            )));
-        }
-        if let Some(arguments) = source
             .strip_prefix("substring (")
             .and_then(|value| value.strip_suffix(')'))
             && let Some((literal, remainder)) = arguments.split_once(',')
@@ -2208,93 +2094,6 @@ impl<'a> Execution<'a> {
         self.variable_value(lexical, namespaces)
             .cloned()
             .map(|value| value.into_string(&self.evaluator.source))
-    }
-
-    fn prepare_custom_function_calls<'b>(
-        &mut self,
-        expression: &'b Expression,
-        node: &SourceNode,
-        position: usize,
-        size: usize,
-    ) -> Result<PreparedCustomCalls<'b>> {
-        const PRIVATE_NS: &str = "urn:structured-world:xml-sec:xslt:user-functions";
-        let has_custom_call = innermost_namespaced_call(
-            &expression.source,
-            &expression.namespaces,
-            |namespace, local| {
-                self.stylesheet.functions.iter().any(|function| {
-                    function.name.namespace.as_deref() == Some(namespace)
-                        && function.name.local == local
-                })
-            },
-        )
-        .is_some();
-        if !has_custom_call {
-            let (variables, reserved_owned_bytes) = self.variables()?;
-            return Ok(PreparedCustomCalls::Borrowed {
-                expression,
-                variables,
-                reserved_owned_bytes,
-            });
-        }
-        let mut source = expression.source.clone();
-        let mut variables = None;
-        let mut index = 0usize;
-        while let Some(call) =
-            innermost_namespaced_call(&source, &expression.namespaces, |namespace, local| {
-                self.stylesheet.functions.iter().any(|function| {
-                    function.name.namespace.as_deref() == Some(namespace)
-                        && function.name.local == local
-                })
-            })
-        {
-            let name = ExpandedName::new(Some(call.namespace.clone()), call.local.clone());
-            let function = self
-                .stylesheet
-                .functions
-                .iter()
-                .filter(|function| function.name == name)
-                .max_by_key(|function| (function.precedence, function.order))
-                .cloned()
-                .ok_or_else(|| Error::Dynamic(format!("unknown function {}", call.display_name)))?;
-            let mut arguments = Vec::with_capacity(call.arguments.len());
-            for argument in &call.arguments {
-                arguments.push(xpath_to_public(self.evaluate(
-                    &expression.derived(argument.clone()),
-                    node,
-                    position,
-                    size,
-                )?));
-            }
-            let value = self.call_exslt_function(&function, arguments, node, position, size)?;
-            if source[..call.start].trim().is_empty() && source[call.end..].trim().is_empty() {
-                return Ok(PreparedCustomCalls::Direct(value));
-            }
-            let local = format!("result{index}");
-            index += 1;
-            if variables.is_none() {
-                variables = Some(self.variables()?);
-            }
-            variables
-                .as_mut()
-                .expect("variable snapshot was initialized")
-                .0
-                .insert(ExpandedName::new(Some(PRIVATE_NS), local.clone()), value);
-            source.replace_range(call.start..call.end, &format!("$__xml_sec_func:{local}"));
-        }
-        let mut namespaces = expression.namespaces.clone();
-        namespaces.push(("__xml_sec_func".into(), PRIVATE_NS.into()));
-        let mut rewritten = expression.derived(source);
-        rewritten.namespaces = namespaces;
-        let (variables, reserved_owned_bytes) = match variables {
-            Some(snapshot) => snapshot,
-            None => self.variables()?,
-        };
-        Ok(PreparedCustomCalls::Rewritten {
-            expression: rewritten,
-            variables,
-            reserved_owned_bytes,
-        })
     }
 
     fn call_exslt_function(

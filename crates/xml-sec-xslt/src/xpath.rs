@@ -182,6 +182,253 @@ struct DocumentRequest {
     base_uri: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct CustomFunctionCall {
+    pub(crate) name: ExpandedName,
+    pub(crate) node: SourceNode,
+    pub(crate) position: usize,
+    pub(crate) size: usize,
+    pub(crate) arguments: Vec<Value>,
+}
+
+#[derive(Default)]
+pub(crate) struct CustomCallSession {
+    state: Rc<RefCell<CustomCallState>>,
+}
+
+#[derive(Default)]
+struct CustomCallState {
+    cursor: usize,
+    pending: Option<Rc<DeferredCustomCall>>,
+    last_requested: Option<Rc<DeferredCustomCall>>,
+    completed: Vec<CompletedCustomCall>,
+    fragments: HashMap<u64, Document>,
+    retained_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeferredCustomCall {
+    name: ExpandedName,
+    node: NodePath,
+    position: usize,
+    size: usize,
+    arguments: Vec<DeferredXPathValue>,
+}
+
+struct CompletedCustomCall {
+    call: Rc<DeferredCustomCall>,
+    result: DeferredXPathValue,
+    fragment: Option<Document>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeferredXPathValue {
+    Boolean(bool),
+    Number(u64),
+    String(String),
+    ResultTreeFragment { identity: u64, value: String },
+    NodeSet(Vec<NodePath>),
+}
+
+impl DeferredCustomCall {
+    fn owned_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.name.local.len())
+            .saturating_add(self.name.namespace.as_deref().map_or(0, str::len))
+            .saturating_add(self.node.owned_bytes())
+            .saturating_add(
+                self.arguments
+                    .iter()
+                    .map(DeferredXPathValue::owned_bytes)
+                    .sum::<usize>(),
+            )
+    }
+}
+
+impl DeferredXPathValue {
+    fn owned_bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(match self {
+            Self::Boolean(_) | Self::Number(_) => 0,
+            Self::String(value) | Self::ResultTreeFragment { value, .. } => value.len(),
+            Self::NodeSet(paths) => paths.iter().map(NodePath::owned_bytes).sum(),
+        })
+    }
+}
+
+impl CustomCallSession {
+    fn begin_attempt(&self) {
+        let mut state = self.state.borrow_mut();
+        state.cursor = 0;
+        state.pending = None;
+    }
+
+    fn register_fragments(&self, variables: &HashMap<ExpandedName, Value>) {
+        let mut state = self.state.borrow_mut();
+        for value in variables.values() {
+            if let Value::ResultTreeFragment(document) = value {
+                state
+                    .fragments
+                    .entry(document.identity())
+                    .or_insert_with(|| document.clone());
+            }
+        }
+    }
+
+    fn fragment(&self, identity: u64) -> Option<Document> {
+        let state = self.state.borrow();
+        state.fragments.get(&identity).cloned().or_else(|| {
+            state
+                .completed
+                .iter()
+                .filter_map(|completed| completed.fragment.as_ref())
+                .find(|document| document.identity() == identity)
+                .cloned()
+        })
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.state.borrow().retained_bytes
+    }
+}
+
+struct DeferredStylesheetFunction {
+    name: ExpandedName,
+    session: Rc<RefCell<CustomCallState>>,
+}
+
+impl function::Function for DeferredStylesheetFunction {
+    fn evaluate<'c, 'd>(
+        &self,
+        context: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
+        arguments: Vec<SxdValue<'d>>,
+    ) -> std::result::Result<SxdValue<'d>, function::Error> {
+        context.reserve_string_allocation(deferred_call_size(
+            &self.name,
+            &context.node,
+            &arguments,
+        ))?;
+        let call = DeferredCustomCall {
+            name: self.name.clone(),
+            node: typed_path_to(&context.node),
+            position: context.position,
+            size: context.size,
+            arguments: arguments
+                .into_iter()
+                .map(defer_sxd_value)
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        };
+        let mut state = self.session.borrow_mut();
+        let cursor = state.cursor;
+        state.cursor = state.cursor.saturating_add(1);
+        if let Some(completed) = state.completed.get(cursor) {
+            if *completed.call != call {
+                return Err(function::Error::Other {
+                    what: "stylesheet function continuation diverged".into(),
+                });
+            }
+            return restore_sxd_value(&completed.result, context.node.document().root().into());
+        }
+        if state.pending.is_some() {
+            return Err(function::Error::Other {
+                what: "multiple pending stylesheet function calls".into(),
+            });
+        }
+        state.pending = Some(Rc::new(call));
+        Err(function::Error::Other {
+            what: "stylesheet function evaluation suspended".into(),
+        })
+    }
+}
+
+fn deferred_call_size(
+    name: &ExpandedName,
+    node: &nodeset::Node<'_>,
+    arguments: &[SxdValue<'_>],
+) -> usize {
+    std::mem::size_of::<DeferredCustomCall>()
+        .saturating_add(name.local.len())
+        .saturating_add(name.namespace.as_deref().map_or(0, str::len))
+        .saturating_add(sxd_node_path_size(node))
+        .saturating_add(arguments.iter().map(deferred_sxd_value_size).sum::<usize>())
+}
+
+fn deferred_sxd_value_size(value: &SxdValue<'_>) -> usize {
+    std::mem::size_of::<DeferredXPathValue>().saturating_add(match value {
+        SxdValue::Boolean(_) | SxdValue::Number(_) => 0,
+        // Scalar payloads move out of the argument values; only their enum slots are new here.
+        SxdValue::String(_) | SxdValue::ResultTreeFragment(_, _) => 0,
+        SxdValue::Nodeset(nodes) => nodes.iter().map(|node| sxd_node_path_size(&node)).sum(),
+    })
+}
+
+fn sxd_node_path_size(node: &nodeset::Node<'_>) -> usize {
+    let mut depth = 0usize;
+    let mut current = match node {
+        nodeset::Node::Attribute(attribute) => attribute.parent().map(nodeset::Node::Element),
+        nodeset::Node::Namespace(namespace) => Some(nodeset::Node::Element(namespace.parent)),
+        node => Some(node.clone()),
+    };
+    while let Some(node) = current {
+        current = node.parent();
+        if current.is_some() {
+            depth = depth.saturating_add(1);
+        }
+    }
+    std::mem::size_of::<NodePath>()
+        .saturating_add(depth.saturating_mul(std::mem::size_of::<usize>()))
+        .saturating_add(match node {
+            nodeset::Node::Attribute(attribute) => {
+                let name = attribute.name();
+                let name = name.get();
+                name.namespace_uri().map_or(0, str::len) + name.local_part().len()
+            }
+            nodeset::Node::Namespace(namespace) => namespace.prefix().len() + namespace.uri().len(),
+            _ => 0,
+        })
+}
+
+fn defer_sxd_value(
+    value: SxdValue<'_>,
+) -> std::result::Result<DeferredXPathValue, function::Error> {
+    Ok(match value {
+        SxdValue::Boolean(value) => DeferredXPathValue::Boolean(value),
+        SxdValue::Number(value) => DeferredXPathValue::Number(value.to_bits()),
+        SxdValue::String(value) => DeferredXPathValue::String(value),
+        SxdValue::ResultTreeFragment(identity, value) => {
+            DeferredXPathValue::ResultTreeFragment { identity, value }
+        }
+        SxdValue::Nodeset(nodes) => {
+            DeferredXPathValue::NodeSet(nodes.document_order().iter().map(typed_path_to).collect())
+        }
+    })
+}
+
+fn restore_sxd_value<'d>(
+    value: &DeferredXPathValue,
+    root: nodeset::Node<'d>,
+) -> std::result::Result<SxdValue<'d>, function::Error> {
+    Ok(match value {
+        DeferredXPathValue::Boolean(value) => SxdValue::Boolean(*value),
+        DeferredXPathValue::Number(bits) => SxdValue::Number(f64::from_bits(*bits)),
+        DeferredXPathValue::String(value) => SxdValue::String(value.clone()),
+        DeferredXPathValue::ResultTreeFragment { identity, value } => {
+            SxdValue::ResultTreeFragment(*identity, value.clone())
+        }
+        DeferredXPathValue::NodeSet(paths) => {
+            let mut nodes = nodeset::Nodeset::new();
+            for path in paths {
+                let node = resolve_node_path(root.clone(), path).ok_or_else(|| {
+                    function::Error::Other {
+                        what: "stylesheet function continuation node is stale".into(),
+                    }
+                })?;
+                nodes.add(node);
+            }
+            SxdValue::Nodeset(nodes)
+        }
+    })
+}
+
 pub(crate) struct Evaluator {
     pub(crate) source: Document,
     package: Package,
@@ -192,6 +439,7 @@ pub(crate) struct Evaluator {
     generated_ids: Rc<RefCell<GeneratedIdCache>>,
     key_index: Rc<RefCell<KeyIndex>>,
     decimal_formats: Rc<Vec<DecimalFormat>>,
+    stylesheet_functions: HashSet<ExpandedName>,
     extension_functions: HashSet<ExpandedName>,
     resolver: Arc<dyn Resolver>,
     documents: HashMap<DocumentRequest, Vec<SourceNode>>,
@@ -277,6 +525,7 @@ impl Evaluator {
             generated_ids: Rc::new(RefCell::new(GeneratedIdCache::default())),
             key_index: Rc::new(RefCell::new(HashMap::new())),
             decimal_formats: Rc::new(Vec::new()),
+            stylesheet_functions: HashSet::new(),
             extension_functions: HashSet::new(),
             resolver,
             documents,
@@ -299,7 +548,8 @@ impl Evaluator {
         extension_functions: impl IntoIterator<Item = ExpandedName>,
     ) {
         self.decimal_formats = Rc::new(decimal_formats.to_vec());
-        self.extension_functions = extension_functions.into_iter().collect();
+        self.stylesheet_functions = extension_functions.into_iter().collect();
+        self.extension_functions = self.stylesheet_functions.clone();
         self.extension_functions.extend([
             ExpandedName::new(Some(EXSLT_COMMON_NS), "node-set"),
             ExpandedName::new(Some(EXSLT_COMMON_NS), "object-type"),
@@ -367,6 +617,10 @@ impl Evaluator {
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "XPath dynamic context and its budget/continuation state are independent inputs"
+    )]
     pub(crate) fn evaluate(
         &mut self,
         expression: &Expression,
@@ -375,11 +629,22 @@ impl Evaluator {
         size: usize,
         variables: &HashMap<ExpandedName, Value>,
         meter: &mut Meter,
+        custom_calls: Option<&CustomCallSession>,
     ) -> Result<XPathValue> {
         loop {
             self.pending_document_requests.borrow_mut().clear();
-            let prepared =
-                self.prepare_extension_calls(expression, node, position, size, variables, meter)?;
+            if let Some(custom_calls) = custom_calls {
+                custom_calls.begin_attempt();
+            }
+            let prepared = self.prepare_extension_calls(
+                expression,
+                node,
+                position,
+                size,
+                variables,
+                meter,
+                custom_calls,
+            )?;
             let (prepared, augmented) = prepared.parts();
             let value = if let Some(name) =
                 variable_reference_name(prepared.source.trim(), &prepared.namespaces)
@@ -387,7 +652,15 @@ impl Evaluator {
             {
                 XPathValue::StoredExpression(source.clone())
             } else {
-                self.evaluate_core(prepared, node, position, size, augmented, meter)?
+                self.evaluate_core(
+                    prepared,
+                    node,
+                    position,
+                    size,
+                    augmented,
+                    meter,
+                    custom_calls,
+                )?
             };
             let requested = self
                 .pending_document_requests
@@ -411,6 +684,149 @@ impl Evaluator {
         nodes.sort_by_key(|node| self.maps.order.get(node).copied());
         nodes.dedup();
         nodes
+    }
+
+    pub(crate) fn take_custom_function_call(
+        &self,
+        session: &CustomCallSession,
+        variables: &HashMap<ExpandedName, Value>,
+        meter: &mut Meter,
+    ) -> Result<Option<CustomFunctionCall>> {
+        let pending = {
+            let mut state = session.state.borrow_mut();
+            let pending = state.pending.take();
+            if let Some(pending) = pending.as_ref() {
+                let retained = pending.owned_bytes();
+                meter.charge(BudgetKind::OwnedBytes, retained)?;
+                state.retained_bytes = state.retained_bytes.saturating_add(retained);
+            }
+            state.last_requested = pending.clone();
+            pending
+        };
+        pending
+            .map(|pending| {
+                let node = self
+                    .maps
+                    .reverse
+                    .get(&pending.node)
+                    .cloned()
+                    .ok_or_else(|| Error::Dynamic("stylesheet function context is stale".into()))?;
+                let arguments = pending
+                    .arguments
+                    .iter()
+                    .map(|argument| self.project_deferred_value(argument, session, variables))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(CustomFunctionCall {
+                    name: pending.name.clone(),
+                    node,
+                    position: pending.position,
+                    size: pending.size,
+                    arguments,
+                })
+            })
+            .transpose()
+    }
+
+    pub(crate) fn complete_custom_function_call(
+        &self,
+        session: &CustomCallSession,
+        value: Value,
+        meter: &mut Meter,
+    ) -> Result<()> {
+        let retained = self.deferred_public_value_size(&value)?;
+        meter.charge(BudgetKind::OwnedBytes, retained)?;
+        let mut state = session.state.borrow_mut();
+        let call = state
+            .last_requested
+            .take()
+            .ok_or_else(|| Error::Dynamic("stylesheet function continuation is missing".into()))?;
+        let (result, fragment) = self.defer_public_value(value)?;
+        state.retained_bytes = state.retained_bytes.saturating_add(retained);
+        state.completed.push(CompletedCustomCall {
+            call,
+            result,
+            fragment,
+        });
+        Ok(())
+    }
+
+    fn deferred_public_value_size(&self, value: &Value) -> Result<usize> {
+        let payload = match value {
+            Value::Boolean(_) | Value::Number(_) => 0,
+            Value::String(value) | Value::StoredExpression(value) => value.len(),
+            Value::NodeSet(nodes) => nodes.iter().try_fold(0usize, |total, node| {
+                let path = self.maps.forward.get(node).ok_or_else(|| {
+                    Error::Dynamic("stylesheet function result node is stale".into())
+                })?;
+                Ok::<_, Error>(total.saturating_add(path.owned_bytes()))
+            })?,
+            Value::ResultTreeFragment(document) => semantic_projection_size(document),
+        };
+        Ok(std::mem::size_of::<DeferredXPathValue>().saturating_add(payload))
+    }
+
+    fn project_deferred_value(
+        &self,
+        value: &DeferredXPathValue,
+        session: &CustomCallSession,
+        variables: &HashMap<ExpandedName, Value>,
+    ) -> Result<Value> {
+        Ok(match value {
+            DeferredXPathValue::Boolean(value) => Value::Boolean(*value),
+            DeferredXPathValue::Number(bits) => Value::Number(f64::from_bits(*bits)),
+            DeferredXPathValue::String(value) => Value::String(value.clone()),
+            DeferredXPathValue::NodeSet(paths) => Value::NodeSet(
+                paths
+                    .iter()
+                    .map(|path| {
+                        self.maps.reverse.get(path).cloned().ok_or_else(|| {
+                            Error::Dynamic("stylesheet function argument node is stale".into())
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            ),
+            DeferredXPathValue::ResultTreeFragment { identity, .. } => variables
+                .values()
+                .find_map(|value| match value {
+                    Value::ResultTreeFragment(document) if document.identity() == *identity => {
+                        Some(document.clone())
+                    }
+                    _ => None,
+                })
+                .or_else(|| session.fragment(*identity))
+                .map(Value::ResultTreeFragment)
+                .ok_or_else(|| Error::Dynamic("stale result-tree-fragment identity".into()))?,
+        })
+    }
+
+    fn defer_public_value(&self, value: Value) -> Result<(DeferredXPathValue, Option<Document>)> {
+        Ok(match value {
+            Value::Boolean(value) => (DeferredXPathValue::Boolean(value), None),
+            Value::Number(value) => (DeferredXPathValue::Number(value.to_bits()), None),
+            Value::String(value) | Value::StoredExpression(value) => {
+                (DeferredXPathValue::String(value), None)
+            }
+            Value::NodeSet(nodes) => (
+                DeferredXPathValue::NodeSet(
+                    nodes
+                        .iter()
+                        .map(|node| {
+                            self.maps.forward.get(node).cloned().ok_or_else(|| {
+                                Error::Dynamic("stylesheet function result node is stale".into())
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                ),
+                None,
+            ),
+            Value::ResultTreeFragment(document) => {
+                let deferred = DeferredXPathValue::ResultTreeFragment {
+                    identity: document.identity(),
+                    value: document.string_value(document.root()),
+                };
+                (deferred, Some(document))
+            }
+        })
     }
 
     fn import_result_tree_fragment(
@@ -473,6 +889,10 @@ impl Evaluator {
         self.documents.insert(request, nodes);
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "extension preparation preserves the complete XPath dynamic context"
+    )]
     fn prepare_extension_calls<'a>(
         &mut self,
         expression: &'a Expression,
@@ -481,6 +901,7 @@ impl Evaluator {
         size: usize,
         variables: &'a HashMap<ExpandedName, Value>,
         meter: &mut Meter,
+        custom_calls: Option<&CustomCallSession>,
     ) -> Result<PreparedExtensionCalls<'a>> {
         if innermost_namespaced_call(
             &expression.source,
@@ -539,6 +960,7 @@ impl Evaluator {
                             size,
                             &augmented,
                             meter,
+                            custom_calls,
                         )?;
                         match value {
                             XPathValue::NodeSet(nodes) => Value::NodeSet(nodes),
@@ -580,6 +1002,7 @@ impl Evaluator {
                                 size,
                                 &augmented,
                                 meter,
+                                custom_calls,
                             )? {
                                 XPathValue::NodeSet(_) => "node-set",
                                 XPathValue::ResultTreeFragment(_) => "RTF",
@@ -607,6 +1030,7 @@ impl Evaluator {
                             size,
                             &augmented,
                             meter,
+                            custom_calls,
                         )?
                         .string(self);
                     let delimiter = if let Some(argument) = call.arguments.get(1) {
@@ -618,6 +1042,7 @@ impl Evaluator {
                                 size,
                                 &augmented,
                                 meter,
+                                custom_calls,
                             )?
                             .string(self),
                         )
@@ -663,6 +1088,7 @@ impl Evaluator {
                             size,
                             &augmented,
                             meter,
+                            custom_calls,
                         )?
                         .string(self);
                     let searches = self.evaluate_extension_strings(
@@ -672,6 +1098,7 @@ impl Evaluator {
                         size,
                         &augmented,
                         meter,
+                        custom_calls,
                     )?;
                     let replacements = self.evaluate_extension_strings(
                         expression.derived(call.arguments[2].clone()),
@@ -680,6 +1107,7 @@ impl Evaluator {
                         size,
                         &augmented,
                         meter,
+                        custom_calls,
                     )?;
                     let replaced = replace_exslt_string(&input, &searches, &replacements, meter)?;
                     let fragment = text_document(&replaced, meter)?;
@@ -702,6 +1130,7 @@ impl Evaluator {
                             size,
                             &augmented,
                             meter,
+                            custom_calls,
                         )?
                         .string(self);
                     if dynamic_source.is_empty() {
@@ -714,6 +1143,7 @@ impl Evaluator {
                             size,
                             &augmented,
                             meter,
+                            custom_calls,
                         ) {
                             Ok(value) => xpath_value_to_public(value),
                             Err(error)
@@ -740,6 +1170,7 @@ impl Evaluator {
                             size,
                             &augmented,
                             meter,
+                            custom_calls,
                         )?
                         .string(self);
                     validate_dynamic_expression(&stored, &expression.namespaces)?;
@@ -766,6 +1197,7 @@ impl Evaluator {
                         size,
                         &augmented,
                         meter,
+                        custom_calls,
                     )?)
                 }
                 ExtensionCallKind::SaxonLineNumber => {
@@ -781,6 +1213,7 @@ impl Evaluator {
                         size,
                         &augmented,
                         meter,
+                        custom_calls,
                     )?;
                     let line = match value {
                         XPathValue::NodeSet(nodes) => nodes
@@ -802,6 +1235,7 @@ impl Evaluator {
                         size,
                         &augmented,
                         meter,
+                        custom_calls,
                     )?
                     else {
                         return Err(Error::Dynamic("dyn:map() requires a node-set".into()));
@@ -814,6 +1248,7 @@ impl Evaluator {
                             size,
                             &augmented,
                             meter,
+                            custom_calls,
                         )?
                         .string(self);
                     let nodes = self.document_order(nodes);
@@ -829,6 +1264,7 @@ impl Evaluator {
                             total,
                             &augmented,
                             meter,
+                            custom_calls,
                         ) {
                             Ok(value) => value,
                             Err(error) if dynamic_expression_error_is_recoverable(&error) => {
@@ -886,6 +1322,10 @@ impl Evaluator {
         })
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "extension arguments preserve the complete XPath dynamic context"
+    )]
     fn evaluate_extension_strings(
         &self,
         expression: Expression,
@@ -894,8 +1334,17 @@ impl Evaluator {
         size: usize,
         variables: &HashMap<ExpandedName, Value>,
         meter: &mut Meter,
+        custom_calls: Option<&CustomCallSession>,
     ) -> Result<Vec<String>> {
-        let value = self.evaluate_core(&expression, node, position, size, variables, meter)?;
+        let value = self.evaluate_core(
+            &expression,
+            node,
+            position,
+            size,
+            variables,
+            meter,
+            custom_calls,
+        )?;
         Ok(match value {
             XPathValue::NodeSet(nodes) => {
                 nodes.iter().map(|node| self.string_value(node)).collect()
@@ -904,6 +1353,10 @@ impl Evaluator {
         })
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "dynamic XPath preserves the caller's complete evaluation context"
+    )]
     fn evaluate_dynamic(
         &mut self,
         expression: &Expression,
@@ -912,17 +1365,30 @@ impl Evaluator {
         size: usize,
         variables: &HashMap<ExpandedName, Value>,
         meter: &mut Meter,
+        custom_calls: Option<&CustomCallSession>,
     ) -> Result<XPathValue> {
         validate_dynamic_expression(&expression.source, &expression.namespaces)?;
         self.dynamic_evaluation_depth = self.dynamic_evaluation_depth.saturating_add(1);
         let depth = self.dynamic_evaluation_depth;
-        let result = meter
-            .recursion(depth.saturating_mul(32))
-            .and_then(|()| self.evaluate(expression, node, position, size, variables, meter));
+        let result = meter.recursion(depth.saturating_mul(32)).and_then(|()| {
+            self.evaluate(
+                expression,
+                node,
+                position,
+                size,
+                variables,
+                meter,
+                custom_calls,
+            )
+        });
         self.dynamic_evaluation_depth -= 1;
         result
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the XPath engine requires every component of its dynamic context"
+    )]
     fn evaluate_core(
         &self,
         expression: &Expression,
@@ -931,7 +1397,11 @@ impl Evaluator {
         size: usize,
         variables: &HashMap<ExpandedName, Value>,
         meter: &mut Meter,
+        custom_calls: Option<&CustomCallSession>,
     ) -> Result<XPathValue> {
+        if let Some(custom_calls) = custom_calls {
+            custom_calls.register_fragments(variables);
+        }
         let document = self.package.as_document();
         let context_node = self
             .maps
@@ -1075,6 +1545,21 @@ impl Evaluator {
                 node_base_uris: Rc::clone(&self.node_base_uris),
             },
         );
+        if let Some(custom_calls) = custom_calls {
+            for name in &self.stylesheet_functions {
+                let qname: sxd_xpath_no_unsafe::OwnedQName = name.namespace.as_deref().map_or_else(
+                    || name.local.as_str().into(),
+                    |namespace| (namespace, name.local.as_str()).into(),
+                );
+                context.set_function(
+                    qname,
+                    DeferredStylesheetFunction {
+                        name: name.clone(),
+                        session: Rc::clone(&custom_calls.state),
+                    },
+                );
+            }
+        }
         for (name, value) in variables {
             let qname: sxd_xpath_no_unsafe::OwnedQName = name.namespace.as_deref().map_or_else(
                 || name.local.as_str().into(),
@@ -1153,6 +1638,11 @@ impl Evaluator {
                         Some(XPathValue::ResultTreeFragment(document.clone()))
                     }
                     _ => None,
+                })
+                .or_else(|| {
+                    custom_calls
+                        .and_then(|session| session.fragment(identity))
+                        .map(XPathValue::ResultTreeFragment)
                 })
                 .ok_or_else(|| Error::Dynamic("stale result-tree-fragment identity".into()));
         }
@@ -1284,6 +1774,7 @@ impl Evaluator {
                 1,
                 variables,
                 meter,
+                None,
             )?;
             let XPathValue::NodeSet(nodes) = selected else {
                 return Err(Error::Dynamic(format!(
@@ -1360,6 +1851,7 @@ impl Evaluator {
                 1,
                 variables,
                 meter,
+                None,
             )?;
             if let XPathValue::NodeSet(nodes) = value {
                 let matches = nodes.contains(node);
