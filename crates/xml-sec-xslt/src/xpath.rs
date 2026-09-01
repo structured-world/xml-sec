@@ -5499,7 +5499,15 @@ fn render_decimal(
     }
     let scaled = value.abs() * multiplier;
     let factor = 10_f64.powi(i32::try_from(maximum_fraction).unwrap_or(i32::MAX));
-    let rounded = (scaled * factor + 0.5).floor() / factor;
+    let rounded = if factor.is_finite() {
+        (scaled * factor + 0.5).floor() / factor
+    } else {
+        // XSLT 1.0 section 12.3 delegates picture precision to DecimalFormat. Once the decimal
+        // scale exceeds finite f64 powers, fixed-precision rendering performs the remaining
+        // rounding without turning a finite input into NaN through `infinity / infinity`.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#format-number
+        scaled
+    };
     let mut rendered = format!("{rounded:.maximum_fraction$}");
     if maximum_fraction > minimum_fraction && rendered.contains('.') {
         while rendered.ends_with('0')

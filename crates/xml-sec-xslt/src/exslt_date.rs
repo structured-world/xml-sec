@@ -160,11 +160,21 @@ impl function::Function for DateFunction {
                     .map_or_else(String::new, DurationValue::render),
             )),
             Seconds => {
-                let input = args.first().map(Value::string).unwrap_or_default();
-                let seconds = DurationValue::parse(&input)
+                // Omitted date:seconds input defaults to date:date-time, so it shares the same
+                // controlled clock and deterministic-policy gate.
+                // https://exslt.github.io/date/functions/seconds/date.seconds.html
+                let current;
+                let input = if let Some(input) = args.first().map(Value::string) {
+                    current = input;
+                    current.as_str()
+                } else {
+                    current = current_datetime_for_operation(self.1.as_ref(), self.2)?;
+                    current.as_str()
+                };
+                let seconds = DurationValue::parse(input)
                     .filter(|duration| duration.months == 0)
                     .map(|duration| duration.seconds)
-                    .or_else(|| DateValue::parse(&input).and_then(DateValue::unix_seconds))
+                    .or_else(|| DateValue::parse(input).and_then(DateValue::unix_seconds))
                     .unwrap_or(f64::NAN);
                 Ok(Value::Number(seconds))
             }

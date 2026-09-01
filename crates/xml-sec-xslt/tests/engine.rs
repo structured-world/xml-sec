@@ -1032,6 +1032,49 @@ fn execution_environment_controls_exslt_current_time() {
 }
 
 #[test]
+fn zero_argument_exslt_seconds_uses_the_execution_clock_and_policy() {
+    // EXSLT date:seconds defines an omitted argument as the current local date-time, so the
+    // operation must use the configured clock and reject ambient time in deterministic mode.
+    // https://exslt.github.io/date/functions/seconds/date.seconds.html
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:date="http://exslt.org/dates-and-times"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="date:seconds()"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse("<source/>", None).expect("source parses");
+    let fixed = time::OffsetDateTime::from_unix_timestamp(0).expect("Unix epoch is valid");
+    let result = stylesheet
+        .execute_with_environment(
+            &source,
+            &Parameters::new(),
+            ExecutionEnvironment::new(Arc::new(NoResolver))
+                .with_clock(Arc::new(FixedClock::new(fixed))),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("fixed operation time is available");
+    assert_eq!(result.serialized.bytes, b"0");
+
+    let error = stylesheet
+        .execute_with_environment(
+            &source,
+            &Parameters::new(),
+            ExecutionEnvironment::new(Arc::new(NoResolver))
+                .with_extension_policy(ExtensionPolicy::Deterministic),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect_err("deterministic execution rejects current-time access");
+    assert!(
+        matches!(error, Error::Dynamic(message) if message.contains("execution extension policy"))
+    );
+}
+
+#[test]
 fn exslt_durations_allow_fractional_syntax_only_for_seconds() {
     // XML Schema 1.0 erratum E2-23 requires digits after a decimal point, but libxslt accepts a
     // trailing point in seconds. Preserve that pinned-oracle exception without accepting decimal
@@ -1899,6 +1942,15 @@ fn number_rejects_multi_character_grouping_separator() {
         )
         .expect_err("malformed grouping-separator must fail");
     assert!(matches!(error, Error::Dynamic(message) if message.contains("grouping-separator")));
+}
+
+#[test]
+fn number_converts_grouping_size_through_xpath_number_semantics() {
+    // XSLT 1.0 sections 7.7 and 7.7.1 define grouping-size as a numeric AVT used by decimal
+    // numbering. libxslt accepts decimal spellings and truncates fractional group widths.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#number
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:number value="1234567" grouping-separator="," grouping-size="3.0"/><xsl:text>|</xsl:text><xsl:number value="1234567" grouping-separator="," grouping-size="2.6"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "1,234,567|1,23,45,67");
 }
 
 #[test]
@@ -4259,6 +4311,39 @@ fn attribute_value_templates_preflight_transient_growth() {
 }
 
 #[test]
+fn retained_secondary_output_uris_share_the_owned_byte_budget() {
+    // Each URI remains live in TransformResult, so repeated large AVT values must accumulate
+    // against OwnedBytes instead of being treated as independent temporary strings.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:xt="http://www.jclark.com/xt" extension-element-prefixes="xt"><xsl:template match="/"><xt:document href="{concat(string(/source), '1')}" method="text"/><xt:document href="{concat(string(/source), '2')}" method="text"/><xt:document href="{concat(string(/source), '3')}" method="text"/><xt:document href="{concat(string(/source), '4')}" method="text"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let payload = "u".repeat(128 * 1024);
+    let source_xml = format!("<source>{payload}</source>");
+    let source = Document::parse(&source_xml, None).expect("source parses");
+    let mut budget = execution_budget(1 << 20);
+    budget.owned_bytes = 700 * 1024;
+    let error = stylesheet
+        .execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect_err("retained output URIs must exhaust the aggregate owned-byte budget");
+    assert!(matches!(
+        error,
+        Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn supported_secondary_output_does_not_execute_fallback() {
     // xsl:fallback belongs only to unsupported extension execution.
     let stylesheet = compile(
@@ -5696,6 +5781,18 @@ fn document_function_decodes_uri_escaped_shorthand_pointers() {
             Err(Error::Unsupported(message)) if message.contains("document fragment")
         ));
     }
+}
+
+#[test]
+fn format_number_handles_fraction_precision_beyond_f64_decimal_exponents() {
+    // XSLT 1.0 section 12.3 delegates picture precision to DecimalFormat; a valid high-precision
+    // picture must not turn a finite value into NaN through an overflowing scale factor.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#format-number
+    let picture = format!("0.{}", "#".repeat(309));
+    let stylesheet = format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="format-number(1, '{picture}')"/></xsl:template></xsl:stylesheet>"#,
+    );
+    assert_eq!(execute(&stylesheet, "<source/>"), "1");
 }
 
 #[test]

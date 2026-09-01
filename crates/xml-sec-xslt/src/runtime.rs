@@ -1705,13 +1705,19 @@ impl<'a> Execution<'a> {
                     })
                     .transpose()?
                     .flatten();
+                // XSLT 1.0 sections 7.7 and 7.7.1 define `grouping-size` as a numeric AVT;
+                // libxslt converts its positive Number to an integral width by truncation.
+                // https://www.w3.org/TR/1999/REC-xslt-19991116#number
                 let grouping_size = number
                     .grouping_size
                     .as_ref()
                     .map(|value| self.evaluate_avt(value, node, position, size))
                     .transpose()?
-                    .and_then(|value| value.parse::<usize>().ok())
-                    .filter(|size| *size > 0);
+                    .and_then(|value| parse_xpath_number(&value))
+                    .filter(|value| value.is_finite())
+                    .filter(|value| *value > 0.0)
+                    .map(|value| value as usize)
+                    .filter(|value| *value > 0);
                 let format = self.evaluate_avt(&number.format, node, position, size)?;
                 let lang = number
                     .lang
@@ -1809,6 +1815,11 @@ impl<'a> Execution<'a> {
                         "secondary-output URI {uri:?} was produced more than once"
                     )));
                 }
+                self.meter.charge(
+                    BudgetKind::OwnedBytes,
+                    uri.len()
+                        .saturating_add(std::mem::size_of::<SecondaryOutput>()),
+                )?;
                 let mut definition = self.stylesheet.output.clone();
                 for (name, value) in properties {
                     let value = self.evaluate_avt(value, node, position, size)?;
