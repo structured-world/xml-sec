@@ -1033,11 +1033,12 @@ fn execution_environment_controls_exslt_current_time() {
 
 #[test]
 fn exslt_durations_allow_fractional_syntax_only_for_seconds() {
-    // XML Schema Part 2 defines the decimal production only for the seconds component of a
-    // duration; integral-valued decimals in every other field remain lexically invalid.
-    // https://www.w3.org/TR/xmlschema-2/#duration-lexical-representation
-    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:date="http://exslt.org/dates-and-times"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="date:add-duration('P1.0Y', 'P1Y')"/><xsl:text>|</xsl:text><xsl:value-of select="date:add-duration('P1.0M', 'P1M')"/><xsl:text>|</xsl:text><xsl:value-of select="date:add-duration('P1.0D', 'P1D')"/><xsl:text>|</xsl:text><xsl:value-of select="date:add-duration('PT1.0H', 'PT1H')"/><xsl:text>|</xsl:text><xsl:value-of select="date:add-duration('PT1.0M', 'PT1M')"/><xsl:text>|</xsl:text><xsl:value-of select="date:add-duration('PT0.5S', 'PT0.5S')"/></xsl:template></xsl:stylesheet>"#;
-    assert_eq!(execute(stylesheet, "<source/>"), "|||||PT1S");
+    // XML Schema 1.0 erratum E2-23 requires digits after a decimal point, but libxslt accepts a
+    // trailing point in seconds. Preserve that pinned-oracle exception without accepting decimal
+    // spellings for any other duration component.
+    // https://www.w3.org/2001/05/xmlschema-errata#e2-23
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:date="http://exslt.org/dates-and-times"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="date:add-duration('P1.0Y', 'P1Y')"/><xsl:text>|</xsl:text><xsl:value-of select="date:add-duration('P1.0M', 'P1M')"/><xsl:text>|</xsl:text><xsl:value-of select="date:add-duration('P1.0D', 'P1D')"/><xsl:text>|</xsl:text><xsl:value-of select="date:add-duration('PT1.0H', 'PT1H')"/><xsl:text>|</xsl:text><xsl:value-of select="date:add-duration('PT1.0M', 'PT1M')"/><xsl:text>|</xsl:text><xsl:value-of select="date:add-duration('PT1.S', 'PT1S')"/><xsl:text>|</xsl:text><xsl:value-of select="date:add-duration('PT0.5S', 'PT0.5S')"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "|||||PT2S|PT1S");
 }
 
 #[test]
@@ -1127,12 +1128,16 @@ fn optimized_addition_distinguishes_xpath_names_from_numbers() {
 #[test]
 fn xpath_normalization_rejects_non_xml_whitespace() {
     // NBSP is an XML character but not XPath whitespace and must not repair invalid syntax.
-    let stylesheet = "<xsl:stylesheet version=\"1.0\" xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\"><xsl:template match=\"/\"><xsl:value-of select=\"count\u{a0}(*)\"/></xsl:template></xsl:stylesheet>";
-    assert!(matches!(
-        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
-            .compile(stylesheet, None),
-        Err(Error::Static(message)) if message.contains("invalid XPath")
-    ));
+    for stylesheet in [
+        "<xsl:stylesheet version=\"1.0\" xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\"><xsl:template match=\"/\"><xsl:value-of select=\"count\u{a0}(*)\"/></xsl:template></xsl:stylesheet>",
+        "<xsl:stylesheet version=\"1.0\" xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\"><xsl:template match=\"/\"><xsl:value-of select=\"/\u{a0}\"/></xsl:template></xsl:stylesheet>",
+    ] {
+        assert!(matches!(
+            Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+                .compile(stylesheet, None),
+            Err(Error::Static(message)) if message.contains("invalid XPath")
+        ));
+    }
 }
 
 #[test]
@@ -1915,6 +1920,15 @@ fn numbering_parses_tokens_widths_and_unicode_decimal_patterns() {
         execute(lexical_numbers, "<source/>"),
         "285311670611|95012.38841989999"
     );
+}
+
+#[test]
+fn numbering_preserves_punctuation_and_groups_only_decimal_tokens() {
+    // XSLT 1.0 section 7.7.1 retains a leading punctuation token when it supplies the default
+    // format token, while grouping-separator/grouping-size apply only to decimal formatting.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#convert
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:number value="27" format="("/><xsl:text>|</xsl:text><xsl:number value="27" format="A" grouping-separator="," grouping-size="1"/><xsl:text>|</xsl:text><xsl:number value="9" format="I" grouping-separator="," grouping-size="1"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "(27|AA|IX");
 }
 
 #[test]
@@ -3805,6 +3819,32 @@ fn sequential_local_scopes_release_retained_binding_memory() {
 }
 
 #[test]
+fn sequential_sorts_release_transient_workspace() {
+    // OwnedBytes is a peak-live-memory ceiling. Each inner sort completes before the next outer
+    // iteration, so structural workspace and text collation keys must not accumulate.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:for-each select="root/group"><xsl:apply-templates select="/root/item"><xsl:sort select="."/></xsl:apply-templates></xsl:for-each></xsl:template><xsl:template match="item"/></xsl:stylesheet>"#,
+    );
+    let item = format!("<item>{}</item>", "x".repeat(128));
+    let source_xml = format!("<root>{}{}</root>", "<group/>".repeat(64), item.repeat(16));
+    let source = Document::parse(&source_xml, None).expect("source parses");
+    let mut budget = execution_budget(source_xml.len());
+    budget.owned_bytes = 256 * 1024;
+    stylesheet
+        .execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("sequential sorts remain below the peak-memory ceiling");
+}
+
+#[test]
 fn repeated_attribute_overrides_release_replaced_storage() {
     // XSLT 1.0 section 7.1.3 makes the last attribute with an expanded name win. Replaced values
     // are no longer live result-tree storage and therefore must not accumulate against the peak
@@ -3837,6 +3877,38 @@ fn repeated_attribute_overrides_release_replaced_storage() {
             .expect("UTF-8 output")
             .contains(&payload)
     );
+}
+
+#[test]
+fn repeated_namespace_overrides_release_replaced_storage() {
+    // Namespace nodes with the same prefix replace one another on a result element. Only the
+    // final URI remains live, so prior bindings must not accumulate against OwnedBytes.
+    let copies = r#"<xsl:copy-of select="root/item/namespace::*[name() = 'p']"/>"#.repeat(4);
+    let stylesheet = compile(&format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><result>{copies}</result></xsl:template></xsl:stylesheet>"#,
+    ));
+    let payload = "x".repeat(4 * 1024);
+    let items = (0..64)
+        .map(|index| format!(r#"<item xmlns:p="urn:{index}:{payload}"/>"#))
+        .collect::<String>();
+    let source_xml = format!("<root>{items}</root>");
+    let source = Document::parse(&source_xml, None).expect("source parses");
+    let mut budget = execution_budget(source_xml.len());
+    budget.owned_bytes = 1700 * 1024;
+    let result = stylesheet
+        .execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("only the final namespace binding remains live");
+    let output = String::from_utf8(result.serialized.bytes).expect("UTF-8 output");
+    assert!(output.contains("xmlns:p=\"urn:63:"));
 }
 
 #[test]
@@ -5704,7 +5776,8 @@ fn match_patterns_trim_only_xml_whitespace() {
 
 #[test]
 fn instruction_attributes_follow_strict_and_forward_compatible_rules() {
-    // Strict XSLT 1.0 rejects unqualified typos but ignores foreign extension attributes.
+    // Strict XSLT 1.0 rejects instruction and literal-result typos but ignores foreign extension
+    // attributes; forward-compatible processing ignores unknown XSLT attributes.
     let typo = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:value-of selct="."/></xsl:template></xsl:stylesheet>"#;
     assert!(matches!(
         Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
@@ -5717,6 +5790,16 @@ fn instruction_attributes_follow_strict_and_forward_compatible_rules() {
     compile(
         r#"<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:value-of select="." future-option="yes"/></xsl:template></xsl:stylesheet>"#,
     );
+
+    let literal_typo = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><out xsl:bogus="yes"/></xsl:template></xsl:stylesheet>"#;
+    assert!(matches!(
+        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+            .compile(literal_typo, None),
+        Err(Error::Static(message)) if message.contains("bogus")
+    ));
+
+    let forward_literal = r#"<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><out xsl:bogus="yes"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(forward_literal, "<source/>"), "<out/>\n");
 }
 
 #[test]

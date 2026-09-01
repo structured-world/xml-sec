@@ -1775,18 +1775,19 @@ impl<'a> Execution<'a> {
                     current_precedence,
                     None,
                 )?;
-                let content = serialize_fragment(&fragment, &mut self.meter)?;
-                self.messages.push(Message {
-                    content: content.clone(),
-                    terminate: *terminate,
-                });
+                let mut content = serialize_fragment(&fragment, &mut self.meter)?;
                 if *terminate {
-                    Err(Error::Dynamic(format!(
-                        "xsl:message terminated transformation: {content}"
-                    )))
-                } else {
-                    Ok(())
+                    const PREFIX: &str = "xsl:message terminated transformation: ";
+                    self.meter
+                        .check_additional(BudgetKind::OwnedBytes, PREFIX.len())?;
+                    content.insert_str(0, PREFIX);
+                    return Err(Error::Dynamic(content));
                 }
+                self.messages.push(Message {
+                    content,
+                    terminate: false,
+                });
+                Ok(())
             }
             Instruction::SecondaryOutput {
                 uri,
@@ -2519,13 +2520,12 @@ impl<'a> Execution<'a> {
         if sorts.is_empty() {
             return Ok(());
         }
-        self.meter.charge(
-            BudgetKind::OwnedBytes,
-            sort_workspace_bytes(nodes.len(), sorts.len()),
-        )?;
-        let specs = sorts
-            .iter()
-            .map(|sort| {
+        let workspace_bytes = sort_workspace_bytes(nodes.len(), sorts.len());
+        self.meter.charge(BudgetKind::OwnedBytes, workspace_bytes)?;
+        let mut retained_bytes = 0usize;
+        let result = (|| {
+            let mut specs = Vec::with_capacity(sorts.len());
+            for sort in sorts {
                 let case_order = sort
                     .case_order
                     .as_ref()
@@ -2569,48 +2569,62 @@ impl<'a> Execution<'a> {
                         "xsl:sort order must evaluate to `ascending` or `descending`, got `{order}`"
                     )));
                 }
-                Ok(EvaluatedSort {
+                let spec = EvaluatedSort {
                     data_type,
                     order,
                     case_order,
                     collator,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let mut keyed = Vec::with_capacity(nodes.len());
-        for (index, node) in nodes.iter().enumerate() {
-            let mut keys = vec![];
-            for (sort, spec) in sorts.iter().zip(&specs) {
-                let value = self.evaluate(&sort.select, node, index + 1, nodes.len())?;
-                let key = if spec.data_type == "number" {
-                    SortKey::Number(value.number(&self.evaluator))
-                } else {
-                    SortKey::text(value.into_string(&self.evaluator), &mut self.meter)?
                 };
-                keys.push(key);
+                let bytes = spec.owned_bytes();
+                self.meter.charge(BudgetKind::OwnedBytes, bytes)?;
+                retained_bytes = retained_bytes
+                    .checked_add(bytes)
+                    .expect("charged sort storage fits usize");
+                specs.push(spec);
             }
-            keyed.push((node.clone(), keys, index));
-        }
-        let mut order = (0..keyed.len()).collect::<Vec<_>>();
-        try_stable_sort_by(&mut order, |left, right| {
-            let left = &keyed[*left];
-            let right = &keyed[*right];
-            self.meter.charge(BudgetKind::SortComparisons, 1)?;
-            for ((l, r), spec) in left.1.iter().zip(&right.1).zip(&specs) {
-                let mut ordering = l.compare(r, spec.case_order.as_deref(), spec.collator.as_ref());
-                if spec.order == "descending" {
-                    ordering = ordering.reverse()
+
+            let mut keyed = Vec::with_capacity(nodes.len());
+            for (index, node) in nodes.iter().enumerate() {
+                let mut keys = Vec::with_capacity(sorts.len());
+                for (sort, spec) in sorts.iter().zip(&specs) {
+                    let value = self.evaluate(&sort.select, node, index + 1, nodes.len())?;
+                    let key = if spec.data_type == "number" {
+                        SortKey::Number(value.number(&self.evaluator))
+                    } else {
+                        SortKey::text(value.into_string(&self.evaluator), &mut self.meter)?
+                    };
+                    retained_bytes = retained_bytes
+                        .checked_add(key.owned_bytes())
+                        .expect("charged sort storage fits usize");
+                    keys.push(key);
                 }
-                if ordering != Ordering::Equal {
-                    return Ok(ordering);
-                }
+                keyed.push((node.clone(), keys, index));
             }
-            Ok(left.2.cmp(&right.2))
-        })?;
-        for (target, index) in nodes.iter_mut().zip(order) {
-            *target = keyed[index].0.clone()
-        }
-        Ok(())
+            let mut order = (0..keyed.len()).collect::<Vec<_>>();
+            try_stable_sort_by(&mut order, |left, right| {
+                let left = &keyed[*left];
+                let right = &keyed[*right];
+                self.meter.charge(BudgetKind::SortComparisons, 1)?;
+                for ((l, r), spec) in left.1.iter().zip(&right.1).zip(&specs) {
+                    let mut ordering =
+                        l.compare(r, spec.case_order.as_deref(), spec.collator.as_ref());
+                    if spec.order == "descending" {
+                        ordering = ordering.reverse()
+                    }
+                    if ordering != Ordering::Equal {
+                        return Ok(ordering);
+                    }
+                }
+                Ok(left.2.cmp(&right.2))
+            })?;
+            for (target, index) in nodes.iter_mut().zip(order) {
+                *target = keyed[index].0.clone()
+            }
+            Ok(())
+        })();
+        self.meter
+            .release_owned_bytes(workspace_bytes.saturating_add(retained_bytes));
+        result
     }
     fn capture_text(
         &mut self,
@@ -3093,23 +3107,29 @@ impl<'a> Execution<'a> {
         }
         self.meter
             .charge(BudgetKind::OwnedBytes, namespace_owned_bytes(&namespace))?;
-        let node = self
-            .result
-            .node_mut(self.parent())
-            .ok_or_else(|| Error::Dynamic("namespace has no result parent".into()))?;
-        let NodeKind::Element { namespaces, .. } = &mut node.kind else {
-            return Err(Error::Dynamic(
-                "namespace requires an element result".into(),
-            ));
+        let replaced_owned_bytes = {
+            let node = self
+                .result
+                .node_mut(self.parent())
+                .ok_or_else(|| Error::Dynamic("namespace has no result parent".into()))?;
+            let NodeKind::Element { namespaces, .. } = &mut node.kind else {
+                return Err(Error::Dynamic(
+                    "namespace requires an element result".into(),
+                ));
+            };
+            if let Some(existing) = namespaces
+                .iter_mut()
+                .find(|existing| existing.prefix == namespace.prefix)
+            {
+                let replaced_owned_bytes = namespace_owned_bytes(existing);
+                *existing = namespace;
+                replaced_owned_bytes
+            } else {
+                namespaces.push(namespace);
+                0
+            }
         };
-        if let Some(existing) = namespaces
-            .iter_mut()
-            .find(|existing| existing.prefix == namespace.prefix)
-        {
-            *existing = namespace
-        } else {
-            namespaces.push(namespace)
-        }
+        self.meter.release_owned_bytes(replaced_owned_bytes);
         Ok(())
     }
     fn alias_name(
@@ -3604,6 +3624,14 @@ struct EvaluatedSort {
     case_order: Option<String>,
     collator: Option<CollatorBorrowed<'static>>,
 }
+impl EvaluatedSort {
+    fn owned_bytes(&self) -> usize {
+        self.data_type
+            .len()
+            .saturating_add(self.order.len())
+            .saturating_add(self.case_order.as_ref().map_or(0, String::len))
+    }
+}
 impl SortKey {
     fn text(value: String, meter: &mut Meter) -> Result<Self> {
         let key_bytes = default_collation_key_bytes(&value);
@@ -3613,6 +3641,13 @@ impl SortKey {
         )?;
         let default_key = default_collation_key(&value, key_bytes);
         Ok(Self::Text { value, default_key })
+    }
+
+    fn owned_bytes(&self) -> usize {
+        match self {
+            Self::Text { value, default_key } => value.len().saturating_add(default_key.len()),
+            Self::Number(_) => 0,
+        }
     }
 
     fn compare(
@@ -3946,6 +3981,7 @@ fn format_number_sequence(
     let tokens = tokenize_number_format(format);
     if tokens.formats.is_empty() {
         let mut output = String::new();
+        append_metered(&mut output, tokens.prefix, meter)?;
         for (index, value) in values.iter().enumerate() {
             if index > 0 {
                 append_metered(&mut output, ".", meter)?;
@@ -4336,11 +4372,11 @@ fn format_number_into(
     match format {
         "A" | "a" if letter_value != Some("traditional") => {
             let value = alphabetic(rounded as usize, format == "A");
-            append_grouped(output, &value, separator, size, meter)
+            append_metered(output, &value, meter)
         }
         "I" | "i" => {
             let value = roman(rounded as usize, format == "I");
-            append_grouped(output, &value, separator, size, meter)
+            append_metered(output, &value, meter)
         }
         _ => {
             let width = format
@@ -4423,37 +4459,6 @@ fn append_localized_decimal(
             output.push(separator);
         }
         output.push(characters.next().expect("decimal width matches iterator"));
-    }
-    Ok(())
-}
-
-fn append_grouped(
-    output: &mut String,
-    value: &str,
-    separator: Option<char>,
-    size: Option<usize>,
-    meter: &Meter,
-) -> Result<()> {
-    let characters = value.chars().count();
-    let grouping_size = size.filter(|size| *size > 0);
-    let groups = grouping_size.map_or(0, |size| characters.saturating_sub(1) / size);
-    let separator_bytes = separator.zip(grouping_size).map_or(0, |(separator, _)| {
-        groups.saturating_mul(separator.len_utf8())
-    });
-    let additional = value.len().saturating_add(separator_bytes);
-    meter.check_additional(
-        BudgetKind::OwnedBytes,
-        output.len().saturating_add(additional),
-    )?;
-    output.reserve(additional);
-    for (index, character) in value.chars().enumerate() {
-        if index > 0
-            && let Some((separator, size)) = separator.zip(grouping_size)
-            && (characters - index).is_multiple_of(size)
-        {
-            output.push(separator);
-        }
-        output.push(character);
     }
     Ok(())
 }
@@ -4565,7 +4570,7 @@ fn roman(mut value: usize, upper: bool) -> String {
 mod tests {
     use std::cmp::Ordering;
 
-    use super::{SortKey, append_grouped, append_localized_decimal, value_string};
+    use super::{SortKey, append_localized_decimal, value_string};
     use crate::budget::Meter;
     use crate::{BudgetKind, Document, Error, ExecutionBudget, Value};
 
@@ -4590,12 +4595,7 @@ mod tests {
     }
 
     #[test]
-    fn grouped_number_writer_is_linear_and_checks_before_writing() {
-        let mut output = String::new();
-        append_grouped(&mut output, "١٢٣٤", Some('·'), Some(1), &meter(64))
-            .expect("grouped number fits");
-        assert_eq!(output, "١·٢·٣·٤");
-
+    fn grouped_decimal_writer_checks_before_writing() {
         let mut rejected = String::new();
         let error = append_localized_decimal(
             &mut rejected,

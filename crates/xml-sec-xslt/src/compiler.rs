@@ -2462,6 +2462,7 @@ fn compile_literal_element(
     context: CompileContext,
 ) -> Result<Instruction> {
     let context = context.with_literal_version(node)?;
+    validate_literal_result_attributes(node, context.forward)?;
     let prefix = node
         .lookup_prefix(node.tag_name().namespace().unwrap_or(""))
         .map(str::to_owned);
@@ -2509,6 +2510,35 @@ fn compile_literal_element(
         children: compile_sequence(node.children(), context)?,
         attribute_sets,
     })
+}
+
+fn validate_literal_result_attributes(
+    node: roxmltree::Node<'_, '_>,
+    forward_compatible: bool,
+) -> Result<()> {
+    // XSLT 1.0 section 7.1.1 defines the complete set of XSLT-namespace control attributes on a
+    // literal result element; section 2.5 permits unknown attributes only in FCP.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#literal-result-element
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#forwards
+    const ALLOWED: &[&str] = &[
+        "version",
+        "extension-element-prefixes",
+        "exclude-result-prefixes",
+        "use-attribute-sets",
+    ];
+    if forward_compatible {
+        return Ok(());
+    }
+    if let Some(attribute) = node.attributes().find(|attribute| {
+        attribute.namespace() == Some(XSLT_NS) && !ALLOWED.contains(&attribute.name())
+    }) {
+        return Err(Error::Static(format!(
+            "literal result element {} does not permit xsl:{}",
+            node.tag_name().name(),
+            attribute.name()
+        )));
+    }
+    Ok(())
 }
 
 fn excluded_result_namespaces(

@@ -3304,7 +3304,7 @@ fn rewrite_absolute_paths(source: &str, logical_root_index: usize) -> std::borro
         "/{DOCUMENTS_ELEMENT}/{DOCUMENT_ELEMENT}[{}]",
         logical_root_index + 1
     );
-    if source.trim() == "/" {
+    if source.trim_matches(crate::lexical::is_xml_whitespace) == "/" {
         return std::borrow::Cow::Owned(logical_root);
     }
     let mut output = String::with_capacity(source.len());
@@ -3329,7 +3329,7 @@ fn rewrite_absolute_paths(source: &str, logical_root_index: usize) -> std::borro
             output.push_str(&logical_root);
             if characters
                 .clone()
-                .find(|candidate| !candidate.is_whitespace())
+                .find(|candidate| !crate::lexical::is_xml_whitespace(*candidate))
                 .is_none_or(|next| {
                     matches!(next, ')' | ']' | ',' | '|' | '=' | '<' | '>' | '+' | '-')
                 })
@@ -3339,7 +3339,7 @@ fn rewrite_absolute_paths(source: &str, logical_root_index: usize) -> std::borro
             }
         }
         output.push(character);
-        if !character.is_whitespace() {
+        if !crate::lexical::is_xml_whitespace(character) {
             previous_non_whitespace = Some(character);
         }
     }
@@ -3368,7 +3368,7 @@ fn contains_absolute_path(source: &str) -> bool {
         if character == '/' && absolute_path_can_start(&source[..offset], previous_non_whitespace) {
             return true;
         }
-        if !character.is_whitespace() {
+        if !crate::lexical::is_xml_whitespace(character) {
             previous_non_whitespace = Some(character);
         }
     }
@@ -3387,7 +3387,7 @@ fn absolute_path_can_start(output: &str, previous: Option<char>) -> bool {
     if previous == Some('*') && multiplication_operator_ends(output) {
         return true;
     }
-    let trimmed = output.trim_end();
+    let trimmed = output.trim_end_matches(crate::lexical::is_xml_whitespace);
     ["and", "or", "div", "mod"].iter().any(|operator| {
         trimmed.strip_suffix(operator).is_some_and(|prefix| {
             prefix
@@ -3399,10 +3399,17 @@ fn absolute_path_can_start(output: &str, previous: Option<char>) -> bool {
 }
 
 fn multiplication_operator_ends(output: &str) -> bool {
-    let Some(prefix) = output.trim_end().strip_suffix('*') else {
+    let Some(prefix) = output
+        .trim_end_matches(crate::lexical::is_xml_whitespace)
+        .strip_suffix('*')
+    else {
         return false;
     };
-    let Some(previous) = prefix.trim_end().chars().next_back() else {
+    let Some(previous) = prefix
+        .trim_end_matches(crate::lexical::is_xml_whitespace)
+        .chars()
+        .next_back()
+    else {
         return false;
     };
     !matches!(

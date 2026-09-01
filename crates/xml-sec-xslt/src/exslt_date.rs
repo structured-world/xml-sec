@@ -413,10 +413,11 @@ impl DurationValue {
                 (true, 'S') => 6,
                 _ => return None,
             };
-            // XML Schema Part 2 permits the decimal production only for seconds. Checking the
-            // parsed number's fractional part is insufficient because it erases the distinction
-            // between `1` and the invalid non-seconds spelling `1.0`.
-            // https://www.w3.org/TR/xmlschema-2/#duration-lexical-representation
+            // XML Schema 1.0 erratum E2-23 requires a digit after the decimal point, but the
+            // pinned libxslt compatibility oracle accepts a trailing point in seconds (`1.S`).
+            // Preserve that deliberate oracle behavior while still rejecting decimals in every
+            // other component.
+            // https://www.w3.org/2001/05/xmlschema-errata#e2-23
             if rank <= last_rank || (rank != 6 && lexical_value.contains('.')) {
                 return None;
             }
