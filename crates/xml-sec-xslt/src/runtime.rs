@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use icu_collator::preferences::CollationCaseFirst;
@@ -160,7 +161,7 @@ impl Stylesheet {
         if let Some(name) = options.initial_template {
             state.call_named(
                 &name,
-                &HashMap::new(),
+                Arc::new(EvaluatedParameters::default()),
                 &root,
                 ApplyFrame::new(1, 1, 1),
                 None,
@@ -169,7 +170,7 @@ impl Stylesheet {
             state.apply_one(
                 root,
                 options.initial_mode.as_ref(),
-                &HashMap::new(),
+                Arc::new(EvaluatedParameters::default()),
                 ApplyFrame::new(1, 1, 1),
             )?;
         }
@@ -243,7 +244,7 @@ struct Execution<'a> {
     evaluator: Evaluator,
     result: Document,
     output_stack: Vec<NodeId>,
-    scopes: Vec<HashMap<ExpandedName, Value>>,
+    scopes: Vec<VariableScope>,
     // A global leaves this map before evaluation, so recursive access is detected without
     // replaying side effects or retrying a failed initializer.
     pending_globals: HashMap<ExpandedName, &'a crate::compiler::GlobalVariable>,
@@ -259,6 +260,66 @@ struct Execution<'a> {
     building_keys: HashSet<(ExpandedName, NodeId)>,
     attribute_insert_position: Option<usize>,
     attribute_protected_names: Option<HashSet<ExpandedName>>,
+}
+
+#[derive(Default)]
+struct VariableScope {
+    values: HashMap<ExpandedName, Value>,
+    retained_owned_bytes: usize,
+}
+
+impl VariableScope {
+    fn insert_retained(&mut self, name: ExpandedName, value: Value, retained_owned_bytes: usize) {
+        self.retained_owned_bytes = self
+            .retained_owned_bytes
+            .saturating_add(retained_owned_bytes);
+        self.values.insert(name, value);
+    }
+}
+
+impl Deref for VariableScope {
+    type Target = HashMap<ExpandedName, Value>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
+impl DerefMut for VariableScope {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.values
+    }
+}
+
+struct RetainedValue {
+    value: Value,
+    retained_owned_bytes: usize,
+}
+
+struct CapturedText {
+    value: String,
+    retained_owned_bytes: usize,
+}
+
+impl CapturedText {
+    fn transfer(self, meter: &mut Meter) -> String {
+        meter.release_owned_bytes(self.retained_owned_bytes);
+        self.value
+    }
+}
+
+#[derive(Default)]
+struct EvaluatedParameters {
+    values: HashMap<ExpandedName, Value>,
+    retained_owned_bytes: usize,
+}
+
+impl Deref for EvaluatedParameters {
+    type Target = HashMap<ExpandedName, Value>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
 }
 
 struct ResultTreeState {
@@ -284,7 +345,7 @@ struct ApplyFrame {
 enum TemplateTask {
     EnterTemplate {
         template: Box<Template>,
-        params: Arc<HashMap<ExpandedName, Value>>,
+        params: Arc<EvaluatedParameters>,
         node: SourceNode,
         frame: ApplyFrame,
         current_rule_precedence: Option<usize>,
@@ -292,7 +353,7 @@ enum TemplateTask {
     ApplyOne {
         node: SourceNode,
         mode: Option<ExpandedName>,
-        params: Arc<HashMap<ExpandedName, Value>>,
+        params: Arc<EvaluatedParameters>,
         frame: ApplyFrame,
     },
     Sequence {
@@ -304,7 +365,7 @@ enum TemplateTask {
         depth: usize,
         precedence: Option<usize>,
     },
-    RestoreScopes(Vec<HashMap<ExpandedName, Value>>),
+    RestoreScopes(Vec<VariableScope>),
     RestoreMode,
     PopOutput,
     PushScope,
@@ -366,7 +427,7 @@ impl<'a> Execution<'a> {
             evaluator,
             result: Document::empty(None),
             output_stack: vec![NodeId(0)],
-            scopes: vec![HashMap::new()],
+            scopes: vec![VariableScope::default()],
             pending_globals: HashMap::new(),
             initializing_globals: Vec::new(),
             meter,
@@ -538,7 +599,7 @@ impl<'a> Execution<'a> {
                     |remap| remap_parameter_value(value, remap),
                 );
                 self.meter.charge(BudgetKind::OwnedBytes, owned_bytes)?;
-                self.scopes[0].insert(name.clone(), value);
+                self.scopes[0].insert_retained(name.clone(), value, owned_bytes);
                 effective.remove(name);
             }
         }
@@ -582,8 +643,8 @@ impl<'a> Execution<'a> {
             None,
         );
         self.initializing_globals.pop();
-        let value = value?;
-        self.scopes[0].insert(name.clone(), value);
+        let retained = value?;
+        self.scopes[0].insert_retained(name.clone(), retained.value, retained.retained_owned_bytes);
         Ok(())
     }
 
@@ -616,17 +677,32 @@ impl<'a> Execution<'a> {
         Ok((variables, reserved_owned_bytes))
     }
 
+    fn pop_scope(&mut self) {
+        let scope = self
+            .scopes
+            .pop()
+            .expect("scope stack retains its global scope");
+        self.meter.release_owned_bytes(scope.retained_owned_bytes);
+    }
+
+    fn release_parameters_if_last(&mut self, parameters: &Arc<EvaluatedParameters>) {
+        if Arc::strong_count(parameters) == 1 {
+            self.meter
+                .release_owned_bytes(parameters.retained_owned_bytes);
+        }
+    }
+
     fn apply_one(
         &mut self,
         node: SourceNode,
         mode: Option<&ExpandedName>,
-        params: &HashMap<ExpandedName, Value>,
+        params: Arc<EvaluatedParameters>,
         frame: ApplyFrame,
     ) -> Result<()> {
         self.run_template_tasks(vec![TemplateTask::ApplyOne {
             node,
             mode: mode.cloned(),
-            params: Arc::new(params.clone()),
+            params,
             frame,
         }])
     }
@@ -635,13 +711,13 @@ impl<'a> Execution<'a> {
         &mut self,
         template: &Template,
         node: SourceNode,
-        params: &HashMap<ExpandedName, Value>,
+        params: Arc<EvaluatedParameters>,
         frame: ApplyFrame,
         current_rule_precedence: Option<usize>,
     ) -> Result<()> {
         self.run_template_tasks(vec![TemplateTask::EnterTemplate {
             template: Box::new(template.clone()),
-            params: Arc::new(params.clone()),
+            params,
             node,
             frame,
             current_rule_precedence,
@@ -660,7 +736,7 @@ impl<'a> Execution<'a> {
                 } => self.push_template_tasks(
                     &mut tasks,
                     &template,
-                    &params,
+                    params,
                     node,
                     frame,
                     current_rule_precedence,
@@ -672,7 +748,7 @@ impl<'a> Execution<'a> {
                     frame,
                 } => self.push_apply_one_tasks(&mut tasks, node, mode, params, frame)?,
                 TemplateTask::RestoreScopes(caller_scopes) => {
-                    self.scopes.pop();
+                    self.pop_scope();
                     self.scopes.extend(caller_scopes);
                 }
                 TemplateTask::RestoreMode => {
@@ -681,9 +757,9 @@ impl<'a> Execution<'a> {
                 TemplateTask::PopOutput => {
                     self.output_stack.pop();
                 }
-                TemplateTask::PushScope => self.scopes.push(HashMap::new()),
+                TemplateTask::PushScope => self.scopes.push(VariableScope::default()),
                 TemplateTask::PopScope => {
-                    self.scopes.pop();
+                    self.pop_scope();
                 }
                 TemplateTask::Sequence {
                     instructions,
@@ -764,6 +840,7 @@ impl<'a> Execution<'a> {
                                     frame: ApplyFrame::new(index + 1, total, depth + 1),
                                 });
                             }
+                            self.release_parameters_if_last(&supplied);
                         }
                         Instruction::ApplyImports => {
                             let current_rule_precedence = precedence.ok_or_else(|| {
@@ -774,7 +851,7 @@ impl<'a> Execution<'a> {
                             tasks.push(TemplateTask::ApplyOne {
                                 node,
                                 mode: self.modes.last().cloned().flatten(),
-                                params: Arc::new(HashMap::new()),
+                                params: Arc::new(EvaluatedParameters::default()),
                                 frame: ApplyFrame {
                                     max_precedence: Some(current_rule_precedence),
                                     position,
@@ -1009,7 +1086,7 @@ impl<'a> Execution<'a> {
         tasks: &mut Vec<TemplateTask>,
         node: SourceNode,
         mode: Option<ExpandedName>,
-        params: Arc<HashMap<ExpandedName, Value>>,
+        params: Arc<EvaluatedParameters>,
         frame: ApplyFrame,
     ) -> Result<()> {
         self.meter.recursion(frame.depth)?;
@@ -1052,6 +1129,7 @@ impl<'a> Execution<'a> {
             });
             return Ok(());
         }
+        self.release_parameters_if_last(&params);
         match &node {
             SourceNode::Node(id) => match self
                 .evaluator
@@ -1062,7 +1140,7 @@ impl<'a> Execution<'a> {
                 Some(NodeKind::Root | NodeKind::Element { .. }) => {
                     let children = self.evaluator.children(&node);
                     let total = children.len();
-                    let built_in_params = Arc::new(HashMap::new());
+                    let built_in_params = Arc::new(EvaluatedParameters::default());
                     for (index, child) in children.into_iter().enumerate().rev() {
                         tasks.push(TemplateTask::ApplyOne {
                             node: child,
@@ -1088,7 +1166,7 @@ impl<'a> Execution<'a> {
         &mut self,
         tasks: &mut Vec<TemplateTask>,
         template: &Template,
-        params: &HashMap<ExpandedName, Value>,
+        params: Arc<EvaluatedParameters>,
         node: SourceNode,
         frame: ApplyFrame,
         current_rule_precedence: Option<usize>,
@@ -1101,26 +1179,39 @@ impl<'a> Execution<'a> {
         } = frame;
         self.meter.recursion(depth)?;
         let caller_scopes = self.scopes.split_off(1);
-        self.scopes.push(HashMap::new());
+        self.scopes.push(VariableScope::default());
         for parameter in &template.params {
-            let value = params.get(&parameter.name).cloned().map_or_else(
-                || {
-                    self.evaluate_variable(
-                        parameter,
-                        &node,
-                        position,
-                        size,
-                        depth,
-                        current_rule_precedence,
-                    )
-                },
-                Ok,
-            )?;
+            let retained = if let Some(value) = params.get(&parameter.name) {
+                let retained_owned_bytes = binding_owned_bytes(&parameter.name, value);
+                self.meter
+                    .check_additional(BudgetKind::OwnedBytes, retained_owned_bytes)?;
+                let value = value.clone();
+                self.meter
+                    .charge(BudgetKind::OwnedBytes, retained_owned_bytes)?;
+                RetainedValue {
+                    value,
+                    retained_owned_bytes,
+                }
+            } else {
+                self.evaluate_variable(
+                    parameter,
+                    &node,
+                    position,
+                    size,
+                    depth,
+                    current_rule_precedence,
+                )?
+            };
             self.scopes
                 .last_mut()
                 .expect("template parameter scope exists")
-                .insert(parameter.name.clone(), value);
+                .insert_retained(
+                    parameter.name.clone(),
+                    retained.value,
+                    retained.retained_owned_bytes,
+                );
         }
+        self.release_parameters_if_last(&params);
         tasks.push(TemplateTask::RestoreScopes(caller_scopes));
         tasks.push(TemplateTask::Sequence {
             instructions: Arc::clone(&template.body),
@@ -1159,7 +1250,7 @@ impl<'a> Execution<'a> {
         depth: usize,
         current_precedence: Option<usize>,
     ) -> Result<()> {
-        self.scopes.push(HashMap::new());
+        self.scopes.push(VariableScope::default());
         let result = self.execute_sequence(
             instructions,
             node,
@@ -1168,7 +1259,7 @@ impl<'a> Execution<'a> {
             depth,
             current_precedence,
         );
-        self.scopes.pop();
+        self.pop_scope();
         result
     }
 
@@ -1247,23 +1338,24 @@ impl<'a> Execution<'a> {
             } => {
                 let mut nodes = self.select_nodes(select, node, position, size)?;
                 self.sort_nodes(&mut nodes, sorts, node, position, size)?;
-                let supplied = self.evaluate_with_params(
+                let supplied = Arc::new(self.evaluate_with_params(
                     parameters,
                     node,
                     position,
                     size,
                     depth,
                     current_precedence,
-                )?;
+                )?);
                 let total = nodes.len();
                 for (index, selected) in nodes.into_iter().enumerate() {
                     self.apply_one(
                         selected,
                         mode.as_ref(),
-                        &supplied,
+                        Arc::clone(&supplied),
                         ApplyFrame::new(index + 1, total, depth + 1),
                     )?
                 }
+                self.release_parameters_if_last(&supplied);
                 Ok(())
             }
             Instruction::ApplyImports => {
@@ -1274,7 +1366,7 @@ impl<'a> Execution<'a> {
                 self.apply_one(
                     node.clone(),
                     mode.as_ref(),
-                    &HashMap::new(),
+                    Arc::new(EvaluatedParameters::default()),
                     ApplyFrame {
                         max_precedence: Some(current_rule_precedence),
                         position,
@@ -1284,17 +1376,17 @@ impl<'a> Execution<'a> {
                 )
             }
             Instruction::CallTemplate { name, parameters } => {
-                let supplied = self.evaluate_with_params(
+                let supplied = Arc::new(self.evaluate_with_params(
                     parameters,
                     node,
                     position,
                     size,
                     depth,
                     current_precedence,
-                )?;
+                )?);
                 self.call_named(
                     name,
-                    &supplied,
+                    supplied,
                     node,
                     ApplyFrame::new(position, size, depth + 1),
                     current_precedence,
@@ -1309,10 +1401,10 @@ impl<'a> Execution<'a> {
                 self.sort_nodes(&mut nodes, sorts, node, position, size)?;
                 let total = nodes.len();
                 for (index, selected) in nodes.iter().enumerate() {
-                    self.scopes.push(HashMap::new());
+                    self.scopes.push(VariableScope::default());
                     let result =
                         self.execute_sequence(body, selected, index + 1, total, depth + 1, None);
-                    self.scopes.pop();
+                    self.pop_scope();
                     result?
                 }
                 Ok(())
@@ -1530,6 +1622,7 @@ impl<'a> Execution<'a> {
                 require_bound_computed_prefix(prefix.as_deref(), namespace.as_deref(), &lexical)?;
                 let value =
                     self.capture_text(body, node, position, size, depth, current_precedence)?;
+                let value = value.transfer(&mut self.meter);
                 self.add_attribute(Attribute {
                     name: ExpandedName::new(namespace, local),
                     prefix,
@@ -1539,6 +1632,7 @@ impl<'a> Execution<'a> {
             Instruction::Comment(body) => {
                 let value =
                     self.capture_text(body, node, position, size, depth, current_precedence)?;
+                let value = value.transfer(&mut self.meter);
                 if value.contains("--") || value.ends_with('-') {
                     return Err(Error::Dynamic(
                         "xsl:comment produced invalid comment content".into(),
@@ -1556,7 +1650,9 @@ impl<'a> Execution<'a> {
                 }
                 let value =
                     self.capture_text(body, node, position, size, depth, current_precedence)?;
-                let value = value.trim_start_matches([' ', '\t', '\r', '\n']).to_owned();
+                let mut value = value.transfer(&mut self.meter);
+                let leading = value.len() - value.trim_start_matches([' ', '\t', '\r', '\n']).len();
+                value.drain(..leading);
                 if value.contains("?>") {
                     return Err(Error::Dynamic("processing instruction contains ?>".into()));
                 }
@@ -1652,7 +1748,7 @@ impl<'a> Execution<'a> {
                 self.append_owned_text(formatted, false)
             }
             Instruction::Variable(variable) => {
-                let value = self.evaluate_variable(
+                let retained = self.evaluate_variable(
                     variable,
                     node,
                     position,
@@ -1663,7 +1759,11 @@ impl<'a> Execution<'a> {
                 self.scopes
                     .last_mut()
                     .ok_or_else(|| Error::Dynamic("missing variable scope".into()))?
-                    .insert(variable.name.clone(), value);
+                    .insert_retained(
+                        variable.name.clone(),
+                        retained.value,
+                        retained.retained_owned_bytes,
+                    );
                 Ok(())
             }
             Instruction::Message { terminate, body } => {
@@ -2178,7 +2278,7 @@ impl<'a> Execution<'a> {
         self.function_depth = self.function_depth.saturating_add(1);
         let depth = self.function_depth;
         let caller_scopes = self.scopes.split_off(1);
-        self.scopes.push(HashMap::new());
+        self.scopes.push(VariableScope::default());
         let previous_result = std::mem::replace(&mut self.result, Document::empty(None));
         let previous_stack = std::mem::replace(&mut self.output_stack, vec![NodeId(0)]);
         self.function_results.push(None);
@@ -2188,15 +2288,28 @@ impl<'a> Execution<'a> {
         let parameters = (|| {
             self.meter.recursion(depth)?;
             for (index, parameter) in function.params.iter().enumerate() {
-                let value = if let Some(value) = arguments.get(index) {
-                    value.clone()
+                let retained = if let Some(value) = arguments.get(index) {
+                    let retained_owned_bytes = binding_owned_bytes(&parameter.name, value);
+                    self.meter
+                        .check_additional(BudgetKind::OwnedBytes, retained_owned_bytes)?;
+                    let value = value.clone();
+                    self.meter
+                        .charge(BudgetKind::OwnedBytes, retained_owned_bytes)?;
+                    RetainedValue {
+                        value,
+                        retained_owned_bytes,
+                    }
                 } else {
                     self.evaluate_variable(parameter, node, position, size, depth + 1, None)?
                 };
                 self.scopes
                     .last_mut()
                     .expect("function parameter scope exists")
-                    .insert(parameter.name.clone(), value);
+                    .insert_retained(
+                        parameter.name.clone(),
+                        retained.value,
+                        retained.retained_owned_bytes,
+                    );
             }
             Ok(())
         })();
@@ -2210,7 +2323,7 @@ impl<'a> Execution<'a> {
         let generated_result_nodes = self.result.node_count() > 1;
         self.result = previous_result;
         self.output_stack = previous_stack;
-        self.scopes.pop();
+        self.pop_scope();
         self.scopes.extend(caller_scopes);
         self.function_depth = self.function_depth.saturating_sub(1);
         execution?;
@@ -2269,7 +2382,7 @@ impl<'a> Execution<'a> {
         size: usize,
         depth: usize,
         current_rule_precedence: Option<usize>,
-    ) -> Result<Value> {
+    ) -> Result<RetainedValue> {
         let value = if let Some(select) = &variable.select {
             xpath_to_public(self.evaluate(select, node, position, size)?)
         } else if variable.content.is_empty() {
@@ -2289,14 +2402,27 @@ impl<'a> Execution<'a> {
         // Selected XPath values become owned by a persistent lexical scope. Result-tree
         // fragments are already metered while their document is built, so only their binding
         // name is additional retained storage here.
-        let retained = expanded_name_owned_bytes(&variable.name).saturating_add(
+        let additional_owned_bytes = expanded_name_owned_bytes(&variable.name).saturating_add(
             variable
                 .select
                 .as_ref()
                 .map_or(0, |_| value_owned_bytes(&value)),
         );
-        self.meter.charge(BudgetKind::OwnedBytes, retained)?;
-        Ok(value)
+        self.meter
+            .charge(BudgetKind::OwnedBytes, additional_owned_bytes)?;
+        let retained_owned_bytes = expanded_name_owned_bytes(&variable.name).saturating_add(
+            if variable.select.is_some() {
+                value_owned_bytes(&value)
+            } else if let Value::ResultTreeFragment(document) = &value {
+                metered_document_owned_bytes(document)
+            } else {
+                0
+            },
+        );
+        Ok(RetainedValue {
+            retained_owned_bytes,
+            value,
+        })
     }
     fn evaluate_with_params(
         &mut self,
@@ -2306,26 +2432,30 @@ impl<'a> Execution<'a> {
         size: usize,
         depth: usize,
         current_rule_precedence: Option<usize>,
-    ) -> Result<HashMap<ExpandedName, Value>> {
-        parameters
-            .iter()
-            .map(|parameter| {
-                self.evaluate_variable(
-                    &parameter.variable,
-                    node,
-                    position,
-                    size,
-                    depth,
-                    current_rule_precedence,
-                )
-                .map(|value| (parameter.variable.name.clone(), value))
-            })
-            .collect()
+    ) -> Result<EvaluatedParameters> {
+        let mut evaluated = EvaluatedParameters::default();
+        for parameter in parameters {
+            let retained = self.evaluate_variable(
+                &parameter.variable,
+                node,
+                position,
+                size,
+                depth,
+                current_rule_precedence,
+            )?;
+            evaluated.retained_owned_bytes = evaluated
+                .retained_owned_bytes
+                .saturating_add(retained.retained_owned_bytes);
+            evaluated
+                .values
+                .insert(parameter.variable.name.clone(), retained.value);
+        }
+        Ok(evaluated)
     }
     fn call_named(
         &mut self,
         name: &ExpandedName,
-        params: &HashMap<ExpandedName, Value>,
+        params: Arc<EvaluatedParameters>,
         node: &SourceNode,
         frame: ApplyFrame,
         current_rule_precedence: Option<usize>,
@@ -2490,7 +2620,7 @@ impl<'a> Execution<'a> {
         size: usize,
         depth: usize,
         precedence: Option<usize>,
-    ) -> Result<String> {
+    ) -> Result<CapturedText> {
         let previous = self.enter_temporary_result_tree(None);
         let result =
             self.execute_scoped_sequence(body, node, position, size, depth + 1, precedence);
@@ -2519,9 +2649,14 @@ impl<'a> Execution<'a> {
                     captured.push_str(value);
                 }
             }
-            Ok(captured)
+            Ok(CapturedText {
+                value: captured,
+                retained_owned_bytes: bytes,
+            })
         });
-        self.restore_result_tree(previous);
+        let temporary = self.restore_result_tree(previous);
+        self.meter
+            .release_owned_bytes(metered_document_owned_bytes(&temporary));
         captured
     }
     fn capture_fragment(
@@ -2857,17 +2992,13 @@ impl<'a> Execution<'a> {
             self.meter.charge(BudgetKind::OwnedBytes, base_uri.len())?;
         }
         namespaces.extend(generated_namespace);
+        let mut replaced_owned_bytes = 0usize;
         if let Some(existing) = attributes
             .iter_mut()
             .find(|existing| existing.name == attribute.name)
         {
-            if !self
-                .attribute_protected_names
-                .as_ref()
-                .is_some_and(|protected| protected.contains(&attribute.name))
-            {
-                *existing = attribute;
-            }
+            let replaced = std::mem::replace(existing, attribute);
+            replaced_owned_bytes = attribute_owned_bytes(&replaced);
         } else {
             match position {
                 AttributePosition::Back => {
@@ -2880,9 +3011,12 @@ impl<'a> Execution<'a> {
                 }
             }
         }
-        if let Some(base_uri) = effective_base {
-            node.base_uri = Some(base_uri);
+        if let Some(base_uri) = effective_base
+            && let Some(replaced) = node.base_uri.replace(base_uri)
+        {
+            replaced_owned_bytes = replaced_owned_bytes.saturating_add(replaced.len());
         }
+        self.meter.release_owned_bytes(replaced_owned_bytes);
         Ok(())
     }
 
@@ -4069,11 +4203,23 @@ fn value_owned_bytes(value: &Value) -> usize {
     }
 }
 
-fn visible_variable_snapshot_size(scopes: &[HashMap<ExpandedName, Value>]) -> (usize, usize) {
+fn metered_document_owned_bytes(document: &Document) -> usize {
+    document.nodes().fold(0usize, |total, (_, node)| {
+        total
+            .saturating_add(node_kind_owned_bytes(&node.kind))
+            .saturating_add(node.base_uri.as_ref().map_or(0, String::len))
+    })
+}
+
+fn binding_owned_bytes(name: &ExpandedName, value: &Value) -> usize {
+    expanded_name_owned_bytes(name).saturating_add(value_owned_bytes(value))
+}
+
+fn visible_variable_snapshot_size(scopes: &[VariableScope]) -> (usize, usize) {
     let mut count = 0usize;
     let mut payload = 0usize;
     for (scope_index, scope) in scopes.iter().enumerate() {
-        for (name, value) in scope {
+        for (name, value) in scope.iter() {
             if scopes[scope_index + 1..]
                 .iter()
                 .any(|inner| inner.contains_key(name))

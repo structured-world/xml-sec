@@ -1540,6 +1540,27 @@ fn whitespace_rules_honor_namespaces_specificity_and_inherited_xml_space() {
 }
 
 #[test]
+fn whitespace_rules_reject_malformed_qname_name_tests() {
+    // XSLT 1.0 section 3.4 permits QName, prefix:* and * only; malformed tokens must not install
+    // inert rules that silently hide stylesheet errors.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#strip
+    for token in ["p:item:extra", ":item", "item:", "p:"] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:p="urn:p"><xsl:strip-space elements="{token}"/></xsl:stylesheet>"#
+        );
+        assert!(matches!(
+            Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+                .compile(&stylesheet, None),
+            Err(Error::Static(message)) if message.contains("whitespace") || message.contains("name test")
+        ));
+    }
+
+    compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:p="urn:p"><xsl:strip-space elements="* p:* p:item"/></xsl:stylesheet>"#,
+    );
+}
+
+#[test]
 fn stylesheet_xml_space_controls_literal_whitespace() {
     // xml:space applies to stylesheet text nodes too; nested `default` resumes stripping.
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><out xml:space="preserve"> <kept> </kept><reset xml:space="default"> </reset> </out></xsl:template></xsl:stylesheet>"#;
@@ -1547,6 +1568,28 @@ fn stylesheet_xml_space_controls_literal_whitespace() {
         execute(stylesheet, "<source/>"),
         "<out xml:space=\"preserve\"> <kept> </kept><reset xml:space=\"default\"/> </out>\n"
     );
+}
+
+#[test]
+fn empty_instructions_honor_inherited_stylesheet_xml_space() {
+    // XSLT 1.0 sections 3.4 and 7.2 make preserved stylesheet whitespace a text node. It is
+    // therefore content, not ignorable indentation, inside instructions required to be empty.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#strip
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#value-of
+    let preserved = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/" xml:space="preserve"><xsl:value-of select="." > </xsl:value-of></xsl:template></xsl:stylesheet>"#;
+    assert!(matches!(
+        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+            .compile(preserved, None),
+        Err(Error::Static(message)) if message.contains("xsl:value-of must be empty")
+    ));
+
+    let indentation = preserved.replace(" xml:space=\"preserve\"", "");
+    Compiler::new(
+        Arc::new(NoResolver),
+        CompileBudget::new(4096, 0, 32, 64 * 1024),
+    )
+    .compile(&indentation, None)
+    .expect("ordinary XML whitespace remains ignorable indentation");
 }
 
 #[test]
@@ -3678,6 +3721,67 @@ fn xpath_scope_snapshot_counts_toward_peak_owned_memory() {
 }
 
 #[test]
+fn sequential_local_scopes_release_retained_binding_memory() {
+    // OwnedBytes is a peak-live-memory ceiling. A for-each binding dies after its iteration, so
+    // identical sequential locals must not be accumulated as if all iterations remained live.
+    let payload = "x".repeat(32 * 1024);
+    let stylesheet = compile(&format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:for-each select="root/item"><xsl:variable name="payload" select="'{payload}'"/></xsl:for-each></xsl:template></xsl:stylesheet>"#
+    ));
+    let source_xml = format!("<root>{}</root>", "<item/>".repeat(64));
+    let source = Document::parse(&source_xml, None).expect("source parses");
+    let mut budget = execution_budget(1024);
+    budget.owned_bytes = 6 * 1024 * 1024;
+    stylesheet
+        .execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("sequential local bindings remain below the peak-memory ceiling");
+}
+
+#[test]
+fn repeated_attribute_overrides_release_replaced_storage() {
+    // XSLT 1.0 section 7.1.3 makes the last attribute with an expanded name win. Replaced values
+    // are no longer live result-tree storage and therefore must not accumulate against the peak
+    // OwnedBytes ceiling: https://www.w3.org/TR/1999/REC-xslt-19991116#creating-attributes
+    let payload = "x".repeat(32 * 1024);
+    let attributes = (0..64)
+        .map(|_| r#"<xsl:attribute name="value"><xsl:value-of select="/source"/></xsl:attribute>"#)
+        .collect::<String>();
+    let stylesheet = compile(&format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><result>{attributes}</result></xsl:template></xsl:stylesheet>"#
+    ));
+    let source_xml = format!("<source>{payload}</source>");
+    let source = Document::parse(&source_xml, None).expect("source parses");
+    let mut budget = execution_budget(source_xml.len());
+    budget.owned_bytes = 768 * 1024;
+    let result = stylesheet
+        .execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("only the final attribute value remains live");
+    assert!(
+        String::from_utf8(result.serialized.bytes)
+            .expect("UTF-8 output")
+            .contains(&payload)
+    );
+}
+
+#[test]
 fn scalar_fast_path_does_not_clone_result_tree_fragments_for_string_conversion() {
     // The retained RTF and its direct string projection fit together. Deep-cloning the whole tree
     // before conversion would add a second tree allocation and cross this operation ceiling.
@@ -5489,6 +5593,22 @@ fn xslt_10_patterns_reject_general_xpath_expressions_statically() {
 }
 
 #[test]
+fn match_patterns_trim_only_xml_whitespace() {
+    // XPath 1.0 permits only XML S around tokens; Unicode whitespace is not a grammar separator.
+    // https://www.w3.org/TR/1999/REC-xpath-19991116/#exprlex
+    let invalid = "<xsl:stylesheet version=\"1.0\" xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\"><xsl:template match=\"\u{a0}/\u{a0}\"/></xsl:stylesheet>";
+    assert!(matches!(
+        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+            .compile(invalid, None),
+        Err(Error::Static(message)) if message.contains("match pattern")
+    ));
+
+    compile(
+        "<xsl:stylesheet version=\"1.0\" xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\"><xsl:template match=\"\t / \r\n\"/></xsl:stylesheet>",
+    );
+}
+
+#[test]
 fn instruction_attributes_follow_strict_and_forward_compatible_rules() {
     // Strict XSLT 1.0 rejects unqualified typos but ignores foreign extension attributes.
     let typo = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:value-of selct="."/></xsl:template></xsl:stylesheet>"#;
@@ -5503,6 +5623,23 @@ fn instruction_attributes_follow_strict_and_forward_compatible_rules() {
     compile(
         r#"<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:value-of select="." future-option="yes"/></xsl:template></xsl:stylesheet>"#,
     );
+}
+
+#[test]
+fn exclude_result_prefixes_rejects_xslt_20_all_token_in_strict_mode() {
+    // XSLT 1.0 section 7.1.1 permits only QName tokens and #default. In forward-compatible
+    // processing, section 2.5 requires the unsupported attribute value to be ignored as a whole.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#literal-result-element
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#forwards
+    let strict = r##"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:p="urn:p" exclude-result-prefixes="#all"><xsl:template match="/"/></xsl:stylesheet>"##;
+    assert!(matches!(
+        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+            .compile(strict, None),
+        Err(Error::Static(message)) if message.contains("#all")
+    ));
+
+    let forward = r##"<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><out xmlns:p="urn:p" xsl:exclude-result-prefixes="p #all"/></xsl:template></xsl:stylesheet>"##;
+    assert_eq!(execute(forward, "<source/>"), "<out xmlns:p=\"urn:p\"/>\n");
 }
 
 #[test]

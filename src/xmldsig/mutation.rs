@@ -1165,8 +1165,13 @@ fn fill_dsig_contents_matching(
     let ranges = document
         .descendants()
         .filter(|node| is_dsig_node(*node, local_name) && scope.includes(*node, signature))
-        .map(|node| node.range())
-        .collect::<Vec<_>>();
+        .map(|node| {
+            if !node.has_actionable_range() {
+                return Err(XmlDocumentError::EntityExpandedMutationTarget.into());
+            }
+            Ok(node.range())
+        })
+        .collect::<Result<Vec<_>, XmlMutationError>>()?;
     if ranges.len() != contents.len() {
         return Err(XmlMutationError::ValueCountMismatch {
             element: local_name,
@@ -1483,6 +1488,34 @@ mod tests {
             .map(|node| node.text())
             .collect();
         assert_eq!(values, [Some("digest-one"), Some("digest-two")]);
+    }
+
+    #[test]
+    fn rejects_entity_expanded_dsig_mutation_targets() {
+        // A general entity can project element nodes, but every expansion shares the entity
+        // reference's lexical range. Mutating that range cannot uniquely target one semantic
+        // element, so signing must fail instead of rewriting the declaration or reference token.
+        let xml = format!(
+            r#"<!DOCTYPE root [<!ENTITY digest '<ds:DigestValue/>'>]><root xmlns:ds="{XMLDSIG_NS}">&digest;</root>"#
+        );
+        let mut policy = crate::policy::SigningPolicy::default();
+        policy.xml.allow_internal_dtd = true;
+        let error = fill_dsig_contents_matching(
+            &xml,
+            "DigestValue",
+            &["digest".to_owned()],
+            Some(&policy),
+            None,
+            DsigReplacementScope::Any,
+        )
+        .expect_err("entity-expanded elements have no independently actionable range");
+        assert!(
+            matches!(
+                error,
+                XmlMutationError::Document(XmlDocumentError::EntityExpandedMutationTarget)
+            ),
+            "unexpected mutation error: {error:?}"
+        );
     }
 
     #[test]

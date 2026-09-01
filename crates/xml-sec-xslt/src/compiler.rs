@@ -81,6 +81,7 @@ impl<R: Resolver> Compiler<R> {
                 .compile_literal_result_stylesheet(root, base_uri, precedence, state, depth);
         };
         validate_top_level_declaration_attributes(root, forward)?;
+        validate_namespace_prefix_attributes(root, forward)?;
         let mut saw_non_import = false;
         self.compile_effective_imports(root, base_uri, state, depth, &mut saw_non_import)?;
         let local_precedence = inherited_precedence.unwrap_or_else(|| state.next_precedence());
@@ -874,7 +875,7 @@ fn is_lexical_qname(value: &str) -> bool {
 }
 impl Pattern {
     fn new(source: &str, node: roxmltree::Node<'_, '_>) -> Result<Self> {
-        if source.trim().is_empty() {
+        if trim_xml_whitespace(source).is_empty() {
             return Err(Error::Static("empty template pattern".into()));
         }
         if contains_variable_reference(source) {
@@ -883,7 +884,7 @@ impl Pattern {
             )));
         }
         for branch in split_pattern_branches(source) {
-            let branch = branch.trim();
+            let branch = trim_xml_whitespace(branch);
             validate_xslt_pattern_branch(branch)?;
             validate_xpath_prefixes(branch, &namespaces(node))?;
             let normalized = normalize_xpath_for_sxd(branch);
@@ -914,11 +915,11 @@ impl Pattern {
     fn template_branches(source: &str, node: roxmltree::Node<'_, '_>) -> Result<Vec<Self>> {
         split_pattern_branches(source)
             .into_iter()
-            .map(|branch| Self::new(branch.trim(), node))
+            .map(|branch| Self::new(trim_xml_whitespace(branch), node))
             .collect()
     }
     fn default_priority(&self) -> f64 {
-        let normalized = normalize_xpath_for_sxd(self.source.trim());
+        let normalized = normalize_xpath_for_sxd(trim_xml_whitespace(&self.source));
         let value = normalized
             .strip_prefix("child::")
             .or_else(|| normalized.strip_prefix("attribute::"))
@@ -937,7 +938,7 @@ impl Pattern {
                 .strip_prefix("processing-instruction(")
                 .and_then(|value| value.strip_suffix(')'))
                 .is_some_and(|value| {
-                    let value = value.trim();
+                    let value = trim_xml_whitespace(value);
                     (value.starts_with('\'') && value.ends_with('\''))
                         || (value.starts_with('"') && value.ends_with('"'))
                 })
@@ -2238,12 +2239,19 @@ fn is_xml_whitespace_only(value: &str) -> bool {
         .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
 }
 
+fn trim_xml_whitespace(value: &str) -> &str {
+    value.trim_matches(|character| matches!(character, ' ' | '\t' | '\r' | '\n'))
+}
+
+fn is_ignorable_stylesheet_text(node: roxmltree::Node<'_, '_>) -> bool {
+    node.is_text()
+        && node.text().is_some_and(is_xml_whitespace_only)
+        && !stylesheet_space_is_preserved(node)
+}
+
 fn require_empty_instruction(node: roxmltree::Node<'_, '_>) -> Result<()> {
     if node.children().any(|child| {
-        child.is_element()
-            || child
-                .text()
-                .is_some_and(|text| !is_xml_whitespace_only(text))
+        child.is_element() || (child.is_text() && !is_ignorable_stylesheet_text(child))
     }) {
         return Err(Error::Static(format!(
             "xsl:{} must be empty",
@@ -2459,7 +2467,7 @@ fn compile_literal_element(
             })
         })
         .collect::<Result<_>>()?;
-    let (exclude_all, excluded) = excluded_result_namespaces(node)?;
+    let excluded = excluded_result_namespaces(node, context.forward)?;
     let used_namespaces = std::iter::once(node.tag_name().namespace())
         .chain(node.attributes().map(|attribute| attribute.namespace()))
         .flatten()
@@ -2468,8 +2476,7 @@ fn compile_literal_element(
         .namespaces()
         .filter(|n| n.uri() != XSLT_NS)
         .filter(|namespace| {
-            used_namespaces.contains(namespace.uri())
-                || !(exclude_all || excluded.contains(namespace.uri()))
+            used_namespaces.contains(namespace.uri()) || !excluded.contains(namespace.uri())
         })
         .map(|n| Namespace {
             prefix: n.name().map(str::to_owned),
@@ -2495,8 +2502,10 @@ fn compile_literal_element(
     })
 }
 
-fn excluded_result_namespaces(node: roxmltree::Node<'_, '_>) -> Result<(bool, HashSet<String>)> {
-    let mut exclude_all = false;
+fn excluded_result_namespaces(
+    node: roxmltree::Node<'_, '_>,
+    forward_compatible: bool,
+) -> Result<HashSet<String>> {
     let mut excluded = HashSet::new();
     if node.ancestors().any(|ancestor| {
         ancestor.has_tag_name((XSLT_NS, "variable")) || ancestor.has_tag_name((XSLT_NS, "param"))
@@ -2535,28 +2544,63 @@ fn excluded_result_namespaces(node: roxmltree::Node<'_, '_>) -> Result<(bool, Ha
             excluded.insert(namespace.to_owned());
         }
         for attribute in ["exclude-result-prefixes", "extension-element-prefixes"] {
-            let value = if ancestor.tag_name().namespace() == Some(XSLT_NS) {
-                ancestor.attribute(attribute)
-            } else {
-                ancestor.attribute((XSLT_NS, attribute))
-            };
-            let Some(value) = value else {
-                continue;
-            };
-            for token in value.split_ascii_whitespace() {
-                if token == "#all" {
-                    exclude_all = true;
-                    continue;
-                }
-                let prefix = (token != "#default").then_some(token);
-                let namespace = ancestor.lookup_namespace_uri(prefix).ok_or_else(|| {
-                    Error::Static(format!("excluded result prefix {token} is not bound"))
-                })?;
-                excluded.insert(namespace.to_owned());
-            }
+            visit_namespace_prefix_attribute(
+                ancestor,
+                attribute,
+                forward_compatible,
+                |namespace| {
+                    excluded.insert(namespace.to_owned());
+                },
+            )?;
         }
     }
-    Ok((exclude_all, excluded))
+    Ok(excluded)
+}
+
+fn validate_namespace_prefix_attributes(
+    node: roxmltree::Node<'_, '_>,
+    forward_compatible: bool,
+) -> Result<()> {
+    for attribute in ["exclude-result-prefixes", "extension-element-prefixes"] {
+        visit_namespace_prefix_attribute(node, attribute, forward_compatible, |_| {})?;
+    }
+    Ok(())
+}
+
+fn visit_namespace_prefix_attribute(
+    node: roxmltree::Node<'_, '_>,
+    attribute: &str,
+    forward_compatible: bool,
+    mut visit: impl FnMut(&str),
+) -> Result<()> {
+    let value = if node.tag_name().namespace() == Some(XSLT_NS) {
+        node.attribute(attribute)
+    } else {
+        node.attribute((XSLT_NS, attribute))
+    };
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value.split_ascii_whitespace().any(|token| token == "#all") {
+        // XSLT 1.0 section 7.1.1 permits QName tokens and #default only. Section 2.5
+        // makes an unsupported optional attribute value ignorable as a whole in FCP.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#literal-result-element
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#forwards
+        if forward_compatible {
+            return Ok(());
+        }
+        return Err(Error::Static(format!(
+            "{attribute} does not permit #all in XSLT 1.0"
+        )));
+    }
+    for token in value.split_ascii_whitespace() {
+        let prefix = (token != "#default").then_some(token);
+        let namespace = node
+            .lookup_namespace_uri(prefix)
+            .ok_or_else(|| Error::Static(format!("{attribute} prefix {token} is not bound")))?;
+        visit(namespace);
+    }
+    Ok(())
 }
 fn validate_local_binding_scope(node: roxmltree::Node<'_, '_>, name: &ExpandedName) -> Result<()> {
     if !node.has_tag_name((XSLT_NS, "variable")) && !node.has_tag_name((XSLT_NS, "param")) {
@@ -2805,6 +2849,11 @@ impl NameTest {
             });
         }
         if let Some((prefix, local)) = value.split_once(':') {
+            if !is_ncname(prefix) || (local != "*" && !is_ncname(local)) {
+                return Err(Error::Static(format!(
+                    "invalid whitespace-rule name test `{value}`"
+                )));
+            }
             let namespace = node
                 .lookup_namespace_uri(Some(prefix))
                 .ok_or_else(|| Error::Static(format!("unbound prefix {prefix}")))?;
@@ -2813,6 +2862,11 @@ impl NameTest {
                 local: (local != "*").then(|| local.into()),
             })
         } else {
+            if !is_ncname(value) {
+                return Err(Error::Static(format!(
+                    "invalid whitespace-rule name test `{value}`"
+                )));
+            }
             Ok(Self {
                 namespace: NamespaceTest::None,
                 local: Some(value.into()),
