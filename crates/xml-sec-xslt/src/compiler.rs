@@ -437,6 +437,9 @@ impl<R: Resolver> Compiler<R> {
                         })
                     })
                     .transpose()?;
+                // XSLT 1.0 section 6 says priority does not affect named-template invocation;
+                // unlike mode in section 5.7, it does not prohibit priority when match is absent.
+                // https://www.w3.org/TR/1999/REC-xslt-19991116#named-templates
                 let mode = optional_qname_attr(node, "mode")?;
                 // XSLT 1.0 section 5.7 forbids mode when the template has no match rule.
                 // https://www.w3.org/TR/1999/REC-xslt-19991116#modes

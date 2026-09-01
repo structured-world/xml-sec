@@ -13,7 +13,7 @@ use crate::compiler::{
     AttributeValueTemplate, AvtPart, Expression, ExsltFunction, Instruction, NameTest, Sort,
     Stylesheet, Template, Variable,
 };
-use crate::lexical::{is_ncname, unicode_decimal_value};
+use crate::lexical::{is_ncname, is_xml_whitespace, unicode_decimal_value};
 use crate::serializer::{serialize, serialize_fragment};
 use crate::xpath::{
     CustomCallSession, Evaluator, EvaluatorSourceOptions, PreparedEvaluatorSource, SourceNode,
@@ -2175,6 +2175,8 @@ impl<'a> Execution<'a> {
         if let Some(variable) = source
             .strip_prefix("string-length($")
             .and_then(|value| value.strip_suffix(") > 0"))
+            && let variable = variable.trim_matches(is_xml_whitespace)
+            && is_lexical_variable_name(variable)
         {
             let value = self.variable_string(variable, &expression.namespaces, 0)?;
             return Ok(Some(XPathValue::Boolean(!value.is_empty())));

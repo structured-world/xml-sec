@@ -8567,6 +8567,28 @@ fn named_only_templates_reject_mode() {
 }
 
 #[test]
+fn named_only_templates_allow_priority_without_affecting_named_dispatch() {
+    // XSLT 1.0 section 6 says match, mode, and priority do not affect invocation through
+    // xsl:call-template. Unlike mode, the specification does not prohibit priority without match.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#named-templates
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template name="named" priority="1"><xsl:text>called</xsl:text></xsl:template><xsl:template match="/"><xsl:call-template name="named"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "called");
+}
+
+#[test]
+fn string_length_variable_fast_path_accepts_xpath_whitespace() {
+    // XPath 1.0 section 3.7 permits XML S between tokens. The shortcut must resolve the same
+    // variable as the generic evaluator for every permitted whitespace character.
+    // https://www.w3.org/TR/1999/REC-xpath-19991116/#exprlex
+    for whitespace in [" ", "&#9;", "&#10;", "&#13;"] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:param name="value" select="'present'"/><xsl:template match="/"><xsl:value-of select="string-length($value{whitespace}) &gt; 0"/></xsl:template></xsl:stylesheet>"#
+        );
+        assert_eq!(execute(&stylesheet, "<source/>"), "true");
+    }
+}
+
+#[test]
 fn empty_document_uris_preserve_their_logical_document_origin() {
     // XSLT 1.0 section 12.1 resolves a zero-length URI to the document that supplies its base.
     // Source-relative requests and the omitted-argument stylesheet default must not collide.
