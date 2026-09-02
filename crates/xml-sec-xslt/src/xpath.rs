@@ -2784,10 +2784,9 @@ fn expand_xinclude_document(
                 if name.namespace.as_deref() == Some(XINCLUDE_NS) && name.local == "include"
         );
         if !is_include {
-            let target = output.push(target_parent, node.kind.clone(), node.base_uri.clone());
-            if let Some(target) = output.node_mut(target) {
-                target.source_line = node.source_line;
-            }
+            let Some(target) = output.append_node_from(target_parent, node) else {
+                continue;
+            };
             principal_mapping.insert(source_id, target);
             pending.extend(node.children.iter().rev().map(|child| (*child, target)));
             continue;
@@ -2824,12 +2823,13 @@ fn expand_xinclude_document(
                     }
                 }
                 output.remap_ids_from(&included.document, &included_mapping)?;
+                output.merge_unparsed_entities_from(&included.document, output.root())?;
                 meter
                     .release_owned_bytes(remap_bytes.saturating_add(included.retained_owned_bytes));
                 retained_owned_bytes = retained_owned_bytes.saturating_add(copied_bytes);
             }
             Ok(XIncludeContent::Text(value, base_uri)) => {
-                output.push(
+                output.push_coalesced(
                     target_parent,
                     NodeKind::Text {
                         value,
@@ -2856,6 +2856,7 @@ fn expand_xinclude_document(
         }
     }
     output.remap_ids_from(source, &principal_mapping)?;
+    output.merge_unparsed_entities_from(source, output.root())?;
     meter.release_owned_bytes(pending_bytes);
     Ok(ExpandedXIncludeDocument {
         document: output,

@@ -2124,12 +2124,19 @@ enum StylesheetModuleKind {
 }
 
 fn stylesheet_module_kind(root: roxmltree::Node<'_, '_>) -> Result<StylesheetModuleKind> {
-    if root.tag_name().namespace() == Some(XSLT_NS)
-        && matches!(root.tag_name().name(), "stylesheet" | "transform")
-    {
-        return Ok(StylesheetModuleKind::Standard {
-            forward: module_forward_compatible(root)?,
-        });
+    if root.tag_name().namespace() == Some(XSLT_NS) {
+        if matches!(root.tag_name().name(), "stylesheet" | "transform") {
+            return Ok(StylesheetModuleKind::Standard {
+                forward: module_forward_compatible(root)?,
+            });
+        }
+        // XSLT 1.0 section 2.3 permits only a literal result element as a simplified
+        // stylesheet; XSLT-namespace elements are instructions, not literal results.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#result-element-stylesheet
+        return Err(Error::Static(format!(
+            "xsl:{} cannot be the document element of a stylesheet",
+            root.tag_name().name()
+        )));
     }
     root.attribute((XSLT_NS, "version"))
         .ok_or_else(|| Error::Static("literal result stylesheet requires xsl:version".into()))

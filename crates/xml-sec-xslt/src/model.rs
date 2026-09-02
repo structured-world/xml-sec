@@ -898,6 +898,84 @@ impl Document {
         id
     }
 
+    pub(crate) fn push_coalesced(
+        &mut self,
+        parent: NodeId,
+        kind: NodeKind,
+        base_uri: Option<String>,
+    ) -> Option<NodeId> {
+        let NodeKind::Text {
+            value,
+            disable_output_escaping,
+        } = kind
+        else {
+            return Some(self.push(parent, kind, base_uri));
+        };
+        if value.is_empty() {
+            return None;
+        }
+        if let Some(last_child) = self.coalescible_text_child(parent, disable_output_escaping) {
+            let NodeKind::Text {
+                value: existing, ..
+            } = &mut self.nodes[last_child.0].kind
+            else {
+                unreachable!("coalescible_text_child returns only text nodes");
+            };
+            existing.push_str(&value);
+            return Some(last_child);
+        }
+        Some(self.push(
+            parent,
+            NodeKind::Text {
+                value,
+                disable_output_escaping,
+            },
+            base_uri,
+        ))
+    }
+
+    pub(crate) fn append_node_from(&mut self, parent: NodeId, source: &Node) -> Option<NodeId> {
+        if let NodeKind::Text {
+            value,
+            disable_output_escaping,
+        } = &source.kind
+        {
+            if value.is_empty() {
+                return None;
+            }
+            if let Some(last_child) = self.coalescible_text_child(parent, *disable_output_escaping)
+            {
+                let NodeKind::Text {
+                    value: existing, ..
+                } = &mut self.nodes[last_child.0].kind
+                else {
+                    unreachable!("coalescible_text_child returns only text nodes");
+                };
+                existing.push_str(value);
+                return Some(last_child);
+            }
+        }
+        let target = self.push(parent, source.kind.clone(), source.base_uri.clone());
+        self.nodes[target.0].source_line = source.source_line;
+        Some(target)
+    }
+
+    fn coalescible_text_child(
+        &self,
+        parent: NodeId,
+        disable_output_escaping: bool,
+    ) -> Option<NodeId> {
+        let child = self.node(parent)?.children.last().copied()?;
+        matches!(
+            self.node(child)?.kind,
+            NodeKind::Text {
+                disable_output_escaping: current,
+                ..
+            } if current == disable_output_escaping
+        )
+        .then_some(child)
+    }
+
     pub(crate) fn append_subtree_from(
         &mut self,
         parent: NodeId,
@@ -906,14 +984,9 @@ impl Document {
         mapping: &mut HashMap<NodeId, NodeId>,
     ) -> NodeId {
         let source_node = source.node(source_id).expect("source subtree node exists");
-        let root = self.push(
-            parent,
-            source_node.kind.clone(),
-            source_node.base_uri.clone(),
-        );
-        if let Some(node) = self.node_mut(root) {
-            node.source_line = source_node.source_line;
-        }
+        let root = self
+            .append_node_from(parent, source_node)
+            .expect("source documents contain no empty text nodes");
         mapping.insert(source_id, root);
         let mut pending = source_node
             .children
@@ -923,14 +996,9 @@ impl Document {
             .collect::<Vec<_>>();
         while let Some((source_id, target_parent)) = pending.pop() {
             let source_node = source.node(source_id).expect("source subtree node exists");
-            let target = self.push(
-                target_parent,
-                source_node.kind.clone(),
-                source_node.base_uri.clone(),
-            );
-            if let Some(node) = self.node_mut(target) {
-                node.source_line = source_node.source_line;
-            }
+            let target = self
+                .append_node_from(target_parent, source_node)
+                .expect("source documents contain no empty text nodes");
             mapping.insert(source_id, target);
             pending.extend(
                 source_node
@@ -956,6 +1024,30 @@ impl Document {
                 .logical_root_for(&NodeReference::Node(owner))
                 .ok_or_else(|| Error::Xml("remapped ID is outside a logical document".into()))?;
             self.register_id_for_root(logical_root, owner, value.to_owned())?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn merge_unparsed_entities_from(
+        &mut self,
+        source: &Self,
+        logical_root: NodeId,
+    ) -> Result<()> {
+        for (name, uri, _) in source.unparsed_entities() {
+            let key = (logical_root, name.to_owned());
+            match self.unparsed_entities.entry(key) {
+                std::collections::hash_map::Entry::Occupied(entry) if entry.get() == uri => {}
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    // XInclude 1.0 section 4.5.1 rejects same-name entities that are not
+                    // duplicates: https://www.w3.org/TR/xinclude/#unparsed-entities
+                    return Err(Error::Xml(format!(
+                        "conflicting unparsed entity `{name}` during XInclude processing"
+                    )));
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(uri.to_owned());
+                }
+            }
         }
         Ok(())
     }
@@ -2154,6 +2246,34 @@ mod parser_boundary_tests {
             .expect("parser oracle thread starts")
             .join()
             .expect("parser oracle thread does not panic")
+    }
+
+    #[test]
+    fn xinclude_entity_merge_accepts_duplicates_and_rejects_conflicts() {
+        // XInclude 1.0 section 4.5.1 collapses duplicate entity metadata but makes a
+        // same-name, different-identity entity fatal.
+        // https://www.w3.org/TR/xinclude/#unparsed-entities
+        let mut output = Document::empty(None);
+        output
+            .register_unparsed_entity("logo", "memory:logo.png")
+            .expect("result entity registers");
+        let mut duplicate = Document::empty(None);
+        duplicate
+            .register_unparsed_entity("logo", "memory:logo.png")
+            .expect("duplicate source entity registers");
+        output
+            .merge_unparsed_entities_from(&duplicate, output.root())
+            .expect("identical entity metadata coalesces");
+
+        let mut conflicting = Document::empty(None);
+        conflicting
+            .register_unparsed_entity("logo", "memory:other.png")
+            .expect("conflicting source entity registers");
+        assert!(
+            output
+                .merge_unparsed_entities_from(&conflicting, output.root())
+                .is_err()
+        );
     }
 
     #[test]

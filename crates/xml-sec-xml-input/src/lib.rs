@@ -270,13 +270,16 @@ pub fn decode_xml_bounded<'a>(
                 return Err(Error::ConflictingEncoding(label.into()));
             }
         }
-    } else if explicit_encoding.is_none()
+    } else if !explicit.is_some_and(is_utf16_encoding)
         && physical.is_some_and(|(encoding, bom_len)| {
             bom_len == 0
                 && matches!(encoding, SelectedEncoding::Standard(value)
                     if value == encoding_rs::UTF_16LE || value == encoding_rs::UTF_16BE)
         })
     {
+        // XML 1.0 section 4.3.3 requires every UTF-16 entity to begin with a BOM. A
+        // byte-order-specific transport label is an explicit decoder contract; generic
+        // UTF-16 metadata is not: https://www.w3.org/TR/xml/#charencoding
         return Err(Error::MissingUtf16ByteOrder);
     }
 
@@ -750,6 +753,21 @@ mod tests {
     #[test]
     fn bomless_generic_utf16_is_rejected_as_ambiguous() {
         let bytes = "<?xml version=\"1.0\" encoding=\"UTF-16\"?><root/>"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            decode_xml(&bytes, Some("UTF-16")),
+            Err(Error::MissingUtf16ByteOrder)
+        ));
+    }
+
+    #[test]
+    fn generic_utf16_metadata_does_not_replace_the_required_bom() {
+        // XML 1.0 section 4.3.3 requires every UTF-16 entity to begin with a BOM; a generic
+        // transport label supplies no byte order and cannot relax that document constraint.
+        // https://www.w3.org/TR/xml/#charencoding
+        let bytes = "<?xml version=\"1.0\"?><root/>"
             .encode_utf16()
             .flat_map(u16::to_le_bytes)
             .collect::<Vec<_>>();

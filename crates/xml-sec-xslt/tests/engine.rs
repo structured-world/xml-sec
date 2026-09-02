@@ -418,6 +418,17 @@ fn malformed_stylesheet_and_budget_exhaustion_are_typed() {
         .expect_err("literal result stylesheet without xsl:version must fail");
     assert!(matches!(error, Error::Static(_)));
 
+    let error = Compiler::new(
+        Arc::new(NoResolver),
+        CompileBudget::new(1 << 20, 0, 64, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:template xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xsl:version="1.0" match="/"/>"#,
+        None,
+    )
+    .expect_err("an XSLT instruction cannot be a simplified stylesheet root");
+    assert!(matches!(error, Error::Static(_)));
+
     let error = Compiler::new(Arc::new(NoResolver), CompileBudget::new(8, 0, 64, 64))
         .compile("<xsl:stylesheet/>", None)
         .expect_err("stylesheet bytes must be bounded before parsing");
@@ -463,6 +474,79 @@ fn malformed_stylesheet_and_budget_exhaustion_are_typed() {
             ..
         }
     ));
+}
+
+#[test]
+fn xinclude_preserves_xpath_text_node_boundaries() {
+    // XPath 1.0 section 5.7 requires maximal text nodes even when XInclude inserts character
+    // information items between text already present in the source infoset.
+    // https://www.w3.org/TR/1999/REC-xpath-19991116/#section-Text-Nodes
+    let resolver = Arc::new(ContextResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            ("value.txt".into(), Some("memory:source.xml".into())),
+            ResolvedResource {
+                canonical_uri: "memory:value.txt".into(),
+                identity: ResourceIdentity("xinclude-text-boundary".into()),
+                bytes: b"included".to_vec(),
+                media_type: Some("text/plain".into()),
+                encoding: Some("UTF-8".into()),
+            },
+        );
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(root/text())"/><xsl:text>|</xsl:text><xsl:value-of select="root"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude">before<xi:include href="value.txt" parse="text"/>after</root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("XInclude source parses");
+    let result = stylesheet
+        .execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        )
+        .expect("text inclusion succeeds");
+    assert_eq!(result.serialized.bytes, b"1|beforeincludedafter");
+}
+
+#[test]
+fn xinclude_preserves_principal_unparsed_entities() {
+    // XInclude 1.0 section 4.5.1 preserves unparsed-entity metadata in the result infoset;
+    // enabling XInclude must not erase metadata when the source contains no include element.
+    // https://www.w3.org/TR/xinclude/#unparsed-entities
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="unparsed-entity-uri('logo')"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let mut source =
+        Document::parse("<root/>", Some("memory:source.xml")).expect("source document parses");
+    source
+        .register_unparsed_entity("logo", "memory:logo.png")
+        .expect("entity metadata registers");
+    let result = stylesheet
+        .execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        )
+        .expect("XInclude projection preserves document metadata");
+    assert_eq!(result.serialized.bytes, b"memory:logo.png");
 }
 
 #[test]
