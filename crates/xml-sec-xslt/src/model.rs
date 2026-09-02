@@ -614,6 +614,76 @@ impl Document {
         self.nodes.len()
     }
 
+    pub(crate) fn retained_tree_container_bytes(&self) -> usize {
+        self.nodes
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Node>())
+            .saturating_add(
+                self.logical_roots
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<NodeId>()),
+            )
+            .saturating_add(self.nodes.iter().fold(0usize, |total, node| {
+                total.saturating_add(
+                    node.children
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<NodeId>()),
+                )
+            }))
+    }
+
+    pub(crate) fn push_container_reservation_bytes(&self, parent: NodeId) -> usize {
+        fn growth_bytes<T>(items: &Vec<T>) -> usize {
+            if std::mem::size_of::<T>() == 0 || items.len() < items.capacity() {
+                0
+            } else {
+                items
+                    .capacity()
+                    .max(4)
+                    .saturating_mul(std::mem::size_of::<T>())
+            }
+        }
+
+        growth_bytes(&self.nodes).saturating_add(
+            self.node(parent)
+                .map_or(0, |node| growth_bytes(&node.children)),
+        )
+    }
+
+    pub(crate) fn reserve_push_containers(
+        &mut self,
+        parent: NodeId,
+    ) -> std::result::Result<usize, std::collections::TryReserveError> {
+        fn reserve_slot<T>(
+            items: &mut Vec<T>,
+        ) -> std::result::Result<(), std::collections::TryReserveError> {
+            if std::mem::size_of::<T>() == 0 || items.len() < items.capacity() {
+                return Ok(());
+            }
+            items.try_reserve_exact(items.capacity().max(4))
+        }
+
+        let old_nodes_capacity = self.nodes.capacity();
+        reserve_slot(&mut self.nodes)?;
+        let nodes_bytes = self
+            .nodes
+            .capacity()
+            .saturating_sub(old_nodes_capacity)
+            .saturating_mul(std::mem::size_of::<Node>());
+        let children_bytes = if let Some(parent) = self.nodes.get_mut(parent.0) {
+            let old_capacity = parent.children.capacity();
+            reserve_slot(&mut parent.children)?;
+            parent
+                .children
+                .capacity()
+                .saturating_sub(old_capacity)
+                .saturating_mul(std::mem::size_of::<NodeId>())
+        } else {
+            0
+        };
+        Ok(nodes_bytes.saturating_add(children_bytes))
+    }
+
     pub(crate) const fn identity(&self) -> u64 {
         self.identity
     }

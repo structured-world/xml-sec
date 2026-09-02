@@ -437,10 +437,15 @@ impl<'a> Execution<'a> {
             &mut meter,
             source_options,
         )?;
+        let result = Document::empty(None);
+        meter.charge(
+            BudgetKind::OwnedBytes,
+            metered_document_owned_bytes(&result),
+        )?;
         let mut state = Self {
             stylesheet,
             evaluator,
-            result: Document::empty(None),
+            result,
             output_stack: vec![NodeId(0)],
             scopes: vec![VariableScope::default()],
             pending_globals: HashMap::new(),
@@ -2439,7 +2444,8 @@ impl<'a> Execution<'a> {
         let depth = self.function_depth;
         let caller_scopes = self.scopes.split_off(1);
         self.scopes.push(VariableScope::default());
-        let previous_result = std::mem::replace(&mut self.result, Document::empty(None));
+        let temporary_result = self.empty_metered_result(None)?;
+        let previous_result = std::mem::replace(&mut self.result, temporary_result);
         let previous_stack = std::mem::replace(&mut self.output_stack, vec![NodeId(0)]);
         self.function_results.push(None);
         if binds_defaults {
@@ -2481,7 +2487,9 @@ impl<'a> Execution<'a> {
         });
         let value = self.function_results.pop().flatten();
         let generated_result_nodes = self.result.node_count() > 1;
-        self.result = previous_result;
+        let temporary_result = std::mem::replace(&mut self.result, previous_result);
+        self.meter
+            .release_owned_bytes(metered_document_owned_bytes(&temporary_result));
         self.output_stack = previous_stack;
         self.pop_scope();
         self.scopes.extend(caller_scopes);
@@ -2813,7 +2821,7 @@ impl<'a> Execution<'a> {
         depth: usize,
         precedence: Option<usize>,
     ) -> Result<CapturedText> {
-        let previous = self.enter_temporary_result_tree(None);
+        let previous = self.enter_temporary_result_tree(None)?;
         let result =
             self.execute_scoped_sequence(body, node, position, size, depth + 1, precedence);
         let captured = result.and_then(|()| {
@@ -2870,9 +2878,7 @@ impl<'a> Execution<'a> {
         precedence: Option<usize>,
         base_uri: Option<&str>,
     ) -> Result<Document> {
-        self.meter
-            .charge(BudgetKind::OwnedBytes, base_uri.map_or(0, str::len))?;
-        let previous = self.enter_temporary_result_tree(base_uri);
+        let previous = self.enter_temporary_result_tree(base_uri)?;
         let result = self.execute_scoped_sequence(
             body,
             node,
@@ -2892,16 +2898,23 @@ impl<'a> Execution<'a> {
         }
     }
 
-    fn enter_temporary_result_tree(&mut self, base_uri: Option<&str>) -> ResultTreeState {
-        ResultTreeState {
-            document: std::mem::replace(
-                &mut self.result,
-                Document::empty(base_uri.map(str::to_owned)),
-            ),
+    fn empty_metered_result(&mut self, base_uri: Option<&str>) -> Result<Document> {
+        let document = Document::empty(base_uri.map(str::to_owned));
+        self.meter.charge(
+            BudgetKind::OwnedBytes,
+            metered_document_owned_bytes(&document),
+        )?;
+        Ok(document)
+    }
+
+    fn enter_temporary_result_tree(&mut self, base_uri: Option<&str>) -> Result<ResultTreeState> {
+        let temporary = self.empty_metered_result(base_uri)?;
+        Ok(ResultTreeState {
+            document: std::mem::replace(&mut self.result, temporary),
             output_stack: std::mem::replace(&mut self.output_stack, vec![NodeId(0)]),
             attribute_insert_position: self.attribute_insert_position.take(),
             attribute_protected_names: self.attribute_protected_names.take(),
-        }
+        })
     }
 
     fn restore_result_tree(&mut self, previous: ResultTreeState) -> Document {
@@ -3073,6 +3086,24 @@ impl<'a> Execution<'a> {
         kind: NodeKind,
         base_uri: Option<String>,
     ) -> Result<NodeId> {
+        let requested_bytes = self.result.push_container_reservation_bytes(parent);
+        self.meter.charge(BudgetKind::OwnedBytes, requested_bytes)?;
+        let actual_bytes = match self.result.reserve_push_containers(parent) {
+            Ok(actual_bytes) => actual_bytes,
+            Err(error) => {
+                self.meter.release_owned_bytes(requested_bytes);
+                return Err(Error::Dynamic(format!(
+                    "failed to reserve retained result-tree storage: {error}"
+                )));
+            }
+        };
+        if actual_bytes < requested_bytes {
+            self.meter
+                .release_owned_bytes(requested_bytes - actual_bytes);
+        } else if actual_bytes > requested_bytes {
+            self.meter
+                .charge(BudgetKind::OwnedBytes, actual_bytes - requested_bytes)?;
+        }
         self.meter
             .charge(BudgetKind::OwnedBytes, node_kind_owned_bytes(&kind))?;
         self.meter.charge(
@@ -3203,6 +3234,15 @@ impl<'a> Execution<'a> {
             ));
         }
         let generated_namespace = fixup_attribute_namespace(&mut attribute, namespaces);
+        if generated_namespace.is_some() {
+            reserve_retained_vec_slot(namespaces, &mut self.meter)?;
+        }
+        let existing_index = attributes
+            .iter()
+            .position(|existing| existing.name == attribute.name);
+        if existing_index.is_none() {
+            reserve_retained_vec_slot(attributes, &mut self.meter)?;
+        }
         let owned_bytes = attribute_owned_bytes(&attribute).saturating_add(
             generated_namespace
                 .as_ref()
@@ -3214,10 +3254,7 @@ impl<'a> Execution<'a> {
         }
         namespaces.extend(generated_namespace);
         let mut replaced_owned_bytes = 0usize;
-        if let Some(existing) = attributes
-            .iter_mut()
-            .find(|existing| existing.name == attribute.name)
-        {
+        if let Some(existing) = existing_index.map(|index| &mut attributes[index]) {
             let replaced = std::mem::replace(existing, attribute);
             replaced_owned_bytes = attribute_owned_bytes(&replaced);
         } else {
@@ -3324,10 +3361,13 @@ impl<'a> Execution<'a> {
                     "namespace requires an element result".into(),
                 ));
             };
-            if let Some(existing) = namespaces
-                .iter_mut()
-                .find(|existing| existing.prefix == namespace.prefix)
-            {
+            let existing_index = namespaces
+                .iter()
+                .position(|existing| existing.prefix == namespace.prefix);
+            if existing_index.is_none() {
+                reserve_retained_vec_slot(namespaces, &mut self.meter)?;
+            }
+            if let Some(existing) = existing_index.map(|index| &mut namespaces[index]) {
                 let replaced_owned_bytes = namespace_owned_bytes(existing);
                 *existing = namespace;
                 replaced_owned_bytes
@@ -4388,7 +4428,17 @@ fn node_kind_owned_bytes(kind: &NodeKind) -> usize {
             .iter()
             .fold(
                 expanded_name_owned_bytes(name)
-                    .saturating_add(prefix.as_ref().map_or(0, String::len)),
+                    .saturating_add(prefix.as_ref().map_or(0, String::len))
+                    .saturating_add(
+                        attributes
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<Attribute>()),
+                    )
+                    .saturating_add(
+                        namespaces
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<Namespace>()),
+                    ),
                 |total, attribute| total.saturating_add(attribute_owned_bytes(attribute)),
             )
             .saturating_add(namespaces.iter().fold(0usize, |total, namespace| {
@@ -4536,11 +4586,14 @@ fn value_owned_bytes(value: &Value) -> usize {
 }
 
 fn metered_document_owned_bytes(document: &Document) -> usize {
-    document.nodes().fold(0usize, |total, (_, node)| {
-        total
-            .saturating_add(node_kind_owned_bytes(&node.kind))
-            .saturating_add(node.base_uri.as_ref().map_or(0, String::len))
-    })
+    document.nodes().fold(
+        document.retained_tree_container_bytes(),
+        |total, (_, node)| {
+            total
+                .saturating_add(node_kind_owned_bytes(&node.kind))
+                .saturating_add(node.base_uri.as_ref().map_or(0, String::len))
+        },
+    )
 }
 
 fn binding_owned_bytes(name: &ExpandedName, value: &Value) -> usize {

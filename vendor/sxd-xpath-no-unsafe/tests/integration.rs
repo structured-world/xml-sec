@@ -39,6 +39,18 @@ fn axis_predicate_order() {
 }
 
 #[test]
+fn following_axis_from_attribute_includes_owner_descendants() {
+    // XPath 1.0 section 2.4 places namespace and attribute nodes before an element's children;
+    // those children are therefore on the following axis of an attribute node.
+    // https://www.w3.org/TR/1999/REC-xpath-19991116/#axes
+    with_document(r#"<root marker="yes"><child/><tail/></root>"#, |doc| {
+        let result = evaluate_xpath(&doc, "count(/root/@marker/following::*)");
+
+        assert_eq!(Ok(Value::Number(2.0)), result);
+    });
+}
+
+#[test]
 fn position_function_in_predicate() {
     with_document("<a><b/><b/></a>", |doc| {
         let result = evaluate_xpath(&doc, "count(//a/*[position() = 2])");

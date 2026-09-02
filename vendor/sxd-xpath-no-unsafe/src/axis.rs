@@ -142,11 +142,25 @@ impl AxisLike for Axis {
                     postorder_right_to_left(sibling, |n| node_test.run(n));
                 }
             }),
-            Following => node_and_each_parent(context.node.clone(), |node| {
-                for sibling in node.following_siblings() {
-                    preorder_left_to_right(sibling, |n| node_test.run(n));
+            Following => {
+                let mut traversal_root = context.node.clone();
+                if matches!(traversal_root, Node::Attribute(_) | Node::Namespace(_))
+                    && let Some(owner) = traversal_root.parent()
+                {
+                    // XPath 1.0 section 5 orders namespace and attribute nodes before children.
+                    // Owner descendants are therefore following, not descendants, of either
+                    // non-child context node: https://www.w3.org/TR/xpath/#data-model
+                    for child in owner.children() {
+                        preorder_left_to_right(child, |node| node_test.run(node));
+                    }
+                    traversal_root = owner;
                 }
-            }),
+                node_and_each_parent(traversal_root, |node| {
+                    for sibling in node.following_siblings() {
+                        preorder_left_to_right(sibling, |n| node_test.run(n));
+                    }
+                });
+            }
             SelfAxis => node_test.run(context.node.clone()),
         }
 

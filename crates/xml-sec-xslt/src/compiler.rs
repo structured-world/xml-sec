@@ -2798,10 +2798,8 @@ fn compile_literal_element(
 ) -> Result<Instruction> {
     let context = context.with_literal_version(node)?;
     validate_literal_result_attributes(node, context.forward)?;
-    let prefix = node
-        .lookup_prefix(node.tag_name().namespace().unwrap_or(""))
-        .map(str::to_owned);
-    let attributes = node
+    let prefix = element_prefix(node);
+    let attributes: Vec<LiteralAttribute> = node
         .attributes()
         .filter(|a| a.namespace() != Some(XSLT_NS))
         .map(|a| {
@@ -2813,15 +2811,21 @@ fn compile_literal_element(
         })
         .collect::<Result<_>>()?;
     let excluded = excluded_result_namespaces(node)?;
-    let used_namespaces = std::iter::once(node.tag_name().namespace())
-        .chain(node.attributes().map(|attribute| attribute.namespace()))
-        .flatten()
-        .collect::<HashSet<_>>();
+    let mut used_prefixes = HashSet::new();
+    if node.tag_name().namespace().is_some() {
+        used_prefixes.insert(prefix.as_deref());
+    }
+    used_prefixes.extend(
+        attributes
+            .iter()
+            .filter(|attribute| attribute.name.namespace.is_some())
+            .map(|attribute| attribute.prefix.as_deref()),
+    );
     let namespaces = node
         .namespaces()
         .filter(|n| n.uri() != XSLT_NS)
         .filter(|namespace| {
-            used_namespaces.contains(namespace.uri()) || !excluded.contains(namespace.uri())
+            used_prefixes.contains(&namespace.name()) || !excluded.contains(namespace.uri())
         })
         .map(|n| Namespace {
             prefix: n.name().map(str::to_owned),
@@ -3624,9 +3628,31 @@ fn attribute_prefix(
     node: roxmltree::Node<'_, '_>,
     attribute: roxmltree::Attribute<'_, '_>,
 ) -> Option<String> {
-    attribute
-        .namespace()
-        .and_then(|uri| node.lookup_prefix(uri))
+    lexical_prefix_at(
+        node.document().input_text(),
+        attribute.range().start,
+        attribute.name(),
+    )
+}
+
+fn element_prefix(node: roxmltree::Node<'_, '_>) -> Option<String> {
+    lexical_prefix_at(
+        node.document().input_text(),
+        node.range().start.saturating_add(1),
+        node.tag_name().name(),
+    )
+}
+
+fn lexical_prefix_at(source: &str, offset: usize, local: &str) -> Option<String> {
+    let lexical = source
+        .get(offset..)?
+        .split(|character: char| {
+            character.is_ascii_whitespace() || matches!(character, '=' | '/' | '>')
+        })
+        .next()?;
+    lexical
+        .strip_suffix(local)?
+        .strip_suffix(':')
         .map(str::to_owned)
 }
 

@@ -3071,6 +3071,73 @@ fn namespaces_fallbacks_and_xml_characters_fail_or_emit_by_contract() {
 }
 
 #[test]
+fn excluded_namespace_alias_is_not_restored_by_a_used_uri() {
+    // XSLT 1.0 section 7.1.1 requires the literal QName's actual prefix, not every in-scope alias
+    // for the same URI; exclude-result-prefixes must still remove an unused alias.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#literal-result-element
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:a="urn:x" xmlns:b="urn:x" exclude-result-prefixes="b"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><a:out/></xsl:template></xsl:stylesheet>"#;
+
+    assert_eq!(
+        execute(stylesheet, "<source/>"),
+        "<a:out xmlns:a=\"urn:x\"/>\n"
+    );
+}
+
+#[test]
+fn result_tree_container_capacity_consumes_owned_memory_budget() {
+    // Empty result elements still retain arena Nodes and parent child slots. A payload-only meter
+    // lets the result tree exceed OwnedBytes whenever ResultNodes is configured independently.
+    let stylesheet = |body: &str| {
+        compile(&format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><out><xsl:for-each select="/source/i">{body}</xsl:for-each></out></xsl:template></xsl:stylesheet>"#
+        ))
+    };
+    let source_xml = format!("<source>{}</source>", "<i/>".repeat(128));
+    let source = Document::parse(&source_xml, None).expect("source parses");
+    let minimum = |stylesheet: &xml_sec_xslt::Stylesheet| {
+        let succeeds = |owned_bytes| {
+            let mut budget = execution_budget(source_xml.len());
+            budget.owned_bytes = owned_bytes;
+            stylesheet
+                .execute(
+                    &source,
+                    &Parameters::new(),
+                    Arc::new(NoResolver),
+                    ExecutionOptions {
+                        budget,
+                        initial_mode: None,
+                        initial_template: None,
+                    },
+                )
+                .is_ok()
+        };
+        let mut rejected = 0;
+        let mut accepted = 1;
+        while !succeeds(accepted) {
+            rejected = accepted;
+            accepted *= 2;
+        }
+        while rejected + 1 < accepted {
+            let candidate = rejected + (accepted - rejected) / 2;
+            if succeeds(candidate) {
+                accepted = candidate;
+            } else {
+                rejected = candidate;
+            }
+        }
+        accepted
+    };
+    let empty = minimum(&stylesheet(""));
+    let elements = minimum(&stylesheet("<a/>"));
+
+    assert!(
+        elements >= empty + 8 * 1024,
+        "128 retained nodes and child slots added only {} metered bytes",
+        elements.saturating_sub(empty)
+    );
+}
+
+#[test]
 fn xpath_accepts_whitespace_before_function_arguments() {
     // XPath permits whitespace between a function QName and its argument list even
     // though the underlying parser requires lexical normalization.
