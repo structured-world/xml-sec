@@ -1880,11 +1880,11 @@ fn parse_dtd_attribute_type(subset: &str, cursor: &mut usize) -> Result<Internal
     {
         *cursor += "NOTATION".len();
         require_dtd_whitespace(subset, cursor, "after NOTATION")?;
-        parse_dtd_enumeration(subset, cursor)?;
+        parse_dtd_enumeration(subset, cursor, DtdEnumerationToken::Name)?;
         return Ok(InternalAttributeType::Tokenized);
     }
     if subset.as_bytes().get(*cursor) == Some(&b'(') {
-        parse_dtd_enumeration(subset, cursor)?;
+        parse_dtd_enumeration(subset, cursor, DtdEnumerationToken::Nmtoken)?;
         return Ok(InternalAttributeType::Tokenized);
     }
     let attribute_type = parse_dtd_name(subset, cursor, "ATTLIST attribute type")?;
@@ -1900,25 +1900,65 @@ fn parse_dtd_attribute_type(subset: &str, cursor: &mut usize) -> Result<Internal
     }
 }
 
-fn parse_dtd_enumeration(subset: &str, cursor: &mut usize) -> Result<()> {
+#[derive(Clone, Copy)]
+enum DtdEnumerationToken {
+    Name,
+    Nmtoken,
+}
+
+fn parse_dtd_enumeration(
+    subset: &str,
+    cursor: &mut usize,
+    token: DtdEnumerationToken,
+) -> Result<()> {
+    // XML 1.0 section 3.3.1 productions [58] and [59] require one or more Name/Nmtoken
+    // entries separated by `|`; merely finding the closing delimiter is insufficient.
+    // https://www.w3.org/TR/xml/#sec-attribute-types
     if subset.as_bytes().get(*cursor) != Some(&b'(') {
         return Err(Error::Xml("ATTLIST enumeration must start with `(`".into()));
     }
-    let start = *cursor;
     *cursor += 1;
-    while let Some(character) = subset[*cursor..].chars().next() {
-        *cursor += character.len_utf8();
-        if character == ')' {
-            if *cursor == start + 2 {
-                return Err(Error::Xml("ATTLIST enumeration must not be empty".into()));
+    skip_xml_whitespace(subset, cursor);
+    loop {
+        match token {
+            DtdEnumerationToken::Name => {
+                parse_dtd_name(subset, cursor, "ATTLIST notation token")?;
             }
-            return Ok(());
+            DtdEnumerationToken::Nmtoken => parse_dtd_nmtoken(subset, cursor)?,
         }
-        if character == '<' || character == '>' {
-            break;
+        skip_xml_whitespace(subset, cursor);
+        match subset.as_bytes().get(*cursor) {
+            Some(b')') => {
+                *cursor += 1;
+                return Ok(());
+            }
+            Some(b'|') => {
+                *cursor += 1;
+                skip_xml_whitespace(subset, cursor);
+            }
+            _ => {
+                return Err(Error::Xml(
+                    "ATTLIST enumeration token must be followed by `|` or `)`".into(),
+                ));
+            }
         }
     }
-    Err(Error::Xml("unterminated ATTLIST enumeration".into()))
+}
+
+fn parse_dtd_nmtoken(subset: &str, cursor: &mut usize) -> Result<()> {
+    let start = *cursor;
+    while let Some(character) = subset[*cursor..].chars().next()
+        && (character == ':' || crate::lexical::is_ncname_char(character))
+    {
+        *cursor += character.len_utf8();
+    }
+    if *cursor == start {
+        Err(Error::Xml(
+            "ATTLIST enumeration has an invalid XML Nmtoken".into(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn parse_dtd_attribute_default(subset: &str, cursor: &mut usize) -> Result<Option<String>> {
@@ -2975,6 +3015,31 @@ mod parser_boundary_tests {
         ] {
             Document::parse_iterative(malformed, None)
                 .expect_err("missing DTD declaration whitespace must be rejected");
+        }
+    }
+
+    #[test]
+    fn internal_dtd_enumerations_follow_xml_token_grammar() {
+        for valid in [
+            r#"<!DOCTYPE r [<!ATTLIST r mode (1 | a:b | x-y) "1">]><r/>"#,
+            r#"<!DOCTYPE r [<!ATTLIST r format NOTATION (png | jpeg) "png">]><r/>"#,
+        ] {
+            Document::parse_iterative(valid, None)
+                .expect("well-formed enumeration tokens must be accepted");
+        }
+
+        for malformed in [
+            r#"<!DOCTYPE r [<!ATTLIST r mode () "a">]><r/>"#,
+            r#"<!DOCTYPE r [<!ATTLIST r mode ( ) "a">]><r/>"#,
+            r#"<!DOCTYPE r [<!ATTLIST r mode (a||b) "a">]><r/>"#,
+            r#"<!DOCTYPE r [<!ATTLIST r mode (|a) "a">]><r/>"#,
+            r#"<!DOCTYPE r [<!ATTLIST r mode (a|) "a">]><r/>"#,
+            r#"<!DOCTYPE r [<!ATTLIST r mode (a b) "a">]><r/>"#,
+            r#"<!DOCTYPE r [<!ATTLIST r format NOTATION (png||jpeg) "png">]><r/>"#,
+            r#"<!DOCTYPE r [<!ATTLIST r format NOTATION (1png|jpeg) "jpeg">]><r/>"#,
+        ] {
+            Document::parse_iterative(malformed, None)
+                .expect_err("malformed enumeration grammar must be rejected");
         }
     }
 

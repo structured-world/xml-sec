@@ -78,6 +78,7 @@ pub struct Context<'d> {
     variables: Variables<'d>,
     namespaces: Namespaces,
     string_allocations: StringAllocationBudget,
+    document_root_resolver: Option<fn(Node<'d>) -> Node<'d>>,
 }
 
 #[derive(Default)]
@@ -102,6 +103,7 @@ impl<'d> Context<'d> {
             variables: Default::default(),
             namespaces: Default::default(),
             string_allocations: StringAllocationBudget::default(),
+            document_root_resolver: None,
         }
     }
 
@@ -114,6 +116,11 @@ impl<'d> Context<'d> {
         self.string_allocations.limit = Some(limit);
         self.string_allocations.used.set(0);
         self.string_allocations.exceeded.set(None);
+    }
+
+    /// Override how the root of the document containing a context node is resolved.
+    pub fn set_document_root_resolver(&mut self, resolver: fn(Node<'d>) -> Node<'d>) {
+        self.document_root_resolver = Some(resolver);
     }
 
     /// Return the first attempted total that exceeded the current context-scoped limit.
@@ -173,6 +180,7 @@ pub struct Evaluation<'c, 'd> {
     variables: &'c Variables<'d>,
     namespaces: &'c Namespaces,
     string_allocations: &'c StringAllocationBudget,
+    document_root_resolver: Option<fn(Node<'d>) -> Node<'d>>,
 }
 
 #[cfg(not(feature = "no-unsafe"))]
@@ -187,6 +195,7 @@ impl<'c, 'd> Evaluation<'c, 'd> {
             variables: &context.variables,
             namespaces: &context.namespaces,
             string_allocations: &context.string_allocations,
+            document_root_resolver: context.document_root_resolver,
             position: 1,
             size: 1,
         }
@@ -220,6 +229,14 @@ impl<'c, 'd> Evaluation<'c, 'd> {
     /// Looks up the namespace URI for the given prefix
     pub fn namespace_for(&self, prefix: &str) -> Option<&str> {
         self.namespaces.get(prefix).map(String::as_str)
+    }
+
+    pub(crate) fn document_root_for(&self, node: Node<'d>) -> Node<'d> {
+        if let Some(resolver) = self.document_root_resolver {
+            resolver(node)
+        } else {
+            node.document().root().into()
+        }
     }
 
     /// Reserve bytes before an extension function allocates an XPath string result.

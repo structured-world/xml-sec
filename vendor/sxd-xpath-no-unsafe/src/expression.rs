@@ -511,7 +511,12 @@ pub struct RootNode;
 
 impl Expression for RootNode {
     fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
-        Ok(Value::Nodeset(nodeset![context.node.document().root()]))
+        // XPath 1.0 section 2.1 roots an absolute location path in the document containing
+        // the current context node, which an embedding may project into a larger package.
+        // https://www.w3.org/TR/1999/REC-xpath-19991116/#location-paths
+        Ok(Value::Nodeset(nodeset![
+            context.document_root_for(context.node.clone())
+        ]))
     }
 }
 

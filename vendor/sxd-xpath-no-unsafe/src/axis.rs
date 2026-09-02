@@ -137,12 +137,17 @@ impl AxisLike for Axis {
                     node_test.run(sibling)
                 }
             }
-            Preceding => node_and_each_parent(context.node.clone(), |node| {
-                for sibling in node.preceding_siblings() {
-                    postorder_right_to_left(sibling, |n| node_test.run(n));
-                }
-            }),
+            Preceding => node_and_each_parent_before(
+                context.node.clone(),
+                context.document_root_for(context.node.clone()),
+                |node| {
+                    for sibling in node.preceding_siblings() {
+                        postorder_right_to_left(sibling, |n| node_test.run(n));
+                    }
+                },
+            ),
             Following => {
+                let document_root = context.document_root_for(context.node.clone());
                 let mut traversal_root = context.node.clone();
                 if matches!(traversal_root, Node::Attribute(_) | Node::Namespace(_))
                     && let Some(owner) = traversal_root.parent()
@@ -155,7 +160,7 @@ impl AxisLike for Axis {
                     }
                     traversal_root = owner;
                 }
-                node_and_each_parent(traversal_root, |node| {
+                node_and_each_parent_before(traversal_root, document_root, |node| {
                     for sibling in node.following_siblings() {
                         preorder_left_to_right(sibling, |n| node_test.run(n));
                     }
@@ -221,6 +226,19 @@ where
     let n = node.clone();
     f(n);
     each_parent(node, f);
+}
+
+fn node_and_each_parent_before<'d, F>(mut node: Node<'d>, boundary: Node<'d>, mut f: F)
+where
+    F: FnMut(Node<'d>),
+{
+    while node != boundary {
+        f(node.clone());
+        let Some(parent) = node.parent() else {
+            break;
+        };
+        node = parent;
+    }
 }
 
 fn each_parent<'d, F>(mut node: Node<'d>, mut f: F)

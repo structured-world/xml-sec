@@ -779,6 +779,41 @@ fn document_function_resolves_dynamic_uris_without_cross_document_leaks() {
 }
 
 #[test]
+fn external_document_paths_and_axes_use_the_dynamic_document_root() {
+    // XPath 1.0 sections 2.1 and 2.2 bind absolute paths and document-order axes to the
+    // document containing the current predicate or axis context node.
+    // https://www.w3.org/TR/1999/REC-xpath-19991116/#location-paths
+    // https://www.w3.org/TR/1999/REC-xpath-19991116/#axes
+    let resolver = Arc::new(MemoryResolver::default());
+    resolver.resources.lock().expect("resolver mutex").insert(
+        "external.xml".into(),
+        "<external><flag/><item>selected</item><a>before</a><b>after</b></external>".into(),
+    );
+    let stylesheet = Compiler::new(
+        Arc::clone(&resolver),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(document('external.xml')/external/item[/external/flag])"/><xsl:text>|</xsl:text><xsl:value-of select="document('external.xml')/external/a/following::b"/><xsl:text>|</xsl:text><xsl:value-of select="document('external.xml')/external/b/preceding::a"/></xsl:template></xsl:stylesheet>"#,
+        Some("memory:main.xsl"),
+    )
+    .expect("stylesheet compiles");
+    let result = stylesheet
+        .execute(
+            &Document::parse("<source/>", Some("memory:source.xml")).expect("source parses"),
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("external document paths evaluate");
+    assert_eq!(result.serialized.bytes, b"1|after|before");
+}
+
+#[test]
 fn key_uses_the_dynamic_document_index() {
     // XSLT 1.0 section 12.2 binds key() to the document containing the context node,
     // including trees loaded by document().

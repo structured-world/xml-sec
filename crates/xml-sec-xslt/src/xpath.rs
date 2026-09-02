@@ -1590,19 +1590,8 @@ impl Evaluator {
             .maps
             .to_sxd(document.root().into(), node)
             .ok_or_else(|| Error::Dynamic("XPath context node is stale".into()))?;
-        let logical_root_id = self
-            .source
-            .logical_root_for(node)
-            .ok_or_else(|| Error::Dynamic("XPath logical document root is stale".into()))?;
-        let logical_root_index = self
-            .source
-            .logical_roots()
-            .iter()
-            .position(|candidate| *candidate == logical_root_id)
-            .ok_or_else(|| Error::Dynamic("XPath logical document root is stale".into()))?;
         let normalized = normalize_xpath_for_sxd(&expression.source);
-        let rooted = rewrite_absolute_paths(&normalized, logical_root_index);
-        let isolated = hide_projection_elements_from_axes(&rooted, logical_root_index);
+        let isolated = hide_projection_elements_from_axes(&normalized);
         let rewritten = rewrite_outer_context_functions(&isolated);
         if !self.expressions.borrow().contains_key(rewritten.as_ref()) {
             // One input byte can produce at most one parser token. This conservative
@@ -1623,6 +1612,7 @@ impl Evaluator {
                 .insert(rewritten.as_ref().to_owned(), xpath);
         }
         let mut context = Context::new();
+        context.set_document_root_resolver(projected_document_root);
         let (owned_bytes, owned_bytes_limit) = meter.usage(BudgetKind::OwnedBytes)?;
         context.set_string_allocation_limit(owned_bytes_limit.saturating_sub(owned_bytes));
         for (prefix, uri) in &expression.namespaces {
@@ -4183,6 +4173,19 @@ fn is_projection_document_wrapper(node: &nodeset::Node<'_>) -> bool {
         .is_some_and(|parent| parent.root().is_some())
 }
 
+fn projected_document_root<'d>(node: nodeset::Node<'d>) -> nodeset::Node<'d> {
+    let mut current = node;
+    loop {
+        if is_projection_document_wrapper(&current) {
+            return current;
+        }
+        let Some(parent) = current.parent() else {
+            return current.document().root().into();
+        };
+        current = parent;
+    }
+}
+
 impl function::Function for NodeNameFunction {
     fn evaluate<'c, 'd>(
         &self,
@@ -5429,10 +5432,7 @@ impl function::Function for ElementAvailable {
     }
 }
 
-fn hide_projection_elements_from_axes(
-    source: &str,
-    logical_root_index: usize,
-) -> std::borrow::Cow<'_, str> {
+fn hide_projection_elements_from_axes(source: &str) -> std::borrow::Cow<'_, str> {
     const AXES: &[&str] = &[
         "ancestor-or-self",
         "ancestor",
@@ -5505,13 +5505,6 @@ fn hide_projection_elements_from_axes(
                 output.push_str("[parent::node()]");
             } else {
                 output.push_str("[not(self::__xml_sec_document and parent::__xml_sec_documents[not(parent::*)])]");
-            }
-            if matches!(*axis, "following" | "preceding") {
-                // Every logical document is a sibling wrapper in the projection. Filtering by
-                // that wrapper's ordinal keeps these otherwise package-wide axes document-local.
-                output.push_str(&format!(
-                    "[count(ancestor::__xml_sec_document[parent::__xml_sec_documents[not(parent::*)]]/preceding-sibling::__xml_sec_document) = {logical_root_index}]"
-                ));
             }
             cursor = end;
             continue;
@@ -6442,9 +6435,7 @@ mod tests {
         let source = "item/@name";
         let normalized = normalize_xpath_for_sxd(source);
         assert!(matches!(&normalized, std::borrow::Cow::Borrowed(_)));
-        let rooted = rewrite_absolute_paths(&normalized, 0);
-        assert!(matches!(&rooted, std::borrow::Cow::Borrowed(_)));
-        let isolated = hide_projection_elements_from_axes(&rooted, 0);
+        let isolated = hide_projection_elements_from_axes(&normalized);
         assert!(matches!(&isolated, std::borrow::Cow::Borrowed(_)));
         let context = rewrite_outer_context_functions(&isolated);
         assert!(matches!(context, std::borrow::Cow::Borrowed(_)));
