@@ -394,7 +394,9 @@ fn parse_encoding(label: &str) -> Result<SelectedEncoding, Error> {
     if let Some(encoding) = registered_single_byte_encoding(label) {
         return Ok(SelectedEncoding::Registered(encoding));
     }
-    // WHATWG aliases these IANA encodings to Windows extensions with different C1 bytes.
+    // `encoding_rs` exposes some registered ISO repertoires directly (including
+    // ISO-8859-2). Reject only lookups whose canonical result proves that the
+    // requested IANA label was redirected to a Windows extension with different C1 bytes.
     // XML 1.0 section 4.3.3 requires registered labels to retain their IANA meaning.
     // https://www.w3.org/TR/xml/#charencoding
     let encoding = encoding_rs::Encoding::for_label(label.as_bytes())
@@ -904,6 +906,17 @@ mod tests {
 
         let source = b"<?xml version=\"1.0\" encoding=\"ISO-8859-2\"?><root>\xA1</root>";
         assert!(decode_xml(source, None).unwrap().contains("<root>Ą</root>"));
+    }
+
+    #[test]
+    fn encoding_lookup_selects_the_strict_iso_8859_2_codec() {
+        // Keep the dependency contract explicit: this label is not a WHATWG redirect in the
+        // encoding_rs release used by the parser, so the standard decoder is the strict codec.
+        assert_eq!(
+            encoding_rs::Encoding::for_label(b"ISO-8859-2"),
+            Some(encoding_rs::ISO_8859_2)
+        );
+        assert_eq!(encoding_rs::ISO_8859_2.name(), "ISO-8859-2");
     }
 
     #[test]

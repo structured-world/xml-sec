@@ -2093,6 +2093,8 @@ struct DocumentPreflightState {
     in_character_data: bool,
     entity_expansions: u32,
     entity_expansion_work: usize,
+    active_namespace_bindings: HashSet<String>,
+    namespace_scopes: Vec<Vec<(String, bool)>>,
 }
 
 #[derive(Default)]
@@ -2121,8 +2123,14 @@ enum PreflightEvent {
     CharacterData {
         xml_whitespace: bool,
     },
-    Start(Vec<u8>),
-    Empty(Vec<u8>),
+    Start {
+        attribute_source: Vec<u8>,
+        namespace_declarations: Vec<NamespaceDeclaration>,
+    },
+    Empty {
+        attribute_source: Vec<u8>,
+        namespace_declarations: Vec<NamespaceDeclaration>,
+    },
     End,
     Node,
     Markup,
@@ -2283,7 +2291,7 @@ fn preflight_xml_fragment(
                 state.in_character_data = false;
                 continue;
             }
-            PreflightEvent::Start(_) | PreflightEvent::Empty(_) | PreflightEvent::End => {}
+            PreflightEvent::Start { .. } | PreflightEvent::Empty { .. } | PreflightEvent::End => {}
         }
 
         if context == FragmentContext::Attribute {
@@ -2291,12 +2299,18 @@ fn preflight_xml_fragment(
         }
         state.in_character_data = false;
         match event {
-            PreflightEvent::Start(attribute_source) => {
+            PreflightEvent::Start {
+                attribute_source,
+                namespace_declarations,
+            } => {
                 let frame = fragments
                     .last_mut()
                     .expect("active element frame remains registered");
                 frame.pending_attribute_source = attribute_source;
                 frame.pending_attribute_offset = 0;
+                let changes =
+                    apply_preflight_namespace_declarations(state, namespace_declarations)?;
+                state.namespace_scopes.push(changes);
                 observe_preflight_node(state, settings, false)?;
                 state.depth = state.depth.saturating_add(1);
                 if state.depth > settings.depth_limit {
@@ -2306,12 +2320,17 @@ fn preflight_xml_fragment(
                     });
                 }
             }
-            PreflightEvent::Empty(attribute_source) => {
+            PreflightEvent::Empty {
+                attribute_source,
+                namespace_declarations,
+            } => {
                 let frame = fragments
                     .last_mut()
                     .expect("active element frame remains registered");
                 frame.pending_attribute_source = attribute_source;
                 frame.pending_attribute_offset = 0;
+                let changes =
+                    apply_preflight_namespace_declarations(state, namespace_declarations)?;
                 observe_preflight_node(state, settings, false)?;
                 let actual = state.depth.saturating_add(1);
                 if actual > settings.depth_limit {
@@ -2320,8 +2339,17 @@ fn preflight_xml_fragment(
                         actual,
                     });
                 }
+                restore_preflight_namespace_bindings(&mut state.active_namespace_bindings, changes);
             }
-            PreflightEvent::End => state.depth = state.depth.saturating_sub(1),
+            PreflightEvent::End => {
+                state.depth = state.depth.saturating_sub(1);
+                if let Some(changes) = state.namespace_scopes.pop() {
+                    restore_preflight_namespace_bindings(
+                        &mut state.active_namespace_bindings,
+                        changes,
+                    );
+                }
+            }
             _ => unreachable!("non-structural events continue above"),
         }
     }
@@ -2412,11 +2440,26 @@ fn scan_preflight_event(
             (PreflightEvent::Done, remaining.len()),
             |end| {
                 let opening = &remaining[..=end];
-                let attributes = element_attribute_reference_source(opening, dtd);
+                let (element_name, attributes) = opening_tag_attributes(opening);
+                let attribute_source =
+                    element_attribute_reference_source(opening, element_name, &attributes, dtd);
+                let namespace_declarations = namespace_declarations(element_name, &attributes, dtd);
                 if opening[..opening.len() - 1].trim_end().ends_with('/') {
-                    (PreflightEvent::Empty(attributes), end + 1)
+                    (
+                        PreflightEvent::Empty {
+                            attribute_source,
+                            namespace_declarations,
+                        },
+                        end + 1,
+                    )
                 } else {
-                    (PreflightEvent::Start(attributes), end + 1)
+                    (
+                        PreflightEvent::Start {
+                            attribute_source,
+                            namespace_declarations,
+                        },
+                        end + 1,
+                    )
                 }
             },
         );
@@ -2485,7 +2528,98 @@ fn find_doctype_end(doctype: &str) -> Option<usize> {
     None
 }
 
-fn element_attribute_reference_source(opening: &str, dtd: &InternalDtd) -> Vec<u8> {
+struct NamespaceDeclaration {
+    prefix: String,
+    is_undeclaration: bool,
+}
+
+fn namespace_declarations(
+    element_name: &str,
+    attributes: &[(&str, &str)],
+    dtd: &InternalDtd,
+) -> Vec<NamespaceDeclaration> {
+    let mut declarations = attributes
+        .iter()
+        .filter_map(|&(name, value)| {
+            let prefix = if name == "xmlns" {
+                ""
+            } else {
+                name.strip_prefix("xmlns:")?
+            };
+            Some(NamespaceDeclaration {
+                prefix: prefix.to_owned(),
+                is_undeclaration: value.is_empty(),
+            })
+        })
+        .collect::<Vec<_>>();
+    if let Some(defaults) = dtd.attribute_defaults.get(element_name) {
+        for default in defaults {
+            if attributes
+                .iter()
+                .any(|(name, _)| *name == default.attribute_name)
+            {
+                continue;
+            }
+            let prefix = if default.attribute_name == "xmlns" {
+                ""
+            } else if let Some(prefix) = default.attribute_name.strip_prefix("xmlns:") {
+                prefix
+            } else {
+                continue;
+            };
+            declarations.push(NamespaceDeclaration {
+                prefix: prefix.to_owned(),
+                is_undeclaration: default.value.is_empty(),
+            });
+        }
+    }
+    declarations
+}
+
+fn apply_preflight_namespace_declarations(
+    state: &mut DocumentPreflightState,
+    declarations: Vec<NamespaceDeclaration>,
+) -> Result<Vec<(String, bool)>, XmlDocumentError> {
+    let mut changes = Vec::with_capacity(declarations.len());
+    for declaration in declarations {
+        let was_active = if declaration.is_undeclaration {
+            state.active_namespace_bindings.remove(&declaration.prefix)
+        } else {
+            state
+                .active_namespace_bindings
+                .insert(declaration.prefix.clone())
+        };
+        changes.push((declaration.prefix, was_active));
+    }
+    let actual = state.active_namespace_bindings.len();
+    let maximum = crate::hard_limits::XML_NAMESPACE_BINDING_CEILING;
+    if actual > maximum {
+        return Err(XmlDocumentError::Parse(
+            ParseError::NamespaceBindingLimitReached { maximum, actual },
+        ));
+    }
+    Ok(changes)
+}
+
+fn restore_preflight_namespace_bindings(
+    active: &mut HashSet<String>,
+    changes: Vec<(String, bool)>,
+) {
+    for (prefix, was_active) in changes.into_iter().rev() {
+        if was_active {
+            active.insert(prefix);
+        } else {
+            active.remove(&prefix);
+        }
+    }
+}
+
+fn element_attribute_reference_source(
+    opening: &str,
+    element_name: &str,
+    attributes: &[(&str, &str)],
+    dtd: &InternalDtd,
+) -> Vec<u8> {
     let mut source = if opening.contains('&') {
         opening.as_bytes().to_vec()
     } else {
@@ -2495,11 +2629,10 @@ fn element_attribute_reference_source(opening: &str, dtd: &InternalDtd) -> Vec<u
         return source;
     }
 
-    let (element_name, present) = opening_tag_names(opening);
     if let Some(defaults) = dtd.attribute_defaults.get(element_name) {
-        let mut present_attributes: HashSet<_> = present.into_iter().collect();
+        let mut present_attributes: HashSet<_> = attributes.iter().map(|(name, _)| *name).collect();
         for default in defaults {
-            if present_attributes.insert(default.attribute_name.clone())
+            if present_attributes.insert(default.attribute_name.as_str())
                 && default.value.contains('&')
             {
                 source.push(b' ');
@@ -2510,7 +2643,7 @@ fn element_attribute_reference_source(opening: &str, dtd: &InternalDtd) -> Vec<u
     source
 }
 
-fn opening_tag_names(opening: &str) -> (&str, Vec<String>) {
+fn opening_tag_attributes(opening: &str) -> (&str, Vec<(&str, &str)>) {
     let bytes = opening.as_bytes();
     let mut offset = 1usize;
     let name_start = offset;
@@ -2545,7 +2678,7 @@ fn opening_tag_names(opening: &str) -> (&str, Vec<String>) {
         if start == offset {
             break;
         }
-        attributes.push(opening[start..offset].to_owned());
+        let name = &opening[start..offset];
         while bytes
             .get(offset)
             .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
@@ -2566,9 +2699,12 @@ fn opening_tag_names(opening: &str) -> (&str, Vec<String>) {
             break;
         };
         offset += 1;
+        let value_start = offset;
         while bytes.get(offset).is_some_and(|byte| *byte != delimiter) {
             offset += 1;
         }
+        let value = &opening[value_start..offset];
+        attributes.push((name, value));
         offset = offset.saturating_add(1);
     }
     (element_name, attributes)
@@ -3362,6 +3498,81 @@ mod tests {
         let exact_settings = DocumentParseSettings::new_with_depth(true, 32, 4, xml.len());
         preflight_document_limits(xml, exact_settings, None)
             .expect("expanded markup at the exact depth boundary must be accepted");
+    }
+
+    #[test]
+    fn namespace_preflight_counts_bindings_inside_entity_replacements() {
+        // Entity replacement text becomes part of the document's namespace context, so it must
+        // consume the same active-binding ceiling as literal markup before a DOM is allocated.
+        let maximum = crate::hard_limits::XML_NAMESPACE_BINDING_CEILING;
+        let declarations = (0..=maximum)
+            .map(|index| format!(r#" xmlns:p{index}="urn:{index}""#))
+            .collect::<String>();
+        let xml = format!(
+            r#"<!DOCTYPE root [<!ENTITY expanded '<child{declarations}/>'>]><root>&expanded;</root>"#
+        );
+        let settings = DocumentParseSettings::new_with_depth(true, 16, 4, xml.len());
+
+        assert!(matches!(
+            preflight_document_limits(&xml, settings, None),
+            Err(XmlDocumentError::Parse(ParseError::NamespaceBindingLimitReached {
+                maximum: observed_maximum,
+                actual,
+            })) if observed_maximum == maximum && actual == maximum + 1
+        ));
+    }
+
+    #[test]
+    fn namespace_preflight_accepts_entity_replacement_at_exact_ceiling() {
+        let maximum = crate::hard_limits::XML_NAMESPACE_BINDING_CEILING;
+        let declarations = (0..maximum)
+            .map(|index| format!(r#" xmlns:p{index}="urn:{index}""#))
+            .collect::<String>();
+        let xml = format!(
+            r#"<!DOCTYPE root [<!ENTITY expanded '<child{declarations}/>'>]><root>&expanded;</root>"#
+        );
+        let settings = DocumentParseSettings::new_with_depth(true, 16, 4, xml.len());
+
+        preflight_document_limits(&xml, settings, None)
+            .expect("the exact expanded namespace-binding boundary is accepted");
+    }
+
+    #[test]
+    fn namespace_preflight_counts_literal_active_bindings() {
+        let maximum = crate::hard_limits::XML_NAMESPACE_BINDING_CEILING;
+        let declarations = (0..=maximum)
+            .map(|index| format!(r#" xmlns:p{index}="urn:{index}""#))
+            .collect::<String>();
+        let xml = format!("<root{declarations}/>");
+        let settings = DocumentParseSettings::new(false, 4, xml.len());
+
+        assert!(matches!(
+            preflight_document_limits(&xml, settings, None),
+            Err(XmlDocumentError::Parse(ParseError::NamespaceBindingLimitReached {
+                maximum: observed_maximum,
+                actual,
+            })) if observed_maximum == maximum && actual == maximum + 1
+        ));
+    }
+
+    #[test]
+    fn namespace_shadowing_does_not_inflate_active_binding_count() {
+        // Namespaces in XML 1.0 section 6.1 makes the nearest declaration replace the active
+        // prefix binding; nested shadowing must not accumulate historical bindings.
+        // https://www.w3.org/TR/REC-xml-names/#scoping-defaulting
+        let mut xml = String::new();
+        for depth in 0..220 {
+            xml.push_str("<n");
+            for prefix in 0..5 {
+                xml.push_str(&format!(r#" xmlns:p{prefix}="urn:{depth}:{prefix}""#));
+            }
+            xml.push('>');
+        }
+        xml.push_str(&"</n>".repeat(220));
+        let settings = DocumentParseSettings::new_with_depth(false, 2_000, 256, xml.len());
+
+        preflight_document_limits(&xml, settings, None)
+            .expect("five shadowed prefixes remain five active bindings");
     }
 
     #[test]

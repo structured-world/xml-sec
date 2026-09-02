@@ -1242,15 +1242,17 @@ fn push_stream_element(
     let mut raw_attributes = Vec::new();
     for attribute in &start.attributes {
         let name = attribute.name.qualified();
-        let is_cdata = declared_attributes
+        let attribute_type = declared_attributes
             .iter()
             .find(|declaration| declaration.name == name)
-            .is_none_or(|declaration| declaration.is_cdata);
+            .map_or(InternalAttributeType::Cdata, |declaration| {
+                declaration.attribute_type
+            });
         let value = prepare_attribute_value(
             name.as_ref(),
             attribute.value,
             &declarations.general,
-            is_cdata,
+            attribute_type.is_cdata(),
             entity_references,
             entity_expansion,
         )?;
@@ -1264,7 +1266,7 @@ fn push_stream_element(
             validate_namespace_binding(Some(prefix), &value)?;
             set_namespace(&mut namespaces, Some(prefix.into()), value);
         } else {
-            raw_attributes.push((name.into_owned(), value));
+            raw_attributes.push((name.into_owned(), value, attribute_type));
         }
     }
     for declaration in declared_attributes {
@@ -1282,7 +1284,7 @@ fn push_stream_element(
             &declaration.name,
             default,
             &declarations.general,
-            declaration.is_cdata,
+            declaration.attribute_type.is_cdata(),
             entity_references,
             entity_expansion,
         )?;
@@ -1293,7 +1295,7 @@ fn push_stream_element(
             validate_namespace_binding(Some(prefix), &value)?;
             set_namespace(&mut namespaces, Some(prefix.into()), value);
         } else {
-            raw_attributes.push((declaration.name.clone(), value));
+            raw_attributes.push((declaration.name.clone(), value, declaration.attribute_type));
         }
     }
     let prefix = start.name.prefix().map(str::to_owned);
@@ -1304,9 +1306,11 @@ fn push_stream_element(
             "undeclared namespace prefix in element {lexical_name}"
         )));
     }
+    let mut id_attribute = None;
     let attributes = raw_attributes
         .into_iter()
-        .map(|(lexical, value)| {
+        .enumerate()
+        .map(|(index, (lexical, value, attribute_type))| {
             let (prefix, local) = split_lexical_name(&lexical)?;
             let namespace = prefix
                 .as_deref()
@@ -1315,6 +1319,11 @@ fn push_stream_element(
                 return Err(Error::Xml(format!(
                     "undeclared namespace prefix in attribute {lexical}"
                 )));
+            }
+            if attribute_type.is_id() && id_attribute.replace(index).is_some() {
+                return Err(Error::Xml(
+                    "an element type must not declare more than one ID attribute".into(),
+                ));
             }
             Ok(Attribute {
                 name: ExpandedName::new(namespace, local),
@@ -1355,6 +1364,24 @@ fn push_stream_element(
         },
         effective_base,
     );
+    if let Some(index) = id_attribute {
+        let value = document
+            .node(projected)
+            .and_then(|node| match &node.kind {
+                NodeKind::Element { attributes, .. } => attributes.get(index),
+                _ => None,
+            })
+            .map(|attribute| collapse_xml_whitespace(&attribute.value).into_owned())
+            .ok_or_else(|| Error::Xml("DTD ID attribute reference is stale".into()))?;
+        // XML 1.0 section 3.3.1 requires an ID value to match the Name production.
+        // https://www.w3.org/TR/xml/#id
+        if !crate::lexical::is_xml_name(&value) {
+            return Err(Error::Xml(
+                "DTD ID attribute value is not an XML Name".into(),
+            ));
+        }
+        document.register_id_value(projected, value)?;
+    }
     if !empty {
         elements.push(StreamElementFrame {
             node: projected,
@@ -1590,8 +1617,25 @@ struct InternalEntityDeclarations {
 
 struct InternalAttributeDeclaration {
     name: String,
-    is_cdata: bool,
+    attribute_type: InternalAttributeType,
     default: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InternalAttributeType {
+    Cdata,
+    Id,
+    Tokenized,
+}
+
+impl InternalAttributeType {
+    const fn is_cdata(self) -> bool {
+        matches!(self, Self::Cdata)
+    }
+
+    const fn is_id(self) -> bool {
+        matches!(self, Self::Id)
+    }
 }
 
 fn collect_internal_entity_declarations(subset: &str) -> Result<InternalEntityDeclarations> {
@@ -1740,7 +1784,7 @@ fn collect_internal_attribute_list(
         }
         let name = parse_dtd_name(subset, &mut cursor, "ATTLIST attribute")?.to_owned();
         require_dtd_whitespace(subset, &mut cursor, "after ATTLIST attribute name")?;
-        let is_cdata = parse_dtd_attribute_type(subset, &mut cursor)?;
+        let attribute_type = parse_dtd_attribute_type(subset, &mut cursor)?;
         require_dtd_whitespace(subset, &mut cursor, "before ATTLIST default declaration")?;
         let default = parse_dtd_attribute_default(subset, &mut cursor)?;
         let element_declarations = declarations.entry(element_name.clone()).or_default();
@@ -1750,14 +1794,14 @@ fn collect_internal_attribute_list(
         {
             element_declarations.push(InternalAttributeDeclaration {
                 name,
-                is_cdata,
+                attribute_type,
                 default,
             });
         }
     }
 }
 
-fn parse_dtd_attribute_type(subset: &str, cursor: &mut usize) -> Result<bool> {
+fn parse_dtd_attribute_type(subset: &str, cursor: &mut usize) -> Result<InternalAttributeType> {
     if subset[*cursor..].starts_with("NOTATION")
         && subset[*cursor + "NOTATION".len()..]
             .chars()
@@ -1767,16 +1811,19 @@ fn parse_dtd_attribute_type(subset: &str, cursor: &mut usize) -> Result<bool> {
         *cursor += "NOTATION".len();
         require_dtd_whitespace(subset, cursor, "after NOTATION")?;
         parse_dtd_enumeration(subset, cursor)?;
-        return Ok(false);
+        return Ok(InternalAttributeType::Tokenized);
     }
     if subset.as_bytes().get(*cursor) == Some(&b'(') {
         parse_dtd_enumeration(subset, cursor)?;
-        return Ok(false);
+        return Ok(InternalAttributeType::Tokenized);
     }
     let attribute_type = parse_dtd_name(subset, cursor, "ATTLIST attribute type")?;
     match attribute_type {
-        "CDATA" => Ok(true),
-        "ID" | "IDREF" | "IDREFS" | "ENTITY" | "ENTITIES" | "NMTOKEN" | "NMTOKENS" => Ok(false),
+        "CDATA" => Ok(InternalAttributeType::Cdata),
+        "ID" => Ok(InternalAttributeType::Id),
+        "IDREF" | "IDREFS" | "ENTITY" | "ENTITIES" | "NMTOKEN" | "NMTOKENS" => {
+            Ok(InternalAttributeType::Tokenized)
+        }
         _ => Err(Error::Xml(format!(
             "unsupported ATTLIST attribute type `{attribute_type}`"
         ))),
@@ -2497,7 +2544,7 @@ mod parser_boundary_tests {
     use std::fmt::Write as _;
 
     use super::{
-        Document, EntityExpansionMeter, Result, doctype_span, expand_document_entities,
+        Document, EntityExpansionMeter, NodeKind, Result, doctype_span, expand_document_entities,
         expand_entity_references, expand_parameter_entity_references, internal_general_entities,
         normalize_predefined_entity_declaration,
     };
@@ -2621,6 +2668,46 @@ mod parser_boundary_tests {
                 .to_string()
                 .contains("entity reference expansion limit")
         );
+    }
+
+    #[test]
+    fn iterative_parser_registers_dtd_declared_id_attributes() {
+        // XML 1.0 section 3.3.1 assigns ID semantics to attributes declared with type ID;
+        // XPath id() must therefore resolve them without caller-supplied metadata.
+        // https://www.w3.org/TR/xml/#sec-attribute-types
+        let document = Document::parse_iterative(
+            r#"<!DOCTYPE root [<!ATTLIST item key ID #REQUIRED>]><root><item key="target"/></root>"#,
+            None,
+        )
+        .expect("DTD-declared ID parses");
+        let owner = document
+            .nodes()
+            .find_map(|(id, node)| match &node.kind {
+                NodeKind::Element { name, .. } if name.local == "item" => Some(id),
+                _ => None,
+            })
+            .expect("ID owner exists");
+
+        assert!(
+            document
+                .ids()
+                .any(|(value, root, registered_owner)| value == "target"
+                    && root == document.root()
+                    && registered_owner == owner)
+        );
+    }
+
+    #[test]
+    fn iterative_parser_rejects_duplicate_dtd_declared_ids() {
+        // XML 1.0 section 3.3.1 requires ID values to be unique within the document.
+        // https://www.w3.org/TR/xml/#id
+        let error = Document::parse_iterative(
+            r#"<!DOCTYPE root [<!ATTLIST item key ID #REQUIRED>]><root><item key="same"/><item key="same"/></root>"#,
+            None,
+        )
+        .expect_err("duplicate DTD-declared IDs are rejected");
+
+        assert!(error.to_string().contains("duplicate XML ID"));
     }
 
     #[test]

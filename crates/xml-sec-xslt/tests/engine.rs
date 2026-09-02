@@ -6613,6 +6613,36 @@ fn automatic_xml_id_registration_normalizes_the_attribute_value() {
 }
 
 #[test]
+fn dtd_declared_ids_are_available_to_xpath_id() {
+    // XML 1.0 section 3.3.1 gives declared ID attributes document-wide identity semantics;
+    // XPath 1.0 section 4.1 requires id() to use that typed identity information.
+    // https://www.w3.org/TR/xml/#sec-attribute-types
+    // https://www.w3.org/TR/1999/REC-xpath-19991116/#function-id
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="id('target')/@name"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse(
+        r#"<!DOCTYPE root [<!ATTLIST item key ID #REQUIRED>]><root><item key="target" name="found"/></root>"#,
+        None,
+    )
+    .expect("DTD-declared ID source parses");
+
+    let result = stylesheet
+        .execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("XPath id() resolves the DTD-declared ID");
+    assert_eq!(result.serialized.bytes, b"found");
+}
+
+#[test]
 fn automatic_xml_id_registration_rejects_non_ncname_values() {
     // xml:id 1.0 section 4 requires the normalized value to be an NCName before registration.
     // https://www.w3.org/TR/xml-id/#processing
