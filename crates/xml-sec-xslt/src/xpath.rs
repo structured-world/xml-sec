@@ -2173,26 +2173,6 @@ impl Evaluator {
             .collect()
     }
 
-    pub(crate) fn namespaces(&self, node: &SourceNode) -> Vec<SourceNode> {
-        let SourceNode::Node(owner) = node else {
-            return Vec::new();
-        };
-        let namespaces = self.source.node(*owner).and_then(|node| match &node.kind {
-            NodeKind::Element { namespaces, .. } => Some(namespaces),
-            _ => None,
-        });
-        namespaces
-            .into_iter()
-            .flatten()
-            .enumerate()
-            .filter(|(_, namespace)| xpath_namespace_is_visible(namespace))
-            .map(|(index, _)| SourceNode::Namespace {
-                owner: *owner,
-                index,
-            })
-            .collect()
-    }
-
     pub(crate) fn preceding_nonempty_comment(&self, node: &SourceNode) -> Vec<SourceNode> {
         let SourceNode::Node(id) = node else {
             return Vec::new();
@@ -5889,8 +5869,9 @@ fn render_decimal(
     }
     let scaled = value.abs() * multiplier;
     let factor = 10_f64.powi(i32::try_from(maximum_fraction).unwrap_or(i32::MAX));
-    let rounded = if factor.is_finite() {
-        (scaled * factor + 0.5).floor() / factor
+    let shifted = scaled * factor;
+    let rounded = if factor.is_finite() && shifted.is_finite() {
+        (shifted + 0.5).floor() / factor
     } else {
         // XSLT 1.0 section 12.3 delegates picture precision to DecimalFormat. Once the decimal
         // scale exceeds finite f64 powers, fixed-precision rendering performs the remaining

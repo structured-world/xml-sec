@@ -414,8 +414,17 @@ impl<R: Resolver> Compiler<R> {
             }
             let body = compile_sequence(children, context)?;
             let order = state.next_order();
+            let name = required_qname_attr(node, "name")?;
+            // EXSLT func:function requires the expanded name to have a non-null namespace;
+            // otherwise it could replace an XPath core function binding.
+            // https://exslt.github.io/func/elements/function/index.html
+            if name.namespace.is_none() {
+                return Err(Error::Static(
+                    "EXSLT func:function name requires a namespace prefix".into(),
+                ));
+            }
             state.functions.push(ExsltFunction {
-                name: required_qname_attr(node, "name")?,
+                name,
                 params,
                 body,
                 precedence,

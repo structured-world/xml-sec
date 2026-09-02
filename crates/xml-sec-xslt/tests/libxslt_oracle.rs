@@ -1273,14 +1273,6 @@ fn assert_strict_xslt_output_deviation(case: &Case, actual: &[u8], expected: &[u
             assert!(!actual.contains("http-equiv=\"Content-Type\""));
             true
         }
-        // XPath document order places attributes of preceding elements before attributes of the
-        // current element. libxslt restarts level-any attribute numbering for each owner.
-        "general/bug-197.xsl" => {
-            assert!(actual.contains("<root attr=\"1\">"));
-            assert!(actual.contains("<foo attr=\"2\">"));
-            assert!(actual.contains("<bar attr=\"3\"/>"));
-            true
-        }
         // XPath 1.0 section 4.2 requires enough decimal digits to distinguish the IEEE-754 value.
         // libxslt rounds these arithmetic results to a shorter, non-distinguishing representation.
         "general/bug-5-.xsl" => {

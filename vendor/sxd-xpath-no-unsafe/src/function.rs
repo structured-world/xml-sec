@@ -2,9 +2,6 @@
 
 use snafu::Snafu;
 use std::borrow::ToOwned;
-use std::collections::HashMap;
-use std::collections::hash_map::Entry;
-use std::iter;
 use std::ops::Index;
 use sxd_document_no_unsafe::XmlChar;
 
@@ -527,14 +524,9 @@ impl Function for Translate {
         args.exactly(3)?;
 
         let source_bytes = args.0[0].string_len();
-        let map_capacity = args.0[1]
-            .string_len()
-            .checked_next_power_of_two()
-            .unwrap_or(usize::MAX);
-        let map_bytes = map_capacity.saturating_mul(
-            std::mem::size_of::<(char, Option<char>)>()
-                .saturating_add(std::mem::size_of::<usize>()),
-        );
+        let map_capacity = args.0[1].string_len();
+        let map_bytes =
+            map_capacity.saturating_mul(std::mem::size_of::<(char, usize, Option<char>)>());
         let result_bytes = source_bytes.saturating_mul(char::MAX.len_utf8());
         context.reserve_string_allocation(map_bytes.saturating_add(result_bytes))?;
 
@@ -542,19 +534,23 @@ impl Function for Translate {
         let from = args.pop_string(context)?;
         let s = args.pop_string(context)?;
 
-        let mut replacements = HashMap::with_capacity(from.chars().count());
-        let pairs = from
-            .chars()
-            .zip(to.chars().map(Some).chain(iter::repeat(None)));
-        for (from, to) in pairs {
-            if let Entry::Vacant(entry) = replacements.entry(from) {
-                entry.insert(to);
-            }
-        }
+        let mut replacements = Vec::with_capacity(from.chars().count());
+        let mut to = to.chars();
+        replacements.extend(
+            from.chars()
+                .enumerate()
+                .map(|(index, from)| (from, index, to.next())),
+        );
+        replacements.sort_unstable_by_key(|&(from, index, _)| (from, index));
+        replacements.dedup_by_key(|replacement| replacement.0);
 
         let s = s
             .chars()
-            .filter_map(|c| replacements.get(&c).cloned().unwrap_or(Some(c)))
+            .filter_map(|c| {
+                replacements
+                    .binary_search_by_key(&c, |replacement| replacement.0)
+                    .map_or(Some(c), |index| replacements[index].2)
+            })
             .collect();
 
         Ok(Value::String(s))
@@ -1121,6 +1117,26 @@ mod test {
             .evaluate(document.root(), Translate, args!["abcd", "a", ""])
             .expect_err("translate workspace must exceed the three-byte allocation budget");
         assert!(error.to_string().contains("string allocation budget"));
+    }
+
+    #[test]
+    fn translate_charges_one_character_replacement_storage() {
+        // The sorted one-entry replacement table and worst-case result require exactly twenty
+        // logical bytes; the operation must reject one byte below that boundary.
+        let package = Package::new();
+        let document = package.as_document();
+        let mut setup = Setup::new();
+        setup.context.set_string_allocation_limit(19);
+        let error = setup
+            .evaluate(document.root(), Translate, args!["a", "a", "b"])
+            .expect_err("replacement table and result must cross the allocation gate");
+        assert!(error.to_string().contains("string allocation budget"));
+
+        setup.context.set_string_allocation_limit(20);
+        assert_eq!(
+            setup.evaluate(document.root(), Translate, args!["a", "a", "b"]),
+            Ok(Value::String("b".into()))
+        );
     }
 
     #[test]

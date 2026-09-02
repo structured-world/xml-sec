@@ -356,6 +356,21 @@ enum TemplateTask {
         params: Arc<EvaluatedParameters>,
         frame: ApplyFrame,
     },
+    ApplyBatch {
+        nodes: Vec<SourceNode>,
+        next: usize,
+        mode: Option<ExpandedName>,
+        params: Arc<EvaluatedParameters>,
+        depth: usize,
+        reserved_owned_bytes: usize,
+    },
+    ForEachBatch {
+        nodes: Vec<SourceNode>,
+        next: usize,
+        body: Arc<[Instruction]>,
+        depth: usize,
+        reserved_owned_bytes: usize,
+    },
     Sequence {
         instructions: Arc<[Instruction]>,
         index: usize,
@@ -768,6 +783,63 @@ impl<'a> Execution<'a> {
                     params,
                     frame,
                 } => self.push_apply_one_tasks(&mut tasks, node, mode, params, frame)?,
+                TemplateTask::ApplyBatch {
+                    nodes,
+                    next,
+                    mode,
+                    params,
+                    depth,
+                    reserved_owned_bytes,
+                } => {
+                    let Some(selected) = nodes.get(next).cloned() else {
+                        self.release_parameters_if_last(&params);
+                        self.meter.release_owned_bytes(reserved_owned_bytes);
+                        continue;
+                    };
+                    let total = nodes.len();
+                    let selected_mode = mode.clone();
+                    tasks.push(TemplateTask::ApplyBatch {
+                        nodes,
+                        next: next + 1,
+                        mode,
+                        params: Arc::clone(&params),
+                        depth,
+                        reserved_owned_bytes,
+                    });
+                    tasks.push(TemplateTask::ApplyOne {
+                        node: selected,
+                        mode: selected_mode,
+                        params,
+                        frame: ApplyFrame::new(next + 1, total, depth),
+                    });
+                }
+                TemplateTask::ForEachBatch {
+                    nodes,
+                    next,
+                    body,
+                    depth,
+                    reserved_owned_bytes,
+                } => {
+                    let Some(selected) = nodes.get(next).cloned() else {
+                        self.meter.release_owned_bytes(reserved_owned_bytes);
+                        continue;
+                    };
+                    let total = nodes.len();
+                    tasks.push(TemplateTask::ForEachBatch {
+                        nodes,
+                        next: next + 1,
+                        body: Arc::clone(&body),
+                        depth,
+                        reserved_owned_bytes,
+                    });
+                    push_scoped_sequence(
+                        &mut tasks,
+                        body,
+                        selected,
+                        ApplyFrame::new(next + 1, total, depth),
+                        None,
+                    );
+                }
                 TemplateTask::RestoreScopes(caller_scopes) => {
                     self.pop_scope();
                     self.scopes.extend(caller_scopes);
@@ -852,16 +924,7 @@ impl<'a> Execution<'a> {
                                 depth,
                                 precedence,
                             )?);
-                            let total = nodes.len();
-                            for (index, selected) in nodes.into_iter().enumerate().rev() {
-                                tasks.push(TemplateTask::ApplyOne {
-                                    node: selected,
-                                    mode: mode.clone(),
-                                    params: Arc::clone(&supplied),
-                                    frame: ApplyFrame::new(index + 1, total, depth + 1),
-                                });
-                            }
-                            self.release_parameters_if_last(&supplied);
+                            self.push_apply_batch(&mut tasks, nodes, mode, supplied, depth + 1)?;
                         }
                         Instruction::ApplyImports => {
                             let current_rule_precedence = precedence.ok_or_else(|| {
@@ -1016,20 +1079,7 @@ impl<'a> Execution<'a> {
                         } => {
                             let mut nodes = self.select_nodes(&select, &node, position, size)?;
                             self.sort_nodes(&mut nodes, &sorts, &node, position, size)?;
-                            let total = nodes.len();
-                            for (index, selected) in nodes.into_iter().enumerate().rev() {
-                                tasks.push(TemplateTask::PopScope);
-                                tasks.push(TemplateTask::Sequence {
-                                    instructions: Arc::from(body.clone()),
-                                    index: 0,
-                                    node: selected,
-                                    position: index + 1,
-                                    size: total,
-                                    depth: depth + 1,
-                                    precedence: None,
-                                });
-                                tasks.push(TemplateTask::PushScope);
-                            }
+                            self.push_for_each_batch(&mut tasks, nodes, body.into(), depth + 1)?;
                         }
                         Instruction::If { test, body } => {
                             if self.evaluate(&test, &node, position, size)?.boolean() {
@@ -1152,17 +1202,8 @@ impl<'a> Execution<'a> {
             {
                 Some(NodeKind::Root | NodeKind::Element { .. }) => {
                     let children = self.evaluator.children(&node);
-                    let total = children.len();
                     let built_in_params = Arc::new(EvaluatedParameters::default());
-                    for (index, child) in children.into_iter().enumerate().rev() {
-                        tasks.push(TemplateTask::ApplyOne {
-                            node: child,
-                            mode: mode.clone(),
-                            params: Arc::clone(&built_in_params),
-                            frame: ApplyFrame::new(index + 1, total, frame.depth + 1),
-                        });
-                    }
-                    Ok(())
+                    self.push_apply_batch(tasks, children, mode, built_in_params, frame.depth + 1)
                 }
                 Some(NodeKind::Text { value, .. }) => self.append_text(&value, false),
                 _ => Ok(()),
@@ -1173,6 +1214,65 @@ impl<'a> Execution<'a> {
             }
             SourceNode::Namespace { .. } => Ok(()),
         }
+    }
+
+    fn push_apply_batch(
+        &mut self,
+        tasks: &mut Vec<TemplateTask>,
+        nodes: Vec<SourceNode>,
+        mode: Option<ExpandedName>,
+        params: Arc<EvaluatedParameters>,
+        depth: usize,
+    ) -> Result<()> {
+        if nodes.is_empty() {
+            self.release_parameters_if_last(&params);
+            return Ok(());
+        }
+        let node_bytes = nodes
+            .capacity()
+            .saturating_mul(std::mem::size_of::<SourceNode>());
+        // The batch retains one mode while one serial application can hold a second clone.
+        let mode_bytes = mode
+            .as_ref()
+            .map_or(0, expanded_name_owned_bytes)
+            .saturating_mul(2);
+        let reserved_owned_bytes = node_bytes.saturating_add(mode_bytes);
+        self.meter
+            .charge(BudgetKind::OwnedBytes, reserved_owned_bytes)?;
+        tasks.push(TemplateTask::ApplyBatch {
+            nodes,
+            next: 0,
+            mode,
+            params,
+            depth,
+            reserved_owned_bytes,
+        });
+        Ok(())
+    }
+
+    fn push_for_each_batch(
+        &mut self,
+        tasks: &mut Vec<TemplateTask>,
+        nodes: Vec<SourceNode>,
+        body: Arc<[Instruction]>,
+        depth: usize,
+    ) -> Result<()> {
+        if nodes.is_empty() {
+            return Ok(());
+        }
+        let reserved_owned_bytes = nodes
+            .capacity()
+            .saturating_mul(std::mem::size_of::<SourceNode>());
+        self.meter
+            .charge(BudgetKind::OwnedBytes, reserved_owned_bytes)?;
+        tasks.push(TemplateTask::ForEachBatch {
+            nodes,
+            next: 0,
+            body,
+            depth,
+            reserved_owned_bytes,
+        });
+        Ok(())
     }
 
     fn push_template_tasks(
@@ -3367,19 +3467,30 @@ impl<'a> Execution<'a> {
                     .source
                     .subtree_in_document_order(logical_root);
                 for id in ids {
-                    let element = SourceNode::Node(id);
-                    let candidates = std::iter::once(element.clone())
-                        .chain(self.evaluator.attributes(&element))
-                        .chain(self.evaluator.namespaces(&element));
-                    for candidate in candidates {
-                        if from(self, &candidate)? {
+                    let candidate = SourceNode::Node(id);
+                    if from(self, &candidate)? {
+                        count = 0;
+                    } else if matches(self, &candidate)? {
+                        count += 1;
+                    }
+                    if &candidate == node {
+                        return Ok((count > 0).then_some(count as f64).into_iter().collect());
+                    }
+                    let is_current_owner = matches!(
+                        node,
+                        SourceNode::Attribute { owner, .. } | SourceNode::Namespace { owner, .. }
+                            if *owner == id
+                    );
+                    if is_current_owner {
+                        // XSLT 1.0 section 7.7 excludes preceding attribute and namespace nodes;
+                        // only the current non-ordinary node joins preceding/ancestor-or-self.
+                        // https://www.w3.org/TR/1999/REC-xslt-19991116#number
+                        if from(self, node)? {
                             count = 0;
-                        } else if matches(self, &candidate)? {
+                        } else if matches(self, node)? {
                             count += 1;
                         }
-                        if &candidate == node {
-                            return Ok((count > 0).then_some(count as f64).into_iter().collect());
-                        }
+                        return Ok((count > 0).then_some(count as f64).into_iter().collect());
                     }
                 }
                 Err(Error::Dynamic(

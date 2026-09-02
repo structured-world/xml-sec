@@ -1465,6 +1465,21 @@ fn exslt_function_results_are_enforced_on_executed_paths() {
 }
 
 #[test]
+fn exslt_function_names_require_a_namespace() {
+    // EXSLT func:function requires a non-null namespace so a stylesheet function cannot replace
+    // an XPath core function: https://exslt.github.io/func/elements/function/index.html
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" extension-element-prefixes="func"><func:function name="concat"><func:result select="'shadowed'"/></func:function></xsl:stylesheet>"#;
+    assert!(matches!(
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 32, 64 * 1024),
+        )
+        .compile(stylesheet, None),
+        Err(Error::Static(message)) if message.contains("namespace")
+    ));
+}
+
+#[test]
 fn built_in_template_rule_ignores_namespace_nodes() {
     // XSLT's built-in text rule copies attributes and text only; selected namespace nodes are
     // silent unless an explicit template handles them.
@@ -6368,12 +6383,70 @@ fn fractional_numeric_predicates_do_not_select_truncated_positions() {
 }
 
 #[test]
-fn level_any_numbering_counts_attributes_on_preceding_elements() {
-    // Attribute document order includes attributes of elements preceding the current owner.
+fn level_any_numbering_excludes_attributes_on_preceding_elements() {
+    // XSLT 1.0 section 7.7 excludes attribute and namespace nodes before the current node from
+    // level="any": https://www.w3.org/TR/1999/REC-xslt-19991116#number
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:apply-templates select="root/*/@id"/></xsl:template><xsl:template match="@id"><xsl:number level="any" count="@id"/><xsl:text>|</xsl:text></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(stylesheet, "<root><a id=\"x\"/><b id=\"y\"/></root>"),
-        "1|2|"
+        "1|1|"
+    );
+}
+
+#[test]
+fn apply_templates_retains_selected_nodes_inside_owned_memory_budget() {
+    // Both templates run over the same source tree; selecting every child must additionally retain
+    // the pending batch inside the operation-owned memory ceiling.
+    let mode = format!("m:{}", "x".repeat(1024));
+    let stylesheet = compile(&format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:m="urn:mode"><xsl:template name="one"><xsl:apply-templates select="/*/*[1]" mode="{mode}"/></xsl:template><xsl:template name="many"><xsl:apply-templates select="/*/*" mode="{mode}"/></xsl:template><xsl:template name="for-one"><xsl:for-each select="/*/*[1]"/></xsl:template><xsl:template name="for-many"><xsl:for-each select="/*/*"/></xsl:template><xsl:template match="item" mode="{mode}"/></xsl:stylesheet>"#,
+    ));
+    let source_xml = format!("<root>{}</root>", "<item/>".repeat(256));
+    let source = Document::parse(&source_xml, None).expect("source parses");
+    let minimum = |initial_template: &str| {
+        let succeeds = |owned_bytes| {
+            let mut budget = execution_budget(source_xml.len());
+            budget.owned_bytes = owned_bytes;
+            stylesheet
+                .execute(
+                    &source,
+                    &Parameters::new(),
+                    Arc::new(NoResolver),
+                    ExecutionOptions {
+                        budget,
+                        initial_mode: None,
+                        initial_template: Some(ExpandedName::new(None::<String>, initial_template)),
+                    },
+                )
+                .is_ok()
+        };
+        let mut rejected = 0;
+        let mut accepted = 1;
+        while !succeeds(accepted) {
+            rejected = accepted;
+            accepted *= 2;
+        }
+        while rejected + 1 < accepted {
+            let candidate = rejected + (accepted - rejected) / 2;
+            if succeeds(candidate) {
+                accepted = candidate;
+            } else {
+                rejected = candidate;
+            }
+        }
+        accepted
+    };
+    let one = minimum("one");
+    let many = minimum("many");
+    assert!(
+        many >= one + 128 * std::mem::size_of::<NodeReference>(),
+        "one={one}, many={many}"
+    );
+    let for_one = minimum("for-one");
+    let for_many = minimum("for-many");
+    assert!(
+        for_many >= for_one + 128 * std::mem::size_of::<NodeReference>(),
+        "for_one={for_one}, for_many={for_many}"
     );
 }
 
@@ -6699,6 +6772,35 @@ fn format_number_handles_fraction_precision_beyond_f64_decimal_exponents() {
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="format-number(1, '{picture}')"/></xsl:template></xsl:stylesheet>"#,
     );
     assert_eq!(execute(&stylesheet, "<source/>"), "1");
+}
+
+#[test]
+fn format_number_keeps_large_finite_parameters_finite() {
+    // XSLT 1.0 section 12.3 delegates formatting to DecimalFormat; intermediate rounding must not
+    // turn a finite input into infinity: https://www.w3.org/TR/1999/REC-xslt-19991116#format-number
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:param name="value"/><xsl:template match="/"><xsl:value-of select="format-number($value, '0.0')"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let mut parameters = Parameters::new();
+    parameters.insert(
+        ExpandedName::new(None::<String>, "value"),
+        Value::Number(1e308),
+    );
+    let output = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &parameters,
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("finite value formats");
+    let output = String::from_utf8(output.serialized.bytes).expect("text output is UTF-8");
+    assert!(!output.to_ascii_lowercase().contains("inf"), "{output}");
+    assert!(output.ends_with(".0"), "{output}");
 }
 
 #[test]
