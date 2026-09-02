@@ -1047,7 +1047,15 @@ impl Evaluator {
         // new root but cannot change the nodes selected in roots that were already projected.
         // Retaining those entries avoids re-running every complex template pattern whenever
         // document() lazily imports another resource.
-        Ok(SourceNode::Node(logical_root))
+        let root = SourceNode::Node(logical_root);
+        let logical_document = self.source.logical_roots().len() - 1;
+        let empty_uri = DocumentRequest::relative_to(
+            String::new(),
+            source_base_uri(&self.source, &root),
+            Some(logical_document),
+        );
+        self.cache_document(empty_uri, vec![root.clone()], meter)?;
+        Ok(root)
     }
 
     fn cache_document(

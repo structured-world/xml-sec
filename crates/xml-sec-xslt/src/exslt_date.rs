@@ -250,9 +250,20 @@ fn current_time_for_operation(
             "zero-argument EXSLT date functions are disabled by the execution extension policy",
         );
     }
-    clock.now_local().map_err(|error| function::Error::Other {
+    let current = clock.now_local().map_err(|error| function::Error::Other {
         what: error.to_string(),
-    })
+    })?;
+    let offset_seconds = current.offset().whole_seconds();
+    // XML Schema 1.0 Part 2 section 3.2.7.3 permits minute-aligned offsets only through +/-14:00.
+    // https://www.w3.org/TR/2004/REC-xmlschema-2-20041028/#dateTime-timezones
+    if offset_seconds % 60 != 0 || offset_seconds.unsigned_abs() > 14 * 60 * 60 {
+        let message = format!(
+            "clock timezone offset {} seconds is not representable by XML Schema dateTime",
+            offset_seconds
+        );
+        return argument_error(&message);
+    }
+    Ok(current)
 }
 
 fn render_current_datetime(current: time::OffsetDateTime) -> String {

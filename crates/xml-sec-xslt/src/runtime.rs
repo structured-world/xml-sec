@@ -986,8 +986,10 @@ impl<'a> Execution<'a> {
                             for attribute in &attributes {
                                 let value =
                                     self.evaluate_avt(&attribute.value, &node, position, size)?;
-                                let (name, prefix) =
-                                    self.alias_name(&attribute.name, attribute.prefix.as_deref());
+                                let (name, prefix) = self.alias_attribute_name(
+                                    &attribute.name,
+                                    attribute.prefix.as_deref(),
+                                );
                                 self.add_attribute(Attribute {
                                     name,
                                     prefix,
@@ -1419,7 +1421,7 @@ impl<'a> Execution<'a> {
                 for attribute in attributes {
                     let value = self.evaluate_avt(&attribute.value, node, position, size)?;
                     let (name, prefix) =
-                        self.alias_name(&attribute.name, attribute.prefix.as_deref());
+                        self.alias_attribute_name(&attribute.name, attribute.prefix.as_deref());
                     self.add_attribute(Attribute {
                         name,
                         prefix,
@@ -3379,6 +3381,20 @@ impl<'a> Execution<'a> {
             ExpandedName::new(alias.result_namespace.clone(), name.local.clone()),
             alias.output_prefix.clone(),
         )
+    }
+
+    fn alias_attribute_name(
+        &self,
+        name: &ExpandedName,
+        prefix: Option<&str>,
+    ) -> (ExpandedName, Option<String>) {
+        // Namespaces in XML 1.0 section 6.2 leaves unprefixed attributes in no namespace, so a
+        // default-namespace alias applies to literal elements but not their unprefixed attributes.
+        // https://www.w3.org/TR/REC-xml-names/#defaulting
+        if prefix.is_none() {
+            return (ExpandedName::new(None::<String>, name.local.clone()), None);
+        }
+        self.alias_name(name, prefix)
     }
 
     fn alias_literal_name_and_namespaces(

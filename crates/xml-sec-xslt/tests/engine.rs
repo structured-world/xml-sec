@@ -4,10 +4,10 @@ use std::{collections::HashMap, sync::Mutex};
 
 use pretty_assertions::assert_eq;
 use xml_sec_xslt::{
-    BudgetKind, CompileBudget, Compiler, Document, Error, ExecutionBudget, ExecutionEnvironment,
-    ExecutionOptions, ExpandedName, ExtensionPolicy, FixedClock, NoResolver, NodeKind,
-    NodeReference, Parameters, ResolvePurpose, ResolvedResource, Resolver, ResourceIdentity,
-    SourceProcessing, Value,
+    BudgetKind, Clock, CompileBudget, Compiler, Document, Error, ExecutionBudget,
+    ExecutionEnvironment, ExecutionOptions, ExpandedName, ExtensionPolicy, FixedClock, NoResolver,
+    NodeKind, NodeReference, Parameters, ResolvePurpose, ResolvedResource, Resolver,
+    ResourceIdentity, SourceProcessing, Value,
 };
 
 fn compile(source: &str) -> xml_sec_xslt::Stylesheet {
@@ -779,6 +779,44 @@ fn document_function_resolves_dynamic_uris_without_cross_document_leaks() {
 }
 
 #[test]
+fn empty_document_uri_from_an_external_tree_returns_that_tree() {
+    // XSLT 1.0 section 12.1 makes a zero-length URI refer to the document that supplies its base;
+    // a nested document() call must not send that URI back through the external resolver.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#document
+    let resolver = Arc::new(MemoryResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            "external.xml".into(),
+            "<doc origin=\"external\"><uri/></doc>".into(),
+        );
+    let stylesheet = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="document(document('external.xml')/doc/uri)/doc/@origin"/></xsl:template></xsl:stylesheet>"#,
+        Some("memory:main.xsl"),
+    )
+    .expect("stylesheet compiles");
+    let output = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("external document owns its empty-URI alias");
+    assert_eq!(output.serialized.bytes, b"external");
+}
+
+#[test]
 fn external_document_paths_and_axes_use_the_dynamic_document_root() {
     // XPath 1.0 sections 2.1 and 2.2 bind absolute paths and document-order axes to the
     // document containing the current predicate or axis context node.
@@ -1393,6 +1431,46 @@ fn execution_environment_controls_exslt_current_time() {
         error,
         Error::Dynamic(message) if message.contains("disabled") && message.contains("extension policy")
     ));
+}
+
+#[test]
+fn exslt_current_time_rejects_non_xsd_timezone_offsets() {
+    // XML Schema 1.0 Part 2 section 3.2.7.3 permits only minute-aligned offsets through +/-14:00.
+    // https://www.w3.org/TR/2004/REC-xmlschema-2-20041028/#dateTime-timezones
+    #[derive(Debug)]
+    struct InvalidOffsetClock(time::UtcOffset);
+
+    impl Clock for InvalidOffsetClock {
+        fn now_local(&self) -> xml_sec_xslt::Result<time::OffsetDateTime> {
+            Ok(time::OffsetDateTime::UNIX_EPOCH.to_offset(self.0))
+        }
+    }
+
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:date="http://exslt.org/dates-and-times"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="date:date-time()"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse("<source/>", None).expect("source parses");
+    for offset in [
+        time::UtcOffset::from_hms(15, 0, 0).expect("test offset is representable"),
+        time::UtcOffset::from_hms(1, 2, 3).expect("test offset is representable"),
+    ] {
+        let error = stylesheet
+            .execute_with_environment(
+                &source,
+                &Parameters::new(),
+                ExecutionEnvironment::new(Arc::new(NoResolver))
+                    .with_clock(Arc::new(InvalidOffsetClock(offset))),
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            )
+            .expect_err("non-XSD timezone offset must be rejected");
+        assert!(
+            matches!(error, Error::Dynamic(message) if message.contains("timezone offset") && message.contains("XML Schema"))
+        );
+    }
 }
 
 #[test]
@@ -6696,6 +6774,18 @@ fn namespace_alias_uses_the_declared_result_prefix() {
     let output = execute(stylesheet, "<source/>");
     assert!(output.starts_with("<new:result"), "{output}");
     assert!(output.contains("xmlns:new=\"urn:new\""), "{output}");
+}
+
+#[test]
+fn default_namespace_alias_does_not_qualify_unprefixed_attributes() {
+    // Namespaces in XML 1.0 section 6.2 excludes unprefixed attributes from the default namespace,
+    // so aliasing the default element namespace cannot qualify a literal unprefixed attribute.
+    // https://www.w3.org/TR/REC-xml-names/#defaulting
+    let stylesheet = r##"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:r="urn:result"><xsl:namespace-alias stylesheet-prefix="#default" result-prefix="r"/><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><out attribute="value"/></xsl:template></xsl:stylesheet>"##;
+    assert_eq!(
+        execute(stylesheet, "<source/>"),
+        "<r:out xmlns:r=\"urn:result\" attribute=\"value\"/>\n"
+    );
 }
 
 #[test]
