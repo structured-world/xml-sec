@@ -1472,6 +1472,21 @@ fn compound_substring_length_uses_the_general_xpath_evaluator() {
 }
 
 #[test]
+fn compound_substring_variables_use_the_general_xpath_evaluator() {
+    // Scalar fast paths may capture only a lexical variable QName. XPath operators in either
+    // captured operand must fall through so the general evaluator preserves XPath 1.0 semantics.
+    // https://www.w3.org/TR/1999/REC-xpath-19991116/#section-String-Functions
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:param name="x" select="2"/><xsl:param name="y" select="3"/><xsl:param name="left" select="/root/left"/><xsl:param name="right" select="/root/right"/><xsl:param name="prefix" select="/root/prefix"/><xsl:param name="other" select="/root/other"/><xsl:template match="/"><xsl:value-of select="substring-before($x + $y, '5')"/><xsl:text>|</xsl:text><xsl:value-of select="substring($left | $right, string-length($prefix)+1)"/><xsl:text>|</xsl:text><xsl:value-of select="substring($left, string-length($prefix | $other)+1)"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(
+            stylesheet,
+            "<root><left>abcd</left><right>ignored</right><prefix>x</prefix><other>yy</other></root>"
+        ),
+        "|bcd|bcd"
+    );
+}
+
+#[test]
 fn exslt_durations_allow_fractional_syntax_only_for_seconds() {
     // XML Schema 1.0 erratum E2-23 requires digits after a decimal point, but libxslt accepts a
     // trailing point in seconds. Preserve that pinned-oracle exception without accepting decimal

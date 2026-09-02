@@ -4554,21 +4554,32 @@ impl function::Function for ExsltCryptoFunction {
 
         match self {
             Self::Md5 | Self::Sha1 => {
-                if args.len() != 1 {
+                let Ok([value]) = <[SxdValue<'d>; 1]>::try_from(args) else {
                     return Err(function::Error::Other {
                         what: "EXSLT hash function requires one argument".into(),
                     });
-                }
-                let value = args[0].string();
-                if value.is_empty() {
+                };
+                if value.string_len() == 0 {
                     return Ok(SxdValue::String(String::new()));
                 }
-                let bytes = match self {
-                    Self::Md5 => md5::Md5::digest(value.as_bytes()).to_vec(),
-                    Self::Sha1 => sha1::Sha1::digest(value.as_bytes()).to_vec(),
+                let output_len = match self {
+                    Self::Md5 => 32,
+                    Self::Sha1 => 40,
                     _ => unreachable!(),
                 };
-                Ok(SxdValue::String(hex_encode(&bytes)))
+                let workspace_bytes = sxd_string_materialization_bytes(&value)
+                    .checked_add(output_len)
+                    .ok_or_else(|| function::Error::Other {
+                        what: "EXSLT hash allocation length overflow".into(),
+                    })?;
+                context.reserve_string_allocation(workspace_bytes)?;
+                let value = value.into_string();
+                let output = match self {
+                    Self::Md5 => hex_encode(&md5::Md5::digest(value.as_bytes())),
+                    Self::Sha1 => hex_encode(&sha1::Sha1::digest(value.as_bytes())),
+                    _ => unreachable!(),
+                };
+                Ok(SxdValue::String(output))
             }
             Self::Rc4Encrypt | Self::Rc4Decrypt => {
                 let Ok([key, input]) = <[SxdValue<'d>; 2]>::try_from(args) else {
@@ -6382,6 +6393,44 @@ mod tests {
                     vec![SxdValue::String("key".into()), SxdValue::String(input)],
                 )
                 .expect_err("workspace exceeds the evaluator budget");
+            assert!(matches!(error, function::Error::Other { what } if what.contains("budget")));
+        }
+    }
+
+    #[test]
+    fn hash_extensions_reserve_materialization_and_output_before_allocating() {
+        // Node string-value coercion and fixed-size hexadecimal output must both cross the
+        // evaluator allocation gate before the extension materializes either buffer.
+        let package = Package::new();
+        let document = package.as_document();
+        let root = document.create_element("root");
+        root.append_child(document.create_text(&"x".repeat(2048)));
+        document.root().append_child(root);
+        let mut nodes = nodeset::Nodeset::new();
+        nodes.add(root);
+
+        for function in [ExsltCryptoFunction::Md5, ExsltCryptoFunction::Sha1] {
+            let mut context = Context::new();
+            context.set_string_allocation_limit(1024);
+            let evaluation =
+                sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+            let error = function
+                .evaluate(&evaluation, vec![SxdValue::Nodeset(nodes.clone())])
+                .expect_err("hash workspace exceeds the evaluator budget");
+            assert!(matches!(error, function::Error::Other { what } if what.contains("budget")));
+        }
+
+        for (function, output_len) in [
+            (ExsltCryptoFunction::Md5, 32),
+            (ExsltCryptoFunction::Sha1, 40),
+        ] {
+            let mut context = Context::new();
+            context.set_string_allocation_limit(output_len - 1);
+            let evaluation =
+                sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+            let error = function
+                .evaluate(&evaluation, vec![SxdValue::String("x".into())])
+                .expect_err("hexadecimal output exceeds the evaluator budget");
             assert!(matches!(error, function::Error::Other { what } if what.contains("budget")));
         }
     }

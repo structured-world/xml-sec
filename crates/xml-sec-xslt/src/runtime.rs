@@ -2272,10 +2272,10 @@ impl<'a> Execution<'a> {
         if let Some((variable, increment)) = source
             .strip_prefix('$')
             .and_then(|value| value.split_once('+'))
-            && is_lexical_variable_name(variable.trim())
+            && let Some(variable) = lexical_variable_name(variable)
             && let Some(increment) = parse_xpath_number(increment)
         {
-            let value = self.variable_value(variable.trim(), &expression.namespaces)?;
+            let value = self.variable_value(variable, &expression.namespaces)?;
             let number = match value {
                 Value::Boolean(value) => f64::from(u8::from(*value)),
                 Value::Number(value) => *value,
@@ -2297,12 +2297,11 @@ impl<'a> Execution<'a> {
                 .trim()
                 .strip_prefix('$')
                 .and_then(|value| value.split_once('*'))
-            && is_lexical_variable_name(variable.trim())
+            && let Some(variable) = lexical_variable_name(variable)
             && let Some(factor) = parse_xpath_number(factor)
         {
             let length =
-                xpath_number(&self.variable_string(variable.trim(), &expression.namespaces, 0)?)
-                    * factor;
+                xpath_number(&self.variable_string(variable, &expression.namespaces, 0)?) * factor;
             let take = length.round().max(1.0) as usize - 1;
             return Ok(Some(XPathValue::String(
                 literal.chars().take(take).collect(),
@@ -2311,8 +2310,7 @@ impl<'a> Execution<'a> {
         if let Some(variable) = source
             .strip_prefix("string-length($")
             .and_then(|value| value.strip_suffix(") > 0"))
-            && let variable = variable.trim_matches(is_xml_whitespace)
-            && is_lexical_variable_name(variable)
+            && let Some(variable) = lexical_variable_name(variable)
         {
             let value = self.variable_string(variable, &expression.namespaces, 0)?;
             return Ok(Some(XPathValue::Boolean(!value.is_empty())));
@@ -2321,9 +2319,10 @@ impl<'a> Execution<'a> {
             .strip_prefix("substring-before($")
             .and_then(|value| value.strip_suffix(')'))
             && let Some((variable, delimiter)) = arguments.split_once(',')
+            && let Some(variable) = lexical_variable_name(variable)
             && let Some(delimiter) = quoted_literal(delimiter.trim())
         {
-            let value = self.variable_string(variable.trim(), &expression.namespaces, 0)?;
+            let value = self.variable_string(variable, &expression.namespaces, 0)?;
             let head = value.split_once(delimiter).map_or("", |(head, _)| head);
             let value_workspace = if matches!(&value, Cow::Owned(_)) {
                 value.len()
@@ -2340,22 +2339,20 @@ impl<'a> Execution<'a> {
             .strip_prefix("substring($")
             .and_then(|value| value.strip_suffix(')'))
             && let Some((variable, offset)) = arguments.split_once(',')
+            && let Some(variable) = lexical_variable_name(variable)
             && let Some(offset) = offset.trim().strip_prefix("string-length($")
             && let Some((length_variable, increment)) = offset.split_once(")+")
+            && let Some(length_variable) = lexical_variable_name(length_variable)
             && let Ok(increment) = increment.trim().parse::<usize>()
         {
-            let value = self.variable_string(variable.trim(), &expression.namespaces, 0)?;
+            let value = self.variable_string(variable, &expression.namespaces, 0)?;
             let value_workspace = if matches!(&value, Cow::Owned(_)) {
                 value.len()
             } else {
                 0
             };
             let length = self
-                .variable_string(
-                    length_variable.trim(),
-                    &expression.namespaces,
-                    value_workspace,
-                )?
+                .variable_string(length_variable, &expression.namespaces, value_workspace)?
                 .chars()
                 .count();
             let start = length.saturating_add(increment).saturating_sub(1);
@@ -2373,7 +2370,7 @@ impl<'a> Execution<'a> {
         if let Some(variable) = source
             .strip_prefix("boolean($")
             .and_then(|value| value.strip_suffix(')'))
-            && is_lexical_variable_name(variable)
+            && let Some(variable) = lexical_variable_name(variable)
         {
             let value = self.variable_value(variable, &expression.namespaces)?;
             return Ok(Some(XPathValue::Boolean(value.boolean())));
@@ -4225,6 +4222,11 @@ fn is_lexical_variable_name(value: &str) -> bool {
         return false;
     };
     is_ncname(first) && parts.next().is_none_or(is_ncname) && parts.next().is_none()
+}
+
+fn lexical_variable_name(value: &str) -> Option<&str> {
+    let value = value.trim_matches(is_xml_whitespace);
+    is_lexical_variable_name(value).then_some(value)
 }
 
 fn quoted_literal(value: &str) -> Option<&str> {

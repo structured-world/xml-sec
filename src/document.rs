@@ -2585,7 +2585,7 @@ fn apply_preflight_namespace_declarations(
         let was_active = if declaration.is_undeclaration {
             state.active_namespace_bindings.remove(&declaration.prefix)
         } else {
-            state
+            !state
                 .active_namespace_bindings
                 .insert(declaration.prefix.clone())
         };
@@ -3573,6 +3573,45 @@ mod tests {
 
         preflight_document_limits(&xml, settings, None)
             .expect("five shadowed prefixes remain five active bindings");
+    }
+
+    #[test]
+    fn namespace_preflight_releases_distinct_empty_sibling_bindings() {
+        // Namespace declarations are scoped to their element. Sequential empty siblings must not
+        // accumulate bindings that are no longer in scope.
+        // https://www.w3.org/TR/REC-xml-names/#scoping-defaulting
+        let maximum = crate::hard_limits::XML_NAMESPACE_BINDING_CEILING;
+        let siblings = (0..=maximum)
+            .map(|index| format!(r#"<child xmlns:p{index}="urn:{index}"/>"#))
+            .collect::<String>();
+        let xml = format!("<root>{siblings}</root>");
+        let settings = DocumentParseSettings::new(false, 2_000, xml.len());
+
+        preflight_document_limits(&xml, settings, None)
+            .expect("bindings on completed empty siblings are no longer active");
+    }
+
+    #[test]
+    fn namespace_preflight_restores_outer_binding_after_shadowing() {
+        // Leaving a nested shadowing scope restores the outer prefix binding, so a subsequent
+        // declaration is measured against the complete in-scope namespace set.
+        // https://www.w3.org/TR/REC-xml-names/#scoping-defaulting
+        let maximum = crate::hard_limits::XML_NAMESPACE_BINDING_CEILING;
+        let declarations = (0..maximum)
+            .map(|index| format!(r#" xmlns:p{index}="urn:outer:{index}""#))
+            .collect::<String>();
+        let xml = format!(
+            r#"<root{declarations}><shadow xmlns:p0="urn:inner"/><overflow xmlns:extra="urn:extra"/></root>"#
+        );
+        let settings = DocumentParseSettings::new(false, 2_000, xml.len());
+
+        assert!(matches!(
+            preflight_document_limits(&xml, settings, None),
+            Err(XmlDocumentError::Parse(ParseError::NamespaceBindingLimitReached {
+                maximum: observed_maximum,
+                actual,
+            })) if observed_maximum == maximum && actual == maximum + 1
+        ));
     }
 
     #[test]
