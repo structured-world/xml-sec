@@ -4,9 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use xml_sec_xml_input::lexical::{Event, Scanner};
 
 use crate::budget::{
-    ENTITY_EXPANSION_BYTE_CEILING, ENTITY_EXPANSION_DEPTH_CEILING, ENTITY_REFERENCE_CEILING,
+    ENTITY_EXPANSION_BYTE_CEILING, ENTITY_EXPANSION_DEPTH_CEILING, ENTITY_REFERENCE_CEILING, Meter,
 };
-use crate::{Error, Result};
+use crate::{BudgetKind, Error, Result};
 
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
@@ -682,6 +682,30 @@ impl Document {
             0
         };
         Ok(nodes_bytes.saturating_add(children_bytes))
+    }
+
+    pub(crate) fn reserve_metered_push_containers(
+        &mut self,
+        parent: NodeId,
+        meter: &mut Meter,
+    ) -> Result<()> {
+        let requested_bytes = self.push_container_reservation_bytes(parent);
+        meter.charge(BudgetKind::OwnedBytes, requested_bytes)?;
+        let actual_bytes = match self.reserve_push_containers(parent) {
+            Ok(actual_bytes) => actual_bytes,
+            Err(error) => {
+                meter.release_owned_bytes(requested_bytes);
+                return Err(Error::Dynamic(format!(
+                    "failed to reserve document tree storage: {error}"
+                )));
+            }
+        };
+        if actual_bytes < requested_bytes {
+            meter.release_owned_bytes(requested_bytes - actual_bytes);
+        } else if actual_bytes > requested_bytes {
+            meter.charge(BudgetKind::OwnedBytes, actual_bytes - requested_bytes)?;
+        }
+        Ok(())
     }
 
     pub(crate) const fn identity(&self) -> u64 {

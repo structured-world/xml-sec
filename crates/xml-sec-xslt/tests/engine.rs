@@ -7338,6 +7338,15 @@ fn format_number_keeps_large_finite_parameters_finite() {
 }
 
 #[test]
+fn format_number_matches_libxslt_midpoint_rounding() {
+    // XSLT 1.0 section 12.3 standardizes the JDK 1.1 picture syntax but leaves rounding
+    // controllable by other XPath facilities. The pinned libxslt oracle rounds these ties up.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#format-number
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="format-number(1.25, '0.0')"/><xsl:text>|</xsl:text><xsl:value-of select="format-number(1.35, '0.0')"/><xsl:text>|</xsl:text><xsl:value-of select="format-number(-1.25, '0.0')"/><xsl:text>|</xsl:text><xsl:value-of select="format-number(0.0125, '0.0%')"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "1.3|1.4|-1.3|1.3%");
+}
+
+#[test]
 fn format_number_suppresses_only_a_rounded_zero_integer() {
     // DecimalFormat applies the picture to the rounded result. Omitting the optional leading
     // zero must not erase an integer produced when rounding crosses the unit boundary.
@@ -7846,6 +7855,15 @@ fn match_pattern_fast_path_trims_xml_whitespace_before_predicates() {
         ),
         "hitmiss"
     );
+}
+
+#[test]
+fn absolute_match_fast_path_trims_xml_whitespace_around_separators() {
+    // XSLT 1.0 section 5.2 permits ExprWhitespace within a Pattern. The absolute-path fast path
+    // must compare normalized node tests without allocating replacement strings.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#patterns
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:apply-templates select="root/item"/></xsl:template><xsl:template match="/ root / item">hit</xsl:template><xsl:template match="item">miss</xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<root><item/></root>"), "hit");
 }
 
 #[test]

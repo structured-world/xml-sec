@@ -3084,24 +3084,8 @@ impl<'a> Execution<'a> {
         kind: NodeKind,
         base_uri: Option<String>,
     ) -> Result<NodeId> {
-        let requested_bytes = self.result.push_container_reservation_bytes(parent);
-        self.meter.charge(BudgetKind::OwnedBytes, requested_bytes)?;
-        let actual_bytes = match self.result.reserve_push_containers(parent) {
-            Ok(actual_bytes) => actual_bytes,
-            Err(error) => {
-                self.meter.release_owned_bytes(requested_bytes);
-                return Err(Error::Dynamic(format!(
-                    "failed to reserve retained result-tree storage: {error}"
-                )));
-            }
-        };
-        if actual_bytes < requested_bytes {
-            self.meter
-                .release_owned_bytes(requested_bytes - actual_bytes);
-        } else if actual_bytes > requested_bytes {
-            self.meter
-                .charge(BudgetKind::OwnedBytes, actual_bytes - requested_bytes)?;
-        }
+        self.result
+            .reserve_metered_push_containers(parent, &mut self.meter)?;
         self.meter
             .charge(BudgetKind::OwnedBytes, node_kind_owned_bytes(&kind))?;
         self.meter.charge(

@@ -1250,20 +1250,7 @@ impl Evaluator {
                             _ => unreachable!(),
                         })
                     };
-                    let tokens = match kind {
-                        ExtensionCallKind::Split => split_exslt_string(&input, &delimiter),
-                        ExtensionCallKind::Tokenize => tokenize_exslt_string(&input, &delimiter),
-                        ExtensionCallKind::NodeSet => unreachable!(),
-                        ExtensionCallKind::ObjectType => unreachable!(),
-                        ExtensionCallKind::Replace => unreachable!(),
-                        ExtensionCallKind::DynamicEvaluate
-                        | ExtensionCallKind::DynamicMap
-                        | ExtensionCallKind::SaxonExpression
-                        | ExtensionCallKind::SaxonEval
-                        | ExtensionCallKind::SaxonEvaluate
-                        | ExtensionCallKind::SaxonLineNumber => unreachable!(),
-                    };
-                    let fragment = token_document(&tokens, meter)?;
+                    let fragment = token_document(&input, &delimiter, kind, meter)?;
                     let root = self.import_document(&fragment, meter)?;
                     let nodes = self.children(&root);
                     Value::NodeSet(nodes)
@@ -2103,9 +2090,10 @@ impl Evaluator {
             .node(*id)
             .ok_or_else(|| Error::Dynamic("template node candidate is stale".into()))?
             .kind;
-        if let Some(segments) = absolute_element_pattern_segments(pattern) {
+        if let Some(path) = simple_absolute_element_pattern_path(pattern) {
             let mut current = Some(*id);
-            for segment in segments.iter().rev() {
+            for segment in path.rsplit('/') {
+                let segment = segment.trim_matches(crate::lexical::is_xml_whitespace);
                 let Some(current_id) = current else {
                     return Ok(Some(false));
                 };
@@ -2566,20 +2554,20 @@ fn terminal_pattern_node_test(branch: &str) -> &str {
     branch[terminal_start..terminal_end].trim()
 }
 
-fn absolute_element_pattern_segments(pattern: &str) -> Option<Vec<&str>> {
+fn simple_absolute_element_pattern_path(pattern: &str) -> Option<&str> {
     let remainder = pattern.strip_prefix('/')?;
     if remainder.is_empty() || remainder.starts_with('/') {
         return None;
     }
-    let segments = remainder.split('/').collect::<Vec<_>>();
-    segments
-        .iter()
+    remainder
+        .split('/')
+        .map(|segment| segment.trim_matches(crate::lexical::is_xml_whitespace))
         .all(|segment| {
             !segment.is_empty()
                 && !segment.contains(['[', ']', '(', ')', '|', '@', '*'])
                 && !segment.contains("::")
         })
-        .then_some(segments)
+        .then_some(remainder)
 }
 
 fn project_semantic_document(source: &Document, meter: &mut Meter) -> Result<Package> {
@@ -3861,38 +3849,21 @@ fn xpath_value_to_public(value: XPathValue) -> Value {
     }
 }
 
-fn split_exslt_string<'a>(input: &'a str, delimiter: &str) -> Vec<&'a str> {
-    if delimiter.is_empty() {
-        input
-            .char_indices()
-            .map(|(offset, character)| &input[offset..offset + character.len_utf8()])
-            .collect()
-    } else {
-        input
-            .split(delimiter)
-            .filter(|token| !token.is_empty())
-            .collect()
-    }
-}
-
-fn tokenize_exslt_string<'a>(input: &'a str, delimiters: &str) -> Vec<&'a str> {
-    if delimiters.is_empty() {
-        return input
-            .char_indices()
-            .map(|(offset, character)| &input[offset..offset + character.len_utf8()])
-            .collect();
-    }
-    input
-        .split(|character| delimiters.contains(character))
-        .filter(|token| !token.is_empty())
-        .collect()
-}
-
-fn token_document(tokens: &[&str], meter: &mut Meter) -> Result<Document> {
+fn token_document(
+    input: &str,
+    delimiters: &str,
+    kind: ExtensionCallKind,
+    meter: &mut Meter,
+) -> Result<Document> {
     let mut document = Document::empty(None);
-    for token in tokens {
+    meter.charge(
+        BudgetKind::OwnedBytes,
+        document.retained_tree_container_bytes(),
+    )?;
+    visit_exslt_tokens(input, delimiters, kind, |token| {
         meter.charge(BudgetKind::ResultNodes, 2)?;
         meter.charge(BudgetKind::OwnedBytes, "token".len() + token.len())?;
+        document.reserve_metered_push_containers(document.root(), meter)?;
         let element = document.push(
             document.root(),
             NodeKind::Element {
@@ -3903,26 +3874,64 @@ fn token_document(tokens: &[&str], meter: &mut Meter) -> Result<Document> {
             },
             None,
         );
+        document.reserve_metered_push_containers(element, meter)?;
         document.push(
             element,
             NodeKind::Text {
-                value: (*token).to_owned(),
+                value: token.to_owned(),
                 disable_output_escaping: false,
             },
             None,
         );
-    }
+        Ok(())
+    })?;
     Ok(document)
+}
+
+fn visit_exslt_tokens(
+    input: &str,
+    delimiters: &str,
+    kind: ExtensionCallKind,
+    mut visit: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    if delimiters.is_empty() {
+        for (offset, character) in input.char_indices() {
+            visit(&input[offset..offset + character.len_utf8()])?;
+        }
+        return Ok(());
+    }
+    match kind {
+        ExtensionCallKind::Split => {
+            for token in input.split(delimiters).filter(|token| !token.is_empty()) {
+                visit(token)?;
+            }
+        }
+        ExtensionCallKind::Tokenize => {
+            for token in input
+                .split(|character| delimiters.contains(character))
+                .filter(|token| !token.is_empty())
+            {
+                visit(token)?;
+            }
+        }
+        _ => unreachable!("token documents are produced only by split and tokenize"),
+    }
+    Ok(())
 }
 
 fn dynamic_map_document(values: &[(&str, String)], meter: &mut Meter) -> Result<Document> {
     let mut document = Document::empty(None);
+    meter.charge(
+        BudgetKind::OwnedBytes,
+        document.retained_tree_container_bytes(),
+    )?;
     for (local, value) in values {
         meter.charge(BudgetKind::ResultNodes, 2)?;
         meter.charge(
             BudgetKind::OwnedBytes,
             local.len() + EXSLT_COMMON_NS.len() + value.len(),
         )?;
+        document.reserve_metered_push_containers(document.root(), meter)?;
         let element = document.push(
             document.root(),
             NodeKind::Element {
@@ -3936,6 +3945,7 @@ fn dynamic_map_document(values: &[(&str, String)], meter: &mut Meter) -> Result<
             },
             None,
         );
+        document.reserve_metered_push_containers(element, meter)?;
         document.push(
             element,
             NodeKind::Text {
@@ -3951,7 +3961,13 @@ fn dynamic_map_document(values: &[(&str, String)], meter: &mut Meter) -> Result<
 fn text_document(value: &str, meter: &mut Meter) -> Result<Document> {
     let mut document = Document::empty(None);
     meter.charge(BudgetKind::ResultNodes, 1)?;
-    meter.charge(BudgetKind::OwnedBytes, value.len())?;
+    meter.charge(
+        BudgetKind::OwnedBytes,
+        document
+            .retained_tree_container_bytes()
+            .saturating_add(value.len()),
+    )?;
+    document.reserve_metered_push_containers(document.root(), meter)?;
     document.push(
         document.root(),
         NodeKind::Text {
@@ -6081,6 +6097,10 @@ fn render_decimal(
     let factor = 10_f64.powi(i32::try_from(maximum_fraction).unwrap_or(i32::MAX));
     let shifted = scaled * factor;
     let rounded = if factor.is_finite() && shifted.is_finite() {
+        // XSLT 1.0 section 12.3 adopts the JDK 1.1 picture syntax but does not mandate a
+        // rounding mode. Match libxslt 1.1.45's `floor(scale * fraction + 0.5)` behavior so
+        // midpoint formatting remains interoperable with the pinned oracle.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#format-number
         (shifted + 0.5).floor() / factor
     } else {
         // XSLT 1.0 section 12.3 delegates picture precision to DecimalFormat. Once the decimal
@@ -6560,6 +6580,36 @@ mod tests {
                 kind: BudgetKind::OwnedBytes,
                 limit: 1,
                 actual: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn token_documents_charge_tree_containers_in_addition_to_payloads() {
+        // Two one-byte token payloads consume twelve bytes including their element names. A
+        // budget of exactly that size must still reject the arena and child-vector allocations.
+        let mut meter = Meter::new(
+            ExecutionBudget {
+                source_bytes: 0,
+                external_documents: 0,
+                recursion_depth: 0,
+                xpath_evaluations: 0,
+                template_applications: 0,
+                sort_comparisons: 0,
+                key_entries: 0,
+                result_nodes: 4,
+                serialized_bytes: 0,
+                messages: 0,
+                owned_bytes: 12,
+            },
+            0,
+        )
+        .expect("empty source fits the payload-only budget");
+        assert!(matches!(
+            token_document("a b", " ", ExtensionCallKind::Split, &mut meter),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
             })
         ));
     }
