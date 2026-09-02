@@ -257,15 +257,19 @@ pub fn decode_xml_bounded<'a>(
     if explicit_encoding.is_none()
         && declaration.is_none()
         && physical.is_some_and(|(encoding, bom_len)| {
-            bom_len == 0
-                && matches!(encoding, SelectedEncoding::Standard(value)
-                    if value == encoding_rs::UTF_16LE || value == encoding_rs::UTF_16BE)
+            bom_len == 0 && (is_utf16_encoding(encoding) || is_utf32_encoding(encoding))
         })
     {
         // XML 1.0 section 4.3.3 allows BOM-less non-UTF-8 input only when an encoding declaration
         // identifies it; byte-pattern detection alone does not supply that declaration.
         // https://www.w3.org/TR/xml/#charencoding
-        return Err(Error::MissingUtf16ByteOrder);
+        return Err(
+            if physical.is_some_and(|(encoding, _)| is_utf32_encoding(encoding)) {
+                Error::MissingUtf32ByteOrder
+            } else {
+                Error::MissingUtf16ByteOrder
+            },
+        );
     }
     if let Some(range) = &declaration {
         let label = &decoded[range.clone()];
@@ -702,7 +706,7 @@ mod tests {
     }
 
     #[test]
-    fn utf32_bom_and_initial_signatures_select_byte_order() {
+    fn utf32_requires_a_bom_metadata_or_encoding_declaration() {
         // XML 1.0 Appendix F defines both UCS-4 BOMs and the BOM-less `<` signatures.
         // https://www.w3.org/TR/xml/#sec-guessing
         let source = "<?xml version=\"1.0\" encoding=\"UTF-32\"?><root>lambda</root>";
@@ -718,11 +722,20 @@ mod tests {
         }
 
         for little_endian in [false, true] {
-            let bytes = encode_utf32("<root>lambda</root>", little_endian);
-            assert_eq!(
-                decode_xml(&bytes, None).expect("initial signature selects UTF-32 byte order"),
-                "<root>lambda</root>"
+            let declaration = encode_utf32(
+                "<?xml version=\"1.0\" encoding=\"UTF-32\"?><root>lambda</root>",
+                little_endian,
             );
+            assert!(
+                decode_xml(&declaration, None)
+                    .expect("the initial signature and declaration identify UTF-32")
+                    .contains("<root>lambda</root>")
+            );
+            let declarationless = encode_utf32("<root>lambda</root>", little_endian);
+            assert!(matches!(
+                decode_xml(&declarationless, None),
+                Err(Error::MissingUtf32ByteOrder)
+            ));
         }
     }
 

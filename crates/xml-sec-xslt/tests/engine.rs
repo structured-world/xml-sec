@@ -39,6 +39,14 @@ fn minimum_execution_owned_bytes(
     stylesheet: &xml_sec_xslt::Stylesheet,
     initial_template: &str,
 ) -> usize {
+    minimum_execution_owned_bytes_with_parameters(stylesheet, initial_template, &Parameters::new())
+}
+
+fn minimum_execution_owned_bytes_with_parameters(
+    stylesheet: &xml_sec_xslt::Stylesheet,
+    initial_template: &str,
+    parameters: &Parameters,
+) -> usize {
     let source = Document::parse("<source/>", None).expect("source parses");
     let succeeds = |owned_bytes| {
         let mut budget = execution_budget(1024);
@@ -47,7 +55,7 @@ fn minimum_execution_owned_bytes(
         stylesheet
             .execute(
                 &source,
-                &Parameters::new(),
+                parameters,
                 Arc::new(NoResolver),
                 ExecutionOptions {
                     budget,
@@ -1732,6 +1740,31 @@ fn built_in_template_rule_ignores_namespace_nodes_in_captured_fragments() {
     // https://www.w3.org/TR/xslt-10/#built-in-rule
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:variable name="captured"><xsl:apply-templates select="/*/namespace::*"/></xsl:variable><xsl:value-of select="$captured"/></xsl:template></xsl:stylesheet>"#;
     assert_eq!(execute(stylesheet, r#"<root xmlns:p="urn:visible"/>"#), "");
+}
+
+#[test]
+fn inert_exslt_function_does_not_exclude_its_name_namespace() {
+    // EXSLT declarations become instructions only when their namespace is designated through
+    // extension-element-prefixes. Foreign top-level data must not affect namespace copying.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#extension
+    let stylesheet = r#"<xsl:stylesheet version="1.0"
+        xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+        xmlns:func="http://exslt.org/functions" xmlns:f="urn:functions"
+        xmlns:exsl="http://exslt.org/common">
+      <xsl:output method="text"/>
+      <func:function name="f:inert"/>
+      <xsl:template match="/">
+        <xsl:variable name="tree"><out/></xsl:variable>
+        <xsl:value-of select="count(exsl:node-set($tree)/out/namespace::*[name()='f'])"/>
+      </xsl:template>
+    </xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "1");
+
+    let active = stylesheet.replace(
+        "xmlns:exsl=",
+        "extension-element-prefixes=\"func\" xmlns:exsl=",
+    );
+    assert_eq!(execute(&active, "<source/>"), "0");
 }
 
 #[test]
@@ -4931,6 +4964,33 @@ fn xpath_scope_snapshot_counts_toward_peak_owned_memory() {
             ..
         })
     ));
+}
+
+#[test]
+fn prepared_extension_calls_borrow_the_visible_variable_snapshot() {
+    // Rewriting an extension call may add generated bindings, but must not deep-clone every
+    // unrelated visible value after the caller has already materialized and charged the snapshot.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:exsl="http://exslt.org/common">
+          <xsl:param name="payload"/>
+          <xsl:output method="text"/>
+          <xsl:template name="baseline"><xsl:value-of select="string-length($payload)"/></xsl:template>
+          <xsl:template name="extension"><xsl:value-of select="exsl:object-type($payload)"/></xsl:template>
+        </xsl:stylesheet>"#,
+    );
+    let mut parameters = Parameters::new();
+    parameters.insert(
+        ExpandedName::new(None::<String>, "payload"),
+        Value::String("x".repeat(256 * 1024)),
+    );
+    let baseline =
+        minimum_execution_owned_bytes_with_parameters(&stylesheet, "baseline", &parameters);
+    let extension =
+        minimum_execution_owned_bytes_with_parameters(&stylesheet, "extension", &parameters);
+    assert!(
+        extension <= baseline.saturating_add(16 * 1024),
+        "extension rewrite required {extension} bytes versus {baseline} for the baseline"
+    );
 }
 
 #[test]

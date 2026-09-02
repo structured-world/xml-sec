@@ -395,7 +395,7 @@ impl<R: Resolver> Compiler<R> {
         state: &mut CompileState,
         depth: usize,
     ) -> Result<()> {
-        if node.has_tag_name((EXSLT_FUNCTIONS_NS, "function")) && is_extension_element(node)? {
+        if is_exslt_function_declaration(node)? {
             validate_exslt_function_result_structure(node)?;
             let context =
                 CompileContext::new(forward, depth, state.budget.recursion_depth, base_uri)?
@@ -2766,6 +2766,10 @@ fn is_extension_element(node: roxmltree::Node<'_, '_>) -> Result<bool> {
     Ok(false)
 }
 
+fn is_exslt_function_declaration(node: roxmltree::Node<'_, '_>) -> Result<bool> {
+    Ok(node.has_tag_name((EXSLT_FUNCTIONS_NS, "function")) && is_extension_element(node)?)
+}
+
 fn forward_compatible_at(node: roxmltree::Node<'_, '_>) -> Result<bool> {
     for ancestor in node.ancestors().filter(roxmltree::Node::is_element) {
         if let Some(forward) = local_forward_compatible(ancestor)? {
@@ -2880,10 +2884,10 @@ fn excluded_result_namespaces(node: roxmltree::Node<'_, '_>) -> Result<HashSet<S
         ancestor.has_tag_name((XSLT_NS, "stylesheet"))
             || ancestor.has_tag_name((XSLT_NS, "transform"))
     }) {
-        for function in stylesheet
-            .children()
-            .filter(|child| child.has_tag_name((EXSLT_FUNCTIONS_NS, "function")))
-        {
+        for function in stylesheet.children() {
+            if !is_exslt_function_declaration(function)? {
+                continue;
+            }
             if let Some((prefix, _)) = function
                 .attribute("name")
                 .and_then(|name| name.split_once(':'))
@@ -2903,7 +2907,7 @@ fn excluded_result_namespaces(node: roxmltree::Node<'_, '_>) -> Result<HashSet<S
         if let Some(local) = local_forward_compatible(ancestor)? {
             forward_compatible = local;
         }
-        if ancestor.has_tag_name((EXSLT_FUNCTIONS_NS, "function"))
+        if is_exslt_function_declaration(ancestor)?
             && let Some((prefix, _)) = ancestor
                 .attribute("name")
                 .and_then(|name| name.split_once(':'))

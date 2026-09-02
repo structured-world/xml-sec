@@ -22,24 +22,100 @@ use crate::{
 
 pub(crate) type SourceNode = NodeReference;
 
+pub(crate) trait VariableBindings {
+    fn get(&self, name: &ExpandedName) -> Option<&Value>;
+
+    fn visit(&self, visitor: &mut dyn FnMut(&ExpandedName, &Value));
+
+    fn result_tree_fragment(&self, identity: u64) -> Option<Arc<Document>>;
+}
+
+impl VariableBindings for HashMap<ExpandedName, Value> {
+    fn get(&self, name: &ExpandedName) -> Option<&Value> {
+        HashMap::get(self, name)
+    }
+
+    fn visit(&self, visitor: &mut dyn FnMut(&ExpandedName, &Value)) {
+        for (name, value) in self {
+            visitor(name, value);
+        }
+    }
+
+    fn result_tree_fragment(&self, identity: u64) -> Option<Arc<Document>> {
+        self.values().find_map(|value| match value {
+            Value::ResultTreeFragment(document) if document.identity() == identity => {
+                Some(Arc::clone(document))
+            }
+            _ => None,
+        })
+    }
+}
+
+struct VariableOverlay<'a> {
+    base: &'a dyn VariableBindings,
+    additions: HashMap<ExpandedName, Value>,
+}
+
+impl<'a> VariableOverlay<'a> {
+    fn new(base: &'a dyn VariableBindings) -> Self {
+        Self {
+            base,
+            additions: HashMap::new(),
+        }
+    }
+
+    fn insert(&mut self, name: ExpandedName, value: Value) {
+        self.additions.insert(name, value);
+    }
+}
+
+impl VariableBindings for VariableOverlay<'_> {
+    fn get(&self, name: &ExpandedName) -> Option<&Value> {
+        self.additions.get(name).or_else(|| self.base.get(name))
+    }
+
+    fn visit(&self, visitor: &mut dyn FnMut(&ExpandedName, &Value)) {
+        self.base.visit(&mut |name, value| {
+            if !self.additions.contains_key(name) {
+                visitor(name, value);
+            }
+        });
+        for (name, value) in &self.additions {
+            visitor(name, value);
+        }
+    }
+
+    fn result_tree_fragment(&self, identity: u64) -> Option<Arc<Document>> {
+        self.additions
+            .values()
+            .find_map(|value| match value {
+                Value::ResultTreeFragment(document) if document.identity() == identity => {
+                    Some(Arc::clone(document))
+                }
+                _ => None,
+            })
+            .or_else(|| self.base.result_tree_fragment(identity))
+    }
+}
+
 enum PreparedExtensionCalls<'a> {
     Borrowed {
         expression: &'a Expression,
-        variables: &'a HashMap<ExpandedName, Value>,
+        variables: &'a dyn VariableBindings,
     },
     Rewritten {
         expression: Expression,
-        variables: HashMap<ExpandedName, Value>,
+        variables: VariableOverlay<'a>,
     },
 }
 
 impl<'a> PreparedExtensionCalls<'a> {
-    fn parts(&'a self) -> (&'a Expression, &'a HashMap<ExpandedName, Value>) {
+    fn parts(&'a self) -> (&'a Expression, &'a dyn VariableBindings) {
         match self {
             Self::Borrowed {
                 expression,
                 variables,
-            } => (expression, variables),
+            } => (expression, *variables),
             Self::Rewritten {
                 expression,
                 variables,
@@ -707,7 +783,7 @@ impl Evaluator {
         node: &SourceNode,
         position: usize,
         size: usize,
-        variables: &HashMap<ExpandedName, Value>,
+        variables: &dyn VariableBindings,
         meter: &mut Meter,
         custom_calls: Option<&CustomCallSession>,
     ) -> Result<XPathValue> {
@@ -769,7 +845,7 @@ impl Evaluator {
     pub(crate) fn take_custom_function_call(
         &self,
         session: &CustomCallSession,
-        variables: &HashMap<ExpandedName, Value>,
+        variables: &dyn VariableBindings,
         meter: &mut Meter,
     ) -> Result<Option<CustomFunctionCall>> {
         let pending = {
@@ -855,7 +931,7 @@ impl Evaluator {
         &self,
         value: &DeferredXPathValue,
         session: &CustomCallSession,
-        variables: &HashMap<ExpandedName, Value>,
+        variables: &dyn VariableBindings,
     ) -> Result<Value> {
         Ok(match value {
             DeferredXPathValue::Boolean(value) => Value::Boolean(*value),
@@ -872,13 +948,7 @@ impl Evaluator {
                     .collect::<Result<Vec<_>>>()?,
             ),
             DeferredXPathValue::ResultTreeFragment { identity, .. } => variables
-                .values()
-                .find_map(|value| match value {
-                    Value::ResultTreeFragment(document) if document.identity() == *identity => {
-                        Some(document.clone())
-                    }
-                    _ => None,
-                })
+                .result_tree_fragment(*identity)
                 .or_else(|| session.fragment(*identity))
                 .map(Value::ResultTreeFragment)
                 .ok_or_else(|| Error::Dynamic("stale result-tree-fragment identity".into()))?,
@@ -1011,7 +1081,7 @@ impl Evaluator {
         node: &SourceNode,
         position: usize,
         size: usize,
-        variables: &'a HashMap<ExpandedName, Value>,
+        variables: &'a dyn VariableBindings,
         meter: &mut Meter,
         custom_calls: Option<&CustomCallSession>,
     ) -> Result<PreparedExtensionCalls<'a>> {
@@ -1028,7 +1098,7 @@ impl Evaluator {
             });
         }
         let mut source = expression.source.clone();
-        let mut augmented = variables.clone();
+        let mut augmented = VariableOverlay::new(variables);
         let mut stored_expressions = HashSet::new();
         let mut variable_index = 0usize;
         while let Some(call) =
@@ -1448,7 +1518,7 @@ impl Evaluator {
         node: &SourceNode,
         position: usize,
         size: usize,
-        variables: &HashMap<ExpandedName, Value>,
+        variables: &dyn VariableBindings,
         meter: &mut Meter,
         custom_calls: Option<&CustomCallSession>,
     ) -> Result<Vec<String>> {
@@ -1479,7 +1549,7 @@ impl Evaluator {
         node: &SourceNode,
         position: usize,
         size: usize,
-        variables: &HashMap<ExpandedName, Value>,
+        variables: &dyn VariableBindings,
         meter: &mut Meter,
         custom_calls: Option<&CustomCallSession>,
     ) -> Result<XPathValue> {
@@ -1511,7 +1581,7 @@ impl Evaluator {
         node: &SourceNode,
         position: usize,
         size: usize,
-        variables: &HashMap<ExpandedName, Value>,
+        variables: &dyn VariableBindings,
         meter: &mut Meter,
         custom_calls: Option<&CustomCallSession>,
     ) -> Result<XPathValue> {
@@ -1657,7 +1727,7 @@ impl Evaluator {
                 );
             }
         }
-        for (name, value) in variables {
+        variables.visit(&mut |name, value| {
             let qname: sxd_xpath_no_unsafe::OwnedQName = name.namespace.as_deref().map_or_else(
                 || name.local.as_str().into(),
                 |namespace| (namespace, name.local.as_str()).into(),
@@ -1686,7 +1756,7 @@ impl Evaluator {
                     context.set_variable(qname, set);
                 }
             }
-        }
+        });
         let expressions = self.expressions.borrow();
         let xpath = expressions
             .get(rewritten.as_ref())
@@ -1729,13 +1799,8 @@ impl Evaluator {
         };
         if let SxdValue::ResultTreeFragment(identity, _) = value {
             return variables
-                .values()
-                .find_map(|value| match value {
-                    Value::ResultTreeFragment(document) if document.identity() == identity => {
-                        Some(XPathValue::ResultTreeFragment(document.clone()))
-                    }
-                    _ => None,
-                })
+                .result_tree_fragment(identity)
+                .map(XPathValue::ResultTreeFragment)
                 .or_else(|| {
                     custom_calls
                         .and_then(|session| session.fragment(identity))
@@ -1750,7 +1815,7 @@ impl Evaluator {
     fn prepare_document_requests(
         &mut self,
         requested: Vec<DocumentRequest>,
-        variables: &HashMap<ExpandedName, Value>,
+        variables: &dyn VariableBindings,
         meter: &mut Meter,
     ) -> Result<()> {
         let mut fragments = Vec::new();
@@ -6259,6 +6324,21 @@ mod tests {
     use super::*;
     use crate::ExecutionBudget;
     use sxd_xpath_no_unsafe::function::Function;
+
+    #[test]
+    fn variable_overlay_borrows_existing_payloads() {
+        let name = ExpandedName::new(None::<String>, "payload");
+        let mut base = HashMap::new();
+        base.insert(name.clone(), Value::String("retained payload".into()));
+        let overlay = VariableOverlay::new(&base);
+        let Some(Value::String(original)) = base.get(&name) else {
+            panic!("base payload is missing");
+        };
+        let Some(Value::String(borrowed)) = overlay.get(&name) else {
+            panic!("overlay payload is missing");
+        };
+        assert!(std::ptr::eq(original, borrowed));
+    }
 
     #[test]
     fn outer_context_functions_accept_xpath_whitespace() {
