@@ -1683,6 +1683,9 @@ impl<'a> Execution<'a> {
                     && let [value] = values.as_slice()
                     && (!value.is_finite() || *value < 0.5)
                 {
+                    // XSLT 1.0 section 7.7 permits recovery from an invalid explicit value only by
+                    // inserting its XPath string-value, before numbering tokens are considered.
+                    // https://www.w3.org/TR/1999/REC-xslt-19991116#number
                     return self.append_text(&crate::value::format_xpath_number(*value), false);
                 }
                 let grouping_separator = number
@@ -2054,18 +2057,23 @@ impl<'a> Execution<'a> {
         else {
             return Ok(None);
         };
-        let target = match target_expression.trim() {
-            "name(current())" => self.evaluator.qualified_name(node),
+        let mut targets = match target_expression.trim() {
+            "name(current())" => vec![self.evaluator.qualified_name(node)],
             path if path.starts_with("current()/") => self
                 .evaluator
-                .relative_string(
+                .relative_nodes(
                     path.trim_start_matches("current()/"),
                     node,
                     &expression.namespaces,
                 )?
-                .unwrap_or_default(),
+                .unwrap_or_default()
+                .iter()
+                .map(|target| self.evaluator.string_value(target))
+                .collect(),
             _ => return Ok(None),
         };
+        targets.sort_unstable();
+        targets.dedup();
         let Some(root) = fragment.node(fragment.root()) else {
             return Ok(Some(0.0));
         };
@@ -2076,11 +2084,22 @@ impl<'a> Execution<'a> {
                 continue;
             };
             if let NodeKind::Element { name, prefix, .. } = &candidate.kind {
-                let qualified = prefix.as_deref().map_or_else(
-                    || name.local.clone(),
-                    |prefix| format!("{prefix}:{}", name.local),
-                );
-                if qualified == target {
+                // XPath 1.0 section 3.4 defines string-to-node-set equality as true when any
+                // selected node has the same string-value; reducing current()/path to its first
+                // node would change predicate semantics.
+                // https://www.w3.org/TR/1999/REC-xpath-19991116/#booleans
+                let matched = targets
+                    .binary_search_by(|target| match prefix.as_deref() {
+                        Some(prefix) => target.as_bytes().iter().copied().cmp(
+                            prefix
+                                .bytes()
+                                .chain(std::iter::once(b':'))
+                                .chain(name.local.bytes()),
+                        ),
+                        None => target.as_str().cmp(name.local.as_str()),
+                    })
+                    .is_ok();
+                if matched {
                     // Preceding sibling sets are nested in document order, so the last
                     // matching element contributes the complete union.
                     union_count = preceding;
@@ -4521,6 +4540,7 @@ fn format_number_into(
     size: Option<usize>,
     meter: &Meter,
 ) -> Result<()> {
+    debug_assert!(value.is_nan() || value.round() > 0.0);
     if value.is_nan() {
         return append_metered(output, "NaN", meter);
     }

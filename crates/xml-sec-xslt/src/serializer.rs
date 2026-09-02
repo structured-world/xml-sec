@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::fmt::Write as _;
+use std::ops::Deref;
 use std::rc::Rc;
 
 use crate::budget::Meter;
@@ -75,6 +76,20 @@ impl OutputDefinition {
                             .saturating_add(name.local.len())
                     }),
             )
+    }
+}
+
+struct EffectiveOutputDefinition<'a> {
+    source: &'a OutputDefinition,
+    method: OutputMethod,
+    indent: bool,
+}
+
+impl Deref for EffectiveOutputDefinition<'_> {
+    type Target = OutputDefinition;
+
+    fn deref(&self) -> &Self::Target {
+        self.source
     }
 }
 
@@ -200,6 +215,11 @@ pub(crate) fn serialize_fragment(document: &Document, meter: &mut Meter) -> Resu
     };
     definition.method_explicit = true;
     definition.indent_explicit = true;
+    let definition = EffectiveOutputDefinition {
+        method: definition.method,
+        indent: definition.indent,
+        source: &definition,
+    };
     let (used, limit) = meter.usage(BudgetKind::OwnedBytes)?;
     let mut counter = RenderBuffer::counting(
         EncodingCounter::new(&OutputEncoding::Utf8),
@@ -226,26 +246,21 @@ fn serialize_charged(
             .is_some_and(|node| matches!(&node.kind, NodeKind::Element { name, .. } if name.namespace.is_none() && name.local.eq_ignore_ascii_case("html")));
     let infer_indent = (infer_html_method || definition.method == OutputMethod::Html)
         && !definition.indent_explicit;
-    if !infer_html_method && !infer_indent {
-        return serialize_with_definition(document, definition, meter, budget_kind);
-    }
-    let definition_owned_bytes = definition.owned_bytes();
-    meter.charge(BudgetKind::OwnedBytes, definition_owned_bytes)?;
-    let mut effective = definition.clone();
-    if infer_html_method {
-        effective.method = OutputMethod::Html;
-    }
-    if infer_indent {
-        effective.indent = true;
-    }
-    let result = serialize_with_definition(document, &effective, meter, budget_kind);
-    meter.release_owned_bytes(definition_owned_bytes);
-    result
+    let effective = EffectiveOutputDefinition {
+        source: definition,
+        method: if infer_html_method {
+            OutputMethod::Html
+        } else {
+            definition.method
+        },
+        indent: infer_indent || definition.indent,
+    };
+    serialize_with_definition(document, &effective, meter, budget_kind)
 }
 
 fn serialize_with_definition(
     document: &Document,
-    definition: &OutputDefinition,
+    definition: &EffectiveOutputDefinition<'_>,
     meter: &mut Meter,
     budget_kind: BudgetKind,
 ) -> Result<SerializedOutput> {
@@ -306,7 +321,7 @@ fn serialize_with_definition(
 
 fn render(
     document: &Document,
-    definition: &OutputDefinition,
+    definition: &EffectiveOutputDefinition<'_>,
     encoding: &OutputEncoding,
     text: &mut RenderBuffer,
 ) -> Result<()> {
@@ -371,7 +386,7 @@ fn render(
 fn render_doctype(
     document: &Document,
     element: NodeId,
-    definition: &OutputDefinition,
+    definition: &EffectiveOutputDefinition<'_>,
     encoding: &OutputEncoding,
     text: &mut RenderBuffer,
 ) -> Result<()> {
@@ -739,7 +754,7 @@ enum RenderTask {
 fn serialize_node(
     document: &Document,
     id: NodeId,
-    definition: &OutputDefinition,
+    definition: &EffectiveOutputDefinition<'_>,
     encoding: &OutputEncoding,
     output: &mut RenderBuffer,
     context: RenderContext,
@@ -1387,7 +1402,7 @@ fn push_decimal_reference(output: &mut RenderBuffer, character: char) {
 
 fn reject_xml11_restricted_markup(
     value: &str,
-    definition: &OutputDefinition,
+    definition: &EffectiveOutputDefinition<'_>,
     kind: &str,
 ) -> Result<()> {
     if definition.method == OutputMethod::Xml
@@ -1743,7 +1758,36 @@ mod tests {
         push_cdata_range, serialize,
     };
     use crate::budget::Meter;
-    use crate::{BudgetKind, Document, ExecutionBudget, NodeKind};
+    use crate::{BudgetKind, Document, ExecutionBudget, ExpandedName, NodeKind};
+
+    #[test]
+    fn inferred_html_output_does_not_clone_caller_owned_output_metadata() {
+        // Method inference changes two scalar properties; a large caller-owned CDATA set must not
+        // be copied into the execution allocation budget merely to apply those overrides.
+        let document = Document::parse("<html/>", None).expect("document parses");
+        let mut definition = OutputDefinition::default();
+        definition.cdata_section_elements.extend(
+            (0..1024).map(|index| ExpandedName::new(None::<String>, format!("item-{index}"))),
+        );
+        let limits = ExecutionBudget {
+            source_bytes: 0,
+            external_documents: 0,
+            recursion_depth: 1,
+            xpath_evaluations: 0,
+            template_applications: 0,
+            sort_comparisons: 0,
+            key_entries: 0,
+            result_nodes: 0,
+            serialized_bytes: 64,
+            messages: 0,
+            owned_bytes: 64,
+        };
+        let mut meter = Meter::new(limits, 0).expect("zero source bytes fit");
+
+        let output = serialize(&document, &definition, &mut meter)
+            .expect("inferred method borrows the output definition");
+        assert_eq!(output.bytes, b"<html></html>\n");
+    }
 
     #[test]
     fn counting_buffer_rejects_repeated_indentation_beyond_the_encoded_limit() {

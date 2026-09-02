@@ -268,13 +268,17 @@ impl<R: Resolver> Compiler<R> {
         require_empty_instruction(node)?;
         let href = required_attr(node, "href")?;
         let effective_base = effective_base_uri(node, base_uri)?;
+        let request_owned_bytes = resolve_request_retained_bytes(href, effective_base.as_deref());
+        state.charge_owned(request_owned_bytes)?;
         let request = ResolveRequest {
             href: href.to_owned(),
             base_uri: effective_base.clone(),
             purpose,
         };
         if let Some(resource) = state.resolved_requests.get(&request) {
-            return Ok(Arc::clone(resource));
+            let resource = Arc::clone(resource);
+            state.release_owned(request_owned_bytes);
+            return Ok(resource);
         }
         state.imported_modules = state.imported_modules.saturating_add(1);
         ensure(
@@ -282,22 +286,32 @@ impl<R: Resolver> Compiler<R> {
             state.budget.imported_modules,
             state.imported_modules,
         )?;
-        let resource = Arc::new(
-            self.resolver
-                .resolve(href, effective_base.as_deref(), purpose)?,
-        );
-        if let Some(previous) = state.resolved_identities.get(&resource.identity)
-            && previous.as_ref() != resource.as_ref()
+        let resolved = match self
+            .resolver
+            .resolve(href, effective_base.as_deref(), purpose)
         {
-            return Err(Error::StaleResource {
-                identity: resource.identity.clone(),
-            });
-        }
-        if !state.resolved_identities.contains_key(&resource.identity) {
-            state.charge_stylesheet(resource.bytes.len())?;
-        }
-        state.charge_owned(resource.bytes.len())?;
+            Ok(resource) => resource,
+            Err(error) => {
+                state.release_owned(request_owned_bytes);
+                return Err(error);
+            }
+        };
+        let (resource, new_identity) =
+            if let Some(previous) = state.resolved_identities.get(&resolved.identity) {
+                if previous.as_ref() != &resolved {
+                    state.release_owned(request_owned_bytes);
+                    return Err(Error::StaleResource {
+                        identity: resolved.identity,
+                    });
+                }
+                (Arc::clone(previous), false)
+            } else {
+                state.charge_stylesheet(resolved.bytes.len())?;
+                state.charge_owned(new_resolved_identity_retained_bytes(&resolved))?;
+                (Arc::new(resolved), true)
+            };
         if !state.module_documents.contains_key(&resource.canonical_uri) {
+            state.charge_owned(module_document_cache_entry_bytes(&resource.canonical_uri))?;
             let source = resource_source(&resource, state)?;
             let document = parse_semantic_document_metered(
                 source.as_str(),
@@ -308,33 +322,37 @@ impl<R: Resolver> Compiler<R> {
                 .module_documents
                 .insert(resource.canonical_uri.clone(), document);
         }
-        state
-            .resolved_identities
-            .entry(resource.identity.clone())
-            .or_insert_with(|| Arc::clone(&resource));
+        if new_identity {
+            state
+                .resolved_identities
+                .insert(resource.identity.clone(), Arc::clone(&resource));
+            state.resources.push(resource.identity.clone());
+        }
         state
             .resolved_requests
             .insert(request, Arc::clone(&resource));
-        if state.resource_set.insert(resource.identity.clone()) {
-            state.resources.push(resource.identity.clone());
-        }
         Ok(resource)
     }
 
     fn enter_resource<T>(
         &self,
-        resource: &ResolvedResource,
+        resource: &Arc<ResolvedResource>,
         state: &mut CompileState,
         compile: impl FnOnce(&mut CompileState) -> Result<T>,
     ) -> Result<T> {
-        if !state.active_resources.insert(resource.identity.clone()) {
+        if state
+            .active_resources
+            .iter()
+            .any(|active| active.identity == resource.identity)
+        {
             return Err(Error::Static(format!(
                 "stylesheet include/import cycle at {}",
                 resource.canonical_uri
             )));
         }
+        state.active_resources.push(Arc::clone(resource));
         let result = compile(state);
-        state.active_resources.remove(&resource.identity);
+        state.active_resources.pop();
         result
     }
 
@@ -1555,8 +1573,7 @@ struct CompileState {
     attribute_sets: Vec<AttributeSet>,
     functions: Vec<ExsltFunction>,
     resources: Vec<ResourceIdentity>,
-    resource_set: HashSet<ResourceIdentity>,
-    active_resources: HashSet<ResourceIdentity>,
+    active_resources: Vec<Arc<ResolvedResource>>,
     resolved_requests: HashMap<ResolveRequest, Arc<ResolvedResource>>,
     resolved_identities: HashMap<ResourceIdentity, Arc<ResolvedResource>>,
     module_sources: HashMap<ResourceIdentity, Arc<String>>,
@@ -1583,8 +1600,7 @@ impl CompileState {
             attribute_sets: vec![],
             functions: vec![],
             resources: vec![],
-            resource_set: HashSet::new(),
-            active_resources: HashSet::new(),
+            active_resources: vec![],
             resolved_requests: HashMap::new(),
             resolved_identities: HashMap::new(),
             module_sources: HashMap::new(),
@@ -1935,6 +1951,53 @@ struct ResolveRequest {
     purpose: ResolvePurpose,
 }
 
+fn hash_entry_storage<K, V>() -> usize {
+    // Hash tables retain control bytes and spare buckets. Two entry widths conservatively model
+    // the standard maximum load without depending on the allocator implementation.
+    std::mem::size_of::<(K, V)>().saturating_mul(2)
+}
+
+fn resolve_request_retained_bytes(href: &str, base_uri: Option<&str>) -> usize {
+    hash_entry_storage::<ResolveRequest, Arc<ResolvedResource>>()
+        .saturating_add(href.len())
+        .saturating_add(base_uri.map_or(0, str::len))
+}
+
+fn resolved_resource_owned_bytes(resource: &ResolvedResource) -> usize {
+    std::mem::size_of::<ResolvedResource>()
+        .saturating_add(std::mem::size_of::<usize>().saturating_mul(2))
+        .saturating_add(resource.canonical_uri.capacity())
+        .saturating_add(resource.identity.0.capacity())
+        .saturating_add(resource.bytes.capacity())
+        .saturating_add(resource.media_type.as_ref().map_or(0, String::capacity))
+        .saturating_add(resource.encoding.as_ref().map_or(0, String::capacity))
+}
+
+fn new_resolved_identity_retained_bytes(resource: &ResolvedResource) -> usize {
+    resolved_resource_owned_bytes(resource)
+        .saturating_add(
+            hash_entry_storage::<ResourceIdentity, Arc<ResolvedResource>>()
+                .saturating_add(resource.identity.0.len()),
+        )
+        .saturating_add(
+            std::mem::size_of::<ResourceIdentity>()
+                .saturating_mul(2)
+                .saturating_add(resource.identity.0.len()),
+        )
+        .saturating_add(std::mem::size_of::<Arc<ResolvedResource>>().saturating_mul(2))
+}
+
+fn module_document_cache_entry_bytes(canonical_uri: &str) -> usize {
+    hash_entry_storage::<String, Document>().saturating_add(canonical_uri.len())
+}
+
+fn module_source_cache_entry_bytes(identity: &ResourceIdentity) -> usize {
+    hash_entry_storage::<ResourceIdentity, Arc<String>>()
+        .saturating_add(identity.0.len())
+        .saturating_add(std::mem::size_of::<String>())
+        .saturating_add(std::mem::size_of::<usize>().saturating_mul(2))
+}
+
 #[derive(Debug, Clone)]
 struct CompileContext {
     forward: bool,
@@ -1993,17 +2056,25 @@ fn resource_source(resource: &ResolvedResource, state: &mut CompileState) -> Res
     if let Some(source) = state.module_sources.get(&resource.identity) {
         return Ok(Arc::clone(source));
     }
+    let cache_entry_bytes = module_source_cache_entry_bytes(&resource.identity);
+    state.charge_owned(cache_entry_bytes)?;
     let maximum = state.budget.owned_bytes.saturating_sub(state.owned_bytes);
-    let decoded = decode_resource(&resource.bytes, resource.encoding.as_deref(), true, maximum)
-        .map_err(|error| match error {
-            xml_sec_xml_input::Error::DecodedLimit { actual, .. } => Error::Budget {
-                kind: BudgetKind::OwnedBytes,
-                limit: state.budget.owned_bytes,
-                actual: state.owned_bytes.saturating_add(actual),
-            },
-            error => Error::Xml(error.to_string()),
-        })?;
-    state.charge_owned(decoded.len())?;
+    let decoded =
+        match decode_resource(&resource.bytes, resource.encoding.as_deref(), true, maximum) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                state.release_owned(cache_entry_bytes);
+                return Err(match error {
+                    xml_sec_xml_input::Error::DecodedLimit { actual, .. } => Error::Budget {
+                        kind: BudgetKind::OwnedBytes,
+                        limit: state.budget.owned_bytes,
+                        actual: state.owned_bytes.saturating_add(actual),
+                    },
+                    error => Error::Xml(error.to_string()),
+                });
+            }
+        };
+    state.charge_owned(decoded.capacity())?;
     let source = Arc::new(decoded);
     state
         .module_sources

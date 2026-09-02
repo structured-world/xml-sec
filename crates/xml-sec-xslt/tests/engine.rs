@@ -366,11 +366,19 @@ fn external_parameter_payload_is_owned_byte_metered() {
 fn number_empty_boundary_and_exceptional_values_follow_xslt() {
     // Empty sequences emit no formatting punctuation, level-any excludes its from boundary,
     // and exceptional explicit values bypass numbering tokens entirely.
-    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:apply-templates select="section/section/item"/><xsl:text>|</xsl:text><xsl:number count="missing" format="(1)"/><xsl:text>|</xsl:text><xsl:number value="0" format="001"/><xsl:text>|</xsl:text><xsl:number value="1 div 0" format="001"/></xsl:template><xsl:template match="item"><xsl:number level="any" count="section|item" from="section"/></xsl:template></xsl:stylesheet>"#;
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:apply-templates select="section/section/item"/><xsl:text>|</xsl:text><xsl:number count="missing" format="(1)"/><xsl:text>|</xsl:text><xsl:number value="0" format="001"/><xsl:text>|</xsl:text><xsl:number value="-2" format="001"/><xsl:text>|</xsl:text><xsl:number value="0 div 0" format="001"/><xsl:text>|</xsl:text><xsl:number value="1 div 0" format="001"/></xsl:template><xsl:template match="item"><xsl:number level="any" count="section|item" from="section"/></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(stylesheet, "<section><section><item/></section></section>"),
-        "1||0|Infinity"
+        "1||0|-2|NaN|Infinity"
     );
+}
+
+#[test]
+fn rtf_order_compares_every_node_selected_from_current() {
+    // XPath node-set equality examines every RHS node, so a value present only after the first
+    // selected child must still match the corresponding temporary-tree element name.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:exsl="http://exslt.org/common"><xsl:output method="text"/><xsl:template match="/"><xsl:apply-templates select="item"/></xsl:template><xsl:template match="item"><xsl:variable name="fragment"><a/><b/></xsl:variable><xsl:value-of select="count(exsl:node-set($fragment)/*[name() = current()/x]/preceding-sibling::*)"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<item><x>z</x><x>b</x></item>"), "1");
 }
 
 #[test]
@@ -4420,6 +4428,49 @@ fn imported_stylesheets_charge_retained_semantic_documents_before_projection() {
             ..
         }
     ));
+}
+
+#[test]
+fn imported_stylesheets_charge_retained_resolver_metadata() {
+    // Resolver-controlled metadata remains live in compilation caches independently of the tiny
+    // stylesheet payload and must therefore cross the same owned-memory gate.
+    struct MetadataResolver;
+
+    impl Resolver for MetadataResolver {
+        fn resolve(
+            &self,
+            _uri: &str,
+            _base_uri: Option<&str>,
+            _purpose: ResolvePurpose,
+        ) -> xml_sec_xslt::Result<ResolvedResource> {
+            let large = "m".repeat(2 << 20);
+            Ok(ResolvedResource {
+                canonical_uri: "memory:included.xsl".into(),
+                identity: ResourceIdentity(large.clone()),
+                bytes: br#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"/>"#.to_vec(),
+                media_type: Some(large),
+                encoding: Some("UTF-8".into()),
+            })
+        }
+    }
+
+    let principal = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:include href="included.xsl"/></xsl:stylesheet>"#;
+    let error = Compiler::new(
+        Arc::new(MetadataResolver),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(principal, Some("memory:main.xsl"))
+    .expect_err("retained resolver metadata exceeds owned-byte budget");
+    assert!(
+        matches!(
+            error,
+            Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            }
+        ),
+        "expected owned-memory rejection, got {error:?}"
+    );
 }
 
 #[test]

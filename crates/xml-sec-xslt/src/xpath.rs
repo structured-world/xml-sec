@@ -2378,12 +2378,12 @@ impl Evaluator {
         )
     }
 
-    pub(crate) fn relative_string(
+    pub(crate) fn relative_nodes(
         &self,
         path: &str,
         node: &SourceNode,
         namespaces: &[(String, String)],
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<Vec<SourceNode>>> {
         let mut selected = vec![node.clone()];
         for step in path.split('/') {
             let mut next = Vec::new();
@@ -2430,11 +2430,7 @@ impl Evaluator {
             }
             selected = next;
         }
-        Ok(Some(
-            selected
-                .first()
-                .map_or_else(String::new, |node| self.string_value(node)),
-        ))
+        Ok(Some(selected))
     }
 
     fn parent_node(&self, node: &SourceNode) -> Option<SourceNode> {
