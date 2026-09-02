@@ -1522,6 +1522,15 @@ fn compound_substring_variables_use_the_general_xpath_evaluator() {
 }
 
 #[test]
+fn two_argument_substring_handles_negative_infinity_without_an_upper_bound() {
+    // XPath 1.0 section 4.2 defines the two-argument form by positions at or after the rounded
+    // start; it has no synthetic upper bound that can become NaN through infinity arithmetic.
+    // https://www.w3.org/TR/1999/REC-xpath-19991116#function-substring
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="substring('abc', -1 div 0)"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "abc");
+}
+
+#[test]
 fn exslt_durations_allow_fractional_syntax_only_for_seconds() {
     // XML Schema 1.0 erratum E2-23 requires digits after a decimal point, but libxslt accepts a
     // trailing point in seconds. Preserve that pinned-oracle exception without accepting decimal
@@ -7822,6 +7831,34 @@ fn match_pattern_current_uses_the_candidate_as_outer_context() {
             r#"<root><group ref="selected"><item id="other"/><item id="selected"/></group></root>"#,
         ),
         "missselected"
+    );
+}
+
+#[test]
+fn match_pattern_fast_path_trims_xml_whitespace_before_predicates() {
+    // XSLT Pattern permits ExprWhitespace around predicate boundaries; the optimized matcher
+    // must preserve the same node test as the general XPath path.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:apply-templates select="root/item"/></xsl:template><xsl:template match="item [@kind='selected']">hit</xsl:template><xsl:template match="item">miss</xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(
+            stylesheet,
+            r#"<root><item kind="selected"/><item kind="other"/></root>"#,
+        ),
+        "hitmiss"
+    );
+}
+
+#[test]
+fn internal_xpath_prefixes_do_not_shadow_stylesheet_namespaces() {
+    // Engine-generated variables require private namespace bindings, but legal caller prefixes
+    // with the old internal-looking spellings remain part of the stylesheet's static context.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings" xmlns:__xml_sec_ctx="urn:caller:context" xmlns:__xml_sec_ext="urn:caller:extension" xmlns:caller_ctx="urn:structured-world:xml-sec:xslt:context" xmlns:caller_ext="urn:structured-world:xml-sec:xslt:extensions"><xsl:output method="text"/><xsl:param name="caller_ctx:position" select="'caller-position'"/><xsl:param name="caller_ext:value0" select="'caller-value'"/><xsl:template match="/"><xsl:for-each select="//__xml_sec_ctx:item"><xsl:value-of select="concat(., ':', position(), '/', last(), ':', $caller_ctx:position)"/></xsl:for-each><xsl:text>|</xsl:text><xsl:value-of select="concat(//__xml_sec_ext:item, ':', str:replace('a', 'a', 'x'), ':', $caller_ext:value0)"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(
+            stylesheet,
+            r#"<root xmlns:c="urn:caller:context" xmlns:e="urn:caller:extension"><c:item>left</c:item><e:item>right</e:item></root>"#,
+        ),
+        "left:1/1:caller-position|right:x:caller-value"
     );
 }
 

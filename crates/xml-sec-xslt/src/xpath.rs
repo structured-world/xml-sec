@@ -1097,6 +1097,18 @@ impl Evaluator {
                 variables,
             });
         }
+        let (extension_prefix, extension_namespace) = unused_internal_namespace(
+            &expression.namespaces,
+            "__xml_sec_ext",
+            EXTENSION_CONTEXT_NS,
+        );
+        let extension_prefix = extension_prefix.into_owned();
+        let extension_namespace = extension_namespace.into_owned();
+        let mut prepared_expression = expression.clone();
+        prepared_expression
+            .namespaces
+            .push((extension_prefix.clone(), extension_namespace.clone()));
+        let expression = &prepared_expression;
         let mut source = expression.source.clone();
         let mut augmented = VariableOverlay::new(variables);
         let mut stored_expressions = HashSet::new();
@@ -1489,19 +1501,21 @@ impl Evaluator {
             let local = format!("value{variable_index}");
             variable_index += 1;
             augmented.insert(
-                ExpandedName::new(Some(EXTENSION_CONTEXT_NS), local.clone()),
+                ExpandedName::new(Some(extension_namespace.as_str()), local.clone()),
                 value,
             );
             if is_stored_expression {
-                stored_expressions
-                    .insert(ExpandedName::new(Some(EXTENSION_CONTEXT_NS), local.clone()));
+                stored_expressions.insert(ExpandedName::new(
+                    Some(extension_namespace.as_str()),
+                    local.clone(),
+                ));
             }
-            source.replace_range(call.start..call.end, &format!("$__xml_sec_ext:{local}"));
+            source.replace_range(
+                call.start..call.end,
+                &format!("${extension_prefix}:{local}"),
+            );
         }
-        let mut namespaces = expression.namespaces.clone();
-        namespaces.push(("__xml_sec_ext".into(), EXTENSION_CONTEXT_NS.into()));
-        let mut rewritten = expression.derived(source);
-        rewritten.namespaces = namespaces;
+        let rewritten = expression.derived(source);
         Ok(PreparedExtensionCalls::Rewritten {
             expression: rewritten,
             variables: augmented,
@@ -1592,7 +1606,14 @@ impl Evaluator {
             .ok_or_else(|| Error::Dynamic("XPath context node is stale".into()))?;
         let normalized = normalize_xpath_for_sxd(&expression.source);
         let isolated = hide_projection_elements_from_axes(&normalized);
-        let rewritten = rewrite_outer_context_functions(&isolated);
+        let context_namespace =
+            (isolated.contains("position") || isolated.contains("last")).then(|| {
+                unused_internal_namespace(&expression.namespaces, "__xml_sec_ctx", CONTEXT_NS)
+            });
+        let rewritten = context_namespace.as_ref().map_or_else(
+            || Cow::Borrowed(isolated.as_ref()),
+            |(prefix, _)| rewrite_outer_context_functions(&isolated, prefix),
+        );
         if !self.expressions.borrow().contains_key(rewritten.as_ref()) {
             // One input byte can produce at most one parser token. This conservative
             // node-sized allowance bounds the retained AST and cache key before insertion.
@@ -1619,10 +1640,11 @@ impl Evaluator {
             context.set_namespace(prefix, uri);
         }
         context.set_namespace("xml", "http://www.w3.org/XML/1998/namespace");
-        context.set_namespace("__xml_sec_ctx", CONTEXT_NS);
-        context.set_namespace("__xml_sec_ext", EXTENSION_CONTEXT_NS);
-        context.set_variable((CONTEXT_NS, "position"), position as f64);
-        context.set_variable((CONTEXT_NS, "last"), size as f64);
+        if let Some((prefix, namespace)) = &context_namespace {
+            context.set_namespace(prefix, namespace);
+            context.set_variable((namespace.as_ref(), "position"), position as f64);
+            context.set_variable((namespace.as_ref(), "last"), size as f64);
+        }
         context.set_function(
             "current",
             CurrentNode {
@@ -2117,6 +2139,7 @@ impl Evaluator {
             else {
                 return Ok(Some(false));
             };
+            let lexical = lexical.trim_matches(crate::lexical::is_xml_whitespace);
             return Ok(Some(
                 (lexical == "*" || element_pattern_name_matches(lexical, name, namespaces)?)
                     && attributes.iter().any(|attribute| {
@@ -3765,13 +3788,9 @@ enum ExtensionCallKind {
 fn variable_reference_name(source: &str, namespaces: &[(String, String)]) -> Option<ExpandedName> {
     let lexical = source.trim().strip_prefix('$')?;
     if let Some((prefix, local)) = lexical.split_once(':') {
-        let namespace = if prefix == "__xml_sec_ext" {
-            EXTENSION_CONTEXT_NS.to_owned()
-        } else {
-            namespaces.iter().find_map(|(candidate, namespace)| {
-                (candidate == prefix).then(|| namespace.clone())
-            })?
-        };
+        let namespace = namespaces
+            .iter()
+            .find_map(|(candidate, namespace)| (candidate == prefix).then(|| namespace.clone()))?;
         Some(ExpandedName::new(Some(namespace), local))
     } else {
         Some(ExpandedName::new(None::<String>, lexical))
@@ -3996,7 +4015,43 @@ fn for_each_exslt_replacement_segment(
     }
 }
 
-fn rewrite_outer_context_functions(source: &str) -> std::borrow::Cow<'_, str> {
+fn unused_internal_namespace<'a>(
+    namespaces: &[(String, String)],
+    preferred_prefix: &'a str,
+    preferred_namespace: &'a str,
+) -> (Cow<'a, str>, Cow<'a, str>) {
+    (
+        unused_internal_name(
+            namespaces.iter().map(|(prefix, _)| prefix.as_str()),
+            preferred_prefix,
+            '_',
+        ),
+        unused_internal_name(
+            namespaces.iter().map(|(_, namespace)| namespace.as_str()),
+            preferred_namespace,
+            ':',
+        ),
+    )
+}
+
+fn unused_internal_name<'existing, 'preferred>(
+    existing: impl Iterator<Item = &'existing str> + Clone,
+    preferred: &'preferred str,
+    padding: char,
+) -> Cow<'preferred, str> {
+    if existing.clone().all(|value| value != preferred) {
+        return Cow::Borrowed(preferred);
+    }
+    let longest = existing.map(str::len).max().unwrap_or(0);
+    let mut unique = String::with_capacity(longest + padding.len_utf8());
+    unique.push_str(preferred);
+    while unique.len() <= longest {
+        unique.push(padding);
+    }
+    Cow::Owned(unique)
+}
+
+fn rewrite_outer_context_functions<'a>(source: &'a str, prefix: &str) -> Cow<'a, str> {
     if !source.contains("position") && !source.contains("last") {
         return std::borrow::Cow::Borrowed(source);
     }
@@ -4027,22 +4082,22 @@ fn rewrite_outer_context_functions(source: &str) -> std::borrow::Cow<'_, str> {
             _ => {}
         }
         if predicate_depth == 0 {
-            let replacement = [
-                ("position", "$__xml_sec_ctx:position"),
-                ("last", "$__xml_sec_ctx:last"),
-            ]
-            .into_iter()
-            .find_map(|(function, variable)| {
-                outer_context_call_len(tail, function).and_then(|length| {
-                    source[..cursor]
-                        .chars()
-                        .next_back()
-                        .is_none_or(|before| !is_xpath_name_character(before))
-                        .then_some((length, variable))
-                })
-            });
-            if let Some((length, variable)) = replacement {
-                output.push_str(variable);
+            let replacement = [("position", "position"), ("last", "last")]
+                .into_iter()
+                .find_map(|(function, local)| {
+                    outer_context_call_len(tail, function).and_then(|length| {
+                        source[..cursor]
+                            .chars()
+                            .next_back()
+                            .is_none_or(|before| !is_xpath_name_character(before))
+                            .then_some((length, local))
+                    })
+                });
+            if let Some((length, local)) = replacement {
+                output.push('$');
+                output.push_str(prefix);
+                output.push(':');
+                output.push_str(local);
                 cursor += length;
                 continue;
             }
@@ -4701,12 +4756,23 @@ fn hex_decode(value: &str) -> std::result::Result<Vec<u8>, function::Error> {
     pairs
         .iter()
         .map(|pair| {
-            let text = std::str::from_utf8(pair).expect("hex input is ASCII-compatible");
-            u8::from_str_radix(text, 16).map_err(|_| function::Error::Other {
-                what: "EXSLT RC4 ciphertext contains invalid hex".into(),
-            })
+            let [high, low] = pair.map(hex_nibble);
+            high.zip(low)
+                .map(|(high, low)| high << 4 | low)
+                .ok_or_else(|| function::Error::Other {
+                    what: "EXSLT RC4 ciphertext contains invalid hex".into(),
+                })
         })
         .collect()
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 enum ExsltMathFunction {
@@ -6351,7 +6417,7 @@ mod tests {
         // XPath allows whitespace between a function name and its empty
         // argument list; rewriting must not depend on one lexical spelling.
         assert_eq!(
-            rewrite_outer_context_functions("position \t( ) + last\n(\r)"),
+            rewrite_outer_context_functions("position \t( ) + last\n(\r)", "__xml_sec_ctx",),
             "$__xml_sec_ctx:position + $__xml_sec_ctx:last"
         );
     }
@@ -6363,7 +6429,7 @@ mod tests {
         // variable reference.
         let source = "f:a\u{0301}position() + position()";
         assert_eq!(
-            rewrite_outer_context_functions(source),
+            rewrite_outer_context_functions(source, "__xml_sec_ctx"),
             "f:a\u{0301}position() + $__xml_sec_ctx:position"
         );
     }
@@ -6390,6 +6456,30 @@ mod tests {
                 .expect_err("workspace exceeds the evaluator budget");
             assert!(matches!(error, function::Error::Other { what } if what.contains("budget")));
         }
+    }
+
+    #[test]
+    fn rc4_decrypt_rejects_non_ascii_hex_without_panicking() {
+        // Ciphertext is attacker-controlled XPath string data. Invalid UTF-8 byte pairs must
+        // reach the typed hexadecimal error instead of an infallible conversion assertion.
+        let package = Package::new();
+        let document = package.as_document();
+        let context = Context::new();
+        let evaluation =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+        let error = ExsltCryptoFunction::Rc4Decrypt
+            .evaluate(
+                &evaluation,
+                vec![
+                    SxdValue::String("key".into()),
+                    SxdValue::String("😀".into()),
+                ],
+            )
+            .expect_err("non-ASCII ciphertext is not hexadecimal");
+        assert!(matches!(
+            error,
+            function::Error::Other { what } if what.contains("invalid hex")
+        ));
     }
 
     #[test]
@@ -6439,7 +6529,7 @@ mod tests {
         assert!(matches!(&normalized, std::borrow::Cow::Borrowed(_)));
         let isolated = hide_projection_elements_from_axes(&normalized);
         assert!(matches!(&isolated, std::borrow::Cow::Borrowed(_)));
-        let context = rewrite_outer_context_functions(&isolated);
+        let context = rewrite_outer_context_functions(&isolated, "__xml_sec_ctx");
         assert!(matches!(context, std::borrow::Cow::Borrowed(_)));
     }
 

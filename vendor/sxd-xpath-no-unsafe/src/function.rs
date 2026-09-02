@@ -436,9 +436,9 @@ impl Function for Substring {
 
         let len = if args.len() == 3 {
             let len = args.pop_number()?;
-            round_ties_to_positive_infinity(len)
+            Some(round_ties_to_positive_infinity(len))
         } else {
-            f64::INFINITY
+            None
         };
 
         let start = args.pop_number()?;
@@ -449,7 +449,7 @@ impl Function for Substring {
         let mut selected_chars = String::with_capacity(s.len());
         selected_chars.extend(s.chars().enumerate().filter_map(|(p, s)| {
             let p = (p + 1) as f64; // 1-based indexing
-            if p >= start && p < start + len {
+            if p >= start && len.is_none_or(|len| p < start + len) {
                 Some(s)
             } else {
                 None
@@ -987,6 +987,16 @@ mod test {
     fn substring_has_optional_length() {
         evaluate_literal(Substring, args!["あいうえお", 2.0, 3.0], |r| {
             assert_eq!(Ok(Value::String("いうえ".to_owned())), r);
+        });
+    }
+
+    #[test]
+    fn substring_without_length_accepts_negative_infinity_start() {
+        // XPath 1.0 section 4.2 selects every finite character position when the rounded start
+        // is negative infinity and no upper bound was supplied.
+        // https://www.w3.org/TR/1999/REC-xpath-19991116#function-substring
+        evaluate_literal(Substring, args!["abc", f64::NEG_INFINITY], |result| {
+            assert_eq!(Ok(Value::String("abc".to_owned())), result);
         });
     }
 
