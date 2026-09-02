@@ -152,29 +152,36 @@ impl function::Function for DateFunction {
                         .map_or_else(String::new, DurationValue::render),
                 ))
             }
-            Duration => Ok(Value::String(
-                args.first()
-                    .map(Value::number)
-                    .filter(|seconds| seconds.is_finite() && seconds.abs() < 1e23)
-                    .map(DurationValue::from_seconds)
-                    .map_or_else(String::new, DurationValue::render),
-            )),
+            Duration => {
+                // EXSLT date:duration defaults an omitted argument to zero-argument
+                // date:seconds(), including its controlled operation-clock semantics.
+                // https://exslt.github.io/date/functions/duration/date.duration.html
+                let seconds = if let Some(value) = args.first() {
+                    value.number()
+                } else {
+                    current_seconds_for_operation(self.1.as_ref(), self.2)?
+                };
+                let duration = if seconds.is_finite() && seconds.abs() < 1e23 {
+                    DurationValue::from_seconds(seconds).render()
+                } else {
+                    String::new()
+                };
+                Ok(Value::String(duration))
+            }
             Seconds => {
                 // Omitted date:seconds input defaults to date:date-time, so it shares the same
                 // controlled clock and deterministic-policy gate.
                 // https://exslt.github.io/date/functions/seconds/date.seconds.html
-                let current;
-                let input = if let Some(input) = args.first().map(Value::string) {
-                    current = input;
-                    current.as_str()
-                } else {
-                    current = current_datetime_for_operation(self.1.as_ref(), self.2)?;
-                    current.as_str()
+                let Some(input) = args.first().map(Value::string) else {
+                    return Ok(Value::Number(current_seconds_for_operation(
+                        self.1.as_ref(),
+                        self.2,
+                    )?));
                 };
-                let seconds = DurationValue::parse(input)
+                let seconds = DurationValue::parse(&input)
                     .filter(|duration| duration.months == 0)
                     .map(|duration| duration.seconds)
-                    .or_else(|| DateValue::parse(input).and_then(DateValue::unix_seconds))
+                    .or_else(|| DateValue::parse(&input).and_then(DateValue::unix_seconds))
                     .unwrap_or(f64::NAN);
                 Ok(Value::Number(seconds))
             }
@@ -221,25 +228,41 @@ fn current_datetime_for_operation(
     clock: &dyn Clock,
     extension_policy: ExtensionPolicy,
 ) -> std::result::Result<String, function::Error> {
+    Ok(render_current_datetime(current_time_for_operation(
+        clock,
+        extension_policy,
+    )?))
+}
+
+fn current_seconds_for_operation(
+    clock: &dyn Clock,
+    extension_policy: ExtensionPolicy,
+) -> std::result::Result<f64, function::Error> {
+    Ok(current_time_for_operation(clock, extension_policy)?.unix_timestamp() as f64)
+}
+
+fn current_time_for_operation(
+    clock: &dyn Clock,
+    extension_policy: ExtensionPolicy,
+) -> std::result::Result<time::OffsetDateTime, function::Error> {
     if extension_policy == ExtensionPolicy::Deterministic {
         return argument_error(
             "zero-argument EXSLT date functions are disabled by the execution extension policy",
         );
     }
-    current_datetime(clock)
+    clock.now_local().map_err(|error| function::Error::Other {
+        what: error.to_string(),
+    })
 }
 
-fn current_datetime(clock: &dyn Clock) -> std::result::Result<String, function::Error> {
-    let current = clock.now_local().map_err(|error| function::Error::Other {
-        what: error.to_string(),
-    })?;
+fn render_current_datetime(current: time::OffsetDateTime) -> String {
     // EXSLT date:date-time uses XSD 1.0 §3.2.7, whose Appendix D.3.2 forbids year zero:
     // https://www.w3.org/TR/xmlschema-2/#noYearZero
     let year = render_year(schema_year(i64::from(current.year())));
     let offset = current.offset().whole_seconds();
     let sign = if offset < 0 { '-' } else { '+' };
     let offset = offset.unsigned_abs();
-    Ok(format!(
+    format!(
         "{year}-{:02}-{:02}T{:02}:{:02}:{:02}{sign}{:02}:{:02}",
         u8::from(current.month()),
         current.day(),
@@ -248,7 +271,7 @@ fn current_datetime(clock: &dyn Clock) -> std::result::Result<String, function::
         current.second(),
         offset / 3600,
         (offset % 3600) / 60,
-    ))
+    )
 }
 
 fn evaluate_component(
@@ -716,6 +739,17 @@ impl DateValue {
         };
         let least = specificity(self.kind)?.min(specificity(other.kind)?);
         if least <= 1 {
+            if least == 0 {
+                // EXSLT date:difference first truncates both operands to their common precision;
+                // subtracting serial months before truncation gives the wrong sign near a year.
+                // https://exslt.github.io/date/functions/difference/date.difference.1.html
+                let years =
+                    astronomical_year(other.year?).checked_sub(astronomical_year(self.year?))?;
+                return Some(DurationValue {
+                    months: years.checked_mul(12)?,
+                    seconds: 0.0,
+                });
+            }
             let serial_month = |date: &Self| {
                 astronomical_year(date.year?)
                     .checked_mul(12)?
@@ -723,7 +757,7 @@ impl DateValue {
             };
             let months = serial_month(&other)?.checked_sub(serial_month(&self)?)?;
             return Some(DurationValue {
-                months: if least == 0 { months / 12 * 12 } else { months },
+                months,
                 seconds: 0.0,
             });
         }
@@ -760,7 +794,10 @@ impl DateValue {
                 .checked_add(duration.months)?;
             let astro = serial.div_euclid(12);
             self.year = Some(schema_year(astro));
-            self.month = self.month.map(|_| (serial.rem_euclid(12) + 1) as u8);
+            // EXSLT date:add promotes gYear to gYearMonth before applying a non-zero month
+            // component, so the computed month must survive even when the input omitted it.
+            // https://exslt.github.io/date/functions/add/date.add.2.html
+            self.month = Some((serial.rem_euclid(12) + 1) as u8);
             if let (Some(year), Some(month), Some(day)) = (self.year, self.month, self.day) {
                 self.day = Some(day.min(days_in_month(year, month)));
             }

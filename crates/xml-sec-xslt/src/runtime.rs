@@ -2297,6 +2297,7 @@ impl<'a> Execution<'a> {
                 .trim()
                 .strip_prefix('$')
                 .and_then(|value| value.split_once('*'))
+            && is_lexical_variable_name(variable.trim())
             && let Some(factor) = parse_xpath_number(factor)
         {
             let length =

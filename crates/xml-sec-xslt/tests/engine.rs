@@ -1404,6 +1404,74 @@ fn zero_argument_exslt_seconds_uses_the_execution_clock_and_policy() {
 }
 
 #[test]
+fn zero_argument_exslt_duration_uses_the_execution_clock_and_policy() {
+    // EXSLT date:duration defines its omitted argument as date:seconds(), so both functions must
+    // share the configured operation clock and deterministic-policy gate.
+    // https://exslt.github.io/date/functions/duration/date.duration.html
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:date="http://exslt.org/dates-and-times"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="date:duration()"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse("<source/>", None).expect("source parses");
+    let fixed = time::OffsetDateTime::from_unix_timestamp(86_400).expect("test time is valid");
+    let result = stylesheet
+        .execute_with_environment(
+            &source,
+            &Parameters::new(),
+            ExecutionEnvironment::new(Arc::new(NoResolver))
+                .with_clock(Arc::new(FixedClock::new(fixed))),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("fixed operation time is available");
+    assert_eq!(result.serialized.bytes, b"P1D");
+
+    let error = stylesheet
+        .execute_with_environment(
+            &source,
+            &Parameters::new(),
+            ExecutionEnvironment::new(Arc::new(NoResolver))
+                .with_extension_policy(ExtensionPolicy::Deterministic),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect_err("deterministic execution rejects current-time access");
+    assert!(
+        matches!(error, Error::Dynamic(message) if message.contains("execution extension policy"))
+    );
+}
+
+#[test]
+fn exslt_date_arithmetic_normalizes_common_precision_before_calculation() {
+    // EXSLT date:difference truncates both operands to the least-specific input before subtraction.
+    // https://exslt.github.io/date/functions/difference/date.difference.1.html
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:date="http://exslt.org/dates-and-times"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="date:difference('2001', '2000-02')"/><xsl:text>|</xsl:text><xsl:value-of select="date:difference('2000-02', '2001')"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "-P1Y|P1Y");
+}
+
+#[test]
+fn exslt_add_promotes_a_year_when_lower_order_components_are_added() {
+    // EXSLT date:add promotes gYear to gYearMonth before applying any non-year component.
+    // https://exslt.github.io/date/functions/add/date.add.2.html
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:date="http://exslt.org/dates-and-times"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="date:add('2000', 'P1M')"/><xsl:text>|</xsl:text><xsl:value-of select="date:add('2000', 'P13M')"/><xsl:text>|</xsl:text><xsl:value-of select="date:add('2000', '-P1M')"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "2000-02|2001-02|1999-12");
+}
+
+#[test]
+fn compound_substring_length_uses_the_general_xpath_evaluator() {
+    // The specialized path is valid only for `$QName * number`; compound arithmetic must retain
+    // XPath 1.0 operator precedence in the general evaluator.
+    // https://www.w3.org/TR/1999/REC-xpath-19991116/#section-String-Functions
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:param name="x" select="2"/><xsl:param name="y" select="1"/><xsl:template match="/"><xsl:value-of select="substring ('abcdef', 0, $x + $y * 2)"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "abc");
+}
+
+#[test]
 fn exslt_durations_allow_fractional_syntax_only_for_seconds() {
     // XML Schema 1.0 erratum E2-23 requires digits after a decimal point, but libxslt accepts a
     // trailing point in seconds. Preserve that pinned-oracle exception without accepting decimal
