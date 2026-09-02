@@ -411,6 +411,39 @@ fn whitespace_aliases_and_decimal_formats_affect_results() {
 }
 
 #[test]
+fn equal_precedence_decimal_formats_merge_explicit_properties() {
+    // XSLT 1.0 section 12.3 merges declarations with the same name and precedence
+    // property by property; defaults must not conflict with separately declared values.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#format-number
+    let stylesheet = r#"
+      <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+        <xsl:output method="text"/>
+        <xsl:decimal-format name="d" infinity="Inf"/>
+        <xsl:decimal-format name="d" NaN="Not a Number"/>
+        <xsl:template match="/">
+          <xsl:value-of select="format-number(1 div 0, '0', 'd')"/>
+          <xsl:text>|</xsl:text>
+          <xsl:value-of select="format-number(0 div 0, '0', 'd')"/>
+        </xsl:template>
+      </xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<root/>"), "Inf|Not a Number");
+
+    let conflict = r#"
+      <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+        <xsl:decimal-format name="d" infinity="Inf"/>
+        <xsl:decimal-format name="d" infinity="Infinite"/>
+      </xsl:stylesheet>"#;
+    assert!(matches!(
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(1 << 20, 0, 64, 1 << 20),
+        )
+            .compile(conflict, None),
+        Err(Error::Static(message)) if message.contains("conflicting xsl:decimal-format")
+    ));
+}
+
+#[test]
 fn malformed_stylesheet_and_budget_exhaustion_are_typed() {
     // Static and resource failures must remain distinguishable to callers.
     let error = Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 64, 4096))

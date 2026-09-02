@@ -5789,6 +5789,7 @@ fn default_decimal_format() -> DecimalFormat {
         zero_digit: '0',
         digit: '#',
         pattern_separator: ';',
+        specified: 0,
     }
 }
 

@@ -590,18 +590,10 @@ impl<R: Resolver> Compiler<R> {
                 // https://www.w3.org/TR/1999/REC-xslt-19991116#format-number
                 require_empty_instruction(node)?;
                 let format = DecimalFormat::parse(node, precedence)?;
-                if let Some(existing) = state.decimal_formats.iter().find(|existing| {
+                if let Some(existing) = state.decimal_formats.iter_mut().find(|existing| {
                     existing.name == format.name && existing.precedence == format.precedence
                 }) {
-                    if existing != &format {
-                        return Err(Error::Static(format!(
-                            "conflicting xsl:decimal-format declaration for {}",
-                            format
-                                .name
-                                .as_ref()
-                                .map_or("the default format", |name| name.local.as_str())
-                        )));
-                    }
+                    existing.merge(format)?;
                 } else {
                     state.decimal_formats.push(format);
                 }
@@ -885,6 +877,7 @@ pub(crate) struct DecimalFormat {
     pub zero_digit: char,
     pub digit: char,
     pub pattern_separator: char,
+    pub(crate) specified: u16,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct NameTest {
@@ -3372,6 +3365,17 @@ impl NameTest {
     }
 }
 impl DecimalFormat {
+    const DECIMAL_SEPARATOR: u16 = 1 << 0;
+    const GROUPING_SEPARATOR: u16 = 1 << 1;
+    const INFINITY: u16 = 1 << 2;
+    const MINUS_SIGN: u16 = 1 << 3;
+    const NAN: u16 = 1 << 4;
+    const PERCENT: u16 = 1 << 5;
+    const PER_MILLE: u16 = 1 << 6;
+    const ZERO_DIGIT: u16 = 1 << 7;
+    const DIGIT: u16 = 1 << 8;
+    const PATTERN_SEPARATOR: u16 = 1 << 9;
+
     fn parse(node: roxmltree::Node<'_, '_>, precedence: usize) -> Result<Self> {
         fn one(node: roxmltree::Node<'_, '_>, name: &str, default: char) -> Result<char> {
             node.attribute(name).map_or(Ok(default), |v| {
@@ -3398,20 +3402,65 @@ impl DecimalFormat {
             zero_digit: one(node, "zero-digit", '0')?,
             digit: one(node, "digit", '#')?,
             pattern_separator: one(node, "pattern-separator", ';')?,
+            specified: [
+                ("decimal-separator", Self::DECIMAL_SEPARATOR),
+                ("grouping-separator", Self::GROUPING_SEPARATOR),
+                ("infinity", Self::INFINITY),
+                ("minus-sign", Self::MINUS_SIGN),
+                ("NaN", Self::NAN),
+                ("percent", Self::PERCENT),
+                ("per-mille", Self::PER_MILLE),
+                ("zero-digit", Self::ZERO_DIGIT),
+                ("digit", Self::DIGIT),
+                ("pattern-separator", Self::PATTERN_SEPARATOR),
+            ]
+            .into_iter()
+            .filter_map(|(name, bit)| node.attribute(name).map(|_| bit))
+            .fold(0, |mask, bit| mask | bit),
         };
-        if unicode_decimal_value(format.zero_digit) != Some(0) {
+        format.validate()?;
+        Ok(format)
+    }
+
+    fn merge(&mut self, incoming: Self) -> Result<()> {
+        macro_rules! merge_property {
+            ($field:ident, $bit:ident) => {
+                if incoming.specified & Self::$bit != 0 {
+                    if self.specified & Self::$bit != 0 && self.$field != incoming.$field {
+                        return Err(self.conflict());
+                    }
+                    self.$field = incoming.$field;
+                }
+            };
+        }
+        merge_property!(decimal_separator, DECIMAL_SEPARATOR);
+        merge_property!(grouping_separator, GROUPING_SEPARATOR);
+        merge_property!(infinity, INFINITY);
+        merge_property!(minus_sign, MINUS_SIGN);
+        merge_property!(nan, NAN);
+        merge_property!(percent, PERCENT);
+        merge_property!(per_mille, PER_MILLE);
+        merge_property!(zero_digit, ZERO_DIGIT);
+        merge_property!(digit, DIGIT);
+        merge_property!(pattern_separator, PATTERN_SEPARATOR);
+        self.specified |= incoming.specified;
+        self.validate()
+    }
+
+    fn validate(&self) -> Result<()> {
+        if unicode_decimal_value(self.zero_digit) != Some(0) {
             return Err(Error::Static(
                 "xsl:decimal-format zero-digit must have Unicode decimal value zero".into(),
             ));
         }
         let syntax = [
-            ("decimal-separator", format.decimal_separator),
-            ("grouping-separator", format.grouping_separator),
-            ("percent", format.percent),
-            ("per-mille", format.per_mille),
-            ("zero-digit", format.zero_digit),
-            ("digit", format.digit),
-            ("pattern-separator", format.pattern_separator),
+            ("decimal-separator", self.decimal_separator),
+            ("grouping-separator", self.grouping_separator),
+            ("percent", self.percent),
+            ("per-mille", self.per_mille),
+            ("zero-digit", self.zero_digit),
+            ("digit", self.digit),
+            ("pattern-separator", self.pattern_separator),
         ];
         for (index, (name, value)) in syntax.iter().enumerate() {
             if let Some((other, _)) = syntax[index + 1..]
@@ -3423,7 +3472,16 @@ impl DecimalFormat {
                 )));
             }
         }
-        Ok(format)
+        Ok(())
+    }
+
+    fn conflict(&self) -> Error {
+        Error::Static(format!(
+            "conflicting xsl:decimal-format declaration for {}",
+            self.name
+                .as_ref()
+                .map_or("the default format", |name| name.local.as_str())
+        ))
     }
 }
 
