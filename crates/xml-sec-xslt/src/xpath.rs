@@ -3969,7 +3969,7 @@ fn for_each_exslt_replacement_segment(
     mut emit: impl FnMut(&str),
 ) {
     let mut cursor = 0;
-    let has_non_empty = searches.iter().any(|search| !search.is_empty());
+    let empty_search = searches.iter().position(String::is_empty);
     while cursor < input.len() {
         let remaining = &input[cursor..];
         let matched = searches
@@ -3988,8 +3988,7 @@ fn for_each_exslt_replacement_segment(
             .expect("cursor remains inside the input");
         emit(&remaining[..character.len_utf8()]);
         cursor += character.len_utf8();
-        if !has_non_empty
-            && let Some(index) = searches.iter().position(String::is_empty)
+        if let Some(index) = empty_search
             && cursor < input.len()
         {
             emit(replacements.get(index).map_or("", String::as_str));
@@ -5144,7 +5143,10 @@ fn visit_uri_encoded_bytes(
 }
 
 fn uri_byte_is_unescaped(character: char, escape_reserved: bool) -> bool {
-    const RESERVED: &str = ";/?:@&=+$,[]#";
+    // EXSLT inherits the reserved delimiters from RFC 2396 section 2.2. `#` is outside that
+    // production and must remain encoded even when reserved delimiters are preserved.
+    // https://www.rfc-editor.org/rfc/rfc2396#section-2.2
+    const RESERVED: &str = ";/?:@&=+$,[]";
     character.is_ascii_alphanumeric()
         || matches!(
             character,
@@ -5968,7 +5970,8 @@ fn render_decimal(
     };
     let (number_first, number_last) = decimal_pattern_bounds(number_pattern, format)?;
     let (affix_first, affix_last) = decimal_pattern_bounds(affix_pattern, format)?;
-    if value.is_infinite() {
+    let scaled = value.abs() * multiplier;
+    if scaled.is_infinite() {
         let mut output = String::new();
         if negative && !negative_subpattern {
             output.push(format.minus_sign);
@@ -6009,7 +6012,6 @@ fn render_decimal(
         minimum_fraction = minimum_fraction.max(1);
         maximum_fraction = maximum_fraction.max(1);
     }
-    let scaled = value.abs() * multiplier;
     let factor = 10_f64.powi(i32::try_from(maximum_fraction).unwrap_or(i32::MAX));
     let shifted = scaled * factor;
     let rounded = if factor.is_finite() && shifted.is_finite() {

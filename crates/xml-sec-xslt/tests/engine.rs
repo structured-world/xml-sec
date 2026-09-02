@@ -8246,11 +8246,13 @@ fn decimal_formats_enforce_character_invariants() {
 
 #[test]
 fn encode_uri_escapes_every_reserved_character_when_requested() {
-    // The true flag escapes the complete RFC 2396 reserved set; false preserves that set.
+    // RFC 2396 section 2.2 does not classify the fragment delimiter as reserved, so EXSLT
+    // encodes `#` under both flag modes instead of changing the resulting URI's semantics.
+    // https://www.rfc-editor.org/rfc/rfc2396#section-2.2
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="str:encode-uri(';/?:@&amp;=+$,[]#', true())"/><xsl:text>|</xsl:text><xsl:value-of select="str:encode-uri(';/?:@&amp;=+$,[]#', false())"/></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(stylesheet, "<source/>"),
-        "%3B%2F%3F%3A%40%26%3D%2B%24%2C%5B%5D%23|;/?:@&=+$,[]#"
+        "%3B%2F%3F%3A%40%26%3D%2B%24%2C%5B%5D%23|;/?:@&=+$,[]%23"
     );
 }
 
@@ -8322,6 +8324,34 @@ fn format_number_applies_affixes_and_negative_subpatterns_to_infinity() {
     // Infinity substitutes for the numeric portion after the selected subpattern is parsed.
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="format-number(1 div 0, 'P0S')"/><xsl:text>|</xsl:text><xsl:value-of select="format-number(-1 div 0, 'P0S;N0Z')"/></xsl:template></xsl:stylesheet>"#;
     assert_eq!(execute(stylesheet, "<source/>"), "PInfinityS|NInfinityZ");
+}
+
+#[test]
+fn format_number_uses_configured_infinity_after_multiplier_overflow() {
+    // XSLT 1.0 section 12.3 delegates percent/per-mille scaling and infinity symbols to
+    // DecimalFormat; overflow of the adjusted number must retain those configured affixes.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#format-number
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:decimal-format infinity="OVER"/><xsl:param name="value"/><xsl:template match="/"><xsl:value-of select="format-number($value, 'P0%S;N0%Z')"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let mut parameters = Parameters::new();
+    parameters.insert(
+        ExpandedName::new(None::<String>, "value"),
+        Value::Number(-1e308),
+    );
+    let output = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &parameters,
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("overflowed multiplier formats as infinity");
+    assert_eq!(output.serialized.bytes, b"NOVER%Z");
 }
 
 #[test]
@@ -9246,6 +9276,21 @@ fn exslt_replace_preserves_libxslt_node_set_string_compatibility() {
             "<root><search>a</search><search>b</search><search>c</search><replacement><mark id=\"kept\">R</mark><!--kept--><?kept value?></replacement></root>",
         ),
         "<out>Rkeptvalue</out>\n",
+    );
+}
+
+#[test]
+fn exslt_replace_applies_empty_searches_after_nonempty_matches() {
+    // EXSLT requires empty search strings to insert their replacement between characters while
+    // longer nonempty searches retain priority.
+    // https://exslt.github.io/str/functions/replace/index.html
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="str:replace('abc', root/search, root/replacement)"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(
+            stylesheet,
+            "<root><search>a</search><search/><replacement>X</replacement><replacement>-</replacement></root>",
+        ),
+        "Xb-c",
     );
 }
 

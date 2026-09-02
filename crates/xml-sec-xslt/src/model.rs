@@ -1712,29 +1712,53 @@ fn collect_internal_entity_declarations(subset: &str) -> Result<InternalEntityDe
     let mut declarations = InternalEntityDeclarations::default();
     let mut cursor = 0;
     while cursor < subset.len() {
+        if subset[cursor..]
+            .chars()
+            .next()
+            .is_some_and(crate::lexical::is_xml_whitespace)
+        {
+            skip_xml_whitespace(subset, &mut cursor);
+            continue;
+        }
         if subset[cursor..].starts_with("<!--") {
-            let length = subset[cursor + 4..]
+            let content_start = cursor + 4;
+            let content_end = subset[content_start..]
                 .find("-->")
-                .map(|offset| offset + 7)
+                .map(|offset| content_start + offset)
                 .ok_or_else(|| Error::Xml("unterminated DTD comment".into()))?;
-            cursor += length;
+            let content = &subset[content_start..content_end];
+            if content.contains("--") || content.ends_with('-') {
+                return Err(Error::Xml(
+                    "DTD comment contains an invalid `--` sequence".into(),
+                ));
+            }
+            cursor = content_end + 3;
             continue;
         }
         if subset[cursor..].starts_with("<?") {
-            let length = subset[cursor + 2..]
-                .find("?>")
-                .map(|offset| offset + 4)
-                .ok_or_else(|| Error::Xml("unterminated DTD processing instruction".into()))?;
-            cursor += length;
+            cursor = parse_dtd_processing_instruction(subset, cursor)?;
             continue;
         }
         if subset[cursor..].starts_with("<!ATTLIST") {
             cursor = collect_internal_attribute_list(subset, cursor, &mut declarations.attributes)?;
             continue;
         }
-        if !subset[cursor..].starts_with("<!ENTITY") {
-            cursor += subset[cursor..].chars().next().map_or(1, char::len_utf8);
+        if subset[cursor..].starts_with("<!ELEMENT") {
+            cursor = parse_dtd_element_declaration(subset, cursor)?;
             continue;
+        }
+        if subset[cursor..].starts_with("<!NOTATION") {
+            cursor = parse_dtd_notation_declaration(subset, cursor)?;
+            continue;
+        }
+        if subset.as_bytes().get(cursor) == Some(&b'%') {
+            parse_dtd_parameter_reference(subset, &mut cursor)?;
+            continue;
+        }
+        if !subset[cursor..].starts_with("<!ENTITY") {
+            return Err(Error::Xml(
+                "internal DTD subset contains invalid markup or character data".into(),
+            ));
         }
         let declaration_start = cursor;
         cursor += "<!ENTITY".len();
@@ -1831,6 +1855,293 @@ fn collect_internal_entity_declarations(subset: &str) -> Result<InternalEntityDe
         }
     }
     Ok(declarations)
+}
+
+fn parse_dtd_processing_instruction(subset: &str, mut cursor: usize) -> Result<usize> {
+    cursor += 2;
+    let target = parse_dtd_name(subset, &mut cursor, "DTD processing instruction target")?;
+    if target.eq_ignore_ascii_case("xml") {
+        return Err(Error::Xml(
+            "DTD processing instruction target must not be XML".into(),
+        ));
+    }
+    if subset[cursor..].starts_with("?>") {
+        return Ok(cursor + 2);
+    }
+    require_dtd_whitespace(
+        subset,
+        &mut cursor,
+        "after DTD processing instruction target",
+    )?;
+    let end = subset[cursor..]
+        .find("?>")
+        .map(|offset| cursor + offset)
+        .ok_or_else(|| Error::Xml("unterminated DTD processing instruction".into()))?;
+    Ok(end + 2)
+}
+
+fn parse_dtd_parameter_reference(subset: &str, cursor: &mut usize) -> Result<()> {
+    *cursor += 1;
+    parse_dtd_name(subset, cursor, "DTD parameter entity reference")?;
+    if subset.as_bytes().get(*cursor) != Some(&b';') {
+        return Err(Error::Xml(
+            "DTD parameter entity reference must end with `;`".into(),
+        ));
+    }
+    *cursor += 1;
+    Ok(())
+}
+
+fn parse_dtd_element_declaration(subset: &str, mut cursor: usize) -> Result<usize> {
+    // XML 1.0 sections 3.2-3.2.2 productions [45]-[51] define the complete element content
+    // grammar. The lexical document scanner exposes the internal subset as one token, so this
+    // parser must validate declarations before discarding their validation-only content model.
+    // https://www.w3.org/TR/xml/#elemdecls
+    cursor += "<!ELEMENT".len();
+    require_dtd_whitespace(subset, &mut cursor, "after <!ELEMENT")?;
+    parse_dtd_name(subset, &mut cursor, "ELEMENT declaration")?;
+    require_dtd_whitespace(subset, &mut cursor, "before ELEMENT content specification")?;
+    if dtd_keyword_at(subset, cursor, "EMPTY") {
+        cursor += "EMPTY".len();
+    } else if dtd_keyword_at(subset, cursor, "ANY") {
+        cursor += "ANY".len();
+    } else if subset.as_bytes().get(cursor) == Some(&b'(') {
+        cursor = parse_dtd_parenthesized_content(subset, cursor)?;
+    } else {
+        return Err(Error::Xml(
+            "ELEMENT declaration has an invalid content specification".into(),
+        ));
+    }
+    skip_xml_whitespace(subset, &mut cursor);
+    if subset.as_bytes().get(cursor) != Some(&b'>') {
+        return Err(Error::Xml(
+            "ELEMENT declaration has trailing or unterminated content".into(),
+        ));
+    }
+    Ok(cursor + 1)
+}
+
+fn dtd_keyword_at(subset: &str, cursor: usize, keyword: &str) -> bool {
+    subset[cursor..].starts_with(keyword)
+        && subset[cursor + keyword.len()..]
+            .chars()
+            .next()
+            .is_none_or(|character| {
+                crate::lexical::is_xml_whitespace(character) || character == '>'
+            })
+}
+
+fn parse_dtd_parenthesized_content(subset: &str, mut cursor: usize) -> Result<usize> {
+    cursor += 1;
+    skip_xml_whitespace(subset, &mut cursor);
+    if subset[cursor..].starts_with("#PCDATA") {
+        return parse_dtd_mixed_content(subset, cursor + "#PCDATA".len());
+    }
+    parse_dtd_children_content(subset, cursor)
+}
+
+fn parse_dtd_mixed_content(subset: &str, mut cursor: usize) -> Result<usize> {
+    let mut named = false;
+    loop {
+        skip_xml_whitespace(subset, &mut cursor);
+        match subset.as_bytes().get(cursor) {
+            Some(b'|') => {
+                cursor += 1;
+                skip_xml_whitespace(subset, &mut cursor);
+                parse_dtd_name(subset, &mut cursor, "mixed ELEMENT content")?;
+                named = true;
+            }
+            Some(b')') => {
+                cursor += 1;
+                let repeated = subset.as_bytes().get(cursor) == Some(&b'*');
+                if repeated {
+                    cursor += 1;
+                }
+                if named && !repeated {
+                    return Err(Error::Xml(
+                        "mixed ELEMENT content with names must end with `*`".into(),
+                    ));
+                }
+                return Ok(cursor);
+            }
+            _ => {
+                return Err(Error::Xml(
+                    "mixed ELEMENT content expects `|` or `)`".into(),
+                ));
+            }
+        }
+    }
+}
+
+struct DtdContentGroup {
+    connector: Option<u8>,
+    items: usize,
+    expects_item: bool,
+}
+
+fn parse_dtd_children_content(subset: &str, mut cursor: usize) -> Result<usize> {
+    let mut groups = vec![DtdContentGroup {
+        connector: None,
+        items: 0,
+        expects_item: true,
+    }];
+    loop {
+        skip_xml_whitespace(subset, &mut cursor);
+        let expects_item = groups
+            .last()
+            .expect("the outer content group remains present")
+            .expects_item;
+        if expects_item {
+            if subset.as_bytes().get(cursor) == Some(&b'(') {
+                cursor += 1;
+                groups.push(DtdContentGroup {
+                    connector: None,
+                    items: 0,
+                    expects_item: true,
+                });
+                continue;
+            }
+            parse_dtd_name(subset, &mut cursor, "ELEMENT content particle")?;
+            parse_dtd_occurrence_indicator(subset, &mut cursor);
+            let group = groups
+                .last_mut()
+                .expect("the current content group remains present");
+            group.items += 1;
+            group.expects_item = false;
+            continue;
+        }
+
+        match subset.as_bytes().get(cursor).copied() {
+            Some(connector @ (b'|' | b',')) => {
+                let group = groups
+                    .last_mut()
+                    .expect("the current content group remains present");
+                if group
+                    .connector
+                    .is_some_and(|existing| existing != connector)
+                {
+                    return Err(Error::Xml(
+                        "ELEMENT content group mixes choice and sequence connectors".into(),
+                    ));
+                }
+                group.connector = Some(connector);
+                group.expects_item = true;
+                cursor += 1;
+            }
+            Some(b')') => {
+                let group = groups.pop().expect("the current content group exists");
+                if group.items == 0
+                    || group.expects_item
+                    || group.connector == Some(b'|') && group.items < 2
+                {
+                    return Err(Error::Xml("ELEMENT content group is incomplete".into()));
+                }
+                cursor += 1;
+                parse_dtd_occurrence_indicator(subset, &mut cursor);
+                let Some(parent) = groups.last_mut() else {
+                    return Ok(cursor);
+                };
+                parent.items += 1;
+                parent.expects_item = false;
+            }
+            _ => {
+                return Err(Error::Xml(
+                    "ELEMENT content group expects a connector or `)`".into(),
+                ));
+            }
+        }
+    }
+}
+
+fn parse_dtd_occurrence_indicator(subset: &str, cursor: &mut usize) {
+    if subset
+        .as_bytes()
+        .get(*cursor)
+        .is_some_and(|byte| matches!(byte, b'?' | b'*' | b'+'))
+    {
+        *cursor += 1;
+    }
+}
+
+fn parse_dtd_notation_declaration(subset: &str, mut cursor: usize) -> Result<usize> {
+    // XML 1.0 section 4.7 productions [82]-[83] require a notation name followed by a complete
+    // SYSTEM external ID or PUBLIC ID, with an optional system literal only for PUBLIC.
+    // https://www.w3.org/TR/xml/#Notations
+    cursor += "<!NOTATION".len();
+    require_dtd_whitespace(subset, &mut cursor, "after <!NOTATION")?;
+    parse_dtd_name(subset, &mut cursor, "NOTATION declaration")?;
+    require_dtd_whitespace(subset, &mut cursor, "before NOTATION identifier")?;
+    if subset[cursor..].starts_with("SYSTEM") {
+        cursor += "SYSTEM".len();
+        require_dtd_whitespace(subset, &mut cursor, "after NOTATION SYSTEM")?;
+        parse_dtd_quoted_literal(subset, &mut cursor, "NOTATION system identifier")?;
+    } else if subset[cursor..].starts_with("PUBLIC") {
+        cursor += "PUBLIC".len();
+        require_dtd_whitespace(subset, &mut cursor, "after NOTATION PUBLIC")?;
+        parse_dtd_public_identifier(subset, &mut cursor)?;
+        let before_spacing = cursor;
+        skip_xml_whitespace(subset, &mut cursor);
+        if subset
+            .as_bytes()
+            .get(cursor)
+            .is_some_and(|byte| matches!(byte, b'\'' | b'"'))
+        {
+            if cursor == before_spacing {
+                return Err(Error::Xml(
+                    "XML whitespace is required before NOTATION system identifier".into(),
+                ));
+            }
+            parse_dtd_quoted_literal(subset, &mut cursor, "NOTATION system identifier")?;
+        }
+    } else {
+        return Err(Error::Xml(
+            "NOTATION declaration requires SYSTEM or PUBLIC".into(),
+        ));
+    }
+    skip_xml_whitespace(subset, &mut cursor);
+    if subset.as_bytes().get(cursor) != Some(&b'>') {
+        return Err(Error::Xml(
+            "NOTATION declaration has trailing or unterminated content".into(),
+        ));
+    }
+    Ok(cursor + 1)
+}
+
+fn parse_dtd_public_identifier(subset: &str, cursor: &mut usize) -> Result<()> {
+    let value = parse_dtd_quoted_literal(subset, cursor, "NOTATION public identifier")?;
+    if value.chars().all(|character| {
+        character.is_ascii_alphanumeric()
+            || matches!(
+                character,
+                ' ' | '\r'
+                    | '\n'
+                    | '-'
+                    | '\''
+                    | '('
+                    | ')'
+                    | '+'
+                    | ','
+                    | '.'
+                    | '/'
+                    | ':'
+                    | '='
+                    | '?'
+                    | ';'
+                    | '!'
+                    | '*'
+                    | '#'
+                    | '@'
+                    | '$'
+                    | '_'
+                    | '%'
+            )
+    }) {
+        Ok(())
+    } else {
+        Err(Error::Xml(
+            "NOTATION public identifier contains an invalid PubidChar".into(),
+        ))
+    }
 }
 
 fn collect_internal_attribute_list(
@@ -3040,6 +3351,33 @@ mod parser_boundary_tests {
         ] {
             Document::parse_iterative(malformed, None)
                 .expect_err("malformed enumeration grammar must be rejected");
+        }
+    }
+
+    #[test]
+    fn internal_dtd_markup_declarations_follow_xml_grammar() {
+        for valid in [
+            r#"<!DOCTYPE r [<!ELEMENT r (head, (body | note)*, tail?)>]><r/>"#,
+            r#"<!DOCTYPE r [<!ELEMENT r (#PCDATA | item)*>]><r/>"#,
+            r#"<!DOCTYPE r [<!NOTATION png SYSTEM "image/png">]><r/>"#,
+            r#"<!DOCTYPE r [<!NOTATION png PUBLIC "image/png">]><r/>"#,
+            r#"<!DOCTYPE r [<!NOTATION png PUBLIC "image/png" "png.viewer">]><r/>"#,
+        ] {
+            Document::parse_iterative(valid, None)
+                .expect("well-formed markup declaration must be accepted");
+        }
+
+        for malformed in [
+            r#"<!DOCTYPE r [<!ELEMENT r (a||b)>]><r/>"#,
+            r#"<!DOCTYPE r [<!ELEMENT r (a,b|c)>]><r/>"#,
+            r#"<!DOCTYPE r [<!ELEMENT r (#PCDATA|item)>]><r/>"#,
+            r#"<!DOCTYPE r [<!ELEMENT r EMPTY extra>]><r/>"#,
+            r#"<!DOCTYPE r [<!NOTATION png SYSTEM>]><r/>"#,
+            r#"<!DOCTYPE r [<!NOTATION png PUBLIC "image/png" extra>]><r/>"#,
+            r#"<!DOCTYPE r [<!UNKNOWN r ANY>]><r/>"#,
+        ] {
+            Document::parse_iterative(malformed, None)
+                .expect_err("malformed markup declaration must be rejected");
         }
     }
 
