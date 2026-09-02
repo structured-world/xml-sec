@@ -4104,6 +4104,14 @@ fn undeclared_unicode_ncname_prefix_is_a_static_error() {
 }
 
 #[test]
+fn xpath_function_whitespace_accepts_complete_unicode_ncnames() {
+    // XPath 1.0 section 3.7 permits XML whitespace before `(`, while FunctionName is a QName and
+    // therefore admits combining NCName characters: https://www.w3.org/TR/1999/REC-xpath-19991116/#exprlex
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" xmlns:f="urn:functions" extension-element-prefixes="func"><xsl:output method="text"/><func:function name="f:á"><func:result select="'ok'"/></func:function><xsl:template match="/"><xsl:value-of select="f:á ()"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "ok");
+}
+
+#[test]
 fn keys_index_full_attribute_axis_patterns() {
     // Candidate enumeration must include attributes for the unabbreviated XPath axis spelling.
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:key name="attrs" match="attribute::*" use="."/><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(key('attrs', 'needle'))"/></xsl:template></xsl:stylesheet>"#;
@@ -6667,6 +6675,27 @@ fn forward_compatible_all_prefix_value_is_ignored_consistently() {
 }
 
 #[test]
+fn strict_namespace_prefix_lists_require_at_least_one_token() {
+    // XSLT 1.0 sections 7.1.1 and 14.1 define these values as token lists, not optional empty
+    // strings: https://www.w3.org/TR/1999/REC-xslt-19991116#literal-result-element
+    for attribute in ["exclude-result-prefixes", "extension-element-prefixes"] {
+        for value in ["", " \t\r\n "] {
+            let stylesheet = format!(
+                r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" {attribute}="{value}"/>"#,
+            );
+            assert!(matches!(
+                Compiler::new(
+                    Arc::new(NoResolver),
+                    CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+                )
+                .compile(&stylesheet, None),
+                Err(Error::Static(message)) if message.contains(attribute) && message.contains("token")
+            ));
+        }
+    }
+}
+
+#[test]
 fn included_modules_validate_namespace_prefix_attributes() {
     // XSLT 1.0 section 2.6.1 treats an included module exactly like its declarations were
     // written at the include site, so an unbound prefix cannot evade principal-root validation.
@@ -8603,6 +8632,62 @@ fn explicit_latin_format_tokens_remain_alphabetic_with_traditional_letter_value(
         );
         assert_eq!(execute(&stylesheet, "<source/>"), expected);
     }
+}
+
+#[test]
+fn alphabetic_and_roman_numbering_do_not_narrow_large_xpath_numbers() {
+    // XSLT 1.0 section 7.7 rounds the XPath Number before formatting; converting that value to a
+    // platform integer must not collapse distinct finite inputs: https://www.w3.org/TR/1999/REC-xslt-19991116#number
+    for (format, expected_1e20, expected_1e30) in [
+        ("A", "ANGWJIRSMASUFQV", "AXDQVMMXOILDPAOLPKLIKN"),
+        ("a", "angwjirsmasufqv", "axdqvmmxoildpaolpklikn"),
+        (
+            "I",
+            "100000000000000000000",
+            "1000000000000000000000000000000",
+        ),
+        (
+            "i",
+            "100000000000000000000",
+            "1000000000000000000000000000000",
+        ),
+    ] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:param name="value"/><xsl:template match="/"><xsl:number value="$value" format="{format}"/></xsl:template></xsl:stylesheet>"#,
+        );
+        let stylesheet = compile(&stylesheet);
+        let execute_value = |value| {
+            let mut parameters = Parameters::new();
+            parameters.insert(
+                ExpandedName::new(None::<String>, "value"),
+                Value::Number(value),
+            );
+            let result = stylesheet
+                .execute(
+                    &Document::parse("<source/>", None).expect("source parses"),
+                    &parameters,
+                    Arc::new(NoResolver),
+                    ExecutionOptions {
+                        budget: execution_budget(1024),
+                        initial_mode: None,
+                        initial_template: None,
+                    },
+                )
+                .expect("large finite number formats");
+            String::from_utf8(result.serialized.bytes).expect("text output is UTF-8")
+        };
+        assert_eq!(execute_value(1e20), expected_1e20);
+        assert_eq!(execute_value(1e30), expected_1e30);
+    }
+}
+
+#[test]
+fn undesignated_exslt_function_declarations_remain_inert() {
+    // XSLT 1.0 section 2.2 ignores foreign top-level data, and EXSLT Functions requires its
+    // namespace to be designated as an extension: https://exslt.github.io/func/#namespace
+    compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions"><func:function/><xsl:template match="/"/></xsl:stylesheet>"#,
+    );
 }
 
 #[test]

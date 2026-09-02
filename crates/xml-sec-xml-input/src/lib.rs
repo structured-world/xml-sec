@@ -220,7 +220,12 @@ pub fn decode_xml_bounded<'a>(
         .filter(|_| !explicit_utf16 && !explicit_utf32)
         .map(parse_encoding)
         .transpose()?;
-    if explicit_utf16 && !physical.is_some_and(|(encoding, _)| is_utf16_encoding(encoding)) {
+    if explicit_utf16
+        && !physical.is_some_and(|(encoding, bom_len)| is_utf16_encoding(encoding) && bom_len > 0)
+    {
+        // XML 1.0 section 4.3.3 requires an entity labeled as generic UTF-16 to begin with a BOM;
+        // a declaration discovered after decoding cannot replace that byte-order signature.
+        // https://www.w3.org/TR/xml/#charencoding
         return Err(Error::MissingUtf16ByteOrder);
     }
     if explicit_utf32 && !physical.is_some_and(|(encoding, _)| is_utf32_encoding(encoding)) {
@@ -249,6 +254,19 @@ pub fn decode_xml_bounded<'a>(
     let bom_len = physical.map_or(0, |(_, bom_len)| bom_len);
     let mut decoded = decode_selected(&bytes[bom_len..], selected, maximum_decoded_bytes)?;
     let declaration = declaration_from_text(&decoded)?;
+    if explicit_encoding.is_none()
+        && declaration.is_none()
+        && physical.is_some_and(|(encoding, bom_len)| {
+            bom_len == 0
+                && matches!(encoding, SelectedEncoding::Standard(value)
+                    if value == encoding_rs::UTF_16LE || value == encoding_rs::UTF_16BE)
+        })
+    {
+        // XML 1.0 section 4.3.3 allows BOM-less non-UTF-8 input only when an encoding declaration
+        // identifies it; byte-pattern detection alone does not supply that declaration.
+        // https://www.w3.org/TR/xml/#charencoding
+        return Err(Error::MissingUtf16ByteOrder);
+    }
     if let Some(range) = &declaration {
         let label = &decoded[range.clone()];
         if is_generic_utf16(label) {
@@ -270,17 +288,6 @@ pub fn decode_xml_bounded<'a>(
                 return Err(Error::ConflictingEncoding(label.into()));
             }
         }
-    } else if !explicit.is_some_and(is_utf16_encoding)
-        && physical.is_some_and(|(encoding, bom_len)| {
-            bom_len == 0
-                && matches!(encoding, SelectedEncoding::Standard(value)
-                    if value == encoding_rs::UTF_16LE || value == encoding_rs::UTF_16BE)
-        })
-    {
-        // XML 1.0 section 4.3.3 requires every UTF-16 entity to begin with a BOM. A
-        // byte-order-specific transport label is an explicit decoder contract; generic
-        // UTF-16 metadata is not: https://www.w3.org/TR/xml/#charencoding
-        return Err(Error::MissingUtf16ByteOrder);
     }
 
     if !selected.is_utf8()
@@ -768,6 +775,20 @@ mod tests {
         // transport label supplies no byte order and cannot relax that document constraint.
         // https://www.w3.org/TR/xml/#charencoding
         let bytes = "<?xml version=\"1.0\"?><root/>"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            decode_xml(&bytes, Some("UTF-16")),
+            Err(Error::MissingUtf16ByteOrder)
+        ));
+    }
+
+    #[test]
+    fn generic_utf16_metadata_cannot_bypass_the_bom_via_a_specific_declaration() {
+        // XML 1.0 section 4.3.3 requires generic UTF-16 entities to begin with a BOM even when
+        // their declaration reveals the byte order: https://www.w3.org/TR/xml/#charencoding
+        let bytes = "<?xml version=\"1.0\" encoding=\"UTF-16LE\"?><root/>"
             .encode_utf16()
             .flat_map(u16::to_le_bytes)
             .collect::<Vec<_>>();

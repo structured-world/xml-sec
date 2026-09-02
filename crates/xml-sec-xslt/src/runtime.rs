@@ -4670,11 +4670,16 @@ fn format_number_into(
         // disambiguates language-specific letter tokens.
         // https://www.w3.org/TR/1999/REC-xslt-19991116#convert
         "A" | "a" => {
-            let value = alphabetic(rounded as usize, format == "A");
+            let decimal = crate::value::format_xpath_number(rounded);
+            let value = alphabetic_decimal(&decimal, format == "A");
             append_metered(output, &value, meter)
         }
         "I" | "i" => {
-            let value = roman(rounded as usize, format == "I");
+            let value = if rounded <= 3999.0 {
+                roman(rounded as usize, format == "I")
+            } else {
+                crate::value::format_xpath_number(rounded)
+            };
             append_metered(output, &value, meter)
         }
         _ => {
@@ -4823,18 +4828,40 @@ fn same_node_kind_and_name(document: &Document, left: &SourceNode, right: &Sourc
     }
 }
 
-fn alphabetic(mut value: usize, upper: bool) -> String {
-    if value == 0 {
-        return "0".into();
-    }
-    let mut output = String::new();
-    while value > 0 {
-        value -= 1;
+fn alphabetic_decimal(decimal: &str, upper: bool) -> String {
+    let mut digits = decimal
+        .bytes()
+        .map(|digit| digit - b'0')
+        .collect::<Vec<_>>();
+    let mut start = 0usize;
+    let mut reversed = Vec::with_capacity(decimal.len());
+    while start < digits.len() {
+        let mut borrow = 1u8;
+        for digit in digits[start..].iter_mut().rev() {
+            if borrow == 0 {
+                break;
+            }
+            if *digit == 0 {
+                *digit = 9;
+            } else {
+                *digit -= 1;
+                borrow = 0;
+            }
+        }
+        let mut remainder = 0u16;
+        for digit in &mut digits[start..] {
+            let dividend = remainder * 10 + u16::from(*digit);
+            *digit = (dividend / 26) as u8;
+            remainder = dividend % 26;
+        }
         let base = if upper { b'A' } else { b'a' };
-        output.insert(0, char::from(base + (value % 26) as u8));
-        value /= 26;
+        reversed.push(base + remainder as u8);
+        while start < digits.len() && digits[start] == 0 {
+            start += 1;
+        }
     }
-    output
+    reversed.reverse();
+    String::from_utf8(reversed).expect("alphabetic digits are ASCII")
 }
 
 fn roman(mut value: usize, upper: bool) -> String {

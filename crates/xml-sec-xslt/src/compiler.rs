@@ -395,7 +395,7 @@ impl<R: Resolver> Compiler<R> {
         state: &mut CompileState,
         depth: usize,
     ) -> Result<()> {
-        if node.has_tag_name((EXSLT_FUNCTIONS_NS, "function")) {
+        if node.has_tag_name((EXSLT_FUNCTIONS_NS, "function")) && is_extension_element(node)? {
             validate_exslt_function_result_structure(node)?;
             let context =
                 CompileContext::new(forward, depth, state.budget.recursion_depth, base_uri)?
@@ -1178,7 +1178,7 @@ pub(crate) fn normalize_xpath_for_sxd(source: &str) -> Cow<'_, str> {
             && output
                 .chars()
                 .next_back()
-                .is_some_and(is_xpath_name_character)
+                .is_some_and(|character| character == ':' || is_ncname_char(character))
         {
             let mut next = index + 1;
             while next < characters.len() && crate::lexical::is_xml_whitespace(characters[next]) {
@@ -1226,10 +1226,6 @@ pub(crate) fn normalize_xpath_for_sxd(source: &str) -> Cow<'_, str> {
     } else {
         Cow::Owned(output)
     }
-}
-
-fn is_xpath_name_character(character: char) -> bool {
-    character.is_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
 }
 
 fn split_pattern_branches(source: &str) -> Vec<&str> {
@@ -2963,7 +2959,16 @@ fn visit_namespace_prefix_attribute(
     let Some(value) = value else {
         return Ok(());
     };
-    if value.split_ascii_whitespace().any(|token| token == "#all") {
+    let mut tokens = value.split_ascii_whitespace().peekable();
+    if tokens.peek().is_none() {
+        // XSLT 1.0 sections 7.1.1 and 14.1 define these attributes as token lists, so an
+        // explicitly present value must contain a prefix token.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#literal-result-element
+        return Err(Error::Static(format!(
+            "{attribute} requires at least one namespace prefix token"
+        )));
+    }
+    if tokens.clone().any(|token| token == "#all") {
         // XSLT 1.0 section 7.1.1 permits QName tokens and #default only. Section 2.5
         // makes an unsupported optional attribute value ignorable as a whole in FCP.
         // https://www.w3.org/TR/1999/REC-xslt-19991116#literal-result-element
@@ -2975,7 +2980,7 @@ fn visit_namespace_prefix_attribute(
             "{attribute} does not permit #all in XSLT 1.0"
         )));
     }
-    for token in value.split_ascii_whitespace() {
+    for token in tokens {
         let prefix = (token != "#default").then_some(token);
         let namespace = node
             .lookup_namespace_uri(prefix)
