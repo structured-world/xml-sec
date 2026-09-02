@@ -1415,24 +1415,27 @@ impl function::Function for LangFunction {
     ) -> Result<Value<'d>, function::Error> {
         let mut args = function::Args(args);
         args.exactly(1)?;
-        let requested = args.pop_string()?.to_ascii_lowercase();
+        let requested = args.pop_string(context)?;
         let mut node = Some(context.node.clone());
         while let Some(current) = node {
             self.work_budget.charge_function(1)?;
             if let Some(element) = current.element()
-                && let Some(language) = element.attributes().into_iter().find_map(|attribute| {
+                && let Some(matches) = element.attributes().into_iter().find_map(|attribute| {
                     let stored_name = attribute.name();
                     let name = sxd_document_no_unsafe::as_qname!(stored_name);
                     (name.local_part() == "lang"
                         && name.namespace_uri() == Some("http://www.w3.org/XML/1998/namespace"))
-                    .then(|| sxd_document_no_unsafe::as_str!(attribute.value()).to_owned())
+                    .then(|| {
+                        let stored_value = attribute.value();
+                        let language = sxd_document_no_unsafe::as_str!(stored_value);
+                        language.eq_ignore_ascii_case(&requested)
+                            || (language.as_bytes().get(requested.len()) == Some(&b'-')
+                                && language
+                                    .get(..requested.len())
+                                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&requested)))
+                    })
                 })
             {
-                let language = language.to_ascii_lowercase();
-                let matches = language == requested
-                    || language
-                        .strip_prefix(&requested)
-                        .is_some_and(|suffix| suffix.starts_with('-'));
                 return Ok(Value::Boolean(matches));
             }
             node = current.parent();

@@ -544,7 +544,15 @@ impl<R: Resolver> Compiler<R> {
                 // https://www.w3.org/TR/1999/REC-xslt-19991116#strip
                 require_empty_instruction(node)?;
                 let preserve = node.tag_name().name() == "preserve-space";
-                for token in required_attr(node, "elements")?.split_ascii_whitespace() {
+                let elements = required_attr(node, "elements")?;
+                let mut name_tests = elements.split_ascii_whitespace().peekable();
+                if name_tests.peek().is_none() {
+                    return Err(Error::Static(format!(
+                        "xsl:{} elements must contain at least one name test",
+                        node.tag_name().name()
+                    )));
+                }
+                for token in name_tests {
                     let order = state.next_order();
                     state.whitespace.push((
                         NameTest::parse(token, node)?,

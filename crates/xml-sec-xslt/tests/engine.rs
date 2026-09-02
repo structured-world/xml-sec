@@ -1835,6 +1835,30 @@ fn whitespace_rules_reject_malformed_qname_name_tests() {
 }
 
 #[test]
+fn whitespace_rules_reject_empty_name_test_lists() {
+    // XSLT 1.0 section 3.4 declares `elements` as required NMTOKENS, which cannot be an
+    // empty or whitespace-only list.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#strip
+    for elements in ["", " \t\r\n "] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:strip-space elements="{elements}"/></xsl:stylesheet>"#
+        );
+        let result = Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 32, 64 * 1024),
+        )
+        .compile(&stylesheet, None);
+        assert!(
+            matches!(
+                &result,
+                Err(Error::Static(message)) if message.contains("elements") && message.contains("name test")
+            ),
+            "unexpected compile result: {result:?}"
+        );
+    }
+}
+
+#[test]
 fn whitespace_declarations_reject_content() {
     // XSLT 1.0 section 3.4 declares both whitespace instructions EMPTY; accepting content
     // would silently discard stylesheet logic instead of reporting a static error.

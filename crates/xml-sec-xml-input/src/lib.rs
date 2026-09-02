@@ -383,9 +383,12 @@ fn parse_encoding(label: &str) -> Result<SelectedEncoding, Error> {
     // WHATWG aliases these IANA encodings to Windows extensions with different C1 bytes.
     // XML 1.0 section 4.3.3 requires registered labels to retain their IANA meaning.
     // https://www.w3.org/TR/xml/#charencoding
-    encoding_rs::Encoding::for_label(label.as_bytes())
-        .map(SelectedEncoding::Standard)
-        .ok_or_else(|| Error::UnsupportedEncoding(label.into()))
+    let encoding = encoding_rs::Encoding::for_label(label.as_bytes())
+        .ok_or_else(|| Error::UnsupportedEncoding(label.into()))?;
+    if !legacy_label_matches_encoding(label, encoding) {
+        return Err(Error::UnsupportedEncoding(label.into()));
+    }
+    Ok(SelectedEncoding::Standard(encoding))
 }
 
 /// Return whether `label` selects strict ISO-8859-1 semantics.
@@ -836,6 +839,19 @@ mod tests {
         ));
         assert_eq!(decode_text(&[0xA1, 0xFB], "TIS-620").unwrap(), "ก๛");
         assert_eq!(decode_text(&[0x80], "windows-874").unwrap(), "€");
+    }
+
+    #[test]
+    fn registered_iana_labels_retain_their_declared_repertoires() {
+        // XML 1.0 section 4.3.3 requires an IANA encoding name to retain its registered
+        // semantics; ISO-8859-2 therefore must not be confused with Windows-1250.
+        // https://www.w3.org/TR/xml/#charencoding
+        assert_eq!(decode_text(&[0x80], "ISO-8859-2").unwrap(), "\u{80}");
+        assert_eq!(decode_text(&[0xA1], "ISO-8859-2").unwrap(), "Ą");
+        assert_eq!(decode_text(&[0x80], "windows-1250").unwrap(), "€");
+
+        let source = b"<?xml version=\"1.0\" encoding=\"ISO-8859-2\"?><root>\xA1</root>";
+        assert!(decode_xml(source, None).unwrap().contains("<root>Ą</root>"));
     }
 
     #[test]

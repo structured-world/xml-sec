@@ -291,6 +291,23 @@ impl<'d> Value<'d> {
         }
     }
 
+    /// Return the XPath string conversion's Unicode code-point length without allocating it.
+    pub(crate) fn string_char_len(&self) -> usize {
+        match self {
+            Value::Boolean(true) => 4,
+            Value::Boolean(false) => 5,
+            Value::Number(number) => {
+                let mut length = FormattedLength(0);
+                write_xpath_number(&mut length, *number).expect("length sink cannot fail");
+                length.0
+            }
+            Value::String(value) | Value::ResultTreeFragment(_, value) => value.chars().count(),
+            Value::Nodeset(nodes) => nodes
+                .document_order_first()
+                .map_or(0, |node| node.string_value_char_len()),
+        }
+    }
+
     pub(crate) fn append_string(self, output: &mut String) {
         match self {
             Value::Boolean(value) => output.push_str(if value { "true" } else { "false" }),

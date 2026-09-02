@@ -307,6 +307,41 @@ impl<'d> Node<'d> {
         }
     }
 
+    /// Returns the number of Unicode code points in this node's string value without building it.
+    pub(crate) fn string_value_char_len(&self) -> usize {
+        use self::Node::*;
+
+        fn descendant_text_char_len(node: &Node<'_>) -> usize {
+            node.children().iter().fold(0usize, |length, child| {
+                length.saturating_add(match child {
+                    Node::Element(_) => descendant_text_char_len(child),
+                    Node::Text(text) => {
+                        sxd_document_no_unsafe::as_str!(text.text()).chars().count()
+                    }
+                    _ => 0,
+                })
+            })
+        }
+
+        match self {
+            Root(_) | Element(_) => descendant_text_char_len(self),
+            Attribute(attribute) => sxd_document_no_unsafe::as_str!(attribute.value())
+                .chars()
+                .count(),
+            ProcessingInstruction(instruction) => {
+                sxd_document_no_unsafe::as_opt_str!(instruction.value())
+                    .unwrap_or("")
+                    .chars()
+                    .count()
+            }
+            Comment(comment) => sxd_document_no_unsafe::as_str!(comment.text())
+                .chars()
+                .count(),
+            Text(text) => sxd_document_no_unsafe::as_str!(text.text()).chars().count(),
+            Namespace(namespace) => namespace.uri().chars().count(),
+        }
+    }
+
     /// Append this node's string value without allocating an intermediate string.
     pub(crate) fn append_string_value(&self, output: &mut String) {
         use self::Node::*;

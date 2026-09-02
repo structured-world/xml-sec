@@ -119,11 +119,6 @@ impl<'d> Args<'d> {
         }
     }
 
-    /// Converts all the arguments into strings.
-    fn into_strings(self) -> Vec<String> {
-        self.0.into_iter().map(Value::into_string).collect()
-    }
-
     /// Removes the **last** argument and ensures it is a boolean. If
     /// the argument is not a boolean, it is converted to one.
     pub fn pop_boolean(&mut self) -> Result<bool, Error> {
@@ -140,8 +135,10 @@ impl<'d> Args<'d> {
 
     /// Removes the **last** argument and ensures it is a string. If
     /// the argument is not a string, it is converted to one.
-    pub fn pop_string(&mut self) -> Result<String, Error> {
-        let v = self.0.pop().ok_or(Error::ArgumentMissing)?;
+    pub fn pop_string(&mut self, context: &context::Evaluation<'_, '_>) -> Result<String, Error> {
+        let v = self.0.last().ok_or(Error::ArgumentMissing)?;
+        reserve_string_conversion(context, v)?;
+        let v = self.0.pop().expect("argument presence was checked");
         Ok(v.into_string())
     }
 
@@ -174,11 +171,13 @@ impl<'d> Args<'d> {
     fn pop_string_value_or_context_node(
         &mut self,
         context: &context::Evaluation<'_, '_>,
-    ) -> String {
-        self.0
-            .pop()
-            .map(Value::into_string)
-            .unwrap_or_else(|| context.node.string_value())
+    ) -> Result<String, Error> {
+        if self.0.is_empty() {
+            context.reserve_string_allocation(context.node.string_value_len())?;
+            Ok(context.node.string_value())
+        } else {
+            self.pop_string(context)
+        }
     }
 
     /// Removes the **last** argument if it is a nodeset. If no
@@ -194,6 +193,17 @@ impl<'d> Args<'d> {
             Some(arg) => Err(Error::not_a_nodeset(&arg)),
             None => Ok(nodeset![context.node.clone()]),
         }
+    }
+}
+
+fn reserve_string_conversion(
+    context: &context::Evaluation<'_, '_>,
+    value: &Value<'_>,
+) -> Result<(), Error> {
+    if matches!(value, Value::String(_) | Value::ResultTreeFragment(..)) {
+        Ok(())
+    } else {
+        context.reserve_string_allocation(value.string_len())
     }
 }
 
@@ -317,8 +327,9 @@ impl Function for StringFn {
     ) -> Result<Value<'d>, Error> {
         let mut args = Args(args);
         args.at_most(1)?;
-        let arg = args.pop_value_or_context_node(context);
-        Ok(Value::String(arg.string()))
+        Ok(Value::String(
+            args.pop_string_value_or_context_node(context)?,
+        ))
     }
 }
 
@@ -351,13 +362,14 @@ struct TwoStringPredicate(fn(&str, &str) -> bool);
 impl Function for TwoStringPredicate {
     fn evaluate<'c, 'd>(
         &self,
-        _context: &context::Evaluation<'c, 'd>,
+        context: &context::Evaluation<'c, 'd>,
         args: Vec<Value<'d>>,
     ) -> Result<Value<'d>, Error> {
-        let args = Args(args);
+        let mut args = Args(args);
         args.exactly(2)?;
-        let args = args.into_strings();
-        let v = self.0(&args[0], &args[1]);
+        let second = args.pop_string(context)?;
+        let first = args.pop_string(context)?;
+        let v = self.0(&first, &second);
         Ok(Value::Boolean(v))
     }
 }
@@ -380,13 +392,15 @@ struct SubstringCommon(for<'s> fn(&'s str, &'s str) -> &'s str);
 impl Function for SubstringCommon {
     fn evaluate<'c, 'd>(
         &self,
-        _context: &context::Evaluation<'c, 'd>,
+        context: &context::Evaluation<'c, 'd>,
         args: Vec<Value<'d>>,
     ) -> Result<Value<'d>, Error> {
-        let args = Args(args);
+        let mut args = Args(args);
         args.exactly(2)?;
-        let args = args.into_strings();
-        let s = self.0(&args[0], &args[1]);
+        let second = args.pop_string(context)?;
+        let first = args.pop_string(context)?;
+        let s = self.0(&first, &second);
+        context.reserve_string_allocation(s.len())?;
         Ok(Value::String(s.to_owned()))
     }
 }
@@ -416,7 +430,7 @@ struct Substring;
 impl Function for Substring {
     fn evaluate<'c, 'd>(
         &self,
-        _context: &context::Evaluation<'c, 'd>,
+        context: &context::Evaluation<'c, 'd>,
         args: Vec<Value<'d>>,
     ) -> Result<Value<'d>, Error> {
         let mut args = Args(args);
@@ -432,19 +446,18 @@ impl Function for Substring {
 
         let start = args.pop_number()?;
         let start = round_ties_to_positive_infinity(start);
-        let s = args.pop_string()?;
+        let s = args.pop_string(context)?;
+        context.reserve_string_allocation(s.len())?;
 
-        let chars = s.chars().enumerate();
-        let selected_chars = chars
-            .filter_map(|(p, s)| {
-                let p = (p + 1) as f64; // 1-based indexing
-                if p >= start && p < start + len {
-                    Some(s)
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let mut selected_chars = String::with_capacity(s.len());
+        selected_chars.extend(s.chars().enumerate().filter_map(|(p, s)| {
+            let p = (p + 1) as f64; // 1-based indexing
+            if p >= start && p < start + len {
+                Some(s)
+            } else {
+                None
+            }
+        }));
 
         Ok(Value::String(selected_chars))
     }
@@ -460,8 +473,8 @@ impl Function for StringLength {
     ) -> Result<Value<'d>, Error> {
         let mut args = Args(args);
         args.at_most(1)?;
-        let arg = args.pop_string_value_or_context_node(context);
-        Ok(Value::Number(arg.chars().count() as f64))
+        let arg = args.pop_value_or_context_node(context);
+        Ok(Value::Number(arg.string_char_len() as f64))
     }
 }
 
@@ -475,7 +488,7 @@ impl Function for NormalizeSpace {
     ) -> Result<Value<'d>, Error> {
         let mut args = Args(args);
         args.at_most(1)?;
-        let arg = args.pop_string_value_or_context_node(context);
+        let arg = args.pop_string_value_or_context_node(context)?;
         let length = arg
             .split(XmlChar::is_space_char)
             .filter(|part| !part.is_empty())
@@ -513,13 +526,6 @@ impl Function for Translate {
         let mut args = Args(args);
         args.exactly(3)?;
 
-        let conversion_bytes = args.0.iter().fold(0usize, |total, value| {
-            let bytes = match value {
-                Value::String(_) | Value::ResultTreeFragment(..) => 0,
-                value => value.string_len(),
-            };
-            total.saturating_add(bytes)
-        });
         let source_bytes = args.0[0].string_len();
         let map_capacity = args.0[1]
             .string_len()
@@ -530,15 +536,11 @@ impl Function for Translate {
                 .saturating_add(std::mem::size_of::<usize>()),
         );
         let result_bytes = source_bytes.saturating_mul(char::MAX.len_utf8());
-        context.reserve_string_allocation(
-            conversion_bytes
-                .saturating_add(map_bytes)
-                .saturating_add(result_bytes),
-        )?;
+        context.reserve_string_allocation(map_bytes.saturating_add(result_bytes))?;
 
-        let to = args.pop_string()?;
-        let from = args.pop_string()?;
-        let s = args.pop_string()?;
+        let to = args.pop_string(context)?;
+        let from = args.pop_string(context)?;
+        let s = args.pop_string(context)?;
 
         let mut replacements = HashMap::with_capacity(from.chars().count());
         let pairs = from
@@ -919,6 +921,29 @@ mod test {
     }
 
     #[test]
+    fn string_predicates_bound_nodeset_argument_conversion() {
+        // Predicate results retain no string, so the argument conversion itself must consume
+        // the allocation budget before materializing an attacker-controlled node string-value.
+        let package = Package::new();
+        let document = package.as_document();
+        let root = document.create_element("root");
+        root.append_child(document.create_text("oversized"));
+        document.root().append_child(root);
+        let mut nodes = Nodeset::new();
+        nodes.add(root);
+        let mut setup = Setup::new();
+        setup.context.set_string_allocation_limit(4);
+        let error = setup
+            .evaluate(
+                document.root(),
+                contains(),
+                vec![Value::Nodeset(nodes), "size".into()],
+            )
+            .expect_err("node-set conversion must exceed the four-byte allocation budget");
+        assert!(error.to_string().contains("string allocation budget"));
+    }
+
+    #[test]
     fn substring_before_slices_before() {
         evaluate_literal(substring_before(), args!["1999/04/01", "/"], |r| {
             assert_eq!(Ok(Value::String("1999".to_owned())), r);
@@ -930,6 +955,29 @@ mod test {
         evaluate_literal(substring_after(), args!["1999/04/01", "/"], |r| {
             assert_eq!(Ok(Value::String("04/01".to_owned())), r);
         });
+    }
+
+    #[test]
+    fn substring_functions_bound_nodeset_argument_conversion() {
+        // Both the converted input and copied result are owned strings and must be reserved
+        // before either allocation occurs.
+        let package = Package::new();
+        let document = package.as_document();
+        let root = document.create_element("root");
+        root.append_child(document.create_text("oversized"));
+        document.root().append_child(root);
+        let mut nodes = Nodeset::new();
+        nodes.add(root);
+        let mut setup = Setup::new();
+        setup.context.set_string_allocation_limit(8);
+        let error = setup
+            .evaluate(
+                document.root(),
+                substring_before(),
+                vec![Value::Nodeset(nodes), "size".into()],
+            )
+            .expect_err("node-set conversion must exceed the eight-byte allocation budget");
+        assert!(error.to_string().contains("string allocation budget"));
     }
 
     #[test]
@@ -994,6 +1042,25 @@ mod test {
         evaluate_literal(StringLength, args!["日本語"], |r| {
             assert_eq!(Ok(Value::Number(3.0)), r);
         });
+    }
+
+    #[test]
+    fn string_length_does_not_materialize_nodeset_string_values() {
+        // XPath string-length only observes code points, so a zero allocation budget must not
+        // force an otherwise unnecessary copy of a node-set string-value.
+        let package = Package::new();
+        let document = package.as_document();
+        let root = document.create_element("root");
+        root.append_child(document.create_text("日本語"));
+        document.root().append_child(root);
+        let mut nodes = Nodeset::new();
+        nodes.add(root);
+        let mut setup = Setup::new();
+        setup.context.set_string_allocation_limit(0);
+        assert_eq!(
+            Ok(Value::Number(3.0)),
+            setup.evaluate(document.root(), StringLength, vec![Value::Nodeset(nodes)])
+        );
     }
 
     #[test]
