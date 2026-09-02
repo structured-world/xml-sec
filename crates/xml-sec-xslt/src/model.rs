@@ -351,11 +351,11 @@ impl Document {
         document.source_bytes = xml.len();
         let mut entity_references = 0;
         let mut entity_expansion = EntityExpansionMeter::new(ENTITY_EXPANSION_BYTE_CEILING);
-        let (parameter_expanded_xml, entities) =
+        let (parameter_expanded_xml, declarations) =
             internal_general_entities(xml, &mut entity_references, &mut entity_expansion)?;
         let expanded_xml = expand_document_entities(
             parameter_expanded_xml.as_ref(),
-            &entities,
+            &declarations.general,
             &mut entity_references,
             &mut entity_expansion,
         )?;
@@ -394,7 +394,7 @@ impl Document {
                         &mut elements,
                         &start,
                         false,
-                        &entities,
+                        &declarations,
                         &mut entity_references,
                         &mut entity_expansion,
                     )?;
@@ -413,7 +413,7 @@ impl Document {
                         &mut elements,
                         &start,
                         true,
-                        &entities,
+                        &declarations,
                         &mut entity_references,
                         &mut entity_expansion,
                     )?;
@@ -563,6 +563,10 @@ impl Document {
         }
         if phase != DocumentPhase::Epilog {
             return Err(Error::Xml("document element is missing".into()));
+        }
+        for (name, system_identifier) in declarations.unparsed {
+            let uri = crate::resolver::resolve_uri_reference(base_uri, &system_identifier)?;
+            document.register_unparsed_entity(name, uri)?;
         }
         document.register_xml_ids()?;
         Ok(document)
@@ -1215,7 +1219,7 @@ fn push_stream_element(
     elements: &mut Vec<StreamElementFrame>,
     start: &xml_sec_xml_input::lexical::StartTag<'_>,
     empty: bool,
-    entities: &HashMap<String, String>,
+    declarations: &InternalEntityDeclarations,
     entity_references: &mut usize,
     entity_expansion: &mut EntityExpansionMeter,
 ) -> Result<NodeId> {
@@ -1230,42 +1234,68 @@ fn push_stream_element(
             uri: "http://www.w3.org/XML/1998/namespace".into(),
         }],
     };
+    let lexical_name = start.name.qualified();
+    let declared_attributes = declarations
+        .attributes
+        .get(lexical_name.as_ref())
+        .map_or(&[][..], Vec::as_slice);
     let mut raw_attributes = Vec::new();
     for attribute in &start.attributes {
         let name = attribute.name.qualified();
-        let value = expand_entity_references(
+        let is_cdata = declared_attributes
+            .iter()
+            .find(|declaration| declaration.name == name)
+            .is_none_or(|declaration| declaration.is_cdata);
+        let value = prepare_attribute_value(
+            name.as_ref(),
             attribute.value,
-            entities,
-            0,
+            &declarations.general,
+            is_cdata,
             entity_references,
             entity_expansion,
         )?;
-        if value.contains('<') {
-            return Err(Error::Xml(format!(
-                "attribute `{name}` entity replacement contains a literal `<`"
-            )));
-        }
-        let value = normalize_xml_attribute_value(value);
-        let value = match xml_sec_xml_input::lexical::decode_references(&value)
-            .map_err(|error| Error::Xml(error.to_string()))?
-        {
-            Cow::Borrowed(_) => value,
-            Cow::Owned(value) => Cow::Owned(value),
-        };
         if name == "xmlns" {
             validate_namespace_binding(None, &value)?;
-            set_namespace(&mut namespaces, None, value.into_owned());
+            set_namespace(&mut namespaces, None, value);
         } else if let Some(prefix) = name.strip_prefix("xmlns:") {
             if !crate::lexical::is_ncname(prefix) {
                 return Err(Error::Xml(format!("invalid namespace prefix {prefix}")));
             }
             validate_namespace_binding(Some(prefix), &value)?;
-            set_namespace(&mut namespaces, Some(prefix.into()), value.into_owned());
+            set_namespace(&mut namespaces, Some(prefix.into()), value);
         } else {
-            raw_attributes.push((name.into_owned(), value.into_owned()));
+            raw_attributes.push((name.into_owned(), value));
         }
     }
-    let lexical_name = start.name.qualified();
+    for declaration in declared_attributes {
+        let Some(default) = declaration.default.as_deref() else {
+            continue;
+        };
+        if start
+            .attributes
+            .iter()
+            .any(|attribute| attribute.name.is_qualified(&declaration.name))
+        {
+            continue;
+        }
+        let value = prepare_attribute_value(
+            &declaration.name,
+            default,
+            &declarations.general,
+            declaration.is_cdata,
+            entity_references,
+            entity_expansion,
+        )?;
+        if declaration.name == "xmlns" {
+            validate_namespace_binding(None, &value)?;
+            set_namespace(&mut namespaces, None, value);
+        } else if let Some(prefix) = declaration.name.strip_prefix("xmlns:") {
+            validate_namespace_binding(Some(prefix), &value)?;
+            set_namespace(&mut namespaces, Some(prefix.into()), value);
+        } else {
+            raw_attributes.push((declaration.name.clone(), value));
+        }
+    }
     let prefix = start.name.prefix().map(str::to_owned);
     let local = start.name.local().to_owned();
     let namespace = namespace_for(&namespaces, prefix.as_deref());
@@ -1332,6 +1362,30 @@ fn push_stream_element(
         });
     }
     Ok(projected)
+}
+
+fn prepare_attribute_value(
+    name: &str,
+    raw: &str,
+    entities: &HashMap<String, String>,
+    is_cdata: bool,
+    entity_references: &mut usize,
+    entity_expansion: &mut EntityExpansionMeter,
+) -> Result<String> {
+    let value = expand_entity_references(raw, entities, 0, entity_references, entity_expansion)?;
+    if value.contains('<') {
+        return Err(Error::Xml(format!(
+            "attribute `{name}` entity replacement contains a literal `<`"
+        )));
+    }
+    let value = normalize_xml_attribute_value(value);
+    let value = xml_sec_xml_input::lexical::decode_references(&value)
+        .map_err(|error| Error::Xml(error.to_string()))?;
+    Ok(if is_cdata {
+        value.into_owned()
+    } else {
+        collapse_xml_whitespace(&value).into_owned()
+    })
 }
 
 fn event_range_start(event: &xml_sec_xml_input::lexical::Event<'_>) -> usize {
@@ -1470,18 +1524,18 @@ fn internal_general_entities<'a>(
     xml: &'a str,
     references: &mut usize,
     meter: &mut EntityExpansionMeter,
-) -> Result<(Cow<'a, str>, HashMap<String, String>)> {
+) -> Result<(Cow<'a, str>, InternalEntityDeclarations)> {
     let Some(doctype) = doctype_span(xml)? else {
-        return Ok((Cow::Borrowed(xml), HashMap::new()));
+        return Ok((Cow::Borrowed(xml), InternalEntityDeclarations::default()));
     };
     let Some((subset_start, subset_end)) = doctype.internal_subset else {
-        return Ok((Cow::Borrowed(xml), HashMap::new()));
+        return Ok((Cow::Borrowed(xml), InternalEntityDeclarations::default()));
     };
     let subset = &xml[subset_start..subset_end];
     let mut expanded_subset = Cow::Borrowed(subset);
     let mut changed = false;
     let mut rounds = 0usize;
-    let entities = loop {
+    let declarations = loop {
         let declarations = collect_internal_entity_declarations(expanded_subset.as_ref())?;
         let next = expand_parameter_entity_references(
             expanded_subset.as_ref(),
@@ -1492,7 +1546,7 @@ fn internal_general_entities<'a>(
             meter,
         )?;
         match next {
-            Cow::Borrowed(_) => break declarations.general,
+            Cow::Borrowed(_) => break declarations,
             Cow::Owned(next) => {
                 changed = true;
                 rounds += 1;
@@ -1511,7 +1565,7 @@ fn internal_general_entities<'a>(
         }
     };
     if !changed {
-        return Ok((Cow::Borrowed(xml), entities));
+        return Ok((Cow::Borrowed(xml), declarations));
     }
     let mut expanded_xml = String::with_capacity(
         xml.len()
@@ -1521,7 +1575,7 @@ fn internal_general_entities<'a>(
     expanded_xml.push_str(&xml[..subset_start]);
     expanded_xml.push_str(expanded_subset.as_ref());
     expanded_xml.push_str(&xml[subset_end..]);
-    Ok((Cow::Owned(expanded_xml), entities))
+    Ok((Cow::Owned(expanded_xml), declarations))
 }
 
 #[derive(Default)]
@@ -1529,6 +1583,15 @@ struct InternalEntityDeclarations {
     general: HashMap<String, String>,
     parameter: HashMap<String, String>,
     parameter_spans: Vec<(usize, usize)>,
+    attributes: HashMap<String, Vec<InternalAttributeDeclaration>>,
+    unparsed: HashMap<String, String>,
+    declared_general: HashSet<String>,
+}
+
+struct InternalAttributeDeclaration {
+    name: String,
+    is_cdata: bool,
+    default: Option<String>,
 }
 
 fn collect_internal_entity_declarations(subset: &str) -> Result<InternalEntityDeclarations> {
@@ -1549,6 +1612,10 @@ fn collect_internal_entity_declarations(subset: &str) -> Result<InternalEntityDe
                 .map(|offset| offset + 4)
                 .ok_or_else(|| Error::Xml("unterminated DTD processing instruction".into()))?;
             cursor += length;
+            continue;
+        }
+        if subset[cursor..].starts_with("<!ATTLIST") {
+            cursor = collect_internal_attribute_list(subset, cursor, &mut declarations.attributes)?;
             continue;
         }
         if !subset[cursor..].starts_with("<!ENTITY") {
@@ -1575,18 +1642,7 @@ fn collect_internal_entity_declarations(subset: &str) -> Result<InternalEntityDe
                 ));
             }
         }
-        let name_start = cursor;
-        while let Some(character) = subset[cursor..].chars().next()
-            && (character == ':' || crate::lexical::is_ncname_char(character))
-        {
-            cursor += character.len_utf8();
-        }
-        let name = &subset[name_start..cursor];
-        if !crate::lexical::is_xml_name(name) {
-            return Err(Error::Xml(
-                "internal entity declaration has an invalid XML Name".into(),
-            ));
-        }
+        let name = parse_dtd_name(subset, &mut cursor, "internal entity declaration")?;
         let spacing_start = cursor;
         skip_xml_whitespace(subset, &mut cursor);
         if cursor == spacing_start {
@@ -1600,7 +1656,17 @@ fn collect_internal_entity_declarations(subset: &str) -> Result<InternalEntityDe
             ));
         };
         if !matches!(quote, b'\'' | b'"') {
-            cursor = declaration_end(subset, cursor)?;
+            let (end, system_identifier) =
+                parse_external_entity_declaration(subset, cursor, parameter)?;
+            if !parameter
+                && declarations.declared_general.insert(name.to_owned())
+                && let Some(system_identifier) = system_identifier
+            {
+                declarations
+                    .unparsed
+                    .insert(name.to_owned(), system_identifier.to_owned());
+            }
+            cursor = end;
             continue;
         }
         cursor += 1;
@@ -1638,19 +1704,223 @@ fn collect_internal_entity_declarations(subset: &str) -> Result<InternalEntityDe
                 .parameter_spans
                 .push((declaration_start, cursor));
         }
-        let entities = if parameter {
-            &mut declarations.parameter
-        } else {
-            &mut declarations.general
-        };
         if !parameter {
             value = normalize_predefined_entity_declaration(name, value)?;
         }
-        if let std::collections::hash_map::Entry::Vacant(entry) = entities.entry(name.to_owned()) {
-            entry.insert(value);
+        if parameter {
+            declarations
+                .parameter
+                .entry(name.to_owned())
+                .or_insert(value);
+        } else if declarations.declared_general.insert(name.to_owned()) {
+            declarations.general.insert(name.to_owned(), value);
         }
     }
     Ok(declarations)
+}
+
+fn collect_internal_attribute_list(
+    subset: &str,
+    mut cursor: usize,
+    declarations: &mut HashMap<String, Vec<InternalAttributeDeclaration>>,
+) -> Result<usize> {
+    cursor += "<!ATTLIST".len();
+    require_dtd_whitespace(subset, &mut cursor, "after <!ATTLIST")?;
+    let element_name = parse_dtd_name(subset, &mut cursor, "ATTLIST element")?.to_owned();
+    loop {
+        let spacing_start = cursor;
+        skip_xml_whitespace(subset, &mut cursor);
+        if subset.as_bytes().get(cursor) == Some(&b'>') {
+            return Ok(cursor + 1);
+        }
+        if cursor == spacing_start {
+            return Err(Error::Xml(
+                "XML whitespace is required before an ATTLIST attribute".into(),
+            ));
+        }
+        let name = parse_dtd_name(subset, &mut cursor, "ATTLIST attribute")?.to_owned();
+        require_dtd_whitespace(subset, &mut cursor, "after ATTLIST attribute name")?;
+        let is_cdata = parse_dtd_attribute_type(subset, &mut cursor)?;
+        require_dtd_whitespace(subset, &mut cursor, "before ATTLIST default declaration")?;
+        let default = parse_dtd_attribute_default(subset, &mut cursor)?;
+        let element_declarations = declarations.entry(element_name.clone()).or_default();
+        if !element_declarations
+            .iter()
+            .any(|declaration| declaration.name == name)
+        {
+            element_declarations.push(InternalAttributeDeclaration {
+                name,
+                is_cdata,
+                default,
+            });
+        }
+    }
+}
+
+fn parse_dtd_attribute_type(subset: &str, cursor: &mut usize) -> Result<bool> {
+    if subset[*cursor..].starts_with("NOTATION")
+        && subset[*cursor + "NOTATION".len()..]
+            .chars()
+            .next()
+            .is_some_and(crate::lexical::is_xml_whitespace)
+    {
+        *cursor += "NOTATION".len();
+        require_dtd_whitespace(subset, cursor, "after NOTATION")?;
+        parse_dtd_enumeration(subset, cursor)?;
+        return Ok(false);
+    }
+    if subset.as_bytes().get(*cursor) == Some(&b'(') {
+        parse_dtd_enumeration(subset, cursor)?;
+        return Ok(false);
+    }
+    let attribute_type = parse_dtd_name(subset, cursor, "ATTLIST attribute type")?;
+    match attribute_type {
+        "CDATA" => Ok(true),
+        "ID" | "IDREF" | "IDREFS" | "ENTITY" | "ENTITIES" | "NMTOKEN" | "NMTOKENS" => Ok(false),
+        _ => Err(Error::Xml(format!(
+            "unsupported ATTLIST attribute type `{attribute_type}`"
+        ))),
+    }
+}
+
+fn parse_dtd_enumeration(subset: &str, cursor: &mut usize) -> Result<()> {
+    if subset.as_bytes().get(*cursor) != Some(&b'(') {
+        return Err(Error::Xml("ATTLIST enumeration must start with `(`".into()));
+    }
+    let start = *cursor;
+    *cursor += 1;
+    while let Some(character) = subset[*cursor..].chars().next() {
+        *cursor += character.len_utf8();
+        if character == ')' {
+            if *cursor == start + 2 {
+                return Err(Error::Xml("ATTLIST enumeration must not be empty".into()));
+            }
+            return Ok(());
+        }
+        if character == '<' || character == '>' {
+            break;
+        }
+    }
+    Err(Error::Xml("unterminated ATTLIST enumeration".into()))
+}
+
+fn parse_dtd_attribute_default(subset: &str, cursor: &mut usize) -> Result<Option<String>> {
+    if subset[*cursor..].starts_with("#REQUIRED") {
+        *cursor += "#REQUIRED".len();
+        return Ok(None);
+    }
+    if subset[*cursor..].starts_with("#IMPLIED") {
+        *cursor += "#IMPLIED".len();
+        return Ok(None);
+    }
+    if subset[*cursor..].starts_with("#FIXED") {
+        *cursor += "#FIXED".len();
+        require_dtd_whitespace(subset, cursor, "after #FIXED")?;
+    }
+    let value = parse_dtd_quoted_literal(subset, cursor, "ATTLIST default value")?;
+    if value.contains('<') {
+        return Err(Error::Xml(
+            "ATTLIST default value must not contain `<`".into(),
+        ));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn parse_external_entity_declaration(
+    subset: &str,
+    mut cursor: usize,
+    parameter: bool,
+) -> Result<(usize, Option<&str>)> {
+    let system_identifier = if subset[cursor..].starts_with("SYSTEM") {
+        cursor += "SYSTEM".len();
+        require_dtd_whitespace(subset, &mut cursor, "after SYSTEM")?;
+        parse_dtd_quoted_literal(subset, &mut cursor, "entity system identifier")?
+    } else if subset[cursor..].starts_with("PUBLIC") {
+        cursor += "PUBLIC".len();
+        require_dtd_whitespace(subset, &mut cursor, "after PUBLIC")?;
+        parse_dtd_quoted_literal(subset, &mut cursor, "entity public identifier")?;
+        require_dtd_whitespace(subset, &mut cursor, "before entity system identifier")?;
+        parse_dtd_quoted_literal(subset, &mut cursor, "entity system identifier")?
+    } else {
+        return Ok((declaration_end(subset, cursor)?, None));
+    };
+    let spacing_start = cursor;
+    skip_xml_whitespace(subset, &mut cursor);
+    let unparsed = if subset[cursor..].starts_with("NDATA") {
+        if parameter {
+            return Err(Error::Xml(
+                "parameter entity declaration must not contain NDATA".into(),
+            ));
+        }
+        if cursor == spacing_start {
+            return Err(Error::Xml("XML whitespace is required before NDATA".into()));
+        }
+        cursor += "NDATA".len();
+        require_dtd_whitespace(subset, &mut cursor, "after NDATA")?;
+        parse_dtd_name(subset, &mut cursor, "NDATA notation")?;
+        skip_xml_whitespace(subset, &mut cursor);
+        true
+    } else {
+        false
+    };
+    if subset.as_bytes().get(cursor) != Some(&b'>') {
+        return Err(Error::Xml(
+            "external entity declaration has trailing content".into(),
+        ));
+    }
+    Ok((cursor + 1, unparsed.then_some(system_identifier)))
+}
+
+fn parse_dtd_name<'a>(subset: &'a str, cursor: &mut usize, context: &str) -> Result<&'a str> {
+    let start = *cursor;
+    while let Some(character) = subset[*cursor..].chars().next()
+        && (character == ':' || crate::lexical::is_ncname_char(character))
+    {
+        *cursor += character.len_utf8();
+    }
+    let name = &subset[start..*cursor];
+    if crate::lexical::is_xml_name(name) {
+        Ok(name)
+    } else {
+        Err(Error::Xml(format!("{context} has an invalid XML Name")))
+    }
+}
+
+fn parse_dtd_quoted_literal<'a>(
+    subset: &'a str,
+    cursor: &mut usize,
+    context: &str,
+) -> Result<&'a str> {
+    let quote = subset
+        .as_bytes()
+        .get(*cursor)
+        .copied()
+        .filter(|quote| matches!(quote, b'\'' | b'"'))
+        .ok_or_else(|| Error::Xml(format!("{context} must be quoted")))?;
+    *cursor += 1;
+    let start = *cursor;
+    while subset
+        .as_bytes()
+        .get(*cursor)
+        .is_some_and(|byte| *byte != quote)
+    {
+        *cursor += 1;
+    }
+    if *cursor == subset.len() {
+        return Err(Error::Xml(format!("unterminated {context}")));
+    }
+    let value = &subset[start..*cursor];
+    *cursor += 1;
+    Ok(value)
+}
+
+fn require_dtd_whitespace(subset: &str, cursor: &mut usize, context: &str) -> Result<()> {
+    let start = *cursor;
+    skip_xml_whitespace(subset, cursor);
+    if *cursor == start {
+        return Err(Error::Xml(format!("XML whitespace is required {context}")));
+    }
+    Ok(())
 }
 
 fn validate_parameter_entity_value(name: &str, value: &str) -> Result<()> {
@@ -2535,6 +2805,56 @@ mod parser_boundary_tests {
     }
 
     #[test]
+    fn internal_dtd_declaration_boundaries_are_enforced() {
+        // XML 1.0 productions [52] and [71] permit an empty ATTLIST but require S before each
+        // attribute definition and before NDATA.
+        // https://www.w3.org/TR/xml/#NT-AttlistDecl
+        // https://www.w3.org/TR/xml/#NT-GEDecl
+        Document::parse_iterative("<!DOCTYPE r [<!ATTLIST r>]><r/>", None)
+            .expect("an empty ATTLIST is well-formed");
+        for malformed in [
+            r#"<!DOCTYPE r [<!ATTLIST r a CDATA "x"b CDATA "y">]><r/>"#,
+            r#"<!DOCTYPE r [<!ENTITY logo SYSTEM "logo.png"NDATA png>]><r/>"#,
+        ] {
+            Document::parse_iterative(malformed, None)
+                .expect_err("missing DTD declaration whitespace must be rejected");
+        }
+    }
+
+    #[test]
+    fn parameter_attributes_and_duplicate_unparsed_entities_keep_xml_semantics() {
+        // Parameter entities can contribute declarations, while XML 1.0 section 4.2 binds the
+        // first general-entity declaration and ignores later duplicates.
+        // https://www.w3.org/TR/xml/#sec-entity-decl
+        let document = Document::parse_iterative(
+            r#"<!DOCTYPE r [
+              <!ENTITY % attrs '<!ATTLIST r status NMTOKENS "  ready   now  ">'>
+              %attrs;
+              <!NOTATION png SYSTEM "image/png">
+              <!ENTITY logo SYSTEM "first.png" NDATA png>
+              <!ENTITY logo SYSTEM "second.png" NDATA png>
+            ]><r/>"#,
+            Some("https://example.test/source.xml"),
+        )
+        .expect("parameter-provided attributes and duplicate entities parse");
+        let status = document.nodes().find_map(|(_, node)| match &node.kind {
+            super::NodeKind::Element { attributes, .. } => attributes
+                .iter()
+                .find(|attribute| attribute.name.local == "status")
+                .map(|attribute| attribute.value.as_str()),
+            _ => None,
+        });
+        assert_eq!(status, Some("ready now"));
+        assert_eq!(
+            document
+                .unparsed_entities()
+                .map(|(name, uri, _)| (name, uri))
+                .collect::<Vec<_>>(),
+            vec![("logo", "https://example.test/first.png")]
+        );
+    }
+
+    #[test]
     fn predefined_entity_redeclarations_preserve_xml_builtins() {
         // XML permits only the normative replacement forms for predefined entities. A malformed
         // declaration must not replace a builtin before the document reaches the XML parser.
@@ -2583,10 +2903,13 @@ mod parser_boundary_tests {
         let xml = r#"<!DOCTYPE r [<!ENTITY % defs '<!ENTITY e "ok">'> %defs;]><r>&e;</r>"#;
         let mut references = 0;
         let mut meter = EntityExpansionMeter::new(ENTITY_EXPANSION_BYTE_CEILING);
-        let (prepared, entities) = internal_general_entities(xml, &mut references, &mut meter)
+        let (prepared, declarations) = internal_general_entities(xml, &mut references, &mut meter)
             .expect("parameter entity subset is prepared");
         assert_eq!(prepared, r#"<!DOCTYPE r [ <!ENTITY e "ok">]><r>&e;</r>"#);
-        assert_eq!(entities.get("e").map(String::as_str), Some("ok"));
+        assert_eq!(
+            declarations.general.get("e").map(String::as_str),
+            Some("ok")
+        );
 
         let document =
             Document::parse_iterative(xml, None).expect("parameter entity declaration expands");

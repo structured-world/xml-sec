@@ -583,6 +583,70 @@ fn xinclude_preserves_principal_unparsed_entities() {
 }
 
 #[test]
+fn internal_dtd_defaults_and_unparsed_entities_reach_xpath() {
+    // XML 1.0 sections 3.3.2 and 4.2.2 require internal attribute defaults and unparsed
+    // entity metadata to reach the document information set consumed by XSLT.
+    // https://www.w3.org/TR/xml/#AVNormalize
+    // https://www.w3.org/TR/xml/#sec-external-ent
+    let stylesheet = r#"<xsl:stylesheet version="1.0"
+        xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+        <xsl:output method="text"/>
+        <xsl:template match="/">
+          <xsl:value-of select="/root/@status"/>
+          <xsl:text>|</xsl:text>
+          <xsl:value-of select="/root/@tokens"/>
+          <xsl:text>|</xsl:text>
+          <xsl:value-of select="unparsed-entity-uri('logo')"/>
+          <xsl:text>|</xsl:text>
+          <xsl:value-of select="unparsed-entity-uri('public-logo')"/>
+        </xsl:template>
+      </xsl:stylesheet>"#;
+    let source = r#"<!DOCTYPE root [
+      <!ENTITY word "ok">
+      <!ATTLIST root status CDATA "&word;" tokens NMTOKENS "  alpha   beta  ">
+      <!ENTITY logo SYSTEM "logo.png" NDATA png>
+      <!ENTITY public-logo PUBLIC "-//EXAMPLE//IMAGE" "public.png" NDATA png>
+    ]><root/>"#;
+    let stylesheet = compile(stylesheet);
+    let source = Document::parse(source, Some("https://example.test/input/source.xml"))
+        .expect("source with internal DTD declarations parses");
+    let result = stylesheet
+        .execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1 << 20),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("DTD metadata is available to XPath");
+    assert_eq!(
+        result.serialized.bytes,
+        b"ok|alpha beta|https://example.test/input/logo.png|https://example.test/input/public.png"
+    );
+
+    let explicit = r#"<!DOCTYPE root [
+      <!ATTLIST root status CDATA "default" tokens NMTOKENS "default">
+    ]><root status="explicit" tokens="  gamma   delta  "/>"#;
+    let explicit = Document::parse(explicit, None).expect("explicit attributes parse");
+    let result = stylesheet
+        .execute(
+            &explicit,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1 << 20),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("explicit attributes override DTD defaults");
+    assert_eq!(result.serialized.bytes, b"explicit|gamma delta||");
+}
+
+#[test]
 fn compile_owned_bytes_counts_empty_instruction_structure() {
     // Empty literal-result elements retain DOM nodes, instruction variants, and child vectors even
     // though their lexical payload is tiny. CompileBudget must bound that structure, not just text.
@@ -4112,6 +4176,46 @@ fn exslt_decode_uri_honors_the_requested_encoding() {
         ),
         Err(Error::Dynamic(message)) if message.contains("unknown encoding")
     ));
+}
+
+#[test]
+fn exslt_encode_uri_honors_the_optional_encoding() {
+    // The current EXSLT contract accepts an optional encoding and percent-encodes the
+    // resulting octets rather than always encoding the source as UTF-8.
+    // https://exslt.github.io/str/functions/encode-uri/index.html
+    let stylesheet = r#"<xsl:stylesheet version="1.0"
+        xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+        xmlns:str="http://exslt.org/strings">
+        <xsl:output method="text"/>
+        <xsl:template match="/">
+          <xsl:value-of select="str:encode-uri('é', true())"/>
+          <xsl:text>|</xsl:text>
+          <xsl:value-of select="str:encode-uri('é', true(), 'ISO-8859-1')"/>
+        </xsl:template>
+      </xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "%C3%A9|%E9");
+
+    for (value, encoding, expected) in [
+        ("é", "not-an-encoding", "unknown encoding"),
+        ("€", "ISO-8859-1", "not representable"),
+    ] {
+        let stylesheet = compile(&format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:template match="/"><xsl:value-of select="str:encode-uri('{value}', true(), '{encoding}')"/></xsl:template></xsl:stylesheet>"#
+        ));
+        assert!(matches!(
+            stylesheet.execute(
+                &Document::parse("<source/>", None).expect("source parses"),
+                &Parameters::new(),
+                Arc::new(NoResolver),
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            ),
+            Err(Error::Dynamic(message)) if message.contains(expected)
+        ));
+    }
 }
 
 #[test]

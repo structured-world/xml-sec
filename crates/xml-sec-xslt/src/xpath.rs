@@ -4894,18 +4894,23 @@ impl function::Function for ExsltStringFunction {
                 Ok(SxdValue::String(output))
             }
             Self::EncodeUri => {
-                if args.len() != 2 {
-                    return extension_argument_error("str:encode-uri() requires two arguments");
+                if !(2..=3).contains(&args.len()) {
+                    return extension_argument_error(
+                        "str:encode-uri() requires two or three arguments",
+                    );
                 }
                 let value = args[0].string();
                 let escape_reserved = args[1].boolean();
-                let encoded_len = percent_encoded_uri_len(&value, escape_reserved)?;
+                let encoding_label = args.get(2).map(SxdValue::string);
+                let encoding = uri_encoding(encoding_label.as_deref(), "str:encode-uri()")?;
+                let encoded_len = percent_encoded_uri_len(&value, escape_reserved, encoding)?;
                 context.reserve_string_allocation(encoded_len)?;
                 Ok(SxdValue::String(percent_encode_uri(
                     &value,
                     escape_reserved,
                     encoded_len,
-                )))
+                    encoding,
+                )?))
             }
             Self::DecodeUri => {
                 if !(1..=2).contains(&args.len()) {
@@ -4914,7 +4919,7 @@ impl function::Function for ExsltStringFunction {
                     );
                 }
                 let encoding_label = args.get(1).map(SxdValue::string);
-                let encoding = uri_encoding(encoding_label.as_deref())?;
+                let encoding = uri_encoding(encoding_label.as_deref(), "str:decode-uri()")?;
                 let value = args[0].string();
                 let decoded_len = percent_decoded_uri_len(&value)?;
                 let (transcoded_len, workspace_len) = match encoding {
@@ -4965,35 +4970,98 @@ fn dynamic_expression_error_is_recoverable(error: &Error) -> bool {
     )
 }
 
-fn percent_encode_uri(value: &str, escape_reserved: bool, encoded_len: usize) -> String {
+fn percent_encode_uri(
+    value: &str,
+    escape_reserved: bool,
+    encoded_len: usize,
+    encoding: UriEncoding,
+) -> std::result::Result<String, function::Error> {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut output = String::with_capacity(encoded_len);
-    for byte in value.as_bytes() {
-        let character = char::from(*byte);
+    visit_uri_encoded_bytes(value, encoding, |byte| {
+        let character = char::from(byte);
         if uri_byte_is_unescaped(character, escape_reserved) {
             output.push(character);
         } else {
             output.push('%');
-            output.push(char::from(HEX[usize::from(*byte >> 4)]));
-            output.push(char::from(HEX[usize::from(*byte & 0x0f)]));
+            output.push(char::from(HEX[usize::from(byte >> 4)]));
+            output.push(char::from(HEX[usize::from(byte & 0x0f)]));
         }
-    }
-    output
+        Ok(())
+    })?;
+    Ok(output)
 }
 
 fn percent_encoded_uri_len(
     value: &str,
     escape_reserved: bool,
+    encoding: UriEncoding,
 ) -> std::result::Result<usize, function::Error> {
-    value.as_bytes().iter().try_fold(0usize, |length, byte| {
-        let character = char::from(*byte);
+    let mut length = 0usize;
+    visit_uri_encoded_bytes(value, encoding, |byte| {
+        let character = char::from(byte);
         let encoded = !uri_byte_is_unescaped(character, escape_reserved);
-        length
+        length = length
             .checked_add(if encoded { 3 } else { 1 })
             .ok_or_else(|| function::Error::Other {
                 what: "str:encode-uri() result length overflow".into(),
-            })
-    })
+            })?;
+        Ok(())
+    })?;
+    Ok(length)
+}
+
+fn visit_uri_encoded_bytes(
+    value: &str,
+    encoding: UriEncoding,
+    mut visit: impl FnMut(u8) -> std::result::Result<(), function::Error>,
+) -> std::result::Result<(), function::Error> {
+    match encoding {
+        UriEncoding::Registered(encoding) => {
+            for character in value.chars() {
+                let byte = encoding.encode_char(character).ok_or_else(|| {
+                    function::Error::Other {
+                        what: format!(
+                            "str:encode-uri() character `{character}` is not representable in {}",
+                            encoding.name()
+                        ),
+                    }
+                })?;
+                visit(byte)?;
+            }
+        }
+        UriEncoding::Standard(encoding) if encoding == encoding_rs::UTF_8 => {
+            for &byte in value.as_bytes() {
+                visit(byte)?;
+            }
+        }
+        UriEncoding::Standard(encoding) => {
+            let mut encoder = encoding.new_encoder();
+            let mut source = value;
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let (result, read, written) =
+                    encoder.encode_from_utf8_without_replacement(source, &mut buffer, true);
+                for &byte in &buffer[..written] {
+                    visit(byte)?;
+                }
+                source = &source[read..];
+                match result {
+                    encoding_rs::EncoderResult::InputEmpty => break,
+                    encoding_rs::EncoderResult::OutputFull => {}
+                    encoding_rs::EncoderResult::Unmappable(character) => {
+                        return Err(function::Error::Other {
+                            what: format!(
+                                "str:encode-uri() character `{character}` is not representable in {}",
+                                encoding.name()
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn uri_byte_is_unescaped(character: char, escape_reserved: bool) -> bool {
@@ -5049,7 +5117,10 @@ enum UriEncoding {
     Registered(xml_sec_xml_input::IanaSingleByteEncoding),
 }
 
-fn uri_encoding(label: Option<&str>) -> std::result::Result<UriEncoding, function::Error> {
+fn uri_encoding(
+    label: Option<&str>,
+    function_name: &str,
+) -> std::result::Result<UriEncoding, function::Error> {
     label.map_or(Ok(UriEncoding::Standard(encoding_rs::UTF_8)), |label| {
         if let Some(encoding) = xml_sec_xml_input::registered_single_byte_encoding(label) {
             return Ok(UriEncoding::Registered(encoding));
@@ -5058,7 +5129,7 @@ fn uri_encoding(label: Option<&str>) -> std::result::Result<UriEncoding, functio
             .filter(|encoding| xml_sec_xml_input::legacy_label_matches_encoding(label, encoding))
             .map(UriEncoding::Standard)
             .ok_or_else(|| function::Error::Other {
-                what: format!("str:decode-uri() has unknown encoding `{label}`"),
+                what: format!("{function_name} has unknown encoding `{label}`"),
             })
     })
 }
