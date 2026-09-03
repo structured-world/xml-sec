@@ -4533,41 +4533,73 @@ impl function::Function for NodeNameFunction {
             return Ok(SxdValue::String(String::new()));
         }
         let value = match self {
-            Self::Qualified => qualified_node_name(&node),
-            Self::Local => node
-                .expanded_name()
-                .map_or_else(String::new, |name| name.local_part().to_owned()),
-            Self::NamespaceUri => node.expanded_name().map_or_else(String::new, |name| {
-                name.namespace_uri().unwrap_or_default().to_owned()
-            }),
+            Self::Qualified => qualified_node_name(context, &node)?,
+            Self::Local => node.expanded_name().map_or_else(
+                || Ok(String::new()),
+                |name| {
+                    let value = name.local_part();
+                    context.reserve_string_allocation(value.len())?;
+                    Ok(value.to_owned())
+                },
+            )?,
+            Self::NamespaceUri => node.expanded_name().map_or_else(
+                || Ok(String::new()),
+                |name| {
+                    let value = name.namespace_uri().unwrap_or_default();
+                    context.reserve_string_allocation(value.len())?;
+                    Ok(value.to_owned())
+                },
+            )?,
         };
         Ok(SxdValue::String(value))
     }
 }
 
-fn qualified_node_name(node: &nodeset::Node<'_>) -> String {
-    let (prefix, local) = match node {
-        nodeset::Node::Element(element) => (
-            element
-                .preferred_prefix()
-                .filter(|prefix| !prefix.is_empty())
-                .map(String::from),
-            element.name().get().local_part().to_owned(),
-        ),
-        nodeset::Node::Attribute(attribute) => (
-            attribute
-                .preferred_prefix()
-                .filter(|prefix| !prefix.is_empty())
-                .map(String::from),
-            attribute.name().get().local_part().to_owned(),
-        ),
-        nodeset::Node::ProcessingInstruction(instruction) => {
-            return instruction.target().to_string();
+fn qualified_node_name(
+    context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
+    node: &nodeset::Node<'_>,
+) -> std::result::Result<String, function::Error> {
+    match node {
+        nodeset::Node::Element(element) => {
+            let prefix = element.preferred_prefix();
+            let name = element.name();
+            materialize_qualified_node_name(context, prefix.as_deref(), name.get().local_part())
         }
-        nodeset::Node::Namespace(namespace) => return namespace.prefix().to_owned(),
-        _ => return String::new(),
+        nodeset::Node::Attribute(attribute) => {
+            let prefix = attribute.preferred_prefix();
+            let name = attribute.name();
+            materialize_qualified_node_name(context, prefix.as_deref(), name.get().local_part())
+        }
+        nodeset::Node::ProcessingInstruction(instruction) => {
+            let value = instruction.target();
+            context.reserve_string_allocation(value.len())?;
+            Ok(value.to_string())
+        }
+        nodeset::Node::Namespace(namespace) => {
+            let value = namespace.prefix();
+            context.reserve_string_allocation(value.len())?;
+            Ok(value.to_owned())
+        }
+        _ => Ok(String::new()),
+    }
+}
+
+fn materialize_qualified_node_name(
+    context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
+    prefix: Option<&str>,
+    local: &str,
+) -> std::result::Result<String, function::Error> {
+    let prefix = prefix.filter(|prefix| !prefix.is_empty());
+    let output_len = prefix.map_or(local.len(), |prefix| prefix.len() + 1 + local.len());
+    context.reserve_string_allocation(output_len)?;
+    let Some(prefix) = prefix else {
+        return Ok(local.to_owned());
     };
-    prefix.map_or(local.clone(), |prefix| format!("{prefix}:{local}"))
+    let mut output = String::with_capacity(output_len);
+    output.push_str(prefix);
+    output.push(':');
+    output.push_str(local);
+    Ok(output)
 }
 
 struct LangFunction;
@@ -6827,6 +6859,29 @@ mod tests {
                 .expect_err("hexadecimal output exceeds the evaluator budget");
             assert!(matches!(error, function::Error::Other { what } if what.contains("budget")));
         }
+    }
+
+    #[test]
+    fn node_name_functions_reserve_qualified_name_before_materializing_it() {
+        // General XPath evaluation can reduce name() to a scalar immediately, but the temporary
+        // QName must still cross the evaluator's owned-memory gate before allocation.
+        let package = Package::new();
+        let document = package.as_document();
+        let local = "n".repeat(2048);
+        let element = document.create_element(("urn:test", local.as_str()));
+        element.set_preferred_prefix(Some("prefix"));
+        document.root().append_child(element);
+        let mut nodes = nodeset::Nodeset::new();
+        nodes.add(element);
+        let mut context = Context::new();
+        context.set_string_allocation_limit(1024);
+        let evaluation =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+
+        let error = NodeNameFunction::Qualified
+            .evaluate(&evaluation, vec![SxdValue::Nodeset(nodes)])
+            .expect_err("qualified name exceeds the evaluator allocation budget");
+        assert!(matches!(error, function::Error::Other { what } if what.contains("budget")));
     }
 
     #[test]

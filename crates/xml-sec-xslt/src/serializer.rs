@@ -1152,14 +1152,15 @@ fn serialize_node(
                 let mut index = 0usize;
                 while index < node.children.len() {
                     let child = node.children[index];
-                    // The pinned libxslt oracle replaces legacy Content-Type metadata with the
-                    // generated declaration above. Restrict that compatibility behavior to the
-                    // XSLT 1.0 form; HTML5 `charset` metadata remains an ordinary result node.
+                    // XSLT 1.0 section 16.2 requires the generated declaration and does not define
+                    // suppression when metadata already exists. The pinned libxslt oracle replaces
+                    // the legacy form; HTML5 `charset` metadata remains an ordinary result node.
+                    // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
                     if definition.inject_content_type
                         && html_head
                         && document
                             .node(child)
-                            .is_some_and(is_legacy_html_content_type_meta)
+                            .is_some_and(is_replaceable_legacy_content_type_meta)
                     {
                         index += 1;
                         continue;
@@ -1485,7 +1486,7 @@ fn escape_html_uri(value: &str, escaping: HtmlUriEscaping) -> Cow<'_, str> {
     Cow::Owned(escaped)
 }
 
-fn is_legacy_html_content_type_meta(node: &crate::Node) -> bool {
+fn is_replaceable_legacy_content_type_meta(node: &crate::Node) -> bool {
     let NodeKind::Element {
         name, attributes, ..
     } = &node.kind

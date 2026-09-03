@@ -958,11 +958,11 @@ impl Document {
     ) -> Result<()> {
         let name = name.into();
         let uri = uri.into();
-        if name.is_empty() || uri.is_empty() {
-            return Err(Error::Xml(
-                "unparsed entity name and URI must not be empty".into(),
-            ));
+        if name.is_empty() {
+            return Err(Error::Xml("unparsed entity name must not be empty".into()));
         }
+        // XML 1.0 production [11] uses `*`, so an empty SystemLiteral is valid metadata.
+        // https://www.w3.org/TR/xml/#NT-SystemLiteral
         let key = (self.root, name.clone());
         match self.unparsed_entities.entry(key) {
             std::collections::hash_map::Entry::Occupied(_) => {
@@ -3749,6 +3749,27 @@ mod parser_boundary_tests {
         Document::parse(valid, None).expect("fragment-free system identifier is valid");
         Document::parse_iterative(valid, None)
             .expect("fragment-free system identifier is valid in the iterative parser");
+    }
+
+    #[test]
+    fn unparsed_entities_accept_empty_system_literals() {
+        // XML 1.0 production [11] permits an empty SystemLiteral. Both parser paths must retain
+        // that empty URI as unparsed-entity metadata instead of rejecting the document.
+        // https://www.w3.org/TR/xml/#NT-SystemLiteral
+        let xml = r#"<!DOCTYPE root [<!NOTATION png SYSTEM "image/png"><!ENTITY logo SYSTEM "" NDATA png>]><root/>"#;
+        for document in [
+            Document::parse(xml, None).expect("empty system identifier is well-formed"),
+            Document::parse_iterative(xml, None)
+                .expect("iterative parser accepts an empty system identifier"),
+        ] {
+            assert_eq!(
+                document
+                    .unparsed_entities()
+                    .map(|(name, uri, _)| (name, uri))
+                    .collect::<Vec<_>>(),
+                vec![("logo", "")]
+            );
+        }
     }
 
     #[test]

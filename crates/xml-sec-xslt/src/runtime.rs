@@ -236,6 +236,9 @@ fn should_strip_whitespace(
     let NodeKind::Element { name, .. } = &parent.kind else {
         return false;
     };
+    // XSLT 1.0 section 3.4 makes inherited xml:space="preserve" an independent
+    // preservation condition, so a matching xsl:strip-space rule cannot override it.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#strip
     let xml_space = node.parent.and_then(|mut ancestor| {
         loop {
             let current = document.node(ancestor)?;

@@ -860,6 +860,35 @@ fn internal_dtd_defaults_and_unparsed_entities_reach_xpath() {
 }
 
 #[test]
+fn empty_unparsed_entity_system_identifier_reaches_xpath() {
+    // XML 1.0 production [11] permits an empty SystemLiteral, and XSLT 1.0 section 12.4
+    // exposes that exact URI through unparsed-entity-uri().
+    // https://www.w3.org/TR/xml/#NT-SystemLiteral
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#function-unparsed-entity-uri
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="unparsed-entity-uri('logo')"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse(
+        r#"<!DOCTYPE root [<!NOTATION png SYSTEM "image/png"><!ENTITY logo SYSTEM "" NDATA png>]><root/>"#,
+        None,
+    )
+    .expect("empty system identifier is well-formed");
+    let result = stylesheet
+        .execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(4096),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("empty unparsed-entity URI remains XPath-visible");
+    assert!(result.serialized.bytes.is_empty());
+}
+
+#[test]
 fn compile_owned_bytes_counts_empty_instruction_structure() {
     // Empty literal-result elements retain DOM nodes, instruction variants, and child vectors even
     // though their lexical payload is tiny. CompileBudget must bound that structure, not just text.
@@ -2510,7 +2539,9 @@ fn stylesheet_static_context_is_module_and_instruction_local() {
 
 #[test]
 fn whitespace_rules_honor_namespaces_specificity_and_inherited_xml_space() {
-    // Import precedence and NameTest priority apply before declaration order; xml:space inherits.
+    // Import precedence and NameTest priority apply before declaration order. XSLT 1.0 section
+    // 3.4 independently preserves whitespace beneath inherited xml:space="preserve".
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#strip
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:n="urn:n"><xsl:output method="text"/><xsl:strip-space elements="*"/><xsl:preserve-space elements="n:keep"/><xsl:template match="/"><xsl:value-of select="count(n:root/text())"/><xsl:text>|</xsl:text><xsl:value-of select="count(n:root/n:keep/text())"/><xsl:text>|</xsl:text><xsl:value-of select="count(n:root/n:drop/n:child/text())"/></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(
