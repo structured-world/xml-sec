@@ -181,6 +181,40 @@ impl Meter {
     }
 }
 
+pub(crate) fn reserve_temporary_vec_slot<T>(
+    items: &mut Vec<T>,
+    meter: &mut Meter,
+    reserved_owned_bytes: &mut usize,
+) -> Result<()> {
+    if std::mem::size_of::<T>() == 0 || items.len() < items.capacity() {
+        return Ok(());
+    }
+    let old_capacity = items.capacity();
+    let requested_slots = old_capacity.max(4);
+    let requested_bytes = requested_slots.saturating_mul(std::mem::size_of::<T>());
+    meter.charge(BudgetKind::OwnedBytes, requested_bytes)?;
+    if let Err(error) = items.try_reserve_exact(requested_slots) {
+        meter.release_owned_bytes(requested_bytes);
+        return Err(Error::Dynamic(format!(
+            "failed to reserve temporary execution storage: {error}"
+        )));
+    }
+    let actual_bytes = items
+        .capacity()
+        .saturating_sub(old_capacity)
+        .saturating_mul(std::mem::size_of::<T>());
+    if actual_bytes < requested_bytes {
+        meter.release_owned_bytes(requested_bytes - actual_bytes);
+    } else if actual_bytes > requested_bytes
+        && let Err(error) = meter.charge(BudgetKind::OwnedBytes, actual_bytes - requested_bytes)
+    {
+        meter.release_owned_bytes(requested_bytes);
+        return Err(error);
+    }
+    *reserved_owned_bytes = reserved_owned_bytes.saturating_add(actual_bytes);
+    Ok(())
+}
+
 pub(crate) fn ensure(kind: BudgetKind, limit: usize, actual: usize) -> Result<()> {
     if actual > limit {
         return Err(Error::Budget {

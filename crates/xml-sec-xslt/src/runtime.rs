@@ -8,7 +8,7 @@ use icu_collator::preferences::CollationCaseFirst;
 use icu_collator::{Collator, CollatorBorrowed, CollatorPreferences, options::CollatorOptions};
 use icu_locale::Locale;
 
-use crate::budget::Meter;
+use crate::budget::{Meter, reserve_temporary_vec_slot};
 use crate::compiler::{
     AttributeValueTemplate, AvtPart, Expression, ExsltFunction, Instruction, NameTest, Sort,
     Stylesheet, Template, Variable,
@@ -148,11 +148,12 @@ impl Stylesheet {
             &source_options,
         )?;
         let source_remap = prepared.remap.take();
+        let source_remap_owned_bytes = std::mem::take(&mut prepared.remap_owned_bytes);
         let mut state = Execution::new(
             self,
             prepared,
             parameters,
-            source_remap.as_ref(),
+            (source_remap, source_remap_owned_bytes),
             environment,
             meter,
             source_options,
@@ -187,56 +188,68 @@ impl Stylesheet {
 pub(crate) fn apply_whitespace_rules(
     document: &mut Document,
     rules: &[(NameTest, bool, usize, usize)],
-) -> Option<HashMap<NodeId, NodeId>> {
+    meter: &mut Meter,
+) -> Result<Option<(HashMap<NodeId, NodeId>, usize)>> {
     if rules.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let removed = document
+    if !document
         .nodes()
-        .filter_map(|(id, node)| {
-            let NodeKind::Text { value, .. } = &node.kind else {
-                return None;
-            };
-            if !value
-                .chars()
-                .all(|character| matches!(character, '\t' | '\n' | '\r' | ' '))
-            {
-                return None;
-            }
-            let parent = node.parent.and_then(|parent| document.node(parent))?;
-            let NodeKind::Element { name, .. } = &parent.kind else {
-                return None;
-            };
-            let xml_space = node.parent.and_then(|mut ancestor| {
-                loop {
-                    let current = document.node(ancestor)?;
-                    if let NodeKind::Element { attributes, .. } = &current.kind
-                        && let Some(value) = attributes.iter().find_map(|attribute| {
-                            (attribute.name.namespace.as_deref()
-                                == Some("http://www.w3.org/XML/1998/namespace")
-                                && attribute.name.local == "space")
-                                .then_some(attribute.value.as_str())
-                        })
-                    {
-                        break Some(value);
-                    }
-                    ancestor = current.parent?;
-                }
-            });
-            if xml_space == Some("preserve") {
-                return None;
-            }
-            let decision = rules
-                .iter()
-                .filter(|(test, _, _, _)| test.matches(name))
-                .max_by_key(|(test, _, precedence, order)| (*precedence, test.priority(), *order));
-            matches!(decision, Some((_, false, _, _))).then_some(id)
-        })
-        .collect::<HashSet<_>>();
-    if !removed.is_empty() {
-        return Some(document.retain_nodes(|id, _| !removed.contains(&id)));
+        .any(|(_, node)| should_strip_whitespace(document, node, rules))
+    {
+        return Ok(None);
     }
-    None
+    document
+        .retain_nodes(meter, |source, _, node| {
+            !should_strip_whitespace(source, node, rules)
+        })
+        .map(Some)
+}
+
+fn should_strip_whitespace(
+    document: &Document,
+    node: &crate::model::Node,
+    rules: &[(NameTest, bool, usize, usize)],
+) -> bool {
+    let NodeKind::Text { value, .. } = &node.kind else {
+        return false;
+    };
+    if !value
+        .chars()
+        .all(|character| matches!(character, '\t' | '\n' | '\r' | ' '))
+    {
+        return false;
+    }
+    let Some(parent) = node.parent.and_then(|parent| document.node(parent)) else {
+        return false;
+    };
+    let NodeKind::Element { name, .. } = &parent.kind else {
+        return false;
+    };
+    let xml_space = node.parent.and_then(|mut ancestor| {
+        loop {
+            let current = document.node(ancestor)?;
+            if let NodeKind::Element { attributes, .. } = &current.kind
+                && let Some(value) = attributes.iter().find_map(|attribute| {
+                    (attribute.name.namespace.as_deref()
+                        == Some("http://www.w3.org/XML/1998/namespace")
+                        && attribute.name.local == "space")
+                        .then_some(attribute.value.as_str())
+                })
+            {
+                break Some(value);
+            }
+            ancestor = current.parent?;
+        }
+    });
+    if xml_space == Some("preserve") {
+        return false;
+    }
+    let decision = rules
+        .iter()
+        .filter(|(test, _, _, _)| test.matches(name))
+        .max_by_key(|(test, _, precedence, order)| (*precedence, test.priority(), *order));
+    matches!(decision, Some((_, false, _, _)))
 }
 
 struct Execution<'a> {
@@ -423,7 +436,7 @@ impl<'a> Execution<'a> {
         stylesheet: &'a Stylesheet,
         source: PreparedEvaluatorSource,
         parameters: &Parameters,
-        source_remap: Option<&HashMap<NodeId, NodeId>>,
+        source_remap: (Option<HashMap<NodeId, NodeId>>, usize),
         environment: ExecutionEnvironment<R>,
         mut meter: Meter,
         source_options: EvaluatorSourceOptions,
@@ -469,7 +482,11 @@ impl<'a> Execution<'a> {
                 .iter()
                 .map(|function| function.name.clone()),
         );
-        state.initialize_globals(parameters, source_remap)?;
+        let (source_remap, source_remap_owned_bytes) = source_remap;
+        let initialized = state.initialize_globals(parameters, source_remap.as_ref());
+        drop(source_remap);
+        state.meter.release_owned_bytes(source_remap_owned_bytes);
+        initialized?;
         Ok(state)
     }
 
@@ -541,46 +558,93 @@ impl<'a> Execution<'a> {
             .collect::<Vec<_>>();
         let variables = HashMap::new();
         for declaration in declarations {
-            let mut entries = Vec::new();
-            let mut pending = vec![logical_root];
-            let mut nodes = Vec::new();
-            while let Some(id) = pending.pop() {
-                let Some(source) = self.evaluator.source.node(id) else {
-                    continue;
-                };
-                pending.extend(source.children.iter().rev().copied());
-                nodes.push(SourceNode::Node(id));
-                if declaration.match_pattern.matches_attributes
-                    && let NodeKind::Element { attributes, .. } = &source.kind
-                {
-                    nodes.extend(
-                        (0..attributes.len())
-                            .map(|index| SourceNode::Attribute { owner: id, index }),
-                    );
+            let mut pending = Vec::new();
+            let mut pending_reservation = 0usize;
+            reserve_temporary_vec_slot(&mut pending, &mut self.meter, &mut pending_reservation)?;
+            pending.push(logical_root);
+            let result = (|| {
+                while let Some(id) = pending.pop() {
+                    let (child_count, attribute_count) =
+                        self.evaluator.source.node(id).map_or((0, 0), |source| {
+                            let attributes = if declaration.match_pattern.matches_attributes {
+                                match &source.kind {
+                                    NodeKind::Element { attributes, .. } => attributes.len(),
+                                    _ => 0,
+                                }
+                            } else {
+                                0
+                            };
+                            (source.children.len(), attributes)
+                        });
+                    for child_index in (0..child_count).rev() {
+                        let Some(child) = self
+                            .evaluator
+                            .source
+                            .node(id)
+                            .and_then(|source| source.children.get(child_index))
+                            .copied()
+                        else {
+                            continue;
+                        };
+                        reserve_temporary_vec_slot(
+                            &mut pending,
+                            &mut self.meter,
+                            &mut pending_reservation,
+                        )?;
+                        pending.push(child);
+                    }
+                    self.append_key_values(&declaration, SourceNode::Node(id), &variables)?;
+                    for index in 0..attribute_count {
+                        self.append_key_values(
+                            &declaration,
+                            SourceNode::Attribute { owner: id, index },
+                            &variables,
+                        )?;
+                    }
                 }
-            }
-            for node in nodes {
-                if !self.matches_pattern(&declaration.match_pattern, &node, &variables)? {
-                    continue;
-                }
-                let value = self.evaluate(&declaration.use_expression, &node, 1, 1)?;
-                let values = match value {
-                    XPathValue::NodeSet(nodes) => nodes
-                        .iter()
-                        .map(|node| self.evaluator.string_value(node))
-                        .collect::<Vec<_>>(),
-                    value => vec![value.string(&self.evaluator)],
-                };
-                entries.extend(
-                    values
-                        .into_iter()
-                        .map(|value| (declaration.name.clone(), value, node.clone())),
-                );
-            }
-            self.evaluator.append_key_index(entries, &mut self.meter)?;
+                Ok(())
+            })();
+            drop(pending);
+            self.meter.release_owned_bytes(pending_reservation);
+            result?;
+            self.evaluator.finish_key_index(&mut self.meter);
         }
         self.building_keys.remove(&identity);
         self.built_keys.insert(identity);
+        Ok(())
+    }
+
+    fn append_key_values(
+        &mut self,
+        declaration: &crate::compiler::KeyDeclaration,
+        node: SourceNode,
+        variables: &HashMap<ExpandedName, Value>,
+    ) -> Result<()> {
+        if !self.matches_pattern(&declaration.match_pattern, &node, variables)? {
+            return Ok(());
+        }
+        match self.evaluate(&declaration.use_expression, &node, 1, 1)? {
+            XPathValue::NodeSet(nodes) => {
+                for selected in nodes.iter() {
+                    let value = self.evaluator.string_value(selected);
+                    self.evaluator.append_key_entry(
+                        declaration.name.clone(),
+                        value,
+                        &node,
+                        &mut self.meter,
+                    )?;
+                }
+            }
+            value => {
+                let value = value.string(&self.evaluator);
+                self.evaluator.append_key_entry(
+                    declaration.name.clone(),
+                    value,
+                    &node,
+                    &mut self.meter,
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -977,9 +1041,8 @@ impl<'a> Execution<'a> {
                                 self.apply_attribute_set(
                                     set,
                                     &node,
-                                    position,
-                                    size,
-                                    depth,
+                                    ApplyFrame::new(position, size, depth),
+                                    precedence,
                                     &mut Vec::new(),
                                 )?;
                             }
@@ -1036,9 +1099,8 @@ impl<'a> Execution<'a> {
                                             self.apply_attribute_set(
                                                 set,
                                                 &node,
-                                                position,
-                                                size,
-                                                depth,
+                                                ApplyFrame::new(position, size, depth),
+                                                precedence,
                                                 &mut Vec::new(),
                                             )?;
                                         }
@@ -1416,7 +1478,13 @@ impl<'a> Execution<'a> {
                 )?;
                 self.output_stack.push(id);
                 for set in attribute_sets {
-                    self.apply_attribute_set(set, node, position, size, depth, &mut Vec::new())?;
+                    self.apply_attribute_set(
+                        set,
+                        node,
+                        ApplyFrame::new(position, size, depth),
+                        current_precedence,
+                        &mut Vec::new(),
+                    )?;
                 }
                 for attribute in attributes {
                     let value = self.evaluate_avt(&attribute.value, node, position, size)?;
@@ -1611,9 +1679,8 @@ impl<'a> Execution<'a> {
                                         self.apply_attribute_set(
                                             set,
                                             node,
-                                            position,
-                                            size,
-                                            depth,
+                                            ApplyFrame::new(position, size, depth),
+                                            current_precedence,
                                             &mut Vec::new(),
                                         )?;
                                     }
@@ -1695,7 +1762,13 @@ impl<'a> Execution<'a> {
                 )?;
                 self.output_stack.push(id);
                 for set in attribute_sets {
-                    self.apply_attribute_set(set, node, position, size, depth, &mut Vec::new())?;
+                    self.apply_attribute_set(
+                        set,
+                        node,
+                        ApplyFrame::new(position, size, depth),
+                        current_precedence,
+                        &mut Vec::new(),
+                    )?;
                 }
                 let result = self.execute_scoped_sequence(
                     body,
@@ -3026,9 +3099,8 @@ impl<'a> Execution<'a> {
         &mut self,
         name: &ExpandedName,
         node: &SourceNode,
-        position: usize,
-        size: usize,
-        depth: usize,
+        frame: ApplyFrame,
+        current_precedence: Option<usize>,
         active: &mut Vec<ExpandedName>,
     ) -> Result<()> {
         if active.contains(name) {
@@ -3063,17 +3135,23 @@ impl<'a> Execution<'a> {
                     let set = sets[cursor];
                     let set_start = self.current_attribute_count()?;
                     for used in &set.uses {
-                        self.meter.recursion(depth + 1)?;
-                        self.apply_attribute_set(used, node, position, size, depth + 1, active)?
+                        self.meter.recursion(frame.depth + 1)?;
+                        self.apply_attribute_set(
+                            used,
+                            node,
+                            ApplyFrame::new(frame.position, frame.size, frame.depth + 1),
+                            current_precedence,
+                            active,
+                        )?
                     }
                     let previous_position = self.attribute_insert_position.replace(set_start);
                     let execution = self.execute_sequence(
                         &set.attributes,
                         node,
-                        position,
-                        size,
-                        depth + 1,
-                        None,
+                        frame.position,
+                        frame.size,
+                        frame.depth + 1,
+                        current_precedence,
                     );
                     self.attribute_insert_position = previous_position;
                     execution?;
@@ -3797,13 +3875,7 @@ fn literal_key_names(
             return Ok(None);
         };
         let argument = argument.trim();
-        let Some(quote @ ('\'' | '"')) = argument.chars().next() else {
-            return Ok(None);
-        };
-        let Some(lexical) = argument
-            .strip_prefix(quote)
-            .and_then(|value| value.strip_suffix(quote))
-        else {
+        let Some(lexical) = xpath_string_literal(argument) else {
             return Ok(None);
         };
         let (prefix, local) = lexical
@@ -3824,6 +3896,14 @@ fn literal_key_names(
         }
     }
     Ok(Some(names))
+}
+
+fn xpath_string_literal(source: &str) -> Option<&str> {
+    let quote @ ('\'' | '"') = source.chars().next()? else {
+        return None;
+    };
+    let value = source.strip_prefix(quote)?.strip_suffix(quote)?;
+    (!value.contains(quote)).then_some(value)
 }
 
 fn fixup_attribute_namespace(
@@ -5062,9 +5142,11 @@ mod tests {
     use std::cmp::Ordering;
     use std::sync::Arc;
 
-    use super::{SortKey, append_localized_decimal, value_string};
+    use super::{SortKey, append_localized_decimal, apply_whitespace_rules, value_string};
     use crate::budget::Meter;
-    use crate::{BudgetKind, Document, Error, ExecutionBudget, Value};
+    use crate::{
+        BudgetKind, CompileBudget, Compiler, Document, Error, ExecutionBudget, NoResolver, Value,
+    };
 
     fn meter(owned_bytes: usize) -> Meter {
         Meter::new(
@@ -5084,6 +5166,60 @@ mod tests {
             0,
         )
         .expect("empty source fits")
+    }
+
+    #[test]
+    fn whitespace_stripping_reserves_and_releases_its_workspaces() {
+        // The retained remap remains charged after in-place compaction, while the DFS and indexed
+        // remap workspaces are released before transformation execution continues.
+        let source_xml = format!("<root>{}</root>", "<item> </item>".repeat(2_048));
+        let stylesheet = Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(1 << 20, 4, 16, 1 << 20),
+        )
+        .compile(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:strip-space elements="*"/></xsl:stylesheet>"#,
+            None,
+        )
+        .expect("strip-space stylesheet compiles");
+        let mut document = Document::parse(&source_xml, None).expect("wide source parses");
+        let mut unbounded = meter(usize::MAX);
+        let (remap, retained_bytes) =
+            apply_whitespace_rules(&mut document, &stylesheet.whitespace, &mut unbounded)
+                .expect("workspace fits")
+                .expect("whitespace nodes are removed");
+        assert_eq!(
+            unbounded
+                .usage(BudgetKind::OwnedBytes)
+                .expect("usage is available")
+                .0,
+            retained_bytes
+        );
+        assert!(retained_bytes >= 2_048 * std::mem::size_of::<(crate::NodeId, crate::NodeId)>());
+        drop(remap);
+        unbounded.release_owned_bytes(retained_bytes);
+        assert_eq!(
+            unbounded
+                .usage(BudgetKind::OwnedBytes)
+                .expect("usage is available")
+                .0,
+            0
+        );
+
+        let mut constrained_document =
+            Document::parse(&source_xml, None).expect("wide source parses again");
+        let mut constrained = meter(retained_bytes - 1);
+        assert!(matches!(
+            apply_whitespace_rules(
+                &mut constrained_document,
+                &stylesheet.whitespace,
+                &mut constrained,
+            ),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -5,6 +5,7 @@ use xml_sec_xml_input::lexical::{Event, Scanner};
 
 use crate::budget::{
     ENTITY_EXPANSION_BYTE_CEILING, ENTITY_EXPANSION_DEPTH_CEILING, ENTITY_REFERENCE_CEILING, Meter,
+    reserve_temporary_vec_slot,
 };
 use crate::{BudgetKind, Error, Result};
 
@@ -1203,24 +1204,95 @@ impl Document {
 
     pub(crate) fn retain_nodes(
         &mut self,
-        mut keep: impl FnMut(NodeId, &Node) -> bool,
-    ) -> HashMap<NodeId, NodeId> {
-        let mut retained = vec![self.root];
-        let mut cursor = 0;
-        while cursor < retained.len() {
-            let id = retained[cursor];
-            for child in &self.nodes[id.0].children {
-                if keep(*child, &self.nodes[child.0]) {
-                    retained.push(*child);
+        meter: &mut Meter,
+        mut keep: impl FnMut(&Document, NodeId, &Node) -> bool,
+    ) -> Result<(HashMap<NodeId, NodeId>, usize)> {
+        let mut temporary_bytes = 0usize;
+        let mut remap_by_index = Vec::new();
+        for _ in 0..self.nodes.len() {
+            if let Err(error) =
+                reserve_temporary_vec_slot(&mut remap_by_index, meter, &mut temporary_bytes)
+            {
+                meter.release_owned_bytes(temporary_bytes);
+                return Err(error);
+            }
+            remap_by_index.push(None);
+        }
+        let mut pending = Vec::new();
+        if let Err(error) = reserve_temporary_vec_slot(&mut pending, meter, &mut temporary_bytes) {
+            meter.release_owned_bytes(temporary_bytes);
+            return Err(error);
+        }
+        pending.push(self.root);
+        let mut retained_count = 0usize;
+        while let Some(id) = pending.pop() {
+            remap_by_index[id.0] = Some(NodeId(retained_count));
+            retained_count += 1;
+            for child in self.nodes[id.0].children.iter().rev() {
+                if keep(self, *child, &self.nodes[child.0]) {
+                    if let Err(error) =
+                        reserve_temporary_vec_slot(&mut pending, meter, &mut temporary_bytes)
+                    {
+                        meter.release_owned_bytes(temporary_bytes);
+                        return Err(error);
+                    }
+                    pending.push(*child);
                 }
             }
-            cursor += 1;
         }
-        let remap = retained
-            .iter()
-            .enumerate()
-            .map(|(new, old)| (*old, NodeId(new)))
-            .collect::<HashMap<_, _>>();
+
+        let map_entry_bytes =
+            std::mem::size_of::<(NodeId, NodeId)>().saturating_add(std::mem::size_of::<usize>());
+        let requested_map_bytes = retained_count.saturating_mul(map_entry_bytes);
+        if let Err(error) = meter.charge(BudgetKind::OwnedBytes, requested_map_bytes) {
+            meter.release_owned_bytes(temporary_bytes);
+            return Err(error);
+        }
+        let mut remap = HashMap::new();
+        if let Err(error) = remap.try_reserve(retained_count) {
+            meter.release_owned_bytes(requested_map_bytes);
+            meter.release_owned_bytes(temporary_bytes);
+            return Err(Error::Dynamic(format!(
+                "failed to reserve whitespace node remap: {error}"
+            )));
+        }
+        let retained_map_bytes = remap.capacity().saturating_mul(map_entry_bytes);
+        if retained_map_bytes < requested_map_bytes {
+            meter.release_owned_bytes(requested_map_bytes - retained_map_bytes);
+        } else if retained_map_bytes > requested_map_bytes
+            && let Err(error) = meter.charge(
+                BudgetKind::OwnedBytes,
+                retained_map_bytes - requested_map_bytes,
+            )
+        {
+            meter.release_owned_bytes(requested_map_bytes);
+            meter.release_owned_bytes(temporary_bytes);
+            return Err(error);
+        }
+        for (old, new) in remap_by_index.iter().copied().enumerate() {
+            if let Some(new) = new {
+                remap.insert(NodeId(old), new);
+            }
+        }
+
+        let rebuilt_map_bytes = self
+            .ids
+            .capacity()
+            .saturating_mul(
+                std::mem::size_of::<((NodeId, String), NodeId)>()
+                    .saturating_add(std::mem::size_of::<u64>()),
+            )
+            .saturating_add(
+                self.unparsed_entities.capacity().saturating_mul(
+                    std::mem::size_of::<((NodeId, String), String)>()
+                        .saturating_add(std::mem::size_of::<u64>()),
+                ),
+            );
+        if let Err(error) = meter.charge(BudgetKind::OwnedBytes, rebuilt_map_bytes) {
+            meter.release_owned_bytes(retained_map_bytes);
+            meter.release_owned_bytes(temporary_bytes);
+            return Err(error);
+        }
         self.ids = std::mem::take(&mut self.ids)
             .into_iter()
             .filter_map(|((root, value), owner)| {
@@ -1234,23 +1306,31 @@ impl Document {
             .into_iter()
             .filter_map(|((root, name), uri)| Some(((remap.get(&root).copied()?, name), uri)))
             .collect();
-        self.nodes = retained
-            .into_iter()
-            .map(|old| {
-                let mut node = self.nodes[old.0].clone();
-                node.parent = node.parent.and_then(|parent| remap.get(&parent).copied());
-                node.children = node
-                    .children
-                    .into_iter()
-                    .filter_map(|child| remap.get(&child).copied())
-                    .collect();
-                node
-            })
-            .collect();
+        let mut old_index = 0usize;
+        self.nodes.retain_mut(|node| {
+            let retained = remap_by_index[old_index].is_some();
+            old_index += 1;
+            if !retained {
+                return false;
+            }
+            node.parent = node.parent.and_then(|parent| remap_by_index[parent.0]);
+            let mut write = 0usize;
+            for read in 0..node.children.len() {
+                if let Some(child) = remap_by_index[node.children[read].0] {
+                    node.children[write] = child;
+                    write += 1;
+                }
+            }
+            node.children.truncate(write);
+            true
+        });
         self.root = NodeId(0);
-        self.logical_roots = vec![self.root];
+        self.logical_roots.clear();
+        self.logical_roots.push(self.root);
         self.source_bytes = 0;
-        remap
+        meter.release_owned_bytes(rebuilt_map_bytes);
+        meter.release_owned_bytes(temporary_bytes);
+        Ok((remap, retained_map_bytes))
     }
 }
 
@@ -2102,7 +2182,7 @@ fn parse_dtd_notation_declaration(subset: &str, mut cursor: usize) -> Result<usi
     } else if subset[cursor..].starts_with("PUBLIC") {
         cursor += "PUBLIC".len();
         require_dtd_whitespace(subset, &mut cursor, "after NOTATION PUBLIC")?;
-        parse_dtd_public_identifier(subset, &mut cursor)?;
+        parse_dtd_public_identifier(subset, &mut cursor, "NOTATION public identifier")?;
         let before_spacing = cursor;
         skip_xml_whitespace(subset, &mut cursor);
         if subset
@@ -2131,8 +2211,12 @@ fn parse_dtd_notation_declaration(subset: &str, mut cursor: usize) -> Result<usi
     Ok(cursor + 1)
 }
 
-fn parse_dtd_public_identifier(subset: &str, cursor: &mut usize) -> Result<()> {
-    let value = parse_dtd_quoted_literal(subset, cursor, "NOTATION public identifier")?;
+fn parse_dtd_public_identifier(subset: &str, cursor: &mut usize, context: &str) -> Result<()> {
+    // XML 1.0 productions [12]-[13] restrict PubidLiteral to PubidChar in every PUBLIC external
+    // identifier, including entity declarations in section 4.2.2.
+    // https://www.w3.org/TR/xml/#NT-PubidLiteral
+    // https://www.w3.org/TR/xml/#sec-external-ent
+    let value = parse_dtd_quoted_literal(subset, cursor, context)?;
     if value.chars().all(|character| {
         character.is_ascii_alphanumeric()
             || matches!(
@@ -2162,9 +2246,9 @@ fn parse_dtd_public_identifier(subset: &str, cursor: &mut usize) -> Result<()> {
     }) {
         Ok(())
     } else {
-        Err(Error::Xml(
-            "NOTATION public identifier contains an invalid PubidChar".into(),
-        ))
+        Err(Error::Xml(format!(
+            "{context} contains an invalid PubidChar"
+        )))
     }
 }
 
@@ -2330,7 +2414,7 @@ fn parse_external_entity_declaration(
     } else if subset[cursor..].starts_with("PUBLIC") {
         cursor += "PUBLIC".len();
         require_dtd_whitespace(subset, &mut cursor, "after PUBLIC")?;
-        parse_dtd_quoted_literal(subset, &mut cursor, "entity public identifier")?;
+        parse_dtd_public_identifier(subset, &mut cursor, "entity public identifier")?;
         require_dtd_whitespace(subset, &mut cursor, "before entity system identifier")?;
         parse_dtd_quoted_literal(subset, &mut cursor, "entity system identifier")?
     } else {
@@ -3398,6 +3482,7 @@ mod parser_boundary_tests {
             r#"<!DOCTYPE r [<!ELEMENT r EMPTY extra>]><r/>"#,
             r#"<!DOCTYPE r [<!NOTATION png SYSTEM>]><r/>"#,
             r#"<!DOCTYPE r [<!NOTATION png PUBLIC "image/png" extra>]><r/>"#,
+            r#"<!DOCTYPE r [<!ENTITY e PUBLIC "[bad" "urn:example">]><r/>"#,
             r#"<!DOCTYPE r [<!UNKNOWN r ANY>]><r/>"#,
         ] {
             Document::parse_iterative(malformed, None)

@@ -8,7 +8,7 @@ use sxd_document_no_unsafe::dom::{Document as SxdDocument, Element as SxdElement
 use sxd_document_no_unsafe::{Package, QName};
 use sxd_xpath_no_unsafe::{Context, Factory, Value as SxdValue, XPath, function, nodeset};
 
-use crate::budget::Meter;
+use crate::budget::{Meter, reserve_temporary_vec_slot};
 use crate::compiler::{DecimalFormat, Expression, NameTest, Pattern, normalize_xpath_for_sxd};
 use crate::expression::innermost_namespaced_call;
 use crate::lexical::{is_ncname, is_ncname_char};
@@ -167,6 +167,7 @@ pub(crate) struct EvaluatorSourceOptions {
 pub(crate) struct PreparedEvaluatorSource {
     pub(crate) document: Document,
     pub(crate) remap: Option<HashMap<NodeId, NodeId>>,
+    pub(crate) remap_owned_bytes: usize,
     resource_identities: HashMap<ResourceIdentity, ResolvedResource>,
 }
 
@@ -191,11 +192,19 @@ pub(crate) fn prepare_evaluator_source(
         meter.charge(BudgetKind::OwnedBytes, source.estimated_clone_bytes())?;
         (source.clone(), None)
     };
-    let whitespace_remap = apply_whitespace_rules(&mut document, &options.whitespace);
-    let remap = compose_node_remaps(include_remap, whitespace_remap);
+    let (whitespace_remap, whitespace_remap_owned_bytes) =
+        apply_whitespace_rules(&mut document, &options.whitespace, meter)?
+            .map_or((None, 0), |(remap, bytes)| (Some(remap), bytes));
+    let (remap, remap_owned_bytes) = compose_node_remaps(
+        include_remap,
+        whitespace_remap,
+        whitespace_remap_owned_bytes,
+        meter,
+    )?;
     Ok(PreparedEvaluatorSource {
         document,
         remap,
+        remap_owned_bytes,
         resource_identities,
     })
 }
@@ -203,21 +212,43 @@ pub(crate) fn prepare_evaluator_source(
 fn compose_node_remaps(
     first: Option<HashMap<NodeId, NodeId>>,
     second: Option<HashMap<NodeId, NodeId>>,
-) -> Option<HashMap<NodeId, NodeId>> {
+    second_owned_bytes: usize,
+    meter: &mut Meter,
+) -> Result<(Option<HashMap<NodeId, NodeId>>, usize)> {
     match (first, second) {
-        (None, None) => None,
-        (Some(remap), None) | (None, Some(remap)) => Some(remap),
-        (Some(first), Some(second)) => Some(
-            first
-                .into_iter()
-                .filter_map(|(original, intermediate)| {
-                    second
-                        .get(&intermediate)
-                        .copied()
-                        .map(|final_id| (original, final_id))
-                })
-                .collect(),
-        ),
+        (None, None) => Ok((None, 0)),
+        (Some(remap), None) => Ok((Some(remap), 0)),
+        (None, Some(remap)) => Ok((Some(remap), second_owned_bytes)),
+        (Some(first), Some(second)) => {
+            let entry_bytes = xinclude_remap_bytes(1);
+            let requested_bytes = first.len().saturating_mul(entry_bytes);
+            meter.charge(BudgetKind::OwnedBytes, requested_bytes)?;
+            let mut composed = HashMap::new();
+            if let Err(error) = composed.try_reserve(first.len()) {
+                meter.release_owned_bytes(requested_bytes);
+                return Err(Error::Dynamic(format!(
+                    "failed to reserve composed node remap: {error}"
+                )));
+            }
+            let retained_bytes = composed.capacity().saturating_mul(entry_bytes);
+            if retained_bytes < requested_bytes {
+                meter.release_owned_bytes(requested_bytes - retained_bytes);
+            } else if retained_bytes > requested_bytes
+                && let Err(error) =
+                    meter.charge(BudgetKind::OwnedBytes, retained_bytes - requested_bytes)
+            {
+                meter.release_owned_bytes(requested_bytes);
+                return Err(error);
+            }
+            for (original, intermediate) in first {
+                if let Some(final_id) = second.get(&intermediate).copied() {
+                    composed.insert(original, final_id);
+                }
+            }
+            drop(second);
+            meter.release_owned_bytes(second_owned_bytes);
+            Ok((Some(composed), retained_bytes))
+        }
     }
 }
 
@@ -232,40 +263,6 @@ fn source_base_uri(source: &Document, node: &SourceNode) -> Option<String> {
     source
         .node(source_node_owner(node))
         .and_then(|node| node.base_uri.clone())
-}
-
-fn reserve_temporary_vec_slot<T>(
-    items: &mut Vec<T>,
-    meter: &mut Meter,
-    reserved_owned_bytes: &mut usize,
-) -> Result<()> {
-    if std::mem::size_of::<T>() == 0 || items.len() < items.capacity() {
-        return Ok(());
-    }
-    let old_capacity = items.capacity();
-    let requested_slots = old_capacity.max(4);
-    let requested_bytes = requested_slots.saturating_mul(std::mem::size_of::<T>());
-    meter.charge(BudgetKind::OwnedBytes, requested_bytes)?;
-    if let Err(error) = items.try_reserve_exact(requested_slots) {
-        meter.release_owned_bytes(requested_bytes);
-        return Err(Error::Dynamic(format!(
-            "failed to reserve temporary XPath storage: {error}"
-        )));
-    }
-    let actual_bytes = items
-        .capacity()
-        .saturating_sub(old_capacity)
-        .saturating_mul(std::mem::size_of::<T>());
-    if actual_bytes < requested_bytes {
-        meter.release_owned_bytes(requested_bytes - actual_bytes);
-    } else if actual_bytes > requested_bytes
-        && let Err(error) = meter.charge(BudgetKind::OwnedBytes, actual_bytes - requested_bytes)
-    {
-        meter.release_owned_bytes(requested_bytes);
-        return Err(error);
-    }
-    *reserved_owned_bytes = reserved_owned_bytes.saturating_add(actual_bytes);
-    Ok(())
 }
 
 type PatternCacheKey = (String, Vec<(String, String)>, NodeId);
@@ -636,6 +633,7 @@ impl Evaluator {
         let PreparedEvaluatorSource {
             document,
             remap: _,
+            remap_owned_bytes: _,
             resource_identities,
         } = prepared_source;
         let mut source = document;
@@ -758,53 +756,55 @@ impl Evaluator {
         ]);
     }
 
-    pub(crate) fn append_key_index(
+    pub(crate) fn append_key_entry(
         &mut self,
-        entries: Vec<(ExpandedName, String, SourceNode)>,
+        name: ExpandedName,
+        value: String,
+        node: &SourceNode,
         meter: &mut Meter,
     ) -> Result<()> {
         let mut index = self.key_index.borrow_mut();
-        for (name, value, node) in entries {
-            let Some(sxd) = self
-                .maps
-                .to_sxd(self.package.as_document().root().into(), &node)
-            else {
-                continue;
-            };
-            let document_index = self
-                .source
-                .logical_root_for(&node)
-                .and_then(|root| {
-                    self.source
-                        .logical_roots()
-                        .iter()
-                        .position(|candidate| *candidate == root)
-                })
-                .ok_or_else(|| Error::Dynamic("key node has no logical document".into()))?;
-            let path = typed_path_to(&sxd);
-            meter.charge(BudgetKind::KeyEntries, 1)?;
-            let path_bytes = path.owned_bytes();
-            let retained_key_bytes = std::mem::size_of::<(ExpandedName, String, usize)>()
-                .saturating_add(name.local.len())
-                .saturating_add(name.namespace.as_deref().map_or(0, str::len))
-                .saturating_add(value.len());
-            match index.entry((name, value, document_index)) {
-                std::collections::hash_map::Entry::Occupied(mut entry) => {
-                    meter.charge(BudgetKind::OwnedBytes, path_bytes)?;
-                    entry.get_mut().push(path);
-                }
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    meter.charge(
-                        BudgetKind::OwnedBytes,
-                        retained_key_bytes.saturating_add(path_bytes),
-                    )?;
-                    entry.insert(vec![path]);
-                }
+        let Some(sxd) = self
+            .maps
+            .to_sxd(self.package.as_document().root().into(), node)
+        else {
+            return Ok(());
+        };
+        let document_index = self
+            .source
+            .logical_root_for(node)
+            .and_then(|root| {
+                self.source
+                    .logical_roots()
+                    .iter()
+                    .position(|candidate| *candidate == root)
+            })
+            .ok_or_else(|| Error::Dynamic("key node has no logical document".into()))?;
+        let path = typed_path_to(&sxd);
+        meter.charge(BudgetKind::KeyEntries, 1)?;
+        let path_bytes = path.owned_bytes();
+        let retained_key_bytes = std::mem::size_of::<(ExpandedName, String, usize)>()
+            .saturating_add(name.local.len())
+            .saturating_add(name.namespace.as_deref().map_or(0, str::len))
+            .saturating_add(value.len());
+        match index.entry((name, value, document_index)) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                meter.charge(BudgetKind::OwnedBytes, path_bytes)?;
+                entry.get_mut().push(path);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                meter.charge(
+                    BudgetKind::OwnedBytes,
+                    retained_key_bytes.saturating_add(path_bytes),
+                )?;
+                entry.insert(vec![path]);
             }
         }
-        drop(index);
-        clear_pattern_cache(&mut self.pattern_matches, meter);
         Ok(())
+    }
+
+    pub(crate) fn finish_key_index(&mut self, meter: &mut Meter) {
+        clear_pattern_cache(&mut self.pattern_matches, meter);
     }
 
     #[expect(
@@ -1923,7 +1923,12 @@ impl Evaluator {
                         } else {
                             (document, None)
                         };
-                    let _ = apply_whitespace_rules(&mut document, &self.whitespace);
+                    if let Some((remap, remap_owned_bytes)) =
+                        apply_whitespace_rules(&mut document, &self.whitespace, meter)?
+                    {
+                        drop(remap);
+                        meter.release_owned_bytes(remap_owned_bytes);
+                    }
                     let root = self.import_document(&document, meter)?;
                     if let Some(reservation) = expanded_reservation {
                         meter.release_owned_bytes(reservation);

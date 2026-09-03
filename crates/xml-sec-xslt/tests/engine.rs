@@ -180,6 +180,22 @@ fn templates_modes_parameters_sort_keys_and_numbering_compose() {
 }
 
 #[test]
+fn compound_key_name_expression_builds_the_runtime_selected_index() {
+    // XPath 1.0 converts the complete first argument to a string before key lookup; matching
+    // outer quotes do not make a compound expression one lexical string literal.
+    let stylesheet = r#"
+      <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+        <xsl:key name="true" match="item" use="@id"/>
+        <xsl:output method="text"/>
+        <xsl:template match="/"><xsl:value-of select="key('a' or 'b', 'wanted')"/></xsl:template>
+      </xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, r#"<root><item id="wanted">found</item></root>"#),
+        "found"
+    );
+}
+
+#[test]
 fn built_in_template_rules_do_not_forward_parameters() {
     // A parameter targets only the selected template; an intervening built-in rule must not
     // accidentally pass it to explicit templates selected for that rule's children.
@@ -8312,6 +8328,56 @@ fn quoted_key_text_does_not_prepare_key_indexes() {
 }
 
 #[test]
+fn key_index_traversal_accounts_for_its_wide_pending_stack() {
+    // A no-match key produces no retained entries, but traversing a wide logical document still
+    // requires a temporary DFS frontier that must count toward peak OwnedBytes.
+    let source_xml = format!("<root>{}</root>", "<item/>".repeat(4_096));
+    let source = Document::parse(&source_xml, None).expect("wide source parses");
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:key name="none" match="missing" use="."/><xsl:output method="text"/><xsl:template name="baseline">ok</xsl:template><xsl:template name="key"><xsl:value-of select="count(key('none', 'x'))"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let minimum = |template: &str| {
+        let succeeds = |owned_bytes| {
+            let mut budget = execution_budget(source_xml.len());
+            budget.owned_bytes = owned_bytes;
+            stylesheet
+                .execute(
+                    &source,
+                    &Parameters::new(),
+                    Arc::new(NoResolver),
+                    ExecutionOptions {
+                        budget,
+                        initial_mode: None,
+                        initial_template: Some(ExpandedName::new(None::<String>, template)),
+                    },
+                )
+                .is_ok()
+        };
+        let mut rejected = 0;
+        let mut accepted = 1;
+        while !succeeds(accepted) {
+            rejected = accepted;
+            accepted *= 2;
+        }
+        while rejected + 1 < accepted {
+            let candidate = rejected + (accepted - rejected) / 2;
+            if succeeds(candidate) {
+                accepted = candidate;
+            } else {
+                rejected = candidate;
+            }
+        }
+        accepted
+    };
+    let baseline = minimum("baseline");
+    let keyed = minimum("key");
+    assert!(
+        keyed + 4 * 1024 >= baseline + 4_096 * std::mem::size_of::<xml_sec_xslt::NodeId>(),
+        "baseline={baseline}, keyed={keyed}"
+    );
+}
+
+#[test]
 fn dynamic_map_preserves_boolean_lexical_values() {
     // EXSLT dyn:map scalar nodes use XPath's true/false lexical representation.
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:dyn="http://exslt.org/dynamic"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="dyn:map(root/item, '. = 2')[1]"/><xsl:text>|</xsl:text><xsl:value-of select="dyn:map(root/item, '. = 2')[2]"/></xsl:template></xsl:stylesheet>"#;
@@ -9431,6 +9497,44 @@ fn content_created_bindings_preserve_the_current_template_rule() {
             .expect("binding content preserves the current matched rule");
         assert_eq!(result.serialized.bytes, b"base");
     }
+}
+
+#[test]
+fn attribute_sets_preserve_the_current_template_rule() {
+    // XSLT 1.0 section 7.1.4 makes use-attribute-sets equivalent to inserting the set's
+    // xsl:attribute instructions at the start of the caller's sequence constructor.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#attribute-sets
+    let resolver = Arc::new(MemoryResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            "base.xsl".into(),
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:text>base</xsl:text></xsl:template></xsl:stylesheet>"#.into(),
+        );
+    let stylesheet = Compiler::new(
+        Arc::clone(&resolver),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:import href="base.xsl"/><xsl:output omit-xml-declaration="yes"/><xsl:attribute-set name="attrs"><xsl:attribute name="value"><xsl:apply-imports/></xsl:attribute></xsl:attribute-set><xsl:template match="/"><out xsl:use-attribute-sets="attrs"/></xsl:template></xsl:stylesheet>"#,
+        Some("memory:main.xsl"),
+    )
+    .expect("attribute-set stylesheet compiles");
+    let result = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("attribute-set content retains the matched template rule");
+    assert_eq!(result.serialized.bytes, b"<out value=\"base\"/>\n");
 }
 
 #[test]
