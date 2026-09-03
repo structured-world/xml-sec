@@ -39,9 +39,15 @@ fn value_into_nodeset(v: Value<'_>) -> Result<Nodeset<'_>, Error> {
 // > order, because the axis that applies to the `[1]` predicate is
 // > the child axis
 //
-fn value_into_ordered_nodes(v: Value<'_>) -> Result<OrderedNodes<'_>, Error> {
+fn value_into_ordered_nodes<'c, 'd>(
+    context: &context::Evaluation<'c, 'd>,
+    v: Value<'d>,
+) -> Result<OrderedNodes<'d>, Error> {
     match v {
-        Value::Nodeset(ns) => Ok(ns.document_order().into()),
+        Value::Nodeset(ns) => ns
+            .document_order_with_context(context)
+            .map(Into::into)
+            .map_err(|source| Error::FunctionEvaluation { source }),
         _ => Err(Error::NotANodeset),
     }
 }
@@ -468,7 +474,7 @@ impl Expression for Filter {
     fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
         self.node_selector
             .evaluate(context)
-            .and_then(value_into_ordered_nodes)
+            .and_then(|value| value_into_ordered_nodes(context, value))
             .and_then(|nodes| self.predicate.select(context, nodes))
             .map(|nodes| Value::Nodeset(nodes.into()))
     }

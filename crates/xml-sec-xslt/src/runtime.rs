@@ -1072,7 +1072,7 @@ impl<'a> Execution<'a> {
                                     name,
                                     prefix,
                                     attributes: vec![],
-                                    namespaces: result_namespaces,
+                                    namespaces: result_namespaces.into(),
                                 },
                                 base_uri.clone(),
                             )?;
@@ -1527,7 +1527,7 @@ impl<'a> Execution<'a> {
                         name,
                         prefix,
                         attributes: vec![],
-                        namespaces: result_namespaces,
+                        namespaces: result_namespaces.into(),
                     },
                     base_uri.clone(),
                 )?;
@@ -1812,7 +1812,7 @@ impl<'a> Execution<'a> {
                     NodeKind::Element {
                         name: ExpandedName::new(namespace, local),
                         prefix,
-                        namespaces,
+                        namespaces: namespaces.into(),
                         attributes: vec![],
                     },
                     base_uri.clone(),
@@ -3447,6 +3447,7 @@ impl<'a> Execution<'a> {
                 "attribute cannot be added after result children".into(),
             ));
         }
+        let namespaces = Arc::make_mut(namespaces);
         let generated_namespace = fixup_attribute_namespace(&mut attribute, namespaces);
         if generated_namespace.is_some() {
             self.meter.charge(BudgetKind::ResultNodes, 1)?;
@@ -3577,6 +3578,7 @@ impl<'a> Execution<'a> {
                     "namespace requires an element result".into(),
                 ));
             };
+            let namespaces = Arc::make_mut(namespaces);
             let existing_index = namespaces
                 .iter()
                 .position(|existing| existing.prefix == namespace.prefix);

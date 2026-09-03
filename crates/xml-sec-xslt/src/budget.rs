@@ -5,6 +5,9 @@ pub(crate) const ENTITY_REFERENCE_CEILING: usize = 255;
 // This is an absolute parser safety ceiling, not a deployment policy default.
 // Caller budgets may reject smaller documents at the compile/execution boundary.
 pub(crate) const ENTITY_EXPANSION_BYTE_CEILING: usize = 16 * 1024 * 1024;
+// This bounds cumulative namespace-scope copies made while projecting an XML document.
+// Shared scopes avoid the charge until a descendant introduces a local declaration.
+pub(crate) const NAMESPACE_SCOPE_BYTE_CEILING: usize = 16 * 1024 * 1024;
 
 /// Independently metered XSLT resource dimensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

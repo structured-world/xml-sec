@@ -644,6 +644,13 @@ fn declaration_from_text(xml: &str) -> Result<Option<Range<usize>>, Error> {
                 .position(|byte| *byte == quote)
                 .ok_or(Error::MalformedDeclaration("unterminated value"))?;
         if name == b"encoding" {
+            let value = &declaration[value_start..value_end];
+            // XML 1.0 section 4.3.3 production [81] requires EncName to start with an ASCII
+            // letter and limits the remaining characters. Validate before normalization erases
+            // the declaration. https://www.w3.org/TR/xml/#NT-EncName
+            if !is_enc_name(value) {
+                return Err(Error::MalformedDeclaration("invalid encoding name"));
+            }
             return Ok(Some((5 + value_start)..(5 + value_end)));
         }
         cursor = value_end + 1;
@@ -655,6 +662,13 @@ fn declaration_from_text(xml: &str) -> Result<Option<Range<usize>>, Error> {
         }
     }
     Ok(None)
+}
+
+fn is_enc_name(value: &[u8]) -> bool {
+    value.first().is_some_and(u8::is_ascii_alphabetic)
+        && value[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn is_generic_utf16(label: &str) -> bool {
@@ -705,6 +719,17 @@ mod tests {
         let decoded = decode_xml(&bytes, Some("UTF-16")).expect("BOM selects UTF-16BE");
         assert!(decoded.contains("encoding=\"UTF-8\""));
         assert!(decoded.contains("<root>lambda</root>"));
+    }
+
+    #[test]
+    fn xml_declaration_rejects_values_outside_the_enc_name_grammar() {
+        // XML 1.0 section 4.3.3 production [81] excludes `:` from EncName.
+        // https://www.w3.org/TR/xml/#NT-EncName
+        let bytes = b"<?xml version=\"1.0\" encoding=\"iso_8859-1:1987\"?><root/>";
+        assert!(matches!(
+            decode_xml(bytes, None),
+            Err(Error::MalformedDeclaration("invalid encoding name"))
+        ));
     }
 
     #[test]

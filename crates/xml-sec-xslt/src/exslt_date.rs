@@ -129,7 +129,7 @@ impl function::Function for DateFunction {
                     return Ok(Value::String(String::new()));
                 }
                 let mut total = DurationValue::default();
-                for node in nodes.document_order() {
+                for node in nodes.document_order_with_context(context)? {
                     let Some(value) = DurationValue::parse(&node.string_value()) else {
                         return Ok(Value::String(String::new()));
                     };

@@ -352,7 +352,7 @@ impl<'d> Value<'d> {
             Boolean(value) => Ok(if *value { 1.0 } else { 0.0 }),
             Number(value) => Ok(*value),
             String(value) | ResultTreeFragment(_, value) => Ok(str_to_num(value)),
-            Nodeset(nodes) => match nodes.document_order_first() {
+            Nodeset(nodes) => match nodes.document_order_first_with_context(context)? {
                 Some(node) => node_to_num_with_context(context, &node),
                 None => Ok(f64::NAN),
             },

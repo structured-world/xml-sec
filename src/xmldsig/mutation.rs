@@ -5,7 +5,7 @@
 
 use std::{collections::HashSet, ops::Range};
 
-use xml_sec_xml_input::lexical::{Event as LexicalEvent, Scanner, escape_attribute, escape_text};
+use xml_sec_xml_input::lexical::{escape_attribute, escape_text};
 
 use super::parse::{XMLDSIG_NS, XMLDSIG11_NS};
 use super::whitespace::is_xml_whitespace_only;
@@ -809,23 +809,7 @@ fn standalone_element(
 }
 
 fn owned_namespace_declarations(opening: &str) -> Result<HashSet<String>, XmlMutationError> {
-    let standalone = format!("{} />", opening.trim_end_matches('/'));
-    let mut scanner = Scanner::new(&standalone);
-    let tag = match scanner.next_event()? {
-        Some(LexicalEvent::Start(tag) | LexicalEvent::Empty(tag)) => tag,
-        _ => return Err(XmlMutationError::InvalidAppendTarget),
-    };
-    Ok(tag
-        .attributes
-        .iter()
-        .filter_map(
-            |attribute| match (attribute.name.prefix(), attribute.name.local()) {
-                (None, "xmlns") => Some(String::new()),
-                (Some("xmlns"), prefix) => Some(prefix.to_owned()),
-                _ => None,
-            },
-        )
-        .collect())
+    xml_sec_xml_input::lexical::declared_namespace_prefixes(opening).map_err(Into::into)
 }
 
 fn is_reusable_placeholder(node: crate::xml::dom::Node<'_, '_>) -> bool {

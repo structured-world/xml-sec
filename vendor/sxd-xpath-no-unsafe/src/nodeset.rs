@@ -301,43 +301,32 @@ impl<'d> Node<'d> {
         &self,
         context: &crate::context::Evaluation<'_, '_>,
     ) -> Result<String, crate::function::Error> {
-        let length = self.string_value_len_with_context(context)?;
-        context.reserve_string_allocation(length)?;
-        let mut result = String::with_capacity(length);
-        self.append_string_value_with_context(&mut result, context)?;
+        if !matches!(self, Node::Root(_) | Node::Element(_)) {
+            let length = self.string_value_len();
+            context.reserve_string_allocation(length)?;
+            return Ok(self.string_value_with_capacity(length));
+        }
+        let mut result = String::new();
+        visit_descendant_text_metered(self, context, |text| {
+            let required = result.len().checked_add(text.len()).ok_or_else(|| {
+                crate::function::Error::Other {
+                    what: "XPath string value exceeds addressable memory".into(),
+                }
+            })?;
+            if required > result.capacity() {
+                let target_capacity = required.max(result.capacity().saturating_mul(2).max(8));
+                let additional = target_capacity - result.capacity();
+                context.reserve_string_allocation(additional)?;
+                result.try_reserve_exact(additional).map_err(|_| {
+                    crate::function::Error::Other {
+                        what: "XPath string value allocation failed".into(),
+                    }
+                })?;
+            }
+            result.push_str(text);
+            Ok(())
+        })?;
         Ok(result)
-    }
-
-    fn string_value_len_with_context(
-        &self,
-        context: &crate::context::Evaluation<'_, '_>,
-    ) -> Result<usize, crate::function::Error> {
-        if !matches!(self, Node::Root(_) | Node::Element(_)) {
-            return Ok(self.string_value_len());
-        }
-        let mut length = 0usize;
-        visit_descendant_text_metered(self, context, |text| {
-            debug_assert!(length.checked_add(text.len()).is_some());
-            length += text.len();
-            true
-        })?;
-        Ok(length)
-    }
-
-    fn append_string_value_with_context(
-        &self,
-        output: &mut String,
-        context: &crate::context::Evaluation<'_, '_>,
-    ) -> Result<(), crate::function::Error> {
-        if !matches!(self, Node::Root(_) | Node::Element(_)) {
-            self.append_string_value(output);
-            return Ok(());
-        }
-        visit_descendant_text_metered(self, context, |text| {
-            output.push_str(text);
-            true
-        })?;
-        Ok(())
     }
 
     pub(crate) fn string_value_with_capacity(&self, capacity: usize) -> String {
@@ -503,40 +492,28 @@ fn visit_descendant_text(node: &Node<'_>, mut visit: impl FnMut(&str) -> bool) -
 fn visit_descendant_text_metered(
     node: &Node<'_>,
     context: &crate::context::Evaluation<'_, '_>,
-    mut visit: impl FnMut(&str) -> bool,
-) -> Result<bool, crate::function::Error> {
-    context.reserve_temporary_allocation(
-        node.children_len()
-            .saturating_mul(std::mem::size_of::<Node<'_>>()),
-    )?;
-    let mut pending = node.children();
-    pending.reverse();
-    while let Some(node) = pending.pop() {
-        match &node {
-            Node::Element(_) => {
-                context.reserve_temporary_allocation(
-                    node.children_len()
-                        .saturating_mul(std::mem::size_of::<Node<'_>>()),
-                )?;
-                let mut children = node.children();
-                children.reverse();
-                let required = pending.len().saturating_add(children.len());
-                if required > pending.capacity() {
-                    let additional = required - pending.capacity();
-                    context.reserve_temporary_allocation(
-                        additional.saturating_mul(std::mem::size_of::<Node<'_>>()),
-                    )?;
-                    pending.reserve_exact(children.len());
-                }
-                pending.extend(children);
+    mut visit: impl FnMut(&str) -> Result<(), crate::function::Error>,
+) -> Result<(), crate::function::Error> {
+    let frame_bytes = std::mem::size_of::<(Node<'_>, usize)>();
+    context.reserve_temporary_allocation(frame_bytes.saturating_mul(4))?;
+    let mut stack = Vec::with_capacity(4);
+    stack.push((node.clone(), 0usize));
+    while let Some((parent, next_child)) = stack.last_mut() {
+        let Some(child) = parent.child_at(*next_child) else {
+            stack.pop();
+            continue;
+        };
+        *next_child += 1;
+        match child {
+            Node::Root(_) | Node::Element(_) => {
+                reserve_metered_vec_slot(&mut stack, context)?;
+                stack.push((child, 0));
             }
-            Node::Text(text) if !visit(sxd_document_no_unsafe::as_str!(text.text())) => {
-                return Ok(false);
-            }
+            Node::Text(text) => visit(sxd_document_no_unsafe::as_str!(text.text()))?,
             _ => {}
         }
     }
-    Ok(true)
+    Ok(())
 }
 
 conversion_trait!(Node, {
@@ -652,6 +629,21 @@ impl<'d> Nodeset<'d> {
             .cloned()
     }
 
+    /// Return the first node while charging document-order key storage to the evaluator.
+    pub fn document_order_first_with_context(
+        &self,
+        context: &crate::context::Evaluation<'_, '_>,
+    ) -> Result<Option<Node<'d>>, crate::function::Error> {
+        let mut first: Option<(Node<'d>, Vec<OrderStep>)> = None;
+        for node in self.iter() {
+            let path = order_path_with_context(&node, Some(context))?;
+            if first.as_ref().is_none_or(|(_, current)| path < *current) {
+                first = Some((node, path));
+            }
+        }
+        Ok(first.map(|(node, _)| node))
+    }
+
     pub fn document_order(&self) -> Vec<Node<'d>> {
         let mut nodes: Vec<_> = self.iter().collect();
         if nodes.len() == 1 {
@@ -660,6 +652,28 @@ impl<'d> Nodeset<'d> {
 
         nodes.sort_by_cached_key(order_path);
         nodes
+    }
+
+    /// Return nodes in document order while charging all temporary key storage.
+    pub fn document_order_with_context(
+        &self,
+        context: &crate::context::Evaluation<'_, '_>,
+    ) -> Result<Vec<Node<'d>>, crate::function::Error> {
+        context.reserve_temporary_allocation(self.size().saturating_mul(
+            std::mem::size_of::<Node<'d>>().saturating_add(std::mem::size_of::<Vec<OrderStep>>()),
+        ))?;
+        let mut keyed = Vec::with_capacity(self.size());
+        for node in self.iter() {
+            let path = order_path_with_context(&node, Some(context))?;
+            keyed.push((node, path));
+        }
+        keyed.sort_by(|(_, left), (_, right)| left.cmp(right));
+        context.reserve_temporary_allocation(
+            keyed.len().saturating_mul(std::mem::size_of::<Node<'d>>()),
+        )?;
+        let mut ordered = Vec::with_capacity(keyed.len());
+        ordered.extend(keyed.into_iter().map(|(node, _)| node));
+        Ok(ordered)
     }
 }
 
@@ -679,36 +693,62 @@ enum OrderStep {
     Child(usize),
 }
 
-fn order_path(node: &Node<'_>) -> Vec<OrderStep> {
+fn order_path<'d>(node: &Node<'d>) -> Vec<OrderStep> {
+    order_path_with_context(node, None).expect("unmetered document ordering cannot fail")
+}
+
+fn order_path_with_context<'d>(
+    node: &Node<'d>,
+    context: Option<&crate::context::Evaluation<'_, '_>>,
+) -> Result<Vec<OrderStep>, crate::function::Error> {
     let mut path = Vec::new();
     let mut current = node.clone();
     while let Some(parent) = current.parent() {
         let step = match &current {
-            Node::Namespace(namespace) => OrderStep::Namespace(namespace.prefix().to_owned()),
+            Node::Namespace(namespace) => {
+                if let Some(context) = context {
+                    context.reserve_temporary_allocation(namespace.prefix().len())?;
+                }
+                OrderStep::Namespace(namespace.prefix().to_owned())
+            }
             Node::Attribute(attribute) => {
-                let attributes = attribute
-                    .parent()
-                    .map(|element| element.attributes())
-                    .unwrap_or_default();
-                let index = attributes
-                    .iter()
-                    .position(|candidate| candidate == attribute)
-                    .unwrap_or(attributes.len());
+                let index = attribute.parent().map_or(0, |element| {
+                    (0..element.attributes_len())
+                        .position(|index| element.attribute_at(index).as_ref() == Some(attribute))
+                        .unwrap_or(element.attributes_len())
+                });
                 OrderStep::Attribute(index)
             }
             _ => OrderStep::Child(
-                parent
-                    .children()
-                    .iter()
-                    .position(|candidate| candidate == &current)
+                (0..parent.children_len())
+                    .position(|index| parent.child_at(index).as_ref() == Some(&current))
                     .unwrap_or(usize::MAX),
             ),
         };
+        if let Some(context) = context {
+            reserve_metered_vec_slot(&mut path, context)?;
+        }
         path.push(step);
         current = parent;
     }
     path.reverse();
-    path
+    Ok(path)
+}
+
+fn reserve_metered_vec_slot<T>(
+    values: &mut Vec<T>,
+    context: &crate::context::Evaluation<'_, '_>,
+) -> Result<(), crate::function::Error> {
+    if values.len() < values.capacity() {
+        return Ok(());
+    }
+    let additional = values.capacity().max(4);
+    context.reserve_temporary_allocation(additional.saturating_mul(std::mem::size_of::<T>()))?;
+    values
+        .try_reserve_exact(additional)
+        .map_err(|_| crate::function::Error::Other {
+            what: "XPath traversal workspace allocation failed".into(),
+        })
 }
 
 impl<'a, 'd: 'a> IntoIterator for &'a Nodeset<'d> {
@@ -1034,10 +1074,8 @@ mod test {
     }
 
     #[test]
-    fn wide_empty_string_value_traversal_obeys_the_allocation_budget() {
-        // Empty descendants contribute no output bytes, but traversal still needs workspace for
-        // their node handles. The allocation-free child count must reject this at the evaluator
-        // gate before `children()` materializes the wide child-handle vector.
+    fn wide_empty_string_value_traversal_uses_depth_bounded_workspace() {
+        // Width must not control traversal allocation: child_at() keeps only the ancestor path.
         let package = Package::new();
         let doc = package.as_document();
         let root = doc.create_element("root");
@@ -1046,18 +1084,31 @@ mod test {
             root.append_child(doc.create_element("empty"));
         }
         let mut context = crate::context::Context::new();
-        context.set_string_allocation_limit(64);
+        context.set_string_allocation_limit(4 * std::mem::size_of::<(Node<'_>, usize)>());
         let evaluation = crate::context::Evaluation::new(&context, doc.root().into());
 
-        assert!(
-            into_node(root)
-                .string_value_with_context(&evaluation)
-                .is_err()
-        );
         assert_eq!(
-            context.string_allocation_exceeded(),
-            Some(1_024 * std::mem::size_of::<Node<'_>>())
+            into_node(root).string_value_with_context(&evaluation),
+            Ok(String::new())
         );
+        assert_eq!(context.string_allocation_exceeded(), None);
+    }
+
+    #[test]
+    fn document_order_charges_cached_paths_before_sorting() {
+        let package = Package::new();
+        let doc = package.as_document();
+        let parent = doc.create_element("parent");
+        let child = doc.create_element("child");
+        doc.root().append_child(parent);
+        parent.append_child(child);
+        let nodes = nodeset![parent, child];
+        let mut context = crate::context::Context::new();
+        context.set_string_allocation_limit(0);
+        let evaluation = crate::context::Evaluation::new(&context, doc.root().into());
+
+        assert!(nodes.document_order_with_context(&evaluation).is_err());
+        assert!(context.string_allocation_exceeded().is_some());
     }
 
     #[test]

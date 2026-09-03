@@ -743,13 +743,17 @@ impl Connections {
                     }
                     _ => return Vec::new(),
                 };
-                let pos = children.iter().position(|c| *c == child_as_root).unwrap();
+                let Some(pos) = children.iter().position(|c| *c == child_as_root) else {
+                    return Vec::new();
+                };
                 children[..pos].iter().map(|&c| c.into()).collect()
             }
             Some(ParentOfChild::Element(parent_idx)) => {
                 let elements = storage.elements.borrow();
                 let children = &elements[parent_idx.idx].children;
-                let pos = children.iter().position(|c| *c == child).unwrap();
+                let Some(pos) = children.iter().position(|c| *c == child) else {
+                    return Vec::new();
+                };
                 children[..pos].to_vec()
             }
             None => Vec::new(),
@@ -774,13 +778,17 @@ impl Connections {
                     }
                     _ => return Vec::new(),
                 };
-                let pos = children.iter().position(|c| *c == child_as_root).unwrap();
+                let Some(pos) = children.iter().position(|c| *c == child_as_root) else {
+                    return Vec::new();
+                };
                 children[pos + 1..].iter().map(|&c| c.into()).collect()
             }
             Some(ParentOfChild::Element(parent_idx)) => {
                 let elements = storage.elements.borrow();
                 let children = &elements[parent_idx.idx].children;
-                let pos = children.iter().position(|c| *c == child).unwrap();
+                let Some(pos) = children.iter().position(|c| *c == child) else {
+                    return Vec::new();
+                };
                 children[pos + 1..].to_vec()
             }
             None => Vec::new(),
@@ -799,6 +807,22 @@ impl Connections {
 
     pub fn attributes(&self, storage: &Storage, parent: Index<Element>) -> Vec<Index<Attribute>> {
         storage.elements.borrow()[parent.idx].attributes.clone()
+    }
+
+    pub fn attributes_len(&self, storage: &Storage, parent: Index<Element>) -> usize {
+        storage.elements.borrow()[parent.idx].attributes.len()
+    }
+
+    pub fn attribute_at(
+        &self,
+        storage: &Storage,
+        parent: Index<Element>,
+        index: usize,
+    ) -> Option<Index<Attribute>> {
+        storage.elements.borrow()[parent.idx]
+            .attributes
+            .get(index)
+            .copied()
     }
 
     pub fn attribute<'n, N>(
@@ -998,7 +1022,15 @@ impl Connections {
     fn replace_root_child_parent(&self, storage: &Storage, child: ChildOfRoot) {
         match child {
             ChildOfRoot::Element(n) => {
-                // Root may only have one element child; remove existing elements
+                // Root may only have one element child; detach the displaced element first.
+                let displaced = storage.roots.borrow()[self.root.idx]
+                    .children
+                    .iter()
+                    .copied()
+                    .find(ChildOfRoot::is_element);
+                if let Some(displaced) = displaced {
+                    self.clear_child_parent(storage, displaced.into());
+                }
                 storage.roots.borrow_mut()[self.root.idx]
                     .children
                     .retain(|c| !c.is_element());

@@ -5,7 +5,12 @@
 //! implementation tokenizer, so consumers can share source ranges, escaping,
 //! and serialization without inheriting a parser's tree semantics.
 
-use std::{borrow::Cow, collections::VecDeque, io::Write, ops::Range};
+use std::{
+    borrow::Cow,
+    collections::{HashSet, VecDeque},
+    io::{Error as IoError, ErrorKind, Write},
+    ops::Range,
+};
 
 /// A lexical XML failure with a source position.
 #[derive(Debug, thiserror::Error)]
@@ -406,6 +411,76 @@ fn validate_qualified_lexeme(source: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Return whether `value` is an XML Namespaces 1.0 `QName`.
+#[must_use]
+pub fn is_qname(value: &str) -> bool {
+    let mut parts = value.split(':');
+    let first = parts.next().unwrap_or_default();
+    !first.is_empty()
+        && is_ncname(first)
+        && parts.next().is_none_or(is_ncname)
+        && parts.next().is_none()
+}
+
+fn is_ncname(value: &str) -> bool {
+    let mut characters = value.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    is_ncname_start(first) && characters.all(is_ncname_char)
+}
+
+fn is_ncname_start(character: char) -> bool {
+    matches!(
+        character,
+        'A'..='Z'
+            | '_'
+            | 'a'..='z'
+            | '\u{C0}'..='\u{D6}'
+            | '\u{D8}'..='\u{F6}'
+            | '\u{F8}'..='\u{2FF}'
+            | '\u{370}'..='\u{37D}'
+            | '\u{37F}'..='\u{1FFF}'
+            | '\u{200C}'..='\u{200D}'
+            | '\u{2070}'..='\u{218F}'
+            | '\u{2C00}'..='\u{2FEF}'
+            | '\u{3001}'..='\u{D7FF}'
+            | '\u{F900}'..='\u{FDCF}'
+            | '\u{FDF0}'..='\u{FFFD}'
+            | '\u{10000}'..='\u{EFFFF}'
+    )
+}
+
+fn is_ncname_char(character: char) -> bool {
+    is_ncname_start(character)
+        || matches!(
+            character,
+            '-' | '.' | '0'..='9' | '\u{B7}' | '\u{0300}'..='\u{036F}' | '\u{203F}'..='\u{2040}'
+        )
+}
+
+/// Return namespace prefixes declared directly by one lexical opening tag.
+///
+/// The default namespace is represented by an empty string.
+pub fn declared_namespace_prefixes(opening: &str) -> Result<HashSet<String>, Error> {
+    let standalone = format!("{} />", opening.trim_end_matches('/'));
+    let mut scanner = Scanner::new(&standalone);
+    let Some(Event::Start(tag) | Event::Empty(tag)) = scanner.next_event()? else {
+        return Err(Error::malformed("expected one opening element tag"));
+    };
+    Ok(tag
+        .attributes
+        .iter()
+        .filter_map(
+            |attribute| match (attribute.name.prefix(), attribute.name.local()) {
+                (None, "xmlns") => Some(String::new()),
+                (Some("xmlns"), prefix) => Some(prefix.to_owned()),
+                _ => None,
+            },
+        )
+        .collect())
+}
+
 /// Expand the five predefined entities and XML character references.
 pub fn decode_references(value: &str) -> Result<Cow<'_, str>, Error> {
     if !value.contains('&') {
@@ -525,8 +600,10 @@ impl<W: Write> Writer<W> {
         attributes: impl IntoIterator<Item = (&'a str, &'a str)>,
         empty: bool,
     ) -> std::io::Result<()> {
+        validate_writer_qname(name)?;
         write!(self.output, "<{name}")?;
         for (attribute, value) in attributes {
+            validate_writer_qname(attribute)?;
             write!(self.output, " {attribute}=\"{}\"", escape_attribute(value))?;
         }
         self.output.write_all(if empty { b"/>" } else { b">" })
@@ -534,6 +611,7 @@ impl<W: Write> Writer<W> {
 
     /// Write a closing tag.
     pub fn end(&mut self, name: &str) -> std::io::Result<()> {
+        validate_writer_qname(name)?;
         write!(self.output, "</{name}>")
     }
 
@@ -551,6 +629,16 @@ impl<W: Write> Writer<W> {
     #[must_use]
     pub fn into_inner(self) -> W {
         self.output
+    }
+}
+
+fn validate_writer_qname(name: &str) -> std::io::Result<()> {
+    // Namespaces in XML 1.0 section 3 production [6] permits exactly one optional prefix.
+    // https://www.w3.org/TR/xml-names/#NT-QName
+    if is_qname(name) {
+        Ok(())
+    } else {
+        Err(IoError::new(ErrorKind::InvalidInput, "invalid XML QName"))
     }
 }
 
@@ -657,5 +745,21 @@ mod tests {
             String::from_utf8(writer.into_inner()).expect("writer emits UTF-8"),
             "line&#13;break\n"
         );
+    }
+
+    #[test]
+    fn writer_rejects_invalid_element_and_attribute_qnames() {
+        for name in ["", ":root", "root:", "a:b:c", "root><injected"] {
+            let mut writer = Writer::new(Vec::new());
+            assert!(
+                writer.empty(name, []).is_err(),
+                "accepted element name {name:?}"
+            );
+        }
+
+        let mut writer = Writer::new(Vec::new());
+        assert!(writer.empty("root", [("a:b:c", "value")]).is_err());
+        let mut writer = Writer::new(Vec::new());
+        assert!(writer.end("root><injected").is_err());
     }
 }

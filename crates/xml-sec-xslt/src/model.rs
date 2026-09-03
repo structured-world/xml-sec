@@ -1,11 +1,12 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use xml_sec_xml_input::lexical::{Event, Scanner};
 
 use crate::budget::{
     ENTITY_EXPANSION_BYTE_CEILING, ENTITY_EXPANSION_DEPTH_CEILING, ENTITY_REFERENCE_CEILING, Meter,
-    reserve_temporary_vec_slot,
+    NAMESPACE_SCOPE_BYTE_CEILING, reserve_temporary_vec_slot,
 };
 use crate::{BudgetKind, Error, Result};
 
@@ -80,7 +81,7 @@ pub enum NodeKind {
         name: ExpandedName,
         prefix: Option<String>,
         attributes: Vec<Attribute>,
-        namespaces: Vec<Namespace>,
+        namespaces: Arc<Vec<Namespace>>,
     },
     Text {
         value: String,
@@ -205,7 +206,7 @@ impl Document {
                     name,
                     prefix,
                     attributes,
-                    namespaces,
+                    namespaces: _,
                 } => name
                     .local
                     .len()
@@ -222,16 +223,6 @@ impl Document {
                             .saturating_add(attribute.name.namespace.as_deref().map_or(0, str::len))
                             .saturating_add(attribute.prefix.as_deref().map_or(0, str::len))
                             .saturating_add(attribute.value.len())
-                    }))
-                    .saturating_add(
-                        namespaces
-                            .len()
-                            .saturating_mul(std::mem::size_of::<Namespace>()),
-                    )
-                    .saturating_add(namespaces.iter().fold(0usize, |total, namespace| {
-                        total
-                            .saturating_add(namespace.prefix.as_deref().map_or(0, str::len))
-                            .saturating_add(namespace.uri.len())
                     })),
             });
         }
@@ -309,7 +300,7 @@ impl Document {
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
-                let mut namespaces = Vec::new();
+                let mut namespaces = Arc::new(Vec::new());
                 for namespace in source.namespaces() {
                     if namespace
                         .name()
@@ -328,7 +319,7 @@ impl Document {
                     namespace.prefix.as_deref() == Some("xml")
                         && namespace.uri == "http://www.w3.org/XML/1998/namespace"
                 }) {
-                    namespaces.insert(
+                    Arc::make_mut(&mut namespaces).insert(
                         0,
                         Namespace {
                             prefix: Some("xml".into()),
@@ -395,15 +386,21 @@ impl Document {
 
         let mut document = Self::empty(base_uri.map(str::to_owned));
         document.source_bytes = xml.len();
-        let mut entity_references = 0;
-        let mut entity_expansion = EntityExpansionMeter::new(ENTITY_EXPANSION_BYTE_CEILING);
-        let (parameter_expanded_xml, declarations) =
-            internal_general_entities(xml, &mut entity_references, &mut entity_expansion)?;
+        let mut meter = StreamParseMeter {
+            entity_references: 0,
+            entity_expansion: EntityExpansionMeter::new(ENTITY_EXPANSION_BYTE_CEILING),
+            namespace_scope_bytes: 0,
+        };
+        let (parameter_expanded_xml, declarations) = internal_general_entities(
+            xml,
+            &mut meter.entity_references,
+            &mut meter.entity_expansion,
+        )?;
         let expanded_xml = expand_document_entities(
             parameter_expanded_xml.as_ref(),
             &declarations.general,
-            &mut entity_references,
-            &mut entity_expansion,
+            &mut meter.entity_references,
+            &mut meter.entity_expansion,
         )?;
         let mut reader = Scanner::new(expanded_xml.as_ref());
         let mut previous_event_offset = 0usize;
@@ -441,8 +438,7 @@ impl Document {
                         &start,
                         false,
                         &declarations,
-                        &mut entity_references,
-                        &mut entity_expansion,
+                        &mut meter,
                     )?;
                     document.nodes[id.0].source_line = Some(source_line);
                 }
@@ -460,8 +456,7 @@ impl Document {
                         &start,
                         true,
                         &declarations,
-                        &mut entity_references,
-                        &mut entity_expansion,
+                        &mut meter,
                     )?;
                     document.nodes[id.0].source_line = Some(source_line);
                 }
@@ -1587,25 +1582,30 @@ struct StreamElementFrame {
     lexical_name: Option<String>,
 }
 
+struct StreamParseMeter {
+    entity_references: usize,
+    entity_expansion: EntityExpansionMeter,
+    namespace_scope_bytes: usize,
+}
+
 fn push_stream_element(
     document: &mut Document,
     elements: &mut Vec<StreamElementFrame>,
     start: &xml_sec_xml_input::lexical::StartTag<'_>,
     empty: bool,
     declarations: &InternalEntityDeclarations,
-    entity_references: &mut usize,
-    entity_expansion: &mut EntityExpansionMeter,
+    meter: &mut StreamParseMeter,
 ) -> Result<NodeId> {
     let parent = elements
         .last()
         .map(|frame| frame.node)
         .expect("document frame remains present");
     let mut namespaces = match document.node(parent).map(|node| &node.kind) {
-        Some(NodeKind::Element { namespaces, .. }) => namespaces.clone(),
-        _ => vec![Namespace {
+        Some(NodeKind::Element { namespaces, .. }) => Arc::clone(namespaces),
+        _ => Arc::new(vec![Namespace {
             prefix: Some("xml".into()),
             uri: "http://www.w3.org/XML/1998/namespace".into(),
-        }],
+        }]),
     };
     let lexical_name = start.name.qualified();
     let declared_attributes = declarations
@@ -1626,18 +1626,28 @@ fn push_stream_element(
             attribute.value,
             &declarations.general,
             attribute_type.is_cdata(),
-            entity_references,
-            entity_expansion,
+            &mut meter.entity_references,
+            &mut meter.entity_expansion,
         )?;
         if name == "xmlns" {
             validate_namespace_binding(None, &value)?;
-            set_namespace(&mut namespaces, None, value);
+            set_namespace_bounded(
+                &mut namespaces,
+                None,
+                value,
+                &mut meter.namespace_scope_bytes,
+            )?;
         } else if let Some(prefix) = name.strip_prefix("xmlns:") {
             if !crate::lexical::is_ncname(prefix) {
                 return Err(Error::Xml(format!("invalid namespace prefix {prefix}")));
             }
             validate_namespace_binding(Some(prefix), &value)?;
-            set_namespace(&mut namespaces, Some(prefix.into()), value);
+            set_namespace_bounded(
+                &mut namespaces,
+                Some(prefix.into()),
+                value,
+                &mut meter.namespace_scope_bytes,
+            )?;
         } else {
             raw_attributes.push((name.into_owned(), value, attribute_type));
         }
@@ -1658,15 +1668,25 @@ fn push_stream_element(
             default,
             &declarations.general,
             declaration.attribute_type.is_cdata(),
-            entity_references,
-            entity_expansion,
+            &mut meter.entity_references,
+            &mut meter.entity_expansion,
         )?;
         if declaration.name == "xmlns" {
             validate_namespace_binding(None, &value)?;
-            set_namespace(&mut namespaces, None, value);
+            set_namespace_bounded(
+                &mut namespaces,
+                None,
+                value,
+                &mut meter.namespace_scope_bytes,
+            )?;
         } else if let Some(prefix) = declaration.name.strip_prefix("xmlns:") {
             validate_namespace_binding(Some(prefix), &value)?;
-            set_namespace(&mut namespaces, Some(prefix.into()), value);
+            set_namespace_bounded(
+                &mut namespaces,
+                Some(prefix.into()),
+                value,
+                &mut meter.namespace_scope_bytes,
+            )?;
         } else {
             raw_attributes.push((declaration.name.clone(), value, declaration.attribute_type));
         }
@@ -1890,7 +1910,8 @@ fn namespace_for(namespaces: &[Namespace], prefix: Option<&str>) -> Option<Strin
         .filter(|namespace| !namespace.is_empty())
 }
 
-fn set_namespace(namespaces: &mut Vec<Namespace>, prefix: Option<String>, uri: String) {
+fn set_namespace(namespaces: &mut Arc<Vec<Namespace>>, prefix: Option<String>, uri: String) {
+    let namespaces = Arc::make_mut(namespaces);
     if let Some(existing) = namespaces
         .iter_mut()
         .find(|namespace| namespace.prefix == prefix)
@@ -1899,6 +1920,36 @@ fn set_namespace(namespaces: &mut Vec<Namespace>, prefix: Option<String>, uri: S
     } else {
         namespaces.push(Namespace { prefix, uri });
     }
+}
+
+fn set_namespace_bounded(
+    namespaces: &mut Arc<Vec<Namespace>>,
+    prefix: Option<String>,
+    uri: String,
+    materialized_bytes: &mut usize,
+) -> Result<()> {
+    let inherited_copy = (Arc::strong_count(namespaces) > 1).then(|| {
+        namespaces.iter().fold(0usize, |total, namespace| {
+            total
+                .saturating_add(std::mem::size_of::<Namespace>())
+                .saturating_add(namespace.prefix.as_deref().map_or(0, str::len))
+                .saturating_add(namespace.uri.len())
+        })
+    });
+    let declaration_bytes = std::mem::size_of::<Namespace>()
+        .saturating_add(prefix.as_deref().map_or(0, str::len))
+        .saturating_add(uri.len());
+    let next = materialized_bytes
+        .saturating_add(inherited_copy.unwrap_or(0))
+        .saturating_add(declaration_bytes);
+    if next > NAMESPACE_SCOPE_BYTE_CEILING {
+        return Err(Error::Xml(
+            "cumulative namespace scope allocation limit exceeded".into(),
+        ));
+    }
+    set_namespace(namespaces, prefix, uri);
+    *materialized_bytes = next;
+    Ok(())
 }
 
 fn validate_namespace_binding(prefix: Option<&str>, uri: &str) -> Result<()> {
@@ -3390,6 +3441,7 @@ fn lexical_attribute_prefix(xml: &str, offset: usize, local: &str) -> Option<Str
 mod parser_boundary_tests {
     use std::collections::HashMap;
     use std::fmt::Write as _;
+    use std::sync::Arc;
 
     use super::{
         Attribute, Document, EntityExpansionMeter, Error, ExpandedName, NodeKind, Result,
@@ -3417,7 +3469,7 @@ mod parser_boundary_tests {
                     prefix: Some("xml".into()),
                     value: " target ".into(),
                 }],
-                namespaces: vec![],
+                namespaces: Arc::new(Vec::new()),
             },
             None,
         );
@@ -3502,6 +3554,23 @@ mod parser_boundary_tests {
                 .expect("iterative parser accepts boundary document");
             assert_eq!(tree, iterative, "parser models differ at depth {depth}");
         }
+    }
+
+    #[test]
+    fn nested_elements_share_unchanged_namespace_scopes() {
+        let document = Document::parse(
+            r#"<root xmlns:p="urn:test"><first><second/></first></root>"#,
+            None,
+        )
+        .expect("nested namespace document parses");
+        let scopes = document.nodes.iter().filter_map(|node| match &node.kind {
+            NodeKind::Element { namespaces, .. } => Some(namespaces),
+            _ => None,
+        });
+        let scopes = scopes.collect::<Vec<_>>();
+        assert_eq!(scopes.len(), 3);
+        assert!(Arc::ptr_eq(scopes[0], scopes[1]));
+        assert!(Arc::ptr_eq(scopes[1], scopes[2]));
     }
 
     #[test]
@@ -4263,7 +4332,7 @@ mod parser_boundary_tests {
                 name: ExpandedName::new(None::<String>, "root"),
                 prefix: None,
                 attributes: Vec::new(),
-                namespaces: Vec::new(),
+                namespaces: Arc::new(Vec::new()),
             },
             None,
         );
@@ -4274,7 +4343,7 @@ mod parser_boundary_tests {
                     name: ExpandedName::new(None::<String>, "empty"),
                     prefix: None,
                     attributes: Vec::new(),
-                    namespaces: Vec::new(),
+                    namespaces: Arc::new(Vec::new()),
                 },
                 None,
             );

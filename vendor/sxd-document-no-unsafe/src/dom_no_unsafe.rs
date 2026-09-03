@@ -445,6 +445,21 @@ impl<'d> Element<'d> {
             .collect()
     }
 
+    /// Returns the number of attributes without materializing attribute handles.
+    pub fn attributes_len(&self) -> usize {
+        self.document
+            .connections
+            .attributes_len(self.document.storage, self.node)
+    }
+
+    /// Returns one attribute without materializing the complete attribute list.
+    pub fn attribute_at(&self, index: usize) -> Option<Attribute<'d>> {
+        self.document
+            .connections
+            .attribute_at(self.document.storage, self.node, index)
+            .map(|attribute| self.document.wrap_attribute(attribute))
+    }
+
     pub fn set_attribute_value<'n, N>(&self, name: N, value: &str) -> Attribute<'d>
     where
         N: Into<QName<'n>>,

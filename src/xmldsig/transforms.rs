@@ -1146,8 +1146,9 @@ fn execute_transform_chain<'s, 'e, 'd>(
         // returns only owned digest bytes. Every C14N output is charged before
         // recursion, so these retained buffers remain a bounded subset of the
         // signature-wide canonicalization work budget.
-        let xml = crate::encoding::decode_xml_octets(&bytes)
-            .map_err(|error| TransformError::XmlParse(error.to_string()))?;
+        let xml =
+            crate::encoding::decode_xml_octets(&bytes, context.budget.xml_parse_settings.max_bytes)
+                .map_err(|error| TransformError::XmlParse(error.to_string()))?;
         let settings = DocumentParseSettings {
             allow_dtd: context.options.internal_dtd_allowed(),
             ..context.budget.xml_parse_settings

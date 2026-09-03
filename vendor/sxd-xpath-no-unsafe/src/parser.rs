@@ -1574,6 +1574,17 @@ mod test {
     }
 
     #[test]
+    fn deeply_nested_expression_is_rejected_at_the_nesting_ceiling() {
+        let mut tokens = vec![Ok(Token::MinusSign); MAX_EXPRESSION_NESTING + 1];
+        tokens.push(Ok(Token::Number(1.0)));
+        let package = Package::new();
+        let doc = TestDoc(package.as_document());
+
+        let ex = Exercise::new(&doc);
+        assert_eq!(Some(Error::NestingLimit), ex.parse_raw(tokens).err());
+    }
+
+    #[test]
     fn variable_reference() {
         let tokens = tokens![Token::Variable("variable-name".into())];
 

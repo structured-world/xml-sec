@@ -794,6 +794,14 @@ impl Connections {
         &parent_r.attributes
     }
 
+    pub fn attributes_len(&self, parent: *mut Element) -> usize {
+        self.attributes(parent).len()
+    }
+
+    pub fn attribute_at(&self, parent: *mut Element, index: usize) -> Option<*mut Attribute> {
+        self.attributes(parent).get(index).copied()
+    }
+
     pub fn attribute<'n, N>(&self, element: *mut Element, name: N) -> Option<*mut Attribute>
     where
         N: Into<QName<'n>>,

@@ -14,7 +14,7 @@ documentation = "https://docs.rs/xml-sec-sxd-document"
 license = "MIT"
 
 [features]
-default = ["typed-arena"]
+default = []
 __internal_expose_string_pool = []
 no-unsafe = []
 
@@ -24,4 +24,4 @@ path = "src/lib.rs"
 
 [dependencies]
 peresil = "0.3.0"
-typed-arena = { version = "2.0", optional = true }
+typed-arena = "2.0"

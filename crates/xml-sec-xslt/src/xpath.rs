@@ -2844,7 +2844,7 @@ fn project_logical_root<'d>(
                     &name.local,
                 ));
                 element.set_preferred_prefix(prefix.as_deref());
-                for namespace in namespaces {
+                for namespace in namespaces.iter() {
                     if let Some(prefix) = &namespace.prefix {
                         element.register_prefix(prefix, &namespace.uri);
                     } else {
@@ -4234,7 +4234,7 @@ fn token_document(
                 name: ExpandedName::new(None::<String>, "token"),
                 prefix: None,
                 attributes: Vec::new(),
-                namespaces: Vec::new(),
+                namespaces: Arc::new(Vec::new()),
             },
             None,
         );
@@ -4302,10 +4302,10 @@ fn dynamic_map_document(values: &[(&str, String)], meter: &mut Meter) -> Result<
                 name: ExpandedName::new(Some(EXSLT_COMMON_NS), *local),
                 prefix: Some("exsl".into()),
                 attributes: Vec::new(),
-                namespaces: vec![crate::Namespace {
+                namespaces: Arc::new(vec![crate::Namespace {
                     prefix: Some("exsl".into()),
                     uri: EXSLT_COMMON_NS.into(),
-                }],
+                }]),
             },
             None,
         );
@@ -4556,7 +4556,7 @@ impl function::Function for GenerateId {
                 what: "generate-id() requires a node-set".into(),
             });
         };
-        let Some(node) = nodes.document_order_first() else {
+        let Some(node) = nodes.document_order_first_with_context(context)? else {
             return Ok(SxdValue::String(String::new()));
         };
         let id = assign_generated_id(context, &self.assigned, typed_path_to(&node))?;
@@ -4628,7 +4628,7 @@ impl function::Function for NodeNameFunction {
     ) -> std::result::Result<SxdValue<'d>, function::Error> {
         let node = match args.as_slice() {
             [] => Some(context.node.clone()),
-            [SxdValue::Nodeset(nodes)] => nodes.document_order_first(),
+            [SxdValue::Nodeset(nodes)] => nodes.document_order_first_with_context(context)?,
             [_] => {
                 return Err(function::Error::Other {
                     what: "node name functions require a node-set argument".into(),
@@ -5234,7 +5234,7 @@ impl function::Function for ExsltMathFunction {
                 .saturating_add(value_bytes)
                 .saturating_add(selection_bytes),
         )?;
-        let ordered = nodes.document_order();
+        let ordered = nodes.document_order_with_context(context)?;
         let numbers = ordered
             .iter()
             .map(|node| SxdValue::String(node.string_value()).number(context))
@@ -5286,7 +5286,7 @@ impl function::Function for ExsltSetFunction {
             let [SxdValue::Nodeset(nodes)] = args.as_slice() else {
                 return extension_argument_error("set:distinct() requires one node-set");
             };
-            let ordered = nodes.document_order();
+            let ordered = nodes.document_order_with_context(context)?;
             let value_bytes = ordered.iter().fold(0usize, |total, node| {
                 total.saturating_add(node.string_value_len())
             });
@@ -5316,21 +5316,21 @@ impl function::Function for ExsltSetFunction {
         let mut result = nodeset::Nodeset::new();
         match self {
             Self::Difference => {
-                for node in left.document_order() {
+                for node in left.document_order_with_context(context)? {
                     if !right.contains(node.clone()) {
                         result.add(node);
                     }
                 }
             }
             Self::Intersection => {
-                for node in left.document_order() {
+                for node in left.document_order_with_context(context)? {
                     if right.contains(node.clone()) {
                         result.add(node);
                     }
                 }
             }
             Self::Leading | Self::Trailing => {
-                let Some(boundary) = right.document_order_first() else {
+                let Some(boundary) = right.document_order_first_with_context(context)? else {
                     return Ok(SxdValue::Nodeset(left.clone()));
                 };
                 // EXSLT Sets defines a non-member boundary as an empty result, even when nodes
@@ -5342,7 +5342,7 @@ impl function::Function for ExsltSetFunction {
                 let mut combined = nodeset::Nodeset::new();
                 combined.extend(left.iter());
                 combined.extend(right.iter());
-                let order = combined.document_order();
+                let order = combined.document_order_with_context(context)?;
                 let boundary = order
                     .iter()
                     .position(|node| node == &boundary)
@@ -5776,7 +5776,11 @@ impl function::Function for DocumentFunction {
                     what: "document() second argument must be a node-set".into(),
                 });
             };
-            let Some(node) = nodes.document_order().into_iter().next() else {
+            let Some(node) = nodes
+                .document_order_with_context(context)?
+                .into_iter()
+                .next()
+            else {
                 return Ok(SxdValue::Nodeset(nodeset::Nodeset::new()));
             };
             let path = typed_path_to(&node);
@@ -6346,22 +6350,24 @@ impl function::Function for FormatNumberFunction {
         } else {
             None
         };
-        let format = self
-            .formats
-            .iter()
-            .rev()
-            .find(|format| format.name == name)
-            .cloned()
-            .or_else(|| name.is_none().then(default_decimal_format))
-            .ok_or_else(|| function::Error::Other {
-                what: "unknown decimal-format".into(),
-            })?;
+        let default_format;
+        let format =
+            if let Some(format) = self.formats.iter().rev().find(|format| format.name == name) {
+                format
+            } else if name.is_none() {
+                default_format = default_decimal_format();
+                &default_format
+            } else {
+                return Err(function::Error::Other {
+                    what: "unknown decimal-format".into(),
+                });
+            };
         let pattern = args[1].string();
         context.reserve_string_allocation(decimal_render_workspace_bytes(&pattern))?;
         Ok(SxdValue::String(render_decimal(
             args[0].number(context)?,
             &pattern,
-            &format,
+            format,
         )?))
     }
 }

@@ -616,6 +616,9 @@ mod test {
         let children = c.root_children();
         assert_eq!(1, children.len());
         assert_eq!(children[0], ChildOfRoot::Element(beta));
+        assert_eq!(None, c.element_parent(alpha));
+        assert!(c.element_preceding_siblings(alpha).is_empty());
+        assert!(c.element_following_siblings(alpha).is_empty());
     }
 
     #[test]

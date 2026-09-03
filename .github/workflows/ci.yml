@@ -215,9 +215,7 @@ jobs:
           LIBXSLT_SOURCE_DIR: ${{ github.workspace }}/donors/libxslt
         run: scripts/import-libxslt-oracle-fixtures.sh --check
       - uses: Swatinem/rust-cache@v2
-      - name: Compare Rust engine with pinned libxslt
-        env:
-          LIBXSLT_XSLTPROC: ${{ github.workspace }}/.tools/libxslt/bin/xsltproc
+      - name: Run Rust engine against pinned libxslt golden corpus
         run: cargo nextest run -p xml-sec-xslt --test libxslt_oracle --no-fail-fast
 
   clippy-matrix:

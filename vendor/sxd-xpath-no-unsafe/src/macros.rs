@@ -1,4 +1,13 @@
-/// Convenience constructor for a nodeset
+/// Convenience constructor for a nodeset.
+///
+/// ```
+/// use sxd_document_no_unsafe::Package;
+///
+/// let package = Package::new();
+/// let root = package.as_document().root();
+/// let nodes = sxd_xpath_no_unsafe::nodeset![root,];
+/// assert_eq!(nodes.size(), 1);
+/// ```
 #[macro_export]
 macro_rules! nodeset(
     ($($e:expr),*) => ({
@@ -7,7 +16,7 @@ macro_rules! nodeset(
         $(_temp.add($e);)*
         _temp
     });
-    ($($e:expr),+,) => (nodeset!($($e),+))
+    ($($e:expr),+,) => ($crate::nodeset!($($e),+))
 );
 
 /// Convenience constructor for an OrderedNodes

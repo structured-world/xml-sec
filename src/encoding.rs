@@ -8,8 +8,11 @@ pub use xml_sec_xml_input::Error as XmlEncodingError;
 ///
 /// UTF-8 input remains borrowed. Other declared XML encodings are decoded
 /// strictly and their declaration is normalized to UTF-8 before parsing.
-pub fn decode_xml_octets(bytes: &[u8]) -> Result<Cow<'_, str>, XmlEncodingError> {
-    xml_sec_xml_input::decode_xml(bytes, None)
+pub fn decode_xml_octets(
+    bytes: &[u8],
+    maximum_decoded_bytes: usize,
+) -> Result<Cow<'_, str>, XmlEncodingError> {
+    xml_sec_xml_input::decode_xml_bounded(bytes, None, maximum_decoded_bytes)
 }
 
 #[cfg(test)]
@@ -51,7 +54,8 @@ mod tests {
             ),
             b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><root>caf\xe9</root>".to_vec(),
         ] {
-            let decoded = decode_xml_octets(&bytes).expect("declared XML encoding must decode");
+            let decoded =
+                decode_xml_octets(&bytes, 1_024).expect("declared XML encoding must decode");
             assert!(decoded.contains("encoding=\"UTF-8\"") || decoded.contains("encoding='UTF-8'"));
         }
     }
@@ -60,7 +64,7 @@ mod tests {
     fn declared_single_byte_xml_is_transcoded_strictly() {
         // XML permits declared encodings beyond its mandatory UTF-8/UTF-16 baseline.
         let latin1 = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><root>caf\xe9</root>";
-        let decoded = decode_xml_octets(latin1).expect("declared Latin-1 XML must decode");
+        let decoded = decode_xml_octets(latin1, 1_024).expect("declared Latin-1 XML must decode");
         assert!(decoded.contains("<root>café</root>"));
         assert!(decoded.contains("encoding=\"UTF-8\""));
     }
@@ -73,7 +77,7 @@ mod tests {
             true,
         );
         assert!(matches!(
-            decode_xml_octets(&conflicting),
+            decode_xml_octets(&conflicting, 1_024),
             Err(XmlEncodingError::ConflictingEncoding(_))
         ));
 
@@ -83,7 +87,7 @@ mod tests {
             false,
         );
         assert!(matches!(
-            decode_xml_octets(&bomless_generic),
+            decode_xml_octets(&bomless_generic, 1_024),
             Err(XmlEncodingError::MissingUtf16ByteOrder)
         ));
     }
@@ -91,8 +95,11 @@ mod tests {
     #[test]
     fn utf8_is_borrowed_and_malformed_bytes_are_rejected() {
         let xml = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><root/>";
-        assert!(matches!(decode_xml_octets(xml), Ok(Cow::Borrowed(_))));
-        assert!(decode_xml_octets(b"<root>\xff</root>").is_err());
+        assert!(matches!(
+            decode_xml_octets(xml, xml.len()),
+            Ok(Cow::Borrowed(_))
+        ));
+        assert!(decode_xml_octets(b"<root>\xff</root>", 1_024).is_err());
     }
 
     #[test]
@@ -101,7 +108,17 @@ mod tests {
             r#"<?xml-stylesheet encoding="ISO-8859-1"?><root/>"#,
             r#"<root data-encoding="ISO-8859-1"/>"#,
         ] {
-            decode_xml_octets(xml.as_bytes()).expect("ordinary content does not select encoding");
+            decode_xml_octets(xml.as_bytes(), 1_024)
+                .expect("ordinary content does not select encoding");
         }
+    }
+
+    #[test]
+    fn transcoding_stops_at_the_decoded_document_limit() {
+        let bytes = utf16_bytes("<?xml version=\"1.0\"?><root>expanded</root>", true, true);
+        assert!(matches!(
+            decode_xml_octets(&bytes, 16),
+            Err(XmlEncodingError::DecodedLimit { maximum: 16, .. })
+        ));
     }
 }

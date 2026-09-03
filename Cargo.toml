@@ -26,13 +26,13 @@ resolver = "3"
 # The complete libxslt oracle includes multi-megabyte DocBook transforms. Keep
 # production-equivalent XSLT/XPath code generation in the test profile so the
 # per-case watchdog measures algorithmic stalls rather than debug arithmetic.
-[profile.test.package.xml-sec-xslt]
+[profile.dev.package.xml-sec-xslt]
 opt-level = 2
 
-[profile.test.package.xml-sec-sxd-document]
+[profile.dev.package.xml-sec-sxd-document]
 opt-level = 2
 
-[profile.test.package.xml-sec-sxd-xpath]
+[profile.dev.package.xml-sec-sxd-xpath]
 opt-level = 2
 
 [[bin]]
@@ -95,6 +95,9 @@ pem = { version = "4", optional = true }
 x509-parser = { version = "0.18", features = ["verify"], optional = true }
 x509-cert = { version = "0.3", default-features = false, optional = true }
 x520-stringprep = { version = "1", features = ["alloc"], optional = true }
+# tinyvec 1.13.0 fails its no_std + alloc build because the new constructor uses
+# vec! without importing the macro. Keep x520-stringprep's resolution buildable.
+tinyvec = { version = "=1.12.0", optional = true }
 der = { version = "0.8", optional = true }
 crypto-bigint = { version = "0.7", optional = true }
 
@@ -145,6 +148,7 @@ xmldsig = [            # XML Digital Signatures (sign + verify)
     "dep:x509-parser",
     "dep:x509-cert",
     "dep:x520-stringprep",
+    "dep:tinyvec",
     "dep:zeroize",
 ]
 xmlenc = [             # XML Encryption (encrypt + decrypt)

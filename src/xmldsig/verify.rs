@@ -2070,7 +2070,11 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
                     .ok_or(SignatureVerificationPipelineError::InvalidStructure {
                         reason: "KeyInfoReference external resource is unavailable",
                     })?;
-                let xml = crate::encoding::decode_xml_octets(bytes).map_err(|_| {
+                let xml = crate::encoding::decode_xml_octets(
+                    bytes,
+                    context.policy.resources().max_xml_document_bytes,
+                )
+                .map_err(|_| {
                     SignatureVerificationPipelineError::InvalidStructure {
                         reason: "KeyInfoReference external resource has an invalid XML encoding",
                     }

@@ -40,7 +40,7 @@ use xml_sec::{
 use xml_sec::{
     XmlDomDocument as Document, XmlDomNode as Node, XmlDomParsingOptions as ParsingOptions,
 };
-use xml_sec_xml_input::lexical::{Event as LexicalEvent, Scanner, escape_attribute, escape_text};
+use xml_sec_xml_input::lexical::{escape_attribute, escape_text};
 
 use crate::{
     Command, Invocation,
@@ -449,7 +449,7 @@ fn read_input(invocation: &Invocation, maximum: usize) -> Result<String, Command
     if bytes.len() > maximum {
         return Err(CommandError::InputTooLarge { maximum });
     }
-    xml_sec::encoding::decode_xml_octets(&bytes)
+    xml_sec::encoding::decode_xml_octets(&bytes, maximum)
         .map(Cow::into_owned)
         .map_err(|error| CommandError::InvalidXmlEncoding(error.to_string()))
 }
@@ -519,7 +519,7 @@ fn read_xml_data(path: &OsStr, maximum: usize) -> Result<String, CommandError> {
     let bytes = read_bounded_file(path, maximum, |maximum| CommandError::InputTooLarge {
         maximum,
     })?;
-    xml_sec::encoding::decode_xml_octets(&bytes)
+    xml_sec::encoding::decode_xml_octets(&bytes, maximum)
         .map(Cow::into_owned)
         .map_err(|error| CommandError::InvalidXmlEncoding(error.to_string()))
 }
@@ -2724,30 +2724,8 @@ fn ensure_plaintext_capacity(
 }
 
 fn owned_namespace_declarations(opening: &str) -> Result<HashSet<String>, CommandError> {
-    let standalone = format!("{} />", opening.trim_end_matches('/'));
-    let mut scanner = Scanner::new(&standalone);
-    let element = match scanner
-        .next_event()
-        .map_err(|error| CommandError::Encryption(error.to_string()))?
-    {
-        Some(LexicalEvent::Start(element) | LexicalEvent::Empty(element)) => element,
-        _ => {
-            return Err(CommandError::Encryption(
-                "generated KeyInfo child has no opening element".into(),
-            ));
-        }
-    };
-    Ok(element
-        .attributes
-        .iter()
-        .filter_map(
-            |attribute| match (attribute.name.prefix(), attribute.name.local()) {
-                (None, "xmlns") => Some(String::new()),
-                (Some("xmlns"), prefix) => Some(prefix.to_owned()),
-                _ => None,
-            },
-        )
-        .collect())
+    xml_sec_xml_input::lexical::declared_namespace_prefixes(opening)
+        .map_err(|error| CommandError::Encryption(error.to_string()))
 }
 
 fn direct_child_element<'a, 'input>(
