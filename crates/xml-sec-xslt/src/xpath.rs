@@ -2213,7 +2213,7 @@ impl Evaluator {
         namespaces: &[(String, String)],
         node: &SourceNode,
     ) -> Result<Option<bool>> {
-        let Some(lexical) = pattern.strip_prefix('@') else {
+        let Some(lexical) = crate::lexical::strip_xpath_attribute_axis(pattern) else {
             return Ok(None);
         };
         if lexical.contains(['/', '[', '(', ')']) {

@@ -114,11 +114,7 @@ impl Equal {
         let left_val = self.left.evaluate(context)?;
         let right_val = self.right.evaluate(context)?;
 
-        Ok(compare_equality_values(
-            &left_val,
-            &right_val,
-            Equality::Equal,
-        ))
+        compare_equality_values(context, &left_val, &right_val, Equality::Equal)
     }
 }
 
@@ -145,11 +141,7 @@ impl Expression for NotEqual {
     fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
         let left = self.left.evaluate(context)?;
         let right = self.right.evaluate(context)?;
-        Ok(Boolean(compare_equality_values(
-            &left,
-            &right,
-            Equality::NotEqual,
-        )))
+        compare_equality_values(context, &left, &right, Equality::NotEqual).map(Boolean)
     }
 }
 
@@ -180,33 +172,95 @@ impl Equality {
             Self::NotEqual => left != right,
         }
     }
+
+    fn result(self, equal: bool) -> bool {
+        match self {
+            Self::Equal => equal,
+            Self::NotEqual => !equal,
+        }
+    }
 }
 
-fn compare_equality_values(left: &Value<'_>, right: &Value<'_>, comparison: Equality) -> bool {
-    match (left, right) {
-        (Value::Nodeset(left), Value::Nodeset(right)) => left.iter().any(|left| {
-            right
-                .iter()
-                .any(|right| comparison.strings(&left.string_value(), &right.string_value()))
-        }),
+fn materialize_node_string<'c, 'd>(
+    context: &context::Evaluation<'c, 'd>,
+    node: &crate::nodeset::Node<'d>,
+) -> Result<String, Error> {
+    let length = node.string_value_len();
+    context
+        .reserve_string_allocation(length)
+        .context(FunctionEvaluation)?;
+    Ok(node.string_value_with_capacity(length))
+}
+
+fn compare_nodesets<'c, 'd>(
+    context: &context::Evaluation<'c, 'd>,
+    left: &Nodeset<'d>,
+    right: &Nodeset<'d>,
+    comparison: Equality,
+) -> Result<bool, Error> {
+    let (materialized, compared) = if left.size() <= right.size() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    for node in materialized.iter() {
+        let value = materialize_node_string(context, &node)?;
+        if compared
+            .iter()
+            .any(|candidate| comparison.result(candidate.string_value_eq(&value)))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn compare_nodes_with_string(nodes: &Nodeset<'_>, value: &str, comparison: Equality) -> bool {
+    nodes
+        .iter()
+        .any(|node| comparison.result(node.string_value_eq(value)))
+}
+
+fn compare_equality_values<'c, 'd>(
+    context: &context::Evaluation<'c, 'd>,
+    left: &Value<'d>,
+    right: &Value<'d>,
+    comparison: Equality,
+) -> Result<bool, Error> {
+    let result = match (left, right) {
+        (Value::Nodeset(left), Value::Nodeset(right)) => {
+            return compare_nodesets(context, left, right, comparison);
+        }
         (Value::Nodeset(nodes), Boolean(value)) | (Boolean(value), Value::Nodeset(nodes)) => {
             comparison.booleans(nodes.size() != 0, *value)
         }
-        (Value::Nodeset(nodes), Number(value)) | (Number(value), Value::Nodeset(nodes)) => nodes
-            .iter()
-            .any(|node| comparison.numbers(Value::String(node.string_value()).number(), *value)),
+        (Value::Nodeset(nodes), Number(value)) | (Number(value), Value::Nodeset(nodes)) => {
+            for node in nodes.iter() {
+                let string = materialize_node_string(context, &node)?;
+                if comparison.numbers(Value::String(string).number(), *value) {
+                    return Ok(true);
+                }
+            }
+            false
+        }
         (Value::Nodeset(nodes), Value::String(value))
-        | (Value::String(value), Value::Nodeset(nodes)) => nodes
-            .iter()
-            .any(|node| comparison.strings(&node.string_value(), value)),
+        | (Value::String(value), Value::Nodeset(nodes)) => {
+            compare_nodes_with_string(nodes, value, comparison)
+        }
         (Value::Nodeset(nodes), Value::ResultTreeFragment(_, value))
-        | (Value::ResultTreeFragment(_, value), Value::Nodeset(nodes)) => nodes
-            .iter()
-            .any(|node| comparison.strings(&node.string_value(), value)),
+        | (Value::ResultTreeFragment(_, value), Value::Nodeset(nodes)) => {
+            compare_nodes_with_string(nodes, value, comparison)
+        }
         (Boolean(_), _) | (_, Boolean(_)) => comparison.booleans(left.boolean(), right.boolean()),
         (Number(_), _) | (_, Number(_)) => comparison.numbers(left.number(), right.number()),
-        _ => comparison.strings(&left.string(), &right.string()),
-    }
+        (Value::String(left), Value::String(right))
+        | (Value::String(left), Value::ResultTreeFragment(_, right))
+        | (Value::ResultTreeFragment(_, left), Value::String(right))
+        | (Value::ResultTreeFragment(_, left), Value::ResultTreeFragment(_, right)) => {
+            comparison.strings(left, right)
+        }
+    };
+    Ok(result)
 }
 
 #[derive(Debug)]
@@ -825,6 +879,42 @@ mod test {
     }
 
     #[test]
+    fn expression_equality_reserves_node_string_values_before_allocation() {
+        let package = Package::new();
+        let document = package.as_document();
+        let left_value = document.create_text("four");
+        let right_value = document.create_text("four");
+
+        let expression = Equal {
+            left: Box::new(Variable {
+                name: "left".into(),
+            }),
+            right: Box::new(Variable {
+                name: "right".into(),
+            }),
+        };
+
+        let mut insufficient = Context::without_core_functions();
+        insufficient.set_variable("left", nodeset![left_value.clone()]);
+        insufficient.set_variable("right", nodeset![right_value.clone()]);
+        insufficient.set_string_allocation_limit(3);
+        let context_node = document.create_element("test");
+        let evaluation = context::Evaluation::new(&insufficient, context_node.clone().into());
+        assert!(matches!(
+            expression.evaluate(&evaluation),
+            Err(Error::FunctionEvaluation { source: function::Error::Other { what } })
+                if what.contains("allocation budget")
+        ));
+
+        let mut exact = Context::without_core_functions();
+        exact.set_variable("left", nodeset![left_value]);
+        exact.set_variable("right", nodeset![right_value]);
+        exact.set_string_allocation_limit(4);
+        let evaluation = context::Evaluation::new(&exact, context_node.into());
+        assert_eq!(expression.evaluate(&evaluation), Ok(Boolean(true)));
+    }
+
+    #[test]
     fn result_tree_fragment_equality_checks_every_nodeset_value_symmetrically() {
         let package = Package::new();
         let setup = Setup::new(&package);
@@ -832,8 +922,15 @@ mod test {
         let matching = setup.doc.create_text("matching");
         let nodes = Value::Nodeset(nodeset![first, matching]);
         let fragment = Value::ResultTreeFragment(1, "matching".into());
-        assert!(compare_equality_values(&nodes, &fragment, Equality::Equal));
-        assert!(compare_equality_values(&fragment, &nodes, Equality::Equal));
+        let context = setup.context();
+        assert_eq!(
+            compare_equality_values(&context, &nodes, &fragment, Equality::Equal),
+            Ok(true)
+        );
+        assert_eq!(
+            compare_equality_values(&context, &fragment, &nodes, Equality::Equal),
+            Ok(true)
+        );
     }
 
     #[test]

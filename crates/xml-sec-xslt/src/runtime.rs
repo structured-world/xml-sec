@@ -13,7 +13,7 @@ use crate::compiler::{
     AttributeValueTemplate, AvtPart, Expression, ExsltFunction, Instruction, NameTest, Sort,
     Stylesheet, Template, Variable,
 };
-use crate::lexical::{is_ncname, is_xml_whitespace, unicode_decimal_value};
+use crate::lexical::{is_ncname, is_xml_whitespace, unicode_decimal_value, xpath_string_literal};
 use crate::serializer::{serialize, serialize_fragment};
 use crate::xpath::{
     CustomCallSession, Evaluator, EvaluatorSourceOptions, PreparedEvaluatorSource, SourceNode,
@@ -2383,7 +2383,7 @@ impl<'a> Execution<'a> {
             .strip_prefix("substring (")
             .and_then(|value| value.strip_suffix(')'))
             && let Some((literal, remainder)) = arguments.split_once(',')
-            && let Some(literal) = quoted_literal(literal.trim())
+            && let Some(literal) = xpath_string_literal(literal)
             && let Some((start, length)) = remainder.split_once(',')
             && start.trim() == "0"
             && let Some((variable, factor)) = length
@@ -2413,7 +2413,7 @@ impl<'a> Execution<'a> {
             .and_then(|value| value.strip_suffix(')'))
             && let Some((variable, delimiter)) = arguments.split_once(',')
             && let Some(variable) = lexical_variable_name(variable)
-            && let Some(delimiter) = quoted_literal(delimiter.trim())
+            && let Some(delimiter) = xpath_string_literal(delimiter)
         {
             let value = self.variable_string(variable, &expression.namespaces, 0)?;
             let head = value.split_once(delimiter).map_or("", |(head, _)| head);
@@ -3874,7 +3874,6 @@ fn literal_key_names(
         let Some(argument) = call.arguments.first() else {
             return Ok(None);
         };
-        let argument = argument.trim();
         let Some(lexical) = xpath_string_literal(argument) else {
             return Ok(None);
         };
@@ -3896,14 +3895,6 @@ fn literal_key_names(
         }
     }
     Ok(Some(names))
-}
-
-fn xpath_string_literal(source: &str) -> Option<&str> {
-    let quote @ ('\'' | '"') = source.chars().next()? else {
-        return None;
-    };
-    let value = source.strip_prefix(quote)?.strip_suffix(quote)?;
-    (!value.contains(quote)).then_some(value)
 }
 
 fn fixup_attribute_namespace(
@@ -4416,14 +4407,6 @@ fn is_lexical_variable_name(value: &str) -> bool {
 fn lexical_variable_name(value: &str) -> Option<&str> {
     let value = value.trim_matches(is_xml_whitespace);
     is_lexical_variable_name(value).then_some(value)
-}
-
-fn quoted_literal(value: &str) -> Option<&str> {
-    let quote = value.as_bytes().first().copied()?;
-    if !matches!(quote, b'\'' | b'"') || value.as_bytes().last().copied() != Some(quote) {
-        return None;
-    }
-    value.get(1..value.len().saturating_sub(1))
 }
 
 fn split_name(value: &str) -> Result<(Option<String>, String)> {

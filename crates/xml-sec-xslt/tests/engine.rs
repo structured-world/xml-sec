@@ -1668,6 +1668,15 @@ fn compound_substring_variables_use_the_general_xpath_evaluator() {
 }
 
 #[test]
+fn compound_substring_delimiter_uses_the_general_xpath_evaluator() {
+    // The optimized delimiter must be one XPath Literal token. Treating a compound expression
+    // with matching outer quotes as that token changes its boolean-to-string conversion.
+    // https://www.w3.org/TR/1999/REC-xpath-19991116/#NT-Literal
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:param name="value" select="&quot;xxa' or 'byy&quot;"/><xsl:template match="/"><xsl:value-of select="substring-before($value, 'a' or 'b')"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "");
+}
+
+#[test]
 fn two_argument_substring_handles_negative_infinity_without_an_upper_bound() {
     // XPath 1.0 section 4.2 defines the two-argument form by positions at or after the rounded
     // start; it has no synthetic upper bound that can become NaN through infinity arithmetic.
@@ -8055,7 +8064,14 @@ fn xslt_10_patterns_reject_variable_references_statically() {
 #[test]
 fn xslt_10_patterns_reject_general_xpath_expressions_statically() {
     // A match attribute uses the restricted Pattern grammar, not the general XPath Expr grammar.
-    for pattern in ["item + 1", "count(item)", "item and other", "(item)"] {
+    for pattern in [
+        "item + 1",
+        "count(item)",
+        "item and other",
+        "(item)",
+        "id('a' or 'b')",
+        "key('a' or 'b', 'x')",
+    ] {
         let stylesheet = format!(
             r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="{pattern}"/></xsl:stylesheet>"#
         );
@@ -8082,6 +8098,15 @@ fn xslt_10_patterns_reject_general_xpath_expressions_statically() {
             .compile(invalid_axis, None),
         Err(Error::Static(message)) if message.contains("match pattern")
     ));
+}
+
+#[test]
+fn attribute_patterns_accept_xpath_expression_whitespace_after_the_axis() {
+    // XSLT 1.0 section 5.2 permits ExprWhitespace around Pattern tokens, including after the
+    // abbreviated attribute axis. The optimized matcher must normalize the same grammar.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#patterns
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:apply-templates select="root/@id"/></xsl:template><xsl:template match="@ id">hit</xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<root id=\"value\"/>"), "hit");
 }
 
 #[test]

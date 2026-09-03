@@ -274,7 +274,11 @@ impl<'d> Node<'d> {
     ///
     /// [string value]: https://www.w3.org/TR/xpath/#dt-string-value
     pub fn string_value(&self) -> String {
-        let mut result = String::with_capacity(self.string_value_len());
+        self.string_value_with_capacity(self.string_value_len())
+    }
+
+    pub(crate) fn string_value_with_capacity(&self, capacity: usize) -> String {
+        let mut result = String::with_capacity(capacity);
         self.append_string_value(&mut result);
         result
     }
@@ -305,6 +309,55 @@ impl<'d> Node<'d> {
             Text(text) => sxd_document_no_unsafe::as_str!(text.text()).len(),
             Namespace(namespace) => namespace.uri().len(),
         }
+    }
+
+    /// Compares this node's XPath string value without materializing an intermediate `String`.
+    pub(crate) fn string_value_eq(&self, expected: &str) -> bool {
+        use self::Node::*;
+
+        fn consume(actual: &str, remaining: &mut &str) -> bool {
+            let Some(rest) = remaining.strip_prefix(actual) else {
+                return false;
+            };
+            *remaining = rest;
+            true
+        }
+
+        fn consume_descendant_text(node: &Node<'_>, remaining: &mut &str) -> bool {
+            for child in node.children() {
+                let matches = match &child {
+                    Node::Element(_) => consume_descendant_text(&child, remaining),
+                    Node::Text(text) => {
+                        consume(sxd_document_no_unsafe::as_str!(text.text()), remaining)
+                    }
+                    _ => true,
+                };
+                if !matches {
+                    return false;
+                }
+            }
+            true
+        }
+
+        let mut remaining = expected;
+        let matches = match self {
+            Root(_) | Element(_) => consume_descendant_text(self, &mut remaining),
+            Attribute(attribute) => consume(
+                sxd_document_no_unsafe::as_str!(attribute.value()),
+                &mut remaining,
+            ),
+            ProcessingInstruction(instruction) => consume(
+                sxd_document_no_unsafe::as_opt_str!(instruction.value()).unwrap_or(""),
+                &mut remaining,
+            ),
+            Comment(comment) => consume(
+                sxd_document_no_unsafe::as_str!(comment.text()),
+                &mut remaining,
+            ),
+            Text(text) => consume(sxd_document_no_unsafe::as_str!(text.text()), &mut remaining),
+            Namespace(namespace) => consume(namespace.uri(), &mut remaining),
+        };
+        matches && remaining.is_empty()
     }
 
     /// Returns the number of Unicode code points in this node's string value without building it.

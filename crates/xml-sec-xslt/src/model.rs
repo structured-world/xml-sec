@@ -2588,11 +2588,10 @@ fn expand_parameter_entity_references<'a>(
     references: &mut usize,
     meter: &mut EntityExpansionMeter,
 ) -> Result<Cow<'a, str>> {
-    if excluded_declarations.is_empty()
-        && (entities.is_empty() || !value.as_bytes().contains(&b'%'))
-    {
+    if excluded_declarations.is_empty() && !value.as_bytes().contains(&b'%') {
         return Ok(Cow::Borrowed(value));
     }
+    let reject_unresolved = excluded_declarations.is_empty() && entities.is_empty();
     let mut output = String::with_capacity(value.len());
     let mut cursor = 0;
     for &(start, end) in excluded_declarations {
@@ -2603,6 +2602,7 @@ fn expand_parameter_entity_references<'a>(
             references,
             meter,
             &mut output,
+            reject_unresolved,
         )?;
         cursor = end;
     }
@@ -2613,6 +2613,7 @@ fn expand_parameter_entity_references<'a>(
         references,
         meter,
         &mut output,
+        reject_unresolved,
     )?;
     Ok(Cow::Owned(output))
 }
@@ -2624,6 +2625,7 @@ fn expand_parameter_entity_references_into(
     references: &mut usize,
     meter: &mut EntityExpansionMeter,
     output: &mut String,
+    reject_unresolved: bool,
 ) -> Result<()> {
     const MAX_ENTITY_NAME_SCAN_BYTES: usize = 1_024;
     let mut cursor = 0usize;
@@ -2641,30 +2643,56 @@ fn expand_parameter_entity_references_into(
             cursor += length;
             continue;
         }
-        if tail.starts_with('%')
-            && let Some(end) = tail.as_bytes()[..tail.len().min(MAX_ENTITY_NAME_SCAN_BYTES)]
+        if let Some(after_percent) = tail.strip_prefix('%') {
+            if after_percent
+                .chars()
+                .next()
+                .is_some_and(crate::lexical::is_xml_whitespace)
+            {
+                // In PEDecl, `%` followed by XML S marks a parameter-entity declaration rather
+                // than a PEReference. XML 1.0 production [72]: https://www.w3.org/TR/xml/#NT-PEDecl
+                meter.append(output, "%")?;
+                cursor += 1;
+                continue;
+            }
+            // XML 1.0 section 4.1 WFC Entity Declared requires every PEReference to resolve;
+            // preserving an unknown reference would defer it into a parser path that may discard
+            // DTD tokens. https://www.w3.org/TR/xml/#wf-entdeclared
+            let end = after_percent.as_bytes()
+                [..after_percent.len().min(MAX_ENTITY_NAME_SCAN_BYTES)]
                 .iter()
                 .position(|byte| *byte == b';')
-            && let name = &tail[1..end]
-            && let Some(replacement) = entities.get(name)
-        {
-            *references += 1;
-            if depth >= ENTITY_EXPANSION_DEPTH_CEILING || *references > ENTITY_REFERENCE_CEILING {
+                .ok_or_else(|| Error::Xml("unterminated parameter entity reference".into()))?;
+            let name = &after_percent[..end];
+            if !crate::lexical::is_xml_name(name) {
+                return Err(Error::Xml("invalid parameter entity reference name".into()));
+            }
+            if let Some(replacement) = entities.get(name) {
+                *references += 1;
+                if depth >= ENTITY_EXPANSION_DEPTH_CEILING || *references > ENTITY_REFERENCE_CEILING
+                {
+                    return Err(Error::Xml(format!(
+                        "entity reference expansion limit exceeded at `%{name};`"
+                    )));
+                }
+                let replacement = decode_parameter_character_references(replacement)?;
+                expand_parameter_entity_references_into(
+                    replacement.as_ref(),
+                    entities,
+                    depth + 1,
+                    references,
+                    meter,
+                    output,
+                    reject_unresolved,
+                )?;
+                cursor += end + 2;
+                continue;
+            }
+            if reject_unresolved {
                 return Err(Error::Xml(format!(
-                    "entity reference expansion limit exceeded at `%{name};`"
+                    "undeclared parameter entity `%{name};`"
                 )));
             }
-            let replacement = decode_parameter_character_references(replacement)?;
-            expand_parameter_entity_references_into(
-                replacement.as_ref(),
-                entities,
-                depth + 1,
-                references,
-                meter,
-                output,
-            )?;
-            cursor += end + 1;
-            continue;
         }
         let plain_end = tail
             .char_indices()
@@ -3074,9 +3102,9 @@ mod parser_boundary_tests {
     use std::fmt::Write as _;
 
     use super::{
-        Document, EntityExpansionMeter, NodeKind, Result, doctype_span, expand_document_entities,
-        expand_entity_references, expand_parameter_entity_references, internal_general_entities,
-        normalize_predefined_entity_declaration,
+        Document, EntityExpansionMeter, Error, NodeKind, Result, doctype_span,
+        expand_document_entities, expand_entity_references, expand_parameter_entity_references,
+        internal_general_entities, normalize_predefined_entity_declaration,
     };
     use crate::budget::ENTITY_EXPANSION_BYTE_CEILING;
 
@@ -3617,6 +3645,24 @@ mod parser_boundary_tests {
 
         Document::parse_iterative("<!DOCTYPE r [<!ENTITY % p \"x\" \t\r\n>]><r/>", None)
             .expect("XML S before the declaration terminator remains valid");
+    }
+
+    #[test]
+    fn undeclared_parameter_entity_references_are_rejected() {
+        // XML 1.0 section 4.1 requires every parameter-entity reference to name a declared
+        // entity; preprocessing must not leave an unknown reference for the DTD scanner to hide.
+        // https://www.w3.org/TR/xml/#wf-entdeclared
+        let error = Document::parse_iterative("<!DOCTYPE r [%missing;]><r/>", None)
+            .expect_err("an undeclared parameter entity is not well-formed XML");
+        assert!(
+            matches!(&error, Error::Xml(message) if message.contains("parameter entity")),
+            "unexpected rejection: {error:?}"
+        );
+        Document::parse_iterative(
+            "<!DOCTYPE r [<!ENTITY % declared '<!ELEMENT r EMPTY>'>%declared;]><r/>",
+            None,
+        )
+        .expect("a declared parameter entity remains valid");
     }
 
     #[test]

@@ -10,6 +10,29 @@ pub(crate) const fn is_xml_whitespace(character: char) -> bool {
     matches!(character, ' ' | '\t' | '\r' | '\n')
 }
 
+/// Returns the contents of exactly one XPath 1.0 `Literal` token.
+///
+/// XPath 1.0 production [29] does not provide quote escaping: the delimiting quote cannot occur
+/// inside the token. https://www.w3.org/TR/1999/REC-xpath-19991116/#NT-Literal
+pub(crate) fn xpath_string_literal(value: &str) -> Option<&str> {
+    let value = value.trim_matches(is_xml_whitespace);
+    let quote @ ('\'' | '"') = value.chars().next()? else {
+        return None;
+    };
+    let literal = value.strip_prefix(quote)?.strip_suffix(quote)?;
+    (!literal.contains(quote)).then_some(literal)
+}
+
+/// Removes XPath's abbreviated attribute axis and its permitted `ExprWhitespace`.
+///
+/// XSLT 1.0 section 5.2 admits `@` as the attribute-axis abbreviation in Pattern steps and
+/// incorporates XPath `ExprWhitespace`. https://www.w3.org/TR/1999/REC-xslt-19991116#patterns
+pub(crate) fn strip_xpath_attribute_axis(value: &str) -> Option<&str> {
+    value
+        .strip_prefix('@')
+        .map(|value| value.trim_start_matches(is_xml_whitespace))
+}
+
 // XML 1.0 Fifth Edition section 2.2, production [2], defines the scalar values admitted by the
 // semantic XML model: https://www.w3.org/TR/xml/#charsets
 pub(crate) const fn is_xml10_character(character: char) -> bool {

@@ -3,7 +3,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::budget::ensure;
-use crate::lexical::{is_ncname, is_ncname_char, is_ncname_start, unicode_decimal_value};
+use crate::lexical::{
+    is_ncname, is_ncname_char, is_ncname_start, is_xml_whitespace, strip_xpath_attribute_axis,
+    unicode_decimal_value, xpath_string_literal,
+};
 use crate::resolver::decode_resource;
 use crate::{
     BudgetKind, CompileBudget, Document, Error, ExpandedName, Namespace, OutputDefinition,
@@ -1293,7 +1296,7 @@ fn strip_id_key_pattern(branch: &str) -> Result<Option<&str>> {
     {
         return Err(invalid_match_pattern(branch));
     }
-    Ok(Some(branch[close + 1..].trim()))
+    Ok(Some(branch[close + 1..].trim_matches(is_xml_whitespace)))
 }
 
 fn split_pattern_steps(source: &str) -> Option<Vec<&str>> {
@@ -1372,14 +1375,18 @@ fn valid_pattern_node_test(node_test: &str) -> bool {
     let normalized = normalize_xpath_for_sxd(node_test);
     let node_test = normalized.as_ref();
     let (node_test, explicit_axis) = match node_test.split_once("::") {
-        Some((axis, test)) if matches!(axis.trim(), "child" | "attribute") => (test.trim(), true),
+        Some((axis, test))
+            if matches!(axis.trim_matches(is_xml_whitespace), "child" | "attribute") =>
+        {
+            (test.trim_matches(is_xml_whitespace), true)
+        }
         Some(_) => return false,
         None => (node_test, false),
     };
     if explicit_axis && node_test.starts_with('@') {
         return false;
     }
-    let node_test = node_test.strip_prefix('@').unwrap_or(node_test);
+    let node_test = strip_xpath_attribute_axis(node_test).unwrap_or(node_test);
     if node_test == "*" || is_lexical_qname(node_test) {
         return true;
     }
@@ -1457,21 +1464,18 @@ fn split_top_level(source: &str, separator: char) -> Vec<&str> {
             '(' | '[' => depth += 1,
             ')' | ']' => depth = depth.saturating_sub(1),
             value if value == separator && depth == 0 => {
-                output.push(source[start..index].trim());
+                output.push(source[start..index].trim_matches(is_xml_whitespace));
                 start = index + character.len_utf8();
             }
             _ => {}
         }
     }
-    output.push(source[start..].trim());
+    output.push(source[start..].trim_matches(is_xml_whitespace));
     output
 }
 
 fn is_xpath_literal(value: &str) -> bool {
-    let value = value.trim();
-    value.len() >= 2
-        && ((value.starts_with('\'') && value.ends_with('\''))
-            || (value.starts_with('"') && value.ends_with('"')))
+    xpath_string_literal(value).is_some()
 }
 
 fn invalid_match_pattern(pattern: &str) -> Error {
