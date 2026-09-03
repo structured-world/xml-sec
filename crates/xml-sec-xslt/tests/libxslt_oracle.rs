@@ -1218,13 +1218,18 @@ fn assert_strict_xslt_output_deviation(case: &Case, actual: &[u8], expected: &[u
             );
             true
         }
-        // libxslt leaves `@` unescaped despite the true escape-reserved argument. EXSLT defines
-        // that mode to percent-encode every reserved URI character.
+        // libxslt leaves `@` unescaped in true mode and `[]` unescaped in false mode. EXSLT's
+        // RFC 2396 contract respectively requires reserved characters to be escaped and excludes
+        // square brackets from the reserved production.
+        // https://www.rfc-editor.org/rfc/rfc2396#section-2.2
         "exslt/strings/uri.xsl" => {
             let expected = String::from_utf8_lossy(expected);
             assert_eq!(
                 actual.as_ref(),
-                expected.replace("<all>@</all>", "<all>%40</all>")
+                expected.replace("<all>@</all>", "<all>%40</all>").replace(
+                    "<no-reserved>;/?:&amp;=[]+$,</no-reserved>",
+                    "<no-reserved>;/?:&amp;=%5B%5D+$,</no-reserved>",
+                )
             );
             true
         }

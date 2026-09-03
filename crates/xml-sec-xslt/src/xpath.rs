@@ -2944,7 +2944,7 @@ impl XPathValue {
         }
     }
 
-    fn into_temporary_string(
+    pub(crate) fn into_temporary_string(
         self,
         evaluator: &Evaluator,
         meter: &mut Meter,
@@ -5466,7 +5466,7 @@ fn uri_byte_is_unescaped(character: char, escape_reserved: bool) -> bool {
     // EXSLT inherits the reserved delimiters from RFC 2396 section 2.2. `#` is outside that
     // production and must remain encoded even when reserved delimiters are preserved.
     // https://www.rfc-editor.org/rfc/rfc2396#section-2.2
-    const RESERVED: &str = ";/?:@&=+$,[]";
+    const RESERVED: &str = ";/?:@&=+$,";
     character.is_ascii_alphanumeric()
         || matches!(
             character,
@@ -7256,5 +7256,17 @@ mod tests {
             )
             .expect_err("decimal rendering workspace must cross the allocation gate");
         assert!(error.to_string().contains("allocation budget"));
+    }
+
+    #[test]
+    fn encode_uri_uses_the_rfc_2396_reserved_set() {
+        // RFC 2396 section 2.2 does not classify square brackets as reserved, so EXSLT encodes
+        // them even when reserved delimiters are preserved.
+        // https://www.rfc-editor.org/rfc/rfc2396#section-2.2
+        assert_eq!(
+            percent_encode_uri("[]", false, 6, UriEncoding::Standard(encoding_rs::UTF_8))
+                .expect("UTF-8 encoding succeeds"),
+            "%5B%5D"
+        );
     }
 }

@@ -5186,7 +5186,7 @@ fn included_stylesheets_decode_each_retained_source_once() {
         ),
     );
     let principal = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:include href="included.xsl"/></xsl:stylesheet>"#;
-    Compiler::new(resolver, CompileBudget::new(1 << 20, 8, 256, 350 * 1024))
+    Compiler::new(resolver, CompileBudget::new(1 << 20, 8, 256, 450 * 1024))
         .compile(principal, Some("memory:main.xsl"))
         .expect("one retained module decode fits the owned-byte budget");
 }
@@ -8658,7 +8658,7 @@ fn encode_uri_escapes_every_reserved_character_when_requested() {
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="str:encode-uri(';/?:@&amp;=+$,[]#', true())"/><xsl:text>|</xsl:text><xsl:value-of select="str:encode-uri(';/?:@&amp;=+$,[]#', false())"/></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(stylesheet, "<source/>"),
-        "%3B%2F%3F%3A%40%26%3D%2B%24%2C%5B%5D%23|;/?:@&=+$,[]%23"
+        "%3B%2F%3F%3A%40%26%3D%2B%24%2C%5B%5D%23|;/?:@&=+$,%5B%5D%23"
     );
 }
 

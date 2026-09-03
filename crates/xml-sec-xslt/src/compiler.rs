@@ -230,6 +230,9 @@ impl<R: Resolver> Compiler<R> {
                 self.enter_resource(&resource, state, |state| {
                     let source = resource_source(&resource, state)?;
                     with_frontend_document(source.as_str(), state, |document, state| {
+                        // Every include occurrence produces distinct retained declarations even
+                        // when the decoded module and parser input are cached.
+                        state.charge_owned(estimate_compiled_owned_bytes(document))?;
                         let included_root = document.root_element();
                         match stylesheet_module_kind(included_root)? {
                             StylesheetModuleKind::Standard {
@@ -3734,6 +3737,29 @@ fn optional_yes_no(value: &str, forward_compatible: bool) -> Result<Option<bool>
 mod tests {
     use super::*;
 
+    struct RepeatedIncludeResolver {
+        module: Vec<u8>,
+    }
+
+    impl Resolver for RepeatedIncludeResolver {
+        fn resolve(
+            &self,
+            uri: &str,
+            _base_uri: Option<&str>,
+            purpose: ResolvePurpose,
+        ) -> Result<ResolvedResource> {
+            assert_eq!(uri, "module.xsl");
+            assert_eq!(purpose, ResolvePurpose::Include);
+            Ok(ResolvedResource {
+                canonical_uri: "memory:module.xsl".into(),
+                identity: ResourceIdentity("repeated-module".into()),
+                bytes: self.module.clone(),
+                media_type: Some("application/xslt+xml".into()),
+                encoding: Some("UTF-8".into()),
+            })
+        }
+    }
+
     #[test]
     fn frontend_workspace_accounts_for_every_parser_arena() {
         // roxmltree preallocates node and attribute vectors from lexical delimiters and retains
@@ -3764,6 +3790,35 @@ mod tests {
             .expect("expression compiles");
 
         assert!(Arc::ptr_eq(&first.namespaces, &second.namespaces));
+    }
+
+    #[test]
+    fn repeated_includes_charge_each_retained_declaration_expansion() {
+        // XSLT 1.0 section 2.6.1 instantiates included declarations at every include point. A
+        // cached source document therefore cannot make repeated compiled IR free.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#include
+        let body = "x".repeat(32 * 1_024);
+        let module = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="item"><out>{body}</out></xsl:template></xsl:stylesheet>"#
+        );
+        let includes = r#"<xsl:include href="module.xsl"/>"#.repeat(32);
+        let principal = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">{includes}</xsl:stylesheet>"#
+        );
+        let compiler = Compiler::new(
+            Arc::new(RepeatedIncludeResolver {
+                module: module.into_bytes(),
+            }),
+            CompileBudget::new(1 << 20, 64, 16, 768 * 1_024),
+        );
+
+        assert!(matches!(
+            compiler.compile(&principal, Some("memory:main.xsl")),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            })
+        ));
     }
 
     #[test]

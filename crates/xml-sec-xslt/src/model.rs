@@ -2393,7 +2393,39 @@ fn parse_dtd_attribute_default(subset: &str, cursor: &mut usize) -> Result<Optio
             "ATTLIST default value must not contain `<`".into(),
         ));
     }
+    validate_attribute_value_references(value)?;
     Ok(Some(value.to_owned()))
+}
+
+fn validate_attribute_value_references(value: &str) -> Result<()> {
+    // XML 1.0 productions [10] and [41] require every ampersand in an AttValue to begin a
+    // complete Reference, even when that default is never applied to an element.
+    // https://www.w3.org/TR/xml/#NT-AttValue
+    let mut cursor = 0usize;
+    while let Some(offset) = value[cursor..].find('&') {
+        cursor += offset + 1;
+        let end = value[cursor..]
+            .find(';')
+            .map(|offset| cursor + offset)
+            .ok_or_else(|| {
+                Error::Xml("ATTLIST default value has an unterminated reference".into())
+            })?;
+        let reference = &value[cursor..end];
+        let valid = if let Some(digits) = reference.strip_prefix("#x") {
+            valid_xml_character_reference(digits, 16)
+        } else if let Some(digits) = reference.strip_prefix('#') {
+            valid_xml_character_reference(digits, 10)
+        } else {
+            crate::lexical::is_xml_name(reference)
+        };
+        if !valid {
+            return Err(Error::Xml(
+                "ATTLIST default value has an invalid reference".into(),
+            ));
+        }
+        cursor = end + 1;
+    }
+    Ok(())
 }
 
 fn parse_external_entity_declaration(
@@ -3489,6 +3521,20 @@ mod parser_boundary_tests {
         ] {
             Document::parse_iterative(malformed, None)
                 .expect_err("missing DTD declaration whitespace must be rejected");
+        }
+    }
+
+    #[test]
+    fn every_attlist_default_validates_reference_grammar() {
+        // XML 1.0 production [10] applies while parsing the declaration, regardless of whether
+        // an explicit attribute later prevents the default from being used.
+        // https://www.w3.org/TR/xml/#NT-AttValue
+        for malformed in [
+            r#"<!DOCTYPE r [<!ATTLIST r a CDATA "&broken">]><r a="explicit"/>"#,
+            r#"<!DOCTYPE r [<!ATTLIST unused a CDATA "&#x110000;">]><r/>"#,
+        ] {
+            Document::parse_iterative(malformed, None)
+                .expect_err("malformed unused ATTLIST defaults must be rejected");
         }
     }
 

@@ -2761,14 +2761,13 @@ impl<'a> Execution<'a> {
                     output.push_str(value);
                 }
                 AvtPart::Expression(expression) => {
-                    let value = self
-                        .evaluate(expression, node, position, size)?
-                        .string(&self.evaluator);
-                    self.meter.check_additional(
-                        BudgetKind::OwnedBytes,
-                        output.len().saturating_add(value.len()),
+                    let value = self.evaluate(expression, node, position, size)?;
+                    append_avt_expression_value(
+                        &mut output,
+                        value,
+                        &self.evaluator,
+                        &mut self.meter,
                     )?;
-                    output.push_str(&value)
                 }
             }
         }
@@ -3752,6 +3751,26 @@ impl<'a> Execution<'a> {
         }
         Ok(count)
     }
+}
+
+fn append_avt_expression_value(
+    output: &mut String,
+    value: XPathValue,
+    evaluator: &Evaluator,
+    meter: &mut Meter,
+) -> Result<()> {
+    let (value, temporary_bytes) = value.into_temporary_string(evaluator, meter)?;
+    let check = meter.check_additional(
+        BudgetKind::OwnedBytes,
+        output.len().saturating_add(value.len()),
+    );
+    if let Err(error) = check {
+        meter.release_owned_bytes(temporary_bytes);
+        return Err(error);
+    }
+    output.push_str(&value);
+    meter.release_owned_bytes(temporary_bytes);
+    Ok(())
 }
 
 fn remap_parameter_value(value: &Value, remap: &HashMap<NodeId, NodeId>) -> Value {
@@ -5177,6 +5196,71 @@ mod tests {
             0,
         )
         .expect("empty source fits")
+    }
+
+    fn minimum_execution_owned_bytes(stylesheet: &crate::Stylesheet, source: &Document) -> usize {
+        let mut rejected = 0usize;
+        let mut accepted = 1usize << 20;
+        while rejected + 1 < accepted {
+            let candidate = rejected + (accepted - rejected) / 2;
+            let budget = ExecutionBudget {
+                source_bytes: usize::MAX,
+                external_documents: usize::MAX,
+                recursion_depth: usize::MAX,
+                xpath_evaluations: usize::MAX,
+                template_applications: usize::MAX,
+                sort_comparisons: usize::MAX,
+                key_entries: usize::MAX,
+                result_nodes: usize::MAX,
+                serialized_bytes: usize::MAX,
+                messages: usize::MAX,
+                owned_bytes: candidate,
+            };
+            match stylesheet.execute(
+                source,
+                &crate::Parameters::new(),
+                Arc::new(NoResolver),
+                crate::ExecutionOptions {
+                    budget,
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            ) {
+                Ok(_) => accepted = candidate,
+                Err(Error::Budget {
+                    kind: BudgetKind::OwnedBytes,
+                    ..
+                }) => rejected = candidate,
+                Err(error) => panic!("unexpected execution error: {error}"),
+            }
+        }
+        accepted
+    }
+
+    #[test]
+    fn avt_nodeset_conversion_reserves_both_live_copies() {
+        // XPath node-set conversion and the growing AVT output coexist until the converted value
+        // is appended, so the owned-byte gate must cover both allocations before conversion.
+        let compile = |attribute: &str| {
+            Compiler::new(
+                Arc::new(NoResolver),
+                CompileBudget::new(1 << 20, 4, 16, 1 << 20),
+            )
+            .compile(
+                &format!(r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><out value="{attribute}"/></xsl:template></xsl:stylesheet>"#),
+                None,
+            )
+            .expect("stylesheet compiles")
+        };
+        let payload = "x".repeat(4_096);
+        let source =
+            Document::parse(&format!("<root>{payload}</root>"), None).expect("source parses");
+        let literal = compile("");
+        let avt = compile("{/root}");
+
+        let literal_minimum = minimum_execution_owned_bytes(&literal, &source);
+        let avt_minimum = minimum_execution_owned_bytes(&avt, &source);
+        assert!(avt_minimum >= literal_minimum.saturating_add(payload.len() * 2));
     }
 
     #[test]
