@@ -742,6 +742,9 @@ pub(crate) struct WithParam {
 pub(crate) enum Instruction {
     Text(String, bool),
     LiteralElement {
+        // XSLT 1.0 section 3.2 assigns a constructed node the base URI of its creating
+        // stylesheet instruction: https://www.w3.org/TR/1999/REC-xslt-19991116#base-uri
+        base_uri: Option<String>,
         name: ExpandedName,
         prefix: Option<String>,
         attributes: Vec<LiteralAttribute>,
@@ -783,6 +786,8 @@ pub(crate) enum Instruction {
         attribute_sets: Vec<ExpandedName>,
     },
     Element {
+        // Computed and literal result elements share the same creating-instruction rule.
+        base_uri: Option<String>,
         name: AttributeValueTemplate,
         namespace: Option<AttributeValueTemplate>,
         namespaces: Vec<(String, String)>,
@@ -2511,6 +2516,7 @@ fn compile_instruction(
             attribute_sets: qname_list_attr(node, "use-attribute-sets")?,
         },
         "element" => Instruction::Element {
+            base_uri: effective_base_uri(node, context.static_base_uri.as_deref())?,
             name: parse_avt(required_attr(node, "name")?, node, &context)?,
             namespace: node
                 .attribute("namespace")
@@ -2896,6 +2902,7 @@ fn compile_literal_element(
         .transpose()?
         .unwrap_or_default();
     Ok(Instruction::LiteralElement {
+        base_uri: effective_base_uri(node, context.static_base_uri.as_deref())?,
         name: ExpandedName::new(node.tag_name().namespace(), node.tag_name().name()),
         prefix,
         attributes,

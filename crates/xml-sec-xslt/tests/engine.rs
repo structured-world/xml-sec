@@ -327,6 +327,68 @@ fn result_tree_fragments_preserve_binding_and_xml_base_uris() {
 }
 
 #[test]
+fn constructed_elements_preserve_their_instruction_base_uri() {
+    // XSLT 1.0 section 3.2 assigns a node the base URI of the stylesheet instruction that
+    // creates it, even when an imported template writes into a caller-owned temporary tree.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#base-uri
+    let resolver = Arc::new(ContextResolver::default());
+    for (href, base, canonical, identity, body) in [
+        (
+            "imported.xsl",
+            "https://example.test/styles/main.xsl",
+            "https://example.test/modules/imported.xsl",
+            "instruction-base-module",
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template name="emit"><item/></xsl:template></xsl:stylesheet>"#,
+        ),
+        (
+            "data.xml",
+            "https://example.test/modules/imported.xsl",
+            "https://example.test/modules/data.xml",
+            "instruction-base-data",
+            "<doc>module</doc>",
+        ),
+    ] {
+        resolver
+            .resources
+            .lock()
+            .expect("test resolver mutex is not poisoned")
+            .insert(
+                (href.into(), Some(base.into())),
+                ResolvedResource {
+                    canonical_uri: canonical.into(),
+                    identity: ResourceIdentity(identity.into()),
+                    bytes: body.as_bytes().to_vec(),
+                    media_type: None,
+                    encoding: Some("UTF-8".into()),
+                },
+            );
+    }
+    let stylesheet = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:exsl="http://exslt.org/common"><xsl:import href="imported.xsl"/><xsl:output method="text"/><xsl:template match="/"><xsl:variable name="tree"><xsl:call-template name="emit"/></xsl:variable><xsl:value-of select="document('data.xml', exsl:node-set($tree)/item)/doc"/></xsl:template></xsl:stylesheet>"#,
+        Some("https://example.test/styles/main.xsl"),
+    )
+    .expect("stylesheet graph compiles");
+    let output = stylesheet
+        .execute(
+            &Document::parse("<root/>", None).expect("source parses"),
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("instruction-relative document resolves");
+
+    assert_eq!(output.serialized.bytes, b"module");
+}
+
+#[test]
 fn doctype_uses_the_first_element_qualified_name() {
     // Prolog nodes do not replace the document element, and a prefixed root requires the same
     // qualified name in both the DOCTYPE and serialized start tag.

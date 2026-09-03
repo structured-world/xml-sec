@@ -252,6 +252,7 @@ fn parse_node_type<'a>(
 ) -> XPathProgress<'a, Token, Error> {
     fn without_arg(p: StringPoint<'_>) -> XPathProgress<'_, Token, ()> {
         let (p, node_type) = try_parse!(p.consume_identifier(&NODE_TESTS));
+        let (p, _) = p.consume_space().optional(p);
         let (p, _) = try_parse!(p.consume_literal("("));
         let (p, _) = p.consume_space().optional(p);
         let (p, _) = try_parse!(p.consume_literal(")"));
@@ -260,7 +261,9 @@ fn parse_node_type<'a>(
     }
 
     fn with_arg<'a>(pm: &mut XPathMaster<'a>, p: StringPoint<'a>) -> XPathProgress<'a, Token, ()> {
-        let (p, _) = try_parse!(p.consume_literal("processing-instruction("));
+        let (p, _) = try_parse!(p.consume_literal("processing-instruction"));
+        let (p, _) = p.consume_space().optional(p);
+        let (p, _) = try_parse!(p.consume_literal("("));
         let (p, _) = p.consume_space().optional(p);
         let (p, arg) = try_parse!(parse_literal(pm, p).map_err(|_| ()));
         let (p, _) = p.consume_space().optional(p);
@@ -893,9 +896,11 @@ mod test {
         // whitespace may separate them: https://www.w3.org/TR/xpath/#location-paths
         for source in [
             "node( )",
+            "node ()",
             "text(\t)",
             "comment(\r\n)",
             "processing-instruction( 'target' )",
+            "processing-instruction ('target')",
         ] {
             assert!(
                 all_tokens(Tokenizer::new(source))

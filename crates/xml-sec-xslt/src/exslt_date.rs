@@ -1167,11 +1167,13 @@ fn format_second(second: f64) -> String {
     }
 }
 fn trim_float(value: f64) -> String {
-    let rendered = format!("{value:.12}");
-    rendered
-        .trim_end_matches('0')
-        .trim_end_matches('.')
-        .to_owned()
+    const DISPLAY_SCALE: f64 = 1_000_000_000_000.0;
+    let rendered = if value.abs() >= DISPLAY_SCALE.recip() {
+        (value * DISPLAY_SCALE).round() / DISPLAY_SCALE
+    } else {
+        value
+    };
+    crate::value::format_xpath_number(rendered)
 }
 fn argument_error<T>(message: &str) -> std::result::Result<T, function::Error> {
     Err(function::Error::Other {
@@ -1240,8 +1242,10 @@ mod tests {
 
     #[test]
     fn duration_render_preserves_nonzero_subnanosecond_values() {
-        let duration = DurationValue::parse("PT0.0000000001S").expect("valid duration parses");
-        assert_ne!(duration.render(), "P");
-        assert_eq!(duration.render(), "PT0.0000000001S");
+        for lexical in ["PT0.0000000001S", "PT0.0000000000001S"] {
+            let duration = DurationValue::parse(lexical).expect("valid duration parses");
+            assert_ne!(duration.render(), "P");
+            assert_eq!(duration.render(), lexical);
+        }
     }
 }

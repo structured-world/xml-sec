@@ -2206,7 +2206,8 @@ fn preflight_xml_fragment(
                         .expect("active entity replacement remains registered"),
                 };
                 let remaining = &source[frame.offset..];
-                let (event, consumed) = scan_preflight_event(remaining, frame.context, dtd);
+                let (event, consumed) =
+                    scan_preflight_event(remaining, frame.context, dtd, state, budget)?;
                 frame.offset = frame.offset.saturating_add(consumed);
                 (event, frame.collect_doctype, frame.context)
             }
@@ -2363,13 +2364,15 @@ fn scan_preflight_event(
     remaining: &str,
     context: FragmentContext,
     dtd: &InternalDtd,
-) -> (PreflightEvent, usize) {
+    state: &mut DocumentPreflightState,
+    budget: Option<&XmlParseWorkBudget>,
+) -> Result<(PreflightEvent, usize), XmlDocumentError> {
     if remaining.is_empty() {
-        return (PreflightEvent::Done, 0);
+        return Ok((PreflightEvent::Done, 0));
     }
     if context == FragmentContext::Attribute {
         let mut references = general_references(remaining.as_bytes());
-        return references
+        return Ok(references
             .next()
             .map_or((PreflightEvent::Done, remaining.len()), |name| {
                 let consumed = references.consumed();
@@ -2380,16 +2383,16 @@ fn scan_preflight_event(
                     },
                     consumed,
                 )
-            });
+            }));
     }
     if remaining.starts_with("<!--") {
-        return find_bytes(&remaining.as_bytes()[4..], b"-->")
+        return Ok(find_bytes(&remaining.as_bytes()[4..], b"-->")
             .map_or((PreflightEvent::Done, remaining.len()), |end| {
                 (PreflightEvent::Node, 4 + end + 3)
-            });
+            }));
     }
     if remaining.starts_with("<![CDATA[") {
-        return find_bytes(&remaining.as_bytes()[9..], b"]]>").map_or(
+        return Ok(find_bytes(&remaining.as_bytes()[9..], b"]]>").map_or(
             (PreflightEvent::Done, remaining.len()),
             |end| {
                 (
@@ -2399,10 +2402,10 @@ fn scan_preflight_event(
                     9 + end + 3,
                 )
             },
-        );
+        ));
     }
     if remaining.starts_with("<?") {
-        return find_bytes(&remaining.as_bytes()[2..], b"?>").map_or(
+        return Ok(find_bytes(&remaining.as_bytes()[2..], b"?>").map_or(
             (PreflightEvent::Done, remaining.len()),
             |end| {
                 let event = if remaining
@@ -2419,10 +2422,10 @@ fn scan_preflight_event(
                 };
                 (event, 2 + end + 2)
             },
-        );
+        ));
     }
     if remaining.starts_with("<!DOCTYPE") {
-        return find_doctype_end(remaining).map_or(
+        return Ok(find_doctype_end(remaining).map_or(
             (PreflightEvent::Done, remaining.len()),
             |end| {
                 (
@@ -2430,45 +2433,39 @@ fn scan_preflight_event(
                     end,
                 )
             },
-        );
+        ));
     }
     if remaining.starts_with("</") {
-        return find_unquoted_byte(remaining.as_bytes(), b'>', 2)
+        return Ok(find_unquoted_byte(remaining.as_bytes(), b'>', 2)
             .map_or((PreflightEvent::Done, remaining.len()), |end| {
                 (PreflightEvent::End, end + 1)
-            });
+            }));
     }
     if remaining.starts_with('<') {
-        return find_unquoted_byte(remaining.as_bytes(), b'>', 1).map_or(
-            (PreflightEvent::Done, remaining.len()),
-            |end| {
-                let opening = &remaining[..=end];
-                let (element_name, attributes) = opening_tag_attributes(opening);
-                let attribute_source =
-                    element_attribute_reference_source(opening, element_name, &attributes, dtd);
-                let namespace_declarations = namespace_declarations(element_name, &attributes, dtd);
-                if opening[..opening.len() - 1].trim_end().ends_with('/') {
-                    (
-                        PreflightEvent::Empty {
-                            attribute_source,
-                            namespace_declarations,
-                        },
-                        end + 1,
-                    )
-                } else {
-                    (
-                        PreflightEvent::Start {
-                            attribute_source,
-                            namespace_declarations,
-                        },
-                        end + 1,
-                    )
-                }
-            },
-        );
+        let Some(end) = find_unquoted_byte(remaining.as_bytes(), b'>', 1) else {
+            return Ok((PreflightEvent::Done, remaining.len()));
+        };
+        let opening = &remaining[..=end];
+        let (element_name, attributes) = opening_tag_attributes(opening);
+        let attribute_source =
+            element_attribute_reference_source(opening, element_name, &attributes, dtd);
+        let namespace_declarations =
+            namespace_declarations(element_name, &attributes, dtd, state, budget)?;
+        let event = if opening[..opening.len() - 1].trim_end().ends_with('/') {
+            PreflightEvent::Empty {
+                attribute_source,
+                namespace_declarations,
+            }
+        } else {
+            PreflightEvent::Start {
+                attribute_source,
+                namespace_declarations,
+            }
+        };
+        return Ok((event, end + 1));
     }
     if let Some(reference) = remaining.strip_prefix('&') {
-        return reference
+        return Ok(reference
             .find(';')
             .map_or((PreflightEvent::Done, remaining.len()), |end| {
                 let name = &reference[..end];
@@ -2479,18 +2476,18 @@ fn scan_preflight_event(
                     },
                     end + 2,
                 )
-            });
+            }));
     }
     let end = remaining.find(['<', '&']).unwrap_or(remaining.len());
     let text = &remaining[..end];
-    (
+    Ok((
         PreflightEvent::CharacterData {
             xml_whitespace: text
                 .chars()
                 .all(|character| matches!(character, ' ' | '\t' | '\r' | '\n')),
         },
         end,
-    )
+    ))
 }
 
 fn is_character_reference(name: &str) -> bool {
@@ -2540,21 +2537,24 @@ fn namespace_declarations(
     element_name: &str,
     attributes: &[(&str, &str)],
     dtd: &InternalDtd,
-) -> Vec<NamespaceDeclaration> {
-    let mut declarations = attributes
-        .iter()
-        .filter_map(|&(name, value)| {
-            let prefix = if name == "xmlns" {
-                ""
-            } else {
-                name.strip_prefix("xmlns:")?
+    state: &mut DocumentPreflightState,
+    budget: Option<&XmlParseWorkBudget>,
+) -> Result<Vec<NamespaceDeclaration>, XmlDocumentError> {
+    let mut declarations = Vec::new();
+    for &(name, value) in attributes {
+        let prefix = if name == "xmlns" {
+            ""
+        } else {
+            let Some(prefix) = name.strip_prefix("xmlns:") else {
+                continue;
             };
-            Some(NamespaceDeclaration {
-                prefix: prefix.to_owned(),
-                is_undeclaration: namespace_value_expands_to_empty(value, dtd),
-            })
-        })
-        .collect::<Vec<_>>();
+            prefix
+        };
+        declarations.push(NamespaceDeclaration {
+            prefix: prefix.to_owned(),
+            is_undeclaration: namespace_value_expands_to_empty(value, dtd, state, budget)?,
+        });
+    }
     if let Some(defaults) = dtd.attribute_defaults.get(element_name) {
         for default in defaults {
             if attributes
@@ -2572,23 +2572,33 @@ fn namespace_declarations(
             };
             declarations.push(NamespaceDeclaration {
                 prefix: prefix.to_owned(),
-                is_undeclaration: namespace_value_expands_to_empty(&default.value, dtd),
+                is_undeclaration: namespace_value_expands_to_empty(
+                    &default.value,
+                    dtd,
+                    state,
+                    budget,
+                )?,
             });
         }
     }
-    declarations
+    Ok(declarations)
 }
 
-fn namespace_value_expands_to_empty<'a>(value: &'a str, dtd: &'a InternalDtd) -> bool {
+fn namespace_value_expands_to_empty<'a>(
+    value: &'a str,
+    dtd: &'a InternalDtd,
+    state: &mut DocumentPreflightState,
+    budget: Option<&XmlParseWorkBudget>,
+) -> Result<bool, XmlDocumentError> {
     // Namespace declaration values are normalized attributes, so entity replacement precedes the
     // empty default-namespace test: XML 1.0 section 3.3.3 and Namespaces 1.0 section 6.2.
     // https://www.w3.org/TR/xml/#AVNormalize
     // https://www.w3.org/TR/REC-xml-names/#defaulting
     if value.is_empty() {
-        return true;
+        return Ok(true);
     }
     if !value.starts_with('&') {
-        return false;
+        return Ok(false);
     }
     let mut pending = vec![value];
     let mut expansions = 0u32;
@@ -2597,23 +2607,24 @@ fn namespace_value_expands_to_empty<'a>(value: &'a str, dtd: &'a InternalDtd) ->
             continue;
         }
         let Some(reference) = remaining.strip_prefix('&') else {
-            return false;
+            return Ok(false);
         };
         let Some(end) = reference.find(';') else {
-            return false;
+            return Ok(false);
         };
         let name = &reference[..end];
         let Some(replacement) = dtd.entities.get(name) else {
-            return false;
+            return Ok(false);
         };
         expansions = expansions.saturating_add(1);
         if expansions > crate::hard_limits::XML_ENTITY_EXPANSION_CEILING {
-            return false;
+            return Ok(false);
         }
+        charge_entity_expansion_work(state, budget, replacement.len())?;
         pending.push(&reference[end + 1..]);
         pending.push(replacement);
     }
-    true
+    Ok(true)
 }
 
 fn apply_preflight_namespace_declarations(
@@ -3470,6 +3481,29 @@ mod tests {
         assert!(matches!(
             build_cell(xml.to_owned(), settings, Some(&budget)),
             Err(XmlDocumentError::Parse(ParseError::NodesLimitReached))
+        ));
+    }
+
+    #[test]
+    fn namespace_entity_chain_consumes_parse_work_budget() {
+        // Namespace normalization expands general entities before testing an undeclaration.
+        // That preflight path must share the same sticky parser-work budget as content expansion.
+        let xml = r#"<!DOCTYPE root [<!ENTITY first "&second;"><!ENTITY second "">]><root xmlns="&first;"/>"#;
+        let resources = crate::policy::ResourcePolicy {
+            max_xml_parse_work_bytes: xml.len() + "&second;".len() - 1,
+            ..crate::policy::ResourcePolicy::default()
+        };
+        let budget = XmlParseWorkBudget::from_resources(&resources);
+        let settings = DocumentParseSettings::new(true, 8, xml.len());
+
+        assert!(matches!(
+            preflight_document_limits(xml, settings, Some(&budget)),
+            Err(XmlDocumentError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
+                    ..
+                }
+            ))
         ));
     }
 

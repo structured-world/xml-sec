@@ -1014,6 +1014,7 @@ impl<'a> Execution<'a> {
                             });
                         }
                         Instruction::LiteralElement {
+                            base_uri,
                             name,
                             prefix,
                             attributes,
@@ -1027,7 +1028,7 @@ impl<'a> Execution<'a> {
                                     prefix.as_deref(),
                                     &namespaces,
                                 );
-                            let id = self.push_node(
+                            let id = self.push_node_with_base(
                                 self.parent(),
                                 NodeKind::Element {
                                     name,
@@ -1035,6 +1036,7 @@ impl<'a> Execution<'a> {
                                     attributes: vec![],
                                     namespaces: result_namespaces,
                                 },
+                                base_uri.clone(),
                             )?;
                             self.output_stack.push(id);
                             for set in &attribute_sets {
@@ -1263,20 +1265,29 @@ impl<'a> Execution<'a> {
         }
         self.release_parameters_if_last(&params);
         match &node {
-            SourceNode::Node(id) => match self
-                .evaluator
-                .source
-                .node(*id)
-                .map(|source| source.kind.clone())
-            {
-                Some(NodeKind::Root | NodeKind::Element { .. }) => {
-                    let children = self.evaluator.children(&node);
-                    let built_in_params = Arc::new(EvaluatedParameters::default());
-                    self.push_apply_batch(tasks, children, mode, built_in_params, frame.depth + 1)
+            SourceNode::Node(id) => {
+                let kind = self.evaluator.source.node(*id).map(|source| &source.kind);
+                match kind {
+                    Some(NodeKind::Root | NodeKind::Element { .. }) => {
+                        let children = self.evaluator.children(&node);
+                        let built_in_params = Arc::new(EvaluatedParameters::default());
+                        self.push_apply_batch(
+                            tasks,
+                            children,
+                            mode,
+                            built_in_params,
+                            frame.depth + 1,
+                        )
+                    }
+                    // Result text must own its payload; cloning only this leaf avoids cloning element
+                    // attributes, namespaces, and child storage merely to choose a built-in rule.
+                    Some(NodeKind::Text { value, .. }) => {
+                        let value = value.clone();
+                        self.append_owned_text(value, false)
+                    }
+                    _ => Ok(()),
                 }
-                Some(NodeKind::Text { value, .. }) => self.append_text(&value, false),
-                _ => Ok(()),
-            },
+            }
             SourceNode::Attribute { .. } => {
                 let value = self.evaluator.string_value(&node);
                 self.append_text(&value, false)
@@ -1457,6 +1468,7 @@ impl<'a> Execution<'a> {
         match instruction {
             Instruction::Text(value, disable) => self.append_text(value, *disable),
             Instruction::LiteralElement {
+                base_uri,
                 name,
                 prefix,
                 attributes,
@@ -1467,7 +1479,7 @@ impl<'a> Execution<'a> {
                 let (name, prefix, result_namespaces) =
                     self.alias_literal_name_and_namespaces(name, prefix.as_deref(), namespaces);
                 let parent = self.parent();
-                let id = self.push_node(
+                let id = self.push_node_with_base(
                     parent,
                     NodeKind::Element {
                         name,
@@ -1475,6 +1487,7 @@ impl<'a> Execution<'a> {
                         attributes: vec![],
                         namespaces: result_namespaces,
                     },
+                    base_uri.clone(),
                 )?;
                 self.output_stack.push(id);
                 for set in attribute_sets {
@@ -1726,6 +1739,7 @@ impl<'a> Execution<'a> {
                 Ok(())
             }
             Instruction::Element {
+                base_uri,
                 name,
                 namespace,
                 namespaces: static_namespaces,
@@ -1751,7 +1765,7 @@ impl<'a> Execution<'a> {
                         }]
                     })
                     .unwrap_or_default();
-                let id = self.push_node(
+                let id = self.push_node_with_base(
                     self.parent(),
                     NodeKind::Element {
                         name: ExpandedName::new(namespace, local),
@@ -1759,6 +1773,7 @@ impl<'a> Execution<'a> {
                         namespaces,
                         attributes: vec![],
                     },
+                    base_uri.clone(),
                 )?;
                 self.output_stack.push(id);
                 for set in attribute_sets {
@@ -3623,40 +3638,57 @@ impl<'a> Execution<'a> {
                     .source
                     .logical_root_for(node)
                     .ok_or_else(|| Error::Dynamic("numbering node has no logical root".into()))?;
-                let ids = self
-                    .evaluator
-                    .source
-                    .subtree_in_document_order(logical_root);
-                for id in ids {
-                    let candidate = SourceNode::Node(id);
-                    if from(self, &candidate)? {
-                        count = 0;
-                    } else if matches(self, &candidate)? {
-                        count += 1;
-                    }
-                    if &candidate == node {
-                        return Ok((count > 0).then_some(count as f64).into_iter().collect());
-                    }
-                    let is_current_owner = matches!(
-                        node,
-                        SourceNode::Attribute { owner, .. } | SourceNode::Namespace { owner, .. }
-                            if *owner == id
-                    );
-                    if is_current_owner {
-                        // XSLT 1.0 section 7.7 excludes preceding attribute and namespace nodes;
-                        // only the current non-ordinary node joins preceding/ancestor-or-self.
-                        // https://www.w3.org/TR/1999/REC-xslt-19991116#number
-                        if from(self, node)? {
+                let node_bytes = std::mem::size_of::<NodeId>();
+                let mut traversal_bytes = 0usize;
+                let result = (|| {
+                    self.meter.charge(BudgetKind::OwnedBytes, node_bytes)?;
+                    traversal_bytes = node_bytes;
+                    let mut pending = Vec::with_capacity(1);
+                    pending.push(logical_root);
+                    while let Some(id) = pending.pop() {
+                        if let Some(source) = self.evaluator.source.node(id) {
+                            let required = pending.len().saturating_add(source.children.len());
+                            if required > pending.capacity() {
+                                let growth = required - pending.capacity();
+                                let growth_bytes = growth.saturating_mul(node_bytes);
+                                self.meter.charge(BudgetKind::OwnedBytes, growth_bytes)?;
+                                traversal_bytes = traversal_bytes.saturating_add(growth_bytes);
+                                pending.reserve_exact(source.children.len());
+                            }
+                            pending.extend(source.children.iter().rev().copied());
+                        }
+                        let candidate = SourceNode::Node(id);
+                        if from(self, &candidate)? {
                             count = 0;
-                        } else if matches(self, node)? {
+                        } else if matches(self, &candidate)? {
                             count += 1;
                         }
-                        return Ok((count > 0).then_some(count as f64).into_iter().collect());
+                        if &candidate == node {
+                            return Ok((count > 0).then_some(count as f64).into_iter().collect());
+                        }
+                        let is_current_owner = matches!(
+                            node,
+                            SourceNode::Attribute { owner, .. } | SourceNode::Namespace { owner, .. }
+                                if *owner == id
+                        );
+                        if is_current_owner {
+                            // XSLT 1.0 section 7.7 excludes preceding attribute and namespace nodes;
+                            // only the current non-ordinary node joins preceding/ancestor-or-self.
+                            // https://www.w3.org/TR/1999/REC-xslt-19991116#number
+                            if from(self, node)? {
+                                count = 0;
+                            } else if matches(self, node)? {
+                                count += 1;
+                            }
+                            return Ok((count > 0).then_some(count as f64).into_iter().collect());
+                        }
                     }
-                }
-                Err(Error::Dynamic(
-                    "numbering node is outside its logical document".into(),
-                ))
+                    Err(Error::Dynamic(
+                        "numbering node is outside its logical document".into(),
+                    ))
+                })();
+                self.meter.release_owned_bytes(traversal_bytes);
+                result
             }
             level => Err(Error::Static(format!(
                 "unsupported xsl:number level {level}"

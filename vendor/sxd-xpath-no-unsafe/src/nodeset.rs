@@ -503,6 +503,14 @@ fn visit_descendant_text_metered(
                         .saturating_mul(std::mem::size_of::<Node<'_>>()),
                 )?;
                 children.reverse();
+                let required = pending.len().saturating_add(children.len());
+                if required > pending.capacity() {
+                    let additional = required - pending.capacity();
+                    context.reserve_temporary_allocation(
+                        additional.saturating_mul(std::mem::size_of::<Node<'_>>()),
+                    )?;
+                    pending.reserve_exact(children.len());
+                }
                 pending.extend(children);
             }
             Node::Text(text) if !visit(sxd_document_no_unsafe::as_str!(text.text())) => {

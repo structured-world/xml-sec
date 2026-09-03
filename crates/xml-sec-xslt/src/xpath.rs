@@ -3957,10 +3957,15 @@ fn absolute_path_can_start(output: &str, previous: Option<char>) -> bool {
     let trimmed = output.trim_end_matches(crate::lexical::is_xml_whitespace);
     ["and", "or", "div", "mod"].iter().any(|operator| {
         trimmed.strip_suffix(operator).is_some_and(|prefix| {
-            prefix
-                .chars()
-                .next_back()
-                .is_none_or(|character| !is_xpath_name_character(character))
+            let Some(boundary) = prefix.chars().next_back() else {
+                return false;
+            };
+            if crate::lexical::is_xml_whitespace(boundary) {
+                return !prefix
+                    .trim_end_matches(crate::lexical::is_xml_whitespace)
+                    .is_empty();
+            }
+            boundary.is_ascii_digit() || matches!(boundary, ')' | ']' | '\'' | '"')
         })
     })
 }
@@ -6677,6 +6682,17 @@ mod tests {
     use super::*;
     use crate::ExecutionBudget;
     use sxd_xpath_no_unsafe::function::Function;
+
+    #[test]
+    fn absolute_path_rewrite_distinguishes_div_name_tests_from_operators() {
+        for path in ["div/span", "root/div/span"] {
+            assert_eq!(rewrite_absolute_paths_for_validation(path), path);
+        }
+        assert_ne!(
+            rewrite_absolute_paths_for_validation("1 div /root"),
+            "1 div /root"
+        );
+    }
 
     #[test]
     fn variable_overlay_borrows_existing_payloads() {

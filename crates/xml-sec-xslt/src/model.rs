@@ -964,19 +964,6 @@ impl Document {
             .map(|(index, node)| (NodeId(index), node))
     }
 
-    pub(crate) fn subtree_in_document_order(&self, root: NodeId) -> Vec<NodeId> {
-        let mut ordered = Vec::new();
-        let mut pending = vec![root];
-        while let Some(id) = pending.pop() {
-            let Some(node) = self.node(id) else {
-                continue;
-            };
-            ordered.push(id);
-            pending.extend(node.children.iter().rev().copied());
-        }
-        ordered
-    }
-
     pub(crate) fn push(
         &mut self,
         parent: NodeId,

@@ -273,7 +273,9 @@ fn reserve_allocation(
 ) -> Result<(), function::Error> {
     let actual = budget.used.get().saturating_add(bytes);
     if budget.limit.is_some_and(|limit| actual > limit) {
-        budget.exceeded.set(Some(actual));
+        if budget.exceeded.get().is_none() {
+            budget.exceeded.set(Some(actual));
+        }
         return Err(function::Error::Other {
             what: "XPath string allocation budget exceeded".into(),
         });
@@ -299,5 +301,20 @@ impl<'c, 'd> Iterator for EvaluationNodesetIter<'c, 'd> {
             size: self.size,
             ..self.parent
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Context;
+
+    #[test]
+    fn allocation_budget_preserves_first_exceeded_total() {
+        let mut context = Context::new();
+        context.set_string_allocation_limit(4);
+
+        assert!(context.reserve_temporary_allocation(5).is_err());
+        assert!(context.reserve_temporary_allocation(9).is_err());
+        assert_eq!(context.string_allocation_exceeded(), Some(5));
     }
 }
