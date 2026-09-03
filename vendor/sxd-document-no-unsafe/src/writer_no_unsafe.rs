@@ -155,14 +155,14 @@ impl PrefixMapping {
         let name = element.name();
         let qn = name.get();
         if let Some(uri) = qn.namespace_uri {
-            self.generate_prefix(uri);
+            self.generate_prefix(uri, true);
         }
 
         for attribute in attributes.iter() {
             let name = attribute.name();
             let qn = name.get();
             if let Some(uri) = qn.namespace_uri {
-                self.generate_prefix(uri);
+                self.generate_prefix(uri, false);
             }
         }
     }
@@ -187,8 +187,8 @@ impl PrefixMapping {
         current_scope.define_prefix(prefix.to_owned(), namespace_uri);
     }
 
-    fn generate_prefix(&mut self, namespace_uri: &str) {
-        if Some(namespace_uri) == self.active_default_namespace_uri() {
+    fn generate_prefix(&mut self, namespace_uri: &str, allow_default: bool) {
+        if allow_default && Some(namespace_uri) == self.active_default_namespace_uri() {
             return;
         }
 
@@ -601,6 +601,22 @@ mod test {
         d.root().append_child(e);
         let xml = format_xml(&d);
         assert_eq!(xml, "<?xml version='1.0'?><local-part xmlns='namespace'/>");
+    }
+
+    #[test]
+    fn attribute_matching_default_namespace_receives_a_prefix() {
+        let p = Package::new();
+        let d = p.as_document();
+        let e = d.create_element(("namespace", "local-part"));
+        e.set_default_namespace_uri(Some("namespace"));
+        e.set_attribute_value(("namespace", "a"), "b");
+        d.root().append_child(e);
+
+        let xml = format_xml(&d);
+        assert_eq!(
+            xml,
+            "<?xml version='1.0'?><local-part autons0:a='b' xmlns='namespace' xmlns:autons0='namespace'/>"
+        );
     }
 
     #[test]

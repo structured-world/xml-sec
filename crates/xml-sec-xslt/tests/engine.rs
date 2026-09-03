@@ -2140,6 +2140,17 @@ fn built_in_template_rule_ignores_namespace_nodes() {
 }
 
 #[test]
+fn namespace_node_name_returns_its_prefix() {
+    // XPath 1.0 section 4.1 defines name() for a namespace node as its namespace prefix.
+    // https://www.w3.org/TR/1999/REC-xpath-19991116/#function-name
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:for-each select="/*/namespace::*[name()='p']"><xsl:value-of select="concat('&lt;',name(.),'&gt;')"/></xsl:for-each></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, r#"<root xmlns:p="urn:visible"/>"#),
+        "<p>"
+    );
+}
+
+#[test]
 fn stylesheet_functions_use_each_predicate_candidate_context() {
     // XPath 1.0 section 2.4 evaluates predicates with each candidate as the context node; a
     // stylesheet-defined function call inside that predicate must observe the same dynamic node.
@@ -7305,6 +7316,17 @@ fn explicit_axis_node_tests_keep_their_default_priority() {
     assert_eq!(
         execute(stylesheet, "<root><foo id=\"x\"/></root>"),
         "element-specific|attribute-specific|"
+    );
+}
+
+#[test]
+fn complex_namespace_wildcard_patterns_use_complex_default_priority() {
+    // XSLT 1.0 section 5.5 assigns 0.5 to patterns other than the listed single-step forms.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#conflict
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:p="urn:test"><xsl:output method="text"/><xsl:template match="/"><xsl:apply-templates select="foo/p:bar"/></xsl:template><xsl:template match="foo/p:*">path</xsl:template><xsl:template match="p:bar">name</xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, r#"<foo xmlns:p="urn:test"><p:bar/></foo>"#),
+        "path"
     );
 }
 

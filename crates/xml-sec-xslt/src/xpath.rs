@@ -2510,17 +2510,18 @@ impl Evaluator {
         matches!(node, SourceNode::Node(id) if self.source.node(*id).is_some_and(|node| matches!(node.kind, NodeKind::Element { .. })))
     }
 
-    pub(crate) fn qualified_name(&self, node: &SourceNode) -> String {
-        let mut bytes = 0usize;
-        self.visit_qualified_name(node, |segment| {
-            bytes = bytes.saturating_add(segment.len());
-        });
-        let mut output = String::with_capacity(bytes);
-        self.visit_qualified_name(node, |segment| output.push_str(segment));
-        output
-    }
-
     pub(crate) fn visit_qualified_name(&self, node: &SourceNode, mut visit: impl FnMut(&str)) {
+        if let SourceNode::Namespace { owner, index } = node {
+            if let Some(prefix) = self.source.node(*owner).and_then(|node| match &node.kind {
+                NodeKind::Element { namespaces, .. } => namespaces
+                    .get(*index)
+                    .and_then(|namespace| namespace.prefix.as_deref()),
+                _ => None,
+            }) {
+                visit(prefix);
+            }
+            return;
+        }
         let named = match node {
             SourceNode::Node(id) => self.source.node(*id).and_then(|node| match &node.kind {
                 NodeKind::Element { name, prefix, .. } => Some((name, prefix.as_deref())),

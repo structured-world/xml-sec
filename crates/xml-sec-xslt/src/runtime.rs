@@ -2368,16 +2368,16 @@ impl<'a> Execution<'a> {
                 return Ok(Some(XPathValue::String(output)));
             }
             "concat('<',name(.),'>')" => {
-                return Ok(Some(XPathValue::String(format!(
-                    "<{}>",
-                    self.evaluator.qualified_name(node)
-                ))));
+                return self
+                    .formatted_qualified_name(node, "<", ">")
+                    .map(XPathValue::String)
+                    .map(Some);
             }
             "concat('</',name(.),'>')" => {
-                return Ok(Some(XPathValue::String(format!(
-                    "</{}>",
-                    self.evaluator.qualified_name(node)
-                ))));
+                return self
+                    .formatted_qualified_name(node, "</", ">")
+                    .map(XPathValue::String)
+                    .map(Some);
             }
             _ => {}
         }
@@ -2488,6 +2488,36 @@ impl<'a> Execution<'a> {
             return Ok(Some(XPathValue::Boolean(value.boolean())));
         }
         Ok(None)
+    }
+
+    fn formatted_qualified_name(
+        &self,
+        node: &SourceNode,
+        opening: &str,
+        closing: &str,
+    ) -> Result<String> {
+        let mut name_bytes = 0usize;
+        self.evaluator.visit_qualified_name(node, |segment| {
+            debug_assert!(name_bytes.checked_add(segment.len()).is_some());
+            name_bytes += segment.len();
+        });
+        debug_assert!(
+            opening
+                .len()
+                .checked_add(name_bytes)
+                .and_then(|bytes| bytes.checked_add(closing.len()))
+                .is_some()
+        );
+        let output_bytes = opening.len() + name_bytes + closing.len();
+        self.meter
+            .check_additional(BudgetKind::OwnedBytes, output_bytes)?;
+
+        let mut output = String::with_capacity(output_bytes);
+        output.push_str(opening);
+        self.evaluator
+            .visit_qualified_name(node, |segment| output.push_str(segment));
+        output.push_str(closing);
+        Ok(output)
     }
 
     fn variable_value(&self, lexical: &str, namespaces: &[(String, String)]) -> Result<&Value> {

@@ -1072,6 +1072,7 @@ impl Pattern {
             .strip_prefix("child::")
             .or_else(|| normalized.strip_prefix("attribute::"))
             .unwrap_or(&normalized);
+        let single_step = !value.contains(['/', '[', '|', '(', ')']);
         if matches!(value, "*" | "@*")
             || matches!(
                 value,
@@ -1079,9 +1080,12 @@ impl Pattern {
             )
         {
             -0.5
-        } else if value.ends_with(":*") {
+        // XSLT 1.0 section 5.5 assigns -0.25 only to a single NCName:* StepPattern;
+        // a LocationPath containing that step has the complex-pattern priority 0.5.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#conflict
+        } else if single_step && value.ends_with(":*") {
             -0.25
-        } else if !value.contains(['/', '[', '|', '(', ')'])
+        } else if single_step
             || value
                 .strip_prefix("processing-instruction(")
                 .and_then(|value| value.strip_suffix(')'))

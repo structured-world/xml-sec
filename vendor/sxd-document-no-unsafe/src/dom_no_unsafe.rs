@@ -459,7 +459,7 @@ impl<'d> Element<'d> {
             .remove_attribute(self.document.storage, self.node, name);
     }
 
-    pub fn set_text(&self, text: &str) -> Text<'_> {
+    pub fn set_text(&self, text: &str) -> Text<'d> {
         let text = self.document.create_text(text);
         self.clear_children();
         self.append_child(text);
@@ -827,6 +827,13 @@ mod test {
     macro_rules! assert_qname_eq(
         ($l:expr, $r:expr) => (assert_eq!($l.get(), Into::<QName<'_>>::into($r)));
     );
+
+    fn set_text_with_document_lifetime<'d>(
+        element: super::Element<'d>,
+        value: &str,
+    ) -> super::Text<'d> {
+        element.set_text(value)
+    }
 
     #[test]
     fn the_root_belongs_to_a_document() {
@@ -1294,7 +1301,7 @@ mod test {
         let doc = package.as_document();
         let sentence = doc.create_element("sentence");
         let quote = "Now is the winter of our discontent.";
-        let text = sentence.set_text(quote);
+        let text = set_text_with_document_lifetime(sentence, quote);
         let children = sentence.children();
         assert_eq!(1, children.len());
         assert_eq!(children[0], ChildOfElement::Text(text));

@@ -33,7 +33,7 @@ where
         match tail.find(&self.chars) {
             Some(start) => {
                 let start = self.start + start;
-                let end = start + 1; // Super dangerous! Assume we are only one byte long
+                let end = start + self.haystack[start..].chars().next()?.len_utf8();
                 if self.start == start {
                     let s = &self.haystack[start..end];
                     self.start = end;
@@ -97,5 +97,14 @@ mod test {
         let delims = |b| b == ',' || b == ';';
         let items: Vec<_> = ",;".split_keeping_delimiter(delims).collect();
         assert_eq!(&items, &[Delimiter(","), Delimiter(";")]);
+    }
+
+    #[test]
+    fn split_with_multibyte_delimiter_keeps_utf8_boundaries() {
+        use super::SplitType::*;
+        let items: Vec<_> = "alphaébeta"
+            .split_keeping_delimiter(|character| character == 'é')
+            .collect();
+        assert_eq!(&items, &[Match("alpha"), Delimiter("é"), Match("beta")]);
     }
 }
