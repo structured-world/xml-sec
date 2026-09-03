@@ -518,6 +518,75 @@ fn copied_namespaces_consume_result_node_budget() {
 }
 
 #[test]
+fn copied_elements_charge_embedded_attribute_and_namespace_nodes() {
+    // XPath 1.0 sections 5.2 and 5.4 model attributes and namespaces as nodes even though the
+    // result arena stores them inside an element. Copying an element must charge the element, its
+    // attribute, and both explicit and implicit namespace nodes before cloning retained data.
+    // https://www.w3.org/TR/1999/REC-xpath-19991116/#data-model
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:copy-of select="/root"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse(r#"<root xmlns:p="urn:p" id="1"/>"#, None).expect("source parses");
+    let mut budget = execution_budget(1024);
+    budget.result_nodes = 2;
+    let error = stylesheet
+        .execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect_err("embedded attributes and namespaces exceed two result nodes");
+    assert!(
+        matches!(
+            &error,
+            Error::Budget {
+                kind: BudgetKind::ResultNodes,
+                limit: 2,
+                actual: 4,
+            }
+        ),
+        "unexpected rejection: {error:?}"
+    );
+}
+
+#[test]
+fn generated_attribute_namespaces_consume_result_node_budget() {
+    // Namespace fixup creates a real XPath namespace node in addition to the result element and
+    // attribute, so the generated binding must consume the shared result-node budget.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><root><xsl:attribute name="p:id" namespace="urn:p">1</xsl:attribute></root></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse("<source/>", None).expect("source parses");
+    let mut budget = execution_budget(1024);
+    budget.result_nodes = 2;
+    let error = stylesheet
+        .execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect_err("element, generated namespace, and attribute exceed two result nodes");
+    assert!(matches!(
+        error,
+        Error::Budget {
+            kind: BudgetKind::ResultNodes,
+            limit: 2,
+            actual: 3,
+        }
+    ));
+}
+
+#[test]
 fn level_any_numbering_resets_at_preceding_non_ancestor_boundary() {
     // The `from` boundary for level-any numbering is the most recent matching node in document
     // order, not only a matching ancestor of the node being numbered.
@@ -4450,6 +4519,37 @@ fn xinclude_rejects_multiple_fallback_children() {
         error,
         Error::Xml(message) if message.contains("at most one xi:fallback")
     ));
+}
+
+#[test]
+fn xinclude_rejects_fallback_outside_include_before_resolution() {
+    // XInclude 1.0 section 3.1 permits xi:fallback only as a direct child of xi:include; a
+    // malformed source must fail before any external capability is invoked.
+    // https://www.w3.org/TR/xinclude/#syntax
+    let resolver = Arc::new(CountingResolver::default());
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#,
+    );
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:fallback><xi:include href="never.xml"/></xi:fallback></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("source parses before XInclude validation");
+    let error = stylesheet
+        .execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            resolver.clone(),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        )
+        .expect_err("standalone xi:fallback is invalid");
+    assert!(matches!(error, Error::Xml(message) if message.contains("direct child")));
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 0);
 }
 
 #[test]

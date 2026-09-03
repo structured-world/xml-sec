@@ -64,7 +64,8 @@ pub(crate) fn resolve_uri_reference(base: Option<&str>, reference: &str) -> Resu
         if reference.starts_with('/') {
             return Ok(reference.to_owned());
         }
-        if let Some((directory, _)) = base.rsplit_once('/') {
+        let base_path = base.split(['?', '#']).next().unwrap_or(base);
+        if let Some((directory, _)) = base_path.rsplit_once('/') {
             return Ok(format!("{directory}/{reference}"));
         }
     }
@@ -139,6 +140,15 @@ mod tests {
             resolve_uri_reference(Some("main.xsl?old=yes#part"), "#new")
                 .expect("fragment replacement succeeds"),
             "main.xsl?old=yes#new"
+        );
+    }
+
+    #[test]
+    fn path_like_resolution_ignores_query_and_fragment_slashes() {
+        assert_eq!(
+            resolve_uri_reference(Some("styles/main.xsl?mirror=/old/file#part"), "sub/")
+                .expect("path resolution succeeds"),
+            "styles/sub/"
         );
     }
 

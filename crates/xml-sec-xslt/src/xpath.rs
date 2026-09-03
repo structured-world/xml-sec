@@ -3080,6 +3080,17 @@ fn expand_xinclude_document(
             NodeKind::Element { name, .. }
                 if name.namespace.as_deref() == Some(XINCLUDE_NS) && name.local == "include"
         );
+        if matches!(
+            &node.kind,
+            NodeKind::Element { name, .. }
+                if name.namespace.as_deref() == Some(XINCLUDE_NS) && name.local == "fallback"
+        ) {
+            // XInclude 1.0 section 3.1 permits xi:fallback only as a direct xi:include child.
+            // https://www.w3.org/TR/xinclude/#syntax
+            return Err(Error::Xml(
+                "xi:fallback must be a direct child of xi:include".into(),
+            ));
+        }
         if !is_include {
             let Some(target) = output.append_node_from(target_parent, node) else {
                 continue;

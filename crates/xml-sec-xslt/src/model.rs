@@ -1746,6 +1746,7 @@ fn internal_general_entities<'a>(
             }
         }
     };
+    validate_attribute_default_entities(&declarations)?;
     if !changed {
         return Ok((Cow::Borrowed(xml), declarations));
     }
@@ -1758,6 +1759,37 @@ fn internal_general_entities<'a>(
     expanded_xml.push_str(expanded_subset.as_ref());
     expanded_xml.push_str(&xml[subset_end..]);
     Ok((Cow::Owned(expanded_xml), declarations))
+}
+
+fn validate_attribute_default_entities(declarations: &InternalEntityDeclarations) -> Result<()> {
+    for declaration in declarations.attributes.values().flatten() {
+        let Some(default) = declaration.default.as_deref() else {
+            continue;
+        };
+        let mut cursor = 0usize;
+        while let Some(offset) = default.as_bytes()[cursor..]
+            .iter()
+            .position(|byte| *byte == b'&')
+        {
+            let start = cursor + offset;
+            let (name, consumed) =
+                general_entity_reference(&default[start..]).ok_or_else(|| {
+                    Error::Xml("ATTLIST default value has an invalid reference".into())
+                })?;
+            if !name.starts_with('#')
+                && !matches!(name, "amp" | "apos" | "gt" | "lt" | "quot")
+                && !declarations.general.contains_key(name)
+            {
+                // XML 1.0 section 4.1 applies Entity Declared even when a default is unused.
+                // https://www.w3.org/TR/xml/#wf-entdeclared
+                return Err(Error::Xml(format!(
+                    "ATTLIST default references undeclared entity `&{name};`"
+                )));
+            }
+            cursor = start + consumed;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -3722,6 +3754,28 @@ mod parser_boundary_tests {
             None,
         )
         .expect("a declared parameter entity remains valid");
+    }
+
+    #[test]
+    fn undeclared_entities_in_unused_attribute_defaults_are_rejected() {
+        // XML 1.0 section 4.1 applies the Entity Declared well-formedness constraint to entity
+        // references in every declared default, whether or not an element uses that attribute.
+        // https://www.w3.org/TR/xml/#wf-entdeclared
+        let error = Document::parse_iterative(
+            r#"<!DOCTYPE r [<!ATTLIST unused value CDATA "&missing;">]><r/>"#,
+            None,
+        )
+        .expect_err("an undeclared entity in an unused default is not well-formed XML");
+        assert!(
+            matches!(&error, Error::Xml(message) if message.contains("undeclared entity")),
+            "unexpected rejection: {error:?}"
+        );
+
+        Document::parse_iterative(
+            r#"<!DOCTYPE r [<!ENTITY declared "ok"><!ATTLIST unused value CDATA "&declared;">]><r/>"#,
+            None,
+        )
+        .expect("a forward-resolved default entity remains valid");
     }
 
     #[test]

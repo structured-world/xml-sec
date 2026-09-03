@@ -18,6 +18,7 @@ members = [
     "crates/xml-sec-xml-input",
     "crates/xml-sec-xslt",
     "tools/capability-ledger",
+    "vendor/sxd-document-no-unsafe",
     "vendor/sxd-xpath-no-unsafe",
 ]
 resolver = "3"
@@ -28,7 +29,7 @@ resolver = "3"
 [profile.test.package.xml-sec-xslt]
 opt-level = 2
 
-[profile.test.package.sxd-document-no-unsafe]
+[profile.test.package.xml-sec-sxd-document]
 opt-level = 2
 
 [profile.test.package.xml-sec-sxd-xpath]
@@ -80,7 +81,7 @@ signature = { version = "3", optional = true }
 subtle = { version = "2", optional = true }
 getrandom = { version = "0.4", features = ["sys_rng"], optional = true }
 zeroize = { version = "1", optional = true }
-sxd-document-no-unsafe = { version = "0.4.1", default-features = false, features = ["no-unsafe"], optional = true }
+sxd-document-no-unsafe = { package = "xml-sec-sxd-document", version = "0.1.0", path = "vendor/sxd-document-no-unsafe", default-features = false, features = ["no-unsafe"], optional = true }
 sxd-xpath-no-unsafe = { package = "xml-sec-sxd-xpath", version = "0.1.0", path = "vendor/sxd-xpath-no-unsafe", default-features = false, features = ["no-unsafe"], optional = true }
 aes = { version = "0.9.2", optional = true }
 aes-gcm = { version = "0.11.1", optional = true }

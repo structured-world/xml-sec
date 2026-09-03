@@ -220,6 +220,15 @@ impl<'d> Node<'d> {
         }
     }
 
+    fn children_len(&self) -> usize {
+        use self::Node::*;
+        match self {
+            Root(node) => node.children_len(),
+            Element(node) => node.children_len(),
+            Attribute(_) | Text(_) | Comment(_) | ProcessingInstruction(_) | Namespace(_) => 0,
+        }
+    }
+
     /// Returns the nodes with the same parent that occur before this node.
     pub fn preceding_siblings(&self) -> Vec<Node<'d>> {
         use self::Node::*;
@@ -486,22 +495,20 @@ fn visit_descendant_text_metered(
     context: &crate::context::Evaluation<'_, '_>,
     mut visit: impl FnMut(&str) -> bool,
 ) -> Result<bool, crate::function::Error> {
-    let mut pending = node.children();
     context.reserve_temporary_allocation(
-        pending
-            .capacity()
+        node.children_len()
             .saturating_mul(std::mem::size_of::<Node<'_>>()),
     )?;
+    let mut pending = node.children();
     pending.reverse();
     while let Some(node) = pending.pop() {
         match &node {
             Node::Element(_) => {
-                let mut children = node.children();
                 context.reserve_temporary_allocation(
-                    children
-                        .capacity()
+                    node.children_len()
                         .saturating_mul(std::mem::size_of::<Node<'_>>()),
                 )?;
+                let mut children = node.children();
                 children.reverse();
                 let required = pending.len().saturating_add(children.len());
                 if required > pending.capacity() {
@@ -1014,7 +1021,8 @@ mod test {
     #[test]
     fn wide_empty_string_value_traversal_obeys_the_allocation_budget() {
         // Empty descendants contribute no output bytes, but traversal still needs workspace for
-        // their node handles; that workspace must cross the evaluator's allocation gate.
+        // their node handles. The allocation-free child count must reject this at the evaluator
+        // gate before `children()` materializes the wide child-handle vector.
         let package = Package::new();
         let doc = package.as_document();
         let root = doc.create_element("root");
@@ -1030,6 +1038,10 @@ mod test {
             into_node(root)
                 .string_value_with_context(&evaluation)
                 .is_err()
+        );
+        assert_eq!(
+            context.string_allocation_exceeded(),
+            Some(1_024 * std::mem::size_of::<Node<'_>>())
         );
     }
 

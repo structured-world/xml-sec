@@ -549,15 +549,12 @@ impl<'a> Execution<'a> {
                 name.local
             )));
         }
-        let declarations = self
-            .stylesheet
-            .keys
+        let declarations = Arc::clone(&self.stylesheet.keys);
+        let variables = HashMap::new();
+        for declaration in declarations
             .iter()
             .filter(|declaration| &declaration.name == name)
-            .cloned()
-            .collect::<Vec<_>>();
-        let variables = HashMap::new();
-        for declaration in declarations {
+        {
             let mut pending = Vec::new();
             let mut pending_reservation = 0usize;
             reserve_temporary_vec_slot(&mut pending, &mut self.meter, &mut pending_reservation)?;
@@ -593,10 +590,10 @@ impl<'a> Execution<'a> {
                         )?;
                         pending.push(child);
                     }
-                    self.append_key_values(&declaration, SourceNode::Node(id), &variables)?;
+                    self.append_key_values(declaration, SourceNode::Node(id), &variables)?;
                     for index in 0..attribute_count {
                         self.append_key_values(
-                            &declaration,
+                            declaration,
                             SourceNode::Attribute { owner: id, index },
                             &variables,
                         )?;
@@ -3053,6 +3050,16 @@ impl<'a> Execution<'a> {
             }
             return Ok(());
         }
+        let clone_bytes = node_kind_owned_bytes(&source.kind)
+            .saturating_add(source.base_uri.as_deref().map_or(0, str::len));
+        self.result
+            .reserve_metered_push_containers(parent, &mut self.meter)?;
+        self.meter.check_additional(
+            BudgetKind::ResultNodes,
+            1usize.saturating_add(node_kind_embedded_nodes(&source.kind)),
+        )?;
+        self.meter
+            .check_additional(BudgetKind::OwnedBytes, clone_bytes)?;
         let target =
             self.push_node_with_base(parent, source.kind.clone(), source.base_uri.clone())?;
         for child in &source.children {
@@ -3086,7 +3093,10 @@ impl<'a> Execution<'a> {
                     .saturating_add(source.base_uri.as_deref().map_or(0, str::len));
                 self.result
                     .reserve_metered_push_containers(parent, &mut self.meter)?;
-                self.meter.check_additional(BudgetKind::ResultNodes, 1)?;
+                self.meter.check_additional(
+                    BudgetKind::ResultNodes,
+                    1usize.saturating_add(node_kind_embedded_nodes(&source.kind)),
+                )?;
                 self.meter
                     .check_additional(BudgetKind::OwnedBytes, clone_bytes)?;
                 let kind = source.kind.clone();
@@ -3230,7 +3240,10 @@ impl<'a> Execution<'a> {
             BudgetKind::OwnedBytes,
             base_uri.as_deref().map_or(0, str::len),
         )?;
-        self.meter.charge(BudgetKind::ResultNodes, 1)?;
+        self.meter.charge(
+            BudgetKind::ResultNodes,
+            1usize.saturating_add(node_kind_embedded_nodes(&kind)),
+        )?;
         Ok(self.result.push(parent, kind, base_uri))
     }
     fn append_text(&mut self, value: &str, disable: bool) -> Result<()> {
@@ -3355,6 +3368,7 @@ impl<'a> Execution<'a> {
         }
         let generated_namespace = fixup_attribute_namespace(&mut attribute, namespaces);
         if generated_namespace.is_some() {
+            self.meter.charge(BudgetKind::ResultNodes, 1)?;
             reserve_retained_vec_slot(namespaces, &mut self.meter)?;
         }
         let existing_index = attributes
@@ -4698,6 +4712,17 @@ fn node_kind_owned_bytes(kind: &NodeKind) -> usize {
             .saturating_add(namespaces.iter().fold(0usize, |total, namespace| {
                 total.saturating_add(namespace_owned_bytes(namespace))
             })),
+    }
+}
+
+fn node_kind_embedded_nodes(kind: &NodeKind) -> usize {
+    match kind {
+        NodeKind::Element {
+            attributes,
+            namespaces,
+            ..
+        } => attributes.len().saturating_add(namespaces.len()),
+        _ => 0,
     }
 }
 

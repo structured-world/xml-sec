@@ -15,7 +15,7 @@ icu_locale = "2.3.1"
 md-5 = "0.11"
 roxmltree = { version = "0.21", features = ["positions"] }
 sha1 = "0.11"
-sxd-document-no-unsafe = { version = "0.4.1", default-features = false, features = ["no-unsafe"] }
+sxd-document-no-unsafe = { package = "xml-sec-sxd-document", version = "0.1.0", path = "../../vendor/sxd-document-no-unsafe", default-features = false, features = ["no-unsafe"] }
 sxd-xpath-no-unsafe = { package = "xml-sec-sxd-xpath", version = "0.1.0", path = "../../vendor/sxd-xpath-no-unsafe", default-features = false, features = ["no-unsafe"] }
 thiserror = "2"
 time = { version = "0.3.55", features = ["local-offset"] }

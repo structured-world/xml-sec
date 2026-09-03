@@ -52,4 +52,6 @@ version = "0.3.0"
 version = "0.9"
 
 [dependencies.sxd-document-no-unsafe]
-version = "0.4.1"
+package = "xml-sec-sxd-document"
+version = "0.1.0"
+path = "../sxd-document-no-unsafe"
