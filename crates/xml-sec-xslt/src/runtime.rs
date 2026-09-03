@@ -10,8 +10,8 @@ use icu_locale::Locale;
 
 use crate::budget::{Meter, reserve_temporary_vec_slot};
 use crate::compiler::{
-    AttributeValueTemplate, AvtPart, Expression, ExsltFunction, Instruction, NameTest, Sort,
-    Stylesheet, Template, Variable,
+    AttributeValueTemplate, AvtPart, Expression, ExsltFunction, Instruction, InstructionSequence,
+    NameTest, Sort, Stylesheet, Template, Variable,
 };
 use crate::lexical::{is_ncname, is_xml_whitespace, unicode_decimal_value, xpath_string_literal};
 use crate::serializer::{serialize, serialize_fragment};
@@ -393,12 +393,12 @@ enum TemplateTask {
     ForEachBatch {
         nodes: Vec<SourceNode>,
         next: usize,
-        body: Arc<[Instruction]>,
+        body: InstructionSequence,
         depth: usize,
         reserved_owned_bytes: usize,
     },
     Sequence {
-        instructions: Arc<[Instruction]>,
+        instructions: InstructionSequence,
         index: usize,
         node: SourceNode,
         position: usize,
@@ -415,7 +415,7 @@ enum TemplateTask {
 
 fn push_scoped_sequence(
     tasks: &mut Vec<TemplateTask>,
-    instructions: Arc<[Instruction]>,
+    instructions: InstructionSequence,
     node: SourceNode,
     frame: ApplyFrame,
     precedence: Option<usize>,
@@ -950,7 +950,7 @@ impl<'a> Execution<'a> {
                     precedence,
                 } => {
                     self.meter.recursion(depth)?;
-                    let Some(instruction) = instructions.get(index).cloned() else {
+                    let Some(instruction) = instructions.get(index) else {
                         continue;
                     };
                     tasks.push(TemplateTask::Sequence {
@@ -966,18 +966,13 @@ impl<'a> Execution<'a> {
                         Instruction::CallTemplate { name, parameters } => {
                             self.meter.charge(BudgetKind::TemplateApplications, 1)?;
                             let supplied = self.evaluate_with_params(
-                                &parameters,
-                                &node,
-                                position,
-                                size,
-                                depth,
-                                precedence,
+                                parameters, &node, position, size, depth, precedence,
                             )?;
                             let target = self
                                 .stylesheet
                                 .templates
                                 .iter()
-                                .filter(|candidate| candidate.name.as_ref() == Some(&name))
+                                .filter(|candidate| candidate.name.as_ref() == Some(name))
                                 .max_by_key(|candidate| (candidate.precedence, candidate.order))
                                 .cloned()
                                 .ok_or_else(|| {
@@ -1000,17 +995,18 @@ impl<'a> Execution<'a> {
                             sorts,
                             parameters,
                         } => {
-                            let mut nodes = self.select_nodes(&select, &node, position, size)?;
-                            self.sort_nodes(&mut nodes, &sorts, &node, position, size)?;
+                            let mut nodes = self.select_nodes(select, &node, position, size)?;
+                            self.sort_nodes(&mut nodes, sorts, &node, position, size)?;
                             let supplied = Arc::new(self.evaluate_with_params(
-                                &parameters,
-                                &node,
-                                position,
-                                size,
-                                depth,
-                                precedence,
+                                parameters, &node, position, size, depth, precedence,
                             )?);
-                            self.push_apply_batch(&mut tasks, nodes, mode, supplied, depth + 1)?;
+                            self.push_apply_batch(
+                                &mut tasks,
+                                nodes,
+                                mode.clone(),
+                                supplied,
+                                depth + 1,
+                            )?;
                         }
                         Instruction::ApplyImports => {
                             let current_rule_precedence = precedence.ok_or_else(|| {
@@ -1041,9 +1037,9 @@ impl<'a> Execution<'a> {
                         } => {
                             let (name, prefix, result_namespaces) = self
                                 .alias_literal_name_and_namespaces(
-                                    &name,
+                                    name,
                                     prefix.as_deref(),
-                                    &namespaces,
+                                    namespaces,
                                 );
                             let id = self.push_node_with_base(
                                 self.parent(),
@@ -1056,7 +1052,7 @@ impl<'a> Execution<'a> {
                                 base_uri.clone(),
                             )?;
                             self.output_stack.push(id);
-                            for set in &attribute_sets {
+                            for set in attribute_sets {
                                 self.apply_attribute_set(
                                     set,
                                     &node,
@@ -1065,7 +1061,7 @@ impl<'a> Execution<'a> {
                                     &mut Vec::new(),
                                 )?;
                             }
-                            for attribute in &attributes {
+                            for attribute in attributes {
                                 let value =
                                     self.evaluate_avt(&attribute.value, &node, position, size)?;
                                 let (name, prefix) = self.alias_attribute_name(
@@ -1081,7 +1077,7 @@ impl<'a> Execution<'a> {
                             tasks.push(TemplateTask::PopOutput);
                             push_scoped_sequence(
                                 &mut tasks,
-                                children.into(),
+                                Arc::clone(children),
                                 node,
                                 ApplyFrame::new(position, size, depth + 1),
                                 precedence,
@@ -1114,7 +1110,7 @@ impl<'a> Execution<'a> {
                                             },
                                         )?;
                                         self.output_stack.push(target);
-                                        for set in &attribute_sets {
+                                        for set in attribute_sets {
                                             self.apply_attribute_set(
                                                 set,
                                                 &node,
@@ -1126,7 +1122,7 @@ impl<'a> Execution<'a> {
                                         tasks.push(TemplateTask::PopOutput);
                                         push_scoped_sequence(
                                             &mut tasks,
-                                            body.into(),
+                                            Arc::clone(body),
                                             node,
                                             ApplyFrame::new(position, size, depth + 1),
                                             precedence,
@@ -1134,7 +1130,7 @@ impl<'a> Execution<'a> {
                                     }
                                     NodeKind::Root => push_scoped_sequence(
                                         &mut tasks,
-                                        body.into(),
+                                        Arc::clone(body),
                                         node,
                                         ApplyFrame::new(position, size, depth + 1),
                                         precedence,
@@ -1165,15 +1161,20 @@ impl<'a> Execution<'a> {
                             sorts,
                             body,
                         } => {
-                            let mut nodes = self.select_nodes(&select, &node, position, size)?;
-                            self.sort_nodes(&mut nodes, &sorts, &node, position, size)?;
-                            self.push_for_each_batch(&mut tasks, nodes, body.into(), depth + 1)?;
+                            let mut nodes = self.select_nodes(select, &node, position, size)?;
+                            self.sort_nodes(&mut nodes, sorts, &node, position, size)?;
+                            self.push_for_each_batch(
+                                &mut tasks,
+                                nodes,
+                                Arc::clone(body),
+                                depth + 1,
+                            )?;
                         }
                         Instruction::If { test, body } => {
-                            if self.evaluate(&test, &node, position, size)?.boolean() {
+                            if self.evaluate(test, &node, position, size)?.boolean() {
                                 push_scoped_sequence(
                                     &mut tasks,
-                                    body.into(),
+                                    Arc::clone(body),
                                     node,
                                     ApplyFrame::new(position, size, depth + 1),
                                     precedence,
@@ -1186,14 +1187,14 @@ impl<'a> Execution<'a> {
                         } => {
                             let mut selected = otherwise;
                             for (test, body) in branches {
-                                if self.evaluate(&test, &node, position, size)?.boolean() {
+                                if self.evaluate(test, &node, position, size)?.boolean() {
                                     selected = body;
                                     break;
                                 }
                             }
                             push_scoped_sequence(
                                 &mut tasks,
-                                selected.into(),
+                                Arc::clone(selected),
                                 node,
                                 ApplyFrame::new(position, size, depth + 1),
                                 precedence,
@@ -1211,14 +1212,14 @@ impl<'a> Execution<'a> {
                             }
                             push_scoped_sequence(
                                 &mut tasks,
-                                body.into(),
+                                Arc::clone(body),
                                 node,
                                 ApplyFrame::new(position, size, depth + 1),
                                 precedence,
                             );
                         }
                         instruction => self.execute_instruction(
-                            &instruction,
+                            instruction,
                             &node,
                             position,
                             size,
@@ -1351,7 +1352,7 @@ impl<'a> Execution<'a> {
         &mut self,
         tasks: &mut Vec<TemplateTask>,
         nodes: Vec<SourceNode>,
-        body: Arc<[Instruction]>,
+        body: InstructionSequence,
         depth: usize,
     ) -> Result<()> {
         if nodes.is_empty() {
@@ -4602,7 +4603,11 @@ fn normalize_computed_namespace(
     const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
 
     if namespace.as_deref() == Some("") {
-        return Ok((None, None));
+        return if matches!(prefix.as_deref(), Some("xml" | "xmlns")) {
+            Ok((prefix, None))
+        } else {
+            Ok((None, None))
+        };
     }
     if namespace.as_deref() == Some(XMLNS_NS) {
         return Err(Error::Dynamic(format!(
@@ -4613,7 +4618,7 @@ fn normalize_computed_namespace(
         // XSLT permits changing the lexical prefix to construct the requested expanded name.
         return Ok((Some("xml".into()), namespace));
     }
-    if matches!(prefix.as_deref(), Some("xml" | "xmlns")) {
+    if matches!(prefix.as_deref(), Some("xml" | "xmlns")) && namespace.is_some() {
         // Preserve the requested expanded name while letting namespace fixup choose a legal
         // replacement for a reserved lexical prefix.
         return Ok((None, namespace));
@@ -5311,6 +5316,7 @@ mod tests {
 
     use super::{SortKey, append_localized_decimal, apply_whitespace_rules, value_string};
     use crate::budget::Meter;
+    use crate::compiler::Instruction;
     use crate::{
         BudgetKind, CompileBudget, Compiler, Document, Error, ExecutionBudget, NoResolver, Value,
     };
@@ -5398,6 +5404,37 @@ mod tests {
         let literal_minimum = minimum_execution_owned_bytes(&literal, &source);
         let avt_minimum = minimum_execution_owned_bytes(&avt, &source);
         assert!(avt_minimum >= literal_minimum.saturating_add(payload.len() * 2));
+    }
+
+    #[test]
+    fn compiled_nested_instruction_sequences_are_shared() {
+        // Execution tasks may retain a reached sequence, but must never recursively copy its
+        // instruction subtree. A large unreachable branch then costs no execution-time storage.
+        let payload = "x".repeat(64 * 1024);
+        let stylesheet = Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(1 << 20, 4, 32, 2 << 20),
+        )
+        .compile(
+            &format!(
+                r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:if test="false()"><xsl:text>{payload}</xsl:text></xsl:if></xsl:template></xsl:stylesheet>"#
+            ),
+            None,
+        )
+        .expect("stylesheet compiles");
+        let instruction = &stylesheet.templates[0].body[0];
+        let Instruction::If { body, .. } = instruction else {
+            panic!("compiled instruction is xsl:if");
+        };
+        let cloned = instruction.clone();
+        let Instruction::If {
+            body: cloned_body, ..
+        } = cloned
+        else {
+            panic!("cloned instruction remains xsl:if");
+        };
+
+        assert!(Arc::ptr_eq(body, &cloned_body));
     }
 
     #[test]

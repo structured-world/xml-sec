@@ -507,8 +507,7 @@ impl<R: Resolver> Compiler<R> {
                 let body: Arc<[Instruction]> = compile_sequence(
                     children,
                     CompileContext::new(forward, depth, state.budget.recursion_depth, base_uri)?,
-                )?
-                .into();
+                )?;
                 let order = state.next_order();
                 if patterns.is_empty() {
                     state.templates.push(Template {
@@ -687,7 +686,7 @@ pub(crate) struct Template {
     pub precedence: usize,
     pub order: usize,
     pub params: Vec<Variable>,
-    pub body: Arc<[Instruction]>,
+    pub body: InstructionSequence,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct GlobalVariable {
@@ -700,7 +699,7 @@ pub(crate) struct GlobalVariable {
 pub(crate) struct ExsltFunction {
     pub name: ExpandedName,
     pub params: Vec<Variable>,
-    pub body: Vec<Instruction>,
+    pub body: InstructionSequence,
     pub precedence: usize,
     pub order: usize,
 }
@@ -708,7 +707,7 @@ pub(crate) struct ExsltFunction {
 pub(crate) struct Variable {
     pub name: ExpandedName,
     pub select: Option<Expression>,
-    pub content: Vec<Instruction>,
+    pub content: InstructionSequence,
     pub base_uri: Option<String>,
 }
 #[derive(Debug, Clone)]
@@ -739,6 +738,8 @@ pub(crate) struct Sort {
 pub(crate) struct WithParam {
     pub variable: Variable,
 }
+pub(crate) type InstructionSequence = Arc<[Instruction]>;
+
 #[derive(Debug, Clone)]
 pub(crate) enum Instruction {
     Text(String, bool),
@@ -750,7 +751,7 @@ pub(crate) enum Instruction {
         prefix: Option<String>,
         attributes: Vec<LiteralAttribute>,
         namespaces: Vec<Namespace>,
-        children: Vec<Instruction>,
+        children: InstructionSequence,
         attribute_sets: Vec<ExpandedName>,
     },
     ApplyTemplates {
@@ -767,15 +768,15 @@ pub(crate) enum Instruction {
     ForEach {
         select: Expression,
         sorts: Vec<Sort>,
-        body: Vec<Instruction>,
+        body: InstructionSequence,
     },
     If {
         test: Expression,
-        body: Vec<Instruction>,
+        body: InstructionSequence,
     },
     Choose {
-        branches: Vec<(Expression, Vec<Instruction>)>,
-        otherwise: Vec<Instruction>,
+        branches: Vec<(Expression, InstructionSequence)>,
+        otherwise: InstructionSequence,
     },
     ValueOf {
         select: Expression,
@@ -783,7 +784,7 @@ pub(crate) enum Instruction {
     },
     CopyOf(Expression),
     Copy {
-        body: Vec<Instruction>,
+        body: InstructionSequence,
         attribute_sets: Vec<ExpandedName>,
     },
     Element {
@@ -792,40 +793,40 @@ pub(crate) enum Instruction {
         name: AttributeValueTemplate,
         namespace: Option<AttributeValueTemplate>,
         namespaces: Vec<(String, String)>,
-        body: Vec<Instruction>,
+        body: InstructionSequence,
         attribute_sets: Vec<ExpandedName>,
     },
     Attribute {
         name: AttributeValueTemplate,
         namespace: Option<AttributeValueTemplate>,
         namespaces: Vec<(String, String)>,
-        body: Vec<Instruction>,
+        body: InstructionSequence,
     },
-    Comment(Vec<Instruction>),
+    Comment(InstructionSequence),
     Processing {
         name: AttributeValueTemplate,
-        body: Vec<Instruction>,
+        body: InstructionSequence,
     },
     Number(NumberInstruction),
     Variable(Variable),
     Message {
         terminate: bool,
-        body: Vec<Instruction>,
+        body: InstructionSequence,
     },
     SecondaryOutput {
         uri: AttributeValueTemplate,
         properties: Vec<(String, AttributeValueTemplate)>,
-        body: Vec<Instruction>,
+        body: InstructionSequence,
     },
     ExtensionFallback {
         name: String,
         present: bool,
-        body: Vec<Instruction>,
+        body: InstructionSequence,
     },
     CompatibilityComment(String),
     FunctionResult {
         select: Option<Expression>,
-        content: Vec<Instruction>,
+        content: InstructionSequence,
         base_uri: Option<String>,
     },
 }
@@ -873,7 +874,7 @@ pub(crate) struct NamespaceAlias {
 pub(crate) struct AttributeSet {
     pub name: ExpandedName,
     pub uses: Vec<ExpandedName>,
-    pub attributes: Vec<Instruction>,
+    pub attributes: InstructionSequence,
     pub precedence: usize,
     pub order: usize,
 }
@@ -2264,7 +2265,7 @@ fn effective_base_uri(
 fn compile_sequence<'a>(
     nodes: impl Iterator<Item = roxmltree::Node<'a, 'a>>,
     context: CompileContext,
-) -> Result<Vec<Instruction>> {
+) -> Result<InstructionSequence> {
     let mut out = Vec::new();
     let mut follows_function_result = false;
     for node in nodes {
@@ -2287,7 +2288,7 @@ fn compile_sequence<'a>(
             out.push(compile_instruction(node, context.descend()?)?);
         }
     }
-    Ok(out)
+    Ok(out.into())
 }
 
 fn stylesheet_space_is_preserved(node: roxmltree::Node<'_, '_>) -> bool {
@@ -2377,12 +2378,16 @@ fn compile_instruction(
                 .collect::<Vec<_>>();
             for child in &fallback_nodes {
                 validate_instruction_attributes(*child, context.forward)?;
-                fallback.extend(compile_sequence(child.children(), context.descend()?)?);
+                fallback.extend(
+                    compile_sequence(child.children(), context.descend()?)?
+                        .iter()
+                        .cloned(),
+                );
             }
             return Ok(Instruction::ExtensionFallback {
                 name: node.tag_name().name().into(),
                 present: !fallback_nodes.is_empty(),
-                body: fallback,
+                body: fallback.into(),
             });
         }
         return compile_literal_element(node, context);
@@ -2476,7 +2481,7 @@ fn compile_instruction(
             Instruction::ForEach {
                 select: context.expression(required_attr(node, "select")?, node)?,
                 sorts,
-                body,
+                body: body.into(),
             }
         }
         "if" => Instruction::If {
@@ -2485,7 +2490,7 @@ fn compile_instruction(
         },
         "choose" => {
             let mut branches = vec![];
-            let mut otherwise = vec![];
+            let mut otherwise = Arc::from([]);
             let mut saw_otherwise = false;
             for child in node.children() {
                 if child.is_text() {
@@ -2610,12 +2615,16 @@ fn compile_instruction(
                 .filter(|child| child.has_tag_name((XSLT_NS, "fallback")))
                 .collect::<Vec<_>>();
             for child in &fallback_nodes {
-                fallback.extend(compile_sequence(child.children(), context.descend()?)?);
+                fallback.extend(
+                    compile_sequence(child.children(), context.descend()?)?
+                        .iter()
+                        .cloned(),
+                );
             }
             Instruction::ExtensionFallback {
                 name: node.tag_name().name().into(),
                 present: !fallback_nodes.is_empty(),
-                body: fallback,
+                body: fallback.into(),
             }
         }
         unknown => {
@@ -3639,7 +3648,7 @@ impl AttributeSet {
         Ok(Self {
             name: required_qname_attr(node, "name")?,
             uses,
-            attributes,
+            attributes: attributes.into(),
             precedence,
             order,
         })

@@ -890,6 +890,7 @@ impl Document {
         value: String,
     ) -> Result<()> {
         match self.ids.entry((logical_root, value)) {
+            std::collections::hash_map::Entry::Occupied(entry) if *entry.get() == owner => Ok(()),
             std::collections::hash_map::Entry::Occupied(entry) => {
                 Err(Error::Xml(format!("duplicate XML ID `{}`", entry.key().1)))
             }
@@ -3566,6 +3567,33 @@ mod parser_boundary_tests {
                     && root == document.root()
                     && registered_owner == owner)
         );
+    }
+
+    #[test]
+    fn iterative_parser_coalesces_dtd_and_xml_id_registration() {
+        // xml:id 1.0 section 4 gives xml:id ID semantics independently of the DTD. If the DTD
+        // declares that same attribute as ID, both mechanisms identify one attribute rather than
+        // two competing IDs: https://www.w3.org/TR/xml-id/#processing
+        let document = Document::parse_iterative(
+            r#"<!DOCTYPE root [<!ATTLIST item xml:id ID #REQUIRED>]><root><item xml:id="target"/></root>"#,
+            None,
+        )
+        .expect("the same xml:id registration is idempotent");
+
+        assert_eq!(
+            document
+                .ids()
+                .filter(|(value, _, _)| *value == "target")
+                .count(),
+            1
+        );
+
+        let error = Document::parse_iterative(
+            r#"<!DOCTYPE root [<!ATTLIST item xml:id ID #REQUIRED>]><root><item xml:id="same"/><item xml:id="same"/></root>"#,
+            None,
+        )
+        .expect_err("the same ID on distinct owners remains invalid");
+        assert!(error.to_string().contains("duplicate XML ID"));
     }
 
     #[test]

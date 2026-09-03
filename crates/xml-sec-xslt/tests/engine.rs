@@ -7026,6 +7026,34 @@ fn computed_names_enforce_reserved_prefix_namespace_pairs() {
 }
 
 #[test]
+fn computed_names_reject_unbound_xmlns_prefix() {
+    // XSLT 1.0 sections 7.1.2 and 7.1.3 require a QName prefix to resolve through the namespace
+    // declarations in scope when no namespace AVT supplies the expanded name.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#creating-elements-with-xsl-element
+    for instruction in [
+        r#"<xsl:element name="xmlns:item"/>"#,
+        r#"<out><xsl:attribute name="xmlns:item">value</xsl:attribute></out>"#,
+    ] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/">{instruction}</xsl:template></xsl:stylesheet>"#
+        );
+        let error = compile(&stylesheet)
+            .execute(
+                &Document::parse("<source/>", None).expect("source parses"),
+                &Parameters::new(),
+                Arc::new(NoResolver),
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            )
+            .expect_err("an unbound reserved prefix must not be discarded");
+        assert!(matches!(error, Error::Dynamic(message) if message.contains("xmlns")));
+    }
+}
+
+#[test]
 fn deep_streaming_parser_rejects_duplicate_expanded_attributes() {
     // Namespace aliases cannot bypass XML's uniqueness rule in the depth fallback parser.
     let xml = format!(
