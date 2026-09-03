@@ -11,10 +11,6 @@ use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::xml::dom::{Document, Node, NodeId, ParseError, ParsingOptions, XmlBackend};
-use quick_xml::{
-    Reader as QuickXmlReader,
-    events::{BytesStart as QuickXmlBytesStart, Event as QuickXmlEvent},
-};
 use self_cell::self_cell;
 
 use crate::IdAttributeRegistration;
@@ -407,6 +403,7 @@ struct ParsedDocument<'input> {
     document: Document<'input>,
     indexes: DocumentIndexes,
     node_count: usize,
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     max_depth: usize,
 }
 
@@ -435,6 +432,9 @@ pub enum XmlDocumentError {
         /// Actual byte length.
         actual: usize,
     },
+    /// External XML bytes could not be decoded under the XML encoding contract.
+    #[error("XML encoding error: {0}")]
+    Encoding(#[from] xml_sec_xml_input::Error),
     /// The input exceeds the active XML element nesting limit.
     #[error("XML document exceeds the maximum element depth of {maximum}: {actual}")]
     DocumentTooDeep {
@@ -561,6 +561,24 @@ impl XmlDocument {
         Self::parse_with_settings(xml, settings)
     }
 
+    /// Decode, parse, and own XML bytes using conservative input defaults.
+    ///
+    /// BOMs and XML declarations select the source encoding. Decoding is
+    /// strict and bounded before the normalized UTF-8 document is retained.
+    pub fn parse_bytes(bytes: &[u8]) -> Result<Self, XmlDocumentError> {
+        let settings = DocumentParseSettings::default();
+        Self::parse_with_settings(decode_owned_xml(bytes, settings.max_bytes)?, settings)
+    }
+
+    /// Decode and parse XML bytes with an explicitly selected semantic backend.
+    pub fn parse_bytes_with_backend(
+        bytes: &[u8],
+        backend: XmlBackend,
+    ) -> Result<Self, XmlDocumentError> {
+        let settings = DocumentParseSettings::default().with_backend(backend);
+        Self::parse_with_settings(decode_owned_xml(bytes, settings.max_bytes)?, settings)
+    }
+
     /// Parse and own XML with an explicitly selected compiled parser backend.
     pub fn parse_with_backend(
         xml: impl AsRef<str> + Into<String>,
@@ -589,6 +607,23 @@ impl XmlDocument {
         )
     }
 
+    /// Decode and parse XML bytes under the operation's immutable policy.
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    pub fn parse_bytes_with_policy(
+        bytes: &[u8],
+        policy: &impl XmlDocumentPolicy,
+    ) -> Result<Self, XmlDocumentError> {
+        let resources = policy.resource_policy();
+        resources.validate()?;
+        let budget = XmlParseWorkBudget::from_resources(resources);
+        let xml = decode_owned_xml(bytes, resources.max_xml_document_bytes)?;
+        Self::parse_with_settings_and_optional_budget(
+            xml,
+            DocumentParseSettings::from_policy(policy.xml_input_policy(), resources),
+            Some(&budget),
+        )
+    }
+
     /// Parse and own XML under an operation policy and explicit parser backend.
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     pub fn parse_with_policy_and_backend(
@@ -600,6 +635,25 @@ impl XmlDocument {
         resources.validate()?;
         let budget = XmlParseWorkBudget::from_resources(resources);
         let xml = own_bounded_xml(xml, resources.max_xml_document_bytes)?;
+        Self::parse_with_settings_and_optional_budget(
+            xml,
+            DocumentParseSettings::from_policy(policy.xml_input_policy(), resources)
+                .with_backend(backend),
+            Some(&budget),
+        )
+    }
+
+    /// Decode and parse XML bytes under policy with an explicit semantic backend.
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    pub fn parse_bytes_with_policy_and_backend(
+        bytes: &[u8],
+        policy: &impl XmlDocumentPolicy,
+        backend: XmlBackend,
+    ) -> Result<Self, XmlDocumentError> {
+        let resources = policy.resource_policy();
+        resources.validate()?;
+        let budget = XmlParseWorkBudget::from_resources(resources);
+        let xml = decode_owned_xml(bytes, resources.max_xml_document_bytes)?;
         Self::parse_with_settings_and_optional_budget(
             xml,
             DocumentParseSettings::from_policy(policy.xml_input_policy(), resources)
@@ -1198,8 +1252,8 @@ impl XmlDocument {
         settings: DocumentParseSettings,
         budget: &XmlParseWorkBudget,
     ) -> Result<(), XmlDocumentError> {
-        // SignatureBuilder serializes this fragment with quick-xml. Parsing the
-        // final candidate once validates both the generated child and its
+        // SignatureBuilder emits this fragment through the shared lexical writer.
+        // Parsing the final candidate once validates both the generated child and its
         // document context without a redundant wrapper-document pass.
         self.append_child_inner(
             target,
@@ -1700,6 +1754,7 @@ impl<'a> DocumentView<'a> {
         self.parsed.node_count
     }
 
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     pub(crate) fn max_depth(self) -> usize {
         self.parsed.max_depth
     }
@@ -1986,6 +2041,7 @@ fn build_semantic_cell(
             document,
             indexes,
             node_count: metrics.node_count,
+            #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
             max_depth: metrics.max_depth,
         })
     })
@@ -2037,6 +2093,8 @@ struct DocumentPreflightState {
     in_character_data: bool,
     entity_expansions: u32,
     entity_expansion_work: usize,
+    active_namespace_bindings: HashSet<String>,
+    namespace_scopes: Vec<Vec<(String, bool)>>,
 }
 
 #[derive(Default)]
@@ -2048,6 +2106,35 @@ struct InternalDtd {
 struct InternalAttributeDefault {
     attribute_name: String,
     value: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FragmentContext {
+    Content,
+    Attribute,
+}
+
+enum PreflightEvent {
+    DocType(Option<String>),
+    GeneralRef {
+        name: Option<String>,
+        is_character_reference: bool,
+    },
+    CharacterData {
+        xml_whitespace: bool,
+    },
+    Start {
+        attribute_source: Vec<u8>,
+        namespace_declarations: Vec<NamespaceDeclaration>,
+    },
+    Empty {
+        attribute_source: Vec<u8>,
+        namespace_declarations: Vec<NamespaceDeclaration>,
+    },
+    End,
+    Node,
+    Markup,
+    Done,
 }
 
 fn preflight_xml_fragment(
@@ -2064,12 +2151,6 @@ fn preflight_xml_fragment(
         Entity(String),
     }
 
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum FragmentContext {
-        Content,
-        Attribute,
-    }
-
     struct FragmentFrame {
         source: FragmentSource,
         offset: usize,
@@ -2077,23 +2158,6 @@ fn preflight_xml_fragment(
         context: FragmentContext,
         pending_attribute_source: Vec<u8>,
         pending_attribute_offset: usize,
-    }
-
-    enum PreflightEvent {
-        DocType(Option<String>),
-        GeneralRef {
-            name: Option<String>,
-            is_character_reference: bool,
-        },
-        CharacterData {
-            xml_whitespace: bool,
-        },
-        Start(Vec<u8>),
-        Empty(Vec<u8>),
-        End,
-        Node,
-        Other,
-        Done,
     }
 
     if state.nodes == 0 {
@@ -2120,6 +2184,9 @@ fn preflight_xml_fragment(
                 frame.pending_attribute_offset = frame
                     .pending_attribute_offset
                     .saturating_add(pending.consumed());
+                // `general_references` excludes numeric and the five predefined entities. XML
+                // 1.0 section 4.6 keeps that classification even for normative redeclarations.
+                // https://www.w3.org/TR/xml/#sec-predefined-ent
                 (
                     PreflightEvent::GeneralRef {
                         name: Some(name.to_owned()),
@@ -2139,63 +2206,9 @@ fn preflight_xml_fragment(
                         .expect("active entity replacement remains registered"),
                 };
                 let remaining = &source[frame.offset..];
-                let mut reader = QuickXmlReader::from_str(remaining);
-                // This pass observes lexical events one at a time and deliberately
-                // leaves structural diagnostics to the selected DOM parser.
-                reader.config_mut().check_end_names = false;
-                // A fresh reader has no opening-tag state for an End event at
-                // this slice boundary. Emit it so our manual depth state and all
-                // later events remain visible; the DOM still rejects bad pairs.
-                reader.config_mut().allow_unmatched_ends = true;
-                let event = match reader.read_event() {
-                    Ok(QuickXmlEvent::DocType(doctype)) => PreflightEvent::DocType(
-                        doctype.decode().ok().map(|value| value.into_owned()),
-                    ),
-                    Ok(QuickXmlEvent::GeneralRef(reference)) => {
-                        let name = reference.decode().ok().map(|value| value.into_owned());
-                        let is_character_reference =
-                            reference.resolve_char_ref().ok().flatten().is_some()
-                                || name.as_deref().is_some_and(|name| {
-                                    matches!(name, "amp" | "apos" | "gt" | "lt" | "quot")
-                                });
-                        PreflightEvent::GeneralRef {
-                            name,
-                            is_character_reference,
-                        }
-                    }
-                    Ok(QuickXmlEvent::Text(text)) => PreflightEvent::CharacterData {
-                        xml_whitespace: text
-                            .as_ref()
-                            .iter()
-                            .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n')),
-                    },
-                    Ok(QuickXmlEvent::CData(_)) => PreflightEvent::CharacterData {
-                        xml_whitespace: false,
-                    },
-                    Ok(QuickXmlEvent::Start(element)) => {
-                        let source = if frame.context == FragmentContext::Content {
-                            element_attribute_reference_source(&element, dtd)
-                        } else {
-                            Vec::new()
-                        };
-                        PreflightEvent::Start(source)
-                    }
-                    Ok(QuickXmlEvent::Empty(element)) => {
-                        let source = if frame.context == FragmentContext::Content {
-                            element_attribute_reference_source(&element, dtd)
-                        } else {
-                            Vec::new()
-                        };
-                        PreflightEvent::Empty(source)
-                    }
-                    Ok(QuickXmlEvent::End(_)) => PreflightEvent::End,
-                    Ok(QuickXmlEvent::Comment(_) | QuickXmlEvent::PI(_)) => PreflightEvent::Node,
-                    Ok(QuickXmlEvent::Eof) | Err(_) => PreflightEvent::Done,
-                    Ok(_) => PreflightEvent::Other,
-                };
-                frame.offset = frame.offset.saturating_add(
-                    usize::try_from(reader.buffer_position()).unwrap_or(remaining.len()),
-                );
+                let (event, consumed) =
+                    scan_preflight_event(remaining, frame.context, dtd, state, budget)?;
+                frame.offset = frame.offset.saturating_add(consumed);
                 (event, frame.collect_doctype, frame.context)
             }
         };
@@ -2278,11 +2291,11 @@ fn preflight_xml_fragment(
                 observe_preflight_node(state, settings, false)?;
                 continue;
             }
-            PreflightEvent::Other => {
+            PreflightEvent::Markup => {
                 state.in_character_data = false;
                 continue;
             }
-            PreflightEvent::Start(_) | PreflightEvent::Empty(_) | PreflightEvent::End => {}
+            PreflightEvent::Start { .. } | PreflightEvent::Empty { .. } | PreflightEvent::End => {}
         }
 
         if context == FragmentContext::Attribute {
@@ -2290,12 +2303,18 @@ fn preflight_xml_fragment(
         }
         state.in_character_data = false;
         match event {
-            PreflightEvent::Start(attribute_source) => {
+            PreflightEvent::Start {
+                attribute_source,
+                namespace_declarations,
+            } => {
                 let frame = fragments
                     .last_mut()
                     .expect("active element frame remains registered");
                 frame.pending_attribute_source = attribute_source;
                 frame.pending_attribute_offset = 0;
+                let changes =
+                    apply_preflight_namespace_declarations(state, namespace_declarations)?;
+                state.namespace_scopes.push(changes);
                 observe_preflight_node(state, settings, false)?;
                 state.depth = state.depth.saturating_add(1);
                 if state.depth > settings.depth_limit {
@@ -2305,12 +2324,17 @@ fn preflight_xml_fragment(
                     });
                 }
             }
-            PreflightEvent::Empty(attribute_source) => {
+            PreflightEvent::Empty {
+                attribute_source,
+                namespace_declarations,
+            } => {
                 let frame = fragments
                     .last_mut()
                     .expect("active element frame remains registered");
                 frame.pending_attribute_source = attribute_source;
                 frame.pending_attribute_offset = 0;
+                let changes =
+                    apply_preflight_namespace_declarations(state, namespace_declarations)?;
                 observe_preflight_node(state, settings, false)?;
                 let actual = state.depth.saturating_add(1);
                 if actual > settings.depth_limit {
@@ -2319,21 +2343,336 @@ fn preflight_xml_fragment(
                         actual,
                     });
                 }
+                restore_preflight_namespace_bindings(&mut state.active_namespace_bindings, changes);
             }
-            PreflightEvent::End => state.depth = state.depth.saturating_sub(1),
+            PreflightEvent::End => {
+                state.depth = state.depth.saturating_sub(1);
+                if let Some(changes) = state.namespace_scopes.pop() {
+                    restore_preflight_namespace_bindings(
+                        &mut state.active_namespace_bindings,
+                        changes,
+                    );
+                }
+            }
             _ => unreachable!("non-structural events continue above"),
         }
     }
     Ok(())
 }
 
+fn scan_preflight_event(
+    remaining: &str,
+    context: FragmentContext,
+    dtd: &InternalDtd,
+    state: &mut DocumentPreflightState,
+    budget: Option<&XmlParseWorkBudget>,
+) -> Result<(PreflightEvent, usize), XmlDocumentError> {
+    if remaining.is_empty() {
+        return Ok((PreflightEvent::Done, 0));
+    }
+    if context == FragmentContext::Attribute {
+        let mut references = general_references(remaining.as_bytes());
+        return Ok(references
+            .next()
+            .map_or((PreflightEvent::Done, remaining.len()), |name| {
+                let consumed = references.consumed();
+                (
+                    PreflightEvent::GeneralRef {
+                        is_character_reference: is_character_reference(name),
+                        name: Some(name.to_owned()),
+                    },
+                    consumed,
+                )
+            }));
+    }
+    if remaining.starts_with("<!--") {
+        return Ok(find_bytes(&remaining.as_bytes()[4..], b"-->")
+            .map_or((PreflightEvent::Done, remaining.len()), |end| {
+                (PreflightEvent::Node, 4 + end + 3)
+            }));
+    }
+    if remaining.starts_with("<![CDATA[") {
+        return Ok(find_bytes(&remaining.as_bytes()[9..], b"]]>").map_or(
+            (PreflightEvent::Done, remaining.len()),
+            |end| {
+                (
+                    PreflightEvent::CharacterData {
+                        xml_whitespace: false,
+                    },
+                    9 + end + 3,
+                )
+            },
+        ));
+    }
+    if remaining.starts_with("<?") {
+        return Ok(find_bytes(&remaining.as_bytes()[2..], b"?>").map_or(
+            (PreflightEvent::Done, remaining.len()),
+            |end| {
+                let event = if remaining
+                    .get(2..5)
+                    .is_some_and(|target| target.eq_ignore_ascii_case("xml"))
+                    && remaining
+                        .as_bytes()
+                        .get(5)
+                        .is_some_and(u8::is_ascii_whitespace)
+                {
+                    PreflightEvent::Markup
+                } else {
+                    PreflightEvent::Node
+                };
+                (event, 2 + end + 2)
+            },
+        ));
+    }
+    if remaining.starts_with("<!DOCTYPE") {
+        return Ok(find_doctype_end(remaining).map_or(
+            (PreflightEvent::Done, remaining.len()),
+            |end| {
+                (
+                    PreflightEvent::DocType(Some(remaining[..end].to_owned())),
+                    end,
+                )
+            },
+        ));
+    }
+    if remaining.starts_with("</") {
+        return Ok(find_unquoted_byte(remaining.as_bytes(), b'>', 2)
+            .map_or((PreflightEvent::Done, remaining.len()), |end| {
+                (PreflightEvent::End, end + 1)
+            }));
+    }
+    if remaining.starts_with('<') {
+        let Some(end) = find_unquoted_byte(remaining.as_bytes(), b'>', 1) else {
+            return Ok((PreflightEvent::Done, remaining.len()));
+        };
+        let opening = &remaining[..=end];
+        let (element_name, attributes) = opening_tag_attributes(opening);
+        let attribute_source =
+            element_attribute_reference_source(opening, element_name, &attributes, dtd);
+        let namespace_declarations =
+            namespace_declarations(element_name, &attributes, dtd, state, budget)?;
+        let event = if opening[..opening.len() - 1].trim_end().ends_with('/') {
+            PreflightEvent::Empty {
+                attribute_source,
+                namespace_declarations,
+            }
+        } else {
+            PreflightEvent::Start {
+                attribute_source,
+                namespace_declarations,
+            }
+        };
+        return Ok((event, end + 1));
+    }
+    if let Some(reference) = remaining.strip_prefix('&') {
+        return Ok(reference
+            .find(';')
+            .map_or((PreflightEvent::Done, remaining.len()), |end| {
+                let name = &reference[..end];
+                (
+                    PreflightEvent::GeneralRef {
+                        name: Some(name.to_owned()),
+                        is_character_reference: is_character_reference(name),
+                    },
+                    end + 2,
+                )
+            }));
+    }
+    let end = remaining.find(['<', '&']).unwrap_or(remaining.len());
+    let text = &remaining[..end];
+    Ok((
+        PreflightEvent::CharacterData {
+            xml_whitespace: text
+                .chars()
+                .all(|character| matches!(character, ' ' | '\t' | '\r' | '\n')),
+        },
+        end,
+    ))
+}
+
+fn is_character_reference(name: &str) -> bool {
+    name.starts_with('#') || matches!(name, "amp" | "apos" | "gt" | "lt" | "quot")
+}
+
+fn find_doctype_end(doctype: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut subset_depth = 0usize;
+    let bytes = doctype.as_bytes();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if quote.is_none() && bytes[offset..].starts_with(b"<!--") {
+            let end = bytes[offset + 4..]
+                .windows(3)
+                .position(|window| window == b"-->")?;
+            offset += 4 + end + 3;
+            continue;
+        }
+        if quote.is_none() && bytes[offset..].starts_with(b"<?") {
+            let end = bytes[offset + 2..]
+                .windows(2)
+                .position(|window| window == b"?>")?;
+            offset += 2 + end + 2;
+            continue;
+        }
+        let byte = bytes[offset];
+        match (quote, byte) {
+            (None, b'\'' | b'"') => quote = Some(byte),
+            (Some(delimiter), current) if delimiter == current => quote = None,
+            (None, b'[') => subset_depth = subset_depth.saturating_add(1),
+            (None, b']') => subset_depth = subset_depth.saturating_sub(1),
+            (None, b'>') if subset_depth == 0 => return Some(offset + 1),
+            _ => {}
+        }
+        offset += 1;
+    }
+    None
+}
+
+struct NamespaceDeclaration {
+    prefix: String,
+    is_undeclaration: bool,
+}
+
+fn namespace_declarations(
+    element_name: &str,
+    attributes: &[(&str, &str)],
+    dtd: &InternalDtd,
+    state: &mut DocumentPreflightState,
+    budget: Option<&XmlParseWorkBudget>,
+) -> Result<Vec<NamespaceDeclaration>, XmlDocumentError> {
+    let mut declarations = Vec::new();
+    for &(name, value) in attributes {
+        let prefix = if name == "xmlns" {
+            ""
+        } else {
+            let Some(prefix) = name.strip_prefix("xmlns:") else {
+                continue;
+            };
+            prefix
+        };
+        declarations.push(NamespaceDeclaration {
+            prefix: prefix.to_owned(),
+            is_undeclaration: namespace_value_expands_to_empty(value, dtd, state, budget)?,
+        });
+    }
+    if let Some(defaults) = dtd.attribute_defaults.get(element_name) {
+        for default in defaults {
+            if attributes
+                .iter()
+                .any(|(name, _)| *name == default.attribute_name)
+            {
+                continue;
+            }
+            let prefix = if default.attribute_name == "xmlns" {
+                ""
+            } else if let Some(prefix) = default.attribute_name.strip_prefix("xmlns:") {
+                prefix
+            } else {
+                continue;
+            };
+            declarations.push(NamespaceDeclaration {
+                prefix: prefix.to_owned(),
+                is_undeclaration: namespace_value_expands_to_empty(
+                    &default.value,
+                    dtd,
+                    state,
+                    budget,
+                )?,
+            });
+        }
+    }
+    Ok(declarations)
+}
+
+fn namespace_value_expands_to_empty<'a>(
+    value: &'a str,
+    dtd: &'a InternalDtd,
+    state: &mut DocumentPreflightState,
+    budget: Option<&XmlParseWorkBudget>,
+) -> Result<bool, XmlDocumentError> {
+    // Namespace declaration values are normalized attributes, so entity replacement precedes the
+    // empty default-namespace test: XML 1.0 section 3.3.3 and Namespaces 1.0 section 6.2.
+    // https://www.w3.org/TR/xml/#AVNormalize
+    // https://www.w3.org/TR/REC-xml-names/#defaulting
+    if value.is_empty() {
+        return Ok(true);
+    }
+    if !value.starts_with('&') {
+        return Ok(false);
+    }
+    let mut pending = vec![value];
+    let mut expansions = 0u32;
+    while let Some(remaining) = pending.pop() {
+        if remaining.is_empty() {
+            continue;
+        }
+        let Some(reference) = remaining.strip_prefix('&') else {
+            return Ok(false);
+        };
+        let Some(end) = reference.find(';') else {
+            return Ok(false);
+        };
+        let name = &reference[..end];
+        let Some(replacement) = dtd.entities.get(name) else {
+            return Ok(false);
+        };
+        expansions = expansions.saturating_add(1);
+        if expansions > crate::hard_limits::XML_ENTITY_EXPANSION_CEILING {
+            return Ok(false);
+        }
+        charge_entity_expansion_work(state, budget, replacement.len())?;
+        pending.push(&reference[end + 1..]);
+        pending.push(replacement);
+    }
+    Ok(true)
+}
+
+fn apply_preflight_namespace_declarations(
+    state: &mut DocumentPreflightState,
+    declarations: Vec<NamespaceDeclaration>,
+) -> Result<Vec<(String, bool)>, XmlDocumentError> {
+    let mut changes = Vec::with_capacity(declarations.len());
+    for declaration in declarations {
+        let was_active = if declaration.is_undeclaration {
+            state.active_namespace_bindings.remove(&declaration.prefix)
+        } else {
+            !state
+                .active_namespace_bindings
+                .insert(declaration.prefix.clone())
+        };
+        changes.push((declaration.prefix, was_active));
+    }
+    let actual = state.active_namespace_bindings.len();
+    let maximum = crate::hard_limits::XML_NAMESPACE_BINDING_CEILING;
+    if actual > maximum {
+        return Err(XmlDocumentError::Parse(
+            ParseError::NamespaceBindingLimitReached { maximum, actual },
+        ));
+    }
+    Ok(changes)
+}
+
+fn restore_preflight_namespace_bindings(
+    active: &mut HashSet<String>,
+    changes: Vec<(String, bool)>,
+) {
+    for (prefix, was_active) in changes.into_iter().rev() {
+        if was_active {
+            active.insert(prefix);
+        } else {
+            active.remove(&prefix);
+        }
+    }
+}
+
 fn element_attribute_reference_source(
-    element: &QuickXmlBytesStart<'_>,
+    opening: &str,
+    element_name: &str,
+    attributes: &[(&str, &str)],
     dtd: &InternalDtd,
 ) -> Vec<u8> {
-    let lexical = element.as_ref();
-    let mut source = if lexical.contains(&b'&') {
-        lexical.to_vec()
+    let mut source = if opening.contains('&') {
+        opening.as_bytes().to_vec()
     } else {
         Vec::new()
     };
@@ -2341,22 +2680,10 @@ fn element_attribute_reference_source(
         return source;
     }
 
-    let element_name = element.name();
-    let Ok(element_name) = std::str::from_utf8(element_name.as_ref()) else {
-        return source;
-    };
     if let Some(defaults) = dtd.attribute_defaults.get(element_name) {
-        let mut present_attributes: HashSet<_> = element
-            .attributes()
-            .flatten()
-            .filter_map(|attribute| {
-                std::str::from_utf8(attribute.key.as_ref())
-                    .ok()
-                    .map(ToOwned::to_owned)
-            })
-            .collect();
+        let mut present_attributes: HashSet<_> = attributes.iter().map(|(name, _)| *name).collect();
         for default in defaults {
-            if present_attributes.insert(default.attribute_name.clone())
+            if present_attributes.insert(default.attribute_name.as_str())
                 && default.value.contains('&')
             {
                 source.push(b' ');
@@ -2365,6 +2692,73 @@ fn element_attribute_reference_source(
         }
     }
     source
+}
+
+fn opening_tag_attributes(opening: &str) -> (&str, Vec<(&str, &str)>) {
+    let bytes = opening.as_bytes();
+    let mut offset = 1usize;
+    let name_start = offset;
+    while bytes
+        .get(offset)
+        .is_some_and(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n' | b'/' | b'>'))
+    {
+        offset += 1;
+    }
+    let element_name = &opening[name_start..offset];
+    let mut attributes = Vec::new();
+    while offset < bytes.len() {
+        while bytes
+            .get(offset)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            offset += 1;
+        }
+        if bytes
+            .get(offset)
+            .is_none_or(|byte| matches!(byte, b'/' | b'>'))
+        {
+            break;
+        }
+        let start = offset;
+        while bytes
+            .get(offset)
+            .is_some_and(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n' | b'='))
+        {
+            offset += 1;
+        }
+        if start == offset {
+            break;
+        }
+        let name = &opening[start..offset];
+        while bytes
+            .get(offset)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            offset += 1;
+        }
+        if bytes.get(offset) != Some(&b'=') {
+            break;
+        }
+        offset += 1;
+        while bytes
+            .get(offset)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            offset += 1;
+        }
+        let Some(delimiter @ (b'\'' | b'"')) = bytes.get(offset).copied() else {
+            break;
+        };
+        offset += 1;
+        let value_start = offset;
+        while bytes.get(offset).is_some_and(|byte| *byte != delimiter) {
+            offset += 1;
+        }
+        let value = &opening[value_start..offset];
+        attributes.push((name, value));
+        offset = offset.saturating_add(1);
+    }
+    (element_name, attributes)
 }
 
 struct GeneralReferences<'a> {
@@ -2820,6 +3214,23 @@ fn own_bounded_xml(
     Ok(xml.into())
 }
 
+fn decode_owned_xml(bytes: &[u8], maximum: usize) -> Result<String, XmlDocumentError> {
+    if bytes.len() > maximum {
+        return Err(XmlDocumentError::DocumentTooLarge {
+            maximum,
+            actual: bytes.len(),
+        });
+    }
+    xml_sec_xml_input::decode_xml_bounded(bytes, None, maximum)
+        .map(|xml| xml.into_owned())
+        .map_err(|error| match error {
+            xml_sec_xml_input::Error::DecodedLimit { actual, .. } => {
+                XmlDocumentError::DocumentTooLarge { maximum, actual }
+            }
+            error => XmlDocumentError::Encoding(error),
+        })
+}
+
 fn allocate_document_identity(counter: &AtomicU64) -> Result<DocumentIdentity, XmlDocumentError> {
     let mut current = counter.load(Ordering::Relaxed);
     loop {
@@ -2988,6 +3399,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn byte_input_decoding_is_identical_for_every_semantic_backend() {
+        // Encoding is resolved before backend selection, so parser choice cannot
+        // change which external XML byte sequences are accepted or interpreted.
+        let latin1 = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><root>caf\xe9</root>";
+        for backend in XmlBackend::available() {
+            let document = XmlDocument::parse_bytes_with_backend(latin1, backend)
+                .expect("declared Latin-1 XML must parse with every backend");
+            assert!(document.as_xml().contains("encoding=\"UTF-8\""));
+            document.with_view(|view| {
+                assert_eq!(view.document().root_element().text(), Some("café"));
+            });
+        }
+    }
+
+    #[test]
+    fn every_semantic_backend_rejects_the_same_encoding_conflict() {
+        // Encoding validation happens before backend dispatch, so a parser
+        // implementation cannot reinterpret contradictory external bytes.
+        let mut bytes = vec![0xff, 0xfe];
+        bytes.extend(
+            "<?xml version=\"1.0\" encoding=\"UTF-16BE\"?><root/>"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes),
+        );
+        for backend in XmlBackend::available() {
+            assert!(matches!(
+                XmlDocument::parse_bytes_with_backend(&bytes, backend),
+                Err(XmlDocumentError::Encoding(
+                    xml_sec_xml_input::Error::ConflictingEncoding(_)
+                ))
+            ));
+        }
+    }
+
+    #[test]
     fn selected_backend_builds_the_retained_semantic_projection() {
         let settings = DocumentParseSettings::default();
         let xml =
@@ -3035,6 +3481,29 @@ mod tests {
         assert!(matches!(
             build_cell(xml.to_owned(), settings, Some(&budget)),
             Err(XmlDocumentError::Parse(ParseError::NodesLimitReached))
+        ));
+    }
+
+    #[test]
+    fn namespace_entity_chain_consumes_parse_work_budget() {
+        // Namespace normalization expands general entities before testing an undeclaration.
+        // That preflight path must share the same sticky parser-work budget as content expansion.
+        let xml = r#"<!DOCTYPE root [<!ENTITY first "&second;"><!ENTITY second "">]><root xmlns="&first;"/>"#;
+        let resources = crate::policy::ResourcePolicy {
+            max_xml_parse_work_bytes: xml.len() + "&second;".len() - 1,
+            ..crate::policy::ResourcePolicy::default()
+        };
+        let budget = XmlParseWorkBudget::from_resources(&resources);
+        let settings = DocumentParseSettings::new(true, 8, xml.len());
+
+        assert!(matches!(
+            preflight_document_limits(xml, settings, Some(&budget)),
+            Err(XmlDocumentError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
+                    ..
+                }
+            ))
         ));
     }
 
@@ -3106,6 +3575,137 @@ mod tests {
     }
 
     #[test]
+    fn namespace_preflight_counts_bindings_inside_entity_replacements() {
+        // Entity replacement text becomes part of the document's namespace context, so it must
+        // consume the same active-binding ceiling as literal markup before a DOM is allocated.
+        let maximum = crate::hard_limits::XML_NAMESPACE_BINDING_CEILING;
+        let declarations = (0..=maximum)
+            .map(|index| format!(r#" xmlns:p{index}="urn:{index}""#))
+            .collect::<String>();
+        let xml = format!(
+            r#"<!DOCTYPE root [<!ENTITY expanded '<child{declarations}/>'>]><root>&expanded;</root>"#
+        );
+        let settings = DocumentParseSettings::new_with_depth(true, 16, 4, xml.len());
+
+        assert!(matches!(
+            preflight_document_limits(&xml, settings, None),
+            Err(XmlDocumentError::Parse(ParseError::NamespaceBindingLimitReached {
+                maximum: observed_maximum,
+                actual,
+            })) if observed_maximum == maximum && actual == maximum + 1
+        ));
+    }
+
+    #[test]
+    fn namespace_preflight_accepts_entity_replacement_at_exact_ceiling() {
+        let maximum = crate::hard_limits::XML_NAMESPACE_BINDING_CEILING;
+        let declarations = (0..maximum)
+            .map(|index| format!(r#" xmlns:p{index}="urn:{index}""#))
+            .collect::<String>();
+        let xml = format!(
+            r#"<!DOCTYPE root [<!ENTITY expanded '<child{declarations}/>'>]><root>&expanded;</root>"#
+        );
+        let settings = DocumentParseSettings::new_with_depth(true, 16, 4, xml.len());
+
+        preflight_document_limits(&xml, settings, None)
+            .expect("the exact expanded namespace-binding boundary is accepted");
+    }
+
+    #[test]
+    fn namespace_preflight_expands_undeclarations_before_counting_bindings() {
+        // Namespaces in XML 1.0 section 6.2 applies the normalized attribute value to a default
+        // namespace declaration: https://www.w3.org/TR/REC-xml-names/#defaulting
+        let maximum = crate::hard_limits::XML_NAMESPACE_BINDING_CEILING;
+        let declarations = (0..maximum)
+            .map(|index| format!(r#" xmlns:p{index}="urn:{index}""#))
+            .collect::<String>();
+        let xml = format!(
+            r#"<!DOCTYPE root [<!ENTITY empty ''>]><root{declarations}><child xmlns="&empty;"/></root>"#
+        );
+        let settings = DocumentParseSettings::new_with_depth(true, 16, 4, xml.len());
+
+        preflight_document_limits(&xml, settings, None)
+            .expect("an entity-expanded empty default namespace is an undeclaration");
+    }
+
+    #[test]
+    fn namespace_preflight_counts_literal_active_bindings() {
+        let maximum = crate::hard_limits::XML_NAMESPACE_BINDING_CEILING;
+        let declarations = (0..=maximum)
+            .map(|index| format!(r#" xmlns:p{index}="urn:{index}""#))
+            .collect::<String>();
+        let xml = format!("<root{declarations}/>");
+        let settings = DocumentParseSettings::new(false, 4, xml.len());
+
+        assert!(matches!(
+            preflight_document_limits(&xml, settings, None),
+            Err(XmlDocumentError::Parse(ParseError::NamespaceBindingLimitReached {
+                maximum: observed_maximum,
+                actual,
+            })) if observed_maximum == maximum && actual == maximum + 1
+        ));
+    }
+
+    #[test]
+    fn namespace_shadowing_does_not_inflate_active_binding_count() {
+        // Namespaces in XML 1.0 section 6.1 makes the nearest declaration replace the active
+        // prefix binding; nested shadowing must not accumulate historical bindings.
+        // https://www.w3.org/TR/REC-xml-names/#scoping-defaulting
+        let mut xml = String::new();
+        for depth in 0..220 {
+            xml.push_str("<n");
+            for prefix in 0..5 {
+                xml.push_str(&format!(r#" xmlns:p{prefix}="urn:{depth}:{prefix}""#));
+            }
+            xml.push('>');
+        }
+        xml.push_str(&"</n>".repeat(220));
+        let settings = DocumentParseSettings::new_with_depth(false, 2_000, 256, xml.len());
+
+        preflight_document_limits(&xml, settings, None)
+            .expect("five shadowed prefixes remain five active bindings");
+    }
+
+    #[test]
+    fn namespace_preflight_releases_distinct_empty_sibling_bindings() {
+        // Namespace declarations are scoped to their element. Sequential empty siblings must not
+        // accumulate bindings that are no longer in scope.
+        // https://www.w3.org/TR/REC-xml-names/#scoping-defaulting
+        let maximum = crate::hard_limits::XML_NAMESPACE_BINDING_CEILING;
+        let siblings = (0..=maximum)
+            .map(|index| format!(r#"<child xmlns:p{index}="urn:{index}"/>"#))
+            .collect::<String>();
+        let xml = format!("<root>{siblings}</root>");
+        let settings = DocumentParseSettings::new(false, 2_000, xml.len());
+
+        preflight_document_limits(&xml, settings, None)
+            .expect("bindings on completed empty siblings are no longer active");
+    }
+
+    #[test]
+    fn namespace_preflight_restores_outer_binding_after_shadowing() {
+        // Leaving a nested shadowing scope restores the outer prefix binding, so a subsequent
+        // declaration is measured against the complete in-scope namespace set.
+        // https://www.w3.org/TR/REC-xml-names/#scoping-defaulting
+        let maximum = crate::hard_limits::XML_NAMESPACE_BINDING_CEILING;
+        let declarations = (0..maximum)
+            .map(|index| format!(r#" xmlns:p{index}="urn:outer:{index}""#))
+            .collect::<String>();
+        let xml = format!(
+            r#"<root{declarations}><shadow xmlns:p0="urn:inner"/><overflow xmlns:extra="urn:extra"/></root>"#
+        );
+        let settings = DocumentParseSettings::new(false, 2_000, xml.len());
+
+        assert!(matches!(
+            preflight_document_limits(&xml, settings, None),
+            Err(XmlDocumentError::Parse(ParseError::NamespaceBindingLimitReached {
+                maximum: observed_maximum,
+                actual,
+            })) if observed_maximum == maximum && actual == maximum + 1
+        ));
+    }
+
+    #[test]
     fn depth_preflight_observes_markup_generated_by_a_character_reference() {
         // Numeric references are normalized while the entity declaration is
         // read, so `&#60;` becomes markup when the replacement is later parsed.
@@ -3137,6 +3737,21 @@ mod tests {
             .expect("comment contents must not participate in entity expansion");
         build_cell(xml.to_owned(), settings, None)
             .expect("the real declaration contains only character data");
+    }
+
+    #[test]
+    fn doctype_protected_regions_cannot_hide_document_nodes_from_preflight() {
+        // Brackets inside DTD comments and processing instructions do not
+        // change internal-subset depth. Scanning must resume at the root.
+        for protected in ["<!-- [ -->", "<?target [ ?>"] {
+            let xml = format!("<!DOCTYPE root [{protected}]><root><child/></root>");
+            let settings = DocumentParseSettings::new_with_depth(true, 1, 4, xml.len());
+
+            assert!(matches!(
+                preflight_document_limits(&xml, settings, None),
+                Err(XmlDocumentError::Parse(ParseError::NodesLimitReached))
+            ));
+        }
     }
 
     #[test]
@@ -3219,6 +3834,26 @@ mod tests {
             })) if observed_maximum == maximum
                 && actual == expected_work
         ));
+    }
+
+    #[test]
+    fn attribute_preflight_exempts_normatively_redeclared_predefined_entities() {
+        // XML 1.0 section 4.6 permits predefined entities to be redeclared only with their
+        // normative replacement text; they remain predefined references, not expansion work.
+        // https://www.w3.org/TR/xml/#sec-predefined-ent
+        let references = "&amp;".repeat(
+            usize::try_from(crate::hard_limits::XML_ENTITY_EXPANSION_CEILING)
+                .expect("entity ceiling fits usize")
+                + 1,
+        );
+        let xml =
+            format!(r#"<!DOCTYPE root [<!ENTITY amp "&#38;#38;">]><root value="{references}"/>"#);
+        let settings = DocumentParseSettings::new_with_depth(true, 8, 1, xml.len());
+        let budget = XmlParseWorkBudget::with_limit(xml.len());
+
+        preflight_document_limits(&xml, settings, Some(&budget))
+            .expect("predefined attribute references do not consume entity expansion budget");
+        assert_eq!(budget.consumed(), xml.len());
     }
 
     #[test]

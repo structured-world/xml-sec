@@ -40,6 +40,7 @@ use xml_sec::{
 use xml_sec::{
     XmlDomDocument as Document, XmlDomNode as Node, XmlDomParsingOptions as ParsingOptions,
 };
+use xml_sec_xml_input::lexical::{Event as LexicalEvent, Scanner, escape_attribute, escape_text};
 
 use crate::{
     Command, Invocation,
@@ -1442,12 +1443,7 @@ fn write_reference_diagnostics(
         let (status, _) = donor_dsig_status(reference.status);
         writeln!(stdout, "<ReferenceVerificationContext status=\"{status}\">")
             .map_err(stdout_error)?;
-        writeln!(
-            stdout,
-            "<URI>{}</URI>",
-            quick_xml::escape::escape(&reference.uri)
-        )
-        .map_err(stdout_error)?;
+        writeln!(stdout, "<URI>{}</URI>", escape_text(&reference.uri)).map_err(stdout_error)?;
         writeln!(stdout, "</ReferenceVerificationContext>").map_err(stdout_error)?;
     }
     writeln!(stdout, "</{container}>").map_err(stdout_error)
@@ -2099,8 +2095,8 @@ fn write_debug_transform(
     writeln!(
         stdout,
         "<Transform name=\"{}\" href=\"{}\" />",
-        quick_xml::escape::escape(name),
-        quick_xml::escape::escape(uri)
+        escape_attribute(name),
+        escape_attribute(uri)
     )
     .map_err(stdout_error)?;
     writeln!(stdout, "</{container}>").map_err(stdout_error)
@@ -2435,7 +2431,7 @@ fn apply_encryption_template(
             })?;
         replacements.push((
             opening_end..opening_end,
-            format!(" Type=\"{}\"", quick_xml::escape::escape(generated_type)),
+            format!(" Type=\"{}\"", escape_attribute(generated_type)),
         ));
     }
 
@@ -2690,7 +2686,7 @@ fn append_standalone_element(
             push_plaintext(output, " ", maximum)?;
             push_plaintext(output, &declaration, maximum)?;
             push_plaintext(output, "=\"", maximum)?;
-            push_plaintext(output, &quick_xml::escape::escape(namespace.uri()), maximum)?;
+            push_plaintext(output, &escape_attribute(namespace.uri()), maximum)?;
             push_plaintext(output, "\"", maximum)?;
         }
     }
@@ -2729,35 +2725,29 @@ fn ensure_plaintext_capacity(
 
 fn owned_namespace_declarations(opening: &str) -> Result<HashSet<String>, CommandError> {
     let standalone = format!("{} />", opening.trim_end_matches('/'));
-    let mut reader = quick_xml::Reader::from_str(&standalone);
-    let event = reader
-        .read_event()
-        .map_err(|error| CommandError::Encryption(error.to_string()))?;
-    let element = match event {
-        quick_xml::events::Event::Start(element) | quick_xml::events::Event::Empty(element) => {
-            element
-        }
+    let mut scanner = Scanner::new(&standalone);
+    let element = match scanner
+        .next_event()
+        .map_err(|error| CommandError::Encryption(error.to_string()))?
+    {
+        Some(LexicalEvent::Start(element) | LexicalEvent::Empty(element)) => element,
         _ => {
             return Err(CommandError::Encryption(
                 "generated KeyInfo child has no opening element".into(),
             ));
         }
     };
-    element
-        .attributes()
-        .map(|attribute| {
-            let attribute =
-                attribute.map_err(|error| CommandError::Encryption(error.to_string()))?;
-            let name = std::str::from_utf8(attribute.key.as_ref()).map_err(|_| {
-                CommandError::Encryption("generated KeyInfo attribute name is not UTF-8".into())
-            })?;
-            Ok(match name {
-                "xmlns" => Some(String::new()),
-                _ => name.strip_prefix("xmlns:").map(str::to_owned),
-            })
-        })
-        .filter_map(|result| result.transpose())
-        .collect()
+    Ok(element
+        .attributes
+        .iter()
+        .filter_map(
+            |attribute| match (attribute.name.prefix(), attribute.name.local()) {
+                (None, "xmlns") => Some(String::new()),
+                (Some("xmlns"), prefix) => Some(prefix.to_owned()),
+                _ => None,
+            },
+        )
+        .collect())
 }
 
 fn direct_child_element<'a, 'input>(
@@ -3006,12 +2996,7 @@ fn write_decryption_diagnostics(
         ("Encoding", "Encoding"),
     ] {
         let value = encrypted_data.attribute(attribute).unwrap_or("NULL");
-        writeln!(
-            stdout,
-            "<{element}>{}</{element}>",
-            quick_xml::escape::escape(value)
-        )
-        .map_err(stdout_error)?;
+        writeln!(stdout, "<{element}>{}</{element}>", escape_text(value)).map_err(stdout_error)?;
     }
     writeln!(stdout, "<Recipient>NULL</Recipient>").map_err(stdout_error)?;
     writeln!(stdout, "<CarriedKeyName>NULL</CarriedKeyName>").map_err(stdout_error)?;
@@ -3019,8 +3004,8 @@ fn write_decryption_diagnostics(
     writeln!(
         stdout,
         "<Transform name=\"{}\" href=\"{}\" />",
-        quick_xml::escape::escape(transform_name),
-        quick_xml::escape::escape(method)
+        escape_attribute(transform_name),
+        escape_attribute(method)
     )
     .map_err(stdout_error)?;
     writeln!(stdout, "</EncryptionMethod>").map_err(stdout_error)?;
@@ -3440,7 +3425,7 @@ fn keys(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
             .parameter
             .as_deref()
             .map_or_else(String::new, |name| {
-                format!("<KeyName>{}</KeyName>\n", quick_xml::escape::escape(name))
+                format!("<KeyName>{}</KeyName>\n", escape_text(name))
             });
         entries.push_str(&format!(
             "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\">\n\
