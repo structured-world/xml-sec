@@ -34,13 +34,13 @@ type Namespaces = HashMap<String, String>;
 /// struct Sigmoid;
 /// impl function::Function for Sigmoid {
 ///     fn evaluate<'c, 'd>(&self,
-///                         _context: &context::Evaluation<'c, 'd>,
+///                         context: &context::Evaluation<'c, 'd>,
 ///                         args: Vec<Value<'d>>)
 ///                         -> Result<Value<'d>, function::Error>
 ///     {
 ///         let mut args = function::Args(args);
 ///         args.exactly(1)?;
-///         let val = args.pop_number()?;
+///         let val = args.pop_number(context)?;
 ///
 ///         let computed = (1.0 + (-val).exp()).recip();
 ///
@@ -64,8 +64,10 @@ type Namespaces = HashMap<String, String>;
 /// let xpath = factory.build(xpath).expect("Could not compile XPath");
 ///
 /// let value = xpath.evaluate(&context, node).expect("XPath evaluation failed");
+/// let evaluation = context::Evaluation::new(&context, node.into());
 ///
-/// assert_eq!(0.952, (value.number() * 1000.0).trunc() / 1000.0);
+/// let number = value.number(&evaluation).expect("numeric conversion failed");
+/// assert_eq!(0.952, (number * 1000.0).trunc() / 1000.0);
 /// ```
 ///
 /// Note that we are using a custom function (`sigmoid`), a variable

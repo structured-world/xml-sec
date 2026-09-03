@@ -4499,14 +4499,6 @@ impl function::Function for IdFunction {
                 what: "id() requires one argument".into(),
             });
         }
-        let values = match &args[0] {
-            SxdValue::Nodeset(nodes) => nodes
-                .document_order()
-                .iter()
-                .map(|node| node.string_value())
-                .collect::<Vec<_>>(),
-            value => vec![value.string()],
-        };
         // XPath 1.0 section 4.1 binds id() to the document containing the dynamic context node.
         // Every projected logical document occupies root/containers/document[index].
         // https://www.w3.org/TR/1999/REC-xpath-19991116/#function-id
@@ -4520,7 +4512,7 @@ impl function::Function for IdFunction {
             return Ok(SxdValue::Nodeset(nodeset::Nodeset::new()));
         };
         let mut result = nodeset::Nodeset::new();
-        for value in values {
+        let mut add_tokens = |value: &str| {
             // XPath 1.0 id() splits on XML's four S characters, not the host language's wider
             // ASCII whitespace class: https://www.w3.org/TR/1999/REC-xpath-19991116/#function-id
             for token in value
@@ -4533,6 +4525,19 @@ impl function::Function for IdFunction {
                 {
                     result.add(node);
                 }
+            }
+        };
+        match &args[0] {
+            SxdValue::Nodeset(nodes) => {
+                for node in nodes.iter() {
+                    let value = node.string_value_with_context(context)?;
+                    add_tokens(&value);
+                }
+            }
+            SxdValue::String(value) | SxdValue::ResultTreeFragment(_, value) => add_tokens(value),
+            value => {
+                context.reserve_string_allocation(value.string_len())?;
+                add_tokens(&value.string());
             }
         }
         Ok(SxdValue::Nodeset(result))
@@ -4928,7 +4933,9 @@ impl function::Function for ExsltMathFunction {
             if args.len() != 2 {
                 return extension_argument_error("math:power() requires two arguments");
             }
-            return Ok(SxdValue::Number(args[0].number().powf(args[1].number())));
+            return Ok(SxdValue::Number(
+                args[0].number(context)?.powf(args[1].number(context)?),
+            ));
         }
         let [SxdValue::Nodeset(nodes)] = args.as_slice() else {
             return extension_argument_error("EXSLT math node functions require one node-set");
@@ -4951,8 +4958,8 @@ impl function::Function for ExsltMathFunction {
         let ordered = nodes.document_order();
         let numbers = ordered
             .iter()
-            .map(|node| SxdValue::String(node.string_value()).number())
-            .collect::<Vec<_>>();
+            .map(|node| SxdValue::String(node.string_value()).number(context))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         if numbers.is_empty() || numbers.iter().any(|value| value.is_nan()) {
             return Ok(match self {
                 Self::Max | Self::Min => SxdValue::Number(f64::NAN),
@@ -5139,7 +5146,7 @@ impl function::Function for ExsltStringFunction {
                 if !(1..=2).contains(&args.len()) {
                     return extension_argument_error("str:padding() requires one or two arguments");
                 }
-                let requested = args[0].number().floor().max(0.0);
+                let requested = args[0].number(context)?.floor().max(0.0);
                 let length = if requested.is_finite() && requested <= usize::MAX as f64 {
                     requested as usize
                 } else {
@@ -6014,7 +6021,7 @@ impl function::Function for FormatNumberFunction {
         let pattern = args[1].string();
         context.reserve_string_allocation(decimal_render_workspace_bytes(&pattern))?;
         Ok(SxdValue::String(render_decimal(
-            args[0].number(),
+            args[0].number(context)?,
             &pattern,
             &format,
         )?))
@@ -6915,6 +6922,45 @@ mod tests {
         let error = ExsltSetFunction::Distinct
             .evaluate(&evaluation, vec![SxdValue::Nodeset(nodes)])
             .expect_err("distinct storage must cross the allocation gate");
+        assert!(error.to_string().contains("allocation budget"));
+    }
+
+    #[test]
+    fn id_nodeset_arguments_stream_through_the_allocation_gate() {
+        // id() needs every node's string-value but does not retain those values. It must meter
+        // each temporary while avoiding simultaneous retention in an unbounded Vec<String>.
+        let package = Package::new();
+        let document = package.as_document();
+        let container = document.create_element("container");
+        let logical_document = document.create_element("document");
+        let target = document.create_element("target");
+        let argument = document.create_element("ids");
+        argument.append_child(document.create_text("target"));
+        logical_document.append_child(target);
+        logical_document.append_child(argument);
+        container.append_child(logical_document);
+        document.root().append_child(container);
+
+        let mut indexed = HashMap::new();
+        indexed.insert(
+            "target".into(),
+            typed_path_to(&nodeset::Node::Element(target)),
+        );
+        let function = IdFunction {
+            nodes_by_document: Rc::new(RefCell::new(vec![indexed])),
+        };
+        let mut nodes = nodeset::Nodeset::new();
+        nodes.add(argument);
+        let mut context = Context::new();
+        context.set_string_allocation_limit("target".len() - 1);
+        let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(
+            &context,
+            nodeset::Node::Element(logical_document),
+        );
+
+        let error = function
+            .evaluate(&evaluation, vec![SxdValue::Nodeset(nodes)])
+            .expect_err("id node string-value must cross the allocation gate");
         assert!(error.to_string().contains("allocation budget"));
     }
 

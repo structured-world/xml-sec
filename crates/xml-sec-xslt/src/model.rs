@@ -2178,7 +2178,7 @@ fn parse_dtd_notation_declaration(subset: &str, mut cursor: usize) -> Result<usi
     if subset[cursor..].starts_with("SYSTEM") {
         cursor += "SYSTEM".len();
         require_dtd_whitespace(subset, &mut cursor, "after NOTATION SYSTEM")?;
-        parse_dtd_quoted_literal(subset, &mut cursor, "NOTATION system identifier")?;
+        parse_dtd_system_literal(subset, &mut cursor, "NOTATION system identifier")?;
     } else if subset[cursor..].starts_with("PUBLIC") {
         cursor += "PUBLIC".len();
         require_dtd_whitespace(subset, &mut cursor, "after NOTATION PUBLIC")?;
@@ -2195,7 +2195,7 @@ fn parse_dtd_notation_declaration(subset: &str, mut cursor: usize) -> Result<usi
                     "XML whitespace is required before NOTATION system identifier".into(),
                 ));
             }
-            parse_dtd_quoted_literal(subset, &mut cursor, "NOTATION system identifier")?;
+            parse_dtd_system_literal(subset, &mut cursor, "NOTATION system identifier")?;
         }
     } else {
         return Err(Error::Xml(
@@ -2410,13 +2410,13 @@ fn parse_external_entity_declaration(
     let system_identifier = if subset[cursor..].starts_with("SYSTEM") {
         cursor += "SYSTEM".len();
         require_dtd_whitespace(subset, &mut cursor, "after SYSTEM")?;
-        parse_dtd_quoted_literal(subset, &mut cursor, "entity system identifier")?
+        parse_dtd_system_literal(subset, &mut cursor, "entity system identifier")?
     } else if subset[cursor..].starts_with("PUBLIC") {
         cursor += "PUBLIC".len();
         require_dtd_whitespace(subset, &mut cursor, "after PUBLIC")?;
         parse_dtd_public_identifier(subset, &mut cursor, "entity public identifier")?;
         require_dtd_whitespace(subset, &mut cursor, "before entity system identifier")?;
-        parse_dtd_quoted_literal(subset, &mut cursor, "entity system identifier")?
+        parse_dtd_system_literal(subset, &mut cursor, "entity system identifier")?
     } else {
         return Ok((declaration_end(subset, cursor)?, None));
     };
@@ -2445,6 +2445,22 @@ fn parse_external_entity_declaration(
         ));
     }
     Ok((cursor + 1, unparsed.then_some(system_identifier)))
+}
+
+fn parse_dtd_system_literal<'a>(
+    subset: &'a str,
+    cursor: &mut usize,
+    context: &str,
+) -> Result<&'a str> {
+    let value = parse_dtd_quoted_literal(subset, cursor, context)?;
+    // XML 1.0 section 4.2.2 makes a fragment identifier in a system identifier an error:
+    // https://www.w3.org/TR/xml/#sec-external-ent
+    if value.contains('#') {
+        return Err(Error::Xml(format!(
+            "{context} must not contain a fragment identifier"
+        )));
+    }
+    Ok(value)
 }
 
 fn parse_dtd_name<'a>(subset: &'a str, cursor: &mut usize, context: &str) -> Result<&'a str> {
@@ -3415,6 +3431,27 @@ mod parser_boundary_tests {
         // quoted SystemLiteral: https://www.w3.org/TR/xml/#NT-doctypedecl
         let xml = r#"<!DOCTYPE r SYSTEM "[<!ENTITY e 'ok'>]"><r>&e;</r>"#;
         assert!(Document::parse_iterative(xml, None).is_err());
+    }
+
+    #[test]
+    fn external_entity_system_literals_reject_fragment_identifiers() {
+        // XML 1.0 section 4.2.2 makes a fragment identifier in a system identifier an error:
+        // https://www.w3.org/TR/xml/#sec-external-ent
+        for declaration in [
+            r#"<!ENTITY logo SYSTEM "image.bin#part" NDATA png>"#,
+            r#"<!ENTITY logo PUBLIC "image" "image.bin#part" NDATA png>"#,
+            r#"<!NOTATION png SYSTEM "image.bin#part">"#,
+            r#"<!NOTATION png PUBLIC "image" "image.bin#part">"#,
+        ] {
+            let xml = format!("<!DOCTYPE root [{declaration}]><root/>");
+            assert!(Document::parse(&xml, None).is_err());
+            assert!(Document::parse_iterative(&xml, None).is_err());
+        }
+
+        let valid = r#"<!DOCTYPE root [<!NOTATION png SYSTEM "image/png"><!ENTITY logo SYSTEM "image.bin" NDATA png>]><root/>"#;
+        Document::parse(valid, None).expect("fragment-free system identifier is valid");
+        Document::parse_iterative(valid, None)
+            .expect("fragment-free system identifier is valid in the iterative parser");
     }
 
     #[test]

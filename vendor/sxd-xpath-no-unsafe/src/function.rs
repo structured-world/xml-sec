@@ -7,7 +7,7 @@ use sxd_document_no_unsafe::XmlChar;
 
 use crate::context;
 use crate::nodeset::Nodeset;
-use crate::{Value, str_to_num};
+use crate::{Value, node_to_num_with_context};
 
 /// Types that can be used as XPath functions.
 pub trait Function {
@@ -125,9 +125,9 @@ impl<'d> Args<'d> {
 
     /// Removes the **last** argument and ensures it is a number. If
     /// the argument is not a number, it is converted to one.
-    pub fn pop_number(&mut self) -> Result<f64, Error> {
-        let v = self.0.pop().ok_or(Error::ArgumentMissing)?;
-        Ok(v.into_number())
+    pub fn pop_number(&mut self, context: &context::Evaluation<'_, '_>) -> Result<f64, Error> {
+        let value = self.0.pop().ok_or(Error::ArgumentMissing)?;
+        value.number(context)
     }
 
     /// Removes the **last** argument and ensures it is a string. If
@@ -170,8 +170,7 @@ impl<'d> Args<'d> {
         context: &context::Evaluation<'_, '_>,
     ) -> Result<String, Error> {
         if self.0.is_empty() {
-            context.reserve_string_allocation(context.node.string_value_len())?;
-            Ok(context.node.string_value())
+            context.node.string_value_with_context(context)
         } else {
             self.pop_string(context)
         }
@@ -435,13 +434,13 @@ impl Function for Substring {
         args.at_most(3)?;
 
         let len = if args.len() == 3 {
-            let len = args.pop_number()?;
+            let len = args.pop_number(context)?;
             Some(round_ties_to_positive_infinity(len))
         } else {
             None
         };
 
-        let start = args.pop_number()?;
+        let start = args.pop_number(context)?;
         let start = round_ties_to_positive_infinity(start);
         let s = args.pop_string(context)?;
         context.reserve_string_allocation(s.len())?;
@@ -618,7 +617,7 @@ impl Function for NumberFn {
         let mut args = Args(args);
         args.at_most(1)?;
         let arg = args.pop_value_or_context_node(context);
-        Ok(Value::Number(arg.number()))
+        Ok(Value::Number(arg.number(context)?))
     }
 }
 
@@ -627,16 +626,16 @@ struct Sum;
 impl Function for Sum {
     fn evaluate<'c, 'd>(
         &self,
-        _context: &context::Evaluation<'c, 'd>,
+        context: &context::Evaluation<'c, 'd>,
         args: Vec<Value<'d>>,
     ) -> Result<Value<'d>, Error> {
         let mut args = Args(args);
         args.exactly(1)?;
         let arg = args.pop_nodeset()?;
-        let r = arg
-            .iter()
-            .map(|n| str_to_num(&n.string_value()))
-            .fold(0.0, |acc, i| acc + i);
+        let mut r = 0.0;
+        for node in arg.iter() {
+            r += node_to_num_with_context(context, &node)?;
+        }
         Ok(Value::Number(r))
     }
 }
@@ -646,12 +645,12 @@ struct NumberConvert(fn(f64) -> f64);
 impl Function for NumberConvert {
     fn evaluate<'c, 'd>(
         &self,
-        _context: &context::Evaluation<'c, 'd>,
+        context: &context::Evaluation<'c, 'd>,
         args: Vec<Value<'d>>,
     ) -> Result<Value<'d>, Error> {
         let mut args = Args(args);
         args.exactly(1)?;
-        let arg = args.pop_number()?;
+        let arg = args.pop_number(context)?;
         Ok(Value::Number(self.0(arg)))
     }
 }
@@ -937,6 +936,40 @@ mod test {
             )
             .expect_err("node-set conversion must exceed the four-byte allocation budget");
         assert!(error.to_string().contains("string allocation budget"));
+    }
+
+    #[test]
+    fn number_and_sum_bound_nodeset_string_materialization() {
+        // Numeric conversion has a scalar result, but its node string-value workspace is still
+        // attacker-controlled and must cross the context allocation gate before allocation.
+        let package = Package::new();
+        let document = package.as_document();
+        let root = document.create_element("root");
+        let first = document.create_element("item");
+        first.append_child(document.create_text("1234"));
+        root.append_child(first);
+        document.root().append_child(root);
+
+        {
+            let mut setup = Setup::new();
+            setup.context.set_string_allocation_limit(3);
+            let error = setup
+                .evaluate(
+                    document.root(),
+                    NumberFn,
+                    vec![Value::Nodeset(nodeset![first.clone()])],
+                )
+                .expect_err("four-byte numeric workspace must exceed a three-byte budget");
+            assert!(error.to_string().contains("string allocation budget"));
+        }
+        {
+            let mut setup = Setup::new();
+            setup.context.set_string_allocation_limit(3);
+            let error = setup
+                .evaluate(document.root(), Sum, vec![Value::Nodeset(nodeset![first])])
+                .expect_err("four-byte sum workspace must exceed a three-byte budget");
+            assert!(error.to_string().contains("string allocation budget"));
+        }
     }
 
     #[test]

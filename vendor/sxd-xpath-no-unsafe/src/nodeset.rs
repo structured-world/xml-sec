@@ -277,6 +277,16 @@ impl<'d> Node<'d> {
         self.string_value_with_capacity(self.string_value_len())
     }
 
+    /// Returns the string value after reserving its exact temporary allocation in the evaluator.
+    pub fn string_value_with_context(
+        &self,
+        context: &crate::context::Evaluation<'_, '_>,
+    ) -> Result<String, crate::function::Error> {
+        let length = self.string_value_len();
+        context.reserve_string_allocation(length)?;
+        Ok(self.string_value_with_capacity(length))
+    }
+
     pub(crate) fn string_value_with_capacity(&self, capacity: usize) -> String {
         let mut result = String::with_capacity(capacity);
         self.append_string_value(&mut result);
@@ -287,18 +297,18 @@ impl<'d> Node<'d> {
     pub fn string_value_len(&self) -> usize {
         use self::Node::*;
 
-        fn descendant_text_len(node: &Node<'_>) -> usize {
-            node.children().iter().fold(0usize, |length, child| {
-                length.saturating_add(match child {
-                    Node::Element(_) => descendant_text_len(child),
-                    Node::Text(text) => sxd_document_no_unsafe::as_str!(text.text()).len(),
-                    _ => 0,
-                })
-            })
-        }
-
         match self {
-            Root(_) | Element(_) => descendant_text_len(self),
+            Root(_) | Element(_) => {
+                let mut length = 0usize;
+                visit_descendant_text(self, |text| {
+                    // Every visited byte already resides in this finite document, so the sum
+                    // cannot exceed the addressable allocation that owns those text nodes.
+                    debug_assert!(length.checked_add(text.len()).is_some());
+                    length += text.len();
+                    true
+                });
+                length
+            }
             Attribute(attribute) => sxd_document_no_unsafe::as_str!(attribute.value()).len(),
             ProcessingInstruction(instruction) => {
                 sxd_document_no_unsafe::as_opt_str!(instruction.value())
@@ -323,25 +333,11 @@ impl<'d> Node<'d> {
             true
         }
 
-        fn consume_descendant_text(node: &Node<'_>, remaining: &mut &str) -> bool {
-            for child in node.children() {
-                let matches = match &child {
-                    Node::Element(_) => consume_descendant_text(&child, remaining),
-                    Node::Text(text) => {
-                        consume(sxd_document_no_unsafe::as_str!(text.text()), remaining)
-                    }
-                    _ => true,
-                };
-                if !matches {
-                    return false;
-                }
-            }
-            true
-        }
-
         let mut remaining = expected;
         let matches = match self {
-            Root(_) | Element(_) => consume_descendant_text(self, &mut remaining),
+            Root(_) | Element(_) => {
+                visit_descendant_text(self, |text| consume(text, &mut remaining))
+            }
             Attribute(attribute) => consume(
                 sxd_document_no_unsafe::as_str!(attribute.value()),
                 &mut remaining,
@@ -364,20 +360,17 @@ impl<'d> Node<'d> {
     pub(crate) fn string_value_char_len(&self) -> usize {
         use self::Node::*;
 
-        fn descendant_text_char_len(node: &Node<'_>) -> usize {
-            node.children().iter().fold(0usize, |length, child| {
-                length.saturating_add(match child {
-                    Node::Element(_) => descendant_text_char_len(child),
-                    Node::Text(text) => {
-                        sxd_document_no_unsafe::as_str!(text.text()).chars().count()
-                    }
-                    _ => 0,
-                })
-            })
-        }
-
         match self {
-            Root(_) | Element(_) => descendant_text_char_len(self),
+            Root(_) | Element(_) => {
+                let mut length = 0usize;
+                visit_descendant_text(self, |text| {
+                    let characters = text.chars().count();
+                    debug_assert!(length.checked_add(characters).is_some());
+                    length += characters;
+                    true
+                });
+                length
+            }
             Attribute(attribute) => sxd_document_no_unsafe::as_str!(attribute.value())
                 .chars()
                 .count(),
@@ -399,20 +392,13 @@ impl<'d> Node<'d> {
     pub(crate) fn append_string_value(&self, output: &mut String) {
         use self::Node::*;
 
-        fn append_descendant_text(node: &Node<'_>, output: &mut String) {
-            for child in node.children() {
-                match &child {
-                    Node::Element(_) => append_descendant_text(&child, output),
-                    Node::Text(text) => {
-                        output.push_str(sxd_document_no_unsafe::as_str!(text.text()));
-                    }
-                    _ => {}
-                }
-            }
-        }
-
         match self {
-            Root(_) | Element(_) => append_descendant_text(self, output),
+            Root(_) | Element(_) => {
+                visit_descendant_text(self, |text| {
+                    output.push_str(text);
+                    true
+                });
+            }
             Attribute(attribute) => {
                 output.push_str(sxd_document_no_unsafe::as_str!(attribute.value()));
             }
@@ -439,6 +425,26 @@ impl<'d> Node<'d> {
             _ => None,
         }
     }
+}
+
+/// Visit descendant text in document order without making source depth native-stack depth.
+fn visit_descendant_text(node: &Node<'_>, mut visit: impl FnMut(&str) -> bool) -> bool {
+    let mut pending = node.children();
+    pending.reverse();
+    while let Some(node) = pending.pop() {
+        match &node {
+            Node::Element(_) => {
+                let mut children = node.children();
+                children.reverse();
+                pending.extend(children);
+            }
+            Node::Text(text) if !visit(sxd_document_no_unsafe::as_str!(text.text())) => {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 conversion_trait!(Node, {
@@ -880,6 +886,29 @@ mod test {
         element.append_child(text3);
 
         assert_eq!("Presenting: Earth!", into_node(element).string_value());
+    }
+
+    #[test]
+    fn deep_string_value_operations_do_not_use_the_native_stack() {
+        // Source depth is attacker-controlled. Every string-value operation must use the same
+        // iterative traversal and preserve document-order text concatenation.
+        let package = Package::new();
+        let doc = package.as_document();
+        let root = doc.create_element("root");
+        doc.root().append_child(root.clone());
+        let mut parent = root.clone();
+        for _ in 0..16_384 {
+            let child = doc.create_element("node");
+            parent.append_child(child.clone());
+            parent = child;
+        }
+        parent.append_child(doc.create_text("deep"));
+        let node = into_node(root);
+
+        assert_eq!(node.string_value_len(), 4);
+        assert_eq!(node.string_value_char_len(), 4);
+        assert!(node.string_value_eq("deep"));
+        assert_eq!(node.string_value(), "deep");
     }
 
     #[test]

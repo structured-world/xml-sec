@@ -185,11 +185,8 @@ fn materialize_node_string<'c, 'd>(
     context: &context::Evaluation<'c, 'd>,
     node: &crate::nodeset::Node<'d>,
 ) -> Result<String, Error> {
-    let length = node.string_value_len();
-    context
-        .reserve_string_allocation(length)
-        .context(FunctionEvaluation)?;
-    Ok(node.string_value_with_capacity(length))
+    node.string_value_with_context(context)
+        .context(FunctionEvaluation)
 }
 
 fn compare_nodesets<'c, 'd>(
@@ -237,7 +234,7 @@ fn compare_equality_values<'c, 'd>(
         (Value::Nodeset(nodes), Number(value)) | (Number(value), Value::Nodeset(nodes)) => {
             for node in nodes.iter() {
                 let string = materialize_node_string(context, &node)?;
-                if comparison.numbers(Value::String(string).number(), *value) {
+                if comparison.numbers(crate::str_to_num(&string), *value) {
                     return Ok(true);
                 }
             }
@@ -252,7 +249,10 @@ fn compare_equality_values<'c, 'd>(
             compare_nodes_with_string(nodes, value, comparison)
         }
         (Boolean(_), _) | (_, Boolean(_)) => comparison.booleans(left.boolean(), right.boolean()),
-        (Number(_), _) | (_, Number(_)) => comparison.numbers(left.number(), right.number()),
+        (Number(_), _) | (_, Number(_)) => comparison.numbers(
+            left.number(context).context(FunctionEvaluation)?,
+            right.number(context).context(FunctionEvaluation)?,
+        ),
         (Value::String(left), Value::String(right))
         | (Value::String(left), Value::ResultTreeFragment(_, right))
         | (Value::ResultTreeFragment(_, left), Value::String(right))
@@ -372,7 +372,9 @@ impl Expression for Math {
         let left = self.left.evaluate(context)?;
         let right = self.right.evaluate(context)?;
         let op = self.operation;
-        Ok(Number(op(left.number(), right.number())))
+        let left = left.number(context).context(FunctionEvaluation)?;
+        let right = right.number(context).context(FunctionEvaluation)?;
+        Ok(Number(op(left, right)))
     }
 }
 
@@ -393,9 +395,11 @@ pub struct Negation {
 
 impl Expression for Negation {
     fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
-        self.expression
-            .evaluate(context)
-            .map(|r| Number(-r.number()))
+        let value = self.expression.evaluate(context)?;
+        value
+            .number(context)
+            .map(|number| Number(-number))
+            .context(FunctionEvaluation)
     }
 }
 
@@ -528,25 +532,88 @@ impl Expression for Relational {
         let left_val = self.left.evaluate(context)?;
         let right_val = self.right.evaluate(context)?;
         let op = self.operation;
-        let result = match (&left_val, &right_val) {
-            (Value::Nodeset(left), Value::Nodeset(right)) => left.iter().any(|left| {
-                right.iter().any(|right| {
-                    op(
-                        Value::String(left.string_value()).number(),
-                        Value::String(right.string_value()).number(),
-                    )
-                })
-            }),
-            (Value::Nodeset(left), right) => left
-                .iter()
-                .any(|left| op(Value::String(left.string_value()).number(), right.number())),
-            (left, Value::Nodeset(right)) => right
-                .iter()
-                .any(|right| op(left.number(), Value::String(right.string_value()).number())),
-            (left, right) => op(left.number(), right.number()),
-        };
+        let result = compare_relational_values(context, &left_val, &right_val, op)?;
         Ok(Boolean(result))
     }
+}
+
+fn compare_relational_values(
+    context: &context::Evaluation<'_, '_>,
+    left: &Value<'_>,
+    right: &Value<'_>,
+    operation: fn(f64, f64) -> bool,
+) -> Result<bool, Error> {
+    match (left, right) {
+        (Value::Nodeset(left), Value::Nodeset(right)) => {
+            if left.size() <= right.size() {
+                let left = collect_node_numbers(context, left)?;
+                for right in right.iter() {
+                    let right = crate::node_to_num_with_context(context, &right)
+                        .context(FunctionEvaluation)?;
+                    if left.iter().any(|left| operation(*left, right)) {
+                        return Ok(true);
+                    }
+                }
+            } else {
+                let right = collect_node_numbers(context, right)?;
+                for left in left.iter() {
+                    let left = crate::node_to_num_with_context(context, &left)
+                        .context(FunctionEvaluation)?;
+                    if right.iter().any(|right| operation(left, *right)) {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        }
+        (Value::Nodeset(left), right) => {
+            let right = right.number(context).context(FunctionEvaluation)?;
+            for left in left.iter() {
+                let left =
+                    crate::node_to_num_with_context(context, &left).context(FunctionEvaluation)?;
+                if operation(left, right) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        (left, Value::Nodeset(right)) => {
+            let left = left.number(context).context(FunctionEvaluation)?;
+            for right in right.iter() {
+                let right =
+                    crate::node_to_num_with_context(context, &right).context(FunctionEvaluation)?;
+                if operation(left, right) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        (left, right) => Ok(operation(
+            left.number(context).context(FunctionEvaluation)?,
+            right.number(context).context(FunctionEvaluation)?,
+        )),
+    }
+}
+
+fn collect_node_numbers(
+    context: &context::Evaluation<'_, '_>,
+    nodes: &Nodeset<'_>,
+) -> Result<Vec<f64>, Error> {
+    if nodes.size() > usize::MAX / std::mem::size_of::<f64>() {
+        return Err(Error::FunctionEvaluation {
+            source: function::Error::Other {
+                what: "XPath numeric workspace size overflow".into(),
+            },
+        });
+    }
+    context
+        .reserve_string_allocation(nodes.size() * std::mem::size_of::<f64>())
+        .context(FunctionEvaluation)?;
+    let mut values = Vec::with_capacity(nodes.size());
+    for node in nodes.iter() {
+        values.push(crate::node_to_num_with_context(context, &node).context(FunctionEvaluation)?);
+    }
+    Ok(values)
 }
 
 impl fmt::Debug for Relational {
@@ -912,6 +979,43 @@ mod test {
         exact.set_string_allocation_limit(4);
         let evaluation = context::Evaluation::new(&exact, context_node.into());
         assert_eq!(expression.evaluate(&evaluation), Ok(Boolean(true)));
+    }
+
+    #[test]
+    fn arithmetic_and_relational_expressions_bound_node_numeric_conversion() {
+        // Arithmetic and relational operators share XPath's node-set-to-number conversion. Its
+        // temporary string must be charged even though both operator results are scalar.
+        let package = Package::new();
+        let mut setup = Setup::new(&package);
+        let value = setup.doc.create_text("1234");
+        setup.context.set_variable("value", nodeset![value]);
+        setup.context.set_string_allocation_limit(3);
+
+        let variable = || {
+            Box::new(Variable {
+                name: "value".into(),
+            }) as SubExpression
+        };
+        let literal = || {
+            Box::new(Literal {
+                value: Value::Number(0.0),
+            }) as SubExpression
+        };
+        let expressions: [SubExpression; 2] = [
+            Math::addition(variable(), literal()),
+            Relational::greater_than(variable(), literal()),
+        ];
+        for expression in expressions {
+            let error = expression
+                .evaluate(&setup.context())
+                .expect_err("numeric conversion must cross the string allocation gate");
+            assert!(matches!(
+                error,
+                Error::FunctionEvaluation {
+                    source: function::Error::Other { what }
+                } if what.contains("allocation budget")
+            ));
+        }
     }
 
     #[test]

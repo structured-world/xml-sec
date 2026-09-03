@@ -82,7 +82,7 @@ struct DateFunction(Operation, Arc<dyn Clock>, ExtensionPolicy);
 impl function::Function for DateFunction {
     fn evaluate<'c, 'd>(
         &self,
-        _: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
+        context: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
         args: Vec<Value<'d>>,
     ) -> std::result::Result<Value<'d>, function::Error> {
         use Operation::*;
@@ -157,7 +157,7 @@ impl function::Function for DateFunction {
                 // date:seconds(), including its controlled operation-clock semantics.
                 // https://exslt.github.io/date/functions/duration/date.duration.html
                 let seconds = if let Some(value) = args.first() {
-                    value.number()
+                    value.number(context)?
                 } else {
                     current_seconds_for_operation(self.1.as_ref(), self.2)?
                 };

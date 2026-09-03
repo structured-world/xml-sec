@@ -273,6 +273,13 @@ fn str_to_num(s: &str) -> f64 {
     }
 }
 
+pub(crate) fn node_to_num_with_context(
+    context: &context::Evaluation<'_, '_>,
+    node: &nodeset::Node<'_>,
+) -> Result<f64, function::Error> {
+    Ok(str_to_num(&node.string_value_with_context(context)?))
+}
+
 impl<'d> Value<'d> {
     /// Return the UTF-8 byte length of this value's XPath string conversion without allocating it.
     pub fn string_len(&self) -> usize {
@@ -338,25 +345,18 @@ impl<'d> Value<'d> {
         self.boolean()
     }
 
-    pub fn number(&self) -> f64 {
+    /// Convert this value to an XPath number under the evaluator's allocation budget.
+    pub fn number(&self, context: &context::Evaluation<'_, '_>) -> Result<f64, function::Error> {
         use crate::Value::*;
-        match *self {
-            Boolean(val) => {
-                if val {
-                    1.0
-                } else {
-                    0.0
-                }
-            }
-            Number(val) => val,
-            String(ref s) => str_to_num(s),
-            ResultTreeFragment(_, ref s) => str_to_num(s),
-            Nodeset(..) => str_to_num(&self.string()),
+        match self {
+            Boolean(value) => Ok(if *value { 1.0 } else { 0.0 }),
+            Number(value) => Ok(*value),
+            String(value) | ResultTreeFragment(_, value) => Ok(str_to_num(value)),
+            Nodeset(nodes) => match nodes.document_order_first() {
+                Some(node) => node_to_num_with_context(context, &node),
+                None => Ok(f64::NAN),
+            },
         }
-    }
-
-    pub fn into_number(self) -> f64 {
-        self.number()
     }
 
     pub fn string(&self) -> string::String {
@@ -575,48 +575,58 @@ mod test {
 
     use super::*;
 
+    fn number(value: &Value<'_>) -> f64 {
+        let package = Package::new();
+        let document = package.as_document();
+        let context = Context::new();
+        let evaluation = context::Evaluation::new(&context, document.root().into());
+        value
+            .number(&evaluation)
+            .expect("test numeric conversion fits the default budget")
+    }
+
     #[test]
     fn number_of_string_is_ieee_754_number() {
         let v = Value::String("1.5".to_owned());
-        assert_eq!(1.5, v.number());
+        assert_eq!(1.5, number(&v));
     }
 
     #[test]
     fn number_of_string_with_negative_is_negative_number() {
         let v = Value::String("-1.5".to_owned());
-        assert_eq!(-1.5, v.number());
+        assert_eq!(-1.5, number(&v));
     }
 
     #[test]
     fn number_of_string_with_surrounding_whitespace_is_number_without_whitespace() {
         let v = Value::String("\r\n1.5 \t".to_owned());
-        assert_eq!(1.5, v.number());
+        assert_eq!(1.5, number(&v));
     }
 
     #[test]
     fn number_of_string_rejects_non_xml_unicode_whitespace() {
         // XPath 1.0 refers to XML S, not Unicode White_Space; NBSP therefore
         // remains part of the lexical value and makes conversion return NaN.
-        assert!(Value::String("\u{a0}1".into()).number().is_nan());
-        assert!(Value::String("1\u{a0}".into()).number().is_nan());
+        assert!(number(&Value::String("\u{a0}1".into())).is_nan());
+        assert!(number(&Value::String("1\u{a0}".into())).is_nan());
     }
 
     #[test]
     fn number_of_garbage_string_is_nan() {
         let v = Value::String("I am not an IEEE 754 number".to_owned());
-        assert!(v.number().is_nan());
+        assert!(number(&v).is_nan());
     }
 
     #[test]
     fn number_of_boolean_true_is_1() {
         let v = Value::Boolean(true);
-        assert_eq!(1.0, v.number());
+        assert_eq!(1.0, number(&v));
     }
 
     #[test]
     fn number_of_boolean_false_is_0() {
         let v = Value::Boolean(false);
-        assert_eq!(0.0, v.number());
+        assert_eq!(0.0, number(&v));
     }
 
     #[test]
@@ -630,7 +640,7 @@ mod test {
         doc.root().append_child(c2);
 
         let v = Value::Nodeset(nodeset![c2, c1]);
-        assert_eq!(42.42, v.number());
+        assert_eq!(42.42, number(&v));
     }
 
     #[test]
