@@ -10118,6 +10118,88 @@ fn exslt_replace_applies_empty_searches_after_nonempty_matches() {
 }
 
 #[test]
+fn exslt_replace_pairs_node_sets_in_document_order() {
+    // EXSLT str:replace pairs node-set arguments in document order, independently of the
+    // hash iteration order used by the underlying XPath implementation.
+    // https://exslt.github.io/str/functions/replace/index.html
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="str:replace('ab', root/search, root/replacement)"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(
+            stylesheet,
+            "<root><search>b</search><search>a</search><replacement>B</replacement><replacement>A</replacement></root>",
+        ),
+        "AB",
+    );
+}
+
+#[test]
+fn exslt_replace_reserves_node_set_string_materialization() {
+    // Search and replacement string-values remain live together while pairing, so both lists
+    // must cross the operation-owned-memory gate before their payloads are allocated.
+    let payload = "x".repeat(32 * 1024);
+    let source = Document::parse(
+        &format!("<root><search>{payload}</search><replacement>{payload}</replacement></root>"),
+        Some("memory:source.xml"),
+    )
+    .expect("source parses");
+    let literal = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="str:replace('', '', '')"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let succeeds = |stylesheet: &xml_sec_xslt::Stylesheet, owned_bytes| {
+        let mut budget = execution_budget(1 << 20);
+        budget.owned_bytes = owned_bytes;
+        stylesheet
+            .execute(
+                &source,
+                &Parameters::new(),
+                Arc::new(NoResolver),
+                ExecutionOptions {
+                    budget,
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            )
+            .is_ok()
+    };
+    let mut rejected = 0;
+    let mut accepted = 1;
+    while !succeeds(&literal, accepted) {
+        rejected = accepted;
+        accepted *= 2;
+    }
+    while rejected + 1 < accepted {
+        let candidate = rejected + (accepted - rejected) / 2;
+        if succeeds(&literal, candidate) {
+            accepted = candidate;
+        } else {
+            rejected = candidate;
+        }
+    }
+    let nodes = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="str:replace('', root/search, root/replacement)"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let mut budget = execution_budget(1 << 20);
+    budget.owned_bytes = accepted + 4096;
+
+    assert!(matches!(
+        nodes.execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn include_position_blocks_later_imports_but_not_earlier_imports() {
     // XSLT 1.0 section 2.6.2 requires imports before every other element child, explicitly
     // including xsl:include, after included imports have been hoisted.

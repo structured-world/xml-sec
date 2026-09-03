@@ -227,11 +227,23 @@ pub(crate) fn serialize_fragment(document: &Document, meter: &mut Meter) -> Resu
         used,
         limit,
     );
-    render(document, &definition, &OutputEncoding::Utf8, &mut counter)?;
+    render(
+        document,
+        &definition,
+        &OutputEncoding::Utf8,
+        &mut counter,
+        meter,
+    )?;
     let bytes = counter.len();
     meter.charge(BudgetKind::OwnedBytes, bytes)?;
     let mut text = RenderBuffer::Text(String::with_capacity(bytes));
-    render(document, &definition, &OutputEncoding::Utf8, &mut text)?;
+    render(
+        document,
+        &definition,
+        &OutputEncoding::Utf8,
+        &mut text,
+        meter,
+    )?;
     Ok(text.into_string())
 }
 
@@ -276,13 +288,13 @@ fn serialize_with_definition(
     let (used, limit) = meter.usage(budget_kind)?;
     let mut counter =
         RenderBuffer::counting(EncodingCounter::new(&encoding), budget_kind, used, limit);
-    render(document, definition, &encoding, &mut counter)?;
+    render(document, definition, &encoding, &mut counter, meter)?;
     let text_bytes = counter.len();
     let encoded_bytes = counter.encoded_len()?;
     meter.check_additional(budget_kind, encoded_bytes)?;
     meter.charge(BudgetKind::OwnedBytes, text_bytes)?;
     let mut text = RenderBuffer::Text(String::with_capacity(text_bytes));
-    render(document, definition, &encoding, &mut text)?;
+    render(document, definition, &encoding, &mut text, meter)?;
     let text = text.into_string();
     if definition.method == OutputMethod::Xml {
         validate_xml_characters(&text, definition.version.as_deref().unwrap_or("1.0"))?;
@@ -324,6 +336,7 @@ fn render(
     definition: &EffectiveOutputDefinition<'_>,
     encoding: &OutputEncoding,
     text: &mut RenderBuffer,
+    meter: &mut Meter,
 ) -> Result<()> {
     if definition.method == OutputMethod::Xml && !definition.omit_xml_declaration {
         text.push_str("<?xml version=\"");
@@ -364,6 +377,7 @@ fn render(
             encoding,
             text,
             RenderContext::root(),
+            meter,
         )?;
         if definition.method == OutputMethod::Xml
             && (definition.indent || !definition.omit_xml_declaration)
@@ -756,6 +770,13 @@ enum RenderTask {
         start: usize,
         end: usize,
     },
+    Children {
+        parent: NodeId,
+        next: usize,
+        context: RenderContext,
+        cdata: bool,
+        skip_legacy_content_type: bool,
+    },
     CloseElement {
         id: NodeId,
         depth: usize,
@@ -774,10 +795,129 @@ fn serialize_node(
     encoding: &OutputEncoding,
     output: &mut RenderBuffer,
     context: RenderContext,
+    meter: &mut Meter,
 ) -> Result<()> {
-    let mut tasks = vec![RenderTask::Node(id, context)];
+    let mut tasks = Vec::new();
+    let mut reserved_owned_bytes = 0usize;
+    push_render_task(
+        &mut tasks,
+        RenderTask::Node(id, context),
+        meter,
+        &mut reserved_owned_bytes,
+    )?;
+    let result = serialize_node_tasks(
+        document,
+        definition,
+        encoding,
+        output,
+        meter,
+        &mut tasks,
+        &mut reserved_owned_bytes,
+    );
+    meter.release_owned_bytes(reserved_owned_bytes);
+    result
+}
+
+fn serialize_node_tasks(
+    document: &Document,
+    definition: &EffectiveOutputDefinition<'_>,
+    encoding: &OutputEncoding,
+    output: &mut RenderBuffer,
+    meter: &mut Meter,
+    tasks: &mut Vec<RenderTask>,
+    reserved_owned_bytes: &mut usize,
+) -> Result<()> {
     while let Some(task) = tasks.pop() {
         output.ensure_within_limit()?;
+        if let RenderTask::Children {
+            parent,
+            mut next,
+            context,
+            cdata,
+            skip_legacy_content_type,
+        } = task
+        {
+            let node = document
+                .node(parent)
+                .ok_or_else(|| Error::Serialization("result element disappeared".into()))?;
+            while next < node.children.len()
+                && skip_legacy_content_type
+                && document
+                    .node(node.children[next])
+                    .is_some_and(is_replaceable_legacy_content_type_meta)
+            {
+                next += 1;
+            }
+            if next == node.children.len() {
+                continue;
+            }
+            let child = node.children[next];
+            if cdata
+                && matches!(
+                    document.node(child).map(|node| &node.kind),
+                    Some(NodeKind::Text {
+                        disable_output_escaping: false,
+                        ..
+                    })
+                )
+            {
+                let start = next;
+                next += 1;
+                while let Some(child) = node.children.get(next)
+                    && matches!(
+                        document.node(*child).map(|node| &node.kind),
+                        Some(NodeKind::Text {
+                            disable_output_escaping: false,
+                            ..
+                        })
+                    )
+                {
+                    next += 1;
+                }
+                push_render_task(
+                    tasks,
+                    RenderTask::Children {
+                        parent,
+                        next,
+                        context,
+                        cdata,
+                        skip_legacy_content_type,
+                    },
+                    meter,
+                    reserved_owned_bytes,
+                )?;
+                push_render_task(
+                    tasks,
+                    RenderTask::CdataRange {
+                        parent,
+                        start,
+                        end: next,
+                    },
+                    meter,
+                    reserved_owned_bytes,
+                )?;
+                continue;
+            }
+            push_render_task(
+                tasks,
+                RenderTask::Children {
+                    parent,
+                    next: next + 1,
+                    context: context.clone(),
+                    cdata,
+                    skip_legacy_content_type,
+                },
+                meter,
+                reserved_owned_bytes,
+            )?;
+            push_render_task(
+                tasks,
+                RenderTask::Node(child, context),
+                meter,
+                reserved_owned_bytes,
+            )?;
+            continue;
+        }
         if let RenderTask::CdataRange { parent, start, end } = task {
             push_cdata_range(
                 document,
@@ -831,9 +971,18 @@ fn serialize_node(
             .ok_or_else(|| Error::Serialization("invalid result node".into()))?;
         match &node.kind {
             NodeKind::Root => {
-                for child in node.children.iter().rev() {
-                    tasks.push(RenderTask::Node(*child, context.clone()));
-                }
+                push_render_task(
+                    tasks,
+                    RenderTask::Children {
+                        parent: id,
+                        next: 0,
+                        context,
+                        cdata: false,
+                        skip_legacy_content_type: false,
+                    },
+                    meter,
+                    reserved_owned_bytes,
+                )?;
             }
             NodeKind::Text {
                 value,
@@ -915,9 +1064,18 @@ fn serialize_node(
                 });
             }
             NodeKind::Element { .. } if definition.method == OutputMethod::Text => {
-                for child in node.children.iter().rev() {
-                    tasks.push(RenderTask::Node(*child, context.clone()));
-                }
+                push_render_task(
+                    tasks,
+                    RenderTask::Children {
+                        parent: id,
+                        next: 0,
+                        context,
+                        cdata: false,
+                        skip_legacy_content_type: false,
+                    },
+                    meter,
+                    reserved_owned_bytes,
+                )?;
             }
             NodeKind::Element {
                 name,
@@ -1148,49 +1306,6 @@ fn serialize_node(
                     html_whitespace_sensitive,
                     in_scope_namespaces: current_namespaces,
                 };
-                let mut child_tasks = Vec::new();
-                let mut index = 0usize;
-                while index < node.children.len() {
-                    let child = node.children[index];
-                    // XSLT 1.0 section 16.2 requires the generated declaration and does not define
-                    // suppression when metadata already exists. The pinned libxslt oracle replaces
-                    // the legacy form; HTML5 `charset` metadata remains an ordinary result node.
-                    // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
-                    if definition.inject_content_type
-                        && html_head
-                        && document
-                            .node(child)
-                            .is_some_and(is_replaceable_legacy_content_type_meta)
-                    {
-                        index += 1;
-                        continue;
-                    }
-                    if cdata
-                        && let Some(NodeKind::Text {
-                            value: _,
-                            disable_output_escaping: false,
-                        }) = document.node(child).map(|node| &node.kind)
-                    {
-                        let start = index;
-                        index += 1;
-                        while let Some(next) = node.children.get(index)
-                            && let Some(NodeKind::Text {
-                                value: _,
-                                disable_output_escaping: false,
-                            }) = document.node(*next).map(|node| &node.kind)
-                        {
-                            index += 1;
-                        }
-                        child_tasks.push(RenderTask::CdataRange {
-                            parent: id,
-                            start,
-                            end: index,
-                        });
-                        continue;
-                    }
-                    child_tasks.push(RenderTask::Node(child, child_context.clone()));
-                    index += 1;
-                }
                 let html_void = definition.method == OutputMethod::Html
                     && name.namespace.is_none()
                     && [
@@ -1199,27 +1314,52 @@ fn serialize_node(
                     ]
                     .iter()
                     .any(|candidate| name.local.eq_ignore_ascii_case(candidate));
-                tasks.push(RenderTask::CloseElement {
-                    id,
-                    depth: context.depth,
-                    mixed,
-                    parent_mixed: context.parent_mixed,
-                    html_whitespace_sensitive,
-                    has_element_child: node.children.iter().any(|child| {
-                        matches!(
-                            document.node(*child).map(|node| &node.kind),
-                            Some(NodeKind::Element { .. })
-                        )
-                    }),
-                    html_void,
-                });
-                for child in child_tasks.into_iter().rev() {
-                    tasks.push(child);
-                }
+                push_render_task(
+                    tasks,
+                    RenderTask::CloseElement {
+                        id,
+                        depth: context.depth,
+                        mixed,
+                        parent_mixed: context.parent_mixed,
+                        html_whitespace_sensitive,
+                        has_element_child: node.children.iter().any(|child| {
+                            matches!(
+                                document.node(*child).map(|node| &node.kind),
+                                Some(NodeKind::Element { .. })
+                            )
+                        }),
+                        html_void,
+                    },
+                    meter,
+                    reserved_owned_bytes,
+                )?;
+                push_render_task(
+                    tasks,
+                    RenderTask::Children {
+                        parent: id,
+                        next: 0,
+                        context: child_context,
+                        cdata,
+                        skip_legacy_content_type: definition.inject_content_type && html_head,
+                    },
+                    meter,
+                    reserved_owned_bytes,
+                )?;
             }
             _ => {}
         }
     }
+    Ok(())
+}
+
+fn push_render_task(
+    tasks: &mut Vec<RenderTask>,
+    task: RenderTask,
+    meter: &mut Meter,
+    reserved_owned_bytes: &mut usize,
+) -> Result<()> {
+    crate::budget::reserve_temporary_vec_slot(tasks, meter, reserved_owned_bytes)?;
+    tasks.push(task);
     Ok(())
 }
 
@@ -1771,8 +1911,8 @@ fn validate_xml_characters(value: &str, version: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        EncodingCounter, OutputDefinition, OutputEncoding, OutputMethod, RenderBuffer,
-        push_cdata_range, serialize,
+        EncodingCounter, OutputDefinition, OutputEncoding, OutputMethod, RenderBuffer, RenderTask,
+        push_cdata_range, serialize, serialize_fragment,
     };
     use crate::budget::Meter;
     use crate::{BudgetKind, Document, ExecutionBudget, ExpandedName, NodeKind};
@@ -1786,6 +1926,7 @@ mod tests {
         definition.cdata_section_elements.extend(
             (0..1024).map(|index| ExpandedName::new(None::<String>, format!("item-{index}"))),
         );
+        let traversal_workspace = 4 * std::mem::size_of::<RenderTask>();
         let limits = ExecutionBudget {
             source_bytes: 0,
             external_documents: 0,
@@ -1797,7 +1938,7 @@ mod tests {
             result_nodes: 0,
             serialized_bytes: 64,
             messages: 0,
-            owned_bytes: 64,
+            owned_bytes: 64 + traversal_workspace,
         };
         let mut meter = Meter::new(limits, 0).expect("zero source bytes fit");
 
@@ -1885,12 +2026,72 @@ mod tests {
     fn transcoding_reserves_utf8_and_encoded_buffers_concurrently() {
         // UTF-16 allocation overlaps the rendered UTF-8 workspace, and the returned encoding and
         // media-type metadata remain live beside the encoded bytes in SerializedOutput.
-        let document = Document::parse("<root>abcdefgh</root>", None).expect("document parses");
+        let payload = "a".repeat(512);
+        let document =
+            Document::parse(&format!("<root>{payload}</root>"), None).expect("document parses");
         let definition = OutputDefinition {
             method: OutputMethod::Text,
             encoding: "UTF-16".into(),
             ..OutputDefinition::default()
         };
+        let encoded_bytes = 2 + payload.len() * 2;
+        let concurrent_buffers = payload.len() + encoded_bytes;
+        debug_assert!(concurrent_buffers > payload.len() + 4 * std::mem::size_of::<RenderTask>());
+        let base_limits = ExecutionBudget {
+            source_bytes: 0,
+            external_documents: 0,
+            recursion_depth: 1,
+            xpath_evaluations: 0,
+            template_applications: 0,
+            sort_comparisons: 0,
+            key_entries: 0,
+            result_nodes: 0,
+            serialized_bytes: encoded_bytes,
+            messages: 0,
+            owned_bytes: 0,
+        };
+        let succeeds = |owned_bytes| {
+            let limits = ExecutionBudget {
+                owned_bytes,
+                ..base_limits
+            };
+            let mut meter = Meter::new(limits, 0).expect("zero source bytes fit");
+            serialize(&document, &definition, &mut meter).is_ok()
+        };
+        let mut rejected = 0;
+        let mut accepted = concurrent_buffers * 2;
+        while rejected + 1 < accepted {
+            let candidate = rejected + (accepted - rejected) / 2;
+            if succeeds(candidate) {
+                accepted = candidate;
+            } else {
+                rejected = candidate;
+            }
+        }
+        assert_eq!(accepted, concurrent_buffers);
+
+        let limits = ExecutionBudget {
+            owned_bytes: accepted,
+            ..base_limits
+        };
+        let mut meter = Meter::new(limits, 0).expect("zero source bytes fit");
+        let output = serialize(&document, &definition, &mut meter)
+            .expect("encoded bytes and retained metadata fit exactly");
+        assert_eq!(output.bytes.len(), encoded_bytes);
+        assert_eq!(
+            meter
+                .usage(BudgetKind::OwnedBytes)
+                .expect("owned-byte usage is available")
+                .0,
+            encoded_bytes + "UTF-16".len() + "text/plain".len()
+        );
+    }
+
+    #[test]
+    fn traversal_workspace_crosses_the_owned_memory_gate() {
+        // Output storage is not the serializer's only live allocation: even a minimal iterative
+        // traversal must reserve its task stack before rendering starts.
+        let document = Document::parse("<root/>", None).expect("document parses");
         let limits = ExecutionBudget {
             source_bytes: 0,
             external_documents: 0,
@@ -1900,31 +2101,18 @@ mod tests {
             sort_comparisons: 0,
             key_entries: 0,
             result_nodes: 0,
-            serialized_bytes: 64,
+            serialized_bytes: 0,
             messages: 0,
-            owned_bytes: 33,
+            owned_bytes: "<root></root>".len(),
         };
         let mut meter = Meter::new(limits, 0).expect("zero source bytes fit");
+
         assert!(matches!(
-            serialize(&document, &definition, &mut meter),
+            serialize_fragment(&document, &mut meter),
             Err(crate::Error::Budget {
                 kind: BudgetKind::OwnedBytes,
                 ..
             })
         ));
-
-        let mut limits = limits;
-        limits.owned_bytes = 34;
-        let mut meter = Meter::new(limits, 0).expect("zero source bytes fit");
-        let output = serialize(&document, &definition, &mut meter)
-            .expect("encoded bytes and retained metadata fit exactly");
-        assert_eq!(output.bytes.len(), 18);
-        assert_eq!(
-            meter
-                .usage(BudgetKind::OwnedBytes)
-                .expect("owned-byte usage is available")
-                .0,
-            34
-        );
     }
 }

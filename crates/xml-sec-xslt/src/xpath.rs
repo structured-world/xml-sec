@@ -602,8 +602,7 @@ pub(crate) struct Evaluator {
     key_index: Rc<RefCell<KeyIndex>>,
     unparsed_entity_index: Rc<RefCell<Vec<HashMap<String, String>>>>,
     decimal_formats: Rc<Vec<DecimalFormat>>,
-    stylesheet_functions: HashSet<ExpandedName>,
-    extension_functions: HashSet<ExpandedName>,
+    stylesheet_functions: Arc<HashSet<ExpandedName>>,
     resolver: Arc<dyn Resolver>,
     documents: HashMap<DocumentRequest, Vec<SourceNode>>,
     document_roots: Rc<RefCell<HashMap<DocumentRequest, Vec<NodePath>>>>,
@@ -616,6 +615,17 @@ pub(crate) struct Evaluator {
     whitespace: Arc<[(NameTest, bool, usize, usize)]>,
     clock: Arc<dyn Clock>,
     extension_policy: ExtensionPolicy,
+}
+
+struct TemporaryStrings {
+    values: Vec<String>,
+    reserved_owned_bytes: usize,
+}
+
+impl TemporaryStrings {
+    fn release(self, meter: &mut Meter) {
+        meter.release_owned_bytes(self.reserved_owned_bytes);
+    }
 }
 
 impl Evaluator {
@@ -713,8 +723,7 @@ impl Evaluator {
             key_index: Rc::new(RefCell::new(HashMap::new())),
             unparsed_entity_index: Rc::new(RefCell::new(unparsed_entity_index)),
             decimal_formats: Rc::new(Vec::new()),
-            stylesheet_functions: HashSet::new(),
-            extension_functions: HashSet::new(),
+            stylesheet_functions: Arc::new(HashSet::new()),
             resolver,
             documents,
             document_roots,
@@ -736,24 +745,7 @@ impl Evaluator {
         extension_functions: impl IntoIterator<Item = ExpandedName>,
     ) {
         self.decimal_formats = Rc::new(decimal_formats.to_vec());
-        self.stylesheet_functions = extension_functions.into_iter().collect();
-        self.extension_functions = self.stylesheet_functions.clone();
-        self.extension_functions.extend([
-            ExpandedName::new(Some(EXSLT_COMMON_NS), "node-set"),
-            ExpandedName::new(Some(EXSLT_COMMON_NS), "object-type"),
-            ExpandedName::new(Some(EXSLT_STRINGS_NS), "split"),
-            ExpandedName::new(Some(EXSLT_STRINGS_NS), "tokenize"),
-            ExpandedName::new(Some(EXSLT_STRINGS_NS), "replace"),
-            ExpandedName::new(Some(EXSLT_DYNAMIC_NS), "evaluate"),
-            ExpandedName::new(Some(EXSLT_DYNAMIC_NS), "map"),
-            ExpandedName::new(Some(SAXON_NS), "expression"),
-            ExpandedName::new(Some(SAXON_NS), "eval"),
-            ExpandedName::new(Some(SAXON_NS), "evaluate"),
-            ExpandedName::new(Some(SAXON_NS), "line-number"),
-            ExpandedName::new(Some(SAXON_NS), "node-set"),
-            ExpandedName::new(Some(XT_NS), "node-set"),
-            ExpandedName::new(Some(LIBXSLT_NS), "node-set"),
-        ]);
+        self.stylesheet_functions = Arc::new(extension_functions.into_iter().collect());
     }
 
     pub(crate) fn append_key_entry(
@@ -1316,7 +1308,7 @@ impl Evaluator {
                             "str:replace() requires three arguments".into(),
                         ));
                     }
-                    let input = self
+                    let (input, input_owned_bytes) = self
                         .evaluate_core(
                             &expression.derived(call.arguments[0].clone()),
                             node,
@@ -1326,8 +1318,8 @@ impl Evaluator {
                             meter,
                             custom_calls,
                         )?
-                        .string(self);
-                    let searches = self.evaluate_extension_strings(
+                        .into_temporary_string(self, meter)?;
+                    let searches = match self.evaluate_extension_strings(
                         expression.derived(call.arguments[1].clone()),
                         node,
                         position,
@@ -1335,8 +1327,14 @@ impl Evaluator {
                         &augmented,
                         meter,
                         custom_calls,
-                    )?;
-                    let replacements = self.evaluate_extension_strings(
+                    ) {
+                        Ok(searches) => searches,
+                        Err(error) => {
+                            meter.release_owned_bytes(input_owned_bytes);
+                            return Err(error);
+                        }
+                    };
+                    let replacements = match self.evaluate_extension_strings(
                         expression.derived(call.arguments[2].clone()),
                         node,
                         position,
@@ -1344,13 +1342,27 @@ impl Evaluator {
                         &augmented,
                         meter,
                         custom_calls,
-                    )?;
+                    ) {
+                        Ok(replacements) => replacements,
+                        Err(error) => {
+                            meter.release_owned_bytes(input_owned_bytes);
+                            searches.release(meter);
+                            return Err(error);
+                        }
+                    };
                     // libxslt implements the earlier str:replace contract by converting each
                     // replacement node to its XPath string-value. The current EXSLT text instead
                     // specifies node copies; preserving libxslt behavior is required for drop-in
                     // compatibility. https://exslt.github.io/str/functions/replace/index.html
-                    let replaced = replace_exslt_string(&input, &searches, &replacements, meter)?;
-                    let fragment = text_document(&replaced, meter)?;
+                    let replaced =
+                        replace_exslt_string(&input, &searches.values, &replacements.values, meter);
+                    meter.release_owned_bytes(input_owned_bytes);
+                    searches.release(meter);
+                    replacements.release(meter);
+                    let replaced = replaced?;
+                    let fragment = text_document(&replaced, meter);
+                    meter.release_owned_bytes(replaced.len());
+                    let fragment = fragment?;
                     let root = self.import_document(&fragment, meter)?;
                     let nodes = self.children(&root);
                     Value::NodeSet(nodes)
@@ -1577,7 +1589,7 @@ impl Evaluator {
         variables: &dyn VariableBindings,
         meter: &mut Meter,
         custom_calls: Option<&CustomCallSession>,
-    ) -> Result<Vec<String>> {
+    ) -> Result<TemporaryStrings> {
         let value = self.evaluate_core(
             &expression,
             node,
@@ -1587,11 +1599,35 @@ impl Evaluator {
             meter,
             custom_calls,
         )?;
-        Ok(match value {
-            XPathValue::NodeSet(nodes) => {
-                nodes.iter().map(|node| self.string_value(node)).collect()
+        let mut values = Vec::new();
+        let mut reserved_owned_bytes = 0usize;
+        let materialized = (|| {
+            match value {
+                XPathValue::NodeSet(nodes) => {
+                    for node in self.document_order(nodes) {
+                        reserve_temporary_vec_slot(&mut values, meter, &mut reserved_owned_bytes)?;
+                        let length = self.string_value_len(&node);
+                        meter.charge(BudgetKind::OwnedBytes, length)?;
+                        reserved_owned_bytes = reserved_owned_bytes.saturating_add(length);
+                        values.push(self.string_value_with_capacity(&node, length));
+                    }
+                }
+                value => {
+                    reserve_temporary_vec_slot(&mut values, meter, &mut reserved_owned_bytes)?;
+                    let (value, temporary_bytes) = value.into_temporary_string(self, meter)?;
+                    reserved_owned_bytes = reserved_owned_bytes.saturating_add(temporary_bytes);
+                    values.push(value);
+                }
             }
-            value => vec![value.string(self)],
+            Ok(())
+        })();
+        if let Err(error) = materialized {
+            meter.release_owned_bytes(reserved_owned_bytes);
+            return Err(error);
+        }
+        Ok(TemporaryStrings {
+            values,
+            reserved_owned_bytes,
         })
     }
 
@@ -1744,17 +1780,12 @@ impl Evaluator {
             },
         );
         context.set_function("lang", LangFunction);
-        let mut extension_functions = self.extension_functions.clone();
-        extension_functions.extend(register_exslt_functions(
-            &mut context,
-            Arc::clone(&self.clock),
-            self.extension_policy,
-        ));
+        register_exslt_functions(&mut context, Arc::clone(&self.clock), self.extension_policy);
         context.set_function(
             "function-available",
             FunctionAvailable {
                 namespaces: function_namespaces,
-                extension_functions,
+                stylesheet_functions: Arc::clone(&self.stylesheet_functions),
             },
         );
         context.set_function(
@@ -1767,7 +1798,7 @@ impl Evaluator {
             },
         );
         if let Some(custom_calls) = custom_calls {
-            for name in &self.stylesheet_functions {
+            for name in self.stylesheet_functions.iter() {
                 let qname: sxd_xpath_no_unsafe::OwnedQName = name.namespace.as_deref().map_or_else(
                     || name.local.as_str().into(),
                     |namespace| (namespace, name.local.as_str()).into(),
@@ -4817,19 +4848,13 @@ fn register_exslt_functions(
     context: &mut Context<'_>,
     clock: Arc<dyn Clock>,
     extension_policy: ExtensionPolicy,
-) -> HashSet<ExpandedName> {
-    let mut registered = HashSet::new();
+) {
     macro_rules! register {
         ($namespace:expr, $name:expr, $function:expr) => {{
             context.set_function(($namespace, $name), $function);
-            registered.insert(ExpandedName::new(Some($namespace), $name));
         }};
     }
     crate::exslt_date::register(context, clock, extension_policy);
-    registered.extend(
-        crate::exslt_date::function_names()
-            .map(|name| ExpandedName::new(Some(crate::exslt_date::NAMESPACE), name)),
-    );
     register!(EXSLT_MATH_NS, "max", ExsltMathFunction::Max);
     register!(EXSLT_MATH_NS, "min", ExsltMathFunction::Min);
     register!(EXSLT_MATH_NS, "highest", ExsltMathFunction::Highest);
@@ -4875,7 +4900,6 @@ fn register_exslt_functions(
     );
     register!(LIBXSLT_TEST_NS, "test", IdentityStringFunction);
     register!(LIBXSLT_TEST_PLUGIN_NS, "testplugin", IdentityStringFunction);
-    registered
 }
 
 struct IdentityStringFunction;
@@ -5976,7 +6000,7 @@ fn xpath_test_matches_root(node_test: &str) -> bool {
 
 struct FunctionAvailable {
     namespaces: Arc<Vec<(String, String)>>,
-    extension_functions: HashSet<ExpandedName>,
+    stylesheet_functions: Arc<HashSet<ExpandedName>>,
 }
 impl function::Function for FunctionAvailable {
     fn evaluate<'c, 'd>(
@@ -5986,7 +6010,7 @@ impl function::Function for FunctionAvailable {
     ) -> std::result::Result<SxdValue<'d>, function::Error> {
         let name = one_qname_argument(args, &self.namespaces, "function-available")?;
         let available = if name.namespace.is_some() {
-            self.extension_functions.contains(&name)
+            self.stylesheet_functions.contains(&name) || is_builtin_extension_function(&name)
         } else {
             matches!(
                 name.local.as_str(),
@@ -6029,6 +6053,42 @@ impl function::Function for FunctionAvailable {
             )
         };
         Ok(SxdValue::Boolean(available))
+    }
+}
+
+fn is_builtin_extension_function(name: &ExpandedName) -> bool {
+    match name.namespace.as_deref() {
+        Some(EXSLT_COMMON_NS) => matches!(name.local.as_str(), "node-set" | "object-type"),
+        Some(EXSLT_STRINGS_NS) => matches!(
+            name.local.as_str(),
+            "split" | "tokenize" | "replace" | "align" | "padding" | "encode-uri" | "decode-uri"
+        ),
+        Some(EXSLT_DYNAMIC_NS) => matches!(name.local.as_str(), "evaluate" | "map"),
+        Some(EXSLT_MATH_NS) => matches!(
+            name.local.as_str(),
+            "max" | "min" | "highest" | "lowest" | "power"
+        ),
+        Some(EXSLT_SETS_NS) => matches!(
+            name.local.as_str(),
+            "difference" | "intersection" | "distinct" | "has-same-node" | "leading" | "trailing"
+        ),
+        Some(EXSLT_CRYPTO_NS) => {
+            matches!(
+                name.local.as_str(),
+                "md5" | "sha1" | "rc4_encrypt" | "rc4_decrypt"
+            )
+        }
+        Some(crate::exslt_date::NAMESPACE) => {
+            crate::exslt_date::function_names().any(|candidate| candidate == name.local)
+        }
+        Some(SAXON_NS) => matches!(
+            name.local.as_str(),
+            "expression" | "eval" | "evaluate" | "line-number" | "node-set"
+        ),
+        Some(XT_NS | LIBXSLT_NS) => name.local == "node-set",
+        Some(LIBXSLT_TEST_NS) => name.local == "test",
+        Some(LIBXSLT_TEST_PLUGIN_NS) => name.local == "testplugin",
+        _ => false,
     }
 }
 
@@ -6751,6 +6811,20 @@ mod tests {
             panic!("overlay payload is missing");
         };
         assert!(std::ptr::eq(original, borrowed));
+    }
+
+    #[test]
+    fn function_available_shares_the_stylesheet_catalog() {
+        let catalog = Arc::new(HashSet::from([ExpandedName::new(
+            Some("urn:extension"),
+            "function",
+        )]));
+        let function = FunctionAvailable {
+            namespaces: Arc::new(vec![]),
+            stylesheet_functions: Arc::clone(&catalog),
+        };
+
+        assert!(Arc::ptr_eq(&function.stylesheet_functions, &catalog));
     }
 
     #[test]

@@ -385,7 +385,7 @@ impl<R: Resolver> Compiler<R> {
             priority: 0.5,
             precedence,
             order,
-            params: Vec::new(),
+            params: Arc::from([]),
             body: vec![compile_literal_element(
                 root,
                 CompileContext::new(forward, depth, state.budget.recursion_depth, base_uri)?,
@@ -508,6 +508,7 @@ impl<R: Resolver> Compiler<R> {
                     children,
                     CompileContext::new(forward, depth, state.budget.recursion_depth, base_uri)?,
                 )?;
+                let params: Arc<[Variable]> = params.into();
                 let order = state.next_order();
                 if patterns.is_empty() {
                     state.templates.push(Template {
@@ -530,7 +531,7 @@ impl<R: Resolver> Compiler<R> {
                             mode: mode.clone(),
                             precedence,
                             order,
-                            params: params.clone(),
+                            params: Arc::clone(&params),
                             body: Arc::clone(&body),
                         });
                     }
@@ -685,7 +686,7 @@ pub(crate) struct Template {
     pub priority: f64,
     pub precedence: usize,
     pub order: usize,
-    pub params: Vec<Variable>,
+    pub params: Arc<[Variable]>,
     pub body: InstructionSequence,
 }
 #[derive(Debug, Clone)]
@@ -1773,7 +1774,7 @@ fn validate_attribute_set_references(
     }
     validate_attribute_set_cycles(sets)?;
     for template in templates {
-        for parameter in &template.params {
+        for parameter in template.params.iter() {
             validate_attribute_sets_in_sequence(&parameter.content, &validate_name)?;
         }
         validate_attribute_sets_in_sequence(&template.body, &validate_name)?;

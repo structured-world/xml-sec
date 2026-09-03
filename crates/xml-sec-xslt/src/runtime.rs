@@ -370,7 +370,7 @@ struct ApplyFrame {
 
 enum TemplateTask {
     EnterTemplate {
-        template: Box<Template>,
+        program: TemplateProgram,
         params: Arc<EvaluatedParameters>,
         node: SourceNode,
         frame: ApplyFrame,
@@ -411,6 +411,32 @@ enum TemplateTask {
     PopOutput,
     PushScope,
     PopScope,
+}
+
+struct TemplateProgram {
+    parameters: Arc<[Variable]>,
+    body: InstructionSequence,
+}
+
+impl TemplateTask {
+    fn enter_template(
+        template: &Template,
+        params: Arc<EvaluatedParameters>,
+        node: SourceNode,
+        frame: ApplyFrame,
+        current_rule_precedence: Option<usize>,
+    ) -> Self {
+        Self::EnterTemplate {
+            program: TemplateProgram {
+                parameters: Arc::clone(&template.params),
+                body: Arc::clone(&template.body),
+            },
+            params,
+            node,
+            frame,
+            current_rule_precedence,
+        }
+    }
 }
 
 fn push_scoped_sequence(
@@ -837,27 +863,27 @@ impl<'a> Execution<'a> {
         frame: ApplyFrame,
         current_rule_precedence: Option<usize>,
     ) -> Result<()> {
-        self.run_template_tasks(vec![TemplateTask::EnterTemplate {
-            template: Box::new(template.clone()),
+        self.run_template_tasks(vec![TemplateTask::enter_template(
+            template,
             params,
             node,
             frame,
             current_rule_precedence,
-        }])
+        )])
     }
 
     fn run_template_tasks(&mut self, mut tasks: Vec<TemplateTask>) -> Result<()> {
         while let Some(task) = tasks.pop() {
             match task {
                 TemplateTask::EnterTemplate {
-                    template,
+                    program,
                     params,
                     node,
                     frame,
                     current_rule_precedence,
                 } => self.push_template_tasks(
                     &mut tasks,
-                    &template,
+                    program,
                     params,
                     node,
                     frame,
@@ -974,20 +1000,19 @@ impl<'a> Execution<'a> {
                                 .iter()
                                 .filter(|candidate| candidate.name.as_ref() == Some(name))
                                 .max_by_key(|candidate| (candidate.precedence, candidate.order))
-                                .cloned()
                                 .ok_or_else(|| {
                                     Error::Dynamic(format!(
                                         "named template {} not found",
                                         name.local
                                     ))
                                 })?;
-                            tasks.push(TemplateTask::EnterTemplate {
-                                template: Box::new(target),
-                                params: Arc::new(supplied),
+                            tasks.push(TemplateTask::enter_template(
+                                target,
+                                Arc::new(supplied),
                                 node,
-                                frame: ApplyFrame::new(position, size, depth + 1),
-                                current_rule_precedence: precedence,
-                            });
+                                ApplyFrame::new(position, size, depth + 1),
+                                precedence,
+                            ));
                         }
                         Instruction::ApplyTemplates {
                             select,
@@ -1267,18 +1292,17 @@ impl<'a> Execution<'a> {
                 selected = Some(template);
             }
         }
-        let selected = selected.cloned();
         if let Some(template) = selected {
             self.modes.push(mode);
             tasks.push(TemplateTask::RestoreMode);
             let current_rule_precedence = Some(template.precedence);
-            tasks.push(TemplateTask::EnterTemplate {
-                template: Box::new(template),
+            tasks.push(TemplateTask::enter_template(
+                template,
                 params,
                 node,
                 frame,
                 current_rule_precedence,
-            });
+            ));
             return Ok(());
         }
         self.release_parameters_if_last(&params);
@@ -1376,7 +1400,7 @@ impl<'a> Execution<'a> {
     fn push_template_tasks(
         &mut self,
         tasks: &mut Vec<TemplateTask>,
-        template: &Template,
+        program: TemplateProgram,
         params: Arc<EvaluatedParameters>,
         node: SourceNode,
         frame: ApplyFrame,
@@ -1391,7 +1415,7 @@ impl<'a> Execution<'a> {
         self.meter.recursion(depth)?;
         let caller_scopes = self.scopes.split_off(1);
         self.scopes.push(VariableScope::default());
-        for parameter in &template.params {
+        for parameter in program.parameters.iter() {
             let retained = if let Some(value) = params.get(&parameter.name) {
                 let retained_owned_bytes = binding_owned_bytes(&parameter.name, value);
                 self.meter
@@ -1425,7 +1449,7 @@ impl<'a> Execution<'a> {
         self.release_parameters_if_last(&params);
         tasks.push(TemplateTask::RestoreScopes(caller_scopes));
         tasks.push(TemplateTask::Sequence {
-            instructions: Arc::clone(&template.body),
+            instructions: program.body,
             index: 0,
             node,
             position,
@@ -5314,7 +5338,10 @@ mod tests {
     use std::cmp::Ordering;
     use std::sync::Arc;
 
-    use super::{SortKey, append_localized_decimal, apply_whitespace_rules, value_string};
+    use super::{
+        ApplyFrame, EvaluatedParameters, SortKey, SourceNode, TemplateTask,
+        append_localized_decimal, apply_whitespace_rules, value_string,
+    };
     use crate::budget::Meter;
     use crate::compiler::Instruction;
     use crate::{
@@ -5435,6 +5462,33 @@ mod tests {
         };
 
         assert!(Arc::ptr_eq(body, &cloned_body));
+    }
+
+    #[test]
+    fn template_dispatch_shares_only_execution_metadata() {
+        let stylesheet = Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(1 << 20, 4, 32, 2 << 20),
+        )
+        .compile(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:unused="urn:large-matching-metadata"><xsl:template match="/"><xsl:param name="value"/><out/></xsl:template></xsl:stylesheet>"#,
+            None,
+        )
+        .expect("stylesheet compiles");
+        let template = &stylesheet.templates[0];
+        let task = TemplateTask::enter_template(
+            template,
+            Arc::new(EvaluatedParameters::default()),
+            SourceNode::Node(crate::NodeId::test(0)),
+            ApplyFrame::new(1, 1, 1),
+            Some(template.precedence),
+        );
+        let TemplateTask::EnterTemplate { program, .. } = task else {
+            panic!("template dispatch creates an entry task");
+        };
+
+        assert!(Arc::ptr_eq(&program.parameters, &template.params));
+        assert!(Arc::ptr_eq(&program.body, &template.body));
     }
 
     #[test]
