@@ -9,6 +9,7 @@ use crate::lexical::{
     is_ncname, is_ncname_char, is_ncname_start, is_xml_whitespace, strip_xpath_attribute_axis,
     unicode_decimal_value, xpath_string_literal,
 };
+use crate::model::prepare_xml_entities_bounded;
 use crate::resolver::decode_resource;
 use crate::{
     BudgetKind, CompileBudget, Document, Error, ExpandedName, Namespace, OutputDefinition,
@@ -1664,6 +1665,9 @@ impl CompileState {
             self.owned_bytes,
         )
     }
+    fn remaining_owned_bytes(&self) -> usize {
+        self.budget.owned_bytes.saturating_sub(self.owned_bytes)
+    }
     fn release_owned(&mut self, amount: usize) {
         self.owned_bytes = self
             .owned_bytes
@@ -1993,12 +1997,36 @@ fn with_frontend_document<T>(
     state: &mut CompileState,
     consume: impl FnOnce(&roxmltree::Document<'_>, &mut CompileState) -> Result<T>,
 ) -> Result<T> {
-    let reserved = frontend_parser_workspace_bytes(xml);
-    state.charge_owned(reserved)?;
-    let result = roxmltree::Document::parse(xml)
+    let lexical_reserved = frontend_parser_workspace_bytes(xml);
+    state.charge_owned(lexical_reserved)?;
+    let prepared = match prepare_xml_entities_bounded(xml, state.remaining_owned_bytes()) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            state.release_owned(lexical_reserved);
+            return Err(error);
+        }
+    };
+    let expanded_owned_bytes = match &prepared {
+        Cow::Borrowed(_) => 0,
+        Cow::Owned(expanded) => expanded.capacity(),
+    };
+    if let Err(error) = state.charge_owned(expanded_owned_bytes) {
+        state.release_owned(lexical_reserved);
+        return Err(error);
+    }
+    let expanded_workspace = frontend_parser_workspace_bytes(prepared.as_ref());
+    let additional_workspace = expanded_workspace.saturating_sub(lexical_reserved);
+    if let Err(error) = state.charge_owned(additional_workspace) {
+        state.release_owned(expanded_owned_bytes);
+        state.release_owned(lexical_reserved);
+        return Err(error);
+    }
+    let result = roxmltree::Document::parse(prepared.as_ref())
         .map_err(|error| Error::Xml(error.to_string()))
         .and_then(|document| consume(&document, state));
-    state.release_owned(reserved);
+    state.release_owned(additional_workspace);
+    state.release_owned(expanded_owned_bytes);
+    state.release_owned(lexical_reserved);
     result
 }
 
@@ -3848,6 +3876,30 @@ mod tests {
                 actual,
                 ..
             }) if actual == required
+        ));
+    }
+
+    #[test]
+    fn frontend_workspace_preflights_internal_entity_expansion() {
+        // The compiler must account for the entity-expanded source before constructing the
+        // frontend DOM; otherwise a short lexical input can allocate far beyond owned_bytes.
+        let replacement = "x".repeat(1_024);
+        let references = "&payload;".repeat(64);
+        let xml = format!(
+            r#"<!DOCTYPE xsl:stylesheet [<!ENTITY payload "{replacement}">]><xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><out>{references}</out></xsl:template></xsl:stylesheet>"#
+        );
+        let lexical_workspace = frontend_parser_workspace_bytes(&xml);
+        let mut state = CompileState::new(
+            CompileBudget::new(xml.len(), 0, 8, lexical_workspace + replacement.len()),
+            xml.len(),
+        );
+
+        assert!(matches!(
+            with_frontend_document(&xml, &mut state, |_document, _state| Ok(())),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            })
         ));
     }
 }

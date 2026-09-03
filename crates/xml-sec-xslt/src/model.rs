@@ -12,9 +12,20 @@ use crate::{BudgetKind, Error, Result};
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
 
-/// Stable index of a node inside one owned document.
+/// Stable, document-bound index of a node inside one owned document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct NodeId(pub usize);
+pub struct NodeId(pub usize, u64);
+
+impl NodeId {
+    pub(crate) const fn document_identity(self) -> u64 {
+        self.1
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn test(index: usize) -> Self {
+        Self(index, 1)
+    }
+}
 
 /// Stable identity of any XPath node in one owned document.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -107,12 +118,46 @@ pub struct Document {
 
 impl PartialEq for Document {
     fn eq(&self, other: &Self) -> bool {
-        self.nodes == other.nodes
-            && self.root == other.root
-            && self.logical_roots == other.logical_roots
+        let nodes_equal = self.nodes.len() == other.nodes.len()
+            && self.nodes.iter().zip(&other.nodes).all(|(left, right)| {
+                left.kind == right.kind
+                    && left.parent.map(|id| id.0) == right.parent.map(|id| id.0)
+                    && left
+                        .children
+                        .iter()
+                        .map(|id| id.0)
+                        .eq(right.children.iter().map(|id| id.0))
+                    && left.base_uri == right.base_uri
+                    && left.source_line == right.source_line
+            });
+        let ids_equal = self.ids.len() == other.ids.len()
+            && self.ids.iter().all(|((root, value), owner)| {
+                other
+                    .ids
+                    .iter()
+                    .any(|((other_root, other_value), other_owner)| {
+                        root.0 == other_root.0 && value == other_value && owner.0 == other_owner.0
+                    })
+            });
+        let entities_equal = self.unparsed_entities.len() == other.unparsed_entities.len()
+            && self.unparsed_entities.iter().all(|((root, name), value)| {
+                other
+                    .unparsed_entities
+                    .iter()
+                    .any(|((other_root, other_name), other_value)| {
+                        root.0 == other_root.0 && name == other_name && value == other_value
+                    })
+            });
+        nodes_equal
+            && self.root.0 == other.root.0
+            && self
+                .logical_roots
+                .iter()
+                .map(|id| id.0)
+                .eq(other.logical_roots.iter().map(|id| id.0))
             && self.source_bytes == other.source_bytes
-            && self.ids == other.ids
-            && self.unparsed_entities == other.unparsed_entities
+            && ids_equal
+            && entities_equal
     }
 }
 
@@ -576,8 +621,9 @@ impl Document {
     #[must_use]
     pub fn empty(base_uri: Option<String>) -> Self {
         static NEXT_DOCUMENT_IDENTITY: AtomicU64 = AtomicU64::new(1);
+        let identity = NEXT_DOCUMENT_IDENTITY.fetch_add(1, Ordering::Relaxed);
         Self {
-            identity: NEXT_DOCUMENT_IDENTITY.fetch_add(1, Ordering::Relaxed),
+            identity,
             nodes: vec![Node {
                 kind: NodeKind::Root,
                 parent: None,
@@ -585,8 +631,8 @@ impl Document {
                 base_uri,
                 source_line: None,
             }],
-            root: NodeId(0),
-            logical_roots: vec![NodeId(0)],
+            root: NodeId(0, identity),
+            logical_roots: vec![NodeId(0, identity)],
             source_bytes: 0,
             ids: HashMap::new(),
             unparsed_entities: HashMap::new(),
@@ -600,10 +646,16 @@ impl Document {
 
     #[must_use]
     pub fn node(&self, id: NodeId) -> Option<&Node> {
+        if id.document_identity() != self.identity {
+            return None;
+        }
         self.nodes.get(id.0)
     }
 
     pub(crate) fn node_mut(&mut self, id: NodeId) -> Option<&mut Node> {
+        if id.document_identity() != self.identity {
+            return None;
+        }
         self.nodes.get_mut(id.0)
     }
 
@@ -630,6 +682,18 @@ impl Document {
                         .capacity()
                         .saturating_mul(std::mem::size_of::<NodeId>()),
                 )
+            }))
+    }
+
+    pub(crate) fn retained_identity_index_bytes(&self) -> usize {
+        self.ids
+            .capacity()
+            .saturating_mul(
+                std::mem::size_of::<((NodeId, String), NodeId)>()
+                    .saturating_add(std::mem::size_of::<u64>()),
+            )
+            .saturating_add(self.ids.keys().fold(0usize, |total, (_, value)| {
+                total.saturating_add(value.capacity())
             }))
     }
 
@@ -767,7 +831,7 @@ impl Document {
 
     pub(crate) fn import(&mut self, source: &Self) -> NodeId {
         let offset = self.nodes.len();
-        let remap = |id: NodeId| NodeId(offset + id.0);
+        let remap = |id: NodeId| NodeId(offset + id.0, self.identity);
         self.nodes
             .extend(source.nodes.iter().cloned().map(|mut node| {
                 node.parent = node.parent.map(remap);
@@ -940,14 +1004,7 @@ impl Document {
                     _ => None,
                 })
                 .ok_or_else(|| Error::Xml("xml:id attribute reference is stale".into()))?;
-            let normalized = collapse_xml_whitespace(&value.value).into_owned();
-            // xml:id 1.0 section 4 requires validation after whitespace normalization.
-            // https://www.w3.org/TR/xml-id/#processing
-            if !crate::lexical::is_ncname(&normalized) {
-                return Err(Error::Xml(format!(
-                    "xml:id value `{normalized}` is not a valid NCName"
-                )));
-            }
+            let normalized = normalized_xml_id(&value.value)?.into_owned();
             if value.value != normalized {
                 value.value.clone_from(&normalized);
             }
@@ -956,12 +1013,120 @@ impl Document {
         Ok(())
     }
 
+    pub(crate) fn finalize_xml_ids(&mut self, meter: &mut Meter) -> Result<()> {
+        let (count, value_bytes) = self.nodes().fold((0usize, 0usize), |totals, (_, node)| {
+            let NodeKind::Element { attributes, .. } = &node.kind else {
+                return totals;
+            };
+            let Some(attribute) = attributes.iter().find(|attribute| {
+                attribute.name.namespace.as_deref() == Some(XML_NS) && attribute.name.local == "id"
+            }) else {
+                return totals;
+            };
+            (
+                totals.0.saturating_add(1),
+                totals.1.saturating_add(attribute.value.len()),
+            )
+        });
+        if count == 0 {
+            return Ok(());
+        }
+        let map_upper_bound = count.saturating_mul(4).saturating_mul(
+            std::mem::size_of::<((NodeId, String), NodeId)>()
+                .saturating_add(std::mem::size_of::<u64>()),
+        );
+        let uniqueness_count = self.ids.len().saturating_add(count);
+        let uniqueness_upper_bound = uniqueness_count
+            .saturating_mul(4)
+            .saturating_mul(std::mem::size_of::<(NodeId, &str)>());
+        let workspace_upper_bound = count
+            .saturating_mul(std::mem::size_of::<(NodeId, usize, NodeId, String)>())
+            .saturating_add(uniqueness_upper_bound)
+            .saturating_add(value_bytes)
+            .saturating_add(map_upper_bound);
+        let peak_upper_bound = workspace_upper_bound.saturating_add(value_bytes);
+        meter.charge(BudgetKind::OwnedBytes, peak_upper_bound)?;
+
+        let prepared = (|| {
+            let mut prepared = Vec::new();
+            prepared.try_reserve_exact(count).map_err(|error| {
+                Error::Dynamic(format!(
+                    "failed to reserve xml:id finalization storage: {error}"
+                ))
+            })?;
+            for (owner, node) in self.nodes() {
+                let NodeKind::Element { attributes, .. } = &node.kind else {
+                    continue;
+                };
+                let Some((index, attribute)) =
+                    attributes.iter().enumerate().find(|(_, attribute)| {
+                        attribute.name.namespace.as_deref() == Some(XML_NS)
+                            && attribute.name.local == "id"
+                    })
+                else {
+                    continue;
+                };
+                let normalized = normalized_xml_id(&attribute.value)?.into_owned();
+                let logical_root = self
+                    .logical_root_for(&NodeReference::Node(owner))
+                    .ok_or_else(|| Error::Xml("xml:id is outside a logical document".into()))?;
+                prepared.push((owner, index, logical_root, normalized));
+            }
+            let mut unique = HashSet::new();
+            unique.try_reserve(uniqueness_count).map_err(|error| {
+                Error::Dynamic(format!(
+                    "failed to reserve xml:id uniqueness storage: {error}"
+                ))
+            })?;
+            unique.extend(self.ids.keys().map(|(root, value)| (*root, value.as_str())));
+            for (_, _, root, value) in &prepared {
+                if !unique.insert((*root, value.as_str())) {
+                    return Err(Error::Xml(format!("duplicate XML ID `{value}`")));
+                }
+            }
+            Ok(prepared)
+        })();
+        let mut prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                meter.release_owned_bytes(peak_upper_bound);
+                return Err(error);
+            }
+        };
+        let retained_before = self.retained_identity_index_bytes();
+        if let Err(error) = self.ids.try_reserve(count) {
+            meter.release_owned_bytes(peak_upper_bound);
+            return Err(Error::Dynamic(format!(
+                "failed to reserve xml:id index storage: {error}"
+            )));
+        }
+        for (owner, index, logical_root, value) in prepared.drain(..) {
+            let attribute = self
+                .node_mut(owner)
+                .and_then(|node| match &mut node.kind {
+                    NodeKind::Element { attributes, .. } => attributes.get_mut(index),
+                    _ => None,
+                })
+                .expect("prepared xml:id attribute remains present");
+            if attribute.value != value {
+                attribute.value.clone_from(&value);
+            }
+            self.ids.insert((logical_root, value), owner);
+        }
+        let retained = self
+            .retained_identity_index_bytes()
+            .saturating_sub(retained_before);
+        debug_assert!(retained <= peak_upper_bound);
+        meter.release_owned_bytes(peak_upper_bound.saturating_sub(retained));
+        Ok(())
+    }
+
     #[must_use]
     pub fn nodes(&self) -> impl ExactSizeIterator<Item = (NodeId, &Node)> {
         self.nodes
             .iter()
             .enumerate()
-            .map(|(index, node)| (NodeId(index), node))
+            .map(|(index, node)| (NodeId(index, self.identity), node))
     }
 
     pub(crate) fn push(
@@ -970,7 +1135,7 @@ impl Document {
         kind: NodeKind,
         base_uri: Option<String>,
     ) -> NodeId {
-        let id = NodeId(self.nodes.len());
+        let id = NodeId(self.nodes.len(), self.identity);
         self.nodes.push(Node {
             kind,
             parent: Some(parent),
@@ -1207,7 +1372,7 @@ impl Document {
         pending.push(self.root);
         let mut retained_count = 0usize;
         while let Some(id) = pending.pop() {
-            remap_by_index[id.0] = Some(NodeId(retained_count));
+            remap_by_index[id.0] = Some(NodeId(retained_count, self.identity));
             retained_count += 1;
             for child in self.nodes[id.0].children.iter().rev() {
                 if keep(self, *child, &self.nodes[child.0]) {
@@ -1252,7 +1417,7 @@ impl Document {
         }
         for (old, new) in remap_by_index.iter().copied().enumerate() {
             if let Some(new) = new {
-                remap.insert(NodeId(old), new);
+                remap.insert(NodeId(old, self.identity), new);
             }
         }
 
@@ -1305,7 +1470,7 @@ impl Document {
             node.children.truncate(write);
             true
         });
-        self.root = NodeId(0);
+        self.root = NodeId(0, self.identity);
         self.logical_roots.clear();
         self.logical_roots.push(self.root);
         self.source_bytes = 0;
@@ -1313,6 +1478,35 @@ impl Document {
         meter.release_owned_bytes(temporary_bytes);
         Ok((remap, retained_map_bytes))
     }
+}
+
+fn normalized_xml_id(value: &str) -> Result<Cow<'_, str>> {
+    let normalized = collapse_xml_whitespace(value);
+    // xml:id 1.0 section 4 requires validation after whitespace normalization.
+    // https://www.w3.org/TR/xml-id/#processing
+    if !crate::lexical::is_ncname(&normalized) {
+        return Err(Error::Xml(format!(
+            "xml:id value `{normalized}` is not a valid NCName"
+        )));
+    }
+    Ok(normalized)
+}
+
+pub(crate) fn prepare_xml_entities_bounded(xml: &str, limit: usize) -> Result<Cow<'_, str>> {
+    let mut entity_references = 0;
+    let mut entity_expansion = EntityExpansionMeter::new(limit.min(ENTITY_EXPANSION_BYTE_CEILING));
+    let (parameter_expanded_xml, declarations) =
+        internal_general_entities(xml, &mut entity_references, &mut entity_expansion)?;
+    let expanded = expand_document_entities(
+        parameter_expanded_xml.as_ref(),
+        &declarations.general,
+        &mut entity_references,
+        &mut entity_expansion,
+    )?;
+    let Cow::Owned(expanded) = expanded else {
+        return Ok(parameter_expanded_xml);
+    };
+    Ok(Cow::Owned(expanded))
 }
 
 fn decode_xml_character_reference(digits: &str, radix: u32) -> Result<String> {
@@ -1750,11 +1944,12 @@ fn internal_general_entities<'a>(
     if !changed {
         return Ok((Cow::Borrowed(xml), declarations));
     }
-    let mut expanded_xml = String::with_capacity(
-        xml.len()
-            .saturating_sub(subset.len())
-            .saturating_add(expanded_subset.len()),
-    );
+    let capacity = xml
+        .len()
+        .saturating_sub(subset.len())
+        .saturating_add(expanded_subset.len());
+    meter.charge(capacity)?;
+    let mut expanded_xml = String::with_capacity(capacity);
     expanded_xml.push_str(&xml[..subset_start]);
     expanded_xml.push_str(expanded_subset.as_ref());
     expanded_xml.push_str(&xml[subset_end..]);
@@ -2653,6 +2848,7 @@ fn expand_parameter_entity_references<'a>(
         return Ok(Cow::Borrowed(value));
     }
     let reject_unresolved = excluded_declarations.is_empty() && entities.is_empty();
+    meter.check(value.len())?;
     let mut output = String::with_capacity(value.len());
     let mut cursor = 0;
     for &(start, end) in excluded_declarations {
@@ -2735,7 +2931,7 @@ fn expand_parameter_entity_references_into(
                         "entity reference expansion limit exceeded at `%{name};`"
                     )));
                 }
-                let replacement = decode_parameter_character_references(replacement)?;
+                let replacement = decode_parameter_character_references(replacement, meter)?;
                 expand_parameter_entity_references_into(
                     replacement.as_ref(),
                     entities,
@@ -2774,10 +2970,14 @@ fn expand_parameter_entity_references_into(
     Ok(())
 }
 
-fn decode_parameter_character_references(value: &str) -> Result<Cow<'_, str>> {
+fn decode_parameter_character_references<'a>(
+    value: &'a str,
+    meter: &EntityExpansionMeter,
+) -> Result<Cow<'a, str>> {
     if !value.as_bytes().windows(2).any(|bytes| bytes == b"&#") {
         return Ok(Cow::Borrowed(value));
     }
+    meter.check(value.len())?;
     let mut output = String::with_capacity(value.len());
     let mut cursor = 0usize;
     while let Some(relative) = value[cursor..].find("&#") {
@@ -2946,6 +3146,7 @@ fn expand_document_entities<'a>(
     if !contains_expandable_entity_reference(&xml[doctype_end..], entities) {
         return Ok(Cow::Borrowed(xml));
     }
+    meter.check(xml.len())?;
     let mut expanded = String::with_capacity(xml.len());
     meter.append(&mut expanded, &xml[..doctype_end])?;
     expand_entity_references_into(
@@ -2969,6 +3170,7 @@ fn expand_entity_references<'a>(
     if entities.is_empty() || !contains_expandable_entity_reference(value, entities) {
         return Ok(Cow::Borrowed(value));
     }
+    meter.check(value.len())?;
     let mut output = String::with_capacity(value.len());
     expand_entity_references_into(value, entities, depth, references, meter, &mut output)?;
     Ok(Cow::Owned(output))
@@ -3088,6 +3290,14 @@ impl EntityExpansionMeter {
         Ok(())
     }
 
+    fn check(&self, amount: usize) -> Result<()> {
+        crate::budget::ensure(
+            crate::BudgetKind::OwnedBytes,
+            self.limit,
+            self.used.saturating_add(amount),
+        )
+    }
+
     fn charge(&mut self, amount: usize) -> Result<()> {
         let actual = self.used.saturating_add(amount);
         crate::budget::ensure(crate::BudgetKind::OwnedBytes, self.limit, actual)?;
@@ -3158,14 +3368,61 @@ mod parser_boundary_tests {
     use std::fmt::Write as _;
 
     use super::{
-        Document, EntityExpansionMeter, Error, NodeKind, Result, doctype_span,
-        expand_document_entities, expand_entity_references, expand_parameter_entity_references,
-        internal_general_entities, normalize_predefined_entity_declaration,
+        Attribute, Document, EntityExpansionMeter, Error, ExpandedName, NodeKind, Result,
+        doctype_span, expand_document_entities, expand_entity_references,
+        expand_parameter_entity_references, internal_general_entities,
+        normalize_predefined_entity_declaration,
     };
-    use crate::budget::ENTITY_EXPANSION_BYTE_CEILING;
+    use crate::budget::{ENTITY_EXPANSION_BYTE_CEILING, Meter};
+    use crate::{BudgetKind, ExecutionBudget};
 
     fn nested_xml(depth: usize, leaf: &str) -> String {
         format!("{}{}{}", "<n>".repeat(depth), leaf, "</n>".repeat(depth))
+    }
+
+    #[test]
+    fn fragment_xml_id_index_is_preflighted_before_mutation() {
+        let mut document = Document::empty(None);
+        document.push(
+            document.root(),
+            NodeKind::Element {
+                name: ExpandedName::new(None::<String>, "item"),
+                prefix: None,
+                attributes: vec![Attribute {
+                    name: ExpandedName::new(Some("http://www.w3.org/XML/1998/namespace"), "id"),
+                    prefix: Some("xml".into()),
+                    value: " target ".into(),
+                }],
+                namespaces: vec![],
+            },
+            None,
+        );
+        let mut meter = Meter::new(
+            ExecutionBudget {
+                source_bytes: usize::MAX,
+                external_documents: usize::MAX,
+                recursion_depth: usize::MAX,
+                xpath_evaluations: usize::MAX,
+                template_applications: usize::MAX,
+                sort_comparisons: usize::MAX,
+                key_entries: usize::MAX,
+                result_nodes: usize::MAX,
+                serialized_bytes: usize::MAX,
+                messages: usize::MAX,
+                owned_bytes: 0,
+            },
+            0,
+        )
+        .expect("zero-byte meter initializes");
+
+        assert!(matches!(
+            document.finalize_xml_ids(&mut meter),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            })
+        ));
+        assert_eq!(document.ids().count(), 0);
     }
 
     fn parse_tree_with_oracle_stack(xml: &str, base_uri: Option<&str>) -> Result<Document> {

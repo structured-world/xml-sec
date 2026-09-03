@@ -27,6 +27,12 @@ use crate::{
 /// Top-level stylesheet parameters supplied by the caller.
 pub type Parameters = HashMap<ExpandedName, Value>;
 
+struct SourceParameterRemap {
+    identity: u64,
+    mapping: Option<HashMap<NodeId, NodeId>>,
+    owned_bytes: usize,
+}
+
 /// Explicit inputs controlling one stylesheet execution.
 #[derive(Debug, Clone)]
 pub struct ExecutionOptions {
@@ -134,6 +140,7 @@ impl Stylesheet {
         source_processing: SourceProcessing,
     ) -> Result<TransformResult> {
         let source_bytes = source.source_bytes();
+        let source_identity = source.identity();
         let mut meter = Meter::new(options.budget, source_bytes)?;
         let source_options = EvaluatorSourceOptions {
             processing: source_processing,
@@ -147,13 +154,16 @@ impl Stylesheet {
             &mut meter,
             &source_options,
         )?;
-        let source_remap = prepared.remap.take();
-        let source_remap_owned_bytes = std::mem::take(&mut prepared.remap_owned_bytes);
+        let source_remap = SourceParameterRemap {
+            identity: source_identity,
+            mapping: prepared.remap.take(),
+            owned_bytes: std::mem::take(&mut prepared.remap_owned_bytes),
+        };
         let mut state = Execution::new(
             self,
             prepared,
             parameters,
-            (source_remap, source_remap_owned_bytes),
+            source_remap,
             environment,
             meter,
             source_options,
@@ -436,7 +446,7 @@ impl<'a> Execution<'a> {
         stylesheet: &'a Stylesheet,
         source: PreparedEvaluatorSource,
         parameters: &Parameters,
-        source_remap: (Option<HashMap<NodeId, NodeId>>, usize),
+        source_remap: SourceParameterRemap,
         environment: ExecutionEnvironment<R>,
         mut meter: Meter,
         source_options: EvaluatorSourceOptions,
@@ -455,11 +465,12 @@ impl<'a> Execution<'a> {
             BudgetKind::OwnedBytes,
             metered_document_owned_bytes(&result),
         )?;
+        let result_root = result.root();
         let mut state = Self {
             stylesheet,
             evaluator,
             result,
-            output_stack: vec![NodeId(0)],
+            output_stack: vec![result_root],
             scopes: vec![VariableScope::default()],
             pending_globals: HashMap::new(),
             initializing_globals: Vec::new(),
@@ -482,10 +493,14 @@ impl<'a> Execution<'a> {
                 .iter()
                 .map(|function| function.name.clone()),
         );
-        let (source_remap, source_remap_owned_bytes) = source_remap;
-        let initialized = state.initialize_globals(parameters, source_remap.as_ref());
-        drop(source_remap);
-        state.meter.release_owned_bytes(source_remap_owned_bytes);
+        let SourceParameterRemap {
+            identity,
+            mapping,
+            owned_bytes,
+        } = source_remap;
+        let initialized = state.initialize_globals(parameters, identity, mapping.as_ref());
+        drop(mapping);
+        state.meter.release_owned_bytes(owned_bytes);
         initialized?;
         Ok(state)
     }
@@ -664,6 +679,7 @@ impl<'a> Execution<'a> {
     fn initialize_globals(
         &mut self,
         parameters: &Parameters,
+        source_identity: u64,
         source_remap: Option<&HashMap<NodeId, NodeId>>,
     ) -> Result<()> {
         let mut effective: HashMap<_, &crate::compiler::GlobalVariable> = HashMap::new();
@@ -692,6 +708,7 @@ impl<'a> Execution<'a> {
             if global.is_parameter
                 && let Some(value) = parameters.get(name)
             {
+                validate_parameter_value(value, source_identity)?;
                 let owned_bytes = expanded_name_owned_bytes(name)
                     .saturating_add(parameter_value_owned_bytes(value, source_remap));
                 self.meter
@@ -2585,8 +2602,9 @@ impl<'a> Execution<'a> {
         let caller_scopes = self.scopes.split_off(1);
         self.scopes.push(VariableScope::default());
         let temporary_result = self.empty_metered_result(None)?;
+        let temporary_root = temporary_result.root();
         let previous_result = std::mem::replace(&mut self.result, temporary_result);
-        let previous_stack = std::mem::replace(&mut self.output_stack, vec![NodeId(0)]);
+        let previous_stack = std::mem::replace(&mut self.output_stack, vec![temporary_root]);
         self.function_results.push(None);
         if binds_defaults {
             self.binding_function_defaults.push(function.name.clone());
@@ -3026,8 +3044,9 @@ impl<'a> Execution<'a> {
             frame.depth + 1,
             precedence,
         );
-        let captured = self.restore_result_tree(previous);
-        match result {
+        let mut captured = self.restore_result_tree(previous);
+        let finalized = result.and_then(|()| captured.finalize_xml_ids(&mut self.meter));
+        match finalized {
             Ok(()) => Ok(captured),
             Err(error) => {
                 self.meter
@@ -3048,9 +3067,10 @@ impl<'a> Execution<'a> {
 
     fn enter_temporary_result_tree(&mut self, base_uri: Option<&str>) -> Result<ResultTreeState> {
         let temporary = self.empty_metered_result(base_uri)?;
+        let temporary_root = temporary.root();
         Ok(ResultTreeState {
             document: std::mem::replace(&mut self.result, temporary),
-            output_stack: std::mem::replace(&mut self.output_stack, vec![NodeId(0)]),
+            output_stack: std::mem::replace(&mut self.output_stack, vec![temporary_root]),
             attribute_insert_position: self.attribute_insert_position.take(),
             attribute_protected_names: self.attribute_protected_names.take(),
         })
@@ -3246,7 +3266,10 @@ impl<'a> Execution<'a> {
         Ok(())
     }
     fn parent(&self) -> NodeId {
-        *self.output_stack.last().unwrap_or(&NodeId(0))
+        self.output_stack
+            .last()
+            .copied()
+            .unwrap_or_else(|| self.result.root())
     }
     fn push_node(&mut self, parent: NodeId, kind: NodeKind) -> Result<NodeId> {
         let base_uri = self
@@ -3859,6 +3882,28 @@ fn remap_parameter_value(value: &Value, remap: &HashMap<NodeId, NodeId>) -> Valu
             .filter_map(|node| remap_parameter_node(node, remap))
             .collect(),
     )
+}
+
+fn validate_parameter_value(value: &Value, source_identity: u64) -> Result<()> {
+    let Value::NodeSet(nodes) = value else {
+        return Ok(());
+    };
+    if nodes
+        .iter()
+        .any(|node| node_reference_owner(node).document_identity() != source_identity)
+    {
+        return Err(Error::Dynamic(
+            "node-set parameter contains a reference from a foreign document".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn node_reference_owner(node: &NodeReference) -> NodeId {
+    match node {
+        NodeReference::Node(id) => *id,
+        NodeReference::Attribute { owner, .. } | NodeReference::Namespace { owner, .. } => *owner,
+    }
 }
 
 fn parameter_value_owned_bytes(value: &Value, remap: Option<&HashMap<NodeId, NodeId>>) -> usize {
@@ -4896,7 +4941,9 @@ fn value_owned_bytes(value: &Value) -> usize {
 
 fn metered_document_owned_bytes(document: &Document) -> usize {
     document.nodes().fold(
-        document.retained_tree_container_bytes(),
+        document
+            .retained_tree_container_bytes()
+            .saturating_add(document.retained_identity_index_bytes()),
         |total, (_, node)| {
             total
                 .saturating_add(node_kind_owned_bytes(&node.kind))

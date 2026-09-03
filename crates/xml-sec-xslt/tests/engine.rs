@@ -10,6 +10,14 @@ use xml_sec_xslt::{
     ResourceIdentity, SourceProcessing, Value,
 };
 
+fn node_id_at(document: &Document, index: usize) -> xml_sec_xslt::NodeId {
+    document
+        .nodes()
+        .nth(index)
+        .map(|(id, _)| id)
+        .expect("document contains the requested arena node")
+}
+
 fn compile(source: &str) -> xml_sec_xslt::Stylesheet {
     Compiler::new(
         Arc::new(NoResolver),
@@ -2742,8 +2750,8 @@ fn direct_nodeset_parameters_are_normalized_to_document_order() {
     parameters.insert(
         ExpandedName::new(None::<String>, "nodes"),
         Value::NodeSet(vec![
-            NodeReference::Node(xml_sec_xslt::NodeId(4)),
-            NodeReference::Node(xml_sec_xslt::NodeId(2)),
+            NodeReference::Node(node_id_at(&document, 4)),
+            NodeReference::Node(node_id_at(&document, 2)),
         ]),
     );
     let output = stylesheet
@@ -2762,6 +2770,46 @@ fn direct_nodeset_parameters_are_normalized_to_document_order() {
         output.serialized.bytes,
         b"<out first=\"first\"><item>first</item><item>second</item></out>\n"
     );
+}
+
+#[test]
+fn nodeset_parameters_reject_foreign_document_references() {
+    // Arena indices are document-local. A cached parameter from another source must never alias
+    // a same-numbered node in the document used for this transformation.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:param name="node"/><xsl:template match="/"><xsl:value-of select="$node"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let foreign =
+        Document::parse("<root><item>foreign</item></root>", None).expect("foreign source parses");
+    let source =
+        Document::parse("<root><item>local</item></root>", None).expect("principal source parses");
+    let mut parameters = Parameters::new();
+    parameters.insert(
+        ExpandedName::new(None::<String>, "node"),
+        Value::NodeSet(vec![NodeReference::Node(
+            foreign
+                .nodes()
+                .find_map(|(id, node)| {
+                    matches!(node.kind, NodeKind::Element { ref name, .. } if name.local == "item")
+                        .then_some(id)
+                })
+                .expect("foreign item exists"),
+        )]),
+    );
+
+    let error = stylesheet
+        .execute(
+            &source,
+            &parameters,
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect_err("foreign node-set parameter is rejected");
+    assert!(error.to_string().contains("foreign document"));
 }
 
 #[test]
@@ -3490,7 +3538,7 @@ fn semantic_projection_preserves_cdata_and_public_node_kinds() {
 
     let document = Document::parse("<root id=\"r\"/>", None).expect("source must parse");
     let attribute = Value::NodeSet(vec![NodeReference::Attribute {
-        owner: xml_sec_xslt::NodeId(1),
+        owner: node_id_at(&document, 1),
         index: 0,
     }]);
     assert_eq!(attribute.into_string(&document), "r");
@@ -3975,7 +4023,9 @@ fn parser_preserves_base_and_lexical_names_across_depths() {
         Some("https://example.test/source.xml"),
     )
     .expect("source parses");
-    let item = document.node(xml_sec_xslt::NodeId(2)).expect("item exists");
+    let item = document
+        .node(node_id_at(&document, 2))
+        .expect("item exists");
     assert_eq!(item.base_uri.as_deref(), Some("https://example.test/sub/"));
     let xml_sec_xslt::NodeKind::Element { attributes, .. } = &item.kind else {
         panic!("item is an element");
@@ -6206,7 +6256,7 @@ fn namespace_axis_excludes_default_namespace_undeclarations() {
     let source = Document::parse(r#"<root xmlns="urn:outer"><child xmlns=""/></root>"#, None)
         .expect("source parses");
     let NodeKind::Element { namespaces, .. } = &source
-        .node(xml_sec_xslt::NodeId(2))
+        .node(node_id_at(&source, 2))
         .expect("child exists")
         .kind
     else {
@@ -7292,6 +7342,42 @@ fn dtd_declared_ids_are_available_to_xpath_id() {
         )
         .expect("XPath id() resolves the DTD-declared ID");
     assert_eq!(result.serialized.bytes, b"found");
+}
+
+#[test]
+fn captured_result_fragments_register_normalized_xml_ids() {
+    // xml:id processing applies to temporary trees before exsl:node-set() exposes them to XPath.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:exsl="http://exslt.org/common"><xsl:output method="text"/><xsl:template match="/"><xsl:variable name="tree"><root><item xml:id="  target  ">found</item></root></xsl:variable><xsl:for-each select="exsl:node-set($tree)/*"><xsl:value-of select="id('target')"/></xsl:for-each></xsl:template></xsl:stylesheet>"#;
+
+    assert_eq!(execute(stylesheet, "<source/>"), "found");
+}
+
+#[test]
+fn captured_result_fragments_reject_invalid_or_duplicate_xml_ids() {
+    // Temporary trees have the same xml:id well-formedness and uniqueness contract as parsed
+    // documents; invalid fragments must fail before exsl:node-set() can expose them.
+    for body in [
+        r#"<root><item><xsl:attribute name="xml:id" namespace="http://www.w3.org/XML/1998/namespace">not valid</xsl:attribute></item></root>"#,
+        r#"<root><first><xsl:attribute name="xml:id" namespace="http://www.w3.org/XML/1998/namespace">same</xsl:attribute></first><second><xsl:attribute name="xml:id" namespace="http://www.w3.org/XML/1998/namespace">same</xsl:attribute></second></root>"#,
+    ] {
+        let stylesheet = compile(&format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:exsl="http://exslt.org/common"><xsl:template match="/"><xsl:variable name="tree">{body}</xsl:variable><xsl:value-of select="count(exsl:node-set($tree)/*)"/></xsl:template></xsl:stylesheet>"#
+        ));
+        let source = Document::parse("<source/>", None).expect("source parses");
+        let error = stylesheet
+            .execute(
+                &source,
+                &Parameters::new(),
+                Arc::new(NoResolver),
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            )
+            .expect_err("invalid fragment xml:id is rejected");
+        assert!(matches!(error, Error::Xml(_)), "{error:?}");
+    }
 }
 
 #[test]
@@ -8958,25 +9044,25 @@ fn stripped_source_nodes_remap_external_nodeset_parameters() {
     let mut parameters = Parameters::new();
     parameters.insert(
         ExpandedName::new(None::<String>, "node"),
-        Value::NodeSet(vec![NodeReference::Node(xml_sec_xslt::NodeId(3))]),
+        Value::NodeSet(vec![NodeReference::Node(node_id_at(&source, 3))]),
     );
     parameters.insert(
         ExpandedName::new(None::<String>, "attr"),
         Value::NodeSet(vec![NodeReference::Attribute {
-            owner: xml_sec_xslt::NodeId(3),
+            owner: node_id_at(&source, 3),
             index: 0,
         }]),
     );
     parameters.insert(
         ExpandedName::new(None::<String>, "namespace"),
         Value::NodeSet(vec![NodeReference::Namespace {
-            owner: xml_sec_xslt::NodeId(3),
+            owner: node_id_at(&source, 3),
             index: 1,
         }]),
     );
     parameters.insert(
         ExpandedName::new(None::<String>, "removed"),
-        Value::NodeSet(vec![NodeReference::Node(xml_sec_xslt::NodeId(2))]),
+        Value::NodeSet(vec![NodeReference::Node(node_id_at(&source, 2))]),
     );
     let result = stylesheet
         .execute(

@@ -6957,9 +6957,12 @@ mod tests {
         let key: PatternCacheKey = (
             "item[@kind='retained']".into(),
             vec![("p".into(), "urn:retained".into())],
-            NodeId(0),
+            NodeId::test(0),
         );
-        let nodes = HashSet::from([SourceNode::Node(NodeId(1)), SourceNode::Node(NodeId(2))]);
+        let nodes = HashSet::from([
+            SourceNode::Node(NodeId::test(1)),
+            SourceNode::Node(NodeId::test(2)),
+        ]);
         let reserved = pattern_cache_entry_owned_bytes(&key, nodes.len());
         let mut cache = HashMap::from([(key, nodes)]);
         let mut meter = Meter::new(
