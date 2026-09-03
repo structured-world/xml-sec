@@ -335,7 +335,7 @@ impl<'a> Scanner<'a> {
                     }
                 },
                 Token::Text { text } => {
-                    self.split_text(text.as_str(), text.range());
+                    self.split_text(text.as_str(), text.range())?;
                     if let Some(event) = self.pending.pop_front() {
                         return Ok(Some(event));
                     }
@@ -350,7 +350,7 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    fn split_text(&mut self, text: &'a str, range: Range<usize>) {
+    fn split_text(&mut self, text: &'a str, range: Range<usize>) -> Result<(), Error> {
         let mut offset = 0;
         while let Some(relative) = text[offset..].find('&') {
             let start = offset + relative;
@@ -361,11 +361,10 @@ impl<'a> Scanner<'a> {
                 });
             }
             let Some(relative_end) = text[start + 1..].find(';') else {
-                self.pending.push_back(Event::Text {
-                    text: &text[start..],
-                    range: range.start + start..range.end,
-                });
-                return;
+                self.pending.clear();
+                return Err(Error::malformed(
+                    "unterminated XML reference in character data",
+                ));
             };
             let end = start + 1 + relative_end;
             self.pending.push_back(Event::Reference {
@@ -380,6 +379,7 @@ impl<'a> Scanner<'a> {
                 range: range.start + offset..range.end,
             });
         }
+        Ok(())
     }
 
     /// Original scanner input.
@@ -571,6 +571,18 @@ mod tests {
         assert!(matches!(&events[3], Event::Reference { name: "#x62", .. }));
         assert!(matches!(&events[4], Event::CData { text: "c", .. }));
         assert!(matches!(&events[5], Event::End { .. }));
+    }
+
+    #[test]
+    fn scanner_rejects_unterminated_references_in_character_data() {
+        // XML 1.0 productions [66]-[68] require every reference opened by `&` to end with `;`.
+        // https://www.w3.org/TR/xml/#NT-Reference
+        for xml in ["<root>AT&T</root>", "<root>&bad</root>"] {
+            let mut scanner = Scanner::new(xml);
+            let result = std::iter::from_fn(|| scanner.next_event().transpose())
+                .collect::<Result<Vec<_>, _>>();
+            assert!(result.is_err(), "accepted {xml}");
+        }
     }
 
     #[test]

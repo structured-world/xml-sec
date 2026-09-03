@@ -1927,8 +1927,8 @@ fn collect_internal_entity_declarations(subset: &str) -> Result<InternalEntityDe
         }
         let mut value = subset[value_start..cursor].to_owned();
         cursor += 1;
+        validate_entity_value(name, &value, parameter)?;
         if parameter {
-            validate_parameter_entity_value(name, &value)?;
             // XML 1.0 Fifth Edition section 4.2, production [72], permits only optional XML S
             // between PEDef and `>`: https://www.w3.org/TR/xml/#sec-entity-decl
             skip_xml_whitespace(subset, &mut cursor);
@@ -2499,10 +2499,11 @@ fn require_dtd_whitespace(subset: &str, cursor: &mut usize, context: &str) -> Re
     Ok(())
 }
 
-fn validate_parameter_entity_value(name: &str, value: &str) -> Result<()> {
-    // Validate production [9] before the declaration is removed from the internal subset; the
-    // downstream tokenizer cannot diagnose syntax that preprocessing has erased:
+fn validate_entity_value(name: &str, value: &str, parameter: bool) -> Result<()> {
+    // XML 1.0 production [9] applies to both general and parameter entity declarations. Validate
+    // it before preprocessing erases the declaration from the downstream tokenizer:
     // https://www.w3.org/TR/xml/#NT-EntityValue
+    let declaration_kind = if parameter { "parameter" } else { "general" };
     let mut cursor = 0usize;
     while cursor < value.len() {
         let character = value[cursor..]
@@ -2511,7 +2512,7 @@ fn validate_parameter_entity_value(name: &str, value: &str) -> Result<()> {
             .expect("cursor is before the end of the entity value");
         if !crate::lexical::is_xml10_character(character) {
             return Err(Error::Xml(format!(
-                "parameter entity declaration `{name}` has an invalid EntityValue"
+                "{declaration_kind} entity declaration `{name}` has an invalid EntityValue"
             )));
         }
         if matches!(character, '&' | '%') {
@@ -2520,7 +2521,7 @@ fn validate_parameter_entity_value(name: &str, value: &str) -> Result<()> {
                 .map(|offset| cursor + 1 + offset)
                 .ok_or_else(|| {
                     Error::Xml(format!(
-                        "parameter entity declaration `{name}` has an unterminated reference"
+                        "{declaration_kind} entity declaration `{name}` has an unterminated reference"
                     ))
                 })?;
             let reference = &value[cursor + 1..end];
@@ -2535,7 +2536,7 @@ fn validate_parameter_entity_value(name: &str, value: &str) -> Result<()> {
             };
             if !valid {
                 return Err(Error::Xml(format!(
-                    "parameter entity declaration `{name}` has an invalid reference"
+                    "{declaration_kind} entity declaration `{name}` has an invalid reference"
                 )));
             }
             cursor = end + 1;
@@ -3470,6 +3471,7 @@ mod parser_boundary_tests {
             r#"<!DOCTYPE r [<!NOTATION png SYSTEM "image/png">]><r/>"#,
             r#"<!DOCTYPE r [<!NOTATION png PUBLIC "image/png">]><r/>"#,
             r#"<!DOCTYPE r [<!NOTATION png PUBLIC "image/png" "png.viewer">]><r/>"#,
+            r#"<!DOCTYPE r [<!ENTITY % p "parameter"><!ENTITY e "%p; &amp; &#37;">]><r>&e;</r>"#,
         ] {
             Document::parse_iterative(valid, None)
                 .expect("well-formed markup declaration must be accepted");
@@ -3483,6 +3485,8 @@ mod parser_boundary_tests {
             r#"<!DOCTYPE r [<!NOTATION png SYSTEM>]><r/>"#,
             r#"<!DOCTYPE r [<!NOTATION png PUBLIC "image/png" extra>]><r/>"#,
             r#"<!DOCTYPE r [<!ENTITY e PUBLIC "[bad" "urn:example">]><r/>"#,
+            r#"<!DOCTYPE r [<!ENTITY e "%">]><r>&e;</r>"#,
+            r#"<!DOCTYPE r [<!ENTITY e "&bad">]><r>&e;</r>"#,
             r#"<!DOCTYPE r [<!UNKNOWN r ANY>]><r/>"#,
         ] {
             Document::parse_iterative(malformed, None)

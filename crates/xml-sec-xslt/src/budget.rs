@@ -84,6 +84,7 @@ pub(crate) struct Meter {
 impl Meter {
     pub(crate) fn new(limits: ExecutionBudget, source_bytes: usize) -> Result<Self> {
         ensure(BudgetKind::SourceBytes, limits.source_bytes, source_bytes)?;
+        ensure(BudgetKind::OwnedBytes, limits.owned_bytes, source_bytes)?;
         Ok(Self {
             limits,
             xpath_evaluations: 0,
@@ -224,4 +225,38 @@ pub(crate) fn ensure(kind: BudgetKind, limit: usize, actual: usize) -> Result<()
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn execution_budget(owned_bytes: usize) -> ExecutionBudget {
+        ExecutionBudget {
+            source_bytes: 64,
+            external_documents: 0,
+            recursion_depth: 1,
+            xpath_evaluations: 0,
+            template_applications: 0,
+            sort_comparisons: 0,
+            key_entries: 0,
+            result_nodes: 0,
+            serialized_bytes: 0,
+            messages: 0,
+            owned_bytes,
+        }
+    }
+
+    #[test]
+    fn meter_rejects_initial_source_ownership_above_its_limit() {
+        assert!(Meter::new(execution_budget(8), 8).is_ok());
+        assert!(matches!(
+            Meter::new(execution_budget(7), 8),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                limit: 7,
+                actual: 8,
+            })
+        ));
+    }
 }
