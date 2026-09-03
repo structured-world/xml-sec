@@ -1,6 +1,8 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::rc::Rc;
+use std::sync::{Arc, Weak};
 
 use crate::budget::ensure;
 use crate::lexical::{
@@ -708,7 +710,7 @@ pub(crate) struct Variable {
 #[derive(Debug, Clone)]
 pub(crate) struct Expression {
     pub source: String,
-    pub namespaces: Vec<(String, String)>,
+    pub namespaces: Arc<Vec<(String, String)>>,
     /// Expanded references let execution initialize only globals on the reached XPath path.
     pub variable_references: Arc<[ExpandedName]>,
     /// Static base of the stylesheet module that owns this expression.
@@ -901,7 +903,15 @@ impl Expression {
         node: roxmltree::Node<'_, '_>,
         static_base_uri: Option<&str>,
     ) -> Result<Self> {
-        let namespaces = namespaces(node);
+        Self::new_with_namespaces(source, node, Arc::new(namespaces(node)), static_base_uri)
+    }
+
+    fn new_with_namespaces(
+        source: &str,
+        node: roxmltree::Node<'_, '_>,
+        namespaces: Arc<Vec<(String, String)>>,
+        static_base_uri: Option<&str>,
+    ) -> Result<Self> {
         validate_xpath_prefixes(source, &namespaces)?;
         let normalized = normalize_xpath_for_sxd(source);
         let normalized = crate::xpath::rewrite_absolute_paths_for_validation(&normalized);
@@ -926,12 +936,12 @@ impl Expression {
     }
 
     pub(crate) fn generated(source: impl Into<String>, namespaces: Vec<(String, String)>) -> Self {
-        Self::from_parts(source.into(), namespaces, None)
+        Self::from_parts(source.into(), Arc::new(namespaces), None)
     }
 
     fn from_parts(
         source: String,
-        namespaces: Vec<(String, String)>,
+        namespaces: Arc<Vec<(String, String)>>,
         static_base_uri: Option<String>,
     ) -> Self {
         let variable_references = referenced_variables(&source, &namespaces).into();
@@ -1900,10 +1910,36 @@ fn estimate_compiled_owned_bytes(document: &roxmltree::Document<'_>) -> usize {
                     .saturating_add(namespace.name().map_or(0, str::len))
                     .saturating_add(namespace.uri().len())
             });
+            let expression_count = node.attributes().fold(0usize, |count, attribute| {
+                count.saturating_add(
+                    1usize.saturating_add(
+                        attribute
+                            .value()
+                            .bytes()
+                            .filter(|byte| *byte == b'{')
+                            .count(),
+                    ),
+                )
+            });
+            let expression_namespace_bytes = if expression_count != 0 {
+                node.namespaces()
+                    .fold(0usize, |sum, namespace| {
+                        sum.saturating_add(std::mem::size_of::<(String, String)>())
+                            .saturating_add(namespace.name().map_or(0, str::len))
+                            .saturating_add(namespace.uri().len())
+                    })
+                    .saturating_add(
+                        expression_count
+                            .saturating_mul(std::mem::size_of::<Arc<Vec<(String, String)>>>()),
+                    )
+            } else {
+                0
+            };
             structural_bytes
                 .saturating_add(name_bytes)
                 .saturating_add(attribute_bytes)
                 .saturating_add(namespace_bytes)
+                .saturating_add(expression_namespace_bytes)
         } else {
             structural_bytes.saturating_add(node.text().map_or(0, str::len))
         };
@@ -2015,7 +2051,10 @@ struct CompileContext {
     max_depth: usize,
     inside_function: bool,
     static_base_uri: Option<String>,
+    namespace_snapshot: NamespaceSnapshot,
 }
+
+type NamespaceSnapshot = Rc<RefCell<Option<(roxmltree::NodeId, Weak<Vec<(String, String)>>)>>>;
 
 impl CompileContext {
     fn new(
@@ -2031,17 +2070,15 @@ impl CompileContext {
             max_depth,
             inside_function: false,
             static_base_uri: static_base_uri.map(str::to_owned),
+            namespace_snapshot: Rc::new(RefCell::new(None)),
         })
     }
 
     fn descend(&self) -> Result<Self> {
-        let mut descended = Self::new(
-            self.forward,
-            self.depth.saturating_add(1),
-            self.max_depth,
-            self.static_base_uri.as_deref(),
-        )?;
-        descended.inside_function = self.inside_function;
+        let depth = self.depth.saturating_add(1);
+        ensure(BudgetKind::RecursionDepth, self.max_depth, depth)?;
+        let mut descended = self.clone();
+        descended.depth = depth;
         Ok(descended)
     }
 
@@ -2051,7 +2088,17 @@ impl CompileContext {
     }
 
     fn expression(&self, source: &str, node: roxmltree::Node<'_, '_>) -> Result<Expression> {
-        Expression::new(source, node, self.static_base_uri.as_deref())
+        let mut snapshot = self.namespace_snapshot.borrow_mut();
+        let namespaces = snapshot
+            .as_ref()
+            .filter(|(id, _)| *id == node.id())
+            .and_then(|(_, namespaces)| namespaces.upgrade())
+            .unwrap_or_else(|| {
+                let namespaces = Arc::new(namespaces(node));
+                *snapshot = Some((node.id(), Arc::downgrade(&namespaces)));
+                namespaces
+            });
+        Expression::new_with_namespaces(source, node, namespaces, self.static_base_uri.as_deref())
     }
 
     fn with_literal_version(mut self, node: roxmltree::Node<'_, '_>) -> Result<Self> {
@@ -3699,6 +3746,24 @@ mod tests {
         let attributes_only = nodes_only.saturating_add(attribute_slots);
 
         assert!(frontend_parser_workspace_bytes(xml) > attributes_only);
+    }
+
+    #[test]
+    fn expressions_on_one_node_share_their_namespace_snapshot() {
+        // A literal result element can contain many AVTs. Sharing one immutable static namespace
+        // context prevents retained memory from growing as expressions times namespaces.
+        let source = r#"<root xmlns:p="urn:namespace"/>"#;
+        let document = roxmltree::Document::parse(source).expect("stylesheet fragment parses");
+        let root = document.root_element();
+        let context = CompileContext::new(false, 0, 8, None).expect("context is valid");
+        let first = context
+            .expression("p:first", root)
+            .expect("expression compiles");
+        let second = context
+            .expression("p:second", root)
+            .expect("expression compiles");
+
+        assert!(Arc::ptr_eq(&first.namespaces, &second.namespaces));
     }
 
     #[test]

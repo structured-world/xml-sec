@@ -282,9 +282,43 @@ impl<'d> Node<'d> {
         &self,
         context: &crate::context::Evaluation<'_, '_>,
     ) -> Result<String, crate::function::Error> {
-        let length = self.string_value_len();
+        let length = self.string_value_len_with_context(context)?;
         context.reserve_string_allocation(length)?;
-        Ok(self.string_value_with_capacity(length))
+        let mut result = String::with_capacity(length);
+        self.append_string_value_with_context(&mut result, context)?;
+        Ok(result)
+    }
+
+    fn string_value_len_with_context(
+        &self,
+        context: &crate::context::Evaluation<'_, '_>,
+    ) -> Result<usize, crate::function::Error> {
+        if !matches!(self, Node::Root(_) | Node::Element(_)) {
+            return Ok(self.string_value_len());
+        }
+        let mut length = 0usize;
+        visit_descendant_text_metered(self, context, |text| {
+            debug_assert!(length.checked_add(text.len()).is_some());
+            length += text.len();
+            true
+        })?;
+        Ok(length)
+    }
+
+    fn append_string_value_with_context(
+        &self,
+        output: &mut String,
+        context: &crate::context::Evaluation<'_, '_>,
+    ) -> Result<(), crate::function::Error> {
+        if !matches!(self, Node::Root(_) | Node::Element(_)) {
+            self.append_string_value(output);
+            return Ok(());
+        }
+        visit_descendant_text_metered(self, context, |text| {
+            output.push_str(text);
+            true
+        })?;
+        Ok(())
     }
 
     pub(crate) fn string_value_with_capacity(&self, capacity: usize) -> String {
@@ -447,6 +481,39 @@ fn visit_descendant_text(node: &Node<'_>, mut visit: impl FnMut(&str) -> bool) -
     true
 }
 
+fn visit_descendant_text_metered(
+    node: &Node<'_>,
+    context: &crate::context::Evaluation<'_, '_>,
+    mut visit: impl FnMut(&str) -> bool,
+) -> Result<bool, crate::function::Error> {
+    let mut pending = node.children();
+    context.reserve_temporary_allocation(
+        pending
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Node<'_>>()),
+    )?;
+    pending.reverse();
+    while let Some(node) = pending.pop() {
+        match &node {
+            Node::Element(_) => {
+                let mut children = node.children();
+                context.reserve_temporary_allocation(
+                    children
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<Node<'_>>()),
+                )?;
+                children.reverse();
+                pending.extend(children);
+            }
+            Node::Text(text) if !visit(sxd_document_no_unsafe::as_str!(text.text())) => {
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
+    Ok(true)
+}
+
 conversion_trait!(Node, {
     dom::Root                  => Node::Root,
     dom::Element               => Node::Element,
@@ -516,7 +583,8 @@ impl<'d> Nodeset<'d> {
         self.nodes.insert(node.into());
     }
 
-    pub(crate) fn add_metered(
+    /// Add a unique node after reserving its container storage in the evaluation budget.
+    pub fn add_metered(
         &mut self,
         context: &crate::context::Evaluation<'_, 'd>,
         node: Node<'d>,
@@ -933,6 +1001,28 @@ mod test {
         assert_eq!(node.string_value_char_len(), 4);
         assert!(node.string_value_eq("deep"));
         assert_eq!(node.string_value(), "deep");
+    }
+
+    #[test]
+    fn wide_empty_string_value_traversal_obeys_the_allocation_budget() {
+        // Empty descendants contribute no output bytes, but traversal still needs workspace for
+        // their node handles; that workspace must cross the evaluator's allocation gate.
+        let package = Package::new();
+        let doc = package.as_document();
+        let root = doc.create_element("root");
+        doc.root().append_child(root.clone());
+        for _ in 0..1_024 {
+            root.append_child(doc.create_element("empty"));
+        }
+        let mut context = crate::context::Context::new();
+        context.set_string_allocation_limit(64);
+        let evaluation = crate::context::Evaluation::new(&context, doc.root().into());
+
+        assert!(
+            into_node(root)
+                .string_value_with_context(&evaluation)
+                .is_err()
+        );
     }
 
     #[test]

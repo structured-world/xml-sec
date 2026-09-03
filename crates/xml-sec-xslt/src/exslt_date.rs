@@ -178,7 +178,7 @@ impl function::Function for DateFunction {
                         self.2,
                     )?));
                 };
-                let seconds = DurationValue::parse(&input)
+                let seconds = DurationValue::parse_libxslt_seconds(&input)
                     .filter(|duration| duration.months == 0)
                     .map(|duration| duration.seconds)
                     .or_else(|| DateValue::parse(&input).and_then(DateValue::unix_seconds))
@@ -416,6 +416,18 @@ struct DurationValue {
 
 impl DurationValue {
     fn parse(input: &str) -> Option<Self> {
+        Self::parse_with_legacy_seconds(input, false)
+    }
+
+    fn parse_libxslt_seconds(input: &str) -> Option<Self> {
+        // libxslt date:seconds() accepts a leading decimal point in the seconds component even
+        // though XML Schema Part 2 section 3.2.6.1 requires a preceding numeral. Keep that
+        // compatibility quirk local to this one oracle-facing conversion; duration arithmetic
+        // remains schema-strict. https://www.w3.org/TR/xmlschema-2/#duration-lexical-representation
+        Self::parse_with_legacy_seconds(input, true)
+    }
+
+    fn parse_with_legacy_seconds(input: &str, allow_legacy_seconds: bool) -> Option<Self> {
         let (sign, input) = input
             .strip_prefix('-')
             .map_or((1.0, input), |rest| (-1.0, rest));
@@ -443,11 +455,17 @@ impl DurationValue {
                 return None;
             }
             let lexical_value = &rest[..end];
+            let designator = rest[end..].chars().next()?;
+            // XML Schema Part 2 section 3.2.6.1 requires the seconds numeral before an optional
+            // decimal fraction; Rust's float parser additionally accepts the invalid `.5` form.
+            // https://www.w3.org/TR/xmlschema-2/#duration-lexical-representation
+            if lexical_value.starts_with('.') && !(allow_legacy_seconds && designator == 'S') {
+                return None;
+            }
             let value = lexical_value.parse::<f64>().ok()?;
             if !value.is_finite() {
                 return None;
             }
-            let designator = rest[end..].chars().next()?;
             let rank = match (in_time, designator) {
                 (false, 'Y') => 1,
                 (false, 'M') => 2,
@@ -521,7 +539,7 @@ impl DurationValue {
         let months = self.months.unsigned_abs();
         let mut seconds = self.seconds.abs();
         let rounded = seconds.round();
-        if (seconds - rounded).abs() < 1e-9 {
+        if rounded != 0.0 && (seconds - rounded).abs() < 1e-9 {
             seconds = rounded;
         }
         let days = (seconds / 86_400.0).floor() as u64;
@@ -1211,5 +1229,19 @@ mod tests {
         let maximum =
             DateValue::parse("9223372036854775807-12-31").expect("maximum schema year parses");
         assert!(maximum.add(DurationValue::from_seconds(86_400.0)).is_none());
+    }
+
+    #[test]
+    fn duration_seconds_require_an_integer_part() {
+        // XML Schema Part 2 section 3.2.6.1 requires the seconds numeral before an optional
+        // decimal fraction: https://www.w3.org/TR/xmlschema-2/#duration-lexical-representation
+        assert!(DurationValue::parse("PT.5S").is_none());
+    }
+
+    #[test]
+    fn duration_render_preserves_nonzero_subnanosecond_values() {
+        let duration = DurationValue::parse("PT0.0000000001S").expect("valid duration parses");
+        assert_ne!(duration.render(), "P");
+        assert_eq!(duration.render(), "PT0.0000000001S");
     }
 }

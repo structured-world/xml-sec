@@ -248,6 +248,11 @@ impl<'c, 'd> Evaluation<'c, 'd> {
 
     /// Reserve bytes before an extension function allocates an XPath string result.
     pub fn reserve_string_allocation(&self, bytes: usize) -> Result<(), function::Error> {
+        self.reserve_temporary_allocation(bytes)
+    }
+
+    /// Reserve bytes in the context-scoped temporary allocation budget.
+    pub fn reserve_temporary_allocation(&self, bytes: usize) -> Result<(), function::Error> {
         reserve_allocation(self.string_allocations, bytes)
     }
 

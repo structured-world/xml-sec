@@ -1147,8 +1147,7 @@ impl Evaluator {
         let extension_prefix = extension_prefix.into_owned();
         let extension_namespace = extension_namespace.into_owned();
         let mut prepared_expression = expression.clone();
-        prepared_expression
-            .namespaces
+        Arc::make_mut(&mut prepared_expression.namespaces)
             .push((extension_prefix.clone(), extension_namespace.clone()));
         let expression = &prepared_expression;
         let mut source = expression.source.clone();
@@ -1679,7 +1678,7 @@ impl Evaluator {
         context.set_document_root_resolver(projected_document_root);
         let (owned_bytes, owned_bytes_limit) = meter.usage(BudgetKind::OwnedBytes)?;
         context.set_string_allocation_limit(owned_bytes_limit.saturating_sub(owned_bytes));
-        for (prefix, uri) in &expression.namespaces {
+        for (prefix, uri) in expression.namespaces.iter() {
             context.set_namespace(prefix, uri);
         }
         context.set_namespace("xml", "http://www.w3.org/XML/1998/namespace");
@@ -1696,19 +1695,19 @@ impl Evaluator {
         );
         // XPath function objects must own their static namespace context. Share one
         // materialization across all functions registered for this evaluation.
-        let function_namespaces = Rc::new(expression.namespaces.clone());
+        let function_namespaces = Arc::clone(&expression.namespaces);
         context.set_function(
             "key",
             KeyFunction {
                 index: Rc::clone(&self.key_index),
-                namespaces: Rc::clone(&function_namespaces),
+                namespaces: Arc::clone(&function_namespaces),
             },
         );
         context.set_function(
             "format-number",
             FormatNumberFunction {
                 formats: Rc::clone(&self.decimal_formats),
-                namespaces: Rc::clone(&function_namespaces),
+                namespaces: Arc::clone(&function_namespaces),
             },
         );
         context.set_function(
@@ -1729,13 +1728,13 @@ impl Evaluator {
         context.set_function(
             "system-property",
             SystemProperty {
-                namespaces: Rc::clone(&function_namespaces),
+                namespaces: Arc::clone(&function_namespaces),
             },
         );
         context.set_function(
             "element-available",
             ElementAvailable {
-                namespaces: Rc::clone(&function_namespaces),
+                namespaces: Arc::clone(&function_namespaces),
             },
         );
         context.set_function(
@@ -5621,12 +5620,32 @@ impl function::Function for DocumentFunction {
         } else {
             DocumentBaseSelection::Omitted
         };
-        let requests = match &args[0] {
-            SxdValue::Nodeset(nodes) => nodes
-                .document_order()
-                .into_iter()
-                .map(|node| {
+        let root: nodeset::Node<'d> = context.node.document().root().into();
+        let mut result = nodeset::Nodeset::new();
+        let roots = self.roots.borrow();
+        let mut process = |request: DocumentRequest| -> std::result::Result<(), function::Error> {
+            let Some(paths) = roots.get(&request) else {
+                let mut pending = self.pending.borrow_mut();
+                if !pending.contains(&request) {
+                    pending.insert(request);
+                }
+                return Ok(());
+            };
+            for path in paths {
+                let node = resolve_node_path(root.clone(), path).ok_or_else(|| {
+                    function::Error::Other {
+                        what: format!("document resource `{}` is stale", request.href),
+                    }
+                })?;
+                result.add_metered(context, node)?;
+            }
+            Ok(())
+        };
+        match &args[0] {
+            SxdValue::Nodeset(nodes) => {
+                for node in nodes.iter() {
                     let path = typed_path_to(&node);
+                    context.reserve_temporary_allocation(path.owned_bytes())?;
                     let (base_uri, logical_document) = match &base_selection {
                         DocumentBaseSelection::Explicit {
                             base_uri,
@@ -5637,9 +5656,18 @@ impl function::Function for DocumentFunction {
                             path.ordinary().get(1).copied(),
                         ),
                     };
-                    DocumentRequest::relative_to(node.string_value(), base_uri, logical_document)
-                })
-                .collect::<Vec<_>>(),
+                    let href = node.string_value_with_context(context)?;
+                    context.reserve_temporary_allocation(
+                        std::mem::size_of::<DocumentRequest>()
+                            .saturating_add(base_uri.as_deref().map_or(0, str::len)),
+                    )?;
+                    process(DocumentRequest::relative_to(
+                        href,
+                        base_uri,
+                        logical_document,
+                    ))?;
+                }
+            }
             value => {
                 let (base_uri, logical_document) = match &base_selection {
                     DocumentBaseSelection::Explicit {
@@ -5648,28 +5676,17 @@ impl function::Function for DocumentFunction {
                     } => (base_uri.clone(), *logical_document),
                     DocumentBaseSelection::Omitted => (self.static_base_uri.clone(), None),
                 };
-                vec![DocumentRequest::relative_to(
-                    value.string(),
+                context.reserve_temporary_allocation(value.string_len())?;
+                let href = value.string();
+                context.reserve_temporary_allocation(
+                    std::mem::size_of::<DocumentRequest>()
+                        .saturating_add(base_uri.as_deref().map_or(0, str::len)),
+                )?;
+                process(DocumentRequest::relative_to(
+                    href,
                     base_uri,
                     logical_document,
-                )]
-            }
-        };
-        let root: nodeset::Node<'d> = context.node.document().root().into();
-        let mut result = nodeset::Nodeset::new();
-        let roots = self.roots.borrow();
-        for request in requests {
-            let Some(paths) = roots.get(&request) else {
-                self.pending.borrow_mut().insert(request);
-                continue;
-            };
-            for path in paths {
-                let node = resolve_node_path(root.clone(), path).ok_or_else(|| {
-                    function::Error::Other {
-                        what: format!("document resource `{}` is stale", request.href),
-                    }
-                })?;
-                result.add(node);
+                ))?;
             }
         }
         Ok(SxdValue::Nodeset(result))
@@ -5677,7 +5694,7 @@ impl function::Function for DocumentFunction {
 }
 
 struct SystemProperty {
-    namespaces: Rc<Vec<(String, String)>>,
+    namespaces: Arc<Vec<(String, String)>>,
 }
 impl function::Function for SystemProperty {
     fn evaluate<'c, 'd>(
@@ -5704,7 +5721,7 @@ impl function::Function for SystemProperty {
 }
 
 struct ElementAvailable {
-    namespaces: Rc<Vec<(String, String)>>,
+    namespaces: Arc<Vec<(String, String)>>,
 }
 impl function::Function for ElementAvailable {
     fn evaluate<'c, 'd>(
@@ -5909,7 +5926,7 @@ fn xpath_test_matches_root(node_test: &str) -> bool {
 }
 
 struct FunctionAvailable {
-    namespaces: Rc<Vec<(String, String)>>,
+    namespaces: Arc<Vec<(String, String)>>,
     extension_functions: HashSet<ExpandedName>,
 }
 impl function::Function for FunctionAvailable {
@@ -6055,7 +6072,7 @@ type KeyIndex = HashMap<(ExpandedName, String, usize), Vec<NodePath>>;
 
 struct KeyFunction {
     index: Rc<RefCell<KeyIndex>>,
-    namespaces: Rc<Vec<(String, String)>>,
+    namespaces: Arc<Vec<(String, String)>>,
 }
 impl function::Function for KeyFunction {
     fn evaluate<'c, 'd>(
@@ -6068,15 +6085,8 @@ impl function::Function for KeyFunction {
                 what: "key() requires exactly two arguments".into(),
             });
         }
+        context.reserve_temporary_allocation(args[0].string_len())?;
         let name = resolve_lexical_name(&args[0].string(), &self.namespaces)?;
-        let values = match &args[1] {
-            SxdValue::Nodeset(nodes) => nodes
-                .document_order()
-                .iter()
-                .map(|node| node.string_value())
-                .collect(),
-            value => vec![value.string()],
-        };
         let document_index =
             path_to(&context.node)
                 .get(1)
@@ -6086,15 +6096,27 @@ impl function::Function for KeyFunction {
                 })?;
         let mut result = nodeset::Nodeset::new();
         let index = self.index.borrow();
-        for value in values {
+        let mut lookup = |value: String| -> std::result::Result<(), function::Error> {
             if let Some(paths) = index.get(&(name.clone(), value, document_index)) {
                 for path in paths {
                     if let Some(node) =
                         resolve_node_path(context.node.document().root().into(), path)
                     {
-                        result.add(node);
+                        result.add_metered(context, node)?;
                     }
                 }
+            }
+            Ok(())
+        };
+        match &args[1] {
+            SxdValue::Nodeset(nodes) => {
+                for node in nodes.iter() {
+                    lookup(node.string_value_with_context(context)?)?;
+                }
+            }
+            value => {
+                context.reserve_temporary_allocation(value.string_len())?;
+                lookup(value.string())?;
             }
         }
         Ok(SxdValue::Nodeset(result))
@@ -6103,7 +6125,7 @@ impl function::Function for KeyFunction {
 
 struct FormatNumberFunction {
     formats: Rc<Vec<DecimalFormat>>,
-    namespaces: Rc<Vec<(String, String)>>,
+    namespaces: Arc<Vec<(String, String)>>,
 }
 impl function::Function for FormatNumberFunction {
     fn evaluate<'c, 'd>(
@@ -6780,6 +6802,53 @@ mod tests {
     }
 
     #[test]
+    fn key_and_document_nodeset_arguments_obey_the_allocation_budget() {
+        // XSLT node-set arguments can contain many large string-values. key() and document()
+        // must not retain an unmetered batch before performing their lookups.
+        let package = Package::new();
+        let document = package.as_document();
+        let documents = document.create_element("documents");
+        let logical = document.create_element("logical");
+        document.root().append_child(documents);
+        documents.append_child(logical);
+        let mut nodes = nodeset::Nodeset::new();
+        for _ in 0..8 {
+            let item = document.create_element("item");
+            item.append_child(document.create_text(&"x".repeat(1_024)));
+            logical.append_child(item);
+            nodes.add(item);
+        }
+        let mut xpath_context = Context::new();
+        xpath_context.set_string_allocation_limit(128);
+        let evaluation =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&xpath_context, logical.into());
+
+        let key = KeyFunction {
+            index: Rc::new(RefCell::new(HashMap::new())),
+            namespaces: Arc::new(Vec::new()),
+        };
+        assert!(matches!(
+            key.evaluate(
+                &evaluation,
+                vec![SxdValue::String("missing".into()), SxdValue::Nodeset(nodes.clone())],
+            ),
+            Err(function::Error::Other { what }) if what.contains("budget")
+        ));
+
+        let document_function = DocumentFunction {
+            roots: Rc::new(RefCell::new(HashMap::new())),
+            pending: Rc::new(RefCell::new(HashSet::new())),
+            node_base_uris: Rc::new(RefCell::new(HashMap::new())),
+            static_base_uri: None,
+        };
+        assert!(matches!(
+            document_function
+                .evaluate(&evaluation, vec![SxdValue::Nodeset(nodes)]),
+            Err(function::Error::Other { what }) if what.contains("budget")
+        ));
+    }
+
+    #[test]
     fn ordinary_xpath_rewrite_pipeline_keeps_borrowed_storage() {
         // Repeated evaluation of a cached relative XPath must not allocate intermediate
         // normalization strings when none of the internal rewrites apply.
@@ -7177,7 +7246,7 @@ mod tests {
             sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
         let function = FormatNumberFunction {
             formats: Rc::new(Vec::new()),
-            namespaces: Rc::new(Vec::new()),
+            namespaces: Arc::new(Vec::new()),
         };
 
         let error = function
