@@ -1268,10 +1268,10 @@ impl Evaluator {
                             meter,
                             custom_calls,
                         )?
-                        .string(self);
+                        .into_temporary_string(self, meter)?;
                     let delimiter = if let Some(argument) = call.arguments.get(1) {
-                        Cow::Owned(
-                            self.evaluate_core(
+                        match self
+                            .evaluate_core(
                                 &expression.derived(argument.clone()),
                                 node,
                                 position,
@@ -1280,21 +1280,35 @@ impl Evaluator {
                                 meter,
                                 custom_calls,
                             )?
-                            .string(self),
-                        )
+                            .into_temporary_string(self, meter)
+                        {
+                            Ok((value, reserved)) => (Cow::Owned(value), reserved),
+                            Err(error) => {
+                                meter.release_owned_bytes(input.1);
+                                return Err(error);
+                            }
+                        }
                     } else {
                         // EXSLT gives tokenize() all four XML whitespace delimiters by default,
                         // while split() defaults to one space character:
                         // https://exslt.github.io/str/functions/tokenize/index.html
-                        Cow::Borrowed(match kind {
-                            ExtensionCallKind::Tokenize => " \t\r\n",
-                            ExtensionCallKind::Split => " ",
-                            _ => unreachable!(),
-                        })
+                        (
+                            Cow::Borrowed(match kind {
+                                ExtensionCallKind::Tokenize => " \t\r\n",
+                                ExtensionCallKind::Split => " ",
+                                _ => unreachable!(),
+                            }),
+                            0,
+                        )
                     };
-                    let fragment = token_document(&input, &delimiter, kind, meter)?;
-                    let root = self.import_document(&fragment, meter)?;
-                    let nodes = self.children(&root);
+                    let nodes = (|| {
+                        let fragment = token_document(&input.0, &delimiter.0, kind, meter)?;
+                        let root = self.import_document(&fragment, meter)?;
+                        Ok(self.children(&root))
+                    })();
+                    debug_assert!(input.1.checked_add(delimiter.1).is_some());
+                    meter.release_owned_bytes(input.1 + delimiter.1);
+                    let nodes = nodes?;
                     Value::NodeSet(nodes)
                 }
                 ExtensionCallKind::Replace => {
@@ -2381,29 +2395,44 @@ impl Evaluator {
     }
 
     pub(crate) fn string_value(&self, node: &SourceNode) -> String {
+        self.string_value_with_capacity(node, 0)
+    }
+
+    fn string_value_with_capacity(&self, node: &SourceNode, capacity: usize) -> String {
+        let mut output = String::with_capacity(capacity);
         match node {
-            SourceNode::Node(id) => self.source.string_value(*id),
+            SourceNode::Node(id) => return self.source.string_value_with_capacity(*id, capacity),
             SourceNode::Attribute { owner, index } => self
                 .source
                 .node(*owner)
                 .and_then(|node| match &node.kind {
                     NodeKind::Element { attributes, .. } => attributes
                         .get(*index)
-                        .map(|attribute| attribute.value.clone()),
+                        .map(|attribute| attribute.value.as_str()),
                     _ => None,
                 })
-                .unwrap_or_default(),
+                .map(|value| output.push_str(value)),
             SourceNode::Namespace { owner, index } => self
                 .source
                 .node(*owner)
                 .and_then(|node| match &node.kind {
                     NodeKind::Element { namespaces, .. } => namespaces
                         .get(*index)
-                        .map(|namespace| namespace.uri.clone()),
+                        .map(|namespace| namespace.uri.as_str()),
                     _ => None,
                 })
-                .unwrap_or_default(),
-        }
+                .map(|value| output.push_str(value)),
+        };
+        output
+    }
+
+    pub(crate) fn string_value_len(&self, node: &SourceNode) -> usize {
+        let mut length = 0usize;
+        self.visit_string_value(node, |value| {
+            debug_assert!(length.checked_add(value.len()).is_some());
+            length += value.len();
+        });
+        length
     }
 
     pub(crate) fn visit_string_value(&self, node: &SourceNode, mut visit: impl FnMut(&str)) {
@@ -2871,6 +2900,48 @@ impl XPathValue {
         match self {
             Self::String(value) | Self::StoredExpression(value) => value,
             value => value.string(evaluator),
+        }
+    }
+
+    fn into_temporary_string(
+        self,
+        evaluator: &Evaluator,
+        meter: &mut Meter,
+    ) -> Result<(String, usize)> {
+        match self {
+            Self::String(value) | Self::StoredExpression(value) => Ok((value, 0)),
+            Self::NodeSet(nodes) => {
+                let Some(node) = nodes.first() else {
+                    return Ok((String::new(), 0));
+                };
+                let length = evaluator.string_value_len(node);
+                meter.charge(BudgetKind::OwnedBytes, length)?;
+                Ok((evaluator.string_value_with_capacity(node, length), length))
+            }
+            Self::ResultTreeFragment(document) => {
+                let length = document.string_value_len(document.root());
+                meter.charge(BudgetKind::OwnedBytes, length)?;
+                Ok((
+                    document.string_value_with_capacity(document.root(), length),
+                    length,
+                ))
+            }
+            Self::Boolean(value) => {
+                let value = if value { "true" } else { "false" };
+                meter.charge(BudgetKind::OwnedBytes, value.len())?;
+                Ok((value.into(), value.len()))
+            }
+            Self::Number(value) => {
+                // XPath decimal expansion of a finite f64 needs at most 327 bytes (the negative
+                // smallest subnormal is the longest). Reserve that bound before formatting.
+                const MAX_XPATH_F64_BYTES: usize = 327;
+                meter.charge(BudgetKind::OwnedBytes, MAX_XPATH_F64_BYTES)?;
+                let value = crate::value::format_xpath_number(value);
+                let retained = value.len();
+                debug_assert!(retained <= MAX_XPATH_F64_BYTES);
+                meter.release_owned_bytes(MAX_XPATH_F64_BYTES - retained);
+                Ok((value, retained))
+            }
         }
     }
     pub(crate) fn number(&self, evaluator: &Evaluator) -> f64 {

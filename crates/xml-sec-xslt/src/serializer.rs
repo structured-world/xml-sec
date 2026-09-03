@@ -401,6 +401,11 @@ fn render_doctype(
     {
         validate_xml_public_identifier(public)?;
     }
+    if definition.method == OutputMethod::Xml
+        && let Some(system) = &definition.doctype_system
+    {
+        validate_xml_system_identifier(system)?;
+    }
     let Some(NodeKind::Element { name, prefix, .. }) =
         document.node(element).map(|node| &node.kind)
     else {
@@ -467,6 +472,17 @@ fn validate_xml_public_identifier(value: &str) -> Result<()> {
             "doctype public identifier contains a character outside XML PubidChar".into(),
         ))
     }
+}
+
+fn validate_xml_system_identifier(value: &str) -> Result<()> {
+    // XML 1.0 section 4.2.2 makes a fragment identifier in a SystemLiteral an error:
+    // https://www.w3.org/TR/xml/#sec-external-ent
+    if value.contains('#') {
+        return Err(Error::Serialization(
+            "doctype system identifier must not contain a fragment identifier".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn push_external_identifier_literal(

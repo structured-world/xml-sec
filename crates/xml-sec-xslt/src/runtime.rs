@@ -3321,6 +3321,7 @@ impl<'a> Execution<'a> {
             .iter()
             .position(|existing| existing.name == attribute.name);
         if existing_index.is_none() {
+            self.meter.charge(BudgetKind::ResultNodes, 1)?;
             reserve_retained_vec_slot(attributes, &mut self.meter)?;
         }
         let owned_bytes = attribute_owned_bytes(&attribute).saturating_add(
@@ -5149,6 +5150,56 @@ mod tests {
             0,
         )
         .expect("empty source fits")
+    }
+
+    #[test]
+    fn new_result_attributes_consume_result_node_budget() {
+        // XPath 1.0 section 5.2 models attributes as nodes, so the result-node ceiling must count
+        // a newly inserted expanded name while allowing replacement of that same node.
+        // https://www.w3.org/TR/1999/REC-xpath-19991116/#attribute-nodes
+        let stylesheet = Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(1 << 20, 4, 16, 1 << 20),
+        )
+        .compile(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><root><xsl:attribute name="a"/><xsl:attribute name="a"/><xsl:attribute name="b"/></root></xsl:template></xsl:stylesheet>"#,
+            None,
+        )
+        .expect("stylesheet compiles");
+        let source = Document::parse("<source/>", None).expect("source parses");
+        let budget = ExecutionBudget {
+            source_bytes: usize::MAX,
+            external_documents: usize::MAX,
+            recursion_depth: usize::MAX,
+            xpath_evaluations: usize::MAX,
+            template_applications: usize::MAX,
+            sort_comparisons: usize::MAX,
+            key_entries: usize::MAX,
+            result_nodes: 2,
+            serialized_bytes: usize::MAX,
+            messages: usize::MAX,
+            owned_bytes: usize::MAX,
+        };
+        let error = stylesheet
+            .execute(
+                &source,
+                &crate::Parameters::new(),
+                Arc::new(NoResolver),
+                crate::ExecutionOptions {
+                    budget,
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            )
+            .expect_err("one element plus two unique attributes exceed two result nodes");
+        assert!(matches!(
+            error,
+            Error::Budget {
+                kind: BudgetKind::ResultNodes,
+                limit: 2,
+                actual: 3,
+            }
+        ));
     }
 
     #[test]

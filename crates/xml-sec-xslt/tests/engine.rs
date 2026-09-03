@@ -6262,6 +6262,57 @@ fn doctype_identifiers_use_a_safe_literal_delimiter() {
 }
 
 #[test]
+fn xml_doctype_rejects_fragmented_system_identifiers() {
+    // XML 1.0 section 4.2.2 makes a fragment identifier in a SystemLiteral an error:
+    // https://www.w3.org/TR/xml/#sec-external-ent
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes" doctype-system="schema.dtd#part"/><xsl:template match="/"><root/></xsl:template></xsl:stylesheet>"#;
+    assert!(matches!(
+        compile(stylesheet).execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Serialization(message))
+            if message.contains("system identifier") && message.contains("fragment")
+    ));
+}
+
+#[test]
+fn exslt_token_arguments_count_temporary_string_values() {
+    // Both node-set conversions remain live while str:split builds its token document. Their
+    // complete peak footprint must cross OwnedBytes even when the delimiter consumes all input.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(str:split(/root, /root))"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let payload = "x".repeat(1 << 20);
+    let source_xml = format!("<root>{payload}</root>");
+    let source = Document::parse(&source_xml, None).expect("source parses");
+    let mut budget = execution_budget(source_xml.len());
+    budget.owned_bytes = 4 << 20;
+    assert!(matches!(
+        stylesheet.execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn xml_doctype_rejects_invalid_public_identifier_characters() {
     // XML output must never serialize a PUBLIC literal outside the XML PubidChar grammar.
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes" doctype-public="bad&lt;id" doctype-system="result.dtd"/><xsl:template match="/"><root/></xsl:template></xsl:stylesheet>"#;

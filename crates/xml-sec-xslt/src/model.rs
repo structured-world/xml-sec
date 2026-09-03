@@ -1152,28 +1152,22 @@ impl Document {
     }
 
     pub(crate) fn string_value(&self, id: NodeId) -> String {
-        let Some(node) = self.node(id) else {
-            return String::new();
-        };
-        match &node.kind {
-            NodeKind::Text { value, .. } => value.clone(),
-            NodeKind::Comment(value) => value.clone(),
-            NodeKind::ProcessingInstruction { value, .. } => value.clone().unwrap_or_default(),
-            NodeKind::Root | NodeKind::Element { .. } => {
-                let mut output = String::new();
-                let mut pending = node.children.iter().rev().copied().collect::<Vec<_>>();
-                while let Some(current) = pending.pop() {
-                    let Some(current) = self.node(current) else {
-                        continue;
-                    };
-                    if let NodeKind::Text { value, .. } = &current.kind {
-                        output.push_str(value);
-                    }
-                    pending.extend(current.children.iter().rev().copied());
-                }
-                output
-            }
-        }
+        self.string_value_with_capacity(id, 0)
+    }
+
+    pub(crate) fn string_value_with_capacity(&self, id: NodeId, capacity: usize) -> String {
+        let mut output = String::with_capacity(capacity);
+        self.visit_string_value(id, |value| output.push_str(value));
+        output
+    }
+
+    pub(crate) fn string_value_len(&self, id: NodeId) -> usize {
+        let mut length = 0usize;
+        self.visit_string_value(id, |value| {
+            debug_assert!(length.checked_add(value.len()).is_some());
+            length += value.len();
+        });
+        length
     }
 
     pub(crate) fn visit_string_value(&self, id: NodeId, mut visit: impl FnMut(&str)) {
@@ -2643,7 +2637,6 @@ fn expand_parameter_entity_references_into(
     output: &mut String,
     reject_unresolved: bool,
 ) -> Result<()> {
-    const MAX_ENTITY_NAME_SCAN_BYTES: usize = 1_024;
     let mut cursor = 0usize;
     while cursor < value.len() {
         let tail = &value[cursor..];
@@ -2674,8 +2667,8 @@ fn expand_parameter_entity_references_into(
             // XML 1.0 section 4.1 WFC Entity Declared requires every PEReference to resolve;
             // preserving an unknown reference would defer it into a parser path that may discard
             // DTD tokens. https://www.w3.org/TR/xml/#wf-entdeclared
-            let end = after_percent.as_bytes()
-                [..after_percent.len().min(MAX_ENTITY_NAME_SCAN_BYTES)]
+            let end = after_percent
+                .as_bytes()
                 .iter()
                 .position(|byte| *byte == b';')
                 .ok_or_else(|| Error::Xml("unterminated parameter entity reference".into()))?;
@@ -2931,28 +2924,29 @@ fn expand_entity_references<'a>(
 }
 
 fn contains_expandable_entity_reference(value: &str, entities: &HashMap<String, String>) -> bool {
-    const MAX_ENTITY_NAME_SCAN_BYTES: usize = 1_024;
     let bytes = value.as_bytes();
     let mut cursor = 0usize;
     while let Some(relative) = bytes[cursor..].iter().position(|byte| *byte == b'&') {
-        let name_start = cursor + relative + 1;
-        let scan_end = name_start
-            .saturating_add(MAX_ENTITY_NAME_SCAN_BYTES)
-            .min(bytes.len());
-        if let Some(relative_end) = bytes[name_start..scan_end]
-            .iter()
-            .position(|byte| *byte == b';')
-        {
-            let name_end = name_start + relative_end;
-            if entities.contains_key(&value[name_start..name_end]) {
+        let reference_start = cursor + relative;
+        if let Some((name, consumed)) = general_entity_reference(&value[reference_start..]) {
+            if entities.contains_key(name) {
                 return true;
             }
-            cursor = name_end + 1;
+            cursor = reference_start + consumed;
         } else {
-            cursor = name_start;
+            cursor = reference_start + 1;
         }
     }
     false
+}
+
+fn general_entity_reference(value: &str) -> Option<(&str, usize)> {
+    let after_ampersand = value.strip_prefix('&')?;
+    let end = after_ampersand
+        .as_bytes()
+        .iter()
+        .position(|byte| matches!(byte, b';' | b'&'))?;
+    (after_ampersand.as_bytes()[end] == b';').then(|| (&after_ampersand[..end], end + 2))
 }
 
 fn expand_entity_references_into(
@@ -2963,7 +2957,6 @@ fn expand_entity_references_into(
     meter: &mut EntityExpansionMeter,
     output: &mut String,
 ) -> Result<()> {
-    const MAX_ENTITY_NAME_SCAN_BYTES: usize = 1_024;
     let mut cursor = 0;
     while cursor < value.len() {
         let tail = &value[cursor..];
@@ -2988,11 +2981,7 @@ fn expand_entity_references_into(
             cursor += length;
             continue;
         }
-        if tail.starts_with('&')
-            && let Some(end) = tail.as_bytes()[..tail.len().min(MAX_ENTITY_NAME_SCAN_BYTES)]
-                .iter()
-                .position(|byte| *byte == b';')
-            && let name = &tail[1..end]
+        if let Some((name, consumed)) = general_entity_reference(tail)
             && let Some(replacement) = entities.get(name)
         {
             *references += 1;
@@ -3009,7 +2998,7 @@ fn expand_entity_references_into(
                 meter,
                 output,
             )?;
-            cursor += end + 1;
+            cursor += consumed;
             continue;
         }
         let plain_end = tail
@@ -3764,11 +3753,12 @@ mod parser_boundary_tests {
     }
 
     #[test]
-    fn entity_name_lookup_has_a_fixed_lexical_window() {
-        // A distant semicolon cannot turn one ampersand into an unbounded linear scan.
-        let name = "a".repeat(1_100);
+    fn entity_expansion_accepts_source_bounded_long_names() {
+        // XML 1.0 productions [4], [5], [68], and [69] impose no lexical byte ceiling on Name.
+        // https://www.w3.org/TR/xml/#NT-Name
+        let name = format!("entity{}", "a".repeat(1_025));
         let source = format!("&{name};");
-        let entities = HashMap::from([(name, "expanded".into())]);
+        let entities = HashMap::from([(name.clone(), "expanded".into())]);
         assert_eq!(
             expand_entity_references(
                 &source,
@@ -3777,9 +3767,34 @@ mod parser_boundary_tests {
                 &mut 0,
                 &mut EntityExpansionMeter::new(ENTITY_EXPANSION_BYTE_CEILING),
             )
-            .expect("bounded entity scan succeeds"),
-            source
+            .expect("source-bounded entity scan succeeds"),
+            "expanded"
         );
+
+        let parameter_source = format!("%{name};");
+        assert_eq!(
+            expand_parameter_entity_references(
+                &parameter_source,
+                &entities,
+                &[],
+                0,
+                &mut 0,
+                &mut EntityExpansionMeter::new(ENTITY_EXPANSION_BYTE_CEILING),
+            )
+            .expect("source-bounded parameter entity scan succeeds"),
+            "expanded"
+        );
+
+        let general_xml = format!("<!DOCTYPE r [<!ENTITY {name} 'expanded'>]><r>&{name};</r>");
+        let general = Document::parse_iterative(&general_xml, None)
+            .expect("a long general entity name remains valid XML");
+        assert_eq!(general.string_value(general.root()), "expanded");
+
+        let parameter_xml =
+            format!("<!DOCTYPE r [<!ENTITY % {name} ' '> %{name};]><r>expanded</r>");
+        let parameter = Document::parse_iterative(&parameter_xml, None)
+            .expect("a long parameter entity name remains valid XML");
+        assert_eq!(parameter.string_value(parameter.root()), "expanded");
     }
 
     #[test]
@@ -3803,9 +3818,9 @@ mod parser_boundary_tests {
     }
 
     #[test]
-    fn entity_name_window_never_slices_inside_utf8() {
-        // The byte-bounded semicolon search must not turn a multibyte scalar
-        // crossing the ceiling into a char-boundary panic.
+    fn unterminated_entity_names_with_utf8_remain_borrowed() {
+        // Source-bounded scanning stops only at lexical delimiters and never slices through a
+        // multibyte scalar when an entity reference is unterminated.
         let source = format!("&{}é", "a".repeat(1_022));
         let entities = HashMap::from([("x".to_owned(), "expanded".to_owned())]);
         assert_eq!(
