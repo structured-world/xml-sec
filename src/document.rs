@@ -2184,6 +2184,9 @@ fn preflight_xml_fragment(
                 frame.pending_attribute_offset = frame
                     .pending_attribute_offset
                     .saturating_add(pending.consumed());
+                // `general_references` excludes numeric and the five predefined entities. XML
+                // 1.0 section 4.6 keeps that classification even for normative redeclarations.
+                // https://www.w3.org/TR/xml/#sec-predefined-ent
                 (
                     PreflightEvent::GeneralRef {
                         name: Some(name.to_owned()),
@@ -3743,6 +3746,26 @@ mod tests {
             })) if observed_maximum == maximum
                 && actual == expected_work
         ));
+    }
+
+    #[test]
+    fn attribute_preflight_exempts_normatively_redeclared_predefined_entities() {
+        // XML 1.0 section 4.6 permits predefined entities to be redeclared only with their
+        // normative replacement text; they remain predefined references, not expansion work.
+        // https://www.w3.org/TR/xml/#sec-predefined-ent
+        let references = "&amp;".repeat(
+            usize::try_from(crate::hard_limits::XML_ENTITY_EXPANSION_CEILING)
+                .expect("entity ceiling fits usize")
+                + 1,
+        );
+        let xml =
+            format!(r#"<!DOCTYPE root [<!ENTITY amp "&#38;#38;">]><root value="{references}"/>"#);
+        let settings = DocumentParseSettings::new_with_depth(true, 8, 1, xml.len());
+        let budget = XmlParseWorkBudget::with_limit(xml.len());
+
+        preflight_document_limits(&xml, settings, Some(&budget))
+            .expect("predefined attribute references do not consume entity expansion budget");
+        assert_eq!(budget.consumed(), xml.len());
     }
 
     #[test]

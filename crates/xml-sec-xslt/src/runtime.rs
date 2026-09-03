@@ -2120,7 +2120,7 @@ impl<'a> Execution<'a> {
     }
 
     fn evaluate_rtf_order(
-        &self,
+        &mut self,
         expression: &Expression,
         node: &SourceNode,
     ) -> Result<Option<f64>> {
@@ -2164,57 +2164,75 @@ impl<'a> Execution<'a> {
         else {
             return Ok(None);
         };
-        let mut targets = match target_expression.trim() {
-            "name(current())" => vec![self.evaluator.qualified_name(node)],
-            path if path.starts_with("current()/") => self
-                .evaluator
-                .relative_nodes(
+        let (mut targets, reserved_owned_bytes) = match target_expression.trim() {
+            "name(current())" => collect_metered_strings(
+                std::slice::from_ref(node),
+                &self.evaluator,
+                &mut self.meter,
+                |evaluator, target, visit| evaluator.visit_qualified_name(target, visit),
+            )?,
+            path if path.starts_with("current()/") => {
+                let Some((nodes, node_reservation)) = self.evaluator.relative_nodes(
                     path.trim_start_matches("current()/"),
                     node,
                     &expression.namespaces,
+                    &mut self.meter,
                 )?
-                .unwrap_or_default()
-                .iter()
-                .map(|target| self.evaluator.string_value(target))
-                .collect(),
+                else {
+                    return Ok(None);
+                };
+                let targets = collect_metered_strings(
+                    &nodes,
+                    &self.evaluator,
+                    &mut self.meter,
+                    |evaluator, target, visit| evaluator.visit_string_value(target, visit),
+                );
+                drop(nodes);
+                self.meter.release_owned_bytes(node_reservation);
+                targets?
+            }
             _ => return Ok(None),
         };
-        targets.sort_unstable();
-        targets.dedup();
-        let Some(root) = fragment.node(fragment.root()) else {
-            return Ok(Some(0.0));
-        };
-        let mut preceding = 0usize;
-        let mut union_count = 0usize;
-        for child in &root.children {
-            let Some(candidate) = fragment.node(*child) else {
-                continue;
+        let result = (|| {
+            targets.sort_unstable();
+            targets.dedup();
+            let Some(root) = fragment.node(fragment.root()) else {
+                return Ok(Some(0.0));
             };
-            if let NodeKind::Element { name, prefix, .. } = &candidate.kind {
-                // XPath 1.0 section 3.4 defines string-to-node-set equality as true when any
-                // selected node has the same string-value; reducing current()/path to its first
-                // node would change predicate semantics.
-                // https://www.w3.org/TR/1999/REC-xpath-19991116/#booleans
-                let matched = targets
-                    .binary_search_by(|target| match prefix.as_deref() {
-                        Some(prefix) => target.as_bytes().iter().copied().cmp(
-                            prefix
-                                .bytes()
-                                .chain(std::iter::once(b':'))
-                                .chain(name.local.bytes()),
-                        ),
-                        None => target.as_str().cmp(name.local.as_str()),
-                    })
-                    .is_ok();
-                if matched {
-                    // Preceding sibling sets are nested in document order, so the last
-                    // matching element contributes the complete union.
-                    union_count = preceding;
+            let mut preceding = 0usize;
+            let mut union_count = 0usize;
+            for child in &root.children {
+                let Some(candidate) = fragment.node(*child) else {
+                    continue;
+                };
+                if let NodeKind::Element { name, prefix, .. } = &candidate.kind {
+                    // XPath 1.0 section 3.4 defines string-to-node-set equality as true when any
+                    // selected node has the same string-value; reducing current()/path to its first
+                    // node would change predicate semantics.
+                    // https://www.w3.org/TR/1999/REC-xpath-19991116/#booleans
+                    let matched = targets
+                        .binary_search_by(|target| match prefix.as_deref() {
+                            Some(prefix) => target.as_bytes().iter().copied().cmp(
+                                prefix
+                                    .bytes()
+                                    .chain(std::iter::once(b':'))
+                                    .chain(name.local.bytes()),
+                            ),
+                            None => target.as_str().cmp(name.local.as_str()),
+                        })
+                        .is_ok();
+                    if matched {
+                        // Preceding sibling sets are nested in document order, so the last
+                        // matching element contributes the complete union.
+                        union_count = preceding;
+                    }
+                    preceding += 1;
                 }
-                preceding += 1;
             }
-        }
-        Ok(Some(union_count as f64))
+            Ok(Some(union_count as f64))
+        })();
+        self.meter.release_owned_bytes(reserved_owned_bytes);
+        result
     }
 
     fn evaluate_scalar_fast(
@@ -3548,59 +3566,77 @@ impl<'a> Execution<'a> {
         node: &SourceNode,
         matches: &mut impl FnMut(&mut Self, &SourceNode) -> Result<bool>,
     ) -> Result<usize> {
-        let siblings = match node {
+        #[derive(Clone, Copy)]
+        enum SiblingAxis {
+            Children { parent: NodeId, count: usize },
+            Attributes { owner: NodeId, count: usize },
+            Namespaces { owner: NodeId, count: usize },
+        }
+
+        let axis = match node {
             SourceNode::Node(id) => {
                 let Some(parent) = self.evaluator.source.node(*id).and_then(|node| node.parent)
                 else {
                     return Ok(1);
                 };
-                self.evaluator
+                let count = self
+                    .evaluator
                     .source
                     .node(parent)
-                    .map(|node| {
-                        node.children
-                            .iter()
-                            .copied()
-                            .map(SourceNode::Node)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default()
+                    .map_or(0, |node| node.children.len());
+                SiblingAxis::Children { parent, count }
             }
-            SourceNode::Attribute { owner, .. } => self
-                .evaluator
-                .source
-                .node(*owner)
-                .and_then(|node| match &node.kind {
-                    NodeKind::Element { attributes, .. } => Some(
-                        (0..attributes.len())
-                            .map(|index| SourceNode::Attribute {
-                                owner: *owner,
-                                index,
-                            })
-                            .collect(),
-                    ),
-                    _ => None,
-                })
-                .unwrap_or_default(),
-            SourceNode::Namespace { owner, .. } => self
-                .evaluator
-                .source
-                .node(*owner)
-                .and_then(|node| match &node.kind {
-                    NodeKind::Element { namespaces, .. } => Some(
-                        (0..namespaces.len())
-                            .map(|index| SourceNode::Namespace {
-                                owner: *owner,
-                                index,
-                            })
-                            .collect(),
-                    ),
-                    _ => None,
-                })
-                .unwrap_or_default(),
+            SourceNode::Attribute { owner, .. } => {
+                let count = self
+                    .evaluator
+                    .source
+                    .node(*owner)
+                    .map_or(0, |node| match &node.kind {
+                        NodeKind::Element { attributes, .. } => attributes.len(),
+                        _ => 0,
+                    });
+                SiblingAxis::Attributes {
+                    owner: *owner,
+                    count,
+                }
+            }
+            SourceNode::Namespace { owner, .. } => {
+                let count = self
+                    .evaluator
+                    .source
+                    .node(*owner)
+                    .map_or(0, |node| match &node.kind {
+                        NodeKind::Element { namespaces, .. } => namespaces.len(),
+                        _ => 0,
+                    });
+                SiblingAxis::Namespaces {
+                    owner: *owner,
+                    count,
+                }
+            }
         };
         let mut count = 0;
-        for sibling in siblings {
+        let sibling_count = match axis {
+            SiblingAxis::Children { count, .. }
+            | SiblingAxis::Attributes { count, .. }
+            | SiblingAxis::Namespaces { count, .. } => count,
+        };
+        for index in 0..sibling_count {
+            let sibling = match axis {
+                SiblingAxis::Children { parent, .. } => {
+                    let Some(child) = self
+                        .evaluator
+                        .source
+                        .node(parent)
+                        .and_then(|node| node.children.get(index))
+                    else {
+                        break;
+                    };
+                    SourceNode::Node(*child)
+                }
+                SiblingAxis::Attributes { owner, .. } => SourceNode::Attribute { owner, index },
+                SiblingAxis::Namespaces { owner, .. } => SourceNode::Namespace { owner, index },
+            };
             if matches(self, &sibling)? {
                 count += 1;
             }
@@ -4137,6 +4173,79 @@ fn reserve_retained_vec_slot<T>(items: &mut Vec<T>, meter: &mut Meter) -> Result
         meter.release_owned_bytes(requested_bytes - actual_bytes);
     } else if actual_bytes > requested_bytes {
         meter.charge(BudgetKind::OwnedBytes, actual_bytes - requested_bytes)?;
+    }
+    Ok(())
+}
+
+fn collect_metered_strings(
+    nodes: &[SourceNode],
+    evaluator: &Evaluator,
+    meter: &mut Meter,
+    mut visit: impl FnMut(&Evaluator, &SourceNode, &mut dyn FnMut(&str)),
+) -> Result<(Vec<String>, usize)> {
+    let mut string_bytes = 0usize;
+    for node in nodes {
+        visit(evaluator, node, &mut |segment| {
+            string_bytes = string_bytes.saturating_add(segment.len());
+        });
+    }
+    let vector_bytes = nodes.len().saturating_mul(std::mem::size_of::<String>());
+    let expected_bytes = vector_bytes.saturating_add(string_bytes);
+    meter.charge(BudgetKind::OwnedBytes, expected_bytes)?;
+    let mut reserved_owned_bytes = expected_bytes;
+    let result = (|| {
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(nodes.len())
+            .map_err(|error| Error::Dynamic(format!("failed to reserve XPath strings: {error}")))?;
+        reconcile_temporary_capacity(
+            meter,
+            &mut reserved_owned_bytes,
+            vector_bytes,
+            values
+                .capacity()
+                .saturating_mul(std::mem::size_of::<String>()),
+        )?;
+        for node in nodes {
+            let mut bytes = 0usize;
+            visit(evaluator, node, &mut |segment| {
+                bytes = bytes.saturating_add(segment.len());
+            });
+            let mut value = String::new();
+            value.try_reserve_exact(bytes).map_err(|error| {
+                Error::Dynamic(format!("failed to reserve XPath string value: {error}"))
+            })?;
+            reconcile_temporary_capacity(
+                meter,
+                &mut reserved_owned_bytes,
+                bytes,
+                value.capacity(),
+            )?;
+            visit(evaluator, node, &mut |segment| value.push_str(segment));
+            values.push(value);
+        }
+        Ok((values, reserved_owned_bytes))
+    })();
+    if result.is_err() {
+        meter.release_owned_bytes(reserved_owned_bytes);
+    }
+    result
+}
+
+fn reconcile_temporary_capacity(
+    meter: &mut Meter,
+    reserved_owned_bytes: &mut usize,
+    expected: usize,
+    actual: usize,
+) -> Result<()> {
+    if actual < expected {
+        let released = expected - actual;
+        meter.release_owned_bytes(released);
+        *reserved_owned_bytes -= released;
+    } else if actual > expected {
+        let additional = actual - expected;
+        meter.charge(BudgetKind::OwnedBytes, additional)?;
+        *reserved_owned_bytes = reserved_owned_bytes.saturating_add(additional);
     }
     Ok(())
 }

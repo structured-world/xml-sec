@@ -1363,6 +1363,58 @@ fn result_tree_fragment_preceding_sibling_count_uses_the_full_node_set() {
 }
 
 #[test]
+fn result_tree_fragment_order_fast_path_accounts_for_target_strings() {
+    // Source string-values retained for the optimized RTF ordering predicate are temporary but
+    // simultaneously live, so their complete payload must increase the peak OwnedBytes budget.
+    let payload = "target".repeat(16 * 1024);
+    let source_xml = format!("<source><target>{payload}</target></source>");
+    let source = Document::parse(&source_xml, None).expect("source parses");
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:exsl="http://exslt.org/common"><xsl:output method="text"/><xsl:template name="baseline"><xsl:variable name="fragment"><a/><b/></xsl:variable><xsl:value-of select="count(exsl:node-set($fragment)/*)"/></xsl:template><xsl:template name="targets"><xsl:variable name="fragment"><a/><b/></xsl:variable><xsl:value-of select="count(exsl:node-set($fragment)/*[name() = current()/source/target]/preceding-sibling::*)"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let minimum = |initial_template: &str| {
+        let succeeds = |owned_bytes| {
+            let mut budget = execution_budget(source_xml.len());
+            budget.owned_bytes = owned_bytes;
+            stylesheet
+                .execute(
+                    &source,
+                    &Parameters::new(),
+                    Arc::new(NoResolver),
+                    ExecutionOptions {
+                        budget,
+                        initial_mode: None,
+                        initial_template: Some(ExpandedName::new(None::<String>, initial_template)),
+                    },
+                )
+                .is_ok()
+        };
+        let mut rejected = 0;
+        let mut accepted = 1;
+        while !succeeds(accepted) {
+            rejected = accepted;
+            accepted *= 2;
+        }
+        while rejected + 1 < accepted {
+            let candidate = rejected + (accepted - rejected) / 2;
+            if succeeds(candidate) {
+                accepted = candidate;
+            } else {
+                rejected = candidate;
+            }
+        }
+        accepted
+    };
+    let baseline = minimum("baseline");
+    let targets = minimum("targets");
+    assert!(
+        targets + 16 * 1024 >= baseline + payload.len(),
+        "baseline={baseline}, targets={targets}, payload={}",
+        payload.len()
+    );
+}
+
+#[test]
 fn empty_result_tree_fragment_remains_truthy_in_generic_xpath() {
     // XSLT 1.0 RTF boolean conversion is true even when its constructed root has no children.
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:variable name="fragment"><xsl:if test="false()">unreachable</xsl:if></xsl:variable><xsl:value-of select="not($fragment)"/><xsl:text>|</xsl:text><xsl:value-of select="string($fragment)"/></xsl:template></xsl:stylesheet>"#;
@@ -9172,6 +9224,56 @@ fn grouped_numbering_is_rejected_before_exceeding_owned_memory() {
             ..
         }
     ));
+}
+
+#[test]
+fn wide_sibling_numbering_does_not_require_a_copied_sibling_set() {
+    // xsl:number can scan the retained source children directly; the number of siblings must not
+    // impose a second SourceNode-sized allocation on the peak OwnedBytes budget.
+    let source_xml = format!("<root>{}</root>", "<item/>".repeat(4_096));
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template name="baseline"><xsl:apply-templates select="root/item[last()]" mode="baseline"/></xsl:template><xsl:template name="number"><xsl:apply-templates select="root/item[last()]" mode="number"/></xsl:template><xsl:template match="item" mode="baseline">4096</xsl:template><xsl:template match="item" mode="number"><xsl:number/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse(&source_xml, None).expect("wide source parses");
+    let minimum = |initial_template: &str| {
+        let succeeds = |owned_bytes| {
+            let mut budget = execution_budget(source_xml.len());
+            budget.owned_bytes = owned_bytes;
+            stylesheet
+                .execute(
+                    &source,
+                    &Parameters::new(),
+                    Arc::new(NoResolver),
+                    ExecutionOptions {
+                        budget,
+                        initial_mode: None,
+                        initial_template: Some(ExpandedName::new(None::<String>, initial_template)),
+                    },
+                )
+                .is_ok()
+        };
+        let mut rejected = 0;
+        let mut accepted = 1;
+        while !succeeds(accepted) {
+            rejected = accepted;
+            accepted *= 2;
+        }
+        while rejected + 1 < accepted {
+            let candidate = rejected + (accepted - rejected) / 2;
+            if succeeds(candidate) {
+                accepted = candidate;
+            } else {
+                rejected = candidate;
+            }
+        }
+        accepted
+    };
+    let baseline = minimum("baseline");
+    let numbering = minimum("number");
+    assert!(
+        numbering <= baseline + 8 * 1024,
+        "baseline={baseline}, numbering={numbering}"
+    );
 }
 
 #[test]

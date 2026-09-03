@@ -234,6 +234,40 @@ fn source_base_uri(source: &Document, node: &SourceNode) -> Option<String> {
         .and_then(|node| node.base_uri.clone())
 }
 
+fn reserve_temporary_vec_slot<T>(
+    items: &mut Vec<T>,
+    meter: &mut Meter,
+    reserved_owned_bytes: &mut usize,
+) -> Result<()> {
+    if std::mem::size_of::<T>() == 0 || items.len() < items.capacity() {
+        return Ok(());
+    }
+    let old_capacity = items.capacity();
+    let requested_slots = old_capacity.max(4);
+    let requested_bytes = requested_slots.saturating_mul(std::mem::size_of::<T>());
+    meter.charge(BudgetKind::OwnedBytes, requested_bytes)?;
+    if let Err(error) = items.try_reserve_exact(requested_slots) {
+        meter.release_owned_bytes(requested_bytes);
+        return Err(Error::Dynamic(format!(
+            "failed to reserve temporary XPath storage: {error}"
+        )));
+    }
+    let actual_bytes = items
+        .capacity()
+        .saturating_sub(old_capacity)
+        .saturating_mul(std::mem::size_of::<T>());
+    if actual_bytes < requested_bytes {
+        meter.release_owned_bytes(requested_bytes - actual_bytes);
+    } else if actual_bytes > requested_bytes
+        && let Err(error) = meter.charge(BudgetKind::OwnedBytes, actual_bytes - requested_bytes)
+    {
+        meter.release_owned_bytes(requested_bytes);
+        return Err(error);
+    }
+    *reserved_owned_bytes = reserved_owned_bytes.saturating_add(actual_bytes);
+    Ok(())
+}
+
 type PatternCacheKey = (String, Vec<(String, String)>, NodeId);
 
 fn pattern_cache_entry_owned_bytes(key: &PatternCacheKey, node_count: usize) -> usize {
@@ -2402,6 +2436,16 @@ impl Evaluator {
     }
 
     pub(crate) fn qualified_name(&self, node: &SourceNode) -> String {
+        let mut bytes = 0usize;
+        self.visit_qualified_name(node, |segment| {
+            bytes = bytes.saturating_add(segment.len());
+        });
+        let mut output = String::with_capacity(bytes);
+        self.visit_qualified_name(node, |segment| output.push_str(segment));
+        output
+    }
+
+    pub(crate) fn visit_qualified_name(&self, node: &SourceNode, mut visit: impl FnMut(&str)) {
         let named = match node {
             SourceNode::Node(id) => self.source.node(*id).and_then(|node| match &node.kind {
                 NodeKind::Element { name, prefix, .. } => Some((name, prefix.as_deref())),
@@ -2421,15 +2465,17 @@ impl Evaluator {
             && let Some(node) = self.source.node(*id)
             && let NodeKind::ProcessingInstruction { target, .. } = &node.kind
         {
-            return target.clone();
+            visit(target);
+            return;
         }
         let Some((name, prefix)) = named else {
-            return String::new();
+            return;
         };
-        prefix.map_or_else(
-            || name.local.clone(),
-            |prefix| format!("{prefix}:{}", name.local),
-        )
+        if let Some(prefix) = prefix {
+            visit(prefix);
+            visit(":");
+        }
+        visit(&name.local);
     }
 
     pub(crate) fn relative_nodes(
@@ -2437,54 +2483,114 @@ impl Evaluator {
         path: &str,
         node: &SourceNode,
         namespaces: &[(String, String)],
-    ) -> Result<Option<Vec<SourceNode>>> {
-        let mut selected = vec![node.clone()];
-        for step in path.split('/') {
-            let mut next = Vec::new();
-            match step {
-                "." => next = selected,
-                ".." => {
-                    next.extend(selected.iter().filter_map(|node| self.parent_node(node)));
+        meter: &mut Meter,
+    ) -> Result<Option<(Vec<SourceNode>, usize)>> {
+        let mut reserved_owned_bytes = 0usize;
+        let result = (|| {
+            let mut selected = Vec::new();
+            reserve_temporary_vec_slot(&mut selected, meter, &mut reserved_owned_bytes)?;
+            selected.push(node.clone());
+            for step in path.split('/') {
+                if step == "." {
+                    continue;
                 }
-                "text()" => {
-                    for parent in &selected {
-                        next.extend(
-                            self.children(parent)
-                                .into_iter()
-                                .filter(|child| self.is_text_node(child)),
-                        );
-                    }
-                }
-                attribute if attribute.starts_with('@') => {
-                    let lexical = &attribute[1..];
-                    for parent in &selected {
-                        for candidate in self.attributes(parent) {
-                            if self.attribute_name_matches(&candidate, lexical, namespaces)? {
-                                next.push(candidate);
-                            }
+                let mut next = Vec::new();
+                match step {
+                    ".." => {
+                        for parent in selected.iter().filter_map(|node| self.parent_node(node)) {
+                            reserve_temporary_vec_slot(
+                                &mut next,
+                                meter,
+                                &mut reserved_owned_bytes,
+                            )?;
+                            next.push(parent);
                         }
                     }
-                }
-                lexical if is_lexical_qname(lexical) => {
-                    for parent in &selected {
-                        for child in self.children(parent) {
-                            let SourceNode::Node(id) = child else {
+                    "text()" => {
+                        for parent in &selected {
+                            let SourceNode::Node(parent) = parent else {
                                 continue;
                             };
-                            let matches = self.source.node(id).is_some_and(|node| {
-                                matches!(&node.kind, NodeKind::Element { name, .. } if element_pattern_name_matches(lexical, name, namespaces).unwrap_or(false))
-                            });
-                            if matches {
-                                next.push(SourceNode::Node(id));
+                            let Some(parent) = self.source.node(*parent) else {
+                                continue;
+                            };
+                            for child in &parent.children {
+                                let candidate = SourceNode::Node(*child);
+                                if self.is_text_node(&candidate) {
+                                    reserve_temporary_vec_slot(
+                                        &mut next,
+                                        meter,
+                                        &mut reserved_owned_bytes,
+                                    )?;
+                                    next.push(candidate);
+                                }
                             }
                         }
                     }
+                    attribute if attribute.starts_with('@') => {
+                        let lexical = &attribute[1..];
+                        for parent in &selected {
+                            let SourceNode::Node(owner) = parent else {
+                                continue;
+                            };
+                            let owner = *owner;
+                            let attribute_count =
+                                self.source.node(owner).map_or(0, |node| match &node.kind {
+                                    NodeKind::Element { attributes, .. } => attributes.len(),
+                                    _ => 0,
+                                });
+                            for index in 0..attribute_count {
+                                let candidate = SourceNode::Attribute { owner, index };
+                                if self.attribute_name_matches(&candidate, lexical, namespaces)? {
+                                    reserve_temporary_vec_slot(
+                                        &mut next,
+                                        meter,
+                                        &mut reserved_owned_bytes,
+                                    )?;
+                                    next.push(candidate);
+                                }
+                            }
+                        }
+                    }
+                    lexical if is_lexical_qname(lexical) => {
+                        for parent in &selected {
+                            let SourceNode::Node(parent) = parent else {
+                                continue;
+                            };
+                            let Some(parent) = self.source.node(*parent) else {
+                                continue;
+                            };
+                            for child in &parent.children {
+                                let matches = self.source.node(*child).is_some_and(|node| {
+                                    matches!(&node.kind, NodeKind::Element { name, .. } if element_pattern_name_matches(lexical, name, namespaces).unwrap_or(false))
+                                });
+                                if matches {
+                                    reserve_temporary_vec_slot(
+                                        &mut next,
+                                        meter,
+                                        &mut reserved_owned_bytes,
+                                    )?;
+                                    next.push(SourceNode::Node(*child));
+                                }
+                            }
+                        }
+                    }
+                    _ => return Ok(None),
                 }
-                _ => return Ok(None),
+                let retired_bytes = selected
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<SourceNode>());
+                drop(selected);
+                meter.release_owned_bytes(retired_bytes);
+                reserved_owned_bytes -= retired_bytes;
+                selected = next;
             }
-            selected = next;
+            Ok(Some((selected, reserved_owned_bytes)))
+        })();
+        if result.is_err() || matches!(result, Ok(None)) {
+            meter.release_owned_bytes(reserved_owned_bytes);
         }
-        Ok(Some(selected))
+        result
     }
 
     fn parent_node(&self, node: &SourceNode) -> Option<SourceNode> {
