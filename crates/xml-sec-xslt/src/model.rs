@@ -1335,18 +1335,41 @@ impl Document {
                 }
             }
             NodeKind::Root | NodeKind::Element { .. } => {
-                let mut pending = node.children.iter().rev().copied().collect::<Vec<_>>();
-                while let Some(current) = pending.pop() {
-                    let Some(current) = self.node(current) else {
-                        continue;
+                let Some(mut current_id) = node.children.first().copied() else {
+                    return;
+                };
+                loop {
+                    let Some(current) = self.node(current_id) else {
+                        return;
                     };
                     if let NodeKind::Text { value, .. } = &current.kind {
                         visit(value);
                     }
-                    pending.extend(current.children.iter().rev().copied());
+                    let Some(next) = self.next_descendant(id, current_id) else {
+                        return;
+                    };
+                    current_id = next;
                 }
             }
         }
+    }
+
+    fn next_descendant(&self, boundary: NodeId, mut current: NodeId) -> Option<NodeId> {
+        if let Some(child) = self.node(current)?.children.first() {
+            return Some(*child);
+        }
+        while current != boundary {
+            let parent = self.node(current)?.parent?;
+            let siblings = &self.node(parent)?.children;
+            // Arena nodes are created monotonically and children are only appended, so their
+            // stable IDs preserve sibling order and permit an allocation-free binary lookup.
+            let index = siblings.binary_search(&current).ok()?;
+            if let Some(sibling) = siblings.get(index + 1) {
+                return Some(*sibling);
+            }
+            current = parent;
+        }
+        None
     }
 
     pub(crate) fn retain_nodes(
@@ -4227,5 +4250,44 @@ mod parser_boundary_tests {
             .expect("bounded entity scan succeeds"),
             source
         );
+    }
+
+    #[test]
+    fn wide_string_value_traversal_preserves_document_order() {
+        // A wide element must not require a sibling-sized DFS frontier merely to find the text
+        // nodes that contribute its XPath string-value.
+        let mut document = Document::empty(None);
+        let root = document.push(
+            document.root(),
+            NodeKind::Element {
+                name: ExpandedName::new(None::<String>, "root"),
+                prefix: None,
+                attributes: Vec::new(),
+                namespaces: Vec::new(),
+            },
+            None,
+        );
+        for _ in 0..4_096 {
+            document.push(
+                root,
+                NodeKind::Element {
+                    name: ExpandedName::new(None::<String>, "empty"),
+                    prefix: None,
+                    attributes: Vec::new(),
+                    namespaces: Vec::new(),
+                },
+                None,
+            );
+        }
+        document.push(
+            root,
+            NodeKind::Text {
+                value: "tail".into(),
+                disable_output_escaping: false,
+            },
+            None,
+        );
+
+        assert_eq!(document.string_value(root), "tail");
     }
 }

@@ -18,6 +18,10 @@ jobs:
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth
       # Workspace path dependencies must exist in the registry before their consumers.
+      - name: Publish document support crate to crates.io
+        run: bash .github/scripts/publish-crate.sh xml-sec-sxd-document
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
       - name: Publish XPath support crate to crates.io
         run: bash .github/scripts/publish-crate.sh xml-sec-sxd-xpath
         env:

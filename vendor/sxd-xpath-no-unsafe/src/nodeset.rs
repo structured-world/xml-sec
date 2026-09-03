@@ -229,6 +229,16 @@ impl<'d> Node<'d> {
         }
     }
 
+    /// Returns one child without allocating a complete child-handle vector.
+    pub fn child_at(&self, index: usize) -> Option<Node<'d>> {
+        use self::Node::*;
+        match self {
+            Root(node) => node.child_at(index).map(Into::into),
+            Element(node) => node.child_at(index).map(Into::into),
+            Attribute(_) | Text(_) | Comment(_) | ProcessingInstruction(_) | Namespace(_) => None,
+        }
+    }
+
     /// Returns the nodes with the same parent that occur before this node.
     pub fn preceding_siblings(&self) -> Vec<Node<'d>> {
         use self::Node::*;
@@ -588,6 +598,11 @@ impl<'d> Nodeset<'d> {
         N: Into<Node<'d>>,
     {
         self.nodes.contains(&node.into())
+    }
+
+    /// Removes and returns whether a node was present.
+    pub fn remove(&mut self, node: &Node<'d>) -> bool {
+        self.nodes.remove(node)
     }
 
     /// Add the given node to the set

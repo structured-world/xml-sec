@@ -203,6 +203,14 @@ impl<'d> Root<'d> {
             .connections
             .root_children_len(self.document.storage)
     }
+
+    /// Returns one child without materializing the complete child list.
+    pub fn child_at(&self, index: usize) -> Option<ChildOfRoot<'d>> {
+        self.document
+            .connections
+            .root_child_at(self.document.storage, index)
+            .map(|node| self.document.wrap_child_of_root(node))
+    }
 }
 
 impl<'d> fmt::Debug for Root<'d> {
@@ -390,6 +398,14 @@ impl<'d> Element<'d> {
         self.document
             .connections
             .element_children_len(self.document.storage, self.node)
+    }
+
+    /// Returns one child without materializing the complete child list.
+    pub fn child_at(&self, index: usize) -> Option<ChildOfElement<'d>> {
+        self.document
+            .connections
+            .element_child_at(self.document.storage, self.node, index)
+            .map(|node| self.document.wrap_child_of_element(node))
     }
 
     pub fn preceding_siblings(&self) -> Vec<ChildOfElement<'d>> {
@@ -1146,6 +1162,26 @@ mod test {
         let children = greek.children();
         assert_eq!(children[0], ChildOfElement::Element(alpha));
         assert_eq!(children[1], ChildOfElement::Element(omega));
+    }
+
+    #[test]
+    fn child_at_reads_without_materializing_siblings() {
+        let package = Package::new();
+        let document = package.as_document();
+        let parent = document.create_element("parent");
+        document.root().append_child(parent);
+        parent.append_child(document.create_element("first"));
+        parent.append_child(document.create_text("second"));
+
+        assert!(document.root().child_at(0).is_some());
+        assert_eq!(
+            parent
+                .child_at(1)
+                .and_then(ChildOfElement::text)
+                .map(|n| n.text().to_string()),
+            Some("second".to_owned())
+        );
+        assert!(parent.child_at(2).is_none());
     }
 
     #[test]

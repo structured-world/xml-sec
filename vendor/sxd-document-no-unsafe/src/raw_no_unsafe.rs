@@ -618,6 +618,13 @@ impl Connections {
         storage.roots.borrow()[self.root.idx].children.len()
     }
 
+    pub fn root_child_at(&self, storage: &Storage, index: usize) -> Option<ChildOfRoot> {
+        storage.roots.borrow()[self.root.idx]
+            .children
+            .get(index)
+            .copied()
+    }
+
     pub fn element_children(
         &self,
         storage: &Storage,
@@ -628,6 +635,18 @@ impl Connections {
 
     pub fn element_children_len(&self, storage: &Storage, parent: Index<Element>) -> usize {
         storage.elements.borrow()[parent.idx].children.len()
+    }
+
+    pub fn element_child_at(
+        &self,
+        storage: &Storage,
+        parent: Index<Element>,
+        index: usize,
+    ) -> Option<ChildOfElement> {
+        storage.elements.borrow()[parent.idx]
+            .children
+            .get(index)
+            .copied()
     }
 
     pub fn element_preceding_siblings(

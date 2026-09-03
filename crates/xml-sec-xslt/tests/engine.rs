@@ -7607,6 +7607,33 @@ fn retained_node_paths_consume_the_execution_memory_budget() {
 }
 
 #[test]
+fn generic_large_nodeset_projection_preserves_deep_document_order() {
+    // More than 64 selected nodes exercises the generic projection path. Deep source paths must
+    // not be duplicated into a second quadratic identity set while preserving document order.
+    let depth = 192;
+    let source_xml = format!("{}text{}", "<n>".repeat(depth), "</n>".repeat(depth));
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:for-each select="//*"><xsl:value-of select="position()"/><xsl:text>|</xsl:text></xsl:for-each></xsl:template></xsl:stylesheet>"#,
+    );
+    let result = stylesheet
+        .execute(
+            &Document::parse(&source_xml, None).expect("deep source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(source_xml.len()),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("large node-set projects within the execution budget");
+    let output = String::from_utf8(result.serialized.bytes).expect("text output is UTF-8");
+
+    assert!(output.starts_with("1|2|3|"));
+    assert!(output.ends_with(&format!("{depth}|")));
+}
+
+#[test]
 fn named_templates_preserve_the_callers_current_template_rule() {
     // apply-imports inside a named template continues from the matched caller's import
     // precedence, not from the named template declaration's precedence.

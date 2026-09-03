@@ -616,6 +616,11 @@ impl Connections {
         parent_r.children.len()
     }
 
+    pub fn root_child_at(&self, index: usize) -> Option<ChildOfRoot> {
+        let parent_r = unsafe { &*self.root };
+        parent_r.children.get(index).copied()
+    }
+
     pub fn element_children(&self, parent: *mut Element) -> &[ChildOfElement] {
         let parent_r = unsafe { &*parent };
         &parent_r.children
@@ -624,6 +629,11 @@ impl Connections {
     pub fn element_children_len(&self, parent: *mut Element) -> usize {
         let parent_r = unsafe { &*parent };
         parent_r.children.len()
+    }
+
+    pub fn element_child_at(&self, parent: *mut Element, index: usize) -> Option<ChildOfElement> {
+        let parent_r = unsafe { &*parent };
+        parent_r.children.get(index).copied()
     }
 
     /// Returns the sibling nodes that come before this node. The

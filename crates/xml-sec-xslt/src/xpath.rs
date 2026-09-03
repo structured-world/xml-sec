@@ -1935,8 +1935,12 @@ impl Evaluator {
                 })
                 .ok_or_else(|| Error::Dynamic("stale result-tree-fragment identity".into()));
         }
-        self.maps
-            .project_value(self.package.as_document().root().into(), value)
+        self.maps.project_value(
+            &self.source,
+            self.package.as_document().root().into(),
+            value,
+            meter,
+        )
     }
 
     fn prepare_document_requests(
@@ -3710,7 +3714,13 @@ impl NodeMaps {
             NodePath::Namespace { prefix, uri, .. } => resolve_namespace_node(node, prefix, uri),
         }
     }
-    fn project_value(&self, root: nodeset::Node<'_>, value: SxdValue<'_>) -> Result<XPathValue> {
+    fn project_value(
+        &self,
+        source: &Document,
+        root: nodeset::Node<'_>,
+        value: SxdValue<'_>,
+        meter: &mut Meter,
+    ) -> Result<XPathValue> {
         Ok(match value {
             SxdValue::Boolean(value) => XPathValue::Boolean(value),
             SxdValue::Number(value) => XPathValue::Number(value),
@@ -3720,7 +3730,7 @@ impl NodeMaps {
                     "result-tree fragment escaped without its owning document".into(),
                 ));
             }
-            SxdValue::Nodeset(nodes) => {
+            SxdValue::Nodeset(mut nodes) => {
                 let node_count = nodes.size();
                 if node_count <= 64 {
                     let mut projected = nodes
@@ -3730,60 +3740,135 @@ impl NodeMaps {
                     projected.sort_by_key(|node| self.order.get(node).copied());
                     return Ok(XPathValue::NodeSet(projected));
                 }
-                let mut requested = nodes
-                    .into_iter()
-                    .map(|node| typed_path_to(&node))
-                    .collect::<HashSet<_>>();
-                let mut projected = Vec::with_capacity(node_count);
-                let mut pending = vec![(root, Vec::new())];
+                let mut projected = Vec::new();
+                let mut traversal = Vec::<(usize, Option<NodeId>)>::new();
+                let mut temporary_bytes = 0usize;
+                let result = (|| {
+                    let mut node = root.clone();
+                    let mut source_id = None;
 
-                // Resolve ordinary nodes and attributes while walking the SXD tree once.
-                // Computing a path independently for every result repeatedly scans sibling
-                // vectors and becomes quadratic for large key() result sets.
-                while let Some((node, path)) = pending.pop() {
-                    let ordinary_path = NodePath::Ordinary(path.clone());
-                    if requested.remove(&ordinary_path)
-                        && let Some(source) = self.reverse.get(&ordinary_path)
-                    {
-                        projected.push(source.clone());
-                    }
-                    if let Some(element) = node.element() {
-                        for attribute in element.attributes() {
-                            let name = attribute.name();
-                            let name = name.get();
-                            let attribute_path = NodePath::Attribute {
-                                parent: path.clone(),
-                                namespace: name.namespace_uri().map(str::to_owned),
-                                local: name.local_part().to_owned(),
-                            };
-                            if !requested.remove(&attribute_path) {
-                                continue;
-                            }
-                            if let Some(source) = self.reverse.get(&attribute_path) {
-                                projected.push(source.clone());
+                    // Resolve ordinary nodes and attributes while walking the SXD tree once.
+                    // Keep selected identities in the evaluator's existing Nodeset and pair the
+                    // projected and semantic trees directly. Materializing one full path per
+                    // selected node makes retained workspace quadratic on deep result sets.
+                    loop {
+                        if nodes.remove(&node)
+                            && let Some(id) = source_id
+                        {
+                            reserve_temporary_vec_slot(
+                                &mut projected,
+                                meter,
+                                &mut temporary_bytes,
+                            )?;
+                            projected.push(SourceNode::Node(id));
+                        }
+                        if let (Some(element), Some(owner)) = (node.element(), source_id) {
+                            let attributes = source.node(owner).and_then(|node| match &node.kind {
+                                NodeKind::Element { attributes, .. } => Some(attributes.as_slice()),
+                                _ => None,
+                            });
+                            for (index, attribute) in
+                                attributes.unwrap_or_default().iter().enumerate()
+                            {
+                                let Some(attribute) = element.attribute(QName::with_namespace_uri(
+                                    attribute.name.namespace.as_deref(),
+                                    &attribute.name.local,
+                                )) else {
+                                    continue;
+                                };
+                                let attribute_node = nodeset::Node::Attribute(attribute);
+                                if !nodes.remove(&attribute_node) {
+                                    continue;
+                                }
+                                reserve_temporary_vec_slot(
+                                    &mut projected,
+                                    meter,
+                                    &mut temporary_bytes,
+                                )?;
+                                projected.push(SourceNode::Attribute { owner, index });
                             }
                         }
-                    }
-                    let children = node.children();
-                    for (index, child) in children.into_iter().enumerate().rev() {
-                        let mut child_path = path.clone();
-                        child_path.push(index);
-                        pending.push((child, child_path));
-                    }
-                }
 
-                // Namespace nodes are synthesized by the XPath engine and are not children in
-                // the SXD DOM. They are uncommon, so only those remaining after the tree walk
-                // need the path-based fallback.
-                projected.extend(
-                    requested
-                        .into_iter()
-                        .filter_map(|path| self.reverse.get(&path).cloned()),
-                );
-                projected.sort_by_key(|node| self.order.get(node).copied());
-                XPathValue::NodeSet(projected)
+                        if let Some(child) = node.child_at(0) {
+                            source_id = projected_child_source(source, &traversal, source_id, 0);
+                            reserve_temporary_vec_slot(
+                                &mut traversal,
+                                meter,
+                                &mut temporary_bytes,
+                            )?;
+                            traversal.push((0, source_id));
+                            node = child;
+                            continue;
+                        }
+                        while let Some((index, _)) = traversal.last_mut() {
+                            let parent = node
+                                .parent()
+                                .expect("a projected non-root node retains its parent");
+                            if let Some(sibling) = parent.child_at(*index + 1) {
+                                *index += 1;
+                                source_id = projected_sibling_source(source, &traversal);
+                                traversal.last_mut().expect("current frame exists").1 = source_id;
+                                node = sibling;
+                                break;
+                            }
+                            traversal.pop();
+                            source_id = traversal.last().and_then(|(_, source)| *source);
+                            node = parent;
+                        }
+                        if traversal.is_empty() && node == root {
+                            break;
+                        }
+                    }
+
+                    // Namespace nodes are synthesized by the XPath engine and are not children in
+                    // the SXD DOM. They are uncommon, so only those remaining after the tree walk
+                    // need the path-based fallback.
+                    for node in nodes {
+                        let path = typed_path_to(&node);
+                        if let Some(source) = self.reverse.get(&path) {
+                            reserve_temporary_vec_slot(
+                                &mut projected,
+                                meter,
+                                &mut temporary_bytes,
+                            )?;
+                            projected.push(source.clone());
+                        }
+                    }
+                    projected.sort_by_key(|node| self.order.get(node).copied());
+                    Ok(XPathValue::NodeSet(projected))
+                })();
+                meter.release_owned_bytes(temporary_bytes);
+                return result;
             }
         })
+    }
+}
+
+fn projected_child_source(
+    source: &Document,
+    traversal: &[(usize, Option<NodeId>)],
+    parent: Option<NodeId>,
+    index: usize,
+) -> Option<NodeId> {
+    match traversal.len() {
+        0 => None,
+        1 => source.logical_roots().get(index).copied(),
+        _ => parent.and_then(|parent| source.node(parent)?.children.get(index).copied()),
+    }
+}
+
+fn projected_sibling_source(
+    source: &Document,
+    traversal: &[(usize, Option<NodeId>)],
+) -> Option<NodeId> {
+    let (index, _) = *traversal.last()?;
+    match traversal.len() {
+        1 => None,
+        2 => source.logical_roots().get(index).copied(),
+        _ => traversal
+            .get(traversal.len() - 2)
+            .and_then(|(_, parent)| *parent)
+            .and_then(|parent| source.node(parent)?.children.get(index).copied()),
     }
 }
 
