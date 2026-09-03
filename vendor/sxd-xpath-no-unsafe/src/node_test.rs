@@ -85,7 +85,9 @@ impl NodeTest for Attribute {
                 .name_test
                 .matches(context, sxd_document_no_unsafe::as_qname!(a.name()))?
         {
-            result.add(context.node.clone());
+            result
+                .add_metered(context, context.node.clone())
+                .map_err(|source| Error::FunctionEvaluation { source })?;
         }
         Ok(())
     }
@@ -111,7 +113,9 @@ impl NodeTest for Namespace {
         if let nodeset::Node::Namespace(ref ns) = context.node
             && self.name_test.matches(context, QName::new(ns.prefix()))?
         {
-            result.add(context.node.clone());
+            result
+                .add_metered(context, context.node.clone())
+                .map_err(|source| Error::FunctionEvaluation { source })?;
         }
         Ok(())
     }
@@ -139,7 +143,9 @@ impl NodeTest for Element {
                 .name_test
                 .matches(context, sxd_document_no_unsafe::as_qname!(e.name()))?
         {
-            result.add(context.node.clone());
+            result
+                .add_metered(context, context.node.clone())
+                .map_err(|source| Error::FunctionEvaluation { source })?;
         }
         Ok(())
     }
@@ -155,7 +161,9 @@ impl NodeTest for Node {
         context: &context::Evaluation<'c, 'd>,
         result: &mut OrderedNodes<'d>,
     ) -> Result<(), Error> {
-        result.add(context.node.clone());
+        result
+            .add_metered(context, context.node.clone())
+            .map_err(|source| Error::FunctionEvaluation { source })?;
         Ok(())
     }
 }
@@ -171,7 +179,9 @@ impl NodeTest for Text {
         result: &mut OrderedNodes<'d>,
     ) -> Result<(), Error> {
         if let nodeset::Node::Text(_) = context.node {
-            result.add(context.node.clone());
+            result
+                .add_metered(context, context.node.clone())
+                .map_err(|source| Error::FunctionEvaluation { source })?;
         }
         Ok(())
     }
@@ -188,7 +198,9 @@ impl NodeTest for Comment {
         result: &mut OrderedNodes<'d>,
     ) -> Result<(), Error> {
         if let nodeset::Node::Comment(_) = context.node {
-            result.add(context.node.clone());
+            result
+                .add_metered(context, context.node.clone())
+                .map_err(|source| Error::FunctionEvaluation { source })?;
         }
         Ok(())
     }
@@ -213,11 +225,13 @@ impl NodeTest for ProcessingInstruction {
     ) -> Result<(), Error> {
         if let nodeset::Node::ProcessingInstruction(pi) = &context.node {
             match self.target {
-                Some(ref name) if name == sxd_document_no_unsafe::as_str!(pi.target()) => {
-                    result.add(context.node.clone())
-                }
+                Some(ref name) if name == sxd_document_no_unsafe::as_str!(pi.target()) => result
+                    .add_metered(context, context.node.clone())
+                    .map_err(|source| Error::FunctionEvaluation { source })?,
                 Some(_) => {}
-                None => result.add(context.node.clone()),
+                None => result
+                    .add_metered(context, context.node.clone())
+                    .map_err(|source| Error::FunctionEvaluation { source })?,
             }
         }
         Ok(())

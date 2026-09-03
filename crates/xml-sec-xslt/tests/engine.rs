@@ -406,6 +406,56 @@ fn rtf_order_compares_every_node_selected_from_current() {
 }
 
 #[test]
+fn rtf_order_fast_path_requires_the_exslt_common_namespace() {
+    // XPath resolves function QNames through the expression's namespace context; a lexical
+    // `exsl` prefix bound elsewhere must not acquire EXSLT semantics.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:exsl="urn:not-exslt"><xsl:output method="text"/><xsl:template match="/"><xsl:variable name="fragment"><a/><b/></xsl:variable><xsl:value-of select="count(exsl:node-set($fragment)/*[name() = name(current())]/preceding-sibling::*)"/></xsl:template></xsl:stylesheet>"#;
+    assert!(matches!(
+        compile(stylesheet).execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Unsupported(message)) if message.contains("node-set")
+    ));
+}
+
+#[test]
+fn copied_namespaces_consume_result_node_budget() {
+    // XPath 1.0 section 5.4 models each in-scope binding as a namespace node. Inserting one new
+    // result binding must therefore consume the same node ceiling as elements and attributes.
+    // https://www.w3.org/TR/1999/REC-xpath-19991116/#namespace-nodes
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><out><xsl:copy-of select="/root/namespace::p"/></out></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse(r#"<root xmlns:p="urn:p"/>"#, None).expect("source parses");
+    let mut budget = execution_budget(1024);
+    budget.result_nodes = 1;
+    assert!(matches!(
+        stylesheet.execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::ResultNodes,
+            limit: 1,
+            actual: 2,
+        })
+    ));
+}
+
+#[test]
 fn level_any_numbering_resets_at_preceding_non_ancestor_boundary() {
     // The `from` boundary for level-any numbering is the most recent matching node in document
     // order, not only a matching ancestor of the node being numbered.
@@ -5528,7 +5578,7 @@ fn xpath_sessions_do_not_clone_retained_result_tree_fragments() {
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:variable name="payload"><xsl:text>{payload}</xsl:text></xsl:variable><xsl:if test="contains($payload, 'missing')">unexpected</xsl:if></xsl:template></xsl:stylesheet>"#
     ));
     let mut budget = execution_budget(1024);
-    budget.owned_bytes = 448 * 1024;
+    budget.owned_bytes = 576 * 1024;
     let result = stylesheet
         .execute(
             &Document::parse("<source/>", None).expect("source parses"),
@@ -5542,6 +5592,23 @@ fn xpath_sessions_do_not_clone_retained_result_tree_fragments() {
         )
         .expect("borrowed RTF session remains inside the allocation gate");
     assert!(result.serialized.bytes.is_empty());
+}
+
+#[test]
+fn generic_xpath_accounts_for_result_tree_fragment_projections() {
+    // A generic XPath context owns an SXD string projection for every in-scope RTF. The duplicate
+    // must fit beside the retained fragment even when the expression never reads that variable.
+    let payload = "x".repeat(64 * 1024);
+    let stylesheet = compile(&format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template name="baseline"><xsl:variable name="payload"><xsl:text>{payload}</xsl:text></xsl:variable></xsl:template><xsl:template name="xpath"><xsl:variable name="payload"><xsl:text>{payload}</xsl:text></xsl:variable><xsl:if test="1 + 1 = 2"/></xsl:template></xsl:stylesheet>"#
+    ));
+
+    let baseline = minimum_execution_owned_bytes(&stylesheet, "baseline");
+    let xpath = minimum_execution_owned_bytes(&stylesheet, "xpath");
+    assert!(
+        xpath >= baseline + payload.len(),
+        "the SXD projection of every in-scope RTF must fit the peak-memory budget"
+    );
 }
 
 #[test]

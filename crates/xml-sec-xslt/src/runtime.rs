@@ -16,8 +16,8 @@ use crate::compiler::{
 use crate::lexical::{is_ncname, is_xml_whitespace, unicode_decimal_value, xpath_string_literal};
 use crate::serializer::{serialize, serialize_fragment};
 use crate::xpath::{
-    CustomCallSession, Evaluator, EvaluatorSourceOptions, PreparedEvaluatorSource, SourceNode,
-    XPathValue, parse_xpath_number, prepare_evaluator_source, xpath_number,
+    CustomCallSession, EXSLT_COMMON_NS, Evaluator, EvaluatorSourceOptions, PreparedEvaluatorSource,
+    SourceNode, XPathValue, parse_xpath_number, prepare_evaluator_source, xpath_number,
 };
 use crate::{
     Attribute, BudgetKind, Document, Error, ExecutionBudget, ExecutionEnvironment, ExpandedName,
@@ -2197,6 +2197,13 @@ impl<'a> Execution<'a> {
         expression: &Expression,
         node: &SourceNode,
     ) -> Result<Option<f64>> {
+        if !expression
+            .namespaces
+            .iter()
+            .any(|(prefix, namespace)| prefix == "exsl" && namespace == EXSLT_COMMON_NS)
+        {
+            return Ok(None);
+        }
         let Some(remainder) = expression
             .source
             .trim()
@@ -3043,26 +3050,41 @@ impl<'a> Execution<'a> {
         self.meter.recursion(depth)?;
         match node {
             SourceNode::Node(id) => {
-                let (kind, children, base_uri) = self
+                let source = self
                     .evaluator
                     .source
                     .node(*id)
-                    .map(|source| {
-                        (
-                            source.kind.clone(),
-                            source.children.clone(),
-                            source.base_uri.clone(),
-                        )
-                    })
                     .ok_or_else(|| Error::Dynamic("stale source node".into()))?;
-                if matches!(kind, NodeKind::Root) {
-                    for child in children {
+                let child_count = source.children.len();
+                if matches!(source.kind, NodeKind::Root) {
+                    for index in 0..child_count {
+                        let child = self
+                            .evaluator
+                            .source
+                            .node(*id)
+                            .and_then(|source| source.children.get(index).copied())
+                            .ok_or_else(|| Error::Dynamic("stale source child".into()))?;
                         self.copy_source(&SourceNode::Node(child), parent, depth + 1)?
                     }
                     return Ok(());
                 }
+                let clone_bytes = node_kind_owned_bytes(&source.kind)
+                    .saturating_add(source.base_uri.as_deref().map_or(0, str::len));
+                self.result
+                    .reserve_metered_push_containers(parent, &mut self.meter)?;
+                self.meter.check_additional(BudgetKind::ResultNodes, 1)?;
+                self.meter
+                    .check_additional(BudgetKind::OwnedBytes, clone_bytes)?;
+                let kind = source.kind.clone();
+                let base_uri = source.base_uri.clone();
                 let target = self.push_node_with_base(parent, kind, base_uri)?;
-                for child in children {
+                for index in 0..child_count {
+                    let child = self
+                        .evaluator
+                        .source
+                        .node(*id)
+                        .and_then(|source| source.children.get(index).copied())
+                        .ok_or_else(|| Error::Dynamic("stale source child".into()))?;
                     self.copy_source(&SourceNode::Node(child), target, depth + 1)?
                 }
             }
@@ -3077,21 +3099,25 @@ impl<'a> Execution<'a> {
     }
     fn copy_source_attribute(&mut self, owner: NodeId, index: usize) -> Result<()> {
         let attribute = match self.evaluator.source.node(owner).map(|node| &node.kind) {
-            Some(NodeKind::Element { attributes, .. }) => attributes.get(index).cloned(),
+            Some(NodeKind::Element { attributes, .. }) => attributes.get(index),
             _ => None,
         };
         if let Some(attribute) = attribute {
-            self.add_attribute(attribute)?;
+            self.meter
+                .check_additional(BudgetKind::OwnedBytes, attribute_owned_bytes(attribute))?;
+            self.add_attribute(attribute.clone())?;
         }
         Ok(())
     }
     fn copy_source_namespace(&mut self, owner: NodeId, index: usize) -> Result<()> {
         let namespace = match self.evaluator.source.node(owner).map(|node| &node.kind) {
-            Some(NodeKind::Element { namespaces, .. }) => namespaces.get(index).cloned(),
+            Some(NodeKind::Element { namespaces, .. }) => namespaces.get(index),
             _ => None,
         };
         if let Some(namespace) = namespace {
-            self.add_namespace(namespace)?;
+            self.meter
+                .check_additional(BudgetKind::OwnedBytes, namespace_owned_bytes(namespace))?;
+            self.add_namespace(namespace.clone())?;
         }
         Ok(())
     }
@@ -3446,6 +3472,7 @@ impl<'a> Execution<'a> {
                 .iter()
                 .position(|existing| existing.prefix == namespace.prefix);
             if existing_index.is_none() {
+                self.meter.charge(BudgetKind::ResultNodes, 1)?;
                 reserve_retained_vec_slot(namespaces, &mut self.meter)?;
             }
             if let Some(existing) = existing_index.map(|index| &mut namespaces[index]) {

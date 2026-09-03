@@ -2551,7 +2551,7 @@ fn namespace_declarations(
             };
             Some(NamespaceDeclaration {
                 prefix: prefix.to_owned(),
-                is_undeclaration: value.is_empty(),
+                is_undeclaration: namespace_value_expands_to_empty(value, dtd),
             })
         })
         .collect::<Vec<_>>();
@@ -2572,11 +2572,48 @@ fn namespace_declarations(
             };
             declarations.push(NamespaceDeclaration {
                 prefix: prefix.to_owned(),
-                is_undeclaration: default.value.is_empty(),
+                is_undeclaration: namespace_value_expands_to_empty(&default.value, dtd),
             });
         }
     }
     declarations
+}
+
+fn namespace_value_expands_to_empty<'a>(value: &'a str, dtd: &'a InternalDtd) -> bool {
+    // Namespace declaration values are normalized attributes, so entity replacement precedes the
+    // empty default-namespace test: XML 1.0 section 3.3.3 and Namespaces 1.0 section 6.2.
+    // https://www.w3.org/TR/xml/#AVNormalize
+    // https://www.w3.org/TR/REC-xml-names/#defaulting
+    if value.is_empty() {
+        return true;
+    }
+    if !value.starts_with('&') {
+        return false;
+    }
+    let mut pending = vec![value];
+    let mut expansions = 0u32;
+    while let Some(remaining) = pending.pop() {
+        if remaining.is_empty() {
+            continue;
+        }
+        let Some(reference) = remaining.strip_prefix('&') else {
+            return false;
+        };
+        let Some(end) = reference.find(';') else {
+            return false;
+        };
+        let name = &reference[..end];
+        let Some(replacement) = dtd.entities.get(name) else {
+            return false;
+        };
+        expansions = expansions.saturating_add(1);
+        if expansions > crate::hard_limits::XML_ENTITY_EXPANSION_CEILING {
+            return false;
+        }
+        pending.push(&reference[end + 1..]);
+        pending.push(replacement);
+    }
+    true
 }
 
 fn apply_preflight_namespace_declarations(
@@ -3538,6 +3575,23 @@ mod tests {
 
         preflight_document_limits(&xml, settings, None)
             .expect("the exact expanded namespace-binding boundary is accepted");
+    }
+
+    #[test]
+    fn namespace_preflight_expands_undeclarations_before_counting_bindings() {
+        // Namespaces in XML 1.0 section 6.2 applies the normalized attribute value to a default
+        // namespace declaration: https://www.w3.org/TR/REC-xml-names/#defaulting
+        let maximum = crate::hard_limits::XML_NAMESPACE_BINDING_CEILING;
+        let declarations = (0..maximum)
+            .map(|index| format!(r#" xmlns:p{index}="urn:{index}""#))
+            .collect::<String>();
+        let xml = format!(
+            r#"<!DOCTYPE root [<!ENTITY empty ''>]><root{declarations}><child xmlns="&empty;"/></root>"#
+        );
+        let settings = DocumentParseSettings::new_with_depth(true, 16, 4, xml.len());
+
+        preflight_document_limits(&xml, settings, None)
+            .expect("an entity-expanded empty default namespace is an undeclaration");
     }
 
     #[test]

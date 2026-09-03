@@ -516,6 +516,20 @@ impl<'d> Nodeset<'d> {
         self.nodes.insert(node.into());
     }
 
+    pub(crate) fn add_metered(
+        &mut self,
+        context: &crate::context::Evaluation<'_, 'd>,
+        node: Node<'d>,
+    ) -> Result<(), crate::function::Error> {
+        if !self.nodes.contains(&node) {
+            // The context counter is the embedding's shared temporary-allocation budget; strings
+            // and node containers must consume the same allowance.
+            context.reserve_string_allocation(std::mem::size_of::<Node<'d>>())?;
+            self.nodes.insert(node);
+        }
+        Ok(())
+    }
+
     pub fn iter<'a>(&'a self) -> Iter<'a, 'd> {
         IntoIterator::into_iter(self)
     }
@@ -673,6 +687,16 @@ impl<'d> OrderedNodes<'d> {
 
     pub fn add(&mut self, node: Node<'d>) {
         self.0.push(node)
+    }
+
+    pub(crate) fn add_metered(
+        &mut self,
+        context: &crate::context::Evaluation<'_, 'd>,
+        node: Node<'d>,
+    ) -> Result<(), crate::function::Error> {
+        context.reserve_string_allocation(std::mem::size_of::<Node<'d>>())?;
+        self.0.push(node);
+        Ok(())
     }
 }
 

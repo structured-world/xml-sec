@@ -127,7 +127,7 @@ const CONTEXT_NS: &str = "urn:structured-world:xml-sec:xslt:context";
 const DOCUMENTS_ELEMENT: &str = "__xml_sec_documents";
 const DOCUMENT_ELEMENT: &str = "__xml_sec_document";
 const EXTENSION_CONTEXT_NS: &str = "urn:structured-world:xml-sec:xslt:extensions";
-const EXSLT_COMMON_NS: &str = "http://exslt.org/common";
+pub(crate) const EXSLT_COMMON_NS: &str = "http://exslt.org/common";
 const EXSLT_STRINGS_NS: &str = "http://exslt.org/strings";
 const EXSLT_MATH_NS: &str = "http://exslt.org/math";
 const EXSLT_SETS_NS: &str = "http://exslt.org/sets";
@@ -1782,29 +1782,61 @@ impl Evaluator {
                 );
             }
         }
+        let mut variable_projection_error = false;
         variables.visit(&mut |name, value| {
+            if variable_projection_error {
+                return;
+            }
             let qname: sxd_xpath_no_unsafe::OwnedQName = name.namespace.as_deref().map_or_else(
                 || name.local.as_str().into(),
                 |namespace| (namespace, name.local.as_str()).into(),
             );
             match value {
-                Value::Boolean(value) => context.set_variable(qname.clone(), *value),
-                Value::Number(value) => context.set_variable(qname.clone(), *value),
-                Value::String(value) => context.set_variable(qname.clone(), value.clone()),
-                Value::StoredExpression(value) => {
-                    context.set_variable(qname.clone(), value.clone())
+                Value::Boolean(value) => context.set_variable(qname, *value),
+                Value::Number(value) => context.set_variable(qname, *value),
+                Value::String(value) => {
+                    let reservation = context.reserve_temporary_allocation(value.len());
+                    if reservation.is_err() {
+                        variable_projection_error = true;
+                        return;
+                    }
+                    context.set_variable(qname, value.clone());
                 }
-                Value::ResultTreeFragment(document) => context.set_variable(
-                    qname.clone(),
-                    SxdValue::ResultTreeFragment(
-                        document.identity(),
-                        document.string_value(document.root()),
-                    ),
-                ),
+                Value::StoredExpression(value) => {
+                    let reservation = context.reserve_temporary_allocation(value.len());
+                    if reservation.is_err() {
+                        variable_projection_error = true;
+                        return;
+                    }
+                    context.set_variable(qname, value.clone())
+                }
+                Value::ResultTreeFragment(document) => {
+                    let length = document.string_value_len(document.root());
+                    let reservation = context.reserve_temporary_allocation(length);
+                    if reservation.is_err() {
+                        variable_projection_error = true;
+                        return;
+                    }
+                    context.set_variable(
+                        qname,
+                        SxdValue::ResultTreeFragment(
+                            document.identity(),
+                            document.string_value_with_capacity(document.root(), length),
+                        ),
+                    );
+                }
                 Value::NodeSet(nodes) => {
                     let mut set = nodeset::Nodeset::new();
                     for reference in nodes {
                         if let Some(node) = self.maps.to_sxd(document.root().into(), reference) {
+                            if !set.contains(node.clone()) {
+                                let reservation = context
+                                    .reserve_temporary_allocation(std::mem::size_of_val(&node));
+                                if reservation.is_err() {
+                                    variable_projection_error = true;
+                                    return;
+                                }
+                            }
                             set.add(node);
                         }
                     }
@@ -1812,6 +1844,16 @@ impl Evaluator {
                 }
             }
         });
+        if variable_projection_error {
+            let attempted = context
+                .string_allocation_exceeded()
+                .expect("failed XPath allocation records its attempted total");
+            return Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                limit: owned_bytes_limit,
+                actual: owned_bytes.saturating_add(attempted),
+            });
+        }
         let expressions = self.expressions.borrow();
         let xpath = expressions
             .get(rewritten.as_ref())

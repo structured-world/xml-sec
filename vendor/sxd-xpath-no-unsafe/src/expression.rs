@@ -726,7 +726,11 @@ where
                 nodes = predicate.select(context, nodes)?;
             }
 
-            unique.extend(Vec::from(nodes));
+            for node in Vec::from(nodes) {
+                unique
+                    .add_metered(context, node)
+                    .context(FunctionEvaluation)?;
+            }
         }
 
         Ok(unique)

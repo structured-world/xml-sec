@@ -130,6 +130,11 @@ impl<'d> Context<'d> {
         self.string_allocations.exceeded.get()
     }
 
+    /// Reserve bytes in the context-scoped temporary allocation budget.
+    pub fn reserve_temporary_allocation(&self, bytes: usize) -> Result<(), function::Error> {
+        reserve_allocation(&self.string_allocations, bytes)
+    }
+
     /// Register a function within the context
     pub fn set_function<N, F>(&mut self, name: N, function: F)
     where
@@ -243,19 +248,7 @@ impl<'c, 'd> Evaluation<'c, 'd> {
 
     /// Reserve bytes before an extension function allocates an XPath string result.
     pub fn reserve_string_allocation(&self, bytes: usize) -> Result<(), function::Error> {
-        let actual = self.string_allocations.used.get().saturating_add(bytes);
-        if self
-            .string_allocations
-            .limit
-            .is_some_and(|limit| actual > limit)
-        {
-            self.string_allocations.exceeded.set(Some(actual));
-            return Err(function::Error::Other {
-                what: "XPath string allocation budget exceeded".into(),
-            });
-        }
-        self.string_allocations.used.set(actual);
-        Ok(())
+        reserve_allocation(self.string_allocations, bytes)
     }
 
     /// Yields a new `Evaluation` context for each node in the nodeset.
@@ -267,6 +260,21 @@ impl<'c, 'd> Evaluation<'c, 'd> {
             size: sz,
         }
     }
+}
+
+fn reserve_allocation(
+    budget: &StringAllocationBudget,
+    bytes: usize,
+) -> Result<(), function::Error> {
+    let actual = budget.used.get().saturating_add(bytes);
+    if budget.limit.is_some_and(|limit| actual > limit) {
+        budget.exceeded.set(Some(actual));
+        return Err(function::Error::Other {
+            what: "XPath string allocation budget exceeded".into(),
+        });
+    }
+    budget.used.set(actual);
+    Ok(())
 }
 
 /// An iterator for the contexts of each node in a nodeset

@@ -96,6 +96,22 @@ fn nodesets_are_unique() {
     });
 }
 
+#[test]
+fn wide_axis_results_obey_the_evaluation_allocation_budget() {
+    // Axis traversal and deduplication both retain temporary node containers. A scalar consumer
+    // must not hide those allocations merely because the final value is a number.
+    with_document("<root><item/><item/></root>", |doc| {
+        let mut context = Context::new();
+        context.set_string_allocation_limit(0);
+        let xpath = Factory::new()
+            .build("count(/root/item)")
+            .expect("XPath parses");
+
+        assert!(xpath.evaluate(&context, doc.root()).is_err());
+        assert!(context.string_allocation_exceeded().is_some());
+    });
+}
+
 fn with_document<F>(xml: &str, f: F)
 where
     F: FnOnce(dom::Document<'_>),
