@@ -2891,6 +2891,43 @@ fn every_xpath_dispatch_consumes_exactly_one_evaluation() {
 }
 
 #[test]
+fn optimized_node_selections_consume_xpath_evaluation_budget() {
+    // Fast paths are implementation details: apply-templates and for-each selections must
+    // consume the same logical XPath budget as expressions handled by the generic evaluator.
+    for instruction in [
+        r#"<xsl:apply-templates select="node()"/>"#,
+        r#"<xsl:for-each select="@*"><xsl:value-of select="."/></xsl:for-each>"#,
+    ] {
+        let stylesheet = compile(&format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><out>{instruction}</out></xsl:template></xsl:stylesheet>"#,
+        ));
+        let mut budget = execution_budget(1024);
+        budget.xpath_evaluations = 0;
+
+        let error = stylesheet
+            .execute(
+                &Document::parse("<source key=\"value\"/>", None).expect("source parses"),
+                &Parameters::new(),
+                Arc::new(NoResolver),
+                ExecutionOptions {
+                    budget,
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            )
+            .expect_err("optimized node selection must consume XPath budget");
+
+        assert!(matches!(
+            error,
+            Error::Budget {
+                kind: BudgetKind::XPathEvaluations,
+                ..
+            }
+        ));
+    }
+}
+
+#[test]
 fn optimized_attribute_pattern_trims_grammar_whitespace() {
     // Whitespace around `=` belongs to the predicate grammar, not the attribute QName.
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:apply-templates select="root/item"/></xsl:template><xsl:template match="item[@id = 'wanted']">yes</xsl:template><xsl:template match="item">no</xsl:template></xsl:stylesheet>"#;
@@ -3136,6 +3173,36 @@ fn serializer_preserves_iana_latin1_alias_semantics() {
             "alias {alias} must retain ISO-8859-1 semantics",
         );
     }
+}
+
+#[test]
+fn serializer_canonicalizes_iana_aliases_in_xml_declarations() {
+    // XML 1.0 section 4.3.3 restricts declaration encoding names to EncName. A registered
+    // alias may contain other punctuation, so the declaration must use its canonical name.
+    // https://www.w3.org/TR/xml/#charencoding
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output encoding="ISO_8859-1:1987"/><xsl:template match="/"><out>café</out></xsl:template></xsl:stylesheet>"#,
+    );
+    let output = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("registered alias serializes");
+
+    assert!(
+        output
+            .serialized
+            .bytes
+            .starts_with(b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>")
+    );
+    assert!(output.serialized.bytes.ends_with(b"<out>caf\xe9</out>\n"));
 }
 
 #[test]

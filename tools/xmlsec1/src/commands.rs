@@ -451,7 +451,7 @@ fn read_input(invocation: &Invocation, maximum: usize) -> Result<String, Command
     }
     xml_sec::encoding::decode_xml_octets(&bytes, maximum)
         .map(Cow::into_owned)
-        .map_err(|error| CommandError::InvalidXmlEncoding(error.to_string()))
+        .map_err(map_xml_decode_error)
 }
 
 fn write_output(
@@ -521,7 +521,16 @@ fn read_xml_data(path: &OsStr, maximum: usize) -> Result<String, CommandError> {
     })?;
     xml_sec::encoding::decode_xml_octets(&bytes, maximum)
         .map(Cow::into_owned)
-        .map_err(|error| CommandError::InvalidXmlEncoding(error.to_string()))
+        .map_err(map_xml_decode_error)
+}
+
+fn map_xml_decode_error(error: xml_sec::encoding::XmlEncodingError) -> CommandError {
+    match error {
+        xml_sec::encoding::XmlEncodingError::DecodedLimit { maximum, .. } => {
+            CommandError::InputTooLarge { maximum }
+        }
+        error => CommandError::InvalidXmlEncoding(error.to_string()),
+    }
 }
 
 fn read_bounded_file(
@@ -4165,6 +4174,31 @@ mod tests {
         assert!(matches!(
             read_input(&invocation, 4),
             Err(CommandError::InputTooLarge { maximum: 4 })
+        ));
+    }
+
+    #[test]
+    fn xml_readers_classify_decoded_expansion_as_input_too_large() {
+        // A declared single-byte document may fit the raw-byte gate but expand after decoding.
+        // Both CLI XML readers must preserve that second boundary as InputTooLarge.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("expanded.xml");
+        let bytes = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><root>\xe9\xe9</root>";
+        fs::write(&path, bytes).unwrap();
+        let invocation = Invocation::parse([
+            OsString::from("xmlsec1"),
+            OsString::from("verify"),
+            path.clone().into_os_string(),
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            read_input(&invocation, bytes.len()),
+            Err(CommandError::InputTooLarge { maximum }) if maximum == bytes.len()
+        ));
+        assert!(matches!(
+            read_xml_data(path.as_os_str(), bytes.len()),
+            Err(CommandError::InputTooLarge { maximum }) if maximum == bytes.len()
         ));
     }
 

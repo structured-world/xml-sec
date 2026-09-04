@@ -163,6 +163,26 @@ impl OutputEncoding {
             }
         }
     }
+
+    fn canonical_name(&self) -> &'static str {
+        match self {
+            Self::Utf8 => "UTF-8",
+            Self::Utf16 => "UTF-16",
+            Self::Utf16Le => "UTF-16LE",
+            Self::Utf16Be => "UTF-16BE",
+            Self::Ascii => "US-ASCII",
+            Self::Registered(encoding) => encoding.name(),
+            Self::Other { encoding, .. } => encoding.name(),
+        }
+    }
+
+    fn declaration_name<'a>(&self, requested: &'a str) -> &'a str {
+        if xml_sec_xml_input::is_xml_encoding_name(requested) {
+            requested
+        } else {
+            self.canonical_name()
+        }
+    }
 }
 
 fn encoding_represents(encoding: &'static encoding_rs::Encoding, character: char) -> bool {
@@ -344,7 +364,7 @@ fn render(
         text.push('"');
         if definition.encoding_explicit {
             text.push_str(" encoding=\"");
-            text.push_str(&definition.encoding);
+            text.push_str(encoding.declaration_name(&definition.encoding));
             text.push('"');
         }
         if let Some(standalone) = definition.standalone {

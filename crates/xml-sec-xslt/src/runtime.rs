@@ -2164,6 +2164,16 @@ impl<'a> Execution<'a> {
         size: usize,
     ) -> Result<XPathValue> {
         self.meter.charge(BudgetKind::XPathEvaluations, 1)?;
+        self.evaluate_after_charge(expression, node, position, size)
+    }
+
+    fn evaluate_after_charge(
+        &mut self,
+        expression: &crate::compiler::Expression,
+        node: &SourceNode,
+        position: usize,
+        size: usize,
+    ) -> Result<XPathValue> {
         self.ensure_expression_globals(expression)?;
         let uses_key = xpath_calls_key(&expression.source);
         if let Some(name) = direct_variable_reference(expression)?
@@ -2699,6 +2709,7 @@ impl<'a> Execution<'a> {
         position: usize,
         size: usize,
     ) -> Result<Vec<SourceNode>> {
+        self.meter.charge(BudgetKind::XPathEvaluations, 1)?;
         match expression.source.trim() {
             // These are the two hot selections used by identity transforms. They
             // are context child-axis expressions, so projecting them through the
@@ -2719,7 +2730,7 @@ impl<'a> Execution<'a> {
         if let Some(nodes) = self.evaluator.select_child_axis(expression, node)? {
             return Ok(nodes);
         }
-        match self.evaluate(expression, node, position, size)? {
+        match self.evaluate_after_charge(expression, node, position, size)? {
             XPathValue::NodeSet(nodes) => Ok(nodes),
             value => Err(Error::Dynamic(format!(
                 "XPath `{}` must return a node-set, received {}",

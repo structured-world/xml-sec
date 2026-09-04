@@ -2074,11 +2074,7 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
                     bytes,
                     context.policy.resources().max_xml_document_bytes,
                 )
-                .map_err(|_| {
-                    SignatureVerificationPipelineError::InvalidStructure {
-                        reason: "KeyInfoReference external resource has an invalid XML encoding",
-                    }
-                })?;
+                .map_err(map_key_info_xml_decode_error)?;
                 let settings = DocumentParseSettings::from_policy(
                     context.policy.xml(),
                     context.policy.resources(),
@@ -2169,6 +2165,25 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
         budgets,
     };
     visit(key_info, resolver, &mut context, materialization, 0)
+}
+
+fn map_key_info_xml_decode_error(
+    error: crate::encoding::XmlEncodingError,
+) -> SignatureVerificationPipelineError {
+    match error {
+        crate::encoding::XmlEncodingError::DecodedLimit { maximum, actual } => {
+            SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_DOCUMENT,
+                    maximum,
+                    actual,
+                },
+            )
+        }
+        _ => SignatureVerificationPipelineError::InvalidStructure {
+            reason: "KeyInfoReference external resource has an invalid XML encoding",
+        },
+    }
 }
 
 fn materialize_key_info_references_for_policy<P: KeyInfoReferencePolicy>(
@@ -6378,8 +6393,9 @@ mod tests {
         Ok(key_info)
     }
 
-    fn materialize_external_key_info_bytes(
+    fn materialize_external_key_info_bytes_with_limit(
         encoded: Vec<u8>,
+        maximum_document_bytes: usize,
     ) -> Result<KeyInfo, SignatureVerificationPipelineError> {
         let resources = HashMap::from([("key.xml".to_owned(), encoded)]);
         let document = XmlDocument::parse("<root/>").unwrap();
@@ -6391,6 +6407,7 @@ mod tests {
         let mut policy = crate::policy::VerificationPolicy::default();
         policy.key_sources.key_info_reference = true;
         policy.uris.key_info_references = UriTypeSet::ALL;
+        policy.resources.max_xml_document_bytes = maximum_document_bytes;
         let mut xpath_parse_budget = XPathSignatureParseBudget::default();
         let execution_budget = TransformExecutionBudget::from_resources(&policy.resources);
         let mut budgets = RetrievalMaterializationBudgets {
@@ -6415,6 +6432,15 @@ mod tests {
             Ok::<_, SignatureVerificationPipelineError>(())
         })?;
         Ok(key_info)
+    }
+
+    fn materialize_external_key_info_bytes(
+        encoded: Vec<u8>,
+    ) -> Result<KeyInfo, SignatureVerificationPipelineError> {
+        materialize_external_key_info_bytes_with_limit(
+            encoded,
+            crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
+        )
     }
 
     #[test]
@@ -6446,6 +6472,27 @@ mod tests {
             SignatureVerificationPipelineError::InvalidStructure {
                 reason: "KeyInfoReference external resource has an invalid XML encoding"
             }
+        ));
+    }
+
+    #[test]
+    fn external_key_info_reference_preserves_decoded_document_limit() {
+        // Decoding can expand a compact single-byte resource beyond the XML document policy.
+        // That is a typed policy failure, not malformed KeyInfo structure.
+        let encoded = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><ds:KeyInfo xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:KeyName>\xe9\xe9</ds:KeyName></ds:KeyInfo>".to_vec();
+        let maximum = encoded.len();
+        let error = materialize_external_key_info_bytes_with_limit(encoded, maximum)
+            .expect_err("decoded XML expansion must retain resource-limit classification");
+
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_DOCUMENT,
+                    maximum: observed_maximum,
+                    actual,
+                }
+            ) if observed_maximum == maximum && actual > maximum
         ));
     }
 

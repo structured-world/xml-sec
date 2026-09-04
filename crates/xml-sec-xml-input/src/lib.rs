@@ -648,7 +648,7 @@ fn declaration_from_text(xml: &str) -> Result<Option<Range<usize>>, Error> {
             // XML 1.0 section 4.3.3 production [81] requires EncName to start with an ASCII
             // letter and limits the remaining characters. Validate before normalization erases
             // the declaration. https://www.w3.org/TR/xml/#NT-EncName
-            if !is_enc_name(value) {
+            if !is_xml_encoding_name_bytes(value) {
                 return Err(Error::MalformedDeclaration("invalid encoding name"));
             }
             return Ok(Some((5 + value_start)..(5 + value_end)));
@@ -664,7 +664,16 @@ fn declaration_from_text(xml: &str) -> Result<Option<Range<usize>>, Error> {
     Ok(None)
 }
 
-fn is_enc_name(value: &[u8]) -> bool {
+/// Return whether a label satisfies XML 1.0's `EncName` production.
+///
+/// See XML 1.0 section 4.3.3, production [81]:
+/// https://www.w3.org/TR/xml/#NT-EncName
+#[must_use]
+pub fn is_xml_encoding_name(value: &str) -> bool {
+    is_xml_encoding_name_bytes(value.as_bytes())
+}
+
+fn is_xml_encoding_name_bytes(value: &[u8]) -> bool {
     value.first().is_some_and(u8::is_ascii_alphabetic)
         && value[1..]
             .iter()
