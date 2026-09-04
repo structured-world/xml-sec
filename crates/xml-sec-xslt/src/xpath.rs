@@ -5681,6 +5681,22 @@ fn sxd_string_materialization_bytes(value: &SxdValue<'_>) -> usize {
     }
 }
 
+fn reserve_sxd_string_arguments(
+    context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
+    args: &[SxdValue<'_>],
+    indices: &[usize],
+    overflow_message: &str,
+) -> std::result::Result<(), function::Error> {
+    let bytes = indices.iter().try_fold(0usize, |bytes, &index| {
+        bytes
+            .checked_add(args.get(index).map_or(0, sxd_string_materialization_bytes))
+            .ok_or_else(|| function::Error::Other {
+                what: overflow_message.into(),
+            })
+    })?;
+    context.reserve_string_allocation(bytes)
+}
+
 fn rc4(key: &[u8], input: &[u8]) -> Vec<u8> {
     let mut state = [0_u8; 256];
     for (index, value) in state.iter_mut().enumerate() {
@@ -5939,9 +5955,16 @@ impl function::Function for ExsltStringFunction {
                 if !(2..=3).contains(&args.len()) {
                     return extension_argument_error("str:align() requires two or three arguments");
                 }
-                let value = args[0].string();
-                let padding = args[1].string();
-                let alignment = args.get(2).map(SxdValue::string).unwrap_or_default();
+                reserve_sxd_string_arguments(
+                    context,
+                    &args,
+                    &[0, 1, 2],
+                    "str:align() allocation length overflow",
+                )?;
+                let mut args = args.into_iter();
+                let value = args.next().expect("arity checked above").into_string();
+                let padding = args.next().expect("arity checked above").into_string();
+                let alignment = args.next().map(SxdValue::into_string).unwrap_or_default();
                 let width = padding.chars().count();
                 let value_width = value.chars().count();
                 if value_width >= width {
@@ -6016,11 +6039,24 @@ impl function::Function for ExsltStringFunction {
                         "str:encode-uri() requires two or three arguments",
                     );
                 }
-                let value = args[0].string();
-                let escape_reserved = args[1].boolean();
-                let encoding_label = args.get(2).map(SxdValue::string);
+                reserve_sxd_string_arguments(
+                    context,
+                    &args,
+                    &[0, 2],
+                    "str:encode-uri() allocation length overflow",
+                )?;
+                let mut args = args.into_iter();
+                let value = args.next().expect("arity checked above").into_string();
+                let escape_reserved = args.next().expect("arity checked above").into_boolean();
+                let encoding_label = args.next().map(SxdValue::into_string);
                 let encoding = uri_encoding(encoding_label.as_deref(), "str:encode-uri()")?;
-                let encoded_len = percent_encoded_uri_len(&value, escape_reserved, encoding)?;
+                let Some(encoded_len) = percent_encoded_uri_len(&value, escape_reserved, encoding)?
+                else {
+                    // EXSLT defines characters outside the requested encoding repertoire as a
+                    // successful empty result, not a dynamic XPath error.
+                    // https://exslt.github.io/str/functions/encode-uri/index.html
+                    return Ok(SxdValue::String(String::new()));
+                };
                 context.reserve_string_allocation(encoded_len)?;
                 Ok(SxdValue::String(percent_encode_uri(
                     &value,
@@ -6035,9 +6071,16 @@ impl function::Function for ExsltStringFunction {
                         "str:decode-uri() requires one or two arguments",
                     );
                 }
-                let encoding_label = args.get(1).map(SxdValue::string);
+                reserve_sxd_string_arguments(
+                    context,
+                    &args,
+                    &[0, 1],
+                    "str:decode-uri() allocation length overflow",
+                )?;
+                let mut args = args.into_iter();
+                let value = args.next().expect("arity checked above").into_string();
+                let encoding_label = args.next().map(SxdValue::into_string);
                 let encoding = uri_encoding(encoding_label.as_deref(), "str:decode-uri()")?;
-                let value = args[0].string();
                 let Some(decoded_len) = percent_decoded_uri_len(&value)? else {
                     // EXSLT defines malformed percent triplets as a successful empty result,
                     // rather than a dynamic XPath error or literal passthrough.
@@ -6100,7 +6143,7 @@ fn percent_encode_uri(
 ) -> std::result::Result<String, function::Error> {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut output = String::with_capacity(encoded_len);
-    visit_uri_encoded_bytes(value, encoding, |byte| {
+    let outcome = visit_uri_encoded_bytes(value, encoding, |byte| {
         let character = char::from(byte);
         if uri_byte_is_unescaped(character, escape_reserved) {
             output.push(character);
@@ -6111,6 +6154,7 @@ fn percent_encode_uri(
         }
         Ok(())
     })?;
+    debug_assert_eq!(outcome, UriEncodingOutcome::Complete);
     Ok(output)
 }
 
@@ -6118,9 +6162,9 @@ fn percent_encoded_uri_len(
     value: &str,
     escape_reserved: bool,
     encoding: UriEncoding,
-) -> std::result::Result<usize, function::Error> {
+) -> std::result::Result<Option<usize>, function::Error> {
     let mut length = 0usize;
-    visit_uri_encoded_bytes(value, encoding, |byte| {
+    let outcome = visit_uri_encoded_bytes(value, encoding, |byte| {
         let character = char::from(byte);
         let encoded = !uri_byte_is_unescaped(character, escape_reserved);
         length = length
@@ -6130,25 +6174,32 @@ fn percent_encoded_uri_len(
             })?;
         Ok(())
     })?;
-    Ok(length)
+    Ok(outcome.is_complete().then_some(length))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UriEncodingOutcome {
+    Complete,
+    Unrepresentable,
+}
+
+impl UriEncodingOutcome {
+    fn is_complete(self) -> bool {
+        self == Self::Complete
+    }
 }
 
 fn visit_uri_encoded_bytes(
     value: &str,
     encoding: UriEncoding,
     mut visit: impl FnMut(u8) -> std::result::Result<(), function::Error>,
-) -> std::result::Result<(), function::Error> {
+) -> std::result::Result<UriEncodingOutcome, function::Error> {
     match encoding {
         UriEncoding::Registered(encoding) => {
             for character in value.chars() {
-                let byte = encoding.encode_char(character).ok_or_else(|| {
-                    function::Error::Other {
-                        what: format!(
-                            "str:encode-uri() character `{character}` is not representable in {}",
-                            encoding.name()
-                        ),
-                    }
-                })?;
+                let Some(byte) = encoding.encode_char(character) else {
+                    return Ok(UriEncodingOutcome::Unrepresentable);
+                };
                 visit(byte)?;
             }
         }
@@ -6171,19 +6222,14 @@ fn visit_uri_encoded_bytes(
                 match result {
                     encoding_rs::EncoderResult::InputEmpty => break,
                     encoding_rs::EncoderResult::OutputFull => {}
-                    encoding_rs::EncoderResult::Unmappable(character) => {
-                        return Err(function::Error::Other {
-                            what: format!(
-                                "str:encode-uri() character `{character}` is not representable in {}",
-                                encoding.name()
-                            ),
-                        });
+                    encoding_rs::EncoderResult::Unmappable(_) => {
+                        return Ok(UriEncodingOutcome::Unrepresentable);
                     }
                 }
             }
         }
     }
-    Ok(())
+    Ok(UriEncodingOutcome::Complete)
 }
 
 fn uri_byte_is_unescaped(character: char, escape_reserved: bool) -> bool {
@@ -8254,6 +8300,31 @@ mod tests {
     }
 
     #[test]
+    fn string_align_reserves_xpath_coercions_before_materializing_them() {
+        // A narrow padding result must not let an untrusted node string bypass the temporary
+        // allocation gate before str:align truncates it.
+        let package = Package::new();
+        let document = package.as_document();
+        let root = document.create_element("root");
+        root.append_child(document.create_text("untrusted node text"));
+        document.root().append_child(root);
+        let mut nodes = nodeset::Nodeset::new();
+        nodes.add(root);
+        let mut context = Context::new();
+        context.set_string_allocation_limit(1);
+        let evaluation =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+
+        let error = ExsltStringFunction::Align
+            .evaluate(
+                &evaluation,
+                vec![SxdValue::Nodeset(nodes), SxdValue::String(".".into())],
+            )
+            .expect_err("node string coercion must cross the allocation gate");
+        assert!(error.to_string().contains("allocation budget"));
+    }
+
+    #[test]
     fn format_number_reserves_dynamic_pattern_workspace_before_rendering() {
         // The decimal pattern may come from untrusted XPath data. Token and precision buffers
         // must cross the operation allocation gate before the renderer materializes them.
@@ -8318,5 +8389,41 @@ mod tests {
                 .expect("UTF-8 encoding succeeds"),
             "%5B%5D"
         );
+    }
+
+    #[test]
+    fn uri_functions_reserve_xpath_coercions_before_empty_results() {
+        // An EXSLT-defined empty result must not bypass metering of the node string inspected to
+        // decide that outcome.
+        for (function, text, extra_args) in [
+            (
+                ExsltStringFunction::EncodeUri,
+                "€",
+                vec![
+                    SxdValue::Boolean(true),
+                    SxdValue::String("ISO-8859-1".into()),
+                ],
+            ),
+            (ExsltStringFunction::DecodeUri, "%", Vec::new()),
+        ] {
+            let package = Package::new();
+            let document = package.as_document();
+            let root = document.create_element("root");
+            root.append_child(document.create_text(text));
+            document.root().append_child(root);
+            let mut nodes = nodeset::Nodeset::new();
+            nodes.add(root);
+            let mut args = vec![SxdValue::Nodeset(nodes)];
+            args.extend(extra_args);
+            let mut context = Context::new();
+            context.set_string_allocation_limit(0);
+            let evaluation =
+                sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+
+            let error = function
+                .evaluate(&evaluation, args)
+                .expect_err("URI coercion must cross the allocation gate");
+            assert!(error.to_string().contains("allocation budget"));
+        }
     }
 }

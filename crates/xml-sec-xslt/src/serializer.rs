@@ -367,6 +367,9 @@ fn render(
         text.push_str("<?xml version=\"");
         text.push_str(definition.version.as_deref().unwrap_or("1.0"));
         text.push('"');
+        // XSLT 1.0 section 16.1 recommends, but does not require, an encoding pseudo-attribute.
+        // Match pinned libxslt output by emitting it only for an explicit xsl:output encoding.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#section-XML-Output-Method
         if definition.encoding_explicit {
             text.push_str(" encoding=\"");
             text.push_str(encoding.declaration_name(&definition.encoding));
@@ -1359,8 +1362,9 @@ fn serialize_node_tasks(
                                 .doctype_public
                                 .as_deref()
                                 .is_some_and(|public| public.contains("XHTML"))));
-                // XSLT 1.0 section 16.2 requires generated content-type metadata immediately
-                // after HEAD; it does not suppress generation when the result tree has metadata.
+                // XSLT 1.0 section 16.2 recommends generated content-type metadata immediately
+                // after HEAD. Its legacy http-equiv markup is an example, not a required lexical
+                // form; pinned libxslt 1.1.45 emits the equivalent HTML5 charset form used here.
                 // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
                 if definition.inject_content_type && html_head {
                     if definition.indent {

@@ -1472,6 +1472,17 @@ fn import_precedence_overrides_but_include_keeps_equal_precedence() {
 #[test]
 fn serializer_honors_doctype_cdata_html_and_text_contracts() {
     // Serializer method selection changes exact transform bytes, not only presentation.
+    let default_xml = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><root/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(default_xml, "<source/>"),
+        "<?xml version=\"1.0\"?>\n<root/>\n"
+    );
+    let explicit_utf8 = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output encoding="UTF-8"/><xsl:template match="/"><root/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(explicit_utf8, "<source/>"),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<root/>\n"
+    );
+
     let xml = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes" doctype-system="result.dtd" cdata-section-elements="script"/><xsl:template match="/"><doc><script><xsl:text>if (a &lt; b) x = ']]&gt;';</xsl:text></script></doc></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(xml, "<source/>"),
@@ -1499,8 +1510,9 @@ fn serializer_honors_doctype_cdata_html_and_text_contracts() {
         r#"<html><head><meta charset="UTF-8"></head></html>"#
     );
 
-    // XSLT 1.0 section 16.2 always generates content-type metadata. The pinned libxslt contract
-    // replaces its legacy equivalent, while unrelated HTML5 charset metadata remains intact.
+    // XSLT 1.0 section 16.2 recommends generated content-type metadata. The pinned libxslt
+    // contract uses HTML5 syntax and replaces its legacy equivalent, while unrelated metadata
+    // remains intact.
     // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
     let existing_html_meta = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="html" indent="no"/><xsl:template match="/"><html><head><meta http-equiv="Content-Type" content="text/plain; charset=ISO-8859-1" data-owner="caller"/></head></html></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
@@ -5458,26 +5470,36 @@ fn exslt_encode_uri_honors_the_optional_encoding() {
       </xsl:stylesheet>"#;
     assert_eq!(execute(stylesheet, "<source/>"), "%C3%A9|%E9");
 
-    for (value, encoding, expected) in [
-        ("é", "not-an-encoding", "unknown encoding"),
-        ("€", "ISO-8859-1", "not representable"),
-    ] {
-        let stylesheet = compile(&format!(
-            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:template match="/"><xsl:value-of select="str:encode-uri('{value}', true(), '{encoding}')"/></xsl:template></xsl:stylesheet>"#
-        ));
-        assert!(matches!(
-            stylesheet.execute(
-                &Document::parse("<source/>", None).expect("source parses"),
-                &Parameters::new(),
-                Arc::new(NoResolver),
-                ExecutionOptions {
-                    budget: execution_budget(1024),
-                    initial_mode: None,
-                    initial_template: None,
-                },
+    let unsupported = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:template match="/"><xsl:value-of select="str:encode-uri('é', true(), 'not-an-encoding')"/></xsl:template></xsl:stylesheet>"#,
+    );
+    assert!(matches!(
+        unsupported.execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Dynamic(message)) if message.contains("unknown encoding")
+    ));
+
+    // EXSLT specifies an empty string when the requested encoding cannot represent a character.
+    // Cover both the built-in single-byte registry and the encoding_rs path.
+    // https://exslt.github.io/str/functions/encode-uri/index.html
+    for (value, encoding) in [("€", "ISO-8859-1"), ("漢", "windows-1252")] {
+        assert_eq!(
+            execute(
+                &format!(
+                    r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="str:encode-uri('{value}', true(), '{encoding}')"/></xsl:template></xsl:stylesheet>"#
+                ),
+                "<source/>",
             ),
-            Err(Error::Dynamic(message)) if message.contains(expected)
-        ));
+            ""
+        );
     }
 }
 
