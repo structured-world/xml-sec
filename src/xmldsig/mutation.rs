@@ -1,14 +1,11 @@
-//! Streaming XML mutation helpers for the XMLDSig signing pipeline.
+//! Lexical XML mutation helpers for the XMLDSig signing pipeline.
 //!
 //! The selected semantic DOM is immutable. These helpers validate structure
-//! through the backend-neutral DOM contract, then rewrite with `quick-xml`.
+//! through the backend-neutral DOM contract, then splice validated source ranges.
 
-use std::{collections::HashSet, io::Write, ops::Range};
+use std::{collections::HashSet, ops::Range};
 
-use quick_xml::events::{BytesText, Event};
-use quick_xml::name::{Namespace, ResolveResult};
-use quick_xml::reader::NsReader;
-use quick_xml::{Reader, Writer};
+use xml_sec_xml_input::lexical::{escape_attribute, escape_text};
 
 use super::parse::{XMLDSIG_NS, XMLDSIG11_NS};
 use super::whitespace::is_xml_whitespace_only;
@@ -67,15 +64,9 @@ pub enum XmlMutationError {
     /// The backend-neutral document boundary rejected generated XML.
     #[error("XML document error: {0}")]
     Document(#[from] XmlDocumentError),
-    /// The streaming XML reader failed.
-    #[error("XML read error: {0}")]
-    Read(#[from] quick_xml::Error),
-    /// The streaming XML writer failed.
-    #[error("XML write error: {0}")]
-    Write(#[from] std::io::Error),
-    /// The writer unexpectedly emitted non-UTF-8 bytes.
-    #[error("XML writer emitted invalid UTF-8: {0}")]
-    InvalidUtf8(#[from] std::string::FromUtf8Error),
+    /// The shared lexical scanner rejected generated XML.
+    #[error("XML lexical error: {0}")]
+    Lexical(#[from] xml_sec_xml_input::lexical::Error),
     /// A template did not contain exactly one XMLDSig `<Signature>` root.
     #[error("signature template root must be one XMLDSig Signature element")]
     InvalidSignatureTemplate,
@@ -128,53 +119,16 @@ pub(super) fn append_signature_to_root_with_options(
 ) -> Result<String, XmlMutationError> {
     validate_signature_template(signature_template, policy)?;
     let source = parse_mutation_xml_with_options(xml, policy)?;
-    if !source.root().children().any(|node| node.is_element()) {
+    let root = source.root_element();
+    if !root.is_element() {
         return Err(XmlMutationError::MissingRootElement);
     }
-
-    let mut reader = Reader::from_str(xml);
-    let mut writer = Writer::new(Vec::new());
-    let mut root_depth = 0usize;
-    let mut saw_root = false;
-    let mut buf = Vec::new();
-
-    loop {
-        match reader.read_event_into(&mut buf)? {
-            Event::Start(element) if root_depth == 0 => {
-                saw_root = true;
-                root_depth = 1;
-                writer.write_event(Event::Start(element))?;
-            }
-            Event::Start(element) => {
-                root_depth += 1;
-                writer.write_event(Event::Start(element))?;
-            }
-            Event::Empty(element) if root_depth == 0 => {
-                saw_root = true;
-                writer.write_event(Event::Start(element.borrow()))?;
-                writer.get_mut().write_all(signature_template.as_bytes())?;
-                writer.write_event(Event::End(element.to_end()))?;
-            }
-            Event::End(element) if root_depth == 1 => {
-                writer.get_mut().write_all(signature_template.as_bytes())?;
-                writer.write_event(Event::End(element))?;
-                root_depth = 0;
-            }
-            Event::End(element) => {
-                root_depth = root_depth.saturating_sub(1);
-                writer.write_event(Event::End(element))?;
-            }
-            Event::Eof => break,
-            event => writer.write_event(event)?,
-        }
-        buf.clear();
-    }
-
-    if !saw_root {
-        return Err(XmlMutationError::MissingRootElement);
-    }
-
-    let output = String::from_utf8(writer.into_inner())?;
+    let root_range = root.range();
+    let output = if xml[root_range.clone()].trim_end().ends_with("/>") {
+        replace_element_content(xml, root_range, signature_template, "", policy)?
+    } else {
+        append_element_content(xml, root_range, signature_template, "", policy)?
+    };
     parse_mutation_xml_with_options(&output, policy)?;
     Ok(output)
 }
@@ -261,22 +215,15 @@ where
         .into_iter()
         .map(|value| value.as_ref().to_owned())
         .collect();
-    let expected = count_signed_info_digest_values(xml, target_signature, policy, budget)?;
-    if expected != values.len() {
-        return Err(XmlMutationError::ValueCountMismatch {
-            element: "DigestValue",
-            expected,
-            actual: values.len(),
-        });
-    }
-
-    fill_dsig_values_matching(
+    fill_dsig_text_values_matching(
         xml,
         "DigestValue",
         values,
         policy,
         budget,
-        |stack, namespace| is_signed_info_reference_context(stack, namespace, target_signature),
+        DsigReplacementScope::SignedInfoReferenceDigest {
+            signature_index: target_signature,
+        },
     )
 }
 
@@ -329,22 +276,15 @@ pub(super) fn fill_signature_value_at_index_with_budget(
     policy: Option<&crate::policy::SigningPolicy>,
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<String, XmlMutationError> {
-    let expected = count_direct_signature_values(xml, target_signature, policy, budget)?;
-    if expected != 1 {
-        return Err(XmlMutationError::ValueCountMismatch {
-            element: "SignatureValue",
-            expected,
-            actual: 1,
-        });
-    }
-
-    fill_dsig_values_matching(
+    fill_dsig_text_values_matching(
         xml,
         "SignatureValue",
         vec![value.to_owned()],
         policy,
         budget,
-        |stack, namespace| is_direct_signature_context(stack, namespace, target_signature),
+        DsigReplacementScope::DirectSignatureChild {
+            signature_index: target_signature,
+        },
     )
 }
 
@@ -481,21 +421,15 @@ pub(super) fn fill_key_info_at_index_with_options(
     target_signature: usize,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<String, XmlMutationError> {
-    let actual = count_direct_key_infos(xml, target_signature, policy)?;
-    if actual != 1 {
-        return Err(XmlMutationError::ValueCountMismatch {
-            element: "KeyInfo",
-            expected: 1,
-            actual,
-        });
-    }
-
-    fill_dsig_element_raw_matching(
+    fill_dsig_raw_value_matching(
         xml,
         "KeyInfo",
         key_info_content,
         policy,
-        |stack, namespace| is_direct_signature_context(stack, namespace, target_signature),
+        None,
+        DsigReplacementScope::DirectSignatureChild {
+            signature_index: target_signature,
+        },
     )
 }
 
@@ -693,7 +627,7 @@ fn merge_one_key_info_source_at_index_with_options(
                         .map_or_else(|| "xmlns".to_owned(), |prefix| format!("xmlns:{prefix}"));
                     attributes.push_str(&format!(
                         " {attribute}=\"{}\"",
-                        quick_xml::escape::escape(namespace.uri())
+                        escape_attribute(namespace.uri())
                     ));
                     Ok(attributes)
                 })?;
@@ -727,7 +661,7 @@ fn merge_one_key_info_source_at_index_with_options(
                     };
                     attributes.push_str(&format!(
                         " {qualified_name}=\"{}\"",
-                        quick_xml::escape::escape(attribute.value())
+                        escape_attribute(attribute.value())
                     ));
                     Ok(attributes)
                 })?;
@@ -815,7 +749,7 @@ fn wrap_key_info_children(
                     .ok_or_else(|| projected_xml_length_overflow(policy))?,
                 None => "xmlns".len(),
             };
-            let escaped_uri = quick_xml::escape::escape(namespace.uri());
+            let escaped_uri = escape_attribute(namespace.uri());
             length
                 .checked_add(4)
                 .and_then(|length| length.checked_add(declaration_len))
@@ -839,7 +773,7 @@ fn wrap_key_info_children(
             .map_or_else(|| "xmlns".to_owned(), |prefix| format!("xmlns:{prefix}"));
         wrapper.push_str(&format!(
             " {declaration}=\"{}\"",
-            quick_xml::escape::escape(namespace.uri())
+            escape_attribute(namespace.uri())
         ));
     }
     wrapper.push('>');
@@ -865,7 +799,7 @@ fn standalone_element(
         if !owned_namespaces.contains(namespace.name().unwrap_or_default()) {
             output.push_str(&format!(
                 " {declaration}=\"{}\"",
-                quick_xml::escape::escape(namespace.uri())
+                escape_attribute(namespace.uri())
             ));
         }
     }
@@ -875,26 +809,7 @@ fn standalone_element(
 }
 
 fn owned_namespace_declarations(opening: &str) -> Result<HashSet<String>, XmlMutationError> {
-    let standalone = format!("{} />", opening.trim_end_matches('/'));
-    let mut reader = Reader::from_str(&standalone);
-    let event = reader.read_event()?;
-    let element = match event {
-        Event::Start(element) | Event::Empty(element) => element,
-        _ => return Err(XmlMutationError::InvalidAppendTarget),
-    };
-    element
-        .attributes()
-        .map(|attribute| {
-            let attribute = attribute.map_err(|_| XmlMutationError::InvalidAppendTarget)?;
-            let name = std::str::from_utf8(attribute.key.as_ref())
-                .map_err(|_| XmlMutationError::InvalidAppendTarget)?;
-            Ok(match name {
-                "xmlns" => Some(String::new()),
-                _ => name.strip_prefix("xmlns:").map(str::to_owned),
-            })
-        })
-        .filter_map(|result| result.transpose())
-        .collect()
+    xml_sec_xml_input::lexical::declared_namespace_prefixes(opening).map_err(Into::into)
 }
 
 fn is_reusable_placeholder(node: crate::xml::dom::Node<'_, '_>) -> bool {
@@ -981,42 +896,18 @@ fn replace_element_content(
     namespace_attributes: &str,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<String, XmlMutationError> {
-    let element = &xml[range.clone()];
-    let replacement_len = if element.trim_end().ends_with("/>") {
-        let name_end = element[1..]
-            .find(|character: char| {
-                character.is_ascii_whitespace() || character == '/' || character == '>'
-            })
-            .map(|offset| offset + 1)
-            .ok_or(XmlMutationError::InvalidAppendTarget)?;
-        let qualified_name = &element[1..name_end];
-        let empty_end = element
-            .rfind("/>")
-            .ok_or(XmlMutationError::InvalidAppendTarget)?;
-        empty_end
-            .checked_add(namespace_attributes.len())
-            .and_then(|length| length.checked_add(1))
-            .and_then(|length| length.checked_add(content.len()))
-            .and_then(|length| length.checked_add(2))
-            .and_then(|length| length.checked_add(qualified_name.len()))
-            .and_then(|length| length.checked_add(1))
-            .ok_or_else(|| projected_xml_length_overflow(policy))?
-    } else {
-        let content_start =
-            element_opening_end(element).ok_or(XmlMutationError::InvalidAppendTarget)?;
-        let content_end = element
-            .rfind("</")
-            .ok_or(XmlMutationError::InvalidAppendTarget)?;
-        (content_start - 1)
-            .checked_add(namespace_attributes.len())
-            .and_then(|length| length.checked_add(1))
-            .and_then(|length| length.checked_add(content.len()))
-            .and_then(|length| length.checked_add(element.len() - content_end))
-            .ok_or_else(|| projected_xml_length_overflow(policy))?
-    };
-    validate_projected_replacement_len(xml, range.len(), replacement_len, policy)?;
-
+    let replacement = render_element_content(&xml[range.clone()], content, namespace_attributes)?;
+    validate_projected_replacement_len(xml, range.len(), replacement.len(), policy)?;
     let mut output = xml.to_owned();
+    output.replace_range(range, &replacement);
+    Ok(output)
+}
+
+fn render_element_content(
+    element: &str,
+    content: &str,
+    namespace_attributes: &str,
+) -> Result<String, XmlMutationError> {
     if element.trim_end().ends_with("/>") {
         let name_end = element[1..]
             .find(|character: char| {
@@ -1028,31 +919,67 @@ fn replace_element_content(
         let empty_end = element
             .rfind("/>")
             .ok_or(XmlMutationError::InvalidAppendTarget)?;
-        output.replace_range(
-            range,
-            &format!(
-                "{}{}>{}</{}>",
-                &element[..empty_end],
-                namespace_attributes,
-                content,
-                qualified_name
-            ),
-        );
+        Ok(format!(
+            "{}{}>{}</{}>",
+            &element[..empty_end],
+            namespace_attributes,
+            content,
+            qualified_name
+        ))
     } else {
         let content_start =
             element_opening_end(element).ok_or(XmlMutationError::InvalidAppendTarget)?;
         let content_end = element
             .rfind("</")
             .ok_or(XmlMutationError::InvalidAppendTarget)?;
-        let replacement = format!(
+        Ok(format!(
             "{}{}>{}{}",
             &element[..content_start - 1],
             namespace_attributes,
             content,
             &element[content_end..]
-        );
-        output.replace_range(range, &replacement);
+        ))
     }
+}
+
+fn replace_element_contents<'a>(
+    xml: &str,
+    replacements: impl IntoIterator<Item = (Range<usize>, &'a String)>,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<String, XmlMutationError> {
+    let mut rendered = replacements
+        .into_iter()
+        .map(|(range, content)| {
+            let replacement = render_element_content(&xml[range.clone()], content, "")?;
+            Ok((range, replacement))
+        })
+        .collect::<Result<Vec<_>, XmlMutationError>>()?;
+    rendered.sort_by_key(|(range, _)| range.start);
+
+    let mut projected = xml.len();
+    let mut previous_end = 0usize;
+    for (range, replacement) in &rendered {
+        if range.start < previous_end || range.end > xml.len() {
+            return Err(XmlMutationError::InvalidAppendTarget);
+        }
+        projected = projected
+            .checked_sub(range.len())
+            .and_then(|length| length.checked_add(replacement.len()))
+            .ok_or_else(|| projected_xml_length_overflow(policy))?;
+        previous_end = range.end;
+    }
+    if let Some(policy) = policy {
+        policy.resources.validate_xml_document_len(projected)?;
+    }
+
+    let mut output = String::with_capacity(projected);
+    let mut copied = 0usize;
+    for (range, replacement) in rendered {
+        output.push_str(&xml[copied..range.start]);
+        output.push_str(&replacement);
+        copied = range.end;
+    }
+    output.push_str(&xml[copied..]);
     Ok(output)
 }
 
@@ -1133,230 +1060,133 @@ where
         .into_iter()
         .map(|value| value.as_ref().to_owned())
         .collect();
-    let expected = count_dsig_elements(xml, local_name)?;
-    if expected != values.len() {
-        return Err(XmlMutationError::ValueCountMismatch {
-            element: local_name,
-            expected,
-            actual: values.len(),
-        });
-    }
-
-    fill_dsig_values_matching(xml, local_name, values, None, None, |_, _| true)
+    fill_dsig_text_values_matching(
+        xml,
+        local_name,
+        values,
+        None,
+        None,
+        DsigReplacementScope::Any,
+    )
 }
 
-fn fill_dsig_values_matching(
+#[derive(Clone, Copy)]
+enum DsigReplacementScope {
+    Any,
+    SignedInfoReferenceDigest { signature_index: usize },
+    DirectSignatureChild { signature_index: usize },
+}
+
+impl DsigReplacementScope {
+    const fn signature_index(self) -> Option<usize> {
+        match self {
+            Self::Any => None,
+            Self::SignedInfoReferenceDigest { signature_index }
+            | Self::DirectSignatureChild { signature_index } => Some(signature_index),
+        }
+    }
+
+    fn includes(
+        self,
+        node: crate::xml::dom::Node<'_, '_>,
+        signature: Option<crate::xml::dom::Node<'_, '_>>,
+    ) -> bool {
+        match self {
+            Self::Any => true,
+            Self::SignedInfoReferenceDigest { .. } => signature
+                .is_some_and(|signature| is_direct_signed_info_reference_digest(node, signature)),
+            Self::DirectSignatureChild { .. } => signature
+                .is_some_and(|signature| node.parent().is_some_and(|parent| parent == signature)),
+        }
+    }
+}
+
+fn fill_dsig_text_values_matching(
     xml: &str,
     local_name: &'static str,
     values: Vec<String>,
     policy: Option<&crate::policy::SigningPolicy>,
     budget: Option<&XmlParseWorkBudget>,
-    mut should_replace: impl FnMut(&[(bool, Vec<u8>, Option<usize>)], &ResolveResult<'_>) -> bool,
+    scope: DsigReplacementScope,
 ) -> Result<String, XmlMutationError> {
-    if let Some(budget) = budget {
-        budget.charge_policy(xml.len())?;
-    }
-    let mut reader = NsReader::from_str(xml);
-    let mut writer = Writer::new(Vec::new());
-    let mut buf = Vec::new();
-    let mut value_index = 0usize;
-    let mut replacing_depth: Option<usize> = None;
-    let mut element_stack: Vec<(bool, Vec<u8>, Option<usize>)> = Vec::new();
-    let mut signature_index = 0usize;
-
-    loop {
-        let (namespace, event) = reader.read_resolved_event_into(&mut buf)?;
-        if let Some(depth) = replacing_depth.as_mut() {
-            match event {
-                Event::Start(_) => *depth += 1,
-                Event::End(end) if *depth == 0 => {
-                    writer.write_event(Event::End(end))?;
-                    replacing_depth = None;
-                    element_stack.pop();
-                }
-                Event::End(_) => *depth -= 1,
-                Event::Eof => break,
-                _ => {}
-            }
-            buf.clear();
-            continue;
-        }
-
-        match event {
-            Event::Start(element)
-                if is_dsig_element(&namespace, element.local_name().as_ref(), local_name)
-                    && should_replace(&element_stack, &namespace) =>
-            {
-                let signature = signature_stack_index(
-                    &namespace,
-                    element.local_name().as_ref(),
-                    &mut signature_index,
-                );
-                element_stack.push((
-                    is_dsig_namespace(&namespace),
-                    element.local_name().as_ref().to_vec(),
-                    signature,
-                ));
-                writer.write_event(Event::Start(element))?;
-                writer.write_event(Event::Text(BytesText::new(&values[value_index])))?;
-                value_index += 1;
-                replacing_depth = Some(0);
-            }
-            Event::Empty(element)
-                if is_dsig_element(&namespace, element.local_name().as_ref(), local_name)
-                    && should_replace(&element_stack, &namespace) =>
-            {
-                let _signature = signature_stack_index(
-                    &namespace,
-                    element.local_name().as_ref(),
-                    &mut signature_index,
-                );
-                writer.write_event(Event::Start(element.borrow()))?;
-                writer.write_event(Event::Text(BytesText::new(&values[value_index])))?;
-                value_index += 1;
-                writer.write_event(Event::End(element.to_end()))?;
-            }
-            Event::Start(element) => {
-                let signature = signature_stack_index(
-                    &namespace,
-                    element.local_name().as_ref(),
-                    &mut signature_index,
-                );
-                element_stack.push((
-                    is_dsig_namespace(&namespace),
-                    element.local_name().as_ref().to_vec(),
-                    signature,
-                ));
-                writer.write_event(Event::Start(element))?;
-            }
-            Event::Empty(element) => {
-                let _signature = signature_stack_index(
-                    &namespace,
-                    element.local_name().as_ref(),
-                    &mut signature_index,
-                );
-                writer.write_event(Event::Empty(element))?
-            }
-            Event::End(element) => {
-                element_stack.pop();
-                writer.write_event(Event::End(element))?;
-            }
-            Event::Eof => break,
-            event => writer.write_event(event)?,
-        }
-        buf.clear();
-    }
-
-    if value_index != values.len() {
-        return Err(XmlMutationError::ValueCountMismatch {
-            element: local_name,
-            expected: values.len(),
-            actual: value_index,
-        });
-    }
-
-    let output = String::from_utf8(writer.into_inner())?;
-    parse_mutation_xml_with_budget(&output, policy, budget)?;
-    Ok(output)
+    let escaped = values
+        .iter()
+        .map(|value| escape_text(value).into_owned())
+        .collect::<Vec<_>>();
+    fill_dsig_contents_matching(xml, local_name, &escaped, policy, budget, scope)
 }
 
-fn fill_dsig_element_raw_matching(
+fn fill_dsig_raw_value_matching(
     xml: &str,
     local_name: &'static str,
     content: &str,
     policy: Option<&crate::policy::SigningPolicy>,
-    mut should_replace: impl FnMut(&[(bool, Vec<u8>, Option<usize>)], &ResolveResult<'_>) -> bool,
+    budget: Option<&XmlParseWorkBudget>,
+    scope: DsigReplacementScope,
 ) -> Result<String, XmlMutationError> {
-    let mut reader = NsReader::from_str(xml);
-    let mut writer = Writer::new(Vec::new());
-    let mut buf = Vec::new();
-    let mut replacing_depth: Option<usize> = None;
-    let mut element_stack: Vec<(bool, Vec<u8>, Option<usize>)> = Vec::new();
-    let mut signature_index = 0usize;
+    fill_dsig_contents_matching(
+        xml,
+        local_name,
+        &[content.to_owned()],
+        policy,
+        budget,
+        scope,
+    )
+}
 
-    loop {
-        let (namespace, event) = reader.read_resolved_event_into(&mut buf)?;
-        if let Some(depth) = replacing_depth.as_mut() {
-            match event {
-                Event::Start(_) => *depth += 1,
-                Event::End(end) if *depth == 0 => {
-                    writer.write_event(Event::End(end))?;
-                    replacing_depth = None;
-                    element_stack.pop();
-                }
-                Event::End(_) => *depth -= 1,
-                Event::Eof => break,
-                _ => {}
+fn fill_dsig_contents_matching(
+    xml: &str,
+    local_name: &'static str,
+    contents: &[String],
+    policy: Option<&crate::policy::SigningPolicy>,
+    budget: Option<&XmlParseWorkBudget>,
+    scope: DsigReplacementScope,
+) -> Result<String, XmlMutationError> {
+    let document = parse_mutation_xml_with_budget(xml, policy, budget)?;
+    let signature = scope
+        .signature_index()
+        .and_then(|index| signature_node(&document, index));
+    let ranges = document
+        .descendants()
+        .filter(|node| is_dsig_node(*node, local_name) && scope.includes(*node, signature))
+        .map(|node| {
+            if !node.has_actionable_range() {
+                return Err(XmlDocumentError::EntityExpandedMutationTarget.into());
             }
-            buf.clear();
-            continue;
-        }
-
-        match event {
-            Event::Start(element)
-                if is_dsig_element(&namespace, element.local_name().as_ref(), local_name)
-                    && should_replace(&element_stack, &namespace) =>
-            {
-                let signature = signature_stack_index(
-                    &namespace,
-                    element.local_name().as_ref(),
-                    &mut signature_index,
-                );
-                element_stack.push((
-                    is_dsig_namespace(&namespace),
-                    element.local_name().as_ref().to_vec(),
-                    signature,
-                ));
-                writer.write_event(Event::Start(element))?;
-                writer.get_mut().write_all(content.as_bytes())?;
-                replacing_depth = Some(0);
-            }
-            Event::Empty(element)
-                if is_dsig_element(&namespace, element.local_name().as_ref(), local_name)
-                    && should_replace(&element_stack, &namespace) =>
-            {
-                let _signature = signature_stack_index(
-                    &namespace,
-                    element.local_name().as_ref(),
-                    &mut signature_index,
-                );
-                writer.write_event(Event::Start(element.borrow()))?;
-                writer.get_mut().write_all(content.as_bytes())?;
-                writer.write_event(Event::End(element.to_end()))?;
-            }
-            Event::Start(element) => {
-                let signature = signature_stack_index(
-                    &namespace,
-                    element.local_name().as_ref(),
-                    &mut signature_index,
-                );
-                element_stack.push((
-                    is_dsig_namespace(&namespace),
-                    element.local_name().as_ref().to_vec(),
-                    signature,
-                ));
-                writer.write_event(Event::Start(element))?;
-            }
-            Event::Empty(element) => {
-                let _signature = signature_stack_index(
-                    &namespace,
-                    element.local_name().as_ref(),
-                    &mut signature_index,
-                );
-                writer.write_event(Event::Empty(element))?
-            }
-            Event::End(element) => {
-                element_stack.pop();
-                writer.write_event(Event::End(element))?;
-            }
-            Event::Eof => break,
-            event => writer.write_event(event)?,
-        }
-        buf.clear();
+            Ok(node.range())
+        })
+        .collect::<Result<Vec<_>, XmlMutationError>>()?;
+    if ranges.len() != contents.len() {
+        return Err(XmlMutationError::ValueCountMismatch {
+            element: local_name,
+            expected: ranges.len(),
+            actual: contents.len(),
+        });
     }
-
-    let output = String::from_utf8(writer.into_inner())?;
-    parse_mutation_xml_with_options(&output, policy)?;
+    let mut ordered_ranges = ranges.iter().collect::<Vec<_>>();
+    ordered_ranges.sort_by_key(|range| range.start);
+    let independently_replaceable = ordered_ranges
+        .iter()
+        .fold((0usize, 0usize), |(count, covered_until), range| {
+            if range.start < covered_until {
+                (count, covered_until)
+            } else {
+                (count + 1, range.end)
+            }
+        })
+        .0;
+    if independently_replaceable != ranges.len() {
+        return Err(XmlMutationError::ValueCountMismatch {
+            element: local_name,
+            expected: contents.len(),
+            actual: independently_replaceable,
+        });
+    }
+    if let Some(budget) = budget {
+        budget.charge_policy(xml.len())?;
+    }
+    let output = replace_element_contents(xml, ranges.into_iter().zip(contents), policy)?;
+    parse_mutation_xml_with_budget(&output, policy, budget)?;
     Ok(output)
 }
 
@@ -1371,75 +1201,6 @@ fn validate_signature_template(
     } else {
         Err(XmlMutationError::InvalidSignatureTemplate)
     }
-}
-
-fn count_dsig_elements(xml: &str, local_name: &str) -> Result<usize, XmlMutationError> {
-    let document = parse_mutation_xml_with_options(xml, None)?;
-    Ok(document
-        .descendants()
-        .filter(|node| {
-            node.is_element()
-                && node.tag_name().namespace() == Some(XMLDSIG_NS)
-                && node.tag_name().name() == local_name
-        })
-        .count())
-}
-
-fn count_signed_info_digest_values(
-    xml: &str,
-    target_signature: usize,
-    policy: Option<&crate::policy::SigningPolicy>,
-    budget: Option<&XmlParseWorkBudget>,
-) -> Result<usize, XmlMutationError> {
-    let document = parse_mutation_xml_with_budget(xml, policy, budget)?;
-    let Some(signature) = signature_node(&document, target_signature) else {
-        return Ok(0);
-    };
-    Ok(document
-        .descendants()
-        .filter(|node| is_direct_signed_info_reference_digest(*node, signature))
-        .count())
-}
-
-fn count_direct_signature_values(
-    xml: &str,
-    target_signature: usize,
-    policy: Option<&crate::policy::SigningPolicy>,
-    budget: Option<&XmlParseWorkBudget>,
-) -> Result<usize, XmlMutationError> {
-    let document = parse_mutation_xml_with_budget(xml, policy, budget)?;
-    let Some(signature) = signature_node(&document, target_signature) else {
-        return Ok(0);
-    };
-    Ok(document
-        .descendants()
-        .filter(|node| {
-            node.is_element()
-                && node.tag_name().namespace() == Some(XMLDSIG_NS)
-                && node.tag_name().name() == "SignatureValue"
-                && node.parent().is_some_and(|parent| parent == signature)
-        })
-        .count())
-}
-
-fn count_direct_key_infos(
-    xml: &str,
-    target_signature: usize,
-    policy: Option<&crate::policy::SigningPolicy>,
-) -> Result<usize, XmlMutationError> {
-    let document = parse_mutation_xml_with_options(xml, policy)?;
-    let Some(signature) = signature_node(&document, target_signature) else {
-        return Ok(0);
-    };
-    Ok(document
-        .descendants()
-        .filter(|node| {
-            node.is_element()
-                && node.tag_name().namespace() == Some(XMLDSIG_NS)
-                && node.tag_name().name() == "KeyInfo"
-                && node.parent().is_some_and(|parent| parent == signature)
-        })
-        .count())
 }
 
 fn signature_node<'a>(
@@ -1496,68 +1257,6 @@ fn is_dsig_node(node: crate::xml::dom::Node<'_, '_>, expected_local: &str) -> bo
     node.is_element()
         && node.tag_name().namespace() == Some(XMLDSIG_NS)
         && node.tag_name().name() == expected_local
-}
-
-fn is_signed_info_reference_context(
-    element_stack: &[(bool, Vec<u8>, Option<usize>)],
-    namespace: &ResolveResult<'_>,
-    target_signature: usize,
-) -> bool {
-    is_dsig_namespace(namespace)
-        && is_in_target_signature(element_stack, target_signature)
-        && matches!(
-            element_stack,
-            [.., (true, signed_info, _), (true, reference, _)]
-                if signed_info.as_slice() == b"SignedInfo"
-                    && reference.as_slice() == b"Reference"
-        )
-}
-
-fn is_direct_signature_context(
-    element_stack: &[(bool, Vec<u8>, Option<usize>)],
-    namespace: &ResolveResult<'_>,
-    target_signature: usize,
-) -> bool {
-    is_dsig_namespace(namespace)
-        && is_in_target_signature(element_stack, target_signature)
-        && matches!(
-            element_stack,
-            [.., (true, signature, Some(index))]
-                if signature.as_slice() == b"Signature" && *index == target_signature
-        )
-}
-
-fn is_in_target_signature(
-    element_stack: &[(bool, Vec<u8>, Option<usize>)],
-    target_signature: usize,
-) -> bool {
-    element_stack
-        .iter()
-        .rev()
-        .find(|(is_dsig, local_name, _)| *is_dsig && local_name.as_slice() == b"Signature")
-        .is_some_and(|(_, _, signature)| *signature == Some(target_signature))
-}
-
-fn is_dsig_element(namespace: &ResolveResult<'_>, local: &[u8], expected_local: &str) -> bool {
-    is_dsig_namespace(namespace) && local == expected_local.as_bytes()
-}
-
-fn is_dsig_namespace(namespace: &ResolveResult<'_>) -> bool {
-    matches!(namespace, ResolveResult::Bound(Namespace(ns)) if *ns == XMLDSIG_NS.as_bytes())
-}
-
-fn signature_stack_index(
-    namespace: &ResolveResult<'_>,
-    local_name: &[u8],
-    next_signature_index: &mut usize,
-) -> Option<usize> {
-    if is_dsig_namespace(namespace) && local_name == b"Signature" {
-        let index = *next_signature_index;
-        *next_signature_index += 1;
-        Some(index)
-    } else {
-        None
-    }
 }
 
 #[cfg(test)]
@@ -1618,8 +1317,8 @@ mod tests {
     }
 
     #[test]
-    fn streaming_mutation_scan_consumes_the_shared_parse_budget() {
-        // The quick-xml rewrite plus bounded preflight and every selected-mode
+    fn lexical_mutation_scan_consumes_the_shared_parse_budget() {
+        // The lexical rewrite plus bounded preflight and every selected-mode
         // semantic parser consume one operation-wide allowance.
         let xml = format!(
             "<root><ds:Signature xmlns:ds=\"{XMLDSIG_NS}\"><ds:SignatureValue/></ds:Signature></root>"
@@ -1776,6 +1475,34 @@ mod tests {
     }
 
     #[test]
+    fn rejects_entity_expanded_dsig_mutation_targets() {
+        // A general entity can project element nodes, but every expansion shares the entity
+        // reference's lexical range. Mutating that range cannot uniquely target one semantic
+        // element, so signing must fail instead of rewriting the declaration or reference token.
+        let xml = format!(
+            r#"<!DOCTYPE root [<!ENTITY digest '<ds:DigestValue/>'>]><root xmlns:ds="{XMLDSIG_NS}">&digest;</root>"#
+        );
+        let mut policy = crate::policy::SigningPolicy::default();
+        policy.xml.allow_internal_dtd = true;
+        let error = fill_dsig_contents_matching(
+            &xml,
+            "DigestValue",
+            &["digest".to_owned()],
+            Some(&policy),
+            None,
+            DsigReplacementScope::Any,
+        )
+        .expect_err("entity-expanded elements have no independently actionable range");
+        assert!(
+            matches!(
+                error,
+                XmlMutationError::Document(XmlDocumentError::EntityExpandedMutationTarget)
+            ),
+            "unexpected mutation error: {error:?}"
+        );
+    }
+
+    #[test]
     fn fills_signature_value_without_touching_digest_values() {
         let signed = append_signature_to_root("<root/>", &template(1)).expect("append signature");
         let filled =
@@ -1791,6 +1518,42 @@ mod tests {
             .find(|node| node.has_tag_name((XMLDSIG_NS, "DigestValue")))
             .expect("DigestValue");
         assert_eq!(digest_value.text(), None);
+    }
+
+    #[test]
+    fn mutation_enforces_the_backend_neutral_namespace_ceiling() {
+        // The shared preflight and semantic parser must enforce the same
+        // active-binding ceiling rather than diverging during mutation.
+        let declarations = (0..1_023)
+            .map(|index| format!(r#" xmlns:n{index}="urn:namespace:{index}""#))
+            .collect::<String>();
+        let xml = format!(
+            r#"<root{declarations}><ds:Signature xmlns:ds="{XMLDSIG_NS}"><ds:SignedInfo/><ds:SignatureValue/></ds:Signature></root>"#
+        );
+
+        let filled = fill_signature_value(&xml, "signature")
+            .expect("validated namespace bindings must remain mutable");
+        let document = dom::Document::parse(&filled).expect("parse output");
+        let signature_value = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "SignatureValue")))
+            .expect("SignatureValue");
+        assert_eq!(signature_value.text(), Some("signature"));
+
+        let excessive_declarations =
+            format!(r#"{declarations} xmlns:overflow="urn:namespace:overflow""#);
+        let excessive = format!(
+            r#"<root{excessive_declarations}><ds:Signature xmlns:ds="{XMLDSIG_NS}"><ds:SignedInfo/><ds:SignatureValue/></ds:Signature></root>"#
+        );
+        let error = fill_signature_value(&excessive, "signature")
+            .expect_err("1025 active namespace bindings must fail during shared preflight");
+        assert!(matches!(
+            error,
+            XmlMutationError::XmlParse(dom::ParseError::NamespaceBindingLimitReached {
+                maximum: 1_024,
+                actual: 1_025,
+            })
+        ));
     }
 
     #[test]

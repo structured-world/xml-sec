@@ -1,0 +1,3 @@
+{
+  "ignorePatterns": "crates/xml-sec-xslt/tests/fixtures/libxslt-1.1.45/upstream/**"
+}
