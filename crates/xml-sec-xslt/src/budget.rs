@@ -205,6 +205,14 @@ impl Meter {
             ))),
         }
     }
+
+    pub(crate) fn remaining_owned_bytes(&self) -> usize {
+        self.limits.owned_bytes.saturating_sub(self.owned_bytes)
+    }
+
+    pub(crate) const fn recursion_limit(&self) -> usize {
+        self.limits.recursion_depth
+    }
 }
 
 pub(crate) fn reserve_temporary_vec_slot<T>(

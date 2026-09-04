@@ -4,6 +4,48 @@ use crate::string_pool::{InternedString, StringPool};
 use std::{marker::PhantomData, slice};
 use typed_arena::Arena;
 
+pub(crate) fn estimated_storage_bytes(r: crate::StorageRequirements) -> usize {
+    fn arena_bytes<T>(items: usize) -> usize {
+        let slots = if items == 0 {
+            0
+        } else {
+            items
+                .checked_next_power_of_two()
+                .unwrap_or(usize::MAX)
+                .max(4)
+        };
+        slots.saturating_mul(std::mem::size_of::<T>())
+    }
+
+    arena_bytes::<Root>(r.roots)
+        .saturating_add(arena_bytes::<Element>(r.elements))
+        .saturating_add(arena_bytes::<Attribute>(r.attributes))
+        .saturating_add(arena_bytes::<Text>(r.texts))
+        .saturating_add(arena_bytes::<Comment>(r.comments))
+        .saturating_add(arena_bytes::<ProcessingInstruction>(
+            r.processing_instructions,
+        ))
+        .saturating_add(
+            r.child_edges
+                .saturating_mul(std::mem::size_of::<ChildOfElement>().saturating_mul(4)),
+        )
+        .saturating_add(
+            r.attributes
+                .saturating_mul(std::mem::size_of::<*mut Attribute>().saturating_mul(4)),
+        )
+        .saturating_add(r.namespace_bindings.saturating_mul(
+            std::mem::size_of::<(InternedString, InternedString)>().saturating_mul(4),
+        ))
+        .saturating_add(
+            r.interned_strings.saturating_mul(
+                std::mem::size_of::<InternedString>()
+                    .saturating_add(std::mem::size_of::<usize>())
+                    .saturating_mul(2),
+            ),
+        )
+        .saturating_add(r.string_bytes)
+}
+
 struct InternedQName {
     namespace_uri: Option<InternedString>,
     local_part: InternedString,

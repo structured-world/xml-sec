@@ -286,6 +286,30 @@ impl Document {
         bytes
     }
 
+    // Conservatively includes namespace arenas owned by a freshly parsed document. Shared
+    // namespace scopes may be counted more than once, which is preferable to under-reserving an
+    // attacker-controlled parse before it is projected into the execution DOM.
+    pub(crate) fn estimated_owned_bytes(&self) -> usize {
+        self.nodes
+            .iter()
+            .fold(self.estimated_clone_bytes(), |total, node| {
+                let NodeKind::Element { namespaces, .. } = &node.kind else {
+                    return total;
+                };
+                total
+                    .saturating_add(
+                        namespaces
+                            .len()
+                            .saturating_mul(std::mem::size_of::<Namespace>()),
+                    )
+                    .saturating_add(namespaces.iter().fold(0usize, |bytes, namespace| {
+                        bytes
+                            .saturating_add(namespace.prefix.as_deref().map_or(0, str::len))
+                            .saturating_add(namespace.uri.len())
+                    }))
+            })
+    }
+
     #[cfg(test)]
     fn parse_tree(xml: &str, base_uri: Option<&str>) -> Result<Self> {
         let parsed =

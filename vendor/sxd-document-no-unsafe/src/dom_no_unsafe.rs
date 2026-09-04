@@ -99,6 +99,13 @@ impl<'d> PartialEq for Document<'d> {
     }
 }
 
+impl hash::Hash for Document<'_> {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) {
+        std::ptr::hash(self.storage, state);
+        std::ptr::hash(self.connections, state);
+    }
+}
+
 impl<'d> fmt::Debug for Document<'d> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Document {{ {:?} }}", self as *const Document<'_>)
@@ -120,7 +127,7 @@ macro_rules! node(
 
         impl<'d> PartialEq for $name<'d> {
             fn eq(&self, other: &$name<'d>) -> bool {
-                self.node == other.node
+                self.document == other.document && self.node == other.node
             }
         }
 
@@ -130,6 +137,7 @@ macro_rules! node(
             fn hash<H>(&self, state: &mut H)
                 where H: hash::Hasher
             {
+                self.document.hash(state);
                 self.node.hash(state)
             }
         }
@@ -148,6 +156,10 @@ impl<'d> Root<'d> {
         C: Into<ChildOfRoot<'d>>,
     {
         let child = child.into();
+        assert!(
+            self.document == child.document(),
+            "node belongs to a different document"
+        );
         self.document
             .connections
             .append_root_child(self.document.storage, child.as_raw());
@@ -177,6 +189,10 @@ impl<'d> Root<'d> {
         C: Into<ChildOfRoot<'d>>,
     {
         let child = child.into();
+        assert!(
+            self.document == child.document(),
+            "node belongs to a different document"
+        );
         self.document
             .connections
             .remove_root_child(self.document.storage, child.as_raw())
@@ -340,6 +356,10 @@ impl<'d> Element<'d> {
         C: Into<ChildOfElement<'d>>,
     {
         let child = child.into();
+        assert!(
+            self.document == child.document(),
+            "node belongs to a different document"
+        );
         self.document.connections.append_element_child(
             self.document.storage,
             self.node,
@@ -371,6 +391,10 @@ impl<'d> Element<'d> {
         C: Into<ChildOfElement<'d>>,
     {
         let child = child.into();
+        assert!(
+            self.document == child.document(),
+            "node belongs to a different document"
+        );
         self.document.connections.remove_element_child(
             self.document.storage,
             self.node,
@@ -759,6 +783,14 @@ impl<'d> ChildOfRoot<'d> {
             }
         }
     }
+
+    fn document(&self) -> Document<'d> {
+        match *self {
+            Self::Element(node) => node.document(),
+            Self::Comment(node) => node.document(),
+            Self::ProcessingInstruction(node) => node.document(),
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -788,6 +820,15 @@ impl<'d> ChildOfElement<'d> {
             ChildOfElement::ProcessingInstruction(n) => {
                 raw::ChildOfElement::ProcessingInstruction(n.node)
             }
+        }
+    }
+
+    fn document(&self) -> Document<'d> {
+        match *self {
+            Self::Element(node) => node.document(),
+            Self::Text(node) => node.document(),
+            Self::Comment(node) => node.document(),
+            Self::ProcessingInstruction(node) => node.document(),
         }
     }
 }
@@ -850,6 +891,8 @@ impl<'d> From<ChildOfRoot<'d>> for ChildOfElement<'d> {
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashSet;
+
     use super::{
         super::{Package, QName},
         ChildOfElement, ChildOfRoot, ParentOfChild,
@@ -872,6 +915,44 @@ mod test {
         let doc = package.as_document();
         let root = doc.root();
         assert_eq!(doc, root.document());
+    }
+
+    #[test]
+    fn node_identity_includes_the_owning_document() {
+        let first = Package::new();
+        let second = Package::new();
+        let first_node = first.as_document().create_element("same-index");
+        let second_node = second.as_document().create_element("same-index");
+        #[expect(
+            clippy::mutable_key_type,
+            reason = "the regression verifies the public node Hash contract across documents"
+        )]
+        let nodes = HashSet::from([first_node, second_node]);
+
+        assert_ne!(first_node, second_node);
+        assert_eq!(nodes.len(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "node belongs to a different document")]
+    fn root_rejects_a_child_from_another_document() {
+        let first = Package::new();
+        let second = Package::new();
+        first
+            .as_document()
+            .root()
+            .append_child(second.as_document().create_element("foreign"));
+    }
+
+    #[test]
+    #[should_panic(expected = "node belongs to a different document")]
+    fn element_rejects_a_child_from_another_document() {
+        let first = Package::new();
+        let second = Package::new();
+        first
+            .as_document()
+            .create_element("parent")
+            .append_child(second.as_document().create_text("foreign"));
     }
 
     #[test]

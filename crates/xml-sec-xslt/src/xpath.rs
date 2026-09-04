@@ -5,10 +5,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use sxd_document_no_unsafe::dom::{Document as SxdDocument, Element as SxdElement};
-use sxd_document_no_unsafe::{Package, QName};
+use sxd_document_no_unsafe::{Package, QName, StorageRequirements};
 use sxd_xpath_no_unsafe::{Context, Factory, Value as SxdValue, XPath, function, nodeset};
 
-use crate::budget::{Meter, reserve_temporary_vec_slot};
+use crate::budget::{Meter, ParseBudget, reserve_temporary_vec_slot};
 use crate::compiler::{DecimalFormat, Expression, NameTest, Pattern, normalize_xpath_for_sxd};
 use crate::expression::innermost_namespaced_call;
 use crate::lexical::{is_ncname, is_ncname_char};
@@ -1039,7 +1039,7 @@ impl Evaluator {
             .into_iter()
             .find_map(|child| child.element())
             .ok_or_else(|| Error::Dynamic("semantic projection root is missing".into()))?;
-        project_logical_root(&self.source, logical_root, sxd_document, documents)?;
+        project_logical_root(&self.source, logical_root, sxd_document, documents, meter)?;
         self.maps.extend(&self.source, first_new_node, meter)?;
         extend_id_index(
             &self.source,
@@ -2011,7 +2011,11 @@ impl Evaluator {
                         resource.encoding.as_deref(),
                         meter,
                     )?;
-                    let document = Document::parse(&xml, Some(&resource.canonical_uri))?;
+                    let (document, parsed_reservation) = parse_external_document_metered(
+                        &xml,
+                        Some(&resource.canonical_uri),
+                        meter,
+                    )?;
                     let (mut document, expanded_reservation) =
                         if self.source_processing == SourceProcessing::XInclude {
                             let mut stack = vec![resource.identity.clone()];
@@ -2034,6 +2038,7 @@ impl Evaluator {
                         meter.release_owned_bytes(remap_owned_bytes);
                     }
                     let root = self.import_document(&document, meter)?;
+                    meter.release_owned_bytes(parsed_reservation);
                     if let Some(reservation) = expanded_reservation {
                         meter.release_owned_bytes(reservation);
                     }
@@ -2176,6 +2181,7 @@ impl Evaluator {
             }
             let root_node = SourceNode::Node(logical_root);
             let evaluation_node = if uses_current { node } else { &root_node };
+            meter.charge(BudgetKind::XPathEvaluations, 1)?;
             let value = self.evaluate(
                 &Expression::generated(expression, pattern.namespaces.clone()),
                 evaluation_node,
@@ -2903,7 +2909,7 @@ fn project_semantic_document(source: &Document, meter: &mut Meter) -> Result<Pac
     document.root().append_child(documents);
 
     for logical_root in source.logical_roots() {
-        project_logical_root(source, *logical_root, document, documents)?;
+        project_logical_root(source, *logical_root, document, documents, meter)?;
     }
     Ok(package)
 }
@@ -2913,75 +2919,119 @@ fn project_logical_root<'d>(
     logical_root: NodeId,
     document: SxdDocument<'d>,
     documents: SxdElement<'d>,
+    meter: &mut Meter,
 ) -> Result<()> {
     let wrapper = document.create_element(QName::new(DOCUMENT_ELEMENT));
     documents.append_child(wrapper);
     let root = source
         .node(logical_root)
         .ok_or_else(|| Error::Dynamic("missing logical document root".into()))?;
-    let mut pending = root
-        .children
-        .iter()
-        .rev()
-        .map(|child| (*child, wrapper))
-        .collect::<Vec<_>>();
-    while let Some((id, parent)) = pending.pop() {
-        let node = source
-            .node(id)
-            .ok_or_else(|| Error::Dynamic(format!("stale semantic node {id:?}")))?;
-        match &node.kind {
-            NodeKind::Root => {
-                pending.extend(node.children.iter().rev().map(|child| (*child, parent)));
-            }
-            NodeKind::Element {
-                name,
-                prefix,
-                attributes,
-                namespaces,
-            } => {
-                let element = document.create_element(QName::with_namespace_uri(
-                    name.namespace.as_deref(),
-                    &name.local,
-                ));
-                element.set_preferred_prefix(prefix.as_deref());
-                for namespace in namespaces.iter() {
-                    if let Some(prefix) = &namespace.prefix {
-                        element.register_prefix(prefix, &namespace.uri);
-                    } else {
-                        element.set_default_namespace_uri(Some(&namespace.uri));
-                        element.register_prefix("", &namespace.uri);
+    let mut pending = Vec::new();
+    let mut pending_reservation = 0usize;
+    let projected = (|| {
+        for child in root.children.iter().rev() {
+            reserve_temporary_vec_slot(&mut pending, meter, &mut pending_reservation)?;
+            pending.push((*child, wrapper));
+        }
+        while let Some((id, parent)) = pending.pop() {
+            let node = source
+                .node(id)
+                .ok_or_else(|| Error::Dynamic(format!("stale semantic node {id:?}")))?;
+            match &node.kind {
+                NodeKind::Root => {
+                    for child in node.children.iter().rev() {
+                        reserve_temporary_vec_slot(&mut pending, meter, &mut pending_reservation)?;
+                        pending.push((*child, parent));
                     }
                 }
-                for attribute in attributes {
-                    let projected = element.set_attribute_value(
-                        QName::with_namespace_uri(
-                            attribute.name.namespace.as_deref(),
-                            &attribute.name.local,
-                        ),
-                        &attribute.value,
-                    );
-                    projected.set_preferred_prefix(attribute.prefix.as_deref());
+                NodeKind::Element {
+                    name,
+                    prefix,
+                    attributes,
+                    namespaces,
+                } => {
+                    let element = document.create_element(QName::with_namespace_uri(
+                        name.namespace.as_deref(),
+                        &name.local,
+                    ));
+                    element.set_preferred_prefix(prefix.as_deref());
+                    for namespace in namespaces.iter() {
+                        if let Some(prefix) = &namespace.prefix {
+                            element.register_prefix(prefix, &namespace.uri);
+                        } else {
+                            element.set_default_namespace_uri(Some(&namespace.uri));
+                            element.register_prefix("", &namespace.uri);
+                        }
+                    }
+                    for attribute in attributes {
+                        let projected = element.set_attribute_value(
+                            QName::with_namespace_uri(
+                                attribute.name.namespace.as_deref(),
+                                &attribute.name.local,
+                            ),
+                            &attribute.value,
+                        );
+                        projected.set_preferred_prefix(attribute.prefix.as_deref());
+                    }
+                    parent.append_child(element);
+                    for child in node.children.iter().rev() {
+                        reserve_temporary_vec_slot(&mut pending, meter, &mut pending_reservation)?;
+                        pending.push((*child, element));
+                    }
                 }
-                parent.append_child(element);
-                pending.extend(node.children.iter().rev().map(|child| (*child, element)));
+                NodeKind::Text { value, .. } => parent.append_child(document.create_text(value)),
+                NodeKind::Comment(value) => parent.append_child(document.create_comment(value)),
+                NodeKind::ProcessingInstruction { target, value } => parent
+                    .append_child(document.create_processing_instruction(target, value.as_deref())),
             }
-            NodeKind::Text { value, .. } => parent.append_child(document.create_text(value)),
-            NodeKind::Comment(value) => parent.append_child(document.create_comment(value)),
-            NodeKind::ProcessingInstruction { target, value } => parent
-                .append_child(document.create_processing_instruction(target, value.as_deref())),
         }
-    }
-    Ok(())
+        Ok(())
+    })();
+    drop(pending);
+    meter.release_owned_bytes(pending_reservation);
+    projected
 }
 
 fn semantic_projection_size(source: &Document) -> usize {
-    source
-        .nodes()
-        .map(|(_, node)| match &node.kind {
-            NodeKind::Root => 0,
-            NodeKind::Text { value, .. } | NodeKind::Comment(value) => value.len(),
+    let mut requirements = StorageRequirements {
+        roots: 1,
+        elements: 1usize.saturating_add(source.logical_roots().len()),
+        child_edges: 1usize.saturating_add(source.logical_roots().len()),
+        interned_strings: 1usize.saturating_add(source.logical_roots().len()),
+        string_bytes: DOCUMENTS_ELEMENT.len().saturating_add(
+            source
+                .logical_roots()
+                .len()
+                .saturating_mul(DOCUMENT_ELEMENT.len()),
+        ),
+        ..StorageRequirements::default()
+    };
+    for (_, node) in source.nodes() {
+        match &node.kind {
+            NodeKind::Root => {}
+            NodeKind::Text { value, .. } => {
+                requirements.texts = requirements.texts.saturating_add(1);
+                requirements.child_edges = requirements.child_edges.saturating_add(1);
+                requirements.interned_strings = requirements.interned_strings.saturating_add(1);
+                requirements.string_bytes = requirements.string_bytes.saturating_add(value.len());
+            }
+            NodeKind::Comment(value) => {
+                requirements.comments = requirements.comments.saturating_add(1);
+                requirements.child_edges = requirements.child_edges.saturating_add(1);
+                requirements.interned_strings = requirements.interned_strings.saturating_add(1);
+                requirements.string_bytes = requirements.string_bytes.saturating_add(value.len());
+            }
             NodeKind::ProcessingInstruction { target, value } => {
-                target.len() + value.as_deref().map_or(0, str::len)
+                requirements.processing_instructions =
+                    requirements.processing_instructions.saturating_add(1);
+                requirements.child_edges = requirements.child_edges.saturating_add(1);
+                requirements.interned_strings = requirements
+                    .interned_strings
+                    .saturating_add(1 + usize::from(value.is_some()));
+                requirements.string_bytes = requirements
+                    .string_bytes
+                    .saturating_add(target.len())
+                    .saturating_add(value.as_deref().map_or(0, str::len));
             }
             NodeKind::Element {
                 name,
@@ -2989,27 +3039,45 @@ fn semantic_projection_size(source: &Document) -> usize {
                 attributes,
                 namespaces,
             } => {
-                name.local.len()
-                    + name.namespace.as_deref().map_or(0, str::len)
-                    + prefix.as_deref().map_or(0, str::len)
-                    + attributes
-                        .iter()
-                        .map(|attribute| {
-                            attribute.name.local.len()
-                                + attribute.name.namespace.as_deref().map_or(0, str::len)
-                                + attribute.prefix.as_deref().map_or(0, str::len)
-                                + attribute.value.len()
-                        })
-                        .sum::<usize>()
-                    + namespaces
-                        .iter()
-                        .map(|namespace| {
-                            namespace.prefix.as_deref().map_or(0, str::len) + namespace.uri.len()
-                        })
-                        .sum::<usize>()
+                requirements.elements = requirements.elements.saturating_add(1);
+                requirements.attributes = requirements.attributes.saturating_add(attributes.len());
+                requirements.namespace_bindings = requirements
+                    .namespace_bindings
+                    .saturating_add(namespaces.len());
+                requirements.child_edges = requirements.child_edges.saturating_add(1);
+                requirements.interned_strings = requirements.interned_strings.saturating_add(
+                    1 + usize::from(name.namespace.is_some()) + usize::from(prefix.is_some()),
+                );
+                requirements.string_bytes = requirements
+                    .string_bytes
+                    .saturating_add(name.local.len())
+                    .saturating_add(name.namespace.as_deref().map_or(0, str::len))
+                    .saturating_add(prefix.as_deref().map_or(0, str::len));
+                for attribute in attributes {
+                    requirements.interned_strings = requirements.interned_strings.saturating_add(
+                        2 + usize::from(attribute.name.namespace.is_some())
+                            + usize::from(attribute.prefix.is_some()),
+                    );
+                    requirements.string_bytes = requirements
+                        .string_bytes
+                        .saturating_add(attribute.name.local.len())
+                        .saturating_add(attribute.name.namespace.as_deref().map_or(0, str::len))
+                        .saturating_add(attribute.prefix.as_deref().map_or(0, str::len))
+                        .saturating_add(attribute.value.len());
+                }
+                for namespace in namespaces.iter() {
+                    requirements.interned_strings = requirements
+                        .interned_strings
+                        .saturating_add(1 + usize::from(namespace.prefix.is_some()));
+                    requirements.string_bytes = requirements
+                        .string_bytes
+                        .saturating_add(namespace.prefix.as_deref().map_or(0, str::len))
+                        .saturating_add(namespace.uri.len());
+                }
             }
-        })
-        .sum()
+        }
+    }
+    sxd_document_no_unsafe::estimated_storage_bytes(requirements)
 }
 
 fn split_pattern_branches(source: &str) -> Vec<&str> {
@@ -3527,8 +3595,9 @@ fn resolve_xinclude(
     // XInclude 1.0 section 4.2 explicitly makes non-well-formed acquired XML a fatal error,
     // unlike resource acquisition/encoding failures that may activate xi:fallback.
     // https://www.w3.org/TR/xinclude/#xml
-    let document =
-        Document::parse(&xml, Some(&resource.canonical_uri)).map_err(XIncludeFailure::Fatal)?;
+    let (document, parsed_reservation) =
+        parse_external_document_metered(&xml, Some(&resource.canonical_uri), meter)
+            .map_err(XIncludeFailure::Fatal)?;
     let resource_identity = resource.identity.clone();
     if identity_is_new {
         charge_resource_identity_cache_entry(&resource, meter).map_err(XIncludeFailure::Fatal)?;
@@ -3546,10 +3615,33 @@ fn resolve_xinclude(
         depth.saturating_add(1),
     );
     include_stack.pop();
+    meter.release_owned_bytes(parsed_reservation);
     meter.release_owned_bytes(decoded_temporary_bytes);
     expanded
         .map(XIncludeContent::Xml)
         .map_err(XIncludeFailure::Fatal)
+}
+
+fn parse_external_document_metered(
+    xml: &str,
+    base_uri: Option<&str>,
+    meter: &mut Meter,
+) -> Result<(Document, usize)> {
+    let structural_node_bytes = std::mem::size_of::<Node>()
+        .saturating_add(std::mem::size_of::<NodeId>())
+        .max(1);
+    let remaining = meter.remaining_owned_bytes();
+    let budget = ParseBudget::new(
+        xml.len(),
+        remaining / structural_node_bytes,
+        meter.recursion_limit(),
+    );
+    let document = Document::parse_with_budget(xml, base_uri, budget)?;
+    // One decoded-size reservation already represents parser-owned lexical payload. Reserve the
+    // arena, indexes, and any semantic payload beyond that proxy until projection completes.
+    let reservation = document.estimated_owned_bytes().saturating_sub(xml.len());
+    meter.charge(BudgetKind::OwnedBytes, reservation)?;
+    Ok((document, reservation))
 }
 
 fn decode_xinclude_resource(
@@ -7328,6 +7420,44 @@ mod tests {
                 actual: 2,
             })
         ));
+    }
+
+    #[test]
+    fn external_parse_derives_node_limit_from_remaining_owned_bytes() {
+        let per_node = std::mem::size_of::<Node>() + std::mem::size_of::<NodeId>();
+        let mut meter = Meter::new(
+            ExecutionBudget {
+                source_bytes: usize::MAX,
+                external_documents: usize::MAX,
+                recursion_depth: 32,
+                xpath_evaluations: usize::MAX,
+                template_applications: usize::MAX,
+                sort_comparisons: usize::MAX,
+                key_entries: usize::MAX,
+                result_nodes: usize::MAX,
+                serialized_bytes: usize::MAX,
+                messages: usize::MAX,
+                owned_bytes: per_node.saturating_mul(3),
+            },
+            0,
+        )
+        .expect("empty source fits");
+
+        assert!(matches!(
+            parse_external_document_metered("<root><a/><b/></root>", None, &mut meter),
+            Err(Error::Budget {
+                kind: BudgetKind::SourceNodes,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn semantic_projection_estimate_includes_structural_storage() {
+        let source = Document::parse("<root><a/><b/><c/></root>", None).expect("source parses");
+        let lexical_payload = "rootab c".len();
+
+        assert!(semantic_projection_size(&source) > lexical_payload);
     }
 
     #[test]

@@ -28,7 +28,6 @@ use crate::{
 pub type Parameters = HashMap<ExpandedName, Value>;
 
 struct SourceParameterRemap {
-    identity: u64,
     mapping: Option<HashMap<NodeId, NodeId>>,
     owned_bytes: usize,
 }
@@ -140,7 +139,9 @@ impl Stylesheet {
         source_processing: SourceProcessing,
     ) -> Result<TransformResult> {
         let source_bytes = source.source_bytes();
-        let source_identity = source.identity();
+        for value in parameters.values() {
+            validate_parameter_value(value, source)?;
+        }
         let mut meter = Meter::new(options.budget, source_bytes)?;
         let source_options = EvaluatorSourceOptions {
             processing: source_processing,
@@ -155,7 +156,6 @@ impl Stylesheet {
             &source_options,
         )?;
         let source_remap = SourceParameterRemap {
-            identity: source_identity,
             mapping: prepared.remap.take(),
             owned_bytes: std::mem::take(&mut prepared.remap_owned_bytes),
         };
@@ -523,11 +523,10 @@ impl<'a> Execution<'a> {
                 .map(|function| function.name.clone()),
         );
         let SourceParameterRemap {
-            identity,
             mapping,
             owned_bytes,
         } = source_remap;
-        let initialized = state.initialize_globals(parameters, identity, mapping.as_ref());
+        let initialized = state.initialize_globals(parameters, mapping.as_ref());
         drop(mapping);
         state.meter.release_owned_bytes(owned_bytes);
         initialized?;
@@ -721,7 +720,6 @@ impl<'a> Execution<'a> {
     fn initialize_globals(
         &mut self,
         parameters: &Parameters,
-        source_identity: u64,
         source_remap: Option<&HashMap<NodeId, NodeId>>,
     ) -> Result<()> {
         let mut effective: HashMap<_, &crate::compiler::GlobalVariable> = HashMap::new();
@@ -750,7 +748,6 @@ impl<'a> Execution<'a> {
             if global.is_parameter
                 && let Some(value) = parameters.get(name)
             {
-                validate_parameter_value(value, source_identity)?;
                 let owned_bytes = expanded_name_owned_bytes(name)
                     .saturating_add(parameter_value_owned_bytes(value, source_remap));
                 self.meter
@@ -3938,17 +3935,21 @@ fn remap_parameter_value(value: &Value, remap: &HashMap<NodeId, NodeId>) -> Valu
     )
 }
 
-fn validate_parameter_value(value: &Value, source_identity: u64) -> Result<()> {
+fn validate_parameter_value(value: &Value, source: &Document) -> Result<()> {
     let Value::NodeSet(nodes) = value else {
         return Ok(());
     };
-    if nodes
-        .iter()
-        .any(|node| node_reference_owner(node).document_identity() != source_identity)
-    {
-        return Err(Error::Dynamic(
-            "node-set parameter contains a reference from a foreign document".into(),
-        ));
+    for node in nodes {
+        if node_reference_owner(node).document_identity() != source.identity() {
+            return Err(Error::Dynamic(
+                "node-set parameter contains a reference from a foreign document".into(),
+            ));
+        }
+        if source.document_order_key(node).is_none() {
+            return Err(Error::Dynamic(
+                "node-set parameter contains a stale or out-of-range reference".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -5374,12 +5375,13 @@ mod tests {
 
     use super::{
         ApplyFrame, EvaluatedParameters, SortKey, SourceNode, TemplateTask,
-        append_localized_decimal, apply_whitespace_rules, value_string,
+        append_localized_decimal, apply_whitespace_rules, validate_parameter_value, value_string,
     };
     use crate::budget::Meter;
     use crate::compiler::Instruction;
     use crate::{
-        BudgetKind, CompileBudget, Compiler, Document, Error, ExecutionBudget, NoResolver, Value,
+        BudgetKind, CompileBudget, Compiler, Document, Error, ExecutionBudget, NoResolver,
+        NodeKind, NodeReference, Value,
     };
 
     fn meter(owned_bytes: usize) -> Meter {
@@ -5698,5 +5700,42 @@ mod tests {
         let borrowed = value_string(&retained, &source, &meter(0), 0)
             .expect("an existing string needs no projection allocation");
         assert!(matches!(borrowed, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn parameter_validation_rejects_stale_and_out_of_range_members() {
+        let mut source =
+            Document::parse("<root id=\"value\"><removed/></root>", None).expect("source parses");
+        let root = source
+            .nodes()
+            .find_map(|(id, node)| matches!(node.kind, NodeKind::Element { .. }).then_some(id))
+            .expect("root exists");
+        let removed = source
+            .nodes()
+            .find_map(|(id, node)| {
+                matches!(node.kind, NodeKind::Element { ref name, .. } if name.local == "removed")
+                    .then_some(id)
+            })
+            .expect("removed node exists");
+
+        assert!(
+            validate_parameter_value(
+                &Value::NodeSet(vec![NodeReference::Attribute {
+                    owner: root,
+                    index: usize::MAX,
+                }]),
+                &source,
+            )
+            .is_err()
+        );
+
+        let mut operation_meter = meter(usize::MAX);
+        source
+            .retain_nodes(&mut operation_meter, |_, id, _| id != removed)
+            .expect("source compacts");
+        assert!(
+            validate_parameter_value(&Value::NodeSet(vec![NodeReference::Node(removed)]), &source,)
+                .is_err()
+        );
     }
 }

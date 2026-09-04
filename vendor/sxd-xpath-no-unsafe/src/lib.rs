@@ -106,6 +106,9 @@
 #[cfg(not(any(feature = "no-unsafe", feature = "raw-pointer-backend")))]
 compile_error!("select either `no-unsafe` or `raw-pointer-backend`");
 
+// Cargo's all-feature verification enables both selectors. Safe precedence keeps that profile
+// free of raw pointers; selecting the legacy backend requires disabling default features.
+
 use snafu::{ResultExt, Snafu};
 use std::borrow::ToOwned;
 use std::string;

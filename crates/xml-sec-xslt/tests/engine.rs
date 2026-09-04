@@ -2962,6 +2962,36 @@ fn optimized_node_selections_consume_xpath_evaluation_budget() {
 }
 
 #[test]
+fn complex_match_patterns_consume_xpath_evaluation_budget() {
+    // The apply-templates selection and the generic predicate match are two XPath evaluations.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:apply-templates select="root/item"/></xsl:template><xsl:template match="item[position() = 1]">hit</xsl:template></xsl:stylesheet>"#,
+    );
+    let mut budget = execution_budget(4096);
+    budget.xpath_evaluations = 1;
+    let error = stylesheet
+        .execute(
+            &Document::parse("<root><item/></root>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect_err("generic match evaluation must consume budget");
+
+    assert!(matches!(
+        error,
+        Error::Budget {
+            kind: BudgetKind::XPathEvaluations,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn optimized_attribute_pattern_trims_grammar_whitespace() {
     // Whitespace around `=` belongs to the predicate grammar, not the attribute QName.
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:apply-templates select="root/item"/></xsl:template><xsl:template match="item[@id = 'wanted']">yes</xsl:template><xsl:template match="item">no</xsl:template></xsl:stylesheet>"#;
@@ -5739,7 +5769,9 @@ fn sequential_xincludes_release_temporary_projection_memory() {
     let source = Document::parse(&source_xml, Some("memory:source.xml")).expect("source parses");
     let mut budget = execution_budget(source_xml.len());
     budget.external_documents = 64;
-    budget.owned_bytes = 176 * 1024;
+    // Includes the conservative SXD arena/container estimate while remaining far below the
+    // aggregate footprint that retaining 64 parsed/projection temporaries would require.
+    budget.owned_bytes = 192 * 1024;
     compile(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#,
     )

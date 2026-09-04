@@ -36,6 +36,7 @@ repository = "https://github.com/structured-world/xml-sec"
 [features]
 default = ["no-unsafe"]
 no-unsafe = ["sxd-document-no-unsafe/no-unsafe"]
+# Select with `--no-default-features`; an all-feature build intentionally retains the safe backend.
 raw-pointer-backend = ["sxd-document-no-unsafe/raw-pointer-backend"]
 unstable = []
 

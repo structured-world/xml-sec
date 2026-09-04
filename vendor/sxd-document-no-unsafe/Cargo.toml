@@ -17,6 +17,8 @@ license = "MIT"
 default = ["no-unsafe"]
 __internal_expose_string_pool = []
 no-unsafe = []
+# Cargo features are additive. Disable defaults when selecting this backend; enabling both keeps
+# the safe backend so workspace `--all-features` remains a valid verification profile.
 raw-pointer-backend = []
 
 [lib]

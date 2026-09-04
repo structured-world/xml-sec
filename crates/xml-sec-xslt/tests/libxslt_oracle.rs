@@ -999,17 +999,52 @@ fn lexical_name_matches(lexical: &str, prefix: Option<&str>, local: &str) -> boo
 }
 
 fn opening_tag_declares_namespace(opening: &str, marker: &str) -> bool {
-    opening.match_indices(marker).any(|(offset, matched)| {
-        let preceded_by_space = opening[..offset]
-            .chars()
-            .next_back()
-            .is_some_and(|ch| matches!(ch, ' ' | '\t' | '\r' | '\n'));
-        let remainder = &opening[offset + matched.len()..];
-        preceded_by_space
-            && remainder
-                .trim_start_matches([' ', '\t', '\r', '\n'])
-                .starts_with('=')
-    })
+    let bytes = opening.as_bytes();
+    let mut cursor = bytes
+        .iter()
+        .position(|byte| *byte == b'<')
+        .map_or(bytes.len(), |start| start + 1);
+    while cursor < bytes.len() && !bytes[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+    while cursor < bytes.len() {
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor == bytes.len() || matches!(bytes[cursor], b'/' | b'>') {
+            break;
+        }
+        let name_start = cursor;
+        while cursor < bytes.len()
+            && !bytes[cursor].is_ascii_whitespace()
+            && !matches!(bytes[cursor], b'=' | b'/' | b'>')
+        {
+            cursor += 1;
+        }
+        let name = &opening[name_start..cursor];
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor == bytes.len() || bytes[cursor] != b'=' {
+            return false;
+        }
+        cursor += 1;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        let Some(&quote @ (b'\'' | b'"')) = bytes.get(cursor) else {
+            return false;
+        };
+        cursor += 1;
+        while cursor < bytes.len() && bytes[cursor] != quote {
+            cursor += 1;
+        }
+        if name == marker {
+            return true;
+        }
+        cursor = cursor.saturating_add(1);
+    }
+    false
 }
 
 fn embedded_stylesheet(xml: &str) -> xml_sec_xslt::Result<String> {
@@ -1057,6 +1092,11 @@ fn embedded_stylesheet_distinguishes_namespace_attribute_names() {
 
     assert!(stylesheet.contains("xmlns:a=\"urn:a\""));
     assert_eq!(stylesheet.matches("xmlns:axsl=").count(), 1);
+
+    // Text that resembles a declaration inside an attribute value is not namespace syntax.
+    let quoted = r#"<outer xmlns:a="urn:a"><xsl:stylesheet xmlns:xsl="http://www.w3.org/1999/XSL/Transform" data-note=" xmlns:a = fake" version="1.0"><xsl:template match="/"/></xsl:stylesheet></outer>"#;
+    let stylesheet = embedded_stylesheet(quoted).expect("embedded stylesheet is extracted");
+    assert!(stylesheet.contains("xmlns:a=\"urn:a\""));
 }
 
 fn decode_numeric_character_references_once(value: &str) -> xml_sec_xslt::Result<String> {

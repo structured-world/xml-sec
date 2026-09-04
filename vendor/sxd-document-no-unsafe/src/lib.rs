@@ -53,10 +53,34 @@
 #[cfg(not(any(feature = "no-unsafe", feature = "raw-pointer-backend")))]
 compile_error!("select either `no-unsafe` or `raw-pointer-backend`");
 
+// Cargo's all-feature verification enables both selectors. Safe precedence keeps that profile
+// free of raw pointers; selecting the legacy backend requires disabling default features.
+
 #[macro_use]
 extern crate peresil;
 
 use std::fmt;
+
+/// Node and edge counts used to reserve storage before projecting into this DOM.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StorageRequirements {
+    pub roots: usize,
+    pub elements: usize,
+    pub attributes: usize,
+    pub texts: usize,
+    pub comments: usize,
+    pub processing_instructions: usize,
+    pub child_edges: usize,
+    pub namespace_bindings: usize,
+    pub interned_strings: usize,
+    pub string_bytes: usize,
+}
+
+/// Conservative heap-storage estimate for one projected document.
+#[must_use]
+pub fn estimated_storage_bytes(requirements: StorageRequirements) -> usize {
+    raw::estimated_storage_bytes(requirements)
+}
 
 mod lazy_hash_map;
 mod str;
