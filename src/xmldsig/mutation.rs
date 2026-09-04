@@ -52,6 +52,34 @@ fn parse_mutation_xml_with_budget<'a>(
         .map_err(|error| map_mutation_parse_error(error, settings))
 }
 
+fn actionable_node_range(
+    node: crate::xml::dom::Node<'_, '_>,
+) -> Result<Range<usize>, XmlMutationError> {
+    if !node.has_actionable_range() {
+        return Err(XmlDocumentError::EntityExpandedMutationTarget.into());
+    }
+    Ok(node.range())
+}
+
+fn order_disjoint_ranges_for_splicing(
+    ranges: &mut [Range<usize>],
+    source_len: usize,
+) -> Result<(), XmlMutationError> {
+    ranges.sort_by_key(|range| range.start);
+    if ranges
+        .iter()
+        .any(|range| range.start > range.end || range.end > source_len)
+        || ranges.windows(2).any(|pair| pair[0].end > pair[1].start)
+    {
+        return Err(XmlDocumentError::InvalidReplacement(
+            "mutation target ranges must be valid and disjoint".into(),
+        )
+        .into());
+    }
+    ranges.reverse();
+    Ok(())
+}
+
 /// Errors produced by XMLDSig XML mutation helpers.
 #[derive(Debug, thiserror::Error)]
 pub enum XmlMutationError {
@@ -508,35 +536,34 @@ pub(super) fn merge_key_info_source_at_index_with_budget(
         // Writer-provided identity is authoritative within its own group.
         // Generated key material replaces stale material, while KeyName is
         // replaced only by a generated KeyName; extension elements remain.
-        let mut stale_ranges = key_info
-            .children()
-            .filter(|node| node.is_element())
-            .flat_map(|node| {
-                let replaces_key_material = !generated_key_material_sources.is_empty()
-                    && is_cryptographic_key_info_source(
-                        node.tag_name().namespace(),
-                        node.tag_name().name(),
-                    );
-                let replaces_key_name = generated_key_name
-                    && is_dsig_key_name(node.tag_name().namespace(), node.tag_name().name());
-                if !(replaces_key_material || replaces_key_name)
-                    || !has_cryptographic_identity_content(node)
+        let mut stale_ranges = Vec::new();
+        for node in key_info.children().filter(|node| node.is_element()) {
+            let replaces_key_material = !generated_key_material_sources.is_empty()
+                && is_cryptographic_key_info_source(
+                    node.tag_name().namespace(),
+                    node.tag_name().name(),
+                );
+            let replaces_key_name = generated_key_name
+                && is_dsig_key_name(node.tag_name().namespace(), node.tag_name().name());
+            if !(replaces_key_material || replaces_key_name)
+                || !has_cryptographic_identity_content(node)
+            {
+                continue;
+            }
+            if generated_x509_data
+                && is_dsig_x509_data(node.tag_name().namespace(), node.tag_name().name())
+            {
+                for child in node
+                    .children()
+                    .filter(|child| child.is_element() && is_x509_identity_child(*child))
                 {
-                    return Vec::new();
+                    stale_ranges.push(actionable_node_range(child)?);
                 }
-                if generated_x509_data
-                    && is_dsig_x509_data(node.tag_name().namespace(), node.tag_name().name())
-                {
-                    return node
-                        .children()
-                        .filter(|child| child.is_element() && is_x509_identity_child(*child))
-                        .map(|child| child.range())
-                        .collect();
-                }
-                vec![node.range()]
-            })
-            .collect::<Vec<_>>();
-        stale_ranges.sort_by_key(|range| std::cmp::Reverse(range.start));
+            } else {
+                stale_ranges.push(actionable_node_range(node)?);
+            }
+        }
+        order_disjoint_ranges_for_splicing(&mut stale_ranges, output.len())?;
         for range in stale_ranges {
             output.replace_range(range, "");
         }
@@ -1151,12 +1178,7 @@ fn fill_dsig_contents_matching(
     let ranges = document
         .descendants()
         .filter(|node| is_dsig_node(*node, local_name) && scope.includes(*node, signature))
-        .map(|node| {
-            if !node.has_actionable_range() {
-                return Err(XmlDocumentError::EntityExpandedMutationTarget.into());
-            }
-            Ok(node.range())
-        })
+        .map(|node| actionable_node_range(node))
         .collect::<Result<Vec<_>, XmlMutationError>>()?;
     if ranges.len() != contents.len() {
         return Err(XmlMutationError::ValueCountMismatch {
@@ -1502,6 +1524,27 @@ mod tests {
             ),
             "unexpected mutation error: {error:?}"
         );
+    }
+
+    #[test]
+    fn rejects_entity_expanded_key_info_replacement_ranges() {
+        // One entity reference can project several semantic children onto the same lexical range.
+        // KeyInfo replacement must reject those non-actionable targets before applying any splice.
+        let xml = format!(
+            r#"<!DOCTYPE ds:Signature [<!ENTITY identities '<ds:X509SubjectName>CN=old</ds:X509SubjectName><ds:X509SKI>b2xk</ds:X509SKI>'>]><ds:Signature xmlns:ds="{XMLDSIG_NS}"><ds:KeyInfo><ds:X509Data>&identities;</ds:X509Data></ds:KeyInfo></ds:Signature>"#
+        );
+        let generated = format!(
+            r#"<ds:X509Data xmlns:ds="{XMLDSIG_NS}"><ds:X509Certificate>bmV3</ds:X509Certificate></ds:X509Data>"#
+        );
+        let mut policy = crate::policy::SigningPolicy::default();
+        policy.xml.allow_internal_dtd = true;
+        let error =
+            merge_key_info_source_at_index_with_budget(&xml, &generated, 0, Some(&policy), None)
+                .expect_err("entity-expanded KeyInfo ranges are not independently actionable");
+        assert!(matches!(
+            error,
+            XmlMutationError::Document(XmlDocumentError::EntityExpandedMutationTarget)
+        ));
     }
 
     #[test]

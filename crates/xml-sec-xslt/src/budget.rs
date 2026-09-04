@@ -12,6 +12,9 @@ pub(crate) const NAMESPACE_SCOPE_BYTE_CEILING: usize = 16 * 1024 * 1024;
 // process-safety ceiling only tightens caller policy until module and instruction traversal are
 // represented entirely by explicit work stacks.
 pub(crate) const COMPILE_RECURSION_DEPTH_CEILING: usize = 256;
+// XInclude resolution currently retains one small native frame per nested acquired document.
+// This absolute process-safety ceiling only tightens the caller's execution policy.
+pub(crate) const XINCLUDE_RECURSION_DEPTH_CEILING: usize = 256;
 
 /// Independently metered XSLT resource dimensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -24,6 +27,7 @@ pub enum BudgetKind {
     ExternalDocuments,
     RecursionDepth,
     XPathEvaluations,
+    PatternEvaluations,
     TemplateApplications,
     SortComparisons,
     KeyEntries,
@@ -87,6 +91,7 @@ pub struct ExecutionBudget {
     pub external_documents: usize,
     pub recursion_depth: usize,
     pub xpath_evaluations: usize,
+    pub pattern_evaluations: usize,
     pub template_applications: usize,
     pub sort_comparisons: usize,
     pub key_entries: usize,
@@ -100,6 +105,7 @@ pub struct ExecutionBudget {
 pub(crate) struct Meter {
     limits: ExecutionBudget,
     xpath_evaluations: usize,
+    pattern_evaluations: usize,
     template_applications: usize,
     sort_comparisons: usize,
     key_entries: usize,
@@ -117,6 +123,7 @@ impl Meter {
         Ok(Self {
             limits,
             xpath_evaluations: 0,
+            pattern_evaluations: 0,
             template_applications: 0,
             sort_comparisons: 0,
             key_entries: 0,
@@ -136,6 +143,14 @@ impl Meter {
         )
     }
 
+    pub(crate) fn recursion_with_ceiling(&self, depth: usize, ceiling: usize) -> Result<()> {
+        ensure(
+            BudgetKind::RecursionDepth,
+            self.limits.recursion_depth.min(ceiling),
+            depth,
+        )
+    }
+
     pub(crate) fn charge(&mut self, kind: BudgetKind, amount: usize) -> Result<()> {
         let (used, limit) = match kind {
             BudgetKind::ExternalDocuments => {
@@ -144,6 +159,10 @@ impl Meter {
             BudgetKind::XPathEvaluations => {
                 (&mut self.xpath_evaluations, self.limits.xpath_evaluations)
             }
+            BudgetKind::PatternEvaluations => (
+                &mut self.pattern_evaluations,
+                self.limits.pattern_evaluations,
+            ),
             BudgetKind::TemplateApplications => (
                 &mut self.template_applications,
                 self.limits.template_applications,
@@ -189,6 +208,9 @@ impl Meter {
             }
             BudgetKind::XPathEvaluations => {
                 Ok((self.xpath_evaluations, self.limits.xpath_evaluations))
+            }
+            BudgetKind::PatternEvaluations => {
+                Ok((self.pattern_evaluations, self.limits.pattern_evaluations))
             }
             BudgetKind::TemplateApplications => Ok((
                 self.template_applications,
@@ -274,6 +296,7 @@ mod tests {
             external_documents: 0,
             recursion_depth: 1,
             xpath_evaluations: 0,
+            pattern_evaluations: 0,
             template_applications: 0,
             sort_comparisons: 0,
             key_entries: 0,

@@ -33,6 +33,7 @@ fn execution_budget(source_bytes: usize) -> ExecutionBudget {
         external_documents: 8,
         recursion_depth: 256,
         xpath_evaluations: 100_000,
+        pattern_evaluations: 100_000_000,
         template_applications: 100_000,
         sort_comparisons: 100_000,
         key_entries: 100_000,
@@ -69,6 +70,44 @@ fn minimum_execution_owned_bytes_with_parameters(
                     budget,
                     initial_mode: None,
                     initial_template: Some(ExpandedName::new(None::<String>, initial_template)),
+                },
+            )
+            .is_ok()
+    };
+    let mut rejected = 0;
+    let mut accepted = 1;
+    while !succeeds(accepted) {
+        rejected = accepted;
+        accepted *= 2;
+    }
+    while rejected + 1 < accepted {
+        let candidate = rejected + (accepted - rejected) / 2;
+        if succeeds(candidate) {
+            accepted = candidate;
+        } else {
+            rejected = candidate;
+        }
+    }
+    accepted
+}
+
+fn minimum_execution_owned_bytes_for_source(
+    stylesheet: &xml_sec_xslt::Stylesheet,
+    source: &Document,
+    source_bytes: usize,
+) -> usize {
+    let succeeds = |owned_bytes| {
+        let mut budget = execution_budget(source_bytes);
+        budget.owned_bytes = owned_bytes;
+        stylesheet
+            .execute(
+                source,
+                &Parameters::new(),
+                Arc::new(NoResolver),
+                ExecutionOptions {
+                    budget,
+                    initial_mode: None,
+                    initial_template: None,
                 },
             )
             .is_ok()
@@ -720,6 +759,7 @@ fn malformed_stylesheet_and_budget_exhaustion_are_typed() {
                     external_documents: 0,
                     recursion_depth: 1,
                     xpath_evaluations: 1,
+                    pattern_evaluations: 1,
                     template_applications: 1,
                     sort_comparisons: 1,
                     key_entries: 1,
@@ -6309,6 +6349,55 @@ fn xinclude_budget_is_checked_before_resolver_access() {
 }
 
 #[test]
+fn xinclude_native_recursion_has_an_absolute_safety_ceiling() {
+    // A caller budget may be intentionally permissive, but resolver-controlled nesting must not
+    // turn that policy choice into unbounded native stack growth.
+    let resolver = Arc::new(CountingResolver::default());
+    {
+        let mut resources = resolver.resources.lock().expect("resolver mutex");
+        for depth in 0..300 {
+            resources.insert(
+                format!("{depth}.xml"),
+                format!(
+                    r#"<node xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="{}.xml"/></node>"#,
+                    depth + 1
+                ),
+            );
+        }
+        resources.insert("300.xml".into(), "<leaf/>".into());
+    }
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="0.xml"/></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("source parses");
+    let mut budget = execution_budget(1024);
+    budget.external_documents = 512;
+    budget.recursion_depth = 512;
+    budget.owned_bytes = 64 << 20;
+    assert!(matches!(
+        compile(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#,
+        )
+        .execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::RecursionDepth,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn xinclude_clone_budget_is_checked_before_resolver_access() {
     // The principal XInclude projection and its remap workspace are retained allocations. A
     // budget that cannot hold them must fail before any include crosses the resolver boundary.
@@ -6833,6 +6922,66 @@ fn core_concat_maps_preallocation_rejection_to_the_owned_bytes_budget() {
         ),
         Err(Error::Budget {
             kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn xpath_extension_string_coercions_reserve_their_peak_memory() {
+    // Node-set coercion materializes the selected node's complete string-value. Functions that
+    // return only a boolean or an empty URI must still reserve that temporary before allocating it.
+    let payload = "a".repeat(64 * 1024);
+    let source_xml = format!("<source>{payload}</source>");
+    let source = Document::parse(&source_xml, None).expect("large source parses");
+    let baseline = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#,
+    );
+    let unparsed = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:if test="unparsed-entity-uri(/*) = ''"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let compatibility = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:lib="http://xmlsoft.org/XSLT/"><xsl:template match="/"><xsl:if test="lib:test(/*) = ''"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let capability = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:if test="function-available(/*)"/></xsl:template></xsl:stylesheet>"#,
+    );
+
+    let baseline_bytes =
+        minimum_execution_owned_bytes_for_source(&baseline, &source, source_xml.len());
+    for stylesheet in [&unparsed, &compatibility, &capability] {
+        assert!(
+            minimum_execution_owned_bytes_for_source(stylesheet, &source, source_xml.len())
+                >= baseline_bytes.saturating_add(payload.len()),
+            "string coercion must fit beside the retained source"
+        );
+    }
+}
+
+#[test]
+fn template_candidate_scans_are_bounded_as_pattern_work() {
+    // Selection scans are attacker-controlled work even when every cheap mode/name check rejects.
+    let decoys = (0..64)
+        .map(|index| format!(r#"<xsl:template match="decoy-{index}" mode="unused"/>"#))
+        .collect::<String>();
+    let stylesheet = compile(&format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">{decoys}<xsl:template match="/"/></xsl:stylesheet>"#
+    ));
+    let mut budget = execution_budget(1024);
+    budget.pattern_evaluations = 0;
+    assert!(matches!(
+        stylesheet.execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::PatternEvaluations,
             ..
         })
     ));

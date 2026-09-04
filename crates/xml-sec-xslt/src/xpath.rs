@@ -8,7 +8,9 @@ use sxd_document_no_unsafe::dom::{Document as SxdDocument, Element as SxdElement
 use sxd_document_no_unsafe::{Package, QName, StorageRequirements};
 use sxd_xpath_no_unsafe::{Context, Factory, Value as SxdValue, XPath, function, nodeset};
 
-use crate::budget::{Meter, ParseBudget, reserve_temporary_vec_slot};
+use crate::budget::{
+    Meter, ParseBudget, XINCLUDE_RECURSION_DEPTH_CEILING, reserve_temporary_vec_slot,
+};
 use crate::compiler::{DecimalFormat, Expression, NameTest, Pattern, normalize_xpath_for_sxd};
 use crate::expression::innermost_namespaced_call;
 use crate::lexical::{is_ncname, is_ncname_char, is_xml_whitespace};
@@ -3321,7 +3323,7 @@ fn expand_xinclude_document_in_chain(
     depth: usize,
     selected_root: Option<NodeId>,
 ) -> Result<ExpandedXIncludeDocument> {
-    meter.recursion(depth)?;
+    meter.recursion_with_ceiling(depth, XINCLUDE_RECURSION_DEPTH_CEILING)?;
     let (source_nodes, source_clone_bytes) = selected_root.map_or_else(
         || (source.node_count(), source.estimated_clone_bytes()),
         |root| source.estimated_subtree_projection(root),
@@ -5658,7 +5660,17 @@ impl function::Function for UnparsedEntityUriFunction {
                 .ok_or_else(|| function::Error::Other {
                     what: "unparsed-entity-uri() context has no logical document".into(),
                 })?;
-        let name = args[0].string();
+        reserve_sxd_string_arguments(
+            context,
+            &args,
+            &[0],
+            "unparsed-entity-uri() string allocation length overflow",
+        )?;
+        let name = args
+            .into_iter()
+            .next()
+            .expect("argument count was checked")
+            .into_string();
         Ok(SxdValue::String(
             self.documents
                 .borrow()
@@ -5748,7 +5760,7 @@ struct IdentityStringFunction;
 impl function::Function for IdentityStringFunction {
     fn evaluate<'c, 'd>(
         &self,
-        _: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
+        context: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
         args: Vec<SxdValue<'d>>,
     ) -> std::result::Result<SxdValue<'d>, function::Error> {
         if args.len() != 1 {
@@ -5756,7 +5768,18 @@ impl function::Function for IdentityStringFunction {
                 what: "libxslt test function requires one argument".into(),
             });
         }
-        Ok(SxdValue::String(args[0].string()))
+        reserve_sxd_string_arguments(
+            context,
+            &args,
+            &[0],
+            "libxslt test function string allocation length overflow",
+        )?;
+        Ok(SxdValue::String(
+            args.into_iter()
+                .next()
+                .expect("argument count was checked")
+                .into_string(),
+        ))
     }
 }
 
@@ -6689,10 +6712,10 @@ struct SystemProperty {
 impl function::Function for SystemProperty {
     fn evaluate<'c, 'd>(
         &self,
-        _: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
+        context: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
         args: Vec<SxdValue<'d>>,
     ) -> std::result::Result<SxdValue<'d>, function::Error> {
-        let name = one_qname_argument(args, &self.namespaces, "system-property")?;
+        let name = one_qname_argument(context, args, &self.namespaces, "system-property")?;
         if name.namespace.as_deref() == Some(crate::compiler::XSLT_NS) && name.local == "version" {
             // XSLT 1.0 section 12.4 defines xsl:version as the number 1.0.
             return Ok(SxdValue::Number(1.0));
@@ -6716,10 +6739,10 @@ struct ElementAvailable {
 impl function::Function for ElementAvailable {
     fn evaluate<'c, 'd>(
         &self,
-        _: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
+        context: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
         args: Vec<SxdValue<'d>>,
     ) -> std::result::Result<SxdValue<'d>, function::Error> {
-        let name = one_qname_argument(args, &self.namespaces, "element-available")?;
+        let name = one_qname_argument(context, args, &self.namespaces, "element-available")?;
         let available = (name.namespace.as_deref() == Some(crate::compiler::XSLT_NS)
             && matches!(
                 name.local.as_str(),
@@ -6922,10 +6945,10 @@ struct FunctionAvailable {
 impl function::Function for FunctionAvailable {
     fn evaluate<'c, 'd>(
         &self,
-        _: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
+        context: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
         args: Vec<SxdValue<'d>>,
     ) -> std::result::Result<SxdValue<'d>, function::Error> {
-        let name = one_qname_argument(args, &self.namespaces, "function-available")?;
+        let name = one_qname_argument(context, args, &self.namespaces, "function-available")?;
         let available = if name.namespace.is_some() {
             self.stylesheet_functions.contains(&name) || is_builtin_extension_function(&name)
         } else {
@@ -7010,6 +7033,7 @@ fn is_builtin_extension_function(name: &ExpandedName) -> bool {
 }
 
 fn one_qname_argument(
+    context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
     args: Vec<SxdValue<'_>>,
     namespaces: &[(String, String)],
     function: &str,
@@ -7019,7 +7043,25 @@ fn one_qname_argument(
             what: format!("{function}() requires one argument"),
         });
     }
-    resolve_lexical_name(&args[0].string(), namespaces)
+    reserve_sxd_string_arguments(
+        context,
+        &args,
+        &[0],
+        "capability-query QName coercion length overflow",
+    )?;
+    let lexical = args
+        .into_iter()
+        .next()
+        .expect("argument count was checked")
+        .into_string();
+    let retained_bytes = lexical.len().saturating_add(
+        lexical
+            .split_once(':')
+            .and_then(|(prefix, _)| namespaces.iter().find(|(candidate, _)| candidate == prefix))
+            .map_or(0, |(_, namespace)| namespace.len()),
+    );
+    context.reserve_string_allocation(retained_bytes)?;
+    resolve_lexical_name(&lexical, namespaces)
 }
 struct CurrentNode {
     path: NodePath,
@@ -7767,6 +7809,7 @@ mod tests {
                 external_documents: 1,
                 recursion_depth: 16,
                 xpath_evaluations: 1,
+                pattern_evaluations: 1,
                 template_applications: 1,
                 sort_comparisons: 1,
                 key_entries: 1,
@@ -8068,6 +8111,7 @@ mod tests {
                 external_documents: 0,
                 recursion_depth: 0,
                 xpath_evaluations: 0,
+                pattern_evaluations: 0,
                 template_applications: 0,
                 sort_comparisons: 0,
                 key_entries: 0,
@@ -8098,6 +8142,7 @@ mod tests {
                 external_documents: usize::MAX,
                 recursion_depth: 32,
                 xpath_evaluations: usize::MAX,
+                pattern_evaluations: usize::MAX,
                 template_applications: usize::MAX,
                 sort_comparisons: usize::MAX,
                 key_entries: usize::MAX,
@@ -8139,6 +8184,7 @@ mod tests {
                 external_documents: 0,
                 recursion_depth: 0,
                 xpath_evaluations: 0,
+                pattern_evaluations: 0,
                 template_applications: 0,
                 sort_comparisons: 0,
                 key_entries: 0,
@@ -8180,6 +8226,7 @@ mod tests {
                 external_documents: usize::MAX,
                 recursion_depth: usize::MAX,
                 xpath_evaluations: usize::MAX,
+                pattern_evaluations: usize::MAX,
                 template_applications: usize::MAX,
                 sort_comparisons: usize::MAX,
                 key_entries: usize::MAX,
@@ -8220,6 +8267,7 @@ mod tests {
             external_documents: usize::MAX,
             recursion_depth: usize::MAX,
             xpath_evaluations: usize::MAX,
+            pattern_evaluations: usize::MAX,
             template_applications: usize::MAX,
             sort_comparisons: usize::MAX,
             key_entries: usize::MAX,
@@ -8269,6 +8317,7 @@ mod tests {
             external_documents: usize::MAX,
             recursion_depth: usize::MAX,
             xpath_evaluations: usize::MAX,
+            pattern_evaluations: usize::MAX,
             template_applications: usize::MAX,
             sort_comparisons: usize::MAX,
             key_entries: usize::MAX,
@@ -8313,6 +8362,7 @@ mod tests {
             external_documents: usize::MAX,
             recursion_depth: usize::MAX,
             xpath_evaluations: usize::MAX,
+            pattern_evaluations: usize::MAX,
             template_applications: usize::MAX,
             sort_comparisons: usize::MAX,
             key_entries: usize::MAX,
@@ -8355,6 +8405,7 @@ mod tests {
             external_documents: usize::MAX,
             recursion_depth: usize::MAX,
             xpath_evaluations: usize::MAX,
+            pattern_evaluations: usize::MAX,
             template_applications: usize::MAX,
             sort_comparisons: usize::MAX,
             key_entries: usize::MAX,
@@ -8396,6 +8447,7 @@ mod tests {
             external_documents: usize::MAX,
             recursion_depth: usize::MAX,
             xpath_evaluations: usize::MAX,
+            pattern_evaluations: usize::MAX,
             template_applications: usize::MAX,
             sort_comparisons: usize::MAX,
             key_entries: usize::MAX,

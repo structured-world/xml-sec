@@ -3832,6 +3832,7 @@ mod parser_boundary_tests {
                 external_documents: usize::MAX,
                 recursion_depth: usize::MAX,
                 xpath_evaluations: usize::MAX,
+                pattern_evaluations: usize::MAX,
                 template_applications: usize::MAX,
                 sort_comparisons: usize::MAX,
                 key_entries: usize::MAX,

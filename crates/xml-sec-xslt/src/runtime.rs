@@ -745,6 +745,16 @@ impl<'a> Execution<'a> {
         node: &SourceNode,
         variables: &HashMap<ExpandedName, Value>,
     ) -> Result<bool> {
+        self.meter.charge(BudgetKind::PatternEvaluations, 1)?;
+        self.matches_pattern_precharged(pattern, node, variables)
+    }
+
+    fn matches_pattern_precharged(
+        &mut self,
+        pattern: &crate::compiler::Pattern,
+        node: &SourceNode,
+        variables: &HashMap<ExpandedName, Value>,
+    ) -> Result<bool> {
         if self.evaluator.pattern_terminal_rejects(pattern, node)? {
             return Ok(false);
         }
@@ -1301,6 +1311,9 @@ impl<'a> Execution<'a> {
         let variables = HashMap::new();
         let mut selected = None::<&Template>;
         for template in self.stylesheet.templates.iter() {
+            // Template selection is pattern work even when a cheap mode or precedence gate rejects
+            // the candidate before its pattern needs evaluation.
+            self.meter.charge(BudgetKind::PatternEvaluations, 1)?;
             if template.pattern.is_none()
                 || template.mode != mode
                 || frame
@@ -1310,7 +1323,7 @@ impl<'a> Execution<'a> {
                 continue;
             }
             let pattern = template.pattern.as_ref().expect("pattern was checked");
-            if self.matches_pattern(pattern, &node, &variables)?
+            if self.matches_pattern_precharged(pattern, &node, &variables)?
                 && selected.is_none_or(|current| {
                     template.precedence > current.precedence
                         || (template.precedence == current.precedence
@@ -5438,6 +5451,7 @@ mod tests {
                 external_documents: usize::MAX,
                 recursion_depth: usize::MAX,
                 xpath_evaluations: usize::MAX,
+                pattern_evaluations: usize::MAX,
                 template_applications: usize::MAX,
                 sort_comparisons: usize::MAX,
                 key_entries: usize::MAX,
@@ -5461,6 +5475,7 @@ mod tests {
                 external_documents: usize::MAX,
                 recursion_depth: usize::MAX,
                 xpath_evaluations: usize::MAX,
+                pattern_evaluations: usize::MAX,
                 template_applications: usize::MAX,
                 sort_comparisons: usize::MAX,
                 key_entries: usize::MAX,
@@ -5594,6 +5609,7 @@ mod tests {
             external_documents: usize::MAX,
             recursion_depth: usize::MAX,
             xpath_evaluations: usize::MAX,
+            pattern_evaluations: usize::MAX,
             template_applications: usize::MAX,
             sort_comparisons: usize::MAX,
             key_entries: usize::MAX,
