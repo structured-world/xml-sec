@@ -905,6 +905,23 @@ mod test {
     }
 
     #[test]
+    fn displaced_root_element_is_detached() {
+        // Replacing the document element must update both sides of the parent/child relation.
+        let package = Package::new();
+        let doc = package.as_document();
+        let root = doc.root();
+        let displaced = doc.create_element("displaced");
+        let replacement = doc.create_element("replacement");
+
+        root.append_child(displaced);
+        root.append_child(replacement);
+
+        assert!(displaced.parent().is_none());
+        assert!(displaced.preceding_siblings().is_empty());
+        assert!(displaced.following_siblings().is_empty());
+    }
+
+    #[test]
     fn root_can_have_comment_children() {
         let package = Package::new();
         let doc = package.as_document();

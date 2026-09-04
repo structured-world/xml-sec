@@ -37,9 +37,11 @@ fallback; unsupported labels and malformed byte sequences are rejected. XML,
 HTML, and text output supports registered `encoding_rs` labels, including UTF-8,
 UTF-16LE/BE, and ISO-8859-1, with the method-specific escaping or rejection
 required for unrepresentable characters.
-`Document::parse` accepts already-decoded Rust text; `Document::parse_bytes` and
-`Compiler::compile_bytes` apply the same strict XML byte-decoding boundary used by
-resolver resources. The production semantic tree always uses one iterative
+`Document::parse` accepts trusted, already-decoded Rust text. Untrusted callers use
+`Document::parse_with_budget` or `Document::parse_bytes_with_budget` to bound decoded
+bytes, semantic nodes, and element depth before arena growth; `Compiler::compile_bytes`
+applies the same strict XML byte-decoding boundary used by resolver resources. The
+production semantic tree always uses one iterative
 lexical-event path, so attacker-controlled document depth cannot select a different
 parser implementation. Stylesheet compilation uses a `roxmltree` frontend and
 immediately projects it into the engine's owned compiler IR; source documents and

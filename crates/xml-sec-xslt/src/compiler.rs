@@ -315,7 +315,7 @@ impl<R: Resolver> Compiler<R> {
                 }
                 (Arc::clone(previous), false)
             } else {
-                state.charge_stylesheet(resolved.bytes.len())?;
+                state.check_stylesheet(resolved.bytes.len())?;
                 state.charge_owned(new_resolved_identity_retained_bytes(&resolved))?;
                 (Arc::new(resolved), true)
             };
@@ -1691,6 +1691,13 @@ impl CompileState {
             self.stylesheet_bytes,
         )
     }
+    fn check_stylesheet(&self, amount: usize) -> Result<()> {
+        ensure(
+            BudgetKind::StylesheetBytes,
+            self.budget.stylesheet_bytes,
+            self.stylesheet_bytes.saturating_add(amount),
+        )
+    }
     fn finish(mut self) -> Result<Stylesheet> {
         self.templates
             .sort_by_key(|template| (template.precedence, template.order));
@@ -2171,13 +2178,27 @@ fn resource_source(resource: &ResolvedResource, state: &mut CompileState) -> Res
     }
     let cache_entry_bytes = module_source_cache_entry_bytes(&resource.identity);
     state.charge_owned(cache_entry_bytes)?;
-    let maximum = state.budget.owned_bytes.saturating_sub(state.owned_bytes);
+    let remaining_stylesheet = state
+        .budget
+        .stylesheet_bytes
+        .saturating_sub(state.stylesheet_bytes);
+    let remaining_owned = state.remaining_owned_bytes();
+    let maximum = remaining_stylesheet.min(remaining_owned);
     let decoded =
         match decode_resource(&resource.bytes, resource.encoding.as_deref(), true, maximum) {
             Ok(decoded) => decoded,
             Err(error) => {
                 state.release_owned(cache_entry_bytes);
                 return Err(match error {
+                    xml_sec_xml_input::Error::DecodedLimit { actual, .. }
+                        if remaining_stylesheet <= remaining_owned =>
+                    {
+                        Error::Budget {
+                            kind: BudgetKind::StylesheetBytes,
+                            limit: state.budget.stylesheet_bytes,
+                            actual: state.stylesheet_bytes.saturating_add(actual),
+                        }
+                    }
                     xml_sec_xml_input::Error::DecodedLimit { actual, .. } => Error::Budget {
                         kind: BudgetKind::OwnedBytes,
                         limit: state.budget.owned_bytes,
@@ -2187,6 +2208,7 @@ fn resource_source(resource: &ResolvedResource, state: &mut CompileState) -> Res
                 });
             }
         };
+    state.charge_stylesheet(decoded.len())?;
     state.charge_owned(decoded.capacity())?;
     let source = Arc::new(decoded);
     state
@@ -3802,6 +3824,7 @@ mod tests {
 
     struct RepeatedIncludeResolver {
         module: Vec<u8>,
+        encoding: Option<String>,
     }
 
     impl Resolver for RepeatedIncludeResolver {
@@ -3818,7 +3841,7 @@ mod tests {
                 identity: ResourceIdentity("repeated-module".into()),
                 bytes: self.module.clone(),
                 media_type: Some("application/xslt+xml".into()),
-                encoding: Some("UTF-8".into()),
+                encoding: self.encoding.clone(),
             })
         }
     }
@@ -3871,6 +3894,7 @@ mod tests {
         let compiler = Compiler::new(
             Arc::new(RepeatedIncludeResolver {
                 module: module.into_bytes(),
+                encoding: Some("UTF-8".into()),
             }),
             CompileBudget::new(1 << 20, 64, 16, 768 * 1_024),
         );
@@ -3881,6 +3905,35 @@ mod tests {
                 kind: BudgetKind::OwnedBytes,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn imported_modules_apply_stylesheet_budget_after_decoding() {
+        // A single-byte source encoding can expand in UTF-8. The compiled stylesheet budget
+        // measures the decoded XML consumed by the parser, not only resolver wire bytes.
+        let prefix = br#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><out>"#;
+        let suffix = b"</out></xsl:template></xsl:stylesheet>";
+        let mut module = Vec::from(prefix.as_slice());
+        module.extend(std::iter::repeat_n(0xe9, 64));
+        module.extend_from_slice(suffix);
+        let principal = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:include href="module.xsl"/></xsl:stylesheet>"#;
+        let raw_total = principal.len() + module.len();
+        let compiler = Compiler::new(
+            Arc::new(RepeatedIncludeResolver {
+                module,
+                encoding: Some("windows-1252".into()),
+            }),
+            CompileBudget::new(raw_total, 1, 4, usize::MAX),
+        );
+
+        assert!(matches!(
+            compiler.compile(principal, Some("memory:main.xsl")),
+            Err(Error::Budget {
+                kind: BudgetKind::StylesheetBytes,
+                limit,
+                actual,
+            }) if limit == raw_total && actual > limit
         ));
     }
 

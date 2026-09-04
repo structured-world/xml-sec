@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# The pinned object ID must resolve directly, never through checkout-local replacement refs.
+export GIT_NO_REPLACE_OBJECTS=1
+
 readonly SOURCE_DIR="${LIBXSLT_SOURCE_DIR:-}"
 readonly PINNED_COMMIT="35323d6a15f6e63c9919ddbc0abe64c90a0dd88a"
 readonly DESTINATION="crates/xml-sec-xslt/tests/fixtures/libxslt-1.1.45"
@@ -40,7 +43,7 @@ fi
 stage="$(mktemp -d)"
 donor_stage="$(mktemp -d)"
 trap 'rm -rf "$stage" "$donor_stage"' EXIT
-mkdir -p "$stage/upstream"
+mkdir -p "$stage/upstream/tests"
 
 # Archive the pinned commit rather than copying the donor worktree. Autotools
 # and local builds leave ignored Makefile.in and generated data behind even in

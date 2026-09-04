@@ -1934,6 +1934,20 @@ fn exslt_durations_allow_fractional_syntax_only_for_seconds() {
 }
 
 #[test]
+fn exslt_duration_arithmetic_rejects_unrenderable_results() {
+    // All duration-producing operations must fail closed instead of exposing Rust's saturating
+    // float-to-integer cast as a plausible duration value.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:date="http://exslt.org/dates-and-times"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="date:add-duration('PT1000000000000000000000000000000S', 'PT1S')"/><xsl:text>|</xsl:text><xsl:value-of select="date:sum(/root/duration)"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(
+            stylesheet,
+            "<root><duration>PT1000000000000000000000000000000S</duration></root>"
+        ),
+        "|"
+    );
+}
+
+#[test]
 fn exslt_current_date_functions_share_the_execution_clock_and_policy() {
     // Core EXSLT current-date functions must be discoverable and use the same controlled clock
     // as zero-argument component functions; deterministic execution rejects ambient time access.
@@ -5545,6 +5559,77 @@ fn imported_stylesheets_charge_retained_resolver_metadata() {
         ),
         "expected owned-memory rejection, got {error:?}"
     );
+}
+
+#[test]
+fn runtime_resource_caches_charge_resolver_metadata_before_retaining_it() {
+    // Both document() and XInclude retain resolver provenance for stale-resource detection. Tiny
+    // XML payloads with oversized metadata must fail the owned-memory gate before cache insertion.
+    struct MetadataResolver;
+
+    impl Resolver for MetadataResolver {
+        fn resolve(
+            &self,
+            _uri: &str,
+            _base_uri: Option<&str>,
+            _purpose: ResolvePurpose,
+        ) -> xml_sec_xslt::Result<ResolvedResource> {
+            let metadata = "m".repeat(2 << 20);
+            Ok(ResolvedResource {
+                canonical_uri: "memory:document.xml".into(),
+                identity: ResourceIdentity(metadata.clone()),
+                bytes: b"<document/>".to_vec(),
+                media_type: Some(metadata),
+                encoding: Some("UTF-8".into()),
+            })
+        }
+    }
+
+    let mut budget = execution_budget(1 << 20);
+    budget.owned_bytes = 1 << 20;
+    let options = ExecutionOptions {
+        budget,
+        initial_mode: None,
+        initial_template: None,
+    };
+    let document_stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:copy-of select="document('document.xml')"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse("<source/>", Some("memory:source.xml")).expect("source parses");
+    assert!(matches!(
+        document_stylesheet.execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(MetadataResolver),
+            options.clone(),
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+
+    let include_stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:copy-of select="."/></xsl:template></xsl:stylesheet>"#,
+    );
+    let include_source = Document::parse(
+        r#"<source xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="document.xml"/></source>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("XInclude source parses");
+    assert!(matches!(
+        include_stylesheet.execute_with_source_processing(
+            &include_source,
+            &Parameters::new(),
+            Arc::new(MetadataResolver),
+            options,
+            SourceProcessing::XInclude,
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
 }
 
 #[test]

@@ -116,6 +116,10 @@ impl ChildOfRoot {
         match *self {
             ChildOfRoot::Element(n) => {
                 let parent_r = unsafe { &mut *parent };
+                let displaced = parent_r.children.iter().copied().find(Self::is_element);
+                if let Some(ChildOfRoot::Element(displaced)) = displaced {
+                    unsafe { &mut *displaced }.parent = None;
+                }
                 let n = unsafe { &mut *n };
                 parent_r.children.retain(|c| !c.is_element());
                 replace_parent(*self, ParentOfChild::Root(parent), &mut n.parent);

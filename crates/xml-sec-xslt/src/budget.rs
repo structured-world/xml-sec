@@ -15,6 +15,7 @@ pub(crate) const NAMESPACE_SCOPE_BYTE_CEILING: usize = 16 * 1024 * 1024;
 pub enum BudgetKind {
     StylesheetBytes,
     SourceBytes,
+    SourceNodes,
     ImportedModules,
     ExternalDocuments,
     RecursionDepth,
@@ -26,6 +27,27 @@ pub enum BudgetKind {
     SerializedBytes,
     Messages,
     OwnedBytes,
+}
+
+/// Explicit limits applied while parsing one caller-supplied XML document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseBudget {
+    pub source_bytes: usize,
+    pub source_nodes: usize,
+    pub recursion_depth: usize,
+}
+
+impl ParseBudget {
+    #[must_use]
+    pub const fn new(source_bytes: usize, source_nodes: usize, recursion_depth: usize) -> Self {
+        Self {
+            source_bytes,
+            source_nodes,
+            recursion_depth,
+        }
+    }
+
+    pub(crate) const UNBOUNDED: Self = Self::new(usize::MAX, usize::MAX, usize::MAX);
 }
 
 /// Explicit immutable limits used while compiling a stylesheet graph.

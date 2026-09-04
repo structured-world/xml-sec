@@ -6,9 +6,9 @@ use xml_sec_xml_input::lexical::{Event, Scanner};
 
 use crate::budget::{
     ENTITY_EXPANSION_BYTE_CEILING, ENTITY_EXPANSION_DEPTH_CEILING, ENTITY_REFERENCE_CEILING, Meter,
-    NAMESPACE_SCOPE_BYTE_CEILING, reserve_temporary_vec_slot,
+    NAMESPACE_SCOPE_BYTE_CEILING, ensure, reserve_temporary_vec_slot,
 };
-use crate::{BudgetKind, Error, Result};
+use crate::{BudgetKind, Error, ParseBudget, Result};
 
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
@@ -165,16 +165,49 @@ impl PartialEq for Document {
 impl Eq for Document {}
 
 impl Document {
-    /// Parse caller-supplied XML into the engine semantic model.
+    /// Parse trusted, caller-decoded XML without a caller-selected resource budget.
+    ///
+    /// Use [`Self::parse_with_budget`] for untrusted input.
     pub fn parse(xml: &str, base_uri: Option<&str>) -> Result<Self> {
         Self::parse_iterative(xml, base_uri)
     }
 
-    /// Decode and parse caller-supplied XML bytes into the semantic model.
+    /// Parse caller-decoded XML while bounding input bytes, nodes, and element depth.
+    pub fn parse_with_budget(
+        xml: &str,
+        base_uri: Option<&str>,
+        budget: ParseBudget,
+    ) -> Result<Self> {
+        ensure(BudgetKind::SourceBytes, budget.source_bytes, xml.len())?;
+        Self::parse_iterative_bounded(xml, base_uri, budget)
+    }
+
+    /// Decode and parse trusted XML bytes without a caller-selected resource budget.
+    ///
+    /// Use [`Self::parse_bytes_with_budget`] for untrusted input.
     pub fn parse_bytes(bytes: &[u8], base_uri: Option<&str>) -> Result<Self> {
         let xml =
             xml_sec_xml_input::decode_xml(bytes, None).map_err(crate::error::decoded_xml_error)?;
         Self::parse_iterative(&xml, base_uri)
+    }
+
+    /// Decode and parse XML bytes while bounding decoded bytes, nodes, and element depth.
+    pub fn parse_bytes_with_budget(
+        bytes: &[u8],
+        base_uri: Option<&str>,
+        budget: ParseBudget,
+    ) -> Result<Self> {
+        let xml = xml_sec_xml_input::decode_xml_bounded(bytes, None, budget.source_bytes).map_err(
+            |error| match error {
+                xml_sec_xml_input::Error::DecodedLimit { actual, .. } => Error::Budget {
+                    kind: BudgetKind::SourceBytes,
+                    limit: budget.source_bytes,
+                    actual,
+                },
+                error => Error::Xml(error.to_string()),
+            },
+        )?;
+        Self::parse_iterative_bounded(&xml, base_uri, budget)
     }
 
     // Account for heap storage materialized by Clone before duplicating the source document.
@@ -376,6 +409,14 @@ impl Document {
     }
 
     fn parse_iterative(xml: &str, base_uri: Option<&str>) -> Result<Self> {
+        Self::parse_iterative_bounded(xml, base_uri, ParseBudget::UNBOUNDED)
+    }
+
+    fn parse_iterative_bounded(
+        xml: &str,
+        base_uri: Option<&str>,
+        budget: ParseBudget,
+    ) -> Result<Self> {
         #[derive(Clone, Copy, PartialEq, Eq)]
         enum DocumentPhase {
             Start,
@@ -384,9 +425,13 @@ impl Document {
             Epilog,
         }
 
+        ensure(BudgetKind::SourceBytes, budget.source_bytes, xml.len())?;
+        ensure(BudgetKind::SourceNodes, budget.source_nodes, 1)?;
         let mut document = Self::empty(base_uri.map(str::to_owned));
         document.source_bytes = xml.len();
         let mut meter = StreamParseMeter {
+            budget,
+            nodes: 1,
             entity_references: 0,
             entity_expansion: EntityExpansionMeter::new(ENTITY_EXPANSION_BYTE_CEILING),
             namespace_scope_bytes: 0,
@@ -489,7 +534,7 @@ impl Document {
                         ));
                     }
                     if elements.len() > 1 && !value.is_empty() {
-                        let id = push_parsed_text(&mut document, &elements, value);
+                        let id = push_parsed_text(&mut document, &elements, value, &mut meter)?;
                         document.nodes[id.0].source_line.get_or_insert(source_line);
                     } else if phase == DocumentPhase::Start {
                         phase = DocumentPhase::Prolog;
@@ -505,7 +550,8 @@ impl Document {
                         &mut document,
                         &elements,
                         normalize_xml_line_endings(text),
-                    );
+                        &mut meter,
+                    )?;
                     document.nodes[id.0].source_line.get_or_insert(source_line);
                 }
                 Event::Comment { text, .. } => {
@@ -518,6 +564,7 @@ impl Document {
                         .node;
                     let inherited_base =
                         document.node(parent).and_then(|node| node.base_uri.clone());
+                    meter.reserve_node()?;
                     let id = document.push(
                         parent,
                         NodeKind::Comment(normalize_xml_line_endings(text)),
@@ -537,6 +584,7 @@ impl Document {
                         .node;
                     let inherited_base =
                         document.node(parent).and_then(|node| node.base_uri.clone());
+                    meter.reserve_node()?;
                     let id = document.push(
                         parent,
                         NodeKind::ProcessingInstruction {
@@ -574,7 +622,7 @@ impl Document {
                             )));
                         }
                     };
-                    let id = push_parsed_text(&mut document, &elements, value);
+                    let id = push_parsed_text(&mut document, &elements, value, &mut meter)?;
                     document.nodes[id.0].source_line.get_or_insert(source_line);
                 }
                 Event::Declaration { .. } => {
@@ -1583,9 +1631,28 @@ struct StreamElementFrame {
 }
 
 struct StreamParseMeter {
+    budget: ParseBudget,
+    nodes: usize,
     entity_references: usize,
     entity_expansion: EntityExpansionMeter,
     namespace_scope_bytes: usize,
+}
+
+impl StreamParseMeter {
+    fn reserve_node(&mut self) -> Result<()> {
+        let actual = self.nodes.saturating_add(1);
+        ensure(BudgetKind::SourceNodes, self.budget.source_nodes, actual)?;
+        self.nodes = actual;
+        Ok(())
+    }
+
+    fn element_depth(&self, depth: usize) -> Result<()> {
+        ensure(
+            BudgetKind::RecursionDepth,
+            self.budget.recursion_depth,
+            depth,
+        )
+    }
 }
 
 fn push_stream_element(
@@ -1596,6 +1663,8 @@ fn push_stream_element(
     declarations: &InternalEntityDeclarations,
     meter: &mut StreamParseMeter,
 ) -> Result<NodeId> {
+    meter.element_depth(elements.len())?;
+    meter.reserve_node()?;
     let parent = elements
         .last()
         .map(|frame| frame.node)
@@ -1860,7 +1929,8 @@ fn push_parsed_text(
     document: &mut Document,
     elements: &[StreamElementFrame],
     value: String,
-) -> NodeId {
+    meter: &mut StreamParseMeter,
+) -> Result<NodeId> {
     let parent = elements
         .last()
         .expect("document frame remains present")
@@ -1875,17 +1945,18 @@ fn push_parsed_text(
         } = &mut document.nodes[last_child.0].kind
     {
         existing.push_str(&value);
-        return last_child;
+        return Ok(last_child);
     }
+    meter.reserve_node()?;
     let inherited_base = document.node(parent).and_then(|node| node.base_uri.clone());
-    document.push(
+    Ok(document.push(
         parent,
         NodeKind::Text {
             value,
             disable_output_escaping: false,
         },
         inherited_base,
-    )
+    ))
 }
 
 fn split_lexical_name(name: &str) -> Result<(Option<String>, String)> {
@@ -3450,7 +3521,7 @@ mod parser_boundary_tests {
         normalize_predefined_entity_declaration,
     };
     use crate::budget::{ENTITY_EXPANSION_BYTE_CEILING, Meter};
-    use crate::{BudgetKind, ExecutionBudget};
+    use crate::{BudgetKind, ExecutionBudget, ParseBudget};
 
     fn nested_xml(depth: usize, leaf: &str) -> String {
         format!("{}{}{}", "<n>".repeat(depth), leaf, "</n>".repeat(depth))
@@ -4358,5 +4429,75 @@ mod parser_boundary_tests {
         );
 
         assert_eq!(document.string_value(root), "tail");
+    }
+
+    #[test]
+    fn bounded_parse_rejects_source_before_building_the_tree() {
+        // A caller-selected source limit is enforced before entity expansion or arena growth.
+        let error = Document::parse_with_budget(
+            "<root/>",
+            None,
+            ParseBudget::new(6, usize::MAX, usize::MAX),
+        )
+        .expect_err("oversized source must be rejected");
+        assert!(matches!(
+            error,
+            Error::Budget {
+                kind: BudgetKind::SourceBytes,
+                limit: 6,
+                actual: 7,
+            }
+        ));
+    }
+
+    #[test]
+    fn bounded_parse_rejects_node_and_depth_growth() {
+        // The synthetic root counts as one node; each XML element must reserve its slot before
+        // materializing attributes, namespace state, or arena storage.
+        assert!(matches!(
+            Document::parse_with_budget(
+                "<root><child/></root>",
+                None,
+                ParseBudget::new(usize::MAX, 2, usize::MAX),
+            ),
+            Err(Error::Budget {
+                kind: BudgetKind::SourceNodes,
+                limit: 2,
+                actual: 3,
+            })
+        ));
+        assert!(matches!(
+            Document::parse_with_budget(
+                "<root><child/></root>",
+                None,
+                ParseBudget::new(usize::MAX, usize::MAX, 1),
+            ),
+            Err(Error::Budget {
+                kind: BudgetKind::RecursionDepth,
+                limit: 1,
+                actual: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn bounded_byte_parse_limits_decoded_output() {
+        // UTF-16 input can expand after decoding; the decoded source budget remains authoritative.
+        let mut bytes = vec![0xff, 0xfe];
+        for unit in "<r>é</r>".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert!(matches!(
+            Document::parse_bytes_with_budget(
+                &bytes,
+                None,
+                ParseBudget::new(8, usize::MAX, usize::MAX),
+            ),
+            Err(Error::Budget {
+                kind: BudgetKind::SourceBytes,
+                limit: 8,
+                actual,
+            }) if actual > 8
+        ));
     }
 }

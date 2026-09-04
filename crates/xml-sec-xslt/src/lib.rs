@@ -7,7 +7,9 @@
 //! The crate performs no implicit filesystem, network, or environment access.
 //! Principal and resolver-provided XML bytes honor declarations, BOMs, UTF-16
 //! initial patterns, and explicit encoding metadata through [`Document::parse_bytes`]
-//! and [`Compiler::compile_bytes`]. [`Document::parse`] accepts caller-decoded Rust text.
+//! and [`Compiler::compile_bytes`]. Untrusted source documents use
+//! [`Document::parse_with_budget`] or [`Document::parse_bytes_with_budget`] so decoded bytes,
+//! arena nodes, and element depth are rejected before their corresponding allocations.
 //!
 //! ```
 //! use std::sync::Arc;
@@ -43,7 +45,7 @@ mod serializer;
 mod value;
 mod xpath;
 
-pub use budget::{BudgetKind, CompileBudget, ExecutionBudget};
+pub use budget::{BudgetKind, CompileBudget, ExecutionBudget, ParseBudget};
 pub use compiler::{Compiler, Stylesheet};
 pub use environment::{Clock, ExecutionEnvironment, ExtensionPolicy, FixedClock, SystemClock};
 pub use error::{Error, ErrorKind, Result};

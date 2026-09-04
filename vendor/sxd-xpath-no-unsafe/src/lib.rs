@@ -103,6 +103,9 @@
     clippy::clone_on_copy // Node, Namespace, Evaluation are Copy only in default build
 )]
 
+#[cfg(not(any(feature = "no-unsafe", feature = "raw-pointer-backend")))]
+compile_error!("select either `no-unsafe` or `raw-pointer-backend`");
+
 use snafu::{ResultExt, Snafu};
 use std::borrow::ToOwned;
 use std::string;

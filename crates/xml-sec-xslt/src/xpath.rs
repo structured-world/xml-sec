@@ -2039,11 +2039,16 @@ impl Evaluator {
                     }
                     meter.release_owned_bytes(xml.len().saturating_mul(2));
                     if identity_is_new {
+                        charge_resource_identity_cache_entry(&resource, meter)?;
                         self.resource_identities
                             .insert(resource.identity.clone(), resource.clone());
                     } else {
                         meter.release_owned_bytes(resource.bytes.len());
                     }
+                    meter.charge(
+                        BudgetKind::OwnedBytes,
+                        resource_document_cache_entry_owned_bytes(&resource.identity),
+                    )?;
                     self.resource_documents
                         .insert(resource.identity, root.clone());
                     self.cache_document(resource_request.clone(), vec![root.clone()], meter)?;
@@ -3509,6 +3514,8 @@ fn resolve_xinclude(
         }
         let canonical_uri = resource.canonical_uri.clone();
         if identity_is_new {
+            charge_resource_identity_cache_entry(&resource, meter)
+                .map_err(XIncludeFailure::Fatal)?;
             identities.insert(resource.identity.clone(), resource);
         } else {
             meter.release_owned_bytes(resource.bytes.len());
@@ -3524,6 +3531,7 @@ fn resolve_xinclude(
         Document::parse(&xml, Some(&resource.canonical_uri)).map_err(XIncludeFailure::Fatal)?;
     let resource_identity = resource.identity.clone();
     if identity_is_new {
+        charge_resource_identity_cache_entry(&resource, meter).map_err(XIncludeFailure::Fatal)?;
         identities.insert(resource_identity.clone(), resource);
     } else {
         meter.release_owned_bytes(resource.bytes.len());
@@ -3629,6 +3637,35 @@ fn decode_resource_for_xml_parse(
     meter: &mut Meter,
 ) -> Result<String> {
     decode_resource_metered(bytes, encoding, meter, true)
+}
+
+fn hash_entry_storage<K, V>() -> usize {
+    std::mem::size_of::<(K, V)>().saturating_mul(2)
+}
+
+fn resource_identity_cache_entry_owned_bytes(resource: &ResolvedResource) -> usize {
+    hash_entry_storage::<ResourceIdentity, ResolvedResource>()
+        .saturating_add(resource.identity.0.len())
+        .saturating_add(resource.canonical_uri.capacity())
+        .saturating_add(resource.identity.0.capacity())
+        .saturating_add(resource.bytes.capacity())
+        .saturating_add(resource.media_type.as_ref().map_or(0, String::capacity))
+        .saturating_add(resource.encoding.as_ref().map_or(0, String::capacity))
+}
+
+fn charge_resource_identity_cache_entry(
+    resource: &ResolvedResource,
+    meter: &mut Meter,
+) -> Result<()> {
+    // The decoder already reserves the resolver byte length. Charge the retained container,
+    // spare byte capacity, key clone, URI, identity, and metadata before cache insertion.
+    let additional =
+        resource_identity_cache_entry_owned_bytes(resource).saturating_sub(resource.bytes.len());
+    meter.charge(BudgetKind::OwnedBytes, additional)
+}
+
+fn resource_document_cache_entry_owned_bytes(identity: &ResourceIdentity) -> usize {
+    hash_entry_storage::<ResourceIdentity, NodeReference>().saturating_add(identity.0.len())
 }
 
 fn decode_resource_metered(
@@ -7410,6 +7447,56 @@ mod tests {
             exact.usage(BudgetKind::OwnedBytes).expect("valid kind").0,
             reserved
         );
+    }
+
+    #[test]
+    fn resolver_identity_cache_accounts_for_retained_metadata() {
+        // Resolver bytes are charged during decode; every retained key, URI, metadata string,
+        // spare byte capacity, and hash entry must cross the same gate before cache insertion.
+        let mut bytes = Vec::with_capacity(64);
+        bytes.extend_from_slice(b"<r/>");
+        let resource = ResolvedResource {
+            canonical_uri: "memory:metadata/document.xml".repeat(4),
+            identity: ResourceIdentity("stable-resource-identity".repeat(4)),
+            bytes,
+            media_type: Some("application/xml".repeat(8)),
+            encoding: Some("UTF-8".repeat(8)),
+        };
+        let additional = resource_identity_cache_entry_owned_bytes(&resource)
+            .saturating_sub(resource.bytes.len());
+        let limits = |owned_bytes| ExecutionBudget {
+            source_bytes: usize::MAX,
+            external_documents: usize::MAX,
+            recursion_depth: usize::MAX,
+            xpath_evaluations: usize::MAX,
+            template_applications: usize::MAX,
+            sort_comparisons: usize::MAX,
+            key_entries: usize::MAX,
+            result_nodes: usize::MAX,
+            serialized_bytes: usize::MAX,
+            messages: usize::MAX,
+            owned_bytes,
+        };
+        let mut insufficient = Meter::new(limits(resource.bytes.len() + additional - 1), 0)
+            .expect("empty source fits");
+        insufficient
+            .charge(BudgetKind::OwnedBytes, resource.bytes.len())
+            .expect("wire bytes fit");
+        assert!(matches!(
+            charge_resource_identity_cache_entry(&resource, &mut insufficient),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            })
+        ));
+
+        let mut exact =
+            Meter::new(limits(resource.bytes.len() + additional), 0).expect("empty source fits");
+        exact
+            .charge(BudgetKind::OwnedBytes, resource.bytes.len())
+            .expect("wire bytes fit");
+        charge_resource_identity_cache_entry(&resource, &mut exact)
+            .expect("exact metadata reservation fits");
     }
 
     #[test]

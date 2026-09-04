@@ -14,9 +14,10 @@ documentation = "https://docs.rs/xml-sec-sxd-document"
 license = "MIT"
 
 [features]
-default = []
+default = ["no-unsafe"]
 __internal_expose_string_pool = []
 no-unsafe = []
+raw-pointer-backend = []
 
 [lib]
 name = "sxd_document_no_unsafe"

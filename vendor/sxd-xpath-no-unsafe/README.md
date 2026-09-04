@@ -12,6 +12,9 @@ including string-allocation accounting, tokenizer failure fusion, namespace-erro
 parser nesting limits, result-tree-fragment comparisons, and XPath 1.0 comma disambiguation.
 Keep these changes when refreshing the upstream source.
 
+The safe indexed DOM is selected by default. The legacy pointer backend requires
+`--no-default-features --features raw-pointer-backend` explicitly.
+
 The project is broken into two crates:
 
 1. [`document`][sxd-document] - Basic DOM manipulation and reading/writing XML from strings.

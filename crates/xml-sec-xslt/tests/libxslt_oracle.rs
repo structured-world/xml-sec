@@ -998,6 +998,20 @@ fn lexical_name_matches(lexical: &str, prefix: Option<&str>, local: &str) -> boo
     )
 }
 
+fn opening_tag_declares_namespace(opening: &str, marker: &str) -> bool {
+    opening.match_indices(marker).any(|(offset, matched)| {
+        let preceded_by_space = opening[..offset]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| matches!(ch, ' ' | '\t' | '\r' | '\n'));
+        let remainder = &opening[offset + matched.len()..];
+        preceded_by_space
+            && remainder
+                .trim_start_matches([' ', '\t', '\r', '\n'])
+                .starts_with('=')
+    })
+}
+
 fn embedded_stylesheet(xml: &str) -> xml_sec_xslt::Result<String> {
     const XSLT_NS: &str = "http://www.w3.org/1999/XSL/Transform";
     let parsed = roxmltree::Document::parse(xml).map_err(|error| Error::Xml(error.to_string()))?;
@@ -1022,7 +1036,7 @@ fn embedded_stylesheet(xml: &str) -> xml_sec_xslt::Result<String> {
         let marker = namespace
             .name()
             .map_or("xmlns".to_owned(), |prefix| format!("xmlns:{prefix}"));
-        if opening.contains(&marker) {
+        if opening_tag_declares_namespace(opening, &marker) {
             continue;
         }
         inherited.push(' ');
@@ -1033,6 +1047,16 @@ fn embedded_stylesheet(xml: &str) -> xml_sec_xslt::Result<String> {
     }
     stylesheet.insert_str(opening_end, &inherited);
     Ok(stylesheet)
+}
+
+#[test]
+fn embedded_stylesheet_distinguishes_namespace_attribute_names() {
+    // An inherited `a` binding must not be mistaken for the local `axsl` declaration.
+    let xml = r#"<outer xmlns:a="urn:a"><axsl:stylesheet xmlns:axsl="http://www.w3.org/1999/XSL/Transform" version="1.0"><axsl:template match="/"/></axsl:stylesheet></outer>"#;
+    let stylesheet = embedded_stylesheet(xml).expect("embedded stylesheet is extracted");
+
+    assert!(stylesheet.contains("xmlns:a=\"urn:a\""));
+    assert_eq!(stylesheet.matches("xmlns:axsl=").count(), 1);
 }
 
 fn decode_numeric_character_references_once(value: &str) -> xml_sec_xslt::Result<String> {

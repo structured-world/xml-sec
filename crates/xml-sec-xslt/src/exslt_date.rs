@@ -161,11 +161,7 @@ impl function::Function for DateFunction {
                 } else {
                     current_seconds_for_operation(self.1.as_ref(), self.2)?
                 };
-                let duration = if seconds.is_finite() && seconds.abs() < 1e23 {
-                    DurationValue::from_seconds(seconds).render()
-                } else {
-                    String::new()
-                };
+                let duration = DurationValue::from_seconds(seconds).render();
                 Ok(Value::String(duration))
             }
             Seconds => {
@@ -414,6 +410,8 @@ struct DurationValue {
     seconds: f64,
 }
 
+const MAX_RENDERABLE_DURATION_SECONDS: f64 = u64::MAX as f64 * 86_400.0;
+
 impl DurationValue {
     fn parse(input: &str) -> Option<Self> {
         Self::parse_with_legacy_seconds(input, false)
@@ -532,6 +530,9 @@ impl DurationValue {
     }
 
     fn render(self) -> String {
+        if !self.seconds.is_finite() || self.seconds.abs() >= MAX_RENDERABLE_DURATION_SECONDS {
+            return String::new();
+        }
         if self.months == 0 && self.seconds == 0.0 {
             return "P0D".into();
         }
@@ -1247,5 +1248,13 @@ mod tests {
             assert_ne!(duration.render(), "P");
             assert_eq!(duration.render(), lexical);
         }
+    }
+
+    #[test]
+    fn duration_render_rejects_unrepresentable_finite_seconds() {
+        // Every operation funnels through render, so arithmetic cannot saturate a float-to-int
+        // conversion into a plausible but incorrect duration.
+        assert_eq!(DurationValue::from_seconds(1.0e30).render(), "");
+        assert_eq!(DurationValue::from_seconds(-1.0e30).render(), "");
     }
 }

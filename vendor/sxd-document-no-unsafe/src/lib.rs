@@ -50,6 +50,9 @@
 
 #![deny(rust_2018_idioms)]
 
+#[cfg(not(any(feature = "no-unsafe", feature = "raw-pointer-backend")))]
+compile_error!("select either `no-unsafe` or `raw-pointer-backend`");
+
 #[macro_use]
 extern crate peresil;
 

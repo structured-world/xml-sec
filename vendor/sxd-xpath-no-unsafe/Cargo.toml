@@ -34,7 +34,9 @@ license = "MIT/Apache-2.0"
 repository = "https://github.com/structured-world/xml-sec"
 
 [features]
+default = ["no-unsafe"]
 no-unsafe = ["sxd-document-no-unsafe/no-unsafe"]
+raw-pointer-backend = ["sxd-document-no-unsafe/raw-pointer-backend"]
 unstable = []
 
 [lib]
@@ -55,3 +57,4 @@ version = "0.9"
 package = "xml-sec-sxd-document"
 version = "0.1.0"
 path = "../sxd-document-no-unsafe"
+default-features = false
