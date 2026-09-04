@@ -49,6 +49,12 @@ runtime trees do not retain that DOM. The event tokenizer and compiler frontend 
 private implementation details and do not define the engine's semantic or encoding
 contract.
 
+The crate exposes policy-neutral compile and execution limits. An embedding security protocol
+must derive those limits, source-processing permission, and extension permission from one compiled
+operation-policy snapshot at its adapter boundary; they are not a second policy domain. The main
+`xml-sec` crate intentionally keeps its XSLT transform adapter disconnected until that typed
+policy, resource-identity, and node-set translation is available.
+
 ## Compatibility oracle
 
 The repository vendors the complete libxslt 1.1.45 test tree and registers all

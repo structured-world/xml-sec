@@ -52,7 +52,11 @@ pub enum ExtensionPolicy {
     Deterministic,
 }
 
-/// Explicit capabilities and permissions shared by one transformation execution.
+/// Explicit capabilities supplied to one transformation execution.
+///
+/// Embedding security protocols must derive extension permission from their operation's compiled
+/// policy snapshot. Keeping that translation at the adapter boundary lets this crate remain
+/// reusable without making these engine-level values an independent security-policy source.
 pub struct ExecutionEnvironment<R: Resolver + 'static> {
     pub(crate) resolver: Arc<R>,
     pub(crate) clock: Arc<dyn Clock>,

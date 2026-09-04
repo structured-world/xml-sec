@@ -5,12 +5,17 @@
 //! implementation tokenizer, so consumers can share source ranges, escaping,
 //! and serialization without inheriting a parser's tree semantics.
 
-use std::{
-    borrow::Cow,
-    collections::{HashSet, VecDeque},
-    io::{Error as IoError, ErrorKind, Write},
-    ops::Range,
+use alloc::{
+    borrow::{Cow, ToOwned},
+    collections::VecDeque,
+    format,
+    string::{String, ToString},
+    vec::Vec,
 };
+use core::ops::Range;
+
+#[cfg(feature = "std")]
+use std::io::{Error as IoError, ErrorKind, Write};
 
 /// A lexical XML failure with a source position.
 #[derive(Debug, thiserror::Error)]
@@ -459,26 +464,39 @@ fn is_ncname_char(character: char) -> bool {
         )
 }
 
-/// Return namespace prefixes declared directly by one lexical opening tag.
+/// Namespace prefixes declared directly by one lexical opening tag.
 ///
 /// The default namespace is represented by an empty string.
-pub fn declared_namespace_prefixes(opening: &str) -> Result<HashSet<String>, Error> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredNamespacePrefixes(Vec<String>);
+
+impl DeclaredNamespacePrefixes {
+    /// Return whether the opening tag declares `prefix` directly.
+    #[must_use]
+    pub fn contains(&self, prefix: &str) -> bool {
+        self.0.iter().any(|candidate| candidate == prefix)
+    }
+}
+
+/// Parse the namespace prefixes declared directly by one lexical opening tag.
+pub fn declared_namespace_prefixes(opening: &str) -> Result<DeclaredNamespacePrefixes, Error> {
     let standalone = format!("{} />", opening.trim_end_matches('/'));
     let mut scanner = Scanner::new(&standalone);
     let Some(Event::Start(tag) | Event::Empty(tag)) = scanner.next_event()? else {
         return Err(Error::malformed("expected one opening element tag"));
     };
-    Ok(tag
-        .attributes
-        .iter()
-        .filter_map(
-            |attribute| match (attribute.name.prefix(), attribute.name.local()) {
-                (None, "xmlns") => Some(String::new()),
-                (Some("xmlns"), prefix) => Some(prefix.to_owned()),
-                _ => None,
-            },
-        )
-        .collect())
+    Ok(DeclaredNamespacePrefixes(
+        tag.attributes
+            .iter()
+            .filter_map(
+                |attribute| match (attribute.name.prefix(), attribute.name.local()) {
+                    (None, "xmlns") => Some(String::new()),
+                    (Some("xmlns"), prefix) => Some(prefix.to_owned()),
+                    _ => None,
+                },
+            )
+            .collect(),
+    ))
 }
 
 /// Expand the five predefined entities and XML character references.
@@ -565,10 +583,12 @@ fn escape(value: &str, attribute: bool) -> Cow<'_, str> {
 }
 
 /// Deterministic UTF-8 XML writer for generated markup.
+#[cfg(feature = "std")]
 pub struct Writer<W> {
     output: W,
 }
 
+#[cfg(feature = "std")]
 impl<W: Write> Writer<W> {
     /// Wrap an output sink.
     #[must_use]
@@ -632,6 +652,7 @@ impl<W: Write> Writer<W> {
     }
 }
 
+#[cfg(feature = "std")]
 fn validate_writer_qname(name: &str) -> std::io::Result<()> {
     // Namespaces in XML 1.0 section 3 production [6] permits exactly one optional prefix.
     // https://www.w3.org/TR/xml-names/#NT-QName

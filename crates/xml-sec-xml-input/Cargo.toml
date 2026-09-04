@@ -7,7 +7,11 @@ license = "Apache-2.0"
 description = "Strict XML byte encoding detection and transcoding for xml-sec"
 repository = "https://github.com/structured-world/xml-sec"
 
+[features]
+default = ["std"]
+std = ["thiserror/std", "xmlparser/std"]
+
 [dependencies]
-encoding_rs = "0.8"
-thiserror = "2"
-xmlparser = "0.13.6"
+encoding_rs = { version = "0.8", default-features = false, features = ["alloc"] }
+thiserror = { version = "2", default-features = false }
+xmlparser = { version = "0.13.6", default-features = false }

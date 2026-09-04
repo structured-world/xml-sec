@@ -1,8 +1,15 @@
 //! Backend-neutral XML byte encoding detection and strict transcoding.
+//!
+//! Disable the default `std` feature for an alloc-only decoder and lexical scanner. The
+//! `std::io::Write`-based lexical writer is available only when `std` is enabled.
 
+#![cfg_attr(not(feature = "std"), no_std)]
 #![deny(unsafe_code)]
 
-use std::{borrow::Cow, ops::Range};
+extern crate alloc;
+
+use alloc::{borrow::Cow, string::String};
+use core::ops::Range;
 
 pub mod lexical;
 
@@ -445,7 +452,8 @@ fn decode_selected<'a>(
         if bytes.iter().any(|byte| !byte.is_ascii()) {
             return Err(Error::InvalidBytes("US-ASCII"));
         }
-        let decoded = std::str::from_utf8(bytes).expect("seven-bit US-ASCII is always valid UTF-8");
+        let decoded =
+            core::str::from_utf8(bytes).expect("seven-bit US-ASCII is always valid UTF-8");
         if decoded.len() > maximum {
             return Err(Error::DecodedLimit {
                 maximum,
@@ -461,7 +469,7 @@ fn decode_selected<'a>(
         unreachable!("special-case encodings returned above")
     };
     if encoding == encoding_rs::UTF_8 {
-        let decoded = std::str::from_utf8(bytes).map_err(|_| Error::InvalidBytes("UTF-8"))?;
+        let decoded = core::str::from_utf8(bytes).map_err(|_| Error::InvalidBytes("UTF-8"))?;
         if decoded.len() > maximum {
             return Err(Error::DecodedLimit {
                 maximum,
@@ -488,7 +496,7 @@ fn decode_selected<'a>(
             return Err(Error::DecodedLimit { maximum, actual });
         }
         decoded.push_str(
-            std::str::from_utf8(&buffer[..written])
+            core::str::from_utf8(&buffer[..written])
                 .expect("encoding_rs emits valid UTF-8 into the output buffer"),
         );
         remaining = &remaining[read..];
@@ -582,7 +590,7 @@ fn declaration_from_ascii_bytes(bytes: &[u8]) -> Result<Option<(Range<usize>, &s
         .ok_or(Error::MalformedDeclaration("unterminated declaration"))?;
     // XML encoding declarations are ASCII for every supported
     // ASCII-compatible encoding, regardless of the following document bytes.
-    let prefix = std::str::from_utf8(&bytes[..end])
+    let prefix = core::str::from_utf8(&bytes[..end])
         .map_err(|_| Error::MalformedDeclaration("declaration is not ASCII-compatible"))?;
     declaration_from_text(prefix).map(|range| {
         range.map(|range| {

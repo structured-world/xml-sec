@@ -93,6 +93,23 @@ jobs:
     steps:
       - run: test "${{ needs.build-matrix.result }}" = "success"
 
+  alloc-only:
+    name: alloc-only XML input
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.92.0"
+          targets: thumbv7em-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p xml-sec-xml-input --no-default-features
+      - run: >-
+          cargo check -p xml-sec-xml-input --no-default-features
+          --target thumbv7em-none-eabihf
+
   test-matrix:
     name: test-matrix (${{ matrix.rust }}, ${{ matrix.xml-backend }})
     runs-on: ubuntu-latest

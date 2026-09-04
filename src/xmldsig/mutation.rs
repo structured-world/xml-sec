@@ -3,7 +3,7 @@
 //! The selected semantic DOM is immutable. These helpers validate structure
 //! through the backend-neutral DOM contract, then splice validated source ranges.
 
-use std::{collections::HashSet, ops::Range};
+use std::ops::Range;
 
 use xml_sec_xml_input::lexical::{escape_attribute, escape_text};
 
@@ -808,7 +808,9 @@ fn standalone_element(
     Ok(output)
 }
 
-fn owned_namespace_declarations(opening: &str) -> Result<HashSet<String>, XmlMutationError> {
+fn owned_namespace_declarations(
+    opening: &str,
+) -> Result<xml_sec_xml_input::lexical::DeclaredNamespacePrefixes, XmlMutationError> {
     xml_sec_xml_input::lexical::declared_namespace_prefixes(opening).map_err(Into::into)
 }
 

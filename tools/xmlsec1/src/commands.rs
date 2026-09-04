@@ -2732,7 +2732,9 @@ fn ensure_plaintext_capacity(
         .ok_or(CommandError::PlaintextTooLarge { maximum })
 }
 
-fn owned_namespace_declarations(opening: &str) -> Result<HashSet<String>, CommandError> {
+fn owned_namespace_declarations(
+    opening: &str,
+) -> Result<xml_sec_xml_input::lexical::DeclaredNamespacePrefixes, CommandError> {
     xml_sec_xml_input::lexical::declared_namespace_prefixes(opening)
         .map_err(|error| CommandError::Encryption(error.to_string()))
 }

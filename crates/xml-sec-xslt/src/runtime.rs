@@ -37,7 +37,11 @@ struct PreparedParameters<'a> {
     source_remap: SourceParameterRemap,
 }
 
-/// Explicit inputs controlling one stylesheet execution.
+/// Policy-neutral inputs controlling one stylesheet execution.
+///
+/// This standalone engine does not depend on an embedding application's policy types. Security
+/// adapters must construct these limits and initial-entry decisions from the operation's single
+/// compiled policy snapshot rather than expose a second caller-configurable policy surface.
 #[derive(Debug, Clone)]
 pub struct ExecutionOptions {
     pub budget: ExecutionBudget,
