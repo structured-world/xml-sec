@@ -2383,6 +2383,46 @@ fn built_in_template_traversal_does_not_use_the_native_stack() {
 }
 
 #[test]
+fn copy_of_source_traversal_does_not_use_the_native_stack() {
+    // xsl:copy-of must honor a deliberately large recursion budget without mapping source depth
+    // onto the process stack.
+    let depth = 8_192usize;
+    let mut source = String::with_capacity(depth.saturating_mul(7));
+    source.extend(std::iter::repeat_n("<n>", depth));
+    source.extend(std::iter::repeat_n("</n>", depth));
+    let mut expected = String::with_capacity(source.len());
+    expected.extend(std::iter::repeat_n("<n>", depth - 1));
+    expected.push_str("<n/>");
+    expected.extend(std::iter::repeat_n("</n>", depth - 1));
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes" indent="no"/><xsl:template match="/"><xsl:copy-of select="."/></xsl:template></xsl:stylesheet>"#,
+    );
+    let mut budget = execution_budget(source.len());
+    budget.recursion_depth = depth + 2;
+    budget.result_nodes = depth.saturating_mul(3);
+    budget.owned_bytes = 2 * 1024 * 1024 * 1024;
+    budget.serialized_bytes = source.len() + 1;
+    let output = stylesheet
+        .execute(
+            &Document::parse(&source, None).expect("deep source parses iteratively"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("copy-of traversal remains iterative");
+    assert_eq!(
+        output.serialized.bytes.len(),
+        expected.len(),
+        "copy-of must preserve the complete deep source"
+    );
+    assert_eq!(output.serialized.bytes, expected.as_bytes());
+}
+
+#[test]
 fn exslt_set_boundaries_must_belong_to_the_first_node_set() {
     // EXSLT explicitly returns an empty set when the first node in the boundary set is absent
     // from the first argument; an empty boundary set instead returns the complete first set.
@@ -5115,6 +5155,43 @@ fn xinclude_element_scheme_budgets_only_the_selected_projection() {
 }
 
 #[test]
+fn xinclude_fallback_releases_failed_xpointer_parse_storage() {
+    // A supported pointer that selects nothing is a recoverable resource error. Repeated fallback
+    // must reuse the same peak allocation allowance rather than accumulate already-dropped parses.
+    let resolver = Arc::new(MemoryResolver::default());
+    resolver.resources.lock().expect("resolver mutex").insert(
+        "included.xml".into(),
+        format!("<doc><payload>{}</payload></doc>", "x".repeat(512 * 1024)),
+    );
+    let includes = r#"<xi:include href="included.xml" xpointer="element(/1/9)"><xi:fallback><fallback/></xi:fallback></xi:include>"#.repeat(4);
+    let source_xml =
+        format!(r#"<root xmlns:xi="http://www.w3.org/2001/XInclude">{includes}</root>"#);
+    let source =
+        Document::parse(&source_xml, Some("memory:source.xml")).expect("XInclude source parses");
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(root/fallback)"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let mut budget = execution_budget(source_xml.len());
+    budget.external_documents = 4;
+    budget.owned_bytes = 2_200 * 1024;
+
+    let result = stylesheet
+        .execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        )
+        .expect("recoverable XPointer parses release their temporary reservations");
+    assert_eq!(result.serialized.bytes, b"4");
+}
+
+#[test]
 fn xinclude_fragment_href_is_rejected_before_resolver_access() {
     // XInclude 1.0 section 3.1 makes any fragment identifier in href a fatal error, including an
     // empty fragment, and therefore it must not cross the resolver boundary.
@@ -6206,9 +6283,10 @@ fn sequential_xincludes_release_temporary_projection_memory() {
     let source = Document::parse(&source_xml, Some("memory:source.xml")).expect("source parses");
     let mut budget = execution_budget(source_xml.len());
     budget.external_documents = 64;
-    // Includes the conservative SXD arena/container estimate while remaining far below the
-    // aggregate footprint that retaining 64 parsed/projection temporaries would require.
-    budget.owned_bytes = 192 * 1024;
+    // Includes the conservative SXD arena/container estimate and the shared namespace arenas
+    // retained by the projected nodes, while remaining far below the aggregate footprint that
+    // retaining 64 complete parsed/projection temporaries would require.
+    budget.owned_bytes = 208 * 1024;
     compile(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#,
     )

@@ -365,6 +365,50 @@ impl Document {
             })
     }
 
+    pub(crate) fn retained_namespace_arena_bytes(
+        &self,
+        selected_root: Option<NodeId>,
+        meter: &mut Meter,
+    ) -> Result<usize> {
+        let root = selected_root.unwrap_or(self.root);
+        let mut arenas = Vec::new();
+        let mut reserved_bytes = 0usize;
+        let result = (|| {
+            let mut current = root;
+            loop {
+                let node = self
+                    .node(current)
+                    .ok_or_else(|| Error::Xml("namespace projection root is stale".into()))?;
+                if let NodeKind::Element { namespaces, .. } = &node.kind {
+                    reserve_temporary_vec_slot(&mut arenas, meter, &mut reserved_bytes)?;
+                    arenas.push((Arc::as_ptr(namespaces) as usize, namespaces));
+                }
+                let Some(next) = self.next_descendant(root, current) else {
+                    break;
+                };
+                current = next;
+            }
+            arenas.sort_unstable_by_key(|(identity, _)| *identity);
+            arenas.dedup_by_key(|(identity, _)| *identity);
+            Ok(arenas.iter().fold(0usize, |total, (_, namespaces)| {
+                total
+                    .saturating_add(
+                        namespaces
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<Namespace>()),
+                    )
+                    .saturating_add(namespaces.iter().fold(0usize, |bytes, namespace| {
+                        bytes
+                            .saturating_add(namespace.prefix.as_deref().map_or(0, str::len))
+                            .saturating_add(namespace.uri.len())
+                    }))
+            }))
+        })();
+        drop(arenas);
+        meter.release_owned_bytes(reserved_bytes);
+        result
+    }
+
     #[cfg(test)]
     fn parse_tree(xml: &str, base_uri: Option<&str>) -> Result<Self> {
         let parsed =

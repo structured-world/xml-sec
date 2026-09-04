@@ -3237,6 +3237,7 @@ struct ExpandedXIncludeDocument {
     document: Document,
     principal_mapping: Option<HashMap<NodeId, NodeId>>,
     retained_owned_bytes: usize,
+    retained_namespace_bytes: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -3269,6 +3270,7 @@ fn expand_xinclude_document(
             .saturating_add(pending_bytes),
     )?;
     let mut retained_owned_bytes = source_clone_bytes.saturating_add(mapping_bytes);
+    let mut retained_namespace_bytes = 0usize;
     let base_uri = source
         .node(source.root())
         .and_then(|node| node.base_uri.clone());
@@ -3385,9 +3387,15 @@ fn expand_xinclude_document(
                 }
                 output.remap_ids_from(&included.document, &included_mapping)?;
                 output.merge_unparsed_entities_from(&included.document, output.root())?;
-                meter
-                    .release_owned_bytes(remap_bytes.saturating_add(included.retained_owned_bytes));
-                retained_owned_bytes = retained_owned_bytes.saturating_add(copied_bytes);
+                let disposable_bytes = included
+                    .retained_owned_bytes
+                    .saturating_sub(included.retained_namespace_bytes);
+                meter.release_owned_bytes(remap_bytes.saturating_add(disposable_bytes));
+                retained_owned_bytes = retained_owned_bytes
+                    .saturating_add(copied_bytes)
+                    .saturating_add(included.retained_namespace_bytes);
+                retained_namespace_bytes =
+                    retained_namespace_bytes.saturating_add(included.retained_namespace_bytes);
             }
             Ok(XIncludeContent::Text(value, base_uri)) => {
                 output.push_coalesced(
@@ -3423,6 +3431,7 @@ fn expand_xinclude_document(
         document: output,
         principal_mapping: Some(principal_mapping),
         retained_owned_bytes,
+        retained_namespace_bytes,
     })
 }
 
@@ -3876,18 +3885,25 @@ fn resolve_xinclude(
         // https://www.w3.org/TR/xinclude/#fragment
         // https://www.w3.org/TR/xptr-framework/#scheme
         // https://www.w3.org/TR/xptr-element/#language
-        Some(
-            select_xpointer_element(&document, pointer)
-                .map_err(XIncludeFailure::Resource)?
-                .ok_or_else(|| {
-                    XIncludeFailure::Resource(Error::Unsupported(
-                        "XInclude xpointer did not identify an element".into(),
-                    ))
-                })?,
-        )
+        match select_xpointer_element(&document, pointer).and_then(|selected| {
+            selected.ok_or_else(|| {
+                Error::Unsupported("XInclude xpointer did not identify an element".into())
+            })
+        }) {
+            Ok(selected) => Some(selected),
+            Err(error) => {
+                meter.release_owned_bytes(parsed_reservation);
+                meter.release_owned_bytes(xml.temporary_bytes);
+                meter.release_owned_bytes(resource.bytes.capacity());
+                return Err(XIncludeFailure::Resource(error));
+            }
+        }
     } else {
         None
     };
+    let retained_namespace_bytes = document
+        .retained_namespace_arena_bytes(selected_root, meter)
+        .map_err(XIncludeFailure::Fatal)?;
     let resource_identity = resource.identity.clone();
     if identity_is_new {
         charge_resource_identity_cache_entry(&resource, meter).map_err(XIncludeFailure::Fatal)?;
@@ -3906,11 +3922,33 @@ fn resolve_xinclude(
         selected_root,
     );
     include_stack.pop();
-    meter.release_owned_bytes(parsed_reservation);
-    meter.release_owned_bytes(xml.temporary_bytes);
-    expanded
-        .map(XIncludeContent::Xml)
-        .map_err(XIncludeFailure::Fatal)
+    match expanded {
+        Ok(mut expanded) => {
+            let transferred_from_parse = retained_namespace_bytes.min(parsed_reservation);
+            let transferred_from_decode = retained_namespace_bytes - transferred_from_parse;
+            if transferred_from_decode > xml.temporary_bytes {
+                meter.release_owned_bytes(parsed_reservation);
+                meter.release_owned_bytes(xml.temporary_bytes);
+                return Err(XIncludeFailure::Fatal(Error::Xml(
+                    "XInclude namespace retention exceeds parsed document storage".into(),
+                )));
+            }
+            meter.release_owned_bytes(parsed_reservation - transferred_from_parse);
+            meter.release_owned_bytes(xml.temporary_bytes - transferred_from_decode);
+            expanded.retained_owned_bytes = expanded
+                .retained_owned_bytes
+                .saturating_add(retained_namespace_bytes);
+            expanded.retained_namespace_bytes = expanded
+                .retained_namespace_bytes
+                .saturating_add(retained_namespace_bytes);
+            Ok(XIncludeContent::Xml(expanded))
+        }
+        Err(error) => {
+            meter.release_owned_bytes(parsed_reservation);
+            meter.release_owned_bytes(xml.temporary_bytes);
+            Err(XIncludeFailure::Fatal(error))
+        }
+    }
 }
 
 fn parse_external_document_metered(
@@ -6000,6 +6038,12 @@ impl function::Function for ExsltStringFunction {
                 if !(1..=2).contains(&args.len()) {
                     return extension_argument_error("str:padding() requires one or two arguments");
                 }
+                reserve_sxd_string_arguments(
+                    context,
+                    &args,
+                    &[1],
+                    "str:padding() allocation length overflow",
+                )?;
                 let requested = args[0].number(context)?.floor().max(0.0);
                 let length = if requested.is_finite() && requested <= usize::MAX as f64 {
                     requested as usize
@@ -7508,6 +7552,27 @@ mod tests {
     use crate::ExecutionBudget;
     use sxd_xpath_no_unsafe::function::Function;
 
+    struct StaticResolver {
+        bytes: Vec<u8>,
+    }
+
+    impl Resolver for StaticResolver {
+        fn resolve(
+            &self,
+            uri: &str,
+            _base_uri: Option<&str>,
+            _purpose: ResolvePurpose,
+        ) -> Result<ResolvedResource> {
+            Ok(ResolvedResource {
+                canonical_uri: format!("memory:{uri}"),
+                identity: ResourceIdentity(uri.into()),
+                bytes: self.bytes.clone(),
+                media_type: Some("application/xml".into()),
+                encoding: Some("UTF-8".into()),
+            })
+        }
+    }
+
     #[test]
     fn xpath_adapter_workspace_includes_namespace_copies() {
         let plain = Expression::generated("/source", Vec::new());
@@ -7522,6 +7587,54 @@ mod tests {
                     + hash_table_entry_bytes::<(String, String)>()
                     + "prefix".len()
                     + "urn:namespace:retained".len()
+        );
+    }
+
+    #[test]
+    fn expanded_xinclude_retains_shared_namespace_arena_reservation() {
+        // Projected nodes keep the parsed document's shared namespace arena alive after the
+        // temporary included document is dropped, so that allocation remains part of the result.
+        let namespace_payload = "n".repeat(128 * 1024);
+        let resolver = StaticResolver {
+            bytes: format!(r#"<included xmlns:p="urn:{namespace_payload}"><child/></included>"#)
+                .into_bytes(),
+        };
+        let source = Document::parse(
+            r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="included.xml"/></root>"#,
+            Some("memory:source.xml"),
+        )
+        .expect("XInclude source parses");
+        let mut meter = Meter::new(
+            ExecutionBudget {
+                source_bytes: source.source_bytes(),
+                external_documents: 1,
+                recursion_depth: 16,
+                xpath_evaluations: 1,
+                template_applications: 1,
+                sort_comparisons: 1,
+                key_entries: 1,
+                result_nodes: 16,
+                serialized_bytes: 1,
+                messages: 1,
+                owned_bytes: 4 * 1024 * 1024,
+            },
+            source.source_bytes(),
+        )
+        .expect("test meter initializes");
+        let expanded = expand_xinclude_document(
+            &source,
+            &resolver,
+            &mut meter,
+            &mut HashMap::new(),
+            &mut Vec::new(),
+            0,
+            None,
+        )
+        .expect("XInclude expands");
+
+        assert!(
+            expanded.retained_owned_bytes >= namespace_payload.len(),
+            "shared namespace arena must remain charged after projection"
         );
     }
 
@@ -8321,6 +8434,31 @@ mod tests {
                 vec![SxdValue::Nodeset(nodes), SxdValue::String(".".into())],
             )
             .expect_err("node string coercion must cross the allocation gate");
+        assert!(error.to_string().contains("allocation budget"));
+    }
+
+    #[test]
+    fn string_padding_reserves_pattern_coercion_before_empty_result() {
+        // A zero-length result must not let the node-set pattern bypass the temporary allocation
+        // gate before str:padding determines that no output bytes are needed.
+        let package = Package::new();
+        let document = package.as_document();
+        let root = document.create_element("root");
+        root.append_child(document.create_text("untrusted node text"));
+        document.root().append_child(root);
+        let mut nodes = nodeset::Nodeset::new();
+        nodes.add(root);
+        let mut context = Context::new();
+        context.set_string_allocation_limit(1);
+        let evaluation =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+
+        let error = ExsltStringFunction::Padding
+            .evaluate(
+                &evaluation,
+                vec![SxdValue::Number(0.0), SxdValue::Nodeset(nodes)],
+            )
+            .expect_err("pattern coercion must cross the allocation gate");
         assert!(error.to_string().contains("allocation budget"));
     }
 

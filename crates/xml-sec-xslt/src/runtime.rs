@@ -37,6 +37,19 @@ struct PreparedParameters<'a> {
     source_remap: SourceParameterRemap,
 }
 
+#[derive(Clone, Copy)]
+enum CopyDocument<'a> {
+    Source,
+    Fragment(&'a Document),
+}
+
+#[derive(Clone, Copy)]
+struct PendingCopyNode {
+    source: NodeId,
+    target_parent: NodeId,
+    depth: usize,
+}
+
 /// Policy-neutral inputs controlling one stylesheet execution.
 ///
 /// This standalone engine does not depend on an embedding application's policy types. Security
@@ -3146,77 +3159,12 @@ impl<'a> Execution<'a> {
         parent: NodeId,
         depth: usize,
     ) -> Result<()> {
-        self.meter.recursion(depth)?;
-        let source = document
-            .node(source_id)
-            .ok_or_else(|| Error::Dynamic("stale result-tree-fragment node".into()))?;
-        if matches!(source.kind, NodeKind::Root) {
-            for child in &source.children {
-                self.copy_document(document, *child, parent, depth + 1)?;
-            }
-            return Ok(());
-        }
-        let clone_bytes = node_kind_owned_bytes(&source.kind)
-            .saturating_add(source.base_uri.as_deref().map_or(0, str::len));
-        self.result
-            .reserve_metered_push_containers(parent, &mut self.meter)?;
-        self.meter.check_additional(
-            BudgetKind::ResultNodes,
-            1usize.saturating_add(node_kind_embedded_nodes(&source.kind)),
-        )?;
-        self.meter
-            .check_additional(BudgetKind::OwnedBytes, clone_bytes)?;
-        let target =
-            self.push_node_with_base(parent, source.kind.clone(), source.base_uri.clone())?;
-        for child in &source.children {
-            self.copy_document(document, *child, target, depth + 1)?;
-        }
-        Ok(())
+        self.copy_node_subtree(CopyDocument::Fragment(document), source_id, parent, depth)
     }
     fn copy_source(&mut self, node: &SourceNode, parent: NodeId, depth: usize) -> Result<()> {
-        self.meter.recursion(depth)?;
         match node {
             SourceNode::Node(id) => {
-                let source = self
-                    .evaluator
-                    .source
-                    .node(*id)
-                    .ok_or_else(|| Error::Dynamic("stale source node".into()))?;
-                let child_count = source.children.len();
-                if matches!(source.kind, NodeKind::Root) {
-                    for index in 0..child_count {
-                        let child = self
-                            .evaluator
-                            .source
-                            .node(*id)
-                            .and_then(|source| source.children.get(index).copied())
-                            .ok_or_else(|| Error::Dynamic("stale source child".into()))?;
-                        self.copy_source(&SourceNode::Node(child), parent, depth + 1)?
-                    }
-                    return Ok(());
-                }
-                let clone_bytes = node_kind_owned_bytes(&source.kind)
-                    .saturating_add(source.base_uri.as_deref().map_or(0, str::len));
-                self.result
-                    .reserve_metered_push_containers(parent, &mut self.meter)?;
-                self.meter.check_additional(
-                    BudgetKind::ResultNodes,
-                    1usize.saturating_add(node_kind_embedded_nodes(&source.kind)),
-                )?;
-                self.meter
-                    .check_additional(BudgetKind::OwnedBytes, clone_bytes)?;
-                let kind = source.kind.clone();
-                let base_uri = source.base_uri.clone();
-                let target = self.push_node_with_base(parent, kind, base_uri)?;
-                for index in 0..child_count {
-                    let child = self
-                        .evaluator
-                        .source
-                        .node(*id)
-                        .and_then(|source| source.children.get(index).copied())
-                        .ok_or_else(|| Error::Dynamic("stale source child".into()))?;
-                    self.copy_source(&SourceNode::Node(child), target, depth + 1)?
-                }
+                self.copy_node_subtree(CopyDocument::Source, *id, parent, depth)?;
             }
             SourceNode::Attribute { owner, index } => {
                 self.copy_source_attribute(*owner, *index)?;
@@ -3226,6 +3174,73 @@ impl<'a> Execution<'a> {
             }
         }
         Ok(())
+    }
+
+    fn copy_node_subtree(
+        &mut self,
+        document: CopyDocument<'_>,
+        source_id: NodeId,
+        parent: NodeId,
+        depth: usize,
+    ) -> Result<()> {
+        let mut pending = Vec::new();
+        let mut pending_reservation = 0usize;
+        reserve_temporary_vec_slot(&mut pending, &mut self.meter, &mut pending_reservation)?;
+        pending.push(PendingCopyNode {
+            source: source_id,
+            target_parent: parent,
+            depth,
+        });
+        let result = (|| {
+            while let Some(current) = pending.pop() {
+                self.meter.recursion(current.depth)?;
+                let source = match document {
+                    CopyDocument::Source => self.evaluator.source.node(current.source),
+                    CopyDocument::Fragment(document) => document.node(current.source),
+                }
+                .ok_or_else(|| Error::Dynamic("stale copy-of source node".into()))?;
+                let child_count = source.children.len();
+                let target_parent = if matches!(source.kind, NodeKind::Root) {
+                    current.target_parent
+                } else {
+                    let clone_bytes = node_kind_owned_bytes(&source.kind)
+                        .saturating_add(source.base_uri.as_deref().map_or(0, str::len));
+                    self.result
+                        .reserve_metered_push_containers(current.target_parent, &mut self.meter)?;
+                    self.meter.check_additional(
+                        BudgetKind::ResultNodes,
+                        1usize.saturating_add(node_kind_embedded_nodes(&source.kind)),
+                    )?;
+                    self.meter
+                        .check_additional(BudgetKind::OwnedBytes, clone_bytes)?;
+                    let kind = source.kind.clone();
+                    let base_uri = source.base_uri.clone();
+                    self.push_node_with_base(current.target_parent, kind, base_uri)?
+                };
+                for index in (0..child_count).rev() {
+                    let child = match document {
+                        CopyDocument::Source => self.evaluator.source.node(current.source),
+                        CopyDocument::Fragment(document) => document.node(current.source),
+                    }
+                    .and_then(|source| source.children.get(index).copied())
+                    .ok_or_else(|| Error::Dynamic("stale copy-of source child".into()))?;
+                    reserve_temporary_vec_slot(
+                        &mut pending,
+                        &mut self.meter,
+                        &mut pending_reservation,
+                    )?;
+                    pending.push(PendingCopyNode {
+                        source: child,
+                        target_parent,
+                        depth: current.depth.saturating_add(1),
+                    });
+                }
+            }
+            Ok(())
+        })();
+        drop(pending);
+        self.meter.release_owned_bytes(pending_reservation);
+        result
     }
     fn copy_source_attribute(&mut self, owner: NodeId, index: usize) -> Result<()> {
         let attribute = match self.evaluator.source.node(owner).map(|node| &node.kind) {
