@@ -9,7 +9,7 @@ use crate::lexical::{
     is_ncname, is_ncname_char, is_ncname_start, is_xml_whitespace, strip_xpath_attribute_axis,
     unicode_decimal_value, xpath_string_literal,
 };
-use crate::model::prepare_xml_entities_bounded;
+use crate::model::prepare_xml_frontend_bounded;
 use crate::resolver::decode_resource;
 use crate::{
     BudgetKind, CompileBudget, Document, Error, ExpandedName, Namespace, OutputDefinition,
@@ -1076,27 +1076,15 @@ impl Pattern {
             .or_else(|| normalized.strip_prefix("attribute::"))
             .unwrap_or(&normalized);
         let single_step = !value.contains(['/', '[', '|', '(', ')']);
-        if matches!(value, "*" | "@*")
-            || matches!(
-                value,
-                "node()" | "text()" | "comment()" | "processing-instruction()"
-            )
-        {
+        let node_test = pattern_node_test(value);
+        if matches!(value, "*" | "@*") || node_test == Some(PatternNodeTest::Generic) {
             -0.5
         // XSLT 1.0 section 5.5 assigns -0.25 only to a single NCName:* StepPattern;
         // a LocationPath containing that step has the complex-pattern priority 0.5.
         // https://www.w3.org/TR/1999/REC-xslt-19991116#conflict
         } else if single_step && value.ends_with(":*") {
             -0.25
-        } else if single_step
-            || value
-                .strip_prefix("processing-instruction(")
-                .and_then(|value| value.strip_suffix(')'))
-                .is_some_and(|value| {
-                    let value = trim_xml_whitespace(value);
-                    (value.starts_with('\'') && value.ends_with('\''))
-                        || (value.starts_with('"') && value.ends_with('"'))
-                })
+        } else if single_step || node_test == Some(PatternNodeTest::ProcessingInstructionWithTarget)
         {
             0.0
         } else {
@@ -1418,12 +1406,31 @@ fn valid_pattern_node_test(node_test: &str) -> bool {
     if node_test.strip_suffix(":*").is_some_and(is_ncname) {
         return true;
     }
-    ["node()", "text()", "comment()"].contains(&node_test)
-        || node_test == "processing-instruction()"
-        || node_test
-            .strip_prefix("processing-instruction(")
-            .and_then(|value| value.strip_suffix(')'))
-            .is_some_and(is_xpath_literal)
+    pattern_node_test(node_test).is_some()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PatternNodeTest {
+    Generic,
+    ProcessingInstructionWithTarget,
+}
+
+fn pattern_node_test(value: &str) -> Option<PatternNodeTest> {
+    // XPath 1.0 section 3.7 permits ExprWhitespace between grammar tokens, including before `)`.
+    // https://www.w3.org/TR/1999/REC-xpath-19991116/#exprlex
+    let open = value.find('(')?;
+    let close = value.strip_suffix(')')?;
+    let name = trim_xml_whitespace(&value[..open]);
+    let argument = trim_xml_whitespace(&close[open + 1..]);
+    match (name, argument) {
+        ("node" | "text" | "comment" | "processing-instruction", "") => {
+            Some(PatternNodeTest::Generic)
+        }
+        ("processing-instruction", argument) if is_xpath_literal(argument) => {
+            Some(PatternNodeTest::ProcessingInstructionWithTarget)
+        }
+        _ => None,
+    }
 }
 
 fn first_top_level_character(source: &str, needle: char) -> Option<usize> {
@@ -2022,7 +2029,7 @@ fn with_frontend_document<T>(
 ) -> Result<T> {
     let lexical_reserved = frontend_parser_workspace_bytes(xml);
     state.charge_owned(lexical_reserved)?;
-    let prepared = match prepare_xml_entities_bounded(xml, state.remaining_owned_bytes()) {
+    let prepared = match prepare_xml_frontend_bounded(xml, state.remaining_owned_bytes()) {
         Ok(prepared) => prepared,
         Err(error) => {
             state.release_owned(lexical_reserved);
@@ -3739,11 +3746,10 @@ fn required_qname(node: roxmltree::Node<'_, '_>, value: &str) -> Result<Expanded
         let uri = node
             .lookup_namespace_uri(Some(prefix))
             .ok_or_else(|| Error::Static(format!("unbound prefix {prefix}")))?;
-        if uri.starts_with('#') {
-            return Err(Error::Static(format!(
-                "QName {value} uses fragment-only namespace name `{uri}`"
-            )));
-        }
+        // Namespaces in XML 1.0 section 2 permits URI references, and RFC 2396 section 4
+        // classifies a fragment-only reference as relative; XSLT 1.0 does not narrow it.
+        // https://www.w3.org/TR/REC-xml-names/#ns-decl
+        // https://www.rfc-editor.org/rfc/rfc2396#section-4
         Ok(ExpandedName::new(Some(uri), local))
     } else {
         if !is_ncname(value) {

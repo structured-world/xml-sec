@@ -14,44 +14,16 @@ pub(crate) fn innermost_namespaced_call(
     namespaces: &[(String, String)],
     accepts: impl Fn(&str, &str) -> bool + Copy,
 ) -> Option<FunctionCall> {
-    let mut source = source;
-    let mut source_offset = 0;
-    loop {
-        let call = first_namespaced_call(source, namespaces, accepts)?;
-        let arguments_start = call.arguments_start;
-        let arguments_end = call.end - 1;
-        if first_namespaced_call(&source[arguments_start..arguments_end], namespaces, accepts)
-            .is_some()
-        {
-            source_offset += arguments_start;
-            source = &source[arguments_start..arguments_end];
-            continue;
-        }
-        return Some(FunctionCall {
-            start: source_offset + call.start,
-            end: source_offset + call.end,
-            arguments: split_function_arguments(&source[arguments_start..arguments_end]),
-            namespace: call.namespace,
-            local: call.local,
-            display_name: call.display_name,
-        });
+    struct PendingCall {
+        start: usize,
+        arguments_start: usize,
+        namespace: usize,
+        local_start: usize,
+        local_end: usize,
+        display_end: usize,
     }
-}
 
-struct LexicalFunctionCall {
-    start: usize,
-    arguments_start: usize,
-    end: usize,
-    namespace: String,
-    local: String,
-    display_name: String,
-}
-
-fn first_namespaced_call(
-    source: &str,
-    namespaces: &[(String, String)],
-    accepts: impl Fn(&str, &str) -> bool + Copy,
-) -> Option<LexicalFunctionCall> {
+    let mut parentheses = Vec::new();
     let mut quote = None;
     let mut cursor = 0;
     while cursor < source.len() {
@@ -66,6 +38,36 @@ fn first_namespaced_call(
         if matches!(character, '\'' | '"') {
             quote = Some(character);
             cursor += character.len_utf8();
+            continue;
+        }
+        if character == '(' {
+            parentheses.push(None);
+            cursor += 1;
+            continue;
+        }
+        if character == ')' {
+            cursor += 1;
+            let Some(pending) = parentheses.pop() else {
+                continue;
+            };
+            if let Some(PendingCall {
+                start,
+                arguments_start,
+                namespace,
+                local_start,
+                local_end,
+                display_end,
+            }) = pending
+            {
+                return Some(FunctionCall {
+                    start,
+                    end: cursor,
+                    arguments: split_function_arguments(&source[arguments_start..cursor - 1]),
+                    namespace: namespaces[namespace].1.clone(),
+                    local: source[local_start..local_end].to_owned(),
+                    display_name: source[start..display_end].to_owned(),
+                });
+            }
             continue;
         }
         if !is_ncname_start(character) {
@@ -87,11 +89,11 @@ fn first_namespaced_call(
         }
         let Some(namespace) = namespaces
             .iter()
-            .find_map(|(candidate, namespace)| (candidate == prefix).then_some(namespace))
+            .position(|(candidate, _)| candidate == prefix)
         else {
             continue;
         };
-        if !accepts(namespace, local) {
+        if !accepts(&namespaces[namespace].1, local) {
             continue;
         }
         let mut open = cursor;
@@ -101,15 +103,15 @@ fn first_namespaced_call(
         if !source[open..].starts_with('(') {
             continue;
         }
-        let close = matching_parenthesis(source, open)?;
-        return Some(LexicalFunctionCall {
+        parentheses.push(Some(PendingCall {
             start,
             arguments_start: open + 1,
-            end: close + 1,
-            namespace: namespace.clone(),
-            local: local.to_owned(),
-            display_name: lexical.to_owned(),
-        });
+            namespace,
+            local_start: start + prefix.len() + 1,
+            local_end: cursor,
+            display_end: cursor,
+        }));
+        cursor = open + 1;
     }
     None
 }
@@ -139,6 +141,8 @@ fn scan_unprefixed_function_calls(
     name: &str,
     mut visit: impl FnMut(usize, usize, usize) -> bool,
 ) -> bool {
+    let mut calls = Vec::<(usize, usize, Option<usize>)>::new();
+    let mut parentheses = Vec::<Option<usize>>::new();
     let mut quote = None;
     let mut cursor = 0;
     while cursor < source.len() {
@@ -155,6 +159,18 @@ fn scan_unprefixed_function_calls(
         if matches!(character, '\'' | '"') {
             quote = Some(character);
             cursor += character.len_utf8();
+            continue;
+        }
+        if character == '(' {
+            parentheses.push(None);
+            cursor += 1;
+            continue;
+        }
+        if character == ')' {
+            cursor += 1;
+            if let Some(Some(call)) = parentheses.pop() {
+                calls[call].2 = Some(cursor - 1);
+            }
             continue;
         }
         if !is_ncname_start(character) {
@@ -183,10 +199,15 @@ fn scan_unprefixed_function_calls(
         if !source[open..].starts_with('(') {
             continue;
         }
-        let Some(close) = matching_parenthesis(source, open) else {
-            continue;
-        };
-        if visit(start, open, close) {
+        let call = calls.len();
+        calls.push((start, open, None));
+        parentheses.push(Some(call));
+        cursor = open + 1;
+    }
+    for (start, open, close) in calls {
+        if let Some(close) = close
+            && visit(start, open, close)
+        {
             return true;
         }
     }
@@ -231,31 +252,6 @@ fn lexical_name_end(source: &str, start: usize) -> Option<(usize, bool)> {
 
 fn is_xpath_space(character: char) -> bool {
     matches!(character, ' ' | '\t' | '\r' | '\n')
-}
-
-fn matching_parenthesis(source: &str, open: usize) -> Option<usize> {
-    let mut quote = None;
-    let mut depth = 0usize;
-    for (offset, character) in source[open..].char_indices() {
-        if let Some(active) = quote {
-            if character == active {
-                quote = None;
-            }
-            continue;
-        }
-        match character {
-            '\'' | '"' => quote = Some(character),
-            '(' => depth += 1,
-            ')' => {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 {
-                    return Some(open + offset);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 fn split_function_arguments(source: &str) -> Vec<String> {
@@ -307,6 +303,20 @@ mod tests {
     }
 
     #[test]
+    fn namespaced_call_discovery_scans_mixed_nesting_once() {
+        // Extension discovery must remain linear when accepted and ordinary calls are interleaved.
+        let source =
+            format!("plain({}x:target(')'))", "x:outer(plain(".repeat(1_000)) + &"))".repeat(1_000);
+        let call = innermost_namespaced_call(
+            &source,
+            &[("x".into(), "urn:test".into())],
+            |namespace, _| namespace == "urn:test",
+        )
+        .expect("innermost accepted call is discovered");
+        assert_eq!(&source[call.start..call.end], "x:target(')')");
+    }
+
+    #[test]
     fn namespaced_call_discovery_accepts_complete_ncname_grammar() {
         // XML NameStartChar includes U+200C; extension discovery must share
         // the same QName grammar as stylesheet compilation.
@@ -335,5 +345,16 @@ mod tests {
         assert!(has_unprefixed_function_call("current ()/item", "current"));
         assert!(!has_unprefixed_function_call("'current()'", "current"));
         assert!(!has_unprefixed_function_call("x:current()", "current"));
+    }
+
+    #[test]
+    fn unprefixed_call_discovery_is_linear_at_extreme_depth() {
+        // Deep caller-controlled expressions must not trigger one complete rescan per call.
+        let source = format!("{}1{}", "key(".repeat(1_000), ")".repeat(1_000));
+        let calls = unprefixed_function_calls(&source, "key");
+        assert_eq!(calls.len(), 1_000);
+        assert_eq!(&source[calls[0].start..calls[0].end], source);
+        let innermost = calls.last().expect("nested expression has calls");
+        assert_eq!(&source[innermost.start..innermost.end], "key(1)");
     }
 }

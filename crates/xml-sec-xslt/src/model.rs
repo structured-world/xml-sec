@@ -316,13 +316,7 @@ impl Document {
             roxmltree::Document::parse(xml).map_err(|error| Error::Xml(error.to_string()))?;
         let mut document = Self::empty(base_uri.map(str::to_owned));
         document.source_bytes = xml.len();
-        let line_starts = std::iter::once(0)
-            .chain(
-                xml.bytes()
-                    .enumerate()
-                    .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
-            )
-            .collect::<Vec<_>>();
+        let line_starts = xml_line_starts(xml);
         let mut mapping = HashMap::new();
         mapping.insert(parsed.root().id(), document.root);
         for source in parsed.descendants().filter(|node| !node.is_root()) {
@@ -475,7 +469,10 @@ impl Document {
         let mut previous_event_offset = 0usize;
         let mut source_line = 1usize;
         let mut phase = DocumentPhase::Start;
-        let mut doctype_name = None::<&str>;
+        // XML 1.0 section 2.8 makes matching the DOCTYPE and document-element names a validity
+        // constraint; section 5.1 does not require this non-validating parser to enforce it.
+        // https://www.w3.org/TR/xml/#sec-prolog-dtd
+        let mut saw_doctype = false;
         let mut elements = vec![StreamElementFrame {
             node: document.root,
             lexical_name: None,
@@ -485,12 +482,9 @@ impl Document {
             .map_err(|error| Error::Xml(error.to_string()))?
         {
             let event_offset = event_range_start(&event);
-            source_line = source_line.saturating_add(
-                expanded_xml.as_bytes()[previous_event_offset..event_offset]
-                    .iter()
-                    .filter(|byte| **byte == b'\n')
-                    .count(),
-            );
+            source_line = source_line.saturating_add(xml_line_endings(
+                &expanded_xml.as_bytes()[previous_event_offset..event_offset],
+            ));
             previous_event_offset = event_offset;
             match event {
                 Event::Start(start) => {
@@ -498,7 +492,6 @@ impl Document {
                         if phase == DocumentPhase::Epilog {
                             return Err(Error::Xml("multiple document elements".into()));
                         }
-                        validate_doctype_root(doctype_name, start.name)?;
                         phase = DocumentPhase::Content;
                     }
                     let id = push_stream_element(
@@ -516,7 +509,6 @@ impl Document {
                         if phase == DocumentPhase::Epilog {
                             return Err(Error::Xml("multiple document elements".into()));
                         }
-                        validate_doctype_root(doctype_name, start.name)?;
                         phase = DocumentPhase::Epilog;
                     }
                     let id = push_stream_element(
@@ -657,16 +649,16 @@ impl Document {
                     }
                     phase = DocumentPhase::Prolog;
                 }
-                Event::DocType { name, .. } => {
+                Event::DocType { .. } => {
                     if matches!(phase, DocumentPhase::Content | DocumentPhase::Epilog) {
                         return Err(Error::Xml(
                             "document type declaration is permitted only in the prolog".into(),
                         ));
                     }
-                    if doctype_name.is_some() {
+                    if saw_doctype {
                         return Err(Error::Xml("duplicate document type declaration".into()));
                     }
-                    doctype_name = Some(name);
+                    saw_doctype = true;
                     phase = DocumentPhase::Prolog;
                 }
             }
@@ -1583,21 +1575,117 @@ fn normalized_xml_id(value: &str) -> Result<Cow<'_, str>> {
     Ok(normalized)
 }
 
-pub(crate) fn prepare_xml_entities_bounded(xml: &str, limit: usize) -> Result<Cow<'_, str>> {
+pub(crate) fn prepare_xml_frontend_bounded(xml: &str, limit: usize) -> Result<Cow<'_, str>> {
     let mut entity_references = 0;
     let mut entity_expansion = EntityExpansionMeter::new(limit.min(ENTITY_EXPANSION_BYTE_CEILING));
     let (parameter_expanded_xml, declarations) =
         internal_general_entities(xml, &mut entity_references, &mut entity_expansion)?;
-    let expanded = expand_document_entities(
+    let expanded_xml = expand_document_entities(
         parameter_expanded_xml.as_ref(),
         &declarations.general,
         &mut entity_references,
         &mut entity_expansion,
     )?;
-    let Cow::Owned(expanded) = expanded else {
-        return Ok(parameter_expanded_xml);
+    let Some(doctype) = doctype_span(expanded_xml.as_ref())? else {
+        return Ok(match expanded_xml {
+            Cow::Borrowed(_) => parameter_expanded_xml,
+            Cow::Owned(expanded) => Cow::Owned(expanded),
+        });
     };
-    Ok(Cow::Owned(expanded))
+
+    let mut insertions = Vec::<(usize, String)>::new();
+    let mut scanner = Scanner::new(expanded_xml.as_ref());
+    while let Some(event) = scanner
+        .next_event()
+        .map_err(|error| Error::Xml(error.to_string()))?
+    {
+        let start = match event {
+            Event::Start(start) | Event::Empty(start) => start,
+            _ => continue,
+        };
+        let Some(defaults) = declarations.attributes.get(start.name.qualified().as_ref()) else {
+            continue;
+        };
+        // XML 1.0 section 3.3.2 requires a non-validating processor to report defaulted
+        // attributes when it reads their declarations from the internal subset.
+        // https://www.w3.org/TR/xml/#sec-attr-defaults
+        let mut insertion = String::new();
+        for declaration in defaults {
+            let Some(default) = declaration.default.as_deref() else {
+                continue;
+            };
+            if start
+                .attributes
+                .iter()
+                .any(|attribute| attribute.name.is_qualified(&declaration.name))
+            {
+                continue;
+            }
+            let value = prepare_attribute_value(
+                &declaration.name,
+                default,
+                &declarations.general,
+                declaration.attribute_type.is_cdata(),
+                &mut entity_references,
+                &mut entity_expansion,
+            )?;
+            let escaped_value_len = value.chars().try_fold(0usize, |length, character| {
+                length.checked_add(match character {
+                    '&' => "&amp;".len(),
+                    '<' => "&lt;".len(),
+                    '"' => "&quot;".len(),
+                    _ => character.len_utf8(),
+                })
+            });
+            let insertion_len = escaped_value_len
+                .and_then(|length| length.checked_add(declaration.name.len()))
+                .and_then(|length| length.checked_add(4))
+                .ok_or_else(|| Error::Xml("DTD default attribute output is too large".into()))?;
+            // The insertion strings coexist with the final prepared document. Charge them before
+            // reserving so defaults cannot hide temporary allocation outside the XML budget.
+            entity_expansion.charge(insertion_len)?;
+            insertion.reserve(insertion_len);
+            insertion.push(' ');
+            insertion.push_str(&declaration.name);
+            insertion.push_str("=\"");
+            for character in value.chars() {
+                match character {
+                    '&' => insertion.push_str("&amp;"),
+                    '<' => insertion.push_str("&lt;"),
+                    '"' => insertion.push_str("&quot;"),
+                    _ => insertion.push(character),
+                }
+            }
+            insertion.push('"');
+        }
+        if !insertion.is_empty() {
+            let before_close = if expanded_xml.as_bytes().get(start.range.end - 2) == Some(&b'/') {
+                start.range.end - 2
+            } else {
+                start.range.end - 1
+            };
+            insertions.push((before_close, insertion));
+        }
+    }
+
+    let added = insertions.iter().fold(0usize, |bytes, (_, value)| {
+        bytes.saturating_add(value.len())
+    });
+    let capacity = expanded_xml
+        .len()
+        .saturating_sub(doctype.end.saturating_sub(doctype.start))
+        .saturating_add(added);
+    entity_expansion.charge(capacity)?;
+    let mut prepared = String::with_capacity(capacity);
+    prepared.push_str(&expanded_xml[..doctype.start]);
+    let mut cursor = doctype.end;
+    for (offset, insertion) in insertions {
+        prepared.push_str(&expanded_xml[cursor..offset]);
+        prepared.push_str(&insertion);
+        cursor = offset;
+    }
+    prepared.push_str(&expanded_xml[cursor..]);
+    Ok(Cow::Owned(prepared))
 }
 
 fn decode_xml_character_reference(digits: &str, radix: u32) -> Result<String> {
@@ -1916,18 +2004,46 @@ fn event_range_start(event: &xml_sec_xml_input::lexical::Event<'_>) -> usize {
     }
 }
 
-fn validate_doctype_root(
-    doctype_name: Option<&str>,
-    element_name: xml_sec_xml_input::lexical::Name<'_>,
-) -> Result<()> {
-    if let Some(doctype_name) = doctype_name
-        && !element_name.is_qualified(doctype_name)
-    {
-        return Err(Error::Xml(format!(
-            "document type name `{doctype_name}` does not match the document element"
-        )));
+fn xml_line_endings(bytes: &[u8]) -> usize {
+    // XML 1.0 section 2.11 treats CR, CRLF, and LF as one logical line ending.
+    // https://www.w3.org/TR/xml/#sec-line-ends
+    let mut lines = 0usize;
+    let mut previous_cr = false;
+    for byte in bytes {
+        if *byte == b'\r' {
+            lines += 1;
+            previous_cr = true;
+        } else {
+            if *byte == b'\n' && !previous_cr {
+                lines += 1;
+            }
+            previous_cr = false;
+        }
     }
-    Ok(())
+    lines
+}
+
+#[cfg(test)]
+fn xml_line_starts(xml: &str) -> Vec<usize> {
+    let bytes = xml.as_bytes();
+    let mut starts = Vec::with_capacity(xml_line_endings(bytes).saturating_add(1));
+    starts.push(0);
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'\r' {
+            cursor += 1;
+            if bytes.get(cursor) == Some(&b'\n') {
+                cursor += 1;
+            }
+            starts.push(cursor);
+        } else if bytes[cursor] == b'\n' {
+            cursor += 1;
+            starts.push(cursor);
+        } else {
+            cursor += 1;
+        }
+    }
+    starts
 }
 
 fn collapse_xml_whitespace(value: &str) -> Cow<'_, str> {
@@ -3177,6 +3293,7 @@ fn decode_parameter_character_references<'a>(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DoctypeSpan {
+    start: usize,
     end: usize,
     internal_subset: Option<(usize, usize)>,
 }
@@ -3205,6 +3322,7 @@ fn doctype_span(xml: &str) -> Result<Option<DoctypeSpan>> {
         }
         let (length, internal_subset) = scan_doctype_end(tail)?;
         return Ok(Some(DoctypeSpan {
+            start: cursor,
             end: cursor + length,
             internal_subset: internal_subset.map(|(start, end)| (cursor + start, cursor + end)),
         }));
@@ -3906,15 +4024,40 @@ mod parser_boundary_tests {
     }
 
     #[test]
-    fn every_parser_rejects_a_doctype_for_another_document_element() {
-        // Document depth must not select a parser with weaker DOCTYPE well-formedness checks.
+    fn every_parser_accepts_a_doctype_for_another_document_element() {
+        // XML 1.0 section 2.8 defines the name match as a validity constraint; section 5.1 does
+        // not require a non-validating processor to enforce it.
         let shallow = "<!DOCTYPE expected><actual/>";
-        assert!(Document::parse(shallow, None).is_err());
-        assert!(Document::parse_iterative(shallow, None).is_err());
+        Document::parse(shallow, None).expect("shallow non-validating parse accepts the document");
+        Document::parse_iterative(shallow, None)
+            .expect("iterative non-validating parse accepts the document");
 
         let deep = format!("<!DOCTYPE expected>{}", nested_xml(130, "<actual/>"));
-        assert!(Document::parse(&deep, None).is_err());
-        assert!(Document::parse_iterative(&deep, None).is_err());
+        Document::parse(&deep, None).expect("deep dispatch accepts the validity-only mismatch");
+        Document::parse_iterative(&deep, None)
+            .expect("iterative parser accepts the validity-only mismatch");
+    }
+
+    #[test]
+    fn parser_paths_count_xml_line_endings_identically() {
+        // XML 1.0 section 2.11 normalizes CR, CRLF, and LF to one logical line ending.
+        for separator in ["\n", "\r", "\r\n"] {
+            let xml = format!("<root>{separator}<child/></root>");
+            for document in [
+                Document::parse_tree(&xml, None).expect("tree parser accepts line ending"),
+                Document::parse_iterative(&xml, None)
+                    .expect("iterative parser accepts line ending"),
+            ] {
+                let child = document
+                    .nodes()
+                    .find_map(|(_, node)| match &node.kind {
+                        NodeKind::Element { name, .. } if name.local == "child" => Some(node),
+                        _ => None,
+                    })
+                    .expect("child exists");
+                assert_eq!(child.source_line, Some(2), "separator {separator:?}");
+            }
+        }
     }
 
     #[test]

@@ -14,8 +14,6 @@
 //! let doc = parser::parse(xml).expect("Failed to parse");
 //! ```
 
-#[allow(unused, deprecated)] // rust-lang/rust#46510
-use std::ascii::AsciiExt;
 use std::{
     char,
     collections::{BTreeSet, HashMap},

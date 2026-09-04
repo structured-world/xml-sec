@@ -1184,6 +1184,7 @@ fn assert_case(case: &Case) {
         }
         (Ok(result), None) if case.errors.is_none() && result.serialized.bytes.is_empty() => {}
         (Ok(result), None) if is_expected_message_only_success(case, &result) => {}
+        (Ok(_), None) if is_standard_conformant_libxslt_divergence(case) => {}
         (Ok(_), None) => panic!(
             "{}: transformation succeeded but upstream expects an error",
             case_name(case)
@@ -1199,6 +1200,14 @@ fn assert_case(case: &Case) {
         (Err(error), Some(_)) if is_expected_strict_xslt_error(case, &error) => {}
         (Err(error), _) => panic!("{}: {error}", case_name(case)),
     }
+}
+
+fn is_standard_conformant_libxslt_divergence(case: &Case) -> bool {
+    // Namespaces in XML 1.0 section 2 permits URI references and RFC 2396 section 4 defines a
+    // fragment-only reference as relative. libxslt's bug-154 regression rejects that legal form.
+    // https://www.w3.org/TR/REC-xml-names/#ns-decl
+    // https://www.rfc-editor.org/rfc/rfc2396#section-4
+    case.suite == "runtest" && case.stylesheet == Path::new("general/bug-154.xsl")
 }
 
 fn is_expected_message_only_success(case: &Case, result: &xml_sec_xslt::TransformResult) -> bool {

@@ -15,9 +15,9 @@ use crate::lexical::{is_ncname, is_ncname_char};
 use crate::resolver::decode_resource;
 use crate::runtime::{SourceProcessing, apply_whitespace_rules};
 use crate::{
-    BudgetKind, Clock, Document, Error, ErrorKind, ExpandedName, ExtensionPolicy, Node, NodeId,
-    NodeKind, NodeReference, ResolvePurpose, ResolvedResource, Resolver, ResourceIdentity, Result,
-    Value,
+    Attribute, BudgetKind, Clock, Document, Error, ErrorKind, ExpandedName, ExtensionPolicy, Node,
+    NodeId, NodeKind, NodeReference, ResolvePurpose, ResolvedResource, Resolver, ResourceIdentity,
+    Result, Value,
 };
 
 pub(crate) type SourceNode = NodeReference;
@@ -3241,6 +3241,13 @@ struct ExpandedXIncludeDocument {
     retained_owned_bytes: usize,
 }
 
+#[derive(Clone, Copy)]
+struct PendingXIncludeNode {
+    source: NodeId,
+    target_parent: NodeId,
+    preserve_language: bool,
+}
+
 fn expand_xinclude_document(
     source: &Document,
     resolver: &dyn Resolver,
@@ -3273,9 +3280,18 @@ fn expand_xinclude_document(
             .node(source.root())
             .into_iter()
             .flat_map(|root| root.children.iter().rev())
-            .map(|child| (*child, output.root())),
+            .map(|child| PendingXIncludeNode {
+                source: *child,
+                target_parent: output.root(),
+                preserve_language: false,
+            }),
     );
-    while let Some((source_id, target_parent)) = pending.pop() {
+    while let Some(PendingXIncludeNode {
+        source: source_id,
+        target_parent,
+        preserve_language,
+    }) = pending.pop()
+    {
         let node = source
             .node(source_id)
             .ok_or_else(|| Error::Xml("XInclude source node is stale".into()))?;
@@ -3299,8 +3315,23 @@ fn expand_xinclude_document(
             let Some(target) = output.append_node_from(target_parent, node) else {
                 continue;
             };
+            if preserve_language {
+                retained_owned_bytes =
+                    retained_owned_bytes.saturating_add(preserve_xinclude_language(
+                        source,
+                        source_id,
+                        &mut output,
+                        target_parent,
+                        target,
+                        meter,
+                    )?);
+            }
             principal_mapping.insert(source_id, target);
-            pending.extend(node.children.iter().rev().map(|child| (*child, target)));
+            pending.extend(node.children.iter().rev().map(|child| PendingXIncludeNode {
+                source: *child,
+                target_parent: target,
+                preserve_language: false,
+            }));
             continue;
         }
 
@@ -3326,12 +3357,21 @@ fn expand_xinclude_document(
                 let mut included_mapping = HashMap::with_capacity(included_nodes);
                 if let Some(root) = included.document.node(included.document.root()) {
                     for child in root.children.iter().copied() {
-                        output.append_subtree_from(
+                        let target = output.append_subtree_from(
                             target_parent,
                             &included.document,
                             child,
                             &mut included_mapping,
                         );
+                        retained_owned_bytes =
+                            retained_owned_bytes.saturating_add(preserve_xinclude_language(
+                                &included.document,
+                                child,
+                                &mut output,
+                                target_parent,
+                                target,
+                                meter,
+                            )?);
                     }
                 }
                 output.remap_ids_from(&included.document, &included_mapping)?;
@@ -3356,13 +3396,13 @@ fn expand_xinclude_document(
                     return Err(error);
                 };
                 if let Some(fallback) = source.node(fallback) {
-                    pending.extend(
-                        fallback
-                            .children
-                            .iter()
-                            .rev()
-                            .map(|child| (*child, target_parent)),
-                    );
+                    pending.extend(fallback.children.iter().rev().map(|child| {
+                        PendingXIncludeNode {
+                            source: *child,
+                            target_parent,
+                            preserve_language: true,
+                        }
+                    }));
                 }
             }
         }
@@ -3375,6 +3415,71 @@ fn expand_xinclude_document(
         principal_mapping: Some(principal_mapping),
         retained_owned_bytes,
     })
+}
+
+fn effective_xml_language(document: &Document, mut id: NodeId) -> Option<&str> {
+    loop {
+        let node = document.node(id)?;
+        if let NodeKind::Element { attributes, .. } = &node.kind
+            && let Some(language) = attributes.iter().find(|attribute| {
+                attribute.name.namespace.as_deref() == Some("http://www.w3.org/XML/1998/namespace")
+                    && attribute.name.local == "lang"
+            })
+        {
+            return Some(language.value.as_str());
+        }
+        id = node.parent?;
+    }
+}
+
+fn preserve_xinclude_language(
+    source: &Document,
+    source_id: NodeId,
+    output: &mut Document,
+    target_parent: NodeId,
+    target: NodeId,
+    meter: &mut Meter,
+) -> Result<usize> {
+    let explicit_language = output.node(target).and_then(|node| match &node.kind {
+        NodeKind::Element { attributes, .. } => attributes.iter().find(|attribute| {
+            attribute.name.namespace.as_deref() == Some("http://www.w3.org/XML/1998/namespace")
+                && attribute.name.local == "lang"
+        }),
+        _ => None,
+    });
+    if explicit_language.is_some() {
+        return Ok(0);
+    }
+    if !matches!(
+        output.node(target).map(|node| &node.kind),
+        Some(NodeKind::Element { .. })
+    ) {
+        return Ok(0);
+    }
+    let original = effective_xml_language(source, source_id);
+    if original == effective_xml_language(output, target_parent) {
+        return Ok(0);
+    }
+    // XInclude 1.0 section 4.5.7 requires top-level included items to preserve their acquired
+    // language; an empty xml:lang prevents accidental inheritance when no language was present.
+    // https://www.w3.org/TR/xinclude/#language
+    let value = original.unwrap_or_default();
+    let bytes = std::mem::size_of::<Attribute>()
+        .saturating_add("http://www.w3.org/XML/1998/namespace".len())
+        .saturating_add("lang".len())
+        .saturating_add("xml".len())
+        .saturating_add(value.len());
+    meter.charge(BudgetKind::OwnedBytes, bytes)?;
+    let value = value.to_owned();
+    output.add_default_attribute(
+        target,
+        Attribute {
+            name: ExpandedName::new(Some("http://www.w3.org/XML/1998/namespace"), "lang"),
+            prefix: Some("xml".into()),
+            value,
+        },
+    )?;
+    Ok(bytes)
 }
 
 fn validate_xinclude_children(source: &Document, include: &Node) -> Result<Option<NodeId>> {

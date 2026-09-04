@@ -933,8 +933,10 @@ fn compile_owned_bytes_counts_empty_instruction_structure() {
 
 #[test]
 fn namespace_name_validation_matches_xslt_1_0_compatibility() {
-    // Legacy XSLT 1.0 stylesheets may use relative namespace names, while a
-    // fragment-only name cannot identify an expanded XSLT QName.
+    // XSLT 1.0 uses the XML Namespaces 1.0 definition, which permits relative URI references;
+    // RFC 2396 section 4 classifies a fragment-only reference as relative as well.
+    // https://www.w3.org/TR/REC-xml-names/#ns-decl
+    // https://www.rfc-editor.org/rfc/rfc2396#section-4
     compile(
         r#"<xsl:stylesheet version="1.0"
              xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
@@ -943,20 +945,44 @@ fn namespace_name_validation_matches_xslt_1_0_compatibility() {
            </xsl:stylesheet>"#,
     );
 
-    let error = Compiler::new(
-        Arc::new(NoResolver),
-        CompileBudget::new(1 << 20, 16, 256, 4 << 20),
-    )
-    .compile(
+    let stylesheet = compile(
         r##"<xsl:stylesheet version="1.0"
              xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
              xmlns:local="#fragment">
-             <xsl:variable name="local:value" select="1"/>
+             <xsl:variable name="local:value" select="'accepted'"/>
+             <xsl:template match="/"><xsl:value-of select="$local:value"/></xsl:template>
            </xsl:stylesheet>"##,
-        Some("memory:fragment-namespace.xsl"),
-    )
-    .expect_err("fragment-only namespace names must be rejected");
-    assert!(matches!(error, Error::Static(_)));
+    );
+    let result = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("fragment namespace variable executes");
+    assert_eq!(
+        result.serialized.bytes,
+        b"<?xml version=\"1.0\"?>\naccepted\n"
+    );
+}
+
+#[test]
+fn stylesheet_uses_internal_dtd_attribute_defaults() {
+    // XML 1.0 section 3.3.2 requires defaulted attributes to be reported to the application.
+    // https://www.w3.org/TR/xml/#sec-attr-defaults
+    let stylesheet = r#"<!DOCTYPE xsl:stylesheet [
+      <!ATTLIST xsl:stylesheet version CDATA "1.0">
+      <!ATTLIST xsl:output method CDATA "text">
+    ]><xsl:stylesheet xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output/><xsl:template match="/">defaulted</xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "defaulted");
+
+    let explicit = stylesheet.replace("<xsl:output/>", "<xsl:output method=\"xml\"/>");
+    assert!(execute(&explicit, "<source/>").starts_with("<?xml"));
 }
 
 #[derive(Default)]
@@ -4642,6 +4668,41 @@ fn xinclude_fallback_handles_only_resource_errors() {
 }
 
 #[test]
+fn xinclude_preserves_acquired_and_fallback_language() {
+    // XInclude 1.0 section 4.5.7 requires top-level included items to retain the language they
+    // had before insertion, including an explicit empty fixup that blocks new inheritance.
+    // https://www.w3.org/TR/xinclude/#language
+    let resolver = Arc::new(MemoryResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert("included.xml".into(), "<included/>".into());
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="root/included/@xml:lang"/><xsl:text>|</xsl:text><xsl:value-of select="boolean(root/included[lang('fr')])"/><xsl:text>|</xsl:text><xsl:value-of select="root/fallback/@xml:lang"/><xsl:text>|</xsl:text><xsl:value-of select="boolean(root/fallback[lang('de')])"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse(
+        r#"<root xml:lang="fr" xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="included.xml"/><xi:include href="missing.xml"><xi:fallback xml:lang="de"><fallback/></xi:fallback></xi:include></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("source parses");
+    let result = stylesheet
+        .execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(4096),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        )
+        .expect("XInclude language fixup succeeds");
+    assert_eq!(result.serialized.bytes, b"|false|de|true");
+}
+
+#[test]
 fn xinclude_text_strips_encoding_signatures() {
     // XInclude 1.0 section 4.3.3 requires an encoding signature to be interpreted and removed
     // before the text resource is included in the document.
@@ -7749,6 +7810,14 @@ fn explicit_axis_node_tests_keep_their_default_priority() {
         execute(stylesheet, "<root><foo id=\"x\"/></root>"),
         "element-specific|attribute-specific|"
     );
+}
+
+#[test]
+fn node_tests_allow_xpath_whitespace_before_the_closing_parenthesis() {
+    // XPath 1.0 section 3.7 permits ExprWhitespace between grammar tokens, including here.
+    // https://www.w3.org/TR/1999/REC-xpath-19991116/#exprlex
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:apply-templates select="root/node()"/></xsl:template><xsl:template match="node( )">generic</xsl:template><xsl:template match="text( )">text</xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<root>value</root>"), "text");
 }
 
 #[test]

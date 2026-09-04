@@ -783,7 +783,17 @@ struct RenderContext {
     parent: Option<NodeId>,
     parent_mixed: bool,
     html_whitespace_sensitive: bool,
-    in_scope_namespaces: Rc<Vec<(Option<String>, String)>>,
+    in_scope_namespaces: Option<Rc<NamespaceScope>>,
+}
+
+enum NamespaceBinding {
+    Document { element: NodeId, index: usize },
+    EmptyDefault,
+}
+
+struct NamespaceScope {
+    binding: NamespaceBinding,
+    parent: Option<Rc<Self>>,
 }
 
 impl RenderContext {
@@ -793,9 +803,53 @@ impl RenderContext {
             parent: None,
             parent_mixed: false,
             html_whitespace_sensitive: false,
-            in_scope_namespaces: Rc::new(vec![]),
+            in_scope_namespaces: None,
         }
     }
+}
+
+fn namespace_in_scope<'a>(
+    document: &'a Document,
+    scope: &Option<Rc<NamespaceScope>>,
+    prefix: Option<&str>,
+) -> Option<&'a str> {
+    let mut current = scope.as_deref();
+    while let Some(frame) = current {
+        match frame.binding {
+            NamespaceBinding::EmptyDefault if prefix.is_none() => return Some(""),
+            NamespaceBinding::Document { element, index } => {
+                let namespace = document.node(element).and_then(|node| match &node.kind {
+                    NodeKind::Element { namespaces, .. } => namespaces.get(index),
+                    _ => None,
+                });
+                if let Some(namespace) = namespace
+                    && namespace.prefix.as_deref() == prefix
+                {
+                    return Some(namespace.uri.as_str());
+                }
+            }
+            NamespaceBinding::EmptyDefault => {}
+        }
+        current = frame.parent.as_deref();
+    }
+    None
+}
+
+fn extend_namespace_scope(
+    scope: &Option<Rc<NamespaceScope>>,
+    binding: NamespaceBinding,
+    meter: &mut Meter,
+    reserved_owned_bytes: &mut usize,
+) -> Result<Option<Rc<NamespaceScope>>> {
+    // Account for the Rc allocation as retained serializer workspace. Binding strings stay
+    // borrowed from Document, so descendant scopes never copy inherited namespace text.
+    let bytes = std::mem::size_of::<NamespaceScope>() + 2 * std::mem::size_of::<usize>();
+    meter.charge(BudgetKind::OwnedBytes, bytes)?;
+    *reserved_owned_bytes = reserved_owned_bytes.saturating_add(bytes);
+    Ok(Some(Rc::new(NamespaceScope {
+        binding,
+        parent: scope.clone(),
+    })))
 }
 
 enum RenderTask {
@@ -1135,11 +1189,8 @@ fn serialize_node_tasks(
                 output.push('<');
                 push_name(prefix.as_deref(), &name.local, encoding, output)?;
                 let mut current_namespaces = context.in_scope_namespaces.clone();
-                let inherited_default_namespace = current_namespaces
-                    .iter()
-                    .rev()
-                    .find(|(prefix, _)| prefix.is_none())
-                    .map(|(_, uri)| uri.as_str());
+                let inherited_default_namespace =
+                    namespace_in_scope(document, &current_namespaces, None);
                 let inherits_empty_default_namespace =
                     inherited_default_namespace.is_none_or(str::is_empty);
                 if name.namespace.is_none()
@@ -1149,15 +1200,12 @@ fn serialize_node_tasks(
                         .any(|namespace| namespace.prefix.is_none() && namespace.uri.is_empty())
                 {
                     output.push_str(" xmlns=\"\"");
-                    let current_namespaces = Rc::make_mut(&mut current_namespaces);
-                    if let Some(existing) = current_namespaces
-                        .iter_mut()
-                        .find(|(prefix, _)| prefix.is_none())
-                    {
-                        existing.1.clear();
-                    } else {
-                        current_namespaces.push((None, String::new()));
-                    }
+                    current_namespaces = extend_namespace_scope(
+                        &current_namespaces,
+                        NamespaceBinding::EmptyDefault,
+                        meter,
+                        reserved_owned_bytes,
+                    )?;
                 }
                 let element_namespace_index = prefix.as_ref().and_then(|_| {
                     namespaces.iter().position(|namespace| {
@@ -1167,16 +1215,17 @@ fn serialize_node_tasks(
                 });
                 let ordered_namespaces = element_namespace_index
                     .into_iter()
-                    .map(|index| &namespaces[index])
+                    .map(|index| (index, &namespaces[index]))
                     .chain(
                         namespaces
                             .iter()
                             .enumerate()
                             .filter_map(|(index, namespace)| {
-                                (Some(index) != element_namespace_index).then_some(namespace)
+                                (Some(index) != element_namespace_index)
+                                    .then_some((index, namespace))
                             }),
                     );
-                for namespace in ordered_namespaces {
+                for (namespace_index, namespace) in ordered_namespaces {
                     if namespace.prefix.as_deref() == Some("xml")
                         && namespace.uri == "http://www.w3.org/XML/1998/namespace"
                     {
@@ -1188,12 +1237,12 @@ fn serialize_node_tasks(
                     {
                         continue;
                     }
-                    let binding = (namespace.prefix.clone(), namespace.uri.clone());
-                    if current_namespaces
-                        .iter()
-                        .rev()
-                        .find(|(prefix, _)| prefix == &namespace.prefix)
-                        .is_some_and(|(_, uri)| uri == &namespace.uri)
+                    if namespace_in_scope(
+                        document,
+                        &current_namespaces,
+                        namespace.prefix.as_deref(),
+                    )
+                    .is_some_and(|uri| uri == namespace.uri)
                     {
                         continue;
                     }
@@ -1211,15 +1260,15 @@ fn serialize_node_tasks(
                         output,
                     );
                     output.push('"');
-                    let current_namespaces = Rc::make_mut(&mut current_namespaces);
-                    if let Some(existing) = current_namespaces
-                        .iter_mut()
-                        .find(|(prefix, _)| prefix == &namespace.prefix)
-                    {
-                        *existing = binding;
-                    } else {
-                        current_namespaces.push(binding);
-                    }
+                    current_namespaces = extend_namespace_scope(
+                        &current_namespaces,
+                        NamespaceBinding::Document {
+                            element: id,
+                            index: namespace_index,
+                        },
+                        meter,
+                        reserved_owned_bytes,
+                    )?;
                 }
                 for attribute in attributes {
                     output.push(' ');
@@ -1877,42 +1926,12 @@ fn encode(
 }
 
 fn validate_text_encoding(value: &str, encoding: &OutputEncoding, label: &str) -> Result<()> {
-    let legacy_encoding = match encoding {
-        OutputEncoding::Utf8
-        | OutputEncoding::Utf16
-        | OutputEncoding::Utf16Le
-        | OutputEncoding::Utf16Be => return Ok(()),
-        OutputEncoding::Ascii => {
-            if let Some(character) = value.chars().find(|character| !character.is_ascii()) {
-                return Err(Error::Serialization(format!(
-                    "text output character `{character}` is not representable in {label}"
-                )));
-            }
-            return Ok(());
-        }
-        OutputEncoding::Registered(encoding) => {
-            if let Some(character) = value
-                .chars()
-                .find(|character| encoding.encode_char(*character).is_none())
-            {
-                return Err(Error::Serialization(format!(
-                    "text output character `{character}` is not representable in {label}"
-                )));
-            }
-            return Ok(());
-        }
-        OutputEncoding::Other { encoding, .. } => *encoding,
-    };
-    let (_, _, had_errors) = legacy_encoding.encode(value);
-    if had_errors {
-        let character = value.chars().find(|character| {
-            let mut bytes = [0_u8; 4];
-            let encoded = character.encode_utf8(&mut bytes);
-            legacy_encoding.encode(encoded).2
-        });
+    if let Some(character) = value
+        .chars()
+        .find(|character| !encoding.represents(*character))
+    {
         return Err(Error::Serialization(format!(
-            "text output character `{}` is not representable in {label}",
-            character.unwrap_or('\u{fffd}')
+            "text output character `{character}` is not representable in {label}"
         )));
     }
     Ok(())
