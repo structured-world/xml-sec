@@ -220,7 +220,8 @@ impl<'d> Node<'d> {
         }
     }
 
-    fn children_len(&self) -> usize {
+    /// Returns the number of children without materializing child handles.
+    pub fn children_len(&self) -> usize {
         use self::Node::*;
         match self {
             Root(node) => node.children_len(),

@@ -1694,18 +1694,32 @@ impl CompileState {
     fn finish(mut self) -> Result<Stylesheet> {
         self.templates
             .sort_by_key(|template| (template.precedence, template.order));
-        let mut named = HashSet::new();
-        for template in self
+        let named_count = self
             .templates
             .iter()
             .filter(|template| template.name.is_some())
-        {
-            if !named.insert((template.name.clone(), template.precedence)) {
-                return Err(Error::Static(
-                    "duplicate named template at equal import precedence".into(),
-                ));
+            .count();
+        let named_workspace =
+            named_count.saturating_mul(hash_entry_storage::<(&ExpandedName, usize), ()>());
+        self.charge_owned(named_workspace)?;
+        let mut named = HashSet::new();
+        let named_result = (|| {
+            for template in self
+                .templates
+                .iter()
+                .filter(|template| template.name.is_some())
+            {
+                if !named.insert((template.name.as_ref(), template.precedence)) {
+                    return Err(Error::Static(
+                        "duplicate named template at equal import precedence".into(),
+                    ));
+                }
             }
-        }
+            Ok(())
+        })();
+        drop(named);
+        self.release_owned(named_workspace);
+        named_result?;
         let mut globals = HashSet::new();
         for global in &self.globals {
             if !globals.insert((&global.variable.name, global.precedence)) {

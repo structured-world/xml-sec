@@ -1682,6 +1682,8 @@ impl Evaluator {
             .maps
             .to_sxd(document.root().into(), node)
             .ok_or_else(|| Error::Dynamic("XPath context node is stale".into()))?;
+        let adapter_workspace = xpath_adapter_workspace_upper_bound(expression);
+        meter.check_additional(BudgetKind::OwnedBytes, adapter_workspace)?;
         let normalized = normalize_xpath_for_sxd(&expression.source);
         let isolated = hide_projection_elements_from_axes(&normalized);
         let context_namespace =
@@ -1699,6 +1701,10 @@ impl Evaluator {
                 .len()
                 .saturating_mul(128)
                 .saturating_add(std::mem::size_of::<XPath>());
+            meter.check_additional(
+                BudgetKind::OwnedBytes,
+                adapter_workspace.saturating_add(retained_bytes),
+            )?;
             meter.charge(BudgetKind::OwnedBytes, retained_bytes)?;
             let xpath = Factory::new().build(&rewritten).map_err(|error| {
                 Error::Static(format!(
@@ -1713,7 +1719,11 @@ impl Evaluator {
         let mut context = Context::new();
         context.set_document_root_resolver(projected_document_root);
         let (owned_bytes, owned_bytes_limit) = meter.usage(BudgetKind::OwnedBytes)?;
-        context.set_string_allocation_limit(owned_bytes_limit.saturating_sub(owned_bytes));
+        context.set_string_allocation_limit(
+            owned_bytes_limit
+                .saturating_sub(owned_bytes)
+                .saturating_sub(adapter_workspace),
+        );
         for (prefix, uri) in expression.namespaces.iter() {
             context.set_namespace(prefix, uri);
         }
@@ -1881,7 +1891,9 @@ impl Evaluator {
             return Err(Error::Budget {
                 kind: BudgetKind::OwnedBytes,
                 limit: owned_bytes_limit,
-                actual: owned_bytes.saturating_add(attempted),
+                actual: owned_bytes
+                    .saturating_add(adapter_workspace)
+                    .saturating_add(attempted),
             });
         }
         let expressions = self.expressions.borrow();
@@ -1903,7 +1915,9 @@ impl Evaluator {
                     return Err(Error::Budget {
                         kind: BudgetKind::OwnedBytes,
                         limit: owned_bytes_limit,
-                        actual: owned_bytes.saturating_add(attempted),
+                        actual: owned_bytes
+                            .saturating_add(adapter_workspace)
+                            .saturating_add(attempted),
                     });
                 }
                 let message = error.to_string();
@@ -2730,6 +2744,87 @@ impl Evaluator {
         };
         element_pattern_name_matches(lexical, &attribute.name, namespaces)
     }
+}
+
+fn xpath_adapter_workspace_upper_bound(expression: &Expression) -> usize {
+    let source = expression.source.as_str();
+    let source_bytes = source.len();
+    let normalizes =
+        source.chars().any(crate::lexical::is_xml_whitespace) || source.as_bytes().contains(&b'*');
+    let normalized_bytes = if normalizes {
+        // One wildcard can expand from one byte to `child::*` (eight bytes). Account for the
+        // allocator's geometric String growth while the normalized buffer remains live.
+        source_bytes.saturating_mul(16)
+    } else {
+        source_bytes
+    };
+    let normalization_peak = if normalizes {
+        source_bytes.saturating_mul(20)
+    } else {
+        0
+    };
+    let axis_rewrites = [
+        "ancestor-or-self::",
+        "ancestor::",
+        "following::",
+        "following-sibling::",
+        "preceding::",
+        "preceding-sibling::",
+        "parent::",
+        "self::",
+    ]
+    .into_iter()
+    .fold(source.matches("..").count(), |count, axis| {
+        count.saturating_add(source.matches(axis).count())
+    });
+    let isolated_bytes = normalized_bytes
+        .saturating_add(axis_rewrites.saturating_mul(192))
+        .saturating_mul(2);
+    let internal_prefix_bytes = expression
+        .namespaces
+        .iter()
+        .map(|(prefix, _)| prefix.len())
+        .max()
+        .unwrap_or(0)
+        .max("__xml_sec_ctx".len())
+        .saturating_add(1);
+    let context_calls = source
+        .matches("position")
+        .count()
+        .saturating_add(source.matches("last").count());
+    let rewritten_bytes = isolated_bytes
+        .saturating_add(context_calls.saturating_mul(internal_prefix_bytes.saturating_add(2)))
+        .saturating_mul(2);
+    let namespace_bytes = expression
+        .namespaces
+        .iter()
+        .fold(0usize, |bytes, (prefix, uri)| {
+            bytes
+                .saturating_add(hash_table_entry_bytes::<(String, String)>())
+                .saturating_add(prefix.len())
+                .saturating_add(uri.len())
+        })
+        .saturating_add(hash_table_entry_bytes::<(String, String)>())
+        .saturating_add("xml".len())
+        .saturating_add("http://www.w3.org/XML/1998/namespace".len())
+        .saturating_add(if context_calls != 0 {
+            hash_table_entry_bytes::<(String, String)>()
+                .saturating_add(internal_prefix_bytes)
+                .saturating_add(CONTEXT_NS.len())
+        } else {
+            0
+        });
+    normalization_peak.max(
+        normalized_bytes
+            .saturating_add(isolated_bytes)
+            .saturating_add(rewritten_bytes)
+            .saturating_add(namespace_bytes)
+            .saturating_add(internal_prefix_bytes.saturating_mul(2)),
+    )
+}
+
+fn hash_table_entry_bytes<T>() -> usize {
+    std::mem::size_of::<T>().saturating_mul(2)
 }
 
 fn reserve_stylesheet_imports(
@@ -6886,6 +6981,23 @@ mod tests {
     use super::*;
     use crate::ExecutionBudget;
     use sxd_xpath_no_unsafe::function::Function;
+
+    #[test]
+    fn xpath_adapter_workspace_includes_namespace_copies() {
+        let plain = Expression::generated("/source", Vec::new());
+        let namespaced = Expression::generated(
+            "/source",
+            vec![("prefix".into(), "urn:namespace:retained".into())],
+        );
+
+        assert!(
+            xpath_adapter_workspace_upper_bound(&namespaced)
+                >= xpath_adapter_workspace_upper_bound(&plain)
+                    + hash_table_entry_bytes::<(String, String)>()
+                    + "prefix".len()
+                    + "urn:namespace:retained".len()
+        );
+    }
 
     #[test]
     fn absolute_path_rewrite_distinguishes_div_name_tests_from_operators() {

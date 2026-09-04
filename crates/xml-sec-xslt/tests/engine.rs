@@ -408,6 +408,26 @@ fn doctype_uses_the_first_element_qualified_name() {
 }
 
 #[test]
+fn html_doctype_uses_the_html_name_for_a_non_html_root() {
+    // XSLT 1.0 section 16.2 fixes the HTML output DOCTYPE name independently of the result root.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="html" doctype-system="result.dtd" indent="no"/><xsl:template match="/"><custom/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<source/>"),
+        "<!DOCTYPE html SYSTEM \"result.dtd\">\n<custom></custom>"
+    );
+}
+
+#[test]
+fn text_output_ignores_doctype_properties() {
+    // XSLT 1.0 section 16.3 emits only result-tree text-node string-values; DOCTYPE properties
+    // are not applicable to the text method.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#output
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text" doctype-system="ignored.dtd"/><xsl:template match="/"><root>payload</root></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "payload");
+}
+
+#[test]
 fn instruction_specific_attributes_are_rejected() {
     // Known attributes on the wrong instruction are static errors rather than silently ignored
     // behavior that makes a malformed stylesheet appear valid.
@@ -3206,6 +3226,37 @@ fn serializer_canonicalizes_iana_aliases_in_xml_declarations() {
 }
 
 #[test]
+fn serializer_canonicalizes_ascii_aliases_for_xml_round_trips() {
+    // XSLT 1.0 section 16.1 requires the declaration to identify the encoding actually used.
+    // Canonical US-ASCII keeps every supported IANA alias parseable by the shared XML decoder.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#output
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output encoding="iso-ir-6"/><xsl:template match="/"><out>ASCII</out></xsl:template></xsl:stylesheet>"#,
+    );
+    let output = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("ASCII alias serializes");
+
+    assert!(
+        output
+            .serialized
+            .bytes
+            .starts_with(b"<?xml version=\"1.0\" encoding=\"US-ASCII\"?>")
+    );
+    xml_sec_xml_input::decode_xml(&output.serialized.bytes, None)
+        .expect("serialized ASCII output decodes as XML");
+}
+
+#[test]
 fn serializer_preserves_strict_iana_single_byte_semantics() {
     // XML 1.0 section 4.3.3 requires registered charset names to retain their IANA
     // repertoire rather than the wider WHATWG Windows mappings.
@@ -5022,7 +5073,9 @@ fn retained_dynamic_xpath_expressions_consume_owned_memory_budget() {
     };
     let repeated_expression = format!("{}1", "1 + ".repeat(64));
     let mut budget = execution_budget(1 << 20);
-    budget.owned_bytes = 256 << 10;
+    // Leave room for one retained AST and the concurrently live adapter workspace. Distinct
+    // expressions must still exhaust this budget through retained cache growth.
+    budget.owned_bytes = 512 << 10;
     stylesheet
         .execute(
             &source_with(&|_| repeated_expression.clone()),
@@ -8939,6 +8992,25 @@ fn key_index_traversal_accounts_for_its_wide_pending_stack() {
     let keyed = minimum("key");
     assert!(
         keyed + 4 * 1024 >= baseline + 4_096 * std::mem::size_of::<xml_sec_xslt::NodeId>(),
+        "baseline={baseline}, keyed={keyed}"
+    );
+}
+
+#[test]
+fn empty_key_build_markers_consume_owned_memory_budget() {
+    // A dynamic key name builds every declaration. Even declarations with no matching nodes
+    // retain one completed-build identity and must therefore consume aggregate OwnedBytes.
+    let declarations = (0..128)
+        .map(|index| format!(r#"<xsl:key name="key-{index}" match="missing" use="."/>"#))
+        .collect::<String>();
+    let stylesheet = compile(&format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">{declarations}<xsl:param name="requested" select="'absent'"/><xsl:output method="text"/><xsl:template name="baseline">ok</xsl:template><xsl:template name="keys"><xsl:value-of select="count(key($requested, 'x'))"/></xsl:template></xsl:stylesheet>"#,
+    ));
+    let baseline = minimum_execution_owned_bytes(&stylesheet, "baseline");
+    let keyed = minimum_execution_owned_bytes(&stylesheet, "keys");
+
+    assert!(
+        keyed >= baseline + 128 * std::mem::size_of::<(ExpandedName, xml_sec_xslt::NodeId)>(),
         "baseline={baseline}, keyed={keyed}"
     );
 }

@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -177,7 +176,14 @@ impl OutputEncoding {
     }
 
     fn declaration_name<'a>(&self, requested: &'a str) -> &'a str {
-        if xml_sec_xml_input::is_xml_encoding_name(requested) {
+        if matches!(self, Self::Ascii) {
+            if requested.eq_ignore_ascii_case("ascii") || requested.eq_ignore_ascii_case("us-ascii")
+            {
+                requested
+            } else {
+                self.canonical_name()
+            }
+        } else if xml_sec_xml_input::is_xml_encoding_name(requested) {
             requested
         } else {
             self.canonical_name()
@@ -387,7 +393,10 @@ fn render(
             .is_some_and(|node| matches!(node.kind, NodeKind::Element { .. }))
     });
     for (index, child) in children.iter().enumerate() {
-        if Some(*child) == document_element {
+        // XSLT 1.0 section 16.3 defines text output as the concatenation of text nodes;
+        // serialization-only declarations therefore cannot appear in it.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#output
+        if definition.method != OutputMethod::Text && Some(*child) == document_element {
             render_doctype(document, *child, definition, encoding, text)?;
         }
         serialize_node(
@@ -448,7 +457,13 @@ fn render_doctype(
         ));
     };
     text.push_str("<!DOCTYPE ");
-    push_name(prefix.as_deref(), &name.local, encoding, text)?;
+    if definition.method == OutputMethod::Html {
+        // XSLT 1.0 section 16.2 fixes this name to HTML independently of the result root.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
+        text.push_str("html");
+    } else {
+        push_name(prefix.as_deref(), &name.local, encoding, text)?;
+    }
     match (&definition.doctype_public, &definition.doctype_system) {
         (Some(public), Some(system)) => {
             text.push_str(" PUBLIC ");
@@ -1232,11 +1247,7 @@ fn serialize_node_tasks(
                         None
                     };
                     if let Some(escaping) = html_uri_escaping {
-                        escape_html_attribute(
-                            &escape_html_uri(&attribute.value, escaping),
-                            encoding,
-                            output,
-                        );
+                        escape_html_uri_attribute(&attribute.value, escaping, encoding, output);
                     } else if definition.method == OutputMethod::Html {
                         escape_html_attribute(&attribute.value, encoding, output);
                     } else {
@@ -1623,27 +1634,32 @@ fn html_uri_escaping(element: &str, attribute: &str) -> Option<HtmlUriEscaping> 
     .then_some(HtmlUriEscaping::NonAscii)
 }
 
-fn escape_html_uri(value: &str, escaping: HtmlUriEscaping) -> Cow<'_, str> {
+fn escape_html_uri_attribute(
+    value: &str,
+    escaping: HtmlUriEscaping,
+    encoding: &OutputEncoding,
+    output: &mut RenderBuffer,
+) {
     // XSLT 1.0 section 16.2 requires non-ASCII URI bytes to be escaped. libxslt also
     // escapes ASCII spaces for its historical URI table, but not for all HTML URI pairs.
     // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
     let value = value.trim_start_matches([' ', '\t', '\r', '\n']);
     let escape_spaces = matches!(escaping, HtmlUriEscaping::NonAsciiAndSpaces);
-    if value
-        .bytes()
-        .all(|byte| byte.is_ascii() && (!escape_spaces || byte != b' '))
-    {
-        return Cow::Borrowed(value);
-    }
-    let mut escaped = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if !byte.is_ascii() || (escape_spaces && byte == b' ') {
-            write!(&mut escaped, "%{byte:02X}").expect("writing to String cannot fail");
-        } else {
-            escaped.push(char::from(byte));
+    let mut plain_start = 0;
+    for (index, character) in value.char_indices() {
+        if !character.is_ascii() || (escape_spaces && character == ' ') {
+            escape_html_attribute(&value[plain_start..index], encoding, output);
+            let mut utf8 = [0_u8; 4];
+            for byte in character.encode_utf8(&mut utf8).bytes() {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                output.push('%');
+                output.push(char::from(HEX[usize::from(byte >> 4)]));
+                output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+            }
+            plain_start = index + character.len_utf8();
         }
     }
-    Cow::Owned(escaped)
+    escape_html_attribute(&value[plain_start..], encoding, output);
 }
 
 fn is_replaceable_legacy_content_type_meta(node: &crate::Node) -> bool {

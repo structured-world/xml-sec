@@ -112,38 +112,49 @@ impl AxisLike for Axis {
                 }
             }
             Child => {
-                for child in context.node.children() {
+                for index in 0..context.node.children_len() {
+                    let child = context
+                        .node
+                        .child_at(index)
+                        .expect("child index is within the observed length");
                     node_test.run(child);
                 }
             }
             Descendant => {
-                for child in context.node.children() {
-                    preorder_left_to_right(child, |n| node_test.run(n));
+                for index in 0..context.node.children_len() {
+                    let child = context
+                        .node
+                        .child_at(index)
+                        .expect("child index is within the observed length");
+                    preorder_left_to_right(context, child, |n| node_test.run(n))?;
                 }
             }
-            DescendantOrSelf => preorder_left_to_right(context.node.clone(), |n| node_test.run(n)),
+            DescendantOrSelf => {
+                preorder_left_to_right(context, context.node.clone(), |n| node_test.run(n))?
+            }
             Parent => {
                 if let Some(parent) = context.node.parent() {
                     node_test.run(parent);
                 }
             }
             PrecedingSibling => {
-                for sibling in context.node.preceding_siblings() {
-                    node_test.run(sibling)
-                }
+                each_preceding_sibling(&context.node, |sibling| node_test.run(sibling));
             }
             FollowingSibling => {
-                for sibling in context.node.following_siblings() {
-                    node_test.run(sibling)
-                }
+                each_following_sibling(&context.node, |sibling| node_test.run(sibling));
             }
             Preceding => node_and_each_parent_before(
                 context.node.clone(),
                 context.document_root_for(context.node.clone()),
                 |node| {
-                    for sibling in node.preceding_siblings() {
-                        postorder_right_to_left(sibling, |n| node_test.run(n));
-                    }
+                    each_preceding_sibling(&node, |sibling| {
+                        if node_test.error.is_none()
+                            && let Err(error) =
+                                postorder_right_to_left(context, sibling, |n| node_test.run(n))
+                        {
+                            node_test.error = Some(error);
+                        }
+                    });
                 },
             ),
             Following => {
@@ -155,15 +166,23 @@ impl AxisLike for Axis {
                     // XPath 1.0 section 5 orders namespace and attribute nodes before children.
                     // Owner descendants are therefore following, not descendants, of either
                     // non-child context node: https://www.w3.org/TR/xpath/#data-model
-                    for child in owner.children() {
-                        preorder_left_to_right(child, |node| node_test.run(node));
+                    for index in 0..owner.children_len() {
+                        let child = owner
+                            .child_at(index)
+                            .expect("child index is within the observed length");
+                        preorder_left_to_right(context, child, |node| node_test.run(node))?;
                     }
                     traversal_root = owner;
                 }
                 node_and_each_parent_before(traversal_root, document_root, |node| {
-                    for sibling in node.following_siblings() {
-                        preorder_left_to_right(sibling, |n| node_test.run(n));
-                    }
+                    each_following_sibling(&node, |sibling| {
+                        if node_test.error.is_none()
+                            && let Err(error) =
+                                preorder_left_to_right(context, sibling, |n| node_test.run(n))
+                        {
+                            node_test.error = Some(error);
+                        }
+                    });
                 });
             }
             SelfAxis => node_test.run(context.node.clone()),
@@ -182,41 +201,110 @@ impl AxisLike for Axis {
     }
 }
 
-fn preorder_left_to_right<'d, F>(node: Node<'d>, mut f: F)
+fn preorder_left_to_right<'c, 'd, F>(
+    context: &context::Evaluation<'c, 'd>,
+    node: Node<'d>,
+    mut f: F,
+) -> Result<(), Error>
 where
     F: FnMut(Node<'d>),
 {
-    let mut stack = vec![node];
-
-    while let Some(current) = stack.pop() {
-        let children = current.children();
-        f(current);
-
-        for child in children.into_iter().rev() {
-            stack.push(child);
+    let mut stack = Vec::new();
+    push_traversal_frame(&mut stack, context, (node, 0))?;
+    while let Some((current, next_child)) = stack.last_mut() {
+        if *next_child == 0 {
+            f(current.clone());
         }
+        if let Some(child) = current.child_at(*next_child) {
+            *next_child += 1;
+            push_traversal_frame(&mut stack, context, (child, 0))?;
+        } else {
+            stack.pop();
+        }
+    }
+    Ok(())
+}
+
+fn postorder_right_to_left<'c, 'd, F>(
+    context: &context::Evaluation<'c, 'd>,
+    node: Node<'d>,
+    mut f: F,
+) -> Result<(), Error>
+where
+    F: FnMut(Node<'d>),
+{
+    let last_child = node.children_len();
+    let mut stack = Vec::new();
+    push_traversal_frame(&mut stack, context, (node, last_child))?;
+    while let Some((current, next_child)) = stack.last_mut() {
+        if *next_child > 0 {
+            *next_child -= 1;
+            let child = current
+                .child_at(*next_child)
+                .expect("child index is within the observed length");
+            let last_child = child.children_len();
+            push_traversal_frame(&mut stack, context, (child, last_child))?;
+        } else {
+            let (current, _) = stack.pop().expect("stack is known to be non-empty");
+            f(current);
+        }
+    }
+    Ok(())
+}
+
+fn push_traversal_frame<'c, 'd>(
+    stack: &mut Vec<(Node<'d>, usize)>,
+    context: &context::Evaluation<'c, 'd>,
+    frame: (Node<'d>, usize),
+) -> Result<(), Error> {
+    if stack.len() == stack.capacity() {
+        let additional = stack.capacity().max(4);
+        context
+            .reserve_temporary_allocation(
+                additional.saturating_mul(std::mem::size_of::<(Node<'d>, usize)>()),
+            )
+            .map_err(|source| Error::FunctionEvaluation { source })?;
+        stack
+            .try_reserve_exact(additional)
+            .map_err(|_| Error::FunctionEvaluation {
+                source: crate::function::Error::Other {
+                    what: "XPath axis traversal allocation failed".into(),
+                },
+            })?;
+    }
+    stack.push(frame);
+    Ok(())
+}
+
+fn each_preceding_sibling<'d>(node: &Node<'d>, mut f: impl FnMut(Node<'d>)) {
+    let Some((parent, index)) = child_position(node) else {
+        return;
+    };
+    for index in (0..index).rev() {
+        f(parent.child_at(index).expect("sibling index is in bounds"));
     }
 }
 
-// There's other implementations that only require a single stack; are
-// those applicable? Are they better?
-fn postorder_right_to_left<'d, F>(node: Node<'d>, mut f: F)
-where
-    F: FnMut(Node<'d>),
-{
-    let mut stack = vec![node];
-    let mut stack2 = vec![];
-
-    while let Some(current) = stack.pop() {
-        for child in current.children().into_iter().rev() {
-            stack.push(child);
-        }
-        stack2.push(current);
+fn each_following_sibling<'d>(node: &Node<'d>, mut f: impl FnMut(Node<'d>)) {
+    let Some((parent, index)) = child_position(node) else {
+        return;
+    };
+    for index in index + 1..parent.children_len() {
+        f(parent.child_at(index).expect("sibling index is in bounds"));
     }
+}
 
-    for current in stack2.into_iter().rev() {
-        f(current);
+fn child_position<'d>(node: &Node<'d>) -> Option<(Node<'d>, usize)> {
+    if matches!(
+        node,
+        Node::Root(_) | Node::Attribute(_) | Node::Namespace(_)
+    ) {
+        return None;
     }
+    let parent = node.parent()?;
+    (0..parent.children_len())
+        .find(|index| parent.child_at(*index).as_ref() == Some(node))
+        .map(|index| (parent, index))
 }
 
 fn node_and_each_parent<'d, F>(node: Node<'d>, mut f: F)
@@ -276,6 +364,19 @@ mod test {
         }
     }
 
+    #[derive(Debug)]
+    struct RejectNodeTest;
+
+    impl NodeTest for RejectNodeTest {
+        fn test<'c, 'd>(
+            &self,
+            _context: &context::Evaluation<'c, 'd>,
+            _result: &mut OrderedNodes<'d>,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
     fn execute<'n, N>(axis: Axis, node: N) -> OrderedNodes<'n>
     where
         N: Into<Node<'n>>,
@@ -286,6 +387,26 @@ mod test {
 
         axis.select_nodes(&context, node_test)
             .expect("test node selection succeeds")
+    }
+
+    #[test]
+    fn descendant_axis_meters_its_depth_stack_before_allocation() {
+        // A node test that rejects everything isolates traversal workspace from result storage.
+        let package = Package::new();
+        let document = package.as_document();
+        let root = document.root();
+        let child = document.create_element("child");
+        root.append_child(child);
+        child.append_child(document.create_element("grandchild"));
+        let mut context = Context::without_core_functions();
+        context.set_string_allocation_limit(0);
+        let evaluation = context::Evaluation::new(&context, root.into());
+
+        assert!(
+            Descendant
+                .select_nodes(&evaluation, &RejectNodeTest)
+                .is_err()
+        );
     }
 
     #[test]

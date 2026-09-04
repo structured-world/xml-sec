@@ -583,11 +583,18 @@ impl<'a> Execution<'a> {
     }
 
     fn build_key(&mut self, name: &ExpandedName, logical_root: NodeId) -> Result<()> {
+        let retained_marker_bytes = key_build_marker_retained_bytes(name);
+        let transient_marker_bytes =
+            retained_marker_bytes.saturating_add(expanded_name_owned_bytes(name));
+        self.meter
+            .charge(BudgetKind::OwnedBytes, transient_marker_bytes)?;
         let identity = (name.clone(), logical_root);
         if self.built_keys.contains(&identity) {
+            self.meter.release_owned_bytes(transient_marker_bytes);
             return Ok(());
         }
         if !self.building_keys.insert(identity.clone()) {
+            self.meter.release_owned_bytes(transient_marker_bytes);
             return Err(Error::Dynamic(format!(
                 "cyclic xsl:key dependency for {}",
                 name.local
@@ -647,10 +654,16 @@ impl<'a> Execution<'a> {
             })();
             drop(pending);
             self.meter.release_owned_bytes(pending_reservation);
-            result?;
+            if let Err(error) = result {
+                self.building_keys.remove(&identity);
+                self.meter.release_owned_bytes(transient_marker_bytes);
+                return Err(error);
+            }
             self.evaluator.finish_key_index(&mut self.meter);
         }
         self.building_keys.remove(&identity);
+        self.meter
+            .release_owned_bytes(transient_marker_bytes - retained_marker_bytes);
         self.built_keys.insert(identity);
         Ok(())
     }
@@ -4784,6 +4797,14 @@ fn expanded_name_owned_bytes(name: &ExpandedName) -> usize {
         .as_ref()
         .map_or(0, String::len)
         .saturating_add(name.local.len())
+}
+
+fn key_build_marker_retained_bytes(name: &ExpandedName) -> usize {
+    // Hash tables retain control bytes and spare buckets. Two entry widths conservatively model
+    // the standard maximum load without coupling execution budgets to one allocator.
+    std::mem::size_of::<((ExpandedName, NodeId), ())>()
+        .saturating_mul(2)
+        .saturating_add(expanded_name_owned_bytes(name))
 }
 
 fn attribute_owned_bytes(attribute: &Attribute) -> usize {
