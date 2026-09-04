@@ -8784,6 +8784,94 @@ fn duplicate_template_parameters_are_static_errors() {
 }
 
 #[test]
+fn unbounded_execution_policy_cannot_exceed_native_recursion_ceiling() {
+    // Caller policy may be unbounded, but native recursive paths must retain a process-safety
+    // ceiling before entering another Rust stack frame.
+    let globals = (0..=256)
+        .map(|index| {
+            if index == 256 {
+                format!(r#"<xsl:variable name="g{index}" select="'done'"/>"#)
+            } else {
+                format!(
+                    r#"<xsl:variable name="g{index}" select="$g{}"/>"#,
+                    index + 1
+                )
+            }
+        })
+        .collect::<String>();
+    let stylesheet = compile(&format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">{globals}<xsl:template match="/"><xsl:value-of select="$g0"/></xsl:template></xsl:stylesheet>"#
+    ));
+    let mut budget = execution_budget(1024);
+    budget.recursion_depth = usize::MAX;
+    assert!(matches!(
+        stylesheet.execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::RecursionDepth,
+            ..
+        })
+    ));
+
+    let attribute_sets = (0..=256)
+        .map(|index| {
+            if index == 256 {
+                format!(r#"<xsl:attribute-set name="s{index}"><xsl:attribute name="done">yes</xsl:attribute></xsl:attribute-set>"#)
+            } else {
+                format!(r#"<xsl:attribute-set name="s{index}" use-attribute-sets="s{}"/>"#, index + 1)
+            }
+        })
+        .collect::<String>();
+    let stylesheet = compile(&format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">{attribute_sets}<xsl:template match="/"><out xsl:use-attribute-sets="s0"/></xsl:template></xsl:stylesheet>"#
+    ));
+    assert!(matches!(
+        stylesheet.execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::RecursionDepth,
+            ..
+        })
+    ));
+
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" xmlns:f="urn:functions" extension-element-prefixes="func"><func:function name="f:down"><xsl:param name="n"/><xsl:choose><xsl:when test="$n &gt; 0"><func:result select="f:down($n - 1)"/></xsl:when><xsl:otherwise><func:result select="0"/></xsl:otherwise></xsl:choose></func:function><xsl:template match="/"><xsl:value-of select="f:down(257)"/></xsl:template></xsl:stylesheet>"#,
+    );
+    assert!(matches!(
+        stylesheet.execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::RecursionDepth,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn forward_compatible_all_prefix_value_is_ignored_consistently() {
     // XSLT 1.0 section 2.5 ignores an optional attribute whose value is not allowed by 1.0;
     // extension classification must not reinterpret the ignored XSLT 2.0 #all token.
@@ -8892,6 +8980,73 @@ fn retained_pattern_match_sets_consume_the_execution_memory_budget() {
             ..
         })
     ));
+}
+
+#[test]
+fn optimized_child_selection_accounts_for_projected_node_storage() {
+    // The child-axis shortcut must reserve its selected-node vector before materializing a wide
+    // source projection, just like the generic XPath evaluator.
+    let source_xml = format!("<root>{}</root>", "<item/>".repeat(4_096));
+    let source = Document::parse(&source_xml, None).expect("wide source parses");
+    let baseline = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#,
+    );
+    let selecting = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:apply-templates select="root/item"/></xsl:template><xsl:template match="item"/></xsl:stylesheet>"#,
+    );
+    let baseline_bytes =
+        minimum_execution_owned_bytes_for_source(&baseline, &source, source_xml.len());
+    let selecting_bytes =
+        minimum_execution_owned_bytes_for_source(&selecting, &source, source_xml.len());
+    assert!(
+        selecting_bytes >= baseline_bytes.saturating_add(4_096),
+        "wide fast-path selection storage must cross OwnedBytes"
+    );
+}
+
+#[test]
+fn effective_global_index_accounts_for_retained_storage() {
+    // The effective-global lookup table survives initialization even when every declaration is
+    // unused, so its buckets and cloned expanded names belong to peak OwnedBytes.
+    let globals = (0..256)
+        .map(|index| format!(r#"<xsl:variable name="global-{index}" select="{index}"/>"#))
+        .collect::<String>();
+    let baseline = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#,
+    );
+    let indexed = compile(&format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">{globals}<xsl:template match="/"/></xsl:stylesheet>"#
+    ));
+    let source = Document::parse("<source/>", None).expect("source parses");
+    let baseline_bytes = minimum_execution_owned_bytes_for_source(&baseline, &source, 1024);
+    let indexed_bytes = minimum_execution_owned_bytes_for_source(&indexed, &source, 1024);
+    assert!(
+        indexed_bytes >= baseline_bytes.saturating_add(16 * 1024),
+        "retained global index must cross OwnedBytes"
+    );
+}
+
+#[test]
+fn multiple_numbering_accounts_for_lineage_workspace() {
+    // level="multiple" retains the ancestor lineage and resulting number sequence concurrently;
+    // both vectors must be reserved before growing from attacker-controlled source depth.
+    let depth = 192;
+    let source_xml = format!("{}<leaf/>{}", "<n>".repeat(depth), "</n>".repeat(depth));
+    let source = Document::parse(&source_xml, None).expect("deep source parses");
+    let baseline = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:apply-templates select="//leaf"/></xsl:template><xsl:template match="leaf"/></xsl:stylesheet>"#,
+    );
+    let numbering = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:apply-templates select="//leaf"/></xsl:template><xsl:template match="leaf"><xsl:number level="multiple" count="n|leaf"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let baseline_bytes =
+        minimum_execution_owned_bytes_for_source(&baseline, &source, source_xml.len());
+    let numbering_bytes =
+        minimum_execution_owned_bytes_for_source(&numbering, &source, source_xml.len());
+    assert!(
+        numbering_bytes >= baseline_bytes.saturating_add(depth),
+        "numbering lineage must cross OwnedBytes"
+    );
 }
 
 #[test]

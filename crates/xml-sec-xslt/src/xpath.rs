@@ -2465,37 +2465,49 @@ impl Evaluator {
         &self,
         expression: &Expression,
         node: &SourceNode,
+        meter: &mut Meter,
     ) -> Result<Option<Vec<SourceNode>>> {
         let source = expression.source.trim();
         if source.contains('|') && source != "*|text()" {
             return Ok(None);
         }
-        let steps = source.split('/').collect::<Vec<_>>();
-        if steps.is_empty()
-            || steps.iter().any(|step| {
+        let steps = source.split('/');
+        if source.is_empty()
+            || steps.clone().any(|step| {
                 step.is_empty()
                     || (step.contains(['[', ']', '(', ')', '@'])
-                        && !matches!(*step, "text()" | "*|text()"))
+                        && !matches!(step, "text()" | "*|text()"))
                     || step.contains("::")
             })
         {
             return Ok(None);
         }
         if steps
-            .iter()
-            .any(|step| !matches!(*step, "*" | "text()" | "*|text()") && !is_lexical_qname(step))
+            .clone()
+            .any(|step| !matches!(step, "*" | "text()" | "*|text()") && !is_lexical_qname(step))
         {
             return Ok(None);
         }
 
-        let mut selected = vec![node.clone()];
+        let mut selected = Vec::new();
+        let mut selected_bytes = 0;
+        reserve_temporary_vec_slot(&mut selected, meter, &mut selected_bytes)?;
+        selected.push(node.clone());
         for step in steps {
             let mut next = Vec::new();
+            let mut next_bytes = 0;
             for parent in &selected {
-                for child in self.children(parent) {
-                    let SourceNode::Node(id) = child else {
-                        continue;
-                    };
+                let SourceNode::Node(parent) = parent else {
+                    continue;
+                };
+                let Some(children) = self
+                    .source
+                    .node(*parent)
+                    .map(|node| node.children.as_slice())
+                else {
+                    continue;
+                };
+                for id in children.iter().copied() {
                     let Some(candidate) = self.source.node(id) else {
                         continue;
                     };
@@ -2514,12 +2526,22 @@ impl Evaluator {
                         },
                     };
                     if matches {
+                        if let Err(error) =
+                            reserve_temporary_vec_slot(&mut next, meter, &mut next_bytes)
+                        {
+                            meter.release_owned_bytes(selected_bytes);
+                            meter.release_owned_bytes(next_bytes);
+                            return Err(error);
+                        }
                         next.push(SourceNode::Node(id));
                     }
                 }
             }
+            meter.release_owned_bytes(selected_bytes);
             selected = next;
+            selected_bytes = next_bytes;
         }
+        meter.release_owned_bytes(selected_bytes);
         Ok(Some(selected))
     }
 

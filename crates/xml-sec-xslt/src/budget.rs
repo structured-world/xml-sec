@@ -15,6 +15,9 @@ pub(crate) const COMPILE_RECURSION_DEPTH_CEILING: usize = 256;
 // XInclude resolution currently retains one small native frame per nested acquired document.
 // This absolute process-safety ceiling only tightens the caller's execution policy.
 pub(crate) const XINCLUDE_RECURSION_DEPTH_CEILING: usize = 256;
+// Global initialization, attribute-set expansion, and stylesheet-defined functions retain native
+// Rust frames. This process-safety ceiling only tightens the caller's execution policy.
+pub(crate) const EXECUTION_RECURSION_DEPTH_CEILING: usize = 256;
 
 /// Independently metered XSLT resource dimensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

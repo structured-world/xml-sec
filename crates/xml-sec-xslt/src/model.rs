@@ -1734,7 +1734,7 @@ pub(crate) fn prepare_xml_frontend_bounded(xml: &str, limit: usize) -> Result<Co
         });
     };
 
-    let mut insertions = Vec::<(usize, String)>::new();
+    let mut edits = Vec::<(std::ops::Range<usize>, String)>::new();
     let mut scanner = Scanner::new(expanded_xml.as_ref());
     while let Some(event) = scanner
         .next_event()
@@ -1744,9 +1744,39 @@ pub(crate) fn prepare_xml_frontend_bounded(xml: &str, limit: usize) -> Result<Co
             Event::Start(start) | Event::Empty(start) => start,
             _ => continue,
         };
-        let Some(defaults) = declarations.attributes.get(start.name.qualified().as_ref()) else {
-            continue;
-        };
+        let defaults = declarations
+            .attributes
+            .get(start.name.qualified().as_ref())
+            .map_or(&[][..], Vec::as_slice);
+        for attribute in &start.attributes {
+            if !contains_expandable_entity_reference(attribute.value, &declarations.general) {
+                continue;
+            }
+            let name = attribute.name.qualified();
+            let is_cdata = defaults
+                .iter()
+                .find(|declaration| declaration.name == name)
+                .is_none_or(|declaration| declaration.attribute_type.is_cdata());
+            let value = prepare_attribute_value(
+                name.as_ref(),
+                attribute.value,
+                &declarations.general,
+                is_cdata,
+                &mut entity_references,
+                &mut entity_expansion,
+            )?;
+            let replacement_len = escaped_xml_attribute_value_len(&value)
+                .and_then(|length| length.checked_add(name.len()))
+                .and_then(|length| length.checked_add(3))
+                .ok_or_else(|| Error::Xml("expanded attribute output is too large".into()))?;
+            entity_expansion.charge(replacement_len)?;
+            let mut replacement = String::with_capacity(replacement_len);
+            replacement.push_str(name.as_ref());
+            replacement.push_str("=\"");
+            push_escaped_xml_attribute_value(&mut replacement, &value);
+            replacement.push('"');
+            edits.push((attribute.range.clone(), replacement));
+        }
         // XML 1.0 section 3.3.2 requires a non-validating processor to report defaulted
         // attributes when it reads their declarations from the internal subset.
         // https://www.w3.org/TR/xml/#sec-attr-defaults
@@ -1770,15 +1800,7 @@ pub(crate) fn prepare_xml_frontend_bounded(xml: &str, limit: usize) -> Result<Co
                 &mut entity_references,
                 &mut entity_expansion,
             )?;
-            let escaped_value_len = value.chars().try_fold(0usize, |length, character| {
-                length.checked_add(match character {
-                    '&' => "&amp;".len(),
-                    '<' => "&lt;".len(),
-                    '"' => "&quot;".len(),
-                    _ => character.len_utf8(),
-                })
-            });
-            let insertion_len = escaped_value_len
+            let insertion_len = escaped_xml_attribute_value_len(&value)
                 .and_then(|length| length.checked_add(declaration.name.len()))
                 .and_then(|length| length.checked_add(4))
                 .ok_or_else(|| Error::Xml("DTD default attribute output is too large".into()))?;
@@ -1789,14 +1811,7 @@ pub(crate) fn prepare_xml_frontend_bounded(xml: &str, limit: usize) -> Result<Co
             insertion.push(' ');
             insertion.push_str(&declaration.name);
             insertion.push_str("=\"");
-            for character in value.chars() {
-                match character {
-                    '&' => insertion.push_str("&amp;"),
-                    '<' => insertion.push_str("&lt;"),
-                    '"' => insertion.push_str("&quot;"),
-                    _ => insertion.push(character),
-                }
-            }
+            push_escaped_xml_attribute_value(&mut insertion, &value);
             insertion.push('"');
         }
         if !insertion.is_empty() {
@@ -1805,28 +1820,55 @@ pub(crate) fn prepare_xml_frontend_bounded(xml: &str, limit: usize) -> Result<Co
             } else {
                 start.range.end - 1
             };
-            insertions.push((before_close, insertion));
+            edits.push((before_close..before_close, insertion));
         }
     }
 
-    let added = insertions.iter().fold(0usize, |bytes, (_, value)| {
+    edits.sort_by_key(|(range, _)| range.start);
+    let removed = edits.iter().fold(0usize, |bytes, (range, _)| {
+        bytes.saturating_add(range.end.saturating_sub(range.start))
+    });
+    let added = edits.iter().fold(0usize, |bytes, (_, value)| {
         bytes.saturating_add(value.len())
     });
     let capacity = expanded_xml
         .len()
         .saturating_sub(doctype.end.saturating_sub(doctype.start))
+        .saturating_sub(removed)
         .saturating_add(added);
     entity_expansion.charge(capacity)?;
     let mut prepared = String::with_capacity(capacity);
     prepared.push_str(&expanded_xml[..doctype.start]);
     let mut cursor = doctype.end;
-    for (offset, insertion) in insertions {
-        prepared.push_str(&expanded_xml[cursor..offset]);
-        prepared.push_str(&insertion);
-        cursor = offset;
+    for (range, replacement) in edits {
+        prepared.push_str(&expanded_xml[cursor..range.start]);
+        prepared.push_str(&replacement);
+        cursor = range.end;
     }
     prepared.push_str(&expanded_xml[cursor..]);
     Ok(Cow::Owned(prepared))
+}
+
+fn escaped_xml_attribute_value_len(value: &str) -> Option<usize> {
+    value.chars().try_fold(0usize, |length, character| {
+        length.checked_add(match character {
+            '&' => "&amp;".len(),
+            '<' => "&lt;".len(),
+            '"' => "&quot;".len(),
+            _ => character.len_utf8(),
+        })
+    })
+}
+
+fn push_escaped_xml_attribute_value(output: &mut String, value: &str) {
+    for character in value.chars() {
+        match character {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '"' => output.push_str("&quot;"),
+            _ => output.push(character),
+        }
+    }
 }
 
 fn decode_xml_character_reference(digits: &str, radix: u32) -> Result<String> {
@@ -3801,6 +3843,7 @@ mod parser_boundary_tests {
         doctype_span, expand_document_entities, expand_entity_references,
         expand_parameter_entity_references, internal_general_entities,
         normalize_predefined_entity_declaration, parser_workspace_bytes,
+        prepare_xml_frontend_bounded,
     };
     use crate::budget::{ENTITY_EXPANSION_BYTE_CEILING, Meter};
     use crate::{BudgetKind, ExecutionBudget, ParseBudget};
@@ -4719,6 +4762,33 @@ mod parser_boundary_tests {
                 .expect("plain attribute is accepted"),
             std::borrow::Cow::Borrowed(_)
         ));
+    }
+
+    #[test]
+    fn shallow_and_iterative_frontends_expand_explicit_attribute_entities_identically() {
+        // XML 1.0 section 3.3.3 requires general entity replacement while normalizing every
+        // explicit attribute value: https://www.w3.org/TR/xml/#AVNormalize
+        let xml =
+            r#"<!DOCTYPE root [<!ENTITY quoted '&quot;value&quot;'>]><root attr="&quoted;"/>"#;
+        let shallow = Document::parse(xml, None).expect("shallow frontend expands the entity");
+        let iterative =
+            Document::parse_iterative(xml, None).expect("iterative frontend expands the entity");
+        assert_eq!(shallow, iterative);
+        let root = shallow
+            .node(shallow.root())
+            .expect("document root exists")
+            .children[0];
+        let NodeKind::Element { attributes, .. } =
+            &shallow.node(root).expect("element exists").kind
+        else {
+            panic!("document child is an element");
+        };
+        assert_eq!(attributes[0].value, "\"value\"");
+
+        let prepared = prepare_xml_frontend_bounded(xml, ENTITY_EXPANSION_BYTE_CEILING)
+            .expect("roxmltree frontend preparation expands the entity");
+        let parsed = roxmltree::Document::parse(&prepared).expect("prepared XML parses");
+        assert_eq!(parsed.root_element().attribute("attr"), Some("\"value\""));
     }
 
     #[test]

@@ -8,7 +8,7 @@ use icu_collator::preferences::CollationCaseFirst;
 use icu_collator::{Collator, CollatorBorrowed, CollatorPreferences, options::CollatorOptions};
 use icu_locale::Locale;
 
-use crate::budget::{Meter, reserve_temporary_vec_slot};
+use crate::budget::{EXECUTION_RECURSION_DEPTH_CEILING, Meter, reserve_temporary_vec_slot};
 use crate::compiler::{
     AttributeValueTemplate, AvtPart, Expression, ExsltFunction, Instruction, InstructionSequence,
     NameTest, Sort, Stylesheet, Template, Variable,
@@ -162,7 +162,7 @@ impl Stylesheet {
     ) -> Result<TransformResult> {
         let source_bytes = source.source_bytes();
         let mut meter = Meter::new(options.budget, source_bytes)?;
-        let effective_globals = effective_globals(self)?;
+        let effective_globals = effective_globals(self, &mut meter)?;
         // XSLT 1.0 section 11.4 defines externally bindable stylesheet parameters through
         // top-level xsl:param and leaves the passing mechanism implementation-defined:
         // https://www.w3.org/TR/1999/REC-xslt-19991116#top-level-variables
@@ -289,6 +289,9 @@ fn should_strip_whitespace(
             ancestor = current.parent?;
         }
     });
+    // XSLT 1.0 section 3.4 says a whitespace text node is preserved if *any* listed condition
+    // applies; inherited xml:space="preserve" is therefore independent of xsl:strip-space.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#strip
     if xml_space == Some("preserve") {
         return false;
     }
@@ -826,6 +829,10 @@ impl<'a> Execution<'a> {
         let Some(global) = self.pending_globals.remove(name) else {
             return Ok(());
         };
+        self.meter.recursion_with_ceiling(
+            self.initializing_globals.len().saturating_add(1),
+            EXECUTION_RECURSION_DEPTH_CEILING,
+        )?;
         self.initializing_globals.push(name.clone());
         let value = self.evaluate_variable(
             &global.variable,
@@ -1940,19 +1947,28 @@ impl<'a> Execution<'a> {
                 Ok(())
             }
             Instruction::Number(number) => {
-                let values = if let Some(expression) = &number.value {
-                    vec![
+                let explicit_value = if let Some(expression) = &number.value {
+                    Some(
                         self.evaluate(expression, node, position, size)?
                             .number(&self.evaluator),
-                    ]
+                    )
+                } else {
+                    None
+                };
+                let (values, values_owned_bytes) = if explicit_value.is_some() {
+                    (Vec::new(), 0)
                 } else {
                     self.number_sequence(number, node)?
                 };
+                let values = explicit_value
+                    .as_ref()
+                    .map_or(values.as_slice(), std::slice::from_ref);
                 if values.is_empty() {
+                    self.meter.release_owned_bytes(values_owned_bytes);
                     return Ok(());
                 }
                 if number.value.is_some()
-                    && let [value] = values.as_slice()
+                    && let [value] = values
                     && (!value.is_finite() || *value < 0.5)
                 {
                     // XSLT 1.0 section 7.7 permits recovery from an invalid explicit value only by
@@ -2020,7 +2036,7 @@ impl<'a> Execution<'a> {
                     }
                 };
                 let formatted = format_number_sequence(
-                    &values,
+                    values,
                     &format,
                     lang.as_deref(),
                     letter_value,
@@ -2028,6 +2044,7 @@ impl<'a> Execution<'a> {
                     grouping_size,
                     &self.meter,
                 )?;
+                self.meter.release_owned_bytes(values_owned_bytes);
                 self.append_owned_text(formatted, false)
             }
             Instruction::Variable(variable) => {
@@ -2225,7 +2242,10 @@ impl<'a> Execution<'a> {
             "@*" => return Ok(XPathValue::NodeSet(self.evaluator.attributes(node))),
             _ => {}
         }
-        if let Some(nodes) = self.evaluator.select_child_axis(expression, node)? {
+        if let Some(nodes) = self
+            .evaluator
+            .select_child_axis(expression, node, &mut self.meter)?
+        {
             return Ok(XPathValue::NodeSet(nodes));
         }
         if let Some(value) = self.evaluate_scalar_fast(expression, node)? {
@@ -2683,7 +2703,8 @@ impl<'a> Execution<'a> {
             self.binding_function_defaults.push(function.name.clone());
         }
         let parameters = (|| {
-            self.meter.recursion(depth)?;
+            self.meter
+                .recursion_with_ceiling(depth, EXECUTION_RECURSION_DEPTH_CEILING)?;
             for (index, parameter) in function.params.iter().enumerate() {
                 let retained = if let Some(value) = arguments.get(index) {
                     let retained_owned_bytes = binding_owned_bytes(&parameter.name, value);
@@ -2762,7 +2783,10 @@ impl<'a> Execution<'a> {
             }
             _ => {}
         }
-        if let Some(nodes) = self.evaluator.select_child_axis(expression, node)? {
+        if let Some(nodes) = self
+            .evaluator
+            .select_child_axis(expression, node, &mut self.meter)?
+        {
             return Ok(nodes);
         }
         match self.evaluate_after_charge(expression, node, position, size)? {
@@ -3286,6 +3310,10 @@ impl<'a> Execution<'a> {
         if active.contains(name) {
             return Err(Error::Static("attribute-set cycle".into()));
         }
+        self.meter.recursion_with_ceiling(
+            active.len().saturating_add(1),
+            EXECUTION_RECURSION_DEPTH_CEILING,
+        )?;
         active.push(name.clone());
         let mut sets = self
             .stylesheet
@@ -3315,7 +3343,6 @@ impl<'a> Execution<'a> {
                     let set = sets[cursor];
                     let set_start = self.current_attribute_count()?;
                     for used in &set.uses {
-                        self.meter.recursion(frame.depth + 1)?;
                         self.apply_attribute_set(
                             used,
                             node,
@@ -3712,8 +3739,11 @@ impl<'a> Execution<'a> {
         &mut self,
         instruction: &crate::compiler::NumberInstruction,
         node: &SourceNode,
-    ) -> Result<Vec<f64>> {
-        let mut lineage = vec![node.clone()];
+    ) -> Result<(Vec<f64>, usize)> {
+        let mut lineage = Vec::new();
+        let mut lineage_owned_bytes = 0;
+        reserve_temporary_vec_slot(&mut lineage, &mut self.meter, &mut lineage_owned_bytes)?;
+        lineage.push(node.clone());
         let mut cursor = match node {
             SourceNode::Node(id) => self.evaluator.source.node(*id).and_then(|node| node.parent),
             SourceNode::Attribute { owner, .. } | SourceNode::Namespace { owner, .. } => {
@@ -3721,6 +3751,12 @@ impl<'a> Execution<'a> {
             }
         };
         while let Some(id) = cursor {
+            if let Err(error) =
+                reserve_temporary_vec_slot(&mut lineage, &mut self.meter, &mut lineage_owned_bytes)
+            {
+                self.meter.release_owned_bytes(lineage_owned_bytes);
+                return Err(error);
+            }
             lineage.push(SourceNode::Node(id));
             cursor = self.evaluator.source.node(id).and_then(|node| node.parent);
         }
@@ -3748,23 +3784,37 @@ impl<'a> Execution<'a> {
                         break;
                     }
                     if matches(self, &candidate)? {
-                        return Ok(vec![self.sibling_number(&candidate, &mut matches)? as f64]);
+                        let mut values = Vec::new();
+                        let mut values_owned_bytes = 0;
+                        reserve_temporary_vec_slot(
+                            &mut values,
+                            &mut self.meter,
+                            &mut values_owned_bytes,
+                        )?;
+                        values.push(self.sibling_number(&candidate, &mut matches)? as f64);
+                        return Ok((values, values_owned_bytes));
                     }
                 }
-                Ok(Vec::new())
+                Ok((Vec::new(), 0))
             }
             "multiple" => {
                 let mut values = Vec::new();
+                let mut values_owned_bytes = 0;
                 for candidate in lineage.into_iter().rev() {
                     if from(self, &candidate)? {
                         values.clear();
                         continue;
                     }
                     if matches(self, &candidate)? {
+                        reserve_temporary_vec_slot(
+                            &mut values,
+                            &mut self.meter,
+                            &mut values_owned_bytes,
+                        )?;
                         values.push(self.sibling_number(&candidate, &mut matches)? as f64);
                     }
                 }
-                Ok(values)
+                Ok((values, values_owned_bytes))
             }
             "any" => {
                 let mut count = 0usize;
@@ -3799,7 +3849,17 @@ impl<'a> Execution<'a> {
                             count += 1;
                         }
                         if &candidate == node {
-                            return Ok((count > 0).then_some(count as f64).into_iter().collect());
+                            let mut values = Vec::new();
+                            let mut values_owned_bytes = 0;
+                            if count > 0 {
+                                reserve_temporary_vec_slot(
+                                    &mut values,
+                                    &mut self.meter,
+                                    &mut values_owned_bytes,
+                                )?;
+                                values.push(count as f64);
+                            }
+                            return Ok((values, values_owned_bytes));
                         }
                         let is_current_owner = matches!(
                             node,
@@ -3815,7 +3875,17 @@ impl<'a> Execution<'a> {
                             } else if matches(self, node)? {
                                 count += 1;
                             }
-                            return Ok((count > 0).then_some(count as f64).into_iter().collect());
+                            let mut values = Vec::new();
+                            let mut values_owned_bytes = 0;
+                            if count > 0 {
+                                reserve_temporary_vec_slot(
+                                    &mut values,
+                                    &mut self.meter,
+                                    &mut values_owned_bytes,
+                                )?;
+                                values.push(count as f64);
+                            }
+                            return Ok((values, values_owned_bytes));
                         }
                     }
                     Err(Error::Dynamic(
@@ -3829,6 +3899,7 @@ impl<'a> Execution<'a> {
                 "unsupported xsl:number level {level}"
             ))),
         })();
+        self.meter.release_owned_bytes(lineage_owned_bytes);
         self.meter.release_owned_bytes(reserved_owned_bytes);
         result
     }
@@ -3920,15 +3991,27 @@ impl<'a> Execution<'a> {
     }
 }
 
-fn effective_globals(
-    stylesheet: &Stylesheet,
-) -> Result<HashMap<ExpandedName, &crate::compiler::GlobalVariable>> {
-    let mut effective: HashMap<ExpandedName, &crate::compiler::GlobalVariable> = HashMap::new();
+fn effective_globals<'a>(
+    stylesheet: &'a Stylesheet,
+    meter: &mut Meter,
+) -> Result<HashMap<ExpandedName, &'a crate::compiler::GlobalVariable>> {
+    // The table retains control bytes and spare buckets for the complete declaration upper bound.
+    let table_bytes = stylesheet
+        .globals
+        .len()
+        .saturating_mul(std::mem::size_of::<(
+            ExpandedName,
+            &crate::compiler::GlobalVariable,
+        )>())
+        .saturating_mul(2);
+    meter.charge(BudgetKind::OwnedBytes, table_bytes)?;
+    let mut effective: HashMap<ExpandedName, &crate::compiler::GlobalVariable> =
+        HashMap::with_capacity(stylesheet.globals.len());
     for global in stylesheet.globals.iter() {
-        if let Some(current) = effective.get(&global.variable.name) {
+        if let Some(current) = effective.get_mut(&global.variable.name) {
             match global.precedence.cmp(&current.precedence) {
                 Ordering::Greater => {
-                    effective.insert(global.variable.name.clone(), global);
+                    *current = global;
                 }
                 Ordering::Equal => {
                     return Err(Error::Static(format!(
@@ -3939,6 +4022,8 @@ fn effective_globals(
                 Ordering::Less => {}
             }
         } else {
+            let name_bytes = expanded_name_owned_bytes(&global.variable.name);
+            meter.charge(BudgetKind::OwnedBytes, name_bytes)?;
             effective.insert(global.variable.name.clone(), global);
         }
     }
