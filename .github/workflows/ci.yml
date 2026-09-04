@@ -105,9 +105,9 @@ jobs:
           toolchain: "1.92.0"
           targets: thumbv7em-none-eabihf
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check -p xml-sec-xml-input --no-default-features
+      - run: cargo +1.92.0 check -p xml-sec-xml-input --no-default-features
       - run: >-
-          cargo check -p xml-sec-xml-input --no-default-features
+          cargo +1.92.0 check -p xml-sec-xml-input --no-default-features
           --target thumbv7em-none-eabihf
 
   test-matrix:
