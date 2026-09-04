@@ -153,10 +153,70 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
-    needs: test-matrix
+    needs: [test-matrix, xslt-oracle]
     if: ${{ always() }}
     steps:
       - run: test "${{ needs.test-matrix.result }}" = "success"
+      - run: test "${{ needs.xslt-oracle.result }}" = "success"
+
+  xslt-oracle:
+    name: XSLT oracle (libxslt 1.1.45)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Read pinned XSLT oracle revisions
+        id: xslt-oracle-revisions
+        run: |
+          libxml2_commit="$(cat compatibility/libxml2-2.15.1-xslt-oracle-commit.txt)"
+          libxslt_commit="$(cat compatibility/libxslt-1.1.45-donor-commit.txt)"
+          [[ "$libxml2_commit" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$libxslt_commit" =~ ^[0-9a-f]{40}$ ]]
+          echo "libxml2=$libxml2_commit" >> "$GITHUB_OUTPUT"
+          echo "libxslt=$libxslt_commit" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        with:
+          repository: GNOME/libxml2
+          ref: ${{ steps.xslt-oracle-revisions.outputs.libxml2 }}
+          path: donors/libxml2
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: GNOME/libxslt
+          ref: ${{ steps.xslt-oracle-revisions.outputs.libxslt }}
+          path: donors/libxslt
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.92.0"
+      - uses: taiki-e/install-action@nextest
+      - name: Build pinned libxml2 and libxslt oracle
+        run: |
+          cmake -S donors/libxml2 -B .tools/libxml2-build \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/.tools/libxml2" \
+            -DLIBXML2_WITH_PYTHON=OFF \
+            -DLIBXML2_WITH_TESTS=OFF \
+            -DLIBXML2_WITH_PROGRAMS=OFF \
+            -DBUILD_SHARED_LIBS=OFF
+          cmake --build .tools/libxml2-build --target install --parallel 2
+          cmake -S donors/libxslt -B .tools/libxslt-build \
+            -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/.tools/libxml2" \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/.tools/libxslt" \
+            -DLIBXSLT_WITH_PYTHON=OFF \
+            -DLIBXSLT_WITH_TESTS=OFF \
+            -DLIBXSLT_WITH_PROGRAMS=ON \
+            -DLIBXSLT_WITH_MODULES=OFF \
+            -DBUILD_SHARED_LIBS=OFF
+          cmake --build .tools/libxslt-build --target install --parallel 2
+          .tools/libxslt/bin/xsltproc --version
+      - name: Verify vendored oracle fixtures
+        env:
+          LIBXSLT_SOURCE_DIR: ${{ github.workspace }}/donors/libxslt
+        run: scripts/import-libxslt-oracle-fixtures.sh --check
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Rust engine against pinned libxslt golden corpus
+        run: cargo nextest run -p xml-sec-xslt --test libxslt_oracle --no-fail-fast
 
   clippy-matrix:
     name: clippy (${{ matrix.xml-backend }})
