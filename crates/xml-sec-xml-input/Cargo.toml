@@ -1,0 +1,17 @@
+[package]
+name = "xml-sec-xml-input"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "Apache-2.0"
+description = "Strict XML byte encoding detection and transcoding for xml-sec"
+repository = "https://github.com/structured-world/xml-sec"
+
+[features]
+default = ["std"]
+std = ["thiserror/std", "xmlparser/std"]
+
+[dependencies]
+encoding_rs = { version = "0.8", default-features = false, features = ["alloc"] }
+thiserror = { version = "2", default-features = false }
+xmlparser = { version = "0.13.6", default-features = false }
