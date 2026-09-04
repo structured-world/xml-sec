@@ -662,8 +662,11 @@ pub struct Stylesheet {
     pub(crate) keys: Arc<[KeyDeclaration]>,
     pub(crate) decimal_formats: Arc<[DecimalFormat]>,
     pub(crate) namespace_aliases: Arc<[NamespaceAlias]>,
+    pub(crate) namespace_alias_index: Arc<HashMap<Arc<str>, usize>>,
+    pub(crate) default_namespace_alias: Option<usize>,
     pub(crate) attribute_sets: Arc<[AttributeSet]>,
     pub(crate) functions: Arc<[ExsltFunction]>,
+    pub(crate) function_names: Arc<HashSet<ExpandedName>>,
     pub(crate) resource_identities: Arc<[ResourceIdentity]>,
 }
 
@@ -1735,22 +1738,77 @@ impl CompileState {
         drop(named);
         self.release_owned(named_workspace);
         named_result?;
-        let mut globals = HashSet::new();
-        for global in &self.globals {
-            if !globals.insert((&global.variable.name, global.precedence)) {
-                return Err(Error::Static(format!(
-                    "duplicate global variable {} at equal import precedence",
-                    global.variable.name.local
-                )));
+        let global_validation_workspace = self
+            .globals
+            .len()
+            .saturating_mul(hash_entry_storage::<(&ExpandedName, usize), ()>());
+        self.charge_owned(global_validation_workspace)?;
+        let mut globals = HashSet::with_capacity(self.globals.len());
+        let global_validation = (|| {
+            for global in &self.globals {
+                if !globals.insert((&global.variable.name, global.precedence)) {
+                    return Err(Error::Static(format!(
+                        "duplicate global variable {} at equal import precedence",
+                        global.variable.name.local
+                    )));
+                }
             }
-        }
-        let mut functions = HashSet::new();
-        for function in &self.functions {
-            if !functions.insert((&function.name, function.precedence)) {
-                return Err(Error::Static(format!(
-                    "duplicate EXSLT function {} at equal import precedence",
-                    function.name.local
-                )));
+            Ok(())
+        })();
+        drop(globals);
+        self.release_owned(global_validation_workspace);
+        global_validation?;
+        let function_validation_workspace = self
+            .functions
+            .len()
+            .saturating_mul(hash_entry_storage::<(&ExpandedName, usize), ()>());
+        self.charge_owned(function_validation_workspace)?;
+        let mut functions = HashSet::with_capacity(self.functions.len());
+        let function_validation = (|| {
+            for function in &self.functions {
+                if !functions.insert((&function.name, function.precedence)) {
+                    return Err(Error::Static(format!(
+                        "duplicate EXSLT function {} at equal import precedence",
+                        function.name.local
+                    )));
+                }
+            }
+            Ok(())
+        })();
+        drop(functions);
+        self.release_owned(function_validation_workspace);
+        function_validation?;
+        let function_index_bytes = self.functions.iter().fold(
+            self.functions
+                .len()
+                .saturating_mul(hash_entry_storage::<ExpandedName, ()>()),
+            |total, function| {
+                total
+                    .saturating_add(function.name.local.len())
+                    .saturating_add(function.name.namespace.as_ref().map_or(0, String::len))
+            },
+        );
+        self.charge_owned(function_index_bytes)?;
+        let function_names = self
+            .functions
+            .iter()
+            .map(|function| function.name.clone())
+            .collect::<HashSet<_>>();
+        let named_alias_count = self
+            .namespace_aliases
+            .iter()
+            .filter(|alias| alias.stylesheet_namespace.is_some())
+            .count();
+        self.charge_owned(
+            named_alias_count.saturating_mul(hash_entry_storage::<Arc<str>, usize>()),
+        )?;
+        let mut namespace_alias_index = HashMap::with_capacity(named_alias_count);
+        let mut default_namespace_alias = None;
+        for (index, alias) in self.namespace_aliases.iter().enumerate() {
+            if let Some(namespace) = &alias.stylesheet_namespace {
+                namespace_alias_index.insert(Arc::clone(namespace), index);
+            } else {
+                default_namespace_alias = Some(index);
             }
         }
         validate_attribute_set_references(
@@ -1770,8 +1828,11 @@ impl CompileState {
             keys: self.keys.into(),
             decimal_formats: self.decimal_formats.into(),
             namespace_aliases: self.namespace_aliases.into(),
+            namespace_alias_index: Arc::new(namespace_alias_index),
+            default_namespace_alias,
             attribute_sets: self.attribute_sets.into(),
             functions: self.functions.into(),
+            function_names: Arc::new(function_names),
             resource_identities: self.resources.into(),
         })
     }
@@ -3836,6 +3897,32 @@ mod tests {
         let attributes_only = nodes_only.saturating_add(attribute_slots);
 
         assert!(parser_workspace_bytes(xml) > attributes_only);
+    }
+
+    #[test]
+    fn compiled_stylesheets_share_the_function_lookup_index() {
+        // Function declarations are immutable compiled state; executions must not rebuild or clone
+        // their lookup keys under the operation budget.
+        let stylesheet = Compiler::new(
+            Arc::new(crate::NoResolver),
+            CompileBudget::new(1 << 20, 0, 32, 1 << 20),
+        )
+        .compile(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" xmlns:f="urn:functions" extension-element-prefixes="func"><func:function name="f:value"><func:result select="'ok'"/></func:function></xsl:stylesheet>"#,
+            None,
+        )
+        .expect("function stylesheet compiles");
+        let cloned = stylesheet.clone();
+
+        assert!(
+            stylesheet
+                .function_names
+                .contains(&ExpandedName::new(Some("urn:functions"), "value"))
+        );
+        assert!(Arc::ptr_eq(
+            &stylesheet.function_names,
+            &cloned.function_names
+        ));
     }
 
     #[test]

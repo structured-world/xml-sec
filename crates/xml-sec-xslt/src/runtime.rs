@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasher;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
@@ -11,7 +12,7 @@ use icu_locale::Locale;
 use crate::budget::{EXECUTION_RECURSION_DEPTH_CEILING, Meter, reserve_temporary_vec_slot};
 use crate::compiler::{
     AttributeValueTemplate, AvtPart, Expression, ExsltFunction, Instruction, InstructionSequence,
-    NameTest, Sort, Stylesheet, Template, Variable,
+    NameTest, NamespaceAlias, Sort, Stylesheet, Template, Variable,
 };
 use crate::lexical::{is_ncname, is_xml_whitespace, unicode_decimal_value, xpath_string_literal};
 use crate::serializer::{serialize, serialize_fragment};
@@ -237,38 +238,53 @@ pub(crate) fn apply_whitespace_rules(
     if rules.is_empty() {
         return Ok(None);
     }
-    if !document
-        .nodes()
-        .any(|(_, node)| should_strip_whitespace(document, node, rules))
-    {
+    let mut stripped = Vec::new();
+    let mut stripped_reservation = 0usize;
+    for (_, node) in document.nodes() {
+        if let Err(error) =
+            reserve_temporary_vec_slot(&mut stripped, meter, &mut stripped_reservation)
+        {
+            meter.release_owned_bytes(stripped_reservation);
+            return Err(error);
+        }
+        match should_strip_whitespace(document, node, rules, meter) {
+            Ok(strip) => stripped.push(u8::from(strip)),
+            Err(error) => {
+                meter.release_owned_bytes(stripped_reservation);
+                return Err(error);
+            }
+        }
+    }
+    if !stripped.contains(&1) {
+        meter.release_owned_bytes(stripped_reservation);
         return Ok(None);
     }
-    document
-        .retain_nodes(meter, |source, _, node| {
-            !should_strip_whitespace(source, node, rules)
-        })
-        .map(Some)
+    let retained = document.retain_nodes(meter, |_, id, _| stripped[id.0] == 0);
+    drop(stripped);
+    meter.release_owned_bytes(stripped_reservation);
+    retained.map(Some)
 }
 
 fn should_strip_whitespace(
     document: &Document,
     node: &crate::model::Node,
     rules: &[(NameTest, bool, usize, usize)],
-) -> bool {
+    meter: &mut Meter,
+) -> Result<bool> {
     let NodeKind::Text { value, .. } = &node.kind else {
-        return false;
+        return Ok(false);
     };
     if !value
         .chars()
         .all(|character| matches!(character, '\t' | '\n' | '\r' | ' '))
     {
-        return false;
+        return Ok(false);
     }
     let Some(parent) = node.parent.and_then(|parent| document.node(parent)) else {
-        return false;
+        return Ok(false);
     };
     let NodeKind::Element { name, .. } = &parent.kind else {
-        return false;
+        return Ok(false);
     };
     // XSLT 1.0 section 3.4 makes inherited xml:space="preserve" an independent
     // preservation condition, so a matching xsl:strip-space rule cannot override it.
@@ -293,13 +309,21 @@ fn should_strip_whitespace(
     // applies; inherited xml:space="preserve" is therefore independent of xsl:strip-space.
     // https://www.w3.org/TR/1999/REC-xslt-19991116#strip
     if xml_space == Some("preserve") {
-        return false;
+        return Ok(false);
     }
-    let decision = rules
-        .iter()
-        .filter(|(test, _, _, _)| test.matches(name))
-        .max_by_key(|(test, _, precedence, order)| (*precedence, test.priority(), *order));
-    matches!(decision, Some((_, false, _, _)))
+    let mut decision: Option<&(NameTest, bool, usize, usize)> = None;
+    for candidate @ (test, _, precedence, order) in rules {
+        meter.charge(BudgetKind::PatternEvaluations, 1)?;
+        if test.matches(name)
+            && decision.is_none_or(|(best_test, _, best_precedence, best_order)| {
+                (*precedence, test.priority(), *order)
+                    > (*best_precedence, best_test.priority(), *best_order)
+            })
+        {
+            decision = Some(candidate);
+        }
+    }
+    Ok(matches!(decision, Some((_, false, _, _))))
 }
 
 struct Execution<'a> {
@@ -554,10 +578,7 @@ impl<'a> Execution<'a> {
         };
         state.evaluator.initialize_xslt(
             Arc::clone(&stylesheet.decimal_formats),
-            stylesheet
-                .functions
-                .iter()
-                .map(|function| function.name.clone()),
+            Arc::clone(&stylesheet.function_names),
         );
         let PreparedParameters {
             effective_globals,
@@ -1112,12 +1133,21 @@ impl<'a> Execution<'a> {
                             children,
                             attribute_sets,
                         } => {
+                            self.meter.check_additional(
+                                BudgetKind::OwnedBytes,
+                                self.literal_projection_owned_bytes(
+                                    name,
+                                    prefix.as_deref(),
+                                    namespaces,
+                                    base_uri.as_deref(),
+                                ),
+                            )?;
                             let (name, prefix, result_namespaces) = self
                                 .alias_literal_name_and_namespaces(
                                     name,
                                     prefix.as_deref(),
                                     namespaces,
-                                );
+                                )?;
                             let id = self.push_node_with_base(
                                 self.parent(),
                                 NodeKind::Element {
@@ -1565,8 +1595,17 @@ impl<'a> Execution<'a> {
                 children,
                 attribute_sets,
             } => {
+                self.meter.check_additional(
+                    BudgetKind::OwnedBytes,
+                    self.literal_projection_owned_bytes(
+                        name,
+                        prefix.as_deref(),
+                        namespaces,
+                        base_uri.as_deref(),
+                    ),
+                )?;
                 let (name, prefix, result_namespaces) =
-                    self.alias_literal_name_and_namespaces(name, prefix.as_deref(), namespaces);
+                    self.alias_literal_name_and_namespaces(name, prefix.as_deref(), namespaces)?;
                 let parent = self.parent();
                 let id = self.push_node_with_base(
                     parent,
@@ -3315,20 +3354,34 @@ impl<'a> Execution<'a> {
             EXECUTION_RECURSION_DEPTH_CEILING,
         )?;
         active.push(name.clone());
-        let mut sets = self
+        let mut sets = Vec::new();
+        let mut sets_reservation = 0usize;
+        for set in self
             .stylesheet
             .attribute_sets
             .iter()
             .filter(|set| &set.name == name)
-            .collect::<Vec<_>>();
+        {
+            if let Err(error) =
+                reserve_temporary_vec_slot(&mut sets, &mut self.meter, &mut sets_reservation)
+            {
+                active.pop();
+                self.meter.release_owned_bytes(sets_reservation);
+                return Err(error);
+            }
+            sets.push(set);
+        }
         if sets.is_empty() {
             active.pop();
+            self.meter.release_owned_bytes(sets_reservation);
             return Err(Error::Static(format!(
                 "undefined attribute-set {}",
                 name.local
             )));
         }
-        sets.sort_by_key(|set| (std::cmp::Reverse(set.precedence), set.order));
+        // `order` is unique, so unstable sorting preserves the complete XSLT declaration order
+        // without allocating the merge buffer used by stable slice sorting.
+        sets.sort_unstable_by_key(|set| (std::cmp::Reverse(set.precedence), set.order));
         let previous_protected = self.attribute_protected_names.take();
         let result = (|| {
             let mut cursor = 0;
@@ -3368,6 +3421,8 @@ impl<'a> Execution<'a> {
             Ok(())
         })();
         self.attribute_protected_names = previous_protected;
+        drop(sets);
+        self.meter.release_owned_bytes(sets_reservation);
         result?;
         active.pop();
         Ok(())
@@ -3668,13 +3723,7 @@ impl<'a> Execution<'a> {
         name: &ExpandedName,
         prefix: Option<&str>,
     ) -> (ExpandedName, Option<String>) {
-        let Some(alias) = self
-            .stylesheet
-            .namespace_aliases
-            .iter()
-            .rev()
-            .find(|alias| alias.stylesheet_namespace.as_deref() == name.namespace.as_deref())
-        else {
+        let Some(alias) = self.namespace_alias(name.namespace.as_deref()) else {
             return (name.clone(), prefix.map(str::to_owned));
         };
         (
@@ -3698,42 +3747,111 @@ impl<'a> Execution<'a> {
     }
 
     fn alias_literal_name_and_namespaces(
+        &mut self,
+        name: &ExpandedName,
+        prefix: Option<&str>,
+        namespaces: &[Namespace],
+    ) -> Result<(ExpandedName, Option<String>, Vec<Namespace>)> {
+        let (name, mut prefix) = self.alias_name(name, prefix);
+        let index_bytes = namespaces
+            .len()
+            .saturating_mul(std::mem::size_of::<(u64, usize)>())
+            .saturating_mul(2);
+        self.meter.charge(BudgetKind::OwnedBytes, index_bytes)?;
+        let mut prefix_positions: HashMap<u64, usize> = HashMap::with_capacity(namespaces.len());
+        let mut result_namespaces =
+            Vec::<Namespace>::with_capacity(namespaces.len().saturating_add(1));
+        for namespace in namespaces {
+            let mapped = self.alias_namespace(namespace);
+            let mut fingerprint = prefix_positions.hasher().hash_one(mapped.prefix.as_deref());
+            loop {
+                if let Some(&existing) = prefix_positions.get(&fingerprint) {
+                    if result_namespaces[existing].prefix == mapped.prefix {
+                        result_namespaces[existing] = mapped;
+                        break;
+                    }
+                    fingerprint = fingerprint.wrapping_add(1);
+                    continue;
+                }
+                prefix_positions.insert(fingerprint, result_namespaces.len());
+                result_namespaces.push(mapped);
+                break;
+            }
+        }
+        fixup_element_namespace(&name, &mut prefix, &mut result_namespaces);
+        drop(prefix_positions);
+        self.meter.release_owned_bytes(index_bytes);
+        Ok((name, prefix, result_namespaces))
+    }
+
+    fn literal_projection_owned_bytes(
         &self,
         name: &ExpandedName,
         prefix: Option<&str>,
         namespaces: &[Namespace],
-    ) -> (ExpandedName, Option<String>, Vec<Namespace>) {
-        let (name, mut prefix) = self.alias_name(name, prefix);
-        let mut result_namespaces = Vec::<Namespace>::with_capacity(namespaces.len());
-        for namespace in namespaces {
-            let mapped = self.alias_namespace(namespace);
-            if let Some(existing) = result_namespaces
-                .iter_mut()
-                .find(|existing| existing.prefix == mapped.prefix)
-            {
-                *existing = mapped;
-            } else {
-                result_namespaces.push(mapped);
-            }
-        }
-        fixup_element_namespace(&name, &mut prefix, &mut result_namespaces);
-        (name, prefix, result_namespaces)
+        base_uri: Option<&str>,
+    ) -> usize {
+        let name_alias = self.namespace_alias(name.namespace.as_deref());
+        let result_namespace = name_alias
+            .and_then(|alias| alias.result_namespace.as_deref())
+            .or(name.namespace.as_deref());
+        let result_prefix = name_alias
+            .and_then(|alias| alias.output_prefix.as_deref())
+            .or(prefix);
+        let namespace_payload = namespaces.iter().fold(0usize, |total, namespace| {
+            let alias = self.namespace_alias(Some(namespace.uri.as_str()));
+            let mapped_prefix = alias
+                .and_then(|alias| alias.output_prefix.as_deref())
+                .or(namespace.prefix.as_deref());
+            let mapped_uri = alias
+                .and_then(|alias| alias.result_namespace.as_deref())
+                .unwrap_or(namespace.uri.as_str());
+            total
+                .saturating_add(mapped_prefix.map_or(0, str::len))
+                .saturating_add(mapped_uri.len())
+        });
+        let generated_prefix_bytes = "ns_"
+            .len()
+            .saturating_add(namespaces.len().saturating_add(1).ilog10() as usize)
+            .saturating_add(1);
+        name.local
+            .len()
+            .saturating_add(result_namespace.map_or(0, str::len))
+            .saturating_add(result_prefix.map_or(0, str::len))
+            .saturating_add(namespace_payload)
+            .saturating_add(
+                namespaces
+                    .len()
+                    .saturating_add(1)
+                    .saturating_mul(std::mem::size_of::<Namespace>()),
+            )
+            // Namespace fixup may both rename a conflicting binding and append the required one.
+            .saturating_add(generated_prefix_bytes)
+            .saturating_add(result_prefix.map_or(0, str::len))
+            .saturating_add(result_namespace.map_or(0, str::len))
+            .saturating_add(base_uri.map_or(0, str::len))
     }
 
     fn alias_namespace(&self, namespace: &Namespace) -> Namespace {
-        let Some(alias) = self
-            .stylesheet
-            .namespace_aliases
-            .iter()
-            .rev()
-            .find(|alias| alias.stylesheet_namespace.as_deref() == Some(&namespace.uri))
-        else {
+        let Some(alias) = self.namespace_alias(Some(namespace.uri.as_str())) else {
             return namespace.clone();
         };
         Namespace {
             prefix: alias.output_prefix.clone(),
             uri: alias.result_namespace.clone().unwrap_or_default(),
         }
+    }
+
+    fn namespace_alias(&self, namespace: Option<&str>) -> Option<&NamespaceAlias> {
+        let index = match namespace {
+            Some(namespace) => self
+                .stylesheet
+                .namespace_alias_index
+                .get(namespace)
+                .copied(),
+            None => self.stylesheet.default_namespace_alias,
+        }?;
+        self.stylesheet.namespace_aliases.get(index)
     }
     fn number_sequence(
         &mut self,

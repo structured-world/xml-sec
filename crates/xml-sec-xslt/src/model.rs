@@ -480,6 +480,7 @@ impl Document {
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let mut namespaces = Arc::new(Vec::new());
+                let mut namespace_index = HashMap::new();
                 for namespace in source.namespaces() {
                     if namespace
                         .name()
@@ -490,6 +491,7 @@ impl Document {
                     validate_namespace_binding(namespace.name(), namespace.uri())?;
                     set_namespace(
                         &mut namespaces,
+                        &mut namespace_index,
                         namespace.name().map(str::to_owned),
                         namespace.uri().to_owned(),
                     );
@@ -1971,6 +1973,15 @@ fn push_stream_element(
             uri: "http://www.w3.org/XML/1998/namespace".into(),
         }]),
     };
+    let mut namespace_index_bytes = namespace_index_owned_bytes(&namespaces);
+    ensure(
+        BudgetKind::OwnedBytes,
+        NAMESPACE_SCOPE_BYTE_CEILING,
+        meter
+            .namespace_scope_bytes
+            .saturating_add(namespace_index_bytes),
+    )?;
+    let mut namespace_index = namespace_index(&namespaces);
     let lexical_name = start.name.qualified();
     let declared_attributes = declarations
         .attributes
@@ -1997,8 +2008,10 @@ fn push_stream_element(
             validate_namespace_binding(None, &value)?;
             set_namespace_bounded(
                 &mut namespaces,
+                &mut namespace_index,
                 None,
                 value,
+                &mut namespace_index_bytes,
                 &mut meter.namespace_scope_bytes,
             )?;
         } else if let Some(prefix) = name.strip_prefix("xmlns:") {
@@ -2008,8 +2021,10 @@ fn push_stream_element(
             validate_namespace_binding(Some(prefix), &value)?;
             set_namespace_bounded(
                 &mut namespaces,
+                &mut namespace_index,
                 Some(prefix.into()),
                 value,
+                &mut namespace_index_bytes,
                 &mut meter.namespace_scope_bytes,
             )?;
         } else {
@@ -2039,16 +2054,20 @@ fn push_stream_element(
             validate_namespace_binding(None, &value)?;
             set_namespace_bounded(
                 &mut namespaces,
+                &mut namespace_index,
                 None,
                 value,
+                &mut namespace_index_bytes,
                 &mut meter.namespace_scope_bytes,
             )?;
         } else if let Some(prefix) = declaration.name.strip_prefix("xmlns:") {
             validate_namespace_binding(Some(prefix), &value)?;
             set_namespace_bounded(
                 &mut namespaces,
+                &mut namespace_index,
                 Some(prefix.into()),
                 value,
+                &mut namespace_index_bytes,
                 &mut meter.namespace_scope_bytes,
             )?;
         } else {
@@ -2057,7 +2076,7 @@ fn push_stream_element(
     }
     let prefix = start.name.prefix().map(str::to_owned);
     let local = start.name.local().to_owned();
-    let namespace = namespace_for(&namespaces, prefix.as_deref());
+    let namespace = namespace_for(&namespaces, &namespace_index, prefix.as_deref());
     if prefix.is_some() && namespace.is_none() {
         return Err(Error::Xml(format!(
             "undeclared namespace prefix in element {lexical_name}"
@@ -2072,7 +2091,7 @@ fn push_stream_element(
             let (prefix, local) = split_lexical_name(&lexical)?;
             let namespace = prefix
                 .as_deref()
-                .and_then(|prefix| namespace_for(&namespaces, Some(prefix)));
+                .and_then(|prefix| namespace_for(&namespaces, &namespace_index, Some(prefix)));
             if prefix.is_some() && namespace.is_none() {
                 return Err(Error::Xml(format!(
                     "undeclared namespace prefix in attribute {lexical}"
@@ -2294,31 +2313,57 @@ fn split_lexical_name(name: &str) -> Result<(Option<String>, String)> {
     Ok((prefix.map(str::to_owned), local.to_owned()))
 }
 
-fn namespace_for(namespaces: &[Namespace], prefix: Option<&str>) -> Option<String> {
-    namespaces
-        .iter()
-        .rev()
-        .find(|namespace| namespace.prefix.as_deref() == prefix)
+fn namespace_for(
+    namespaces: &[Namespace],
+    index: &HashMap<String, usize>,
+    prefix: Option<&str>,
+) -> Option<String> {
+    index
+        .get(prefix.unwrap_or_default())
+        .and_then(|index| namespaces.get(*index))
         .map(|namespace| namespace.uri.clone())
         .filter(|namespace| !namespace.is_empty())
 }
 
-fn set_namespace(namespaces: &mut Arc<Vec<Namespace>>, prefix: Option<String>, uri: String) {
+fn namespace_index(namespaces: &[Namespace]) -> HashMap<String, usize> {
+    let mut index = HashMap::with_capacity(namespaces.len());
+    for (position, namespace) in namespaces.iter().enumerate() {
+        index.insert(namespace.prefix.clone().unwrap_or_default(), position);
+    }
+    index
+}
+
+fn namespace_index_owned_bytes(namespaces: &[Namespace]) -> usize {
+    namespaces
+        .len()
+        .saturating_mul(std::mem::size_of::<(String, usize)>())
+        .saturating_mul(2)
+        .saturating_add(namespaces.iter().fold(0usize, |total, namespace| {
+            total.saturating_add(namespace.prefix.as_deref().map_or(0, str::len))
+        }))
+}
+
+fn set_namespace(
+    namespaces: &mut Arc<Vec<Namespace>>,
+    index: &mut HashMap<String, usize>,
+    prefix: Option<String>,
+    uri: String,
+) {
     let namespaces = Arc::make_mut(namespaces);
-    if let Some(existing) = namespaces
-        .iter_mut()
-        .find(|namespace| namespace.prefix == prefix)
-    {
-        existing.uri = uri;
+    if let Some(position) = index.get(prefix.as_deref().unwrap_or_default()).copied() {
+        namespaces[position].uri = uri;
     } else {
+        index.insert(prefix.clone().unwrap_or_default(), namespaces.len());
         namespaces.push(Namespace { prefix, uri });
     }
 }
 
 fn set_namespace_bounded(
     namespaces: &mut Arc<Vec<Namespace>>,
+    index: &mut HashMap<String, usize>,
     prefix: Option<String>,
     uri: String,
+    namespace_index_bytes: &mut usize,
     materialized_bytes: &mut usize,
 ) -> Result<()> {
     let inherited_copy = (Arc::strong_count(namespaces) > 1).then(|| {
@@ -2332,7 +2377,16 @@ fn set_namespace_bounded(
     let declaration_bytes = std::mem::size_of::<Namespace>()
         .saturating_add(prefix.as_deref().map_or(0, str::len))
         .saturating_add(uri.len());
+    let additional_index_bytes = if index.contains_key(prefix.as_deref().unwrap_or_default()) {
+        0
+    } else {
+        std::mem::size_of::<(String, usize)>()
+            .saturating_mul(2)
+            .saturating_add(prefix.as_deref().map_or(0, str::len))
+    };
+    let next_index_bytes = namespace_index_bytes.saturating_add(additional_index_bytes);
     let next = materialized_bytes
+        .saturating_add(next_index_bytes)
         .saturating_add(inherited_copy.unwrap_or(0))
         .saturating_add(declaration_bytes);
     if next > NAMESPACE_SCOPE_BYTE_CEILING {
@@ -2340,8 +2394,9 @@ fn set_namespace_bounded(
             "cumulative namespace scope allocation limit exceeded".into(),
         ));
     }
-    set_namespace(namespaces, prefix, uri);
-    *materialized_bytes = next;
+    set_namespace(namespaces, index, prefix, uri);
+    *namespace_index_bytes = next_index_bytes;
+    *materialized_bytes = next.saturating_sub(next_index_bytes);
     Ok(())
 }
 
@@ -3839,11 +3894,11 @@ mod parser_boundary_tests {
     use std::sync::Arc;
 
     use super::{
-        Attribute, Document, EntityExpansionMeter, Error, ExpandedName, NodeKind, Result,
-        doctype_span, expand_document_entities, expand_entity_references,
-        expand_parameter_entity_references, internal_general_entities,
-        normalize_predefined_entity_declaration, parser_workspace_bytes,
-        prepare_xml_frontend_bounded,
+        Attribute, Document, EntityExpansionMeter, Error, ExpandedName, Namespace, NodeKind,
+        Result, doctype_span, expand_document_entities, expand_entity_references,
+        expand_parameter_entity_references, internal_general_entities, namespace_for,
+        namespace_index, normalize_predefined_entity_declaration, parser_workspace_bytes,
+        prepare_xml_frontend_bounded, set_namespace,
     };
     use crate::budget::{ENTITY_EXPANSION_BYTE_CEILING, Meter};
     use crate::{BudgetKind, ExecutionBudget, ParseBudget};
@@ -4878,6 +4933,50 @@ mod parser_boundary_tests {
         let xml = format!("<root{attributes}/>");
         let document = Document::parse(&xml, None).expect("wide document parses");
         assert!(parser_workspace_bytes(&xml) >= document.estimated_owned_bytes());
+    }
+
+    #[test]
+    fn namespace_index_preserves_order_while_overriding_bindings() {
+        // QName lookup needs constant-time prefix selection without changing namespace-node order.
+        let mut namespaces = Arc::new(vec![
+            Namespace {
+                prefix: Some("a".into()),
+                uri: "urn:old".into(),
+            },
+            Namespace {
+                prefix: None,
+                uri: "urn:default".into(),
+            },
+        ]);
+        let mut index = namespace_index(&namespaces);
+        set_namespace(
+            &mut namespaces,
+            &mut index,
+            Some("a".into()),
+            "urn:new".into(),
+        );
+        set_namespace(
+            &mut namespaces,
+            &mut index,
+            Some("b".into()),
+            "urn:added".into(),
+        );
+
+        assert_eq!(
+            namespaces
+                .iter()
+                .map(|namespace| (namespace.prefix.as_deref(), namespace.uri.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some("a"), "urn:new"),
+                (None, "urn:default"),
+                (Some("b"), "urn:added"),
+            ]
+        );
+        assert_eq!(
+            namespace_for(&namespaces, &index, Some("a")).as_deref(),
+            Some("urn:new")
+        );
     }
 
     #[test]

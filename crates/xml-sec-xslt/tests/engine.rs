@@ -9027,6 +9027,126 @@ fn effective_global_index_accounts_for_retained_storage() {
 }
 
 #[test]
+fn attribute_set_selection_workspace_consumes_owned_bytes() {
+    // Selecting declarations is execution-local temporary work, so the same compiled stylesheet
+    // must require more peak memory only when the large set is actually applied.
+    let declarations = (0..256)
+        .map(|_| r#"<xsl:attribute-set name="attrs"/>"#)
+        .collect::<String>();
+    let stylesheet = compile(&format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">{declarations}<xsl:template name="idle"/><xsl:template name="apply"><out xsl:use-attribute-sets="attrs"/></xsl:template></xsl:stylesheet>"#
+    ));
+    let idle = minimum_execution_owned_bytes(&stylesheet, "idle");
+    let applying = minimum_execution_owned_bytes(&stylesheet, "apply");
+
+    assert!(
+        applying >= idle.saturating_add(256 * std::mem::size_of::<usize>()),
+        "attribute-set selection pointers must cross OwnedBytes"
+    );
+}
+
+#[test]
+fn whitespace_rule_candidate_work_consumes_pattern_budget() {
+    // Product work limits are independent of XSLT's whitespace semantics: every candidate rule
+    // inspected for an untrusted text node must consume aggregate pattern work.
+    let rules = (0..64)
+        .map(|index| format!(r#"<xsl:strip-space elements="n{index}"/>"#))
+        .collect::<String>();
+    let stylesheet = compile(&format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">{rules}<xsl:template match="/"/></xsl:stylesheet>"#
+    ));
+    let source = Document::parse("<root> <target> </target> </root>", None)
+        .expect("whitespace source parses");
+    let mut budget = execution_budget(1024);
+    budget.pattern_evaluations = 32;
+
+    assert!(matches!(
+        stylesheet.execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::PatternEvaluations,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn literal_namespace_projection_crosses_owned_bytes_before_result_materialization() {
+    // A literal result's namespace projection is attacker-controlled compiled data. The complete
+    // name, namespace vector, fixup slot, and base URI must fit before any clone is performed.
+    let namespace = "n".repeat(64 * 1024);
+    let baseline = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template name="run"><out/></xsl:template></xsl:stylesheet>"#,
+    );
+    let projected = compile(&format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:p="urn:{namespace}"><xsl:template name="run"><p:out/></xsl:template></xsl:stylesheet>"#
+    ));
+    let baseline_bytes = minimum_execution_owned_bytes(&baseline, "run");
+    let source = Document::parse("<source/>", None).expect("source parses");
+    let mut budget = execution_budget(1024);
+    budget.owned_bytes = baseline_bytes.saturating_add(1024);
+
+    assert!(matches!(
+        projected.execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: Some(ExpandedName::new(None::<String>, "run")),
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn function_literal_namespace_projection_uses_the_same_owned_bytes_gate() {
+    // Stylesheet-function continuations execute literal elements through a separate task stack;
+    // they must retain the same pre-allocation gate as ordinary template instructions.
+    let namespace = "n".repeat(64 * 1024);
+    let baseline = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" xmlns:f="urn:functions" extension-element-prefixes="func"><func:function name="f:build"><func:result><out/></func:result></func:function><xsl:template name="run"><xsl:copy-of select="f:build()"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let projected = compile(&format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" xmlns:f="urn:functions" xmlns:p="urn:{namespace}" extension-element-prefixes="func"><func:function name="f:build"><func:result><p:out/></func:result></func:function><xsl:template name="run"><xsl:copy-of select="f:build()"/></xsl:template></xsl:stylesheet>"#
+    ));
+    let baseline_bytes = minimum_execution_owned_bytes(&baseline, "run");
+    let source = Document::parse("<source/>", None).expect("source parses");
+    let mut budget = execution_budget(1024);
+    budget.owned_bytes = baseline_bytes.saturating_add(1024);
+
+    assert!(matches!(
+        projected.execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: Some(ExpandedName::new(None::<String>, "run")),
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn multiple_numbering_accounts_for_lineage_workspace() {
     // level="multiple" retains the ancestor lineage and resulting number sequence concurrently;
     // both vectors must be reserved before growing from attacker-controlled source depth.

@@ -746,10 +746,10 @@ impl Evaluator {
     pub(crate) fn initialize_xslt(
         &mut self,
         decimal_formats: Arc<[DecimalFormat]>,
-        extension_functions: impl IntoIterator<Item = ExpandedName>,
+        stylesheet_functions: Arc<HashSet<ExpandedName>>,
     ) {
         self.decimal_formats = decimal_formats;
-        self.stylesheet_functions = Arc::new(extension_functions.into_iter().collect());
+        self.stylesheet_functions = stylesheet_functions;
     }
 
     pub(crate) fn append_key_entry(
@@ -5701,9 +5701,69 @@ fn build_unparsed_entity_index(
     source: &Document,
     meter: &mut Meter,
 ) -> Result<Vec<HashMap<String, String>>> {
-    let mut index = Vec::with_capacity(source.logical_roots().len());
-    for &root in source.logical_roots() {
-        append_unparsed_entity_document(source, root, &mut index, meter)?;
+    let root_count = source.logical_roots().len();
+    let requested_index_bytes =
+        root_count.saturating_mul(std::mem::size_of::<HashMap<String, String>>());
+    meter.charge(BudgetKind::OwnedBytes, requested_index_bytes)?;
+    let mut index = Vec::new();
+    if let Err(error) = index.try_reserve_exact(root_count) {
+        meter.release_owned_bytes(requested_index_bytes);
+        return Err(Error::Dynamic(format!(
+            "failed to reserve unparsed-entity document index: {error}"
+        )));
+    }
+    let actual_index_bytes = index
+        .capacity()
+        .saturating_mul(std::mem::size_of::<HashMap<String, String>>());
+    if actual_index_bytes < requested_index_bytes {
+        meter.release_owned_bytes(requested_index_bytes - actual_index_bytes);
+    } else if actual_index_bytes > requested_index_bytes {
+        meter.charge(
+            BudgetKind::OwnedBytes,
+            actual_index_bytes - requested_index_bytes,
+        )?;
+    }
+    let count_bytes = root_count.saturating_mul(std::mem::size_of::<usize>());
+    meter.charge(BudgetKind::OwnedBytes, count_bytes)?;
+    let mut entity_counts = Vec::new();
+    if let Err(error) = entity_counts.try_reserve_exact(root_count) {
+        meter.release_owned_bytes(count_bytes);
+        return Err(Error::Dynamic(format!(
+            "failed to reserve unparsed-entity document counts: {error}"
+        )));
+    }
+    entity_counts.resize(root_count, 0usize);
+    for (_, _, root) in source.unparsed_entities() {
+        if let Ok(root_index) = source.logical_roots().binary_search(&root) {
+            entity_counts[root_index] = entity_counts[root_index].saturating_add(1);
+        }
+    }
+    for entity_count in entity_counts {
+        let requested_table_bytes = unparsed_entity_table_bytes(entity_count);
+        meter.charge(BudgetKind::OwnedBytes, requested_table_bytes)?;
+        let mut entities = HashMap::new();
+        if let Err(error) = entities.try_reserve(entity_count) {
+            meter.release_owned_bytes(requested_table_bytes);
+            meter.release_owned_bytes(count_bytes);
+            return Err(Error::Dynamic(format!(
+                "failed to reserve unparsed-entity lookup table: {error}"
+            )));
+        }
+        reconcile_unparsed_entity_table_reservation(&entities, requested_table_bytes, meter)?;
+        index.push(entities);
+    }
+    meter.release_owned_bytes(count_bytes);
+    for (name, uri, root) in source.unparsed_entities() {
+        let Some(entities) = source
+            .logical_roots()
+            .binary_search(&root)
+            .ok()
+            .and_then(|root_index| index.get_mut(root_index))
+        else {
+            continue;
+        };
+        meter.charge(BudgetKind::OwnedBytes, name.len().saturating_add(uri.len()))?;
+        entities.insert(name.to_owned(), uri.to_owned());
     }
     Ok(index)
 }
@@ -5714,21 +5774,51 @@ fn append_unparsed_entity_document(
     index: &mut Vec<HashMap<String, String>>,
     meter: &mut Meter,
 ) -> Result<()> {
+    let entity_count = source
+        .unparsed_entities()
+        .filter(|(_, _, candidate)| *candidate == root)
+        .count();
+    let requested_table_bytes = unparsed_entity_table_bytes(entity_count);
+    meter.charge(BudgetKind::OwnedBytes, requested_table_bytes)?;
     let mut entities = HashMap::new();
+    if let Err(error) = entities.try_reserve(entity_count) {
+        meter.release_owned_bytes(requested_table_bytes);
+        return Err(Error::Dynamic(format!(
+            "failed to reserve unparsed-entity lookup table: {error}"
+        )));
+    }
+    reconcile_unparsed_entity_table_reservation(&entities, requested_table_bytes, meter)?;
     for (name, uri, _) in source
         .unparsed_entities()
         .filter(|(_, _, candidate)| *candidate == root)
     {
-        meter.charge(
-            BudgetKind::OwnedBytes,
-            name.len()
-                .saturating_add(uri.len())
-                .saturating_add(std::mem::size_of::<(String, String)>()),
-        )?;
+        meter.charge(BudgetKind::OwnedBytes, name.len().saturating_add(uri.len()))?;
         entities.insert(name.to_owned(), uri.to_owned());
     }
     index.push(entities);
     Ok(())
+}
+
+fn reconcile_unparsed_entity_table_reservation(
+    entities: &HashMap<String, String>,
+    requested_bytes: usize,
+    meter: &mut Meter,
+) -> Result<()> {
+    let actual_bytes = unparsed_entity_table_bytes(entities.capacity());
+    if actual_bytes < requested_bytes {
+        meter.release_owned_bytes(requested_bytes - actual_bytes);
+    } else if actual_bytes > requested_bytes {
+        meter.charge(BudgetKind::OwnedBytes, actual_bytes - requested_bytes)?;
+    }
+    Ok(())
+}
+
+fn unparsed_entity_table_bytes(capacity: usize) -> usize {
+    // Account conservatively for buckets, control bytes, and spare capacity without coupling the
+    // public budget contract to the standard library's hash-table implementation.
+    capacity
+        .saturating_mul(std::mem::size_of::<(String, String)>())
+        .saturating_mul(2)
 }
 
 struct UnparsedEntityUriFunction {
@@ -7880,6 +7970,57 @@ mod tests {
                     + "prefix".len()
                     + "urn:namespace:retained".len()
         );
+    }
+
+    #[test]
+    fn unparsed_entity_index_accounts_for_retained_containers() {
+        // Names and URIs are only the payload: the per-document vector and hash-table capacity
+        // remain live for the evaluator lifetime and must cross the same OwnedBytes gate.
+        let source = Document::parse(
+            r#"<!DOCTYPE root [<!NOTATION image SYSTEM "image/png"><!ENTITY logo SYSTEM "logo.png" NDATA image>]><root/>"#,
+            None,
+        )
+        .expect("unparsed-entity source parses");
+        let mut meter = Meter::new(
+            ExecutionBudget {
+                source_bytes: source.source_bytes(),
+                external_documents: 0,
+                recursion_depth: 1,
+                xpath_evaluations: 0,
+                pattern_evaluations: 0,
+                template_applications: 0,
+                sort_comparisons: 0,
+                key_entries: 0,
+                result_nodes: 0,
+                serialized_bytes: 0,
+                messages: 0,
+                owned_bytes: usize::MAX,
+            },
+            source.source_bytes(),
+        )
+        .expect("test meter initializes");
+        let before = meter
+            .usage(BudgetKind::OwnedBytes)
+            .expect("valid budget kind")
+            .0;
+        let index =
+            build_unparsed_entity_index(&source, &mut meter).expect("unparsed-entity index builds");
+        let charged = meter
+            .usage(BudgetKind::OwnedBytes)
+            .expect("valid budget kind")
+            .0
+            - before;
+        let containers = index
+            .capacity()
+            .saturating_mul(std::mem::size_of::<HashMap<String, String>>())
+            .saturating_add(
+                index
+                    .iter()
+                    .map(|entities| unparsed_entity_table_bytes(entities.capacity()))
+                    .sum::<usize>(),
+            );
+
+        assert!(charged >= containers.saturating_add("logo".len() + "logo.png".len()));
     }
 
     #[test]
