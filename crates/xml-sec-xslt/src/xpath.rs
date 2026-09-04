@@ -11,7 +11,7 @@ use sxd_xpath_no_unsafe::{Context, Factory, Value as SxdValue, XPath, function, 
 use crate::budget::{Meter, ParseBudget, reserve_temporary_vec_slot};
 use crate::compiler::{DecimalFormat, Expression, NameTest, Pattern, normalize_xpath_for_sxd};
 use crate::expression::innermost_namespaced_call;
-use crate::lexical::{is_ncname, is_ncname_char};
+use crate::lexical::{is_ncname, is_ncname_char, is_xml_whitespace};
 use crate::resolver::decode_resource;
 use crate::runtime::{SourceProcessing, apply_whitespace_rules};
 use crate::{
@@ -186,6 +186,7 @@ pub(crate) fn prepare_evaluator_source(
             &mut resource_identities,
             &mut Vec::new(),
             0,
+            None,
         )?;
         (expanded.document, expanded.principal_mapping)
     } else {
@@ -2026,6 +2027,7 @@ impl Evaluator {
                                 &mut self.resource_identities,
                                 &mut stack,
                                 1,
+                                None,
                             )?;
                             (expanded.document, Some(expanded.retained_owned_bytes))
                         } else {
@@ -3255,10 +3257,13 @@ fn expand_xinclude_document(
     identities: &mut HashMap<ResourceIdentity, ResolvedResource>,
     include_stack: &mut Vec<ResourceIdentity>,
     depth: usize,
+    selected_root: Option<NodeId>,
 ) -> Result<ExpandedXIncludeDocument> {
     meter.recursion(depth)?;
-    let source_nodes = source.node_count();
-    let source_clone_bytes = source.estimated_clone_bytes();
+    let (source_nodes, source_clone_bytes) = selected_root.map_or_else(
+        || (source.node_count(), source.estimated_clone_bytes()),
+        |root| source.estimated_subtree_projection(root),
+    );
     let mapping_bytes = xinclude_remap_bytes(source_nodes);
     let pending_bytes = xinclude_pending_bytes(source_nodes);
     meter.charge(
@@ -3275,17 +3280,25 @@ fn expand_xinclude_document(
     let mut principal_mapping = HashMap::with_capacity(source_nodes);
     principal_mapping.insert(source.root(), output.root());
     let mut pending = Vec::with_capacity(source_nodes.saturating_sub(1));
-    pending.extend(
-        source
-            .node(source.root())
-            .into_iter()
-            .flat_map(|root| root.children.iter().rev())
-            .map(|child| PendingXIncludeNode {
-                source: *child,
-                target_parent: output.root(),
-                preserve_language: false,
-            }),
-    );
+    if let Some(selected_root) = selected_root {
+        pending.push(PendingXIncludeNode {
+            source: selected_root,
+            target_parent: output.root(),
+            preserve_language: false,
+        });
+    } else {
+        pending.extend(
+            source
+                .node(source.root())
+                .into_iter()
+                .flat_map(|root| root.children.iter().rev())
+                .map(|child| PendingXIncludeNode {
+                    source: *child,
+                    target_parent: output.root(),
+                    preserve_language: false,
+                }),
+        );
+    }
     while let Some(PendingXIncludeNode {
         source: source_id,
         target_parent,
@@ -3513,6 +3526,160 @@ fn validate_xinclude_children(source: &Document, include: &Node) -> Result<Optio
     Ok(fallback)
 }
 
+fn select_xpointer_element(document: &Document, pointer: &str) -> Result<Option<NodeId>> {
+    let pointer = pointer.trim_matches(is_xml_whitespace);
+    if is_ncname(pointer) {
+        return Ok(xpointer_id(document, pointer));
+    }
+
+    let bytes = pointer.as_bytes();
+    let mut cursor = 0usize;
+    let mut saw_part = false;
+    while cursor < bytes.len() {
+        while bytes
+            .get(cursor)
+            .is_some_and(|byte| byte_is_xml_whitespace(*byte))
+        {
+            cursor += 1;
+        }
+        if cursor == bytes.len() {
+            break;
+        }
+        let scheme_start = cursor;
+        while bytes.get(cursor).is_some_and(|byte| *byte != b'(') {
+            if byte_is_xml_whitespace(bytes[cursor]) {
+                return Err(Error::Unsupported(
+                    "XInclude xpointer has whitespace before scheme data".into(),
+                ));
+            }
+            cursor += 1;
+        }
+        let scheme = pointer.get(scheme_start..cursor).ok_or_else(|| {
+            Error::Unsupported("XInclude xpointer scheme boundary is invalid UTF-8".into())
+        })?;
+        if cursor == bytes.len() || !is_xpointer_scheme_name(scheme) {
+            return Err(Error::Unsupported(
+                "XInclude xpointer has an invalid scheme name".into(),
+            ));
+        }
+        cursor += 1;
+        let data_start = cursor;
+        let mut nested = 0usize;
+        let data_end = loop {
+            let byte = *bytes.get(cursor).ok_or_else(|| {
+                Error::Unsupported("XInclude xpointer has unbalanced scheme data".into())
+            })?;
+            match byte {
+                b'^' => {
+                    let escaped = *bytes.get(cursor + 1).ok_or_else(|| {
+                        Error::Unsupported("XInclude xpointer ends with an escape".into())
+                    })?;
+                    if !matches!(escaped, b'^' | b'(' | b')') {
+                        return Err(Error::Unsupported(
+                            "XInclude xpointer has an invalid scheme-data escape".into(),
+                        ));
+                    }
+                    cursor += 2;
+                }
+                b'(' => {
+                    nested += 1;
+                    cursor += 1;
+                }
+                b')' if nested == 0 => break cursor,
+                b')' => {
+                    nested -= 1;
+                    cursor += 1;
+                }
+                _ => cursor += 1,
+            }
+        };
+        let data = pointer.get(data_start..data_end).ok_or_else(|| {
+            Error::Unsupported("XInclude xpointer data boundary is invalid UTF-8".into())
+        })?;
+        cursor += 1;
+        saw_part = true;
+        // XPointer Framework section 3.3 skips unsupported schemes and continues left-to-right.
+        // The unqualified element scheme does not use the namespace binding context.
+        // https://www.w3.org/TR/xptr-framework/#scheme
+        if scheme == "element"
+            && let Some(selected) = select_xpointer_element_part(document, data)
+        {
+            return Ok(Some(selected));
+        }
+        if cursor < bytes.len() && !byte_is_xml_whitespace(bytes[cursor]) {
+            return Err(Error::Unsupported(
+                "XInclude xpointer parts must be separated by XML whitespace".into(),
+            ));
+        }
+    }
+    if !saw_part {
+        return Err(Error::Unsupported("XInclude xpointer is empty".into()));
+    }
+    Ok(None)
+}
+
+fn select_xpointer_element_part(document: &Document, data: &str) -> Option<NodeId> {
+    // XPointer element() section 3 defines either an NCName anchor, an absolute child sequence,
+    // or an NCName followed by a child sequence. Child numbers are positive and count elements.
+    // https://www.w3.org/TR/xptr-element/#language
+    let (mut current, mut sequence) = if data.starts_with('/') {
+        (document.root(), data)
+    } else {
+        let (anchor, suffix) = data
+            .find('/')
+            .map_or((data, ""), |slash| (&data[..slash], &data[slash..]));
+        if !is_ncname(anchor) {
+            return None;
+        }
+        (xpointer_id(document, anchor)?, suffix)
+    };
+    while !sequence.is_empty() {
+        sequence = sequence.strip_prefix('/')?;
+        let end = sequence.find('/').unwrap_or(sequence.len());
+        let step = sequence.get(..end)?;
+        if step.starts_with('0') || !step.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let position = step.parse::<usize>().ok()?;
+        current = document
+            .node(current)?
+            .children
+            .iter()
+            .filter(|child| {
+                matches!(
+                    document.node(**child).map(|node| &node.kind),
+                    Some(NodeKind::Element { .. })
+                )
+            })
+            .nth(position - 1)
+            .copied()?;
+        sequence = sequence.get(end..)?;
+    }
+    matches!(
+        document.node(current).map(|node| &node.kind),
+        Some(NodeKind::Element { .. })
+    )
+    .then_some(current)
+}
+
+fn xpointer_id(document: &Document, value: &str) -> Option<NodeId> {
+    document
+        .ids()
+        .find(|(candidate, root, _)| *candidate == value && *root == document.root())
+        .map(|(_, _, owner)| owner)
+}
+
+fn is_xpointer_scheme_name(value: &str) -> bool {
+    value.split_once(':').map_or_else(
+        || is_ncname(value),
+        |(prefix, local)| is_ncname(prefix) && is_ncname(local) && !local.contains(':'),
+    )
+}
+
+const fn byte_is_xml_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
+}
+
 fn decode_document_fragment<'a>(
     fragment: &'a str,
     meter: &mut Meter,
@@ -3578,7 +3745,7 @@ fn hex_value(byte: u8) -> u8 {
 }
 
 fn xinclude_pending_bytes(node_count: usize) -> usize {
-    node_count.saturating_mul(std::mem::size_of::<(NodeId, NodeId)>())
+    node_count.saturating_mul(std::mem::size_of::<PendingXIncludeNode>())
 }
 
 fn xinclude_remap_bytes(node_count: usize) -> usize {
@@ -3630,12 +3797,12 @@ fn resolve_xinclude(
             "unsupported XInclude parse mode {parse}"
         ))));
     }
-    if attribute("xpointer").is_some() {
-        // XInclude 1.0 section 4.2 classifies an XPointer evaluation error as a resource error,
-        // which activates xi:fallback when present.
-        // https://www.w3.org/TR/xinclude/#xml
-        return Err(XIncludeFailure::Resource(Error::Unsupported(
-            "XInclude xpointer selection is not implemented".into(),
+    let xpointer = attribute("xpointer");
+    if parse == "text" && xpointer.is_some() {
+        // XInclude 1.0 section 3.1 permits xpointer only when parse="xml".
+        // https://www.w3.org/TR/xinclude/#include_element
+        return Err(XIncludeFailure::Fatal(Error::Xml(
+            "XInclude xpointer is not permitted with parse=\"text\"".into(),
         )));
     }
     // XInclude 1.0 section 3.1 forbids fragment identifiers in href, including an empty
@@ -3706,6 +3873,25 @@ fn resolve_xinclude(
     let (document, parsed_reservation) =
         parse_external_document_metered(&xml, Some(&resource.canonical_uri), meter)
             .map_err(XIncludeFailure::Fatal)?;
+    let selected_root = if let Some(pointer) = xpointer {
+        // XInclude 1.0 section 4.2.2 requires the XPointer Framework and element() scheme. A
+        // syntactically valid pointer whose supported parts select nothing is a resource error,
+        // allowing xi:fallback; malformed acquired XML remains fatal above.
+        // https://www.w3.org/TR/xinclude/#fragment
+        // https://www.w3.org/TR/xptr-framework/#scheme
+        // https://www.w3.org/TR/xptr-element/#language
+        Some(
+            select_xpointer_element(&document, pointer)
+                .map_err(XIncludeFailure::Resource)?
+                .ok_or_else(|| {
+                    XIncludeFailure::Resource(Error::Unsupported(
+                        "XInclude xpointer did not identify an element".into(),
+                    ))
+                })?,
+        )
+    } else {
+        None
+    };
     let resource_identity = resource.identity.clone();
     if identity_is_new {
         charge_resource_identity_cache_entry(&resource, meter).map_err(XIncludeFailure::Fatal)?;
@@ -3721,6 +3907,7 @@ fn resolve_xinclude(
         identities,
         include_stack,
         depth.saturating_add(1),
+        selected_root,
     );
     include_stack.pop();
     meter.release_owned_bytes(parsed_reservation);
@@ -3759,7 +3946,7 @@ fn decode_xinclude_resource(
     parsed_xml: bool,
 ) -> std::result::Result<String, XIncludeFailure> {
     let (bytes, encoding) = if !parsed_xml {
-        let (bytes, encoding) = xinclude_text_payload(bytes, encoding.unwrap_or("UTF-8"));
+        let (bytes, encoding) = xinclude_text_payload(bytes, encoding);
         (bytes, Some(encoding))
     } else {
         (bytes, encoding)
@@ -3782,11 +3969,19 @@ fn decode_xinclude_resource(
     })
 }
 
-fn xinclude_text_payload<'a>(bytes: &'a [u8], encoding: &'a str) -> (&'a [u8], &'a str) {
+fn xinclude_text_payload<'a>(bytes: &'a [u8], encoding: Option<&'a str>) -> (&'a [u8], &'a str) {
     // XInclude 1.0 section 4.3.3 says an encoding signature is not part of the acquired text.
     // Select generic UTF byte order from that signature, then borrow past it so neither decoding
     // nor post-decode buffer shifting performs work for a character that must be discarded.
     // https://www.w3.org/TR/xinclude/#text_included
+    let encoding = match encoding {
+        Some(encoding) => encoding,
+        None if bytes.starts_with(&[0x00, 0x00, 0xFE, 0xFF]) => "UTF-32BE",
+        None if bytes.starts_with(&[0xFF, 0xFE, 0x00, 0x00]) => "UTF-32LE",
+        None if bytes.starts_with(&[0xFE, 0xFF]) => "UTF-16BE",
+        None if bytes.starts_with(&[0xFF, 0xFE]) => "UTF-16LE",
+        None => "UTF-8",
+    };
     if (encoding.eq_ignore_ascii_case("UTF-8") || encoding.eq_ignore_ascii_case("UTF8"))
         && let Some(payload) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF])
     {
@@ -6677,8 +6872,11 @@ impl function::Function for FormatNumberFunction {
                 what: "format-number() requires two or three arguments".into(),
             });
         }
-        let name = if args.len() == 3 {
-            Some(resolve_lexical_name(&args[2].string(), &self.namespaces)?)
+        let has_name = args.len() == 3;
+        let mut args = function::Args(args);
+        let name = if has_name {
+            let lexical = args.pop_string(context)?;
+            Some(resolve_lexical_name(&lexical, &self.namespaces)?)
         } else {
             None
         };
@@ -6694,10 +6892,10 @@ impl function::Function for FormatNumberFunction {
                     what: "unknown decimal-format".into(),
                 });
             };
-        let pattern = args[1].string();
+        let pattern = args.pop_string(context)?;
         context.reserve_string_allocation(decimal_render_workspace_bytes(&pattern))?;
         Ok(SxdValue::String(render_decimal(
-            args[0].number(context)?,
+            args.pop_number(context)?,
             &pattern,
             format,
         )?))
@@ -7985,6 +8183,37 @@ mod tests {
             )
             .expect_err("decimal rendering workspace must cross the allocation gate");
         assert!(error.to_string().contains("allocation budget"));
+    }
+
+    #[test]
+    fn format_number_reserves_each_string_conversion_before_materializing_it() {
+        // Both dynamic picture and decimal-format name values may require owned XPath string
+        // conversions. Their exact byte lengths must cross the gate before either clone occurs.
+        let package = Package::new();
+        let document = package.as_document();
+        let function = FormatNumberFunction {
+            formats: Arc::from([]),
+            namespaces: Arc::new(Vec::new()),
+        };
+
+        for args in [
+            vec![SxdValue::Number(1.0), SxdValue::Boolean(true)],
+            vec![
+                SxdValue::Number(1.0),
+                SxdValue::String("0".into()),
+                SxdValue::Boolean(true),
+            ],
+        ] {
+            let mut context = Context::new();
+            context.set_string_allocation_limit(3);
+            let evaluation =
+                sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+            let error = function
+                .evaluate(&evaluation, args)
+                .expect_err("four-byte conversion must cross the allocation gate");
+            assert!(error.to_string().contains("allocation budget"));
+            assert_eq!(context.string_allocation_exceeded(), Some(4));
+        }
     }
 
     #[test]

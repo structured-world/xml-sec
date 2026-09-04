@@ -29,7 +29,7 @@ pub enum BudgetKind {
     OwnedBytes,
 }
 
-/// Explicit limits applied while parsing one caller-supplied XML document.
+/// Policy-neutral enforcement limits for parsing one caller-supplied XML document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParseBudget {
     pub source_bytes: usize,
@@ -50,7 +50,7 @@ impl ParseBudget {
     pub(crate) const UNBOUNDED: Self = Self::new(usize::MAX, usize::MAX, usize::MAX);
 }
 
-/// Explicit immutable limits used while compiling a stylesheet graph.
+/// Policy-neutral immutable enforcement limits for compiling a stylesheet graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompileBudget {
     pub stylesheet_bytes: usize,
@@ -76,7 +76,7 @@ impl CompileBudget {
     }
 }
 
-/// Explicit immutable limits shared by one transformation execution.
+/// Policy-neutral immutable enforcement limits shared by one transformation execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecutionBudget {
     pub source_bytes: usize,

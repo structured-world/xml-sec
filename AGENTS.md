@@ -27,6 +27,10 @@ one typed immutable policy domain; do not extend the current scattered configura
   network access, or hot reload. Versioned external configuration and atomic policy-store
   integration belong to the separate `xml-sec-config` boundary.
 - Never select a permissive profile from untrusted document content.
+- Standalone mechanism crates may accept typed enforcement limits so they remain reusable and
+  bounded without depending on `xml-sec` policy types. XML-security adapters must derive every
+  such limit from the operation's one compiled policy snapshot and must not expose a parallel
+  caller-configurable policy surface.
 
 For `/next-task`, inventory every policy decision and enforcement point in the mandatory
 research summary before editing code. If full implementation would require a temporary

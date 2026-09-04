@@ -4679,7 +4679,9 @@ fn xinclude_fallback_handles_only_resource_errors() {
             },
             SourceProcessing::XInclude,
         ),
-        Err(Error::Unsupported(message)) if message.contains("xpointer")
+        Err(Error::Resolver { uri, message })
+            if uri == "unused.xml"
+                && message == "external resource access is not configured"
     ));
 
     let resolver = Arc::new(MemoryResolver::default());
@@ -4790,6 +4792,43 @@ fn xinclude_text_strips_encoding_signatures() {
                 },
             );
     }
+
+    for (href, bytes) in [
+        (
+            "utf16-signature.txt",
+            [0xFEFF_u16]
+                .into_iter()
+                .chain("delta".encode_utf16())
+                .flat_map(u16::to_le_bytes)
+                .collect(),
+        ),
+        (
+            "utf32-signature.txt",
+            [0xFF, 0xFE, 0x00, 0x00]
+                .into_iter()
+                .chain(
+                    "epsilon"
+                        .chars()
+                        .flat_map(|character| u32::from(character).to_le_bytes()),
+                )
+                .collect(),
+        ),
+    ] {
+        resolver
+            .resources
+            .lock()
+            .expect("test resolver mutex is not poisoned")
+            .insert(
+                (href.into(), Some("memory:source.xml".into())),
+                ResolvedResource {
+                    canonical_uri: format!("memory:{href}"),
+                    identity: ResourceIdentity(href.into()),
+                    bytes,
+                    media_type: Some("text/plain".into()),
+                    encoding: None,
+                },
+            );
+    }
     let stylesheet = compile(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="root"/></xsl:template></xsl:stylesheet>"#,
     );
@@ -4797,6 +4836,8 @@ fn xinclude_text_strips_encoding_signatures() {
         ("utf8.txt", "alpha"),
         ("utf16le.txt", "beta"),
         ("utf16be.txt", "gamma"),
+        ("utf16-signature.txt", "delta"),
+        ("utf32-signature.txt", "epsilon"),
     ] {
         let source = Document::parse(
             &format!(
@@ -4857,6 +4898,120 @@ fn xinclude_text_strips_encoding_signatures() {
                 SourceProcessing::XInclude,
             )
             .is_err()
+    );
+}
+
+#[test]
+fn xinclude_element_scheme_selects_only_the_addressed_element() {
+    // XInclude 1.0 section 4.2.2 requires support for the XPointer Framework element() scheme.
+    // Child sequence numbers count element children, and an ID may anchor the sequence.
+    // https://www.w3.org/TR/xinclude/#fragment
+    let resolver = Arc::new(MemoryResolver::default());
+    resolver.resources.lock().expect("resolver mutex").insert(
+        "included.xml".into(),
+        r#"<doc><first/><second xml:id="anchor"><leaf/></second><outside xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="must-not-resolve.xml"/></outside></doc>"#.into(),
+    );
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><xsl:copy-of select="."/></xsl:template></xsl:stylesheet>"#,
+    );
+
+    for (pointer, expected) in [
+        ("element(/1/2/1)", "<leaf/>"),
+        ("element(anchor/1)", "<leaf/>"),
+        ("anchor", "<second xml:id=\"anchor\"><leaf/></second>"),
+        ("unknown(a(b)) element(/1/1)", "<first/>"),
+    ] {
+        let source = Document::parse(
+            &format!(
+                r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="included.xml" xpointer="{pointer}"/></root>"#
+            ),
+            Some("memory:source.xml"),
+        )
+        .expect("source parses");
+        let result = stylesheet
+            .execute_with_source_processing(
+                &source,
+                &Parameters::new(),
+                resolver.clone(),
+                ExecutionOptions {
+                    budget: execution_budget(4096),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+                SourceProcessing::XInclude,
+            )
+            .expect("required element() scheme selects a subresource");
+        let output = String::from_utf8(result.serialized.bytes).expect("result is UTF-8");
+        assert!(
+            output.contains(expected),
+            "unexpected selection for {pointer}: {output}"
+        );
+        assert!(!output.contains("must-not-resolve"));
+    }
+
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="included.xml" xpointer="element(/1/9)"><xi:fallback><fallback/></xi:fallback></xi:include></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("source parses");
+    let result = stylesheet
+        .execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(4096),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        )
+        .expect("an empty element() selection activates fallback");
+    assert!(
+        String::from_utf8(result.serialized.bytes)
+            .expect("result is UTF-8")
+            .contains("<fallback/>")
+    );
+}
+
+#[test]
+fn xinclude_element_scheme_budgets_only_the_selected_projection() {
+    // The acquired resource must be parsed in full, but XInclude 1.0 section 4.2.2 adds only the
+    // selected subresource to the result. Unselected payload must not be charged as a second copy.
+    // https://www.w3.org/TR/xinclude/#fragment
+    let resolver = Arc::new(MemoryResolver::default());
+    let unselected = "x".repeat(256 * 1024);
+    resolver.resources.lock().expect("resolver mutex").insert(
+        "included.xml".into(),
+        format!(r#"<doc><selected/><unselected>{unselected}</unselected></doc>"#),
+    );
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><xsl:copy-of select="."/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="included.xml" xpointer="element(/1/1)"/></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("source parses");
+    let mut budget = execution_budget(512 * 1024);
+    budget.owned_bytes = 900 * 1024;
+    let result = stylesheet
+        .execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        )
+        .expect("an unselected sibling must not consume projection budget");
+    assert!(
+        String::from_utf8(result.serialized.bytes)
+            .expect("result is UTF-8")
+            .contains("<selected/>")
     );
 }
 

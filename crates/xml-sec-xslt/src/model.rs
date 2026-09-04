@@ -164,6 +164,45 @@ impl PartialEq for Document {
 
 impl Eq for Document {}
 
+fn estimated_node_clone_bytes(node: &Node) -> usize {
+    std::mem::size_of::<Node>()
+        .saturating_add(
+            node.children
+                .len()
+                .saturating_mul(std::mem::size_of::<NodeId>()),
+        )
+        .saturating_add(node.base_uri.as_deref().map_or(0, str::len))
+        .saturating_add(match &node.kind {
+            NodeKind::Root => 0,
+            NodeKind::Text { value, .. } | NodeKind::Comment(value) => value.len(),
+            NodeKind::ProcessingInstruction { target, value } => target
+                .len()
+                .saturating_add(value.as_deref().map_or(0, str::len)),
+            NodeKind::Element {
+                name,
+                prefix,
+                attributes,
+                namespaces: _,
+            } => name
+                .local
+                .len()
+                .saturating_add(name.namespace.as_deref().map_or(0, str::len))
+                .saturating_add(prefix.as_deref().map_or(0, str::len))
+                .saturating_add(
+                    attributes
+                        .len()
+                        .saturating_mul(std::mem::size_of::<Attribute>()),
+                )
+                .saturating_add(attributes.iter().fold(0usize, |total, attribute| {
+                    total
+                        .saturating_add(attribute.name.local.len())
+                        .saturating_add(attribute.name.namespace.as_deref().map_or(0, str::len))
+                        .saturating_add(attribute.prefix.as_deref().map_or(0, str::len))
+                        .saturating_add(attribute.value.len())
+                })),
+        })
+}
+
 impl Document {
     /// Parse trusted, caller-decoded XML without a caller-selected resource budget.
     ///
@@ -213,51 +252,11 @@ impl Document {
     // Account for heap storage materialized by Clone before duplicating the source document.
     pub(crate) fn estimated_clone_bytes(&self) -> usize {
         let mut bytes = self
-            .nodes
+            .logical_roots
             .len()
-            .saturating_mul(std::mem::size_of::<Node>())
-            .saturating_add(
-                self.logical_roots
-                    .len()
-                    .saturating_mul(std::mem::size_of::<NodeId>()),
-            );
+            .saturating_mul(std::mem::size_of::<NodeId>());
         for node in &self.nodes {
-            bytes = bytes
-                .saturating_add(
-                    node.children
-                        .len()
-                        .saturating_mul(std::mem::size_of::<NodeId>()),
-                )
-                .saturating_add(node.base_uri.as_deref().map_or(0, str::len));
-            bytes = bytes.saturating_add(match &node.kind {
-                NodeKind::Root => 0,
-                NodeKind::Text { value, .. } | NodeKind::Comment(value) => value.len(),
-                NodeKind::ProcessingInstruction { target, value } => target
-                    .len()
-                    .saturating_add(value.as_deref().map_or(0, str::len)),
-                NodeKind::Element {
-                    name,
-                    prefix,
-                    attributes,
-                    namespaces: _,
-                } => name
-                    .local
-                    .len()
-                    .saturating_add(name.namespace.as_deref().map_or(0, str::len))
-                    .saturating_add(prefix.as_deref().map_or(0, str::len))
-                    .saturating_add(
-                        attributes
-                            .len()
-                            .saturating_mul(std::mem::size_of::<Attribute>()),
-                    )
-                    .saturating_add(attributes.iter().fold(0usize, |total, attribute| {
-                        total
-                            .saturating_add(attribute.name.local.len())
-                            .saturating_add(attribute.name.namespace.as_deref().map_or(0, str::len))
-                            .saturating_add(attribute.prefix.as_deref().map_or(0, str::len))
-                            .saturating_add(attribute.value.len())
-                    })),
-            });
+            bytes = bytes.saturating_add(estimated_node_clone_bytes(node));
         }
         bytes = bytes
             .saturating_add(
@@ -284,6 +283,62 @@ impl Document {
                 },
             ));
         bytes
+    }
+
+    pub(crate) fn estimated_subtree_projection(&self, root: NodeId) -> (usize, usize) {
+        let mut node_count = 1usize;
+        let mut bytes = std::mem::size_of::<Node>()
+            .saturating_add(std::mem::size_of::<NodeId>())
+            .saturating_add(
+                self.node(self.root)
+                    .and_then(|node| node.base_uri.as_deref())
+                    .map_or(0, str::len),
+            );
+        let mut current = root;
+        loop {
+            let Some(node) = self.node(current) else {
+                return (node_count, bytes);
+            };
+            node_count = node_count.saturating_add(1);
+            bytes = bytes.saturating_add(estimated_node_clone_bytes(node));
+            let Some(next) = self.next_descendant(root, current) else {
+                break;
+            };
+            current = next;
+        }
+        let id_entry_bytes = std::mem::size_of::<((NodeId, String), NodeId)>()
+            .saturating_add(std::mem::size_of::<u64>());
+        for ((_, name), owner) in &self.ids {
+            if self.node_is_in_subtree(root, *owner) {
+                bytes = bytes
+                    .saturating_add(id_entry_bytes)
+                    .saturating_add(name.len());
+            }
+        }
+        let entity_entry_bytes = std::mem::size_of::<((NodeId, String), String)>()
+            .saturating_add(std::mem::size_of::<u64>());
+        bytes = bytes.saturating_add(self.unparsed_entities.iter().fold(
+            0usize,
+            |total, ((_, name), value)| {
+                total
+                    .saturating_add(entity_entry_bytes)
+                    .saturating_add(name.len())
+                    .saturating_add(value.len())
+            },
+        ));
+        (node_count, bytes)
+    }
+
+    fn node_is_in_subtree(&self, root: NodeId, mut candidate: NodeId) -> bool {
+        loop {
+            if candidate == root {
+                return true;
+            }
+            let Some(parent) = self.node(candidate).and_then(|node| node.parent) else {
+                return false;
+            };
+            candidate = parent;
+        }
     }
 
     // Conservatively includes namespace arenas owned by a freshly parsed document. Shared
