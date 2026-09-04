@@ -4614,14 +4614,13 @@ fn xinclude_fallback_never_swallows_security_budget_failures() {
 
 #[test]
 fn xinclude_fallback_handles_only_resource_errors() {
-    // XInclude 1.0 makes invalid syntax and unsupported selection fatal; fallback is reserved for
-    // failures to acquire a resource and must not turn malformed include instructions into data.
+    // XInclude 1.0 makes invalid syntax fatal; fallback must not turn malformed instructions into
+    // data, while selection failures are resource errors under section 4.2.
     let stylesheet = compile(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:copy-of select="."/></xsl:template></xsl:stylesheet>"#,
     );
     for source in [
         r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="missing.xml" parse="invalid"><xi:fallback><wrong/></xi:fallback></xi:include></root>"#,
-        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="missing.xml" xpointer="element(/1)"><xi:fallback><wrong/></xi:fallback></xi:include></root>"#,
         r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="missing.xml#fragment"><xi:fallback><wrong/></xi:fallback></xi:include></root>"#,
     ] {
         let error = stylesheet
@@ -4639,6 +4638,49 @@ fn xinclude_fallback_handles_only_resource_errors() {
             .expect_err("fatal XInclude errors must bypass fallback");
         assert!(matches!(error, Error::Xml(_) | Error::Unsupported(_)));
     }
+
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="unused.xml" xpointer="element(/1)"><xi:fallback><selected/></xi:fallback></xi:include></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("source parses");
+    let result = stylesheet
+        .execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        )
+        .expect("an unavailable XPointer selection activates fallback");
+    assert_eq!(
+        String::from_utf8(result.serialized.bytes).expect("result is UTF-8"),
+        "<?xml version=\"1.0\"?>\n<root xmlns:xi=\"http://www.w3.org/2001/XInclude\"><selected/></root>\n"
+    );
+
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="unused.xml" xpointer="element(/1)"/></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("source parses");
+    assert!(matches!(
+        stylesheet.execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        ),
+        Err(Error::Unsupported(message)) if message.contains("xpointer")
+    ));
 
     let resolver = Arc::new(MemoryResolver::default());
     resolver
@@ -9713,7 +9755,15 @@ fn byte_entry_points_share_strict_non_utf8_xml_decoding() {
     )
     .compile_bytes(&stylesheet, None)
     .expect("UTF-32BE stylesheet bytes compile");
-    let source = utf32("<root>lambda</root>", true);
+    let declarationless = utf32("<root>lambda</root>", true);
+    assert!(matches!(
+        Document::parse_bytes(&declarationless, None),
+        Err(Error::Xml(message)) if message.contains("encoding declaration")
+    ));
+    let source = utf32(
+        r#"<?xml version="1.0" encoding="UTF-32"?><root>lambda</root>"#,
+        true,
+    );
     let document = Document::parse_bytes(&source, None).expect("UTF-32LE source bytes parse");
     let result = compiled
         .execute(

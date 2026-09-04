@@ -38,6 +38,9 @@ pub enum Error {
     /// A UTF-32 document did not identify its byte order through metadata or its signature.
     #[error("UTF-32 XML input requires a UTF-32LE/UTF-32BE encoding or byte-order signature")]
     MissingUtf32ByteOrder,
+    /// A non-UTF-8/UTF-16 entity omitted both external encoding metadata and its declaration.
+    #[error("{0} XML input requires an encoding declaration or trusted external encoding metadata")]
+    MissingEncodingDeclaration(&'static str),
     /// A UTF-16 code unit was truncated.
     #[error("{0} XML input has an odd byte length")]
     InvalidUtf16Length(&'static str),
@@ -264,15 +267,15 @@ pub fn decode_xml_bounded<'a>(
     if explicit_encoding.is_none()
         && declaration.is_none()
         && physical.is_some_and(|(encoding, bom_len)| {
-            bom_len == 0 && (is_utf16_encoding(encoding) || is_utf32_encoding(encoding))
+            is_utf32_encoding(encoding) || (bom_len == 0 && is_utf16_encoding(encoding))
         })
     {
-        // XML 1.0 section 4.3.3 allows BOM-less non-UTF-8 input only when an encoding declaration
-        // identifies it; byte-pattern detection alone does not supply that declaration.
+        // XML 1.0 section 4.3.3 permits declarationless entities only for UTF-8 and UTF-16. A
+        // UTF-32 BOM identifies byte order but does not make UTF-32 one of those two exceptions.
         // https://www.w3.org/TR/xml/#charencoding
         return Err(
             if physical.is_some_and(|(encoding, _)| is_utf32_encoding(encoding)) {
-                Error::MissingUtf32ByteOrder
+                Error::MissingEncodingDeclaration("UTF-32")
             } else {
                 Error::MissingUtf16ByteOrder
             },
@@ -763,6 +766,13 @@ mod tests {
             let decoded = decode_xml(&bytes, None).expect("UTF-32 BOM selects byte order");
             assert!(decoded.contains("encoding=\"UTF-8\""));
             assert!(decoded.contains("<root>lambda</root>"));
+
+            let mut declarationless = bom.to_vec();
+            declarationless.extend(encode_utf32("<root>lambda</root>", little_endian));
+            assert!(
+                decode_xml(&declarationless, None).is_err(),
+                "a UTF-32 BOM identifies byte order but does not replace the encoding declaration"
+            );
         }
 
         for little_endian in [false, true] {
@@ -778,8 +788,20 @@ mod tests {
             let declarationless = encode_utf32("<root>lambda</root>", little_endian);
             assert!(matches!(
                 decode_xml(&declarationless, None),
-                Err(Error::MissingUtf32ByteOrder)
+                Err(Error::MissingEncodingDeclaration("UTF-32"))
             ));
+            assert_eq!(
+                decode_xml(
+                    &declarationless,
+                    Some(if little_endian {
+                        "UTF-32LE"
+                    } else {
+                        "UTF-32BE"
+                    })
+                )
+                .expect("trusted external metadata supplies the encoding"),
+                "<root>lambda</root>"
+            );
         }
     }
 

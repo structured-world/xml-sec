@@ -624,6 +624,7 @@ impl<W: Write> Writer<W> {
         write!(self.output, "<{name}")?;
         for (attribute, value) in attributes {
             validate_writer_qname(attribute)?;
+            validate_writer_characters(value)?;
             write!(self.output, " {attribute}=\"{}\"", escape_attribute(value))?;
         }
         self.output.write_all(if empty { b"/>" } else { b">" })
@@ -637,6 +638,7 @@ impl<W: Write> Writer<W> {
 
     /// Write escaped character data.
     pub fn text(&mut self, value: &str) -> std::io::Result<()> {
+        validate_writer_characters(value)?;
         write!(self.output, "{}", escape_text(value))
     }
 
@@ -660,6 +662,27 @@ fn validate_writer_qname(name: &str) -> std::io::Result<()> {
         Ok(())
     } else {
         Err(IoError::new(ErrorKind::InvalidInput, "invalid XML QName"))
+    }
+}
+
+#[cfg(feature = "std")]
+fn validate_writer_characters(value: &str) -> std::io::Result<()> {
+    // XML 1.0 section 2.2 production [2] is the character repertoire for parsed entities;
+    // escaping markup delimiters cannot make a forbidden control character legal.
+    // https://www.w3.org/TR/xml/#charsets
+    if let Some(character) = value
+        .chars()
+        .find(|character| !is_xml_1_0_character(*character))
+    {
+        Err(IoError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "character U+{:04X} is forbidden by XML 1.0",
+                u32::from(character)
+            ),
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -782,5 +805,19 @@ mod tests {
         assert!(writer.empty("root", [("a:b:c", "value")]).is_err());
         let mut writer = Writer::new(Vec::new());
         assert!(writer.end("root><injected").is_err());
+    }
+
+    #[test]
+    fn writer_rejects_characters_forbidden_by_xml_1_0() {
+        let mut writer = Writer::new(Vec::new());
+        assert!(writer.text("before\0after").is_err());
+        assert!(writer.into_inner().is_empty());
+
+        let mut writer = Writer::new(Vec::new());
+        assert!(
+            writer
+                .empty("root", [("value", "before\u{1}after")])
+                .is_err()
+        );
     }
 }

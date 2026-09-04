@@ -2,7 +2,6 @@ use std::cell::Cell;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::ops::Deref;
-use std::rc::Rc;
 
 use crate::budget::Meter;
 use crate::{BudgetKind, Document, Error, NodeId, NodeKind, Result};
@@ -783,7 +782,7 @@ struct RenderContext {
     parent: Option<NodeId>,
     parent_mixed: bool,
     html_whitespace_sensitive: bool,
-    in_scope_namespaces: Option<Rc<NamespaceScope>>,
+    in_scope_namespaces: Option<usize>,
 }
 
 enum NamespaceBinding {
@@ -793,7 +792,7 @@ enum NamespaceBinding {
 
 struct NamespaceScope {
     binding: NamespaceBinding,
-    parent: Option<Rc<Self>>,
+    parent: Option<usize>,
 }
 
 impl RenderContext {
@@ -810,11 +809,13 @@ impl RenderContext {
 
 fn namespace_in_scope<'a>(
     document: &'a Document,
-    scope: &Option<Rc<NamespaceScope>>,
+    scopes: &[NamespaceScope],
+    scope: Option<usize>,
     prefix: Option<&str>,
 ) -> Option<&'a str> {
-    let mut current = scope.as_deref();
-    while let Some(frame) = current {
+    let mut current = scope;
+    while let Some(index) = current {
+        let frame = &scopes[index];
         match frame.binding {
             NamespaceBinding::EmptyDefault if prefix.is_none() => return Some(""),
             NamespaceBinding::Document { element, index } => {
@@ -830,26 +831,25 @@ fn namespace_in_scope<'a>(
             }
             NamespaceBinding::EmptyDefault => {}
         }
-        current = frame.parent.as_deref();
+        current = frame.parent;
     }
     None
 }
 
 fn extend_namespace_scope(
-    scope: &Option<Rc<NamespaceScope>>,
+    scopes: &mut Vec<NamespaceScope>,
+    scope: Option<usize>,
     binding: NamespaceBinding,
     meter: &mut Meter,
     reserved_owned_bytes: &mut usize,
-) -> Result<Option<Rc<NamespaceScope>>> {
-    // Account for the Rc allocation as retained serializer workspace. Binding strings stay
-    // borrowed from Document, so descendant scopes never copy inherited namespace text.
-    let bytes = std::mem::size_of::<NamespaceScope>() + 2 * std::mem::size_of::<usize>();
-    meter.charge(BudgetKind::OwnedBytes, bytes)?;
-    *reserved_owned_bytes = reserved_owned_bytes.saturating_add(bytes);
-    Ok(Some(Rc::new(NamespaceScope {
+) -> Result<Option<usize>> {
+    crate::budget::reserve_temporary_vec_slot(scopes, meter, reserved_owned_bytes)?;
+    let index = scopes.len();
+    scopes.push(NamespaceScope {
         binding,
-        parent: scope.clone(),
-    })))
+        parent: scope,
+    });
+    Ok(Some(index))
 }
 
 enum RenderTask {
@@ -874,7 +874,49 @@ enum RenderTask {
         html_whitespace_sensitive: bool,
         has_element_child: bool,
         html_void: bool,
+        namespace_scope_len: usize,
     },
+}
+
+struct RenderWorkspace {
+    tasks: Vec<RenderTask>,
+    namespace_scopes: Vec<NamespaceScope>,
+    reserved_owned_bytes: usize,
+}
+
+impl RenderWorkspace {
+    const fn new() -> Self {
+        Self {
+            tasks: Vec::new(),
+            namespace_scopes: Vec::new(),
+            reserved_owned_bytes: 0,
+        }
+    }
+
+    fn push(&mut self, task: RenderTask, meter: &mut Meter) -> Result<()> {
+        crate::budget::reserve_temporary_vec_slot(
+            &mut self.tasks,
+            meter,
+            &mut self.reserved_owned_bytes,
+        )?;
+        self.tasks.push(task);
+        Ok(())
+    }
+
+    fn extend_namespace_scope(
+        &mut self,
+        scope: Option<usize>,
+        binding: NamespaceBinding,
+        meter: &mut Meter,
+    ) -> Result<Option<usize>> {
+        extend_namespace_scope(
+            &mut self.namespace_scopes,
+            scope,
+            binding,
+            meter,
+            &mut self.reserved_owned_bytes,
+        )
+    }
 }
 
 fn serialize_node(
@@ -886,24 +928,17 @@ fn serialize_node(
     context: RenderContext,
     meter: &mut Meter,
 ) -> Result<()> {
-    let mut tasks = Vec::new();
-    let mut reserved_owned_bytes = 0usize;
-    push_render_task(
-        &mut tasks,
-        RenderTask::Node(id, context),
-        meter,
-        &mut reserved_owned_bytes,
-    )?;
+    let mut workspace = RenderWorkspace::new();
+    workspace.push(RenderTask::Node(id, context), meter)?;
     let result = serialize_node_tasks(
         document,
         definition,
         encoding,
         output,
         meter,
-        &mut tasks,
-        &mut reserved_owned_bytes,
+        &mut workspace,
     );
-    meter.release_owned_bytes(reserved_owned_bytes);
+    meter.release_owned_bytes(workspace.reserved_owned_bytes);
     result
 }
 
@@ -913,10 +948,9 @@ fn serialize_node_tasks(
     encoding: &OutputEncoding,
     output: &mut RenderBuffer,
     meter: &mut Meter,
-    tasks: &mut Vec<RenderTask>,
-    reserved_owned_bytes: &mut usize,
+    workspace: &mut RenderWorkspace,
 ) -> Result<()> {
-    while let Some(task) = tasks.pop() {
+    while let Some(task) = workspace.tasks.pop() {
         output.ensure_within_limit()?;
         if let RenderTask::Children {
             parent,
@@ -963,8 +997,7 @@ fn serialize_node_tasks(
                 {
                     next += 1;
                 }
-                push_render_task(
-                    tasks,
+                workspace.push(
                     RenderTask::Children {
                         parent,
                         next,
@@ -973,22 +1006,18 @@ fn serialize_node_tasks(
                         skip_legacy_content_type,
                     },
                     meter,
-                    reserved_owned_bytes,
                 )?;
-                push_render_task(
-                    tasks,
+                workspace.push(
                     RenderTask::CdataRange {
                         parent,
                         start,
                         end: next,
                     },
                     meter,
-                    reserved_owned_bytes,
                 )?;
                 continue;
             }
-            push_render_task(
-                tasks,
+            workspace.push(
                 RenderTask::Children {
                     parent,
                     next: next + 1,
@@ -997,14 +1026,8 @@ fn serialize_node_tasks(
                     skip_legacy_content_type,
                 },
                 meter,
-                reserved_owned_bytes,
             )?;
-            push_render_task(
-                tasks,
-                RenderTask::Node(child, context),
-                meter,
-                reserved_owned_bytes,
-            )?;
+            workspace.push(RenderTask::Node(child, context), meter)?;
             continue;
         }
         if let RenderTask::CdataRange { parent, start, end } = task {
@@ -1027,6 +1050,7 @@ fn serialize_node_tasks(
             html_whitespace_sensitive,
             has_element_child,
             html_void,
+            namespace_scope_len,
         } = task
         {
             if definition.indent
@@ -1050,6 +1074,7 @@ fn serialize_node_tasks(
                 push_name(prefix.as_deref(), &name.local, encoding, output)?;
                 output.push('>');
             }
+            workspace.namespace_scopes.truncate(namespace_scope_len);
             continue;
         }
         let RenderTask::Node(id, context) = task else {
@@ -1060,8 +1085,7 @@ fn serialize_node_tasks(
             .ok_or_else(|| Error::Serialization("invalid result node".into()))?;
         match &node.kind {
             NodeKind::Root => {
-                push_render_task(
-                    tasks,
+                workspace.push(
                     RenderTask::Children {
                         parent: id,
                         next: 0,
@@ -1070,7 +1094,6 @@ fn serialize_node_tasks(
                         skip_legacy_content_type: false,
                     },
                     meter,
-                    reserved_owned_bytes,
                 )?;
             }
             NodeKind::Text {
@@ -1153,8 +1176,7 @@ fn serialize_node_tasks(
                 });
             }
             NodeKind::Element { .. } if definition.method == OutputMethod::Text => {
-                push_render_task(
-                    tasks,
+                workspace.push(
                     RenderTask::Children {
                         parent: id,
                         next: 0,
@@ -1163,7 +1185,6 @@ fn serialize_node_tasks(
                         skip_legacy_content_type: false,
                     },
                     meter,
-                    reserved_owned_bytes,
                 )?;
             }
             NodeKind::Element {
@@ -1188,9 +1209,14 @@ fn serialize_node_tasks(
                 }
                 output.push('<');
                 push_name(prefix.as_deref(), &name.local, encoding, output)?;
-                let mut current_namespaces = context.in_scope_namespaces.clone();
-                let inherited_default_namespace =
-                    namespace_in_scope(document, &current_namespaces, None);
+                let namespace_scope_len = workspace.namespace_scopes.len();
+                let mut current_namespaces = context.in_scope_namespaces;
+                let inherited_default_namespace = namespace_in_scope(
+                    document,
+                    &workspace.namespace_scopes,
+                    current_namespaces,
+                    None,
+                );
                 let inherits_empty_default_namespace =
                     inherited_default_namespace.is_none_or(str::is_empty);
                 if name.namespace.is_none()
@@ -1200,11 +1226,10 @@ fn serialize_node_tasks(
                         .any(|namespace| namespace.prefix.is_none() && namespace.uri.is_empty())
                 {
                     output.push_str(" xmlns=\"\"");
-                    current_namespaces = extend_namespace_scope(
-                        &current_namespaces,
+                    current_namespaces = workspace.extend_namespace_scope(
+                        current_namespaces,
                         NamespaceBinding::EmptyDefault,
                         meter,
-                        reserved_owned_bytes,
                     )?;
                 }
                 let element_namespace_index = prefix.as_ref().and_then(|_| {
@@ -1239,7 +1264,8 @@ fn serialize_node_tasks(
                     }
                     if namespace_in_scope(
                         document,
-                        &current_namespaces,
+                        &workspace.namespace_scopes,
+                        current_namespaces,
                         namespace.prefix.as_deref(),
                     )
                     .is_some_and(|uri| uri == namespace.uri)
@@ -1260,14 +1286,13 @@ fn serialize_node_tasks(
                         output,
                     );
                     output.push('"');
-                    current_namespaces = extend_namespace_scope(
-                        &current_namespaces,
+                    current_namespaces = workspace.extend_namespace_scope(
+                        current_namespaces,
                         NamespaceBinding::Document {
                             element: id,
                             index: namespace_index,
                         },
                         meter,
-                        reserved_owned_bytes,
                     )?;
                 }
                 for attribute in attributes {
@@ -1322,6 +1347,7 @@ fn serialize_node_tasks(
                             "/>"
                         },
                     );
+                    workspace.namespace_scopes.truncate(namespace_scope_len);
                     continue;
                 }
                 output.push('>');
@@ -1394,8 +1420,7 @@ fn serialize_node_tasks(
                     ]
                     .iter()
                     .any(|candidate| name.local.eq_ignore_ascii_case(candidate));
-                push_render_task(
-                    tasks,
+                workspace.push(
                     RenderTask::CloseElement {
                         id,
                         depth: context.depth,
@@ -1409,12 +1434,11 @@ fn serialize_node_tasks(
                             )
                         }),
                         html_void,
+                        namespace_scope_len,
                     },
                     meter,
-                    reserved_owned_bytes,
                 )?;
-                push_render_task(
-                    tasks,
+                workspace.push(
                     RenderTask::Children {
                         parent: id,
                         next: 0,
@@ -1423,23 +1447,11 @@ fn serialize_node_tasks(
                         skip_legacy_content_type: definition.inject_content_type && html_head,
                     },
                     meter,
-                    reserved_owned_bytes,
                 )?;
             }
             _ => {}
         }
     }
-    Ok(())
-}
-
-fn push_render_task(
-    tasks: &mut Vec<RenderTask>,
-    task: RenderTask,
-    meter: &mut Meter,
-    reserved_owned_bytes: &mut usize,
-) -> Result<()> {
-    crate::budget::reserve_temporary_vec_slot(tasks, meter, reserved_owned_bytes)?;
-    tasks.push(task);
     Ok(())
 }
 
@@ -2169,5 +2181,49 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn namespace_workspace_tracks_depth_instead_of_sibling_count() {
+        // Namespace scopes are live only along the current ancestor path. A wide result must reuse
+        // that workspace rather than retaining one allocation charge for every completed sibling.
+        fn minimum_workspace(source: &str) -> usize {
+            let document = Document::parse(source, None).expect("document parses");
+            let limits = ExecutionBudget {
+                source_bytes: 0,
+                external_documents: 0,
+                recursion_depth: 1,
+                xpath_evaluations: 0,
+                template_applications: 0,
+                sort_comparisons: 0,
+                key_entries: 0,
+                result_nodes: 0,
+                serialized_bytes: 0,
+                messages: 0,
+                owned_bytes: usize::MAX,
+            };
+            let mut meter = Meter::new(limits, 0).expect("zero source bytes fit");
+            let output = serialize_fragment(&document, &mut meter).expect("fixture serializes");
+            let mut rejected = output.len().saturating_sub(1);
+            let mut accepted = output.len().saturating_add(64 * 1024);
+            while rejected + 1 < accepted {
+                let candidate = rejected + (accepted - rejected) / 2;
+                let limits = ExecutionBudget {
+                    owned_bytes: candidate,
+                    ..limits
+                };
+                let mut meter = Meter::new(limits, 0).expect("zero source bytes fit");
+                if serialize_fragment(&document, &mut meter).is_ok() {
+                    accepted = candidate;
+                } else {
+                    rejected = candidate;
+                }
+            }
+            accepted - output.len()
+        }
+
+        let narrow = "<root><item xmlns:p='urn:test'/></root>";
+        let wide = format!("<root>{}</root>", "<item xmlns:p='urn:test'/>".repeat(512));
+        assert_eq!(minimum_workspace(narrow), minimum_workspace(&wide));
     }
 }

@@ -133,7 +133,65 @@ pub(crate) fn unprefixed_function_calls(source: &str, name: &str) -> Vec<Functio
 }
 
 pub(crate) fn has_unprefixed_function_call(source: &str, name: &str) -> bool {
-    scan_unprefixed_function_calls(source, name, |_, _, _| true)
+    let mut quote = None;
+    let mut depth = 0usize;
+    let mut candidate_depth = None;
+    let mut cursor = 0;
+    while cursor < source.len() {
+        let Some(character) = source[cursor..].chars().next() else {
+            break;
+        };
+        if let Some(active) = quote {
+            if character == active {
+                quote = None;
+            }
+            cursor += character.len_utf8();
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            cursor += character.len_utf8();
+            continue;
+        }
+        if character == '(' {
+            depth += 1;
+            cursor += 1;
+            continue;
+        }
+        if character == ')' {
+            if candidate_depth == Some(depth) {
+                return true;
+            }
+            depth = depth.saturating_sub(1);
+            cursor += 1;
+            continue;
+        }
+        if !is_ncname_start(character) {
+            cursor += character.len_utf8();
+            continue;
+        }
+        let start = cursor;
+        let Some((end, qualified)) = lexical_name_end(source, start) else {
+            break;
+        };
+        cursor = end;
+        if qualified || &source[start..cursor] != name {
+            continue;
+        }
+        while cursor < source.len() && source[cursor..].chars().next().is_some_and(is_xpath_space) {
+            cursor += source[cursor..]
+                .chars()
+                .next()
+                .expect("cursor is inside source")
+                .len_utf8();
+        }
+        if source[cursor..].starts_with('(') {
+            depth += 1;
+            candidate_depth = Some(depth);
+            cursor += 1;
+        }
+    }
+    false
 }
 
 fn scan_unprefixed_function_calls(
@@ -345,6 +403,19 @@ mod tests {
         assert!(has_unprefixed_function_call("current ()/item", "current"));
         assert!(!has_unprefixed_function_call("'current()'", "current"));
         assert!(!has_unprefixed_function_call("x:current()", "current"));
+        assert!(!has_unprefixed_function_call("current(", "current"));
+        assert!(has_unprefixed_function_call(
+            "current(('current())'))",
+            "current"
+        ));
+    }
+
+    #[test]
+    fn unprefixed_boolean_detection_does_not_retain_matches() {
+        // Boolean capability checks must scan a caller-sized expression without retaining every
+        // lexical call; the first complete match is sufficient.
+        let source = "ordinary(),".repeat(100_000) + "current()";
+        assert!(has_unprefixed_function_call(&source, "current"));
     }
 
     #[test]

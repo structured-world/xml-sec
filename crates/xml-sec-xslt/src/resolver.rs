@@ -202,7 +202,9 @@ mod tests {
         );
         assert!(matches!(
             decode_resource(&[0, 0, 0, b'<'], None, true, usize::MAX),
-            Err(xml_sec_xml_input::Error::MissingUtf32ByteOrder)
+            Err(xml_sec_xml_input::Error::MissingEncodingDeclaration(
+                "UTF-32"
+            ))
         ));
         assert!(decode_resource(&[0, 0, b'<', 0], None, true, usize::MAX).is_err());
     }

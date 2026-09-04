@@ -3631,7 +3631,10 @@ fn resolve_xinclude(
         ))));
     }
     if attribute("xpointer").is_some() {
-        return Err(XIncludeFailure::Fatal(Error::Unsupported(
+        // XInclude 1.0 section 4.2 classifies an XPointer evaluation error as a resource error,
+        // which activates xi:fallback when present.
+        // https://www.w3.org/TR/xinclude/#xml
+        return Err(XIncludeFailure::Resource(Error::Unsupported(
             "XInclude xpointer selection is not implemented".into(),
         )));
     }
