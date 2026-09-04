@@ -717,20 +717,25 @@ impl<'a> Execution<'a> {
         match self.evaluate(&declaration.use_expression, &node, 1, 1)? {
             XPathValue::NodeSet(nodes) => {
                 for selected in nodes.iter() {
-                    let value = self.evaluator.string_value(selected);
+                    let (value, value_reservation) = self
+                        .evaluator
+                        .materialize_temporary_string_value(selected, &mut self.meter)?;
                     self.evaluator.append_key_entry(
-                        declaration.name.clone(),
+                        &declaration.name,
                         value,
+                        value_reservation,
                         &node,
                         &mut self.meter,
                     )?;
                 }
             }
             value => {
-                let value = value.string(&self.evaluator);
+                let (value, value_reservation) =
+                    value.into_fully_metered_temporary_string(&self.evaluator, &mut self.meter)?;
                 self.evaluator.append_key_entry(
-                    declaration.name.clone(),
+                    &declaration.name,
                     value,
+                    value_reservation,
                     &node,
                     &mut self.meter,
                 )?;
@@ -1364,19 +1369,11 @@ impl<'a> Execution<'a> {
                             frame.depth + 1,
                         )
                     }
-                    // Result text must own its payload; cloning only this leaf avoids cloning element
-                    // attributes, namespaces, and child storage merely to choose a built-in rule.
-                    Some(NodeKind::Text { value, .. }) => {
-                        let value = value.clone();
-                        self.append_owned_text(value, false)
-                    }
+                    Some(NodeKind::Text { .. }) => self.append_source_leaf_text(&node, false),
                     _ => Ok(()),
                 }
             }
-            SourceNode::Attribute { .. } => {
-                let value = self.evaluator.string_value(&node);
-                self.append_text(&value, false)
-            }
+            SourceNode::Attribute { .. } => self.append_source_leaf_text(&node, false),
             SourceNode::Namespace { .. } => Ok(()),
         }
     }
@@ -1726,10 +1723,8 @@ impl<'a> Execution<'a> {
                 select,
                 disable_output_escaping,
             } => {
-                let value = self
-                    .evaluate(select, node, position, size)?
-                    .into_string(&self.evaluator);
-                self.append_owned_text(value, *disable_output_escaping)
+                let value = self.evaluate(select, node, position, size)?;
+                self.append_xpath_text(value, *disable_output_escaping)
             }
             Instruction::CopyOf(select) => {
                 match self.evaluate(select, node, position, size)? {
@@ -1741,10 +1736,7 @@ impl<'a> Execution<'a> {
                     XPathValue::ResultTreeFragment(fragment) => {
                         self.copy_document(&fragment, fragment.root(), self.parent(), depth + 1)?;
                     }
-                    value => {
-                        let text = value.into_string(&self.evaluator);
-                        self.append_owned_text(text, false)?
-                    }
+                    value => self.append_xpath_text(value, false)?,
                 }
                 Ok(())
             }
@@ -3016,7 +3008,11 @@ impl<'a> Execution<'a> {
                     let key = if spec.data_type == "number" {
                         SortKey::Number(value.number(&self.evaluator))
                     } else {
-                        SortKey::text(value.into_string(&self.evaluator), &mut self.meter)?
+                        let (value, reservation) = value.into_fully_metered_temporary_string(
+                            &self.evaluator,
+                            &mut self.meter,
+                        )?;
+                        SortKey::text_precharged(value, reservation, &mut self.meter)?
                     };
                     retained_bytes = retained_bytes
                         .checked_add(key.owned_bytes())
@@ -3356,11 +3352,7 @@ impl<'a> Execution<'a> {
             .unwrap_or_else(|| self.result.root())
     }
     fn push_node(&mut self, parent: NodeId, kind: NodeKind) -> Result<NodeId> {
-        let base_uri = self
-            .result
-            .node(parent)
-            .and_then(|node| node.base_uri.clone());
-        self.push_node_with_base(parent, kind, base_uri)
+        push_result_node(&mut self.result, &mut self.meter, parent, kind)
     }
 
     fn push_node_with_base(
@@ -3389,57 +3381,47 @@ impl<'a> Execution<'a> {
     fn append_owned_text(&mut self, value: String, disable: bool) -> Result<()> {
         self.append_text_value(Cow::Owned(value), disable)
     }
-    fn append_text_value(&mut self, value: Cow<'_, str>, disable: bool) -> Result<()> {
-        // XSLT's result tree never retains zero-length text nodes.
-        if value.is_empty() {
-            return Ok(());
-        }
+
+    fn append_source_leaf_text(&mut self, node: &SourceNode, disable: bool) -> Result<()> {
         let parent = self.parent();
-        let previous = self
-            .result
-            .node(parent)
-            .and_then(|node| node.children.last().copied());
-        if let Some(previous) = previous
-            && self.result.node(previous).is_some_and(|node| {
-                matches!(
-                    &node.kind,
-                    NodeKind::Text {
-                        disable_output_escaping,
-                        ..
-                    } if *disable_output_escaping == disable
-                )
-            })
-        {
-            let temporary_bytes = matches!(&value, Cow::Owned(_)).then_some(value.len());
-            if let Some(bytes) = temporary_bytes {
-                self.meter.charge(BudgetKind::OwnedBytes, bytes)?;
-            }
-            if let Err(error) = self.meter.charge(BudgetKind::OwnedBytes, value.len()) {
-                if let Some(bytes) = temporary_bytes {
-                    self.meter.release_owned_bytes(bytes);
-                }
-                return Err(error);
-            }
-            if let Some(NodeKind::Text { value: current, .. }) =
-                self.result.node_mut(previous).map(|node| &mut node.kind)
-            {
-                current.push_str(&value);
-            }
-            if let Some(bytes) = temporary_bytes {
-                self.meter.release_owned_bytes(bytes);
-            }
+        let Some(value) = self.evaluator.borrowed_leaf_string_value(node) else {
             return Ok(());
-        }
-        self.meter
-            .check_additional(BudgetKind::OwnedBytes, value.len())?;
-        self.push_node(
+        };
+        append_result_text(
+            &mut self.result,
+            &mut self.meter,
             parent,
-            NodeKind::Text {
-                value: value.into_owned(),
-                disable_output_escaping: disable,
-            },
-        )?;
-        Ok(())
+            Cow::Borrowed(value),
+            disable,
+        )
+    }
+
+    fn append_xpath_text(&mut self, value: XPathValue, disable: bool) -> Result<()> {
+        let (value, reservation) =
+            value.into_fully_metered_temporary_string(&self.evaluator, &mut self.meter)?;
+        self.append_precharged_text(value, reservation, disable)
+    }
+
+    fn append_precharged_text(
+        &mut self,
+        value: String,
+        reservation: usize,
+        disable: bool,
+    ) -> Result<()> {
+        let parent = self.parent();
+        append_precharged_result_text(
+            &mut self.result,
+            &mut self.meter,
+            parent,
+            value,
+            reservation,
+            disable,
+        )
+    }
+
+    fn append_text_value(&mut self, value: Cow<'_, str>, disable: bool) -> Result<()> {
+        let parent = self.parent();
+        append_result_text(&mut self.result, &mut self.meter, parent, value, disable)
     }
 
     fn add_attribute(&mut self, attribute: Attribute) -> Result<()> {
@@ -4302,12 +4284,13 @@ impl EvaluatedSort {
     }
 }
 impl SortKey {
-    fn text(value: String, meter: &mut Meter) -> Result<Self> {
+    fn text_precharged(value: String, reservation: usize, meter: &mut Meter) -> Result<Self> {
+        debug_assert_eq!(reservation, value.len());
         let key_bytes = default_collation_key_bytes(&value);
-        meter.charge(
-            BudgetKind::OwnedBytes,
-            value.len().saturating_add(key_bytes),
-        )?;
+        if let Err(error) = meter.charge(BudgetKind::OwnedBytes, key_bytes) {
+            meter.release_owned_bytes(reservation);
+            return Err(error);
+        }
         let default_key = default_collation_key(&value, key_bytes);
         Ok(Self::Text { value, default_key })
     }
@@ -4872,6 +4855,147 @@ fn attribute_owned_bytes(attribute: &Attribute) -> usize {
     expanded_name_owned_bytes(&attribute.name)
         .saturating_add(attribute.prefix.as_ref().map_or(0, String::len))
         .saturating_add(attribute.value.len())
+}
+
+fn append_result_text(
+    result: &mut Document,
+    meter: &mut Meter,
+    parent: NodeId,
+    value: Cow<'_, str>,
+    disable: bool,
+) -> Result<()> {
+    // XSLT's result tree never retains zero-length text nodes.
+    if value.is_empty() {
+        return Ok(());
+    }
+    let previous = result
+        .node(parent)
+        .and_then(|node| node.children.last().copied());
+    if let Some(previous) = previous
+        && result.node(previous).is_some_and(|node| {
+            matches!(
+                &node.kind,
+                NodeKind::Text {
+                    disable_output_escaping,
+                    ..
+                } if *disable_output_escaping == disable
+            )
+        })
+    {
+        let temporary_bytes = matches!(&value, Cow::Owned(_)).then_some(value.len());
+        if let Some(bytes) = temporary_bytes {
+            meter.charge(BudgetKind::OwnedBytes, bytes)?;
+        }
+        if let Err(error) = meter.charge(BudgetKind::OwnedBytes, value.len()) {
+            if let Some(bytes) = temporary_bytes {
+                meter.release_owned_bytes(bytes);
+            }
+            return Err(error);
+        }
+        if let Some(NodeKind::Text { value: current, .. }) =
+            result.node_mut(previous).map(|node| &mut node.kind)
+        {
+            current.push_str(&value);
+        }
+        if let Some(bytes) = temporary_bytes {
+            meter.release_owned_bytes(bytes);
+        }
+        return Ok(());
+    }
+    meter.check_additional(BudgetKind::OwnedBytes, value.len())?;
+    push_result_node(
+        result,
+        meter,
+        parent,
+        NodeKind::Text {
+            value: value.into_owned(),
+            disable_output_escaping: disable,
+        },
+    )?;
+    Ok(())
+}
+
+fn append_precharged_result_text(
+    result: &mut Document,
+    meter: &mut Meter,
+    parent: NodeId,
+    value: String,
+    reservation: usize,
+    disable: bool,
+) -> Result<()> {
+    debug_assert_eq!(reservation, value.len());
+    if value.is_empty() {
+        meter.release_owned_bytes(reservation);
+        return Ok(());
+    }
+    let previous = result
+        .node(parent)
+        .and_then(|node| node.children.last().copied());
+    if let Some(previous) = previous
+        && result.node(previous).is_some_and(|node| {
+            matches!(
+                &node.kind,
+                NodeKind::Text {
+                    disable_output_escaping,
+                    ..
+                } if *disable_output_escaping == disable
+            )
+        })
+    {
+        if let Err(error) = meter.charge(BudgetKind::OwnedBytes, value.len()) {
+            meter.release_owned_bytes(reservation);
+            return Err(error);
+        }
+        if let Some(NodeKind::Text { value: current, .. }) =
+            result.node_mut(previous).map(|node| &mut node.kind)
+        {
+            current.push_str(&value);
+        }
+        meter.release_owned_bytes(reservation);
+        return Ok(());
+    }
+
+    let base_uri = result.node(parent).and_then(|node| node.base_uri.clone());
+    let insertion = (|| {
+        result.reserve_metered_push_containers(parent, meter)?;
+        meter.charge(
+            BudgetKind::OwnedBytes,
+            base_uri.as_deref().map_or(0, str::len),
+        )?;
+        meter.charge(BudgetKind::ResultNodes, 1)?;
+        Ok(result.push(
+            parent,
+            NodeKind::Text {
+                value,
+                disable_output_escaping: disable,
+            },
+            base_uri,
+        ))
+    })();
+    if insertion.is_err() {
+        meter.release_owned_bytes(reservation);
+    }
+    insertion.map(|_| ())
+}
+
+fn push_result_node(
+    result: &mut Document,
+    meter: &mut Meter,
+    parent: NodeId,
+    kind: NodeKind,
+) -> Result<NodeId> {
+    let base_uri = result.node(parent).and_then(|node| node.base_uri.clone());
+    result.reserve_metered_push_containers(parent, meter)?;
+    meter.charge(BudgetKind::OwnedBytes, node_kind_owned_bytes(&kind))?;
+    meter.charge(
+        BudgetKind::OwnedBytes,
+        base_uri.as_deref().map_or(0, str::len),
+    )?;
+    meter.charge(
+        BudgetKind::ResultNodes,
+        1usize.saturating_add(node_kind_embedded_nodes(&kind)),
+    )?;
+    Ok(result.push(parent, kind, base_uri))
 }
 
 fn namespace_owned_bytes(namespace: &Namespace) -> usize {
@@ -5722,21 +5846,40 @@ mod tests {
         // The underscore sentinel expands from one to four UTF-8 bytes, so the pre-allocation
         // accounting must use the produced collation key rather than the source byte length.
         let value = "A_".to_owned();
+        let mut rejected = meter(value.len() + 4);
+        rejected
+            .charge(BudgetKind::OwnedBytes, value.len())
+            .expect("source value fits");
         assert!(matches!(
-            SortKey::text(value.clone(), &mut meter(value.len() + 4)),
+            SortKey::text_precharged(value.clone(), value.len(), &mut rejected),
             Err(Error::Budget {
                 kind: BudgetKind::OwnedBytes,
                 ..
             })
         ));
-        SortKey::text(value.clone(), &mut meter(value.len() + 5))
+        let mut accepted = meter(value.len() + 5);
+        accepted
+            .charge(BudgetKind::OwnedBytes, value.len())
+            .expect("source value fits");
+        SortKey::text_precharged(value.clone(), value.len(), &mut accepted)
             .expect("the exact retained sort-key payload fits");
     }
 
     #[test]
     fn text_sort_key_resolves_internal_sentinel_collisions_without_allocation() {
-        let left = SortKey::text("_".into(), &mut meter(64)).expect("left key fits");
-        let right = SortKey::text(char::MAX.to_string(), &mut meter(64)).expect("right key fits");
+        let mut left_meter = meter(64);
+        left_meter
+            .charge(BudgetKind::OwnedBytes, 1)
+            .expect("source value fits");
+        let left = SortKey::text_precharged("_".into(), 1, &mut left_meter).expect("left key fits");
+        let right_value = char::MAX.to_string();
+        let mut right_meter = meter(64);
+        right_meter
+            .charge(BudgetKind::OwnedBytes, right_value.len())
+            .expect("source value fits");
+        let right =
+            SortKey::text_precharged(right_value.clone(), right_value.len(), &mut right_meter)
+                .expect("right key fits");
         assert_eq!(
             left.compare(&right, Some("lower-first"), None),
             Ordering::Less

@@ -129,6 +129,45 @@ fn minimum_execution_owned_bytes_for_source(
     accepted
 }
 
+fn minimum_execution_owned_bytes_for_named_source(
+    stylesheet: &xml_sec_xslt::Stylesheet,
+    source: &Document,
+    source_bytes: usize,
+    initial_template: &str,
+) -> usize {
+    let succeeds = |owned_bytes| {
+        let mut budget = execution_budget(source_bytes);
+        budget.owned_bytes = owned_bytes;
+        stylesheet
+            .execute(
+                source,
+                &Parameters::new(),
+                Arc::new(NoResolver),
+                ExecutionOptions {
+                    budget,
+                    initial_mode: None,
+                    initial_template: Some(ExpandedName::new(None::<String>, initial_template)),
+                },
+            )
+            .is_ok()
+    };
+    let mut rejected = 0;
+    let mut accepted = 1;
+    while !succeeds(accepted) {
+        rejected = accepted;
+        accepted *= 2;
+    }
+    while rejected + 1 < accepted {
+        let candidate = rejected + (accepted - rejected) / 2;
+        if succeeds(candidate) {
+            accepted = candidate;
+        } else {
+            rejected = candidate;
+        }
+    }
+    accepted
+}
+
 fn execute(stylesheet: &str, source: &str) -> String {
     let result = compile(stylesheet)
         .execute(
@@ -6959,6 +6998,33 @@ fn xpath_extension_string_coercions_reserve_their_peak_memory() {
 }
 
 #[test]
+fn dynamic_evaluators_reserve_source_coercion_before_parsing() {
+    // Both dynamic XPath extensions accept node-set arguments. Their complete string-value must
+    // fit beside the retained source before the derived expression is parsed or cached.
+    let expression = format!("{}true()", " ".repeat(64 * 1024));
+    let source_xml = format!("<source>{expression}</source>");
+    let source = Document::parse(&source_xml, None).expect("dynamic expression source parses");
+    let baseline = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#,
+    );
+    let dynamic = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:dyn="http://exslt.org/dynamic"><xsl:template match="/"><xsl:if test="dyn:evaluate(/*)"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let saxon = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:saxon="http://icl.com/saxon"><xsl:template match="/"><xsl:if test="saxon:evaluate(/*)"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let baseline_bytes =
+        minimum_execution_owned_bytes_for_source(&baseline, &source, source_xml.len());
+    for stylesheet in [&dynamic, &saxon] {
+        assert!(
+            minimum_execution_owned_bytes_for_source(stylesheet, &source, source_xml.len())
+                >= baseline_bytes.saturating_add(expression.len()),
+            "dynamic expression coercion must be reserved before parsing"
+        );
+    }
+}
+
+#[test]
 fn template_candidate_scans_are_bounded_as_pattern_work() {
     // Selection scans are attacker-controlled work even when every cheap mode/name check rejects.
     let decoys = (0..64)
@@ -9866,6 +9932,35 @@ fn key_index_traversal_accounts_for_its_wide_pending_stack() {
     assert!(
         keyed + 4 * 1024 >= baseline + 4_096 * std::mem::size_of::<xml_sec_xslt::NodeId>(),
         "baseline={baseline}, keyed={keyed}"
+    );
+}
+
+#[test]
+fn duplicate_key_values_count_materialization_toward_peak_memory() {
+    // Building the second equal key value temporarily retains its source-derived String while the
+    // first value remains in the index. The duplicate path must therefore observe both payloads.
+    let payload = "x".repeat(64 * 1024);
+    let source_xml = format!("<root><item>{payload}</item><item>{payload}</item></root>");
+    let source = Document::parse(&source_xml, None).expect("source parses");
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:key name="all" match="item" use="."/><xsl:output method="text"/><xsl:template name="baseline">ok</xsl:template><xsl:template name="key"><xsl:value-of select="count(key('all', 'missing'))"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let baseline = minimum_execution_owned_bytes_for_named_source(
+        &stylesheet,
+        &source,
+        source_xml.len(),
+        "baseline",
+    );
+    let key = minimum_execution_owned_bytes_for_named_source(
+        &stylesheet,
+        &source,
+        source_xml.len(),
+        "key",
+    );
+    assert!(
+        key >= baseline.saturating_add(payload.len().saturating_mul(19) / 10),
+        "baseline={baseline}, key={key}, payload={}",
+        payload.len()
     );
 }
 

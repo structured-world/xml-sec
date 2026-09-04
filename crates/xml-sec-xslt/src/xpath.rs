@@ -754,16 +754,18 @@ impl Evaluator {
 
     pub(crate) fn append_key_entry(
         &mut self,
-        name: ExpandedName,
+        name: &ExpandedName,
         value: String,
+        value_reservation: usize,
         node: &SourceNode,
         meter: &mut Meter,
     ) -> Result<()> {
-        let mut index = self.key_index.borrow_mut();
+        debug_assert_eq!(value_reservation, value.len());
         let Some(sxd) = self
             .maps
             .to_sxd(self.package.as_document().root().into(), node)
         else {
+            meter.release_owned_bytes(value_reservation);
             return Ok(());
         };
         let document_index = self
@@ -775,24 +777,48 @@ impl Evaluator {
                     .iter()
                     .position(|candidate| *candidate == root)
             })
-            .ok_or_else(|| Error::Dynamic("key node has no logical document".into()))?;
+            .ok_or_else(|| Error::Dynamic("key node has no logical document".into()));
+        let document_index = match document_index {
+            Ok(document_index) => document_index,
+            Err(error) => {
+                meter.release_owned_bytes(value_reservation);
+                return Err(error);
+            }
+        };
         let path = typed_path_to(&sxd);
-        meter.charge(BudgetKind::KeyEntries, 1)?;
+        let name_bytes = name
+            .local
+            .len()
+            .saturating_add(name.namespace.as_deref().map_or(0, str::len));
+        if let Err(error) = meter.charge(BudgetKind::OwnedBytes, name_bytes) {
+            meter.release_owned_bytes(value_reservation);
+            return Err(error);
+        }
+        let owned_name = name.clone();
+        if let Err(error) = meter.charge(BudgetKind::KeyEntries, 1) {
+            meter.release_owned_bytes(name_bytes.saturating_add(value_reservation));
+            return Err(error);
+        }
         let path_bytes = path.owned_bytes();
-        let retained_key_bytes = std::mem::size_of::<(ExpandedName, String, usize)>()
-            .saturating_add(name.local.len())
-            .saturating_add(name.namespace.as_deref().map_or(0, str::len))
-            .saturating_add(value.len());
-        match index.entry((name, value, document_index)) {
+        let unreserved_value_bytes = value.len().saturating_sub(value_reservation);
+        let mut index = self.key_index.borrow_mut();
+        match index.entry((owned_name, value, document_index)) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
-                meter.charge(BudgetKind::OwnedBytes, path_bytes)?;
+                if let Err(error) = meter.charge(BudgetKind::OwnedBytes, path_bytes) {
+                    meter.release_owned_bytes(name_bytes.saturating_add(value_reservation));
+                    return Err(error);
+                }
                 entry.get_mut().push(path);
+                meter.release_owned_bytes(name_bytes.saturating_add(value_reservation));
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
-                meter.charge(
-                    BudgetKind::OwnedBytes,
-                    retained_key_bytes.saturating_add(path_bytes),
-                )?;
+                let additional = std::mem::size_of::<(ExpandedName, String, usize)>()
+                    .saturating_add(unreserved_value_bytes)
+                    .saturating_add(path_bytes);
+                if let Err(error) = meter.charge(BudgetKind::OwnedBytes, additional) {
+                    meter.release_owned_bytes(name_bytes.saturating_add(value_reservation));
+                    return Err(error);
+                }
                 entry.insert(vec![path]);
             }
         }
@@ -1378,7 +1404,7 @@ impl Evaluator {
                             call.display_name
                         )));
                     }
-                    let dynamic_source = self
+                    let (dynamic_source, dynamic_source_bytes) = self
                         .evaluate_core(
                             &expression.derived(call.arguments[0].clone()),
                             node,
@@ -1388,9 +1414,9 @@ impl Evaluator {
                             meter,
                             custom_calls,
                         )?
-                        .string(self);
-                    if dynamic_source.is_empty() {
-                        Value::NodeSet(Vec::new())
+                        .into_fully_metered_temporary_string(self, meter)?;
+                    let result = if dynamic_source.is_empty() {
+                        Ok(Value::NodeSet(Vec::new()))
                     } else {
                         match self.evaluate_dynamic(
                             &expression.derived(dynamic_source),
@@ -1401,16 +1427,18 @@ impl Evaluator {
                             meter,
                             custom_calls,
                         ) {
-                            Ok(value) => xpath_value_to_public(value),
+                            Ok(value) => Ok(xpath_value_to_public(value)),
                             Err(error)
                                 if kind == ExtensionCallKind::DynamicEvaluate
                                     && dynamic_expression_error_is_recoverable(&error) =>
                             {
-                                Value::NodeSet(Vec::new())
+                                Ok(Value::NodeSet(Vec::new()))
                             }
-                            Err(error) => return Err(error),
+                            Err(error) => Err(error),
                         }
-                    }
+                    };
+                    meter.release_owned_bytes(dynamic_source_bytes);
+                    result?
                 }
                 ExtensionCallKind::SaxonExpression => {
                     if call.arguments.len() != 1 {
@@ -2499,6 +2527,16 @@ impl Evaluator {
         self.string_value_with_capacity(node, 0)
     }
 
+    pub(crate) fn materialize_temporary_string_value(
+        &self,
+        node: &SourceNode,
+        meter: &mut Meter,
+    ) -> Result<(String, usize)> {
+        let length = self.string_value_len(node);
+        meter.charge(BudgetKind::OwnedBytes, length)?;
+        Ok((self.string_value_with_capacity(node, length), length))
+    }
+
     fn string_value_with_capacity(&self, node: &SourceNode, capacity: usize) -> String {
         let mut output = String::with_capacity(capacity);
         match node {
@@ -2558,6 +2596,31 @@ impl Evaluator {
                 }) {
                     visit(value);
                 }
+            }
+        }
+    }
+
+    pub(crate) fn borrowed_leaf_string_value(&self, node: &SourceNode) -> Option<&str> {
+        match node {
+            SourceNode::Node(id) => self.source.node(*id).and_then(|node| match &node.kind {
+                NodeKind::Text { value, .. } => Some(value.as_str()),
+                _ => None,
+            }),
+            SourceNode::Attribute { owner, index } => {
+                self.source.node(*owner).and_then(|node| match &node.kind {
+                    NodeKind::Element { attributes, .. } => attributes
+                        .get(*index)
+                        .map(|attribute| attribute.value.as_str()),
+                    _ => None,
+                })
+            }
+            SourceNode::Namespace { owner, index } => {
+                self.source.node(*owner).and_then(|node| match &node.kind {
+                    NodeKind::Element { namespaces, .. } => namespaces
+                        .get(*index)
+                        .map(|namespace| namespace.uri.as_str()),
+                    _ => None,
+                })
             }
         }
     }
@@ -3141,13 +3204,6 @@ impl XPathValue {
             Self::StoredExpression(value) => value.clone(),
         }
     }
-    pub(crate) fn into_string(self, evaluator: &Evaluator) -> String {
-        match self {
-            Self::String(value) | Self::StoredExpression(value) => value,
-            value => value.string(evaluator),
-        }
-    }
-
     pub(crate) fn into_temporary_string(
         self,
         evaluator: &Evaluator,
@@ -3187,6 +3243,21 @@ impl XPathValue {
                 meter.release_owned_bytes(MAX_XPATH_F64_BYTES - retained);
                 Ok((value, retained))
             }
+        }
+    }
+
+    pub(crate) fn into_fully_metered_temporary_string(
+        self,
+        evaluator: &Evaluator,
+        meter: &mut Meter,
+    ) -> Result<(String, usize)> {
+        match self {
+            Self::String(value) | Self::StoredExpression(value) => {
+                meter.charge(BudgetKind::OwnedBytes, value.len())?;
+                let length = value.len();
+                Ok((value, length))
+            }
+            value => value.into_temporary_string(evaluator, meter),
         }
     }
     pub(crate) fn number(&self, evaluator: &Evaluator) -> f64 {
