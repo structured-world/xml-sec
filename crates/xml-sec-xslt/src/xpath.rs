@@ -2007,13 +2007,9 @@ impl Evaluator {
                     self.cache_document(resource_request.clone(), vec![root.clone()], meter)?;
                     Some(root)
                 } else {
-                    let xml = decode_resource_for_xml_parse(
-                        &resource.bytes,
-                        resource.encoding.as_deref(),
-                        meter,
-                    )?;
+                    let xml = decode_resource_for_xml_parse(&resource, meter)?;
                     let (document, parsed_reservation) = parse_external_document_metered(
-                        &xml,
+                        &xml.value,
                         Some(&resource.canonical_uri),
                         meter,
                     )?;
@@ -2044,13 +2040,13 @@ impl Evaluator {
                     if let Some(reservation) = expanded_reservation {
                         meter.release_owned_bytes(reservation);
                     }
-                    meter.release_owned_bytes(xml.len().saturating_mul(2));
+                    meter.release_owned_bytes(xml.temporary_bytes);
                     if identity_is_new {
                         charge_resource_identity_cache_entry(&resource, meter)?;
                         self.resource_identities
                             .insert(resource.identity.clone(), resource.clone());
                     } else {
-                        meter.release_owned_bytes(resource.bytes.len());
+                        meter.release_owned_bytes(resource.bytes.capacity());
                     }
                     meter.charge(
                         BudgetKind::OwnedBytes,
@@ -3843,10 +3839,11 @@ fn resolve_xinclude(
     };
     if parse == "text" {
         let encoding = attribute("encoding").or(resource.encoding.as_deref());
-        let value = decode_xinclude_resource(&resource.bytes, encoding, meter, false)?;
+        let value = decode_xinclude_resource(&resource, encoding, meter, false)?;
         // XInclude 1.0 section 4.3 makes every character forbidden in XML documents a fatal
         // error, even after successful decoding: https://www.w3.org/TR/xinclude/#text_included
         if let Some(character) = value
+            .value
             .chars()
             .find(|character| !crate::lexical::is_xml10_character(*character))
         {
@@ -3861,17 +3858,16 @@ fn resolve_xinclude(
                 .map_err(XIncludeFailure::Fatal)?;
             identities.insert(resource.identity.clone(), resource);
         } else {
-            meter.release_owned_bytes(resource.bytes.len());
+            meter.release_owned_bytes(resource.bytes.capacity());
         }
-        return Ok(XIncludeContent::Text(value, canonical_uri));
+        return Ok(XIncludeContent::Text(value.value, canonical_uri));
     }
-    let xml = decode_xinclude_resource(&resource.bytes, resource.encoding.as_deref(), meter, true)?;
-    let decoded_temporary_bytes = xml.len().saturating_mul(2);
+    let xml = decode_xinclude_resource(&resource, resource.encoding.as_deref(), meter, true)?;
     // XInclude 1.0 section 4.2 explicitly makes non-well-formed acquired XML a fatal error,
     // unlike resource acquisition/encoding failures that may activate xi:fallback.
     // https://www.w3.org/TR/xinclude/#xml
     let (document, parsed_reservation) =
-        parse_external_document_metered(&xml, Some(&resource.canonical_uri), meter)
+        parse_external_document_metered(&xml.value, Some(&resource.canonical_uri), meter)
             .map_err(XIncludeFailure::Fatal)?;
     let selected_root = if let Some(pointer) = xpointer {
         // XInclude 1.0 section 4.2.2 requires the XPointer Framework and element() scheme. A
@@ -3897,7 +3893,7 @@ fn resolve_xinclude(
         charge_resource_identity_cache_entry(&resource, meter).map_err(XIncludeFailure::Fatal)?;
         identities.insert(resource_identity.clone(), resource);
     } else {
-        meter.release_owned_bytes(resource.bytes.len());
+        meter.release_owned_bytes(resource.bytes.capacity());
     }
     include_stack.push(resource_identity);
     let expanded = expand_xinclude_document(
@@ -3911,7 +3907,7 @@ fn resolve_xinclude(
     );
     include_stack.pop();
     meter.release_owned_bytes(parsed_reservation);
-    meter.release_owned_bytes(decoded_temporary_bytes);
+    meter.release_owned_bytes(xml.temporary_bytes);
     expanded
         .map(XIncludeContent::Xml)
         .map_err(XIncludeFailure::Fatal)
@@ -3940,33 +3936,42 @@ fn parse_external_document_metered(
 }
 
 fn decode_xinclude_resource(
-    bytes: &[u8],
+    resource: &ResolvedResource,
     encoding: Option<&str>,
     meter: &mut Meter,
     parsed_xml: bool,
-) -> std::result::Result<String, XIncludeFailure> {
+) -> std::result::Result<MeteredDecodedResource, XIncludeFailure> {
+    let source_owned_bytes = resource.bytes.capacity();
+    let bytes = resource.bytes.as_slice();
     let (bytes, encoding) = if !parsed_xml {
         let (bytes, encoding) = xinclude_text_payload(bytes, encoding);
         (bytes, Some(encoding))
     } else {
         (bytes, encoding)
     };
-    decode_resource_metered_inner(bytes, encoding, meter, parsed_xml).map_err(|error| match error {
-        MeteredDecodeError::Budget(error) => XIncludeFailure::Fatal(error),
-        MeteredDecodeError::Decode(error) => {
-            let recoverable = matches!(
-                error,
-                xml_sec_xml_input::Error::UnsupportedByteEncoding(_)
-                    | xml_sec_xml_input::Error::UnsupportedEncoding(_)
-            );
-            let error = Error::Xml(error.to_string());
-            if recoverable {
-                XIncludeFailure::Resource(error)
-            } else {
-                XIncludeFailure::Fatal(error)
+    decode_resource_metered_inner(bytes, source_owned_bytes, encoding, meter, parsed_xml).map_err(
+        |error| match error {
+            MeteredDecodeError::Budget(error) => XIncludeFailure::Fatal(error),
+            MeteredDecodeError::Decode(error) => {
+                // XInclude 1.0 section 4.3.3 classifies every text acquisition encoding failure as
+                // a resource error. XML-mode malformed bytes instead make the acquired XML
+                // non-well-formed and remain fatal under section 4.2.
+                // https://www.w3.org/TR/xinclude/#text_included
+                let recoverable = !parsed_xml
+                    || matches!(
+                        error,
+                        xml_sec_xml_input::Error::UnsupportedByteEncoding(_)
+                            | xml_sec_xml_input::Error::UnsupportedEncoding(_)
+                    );
+                let error = Error::Xml(error.to_string());
+                if recoverable {
+                    XIncludeFailure::Resource(error)
+                } else {
+                    XIncludeFailure::Fatal(error)
+                }
             }
-        }
-    })
+        },
+    )
 }
 
 fn xinclude_text_payload<'a>(bytes: &'a [u8], encoding: Option<&'a str>) -> (&'a [u8], &'a str) {
@@ -4027,11 +4032,16 @@ fn xinclude_text_payload<'a>(bytes: &'a [u8], encoding: Option<&'a str>) -> (&'a
 }
 
 fn decode_resource_for_xml_parse(
-    bytes: &[u8],
-    encoding: Option<&str>,
+    resource: &ResolvedResource,
     meter: &mut Meter,
-) -> Result<String> {
-    decode_resource_metered(bytes, encoding, meter, true)
+) -> Result<MeteredDecodedResource> {
+    decode_resource_metered(
+        &resource.bytes,
+        resource.bytes.capacity(),
+        resource.encoding.as_deref(),
+        meter,
+        true,
+    )
 }
 
 fn hash_entry_storage<K, V>() -> usize {
@@ -4052,10 +4062,10 @@ fn charge_resource_identity_cache_entry(
     resource: &ResolvedResource,
     meter: &mut Meter,
 ) -> Result<()> {
-    // The decoder already reserves the resolver byte length. Charge the retained container,
-    // spare byte capacity, key clone, URI, identity, and metadata before cache insertion.
-    let additional =
-        resource_identity_cache_entry_owned_bytes(resource).saturating_sub(resource.bytes.len());
+    // The decoder already reserves the complete resolver byte allocation. Charge the retained
+    // container, key clone, URI, identity, and metadata before cache insertion.
+    let additional = resource_identity_cache_entry_owned_bytes(resource)
+        .saturating_sub(resource.bytes.capacity());
     meter.charge(BudgetKind::OwnedBytes, additional)
 }
 
@@ -4065,14 +4075,22 @@ fn resource_document_cache_entry_owned_bytes(identity: &ResourceIdentity) -> usi
 
 fn decode_resource_metered(
     bytes: &[u8],
+    source_owned_bytes: usize,
     encoding: Option<&str>,
     meter: &mut Meter,
     parsed_xml: bool,
-) -> Result<String> {
-    decode_resource_metered_inner(bytes, encoding, meter, parsed_xml).map_err(|error| match error {
-        MeteredDecodeError::Budget(error) => error,
-        MeteredDecodeError::Decode(error) => Error::Xml(error.to_string()),
-    })
+) -> Result<MeteredDecodedResource> {
+    decode_resource_metered_inner(bytes, source_owned_bytes, encoding, meter, parsed_xml).map_err(
+        |error| match error {
+            MeteredDecodeError::Budget(error) => error,
+            MeteredDecodeError::Decode(error) => Error::Xml(error.to_string()),
+        },
+    )
+}
+
+struct MeteredDecodedResource {
+    value: String,
+    temporary_bytes: usize,
 }
 
 enum MeteredDecodeError {
@@ -4082,16 +4100,20 @@ enum MeteredDecodeError {
 
 fn decode_resource_metered_inner(
     bytes: &[u8],
+    source_owned_bytes: usize,
     encoding: Option<&str>,
     meter: &mut Meter,
     parsed_xml: bool,
-) -> std::result::Result<String, MeteredDecodeError> {
+) -> std::result::Result<MeteredDecodedResource, MeteredDecodeError> {
     // XML parsing retains one decoded source copy while the decoder's output is still live.
     let decoded_copies = if parsed_xml { 2 } else { 1 };
     let (used, limit) = meter
         .usage(BudgetKind::OwnedBytes)
         .map_err(MeteredDecodeError::Budget)?;
-    let available = limit.saturating_sub(used).saturating_sub(bytes.len());
+    debug_assert!(source_owned_bytes >= bytes.len());
+    let available = limit
+        .saturating_sub(used)
+        .saturating_sub(source_owned_bytes);
     let maximum_decoded = available / decoded_copies;
     let decoded = decode_resource(bytes, encoding, parsed_xml, maximum_decoded).map_err(
         |error| match error {
@@ -4100,20 +4122,23 @@ fn decode_resource_metered_inner(
                     kind: BudgetKind::OwnedBytes,
                     limit,
                     actual: used
-                        .saturating_add(bytes.len())
+                        .saturating_add(source_owned_bytes)
                         .saturating_add(actual.saturating_mul(decoded_copies)),
                 })
             }
             error => MeteredDecodeError::Decode(error),
         },
     )?;
-    let retained = bytes
-        .len()
-        .saturating_add(decoded.len().saturating_mul(decoded_copies));
+    let parser_owned_bytes = if parsed_xml { decoded.len() } else { 0 };
+    let temporary_bytes = decoded.capacity().saturating_add(parser_owned_bytes);
+    let retained = source_owned_bytes.saturating_add(temporary_bytes);
     meter
         .charge(BudgetKind::OwnedBytes, retained)
         .map_err(MeteredDecodeError::Budget)?;
-    Ok(decoded)
+    Ok(MeteredDecodedResource {
+        value: decoded,
+        temporary_bytes,
+    })
 }
 
 struct NodeMaps {
@@ -6013,7 +6038,12 @@ impl function::Function for ExsltStringFunction {
                 let encoding_label = args.get(1).map(SxdValue::string);
                 let encoding = uri_encoding(encoding_label.as_deref(), "str:decode-uri()")?;
                 let value = args[0].string();
-                let decoded_len = percent_decoded_uri_len(&value)?;
+                let Some(decoded_len) = percent_decoded_uri_len(&value)? else {
+                    // EXSLT defines malformed percent triplets as a successful empty result,
+                    // rather than a dynamic XPath error or literal passthrough.
+                    // https://exslt.github.io/str/functions/decode-uri/index.html
+                    return Ok(SxdValue::String(String::new()));
+                };
                 let (transcoded_len, workspace_len) = match encoding {
                     UriEncoding::Standard(encoding) => {
                         let transcoded_len = encoding
@@ -6258,12 +6288,15 @@ fn visit_percent_decoded_bytes(
     let bytes = value.as_bytes();
     let mut cursor = 0;
     while cursor < bytes.len() {
-        if bytes[cursor] == b'%'
-            && let Some(encoded) = bytes.get(cursor + 1..cursor + 3)
-            && let Ok(encoded) = std::str::from_utf8(encoded)
-            && let Ok(byte) = u8::from_str_radix(encoded, 16)
-        {
-            visit(byte)?;
+        if bytes[cursor] == b'%' {
+            let encoded = bytes
+                .get(cursor + 1..cursor + 3)
+                .and_then(|encoded| std::str::from_utf8(encoded).ok())
+                .and_then(|encoded| u8::from_str_radix(encoded, 16).ok())
+                .ok_or_else(|| function::Error::Other {
+                    what: "str:decode-uri() contains a malformed percent escape".into(),
+                })?;
+            visit(encoded)?;
             cursor += 3;
         } else {
             visit(bytes[cursor])?;
@@ -6273,17 +6306,29 @@ fn visit_percent_decoded_bytes(
     Ok(())
 }
 
-fn percent_decoded_uri_len(value: &str) -> std::result::Result<usize, function::Error> {
+fn percent_decoded_uri_len(value: &str) -> std::result::Result<Option<usize>, function::Error> {
+    let bytes = value.as_bytes();
+    let mut cursor = 0;
     let mut decoded_len = 0usize;
-    visit_percent_decoded_bytes(value, |_| {
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'%' {
+            let Some(encoded) = bytes.get(cursor + 1..cursor + 3) else {
+                return Ok(None);
+            };
+            if !encoded.iter().all(u8::is_ascii_hexdigit) {
+                return Ok(None);
+            }
+            cursor += 3;
+        } else {
+            cursor += 1;
+        }
         decoded_len = decoded_len
             .checked_add(1)
             .ok_or_else(|| function::Error::Other {
                 what: "str:decode-uri() result length overflow".into(),
             })?;
-        Ok(())
-    })?;
-    Ok(decoded_len)
+    }
+    Ok(Some(decoded_len))
 }
 
 impl function::Function for DocumentFunction {
@@ -7898,8 +7943,9 @@ mod tests {
             media_type: Some("application/xml".repeat(8)),
             encoding: Some("UTF-8".repeat(8)),
         };
-        let additional = resource_identity_cache_entry_owned_bytes(&resource)
-            .saturating_sub(resource.bytes.len());
+        let source_owned_bytes = resource.bytes.capacity();
+        let additional =
+            resource_identity_cache_entry_owned_bytes(&resource).saturating_sub(source_owned_bytes);
         let limits = |owned_bytes| ExecutionBudget {
             source_bytes: usize::MAX,
             external_documents: usize::MAX,
@@ -7913,11 +7959,11 @@ mod tests {
             messages: usize::MAX,
             owned_bytes,
         };
-        let mut insufficient = Meter::new(limits(resource.bytes.len() + additional - 1), 0)
-            .expect("empty source fits");
+        let mut insufficient =
+            Meter::new(limits(source_owned_bytes + additional - 1), 0).expect("empty source fits");
         insufficient
-            .charge(BudgetKind::OwnedBytes, resource.bytes.len())
-            .expect("wire bytes fit");
+            .charge(BudgetKind::OwnedBytes, source_owned_bytes)
+            .expect("resolver byte allocation fits");
         assert!(matches!(
             charge_resource_identity_cache_entry(&resource, &mut insufficient),
             Err(Error::Budget {
@@ -7927,12 +7973,58 @@ mod tests {
         ));
 
         let mut exact =
-            Meter::new(limits(resource.bytes.len() + additional), 0).expect("empty source fits");
+            Meter::new(limits(source_owned_bytes + additional), 0).expect("empty source fits");
         exact
-            .charge(BudgetKind::OwnedBytes, resource.bytes.len())
-            .expect("wire bytes fit");
+            .charge(BudgetKind::OwnedBytes, source_owned_bytes)
+            .expect("resolver byte allocation fits");
         charge_resource_identity_cache_entry(&resource, &mut exact)
             .expect("exact metadata reservation fits");
+    }
+
+    #[test]
+    fn resource_decoding_charges_allocated_capacity() {
+        // UTF-16 ASCII decodes to fewer logical bytes than the decoder reserves. Both the
+        // retained allocation and a parser-owned copy must be represented in peak memory.
+        let bytes: Vec<u8> = "a"
+            .repeat(4096)
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let limits = |owned_bytes| ExecutionBudget {
+            source_bytes: usize::MAX,
+            external_documents: usize::MAX,
+            recursion_depth: usize::MAX,
+            xpath_evaluations: usize::MAX,
+            template_applications: usize::MAX,
+            sort_comparisons: usize::MAX,
+            key_entries: usize::MAX,
+            result_nodes: usize::MAX,
+            serialized_bytes: usize::MAX,
+            messages: usize::MAX,
+            owned_bytes,
+        };
+
+        for parsed_xml in [false, true] {
+            let mut meter = Meter::new(limits(usize::MAX), 0).expect("empty source fits");
+            let Ok(decoded) = decode_resource_metered_inner(
+                &bytes,
+                bytes.capacity(),
+                Some("UTF-16LE"),
+                &mut meter,
+                parsed_xml,
+            ) else {
+                panic!("UTF-16 resource must decode");
+            };
+            let parser_owned_bytes = if parsed_xml { decoded.value.len() } else { 0 };
+            let expected = bytes
+                .capacity()
+                .saturating_add(decoded.value.capacity())
+                .saturating_add(parser_owned_bytes);
+            assert_eq!(
+                meter.usage(BudgetKind::OwnedBytes).expect("valid kind").0,
+                expected
+            );
+        }
     }
 
     #[test]

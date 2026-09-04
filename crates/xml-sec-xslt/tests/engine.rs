@@ -4613,6 +4613,93 @@ fn xinclude_fallback_never_swallows_security_budget_failures() {
 }
 
 #[test]
+fn xinclude_text_encoding_errors_activate_fallback() {
+    // XInclude 1.0 section 4.3.3 classifies malformed acquired byte sequences as resource
+    // errors, so fallback applies; successfully decoded XML-forbidden characters remain fatal.
+    // https://www.w3.org/TR/xinclude/#text_included
+    let resolver = Arc::new(ContextResolver::default());
+    for (href, encoding, bytes) in [
+        ("invalid-utf8.txt", "UTF-8", vec![0xFF]),
+        ("truncated-utf16.txt", "UTF-16LE", vec![0x41]),
+    ] {
+        resolver
+            .resources
+            .lock()
+            .expect("test resolver mutex is not poisoned")
+            .insert(
+                (href.into(), Some("memory:source.xml".into())),
+                ResolvedResource {
+                    canonical_uri: format!("memory:{href}"),
+                    identity: ResourceIdentity(href.into()),
+                    bytes,
+                    media_type: Some("text/plain".into()),
+                    encoding: Some(encoding.into()),
+                },
+            );
+    }
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="root"/></xsl:template></xsl:stylesheet>"#,
+    );
+    for href in ["invalid-utf8.txt", "truncated-utf16.txt"] {
+        let source = Document::parse(
+            &format!(
+                r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="{href}" parse="text"><xi:fallback>fallback</xi:fallback></xi:include></root>"#
+            ),
+            Some("memory:source.xml"),
+        )
+        .expect("XInclude source parses");
+        let result = stylesheet
+            .execute_with_source_processing(
+                &source,
+                &Parameters::new(),
+                resolver.clone(),
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+                SourceProcessing::XInclude,
+            )
+            .expect("encoding resource errors activate fallback");
+        assert_eq!(result.serialized.bytes, b"fallback");
+    }
+
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            ("forbidden.txt".into(), Some("memory:source.xml".into())),
+            ResolvedResource {
+                canonical_uri: "memory:forbidden.txt".into(),
+                identity: ResourceIdentity("forbidden.txt".into()),
+                bytes: vec![0x01],
+                media_type: Some("text/plain".into()),
+                encoding: Some("UTF-8".into()),
+            },
+        );
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="forbidden.txt" parse="text"><xi:fallback>wrong</xi:fallback></xi:include></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("XInclude source parses");
+    assert!(matches!(
+        stylesheet.execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        ),
+        Err(Error::Xml(message)) if message.contains("forbidden XML character")
+    ));
+}
+
+#[test]
 fn xinclude_fallback_handles_only_resource_errors() {
     // XInclude 1.0 makes invalid syntax fatal; fallback must not turn malformed instructions into
     // data, while selection failures are resource errors under section 4.2.
@@ -5332,6 +5419,26 @@ fn exslt_decode_uri_honors_the_requested_encoding() {
         ),
         Err(Error::Dynamic(message)) if message.contains("unknown encoding")
     ));
+}
+
+#[test]
+fn exslt_decode_uri_returns_empty_for_malformed_percent_escapes() {
+    // EXSLT str:decode-uri returns the empty string when `%` is not followed by exactly two
+    // hexadecimal digits; malformed suffixes must not leak through as literal text.
+    // https://exslt.github.io/str/functions/decode-uri/index.html
+    for value in ["%", "%A", "%ZZ", "%41%ZZ"] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="str:decode-uri('{value}')"/></xsl:template></xsl:stylesheet>"#
+        );
+        assert_eq!(execute(&stylesheet, "<source/>"), "");
+    }
+    assert_eq!(
+        execute(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="str:decode-uri('%41')"/></xsl:template></xsl:stylesheet>"#,
+            "<source/>",
+        ),
+        "A"
+    );
 }
 
 #[test]
