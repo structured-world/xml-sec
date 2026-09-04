@@ -49,6 +49,7 @@ struct PendingCopyNode {
     source: NodeId,
     target_parent: NodeId,
     depth: usize,
+    use_instruction_base: bool,
 }
 
 /// Policy-neutral inputs controlling one stylesheet execution.
@@ -220,6 +221,7 @@ impl Stylesheet {
                 ApplyFrame::new(1, 1, 1),
             )?;
         }
+        state.result.finalize_xml_ids(&mut state.meter)?;
         let serialized = serialize(&state.result, &self.output, &mut state.meter)?;
         Ok(TransformResult {
             document: state.result,
@@ -1772,15 +1774,26 @@ impl<'a> Execution<'a> {
                 let value = self.evaluate(select, node, position, size)?;
                 self.append_xpath_text(value, *disable_output_escaping)
             }
-            Instruction::CopyOf(select) => {
+            Instruction::CopyOf { select, base_uri } => {
                 match self.evaluate(select, node, position, size)? {
                     XPathValue::NodeSet(nodes) => {
                         for selected in nodes {
-                            self.copy_source(&selected, self.parent(), depth + 1)?
+                            self.copy_source(
+                                &selected,
+                                self.parent(),
+                                depth + 1,
+                                base_uri.as_deref(),
+                            )?
                         }
                     }
                     XPathValue::ResultTreeFragment(fragment) => {
-                        self.copy_document(&fragment, fragment.root(), self.parent(), depth + 1)?;
+                        self.copy_document(
+                            &fragment,
+                            fragment.root(),
+                            self.parent(),
+                            depth + 1,
+                            base_uri.as_deref(),
+                        )?;
                     }
                     value => self.append_xpath_text(value, false)?,
                 }
@@ -3230,13 +3243,32 @@ impl<'a> Execution<'a> {
         source_id: NodeId,
         parent: NodeId,
         depth: usize,
+        instruction_base_uri: Option<&str>,
     ) -> Result<()> {
-        self.copy_node_subtree(CopyDocument::Fragment(document), source_id, parent, depth)
+        self.copy_node_subtree(
+            CopyDocument::Fragment(document),
+            source_id,
+            parent,
+            depth,
+            instruction_base_uri,
+        )
     }
-    fn copy_source(&mut self, node: &SourceNode, parent: NodeId, depth: usize) -> Result<()> {
+    fn copy_source(
+        &mut self,
+        node: &SourceNode,
+        parent: NodeId,
+        depth: usize,
+        instruction_base_uri: Option<&str>,
+    ) -> Result<()> {
         match node {
             SourceNode::Node(id) => {
-                self.copy_node_subtree(CopyDocument::Source, *id, parent, depth)?;
+                self.copy_node_subtree(
+                    CopyDocument::Source,
+                    *id,
+                    parent,
+                    depth,
+                    instruction_base_uri,
+                )?;
             }
             SourceNode::Attribute { owner, index } => {
                 self.copy_source_attribute(*owner, *index)?;
@@ -3254,6 +3286,7 @@ impl<'a> Execution<'a> {
         source_id: NodeId,
         parent: NodeId,
         depth: usize,
+        instruction_base_uri: Option<&str>,
     ) -> Result<()> {
         let mut pending = Vec::new();
         let mut pending_reservation = 0usize;
@@ -3262,6 +3295,7 @@ impl<'a> Execution<'a> {
             source: source_id,
             target_parent: parent,
             depth,
+            use_instruction_base: true,
         });
         let result = (|| {
             while let Some(current) = pending.pop() {
@@ -3275,8 +3309,16 @@ impl<'a> Execution<'a> {
                 let target_parent = if matches!(source.kind, NodeKind::Root) {
                     current.target_parent
                 } else {
+                    let inherited_base = if current.use_instruction_base {
+                        instruction_base_uri
+                    } else {
+                        self.result
+                            .node(current.target_parent)
+                            .and_then(|node| node.base_uri.as_deref())
+                    };
+                    let base_uri = copied_node_base_uri(&source.kind, inherited_base)?;
                     let clone_bytes = node_kind_owned_bytes(&source.kind)
-                        .saturating_add(source.base_uri.as_deref().map_or(0, str::len));
+                        .saturating_add(base_uri.as_deref().map_or(0, str::len));
                     self.result
                         .reserve_metered_push_containers(current.target_parent, &mut self.meter)?;
                     self.meter.check_additional(
@@ -3286,7 +3328,6 @@ impl<'a> Execution<'a> {
                     self.meter
                         .check_additional(BudgetKind::OwnedBytes, clone_bytes)?;
                     let kind = source.kind.clone();
-                    let base_uri = source.base_uri.clone();
                     self.push_node_with_base(current.target_parent, kind, base_uri)?
                 };
                 for index in (0..child_count).rev() {
@@ -3305,6 +3346,7 @@ impl<'a> Execution<'a> {
                         source: child,
                         target_parent,
                         depth: current.depth.saturating_add(1),
+                        use_instruction_base: false,
                     });
                 }
             }
@@ -4900,11 +4942,10 @@ fn normalize_computed_namespace(
     const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
 
     if namespace.as_deref() == Some("") {
-        return if matches!(prefix.as_deref(), Some("xml" | "xmlns")) {
-            Ok((prefix, None))
-        } else {
-            Ok((None, None))
-        };
+        // XSLT 1.0 section 7.1.2 requires a null namespace to produce an unprefixed QName,
+        // including when the lexical name used a reserved prefix.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#creating-elements-with-xsl-element
+        return Ok((None, None));
     }
     if namespace.as_deref() == Some(XMLNS_NS) {
         return Err(Error::Dynamic(format!(
@@ -4921,6 +4962,21 @@ fn normalize_computed_namespace(
         return Ok((None, namespace));
     }
     Ok((prefix, namespace))
+}
+
+fn copied_node_base_uri(kind: &NodeKind, inherited: Option<&str>) -> Result<Option<String>> {
+    const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
+
+    let explicit = match kind {
+        NodeKind::Element { attributes, .. } => attributes.iter().find(|attribute| {
+            attribute.name.namespace.as_deref() == Some(XML_NS) && attribute.name.local == "base"
+        }),
+        _ => None,
+    };
+    explicit.map_or_else(
+        || Ok(inherited.map(str::to_owned)),
+        |attribute| crate::resolver::resolve_uri_reference(inherited, &attribute.value).map(Some),
+    )
 }
 
 fn static_namespace(namespaces: &[(String, String)], prefix: &str) -> Option<String> {

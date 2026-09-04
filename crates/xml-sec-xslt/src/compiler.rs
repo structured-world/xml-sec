@@ -786,7 +786,10 @@ pub(crate) enum Instruction {
         select: Expression,
         disable_output_escaping: bool,
     },
-    CopyOf(Expression),
+    CopyOf {
+        select: Expression,
+        base_uri: Option<String>,
+    },
     Copy {
         body: InstructionSequence,
         attribute_sets: Vec<ExpandedName>,
@@ -1985,7 +1988,7 @@ fn validate_attribute_sets_in_sequence(
             Instruction::Text(..)
             | Instruction::ApplyImports
             | Instruction::ValueOf { .. }
-            | Instruction::CopyOf(_)
+            | Instruction::CopyOf { .. }
             | Instruction::Number(_)
             | Instruction::CompatibilityComment(_) => {}
         }
@@ -2623,7 +2626,10 @@ fn compile_instruction(
         }
         "copy-of" => {
             require_empty_instruction(node)?;
-            Instruction::CopyOf(context.expression(required_attr(node, "select")?, node)?)
+            Instruction::CopyOf {
+                select: context.expression(required_attr(node, "select")?, node)?,
+                base_uri: effective_base_uri(node, context.static_base_uri.as_deref())?,
+            }
         }
         "copy" => Instruction::Copy {
             body: sequence()?,

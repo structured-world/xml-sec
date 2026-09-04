@@ -191,7 +191,12 @@ pub(crate) fn prepare_evaluator_source(
             0,
             None,
         )?;
-        (expanded.document, expanded.principal_mapping)
+        (
+            expanded.document,
+            expanded
+                .principal_mapping
+                .map(|mapping| (mapping, expanded.principal_mapping_owned_bytes)),
+        )
     } else {
         meter.charge(BudgetKind::OwnedBytes, source.estimated_clone_bytes())?;
         (source.clone(), None)
@@ -199,8 +204,11 @@ pub(crate) fn prepare_evaluator_source(
     let (whitespace_remap, whitespace_remap_owned_bytes) =
         apply_whitespace_rules(&mut document, &options.whitespace, meter)?
             .map_or((None, 0), |(remap, bytes)| (Some(remap), bytes));
+    let (include_remap, include_remap_owned_bytes) =
+        include_remap.map_or((None, 0), |(remap, bytes)| (Some(remap), bytes));
     let (remap, remap_owned_bytes) = compose_node_remaps(
         include_remap,
+        include_remap_owned_bytes,
         whitespace_remap,
         whitespace_remap_owned_bytes,
         meter,
@@ -215,43 +223,28 @@ pub(crate) fn prepare_evaluator_source(
 
 fn compose_node_remaps(
     first: Option<HashMap<NodeId, NodeId>>,
+    first_owned_bytes: usize,
     second: Option<HashMap<NodeId, NodeId>>,
     second_owned_bytes: usize,
     meter: &mut Meter,
 ) -> Result<(Option<HashMap<NodeId, NodeId>>, usize)> {
     match (first, second) {
         (None, None) => Ok((None, 0)),
-        (Some(remap), None) => Ok((Some(remap), 0)),
+        (Some(remap), None) => Ok((Some(remap), first_owned_bytes)),
         (None, Some(remap)) => Ok((Some(remap), second_owned_bytes)),
-        (Some(first), Some(second)) => {
-            let entry_bytes = xinclude_remap_bytes(1);
-            let requested_bytes = first.len().saturating_mul(entry_bytes);
-            meter.charge(BudgetKind::OwnedBytes, requested_bytes)?;
-            let mut composed = HashMap::new();
-            if let Err(error) = composed.try_reserve(first.len()) {
-                meter.release_owned_bytes(requested_bytes);
-                return Err(Error::Dynamic(format!(
-                    "failed to reserve composed node remap: {error}"
-                )));
-            }
-            let retained_bytes = composed.capacity().saturating_mul(entry_bytes);
-            if retained_bytes < requested_bytes {
-                meter.release_owned_bytes(requested_bytes - retained_bytes);
-            } else if retained_bytes > requested_bytes
-                && let Err(error) =
-                    meter.charge(BudgetKind::OwnedBytes, retained_bytes - requested_bytes)
-            {
-                meter.release_owned_bytes(requested_bytes);
-                return Err(error);
-            }
-            for (original, intermediate) in first {
-                if let Some(final_id) = second.get(&intermediate).copied() {
-                    composed.insert(original, final_id);
-                }
-            }
+        (Some(mut first), Some(second)) => {
+            // Compose in place: both maps are already retained, so allocating a third map would
+            // add avoidable peak memory before either input reservation can be released.
+            first.retain(|_, intermediate| {
+                let Some(final_id) = second.get(intermediate).copied() else {
+                    return false;
+                };
+                *intermediate = final_id;
+                true
+            });
             drop(second);
             meter.release_owned_bytes(second_owned_bytes);
-            Ok((Some(composed), retained_bytes))
+            Ok((Some(first), first_owned_bytes))
         }
     }
 }
@@ -3331,6 +3324,7 @@ const XINCLUDE_NS: &str = "http://www.w3.org/2001/XInclude";
 struct ExpandedXIncludeDocument {
     document: Document,
     principal_mapping: Option<HashMap<NodeId, NodeId>>,
+    principal_mapping_owned_bytes: usize,
     retained_owned_bytes: usize,
     retained_namespace_bytes: usize,
 }
@@ -3593,6 +3587,7 @@ fn expand_xinclude_document_in_chain(
     Ok(ExpandedXIncludeDocument {
         document: output,
         principal_mapping: Some(principal_mapping),
+        principal_mapping_owned_bytes: mapping_bytes,
         retained_owned_bytes,
         retained_namespace_bytes,
     })
@@ -3673,21 +3668,35 @@ fn validate_xinclude_children(source: &Document, include: &Node) -> Result<Optio
         else {
             continue;
         };
-        if name.namespace.as_deref() != Some(XINCLUDE_NS) {
-            continue;
+        if name.namespace.as_deref() == Some(XINCLUDE_NS) {
+            // XInclude 1.0 section 3.1 permits local/foreign extension children (which are
+            // ignored), but makes every XInclude-namespace child except one fallback fatal.
+            // https://www.w3.org/TR/xinclude/#syntax
+            if name.local != "fallback" {
+                return Err(Error::Xml(format!(
+                    "XInclude namespace child xi:{} is not permitted in xi:include",
+                    name.local
+                )));
+            }
+            if fallback.replace(*child).is_some() {
+                return Err(Error::Xml(
+                    "XInclude xi:include permits at most one xi:fallback child".into(),
+                ));
+            }
         }
-        // XInclude 1.0 section 3.1 permits local/foreign extension children (which are
-        // ignored), but makes every XInclude-namespace child except one fallback fatal.
-        // https://www.w3.org/TR/xinclude/#syntax
-        if name.local != "fallback" {
-            return Err(Error::Xml(format!(
-                "XInclude namespace child xi:{} is not permitted in xi:include",
-                name.local
-            )));
-        }
-        if fallback.replace(*child).is_some() {
+        if source.descendants(*child).any(|(_, descendant)| {
+            matches!(
+                &descendant.kind,
+                NodeKind::Element { name, .. }
+                    if name.namespace.as_deref() == Some(XINCLUDE_NS)
+                        && name.local == "fallback"
+            )
+        }) {
+            // XInclude 1.0 section 3.2 makes xi:fallback anywhere except a direct child of
+            // xi:include fatal, including under otherwise ignored extension content.
+            // https://www.w3.org/TR/xinclude/#fallback_element
             return Err(Error::Xml(
-                "XInclude xi:include permits at most one xi:fallback child".into(),
+                "xi:fallback must be a direct child of xi:include".into(),
             ));
         }
     }
@@ -3967,11 +3976,20 @@ fn resolve_xinclude(
         ))));
     }
     let xpointer = attribute("xpointer");
+    let encoding = attribute("encoding");
     if parse == "text" && xpointer.is_some() {
         // XInclude 1.0 section 3.1 permits xpointer only when parse="xml".
         // https://www.w3.org/TR/xinclude/#include_element
         return Err(XIncludeFailure::Fatal(Error::Xml(
             "XInclude xpointer is not permitted with parse=\"text\"".into(),
+        )));
+    }
+    if parse == "xml" && encoding.is_some() {
+        // XInclude 1.0 section 3.1 permits encoding only for parse="text" and requires this
+        // syntax error to be rejected before resource acquisition.
+        // https://www.w3.org/TR/xinclude/#include_element
+        return Err(XIncludeFailure::Fatal(Error::Xml(
+            "XInclude encoding is not permitted with parse=\"xml\"".into(),
         )));
     }
     // XInclude 1.0 section 3.1 forbids fragment identifiers in href, including an empty
@@ -4059,7 +4077,7 @@ fn resolve_xinclude(
         None => true,
     };
     if parse == "text" {
-        let encoding = attribute("encoding").or(resource.encoding.as_deref());
+        let encoding = encoding.or(resource.encoding.as_deref());
         let value = decode_xinclude_resource(&resource, encoding, meter, false)?;
         // XInclude 1.0 section 4.3 makes every character forbidden in XML documents a fatal
         // error, even after successful decoding: https://www.w3.org/TR/xinclude/#text_included
@@ -7936,6 +7954,102 @@ mod tests {
 
     struct StaticResolver {
         bytes: Vec<u8>,
+    }
+
+    #[test]
+    fn principal_xinclude_remap_reports_its_retained_reservation() {
+        // The remap is retained until public parameter node identities are translated. Its
+        // reservation must travel with it so dropping the map releases the same budget charge.
+        let source = Document::parse("<root><first/><second/></root>", None)
+            .expect("source document parses");
+        let mut meter = Meter::new(
+            ExecutionBudget {
+                source_bytes: usize::MAX,
+                external_documents: 0,
+                recursion_depth: usize::MAX,
+                xpath_evaluations: usize::MAX,
+                pattern_evaluations: usize::MAX,
+                template_applications: usize::MAX,
+                sort_comparisons: usize::MAX,
+                key_entries: usize::MAX,
+                result_nodes: usize::MAX,
+                serialized_bytes: usize::MAX,
+                messages: usize::MAX,
+                owned_bytes: usize::MAX,
+            },
+            source.source_bytes(),
+        )
+        .expect("test meter initializes");
+        let prepared = prepare_evaluator_source(
+            &source,
+            &crate::NoResolver,
+            &mut meter,
+            &EvaluatorSourceOptions {
+                processing: SourceProcessing::XInclude,
+                whitespace: Arc::from([]),
+                clock: Arc::new(crate::SystemClock),
+                extension_policy: crate::ExtensionPolicy::Compatible,
+            },
+        )
+        .expect("XInclude preprocessing succeeds without external resources");
+        assert!(prepared.remap.is_some());
+        assert!(
+            prepared.remap_owned_bytes > 0,
+            "retained mapping bytes must remain attributable to the map owner"
+        );
+    }
+
+    #[test]
+    fn node_remap_composition_reuses_the_first_allocation() {
+        // Both input maps are retained before composition. Updating the first in place keeps peak
+        // memory flat and releases the second map's complete reservation when it is consumed.
+        let document = Document::parse("<root><first/><second/></root>", None)
+            .expect("identity source parses");
+        let ids = document.nodes().map(|(id, _)| id).collect::<Vec<_>>();
+        let first = HashMap::from([(ids[1], ids[2]), (ids[2], ids[3])]);
+        let second = HashMap::from([(ids[2], ids[3])]);
+        let first_bytes = xinclude_remap_bytes(first.len());
+        let second_bytes = xinclude_remap_bytes(second.len());
+        let mut meter = Meter::new(
+            ExecutionBudget {
+                source_bytes: usize::MAX,
+                external_documents: 0,
+                recursion_depth: usize::MAX,
+                xpath_evaluations: usize::MAX,
+                pattern_evaluations: usize::MAX,
+                template_applications: usize::MAX,
+                sort_comparisons: usize::MAX,
+                key_entries: usize::MAX,
+                result_nodes: usize::MAX,
+                serialized_bytes: usize::MAX,
+                messages: usize::MAX,
+                owned_bytes: usize::MAX,
+            },
+            0,
+        )
+        .expect("test meter initializes");
+        meter
+            .charge(BudgetKind::OwnedBytes, first_bytes + second_bytes)
+            .expect("input maps fit");
+
+        let (composed, retained_bytes) = compose_node_remaps(
+            Some(first),
+            first_bytes,
+            Some(second),
+            second_bytes,
+            &mut meter,
+        )
+        .expect("remaps compose");
+        let composed = composed.expect("the first remap remains retained");
+        assert_eq!(composed, HashMap::from([(ids[1], ids[3])]));
+        assert_eq!(retained_bytes, first_bytes);
+        assert_eq!(
+            meter
+                .usage(BudgetKind::OwnedBytes)
+                .expect("usage is available")
+                .0,
+            first_bytes
+        );
     }
 
     impl Resolver for StaticResolver {

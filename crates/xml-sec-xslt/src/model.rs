@@ -1556,6 +1556,14 @@ impl Document {
         }
     }
 
+    pub(crate) fn descendants(&self, root: NodeId) -> impl Iterator<Item = (NodeId, &Node)> {
+        let first = self
+            .node(root)
+            .and_then(|node| node.children.first().copied());
+        std::iter::successors(first, move |current| self.next_descendant(root, *current))
+            .filter_map(|id| self.node(id).map(|node| (id, node)))
+    }
+
     fn next_descendant(&self, boundary: NodeId, mut current: NodeId) -> Option<NodeId> {
         if let Some(child) = self.node(current)?.children.first() {
             return Some(*child);

@@ -475,6 +475,72 @@ fn constructed_elements_preserve_their_instruction_base_uri() {
 }
 
 #[test]
+fn copy_of_uses_the_creating_instruction_base_uri() {
+    // XSLT 1.0 section 3.2 assigns copied result nodes the base URI of xsl:copy-of, not an
+    // inherited base URI from the source tree. A copied xml:base may refine that base afterward.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#base-uri
+    let resolver = Arc::new(ContextResolver::default());
+    for (href, base, body) in [
+        (
+            "relative.xml",
+            "https://example.test/styles/main.xsl",
+            "<doc>stylesheet</doc>",
+        ),
+        (
+            "relative.xml",
+            "https://example.test/styles/nested/",
+            "<doc>nested</doc>",
+        ),
+        (
+            "relative.xml",
+            "https://attacker.test/source/",
+            "<doc>source</doc>",
+        ),
+    ] {
+        resolver
+            .resources
+            .lock()
+            .expect("test resolver mutex is not poisoned")
+            .insert(
+                (href.into(), Some(base.into())),
+                ResolvedResource {
+                    canonical_uri: format!("{base}{href}"),
+                    identity: ResourceIdentity(format!("{base}{href}")),
+                    bytes: body.as_bytes().to_vec(),
+                    media_type: None,
+                    encoding: Some("UTF-8".into()),
+                },
+            );
+    }
+    let stylesheet = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:exsl="http://exslt.org/common"><xsl:output method="text"/><xsl:template match="/"><xsl:variable name="fragment"><xsl:copy-of select="root/item"/></xsl:variable><xsl:for-each select="exsl:node-set($fragment)/item"><xsl:value-of select="document('relative.xml', .)/doc"/><xsl:text>|</xsl:text></xsl:for-each><xsl:variable name="whole"><xsl:copy-of select="/"/></xsl:variable><xsl:value-of select="document('relative.xml', exsl:node-set($whole)/root)/doc"/></xsl:template></xsl:stylesheet>"#,
+        Some("https://example.test/styles/main.xsl"),
+    )
+    .expect("stylesheet compiles");
+    let result = stylesheet
+        .execute(
+            &Document::parse(
+                r#"<root><item/><item xml:base="nested/"/></root>"#,
+                Some("https://example.test/source.xml"),
+            )
+            .expect("source parses"),
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("copied node resolves relative to its creating instruction");
+    assert_eq!(result.serialized.bytes, b"stylesheet|nested|stylesheet");
+}
+
+#[test]
 fn doctype_uses_the_first_element_qualified_name() {
     // Prolog nodes do not replace the document element, and a prefixed root requires the same
     // qualified name in both the DOCTYPE and serialized start tag.
@@ -5422,6 +5488,80 @@ fn xinclude_rejects_fallback_outside_include_before_resolution() {
 }
 
 #[test]
+fn xinclude_rejects_misplaced_nested_fallback_before_resolution() {
+    // XInclude 1.0 section 3.2 permits xi:fallback only as a direct xi:include child, including
+    // inside otherwise ignored extension content. Validation must precede resource acquisition.
+    // https://www.w3.org/TR/xinclude/#fallback_element
+    let resolver = Arc::new(CountingResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert("included.xml".into(), "<included/>".into());
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#,
+    );
+    for source in [
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude" xmlns:ext="urn:extension"><xi:include href="included.xml"><ext:wrapper><xi:fallback/></ext:wrapper></xi:include></root>"#,
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="included.xml"><xi:fallback><xi:fallback/></xi:fallback></xi:include></root>"#,
+    ] {
+        let source = Document::parse(source, Some("memory:source.xml"))
+            .expect("source parses before XInclude validation");
+        let error = stylesheet
+            .execute_with_source_processing(
+                &source,
+                &Parameters::new(),
+                resolver.clone(),
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+                SourceProcessing::XInclude,
+            )
+            .expect_err("a nested xi:fallback is a fatal syntax error");
+        assert!(matches!(error, Error::Xml(message) if message.contains("direct child")));
+    }
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn xinclude_rejects_text_encoding_in_xml_mode_before_resolution() {
+    // XInclude 1.0 section 3.1 forbids encoding when parse="xml", including the default mode.
+    // https://www.w3.org/TR/xinclude/#include_element
+    let resolver = Arc::new(CountingResolver::default());
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#,
+    );
+    for parse in ["", r#" parse="xml""#] {
+        let source = Document::parse(
+            &format!(
+                r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="included.xml"{parse} encoding="UTF-8"/></root>"#
+            ),
+            Some("memory:source.xml"),
+        )
+        .expect("source parses before XInclude validation");
+        let error = stylesheet
+            .execute_with_source_processing(
+                &source,
+                &Parameters::new(),
+                resolver.clone(),
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+                SourceProcessing::XInclude,
+            )
+            .expect_err("encoding with XML-mode inclusion is fatal");
+        assert!(
+            matches!(error, Error::Xml(message) if message.contains("encoding") && message.contains("parse=\"xml\""))
+        );
+    }
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn xinclude_distinguishes_extension_content_from_reserved_children() {
     // XInclude 1.0 section 3.1 permits local and foreign-namespace extension children but
     // reserves XInclude-namespace children other than xi:fallback.
@@ -6096,6 +6236,9 @@ fn computed_names_normalize_an_explicit_empty_namespace() {
     // undeclarable `xmlns:p=""` binding and change the expanded-name contract.
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:p="urn:source"><xsl:output omit-xml-declaration="yes" indent="no"/><xsl:template match="/"><xsl:element name="p:out" namespace=""><xsl:attribute name="p:value" namespace="">ok</xsl:attribute></xsl:element></xsl:template></xsl:stylesheet>"#;
     assert_eq!(execute(stylesheet, "<source/>"), "<out value=\"ok\"/>");
+
+    let reserved = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes" indent="no"/><xsl:template match="/"><xsl:element name="xml:item" namespace=""/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(reserved, "<source/>"), "<item/>");
 }
 
 #[test]
@@ -8487,6 +8630,67 @@ fn captured_result_fragments_reject_invalid_or_duplicate_xml_ids() {
             )
             .expect_err("invalid fragment xml:id is rejected");
         assert!(matches!(error, Error::Xml(_)), "{error:?}");
+    }
+}
+
+#[test]
+fn main_result_tree_finalizes_xml_ids_before_returning() {
+    // xml:id 1.0 section 4 applies to the returned result document as well as temporary trees:
+    // normalized IDs must be indexed for a subsequent transformation, and invalid IDs must fail.
+    // https://www.w3.org/TR/xml-id/#processing
+    let producer = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><root><item xml:id="  target  ">found</item></root></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse("<source/>", None).expect("source parses");
+    let produced = producer
+        .execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("valid result xml:id is finalized");
+    let consumer = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="id('target')"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let consumed = consumer
+        .execute(
+            &produced.document,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("a subsequent transformation sees the finalized ID index");
+    assert_eq!(consumed.serialized.bytes, b"found");
+
+    for body in [
+        r#"<root><item><xsl:attribute name="xml:id" namespace="http://www.w3.org/XML/1998/namespace">not valid</xsl:attribute></item></root>"#,
+        r#"<root><first><xsl:attribute name="xml:id" namespace="http://www.w3.org/XML/1998/namespace">same</xsl:attribute></first><second><xsl:attribute name="xml:id" namespace="http://www.w3.org/XML/1998/namespace">same</xsl:attribute></second></root>"#,
+    ] {
+        let invalid = compile(&format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/">{body}</xsl:template></xsl:stylesheet>"#
+        ));
+        assert!(matches!(
+            invalid.execute(
+                &source,
+                &Parameters::new(),
+                Arc::new(NoResolver),
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            ),
+            Err(Error::Xml(_))
+        ));
     }
 }
 
