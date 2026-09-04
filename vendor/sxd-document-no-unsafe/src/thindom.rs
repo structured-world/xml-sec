@@ -4,33 +4,34 @@ use super::{QName, raw};
 
 pub struct Storage<'d> {
     storage: &'d raw::Storage,
+    identity: usize,
 }
 
 impl<'d> Storage<'d> {
-    pub fn new(storage: &raw::Storage) -> Storage<'_> {
-        Storage { storage }
+    pub fn new(storage: &'d raw::Storage, identity: usize) -> Storage<'d> {
+        Storage { storage, identity }
     }
 
     pub fn create_element<'n, N>(&'d self, name: N) -> Element<'d>
     where
         N: Into<QName<'n>>,
     {
-        Element::wrap(self.storage.create_element(name))
+        Element::wrap(self.storage.create_element(name), self.identity)
     }
 
     pub fn create_attribute<'n, N>(&'d self, name: N, value: &str) -> Attribute<'d>
     where
         N: Into<QName<'n>>,
     {
-        Attribute::wrap(self.storage.create_attribute(name, value))
+        Attribute::wrap(self.storage.create_attribute(name, value), self.identity)
     }
 
     pub fn create_text(&'d self, text: &str) -> Text<'d> {
-        Text::wrap(self.storage.create_text(text))
+        Text::wrap(self.storage.create_text(text), self.identity)
     }
 
     pub fn create_comment(&'d self, text: &str) -> Comment<'d> {
-        Comment::wrap(self.storage.create_comment(text))
+        Comment::wrap(self.storage.create_comment(text), self.identity)
     }
 
     pub fn create_processing_instruction(
@@ -38,21 +39,27 @@ impl<'d> Storage<'d> {
         target: &str,
         value: Option<&str>,
     ) -> ProcessingInstruction<'d> {
-        ProcessingInstruction::wrap(self.storage.create_processing_instruction(target, value))
+        ProcessingInstruction::wrap(
+            self.storage.create_processing_instruction(target, value),
+            self.identity,
+        )
     }
 
     pub fn element_set_name<'n, N>(&self, element: Element<'_>, name: N)
     where
         N: Into<QName<'n>>,
     {
+        element.assert_identity(self.identity);
         self.storage.element_set_name(element.node, name)
     }
 
     pub fn text_set_text(&self, text: Text<'_>, new_text: &str) {
+        text.assert_identity(self.identity);
         self.storage.text_set_text(text.node, new_text)
     }
 
     pub fn comment_set_text(&self, comment: Comment<'_>, new_text: &str) {
+        comment.assert_identity(self.identity);
         self.storage.comment_set_text(comment.node, new_text)
     }
 
@@ -61,6 +68,7 @@ impl<'d> Storage<'d> {
         pi: ProcessingInstruction<'_>,
         new_target: &str,
     ) {
+        pi.assert_identity(self.identity);
         self.storage
             .processing_instruction_set_target(pi.node, new_target)
     }
@@ -70,6 +78,7 @@ impl<'d> Storage<'d> {
         pi: ProcessingInstruction<'_>,
         new_value: Option<&str>,
     ) {
+        pi.assert_identity(self.identity);
         self.storage
             .processing_instruction_set_value(pi.node, new_value)
     }
@@ -77,40 +86,50 @@ impl<'d> Storage<'d> {
 
 pub struct Connections<'d> {
     connections: &'d raw::Connections,
+    identity: usize,
 }
 
 impl<'d> Connections<'d> {
-    pub fn new(connections: &raw::Connections) -> Connections<'_> {
-        Connections { connections }
+    pub fn new(connections: &'d raw::Connections, identity: usize) -> Connections<'d> {
+        Connections {
+            connections,
+            identity,
+        }
     }
 
     pub fn root(&self) -> Root<'d> {
-        Root::wrap(self.connections.root())
+        Root::wrap(self.connections.root(), self.identity)
     }
 
     pub fn element_parent(&self, child: Element<'d>) -> Option<ParentOfChild<'d>> {
+        child.assert_identity(self.identity);
         self.connections
             .element_parent(child.node)
-            .map(ParentOfChild::wrap)
+            .map(|parent| ParentOfChild::wrap(parent, self.identity))
     }
 
     pub fn text_parent(&self, child: Text<'d>) -> Option<Element<'d>> {
-        self.connections.text_parent(child.node).map(Element::wrap)
+        child.assert_identity(self.identity);
+        self.connections
+            .text_parent(child.node)
+            .map(|parent| Element::wrap(parent, self.identity))
     }
 
     pub fn comment_parent(&self, child: Comment<'d>) -> Option<ParentOfChild<'d>> {
+        child.assert_identity(self.identity);
         self.connections
             .comment_parent(child.node)
-            .map(ParentOfChild::wrap)
+            .map(|parent| ParentOfChild::wrap(parent, self.identity))
     }
 
     pub fn processing_instruction_parent(
         &self,
         child: ProcessingInstruction<'d>,
     ) -> Option<ParentOfChild<'d>> {
+        child.assert_identity(self.identity);
         self.connections
             .processing_instruction_parent(child.node)
-            .map(ParentOfChild::wrap)
+            .map(|parent| ParentOfChild::wrap(parent, self.identity))
     }
 
     pub fn append_root_child<C>(&mut self, child: C)
@@ -118,6 +137,7 @@ impl<'d> Connections<'d> {
         C: Into<ChildOfRoot<'d>>,
     {
         let child = child.into();
+        child.assert_identity(self.identity);
         self.connections.append_root_child(child.as_raw())
     }
 
@@ -126,6 +146,8 @@ impl<'d> Connections<'d> {
         C: Into<ChildOfElement<'d>>,
     {
         let child = child.into();
+        parent.assert_identity(self.identity);
+        child.assert_identity(self.identity);
         self.connections
             .append_element_child(parent.node, child.as_raw())
     }
@@ -134,55 +156,70 @@ impl<'d> Connections<'d> {
         // This is safe because we disallow mutation while this borrow is active.
         RootChildren {
             iter: self.connections.root_children().iter(),
+            identity: self.identity,
         }
     }
 
     pub fn element_children(&self, parent: Element<'_>) -> ElementChildren<'_> {
+        parent.assert_identity(self.identity);
         // This is safe because we disallow mutation while this borrow is active.
         ElementChildren {
             iter: self.connections.element_children(parent.node).iter(),
+            identity: self.identity,
         }
     }
 
     pub fn element_preceding_siblings(&self, element: Element<'_>) -> Siblings<'_> {
+        element.assert_identity(self.identity);
         // This is safe because we disallow mutation while this borrow is active.
         Siblings {
             iter: self.connections.element_preceding_siblings(element.node),
+            identity: self.identity,
         }
     }
 
     pub fn element_following_siblings(&self, element: Element<'_>) -> Siblings<'_> {
+        element.assert_identity(self.identity);
         // This is safe because we disallow mutation while this borrow is active.
         Siblings {
             iter: self.connections.element_following_siblings(element.node),
+            identity: self.identity,
         }
     }
 
     pub fn text_preceding_siblings(&self, text: Text<'_>) -> Siblings<'_> {
+        text.assert_identity(self.identity);
         // This is safe because we disallow mutation while this borrow is active.
         Siblings {
             iter: self.connections.text_preceding_siblings(text.node),
+            identity: self.identity,
         }
     }
 
     pub fn text_following_siblings(&self, text: Text<'_>) -> Siblings<'_> {
+        text.assert_identity(self.identity);
         // This is safe because we disallow mutation while this borrow is active.
         Siblings {
             iter: self.connections.text_following_siblings(text.node),
+            identity: self.identity,
         }
     }
 
     pub fn comment_preceding_siblings(&self, comment: Comment<'_>) -> Siblings<'_> {
+        comment.assert_identity(self.identity);
         // This is safe because we disallow mutation while this borrow is active.
         Siblings {
             iter: self.connections.comment_preceding_siblings(comment.node),
+            identity: self.identity,
         }
     }
 
     pub fn comment_following_siblings(&self, comment: Comment<'_>) -> Siblings<'_> {
+        comment.assert_identity(self.identity);
         // This is safe because we disallow mutation while this borrow is active.
         Siblings {
             iter: self.connections.comment_following_siblings(comment.node),
+            identity: self.identity,
         }
     }
 
@@ -190,11 +227,13 @@ impl<'d> Connections<'d> {
         &self,
         pi: ProcessingInstruction<'_>,
     ) -> Siblings<'_> {
+        pi.assert_identity(self.identity);
         // This is safe because we disallow mutation while this borrow is active.
         Siblings {
             iter: self
                 .connections
                 .processing_instruction_preceding_siblings(pi.node),
+            identity: self.identity,
         }
     }
 
@@ -202,33 +241,41 @@ impl<'d> Connections<'d> {
         &self,
         pi: ProcessingInstruction<'_>,
     ) -> Siblings<'_> {
+        pi.assert_identity(self.identity);
         // This is safe because we disallow mutation while this borrow is active.
         Siblings {
             iter: self
                 .connections
                 .processing_instruction_following_siblings(pi.node),
+            identity: self.identity,
         }
     }
 
     pub fn attribute_parent(&self, attribute: Attribute<'d>) -> Option<Element<'d>> {
+        attribute.assert_identity(self.identity);
         self.connections
             .attribute_parent(attribute.node)
-            .map(Element::wrap)
+            .map(|parent| Element::wrap(parent, self.identity))
     }
 
     pub fn attributes(&self, parent: Element<'d>) -> Attributes<'d> {
+        parent.assert_identity(self.identity);
         // This is safe because we disallow mutation while this borrow is active
         // TODO: Test that
         Attributes {
             iter: self.connections.attributes(parent.node).iter(),
+            identity: self.identity,
         }
     }
 
     pub fn set_attribute(&mut self, parent: Element<'d>, attribute: Attribute<'d>) {
+        parent.assert_identity(self.identity);
+        attribute.assert_identity(self.identity);
         self.connections.set_attribute(parent.node, attribute.node);
     }
 
     pub fn attribute_value(&self, parent: Element<'d>, name: &str) -> Option<&'d str> {
+        parent.assert_identity(self.identity);
         self.connections.attribute(parent.node, name).map(|a| {
             let a_r = unsafe { &*a };
             a_r.value()
@@ -238,49 +285,61 @@ impl<'d> Connections<'d> {
 
 pub struct RootChildren<'d> {
     iter: slice::Iter<'d, raw::ChildOfRoot>,
+    identity: usize,
 }
 
 impl<'d> Iterator for RootChildren<'d> {
     type Item = ChildOfRoot<'d>;
 
     fn next(&mut self) -> Option<ChildOfRoot<'d>> {
-        self.iter.next().map(|&c| ChildOfRoot::wrap(c))
+        self.iter
+            .next()
+            .map(|&child| ChildOfRoot::wrap(child, self.identity))
     }
 }
 
 pub struct ElementChildren<'d> {
     iter: slice::Iter<'d, raw::ChildOfElement>,
+    identity: usize,
 }
 
 impl<'d> Iterator for ElementChildren<'d> {
     type Item = ChildOfElement<'d>;
 
     fn next(&mut self) -> Option<ChildOfElement<'d>> {
-        self.iter.next().map(|&c| ChildOfElement::wrap(c))
+        self.iter
+            .next()
+            .map(|&child| ChildOfElement::wrap(child, self.identity))
     }
 }
 
 pub struct Attributes<'d> {
     iter: slice::Iter<'d, *mut raw::Attribute>,
+    identity: usize,
 }
 
 impl<'d> Iterator for Attributes<'d> {
     type Item = Attribute<'d>;
 
     fn next(&mut self) -> Option<Attribute<'d>> {
-        self.iter.next().map(|&a| Attribute::wrap(a))
+        self.iter
+            .next()
+            .map(|&attribute| Attribute::wrap(attribute, self.identity))
     }
 }
 
 pub struct Siblings<'d> {
     iter: raw::SiblingIter<'d>,
+    identity: usize,
 }
 
 impl<'d> Iterator for Siblings<'d> {
     type Item = ChildOfElement<'d>;
 
     fn next(&mut self) -> Option<ChildOfElement<'d>> {
-        self.iter.next().map(ChildOfElement::wrap)
+        self.iter
+            .next()
+            .map(|child| ChildOfElement::wrap(child, self.identity))
     }
 }
 
@@ -289,15 +348,25 @@ macro_rules! node(
         #[derive(Copy,Clone)]
         pub struct $name<'d> {
             node: *mut $raw,
+            identity: usize,
             lifetime: PhantomData<Storage<'d>>,
         }
 
         impl<'d> $name<'d> {
-            fn wrap(node: *mut $raw) -> $name<'d> {
+            fn wrap(node: *mut $raw, identity: usize) -> $name<'d> {
                 $name {
                     node,
+                    identity,
                     lifetime: PhantomData,
                 }
+            }
+
+            #[allow(dead_code)]
+            fn assert_identity(self, identity: usize) {
+                assert!(
+                    self.identity == identity,
+                    "thin DOM nodes must belong to the same Package",
+                );
             }
 
             #[allow(dead_code)]
@@ -306,7 +375,7 @@ macro_rules! node(
 
         impl<'d> PartialEq for $name<'d> {
             fn eq(&self, other: &$name<'d>) -> bool {
-                self.node == other.node
+                self.node == other.node && self.identity == other.identity
             }
         }
 
@@ -316,7 +385,8 @@ macro_rules! node(
             fn hash<H>(&self, state: &mut H)
                 where H: hash::Hasher
             {
-                self.node.hash(state)
+                self.node.hash(state);
+                self.identity.hash(state);
             }
         }
     )
@@ -444,13 +514,21 @@ impl<'d> ChildOfRoot<'d> {
         ProcessingInstruction
     );
 
-    pub fn wrap(node: raw::ChildOfRoot) -> ChildOfRoot<'d> {
+    pub fn wrap(node: raw::ChildOfRoot, identity: usize) -> ChildOfRoot<'d> {
         match node {
-            raw::ChildOfRoot::Element(n) => ChildOfRoot::Element(Element::wrap(n)),
-            raw::ChildOfRoot::Comment(n) => ChildOfRoot::Comment(Comment::wrap(n)),
+            raw::ChildOfRoot::Element(n) => ChildOfRoot::Element(Element::wrap(n, identity)),
+            raw::ChildOfRoot::Comment(n) => ChildOfRoot::Comment(Comment::wrap(n, identity)),
             raw::ChildOfRoot::ProcessingInstruction(n) => {
-                ChildOfRoot::ProcessingInstruction(ProcessingInstruction::wrap(n))
+                ChildOfRoot::ProcessingInstruction(ProcessingInstruction::wrap(n, identity))
             }
+        }
+    }
+
+    fn assert_identity(self, identity: usize) {
+        match self {
+            Self::Element(node) => node.assert_identity(identity),
+            Self::Comment(node) => node.assert_identity(identity),
+            Self::ProcessingInstruction(node) => node.assert_identity(identity),
         }
     }
 
@@ -484,14 +562,23 @@ impl<'d> ChildOfElement<'d> {
         ProcessingInstruction
     );
 
-    pub fn wrap(node: raw::ChildOfElement) -> ChildOfElement<'d> {
+    pub fn wrap(node: raw::ChildOfElement, identity: usize) -> ChildOfElement<'d> {
         match node {
-            raw::ChildOfElement::Element(n) => ChildOfElement::Element(Element::wrap(n)),
-            raw::ChildOfElement::Text(n) => ChildOfElement::Text(Text::wrap(n)),
-            raw::ChildOfElement::Comment(n) => ChildOfElement::Comment(Comment::wrap(n)),
+            raw::ChildOfElement::Element(n) => ChildOfElement::Element(Element::wrap(n, identity)),
+            raw::ChildOfElement::Text(n) => ChildOfElement::Text(Text::wrap(n, identity)),
+            raw::ChildOfElement::Comment(n) => ChildOfElement::Comment(Comment::wrap(n, identity)),
             raw::ChildOfElement::ProcessingInstruction(n) => {
-                ChildOfElement::ProcessingInstruction(ProcessingInstruction::wrap(n))
+                ChildOfElement::ProcessingInstruction(ProcessingInstruction::wrap(n, identity))
             }
+        }
+    }
+
+    fn assert_identity(self, identity: usize) {
+        match self {
+            Self::Element(node) => node.assert_identity(identity),
+            Self::Text(node) => node.assert_identity(identity),
+            Self::Comment(node) => node.assert_identity(identity),
+            Self::ProcessingInstruction(node) => node.assert_identity(identity),
         }
     }
 
@@ -517,10 +604,10 @@ impl<'d> ParentOfChild<'d> {
     unpack!(ParentOfChild, root, Root, Root);
     unpack!(ParentOfChild, element, Element, Element);
 
-    pub fn wrap(node: raw::ParentOfChild) -> ParentOfChild<'d> {
+    pub fn wrap(node: raw::ParentOfChild, identity: usize) -> ParentOfChild<'d> {
         match node {
-            raw::ParentOfChild::Root(n) => ParentOfChild::Root(Root::wrap(n)),
-            raw::ParentOfChild::Element(n) => ParentOfChild::Element(Element::wrap(n)),
+            raw::ParentOfChild::Root(n) => ParentOfChild::Root(Root::wrap(n, identity)),
+            raw::ParentOfChild::Element(n) => ParentOfChild::Element(Element::wrap(n, identity)),
         }
     }
 }
@@ -962,5 +1049,28 @@ mod test {
         let children: Vec<_> = c.root_children().collect();
         let element = children[0].element().unwrap();
         assert_qname_eq!(element.name(), "hello");
+    }
+
+    #[test]
+    #[should_panic(expected = "same Package")]
+    fn root_rejects_a_child_from_another_package() {
+        let package = Package::new();
+        let foreign = Package::new();
+        let (_, mut connections) = package.as_thin_document();
+        let (foreign_storage, _) = foreign.as_thin_document();
+        connections.append_root_child(foreign_storage.create_element("foreign"));
+    }
+
+    #[test]
+    #[should_panic(expected = "same Package")]
+    fn element_rejects_nodes_from_another_package() {
+        let package = Package::new();
+        let foreign = Package::new();
+        let (storage, mut connections) = package.as_thin_document();
+        let (foreign_storage, _) = foreign.as_thin_document();
+        connections.append_element_child(
+            storage.create_element("local"),
+            foreign_storage.create_text("foreign"),
+        );
     }
 }

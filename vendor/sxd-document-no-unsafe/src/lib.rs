@@ -316,11 +316,14 @@ impl Package {
 
     #[doc(hidden)]
     pub fn as_thin_document(&self) -> (thindom::Storage<'_>, thindom::Connections<'_>) {
-        let s = thindom::Storage::new(&self.storage);
+        // The returned handles borrow this Package, so its address is a stable runtime brand
+        // for rejecting nodes created by a different arena before index or pointer access.
+        let identity = std::ptr::from_ref(self).addr();
+        let s = thindom::Storage::new(&self.storage, identity);
         #[cfg(not(feature = "no-unsafe"))]
-        let c = thindom::Connections::new(&self.connections);
+        let c = thindom::Connections::new(&self.connections, identity);
         #[cfg(feature = "no-unsafe")]
-        let c = thindom::Connections::new(&self.connections, &self.storage);
+        let c = thindom::Connections::new(&self.connections, &self.storage, identity);
         (s, c)
     }
 }
