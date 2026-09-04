@@ -5114,6 +5114,56 @@ fn xinclude_element_scheme_selects_only_the_addressed_element() {
 }
 
 #[test]
+fn xinclude_empty_href_selects_the_source_document_without_resolution() {
+    // XInclude 1.0 section 3.1 defines an absent href as the containing document. The selection
+    // therefore stays inside the current document and must not consume resolver capability.
+    // https://www.w3.org/TR/xinclude/#include_element
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(root/selected)"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><selected/><xi:include xpointer="element(/1/1)"/></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("same-document XInclude source parses");
+
+    let result = stylesheet
+        .execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(4096),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        )
+        .expect("same-document XPointer resolves without an external resolver");
+    assert_eq!(result.serialized.bytes, b"2");
+
+    let recursive = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><selected/><xi:include href="" xpointer="element(/1/2)"/></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("recursive same-document XInclude source parses");
+    assert!(matches!(
+        stylesheet.execute_with_source_processing(
+            &recursive,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(4096),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        ),
+        Err(Error::Xml(message)) if message.contains("same-document cycle")
+    ));
+}
+
+#[test]
 fn xinclude_element_scheme_budgets_only_the_selected_projection() {
     // The acquired resource must be parsed in full, but XInclude 1.0 section 4.2.2 adds only the
     // selected subresource to the result. Unselected payload must not be charged as a second copy.
@@ -5133,7 +5183,9 @@ fn xinclude_element_scheme_budgets_only_the_selected_projection() {
     )
     .expect("source parses");
     let mut budget = execution_budget(512 * 1024);
-    budget.owned_bytes = 900 * 1024;
+    // The full acquired document needs transient parser workspace. This allowance still leaves
+    // insufficient room to retain the unselected 256 KiB payload as an additional projection.
+    budget.owned_bytes = 1200 * 1024;
     let result = stylesheet
         .execute_with_source_processing(
             &source,
@@ -5794,6 +5846,38 @@ fn include_import_scan_checks_recursion_before_resolving_the_next_module() {
             .expect("test resolver mutex is not poisoned"),
         2,
         "the over-limit module must not be resolved"
+    );
+}
+
+#[test]
+fn unbounded_compile_policy_cannot_exceed_the_native_stack_ceiling() {
+    // Resolver-controlled module depth must terminate with a typed budget error even when caller
+    // policy is effectively unbounded; otherwise the host stack becomes the accidental limit.
+    let resolver = Arc::new(IncludeChainResolver::default());
+    let error = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 1024, usize::MAX, 16 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:include href="level-1.xsl"/></xsl:stylesheet>"#,
+        Some("memory:main.xsl"),
+    )
+    .expect_err("absolute compile ceiling must stop the include chain");
+    assert!(matches!(
+        error,
+        Error::Budget {
+            kind: BudgetKind::RecursionDepth,
+            limit: 256,
+            actual: 257,
+        }
+    ));
+    assert_eq!(
+        *resolver
+            .calls
+            .lock()
+            .expect("test resolver mutex is not poisoned"),
+        255,
+        "the over-ceiling module must not cross the resolver boundary"
     );
 }
 

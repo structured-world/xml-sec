@@ -39,7 +39,7 @@ impl Error {
 }
 
 /// A borrowed qualified XML name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Name<'a> {
     prefix: &'a str,
     local: &'a str,
@@ -186,6 +186,39 @@ struct PendingStart<'a> {
     start: usize,
 }
 
+fn validate_unique_attributes(attributes: &mut [Attribute<'_>]) -> Result<(), Error> {
+    const SMALL_TAG_ATTRIBUTES: usize = 8;
+
+    if attributes.len() <= SMALL_TAG_ATTRIBUTES {
+        for index in 1..attributes.len() {
+            let name = attributes[index].name;
+            if attributes[..index]
+                .iter()
+                .any(|attribute| attribute.name == name)
+            {
+                return Err(Error::malformed(format!(
+                    "duplicate attribute `{}`",
+                    name.qualified()
+                )));
+            }
+        }
+        return Ok(());
+    }
+
+    attributes.sort_unstable_by_key(|attribute| attribute.name);
+    if let Some(name) = attributes
+        .windows(2)
+        .find_map(|pair| (pair[0].name == pair[1].name).then_some(pair[0].name))
+    {
+        return Err(Error::malformed(format!(
+            "duplicate attribute `{}`",
+            name.qualified()
+        )));
+    }
+    attributes.sort_unstable_by_key(|attribute| attribute.range.start);
+    Ok(())
+}
+
 impl<'a> Scanner<'a> {
     /// Scan a complete XML document.
     #[must_use]
@@ -300,16 +333,6 @@ impl<'a> Scanner<'a> {
                         prefix: prefix.as_str(),
                         local: local.as_str(),
                     };
-                    if start
-                        .attributes
-                        .iter()
-                        .any(|attribute| attribute.name == name)
-                    {
-                        return Err(Error::malformed(format!(
-                            "duplicate attribute `{}`",
-                            name.qualified()
-                        )));
-                    }
                     start.attributes.push(Attribute {
                         name,
                         value: value.as_str(),
@@ -318,10 +341,11 @@ impl<'a> Scanner<'a> {
                 }
                 Token::ElementEnd { end, span } => match end {
                     ElementEnd::Open | ElementEnd::Empty => {
-                        let start = self
+                        let mut start = self
                             .pending_start
                             .take()
                             .ok_or_else(|| Error::malformed("element end without a start"))?;
+                        validate_unique_attributes(&mut start.attributes)?;
                         let tag = StartTag {
                             name: start.name,
                             attributes: start.attributes,
@@ -754,6 +778,32 @@ mod tests {
         ] {
             assert!(Scanner::new(xml).next_event().is_err(), "accepted {xml}");
         }
+    }
+
+    #[test]
+    fn scanner_validates_wide_attributes_without_changing_source_order() {
+        // Wide tags use the allocation-free sorted duplicate check. Restoring source order is part
+        // of the public lexical event contract and keeps downstream namespace processing stable.
+        let attributes = (0..4096)
+            .rev()
+            .map(|index| format!(" a{index}='{index}'"))
+            .collect::<String>();
+        let xml = format!("<root{attributes}/>");
+        let Some(Event::Empty(tag)) = Scanner::new(&xml)
+            .next_event()
+            .expect("wide start tag scans")
+        else {
+            panic!("wide empty element must produce one empty-tag event");
+        };
+        assert_eq!(tag.attributes.len(), 4096);
+        assert_eq!(tag.attributes[0].name.local(), "a4095");
+        assert_eq!(tag.attributes[4095].name.local(), "a0");
+
+        let unique = (0..4096)
+            .map(|index| format!(" a{index}='x'"))
+            .collect::<String>();
+        let duplicate = format!("<root{unique} a0='duplicate'/>");
+        assert!(Scanner::new(&duplicate).next_event().is_err());
     }
 
     #[test]

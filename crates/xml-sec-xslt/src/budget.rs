@@ -8,6 +8,10 @@ pub(crate) const ENTITY_EXPANSION_BYTE_CEILING: usize = 16 * 1024 * 1024;
 // This bounds cumulative namespace-scope copies made while projecting an XML document.
 // Shared scopes avoid the charge until a descendant introduces a local declaration.
 pub(crate) const NAMESPACE_SCOPE_BYTE_CEILING: usize = 16 * 1024 * 1024;
+// Compilation still uses bounded native recursion while borrowing frontend nodes. This absolute
+// process-safety ceiling only tightens caller policy until module and instruction traversal are
+// represented entirely by explicit work stacks.
+pub(crate) const COMPILE_RECURSION_DEPTH_CEILING: usize = 256;
 
 /// Independently metered XSLT resource dimensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

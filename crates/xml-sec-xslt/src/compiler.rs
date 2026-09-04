@@ -4,12 +4,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
 
-use crate::budget::ensure;
+use crate::budget::{COMPILE_RECURSION_DEPTH_CEILING, ensure};
 use crate::lexical::{
     is_ncname, is_ncname_char, is_ncname_start, is_xml_whitespace, strip_xpath_attribute_axis,
     unicode_decimal_value, xpath_string_literal,
 };
-use crate::model::prepare_xml_frontend_bounded;
+use crate::model::{parser_workspace_bytes, prepare_xml_frontend_bounded};
 use crate::resolver::decode_resource;
 use crate::{
     BudgetKind, CompileBudget, Document, Error, ExpandedName, Namespace, OutputDefinition,
@@ -1627,7 +1627,8 @@ struct CompileState {
     order: usize,
 }
 impl CompileState {
-    fn new(budget: CompileBudget, stylesheet_bytes: usize) -> Self {
+    fn new(mut budget: CompileBudget, stylesheet_bytes: usize) -> Self {
+        budget.recursion_depth = budget.recursion_depth.min(COMPILE_RECURSION_DEPTH_CEILING);
         Self {
             budget,
             templates: vec![],
@@ -1993,41 +1994,12 @@ fn estimate_compiled_owned_bytes(document: &roxmltree::Document<'_>) -> usize {
     })
 }
 
-fn frontend_parser_workspace_bytes(xml: &str) -> usize {
-    let (node_slots, attribute_slots) =
-        xml.bytes()
-            .fold((0usize, 0usize), |(nodes, attributes), byte| {
-                (
-                    nodes.saturating_add(usize::from(byte == b'<')),
-                    attributes.saturating_add(usize::from(byte == b'=')),
-                )
-            });
-    let word = std::mem::size_of::<usize>();
-    let node_bytes = 12usize.saturating_mul(word);
-    let attribute_bytes = 10usize.saturating_mul(word);
-    let namespace_bytes = 6usize.saturating_mul(word);
-    let traversal_bytes = 3usize.saturating_mul(word);
-    let fixed_workspace = 16usize
-        .saturating_mul(attribute_bytes)
-        .saturating_add(8usize.saturating_mul(word));
-
-    // roxmltree derives its initial node and attribute capacities from these same delimiters.
-    // These machine-word bounds conservatively cover its private node/attribute/namespace arena
-    // entries and the per-depth traversal stacks without coupling this crate to private types.
-    xml.len()
-        .saturating_add(fixed_workspace)
-        .saturating_add(node_slots.saturating_mul(node_bytes.saturating_add(traversal_bytes)))
-        .saturating_add(
-            attribute_slots.saturating_mul(attribute_bytes.saturating_add(namespace_bytes)),
-        )
-}
-
 fn with_frontend_document<T>(
     xml: &str,
     state: &mut CompileState,
     consume: impl FnOnce(&roxmltree::Document<'_>, &mut CompileState) -> Result<T>,
 ) -> Result<T> {
-    let lexical_reserved = frontend_parser_workspace_bytes(xml);
+    let lexical_reserved = parser_workspace_bytes(xml);
     state.charge_owned(lexical_reserved)?;
     let prepared = match prepare_xml_frontend_bounded(xml, state.remaining_owned_bytes()) {
         Ok(prepared) => prepared,
@@ -2044,7 +2016,7 @@ fn with_frontend_document<T>(
         state.release_owned(lexical_reserved);
         return Err(error);
     }
-    let expanded_workspace = frontend_parser_workspace_bytes(prepared.as_ref());
+    let expanded_workspace = parser_workspace_bytes(prepared.as_ref());
     let additional_workspace = expanded_workspace.saturating_sub(lexical_reserved);
     if let Err(error) = state.charge_owned(additional_workspace) {
         state.release_owned(expanded_owned_bytes);
@@ -3863,7 +3835,7 @@ mod tests {
         let nodes_only = lexical_only.saturating_add(node_slots);
         let attributes_only = nodes_only.saturating_add(attribute_slots);
 
-        assert!(frontend_parser_workspace_bytes(xml) > attributes_only);
+        assert!(parser_workspace_bytes(xml) > attributes_only);
     }
 
     #[test]
@@ -3948,7 +3920,7 @@ mod tests {
         // A malformed input must still report the exhausted allocation gate first: the frontend
         // parser is not allowed to allocate merely to discover a later syntax error.
         let xml = "<stylesheet>";
-        let required = frontend_parser_workspace_bytes(xml);
+        let required = parser_workspace_bytes(xml);
         let mut state =
             CompileState::new(CompileBudget::new(xml.len(), 0, 1, required - 1), xml.len());
 
@@ -3971,7 +3943,7 @@ mod tests {
         let xml = format!(
             r#"<!DOCTYPE xsl:stylesheet [<!ENTITY payload "{replacement}">]><xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><out>{references}</out></xsl:template></xsl:stylesheet>"#
         );
-        let lexical_workspace = frontend_parser_workspace_bytes(&xml);
+        let lexical_workspace = parser_workspace_bytes(&xml);
         let mut state = CompileState::new(
             CompileBudget::new(xml.len(), 0, 8, lexical_workspace + replacement.len()),
             xml.len(),

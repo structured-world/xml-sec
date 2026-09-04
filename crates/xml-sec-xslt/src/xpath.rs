@@ -12,6 +12,7 @@ use crate::budget::{Meter, ParseBudget, reserve_temporary_vec_slot};
 use crate::compiler::{DecimalFormat, Expression, NameTest, Pattern, normalize_xpath_for_sxd};
 use crate::expression::innermost_namespaced_call;
 use crate::lexical::{is_ncname, is_ncname_char, is_xml_whitespace};
+use crate::model::parser_workspace_bytes;
 use crate::resolver::decode_resource;
 use crate::runtime::{SourceProcessing, apply_whitespace_rules};
 use crate::{
@@ -181,10 +182,10 @@ pub(crate) fn prepare_evaluator_source(
     let (mut document, include_remap) = if options.processing == SourceProcessing::XInclude {
         let expanded = expand_xinclude_document(
             source,
+            &XIncludeDocumentIdentity::InMemory(source as *const Document as usize),
             resolver,
             meter,
             &mut resource_identities,
-            &mut Vec::new(),
             0,
             None,
         )?;
@@ -2015,13 +2016,12 @@ impl Evaluator {
                     )?;
                     let (mut document, expanded_reservation) =
                         if self.source_processing == SourceProcessing::XInclude {
-                            let mut stack = vec![resource.identity.clone()];
                             let expanded = expand_xinclude_document(
                                 &document,
+                                &XIncludeDocumentIdentity::External(resource.identity.clone()),
                                 self.resolver.as_ref(),
                                 meter,
                                 &mut self.resource_identities,
-                                &mut stack,
                                 1,
                                 None,
                             )?;
@@ -3247,12 +3247,77 @@ struct PendingXIncludeNode {
     preserve_language: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum XIncludeDocumentIdentity {
+    InMemory(usize),
+    External(ResourceIdentity),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct XIncludeChainEntry {
+    document: XIncludeDocumentIdentity,
+    selected_root: NodeId,
+}
+
+#[derive(Default)]
+struct XIncludeChain {
+    entries: Vec<XIncludeChainEntry>,
+    reserved_owned_bytes: usize,
+}
+
+impl XIncludeChain {
+    fn contains(&self, entry: &XIncludeChainEntry) -> bool {
+        self.entries.contains(entry)
+    }
+
+    fn push(&mut self, entry: XIncludeChainEntry, meter: &mut Meter) -> Result<()> {
+        reserve_temporary_vec_slot(&mut self.entries, meter, &mut self.reserved_owned_bytes)?;
+        self.entries.push(entry);
+        Ok(())
+    }
+
+    fn pop(&mut self) {
+        self.entries.pop().expect("XInclude chain entry was pushed");
+    }
+}
+
+struct XIncludeTraversal<'a> {
+    source_identity: &'a XIncludeDocumentIdentity,
+    chain: &'a mut XIncludeChain,
+}
+
 fn expand_xinclude_document(
+    source: &Document,
+    source_identity: &XIncludeDocumentIdentity,
+    resolver: &dyn Resolver,
+    meter: &mut Meter,
+    identities: &mut HashMap<ResourceIdentity, ResolvedResource>,
+    depth: usize,
+    selected_root: Option<NodeId>,
+) -> Result<ExpandedXIncludeDocument> {
+    let mut chain = XIncludeChain::default();
+    let result = expand_xinclude_document_in_chain(
+        source,
+        resolver,
+        meter,
+        identities,
+        XIncludeTraversal {
+            source_identity,
+            chain: &mut chain,
+        },
+        depth,
+        selected_root,
+    );
+    meter.release_owned_bytes(chain.reserved_owned_bytes);
+    result
+}
+
+fn expand_xinclude_document_in_chain(
     source: &Document,
     resolver: &dyn Resolver,
     meter: &mut Meter,
     identities: &mut HashMap<ResourceIdentity, ResolvedResource>,
-    include_stack: &mut Vec<ResourceIdentity>,
+    traversal: XIncludeTraversal<'_>,
     depth: usize,
     selected_root: Option<NodeId>,
 ) -> Result<ExpandedXIncludeDocument> {
@@ -3353,7 +3418,10 @@ fn expand_xinclude_document(
             resolver,
             meter,
             identities,
-            include_stack,
+            XIncludeTraversal {
+                source_identity: traversal.source_identity,
+                chain: traversal.chain,
+            },
             depth,
         );
         match result {
@@ -3775,7 +3843,7 @@ fn resolve_xinclude(
     resolver: &dyn Resolver,
     meter: &mut Meter,
     identities: &mut HashMap<ResourceIdentity, ResolvedResource>,
-    include_stack: &mut Vec<ResourceIdentity>,
+    traversal: XIncludeTraversal<'_>,
     depth: usize,
 ) -> std::result::Result<XIncludeContent, XIncludeFailure> {
     let node = source
@@ -3795,7 +3863,8 @@ fn resolve_xinclude(
             .find(|attribute| attribute.name.namespace.is_none() && attribute.name.local == local)
             .map(|attribute| attribute.value.as_str())
     };
-    let href = attribute("href").unwrap_or_default();
+    let href_attribute = attribute("href");
+    let href = href_attribute.unwrap_or_default();
     let parse = attribute("parse").unwrap_or("xml");
     if !matches!(parse, "xml" | "text") {
         return Err(XIncludeFailure::Fatal(Error::Xml(format!(
@@ -3818,6 +3887,60 @@ fn resolve_xinclude(
             "XInclude href must not contain a fragment identifier".into(),
         )));
     }
+    if parse == "xml" && href_attribute.is_none() && xpointer.is_none() {
+        // XInclude 1.0 section 3.1 requires xpointer when parse="xml" omits href.
+        // https://www.w3.org/TR/xinclude/#include_element
+        return Err(XIncludeFailure::Fatal(Error::Xml(
+            "XInclude without href must provide xpointer when parse=\"xml\"".into(),
+        )));
+    }
+    if href.is_empty() && parse == "xml" {
+        // XInclude 1.0 sections 3.1 and 4.2 define an empty location as the source infoset. Keep
+        // this path inside the semantic document so it cannot accidentally acquire resolver
+        // authority: https://www.w3.org/TR/xinclude/#include_element
+        let selected_root = match xpointer {
+            Some(pointer) => select_xpointer_element(source, pointer)
+                .map_err(XIncludeFailure::Resource)?
+                .ok_or_else(|| {
+                    XIncludeFailure::Resource(Error::Unsupported(
+                        "XInclude xpointer did not identify an element".into(),
+                    ))
+                })?,
+            None => source.root(),
+        };
+        let entry = XIncludeChainEntry {
+            document: traversal.source_identity.clone(),
+            selected_root,
+        };
+        if traversal.chain.contains(&entry) {
+            // XInclude 1.0 section 4.2.7 identifies a loop by the include location and XPointer,
+            // not by the resource alone. The selected node is the semantic identity of that pair,
+            // including equivalent XPointer spellings: https://www.w3.org/TR/xinclude/#loops
+            return Err(XIncludeFailure::Fatal(Error::Xml(
+                "XInclude same-document cycle detected".into(),
+            )));
+        }
+        traversal
+            .chain
+            .push(entry, meter)
+            .map_err(XIncludeFailure::Fatal)?;
+        let expanded = expand_xinclude_document_in_chain(
+            source,
+            resolver,
+            meter,
+            identities,
+            XIncludeTraversal {
+                source_identity: traversal.source_identity,
+                chain: traversal.chain,
+            },
+            depth.saturating_add(1),
+            Some(selected_root),
+        );
+        traversal.chain.pop();
+        return expanded
+            .map(XIncludeContent::Xml)
+            .map_err(XIncludeFailure::Fatal);
+    }
     // Denied operations must not cross the resolver boundary. Charging before resolution also
     // bounds repeated failed attempts that are handled by xi:fallback.
     meter
@@ -3831,12 +3954,6 @@ fn resolve_xinclude(
             }
             error => XIncludeFailure::Fatal(error),
         })?;
-    if include_stack.contains(&resource.identity) {
-        return Err(XIncludeFailure::Fatal(Error::Resolver {
-            uri: resource.canonical_uri,
-            message: "XInclude cycle detected".into(),
-        }));
-    }
     let identity_is_new = match identities.get(&resource.identity) {
         Some(previous) if previous != &resource => {
             return Err(XIncludeFailure::Fatal(Error::StaleResource {
@@ -3879,9 +3996,9 @@ fn resolve_xinclude(
         parse_external_document_metered(&xml.value, Some(&resource.canonical_uri), meter)
             .map_err(XIncludeFailure::Fatal)?;
     let selected_root = if let Some(pointer) = xpointer {
-        // XInclude 1.0 section 4.2.2 requires the XPointer Framework and element() scheme. A
-        // syntactically valid pointer whose supported parts select nothing is a resource error,
-        // allowing xi:fallback; malformed acquired XML remains fatal above.
+        // XInclude 1.0 section 4.2 requires the XPointer Framework and element() scheme and
+        // classifies any XPointer error, including malformed syntax or an empty selection, as a
+        // resource error that permits xi:fallback; malformed acquired XML remains fatal above.
         // https://www.w3.org/TR/xinclude/#fragment
         // https://www.w3.org/TR/xptr-framework/#scheme
         // https://www.w3.org/TR/xptr-element/#language
@@ -3901,6 +4018,19 @@ fn resolve_xinclude(
     } else {
         None
     };
+    let chain_entry = XIncludeChainEntry {
+        document: XIncludeDocumentIdentity::External(resource.identity.clone()),
+        selected_root: selected_root.unwrap_or_else(|| document.root()),
+    };
+    if traversal.chain.contains(&chain_entry) {
+        meter.release_owned_bytes(parsed_reservation);
+        meter.release_owned_bytes(xml.temporary_bytes);
+        meter.release_owned_bytes(resource.bytes.capacity());
+        return Err(XIncludeFailure::Fatal(Error::Resolver {
+            uri: resource.canonical_uri,
+            message: "XInclude cycle detected".into(),
+        }));
+    }
     let retained_namespace_bytes = document
         .retained_namespace_arena_bytes(selected_root, meter)
         .map_err(XIncludeFailure::Fatal)?;
@@ -3911,17 +4041,24 @@ fn resolve_xinclude(
     } else {
         meter.release_owned_bytes(resource.bytes.capacity());
     }
-    include_stack.push(resource_identity);
-    let expanded = expand_xinclude_document(
+    traversal
+        .chain
+        .push(chain_entry, meter)
+        .map_err(XIncludeFailure::Fatal)?;
+    let external_identity = XIncludeDocumentIdentity::External(resource_identity);
+    let expanded = expand_xinclude_document_in_chain(
         &document,
         resolver,
         meter,
         identities,
-        include_stack,
+        XIncludeTraversal {
+            source_identity: &external_identity,
+            chain: traversal.chain,
+        },
         depth.saturating_add(1),
         selected_root,
     );
-    include_stack.pop();
+    traversal.chain.pop();
     match expanded {
         Ok(mut expanded) => {
             let transferred_from_parse = retained_namespace_bytes.min(parsed_reservation);
@@ -3956,6 +4093,10 @@ fn parse_external_document_metered(
     base_uri: Option<&str>,
     meter: &mut Meter,
 ) -> Result<(Document, usize)> {
+    // The decoded-source reservation already covers one lexical payload copy. Reserve every
+    // additional parser arena and traversal slot before untrusted tokenization starts.
+    let workspace_reservation = parser_workspace_bytes(xml);
+    meter.charge(BudgetKind::OwnedBytes, workspace_reservation)?;
     let structural_node_bytes = std::mem::size_of::<Node>()
         .saturating_add(std::mem::size_of::<NodeId>())
         .max(1);
@@ -3965,12 +4106,28 @@ fn parse_external_document_metered(
         remaining / structural_node_bytes,
         meter.recursion_limit(),
     );
-    let document = Document::parse_with_budget(xml, base_uri, budget)?;
+    let document = match Document::parse_with_budget(xml, base_uri, budget) {
+        Ok(document) => document,
+        Err(error) => {
+            meter.release_owned_bytes(workspace_reservation);
+            return Err(error);
+        }
+    };
     // One decoded-size reservation already represents parser-owned lexical payload. Reserve the
     // arena, indexes, and any semantic payload beyond that proxy until projection completes.
-    let reservation = document.estimated_owned_bytes().saturating_sub(xml.len());
-    meter.charge(BudgetKind::OwnedBytes, reservation)?;
-    Ok((document, reservation))
+    let retained_reservation = document.estimated_owned_bytes().saturating_sub(xml.len());
+    if retained_reservation < workspace_reservation {
+        meter.release_owned_bytes(workspace_reservation - retained_reservation);
+    } else if retained_reservation > workspace_reservation
+        && let Err(error) = meter.charge(
+            BudgetKind::OwnedBytes,
+            retained_reservation - workspace_reservation,
+        )
+    {
+        meter.release_owned_bytes(workspace_reservation);
+        return Err(error);
+    }
+    Ok((document, retained_reservation))
 }
 
 fn decode_xinclude_resource(
@@ -7623,10 +7780,10 @@ mod tests {
         .expect("test meter initializes");
         let expanded = expand_xinclude_document(
             &source,
+            &XIncludeDocumentIdentity::InMemory(&source as *const Document as usize),
             &resolver,
             &mut meter,
             &mut HashMap::new(),
-            &mut Vec::new(),
             0,
             None,
         )
@@ -7933,7 +8090,7 @@ mod tests {
     }
 
     #[test]
-    fn external_parse_derives_node_limit_from_remaining_owned_bytes() {
+    fn external_parse_rejects_workspace_before_deriving_the_node_limit() {
         let per_node = std::mem::size_of::<Node>() + std::mem::size_of::<NodeId>();
         let mut meter = Meter::new(
             ExecutionBudget {
@@ -7953,12 +8110,14 @@ mod tests {
         )
         .expect("empty source fits");
 
+        let required = parser_workspace_bytes("<root><a/><b/></root>");
         assert!(matches!(
             parse_external_document_metered("<root><a/><b/></root>", None, &mut meter),
             Err(Error::Budget {
-                kind: BudgetKind::SourceNodes,
+                kind: BudgetKind::OwnedBytes,
+                actual,
                 ..
-            })
+            }) if actual == required
         ));
     }
 

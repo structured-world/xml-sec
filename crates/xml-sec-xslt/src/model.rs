@@ -13,6 +13,35 @@ use crate::{BudgetKind, Error, ParseBudget, Result};
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
 
+pub(crate) fn parser_workspace_bytes(xml: &str) -> usize {
+    let (node_slots, attribute_slots) =
+        xml.bytes()
+            .fold((0usize, 0usize), |(nodes, attributes), byte| {
+                (
+                    nodes.saturating_add(usize::from(byte == b'<')),
+                    attributes.saturating_add(usize::from(byte == b'=')),
+                )
+            });
+    let word = std::mem::size_of::<usize>();
+    let node_bytes = 12usize.saturating_mul(word);
+    let attribute_bytes = 10usize.saturating_mul(word);
+    let namespace_bytes = 6usize.saturating_mul(word);
+    let traversal_bytes = 3usize.saturating_mul(word);
+    let fixed_workspace = 16usize
+        .saturating_mul(attribute_bytes)
+        .saturating_add(8usize.saturating_mul(word));
+
+    // The lexical and semantic frontends derive their attacker-controlled capacities from tag and
+    // attribute delimiters. Machine-word bounds conservatively cover their private arenas and
+    // traversal stacks without coupling budget enforcement to allocator-specific capacities.
+    xml.len()
+        .saturating_add(fixed_workspace)
+        .saturating_add(node_slots.saturating_mul(node_bytes.saturating_add(traversal_bytes)))
+        .saturating_add(
+            attribute_slots.saturating_mul(attribute_bytes.saturating_add(namespace_bytes)),
+        )
+}
+
 /// Stable, document-bound index of a node inside one owned document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub usize, u64);
@@ -3771,7 +3800,7 @@ mod parser_boundary_tests {
         Attribute, Document, EntityExpansionMeter, Error, ExpandedName, NodeKind, Result,
         doctype_span, expand_document_entities, expand_entity_references,
         expand_parameter_entity_references, internal_general_entities,
-        normalize_predefined_entity_declaration,
+        normalize_predefined_entity_declaration, parser_workspace_bytes,
     };
     use crate::budget::{ENTITY_EXPANSION_BYTE_CEILING, Meter};
     use crate::{BudgetKind, ExecutionBudget, ParseBudget};
@@ -4766,6 +4795,18 @@ mod parser_boundary_tests {
                 actual: 7,
             }
         ));
+    }
+
+    #[test]
+    fn parser_workspace_bound_covers_wide_retained_documents() {
+        // External-resource parsing reserves this bound before scanning. A wide start tag is the
+        // adversarial shape where attribute-vector and semantic-arena storage dominate input size.
+        let attributes = (0..4096)
+            .map(|index| format!(" a{index}='x'"))
+            .collect::<String>();
+        let xml = format!("<root{attributes}/>");
+        let document = Document::parse(&xml, None).expect("wide document parses");
+        assert!(parser_workspace_bytes(&xml) >= document.estimated_owned_bytes());
     }
 
     #[test]
