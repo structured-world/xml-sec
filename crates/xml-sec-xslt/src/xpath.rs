@@ -9,14 +9,15 @@ use sxd_document_no_unsafe::{Package, QName, StorageRequirements};
 use sxd_xpath_no_unsafe::{Context, Factory, Value as SxdValue, XPath, function, nodeset};
 
 use crate::budget::{
-    Meter, ParseBudget, XINCLUDE_RECURSION_DEPTH_CEILING, reserve_temporary_vec_slot,
+    Meter, ParseBudget, XINCLUDE_RECURSION_DEPTH_CEILING, reserve_retained_hash_map_slot,
+    reserve_retained_hash_set_slot, reserve_temporary_vec_slot, retained_hash_storage,
 };
 use crate::compiler::{DecimalFormat, Expression, NameTest, Pattern, normalize_xpath_for_sxd};
 use crate::expression::innermost_namespaced_call;
 use crate::lexical::{is_ncname, is_ncname_char, is_xml_whitespace};
 use crate::model::parser_workspace_bytes;
 use crate::resolver::decode_resource;
-use crate::runtime::{SourceProcessing, apply_whitespace_rules};
+use crate::runtime::{SourceProcessing, apply_whitespace_rules, expanded_name_owned_bytes};
 use crate::{
     Attribute, BudgetKind, Clock, Document, Error, ErrorKind, ExpandedName, ExtensionPolicy, Node,
     NodeId, NodeKind, NodeReference, ResolvePurpose, ResolvedResource, Resolver, ResourceIdentity,
@@ -344,18 +345,34 @@ impl DocumentRequest {
             empty_document: empty_resource.then_some(logical_document).flatten(),
         }
     }
+
+    fn payload_owned_bytes(&self) -> usize {
+        self.href
+            .capacity()
+            .saturating_add(self.base_uri.as_ref().map_or(0, String::capacity))
+    }
+}
+
+#[derive(Default)]
+struct PendingDocumentRequests {
+    items: HashSet<DocumentRequest>,
+    payload_bytes: usize,
+}
+
+impl PendingDocumentRequests {
+    fn retained_owned_bytes(&self) -> usize {
+        retained_hash_storage::<DocumentRequest>(self.items.capacity())
+            .saturating_add(self.payload_bytes)
+    }
 }
 
 fn document_cache_key_owned_bytes(request: &DocumentRequest) -> usize {
-    std::mem::size_of::<DocumentRequest>()
-        .saturating_mul(2)
-        .saturating_add(request.href.len().saturating_mul(2))
-        .saturating_add(
-            request
-                .base_uri
-                .as_ref()
-                .map_or(0, |base_uri| base_uri.len().saturating_mul(2)),
-        )
+    request.href.capacity().saturating_mul(2).saturating_add(
+        request
+            .base_uri
+            .as_ref()
+            .map_or(0, |base_uri| base_uri.capacity().saturating_mul(2)),
+    )
 }
 
 fn charge_document_cache_keys(request: &DocumentRequest, meter: &mut Meter) -> Result<()> {
@@ -365,21 +382,41 @@ fn charge_document_cache_keys(request: &DocumentRequest, meter: &mut Meter) -> R
     )
 }
 
+#[derive(Default)]
+struct DocumentCacheIndexBytes {
+    documents: usize,
+    roots: usize,
+}
+
 fn seed_document_cache(
     request: DocumentRequest,
     root: NodeId,
     maps: &NodeMaps,
     documents: &mut HashMap<DocumentRequest, Vec<SourceNode>>,
     document_roots: &mut HashMap<DocumentRequest, Vec<NodePath>>,
+    index_bytes: &mut DocumentCacheIndexBytes,
     meter: &mut Meter,
 ) -> Result<()> {
     charge_document_cache_keys(&request, meter)?;
     let root = SourceNode::Node(root);
-    document_roots.insert(
-        request.clone(),
-        maps.forward.get(&root).cloned().into_iter().collect(),
-    );
-    documents.insert(request, vec![root]);
+    reserve_retained_hash_map_slot(documents, meter, &mut index_bytes.documents)?;
+    reserve_retained_hash_map_slot(document_roots, meter, &mut index_bytes.roots)?;
+    let mut roots = Vec::new();
+    let mut roots_bytes = 0;
+    if let Some(path) = maps.forward.get(&root) {
+        reserve_temporary_vec_slot(&mut roots, meter, &mut roots_bytes)?;
+        meter.charge(BudgetKind::OwnedBytes, path.owned_bytes())?;
+        roots.push(path.clone());
+    }
+    let nodes = vec![root];
+    meter.charge(
+        BudgetKind::OwnedBytes,
+        nodes
+            .capacity()
+            .saturating_mul(std::mem::size_of::<SourceNode>()),
+    )?;
+    document_roots.insert(request.clone(), roots);
+    documents.insert(request, nodes);
     Ok(())
 }
 
@@ -630,8 +667,12 @@ pub(crate) struct Evaluator {
     stylesheet_functions: Arc<HashSet<ExpandedName>>,
     resolver: Arc<dyn Resolver>,
     documents: HashMap<DocumentRequest, Vec<SourceNode>>,
+    document_cache_index_bytes: DocumentCacheIndexBytes,
     document_roots: Rc<RefCell<HashMap<DocumentRequest, Vec<NodePath>>>>,
-    pending_document_requests: Rc<RefCell<HashSet<DocumentRequest>>>,
+    pending_document_requests: Rc<RefCell<PendingDocumentRequests>>,
+    pending_dynamic_variables: HashSet<ExpandedName>,
+    pending_dynamic_variable_index_bytes: usize,
+    pending_dynamic_variable_payload_bytes: usize,
     resource_identities: HashMap<ResourceIdentity, ResolvedResource>,
     resource_documents: HashMap<ResourceIdentity, SourceNode>,
     result_tree_fragments: HashMap<u64, SourceNode>,
@@ -647,6 +688,18 @@ struct TemporaryStrings {
     reserved_owned_bytes: usize,
 }
 
+pub(crate) struct DynamicVariableRequests {
+    pub(crate) names: HashSet<ExpandedName>,
+    index_bytes: usize,
+    payload_bytes: usize,
+}
+
+impl DynamicVariableRequests {
+    pub(crate) fn release(self, meter: &mut Meter) {
+        meter.release_owned_bytes(self.index_bytes.saturating_add(self.payload_bytes));
+    }
+}
+
 impl TemporaryStrings {
     fn release(self, meter: &mut Meter) {
         meter.release_owned_bytes(self.reserved_owned_bytes);
@@ -654,6 +707,14 @@ impl TemporaryStrings {
 }
 
 impl Evaluator {
+    pub(crate) fn take_dynamic_variable_requests(&mut self) -> DynamicVariableRequests {
+        DynamicVariableRequests {
+            names: std::mem::take(&mut self.pending_dynamic_variables),
+            index_bytes: std::mem::take(&mut self.pending_dynamic_variable_index_bytes),
+            payload_bytes: std::mem::take(&mut self.pending_dynamic_variable_payload_bytes),
+        }
+    }
+
     pub(crate) fn new<R: Resolver + 'static>(
         prepared_source: PreparedEvaluatorSource,
         principal_stylesheet: &Document,
@@ -708,12 +769,14 @@ impl Evaluator {
         };
         let mut document_root_entries = HashMap::new();
         let mut documents = HashMap::new();
+        let mut document_cache_index_bytes = DocumentCacheIndexBytes::default();
         seed_document_cache(
             principal_request,
             stylesheet_root,
             &maps,
             &mut documents,
             &mut document_root_entries,
+            &mut document_cache_index_bytes,
             meter,
         )?;
         let source_root = source.root();
@@ -728,6 +791,7 @@ impl Evaluator {
             &maps,
             &mut documents,
             &mut document_root_entries,
+            &mut document_cache_index_bytes,
             meter,
         )?;
         for (uri, root) in module_roots {
@@ -742,11 +806,12 @@ impl Evaluator {
                 &maps,
                 &mut documents,
                 &mut document_root_entries,
+                &mut document_cache_index_bytes,
                 meter,
             )?;
         }
         let document_roots = Rc::new(RefCell::new(document_root_entries));
-        let pending_document_requests = Rc::new(RefCell::new(HashSet::new()));
+        let pending_document_requests = Rc::new(RefCell::new(PendingDocumentRequests::default()));
         Ok(Self {
             source,
             package,
@@ -762,8 +827,12 @@ impl Evaluator {
             stylesheet_functions: Arc::new(HashSet::new()),
             resolver,
             documents,
+            document_cache_index_bytes,
             document_roots,
             pending_document_requests,
+            pending_dynamic_variables: HashSet::new(),
+            pending_dynamic_variable_index_bytes: 0,
+            pending_dynamic_variable_payload_bytes: 0,
             resource_identities,
             resource_documents: HashMap::new(),
             result_tree_fragments: HashMap::new(),
@@ -876,7 +945,6 @@ impl Evaluator {
         custom_calls: Option<&CustomCallSession>,
     ) -> Result<XPathValue> {
         loop {
-            self.pending_document_requests.borrow_mut().clear();
             if let Some(custom_calls) = custom_calls {
                 custom_calls.begin_attempt();
             }
@@ -908,16 +976,16 @@ impl Evaluator {
                         custom_calls,
                     )?
                 };
-                let requested = self
-                    .pending_document_requests
-                    .borrow_mut()
-                    .drain()
-                    .collect::<Vec<_>>();
-                if requested.is_empty() {
+                let requested = std::mem::take(&mut *self.pending_document_requests.borrow_mut());
+                if requested.items.is_empty() {
                     return Ok(Some(value));
                 }
+                let requested_owned_bytes = requested.retained_owned_bytes();
+                meter.charge(BudgetKind::OwnedBytes, requested_owned_bytes)?;
                 let prepared_count = self.documents.len();
-                self.prepare_document_requests(requested, augmented, meter)?;
+                let prepared = self.prepare_document_requests(requested.items, augmented, meter);
+                meter.release_owned_bytes(requested_owned_bytes);
+                prepared?;
                 if self.documents.len() == prepared_count {
                     return Err(Error::Dynamic(
                         "document() resolution made no progress".into(),
@@ -928,6 +996,9 @@ impl Evaluator {
             let reserved_owned_bytes = prepared.reserved_owned_bytes();
             drop(prepared);
             meter.release_owned_bytes(reserved_owned_bytes);
+            if outcome.is_err() {
+                *self.pending_document_requests.borrow_mut() = PendingDocumentRequests::default();
+            }
             if let Some(value) = outcome? {
                 return Ok(value);
             }
@@ -1166,10 +1237,32 @@ impl Evaluator {
             return Ok(());
         }
         charge_document_cache_keys(&request, meter)?;
-        let roots = nodes
-            .iter()
-            .filter_map(|node| self.maps.forward.get(node).cloned())
-            .collect();
+        reserve_retained_hash_map_slot(
+            &mut self.documents,
+            meter,
+            &mut self.document_cache_index_bytes.documents,
+        )?;
+        reserve_retained_hash_map_slot(
+            &mut self.document_roots.borrow_mut(),
+            meter,
+            &mut self.document_cache_index_bytes.roots,
+        )?;
+        meter.charge(
+            BudgetKind::OwnedBytes,
+            nodes
+                .capacity()
+                .saturating_mul(std::mem::size_of::<SourceNode>()),
+        )?;
+        let mut roots = Vec::new();
+        let mut roots_index_bytes = 0;
+        for node in &nodes {
+            let Some(path) = self.maps.forward.get(node) else {
+                continue;
+            };
+            reserve_temporary_vec_slot(&mut roots, meter, &mut roots_index_bytes)?;
+            meter.charge(BudgetKind::OwnedBytes, path.owned_bytes())?;
+            roots.push(path.clone());
+        }
         self.document_roots
             .borrow_mut()
             .insert(request.clone(), roots);
@@ -1493,8 +1586,30 @@ impl Evaluator {
                     let result = if dynamic_source.is_empty() {
                         Ok(Value::NodeSet(Vec::new()))
                     } else {
+                        let dynamic_expression = expression.derived(dynamic_source);
+                        for name in dynamic_expression.variable_references.iter() {
+                            if augmented.get(name).is_some()
+                                || self.pending_dynamic_variables.contains(name)
+                            {
+                                continue;
+                            }
+                            let payload_bytes = expanded_name_owned_bytes(name);
+                            meter.charge(BudgetKind::OwnedBytes, payload_bytes)?;
+                            if let Err(error) = reserve_retained_hash_set_slot(
+                                &mut self.pending_dynamic_variables,
+                                meter,
+                                &mut self.pending_dynamic_variable_index_bytes,
+                            ) {
+                                meter.release_owned_bytes(payload_bytes);
+                                return Err(error);
+                            }
+                            self.pending_dynamic_variables.insert(name.clone());
+                            self.pending_dynamic_variable_payload_bytes = self
+                                .pending_dynamic_variable_payload_bytes
+                                .saturating_add(payload_bytes);
+                        }
                         match self.evaluate_dynamic(
-                            &expression.derived(dynamic_source),
+                            &dynamic_expression,
                             node,
                             position,
                             size,
@@ -2090,7 +2205,7 @@ impl Evaluator {
 
     fn prepare_document_requests(
         &mut self,
-        requested: Vec<DocumentRequest>,
+        requested: HashSet<DocumentRequest>,
         variables: &dyn VariableBindings,
         meter: &mut Meter,
     ) -> Result<()> {
@@ -6253,7 +6368,7 @@ impl function::Function for UnparsedEntityUriFunction {
 
 struct DocumentFunction {
     roots: Rc<RefCell<HashMap<DocumentRequest, Vec<NodePath>>>>,
-    pending: Rc<RefCell<HashSet<DocumentRequest>>>,
+    pending: Rc<RefCell<PendingDocumentRequests>>,
     node_base_uris: Rc<RefCell<HashMap<NodePath, Option<String>>>>,
     static_base_uri: Option<String>,
 }
@@ -7220,8 +7335,24 @@ impl function::Function for DocumentFunction {
         let mut process = |request: DocumentRequest| -> std::result::Result<(), function::Error> {
             let Some(paths) = roots.get(&request) else {
                 let mut pending = self.pending.borrow_mut();
-                if !pending.contains(&request) {
-                    pending.insert(request);
+                if !pending.items.contains(&request) {
+                    let capacity = pending.items.capacity();
+                    let next_capacity = if pending.items.len() < capacity {
+                        capacity
+                    } else if capacity == 0 {
+                        3
+                    } else {
+                        capacity.saturating_mul(2).saturating_add(1)
+                    };
+                    let index_growth = retained_hash_storage::<DocumentRequest>(next_capacity)
+                        .saturating_sub(retained_hash_storage::<DocumentRequest>(capacity));
+                    context.reserve_temporary_allocation(
+                        index_growth.saturating_add(request.payload_owned_bytes()),
+                    )?;
+                    pending.payload_bytes = pending
+                        .payload_bytes
+                        .saturating_add(request.payload_owned_bytes());
+                    pending.items.insert(request);
                 }
                 return Ok(());
             };
@@ -8874,7 +9005,7 @@ mod tests {
 
         let document_function = DocumentFunction {
             roots: Rc::new(RefCell::new(HashMap::new())),
-            pending: Rc::new(RefCell::new(HashSet::new())),
+            pending: Rc::new(RefCell::new(PendingDocumentRequests::default())),
             node_base_uris: Rc::new(RefCell::new(HashMap::new())),
             static_base_uri: None,
         };
@@ -9420,7 +9551,7 @@ mod tests {
         let base_uri = "memory:base/".repeat(32);
         let function = DocumentFunction {
             roots: Rc::new(RefCell::new(HashMap::new())),
-            pending: Rc::new(RefCell::new(HashSet::new())),
+            pending: Rc::new(RefCell::new(PendingDocumentRequests::default())),
             node_base_uris: Rc::new(RefCell::new(HashMap::from([(
                 path,
                 Some(base_uri.clone()),

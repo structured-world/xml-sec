@@ -1,3 +1,6 @@
+use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, Hash};
+
 use crate::{Error, Result};
 
 pub(crate) const ENTITY_EXPANSION_DEPTH_CEILING: usize = 10;
@@ -286,7 +289,7 @@ pub(crate) fn reserve_temporary_vec_slot<T>(
     let actual_bytes = replacement
         .capacity()
         .saturating_mul(std::mem::size_of::<T>());
-    reconcile_temporary_vec_growth(meter, requested_bytes, actual_bytes)?;
+    reconcile_replacement_growth(meter, requested_bytes, actual_bytes)?;
 
     replacement.append(items);
     std::mem::swap(items, &mut replacement);
@@ -301,7 +304,7 @@ pub(crate) fn reserve_temporary_vec_slot<T>(
     Ok(())
 }
 
-fn reconcile_temporary_vec_growth(
+fn reconcile_replacement_growth(
     meter: &mut Meter,
     requested_bytes: usize,
     actual_bytes: usize,
@@ -314,8 +317,91 @@ fn reconcile_temporary_vec_growth(
             meter.release_owned_bytes(requested_bytes);
             return Err(error);
         }
-        meter.charge(BudgetKind::OwnedBytes, shortfall)?;
+        let charged_before_shortfall = meter.owned_bytes;
+        if let Err(error) = meter.charge(BudgetKind::OwnedBytes, shortfall) {
+            meter.owned_bytes = charged_before_shortfall;
+            meter.release_owned_bytes(requested_bytes);
+            return Err(error);
+        }
     }
+    Ok(())
+}
+
+pub(crate) fn retained_hash_storage<T>(capacity: usize) -> usize {
+    capacity
+        .saturating_mul(std::mem::size_of::<T>())
+        .saturating_mul(2)
+}
+
+pub(crate) fn reserve_retained_hash_set_slot<T, S>(
+    items: &mut HashSet<T, S>,
+    meter: &mut Meter,
+    reserved_owned_bytes: &mut usize,
+) -> Result<()>
+where
+    T: Eq + Hash,
+    S: BuildHasher + Clone,
+{
+    if items.len() < items.capacity() {
+        return Ok(());
+    }
+    let old_capacity = items.capacity();
+    let target_capacity = old_capacity.saturating_add(old_capacity.max(4));
+    let requested_bytes = retained_hash_storage::<T>(target_capacity);
+    meter.charge(BudgetKind::OwnedBytes, requested_bytes)?;
+    let mut replacement = HashSet::with_hasher(items.hasher().clone());
+    if let Err(error) = replacement.try_reserve(target_capacity) {
+        meter.release_owned_bytes(requested_bytes);
+        return Err(Error::Dynamic(format!(
+            "failed to reserve retained hash-set storage: {error}"
+        )));
+    }
+    let actual_bytes = retained_hash_storage::<T>(replacement.capacity());
+    reconcile_replacement_growth(meter, requested_bytes, actual_bytes)?;
+    replacement.extend(items.drain());
+    std::mem::swap(items, &mut replacement);
+    let old_bytes = retained_hash_storage::<T>(replacement.capacity());
+    *reserved_owned_bytes = reserved_owned_bytes
+        .checked_sub(old_bytes)
+        .expect("retained hash-set capacity was previously charged")
+        .saturating_add(actual_bytes);
+    meter.release_owned_bytes(old_bytes);
+    Ok(())
+}
+
+pub(crate) fn reserve_retained_hash_map_slot<K, V, S>(
+    items: &mut HashMap<K, V, S>,
+    meter: &mut Meter,
+    reserved_owned_bytes: &mut usize,
+) -> Result<()>
+where
+    K: Eq + Hash,
+    S: BuildHasher + Clone,
+{
+    if items.len() < items.capacity() {
+        return Ok(());
+    }
+    let old_capacity = items.capacity();
+    let target_capacity = old_capacity.saturating_add(old_capacity.max(4));
+    let requested_bytes = retained_hash_storage::<(K, V)>(target_capacity);
+    meter.charge(BudgetKind::OwnedBytes, requested_bytes)?;
+    let mut replacement = HashMap::with_hasher(items.hasher().clone());
+    if let Err(error) = replacement.try_reserve(target_capacity) {
+        meter.release_owned_bytes(requested_bytes);
+        return Err(Error::Dynamic(format!(
+            "failed to reserve retained hash-map storage: {error}"
+        )));
+    }
+    let actual_bytes = retained_hash_storage::<(K, V)>(replacement.capacity());
+    reconcile_replacement_growth(meter, requested_bytes, actual_bytes)?;
+    replacement.extend(items.drain());
+    std::mem::swap(items, &mut replacement);
+    let old_bytes = retained_hash_storage::<(K, V)>(replacement.capacity());
+    *reserved_owned_bytes = reserved_owned_bytes
+        .checked_sub(old_bytes)
+        .expect("retained hash-map capacity was previously charged")
+        .saturating_add(actual_bytes);
+    meter.release_owned_bytes(old_bytes);
     Ok(())
 }
 
@@ -374,7 +460,7 @@ mod tests {
             .charge(BudgetKind::OwnedBytes, 8)
             .expect("requested growth fits");
         assert!(matches!(
-            reconcile_temporary_vec_growth(&mut meter, 8, 12),
+            reconcile_replacement_growth(&mut meter, 8, 12),
             Err(Error::Budget {
                 kind: BudgetKind::OwnedBytes,
                 limit: 10,
@@ -390,6 +476,34 @@ mod tests {
         meter
             .charge(BudgetKind::OwnedBytes, 10)
             .expect("failed replacement leaves the original allowance available");
+    }
+
+    #[test]
+    fn overflowing_replacement_shortfall_releases_the_provisional_charge() {
+        // check_additional saturates at usize::MAX, while charge detects the arithmetic overflow.
+        // The replacement's provisional reservation must still be released on that error path.
+        let mut meter = Meter::new(execution_budget(usize::MAX), 0).expect("meter initializes");
+        meter
+            .charge(BudgetKind::OwnedBytes, usize::MAX - 2)
+            .expect("baseline fits");
+        meter
+            .charge(BudgetKind::OwnedBytes, 1)
+            .expect("provisional replacement charge fits");
+
+        assert!(matches!(
+            reconcile_replacement_growth(&mut meter, 1, 3),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                limit: usize::MAX,
+                actual: usize::MAX,
+            })
+        ));
+        assert_eq!(
+            meter
+                .usage(BudgetKind::OwnedBytes)
+                .expect("owned-byte usage is available"),
+            (usize::MAX - 2, usize::MAX)
+        );
     }
 
     #[test]

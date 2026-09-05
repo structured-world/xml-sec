@@ -661,10 +661,12 @@ pub struct Stylesheet {
     pub(crate) principal_base_uri: Option<String>,
     pub(crate) module_documents: Arc<[(String, Document)]>,
     pub(crate) templates: Arc<[Template]>,
+    pub(crate) named_template_index: Arc<HashMap<ExpandedName, usize>>,
     pub(crate) globals: Arc<[GlobalVariable]>,
     pub(crate) output: OutputDefinition,
     pub(crate) whitespace: Arc<[(NameTest, bool, usize, usize)]>,
     pub(crate) keys: Arc<[KeyDeclaration]>,
+    pub(crate) key_name_indices: Arc<[usize]>,
     pub(crate) decimal_formats: Arc<[DecimalFormat]>,
     pub(crate) namespace_aliases: Arc<[NamespaceAlias]>,
     pub(crate) namespace_alias_index: Arc<HashMap<Arc<str>, usize>>,
@@ -1756,6 +1758,63 @@ impl CompileState {
         drop(named);
         self.release_owned(named_workspace);
         named_result?;
+        let named_index_bytes = self.templates.iter().fold(0usize, |total, template| {
+            total.saturating_add(template.name.as_ref().map_or(0, |name| {
+                hash_entry_storage::<ExpandedName, usize>()
+                    .saturating_add(name.local.len())
+                    .saturating_add(name.namespace.as_ref().map_or(0, String::len))
+            }))
+        });
+        self.charge_owned(named_index_bytes)?;
+        let mut named_template_index: HashMap<ExpandedName, usize> =
+            HashMap::with_capacity(named_count);
+        for (index, template) in self.templates.iter().enumerate() {
+            let Some(name) = &template.name else {
+                continue;
+            };
+            match named_template_index.entry(name.clone()) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let selected = &self.templates[*entry.get()];
+                    if (template.precedence, template.order) > (selected.precedence, selected.order)
+                    {
+                        entry.insert(index);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(index);
+                }
+            }
+        }
+        let actual_named_index_bytes = named_template_index.iter().fold(
+            named_template_index
+                .len()
+                .saturating_mul(hash_entry_storage::<ExpandedName, usize>()),
+            |total, (name, _)| {
+                total
+                    .saturating_add(name.local.len())
+                    .saturating_add(name.namespace.as_ref().map_or(0, String::len))
+            },
+        );
+        self.release_owned(named_index_bytes.saturating_sub(actual_named_index_bytes));
+        let key_name_workspace = self
+            .keys
+            .len()
+            .saturating_mul(hash_entry_storage::<&ExpandedName, ()>());
+        let key_name_index_upper = self.keys.len().saturating_mul(std::mem::size_of::<usize>());
+        self.charge_owned(key_name_workspace.saturating_add(key_name_index_upper))?;
+        let mut key_names = HashSet::with_capacity(self.keys.len());
+        let key_name_indices = self
+            .keys
+            .iter()
+            .enumerate()
+            .filter_map(|(index, declaration)| key_names.insert(&declaration.name).then_some(index))
+            .collect::<Vec<_>>();
+        drop(key_names);
+        self.release_owned(key_name_workspace);
+        let key_name_index_bytes = key_name_indices
+            .capacity()
+            .saturating_mul(std::mem::size_of::<usize>());
+        self.release_owned(key_name_index_upper.saturating_sub(key_name_index_bytes));
         let global_validation_workspace = self
             .globals
             .len()
@@ -1840,10 +1899,12 @@ impl CompileState {
             principal_base_uri: None,
             module_documents: self.module_documents.into_iter().collect::<Vec<_>>().into(),
             templates: self.templates.into(),
+            named_template_index: Arc::new(named_template_index),
             globals: self.globals.into(),
             output: self.output,
             whitespace: self.whitespace.into(),
             keys: self.keys.into(),
+            key_name_indices: key_name_indices.into(),
             decimal_formats: self.decimal_formats.into(),
             namespace_aliases: self.namespace_aliases.into(),
             namespace_alias_index: Arc::new(namespace_alias_index),
@@ -3951,6 +4012,42 @@ mod tests {
         assert!(Arc::ptr_eq(
             &stylesheet.function_names,
             &cloned.function_names
+        ));
+    }
+
+    #[test]
+    fn compiled_stylesheets_index_unique_keys_and_named_templates() {
+        // Runtime dispatch must borrow declarations from immutable compiled state instead of
+        // rebuilding owned name collections for every key() or xsl:call-template invocation.
+        let stylesheet = Compiler::new(
+            Arc::new(crate::NoResolver),
+            CompileBudget::new(1 << 20, 0, 32, 1 << 20),
+        )
+        .compile(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:key name="a" match="a" use="."/><xsl:key name="a" match="b" use="."/><xsl:key name="b" match="b" use="."/><xsl:template name="target"/><xsl:template match="/"/></xsl:stylesheet>"#,
+            None,
+        )
+        .expect("indexed stylesheet compiles");
+        let cloned = stylesheet.clone();
+
+        assert_eq!(stylesheet.key_name_indices.as_ref(), &[0, 2]);
+        let target = ExpandedName::new(None::<String>, "target");
+        assert_eq!(
+            stylesheet.templates[*stylesheet
+                .named_template_index
+                .get(&target)
+                .expect("named template is indexed")]
+            .name
+            .as_ref(),
+            Some(&target)
+        );
+        assert!(Arc::ptr_eq(
+            &stylesheet.named_template_index,
+            &cloned.named_template_index
+        ));
+        assert!(Arc::ptr_eq(
+            &stylesheet.key_name_indices,
+            &cloned.key_name_indices
         ));
     }
 

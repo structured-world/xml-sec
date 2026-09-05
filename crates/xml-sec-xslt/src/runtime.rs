@@ -9,7 +9,10 @@ use icu_collator::preferences::CollationCaseFirst;
 use icu_collator::{Collator, CollatorBorrowed, CollatorPreferences, options::CollatorOptions};
 use icu_locale::Locale;
 
-use crate::budget::{EXECUTION_RECURSION_DEPTH_CEILING, Meter, reserve_temporary_vec_slot};
+use crate::budget::{
+    EXECUTION_RECURSION_DEPTH_CEILING, Meter, reserve_retained_hash_set_slot,
+    reserve_temporary_vec_slot,
+};
 use crate::compiler::{
     AttributeValueTemplate, AvtPart, Expression, ExsltFunction, Instruction, InstructionSequence,
     NameTest, NamespaceAlias, Sort, Stylesheet, Template, Variable,
@@ -350,8 +353,20 @@ struct Execution<'a> {
     built_keys: HashSet<(ExpandedName, NodeId)>,
     building_keys: HashSet<(ExpandedName, NodeId)>,
     attribute_insert_position: Option<usize>,
-    attribute_protected_names: Option<HashSet<ExpandedName>>,
+    attribute_protected_names: Option<ProtectedAttributeNames>,
     result_is_temporary: bool,
+}
+
+struct ProtectedAttributeNames {
+    fingerprints: HashSet<u64>,
+    protected_count: usize,
+    index_bytes: usize,
+}
+
+impl ProtectedAttributeNames {
+    fn release(self, meter: &mut Meter) {
+        meter.release_owned_bytes(self.index_bytes);
+    }
 }
 
 #[derive(Default)]
@@ -418,7 +433,7 @@ struct ResultTreeState {
     document: Document,
     output_stack: Vec<NodeId>,
     attribute_insert_position: Option<usize>,
-    attribute_protected_names: Option<HashSet<ExpandedName>>,
+    attribute_protected_names: Option<ProtectedAttributeNames>,
     was_temporary: bool,
 }
 
@@ -636,23 +651,21 @@ impl<'a> Execution<'a> {
         namespaces: &[(String, String)],
         context: &SourceNode,
     ) -> Result<()> {
-        let requested = literal_key_names(source, namespaces)?.unwrap_or_else(|| {
-            self.stylesheet
-                .keys
-                .iter()
-                .map(|declaration| declaration.name.clone())
-                .collect()
-        });
-        if requested.is_empty() {
-            return Ok(());
-        }
         let logical_root = self
             .evaluator
             .source
             .logical_root_for(context)
             .ok_or_else(|| Error::Dynamic("key() context has no logical document".into()))?;
-        for name in requested {
-            self.build_key(&name, logical_root)?;
+        if let Some(requested) = literal_key_names(source, namespaces)? {
+            for name in requested {
+                self.build_key(&name, logical_root)?;
+            }
+        } else {
+            let keys = Arc::clone(&self.stylesheet.keys);
+            let indices = Arc::clone(&self.stylesheet.key_name_indices);
+            for index in indices.iter().copied() {
+                self.build_key(&keys[index].name, logical_root)?;
+            }
         }
         Ok(())
     }
@@ -662,17 +675,20 @@ impl<'a> Execution<'a> {
         source: &str,
         namespaces: &[(String, String)],
     ) -> Result<()> {
-        let requested = literal_key_names(source, namespaces)?.unwrap_or_else(|| {
-            self.stylesheet
-                .keys
-                .iter()
-                .map(|declaration| declaration.name.clone())
-                .collect()
-        });
         let roots = self.evaluator.source.logical_roots().to_vec();
-        for root in roots {
-            for name in &requested {
-                self.build_key(name, root)?;
+        if let Some(requested) = literal_key_names(source, namespaces)? {
+            for root in roots {
+                for name in &requested {
+                    self.build_key(name, root)?;
+                }
+            }
+        } else {
+            let keys = Arc::clone(&self.stylesheet.keys);
+            let indices = Arc::clone(&self.stylesheet.key_name_indices);
+            for root in roots {
+                for index in indices.iter().copied() {
+                    self.build_key(&keys[index].name, root)?;
+                }
             }
         }
         Ok(())
@@ -1247,7 +1263,7 @@ impl<'a> Execution<'a> {
                                     &attribute.name,
                                     attribute.prefix.as_deref(),
                                 );
-                                self.add_attribute(Attribute {
+                                self.add_literal_attribute(Attribute {
                                     name,
                                     prefix,
                                     value,
@@ -1711,7 +1727,7 @@ impl<'a> Execution<'a> {
                     let value = self.evaluate_avt(&attribute.value, node, position, size)?;
                     let (name, prefix) =
                         self.alias_attribute_name(&attribute.name, attribute.prefix.as_deref());
-                    self.add_attribute(Attribute {
+                    self.add_literal_attribute(Attribute {
                         name,
                         prefix,
                         value,
@@ -2399,7 +2415,7 @@ impl<'a> Execution<'a> {
         if let Some(value) = self.evaluate_rtf_order(expression, node)? {
             return Ok(XPathValue::Number(value));
         }
-        let (variables, reserved_owned_bytes) = self.variables()?;
+        let (mut variables, mut reserved_owned_bytes) = self.variables()?;
         let custom_calls = CustomCallSession::default();
         loop {
             if uses_key {
@@ -2418,6 +2434,30 @@ impl<'a> Execution<'a> {
                 &mut self.meter,
                 Some(&custom_calls),
             );
+            let dynamic_variables = self.evaluator.take_dynamic_variable_requests();
+            if dynamic_variables
+                .names
+                .iter()
+                .any(|name| self.pending_globals.contains_key(name))
+            {
+                self.meter.release_owned_bytes(reserved_owned_bytes);
+                drop(variables);
+                let mut initialized = Ok(());
+                for name in &dynamic_variables.names {
+                    if self.pending_globals.contains_key(name)
+                        && let Err(error) = self.ensure_global(name)
+                    {
+                        initialized = Err(error);
+                        break;
+                    }
+                }
+                dynamic_variables.release(&mut self.meter);
+                initialized?;
+                (variables, reserved_owned_bytes) = self.variables()?;
+                self.meter.charge(BudgetKind::XPathEvaluations, 1)?;
+                continue;
+            }
+            dynamic_variables.release(&mut self.meter);
             if uses_key && self.evaluator.source.logical_roots().len() != document_count {
                 // document() can import a logical document while evaluating the expression.
                 // XSLT 1.0 section 12.2 defines key() relative to the dynamic context document,
@@ -3023,10 +3063,9 @@ impl<'a> Execution<'a> {
         self.meter.charge(BudgetKind::TemplateApplications, 1)?;
         let template = self
             .stylesheet
-            .templates
-            .iter()
-            .filter(|template| template.name.as_ref() == Some(name))
-            .max_by_key(|template| (template.precedence, template.order))
+            .named_template_index
+            .get(name)
+            .map(|index| &self.stylesheet.templates[*index])
             .ok_or_else(|| Error::Dynamic(format!("named template {} not found", name.local)))?;
         self.execute_template(
             template,
@@ -3538,14 +3577,21 @@ impl<'a> Execution<'a> {
         // `order` is unique, so unstable sorting preserves the complete XSLT declaration order
         // without allocating the merge buffer used by stable slice sorting.
         sets.sort_unstable_by_key(|set| (std::cmp::Reverse(set.precedence), set.order));
-        let previous_protected = self.attribute_protected_names.take();
+        let mut previous_protected = self.attribute_protected_names.take();
+        let mut outer_protected = None;
         let result = (|| {
             let mut cursor = 0;
             while cursor < sets.len() {
                 let precedence = sets[cursor].precedence;
                 if cursor == 0 {
-                    self.attribute_protected_names = previous_protected.clone();
+                    self.attribute_protected_names = previous_protected.take();
                 } else {
+                    let retired = self.attribute_protected_names.take();
+                    if outer_protected.is_none() {
+                        outer_protected = retired;
+                    } else if let Some(retired) = retired {
+                        retired.release(&mut self.meter);
+                    }
                     self.attribute_protected_names = Some(self.current_attribute_names()?);
                 }
                 while cursor < sets.len() && sets[cursor].precedence == precedence {
@@ -3576,7 +3622,15 @@ impl<'a> Execution<'a> {
             }
             Ok(())
         })();
-        self.attribute_protected_names = previous_protected;
+        let active_protection = self.attribute_protected_names.take();
+        if let Some(outer) = outer_protected {
+            if let Some(active_protection) = active_protection {
+                active_protection.release(&mut self.meter);
+            }
+            self.attribute_protected_names = Some(outer);
+        } else {
+            self.attribute_protected_names = active_protection;
+        }
         drop(sets);
         self.meter.release_owned_bytes(sets_reservation);
         result?;
@@ -3690,39 +3744,50 @@ impl<'a> Execution<'a> {
     }
 
     fn add_attribute(&mut self, attribute: Attribute) -> Result<()> {
-        self.add_attribute_with_position(attribute, AttributePosition::Back)
+        self.add_attribute_with_position(attribute, AttributePosition::Back, false)
+    }
+
+    fn add_literal_attribute(&mut self, attribute: Attribute) -> Result<()> {
+        self.add_attribute_with_position(attribute, AttributePosition::Back, true)
     }
 
     fn add_attribute_with_position(
         &mut self,
         mut attribute: Attribute,
         position: AttributePosition,
+        element_base_includes_attribute: bool,
     ) -> Result<()> {
         let parent = self.parent();
         let protected = self
             .attribute_protected_names
             .as_ref()
-            .is_some_and(|protected| protected.contains(&attribute.name));
-        if protected
-            && self.result.node(parent).is_some_and(|node| {
-                matches!(
-                    &node.kind,
-                    NodeKind::Element { attributes, .. }
-                        if attributes.iter().any(|existing| existing.name == attribute.name)
-                )
-            })
-        {
+            .is_some_and(|protected| {
+                let fingerprint = protected.fingerprints.hasher().hash_one(&attribute.name);
+                protected.fingerprints.contains(&fingerprint)
+                    && self.result.node(parent).is_some_and(|node| {
+                        matches!(
+                            &node.kind,
+                            NodeKind::Element { attributes, .. }
+                                if attributes[..protected.protected_count]
+                                    .iter()
+                                    .any(|existing| existing.name == attribute.name)
+                        )
+                    })
+            });
+        if protected {
             return Ok(());
         }
         const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
-        let effective_base = if attribute.name.namespace.as_deref() == Some(XML_NS)
+        let effective_base = if !element_base_includes_attribute
+            && attribute.name.namespace.as_deref() == Some(XML_NS)
             && attribute.name.local == "base"
         {
+            // XSLT 1.0 section 3.2 assigns the result node its creating instruction's base URI;
+            // xml:base refines that preassigned URI, not the result parent's URI.
+            // https://www.w3.org/TR/1999/REC-xslt-19991116#base-uri
             let inherited = self
                 .result
                 .node(parent)
-                .and_then(|node| node.parent)
-                .and_then(|parent| self.result.node(parent))
                 .and_then(|node| node.base_uri.as_deref());
             Some(crate::resolver::resolve_uri_reference(
                 inherited,
@@ -3811,7 +3876,7 @@ impl<'a> Execution<'a> {
         Ok(attributes.len())
     }
 
-    fn current_attribute_names(&self) -> Result<HashSet<ExpandedName>> {
+    fn current_attribute_names(&mut self) -> Result<ProtectedAttributeNames> {
         let node = self
             .result
             .node(self.parent())
@@ -3821,10 +3886,19 @@ impl<'a> Execution<'a> {
                 "attribute requires an element result".into(),
             ));
         };
-        Ok(attributes
-            .iter()
-            .map(|attribute| attribute.name.clone())
-            .collect())
+        let protected_count = attributes.len();
+        let mut fingerprints = HashSet::new();
+        let mut index_bytes = 0;
+        for attribute in attributes {
+            let fingerprint = fingerprints.hasher().hash_one(&attribute.name);
+            reserve_retained_hash_set_slot(&mut fingerprints, &mut self.meter, &mut index_bytes)?;
+            fingerprints.insert(fingerprint);
+        }
+        Ok(ProtectedAttributeNames {
+            fingerprints,
+            protected_count,
+            index_bytes,
+        })
     }
     fn add_namespace(&mut self, mut namespace: Namespace) -> Result<()> {
         let node = self
@@ -4879,52 +4953,6 @@ fn reserve_retained_vec_slot<T>(items: &mut Vec<T>, meter: &mut Meter) -> Result
     reserve_temporary_vec_slot(items, meter, &mut reserved_owned_bytes)
 }
 
-fn reserve_retained_hash_set_slot<T>(
-    items: &mut HashSet<T>,
-    meter: &mut Meter,
-    reserved_owned_bytes: &mut usize,
-) -> Result<()>
-where
-    T: Eq + std::hash::Hash,
-{
-    if items.len() < items.capacity() {
-        return Ok(());
-    }
-    let old_capacity = items.capacity();
-    let requested_slots = old_capacity.max(4);
-    let slot_bytes = std::mem::size_of::<T>().saturating_mul(2);
-    let target_capacity = old_capacity.saturating_add(requested_slots);
-    let requested_bytes = target_capacity.saturating_mul(slot_bytes);
-    meter.charge(BudgetKind::OwnedBytes, requested_bytes)?;
-    let mut replacement = HashSet::with_hasher(items.hasher().clone());
-    if let Err(error) = replacement.try_reserve(target_capacity) {
-        meter.release_owned_bytes(requested_bytes);
-        return Err(Error::Dynamic(format!(
-            "failed to reserve retained URI index storage: {error}"
-        )));
-    }
-    let actual_bytes = replacement.capacity().saturating_mul(slot_bytes);
-    if actual_bytes < requested_bytes {
-        meter.release_owned_bytes(requested_bytes - actual_bytes);
-    } else if actual_bytes > requested_bytes {
-        let shortfall = actual_bytes - requested_bytes;
-        if let Err(error) = meter.check_additional(BudgetKind::OwnedBytes, shortfall) {
-            meter.release_owned_bytes(requested_bytes);
-            return Err(error);
-        }
-        meter.charge(BudgetKind::OwnedBytes, shortfall)?;
-    }
-    replacement.extend(items.drain());
-    std::mem::swap(items, &mut replacement);
-    let old_bytes = replacement.capacity().saturating_mul(slot_bytes);
-    *reserved_owned_bytes = reserved_owned_bytes
-        .checked_sub(old_bytes)
-        .expect("retained hash-set capacity was previously charged")
-        .saturating_add(actual_bytes);
-    meter.release_owned_bytes(old_bytes);
-    Ok(())
-}
-
 fn collect_metered_strings(
     nodes: &[SourceNode],
     evaluator: &Evaluator,
@@ -5261,7 +5289,7 @@ struct NumberFormatTokens<'a> {
     suffix: &'a str,
 }
 
-fn expanded_name_owned_bytes(name: &ExpandedName) -> usize {
+pub(crate) fn expanded_name_owned_bytes(name: &ExpandedName) -> usize {
     name.namespace
         .as_ref()
         .map_or(0, String::len)

@@ -414,6 +414,45 @@ fn result_tree_fragments_preserve_binding_and_xml_base_uris() {
 }
 
 #[test]
+fn literal_xml_base_resolves_from_the_creating_instruction() {
+    // XSLT 1.0 section 3.2 assigns a result node the base URI of the stylesheet node that
+    // created it; a relative xml:base refines that URI rather than the result-tree parent.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#base-uri
+    let stylesheet = Compiler::new(
+        Arc::new(NoResolver),
+        CompileBudget::new(1 << 20, 16, 256, 4 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><out xml:base="sub/"/></xsl:template></xsl:stylesheet>"#,
+        Some("https://example.test/styles/main.xsl"),
+    )
+    .expect("stylesheet compiles");
+    let result = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("transform succeeds");
+    let element = result
+        .document
+        .node(result.document.root())
+        .and_then(|root| root.children.first())
+        .and_then(|id| result.document.node(*id))
+        .expect("literal result element exists");
+
+    assert_eq!(
+        element.base_uri.as_deref(),
+        Some("https://example.test/styles/sub/")
+    );
+}
+
+#[test]
 fn constructed_elements_preserve_their_instruction_base_uri() {
     // XSLT 1.0 section 3.2 assigns a node the base URI of the stylesheet instruction that
     // creates it, even when an imported template writes into a caller-owned temporary tree.
@@ -6410,6 +6449,16 @@ fn retained_dynamic_xpath_expressions_consume_owned_memory_budget() {
             ..
         })
     ));
+}
+
+#[test]
+fn dynamic_evaluate_can_reference_a_later_global() {
+    // XSLT 1.0 section 11.4 makes every top-level binding visible regardless of declaration
+    // order; generated XPath receives the same variable context as its call site.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#top-level-variables
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:dyn="http://exslt.org/dynamic"><xsl:output method="text"/><xsl:variable name="early" select="dyn:evaluate('$later')"/><xsl:variable name="later" select="'visible'"/><xsl:template match="/"><xsl:value-of select="$early"/></xsl:template></xsl:stylesheet>"#;
+
+    assert_eq!(execute(stylesheet, "<source/>"), "visible");
 }
 
 #[test]
