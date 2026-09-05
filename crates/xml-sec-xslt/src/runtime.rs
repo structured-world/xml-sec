@@ -96,7 +96,7 @@ pub struct TransformResult {
 /// One secondary result produced by a compatible XSLT extension element.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecondaryOutput {
-    pub uri: String,
+    pub uri: Arc<String>,
     pub serialized: SerializedOutput,
 }
 
@@ -341,6 +341,8 @@ struct Execution<'a> {
     meter: Meter,
     messages: Vec<Message>,
     secondary_outputs: Vec<SecondaryOutput>,
+    secondary_output_uris: HashSet<Arc<String>>,
+    secondary_output_uri_index_bytes: usize,
     modes: Vec<Option<ExpandedName>>,
     function_results: Vec<Option<Value>>,
     function_depth: usize,
@@ -483,6 +485,28 @@ struct TemplateProgram {
     body: InstructionSequence,
 }
 
+#[derive(Default)]
+struct TemplateTaskStack {
+    items: Vec<TemplateTask>,
+    reserved_owned_bytes: usize,
+}
+
+impl TemplateTaskStack {
+    fn push(&mut self, task: TemplateTask, meter: &mut Meter) -> Result<()> {
+        reserve_temporary_vec_slot(&mut self.items, meter, &mut self.reserved_owned_bytes)?;
+        self.items.push(task);
+        Ok(())
+    }
+
+    fn pop(&mut self) -> Option<TemplateTask> {
+        self.items.pop()
+    }
+
+    fn release(self, meter: &mut Meter) {
+        meter.release_owned_bytes(self.reserved_owned_bytes);
+    }
+}
+
 impl TemplateTask {
     fn enter_template(
         template: &Template,
@@ -505,23 +529,27 @@ impl TemplateTask {
 }
 
 fn push_scoped_sequence(
-    tasks: &mut Vec<TemplateTask>,
+    tasks: &mut TemplateTaskStack,
+    meter: &mut Meter,
     instructions: InstructionSequence,
     node: SourceNode,
     frame: ApplyFrame,
     precedence: Option<usize>,
-) {
-    tasks.push(TemplateTask::PopScope);
-    tasks.push(TemplateTask::Sequence {
-        instructions,
-        index: 0,
-        node,
-        position: frame.position,
-        size: frame.size,
-        depth: frame.depth,
-        precedence,
-    });
-    tasks.push(TemplateTask::PushScope);
+) -> Result<()> {
+    tasks.push(TemplateTask::PopScope, meter)?;
+    tasks.push(
+        TemplateTask::Sequence {
+            instructions,
+            index: 0,
+            node,
+            position: frame.position,
+            size: frame.size,
+            depth: frame.depth,
+            precedence,
+        },
+        meter,
+    )?;
+    tasks.push(TemplateTask::PushScope, meter)
 }
 
 impl ApplyFrame {
@@ -571,6 +599,8 @@ impl<'a> Execution<'a> {
             meter,
             messages: vec![],
             secondary_outputs: vec![],
+            secondary_output_uris: HashSet::new(),
+            secondary_output_uri_index_bytes: 0,
             modes: vec![None],
             function_results: vec![],
             function_depth: 0,
@@ -925,12 +955,12 @@ impl<'a> Execution<'a> {
         params: Arc<EvaluatedParameters>,
         frame: ApplyFrame,
     ) -> Result<()> {
-        self.run_template_tasks(vec![TemplateTask::ApplyOne {
+        self.run_template_tasks(TemplateTask::ApplyOne {
             node,
             mode: mode.cloned(),
             params,
             frame,
-        }])
+        })
     }
 
     fn execute_template(
@@ -941,16 +971,25 @@ impl<'a> Execution<'a> {
         frame: ApplyFrame,
         current_rule_precedence: Option<usize>,
     ) -> Result<()> {
-        self.run_template_tasks(vec![TemplateTask::enter_template(
+        self.run_template_tasks(TemplateTask::enter_template(
             template,
             params,
             node,
             frame,
             current_rule_precedence,
-        )])
+        ))
     }
 
-    fn run_template_tasks(&mut self, mut tasks: Vec<TemplateTask>) -> Result<()> {
+    fn run_template_tasks(&mut self, initial: TemplateTask) -> Result<()> {
+        let mut tasks = TemplateTaskStack::default();
+        let result = tasks
+            .push(initial, &mut self.meter)
+            .and_then(|()| self.run_template_task_stack(&mut tasks));
+        tasks.release(&mut self.meter);
+        result
+    }
+
+    fn run_template_task_stack(&mut self, tasks: &mut TemplateTaskStack) -> Result<()> {
         while let Some(task) = tasks.pop() {
             match task {
                 TemplateTask::EnterTemplate {
@@ -960,7 +999,7 @@ impl<'a> Execution<'a> {
                     frame,
                     current_rule_precedence,
                 } => self.push_template_tasks(
-                    &mut tasks,
+                    tasks,
                     program,
                     params,
                     node,
@@ -972,7 +1011,7 @@ impl<'a> Execution<'a> {
                     mode,
                     params,
                     frame,
-                } => self.push_apply_one_tasks(&mut tasks, node, mode, params, frame)?,
+                } => self.push_apply_one_tasks(tasks, node, mode, params, frame)?,
                 TemplateTask::ApplyBatch {
                     nodes,
                     next,
@@ -988,20 +1027,26 @@ impl<'a> Execution<'a> {
                     };
                     let total = nodes.len();
                     let selected_mode = mode.clone();
-                    tasks.push(TemplateTask::ApplyBatch {
-                        nodes,
-                        next: next + 1,
-                        mode,
-                        params: Arc::clone(&params),
-                        depth,
-                        reserved_owned_bytes,
-                    });
-                    tasks.push(TemplateTask::ApplyOne {
-                        node: selected,
-                        mode: selected_mode,
-                        params,
-                        frame: ApplyFrame::new(next + 1, total, depth),
-                    });
+                    tasks.push(
+                        TemplateTask::ApplyBatch {
+                            nodes,
+                            next: next + 1,
+                            mode,
+                            params: Arc::clone(&params),
+                            depth,
+                            reserved_owned_bytes,
+                        },
+                        &mut self.meter,
+                    )?;
+                    tasks.push(
+                        TemplateTask::ApplyOne {
+                            node: selected,
+                            mode: selected_mode,
+                            params,
+                            frame: ApplyFrame::new(next + 1, total, depth),
+                        },
+                        &mut self.meter,
+                    )?;
                 }
                 TemplateTask::ForEachBatch {
                     nodes,
@@ -1015,20 +1060,24 @@ impl<'a> Execution<'a> {
                         continue;
                     };
                     let total = nodes.len();
-                    tasks.push(TemplateTask::ForEachBatch {
-                        nodes,
-                        next: next + 1,
-                        body: Arc::clone(&body),
-                        depth,
-                        reserved_owned_bytes,
-                    });
+                    tasks.push(
+                        TemplateTask::ForEachBatch {
+                            nodes,
+                            next: next + 1,
+                            body: Arc::clone(&body),
+                            depth,
+                            reserved_owned_bytes,
+                        },
+                        &mut self.meter,
+                    )?;
                     push_scoped_sequence(
-                        &mut tasks,
+                        tasks,
+                        &mut self.meter,
                         body,
                         selected,
                         ApplyFrame::new(next + 1, total, depth),
                         None,
-                    );
+                    )?;
                 }
                 TemplateTask::RestoreScopes(caller_scopes) => {
                     self.pop_scope();
@@ -1057,15 +1106,18 @@ impl<'a> Execution<'a> {
                     let Some(instruction) = instructions.get(index) else {
                         continue;
                     };
-                    tasks.push(TemplateTask::Sequence {
-                        instructions: instructions.clone(),
-                        index: index + 1,
-                        node: node.clone(),
-                        position,
-                        size,
-                        depth,
-                        precedence,
-                    });
+                    tasks.push(
+                        TemplateTask::Sequence {
+                            instructions: instructions.clone(),
+                            index: index + 1,
+                            node: node.clone(),
+                            position,
+                            size,
+                            depth,
+                            precedence,
+                        },
+                        &mut self.meter,
+                    )?;
                     match instruction {
                         Instruction::CallTemplate { name, parameters } => {
                             self.meter.charge(BudgetKind::TemplateApplications, 1)?;
@@ -1084,13 +1136,16 @@ impl<'a> Execution<'a> {
                                         name.local
                                     ))
                                 })?;
-                            tasks.push(TemplateTask::enter_template(
-                                target,
-                                Arc::new(supplied),
-                                node,
-                                ApplyFrame::new(position, size, depth + 1),
-                                precedence,
-                            ));
+                            tasks.push(
+                                TemplateTask::enter_template(
+                                    target,
+                                    Arc::new(supplied),
+                                    node,
+                                    ApplyFrame::new(position, size, depth + 1),
+                                    precedence,
+                                ),
+                                &mut self.meter,
+                            )?;
                         }
                         Instruction::ApplyTemplates {
                             select,
@@ -1103,13 +1158,7 @@ impl<'a> Execution<'a> {
                             let supplied = Arc::new(self.evaluate_with_params(
                                 parameters, &node, position, size, depth, precedence,
                             )?);
-                            self.push_apply_batch(
-                                &mut tasks,
-                                nodes,
-                                mode.clone(),
-                                supplied,
-                                depth + 1,
-                            )?;
+                            self.push_apply_batch(tasks, nodes, mode.clone(), supplied, depth + 1)?;
                         }
                         Instruction::ApplyImports => {
                             let current_rule_precedence = precedence.ok_or_else(|| {
@@ -1117,17 +1166,20 @@ impl<'a> Execution<'a> {
                                     "xsl:apply-imports requires a current template rule".into(),
                                 )
                             })?;
-                            tasks.push(TemplateTask::ApplyOne {
-                                node,
-                                mode: self.modes.last().cloned().flatten(),
-                                params: Arc::new(EvaluatedParameters::default()),
-                                frame: ApplyFrame {
-                                    max_precedence: Some(current_rule_precedence),
-                                    position,
-                                    size,
-                                    depth: depth + 1,
+                            tasks.push(
+                                TemplateTask::ApplyOne {
+                                    node,
+                                    mode: self.modes.last().cloned().flatten(),
+                                    params: Arc::new(EvaluatedParameters::default()),
+                                    frame: ApplyFrame {
+                                        max_precedence: Some(current_rule_precedence),
+                                        position,
+                                        size,
+                                        depth: depth + 1,
+                                    },
                                 },
-                            });
+                                &mut self.meter,
+                            )?;
                         }
                         Instruction::LiteralElement {
                             base_uri,
@@ -1186,14 +1238,15 @@ impl<'a> Execution<'a> {
                                     value,
                                 })?;
                             }
-                            tasks.push(TemplateTask::PopOutput);
+                            tasks.push(TemplateTask::PopOutput, &mut self.meter)?;
                             push_scoped_sequence(
-                                &mut tasks,
+                                tasks,
+                                &mut self.meter,
                                 Arc::clone(children),
                                 node,
                                 ApplyFrame::new(position, size, depth + 1),
                                 precedence,
-                            );
+                            )?;
                         }
                         Instruction::Copy {
                             base_uri,
@@ -1229,22 +1282,24 @@ impl<'a> Execution<'a> {
                                                 &mut Vec::new(),
                                             )?;
                                         }
-                                        tasks.push(TemplateTask::PopOutput);
+                                        tasks.push(TemplateTask::PopOutput, &mut self.meter)?;
                                         push_scoped_sequence(
-                                            &mut tasks,
+                                            tasks,
+                                            &mut self.meter,
                                             Arc::clone(body),
                                             node,
                                             ApplyFrame::new(position, size, depth + 1),
                                             precedence,
-                                        );
+                                        )?;
                                     }
                                     NodeKind::Root => push_scoped_sequence(
-                                        &mut tasks,
+                                        tasks,
+                                        &mut self.meter,
                                         Arc::clone(body),
                                         node,
                                         ApplyFrame::new(position, size, depth + 1),
                                         precedence,
-                                    ),
+                                    )?,
                                     NodeKind::Text { value, .. } => {
                                         self.append_text(&value, false)?
                                     }
@@ -1273,22 +1328,18 @@ impl<'a> Execution<'a> {
                         } => {
                             let mut nodes = self.select_nodes(select, &node, position, size)?;
                             self.sort_nodes(&mut nodes, sorts, &node, position, size)?;
-                            self.push_for_each_batch(
-                                &mut tasks,
-                                nodes,
-                                Arc::clone(body),
-                                depth + 1,
-                            )?;
+                            self.push_for_each_batch(tasks, nodes, Arc::clone(body), depth + 1)?;
                         }
                         Instruction::If { test, body } => {
                             if self.evaluate(test, &node, position, size)?.boolean() {
                                 push_scoped_sequence(
-                                    &mut tasks,
+                                    tasks,
+                                    &mut self.meter,
                                     Arc::clone(body),
                                     node,
                                     ApplyFrame::new(position, size, depth + 1),
                                     precedence,
-                                );
+                                )?;
                             }
                         }
                         Instruction::Choose {
@@ -1303,12 +1354,13 @@ impl<'a> Execution<'a> {
                                 }
                             }
                             push_scoped_sequence(
-                                &mut tasks,
+                                tasks,
+                                &mut self.meter,
                                 Arc::clone(selected),
                                 node,
                                 ApplyFrame::new(position, size, depth + 1),
                                 precedence,
-                            );
+                            )?;
                         }
                         Instruction::ExtensionFallback {
                             name,
@@ -1321,12 +1373,13 @@ impl<'a> Execution<'a> {
                                 )));
                             }
                             push_scoped_sequence(
-                                &mut tasks,
+                                tasks,
+                                &mut self.meter,
                                 Arc::clone(body),
                                 node,
                                 ApplyFrame::new(position, size, depth + 1),
                                 precedence,
-                            );
+                            )?;
                         }
                         instruction => self.execute_instruction(
                             instruction,
@@ -1345,7 +1398,7 @@ impl<'a> Execution<'a> {
 
     fn push_apply_one_tasks(
         &mut self,
-        tasks: &mut Vec<TemplateTask>,
+        tasks: &mut TemplateTaskStack,
         node: SourceNode,
         mode: Option<ExpandedName>,
         params: Arc<EvaluatedParameters>,
@@ -1382,15 +1435,18 @@ impl<'a> Execution<'a> {
         }
         if let Some(template) = selected {
             self.modes.push(mode);
-            tasks.push(TemplateTask::RestoreMode);
+            tasks.push(TemplateTask::RestoreMode, &mut self.meter)?;
             let current_rule_precedence = Some(template.precedence);
-            tasks.push(TemplateTask::enter_template(
-                template,
-                params,
-                node,
-                frame,
-                current_rule_precedence,
-            ));
+            tasks.push(
+                TemplateTask::enter_template(
+                    template,
+                    params,
+                    node,
+                    frame,
+                    current_rule_precedence,
+                ),
+                &mut self.meter,
+            )?;
             return Ok(());
         }
         self.release_parameters_if_last(&params);
@@ -1420,7 +1476,7 @@ impl<'a> Execution<'a> {
 
     fn push_apply_batch(
         &mut self,
-        tasks: &mut Vec<TemplateTask>,
+        tasks: &mut TemplateTaskStack,
         nodes: Vec<SourceNode>,
         mode: Option<ExpandedName>,
         params: Arc<EvaluatedParameters>,
@@ -1441,20 +1497,22 @@ impl<'a> Execution<'a> {
         let reserved_owned_bytes = node_bytes.saturating_add(mode_bytes);
         self.meter
             .charge(BudgetKind::OwnedBytes, reserved_owned_bytes)?;
-        tasks.push(TemplateTask::ApplyBatch {
-            nodes,
-            next: 0,
-            mode,
-            params,
-            depth,
-            reserved_owned_bytes,
-        });
-        Ok(())
+        tasks.push(
+            TemplateTask::ApplyBatch {
+                nodes,
+                next: 0,
+                mode,
+                params,
+                depth,
+                reserved_owned_bytes,
+            },
+            &mut self.meter,
+        )
     }
 
     fn push_for_each_batch(
         &mut self,
-        tasks: &mut Vec<TemplateTask>,
+        tasks: &mut TemplateTaskStack,
         nodes: Vec<SourceNode>,
         body: InstructionSequence,
         depth: usize,
@@ -1467,19 +1525,21 @@ impl<'a> Execution<'a> {
             .saturating_mul(std::mem::size_of::<SourceNode>());
         self.meter
             .charge(BudgetKind::OwnedBytes, reserved_owned_bytes)?;
-        tasks.push(TemplateTask::ForEachBatch {
-            nodes,
-            next: 0,
-            body,
-            depth,
-            reserved_owned_bytes,
-        });
-        Ok(())
+        tasks.push(
+            TemplateTask::ForEachBatch {
+                nodes,
+                next: 0,
+                body,
+                depth,
+                reserved_owned_bytes,
+            },
+            &mut self.meter,
+        )
     }
 
     fn push_template_tasks(
         &mut self,
-        tasks: &mut Vec<TemplateTask>,
+        tasks: &mut TemplateTaskStack,
         program: TemplateProgram,
         params: Arc<EvaluatedParameters>,
         node: SourceNode,
@@ -1527,17 +1587,19 @@ impl<'a> Execution<'a> {
                 );
         }
         self.release_parameters_if_last(&params);
-        tasks.push(TemplateTask::RestoreScopes(caller_scopes));
-        tasks.push(TemplateTask::Sequence {
-            instructions: program.body,
-            index: 0,
-            node,
-            position,
-            size,
-            depth,
-            precedence: current_rule_precedence,
-        });
-        Ok(())
+        tasks.push(TemplateTask::RestoreScopes(caller_scopes), &mut self.meter)?;
+        tasks.push(
+            TemplateTask::Sequence {
+                instructions: program.body,
+                index: 0,
+                node,
+                position,
+                size,
+                depth,
+                precedence: current_rule_precedence,
+            },
+            &mut self.meter,
+        )
     }
 
     fn execute_sequence(
@@ -2152,16 +2214,23 @@ impl<'a> Execution<'a> {
                         "secondary-output URI must not be empty".into(),
                     ));
                 }
-                if self
-                    .secondary_outputs
-                    .iter()
-                    .any(|output| output.uri == uri)
-                {
+                if self.secondary_output_uris.contains(&uri) {
                     return Err(Error::Dynamic(format!(
                         "secondary-output URI {uri:?} was produced more than once"
                     )));
                 }
-                self.meter.charge(BudgetKind::OwnedBytes, uri.len())?;
+                let uri_owned_bytes = uri.capacity().saturating_add(
+                    std::mem::size_of::<String>()
+                        .saturating_add(2usize.saturating_mul(std::mem::size_of::<usize>())),
+                );
+                self.meter.charge(BudgetKind::OwnedBytes, uri_owned_bytes)?;
+                reserve_retained_hash_set_slot(
+                    &mut self.secondary_output_uris,
+                    &mut self.meter,
+                    &mut self.secondary_output_uri_index_bytes,
+                )?;
+                let uri = Arc::new(uri);
+                self.secondary_output_uris.insert(Arc::clone(&uri));
                 let definition_owned_bytes = self.stylesheet.output.owned_bytes();
                 self.meter
                     .charge(BudgetKind::OwnedBytes, definition_owned_bytes)?;
@@ -4812,6 +4881,41 @@ fn reserve_retained_vec_slot<T>(items: &mut Vec<T>, meter: &mut Meter) -> Result
     Ok(())
 }
 
+fn reserve_retained_hash_set_slot<T>(
+    items: &mut HashSet<T>,
+    meter: &mut Meter,
+    reserved_owned_bytes: &mut usize,
+) -> Result<()>
+where
+    T: Eq + std::hash::Hash,
+{
+    if items.len() < items.capacity() {
+        return Ok(());
+    }
+    let old_capacity = items.capacity();
+    let requested_slots = old_capacity.max(4);
+    let slot_bytes = std::mem::size_of::<T>().saturating_mul(2);
+    let requested_bytes = requested_slots.saturating_mul(slot_bytes);
+    meter.charge(BudgetKind::OwnedBytes, requested_bytes)?;
+    if let Err(error) = items.try_reserve(requested_slots) {
+        meter.release_owned_bytes(requested_bytes);
+        return Err(Error::Dynamic(format!(
+            "failed to reserve retained URI index storage: {error}"
+        )));
+    }
+    let actual_bytes = items
+        .capacity()
+        .saturating_sub(old_capacity)
+        .saturating_mul(slot_bytes);
+    if actual_bytes < requested_bytes {
+        meter.release_owned_bytes(requested_bytes - actual_bytes);
+    } else if actual_bytes > requested_bytes {
+        meter.charge(BudgetKind::OwnedBytes, actual_bytes - requested_bytes)?;
+    }
+    *reserved_owned_bytes = reserved_owned_bytes.saturating_add(actual_bytes);
+    Ok(())
+}
+
 fn collect_metered_strings(
     nodes: &[SourceNode],
     evaluator: &Evaluator,
@@ -5956,15 +6060,29 @@ mod tests {
             )
             .expect("stylesheet compiles")
         };
-        let payload = "x".repeat(4_096);
-        let source =
-            Document::parse(&format!("<root>{payload}</root>"), None).expect("source parses");
         let literal = compile("");
         let avt = compile("{/root}");
-
-        let literal_minimum = minimum_execution_owned_bytes(&literal, &source);
-        let avt_minimum = minimum_execution_owned_bytes(&avt, &source);
-        assert!(avt_minimum >= literal_minimum.saturating_add(payload.len() * 2));
+        let minimum_delta = |payload_bytes: usize| {
+            let payload = "x".repeat(payload_bytes);
+            let source =
+                Document::parse(&format!("<root>{payload}</root>"), None).expect("source parses");
+            minimum_execution_owned_bytes(&avt, &source)
+                .saturating_sub(minimum_execution_owned_bytes(&literal, &source))
+        };
+        let small_payload_bytes = 256;
+        let large_payload_bytes = 64 * 1_024;
+        let small_delta = minimum_delta(small_payload_bytes);
+        let large_delta = minimum_delta(large_payload_bytes);
+        // Compare the marginal slope because the two execution paths have different fixed-size
+        // task layouts and allocator buckets. A slope near 2 still proves both payload-sized
+        // allocations are live; one missing charge would cap it near 1.
+        assert!(
+            large_delta.saturating_sub(small_delta) * 10
+                >= large_payload_bytes
+                    .saturating_sub(small_payload_bytes)
+                    .saturating_mul(19),
+            "small_delta={small_delta}, large_delta={large_delta}"
+        );
     }
 
     #[test]

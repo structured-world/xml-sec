@@ -448,6 +448,12 @@ partial_eq_impl!(nodeset::Nodeset<'d>, Value::Nodeset(ref v) => v);
 pub struct XPath(Box<dyn expression::Expression + 'static>);
 
 impl XPath {
+    /// Returns the maximum evaluator call depth represented by this compiled expression.
+    #[must_use]
+    pub fn ast_depth(&self) -> usize {
+        self.0.ast_depth()
+    }
+
     /// Evaluate this expression in the given context.
     ///
     /// # Examples

@@ -591,7 +591,12 @@ impl<R: Resolver> Compiler<R> {
                 state.keys.push(KeyDeclaration {
                     name: required_qname_attr(node, "name")?,
                     match_pattern: Pattern::new(match_pattern, node)?,
-                    use_expression: Expression::new(use_expression, node, base_uri)?,
+                    use_expression: Expression::new(
+                        use_expression,
+                        node,
+                        base_uri,
+                        state.budget.recursion_depth,
+                    )?,
                 });
             }
             "decimal-format" => {
@@ -920,8 +925,15 @@ impl Expression {
         source: &str,
         node: roxmltree::Node<'_, '_>,
         static_base_uri: Option<&str>,
+        max_depth: usize,
     ) -> Result<Self> {
-        Self::new_with_namespaces(source, node, Arc::new(namespaces(node)), static_base_uri)
+        Self::new_with_namespaces(
+            source,
+            node,
+            Arc::new(namespaces(node)),
+            static_base_uri,
+            max_depth,
+        )
     }
 
     fn new_with_namespaces(
@@ -929,15 +941,17 @@ impl Expression {
         node: roxmltree::Node<'_, '_>,
         namespaces: Arc<Vec<(String, String)>>,
         static_base_uri: Option<&str>,
+        max_depth: usize,
     ) -> Result<Self> {
         validate_xpath_prefixes(source, &namespaces)?;
         let normalized = normalize_xpath_for_sxd(source);
         let normalized = crate::xpath::rewrite_absolute_paths_for_validation(&normalized);
-        sxd_xpath_no_unsafe::Factory::new()
+        let parsed = sxd_xpath_no_unsafe::Factory::new()
             .build(&normalized)
             .map_err(|error| {
                 Error::Static(format!("invalid XPath expression `{source}`: {error}"))
             })?;
+        ensure(BudgetKind::RecursionDepth, max_depth, parsed.ast_depth())?;
         Ok(Self::from_parts(
             source.to_owned(),
             namespaces,
@@ -2206,7 +2220,13 @@ impl CompileContext {
                 *snapshot = Some((node.id(), Arc::downgrade(&namespaces)));
                 namespaces
             });
-        Expression::new_with_namespaces(source, node, namespaces, self.static_base_uri.as_deref())
+        Expression::new_with_namespaces(
+            source,
+            node,
+            namespaces,
+            self.static_base_uri.as_deref(),
+            self.max_depth,
+        )
     }
 
     fn with_literal_version(mut self, node: roxmltree::Node<'_, '_>) -> Result<Self> {

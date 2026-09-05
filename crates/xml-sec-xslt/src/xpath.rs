@@ -645,11 +645,22 @@ impl Evaluator {
         } = prepared_source;
         let mut source = document;
         reserve_stylesheet_imports(principal_stylesheet, module_documents, meter)?;
-        let stylesheet_root = source.import(principal_stylesheet);
-        let module_roots = module_documents
-            .iter()
-            .map(|(uri, document)| (uri.clone(), source.import(document)))
-            .collect::<Vec<_>>();
+        let stylesheet_root = import_stylesheet_document(
+            &mut source,
+            principal_stylesheet,
+            &source_options.whitespace,
+            meter,
+        )?;
+        let mut module_roots = Vec::with_capacity(module_documents.len());
+        for (uri, document) in module_documents {
+            let root = import_stylesheet_document(
+                &mut source,
+                document,
+                &source_options.whitespace,
+                meter,
+            )?;
+            module_roots.push((uri.clone(), root));
+        }
         let package = project_semantic_document(&source, meter)?;
         let maps = NodeMaps::new(&source, meter)?;
         let mut id_index = Vec::new();
@@ -2928,6 +2939,28 @@ fn reserve_stylesheet_imports(
     meter.charge(BudgetKind::OwnedBytes, clone_bytes)
 }
 
+fn import_stylesheet_document(
+    target: &mut Document,
+    source: &Document,
+    whitespace: &[(NameTest, bool, usize, usize)],
+    meter: &mut Meter,
+) -> Result<NodeId> {
+    // XSLT 1.0 sections 3.4 and 12.1 make stylesheet documents addressed by document('')
+    // source trees, so whitespace stripping precedes every other use of those imported trees.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#strip
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#document
+    let clone_bytes = source.estimated_clone_bytes();
+    meter.charge(BudgetKind::OwnedBytes, clone_bytes)?;
+    let mut prepared = source.clone();
+    if let Some((_, remap_owned_bytes)) = apply_whitespace_rules(&mut prepared, whitespace, meter)?
+    {
+        meter.release_owned_bytes(remap_owned_bytes);
+    }
+    let root = target.import(&prepared);
+    meter.release_owned_bytes(clone_bytes);
+    Ok(root)
+}
+
 fn terminal_pattern_node_test(branch: &str) -> &str {
     let branch = branch.trim();
     let mut quote = None;
@@ -4094,7 +4127,8 @@ fn resolve_xinclude(
     };
     if parse == "text" {
         let encoding = encoding.or(resource.encoding.as_deref());
-        let value = decode_xinclude_resource(&resource, encoding, meter, false)?;
+        let mut value = decode_xinclude_resource(&resource, encoding, meter, false)?;
+        normalize_xinclude_text_line_endings(&mut value, meter).map_err(XIncludeFailure::Fatal)?;
         // XInclude 1.0 section 4.3 makes every character forbidden in XML documents a fatal
         // error, even after successful decoding: https://www.w3.org/TR/xinclude/#text_included
         if let Some(character) = value
@@ -4215,6 +4249,46 @@ fn resolve_xinclude(
             Err(XIncludeFailure::Fatal(error))
         }
     }
+}
+
+fn normalize_xinclude_text_line_endings(
+    value: &mut MeteredDecodedResource,
+    meter: &mut Meter,
+) -> Result<()> {
+    if !value.value.as_bytes().contains(&b'\r') {
+        return Ok(());
+    }
+
+    let requested = value.value.len();
+    meter.check_additional(BudgetKind::OwnedBytes, requested)?;
+    let mut normalized = String::new();
+    normalized.try_reserve_exact(requested).map_err(|error| {
+        Error::Dynamic(format!(
+            "failed to reserve XInclude line-normalization storage: {error}"
+        ))
+    })?;
+    meter.charge(BudgetKind::OwnedBytes, normalized.capacity())?;
+
+    let mut characters = value.value.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\r' {
+            if characters.peek() == Some(&'\n') {
+                characters.next();
+            }
+            normalized.push('\n');
+        } else {
+            normalized.push(character);
+        }
+    }
+
+    let old_capacity = value.value.capacity();
+    value.temporary_bytes = value
+        .temporary_bytes
+        .saturating_sub(old_capacity)
+        .saturating_add(normalized.capacity());
+    value.value = normalized;
+    meter.release_owned_bytes(old_capacity);
+    Ok(())
 }
 
 fn parse_external_document_metered(

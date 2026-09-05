@@ -54,6 +54,10 @@ fn value_into_ordered_nodes<'c, 'd>(
 
 pub trait Expression: fmt::Debug {
     fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error>;
+
+    fn ast_depth(&self) -> usize {
+        1
+    }
 }
 
 impl<T: ?Sized> Expression for Box<T>
@@ -62,6 +66,10 @@ where
 {
     fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
         (**self).evaluate(context)
+    }
+
+    fn ast_depth(&self) -> usize {
+        (**self).ast_depth()
     }
 }
 
@@ -78,6 +86,10 @@ macro_rules! binary_constructor(
     );
 );
 
+fn binary_ast_depth(left: &SubExpression, right: &SubExpression) -> usize {
+    1usize.saturating_add(left.ast_depth().max(right.ast_depth()))
+}
+
 #[derive(Debug)]
 pub struct And {
     pub left: SubExpression,
@@ -91,6 +103,10 @@ impl Expression for And {
         let left = self.left.evaluate(context)?.boolean();
         let v = left && self.right.evaluate(context)?.boolean();
         Ok(Boolean(v))
+    }
+
+    fn ast_depth(&self) -> usize {
+        binary_ast_depth(&self.left, &self.right)
     }
 }
 
@@ -128,6 +144,10 @@ impl Expression for Equal {
     fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
         self.boolean_evaluate(context).map(Boolean)
     }
+
+    fn ast_depth(&self) -> usize {
+        binary_ast_depth(&self.left, &self.right)
+    }
 }
 
 #[derive(Debug)]
@@ -148,6 +168,10 @@ impl Expression for NotEqual {
         let left = self.left.evaluate(context)?;
         let right = self.right.evaluate(context)?;
         compare_equality_values(context, &left, &right, Equality::NotEqual).map(Boolean)
+    }
+
+    fn ast_depth(&self) -> usize {
+        binary_ast_depth(&self.left, &self.right)
     }
 }
 
@@ -290,6 +314,16 @@ impl Expression for Function {
                 fun.evaluate(context, args).context(FunctionEvaluation)
             })
     }
+
+    fn ast_depth(&self) -> usize {
+        1usize.saturating_add(
+            self.arguments
+                .iter()
+                .map(|argument| argument.ast_depth())
+                .max()
+                .unwrap_or(0),
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -382,6 +416,10 @@ impl Expression for Math {
         let right = right.number(context).context(FunctionEvaluation)?;
         Ok(Number(op(left, right)))
     }
+
+    fn ast_depth(&self) -> usize {
+        binary_ast_depth(&self.left, &self.right)
+    }
 }
 
 impl fmt::Debug for Math {
@@ -407,6 +445,10 @@ impl Expression for Negation {
             .map(|number| Number(-number))
             .context(FunctionEvaluation)
     }
+
+    fn ast_depth(&self) -> usize {
+        1usize.saturating_add(self.expression.ast_depth())
+    }
 }
 
 #[derive(Debug)]
@@ -422,6 +464,10 @@ impl Expression for Or {
         let left = self.left.evaluate(context)?.boolean();
         let v = left || self.right.evaluate(context)?.boolean();
         Ok(Boolean(v))
+    }
+
+    fn ast_depth(&self) -> usize {
+        binary_ast_depth(&self.left, &self.right)
     }
 }
 
@@ -448,6 +494,18 @@ impl Expression for Path {
         }
 
         Ok(Value::Nodeset(result))
+    }
+
+    fn ast_depth(&self) -> usize {
+        1usize.saturating_add(
+            self.start_point.ast_depth().max(
+                self.steps
+                    .iter()
+                    .map(ParameterizedStep::ast_depth)
+                    .max()
+                    .unwrap_or(0),
+            ),
+        )
     }
 }
 
@@ -477,6 +535,14 @@ impl Expression for Filter {
             .and_then(|value| value_into_ordered_nodes(context, value))
             .and_then(|nodes| self.predicate.select(context, nodes))
             .map(|nodes| Value::Nodeset(nodes.into()))
+    }
+
+    fn ast_depth(&self) -> usize {
+        1usize.saturating_add(
+            self.node_selector
+                .ast_depth()
+                .max(self.predicate.expression.ast_depth()),
+        )
     }
 }
 
@@ -540,6 +606,10 @@ impl Expression for Relational {
         let op = self.operation;
         let result = compare_relational_values(context, &left_val, &right_val, op)?;
         Ok(Boolean(result))
+    }
+
+    fn ast_depth(&self) -> usize {
+        binary_ast_depth(&self.left, &self.right)
     }
 }
 
@@ -741,6 +811,14 @@ where
 
         Ok(unique)
     }
+
+    fn ast_depth(&self) -> usize {
+        self.predicates
+            .iter()
+            .map(|predicate| predicate.expression.ast_depth())
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 #[derive(Debug)]
@@ -760,6 +838,10 @@ impl Expression for Union {
 
         left_nodes.extend(right_nodes);
         Ok(Value::Nodeset(left_nodes))
+    }
+
+    fn ast_depth(&self) -> usize {
+        binary_ast_depth(&self.left, &self.right)
     }
 }
 

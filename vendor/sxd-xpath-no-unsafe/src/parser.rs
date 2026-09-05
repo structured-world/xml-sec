@@ -142,6 +142,7 @@ impl LeftAssociativeBinaryParser {
             None => return Ok(None),
             Some(x) => x,
         };
+        let mut left_depth = left.ast_depth();
 
         while source.has_more_tokens() {
             let mut found = false;
@@ -152,7 +153,11 @@ impl LeftAssociativeBinaryParser {
 
                     let right = child_parse(source)?.context(RightHandSideExpressionMissing)?;
 
+                    let next_depth = 1usize.saturating_add(left_depth.max(right.ast_depth()));
+                    ensure!(next_depth <= MAX_EXPRESSION_NESTING, NestingLimit);
+
                     left = (rule.builder)(left, right);
+                    left_depth = next_depth;
 
                     found = true;
                     break;
@@ -494,9 +499,16 @@ impl Parser {
             Some(expr) => {
                 let predicates = self.parse_predicates(source)?;
 
-                Ok(Some(predicates.into_iter().fold(expr, |expr, pred| {
-                    expression::Filter::new(expr, pred)
-                })))
+                let mut expression = expr;
+                let mut expression_depth = expression.ast_depth();
+                for predicate in predicates {
+                    let next_depth =
+                        1usize.saturating_add(expression_depth.max(predicate.ast_depth()));
+                    ensure!(next_depth <= MAX_EXPRESSION_NESTING, NestingLimit);
+                    expression = expression::Filter::new(expression, predicate);
+                    expression_depth = next_depth;
+                }
+                Ok(Some(expression))
             }
             None => Ok(None),
         }

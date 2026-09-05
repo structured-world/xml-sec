@@ -3074,7 +3074,7 @@ fn included_module_document_is_retained_for_document_empty_uri() {
             Ok(ResolvedResource {
                 canonical_uri: "memory:module.xsl".into(),
                 identity: ResourceIdentity("module".into()),
-                bytes: br#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:meta="urn:metadata"><meta:marker>module</meta:marker><xsl:template name="read"><xsl:value-of select="document('')/*/meta:marker"/></xsl:template></xsl:stylesheet>"#.to_vec(),
+                bytes: br#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:meta="urn:metadata"><meta:marker>  <meta:item/>  </meta:marker><xsl:template name="read"><xsl:value-of select="count(document('')/*/meta:marker/text())"/></xsl:template></xsl:stylesheet>"#.to_vec(),
                 media_type: Some("application/xslt+xml".into()),
                 encoding: Some("UTF-8".into()),
             })
@@ -3086,7 +3086,7 @@ fn included_module_document_is_retained_for_document_empty_uri() {
         CompileBudget::new(1 << 20, 8, 256, 4 << 20),
     )
     .compile(
-        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:include href="module.xsl"/><xsl:template match="/"><xsl:call-template name="read"/></xsl:template></xsl:stylesheet>"#,
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:strip-space elements="*"/><xsl:output method="text"/><xsl:include href="module.xsl"/><xsl:template match="/"><xsl:call-template name="read"/></xsl:template></xsl:stylesheet>"#,
         Some("memory:main.xsl"),
     )
     .expect("stylesheet graph compiles");
@@ -3103,8 +3103,30 @@ fn included_module_document_is_retained_for_document_empty_uri() {
             },
         )
         .expect("retained module document resolves without runtime I/O");
-    assert_eq!(output.serialized.bytes, b"module");
+    assert_eq!(output.serialized.bytes, b"0");
     assert!(resolver.calls.lock().expect("calls lock").is_empty());
+}
+
+#[test]
+fn principal_stylesheet_document_obeys_whitespace_rules() {
+    // XSLT 1.0 sections 3.4 and 12.1 make the stylesheet tree returned by document('') a source
+    // tree, so the effective strip-space rules apply before XPath can inspect it.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:meta="urn:metadata"><xsl:strip-space elements="*"/><meta:marker>  <meta:item/>  </meta:marker><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(document('')/*/meta:marker/text())"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let result = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("stylesheet document transforms");
+    assert_eq!(result.serialized.bytes, b"0");
 }
 
 #[test]
@@ -4055,6 +4077,51 @@ fn recursion_and_output_budgets_gate_work_before_growth() {
             ..
         })
     ));
+}
+
+#[test]
+fn flat_xpath_ast_obeys_the_compile_recursion_budget() {
+    // Left-associative grammar loops must not create a deeper evaluator tree than the caller
+    // allowed merely because the source expression contains no nested parentheses.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:value-of select="1+1+1+1+1+1+1+1+1"/></xsl:template></xsl:stylesheet>"#;
+    assert!(matches!(
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 8, 64 * 1024),
+        )
+        .compile(stylesheet, None),
+        Err(Error::Budget {
+            kind: BudgetKind::RecursionDepth,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn template_task_stack_growth_consumes_owned_bytes() {
+    // An iterative evaluator still retains caller continuations. A deep named-template chain must
+    // therefore require more peak owned storage than one leaf template.
+    let templates = (0..64)
+        .map(|index| {
+            if index == 63 {
+                format!(r#"<xsl:template name="t{index}"/>"#)
+            } else {
+                format!(
+                    r#"<xsl:template name="t{index}"><xsl:call-template name="t{}"/></xsl:template>"#,
+                    index + 1
+                )
+            }
+        })
+        .collect::<String>();
+    let stylesheet = compile(&format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template name="leaf"/>{templates}</xsl:stylesheet>"#
+    ));
+    let leaf = minimum_execution_owned_bytes(&stylesheet, "leaf");
+    let chained = minimum_execution_owned_bytes(&stylesheet, "t0");
+    assert!(
+        chained > leaf + 1024,
+        "task continuations must be metered: leaf={leaf}, chained={chained}"
+    );
 }
 
 #[test]
@@ -7553,6 +7620,61 @@ fn sequential_secondary_outputs_release_temporary_fragment_memory() {
         )
         .expect("temporary secondary-output fragments remain below the peak-memory ceiling");
     assert_eq!(result.secondary_outputs.len(), 32);
+}
+
+#[test]
+fn secondary_output_uri_index_scales_and_rejects_duplicates() {
+    // URI uniqueness is an indexed invariant, not a scan whose work grows quadratically with the
+    // number of otherwise tiny result documents.
+    let outputs = (0..2048)
+        .map(|index| format!(r#"<xt:document href="memory:{index}.xml" method="text"/>"#))
+        .collect::<String>();
+    let stylesheet = Compiler::new(
+        Arc::new(NoResolver),
+        CompileBudget::new(1 << 20, 0, 256, 16 << 20),
+    )
+    .compile(
+        &format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:xt="http://www.jclark.com/xt" extension-element-prefixes="xt"><xsl:template match="/">{outputs}</xsl:template></xsl:stylesheet>"#
+        ),
+        None,
+    )
+    .expect("large secondary-output stylesheet compiles");
+    let mut budget = execution_budget(1024);
+    budget.owned_bytes = 16 << 20;
+    let result = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("indexed unique outputs execute");
+    assert_eq!(result.secondary_outputs.len(), 2048);
+    assert_eq!(
+        result.secondary_outputs[2047].uri.as_str(),
+        "memory:2047.xml"
+    );
+
+    let duplicate = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:xt="http://www.jclark.com/xt" extension-element-prefixes="xt"><xsl:template match="/"><xt:document href="memory:same"/><xt:document href="memory:same"/></xsl:template></xsl:stylesheet>"#,
+    )
+    .execute(
+        &Document::parse("<source/>", None).expect("source parses"),
+        &Parameters::new(),
+        Arc::new(NoResolver),
+        ExecutionOptions {
+            budget: execution_budget(1024),
+            initial_mode: None,
+            initial_template: None,
+        },
+    )
+    .expect_err("duplicate URI must fail");
+    assert!(matches!(duplicate, Error::Dynamic(message) if message.contains("more than once")));
 }
 
 #[test]
@@ -11834,6 +11956,40 @@ fn xinclude_text_rejects_characters_forbidden_by_xml() {
         )
         .expect_err("forbidden XML characters must fail inclusion");
     assert!(matches!(error, Error::Xml(message) if message.contains("XML character")));
+}
+
+#[test]
+fn xinclude_text_normalizes_all_line_endings() {
+    // XInclude 1.0 section 4.3 requires acquired text line breaks to follow XML 1.0 end-of-line
+    // normalization before the resulting characters enter the source tree.
+    let resolver = Arc::new(MemoryResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert("lines.txt".into(), "a\r\nb\rc\nd".into());
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="."/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="lines.txt" parse="text"/></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("source parses");
+    let result = stylesheet
+        .execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        )
+        .expect("text inclusion succeeds");
+    assert_eq!(result.serialized.bytes, b"a\nb\nc\nd");
 }
 
 #[test]

@@ -1839,7 +1839,7 @@ fn every_multiple_output_matches_the_libxslt_oracle() {
         let actual = result
             .secondary_outputs
             .iter()
-            .find(|output| output.uri == uri)
+            .find(|output| output.uri.as_str() == uri)
             .unwrap_or_else(|| panic!("secondary output {uri} exists"));
         let expected = std::fs::read(&path).expect("oracle secondary output is readable");
         assert_eq!(
