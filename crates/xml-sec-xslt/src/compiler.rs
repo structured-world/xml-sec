@@ -2155,7 +2155,11 @@ fn with_frontend_document<T>(
 ) -> Result<T> {
     let lexical_reserved = parser_workspace_bytes(xml);
     state.charge_owned(lexical_reserved)?;
-    let prepared = match prepare_xml_frontend_bounded(xml, state.remaining_owned_bytes()) {
+    let prepared = match prepare_xml_frontend_bounded(
+        xml,
+        state.remaining_owned_bytes(),
+        state.budget.recursion_depth,
+    ) {
         Ok(prepared) => prepared,
         Err(error) => {
             state.release_owned(lexical_reserved);
