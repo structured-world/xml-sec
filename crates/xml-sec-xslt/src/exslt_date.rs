@@ -79,6 +79,14 @@ enum Operation {
 
 struct DateFunction(Operation, Arc<dyn Clock>, ExtensionPolicy);
 
+fn xpath_string(
+    context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
+    value: &Value<'_>,
+) -> std::result::Result<String, function::Error> {
+    context.reserve_temporary_allocation(value.string_len())?;
+    Ok(value.string())
+}
+
 impl function::Function for DateFunction {
     fn evaluate<'c, 'd>(
         &self,
@@ -105,7 +113,8 @@ impl function::Function for DateFunction {
             )?)),
             Date => {
                 let current;
-                let input = if let Some(input) = args.first().map(Value::string) {
+                let input = if let Some(value) = args.first() {
+                    let input = xpath_string(context, value)?;
                     current = input;
                     current.as_str()
                 } else {
@@ -130,6 +139,7 @@ impl function::Function for DateFunction {
                 }
                 let mut total = DurationValue::default();
                 for node in nodes.document_order_with_context(context)? {
+                    context.reserve_temporary_allocation(node.string_value_len())?;
                     let Some(value) = DurationValue::parse(&node.string_value()) else {
                         return Ok(Value::String(String::new()));
                     };
@@ -141,10 +151,10 @@ impl function::Function for DateFunction {
                 Ok(Value::String(total.render()))
             }
             AddDuration => {
-                let Some(left) = DurationValue::parse(&args[0].string()) else {
+                let Some(left) = DurationValue::parse(&xpath_string(context, &args[0])?) else {
                     return Ok(Value::String(String::new()));
                 };
-                let Some(right) = DurationValue::parse(&args[1].string()) else {
+                let Some(right) = DurationValue::parse(&xpath_string(context, &args[1])?) else {
                     return Ok(Value::String(String::new()));
                 };
                 Ok(Value::String(
@@ -168,12 +178,13 @@ impl function::Function for DateFunction {
                 // Omitted date:seconds input defaults to date:date-time, so it shares the same
                 // controlled clock and deterministic-policy gate.
                 // https://exslt.github.io/date/functions/seconds/date.seconds.html
-                let Some(input) = args.first().map(Value::string) else {
+                let Some(value) = args.first() else {
                     return Ok(Value::Number(current_seconds_for_operation(
                         self.1.as_ref(),
                         self.2,
                     )?));
                 };
+                let input = xpath_string(context, value)?;
                 let seconds = DurationValue::parse_libxslt_seconds(&input)
                     .filter(|duration| duration.months == 0)
                     .map(|duration| duration.seconds)
@@ -182,10 +193,10 @@ impl function::Function for DateFunction {
                 Ok(Value::Number(seconds))
             }
             Add => {
-                let Some(date) = DateValue::parse(&args[0].string()) else {
+                let Some(date) = DateValue::parse(&xpath_string(context, &args[0])?) else {
                     return Ok(Value::String(String::new()));
                 };
-                let Some(duration) = DurationValue::parse(&args[1].string()) else {
+                let Some(duration) = DurationValue::parse(&xpath_string(context, &args[1])?) else {
                     return Ok(Value::String(String::new()));
                 };
                 Ok(Value::String(
@@ -194,10 +205,10 @@ impl function::Function for DateFunction {
                 ))
             }
             Difference => {
-                let Some(left) = DateValue::parse(&args[0].string()) else {
+                let Some(left) = DateValue::parse(&xpath_string(context, &args[0])?) else {
                     return Ok(Value::String(String::new()));
                 };
-                let Some(right) = DateValue::parse(&args[1].string()) else {
+                let Some(right) = DateValue::parse(&xpath_string(context, &args[1])?) else {
                     return Ok(Value::String(String::new()));
                 };
                 Ok(Value::String(
@@ -206,7 +217,10 @@ impl function::Function for DateFunction {
                 ))
             }
             operation => {
-                let input = args.first().map(Value::string);
+                let input = args
+                    .first()
+                    .map(|value| xpath_string(context, value))
+                    .transpose()?;
                 let current;
                 let input = if let Some(input) = input.as_deref() {
                     input
@@ -1184,7 +1198,35 @@ fn argument_error<T>(message: &str) -> std::result::Result<T, function::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DateValue, DurationValue, split_timezone};
+    use super::{DateFunction, DateValue, DurationValue, Operation, split_timezone};
+    use sxd_document_no_unsafe::Package;
+    use sxd_xpath_no_unsafe::{Context, Value, function::Function, nodeset};
+
+    #[test]
+    fn date_extensions_meter_every_xpath_string_coercion() {
+        // EXSLT date functions inspect the XPath string-value even when parsing returns an empty
+        // result, so the temporary materialization must cross the operation allocation gate.
+        let package = Package::new();
+        let document = package.as_document();
+        let root = document.create_element("root");
+        root.append_child(document.create_text("2000-01-01"));
+        document.root().append_child(root);
+        let mut nodes = nodeset::Nodeset::new();
+        nodes.add(root);
+
+        let mut context = Context::new();
+        context.set_string_allocation_limit(0);
+        let evaluation =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+        let error = DateFunction(
+            Operation::Date,
+            std::sync::Arc::new(crate::FixedClock::new(time::OffsetDateTime::UNIX_EPOCH)),
+            crate::ExtensionPolicy::Compatible,
+        )
+        .evaluate(&evaluation, vec![Value::Nodeset(nodes)])
+        .expect_err("date input coercion must cross the allocation gate");
+        assert!(error.to_string().contains("allocation budget"));
+    }
 
     #[test]
     fn end_of_day_lexical_forms_normalize_without_accepting_later_times() {

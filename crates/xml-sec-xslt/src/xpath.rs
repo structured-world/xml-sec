@@ -25,6 +25,22 @@ use crate::{
 
 pub(crate) type SourceNode = NodeReference;
 
+fn projected_node_storage(count: usize, meter: &Meter) -> Result<Vec<SourceNode>> {
+    let requested = count.saturating_mul(std::mem::size_of::<SourceNode>());
+    meter.check_additional(BudgetKind::OwnedBytes, requested)?;
+    let mut nodes = Vec::new();
+    nodes.try_reserve_exact(count).map_err(|error| {
+        Error::Dynamic(format!("failed to reserve XPath node projection: {error}"))
+    })?;
+    meter.check_additional(
+        BudgetKind::OwnedBytes,
+        nodes
+            .capacity()
+            .saturating_mul(std::mem::size_of::<SourceNode>()),
+    )?;
+    Ok(nodes)
+}
+
 pub(crate) trait VariableBindings {
     fn get(&self, name: &ExpandedName) -> Option<&Value>;
 
@@ -1266,7 +1282,8 @@ impl Evaluator {
                         && let Some(Value::ResultTreeFragment(fragment)) = augmented.get(&name)
                     {
                         let fragment = fragment.clone();
-                        Value::NodeSet(vec![self.import_result_tree_fragment(&fragment, meter)?])
+                        let root = self.import_result_tree_fragment(&fragment, meter)?;
+                        Value::NodeSet(self.singleton(&root, true, meter)?)
                     } else {
                         let value = self.evaluate_core(
                             &expression.derived(argument),
@@ -1282,7 +1299,7 @@ impl Evaluator {
                             value => {
                                 let fragment = text_document(&value.string(self), meter)?;
                                 let root = self.import_document(&fragment, meter)?;
-                                let nodes = self.children(&root);
+                                let nodes = self.children(&root, meter)?;
                                 Value::NodeSet(nodes)
                             }
                         }
@@ -1383,7 +1400,7 @@ impl Evaluator {
                     let nodes = (|| {
                         let fragment = token_document(&input.0, &delimiter.0, kind, meter)?;
                         let root = self.import_document(&fragment, meter)?;
-                        Ok(self.children(&root))
+                        self.children(&root, meter)
                     })();
                     debug_assert!(input.1.checked_add(delimiter.1).is_some());
                     meter.release_owned_bytes(input.1 + delimiter.1);
@@ -1452,7 +1469,7 @@ impl Evaluator {
                     meter.release_owned_bytes(replaced.len());
                     let fragment = fragment?;
                     let root = self.import_document(&fragment, meter)?;
-                    let nodes = self.children(&root);
+                    let nodes = self.children(&root, meter)?;
                     Value::NodeSet(nodes)
                 }
                 ExtensionCallKind::DynamicEvaluate | ExtensionCallKind::SaxonEvaluate => {
@@ -2474,26 +2491,23 @@ impl Evaluator {
         ))
     }
 
-    pub(crate) fn children(&self, node: &SourceNode) -> Vec<SourceNode> {
-        match node {
+    pub(crate) fn children(&self, node: &SourceNode, meter: &Meter) -> Result<Vec<SourceNode>> {
+        let children = match node {
             SourceNode::Node(id) => self
                 .source
                 .node(*id)
-                .map(|node| {
-                    node.children
-                        .iter()
-                        .copied()
-                        .map(SourceNode::Node)
-                        .collect()
-                })
+                .map(|node| node.children.as_slice())
                 .unwrap_or_default(),
-            SourceNode::Attribute { .. } | SourceNode::Namespace { .. } => Vec::new(),
-        }
+            SourceNode::Attribute { .. } | SourceNode::Namespace { .. } => &[],
+        };
+        let mut projected = projected_node_storage(children.len(), meter)?;
+        projected.extend(children.iter().copied().map(SourceNode::Node));
+        Ok(projected)
     }
 
-    pub(crate) fn attributes(&self, node: &SourceNode) -> Vec<SourceNode> {
+    pub(crate) fn attributes(&self, node: &SourceNode, meter: &Meter) -> Result<Vec<SourceNode>> {
         let SourceNode::Node(owner) = node else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let count = self
             .source
@@ -2503,28 +2517,70 @@ impl Evaluator {
                 _ => None,
             })
             .unwrap_or_default();
-        (0..count)
-            .map(|index| SourceNode::Attribute {
-                owner: *owner,
-                index,
-            })
-            .collect()
+        let mut projected = projected_node_storage(count, meter)?;
+        projected.extend((0..count).map(|index| SourceNode::Attribute {
+            owner: *owner,
+            index,
+        }));
+        Ok(projected)
     }
 
-    pub(crate) fn preceding_nonempty_comment(&self, node: &SourceNode) -> Vec<SourceNode> {
+    pub(crate) fn attributes_and_children(
+        &self,
+        node: &SourceNode,
+        meter: &Meter,
+    ) -> Result<Vec<SourceNode>> {
+        let SourceNode::Node(owner) = node else {
+            return Ok(Vec::new());
+        };
+        let Some(source) = self.source.node(*owner) else {
+            return Ok(Vec::new());
+        };
+        let attribute_count = match &source.kind {
+            NodeKind::Element { attributes, .. } => attributes.len(),
+            _ => 0,
+        };
+        let mut projected =
+            projected_node_storage(attribute_count.saturating_add(source.children.len()), meter)?;
+        projected.extend((0..attribute_count).map(|index| SourceNode::Attribute {
+            owner: *owner,
+            index,
+        }));
+        projected.extend(source.children.iter().copied().map(SourceNode::Node));
+        Ok(projected)
+    }
+
+    pub(crate) fn singleton(
+        &self,
+        node: &SourceNode,
+        include: bool,
+        meter: &Meter,
+    ) -> Result<Vec<SourceNode>> {
+        let mut projected = projected_node_storage(usize::from(include), meter)?;
+        if include {
+            projected.push(node.clone());
+        }
+        Ok(projected)
+    }
+
+    pub(crate) fn preceding_nonempty_comment(
+        &self,
+        node: &SourceNode,
+        meter: &Meter,
+    ) -> Result<Vec<SourceNode>> {
         let SourceNode::Node(id) = node else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let Some(parent) = self.source.node(*id).and_then(|node| node.parent) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let Some(parent) = self.source.node(parent) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let Some(position) = parent.children.iter().position(|child| child == id) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        parent.children[..position]
+        let candidate = parent.children[..position]
             .iter()
             .rev()
             .find(|candidate| {
@@ -2539,8 +2595,10 @@ impl Evaluator {
                     .node(**candidate)
                     .is_some_and(|node| matches!(node.kind, NodeKind::Comment(_)))
             })
-            .map(|candidate| vec![SourceNode::Node(*candidate)])
-            .unwrap_or_default()
+            .copied();
+        let mut projected = projected_node_storage(usize::from(candidate.is_some()), meter)?;
+        projected.extend(candidate.map(SourceNode::Node));
+        Ok(projected)
     }
 
     pub(crate) fn select_child_axis(
@@ -3923,6 +3981,11 @@ fn validate_xinclude_children(source: &Document, include: &Node) -> Result<Optio
                     "XInclude xi:include permits at most one xi:fallback child".into(),
                 ));
             }
+            // XInclude 1.0 section 3.2 requires ignored fallback content to remain completely
+            // unexamined until a resource error activates it. Validation resumes when that
+            // subtree is processed as replacement content.
+            // https://www.w3.org/TR/xinclude/#fallback_element
+            continue;
         }
         if source.descendants(*child).any(|(_, descendant)| {
             matches!(
@@ -4201,21 +4264,9 @@ fn resolve_xinclude(
             )));
         }
     };
-    if let Some(attribute) = attributes.iter().find(|attribute| {
-        attribute.name.namespace.is_none()
-            && !matches!(
-                attribute.name.local.as_str(),
-                "href" | "parse" | "xpointer" | "encoding" | "accept" | "accept-language"
-            )
-    }) {
-        // XInclude 1.0 section 3.1 permits only the six named unprefixed attributes on
-        // xi:include; foreign-namespaced attributes remain extensible.
-        // https://www.w3.org/TR/xinclude/#include_element
-        return Err(XIncludeFailure::Fatal(Error::Xml(format!(
-            "unprefixed attribute {} is not permitted on xi:include",
-            attribute.name.local
-        ))));
-    }
+    // XInclude 1.0 section 3.1 reserves unknown unprefixed attributes for future revisions and
+    // requires 1.0 processors to ignore them; foreign-namespaced attributes are also extensible.
+    // https://www.w3.org/TR/xinclude/#include_element
     let attribute = |local: &str| {
         attributes
             .iter()
@@ -4239,14 +4290,9 @@ fn resolve_xinclude(
             "XInclude xpointer is not permitted with parse=\"text\"".into(),
         )));
     }
-    if parse == "xml" && encoding.is_some() {
-        // XInclude 1.0 section 3.1 permits encoding only for parse="text" and requires this
-        // syntax error to be rejected before resource acquisition.
-        // https://www.w3.org/TR/xinclude/#include_element
-        return Err(XIncludeFailure::Fatal(Error::Xml(
-            "XInclude encoding is not permitted with parse=\"xml\"".into(),
-        )));
-    }
+    // XInclude 1.0 section 3.1 says encoding has no effect in XML mode. Keep it available for
+    // text decoding below, but do not reject or apply it when parse="xml".
+    // https://www.w3.org/TR/xinclude/#include_element
     // XInclude 1.0 section 3.1 forbids fragment identifiers in href, including an empty
     // fragment; subresources are selected through the separate xpointer attribute.
     // https://www.w3.org/TR/xinclude/#include_element
@@ -4567,16 +4613,15 @@ fn decode_xinclude_resource(
         |error| match error {
             MeteredDecodeError::Budget(error) => XIncludeFailure::Fatal(error),
             MeteredDecodeError::Decode(error) => {
-                // XInclude 1.0 section 4.3.3 classifies every text acquisition encoding failure as
-                // a resource error. XML-mode malformed bytes instead make the acquired XML
-                // non-well-formed and remain fatal under section 4.2.
+                // XInclude 1.0 section 4.3 classifies an unavailable/unsupported encoding as a
+                // resource error, but explicitly makes byte sequences outside the selected
+                // encoding fatal. XML-mode malformed bytes are likewise fatal under section 4.2.
                 // https://www.w3.org/TR/xinclude/#text_included
-                let recoverable = !parsed_xml
-                    || matches!(
-                        error,
-                        xml_sec_xml_input::Error::UnsupportedByteEncoding(_)
-                            | xml_sec_xml_input::Error::UnsupportedEncoding(_)
-                    );
+                let recoverable = matches!(
+                    error,
+                    xml_sec_xml_input::Error::UnsupportedByteEncoding(_)
+                        | xml_sec_xml_input::Error::UnsupportedEncoding(_)
+                );
                 let error = Error::Xml(error.to_string());
                 if recoverable {
                     XIncludeFailure::Resource(error)
@@ -5516,14 +5561,18 @@ fn replace_exslt_string(
     meter: &mut Meter,
 ) -> Result<String> {
     let mut output_bytes = 0usize;
-    for_each_exslt_replacement_segment(input, searches, replacements, |segment| {
-        output_bytes = output_bytes.saturating_add(segment.len());
-    });
+    for_each_exslt_replacement_segment(input, searches, replacements, meter, |segment| {
+        output_bytes = output_bytes
+            .checked_add(segment.len())
+            .ok_or_else(|| Error::Dynamic("str:replace() result length overflow".into()))?;
+        Ok(())
+    })?;
     meter.charge(BudgetKind::OwnedBytes, output_bytes)?;
     let mut output = String::with_capacity(output_bytes);
-    for_each_exslt_replacement_segment(input, searches, replacements, |segment| {
+    for_each_exslt_replacement_segment(input, searches, replacements, meter, |segment| {
         output.push_str(segment);
-    });
+        Ok(())
+    })?;
     Ok(output)
 }
 
@@ -5531,19 +5580,30 @@ fn for_each_exslt_replacement_segment(
     input: &str,
     searches: &[String],
     replacements: &[String],
-    mut emit: impl FnMut(&str),
-) {
+    meter: &mut Meter,
+    mut emit: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
     let mut cursor = 0;
     let empty_search = searches.iter().position(String::is_empty);
     while cursor < input.len() {
         let remaining = &input[cursor..];
-        let matched = searches
-            .iter()
-            .enumerate()
-            .filter(|(_, search)| !search.is_empty() && remaining.starts_with(search.as_str()))
-            .max_by_key(|(index, search)| (search.len(), usize::MAX - *index));
+        let mut matched = None;
+        for (index, search) in searches.iter().enumerate() {
+            if search.is_empty() {
+                continue;
+            }
+            // Extension-internal candidate comparisons are execution work even when the XPath
+            // expression has a tiny result. Charging before starts_with prevents input x search
+            // fan-out from bypassing the operation's typed extension-work ceiling.
+            meter.charge(BudgetKind::ExtensionOperations, 1)?;
+            if remaining.starts_with(search.as_str())
+                && matched.is_none_or(|(_, best): (usize, &String)| search.len() > best.len())
+            {
+                matched = Some((index, search));
+            }
+        }
         if let Some((index, search)) = matched {
-            emit(replacements.get(index).map_or("", String::as_str));
+            emit(replacements.get(index).map_or("", String::as_str))?;
             cursor += search.len();
             continue;
         }
@@ -5551,14 +5611,15 @@ fn for_each_exslt_replacement_segment(
             .chars()
             .next()
             .expect("cursor remains inside the input");
-        emit(&remaining[..character.len_utf8()]);
+        emit(&remaining[..character.len_utf8()])?;
         cursor += character.len_utf8();
         if let Some(index) = empty_search
             && cursor < input.len()
         {
-            emit(replacements.get(index).map_or("", String::as_str));
+            emit(replacements.get(index).map_or("", String::as_str))?;
         }
     }
+    Ok(())
 }
 
 fn unused_internal_namespace<'a>(
@@ -6181,14 +6242,12 @@ impl function::Function for UnparsedEntityUriFunction {
             .next()
             .expect("argument count was checked")
             .into_string();
-        Ok(SxdValue::String(
-            self.documents
-                .borrow()
-                .get(document_index)
-                .and_then(|entities| entities.get(&name))
-                .cloned()
-                .unwrap_or_default(),
-        ))
+        let documents = self.documents.borrow();
+        let uri = documents
+            .get(document_index)
+            .and_then(|entities| entities.get(&name));
+        context.reserve_string_allocation(uri.map_or(0, String::len))?;
+        Ok(SxdValue::String(uri.cloned().unwrap_or_default()))
     }
 }
 
@@ -6205,6 +6264,14 @@ enum DocumentBaseSelection {
         base_uri: Option<String>,
         logical_document: Option<usize>,
     },
+}
+
+fn clone_metered_optional_string(
+    context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
+    value: Option<&String>,
+) -> std::result::Result<Option<String>, function::Error> {
+    context.reserve_temporary_allocation(value.map_or(0, String::len))?;
+    Ok(value.cloned())
 }
 
 fn register_exslt_functions(
@@ -7136,8 +7203,12 @@ impl function::Function for DocumentFunction {
                 return Ok(SxdValue::Nodeset(nodeset::Nodeset::new()));
             };
             let path = typed_path_to(&node);
+            let base_uris = self.node_base_uris.borrow();
             DocumentBaseSelection::Explicit {
-                base_uri: self.node_base_uris.borrow().get(&path).cloned().flatten(),
+                base_uri: clone_metered_optional_string(
+                    context,
+                    base_uris.get(&path).and_then(Option::as_ref),
+                )?,
                 logical_document: path.ordinary().get(1).copied(),
             }
         } else {
@@ -7173,17 +7244,23 @@ impl function::Function for DocumentFunction {
                         DocumentBaseSelection::Explicit {
                             base_uri,
                             logical_document,
-                        } => (base_uri.clone(), *logical_document),
-                        DocumentBaseSelection::Omitted => (
-                            self.node_base_uris.borrow().get(&path).cloned().flatten(),
-                            path.ordinary().get(1).copied(),
+                        } => (
+                            clone_metered_optional_string(context, base_uri.as_ref())?,
+                            *logical_document,
                         ),
+                        DocumentBaseSelection::Omitted => {
+                            let base_uris = self.node_base_uris.borrow();
+                            (
+                                clone_metered_optional_string(
+                                    context,
+                                    base_uris.get(&path).and_then(Option::as_ref),
+                                )?,
+                                path.ordinary().get(1).copied(),
+                            )
+                        }
                     };
                     let href = node.string_value_with_context(context)?;
-                    context.reserve_temporary_allocation(
-                        std::mem::size_of::<DocumentRequest>()
-                            .saturating_add(base_uri.as_deref().map_or(0, str::len)),
-                    )?;
+                    context.reserve_temporary_allocation(std::mem::size_of::<DocumentRequest>())?;
                     process(DocumentRequest::relative_to(
                         href,
                         base_uri,
@@ -7196,15 +7273,18 @@ impl function::Function for DocumentFunction {
                     DocumentBaseSelection::Explicit {
                         base_uri,
                         logical_document,
-                    } => (base_uri.clone(), *logical_document),
-                    DocumentBaseSelection::Omitted => (self.static_base_uri.clone(), None),
+                    } => (
+                        clone_metered_optional_string(context, base_uri.as_ref())?,
+                        *logical_document,
+                    ),
+                    DocumentBaseSelection::Omitted => (
+                        clone_metered_optional_string(context, self.static_base_uri.as_ref())?,
+                        None,
+                    ),
                 };
                 context.reserve_temporary_allocation(value.string_len())?;
                 let href = value.string();
-                context.reserve_temporary_allocation(
-                    std::mem::size_of::<DocumentRequest>()
-                        .saturating_add(base_uri.as_deref().map_or(0, str::len)),
-                )?;
+                context.reserve_temporary_allocation(std::mem::size_of::<DocumentRequest>())?;
                 process(DocumentRequest::relative_to(
                     href,
                     base_uri,
@@ -8277,6 +8357,7 @@ mod tests {
                 external_documents: 0,
                 recursion_depth: usize::MAX,
                 xpath_evaluations: usize::MAX,
+                extension_operations: usize::MAX,
                 pattern_evaluations: usize::MAX,
                 template_applications: usize::MAX,
                 sort_comparisons: usize::MAX,
@@ -8325,6 +8406,7 @@ mod tests {
                 external_documents: 0,
                 recursion_depth: usize::MAX,
                 xpath_evaluations: usize::MAX,
+                extension_operations: usize::MAX,
                 pattern_evaluations: usize::MAX,
                 template_applications: usize::MAX,
                 sort_comparisons: usize::MAX,
@@ -8410,6 +8492,7 @@ mod tests {
                 external_documents: 0,
                 recursion_depth: 1,
                 xpath_evaluations: 0,
+                extension_operations: 0,
                 pattern_evaluations: 0,
                 template_applications: 0,
                 sort_comparisons: 0,
@@ -8466,6 +8549,7 @@ mod tests {
                 external_documents: 1,
                 recursion_depth: 16,
                 xpath_evaluations: 1,
+                extension_operations: 1,
                 pattern_evaluations: 1,
                 template_applications: 1,
                 sort_comparisons: 1,
@@ -8824,6 +8908,7 @@ mod tests {
                 external_documents: 0,
                 recursion_depth: 0,
                 xpath_evaluations: 0,
+                extension_operations: 0,
                 pattern_evaluations: 0,
                 template_applications: 0,
                 sort_comparisons: 0,
@@ -8855,6 +8940,7 @@ mod tests {
                 external_documents: usize::MAX,
                 recursion_depth: 32,
                 xpath_evaluations: usize::MAX,
+                extension_operations: usize::MAX,
                 pattern_evaluations: usize::MAX,
                 template_applications: usize::MAX,
                 sort_comparisons: usize::MAX,
@@ -8897,6 +8983,7 @@ mod tests {
                 external_documents: 0,
                 recursion_depth: 0,
                 xpath_evaluations: 0,
+                extension_operations: 0,
                 pattern_evaluations: 0,
                 template_applications: 0,
                 sort_comparisons: 0,
@@ -8939,6 +9026,7 @@ mod tests {
                 external_documents: usize::MAX,
                 recursion_depth: usize::MAX,
                 xpath_evaluations: usize::MAX,
+                extension_operations: usize::MAX,
                 pattern_evaluations: usize::MAX,
                 template_applications: usize::MAX,
                 sort_comparisons: usize::MAX,
@@ -8980,6 +9068,7 @@ mod tests {
             external_documents: usize::MAX,
             recursion_depth: usize::MAX,
             xpath_evaluations: usize::MAX,
+            extension_operations: usize::MAX,
             pattern_evaluations: usize::MAX,
             template_applications: usize::MAX,
             sort_comparisons: usize::MAX,
@@ -9030,6 +9119,7 @@ mod tests {
             external_documents: usize::MAX,
             recursion_depth: usize::MAX,
             xpath_evaluations: usize::MAX,
+            extension_operations: usize::MAX,
             pattern_evaluations: usize::MAX,
             template_applications: usize::MAX,
             sort_comparisons: usize::MAX,
@@ -9075,6 +9165,7 @@ mod tests {
             external_documents: usize::MAX,
             recursion_depth: usize::MAX,
             xpath_evaluations: usize::MAX,
+            extension_operations: usize::MAX,
             pattern_evaluations: usize::MAX,
             template_applications: usize::MAX,
             sort_comparisons: usize::MAX,
@@ -9118,6 +9209,7 @@ mod tests {
             external_documents: usize::MAX,
             recursion_depth: usize::MAX,
             xpath_evaluations: usize::MAX,
+            extension_operations: usize::MAX,
             pattern_evaluations: usize::MAX,
             template_applications: usize::MAX,
             sort_comparisons: usize::MAX,
@@ -9160,6 +9252,7 @@ mod tests {
             external_documents: usize::MAX,
             recursion_depth: usize::MAX,
             xpath_evaluations: usize::MAX,
+            extension_operations: usize::MAX,
             pattern_evaluations: usize::MAX,
             template_applications: usize::MAX,
             sort_comparisons: usize::MAX,
@@ -9281,6 +9374,116 @@ mod tests {
                 .expect("entity URI resolves"),
             SxdValue::String("external.png".into())
         );
+    }
+
+    #[test]
+    fn unparsed_entity_uri_reserves_the_returned_uri() {
+        // The retained entity index owns one URI copy. Returning the XPath string creates a
+        // second allocation, which must cross the operation allocation gate first.
+        let package = Package::new();
+        let document = package.as_document();
+        let documents = document.create_element("documents");
+        let logical_document = document.create_element("document");
+        document.root().append_child(documents);
+        documents.append_child(logical_document);
+        let uri = "memory:entity/".repeat(32);
+        let function = UnparsedEntityUriFunction {
+            documents: Rc::new(RefCell::new(vec![HashMap::from([(
+                "logo".into(),
+                uri.clone(),
+            )])])),
+        };
+        let mut context = Context::new();
+        context.set_string_allocation_limit(uri.len() - 1);
+        let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(
+            &context,
+            nodeset::Node::Element(logical_document),
+        );
+
+        let error = function
+            .evaluate(&evaluation, vec![SxdValue::String("logo".into())])
+            .expect_err("returned URI must cross the allocation gate");
+        assert!(error.to_string().contains("allocation budget"));
+    }
+
+    #[test]
+    fn document_function_reserves_explicit_base_selection_before_cloning() {
+        // The second argument's effective base is retained for the complete document() call.
+        // Reserve that first clone independently of each request constructed later.
+        let package = Package::new();
+        let document = package.as_document();
+        let root = document.create_element("root");
+        let base = document.create_element("base");
+        root.append_child(base);
+        document.root().append_child(root);
+        let path = typed_path_to(&nodeset::Node::Element(base));
+        let base_uri = "memory:base/".repeat(32);
+        let function = DocumentFunction {
+            roots: Rc::new(RefCell::new(HashMap::new())),
+            pending: Rc::new(RefCell::new(HashSet::new())),
+            node_base_uris: Rc::new(RefCell::new(HashMap::from([(
+                path,
+                Some(base_uri.clone()),
+            )]))),
+            static_base_uri: None,
+        };
+        let mut nodes = nodeset::Nodeset::new();
+        nodes.add(base);
+        let mut context = Context::new();
+        context.set_string_allocation_limit(base_uri.len() - 1);
+        let evaluation =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&context, nodeset::Node::Element(root));
+
+        let error = function
+            .evaluate(
+                &evaluation,
+                vec![
+                    SxdValue::String("resource.xml".into()),
+                    SxdValue::Nodeset(nodes),
+                ],
+            )
+            .expect_err("explicit base URI must cross the allocation gate before cloning");
+        assert!(
+            context
+                .string_allocation_exceeded()
+                .is_some_and(|attempted| attempted > base_uri.len()),
+            "base URI must be charged on top of node-ordering workspace"
+        );
+        assert!(error.to_string().contains("allocation budget"));
+    }
+
+    #[test]
+    fn exslt_replace_charges_candidate_search_work() {
+        // A small result can still require attacker-controlled input x search fan-out. Internal
+        // candidate tests must consume a typed execution budget before each comparison.
+        let mut meter = Meter::new(
+            ExecutionBudget {
+                source_bytes: usize::MAX,
+                external_documents: usize::MAX,
+                recursion_depth: usize::MAX,
+                xpath_evaluations: usize::MAX,
+                extension_operations: 2,
+                pattern_evaluations: usize::MAX,
+                template_applications: usize::MAX,
+                sort_comparisons: usize::MAX,
+                key_entries: usize::MAX,
+                result_nodes: usize::MAX,
+                serialized_bytes: usize::MAX,
+                messages: usize::MAX,
+                owned_bytes: usize::MAX,
+            },
+            0,
+        )
+        .expect("test meter initializes");
+        let searches = vec!["b".into(), "c".into(), "d".into()];
+
+        assert!(matches!(
+            replace_exslt_string("a", &searches, &[], &mut meter),
+            Err(Error::Budget {
+                kind: BudgetKind::ExtensionOperations,
+                ..
+            })
+        ));
     }
 
     #[test]

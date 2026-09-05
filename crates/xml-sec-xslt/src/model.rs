@@ -886,78 +886,22 @@ impl Document {
             }))
     }
 
-    pub(crate) fn push_container_reservation_bytes(&self, parent: NodeId) -> usize {
-        fn growth_bytes<T>(items: &Vec<T>) -> usize {
-            if std::mem::size_of::<T>() == 0 || items.len() < items.capacity() {
-                0
-            } else {
-                items
-                    .capacity()
-                    .max(4)
-                    .saturating_mul(std::mem::size_of::<T>())
-            }
-        }
-
-        growth_bytes(&self.nodes).saturating_add(
-            self.node(parent)
-                .map_or(0, |node| growth_bytes(&node.children)),
-        )
-    }
-
-    pub(crate) fn reserve_push_containers(
-        &mut self,
-        parent: NodeId,
-    ) -> std::result::Result<usize, std::collections::TryReserveError> {
-        fn reserve_slot<T>(
-            items: &mut Vec<T>,
-        ) -> std::result::Result<(), std::collections::TryReserveError> {
-            if std::mem::size_of::<T>() == 0 || items.len() < items.capacity() {
-                return Ok(());
-            }
-            items.try_reserve_exact(items.capacity().max(4))
-        }
-
-        let old_nodes_capacity = self.nodes.capacity();
-        reserve_slot(&mut self.nodes)?;
-        let nodes_bytes = self
-            .nodes
-            .capacity()
-            .saturating_sub(old_nodes_capacity)
-            .saturating_mul(std::mem::size_of::<Node>());
-        let children_bytes = if let Some(parent) = self.nodes.get_mut(parent.0) {
-            let old_capacity = parent.children.capacity();
-            reserve_slot(&mut parent.children)?;
-            parent
-                .children
-                .capacity()
-                .saturating_sub(old_capacity)
-                .saturating_mul(std::mem::size_of::<NodeId>())
-        } else {
-            0
-        };
-        Ok(nodes_bytes.saturating_add(children_bytes))
-    }
-
     pub(crate) fn reserve_metered_push_containers(
         &mut self,
         parent: NodeId,
         meter: &mut Meter,
     ) -> Result<()> {
-        let requested_bytes = self.push_container_reservation_bytes(parent);
-        meter.charge(BudgetKind::OwnedBytes, requested_bytes)?;
-        let actual_bytes = match self.reserve_push_containers(parent) {
-            Ok(actual_bytes) => actual_bytes,
-            Err(error) => {
-                meter.release_owned_bytes(requested_bytes);
-                return Err(Error::Dynamic(format!(
-                    "failed to reserve document tree storage: {error}"
-                )));
-            }
-        };
-        if actual_bytes < requested_bytes {
-            meter.release_owned_bytes(requested_bytes - actual_bytes);
-        } else if actual_bytes > requested_bytes {
-            meter.charge(BudgetKind::OwnedBytes, actual_bytes - requested_bytes)?;
+        let mut nodes_reservation = self
+            .nodes
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Node>());
+        reserve_temporary_vec_slot(&mut self.nodes, meter, &mut nodes_reservation)?;
+        if let Some(parent) = self.nodes.get_mut(parent.0) {
+            let mut children_reservation = parent
+                .children
+                .capacity()
+                .saturating_mul(std::mem::size_of::<NodeId>());
+            reserve_temporary_vec_slot(&mut parent.children, meter, &mut children_reservation)?;
         }
         Ok(())
     }
@@ -3940,6 +3884,7 @@ mod parser_boundary_tests {
                 external_documents: usize::MAX,
                 recursion_depth: usize::MAX,
                 xpath_evaluations: usize::MAX,
+                extension_operations: usize::MAX,
                 pattern_evaluations: usize::MAX,
                 template_applications: usize::MAX,
                 sort_comparisons: usize::MAX,
@@ -3982,6 +3927,7 @@ mod parser_boundary_tests {
                 external_documents: usize::MAX,
                 recursion_depth: usize::MAX,
                 xpath_evaluations: usize::MAX,
+                extension_operations: usize::MAX,
                 pattern_evaluations: usize::MAX,
                 template_applications: usize::MAX,
                 sort_comparisons: usize::MAX,

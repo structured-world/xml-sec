@@ -835,31 +835,46 @@ impl<'a> Execution<'a> {
         source_remap: Option<&HashMap<NodeId, NodeId>>,
         mut effective: HashMap<ExpandedName, &'a crate::compiler::GlobalVariable>,
     ) -> Result<()> {
-        let mut order = effective.values().copied().collect::<Vec<_>>();
-        order.sort_by_key(|global| global.order);
-        for global in &order {
-            let name = &global.variable.name;
-            if global.is_parameter
-                && let Some(value) = parameters.get(name)
+        let mut order = Vec::new();
+        let mut order_reservation = 0usize;
+        for global in effective.values().copied() {
+            if let Err(error) =
+                reserve_temporary_vec_slot(&mut order, &mut self.meter, &mut order_reservation)
             {
-                let owned_bytes = expanded_name_owned_bytes(name)
-                    .saturating_add(parameter_value_owned_bytes(value, source_remap));
-                self.meter
-                    .check_additional(BudgetKind::OwnedBytes, owned_bytes)?;
-                let value = source_remap.map_or_else(
-                    || value.clone(),
-                    |remap| remap_parameter_value(value, remap),
-                );
-                self.meter.charge(BudgetKind::OwnedBytes, owned_bytes)?;
-                self.scopes[0].insert_retained(name.clone(), value, owned_bytes);
-                effective.remove(name);
+                self.meter.release_owned_bytes(order_reservation);
+                return Err(error);
             }
+            order.push(global);
         }
-        self.pending_globals = effective;
-        for global in order {
-            self.ensure_global(&global.variable.name)?;
-        }
-        Ok(())
+        order.sort_by_key(|global| global.order);
+        let initialized = (|| {
+            for global in &order {
+                let name = &global.variable.name;
+                if global.is_parameter
+                    && let Some(value) = parameters.get(name)
+                {
+                    let owned_bytes = expanded_name_owned_bytes(name)
+                        .saturating_add(parameter_value_owned_bytes(value, source_remap));
+                    self.meter
+                        .check_additional(BudgetKind::OwnedBytes, owned_bytes)?;
+                    let value = source_remap.map_or_else(
+                        || value.clone(),
+                        |remap| remap_parameter_value(value, remap),
+                    );
+                    self.meter.charge(BudgetKind::OwnedBytes, owned_bytes)?;
+                    self.scopes[0].insert_retained(name.clone(), value, owned_bytes);
+                    effective.remove(name);
+                }
+            }
+            self.pending_globals = effective;
+            for global in &order {
+                self.ensure_global(&global.variable.name)?;
+            }
+            Ok(())
+        })();
+        drop(order);
+        self.meter.release_owned_bytes(order_reservation);
+        initialized
     }
 
     fn ensure_global(&mut self, name: &ExpandedName) -> Result<()> {
@@ -1455,7 +1470,7 @@ impl<'a> Execution<'a> {
                 let kind = self.evaluator.source.node(*id).map(|source| &source.kind);
                 match kind {
                     Some(NodeKind::Root | NodeKind::Element { .. }) => {
-                        let children = self.evaluator.children(&node);
+                        let children = self.evaluator.children(&node, &self.meter)?;
                         let built_in_params = Arc::new(EvaluatedParameters::default());
                         self.push_apply_batch(
                             tasks,
@@ -2358,8 +2373,18 @@ impl<'a> Execution<'a> {
             return Ok(public_to_xpath(value));
         }
         match expression.source.trim() {
-            "." => return Ok(XPathValue::NodeSet(vec![node.clone()])),
-            "@*" => return Ok(XPathValue::NodeSet(self.evaluator.attributes(node))),
+            "." => {
+                return Ok(XPathValue::NodeSet(self.evaluator.singleton(
+                    node,
+                    true,
+                    &self.meter,
+                )?));
+            }
+            "@*" => {
+                return Ok(XPathValue::NodeSet(
+                    self.evaluator.attributes(node, &self.meter)?,
+                ));
+            }
             _ => {}
         }
         if let Some(nodes) = self
@@ -2565,22 +2590,18 @@ impl<'a> Execution<'a> {
         let source = expression.source.trim();
         match source {
             "self::text()" => {
-                return Ok(Some(XPathValue::NodeSet(
-                    self.evaluator
-                        .is_text_node(node)
-                        .then(|| node.clone())
-                        .into_iter()
-                        .collect(),
-                )));
+                return Ok(Some(XPathValue::NodeSet(self.evaluator.singleton(
+                    node,
+                    self.evaluator.is_text_node(node),
+                    &self.meter,
+                )?)));
             }
             "self::*" => {
-                return Ok(Some(XPathValue::NodeSet(
-                    self.evaluator
-                        .is_element_node(node)
-                        .then(|| node.clone())
-                        .into_iter()
-                        .collect(),
-                )));
+                return Ok(Some(XPathValue::NodeSet(self.evaluator.singleton(
+                    node,
+                    self.evaluator.is_element_node(node),
+                    &self.meter,
+                )?)));
             }
             "normalize-space(.)" => {
                 let mut capacity = 0usize;
@@ -2886,16 +2907,14 @@ impl<'a> Execution<'a> {
             // These are the two hot selections used by identity transforms. They
             // are context child-axis expressions, so projecting them through the
             // general XPath engine for every source node is unnecessary work.
-            "node()" => return Ok(self.evaluator.children(node)),
-            "." => return Ok(vec![node.clone()]),
-            "@*" => return Ok(self.evaluator.attributes(node)),
+            "node()" => return self.evaluator.children(node, &self.meter),
+            "." => return self.evaluator.singleton(node, true, &self.meter),
+            "@*" => return self.evaluator.attributes(node, &self.meter),
             "preceding-sibling::node()[normalize-space()][1][self::comment()]" => {
-                return Ok(self.evaluator.preceding_nonempty_comment(node));
+                return self.evaluator.preceding_nonempty_comment(node, &self.meter);
             }
             "@*|node()" | "node()|@*" => {
-                let mut selected = self.evaluator.attributes(node);
-                selected.extend(self.evaluator.children(node));
-                return Ok(selected);
+                return self.evaluator.attributes_and_children(node, &self.meter);
             }
             _ => {}
         }
@@ -4494,7 +4513,7 @@ fn sort_workspace_bytes(node_count: usize, sort_count: usize) -> usize {
 }
 
 fn xpath_calls_key(source: &str) -> bool {
-    !crate::expression::unprefixed_function_calls(source, "key").is_empty()
+    crate::expression::has_unprefixed_function_call(source, "key")
 }
 
 fn literal_key_names(
@@ -4856,29 +4875,8 @@ fn secondary_output_property_retains_value(name: &str) -> Result<bool> {
 }
 
 fn reserve_retained_vec_slot<T>(items: &mut Vec<T>, meter: &mut Meter) -> Result<()> {
-    if std::mem::size_of::<T>() == 0 || items.len() < items.capacity() {
-        return Ok(());
-    }
-    let old_capacity = items.capacity();
-    let requested_slots = old_capacity.max(4);
-    let requested_bytes = requested_slots.saturating_mul(std::mem::size_of::<T>());
-    meter.charge(BudgetKind::OwnedBytes, requested_bytes)?;
-    if let Err(error) = items.try_reserve_exact(requested_slots) {
-        meter.release_owned_bytes(requested_bytes);
-        return Err(Error::Dynamic(format!(
-            "failed to reserve retained result storage: {error}"
-        )));
-    }
-    let actual_bytes = items
-        .capacity()
-        .saturating_sub(old_capacity)
-        .saturating_mul(std::mem::size_of::<T>());
-    if actual_bytes < requested_bytes {
-        meter.release_owned_bytes(requested_bytes - actual_bytes);
-    } else if actual_bytes > requested_bytes {
-        meter.charge(BudgetKind::OwnedBytes, actual_bytes - requested_bytes)?;
-    }
-    Ok(())
+    let mut reserved_owned_bytes = items.capacity().saturating_mul(std::mem::size_of::<T>());
+    reserve_temporary_vec_slot(items, meter, &mut reserved_owned_bytes)
 }
 
 fn reserve_retained_hash_set_slot<T>(
@@ -4895,24 +4893,35 @@ where
     let old_capacity = items.capacity();
     let requested_slots = old_capacity.max(4);
     let slot_bytes = std::mem::size_of::<T>().saturating_mul(2);
-    let requested_bytes = requested_slots.saturating_mul(slot_bytes);
+    let target_capacity = old_capacity.saturating_add(requested_slots);
+    let requested_bytes = target_capacity.saturating_mul(slot_bytes);
     meter.charge(BudgetKind::OwnedBytes, requested_bytes)?;
-    if let Err(error) = items.try_reserve(requested_slots) {
+    let mut replacement = HashSet::with_hasher(items.hasher().clone());
+    if let Err(error) = replacement.try_reserve(target_capacity) {
         meter.release_owned_bytes(requested_bytes);
         return Err(Error::Dynamic(format!(
             "failed to reserve retained URI index storage: {error}"
         )));
     }
-    let actual_bytes = items
-        .capacity()
-        .saturating_sub(old_capacity)
-        .saturating_mul(slot_bytes);
+    let actual_bytes = replacement.capacity().saturating_mul(slot_bytes);
     if actual_bytes < requested_bytes {
         meter.release_owned_bytes(requested_bytes - actual_bytes);
     } else if actual_bytes > requested_bytes {
-        meter.charge(BudgetKind::OwnedBytes, actual_bytes - requested_bytes)?;
+        let shortfall = actual_bytes - requested_bytes;
+        if let Err(error) = meter.check_additional(BudgetKind::OwnedBytes, shortfall) {
+            meter.release_owned_bytes(requested_bytes);
+            return Err(error);
+        }
+        meter.charge(BudgetKind::OwnedBytes, shortfall)?;
     }
-    *reserved_owned_bytes = reserved_owned_bytes.saturating_add(actual_bytes);
+    replacement.extend(items.drain());
+    std::mem::swap(items, &mut replacement);
+    let old_bytes = replacement.capacity().saturating_mul(slot_bytes);
+    *reserved_owned_bytes = reserved_owned_bytes
+        .checked_sub(old_bytes)
+        .expect("retained hash-set capacity was previously charged")
+        .saturating_add(actual_bytes);
+    meter.release_owned_bytes(old_bytes);
     Ok(())
 }
 
@@ -5991,6 +6000,7 @@ mod tests {
                 external_documents: usize::MAX,
                 recursion_depth: usize::MAX,
                 xpath_evaluations: usize::MAX,
+                extension_operations: usize::MAX,
                 pattern_evaluations: usize::MAX,
                 template_applications: usize::MAX,
                 sort_comparisons: usize::MAX,
@@ -6015,6 +6025,7 @@ mod tests {
                 external_documents: usize::MAX,
                 recursion_depth: usize::MAX,
                 xpath_evaluations: usize::MAX,
+                extension_operations: usize::MAX,
                 pattern_evaluations: usize::MAX,
                 template_applications: usize::MAX,
                 sort_comparisons: usize::MAX,
@@ -6163,6 +6174,7 @@ mod tests {
             external_documents: usize::MAX,
             recursion_depth: usize::MAX,
             xpath_evaluations: usize::MAX,
+            extension_operations: usize::MAX,
             pattern_evaluations: usize::MAX,
             template_applications: usize::MAX,
             sort_comparisons: usize::MAX,

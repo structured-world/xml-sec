@@ -33,6 +33,7 @@ fn execution_budget(source_bytes: usize) -> ExecutionBudget {
         external_documents: 8,
         recursion_depth: 256,
         xpath_evaluations: 100_000,
+        extension_operations: 100_000_000,
         pattern_evaluations: 100_000_000,
         template_applications: 100_000,
         sort_comparisons: 100_000,
@@ -965,6 +966,7 @@ fn malformed_stylesheet_and_budget_exhaustion_are_typed() {
                     external_documents: 0,
                     recursion_depth: 1,
                     xpath_evaluations: 1,
+                    extension_operations: 1,
                     pattern_evaluations: 1,
                     template_applications: 1,
                     sort_comparisons: 1,
@@ -4991,9 +4993,9 @@ fn xinclude_fallback_never_swallows_security_budget_failures() {
 }
 
 #[test]
-fn xinclude_text_encoding_errors_activate_fallback() {
-    // XInclude 1.0 section 4.3.3 classifies malformed acquired byte sequences as resource
-    // errors, so fallback applies; successfully decoded XML-forbidden characters remain fatal.
+fn xinclude_text_distinguishes_unavailable_encodings_from_invalid_bytes() {
+    // XInclude 1.0 section 4.3 classifies an unavailable encoding as a resource error, but byte
+    // sequences outside the selected encoding and XML-forbidden characters as fatal errors.
     // https://www.w3.org/TR/xinclude/#text_included
     let resolver = Arc::new(ContextResolver::default());
     for (href, encoding, bytes) in [
@@ -5026,7 +5028,7 @@ fn xinclude_text_encoding_errors_activate_fallback() {
             Some("memory:source.xml"),
         )
         .expect("XInclude source parses");
-        let result = stylesheet
+        let error = stylesheet
             .execute_with_source_processing(
                 &source,
                 &Parameters::new(),
@@ -5038,9 +5040,43 @@ fn xinclude_text_encoding_errors_activate_fallback() {
                 },
                 SourceProcessing::XInclude,
             )
-            .expect("encoding resource errors activate fallback");
-        assert_eq!(result.serialized.bytes, b"fallback");
+            .expect_err("invalid byte sequences are fatal");
+        assert!(matches!(error, Error::Xml(_)));
     }
+
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            ("unsupported.txt".into(), Some("memory:source.xml".into())),
+            ResolvedResource {
+                canonical_uri: "memory:unsupported.txt".into(),
+                identity: ResourceIdentity("unsupported.txt".into()),
+                bytes: b"text".to_vec(),
+                media_type: Some("text/plain".into()),
+                encoding: Some("X-NOT-AVAILABLE".into()),
+            },
+        );
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="unsupported.txt" parse="text"><xi:fallback>fallback</xi:fallback></xi:include></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("XInclude source parses");
+    let result = stylesheet
+        .execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            resolver.clone(),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        )
+        .expect("unsupported encoding activates fallback");
+    assert_eq!(result.serialized.bytes, b"fallback");
 
     resolver
         .resources
@@ -5831,9 +5867,10 @@ fn xinclude_rejects_fallback_outside_include_before_resolution() {
 }
 
 #[test]
-fn xinclude_rejects_misplaced_nested_fallback_before_resolution() {
-    // XInclude 1.0 section 3.2 permits xi:fallback only as a direct xi:include child, including
-    // inside otherwise ignored extension content. Validation must precede resource acquisition.
+fn xinclude_defers_validation_inside_unused_fallback() {
+    // XInclude 1.0 section 3.2 says apparent fatal errors inside fallback content must not be
+    // reported unless a resource error activates that fallback. Misplaced fallback outside the
+    // direct fallback subtree remains fatal before resource acquisition.
     // https://www.w3.org/TR/xinclude/#fallback_element
     let resolver = Arc::new(CountingResolver::default());
     resolver
@@ -5844,35 +5881,59 @@ fn xinclude_rejects_misplaced_nested_fallback_before_resolution() {
     let stylesheet = compile(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#,
     );
-    for source in [
+    let source = Document::parse(
         r#"<root xmlns:xi="http://www.w3.org/2001/XInclude" xmlns:ext="urn:extension"><xi:include href="included.xml"><ext:wrapper><xi:fallback/></ext:wrapper></xi:include></root>"#,
-        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="included.xml"><xi:fallback><xi:fallback/></xi:fallback></xi:include></root>"#,
-    ] {
-        let source = Document::parse(source, Some("memory:source.xml"))
-            .expect("source parses before XInclude validation");
-        let error = stylesheet
-            .execute_with_source_processing(
-                &source,
-                &Parameters::new(),
-                resolver.clone(),
-                ExecutionOptions {
-                    budget: execution_budget(1024),
-                    initial_mode: None,
-                    initial_template: None,
-                },
-                SourceProcessing::XInclude,
-            )
-            .expect_err("a nested xi:fallback is a fatal syntax error");
-        assert!(matches!(error, Error::Xml(message) if message.contains("direct child")));
-    }
+        Some("memory:source.xml"),
+    )
+    .expect("source parses before XInclude validation");
+    let error = stylesheet
+        .execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            resolver.clone(),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        )
+        .expect_err("fallback outside the direct fallback subtree is fatal");
+    assert!(matches!(error, Error::Xml(message) if message.contains("direct child")));
     assert_eq!(resolver.calls.load(Ordering::Relaxed), 0);
+
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="included.xml"><xi:fallback><xi:fallback/></xi:fallback></xi:include></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("source parses before XInclude processing");
+    stylesheet
+        .execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            resolver.clone(),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        )
+        .expect("invalid content in an unused fallback is ignored");
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 1);
 }
 
 #[test]
-fn xinclude_rejects_text_encoding_in_xml_mode_before_resolution() {
-    // XInclude 1.0 section 3.1 forbids encoding when parse="xml", including the default mode.
+fn xinclude_ignores_encoding_in_xml_mode() {
+    // XInclude 1.0 section 3.1 states that encoding has no effect when parse="xml"; it is not a
+    // syntax error and must not prevent acquisition of the XML resource.
     // https://www.w3.org/TR/xinclude/#include_element
     let resolver = Arc::new(CountingResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert("included.xml".into(), "<included/>".into());
     let stylesheet = compile(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#,
     );
@@ -5884,7 +5945,7 @@ fn xinclude_rejects_text_encoding_in_xml_mode_before_resolution() {
             Some("memory:source.xml"),
         )
         .expect("source parses before XInclude validation");
-        let error = stylesheet
+        stylesheet
             .execute_with_source_processing(
                 &source,
                 &Parameters::new(),
@@ -5896,18 +5957,15 @@ fn xinclude_rejects_text_encoding_in_xml_mode_before_resolution() {
                 },
                 SourceProcessing::XInclude,
             )
-            .expect_err("encoding with XML-mode inclusion is fatal");
-        assert!(
-            matches!(error, Error::Xml(message) if message.contains("encoding") && message.contains("parse=\"xml\""))
-        );
+            .expect("encoding is ignored for XML-mode inclusion");
     }
-    assert_eq!(resolver.calls.load(Ordering::Relaxed), 0);
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 2);
 }
 
 #[test]
-fn xinclude_validates_attributes_and_missing_href_before_resolution() {
-    // XInclude 1.0 section 3.1 makes unknown unprefixed attributes fatal and requires xpointer
-    // whenever href is absent; neither syntax error may cross the resolver capability boundary.
+fn xinclude_ignores_reserved_attributes_but_rejects_missing_href() {
+    // XInclude 1.0 section 3.1 reserves unknown unprefixed attributes for future versions and
+    // requires 1.0 processors to ignore them; the separate missing-href constraint remains fatal.
     // https://www.w3.org/TR/xinclude/#include_element
     let resolver = Arc::new(CountingResolver::default());
     resolver
@@ -5918,28 +5976,46 @@ fn xinclude_validates_attributes_and_missing_href_before_resolution() {
     let stylesheet = compile(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#,
     );
-    for source in [
+    let source = Document::parse(
         r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="included.xml" typo="value"/></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("source parses before XInclude processing");
+    stylesheet
+        .execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            resolver.clone(),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        )
+        .expect("reserved unprefixed attributes are ignored");
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 1);
+
+    let source = Document::parse(
         r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include parse="text"><xi:fallback>masked</xi:fallback></xi:include></root>"#,
-    ] {
-        let source = Document::parse(source, Some("memory:source.xml"))
-            .expect("source parses before XInclude validation");
-        let error = stylesheet
-            .execute_with_source_processing(
-                &source,
-                &Parameters::new(),
-                resolver.clone(),
-                ExecutionOptions {
-                    budget: execution_budget(1024),
-                    initial_mode: None,
-                    initial_template: None,
-                },
-                SourceProcessing::XInclude,
-            )
-            .expect_err("invalid include syntax is fatal before resource acquisition");
-        assert!(matches!(error, Error::Xml(_)));
-    }
-    assert_eq!(resolver.calls.load(Ordering::Relaxed), 0);
+        Some("memory:source.xml"),
+    )
+    .expect("source parses before XInclude validation");
+    let error = stylesheet
+        .execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            resolver.clone(),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        )
+        .expect_err("missing href in text mode remains fatal");
+    assert!(matches!(error, Error::Xml(_)));
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 1);
 
     let source = Document::parse(
         r#"<root xmlns:xi="http://www.w3.org/2001/XInclude" xmlns:ext="urn:extension"><xi:include href="included.xml" ext:metadata="allowed"/></root>"#,
@@ -5959,7 +6035,7 @@ fn xinclude_validates_attributes_and_missing_href_before_resolution() {
             SourceProcessing::XInclude,
         )
         .expect("foreign-namespaced attributes remain permitted");
-    assert_eq!(resolver.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 2);
 }
 
 #[test]
@@ -9661,6 +9737,36 @@ fn optimized_child_selection_accounts_for_projected_node_storage() {
     assert!(
         selecting_bytes >= baseline_bytes.saturating_add(4_096),
         "wide fast-path selection storage must cross OwnedBytes"
+    );
+}
+
+#[test]
+fn identity_axis_shortcuts_account_for_projected_node_storage() {
+    // Identity-transform shortcuts must apply the same temporary node-set budget as the generic
+    // XPath path even when recursive execution consumes the returned vector directly.
+    let attributes = (0..2_048)
+        .map(|index| format!(r#" a{index}="""#))
+        .collect::<String>();
+    let source_xml = format!("<root{attributes}/>");
+    let source = Document::parse(&source_xml, None).expect("wide source parses");
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template name="baseline"><xsl:for-each select="root"/></xsl:template><xsl:template name="selecting"><xsl:for-each select="root"><xsl:value-of select="@*"/></xsl:for-each></xsl:template></xsl:stylesheet>"#,
+    );
+    let baseline = minimum_execution_owned_bytes_for_named_source(
+        &stylesheet,
+        &source,
+        source_xml.len(),
+        "baseline",
+    );
+    let selecting = minimum_execution_owned_bytes_for_named_source(
+        &stylesheet,
+        &source,
+        source_xml.len(),
+        "selecting",
+    );
+    assert!(
+        selecting >= baseline.saturating_add(4_096),
+        "identity-axis shortcut storage must cross OwnedBytes"
     );
 }
 

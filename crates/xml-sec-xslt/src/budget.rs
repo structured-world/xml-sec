@@ -30,6 +30,7 @@ pub enum BudgetKind {
     ExternalDocuments,
     RecursionDepth,
     XPathEvaluations,
+    ExtensionOperations,
     PatternEvaluations,
     TemplateApplications,
     SortComparisons,
@@ -94,6 +95,8 @@ pub struct ExecutionBudget {
     pub external_documents: usize,
     pub recursion_depth: usize,
     pub xpath_evaluations: usize,
+    /// Internal work performed by extension functions after one XPath call is dispatched.
+    pub extension_operations: usize,
     pub pattern_evaluations: usize,
     pub template_applications: usize,
     pub sort_comparisons: usize,
@@ -108,6 +111,7 @@ pub struct ExecutionBudget {
 pub(crate) struct Meter {
     limits: ExecutionBudget,
     xpath_evaluations: usize,
+    extension_operations: usize,
     pattern_evaluations: usize,
     template_applications: usize,
     sort_comparisons: usize,
@@ -126,6 +130,7 @@ impl Meter {
         Ok(Self {
             limits,
             xpath_evaluations: 0,
+            extension_operations: 0,
             pattern_evaluations: 0,
             template_applications: 0,
             sort_comparisons: 0,
@@ -162,6 +167,10 @@ impl Meter {
             BudgetKind::XPathEvaluations => {
                 (&mut self.xpath_evaluations, self.limits.xpath_evaluations)
             }
+            BudgetKind::ExtensionOperations => (
+                &mut self.extension_operations,
+                self.limits.extension_operations,
+            ),
             BudgetKind::PatternEvaluations => (
                 &mut self.pattern_evaluations,
                 self.limits.pattern_evaluations,
@@ -204,19 +213,6 @@ impl Meter {
         ensure(kind, limit, used.saturating_add(amount))
     }
 
-    fn record_owned_allocation(&mut self, amount: usize) -> Result<()> {
-        let Some(actual) = self.owned_bytes.checked_add(amount) else {
-            self.owned_bytes = usize::MAX;
-            return Err(Error::Budget {
-                kind: BudgetKind::OwnedBytes,
-                limit: self.limits.owned_bytes,
-                actual: usize::MAX,
-            });
-        };
-        self.owned_bytes = actual;
-        ensure(BudgetKind::OwnedBytes, self.limits.owned_bytes, actual)
-    }
-
     pub(crate) fn release_owned_bytes(&mut self, amount: usize) {
         self.owned_bytes = self
             .owned_bytes
@@ -231,6 +227,9 @@ impl Meter {
             }
             BudgetKind::XPathEvaluations => {
                 Ok((self.xpath_evaluations, self.limits.xpath_evaluations))
+            }
+            BudgetKind::ExtensionOperations => {
+                Ok((self.extension_operations, self.limits.extension_operations))
             }
             BudgetKind::PatternEvaluations => {
                 Ok((self.pattern_evaluations, self.limits.pattern_evaluations))
@@ -274,38 +273,49 @@ pub(crate) fn reserve_temporary_vec_slot<T>(
     }
     let old_capacity = items.capacity();
     let requested_slots = old_capacity.max(4);
-    let requested_bytes = requested_slots.saturating_mul(std::mem::size_of::<T>());
+    let target_capacity = old_capacity.saturating_add(requested_slots);
+    let requested_bytes = target_capacity.saturating_mul(std::mem::size_of::<T>());
     meter.charge(BudgetKind::OwnedBytes, requested_bytes)?;
-    if let Err(error) = items.try_reserve_exact(requested_slots) {
+    let mut replacement = Vec::new();
+    if let Err(error) = replacement.try_reserve_exact(target_capacity) {
         meter.release_owned_bytes(requested_bytes);
         return Err(Error::Dynamic(format!(
             "failed to reserve temporary execution storage: {error}"
         )));
     }
-    let actual_bytes = items
+    let actual_bytes = replacement
         .capacity()
-        .saturating_sub(old_capacity)
         .saturating_mul(std::mem::size_of::<T>());
-    reconcile_temporary_vec_growth(meter, reserved_owned_bytes, requested_bytes, actual_bytes)
+    reconcile_temporary_vec_growth(meter, requested_bytes, actual_bytes)?;
+
+    replacement.append(items);
+    std::mem::swap(items, &mut replacement);
+    let old_bytes = replacement
+        .capacity()
+        .saturating_mul(std::mem::size_of::<T>());
+    *reserved_owned_bytes = reserved_owned_bytes
+        .checked_sub(old_bytes)
+        .expect("temporary vector capacity was previously charged")
+        .saturating_add(actual_bytes);
+    meter.release_owned_bytes(old_bytes);
+    Ok(())
 }
 
 fn reconcile_temporary_vec_growth(
     meter: &mut Meter,
-    reserved_owned_bytes: &mut usize,
     requested_bytes: usize,
     actual_bytes: usize,
 ) -> Result<()> {
     if actual_bytes < requested_bytes {
         meter.release_owned_bytes(requested_bytes - actual_bytes);
     } else if actual_bytes > requested_bytes {
-        *reserved_owned_bytes = reserved_owned_bytes.saturating_add(actual_bytes);
-        // Vec may retain allocator-granted excess capacity and offers no guaranteed rollback.
-        // Record it even when it crosses the limit so a caller that catches the error cannot
-        // reuse unmetered storage; the over-limit meter then remains fail-closed.
-        meter.record_owned_allocation(actual_bytes - requested_bytes)?;
-        return Ok(());
+        let shortfall = actual_bytes - requested_bytes;
+        if let Err(error) = meter.check_additional(BudgetKind::OwnedBytes, shortfall) {
+            meter.release_owned_bytes(requested_bytes);
+            return Err(error);
+        }
+        meter.charge(BudgetKind::OwnedBytes, shortfall)?;
     }
-    *reserved_owned_bytes = reserved_owned_bytes.saturating_add(actual_bytes);
     Ok(())
 }
 
@@ -330,6 +340,7 @@ mod tests {
             external_documents: 0,
             recursion_depth: 1,
             xpath_evaluations: 0,
+            extension_operations: 0,
             pattern_evaluations: 0,
             template_applications: 0,
             sort_comparisons: 0,
@@ -355,18 +366,15 @@ mod tests {
     }
 
     #[test]
-    fn failed_vec_growth_shortfall_remains_accounted() {
-        // An allocator may grant more capacity than Vec::try_reserve_exact requests. Once that
-        // allocation exists, a failed shortfall charge must leave the meter fail-closed rather
-        // than making the retained capacity reusable without accounting.
+    fn failed_vec_replacement_shortfall_rolls_back_accounting() {
+        // An allocator may grant more capacity than Vec::try_reserve_exact requests. Rejecting
+        // that temporary replacement must restore the meter before the replacement is dropped.
         let mut meter = Meter::new(execution_budget(10), 0).expect("meter initializes");
         meter
             .charge(BudgetKind::OwnedBytes, 8)
             .expect("requested growth fits");
-        let mut reserved = 0;
-
         assert!(matches!(
-            reconcile_temporary_vec_growth(&mut meter, &mut reserved, 8, 12),
+            reconcile_temporary_vec_growth(&mut meter, 8, 12),
             Err(Error::Budget {
                 kind: BudgetKind::OwnedBytes,
                 limit: 10,
@@ -377,18 +385,19 @@ mod tests {
             meter
                 .usage(BudgetKind::OwnedBytes)
                 .expect("owned-byte usage is available"),
-            (12, 10)
+            (0, 10)
         );
-        assert_eq!(reserved, 12);
-        assert!(meter.charge(BudgetKind::OwnedBytes, 1).is_err());
+        meter
+            .charge(BudgetKind::OwnedBytes, 10)
+            .expect("failed replacement leaves the original allowance available");
     }
 
     #[test]
-    fn overflowing_owned_allocation_leaves_the_meter_fail_closed() {
+    fn overflowing_owned_charge_leaves_the_meter_fail_closed() {
         let mut meter = Meter::new(execution_budget(usize::MAX), 1).expect("meter initializes");
 
         assert!(matches!(
-            meter.record_owned_allocation(usize::MAX),
+            meter.charge(BudgetKind::OwnedBytes, usize::MAX),
             Err(Error::Budget {
                 kind: BudgetKind::OwnedBytes,
                 limit: usize::MAX,

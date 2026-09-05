@@ -3707,7 +3707,7 @@ fn validate_key_dependency_expression(attribute: &str, source: &str) -> Result<(
             "xsl:key {attribute} must not contain a variable reference"
         )));
     }
-    if !crate::expression::unprefixed_function_calls(source, "key").is_empty() {
+    if crate::expression::has_unprefixed_function_call(source, "key") {
         return Err(Error::Static(format!(
             "xsl:key {attribute} must not call key()"
         )));
