@@ -204,6 +204,9 @@ pub type NsStr<'d> = &'d str;
 /// String type used for namespace prefix/URI storage.
 /// `&'d str` in default mode, `String` in no-unsafe mode.
 #[cfg(feature = "no-unsafe")]
+///
+/// The lifetime is intentionally retained so cfg-independent generic code has one public type
+/// signature; owned storage does not borrow from `'d` in this mode.
 pub type NsStr<'d> = String;
 
 static XML_NS_PREFIX: &str = "xml";

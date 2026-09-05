@@ -2095,9 +2095,11 @@ impl<'a> Execution<'a> {
                 }
                 let value =
                     self.capture_text(body, node, position, size, depth, current_precedence)?;
-                let mut value = value.transfer(&mut self.meter);
-                let leading = value.len() - value.trim_start_matches([' ', '\t', '\r', '\n']).len();
-                value.drain(..leading);
+                // XSLT 1.0 section 7.3 defines PI content as the sequence constructor's
+                // string-value. The serializer supplies the required separator; whitespace in
+                // this value is data and must remain intact.
+                // https://www.w3.org/TR/1999/REC-xslt-19991116#section-Creating-Processing-Instructions
+                let value = value.transfer(&mut self.meter);
                 if value.contains("?>") {
                     return Err(Error::Dynamic("processing instruction contains ?>".into()));
                 }

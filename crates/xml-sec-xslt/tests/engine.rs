@@ -6585,10 +6585,11 @@ fn unicode_variable_names_preserve_result_tree_fragments() {
 }
 
 #[test]
-fn processing_instruction_strips_leading_xml_whitespace() {
-    // XSLT strips leading PI data whitespace before the serializer adds one separator.
+fn processing_instruction_preserves_leading_xml_whitespace() {
+    // XSLT 1.0 section 7.3 uses the sequence constructor's string-value as PI content; the
+    // serializer adds its own separator without deleting data whitespace.
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><xsl:processing-instruction name="p"><xsl:text>  value</xsl:text></xsl:processing-instruction></xsl:template></xsl:stylesheet>"#;
-    assert_eq!(execute(stylesheet, "<source/>"), "<?p value?>\n");
+    assert_eq!(execute(stylesheet, "<source/>"), "<?p   value?>\n");
 }
 
 #[derive(Default)]

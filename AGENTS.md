@@ -1,6 +1,6 @@
 # xml-sec Agent Rules
 
-These rules extend `/Users/polaz/projects/sw/AGENTS.md` for this repository.
+These repository-specific rules supplement the active global agent instructions.
 
 ## Unified Policy Architecture (CRITICAL)
 

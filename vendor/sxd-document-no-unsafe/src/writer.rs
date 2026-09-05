@@ -228,6 +228,9 @@ impl<'d> PrefixMapping<'d> {
         // Check if the parent already defined a prefix for this ns
         for parent_scope in parents.iter().rev() {
             if let Some(prefix) = parent_scope.prefix_for(namespace_uri) {
+                if current_scope.has_prefix(prefix) {
+                    continue;
+                }
                 // A parent happens to have a prefix for this URI.
                 // Prevent redefining it
                 current_scope.add_mapping(prefix, namespace_uri);
@@ -376,9 +379,16 @@ impl Writer {
     where
         W: Write + ?Sized,
     {
-        for item in value
-            .split_keeping_delimiter(|c| c == '<' || c == '>' || c == '&' || c == '\'' || c == '"')
-        {
+        for item in value.split_keeping_delimiter(|c| {
+            c == '<'
+                || c == '>'
+                || c == '&'
+                || c == '\''
+                || c == '"'
+                || c == '\t'
+                || c == '\n'
+                || c == '\r'
+        }) {
             match item {
                 SplitType::Match(t) => writer.write_str(t)?,
                 SplitType::Delimiter("<") => writer.write_str("&lt;")?,
@@ -386,6 +396,12 @@ impl Writer {
                 SplitType::Delimiter("&") => writer.write_str("&amp;")?,
                 SplitType::Delimiter("'") => writer.write_str("&apos;")?,
                 SplitType::Delimiter("\"") => writer.write_str("&quot;")?,
+                // XML 1.0 section 3.3.3 normalizes literal attribute whitespace to spaces;
+                // references preserve the original code points.
+                // https://www.w3.org/TR/xml/#AVNormalize
+                SplitType::Delimiter("\t") => writer.write_str("&#x9;")?,
+                SplitType::Delimiter("\n") => writer.write_str("&#xA;")?,
+                SplitType::Delimiter("\r") => writer.write_str("&#xD;")?,
                 SplitType::Delimiter(..) => unreachable!(),
             }
         }
@@ -426,14 +442,16 @@ impl Writer {
 
         if let Some(ns_uri) = mapping.default_namespace_uri_in_current_scope() {
             writer.write_str(" xmlns='")?;
-            writer.write_str(ns_uri)?;
+            self.format_attribute_value(ns_uri, writer)?;
             writer.write_str("'")?;
         }
 
         for (prefix, ns_uri) in mapping.prefixes_in_current_scope() {
             writer.write_str(" xmlns:")?;
             writer.write_str(prefix)?;
-            write!(writer, "='{}'", ns_uri)?;
+            writer.write_str("='")?;
+            self.format_attribute_value(ns_uri, writer)?;
+            writer.write_str("'")?;
         }
 
         let mut children = element.children();
@@ -484,13 +502,17 @@ impl Writer {
     {
         for item in text
             .text()
-            .split_keeping_delimiter(|c| c == '<' || c == '>' || c == '&')
+            .split_keeping_delimiter(|c| c == '<' || c == '>' || c == '&' || c == '\r')
         {
             match item {
                 SplitType::Match(t) => writer.write_str(t)?,
                 SplitType::Delimiter("<") => writer.write_str("&lt;")?,
                 SplitType::Delimiter(">") => writer.write_str("&gt;")?,
                 SplitType::Delimiter("&") => writer.write_str("&amp;")?,
+                // XML 1.0 section 2.11 normalizes literal carriage returns to line feeds;
+                // a character reference preserves the DOM value across reparsing.
+                // https://www.w3.org/TR/xml/#sec-line-ends
+                SplitType::Delimiter("\r") => writer.write_str("&#xD;")?,
                 SplitType::Delimiter(..) => unreachable!(),
             }
         }
@@ -914,6 +936,41 @@ mod test {
         assert_eq!(
             xml,
             "<?xml version='1.0'?><p:hello xmlns:p='outer'><p:world xmlns:p='inner'/></p:hello>"
+        );
+    }
+
+    #[test]
+    fn inherited_prefix_rebound_by_child_is_not_reused_for_another_namespace() {
+        let p = Package::new();
+        let d = p.as_document();
+        let parent = d.create_element(("outer", "parent"));
+        parent.set_preferred_prefix(Some("p"));
+        let child = d.create_element(("inner", "child"));
+        child.set_preferred_prefix(Some("p"));
+        child.set_attribute_value(("outer", "attribute"), "value");
+        parent.append_child(child);
+        d.root().append_child(parent);
+
+        let xml = format_xml(&d);
+        assert_eq!(
+            xml,
+            "<?xml version='1.0'?><p:parent xmlns:p='outer'><p:child autons0:attribute='value' xmlns:p='inner' xmlns:autons0='outer'/></p:parent>"
+        );
+    }
+
+    #[test]
+    fn namespace_and_normalized_characters_round_trip_lexically() {
+        let p = Package::new();
+        let d = p.as_document();
+        let element = d.create_element(("urn:a&b", "root"));
+        element.set_default_namespace_uri(Some("urn:a&b"));
+        element.set_attribute_value("value", "a\tb\nc\rd");
+        element.append_child(d.create_text("left\rright"));
+        d.root().append_child(element);
+
+        assert_eq!(
+            format_xml(&d),
+            "<?xml version='1.0'?><root value='a&#x9;b&#xA;c&#xD;d' xmlns='urn:a&amp;b'>left&#xD;right</root>"
         );
     }
 

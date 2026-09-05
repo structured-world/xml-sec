@@ -1164,18 +1164,21 @@ mod test {
 
     #[test]
     fn translate_charges_one_character_replacement_storage() {
-        // The sorted one-entry replacement table and worst-case result require exactly twenty
-        // logical bytes; the operation must reject one byte below that boundary.
+        // Derive the target-dependent tuple layout from the production representation instead of
+        // assuming a 64-bit ABI.
+        let required = std::mem::size_of::<(char, usize, Option<char>)>() + char::MAX.len_utf8();
         let package = Package::new();
         let document = package.as_document();
         let mut setup = Setup::new();
-        setup.context.set_string_allocation_limit(19);
+        setup
+            .context
+            .set_string_allocation_limit(required.saturating_sub(1));
         let error = setup
             .evaluate(document.root(), Translate, args!["a", "a", "b"])
             .expect_err("replacement table and result must cross the allocation gate");
         assert!(error.to_string().contains("string allocation budget"));
 
-        setup.context.set_string_allocation_limit(20);
+        setup.context.set_string_allocation_limit(required);
         assert_eq!(
             setup.evaluate(document.root(), Translate, args!["a", "a", "b"]),
             Ok(Value::String("b".into()))
