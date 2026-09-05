@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use xml_sec_xml_input::lexical::{Event, Scanner};
 
 use crate::budget::{
-    ENTITY_EXPANSION_BYTE_CEILING, ENTITY_EXPANSION_DEPTH_CEILING, ENTITY_REFERENCE_CEILING, Meter,
-    NAMESPACE_SCOPE_BYTE_CEILING, ensure, reserve_temporary_vec_slot,
+    ENTITY_EXPANSION_BYTE_CEILING, ENTITY_EXPANSION_DEPTH_CEILING, Meter, ensure,
+    reserve_temporary_vec_slot,
 };
 use crate::{BudgetKind, Error, ParseBudget, Result};
 
@@ -240,7 +240,7 @@ impl Document {
         Self::parse_iterative(xml, base_uri)
     }
 
-    /// Parse caller-decoded XML while bounding input bytes, nodes, and element depth.
+    /// Parse caller-decoded XML with explicit structural and allocation limits.
     pub fn parse_with_budget(
         xml: &str,
         base_uri: Option<&str>,
@@ -259,7 +259,7 @@ impl Document {
         Self::parse_iterative(&xml, base_uri)
     }
 
-    /// Decode and parse XML bytes while bounding decoded bytes, nodes, and element depth.
+    /// Decode and parse XML bytes with explicit structural and allocation limits.
     pub fn parse_bytes_with_budget(
         bytes: &[u8],
         base_uri: Option<&str>,
@@ -581,7 +581,10 @@ impl Document {
             budget,
             nodes: 1,
             entity_references: 0,
-            entity_expansion: EntityExpansionMeter::new(ENTITY_EXPANSION_BYTE_CEILING),
+            entity_expansion: EntityExpansionMeter::with_reference_limit(
+                ENTITY_EXPANSION_BYTE_CEILING,
+                budget.entity_references,
+            ),
             namespace_scope_bytes: 0,
         };
         let (parameter_expanded_xml, declarations) = internal_general_entities(
@@ -1929,8 +1932,8 @@ fn push_stream_element(
     };
     let mut namespace_index_bytes = namespace_index_owned_bytes(&namespaces);
     ensure(
-        BudgetKind::OwnedBytes,
-        NAMESPACE_SCOPE_BYTE_CEILING,
+        BudgetKind::NamespaceScopeBytes,
+        meter.budget.namespace_scope_bytes,
         meter
             .namespace_scope_bytes
             .saturating_add(namespace_index_bytes),
@@ -1965,6 +1968,7 @@ fn push_stream_element(
                 &mut namespace_index,
                 None,
                 value,
+                meter.budget.namespace_scope_bytes,
                 &mut namespace_index_bytes,
                 &mut meter.namespace_scope_bytes,
             )?;
@@ -1978,6 +1982,7 @@ fn push_stream_element(
                 &mut namespace_index,
                 Some(prefix.into()),
                 value,
+                meter.budget.namespace_scope_bytes,
                 &mut namespace_index_bytes,
                 &mut meter.namespace_scope_bytes,
             )?;
@@ -2011,6 +2016,7 @@ fn push_stream_element(
                 &mut namespace_index,
                 None,
                 value,
+                meter.budget.namespace_scope_bytes,
                 &mut namespace_index_bytes,
                 &mut meter.namespace_scope_bytes,
             )?;
@@ -2021,6 +2027,7 @@ fn push_stream_element(
                 &mut namespace_index,
                 Some(prefix.into()),
                 value,
+                meter.budget.namespace_scope_bytes,
                 &mut namespace_index_bytes,
                 &mut meter.namespace_scope_bytes,
             )?;
@@ -2317,6 +2324,7 @@ fn set_namespace_bounded(
     index: &mut HashMap<String, usize>,
     prefix: Option<String>,
     uri: String,
+    limit: usize,
     namespace_index_bytes: &mut usize,
     materialized_bytes: &mut usize,
 ) -> Result<()> {
@@ -2343,11 +2351,7 @@ fn set_namespace_bounded(
         .saturating_add(next_index_bytes)
         .saturating_add(inherited_copy.unwrap_or(0))
         .saturating_add(declaration_bytes);
-    if next > NAMESPACE_SCOPE_BYTE_CEILING {
-        return Err(Error::Xml(
-            "cumulative namespace scope allocation limit exceeded".into(),
-        ));
-    }
+    ensure(BudgetKind::NamespaceScopeBytes, limit, next)?;
     set_namespace(namespaces, index, prefix, uri);
     *namespace_index_bytes = next_index_bytes;
     *materialized_bytes = next.saturating_sub(next_index_bytes);
@@ -2409,11 +2413,6 @@ fn internal_general_entities<'a>(
                     ));
                 }
                 expanded_subset = Cow::Owned(next);
-                if *references > ENTITY_REFERENCE_CEILING {
-                    return Err(Error::Xml(
-                        "parameter entity expansion limit exceeded".into(),
-                    ));
-                }
             }
         }
     };
@@ -3401,11 +3400,10 @@ fn expand_parameter_entity_references_into(
                 return Err(Error::Xml("invalid parameter entity reference name".into()));
             }
             if let Some(replacement) = entities.get(name) {
-                *references += 1;
-                if depth >= ENTITY_EXPANSION_DEPTH_CEILING || *references > ENTITY_REFERENCE_CEILING
-                {
+                meter.charge_reference(references)?;
+                if depth >= ENTITY_EXPANSION_DEPTH_CEILING {
                     return Err(Error::Xml(format!(
-                        "entity reference expansion limit exceeded at `%{name};`"
+                        "entity expansion depth limit exceeded at `%{name};`"
                     )));
                 }
                 let replacement = decode_parameter_character_references(replacement, meter)?;
@@ -3716,10 +3714,10 @@ fn expand_entity_references_into(
         if let Some((name, consumed)) = general_entity_reference(tail)
             && let Some(replacement) = entities.get(name)
         {
-            *references += 1;
-            if depth >= ENTITY_EXPANSION_DEPTH_CEILING || *references > ENTITY_REFERENCE_CEILING {
+            meter.charge_reference(references)?;
+            if depth >= ENTITY_EXPANSION_DEPTH_CEILING {
                 return Err(Error::Xml(format!(
-                    "entity reference expansion limit exceeded at `{name}`"
+                    "entity expansion depth limit exceeded at `{name}`"
                 )));
             }
             expand_entity_references_into(
@@ -3756,11 +3754,31 @@ fn expand_entity_references_into(
 struct EntityExpansionMeter {
     limit: usize,
     used: usize,
+    reference_limit: usize,
 }
 
 impl EntityExpansionMeter {
     const fn new(limit: usize) -> Self {
-        Self { limit, used: 0 }
+        Self::with_reference_limit(limit, usize::MAX)
+    }
+
+    const fn with_reference_limit(limit: usize, reference_limit: usize) -> Self {
+        Self {
+            limit,
+            used: 0,
+            reference_limit,
+        }
+    }
+
+    fn charge_reference(&self, references: &mut usize) -> Result<()> {
+        let actual = references.saturating_add(1);
+        crate::budget::ensure(
+            crate::BudgetKind::EntityReferences,
+            self.reference_limit,
+            actual,
+        )?;
+        *references = actual;
+        Ok(())
     }
 
     fn append(&mut self, output: &mut String, value: &str) -> Result<()> {
@@ -4080,13 +4098,84 @@ mod parser_boundary_tests {
         let body = format!("<leaf>{}</leaf>", "&e;".repeat(256));
         let xml = format!(r#"<!DOCTYPE n [<!ENTITY e "x">]>{}"#, nested_xml(65, &body));
 
-        let error = Document::parse_iterative(&xml, None)
-            .expect_err("the document-wide entity-reference ceiling must reject sibling fanout");
-        assert!(
-            error
-                .to_string()
-                .contains("entity reference expansion limit")
+        let budget = ParseBudget::new(usize::MAX, usize::MAX, usize::MAX, 255, usize::MAX);
+        assert!(matches!(
+            Document::parse_with_budget(&xml, None, budget),
+            Err(Error::Budget {
+                kind: BudgetKind::EntityReferences,
+                limit: 255,
+                actual: 256,
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_budget_controls_entity_reference_occurrences() {
+        // XML 1.0 section 4.1 defines reference syntax but no occurrence ceiling; this is a
+        // caller-selected resource limit rather than malformed XML.
+        // https://www.w3.org/TR/xml/#sec-references
+        let xml = format!(
+            r#"<!DOCTYPE root [<!ENTITY e "x">]><root>{}</root>"#,
+            "&e;".repeat(256)
         );
+        let constrained = ParseBudget::new(usize::MAX, usize::MAX, usize::MAX, 255, usize::MAX);
+        assert!(matches!(
+            Document::parse_with_budget(&xml, None, constrained),
+            Err(Error::Budget {
+                kind: BudgetKind::EntityReferences,
+                limit: 255,
+                actual: 256,
+            })
+        ));
+
+        let admitted = ParseBudget::new(usize::MAX, usize::MAX, usize::MAX, 256, usize::MAX);
+        Document::parse_with_budget(&xml, None, admitted)
+            .expect("the caller-selected reference limit admits its exact boundary");
+    }
+
+    #[test]
+    fn parse_budget_controls_namespace_scope_materialization() {
+        // Namespaces in XML 1.0 section 6.1 defines scope but no storage ceiling; the parser must
+        // classify its allocation guard as caller-selected resource policy.
+        // https://www.w3.org/TR/xml-names/#scoping
+        let xml = "<root xmlns:p='urn:p'><p:child/></root>";
+        let mut exact_limit = 0;
+        loop {
+            let candidate =
+                ParseBudget::new(usize::MAX, usize::MAX, usize::MAX, usize::MAX, exact_limit);
+            match Document::parse_with_budget(xml, None, candidate) {
+                Ok(_) => break,
+                Err(Error::Budget {
+                    kind: BudgetKind::NamespaceScopeBytes,
+                    actual,
+                    ..
+                }) => {
+                    assert!(actual > exact_limit);
+                    exact_limit = actual;
+                }
+                Err(_) => panic!("namespace storage must use the typed parse-budget contract"),
+            }
+        }
+        let below_boundary = ParseBudget::new(
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            exact_limit - 1,
+        );
+        assert!(matches!(
+            Document::parse_with_budget(xml, None, below_boundary),
+            Err(Error::Budget {
+                kind: BudgetKind::NamespaceScopeBytes,
+                actual,
+                ..
+            }) if actual == exact_limit
+        ));
+
+        let admitted =
+            ParseBudget::new(usize::MAX, usize::MAX, usize::MAX, usize::MAX, exact_limit);
+        Document::parse_with_budget(xml, None, admitted)
+            .expect("the caller-selected namespace limit admits its exact boundary");
     }
 
     #[test]
@@ -4715,17 +4804,21 @@ mod parser_boundary_tests {
 
         let leaf = HashMap::from([("leaf".into(), "x".into())]);
         let references = "%leaf;".repeat(256);
-        assert!(
+        assert!(matches!(
             expand_parameter_entity_references(
                 &references,
                 &leaf,
                 &[],
                 0,
                 &mut 0,
-                &mut EntityExpansionMeter::new(ENTITY_EXPANSION_BYTE_CEILING),
-            )
-            .is_err()
-        );
+                &mut EntityExpansionMeter::with_reference_limit(ENTITY_EXPANSION_BYTE_CEILING, 255,),
+            ),
+            Err(Error::Budget {
+                kind: BudgetKind::EntityReferences,
+                limit: 255,
+                actual: 256,
+            })
+        ));
         assert!(
             expand_parameter_entity_references(
                 "%leaf;",
@@ -4913,7 +5006,7 @@ mod parser_boundary_tests {
         let error = Document::parse_with_budget(
             "<root/>",
             None,
-            ParseBudget::new(6, usize::MAX, usize::MAX),
+            ParseBudget::new(6, usize::MAX, usize::MAX, usize::MAX, usize::MAX),
         )
         .expect_err("oversized source must be rejected");
         assert!(matches!(
@@ -4990,7 +5083,7 @@ mod parser_boundary_tests {
             Document::parse_with_budget(
                 "<root><child/></root>",
                 None,
-                ParseBudget::new(usize::MAX, 2, usize::MAX),
+                ParseBudget::new(usize::MAX, 2, usize::MAX, usize::MAX, usize::MAX,),
             ),
             Err(Error::Budget {
                 kind: BudgetKind::SourceNodes,
@@ -5002,7 +5095,7 @@ mod parser_boundary_tests {
             Document::parse_with_budget(
                 "<root><child/></root>",
                 None,
-                ParseBudget::new(usize::MAX, usize::MAX, 1),
+                ParseBudget::new(usize::MAX, usize::MAX, 1, usize::MAX, usize::MAX,),
             ),
             Err(Error::Budget {
                 kind: BudgetKind::RecursionDepth,
@@ -5023,7 +5116,7 @@ mod parser_boundary_tests {
             Document::parse_bytes_with_budget(
                 &bytes,
                 None,
-                ParseBudget::new(8, usize::MAX, usize::MAX),
+                ParseBudget::new(8, usize::MAX, usize::MAX, usize::MAX, usize::MAX),
             ),
             Err(Error::Budget {
                 kind: BudgetKind::SourceBytes,
