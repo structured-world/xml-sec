@@ -379,8 +379,8 @@ struct Execution<'a> {
     function_results: Vec<Option<Value>>,
     function_depth: usize,
     binding_function_defaults: Vec<ExpandedName>,
-    built_keys: HashSet<(ExpandedName, NodeId)>,
-    building_keys: HashSet<(ExpandedName, NodeId)>,
+    building_keys: HashSet<(usize, NodeId)>,
+    building_key_index_bytes: usize,
     attribute_insert_position: Option<usize>,
     attribute_protected_names: Option<ProtectedAttributeNames>,
     result_is_temporary: bool,
@@ -649,8 +649,8 @@ impl<'a> Execution<'a> {
             function_results: vec![],
             function_depth: 0,
             binding_function_defaults: vec![],
-            built_keys: HashSet::new(),
             building_keys: HashSet::new(),
+            building_key_index_bytes: 0,
             attribute_insert_position: None,
             attribute_protected_names: None,
             result_is_temporary: false,
@@ -658,6 +658,8 @@ impl<'a> Execution<'a> {
         state.evaluator.initialize_xslt(
             Arc::clone(&stylesheet.decimal_formats),
             Arc::clone(&stylesheet.function_names),
+            Arc::clone(&stylesheet.keys),
+            Arc::clone(&stylesheet.key_name_indices),
         );
         let PreparedParameters {
             effective_globals,
@@ -730,24 +732,37 @@ impl<'a> Execution<'a> {
     }
 
     fn build_key(&mut self, name: &ExpandedName, logical_root: NodeId) -> Result<()> {
-        let retained_marker_bytes = key_build_marker_retained_bytes(name);
-        let transient_marker_bytes =
-            retained_marker_bytes.saturating_add(expanded_name_owned_bytes(name));
-        self.meter
-            .charge(BudgetKind::OwnedBytes, transient_marker_bytes)?;
-        let identity = (name.clone(), logical_root);
-        if self.built_keys.contains(&identity) {
-            self.meter.release_owned_bytes(transient_marker_bytes);
+        let Some(key_slot) = self
+            .stylesheet
+            .key_name_indices
+            .iter()
+            .position(|index| self.stylesheet.keys[*index].name == *name)
+        else {
+            return Ok(());
+        };
+        self.build_key_slot(key_slot, logical_root)
+    }
+
+    fn build_key_slot(&mut self, key_slot: usize, logical_root: NodeId) -> Result<()> {
+        if self.evaluator.key_index_ready(key_slot, logical_root) {
             return Ok(());
         }
-        if !self.building_keys.insert(identity.clone()) {
-            self.meter.release_owned_bytes(transient_marker_bytes);
+        reserve_retained_hash_set_slot(
+            &mut self.building_keys,
+            &mut self.meter,
+            &mut self.building_key_index_bytes,
+        )?;
+        let identity = (key_slot, logical_root);
+        if !self.building_keys.insert(identity) {
+            let key_index = self.stylesheet.key_name_indices[key_slot];
             return Err(Error::Dynamic(format!(
                 "cyclic xsl:key dependency for {}",
-                name.local
+                self.stylesheet.keys[key_index].name.local
             )));
         }
         let declarations = Arc::clone(&self.stylesheet.keys);
+        let key_index = self.stylesheet.key_name_indices[key_slot];
+        let name = &declarations[key_index].name;
         let variables = HashMap::new();
         for declaration in declarations
             .iter()
@@ -803,16 +818,12 @@ impl<'a> Execution<'a> {
             self.meter.release_owned_bytes(pending_reservation);
             if let Err(error) = result {
                 self.building_keys.remove(&identity);
-                self.meter.release_owned_bytes(transient_marker_bytes);
                 return Err(error);
             }
-            self.evaluator.finish_key_index(&mut self.meter);
         }
         self.building_keys.remove(&identity);
-        self.meter
-            .release_owned_bytes(transient_marker_bytes - retained_marker_bytes);
-        self.built_keys.insert(identity);
-        Ok(())
+        self.evaluator
+            .finish_key_index(key_slot, logical_root, &mut self.meter)
     }
 
     fn append_key_values(
@@ -2480,6 +2491,11 @@ impl<'a> Execution<'a> {
                 continue;
             }
             dynamic_variables.release(&mut self.meter);
+            if let Some((key_slot, logical_root)) = self.evaluator.take_dynamic_key_request() {
+                self.build_key_slot(key_slot, logical_root)?;
+                self.meter.charge(BudgetKind::XPathEvaluations, 1)?;
+                continue;
+            }
             if uses_key && self.evaluator.source.logical_roots().len() != document_count {
                 // document() can import a logical document while evaluating the expression.
                 // XSLT 1.0 section 12.2 defines key() relative to the dynamic context document,
@@ -5343,14 +5359,6 @@ pub(crate) fn expanded_name_owned_bytes(name: &ExpandedName) -> usize {
         .as_ref()
         .map_or(0, String::len)
         .saturating_add(name.local.len())
-}
-
-fn key_build_marker_retained_bytes(name: &ExpandedName) -> usize {
-    // Hash tables retain control bytes and spare buckets. Two entry widths conservatively model
-    // the standard maximum load without coupling execution budgets to one allocator.
-    std::mem::size_of::<((ExpandedName, NodeId), ())>()
-        .saturating_mul(2)
-        .saturating_add(expanded_name_owned_bytes(name))
 }
 
 fn attribute_owned_bytes(attribute: &Attribute) -> usize {

@@ -12,7 +12,9 @@ use crate::budget::{
     Meter, ParseBudget, XINCLUDE_RECURSION_DEPTH_CEILING, reserve_retained_hash_map_slot,
     reserve_retained_hash_set_slot, reserve_temporary_vec_slot, retained_hash_storage,
 };
-use crate::compiler::{DecimalFormat, Expression, NameTest, Pattern, normalize_xpath_for_sxd};
+use crate::compiler::{
+    DecimalFormat, Expression, KeyDeclaration, NameTest, Pattern, normalize_xpath_for_sxd,
+};
 use crate::expression::innermost_namespaced_call;
 use crate::lexical::{is_ncname, is_ncname_char, is_xml_whitespace};
 use crate::model::parser_workspace_bytes;
@@ -670,6 +672,11 @@ pub(crate) struct Evaluator {
     generated_ids: Rc<RefCell<GeneratedIdCache>>,
     id_index: Rc<RefCell<IdIndex>>,
     key_index: Rc<RefCell<KeyIndex>>,
+    key_declarations: Arc<[KeyDeclaration]>,
+    key_name_indices: Arc<[usize]>,
+    ready_key_indexes: Rc<RefCell<HashSet<(usize, usize)>>>,
+    ready_key_index_bytes: usize,
+    pending_dynamic_key_request: Rc<RefCell<Option<(usize, usize)>>>,
     unparsed_entity_index: Rc<RefCell<Vec<HashMap<String, String>>>>,
     decimal_formats: Arc<[DecimalFormat]>,
     stylesheet_functions: Arc<HashSet<ExpandedName>>,
@@ -721,6 +728,15 @@ impl Evaluator {
             index_bytes: std::mem::take(&mut self.pending_dynamic_variable_index_bytes),
             payload_bytes: std::mem::take(&mut self.pending_dynamic_variable_payload_bytes),
         }
+    }
+
+    pub(crate) fn take_dynamic_key_request(&mut self) -> Option<(usize, NodeId)> {
+        let (key_slot, document_index) = self.pending_dynamic_key_request.borrow_mut().take()?;
+        self.source
+            .logical_roots()
+            .get(document_index)
+            .copied()
+            .map(|root| (key_slot, root))
     }
 
     pub(crate) fn new<R: Resolver + 'static>(
@@ -830,6 +846,11 @@ impl Evaluator {
             generated_ids: Rc::new(RefCell::new(GeneratedIdCache::default())),
             id_index: Rc::new(RefCell::new(id_index)),
             key_index: Rc::new(RefCell::new(HashMap::new())),
+            key_declarations: Arc::from([]),
+            key_name_indices: Arc::from([]),
+            ready_key_indexes: Rc::new(RefCell::new(HashSet::new())),
+            ready_key_index_bytes: 0,
+            pending_dynamic_key_request: Rc::new(RefCell::new(None)),
             unparsed_entity_index: Rc::new(RefCell::new(unparsed_entity_index)),
             decimal_formats: Arc::from([]),
             stylesheet_functions: Arc::new(HashSet::new()),
@@ -856,9 +877,47 @@ impl Evaluator {
         &mut self,
         decimal_formats: Arc<[DecimalFormat]>,
         stylesheet_functions: Arc<HashSet<ExpandedName>>,
+        key_declarations: Arc<[KeyDeclaration]>,
+        key_name_indices: Arc<[usize]>,
     ) {
         self.decimal_formats = decimal_formats;
         self.stylesheet_functions = stylesheet_functions;
+        self.key_declarations = key_declarations;
+        self.key_name_indices = key_name_indices;
+    }
+
+    pub(crate) fn key_index_ready(&self, key_slot: usize, logical_root: NodeId) -> bool {
+        let Some(document_index) = self
+            .source
+            .logical_roots()
+            .iter()
+            .position(|candidate| *candidate == logical_root)
+        else {
+            return false;
+        };
+        self.ready_key_indexes
+            .borrow()
+            .contains(&(key_slot, document_index))
+    }
+
+    pub(crate) fn finish_key_index(
+        &mut self,
+        key_slot: usize,
+        logical_root: NodeId,
+        meter: &mut Meter,
+    ) -> Result<()> {
+        let document_index = self
+            .source
+            .logical_roots()
+            .iter()
+            .position(|candidate| *candidate == logical_root)
+            .ok_or_else(|| Error::Dynamic("key index has no logical document".into()))?;
+        let mut ready = self.ready_key_indexes.borrow_mut();
+        reserve_retained_hash_set_slot(&mut ready, meter, &mut self.ready_key_index_bytes)?;
+        ready.insert((key_slot, document_index));
+        drop(ready);
+        clear_pattern_cache(&mut self.pattern_matches, meter);
+        Ok(())
     }
 
     pub(crate) fn append_key_entry(
@@ -932,10 +991,6 @@ impl Evaluator {
             }
         }
         Ok(())
-    }
-
-    pub(crate) fn finish_key_index(&mut self, meter: &mut Meter) {
-        clear_pattern_cache(&mut self.pattern_matches, meter);
     }
 
     #[expect(
@@ -2001,6 +2056,10 @@ impl Evaluator {
             KeyFunction {
                 index: Rc::clone(&self.key_index),
                 namespaces: Arc::clone(&function_namespaces),
+                declarations: Arc::clone(&self.key_declarations),
+                name_indices: Arc::clone(&self.key_name_indices),
+                ready: Rc::clone(&self.ready_key_indexes),
+                pending: Rc::clone(&self.pending_dynamic_key_request),
             },
         );
         context.set_function(
@@ -7903,6 +7962,10 @@ type KeyIndex = HashMap<(ExpandedName, String, usize), Vec<NodePath>>;
 struct KeyFunction {
     index: Rc<RefCell<KeyIndex>>,
     namespaces: Arc<Vec<(String, String)>>,
+    declarations: Arc<[KeyDeclaration]>,
+    name_indices: Arc<[usize]>,
+    ready: Rc<RefCell<HashSet<(usize, usize)>>>,
+    pending: Rc<RefCell<Option<(usize, usize)>>>,
 }
 impl function::Function for KeyFunction {
     fn evaluate<'c, 'd>(
@@ -7924,6 +7987,18 @@ impl function::Function for KeyFunction {
                 .ok_or_else(|| function::Error::Other {
                     what: "key() context has no logical document".into(),
                 })?;
+        if let Some(key_slot) = self
+            .name_indices
+            .iter()
+            .position(|index| self.declarations[*index].name == name)
+            && !self.ready.borrow().contains(&(key_slot, document_index))
+        {
+            let mut pending = self.pending.borrow_mut();
+            if pending.is_none() {
+                *pending = Some((key_slot, document_index));
+            }
+            return Ok(SxdValue::Nodeset(nodeset::Nodeset::new()));
+        }
         let mut result = nodeset::Nodeset::new();
         let index = self.index.borrow();
         let mut lookup = |value: String| -> std::result::Result<(), function::Error> {
@@ -9113,6 +9188,10 @@ mod tests {
         let key = KeyFunction {
             index: Rc::new(RefCell::new(HashMap::new())),
             namespaces: Arc::new(Vec::new()),
+            declarations: Arc::from([]),
+            name_indices: Arc::from([]),
+            ready: Rc::new(RefCell::new(HashSet::new())),
+            pending: Rc::new(RefCell::new(None)),
         };
         assert!(matches!(
             key.evaluate(

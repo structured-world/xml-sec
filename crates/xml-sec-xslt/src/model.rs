@@ -134,6 +134,18 @@ pub struct Node {
     pub source_line: Option<usize>,
 }
 
+impl Node {
+    fn xml_base_reference(&self) -> Option<&str> {
+        let NodeKind::Element { attributes, .. } = &self.kind else {
+            return None;
+        };
+        attributes.iter().find_map(|attribute| {
+            (attribute.name.namespace.as_deref() == Some(XML_NS) && attribute.name.local == "base")
+                .then_some(attribute.value.as_str())
+        })
+    }
+}
+
 /// Parser-independent owned XML tree.
 #[derive(Debug, Clone)]
 pub struct Document {
@@ -1074,9 +1086,9 @@ impl Document {
     /// Add a schema/DTD-defaulted attribute supplied by a trusted parser.
     pub fn add_default_attribute(&mut self, owner: NodeId, attribute: Attribute) -> Result<()> {
         let node = self
-            .node_mut(owner)
+            .node(owner)
             .ok_or_else(|| Error::Xml("defaulted attribute owner is stale".into()))?;
-        let NodeKind::Element { attributes, .. } = &mut node.kind else {
+        let NodeKind::Element { attributes, .. } = &node.kind else {
             return Err(Error::Xml(
                 "defaulted attribute owner is not an element".into(),
             ));
@@ -1087,8 +1099,57 @@ impl Document {
         {
             return Ok(());
         }
+        let updated_bases = if attribute.name.namespace.as_deref() == Some(XML_NS)
+            && attribute.name.local == "base"
+        {
+            Some(self.defaulted_xml_base_updates(owner, &attribute.value)?)
+        } else {
+            None
+        };
+        let NodeKind::Element { attributes, .. } = &mut self
+            .node_mut(owner)
+            .expect("defaulted attribute owner remains present")
+            .kind
+        else {
+            unreachable!("defaulted attribute owner was checked as an element");
+        };
         attributes.push(attribute);
+        if let Some(updates) = updated_bases {
+            for (node, base_uri) in updates {
+                self.nodes[node.0].base_uri = base_uri;
+            }
+        }
         Ok(())
+    }
+
+    fn defaulted_xml_base_updates(
+        &self,
+        owner: NodeId,
+        reference: &str,
+    ) -> Result<Vec<(NodeId, Option<String>)>> {
+        let inherited = self.node(owner).and_then(|node| node.base_uri.as_deref());
+        let owner_base = Some(crate::resolver::resolve_uri_reference(
+            inherited, reference,
+        )?);
+        let mut updates = vec![(owner, owner_base)];
+        let mut cursor = 0;
+        while cursor < updates.len() {
+            let parent = updates[cursor].0;
+            for child in self.nodes[parent.0].children.iter().copied() {
+                let base_uri = {
+                    let child_base = updates[cursor].1.as_deref();
+                    self.nodes[child.0].xml_base_reference().map_or_else(
+                        || Ok(child_base.map(str::to_owned)),
+                        |reference| {
+                            crate::resolver::resolve_uri_reference(child_base, reference).map(Some)
+                        },
+                    )?
+                };
+                updates.push((child, base_uri));
+            }
+            cursor += 1;
+        }
+        Ok(updates)
     }
 
     pub(crate) fn ids(&self) -> impl Iterator<Item = (&str, NodeId, NodeId)> {
@@ -3648,13 +3709,17 @@ fn expand_document_entities<'a>(
     let mut expanded = String::with_capacity(xml.len());
     let mut active = [""; ENTITY_EXPANSION_DEPTH_CEILING];
     meter.append(&mut expanded, &xml[..doctype_end])?;
+    let mut position = DocumentEntityPosition::BeforeElement;
     expand_entity_references_into(
         &xml[doctype_end..],
         entities,
         0,
         references,
         meter,
-        &mut expanded,
+        &mut EntityExpansionOutput {
+            value: &mut expanded,
+            document_position: Some(&mut position),
+        },
         &mut active,
     )?;
     Ok(Cow::Owned(expanded))
@@ -3679,7 +3744,10 @@ fn expand_entity_references<'a>(
         depth,
         references,
         meter,
-        &mut output,
+        &mut EntityExpansionOutput {
+            value: &mut output,
+            document_position: None,
+        },
         &mut active,
     )?;
     Ok(Cow::Owned(output))
@@ -3711,13 +3779,57 @@ fn general_entity_reference(value: &str) -> Option<(&str, usize)> {
     (after_ampersand.as_bytes()[end] == b';').then(|| (&after_ampersand[..end], end + 2))
 }
 
+enum DocumentEntityPosition {
+    BeforeElement,
+    Content(usize),
+    AfterElement,
+}
+
+impl DocumentEntityPosition {
+    fn permits_reference(&self) -> bool {
+        matches!(self, Self::Content(_))
+    }
+
+    fn observe_markup(&mut self, markup: &str) {
+        if markup.starts_with("<!--")
+            || markup.starts_with("<![CDATA[")
+            || markup.starts_with("<?")
+            || markup.starts_with("<!")
+        {
+            return;
+        }
+        if markup.starts_with("</") {
+            if let Self::Content(depth) = self {
+                if *depth == 1 {
+                    *self = Self::AfterElement;
+                } else {
+                    *depth -= 1;
+                }
+            }
+            return;
+        }
+        let empty = markup[..markup.len() - 1].trim_end().ends_with('/');
+        match self {
+            Self::BeforeElement if empty => *self = Self::AfterElement,
+            Self::BeforeElement => *self = Self::Content(1),
+            Self::Content(depth) if !empty => *depth += 1,
+            Self::Content(_) | Self::AfterElement => {}
+        }
+    }
+}
+
+struct EntityExpansionOutput<'output, 'position> {
+    value: &'output mut String,
+    document_position: Option<&'position mut DocumentEntityPosition>,
+}
+
 fn expand_entity_references_into<'entities>(
     value: &str,
     entities: &'entities HashMap<String, String>,
     depth: usize,
     references: &mut usize,
     meter: &mut EntityExpansionMeter,
-    output: &mut String,
+    output: &mut EntityExpansionOutput<'_, '_>,
     active: &mut [&'entities str; ENTITY_EXPANSION_DEPTH_CEILING],
 ) -> Result<()> {
     let mut cursor = 0;
@@ -3733,20 +3845,40 @@ fn expand_entity_references_into<'entities>(
             None
         };
         if let Some(length) = protected_end {
-            meter.append(output, &tail[..length])?;
+            let markup = &tail[..length];
+            if let Some(position) = output.document_position.as_deref_mut() {
+                position.observe_markup(markup);
+            }
+            meter.append(output.value, markup)?;
             cursor += length;
             continue;
         }
         if tail.starts_with('<')
             && let Some(length) = xml_markup_len(tail)
         {
-            meter.append(output, &tail[..length])?;
+            let markup = &tail[..length];
+            if let Some(position) = output.document_position.as_deref_mut() {
+                position.observe_markup(markup);
+            }
+            meter.append(output.value, markup)?;
             cursor += length;
             continue;
         }
         if let Some((name, consumed)) = general_entity_reference(tail)
             && let Some((entity_name, replacement)) = entities.get_key_value(name)
         {
+            if output
+                .document_position
+                .as_deref()
+                .is_some_and(|position| !position.permits_reference())
+            {
+                // XML 1.0 production [1] permits content only inside the document element;
+                // prolog and trailing Misc cannot contain general entity references.
+                // https://www.w3.org/TR/xml/#sec-well-formed
+                return Err(Error::Xml(format!(
+                    "entity reference `&{name};` is outside the document element"
+                )));
+            }
             meter.charge_reference(references)?;
             // XML 1.0 section 4.1 WFC No Recursion rejects cycles as malformed XML rather than
             // reporting them as exhaustion of a caller-selected recursion budget.
@@ -3762,7 +3894,10 @@ fn expand_entity_references_into<'entities>(
                 depth + 1,
                 references,
                 meter,
-                output,
+                &mut EntityExpansionOutput {
+                    value: output.value,
+                    document_position: None,
+                },
                 active,
             );
             active[depth] = "";
@@ -3784,7 +3919,7 @@ fn expand_entity_references_into<'entities>(
                     tail.len()
                 }
             });
-        meter.append(output, &tail[..plain_end])?;
+        meter.append(output.value, &tail[..plain_end])?;
         cursor += plain_end;
     }
     Ok(())
@@ -4131,6 +4266,49 @@ mod parser_boundary_tests {
     }
 
     #[test]
+    fn defaulted_xml_base_recomputes_the_complete_subtree() {
+        // XML Base section 3 permits xml:base to be supplied by defaulting, and section 4.2
+        // applies it to the owning element and descendants.
+        // https://www.w3.org/TR/xmlbase/#syntax
+        // https://www.w3.org/TR/xmlbase/#granularity
+        let mut document = Document::parse(
+            r#"<root><child xml:base="nested/"><leaf/></child><sibling/></root>"#,
+            Some("https://example.test/original/source.xml"),
+        )
+        .expect("source document parses");
+        let element = |document: &Document, local: &str| {
+            document
+                .nodes()
+                .find_map(|(id, node)| match &node.kind {
+                    NodeKind::Element { name, .. } if name.local == local => Some(id),
+                    _ => None,
+                })
+                .expect("named element exists")
+        };
+        let root = element(&document, "root");
+        document
+            .add_default_attribute(
+                root,
+                Attribute {
+                    name: ExpandedName::new(Some(super::XML_NS), "base"),
+                    prefix: Some("xml".into()),
+                    value: "../default/".into(),
+                },
+            )
+            .expect("trusted defaulted xml:base is applied");
+
+        let base = |local| {
+            document
+                .node(element(&document, local))
+                .and_then(|node| node.base_uri.as_deref())
+        };
+        assert_eq!(base("root"), Some("https://example.test/default/"));
+        assert_eq!(base("child"), Some("https://example.test/default/nested/"));
+        assert_eq!(base("leaf"), Some("https://example.test/default/nested/"));
+        assert_eq!(base("sibling"), Some("https://example.test/default/"));
+    }
+
+    #[test]
     fn oracle_and_iterative_parsers_coalesce_adjacent_character_data() {
         // Tokenizer event boundaries are not XPath text-node boundaries: text, references and
         // CDATA in one character-data run must project as one semantic text node.
@@ -4173,6 +4351,29 @@ mod parser_boundary_tests {
                 actual: 256,
             })
         ));
+    }
+
+    #[test]
+    fn general_entities_cannot_supply_or_follow_the_document_element() {
+        // XML 1.0 production [1] requires one literal document element surrounded only by
+        // prolog and Misc; entity references are content and cannot occupy either outer region.
+        // https://www.w3.org/TR/xml/#sec-well-formed
+        for malformed in [
+            r#"<!DOCTYPE root [<!ENTITY root "<root/>">]>&root;"#,
+            r#"<!DOCTYPE root [<!ENTITY empty "">]><root/>&empty;"#,
+        ] {
+            assert!(
+                matches!(Document::parse(malformed, None), Err(Error::Xml(_))),
+                "outer entity reference must remain malformed: {malformed}"
+            );
+        }
+
+        let valid = Document::parse(
+            r#"<!DOCTYPE root [<!ENTITY child "<child>ok</child>">]><root>&child;</root>"#,
+            None,
+        )
+        .expect("an entity in document content remains valid");
+        assert_eq!(valid.string_value(valid.root()), "ok");
     }
 
     #[test]

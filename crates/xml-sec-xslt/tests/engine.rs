@@ -4,7 +4,7 @@ use std::{collections::HashMap, sync::Mutex};
 
 use pretty_assertions::assert_eq;
 use xml_sec_xslt::{
-    BudgetKind, Clock, CompileBudget, Compiler, Document, Error, ExecutionBudget,
+    Attribute, BudgetKind, Clock, CompileBudget, Compiler, Document, Error, ExecutionBudget,
     ExecutionEnvironment, ExecutionOptions, ExpandedName, ExtensionPolicy, FixedClock, NoResolver,
     NodeKind, NodeReference, Parameters, ResolvePurpose, ResolveRequest, ResolvedResource,
     Resolver, ResourceIdentity, SourceProcessing, Value,
@@ -4034,6 +4034,100 @@ fn module_resolution_honors_xml_base_and_resource_identity() {
 }
 
 #[test]
+fn defaulted_xml_base_controls_document_resolution() {
+    // XSLT 1.0 section 12.1 resolves document() against the base URI of the node supplying the
+    // URI. A parser-supplied xml:base default must therefore invalidate descendant base caches.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#document
+    let resolver = Arc::new(ContextResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            (
+                "payload.xml".into(),
+                Some("https://example.test/defaulted/".into()),
+            ),
+            ResolvedResource {
+                canonical_uri: "https://example.test/defaulted/payload.xml".into(),
+                identity: ResourceIdentity("defaulted-base-payload".into()),
+                bytes: b"<payload>resolved</payload>".to_vec(),
+                media_type: Some("application/xml".into()),
+                encoding: Some("UTF-8".into()),
+            },
+        );
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="document(root/branch/@href)/payload"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let mut source = Document::parse(
+        r#"<root><branch href="payload.xml"/></root>"#,
+        Some("https://example.test/original/source.xml"),
+    )
+    .expect("source parses");
+    let owner = source
+        .nodes()
+        .find_map(|(id, node)| matches!(&node.kind, NodeKind::Element { .. }).then_some(id))
+        .expect("source has a document element");
+    source
+        .add_default_attribute(
+            owner,
+            Attribute {
+                name: ExpandedName::new(Some("http://www.w3.org/XML/1998/namespace"), "base"),
+                prefix: Some("xml".into()),
+                value: "https://example.test/defaulted/".into(),
+            },
+        )
+        .expect("trusted parser default is accepted");
+    let output = stylesheet
+        .execute(
+            &source,
+            &Parameters::new(),
+            resolver.clone(),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("document() uses the recomputed descendant base URI");
+    assert_eq!(
+        String::from_utf8(output.serialized.bytes).expect("UTF-8 output"),
+        "resolved"
+    );
+    assert!(
+        resolver
+            .calls
+            .lock()
+            .expect("test resolver mutex is not poisoned")
+            .iter()
+            .any(|(uri, base, purpose)| {
+                uri == "payload.xml"
+                    && base.as_deref() == Some("https://example.test/defaulted/")
+                    && *purpose == ResolvePurpose::Document
+            })
+    );
+}
+
+#[test]
+fn stylesheet_entities_cannot_supply_or_follow_the_document_element() {
+    // XML 1.0 production [1] permits references only within document content, not in the prolog
+    // or Misc after the document element. https://www.w3.org/TR/xml/#sec-well-formed
+    for stylesheet in [
+        r#"<!DOCTYPE xsl:stylesheet [<!ENTITY sheet '<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"/>'>]>&sheet;"#,
+        r#"<!DOCTYPE xsl:stylesheet [<!ENTITY tail '<extra/>'>]><xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"/>&tail;"#,
+    ] {
+        assert!(matches!(
+            Compiler::new(
+                Arc::new(NoResolver),
+                CompileBudget::new(1 << 20, 16, 256, 4 << 20),
+            )
+            .compile(stylesheet, Some("memory:entity-boundary.xsl")),
+            Err(Error::Xml(_))
+        ));
+    }
+}
+
+#[test]
 fn lower_precedence_attribute_sets_keep_equal_precedence_ordering() {
     // A principal declaration protects only the attributes it defines; later imported
     // declarations at the same precedence still override earlier imported declarations.
@@ -6462,6 +6556,63 @@ fn keys_index_full_attribute_axis_patterns() {
     // Candidate enumeration must include attributes for the unabbreviated XPath axis spelling.
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:key name="attrs" match="attribute::*" use="."/><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(key('attrs', 'needle'))"/></xsl:template></xsl:stylesheet>"#;
     assert_eq!(execute(stylesheet, "<source value=\"needle\"/>"), "1");
+}
+
+#[test]
+fn dynamic_xpath_evaluators_build_key_indexes_before_lookup() {
+    // EXSLT dyn:evaluate() and Saxon's compatible evaluate extension run their string argument
+    // as XPath in the current context; key() must therefore see the context document's index.
+    // https://exslt.github.io/dyn/functions/evaluate/index.html
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#key
+    for (namespace, function) in [
+        ("http://exslt.org/dynamic", "dyn:evaluate"),
+        ("http://icl.com/saxon", "saxon:evaluate"),
+    ] {
+        let prefix = function.split_once(':').expect("qualified function").0;
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:{prefix}="{namespace}"><xsl:key name="by-id" match="item" use="@id"/><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="{function}(&quot;key('by-id','wanted')&quot;)"/><xsl:text>|</xsl:text><xsl:value-of select="{function}(&quot;key('by-id','missing')&quot;)"/></xsl:template></xsl:stylesheet>"#
+        );
+        assert_eq!(
+            execute(
+                &stylesheet,
+                r#"<root><item id="wanted">found</item><item id="other">ignored</item></root>"#,
+            ),
+            "found|",
+            "{function} must build the key index before evaluating generated XPath"
+        );
+    }
+}
+
+#[test]
+fn dynamic_xpath_builds_only_the_requested_key_index() {
+    // A generated key() call must request its exact expanded key name. Eagerly building every
+    // declaration changes a valid transformation into a budget failure as unrelated keys grow.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:dyn="http://exslt.org/dynamic"><xsl:key name="requested" match="item[@selected]" use="@id"/><xsl:key name="unrelated" match="item" use="@id"/><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="dyn:evaluate(&quot;key('requested','wanted')&quot;)"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse(
+        r#"<root><item id="wanted" selected="yes">found</item><item id="other">ignored</item></root>"#,
+        None,
+    )
+    .expect("source parses");
+    let mut budget = execution_budget(1024);
+    budget.key_entries = 1;
+    let output = stylesheet
+        .execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("the unrelated key must not consume the key-entry budget");
+    assert_eq!(
+        String::from_utf8(output.serialized.bytes).expect("UTF-8 output"),
+        "found"
+    );
 }
 
 #[test]
