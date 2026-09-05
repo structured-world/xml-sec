@@ -80,9 +80,13 @@ impl SelectedEncoding {
 /// Strict IANA single-byte repertoire shared by XML input and XSLT output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IanaSingleByteEncoding {
+    /// ISO-8859-1 (Latin-1).
     Latin1,
+    /// ISO-8859-9 (Latin-5).
     Latin5,
+    /// ISO-8859-11 Thai encoding.
     Iso8859_11,
+    /// TIS-620 Thai encoding.
     Tis620,
 }
 

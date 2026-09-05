@@ -1182,7 +1182,14 @@ fn assert_case(case: &Case) {
         }
         (Ok(result), None) if case.errors.is_none() && result.serialized.bytes.is_empty() => {}
         (Ok(result), None) if is_expected_message_only_success(case, &result) => {}
-        (Ok(_), None) if is_standard_conformant_libxslt_divergence(case) => {}
+        (Ok(result), None) if is_standard_conformant_libxslt_divergence(case) => {
+            assert_eq!(
+                result.serialized.bytes,
+                b"<?xml version=\"1.0\"?>\n\n",
+                "{}: standards divergence produced unexpected output",
+                case_name(case)
+            );
+        }
         (Ok(_), None) => panic!(
             "{}: transformation succeeded but upstream expects an error",
             case_name(case)

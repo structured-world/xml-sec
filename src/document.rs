@@ -117,6 +117,7 @@ pub(crate) struct DocumentParseSettings {
     pub(crate) allow_dtd: bool,
     pub(crate) nodes_limit: u32,
     pub(crate) depth_limit: usize,
+    pub(crate) namespace_bindings_limit: usize,
     pub(crate) max_bytes: usize,
 }
 
@@ -127,6 +128,7 @@ impl Default for DocumentParseSettings {
             allow_dtd: false,
             nodes_limit: crate::hard_limits::XML_DOCUMENT_NODE_CEILING,
             depth_limit: crate::hard_limits::XML_DOCUMENT_DEPTH_CEILING,
+            namespace_bindings_limit: crate::hard_limits::XML_NAMESPACE_BINDING_CEILING,
             max_bytes: crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
         }
     }
@@ -162,6 +164,7 @@ impl DocumentParseSettings {
             allow_dtd,
             nodes_limit,
             depth_limit,
+            namespace_bindings_limit: crate::hard_limits::XML_NAMESPACE_BINDING_CEILING,
             max_bytes,
         }
     }
@@ -170,12 +173,14 @@ impl DocumentParseSettings {
         xml: &crate::policy::XmlInputPolicy,
         resources: &crate::policy::ResourcePolicy,
     ) -> Self {
-        Self::new_with_depth(
-            xml.allow_internal_dtd,
-            resources.effective_xml_nodes(),
-            resources.max_xml_depth,
-            resources.max_xml_document_bytes,
-        )
+        Self {
+            allow_dtd: xml.allow_internal_dtd,
+            nodes_limit: resources.effective_xml_nodes(),
+            depth_limit: resources.max_xml_depth,
+            namespace_bindings_limit: resources.max_xml_namespace_bindings,
+            max_bytes: resources.max_xml_document_bytes,
+            ..Self::default()
+        }
     }
 }
 
@@ -2312,8 +2317,11 @@ fn preflight_xml_fragment(
                     .expect("active element frame remains registered");
                 frame.pending_attribute_source = attribute_source;
                 frame.pending_attribute_offset = 0;
-                let changes =
-                    apply_preflight_namespace_declarations(state, namespace_declarations)?;
+                let changes = apply_preflight_namespace_declarations(
+                    state,
+                    namespace_declarations,
+                    settings.namespace_bindings_limit,
+                )?;
                 state.namespace_scopes.push(changes);
                 observe_preflight_node(state, settings, false)?;
                 state.depth = state.depth.saturating_add(1);
@@ -2333,8 +2341,11 @@ fn preflight_xml_fragment(
                     .expect("active element frame remains registered");
                 frame.pending_attribute_source = attribute_source;
                 frame.pending_attribute_offset = 0;
-                let changes =
-                    apply_preflight_namespace_declarations(state, namespace_declarations)?;
+                let changes = apply_preflight_namespace_declarations(
+                    state,
+                    namespace_declarations,
+                    settings.namespace_bindings_limit,
+                )?;
                 observe_preflight_node(state, settings, false)?;
                 let actual = state.depth.saturating_add(1);
                 if actual > settings.depth_limit {
@@ -2630,6 +2641,7 @@ fn namespace_value_expands_to_empty<'a>(
 fn apply_preflight_namespace_declarations(
     state: &mut DocumentPreflightState,
     declarations: Vec<NamespaceDeclaration>,
+    maximum: usize,
 ) -> Result<Vec<(String, bool)>, XmlDocumentError> {
     let mut changes = Vec::with_capacity(declarations.len());
     for declaration in declarations {
@@ -2643,7 +2655,6 @@ fn apply_preflight_namespace_declarations(
         changes.push((declaration.prefix, was_active));
     }
     let actual = state.active_namespace_bindings.len();
-    let maximum = crate::hard_limits::XML_NAMESPACE_BINDING_CEILING;
     if actual > maximum {
         return Err(XmlDocumentError::Parse(
             ParseError::NamespaceBindingLimitReached { maximum, actual },
@@ -2837,6 +2848,7 @@ pub(crate) fn preflight_dom_limits(
         allow_dtd: effective.allow_dtd,
         nodes_limit: effective.nodes_limit,
         depth_limit: crate::hard_limits::XML_DOCUMENT_DEPTH_CEILING,
+        namespace_bindings_limit: crate::hard_limits::XML_NAMESPACE_BINDING_CEILING,
         max_bytes: crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
     };
     match preflight_document_limits(xml, settings, None) {
@@ -3643,6 +3655,29 @@ mod tests {
                 maximum: observed_maximum,
                 actual,
             })) if observed_maximum == maximum && actual == maximum + 1
+        ));
+    }
+
+    #[test]
+    fn namespace_preflight_enforces_compiled_resource_policy() {
+        let xml = r#"<root xmlns:first="urn:first" xmlns:second="urn:second"/>"#;
+        let resources = crate::policy::ResourcePolicy {
+            max_xml_namespace_bindings: 1,
+            ..crate::policy::ResourcePolicy::default()
+        };
+        let settings = DocumentParseSettings::from_policy(
+            &crate::policy::XmlInputPolicy::default(),
+            &resources,
+        );
+
+        assert!(matches!(
+            preflight_document_limits(xml, settings, None),
+            Err(XmlDocumentError::Parse(
+                ParseError::NamespaceBindingLimitReached {
+                    maximum: 1,
+                    actual: 2,
+                }
+            ))
         ));
     }
 
