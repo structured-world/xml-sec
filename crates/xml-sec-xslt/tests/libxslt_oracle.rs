@@ -1991,6 +1991,11 @@ fn normalize_case_specific_oracle_output(case: &Case, bytes: Vec<u8>) -> Vec<u8>
         bytes
     };
     let stylesheet = case.stylesheet.to_string_lossy();
+    let bytes = if case.kind == "xinclude" && stylesheet == "xinclude/e.xsl" {
+        normalize_libxslt_missing_xinclude_base(bytes)
+    } else {
+        bytes
+    };
     let bytes = if case.suite == "runtest"
         && matches!(
             stylesheet.as_ref(),
@@ -2024,6 +2029,25 @@ fn normalize_case_specific_oracle_output(case: &Case, bytes: Vec<u8>) -> Vec<u8>
         cursor += 1;
     }
     output
+}
+
+fn normalize_libxslt_missing_xinclude_base(mut bytes: Vec<u8>) -> Vec<u8> {
+    // XInclude 1.0 section 4.5.5 requires the included top-level element to expose an xml:base
+    // fixup. libxslt's e.xml oracle omits it, so normalize only that known donor deviation.
+    // https://www.w3.org/TR/xinclude/#base
+    let marker = b" xml:base=\"";
+    let Some(start) = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+    else {
+        return bytes;
+    };
+    let value_start = start + marker.len();
+    let Some(value_end) = bytes[value_start..].iter().position(|byte| *byte == b'\"') else {
+        return bytes;
+    };
+    bytes.drain(start..value_start + value_end + 1);
+    bytes
 }
 
 fn normalize_libxslt_scientific_xpath_numbers(mut bytes: Vec<u8>) -> Vec<u8> {

@@ -109,6 +109,7 @@ enum PreparedExtensionCalls<'a> {
     Rewritten {
         expression: Expression,
         variables: VariableOverlay<'a>,
+        reserved_owned_bytes: usize,
     },
 }
 
@@ -122,7 +123,18 @@ impl<'a> PreparedExtensionCalls<'a> {
             Self::Rewritten {
                 expression,
                 variables,
+                ..
             } => (expression, variables),
+        }
+    }
+
+    fn reserved_owned_bytes(&self) -> usize {
+        match self {
+            Self::Borrowed { .. } => 0,
+            Self::Rewritten {
+                reserved_owned_bytes,
+                ..
+            } => *reserved_owned_bytes,
         }
     }
 }
@@ -861,37 +873,47 @@ impl Evaluator {
                 meter,
                 custom_calls,
             )?;
-            let (prepared, augmented) = prepared.parts();
-            let value = if let Some(name) =
-                variable_reference_name(prepared.source.trim(), &prepared.namespaces)
-                && let Some(Value::StoredExpression(source)) = augmented.get(&name)
-            {
-                XPathValue::StoredExpression(source.clone())
-            } else {
-                self.evaluate_core(
-                    prepared,
-                    node,
-                    position,
-                    size,
-                    augmented,
-                    meter,
-                    custom_calls,
-                )?
-            };
-            let requested = self
-                .pending_document_requests
-                .borrow_mut()
-                .drain()
-                .collect::<Vec<_>>();
-            if requested.is_empty() {
+            let outcome = (|| {
+                let (prepared_expression, augmented) = prepared.parts();
+                let value = if let Some(name) = variable_reference_name(
+                    prepared_expression.source.trim(),
+                    &prepared_expression.namespaces,
+                ) && let Some(Value::StoredExpression(source)) = augmented.get(&name)
+                {
+                    XPathValue::StoredExpression(source.clone())
+                } else {
+                    self.evaluate_core(
+                        prepared_expression,
+                        node,
+                        position,
+                        size,
+                        augmented,
+                        meter,
+                        custom_calls,
+                    )?
+                };
+                let requested = self
+                    .pending_document_requests
+                    .borrow_mut()
+                    .drain()
+                    .collect::<Vec<_>>();
+                if requested.is_empty() {
+                    return Ok(Some(value));
+                }
+                let prepared_count = self.documents.len();
+                self.prepare_document_requests(requested, augmented, meter)?;
+                if self.documents.len() == prepared_count {
+                    return Err(Error::Dynamic(
+                        "document() resolution made no progress".into(),
+                    ));
+                }
+                Ok(None)
+            })();
+            let reserved_owned_bytes = prepared.reserved_owned_bytes();
+            drop(prepared);
+            meter.release_owned_bytes(reserved_owned_bytes);
+            if let Some(value) = outcome? {
                 return Ok(value);
-            }
-            let prepared_count = self.documents.len();
-            self.prepare_document_requests(requested, augmented, meter)?;
-            if self.documents.len() == prepared_count {
-                return Err(Error::Dynamic(
-                    "document() resolution made no progress".into(),
-                ));
             }
         }
     }
@@ -1152,6 +1174,38 @@ impl Evaluator {
         variables: &'a dyn VariableBindings,
         meter: &mut Meter,
         custom_calls: Option<&CustomCallSession>,
+    ) -> Result<PreparedExtensionCalls<'a>> {
+        let mut reserved_owned_bytes = 0usize;
+        let prepared = self.prepare_extension_calls_inner(
+            expression,
+            node,
+            position,
+            size,
+            variables,
+            meter,
+            custom_calls,
+            &mut reserved_owned_bytes,
+        );
+        if prepared.is_err() {
+            meter.release_owned_bytes(reserved_owned_bytes);
+        }
+        prepared
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "extension preparation also tracks temporary storage for fail-closed cleanup"
+    )]
+    fn prepare_extension_calls_inner<'a>(
+        &mut self,
+        expression: &'a Expression,
+        node: &SourceNode,
+        position: usize,
+        size: usize,
+        variables: &'a dyn VariableBindings,
+        meter: &mut Meter,
+        custom_calls: Option<&CustomCallSession>,
+        reserved_owned_bytes: &mut usize,
     ) -> Result<PreparedExtensionCalls<'a>> {
         if innermost_namespaced_call(
             &expression.source,
@@ -1541,7 +1595,6 @@ impl Evaluator {
                         .string(self);
                     let nodes = self.document_order(nodes);
                     let mut result_nodes = Vec::new();
-                    let mut seen = HashSet::new();
                     let mut scalars = Vec::new();
                     let total = nodes.len();
                     for (index, mapped_node) in nodes.iter().enumerate() {
@@ -1563,29 +1616,53 @@ impl Evaluator {
                         match value {
                             XPathValue::NodeSet(nodes) => {
                                 for node in nodes {
-                                    if seen.insert(node.clone()) {
-                                        result_nodes.push(node);
-                                    }
+                                    reserve_temporary_vec_slot(
+                                        &mut result_nodes,
+                                        meter,
+                                        reserved_owned_bytes,
+                                    )?;
+                                    result_nodes.push(node);
                                 }
                             }
-                            XPathValue::Boolean(value) => scalars
-                                .push(("boolean", if value { "true" } else { "false" }.into())),
-                            XPathValue::Number(value) => {
-                                scalars.push(("number", crate::value::format_xpath_number(value)))
-                            }
-                            XPathValue::String(value) => scalars.push(("string", value)),
-                            XPathValue::StoredExpression(value) => scalars.push(("string", value)),
-                            XPathValue::ResultTreeFragment(document) => {
-                                scalars.push(("string", document.string_value(document.root())))
+                            value => {
+                                let kind = match value {
+                                    XPathValue::Boolean(_) => "boolean",
+                                    XPathValue::Number(_) => "number",
+                                    XPathValue::String(_)
+                                    | XPathValue::StoredExpression(_)
+                                    | XPathValue::ResultTreeFragment(_) => "string",
+                                    XPathValue::NodeSet(_) => unreachable!(),
+                                };
+                                reserve_temporary_vec_slot(
+                                    &mut scalars,
+                                    meter,
+                                    reserved_owned_bytes,
+                                )?;
+                                let (value, value_bytes) =
+                                    value.into_fully_metered_temporary_string(self, meter)?;
+                                *reserved_owned_bytes =
+                                    reserved_owned_bytes.saturating_add(value_bytes);
+                                scalars.push((kind, value));
                             }
                         }
                     }
                     if !scalars.is_empty() {
                         let fragment = dynamic_map_document(&scalars, meter)?;
                         let root = self.import_document(&fragment, meter)?;
-                        result_nodes.extend(self.children(&root));
+                        if let SourceNode::Node(root) = root
+                            && let Some(root) = self.source.node(root)
+                        {
+                            for child in root.children.iter().copied() {
+                                reserve_temporary_vec_slot(
+                                    &mut result_nodes,
+                                    meter,
+                                    reserved_owned_bytes,
+                                )?;
+                                result_nodes.push(SourceNode::Node(child));
+                            }
+                        }
                     }
-                    Value::NodeSet(result_nodes)
+                    Value::NodeSet(self.document_order(result_nodes))
                 }
             };
             let local = format!("value{variable_index}");
@@ -1609,6 +1686,7 @@ impl Evaluator {
         Ok(PreparedExtensionCalls::Rewritten {
             expression: rewritten,
             variables: augmented,
+            reserved_owned_bytes: *reserved_owned_bytes,
         })
     }
 
@@ -3366,7 +3444,7 @@ struct ExpandedXIncludeDocument {
 struct PendingXIncludeNode {
     source: NodeId,
     target_parent: NodeId,
-    preserve_language: bool,
+    preserve_context: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3375,11 +3453,20 @@ enum XIncludeDocumentIdentity {
     External(ResourceIdentity),
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 struct XIncludeChainEntry {
     document: XIncludeDocumentIdentity,
-    selected_root: NodeId,
+    selected_root: Vec<usize>,
+    selected_root_owned_bytes: usize,
 }
+
+impl PartialEq for XIncludeChainEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.document == other.document && self.selected_root == other.selected_root
+    }
+}
+
+impl Eq for XIncludeChainEntry {}
 
 #[derive(Default)]
 struct XIncludeChain {
@@ -3393,14 +3480,51 @@ impl XIncludeChain {
     }
 
     fn push(&mut self, entry: XIncludeChainEntry, meter: &mut Meter) -> Result<()> {
-        reserve_temporary_vec_slot(&mut self.entries, meter, &mut self.reserved_owned_bytes)?;
+        if let Err(error) =
+            reserve_temporary_vec_slot(&mut self.entries, meter, &mut self.reserved_owned_bytes)
+        {
+            meter.release_owned_bytes(entry.selected_root_owned_bytes);
+            return Err(error);
+        }
         self.entries.push(entry);
         Ok(())
     }
 
-    fn pop(&mut self) {
-        self.entries.pop().expect("XInclude chain entry was pushed");
+    fn pop(&mut self, meter: &mut Meter) {
+        let entry = self.entries.pop().expect("XInclude chain entry was pushed");
+        meter.release_owned_bytes(entry.selected_root_owned_bytes);
     }
+}
+
+fn xinclude_selected_path(
+    document: &Document,
+    mut selected: NodeId,
+    meter: &mut Meter,
+) -> Result<(Vec<usize>, usize)> {
+    let mut path = Vec::new();
+    let mut reserved_owned_bytes = 0usize;
+    let result = (|| {
+        while let Some(parent) = document
+            .node(selected)
+            .ok_or_else(|| Error::Xml("XInclude selected node is stale".into()))?
+            .parent
+        {
+            let index = document
+                .node(parent)
+                .and_then(|node| node.children.iter().position(|child| *child == selected))
+                .ok_or_else(|| Error::Xml("XInclude selected node has a stale parent".into()))?;
+            reserve_temporary_vec_slot(&mut path, meter, &mut reserved_owned_bytes)?;
+            path.push(index);
+            selected = parent;
+        }
+        path.reverse();
+        Ok(())
+    })();
+    if let Err(error) = result {
+        meter.release_owned_bytes(reserved_owned_bytes);
+        return Err(error);
+    }
+    Ok((path, reserved_owned_bytes))
 }
 
 struct XIncludeTraversal<'a> {
@@ -3469,7 +3593,7 @@ fn expand_xinclude_document_in_chain(
         pending.push(PendingXIncludeNode {
             source: selected_root,
             target_parent: output.root(),
-            preserve_language: false,
+            preserve_context: false,
         });
     } else {
         pending.extend(
@@ -3480,14 +3604,14 @@ fn expand_xinclude_document_in_chain(
                 .map(|child| PendingXIncludeNode {
                     source: *child,
                     target_parent: output.root(),
-                    preserve_language: false,
+                    preserve_context: false,
                 }),
         );
     }
     while let Some(PendingXIncludeNode {
         source: source_id,
         target_parent,
-        preserve_language,
+        preserve_context,
     }) = pending.pop()
     {
         let node = source
@@ -3513,9 +3637,9 @@ fn expand_xinclude_document_in_chain(
             let Some(target) = output.append_node_from(target_parent, node) else {
                 continue;
             };
-            if preserve_language {
+            if preserve_context {
                 retained_owned_bytes =
-                    retained_owned_bytes.saturating_add(preserve_xinclude_language(
+                    retained_owned_bytes.saturating_add(preserve_xinclude_context(
                         source,
                         source_id,
                         &mut output,
@@ -3528,7 +3652,7 @@ fn expand_xinclude_document_in_chain(
             pending.extend(node.children.iter().rev().map(|child| PendingXIncludeNode {
                 source: *child,
                 target_parent: target,
-                preserve_language: false,
+                preserve_context: false,
             }));
             continue;
         }
@@ -3563,9 +3687,10 @@ fn expand_xinclude_document_in_chain(
                             &included.document,
                             child,
                             &mut included_mapping,
-                        );
+                            meter,
+                        )?;
                         retained_owned_bytes =
-                            retained_owned_bytes.saturating_add(preserve_xinclude_language(
+                            retained_owned_bytes.saturating_add(preserve_xinclude_context(
                                 &included.document,
                                 child,
                                 &mut output,
@@ -3607,7 +3732,7 @@ fn expand_xinclude_document_in_chain(
                         PendingXIncludeNode {
                             source: *child,
                             target_parent,
-                            preserve_language: true,
+                            preserve_context: true,
                         }
                     }));
                 }
@@ -3639,6 +3764,88 @@ fn effective_xml_language(document: &Document, mut id: NodeId) -> Option<&str> {
         }
         id = node.parent?;
     }
+}
+
+fn preserve_xinclude_context(
+    source: &Document,
+    source_id: NodeId,
+    output: &mut Document,
+    target_parent: NodeId,
+    target: NodeId,
+    meter: &mut Meter,
+) -> Result<usize> {
+    let base_bytes =
+        preserve_xinclude_base(source, source_id, output, target_parent, target, meter)?;
+    preserve_xinclude_language(source, source_id, output, target_parent, target, meter)
+        .map(|language_bytes| base_bytes.saturating_add(language_bytes))
+}
+
+fn preserve_xinclude_base(
+    source: &Document,
+    source_id: NodeId,
+    output: &mut Document,
+    target_parent: NodeId,
+    target: NodeId,
+    meter: &mut Meter,
+) -> Result<usize> {
+    if !matches!(
+        output.node(target).map(|node| &node.kind),
+        Some(NodeKind::Element { .. })
+    ) {
+        return Ok(0);
+    }
+    let Some(acquired_base) = source
+        .node(source_id)
+        .and_then(|node| node.base_uri.as_deref())
+    else {
+        return Ok(0);
+    };
+    let parent_base = output
+        .node(target_parent)
+        .and_then(|node| node.base_uri.as_deref());
+    if parent_base == Some(acquired_base) {
+        return Ok(0);
+    }
+
+    // XInclude 1.0 section 4.5.5 requires a real xml:base attribute on each top-level included
+    // element whose acquired base differs from the include parent's base, replacing an existing
+    // attribute. Use the acquired absolute URI, one of the two representations allowed there.
+    // https://www.w3.org/TR/xinclude/#base
+    let existing = output.node(target).and_then(|node| match &node.kind {
+        NodeKind::Element { attributes, .. } => attributes.iter().position(|attribute| {
+            attribute.name.namespace.as_deref() == Some("http://www.w3.org/XML/1998/namespace")
+                && attribute.name.local == "base"
+        }),
+        _ => None,
+    });
+    if let Some(index) = existing {
+        meter.charge(BudgetKind::OwnedBytes, acquired_base.len())?;
+        let value = acquired_base.to_owned();
+        let node = output
+            .node_mut(target)
+            .expect("XInclude fixup target remains present");
+        let NodeKind::Element { attributes, .. } = &mut node.kind else {
+            unreachable!("XInclude base fixup target was checked as an element");
+        };
+        attributes[index].value = value;
+        return Ok(acquired_base.len());
+    }
+
+    let bytes = std::mem::size_of::<Attribute>()
+        .saturating_add("http://www.w3.org/XML/1998/namespace".len())
+        .saturating_add("base".len())
+        .saturating_add("xml".len())
+        .saturating_add(acquired_base.len());
+    meter.charge(BudgetKind::OwnedBytes, bytes)?;
+    output.add_default_attribute(
+        target,
+        Attribute {
+            name: ExpandedName::new(Some("http://www.w3.org/XML/1998/namespace"), "base"),
+            prefix: Some("xml".into()),
+            value: acquired_base.to_owned(),
+        },
+    )?;
+    Ok(bytes)
 }
 
 fn preserve_xinclude_language(
@@ -4070,11 +4277,15 @@ fn resolve_xinclude(
                 })?,
             None => source.root(),
         };
+        let (selected_path, selected_path_owned_bytes) =
+            xinclude_selected_path(source, selected_root, meter).map_err(XIncludeFailure::Fatal)?;
         let entry = XIncludeChainEntry {
             document: traversal.source_identity.clone(),
-            selected_root,
+            selected_root: selected_path,
+            selected_root_owned_bytes: selected_path_owned_bytes,
         };
         if traversal.chain.contains(&entry) {
+            meter.release_owned_bytes(entry.selected_root_owned_bytes);
             // XInclude 1.0 section 4.2.7 identifies a loop by the include location and XPointer,
             // not by the resource alone. The selected node is the semantic identity of that pair,
             // including equivalent XPointer spellings: https://www.w3.org/TR/xinclude/#loops
@@ -4098,7 +4309,7 @@ fn resolve_xinclude(
             depth.saturating_add(1),
             Some(selected_root),
         );
-        traversal.chain.pop();
+        traversal.chain.pop(meter);
         return expanded
             .map(XIncludeContent::Xml)
             .map_err(XIncludeFailure::Fatal);
@@ -4181,11 +4392,16 @@ fn resolve_xinclude(
     } else {
         None
     };
+    let selected_node = selected_root.unwrap_or_else(|| document.root());
+    let (selected_path, selected_path_owned_bytes) =
+        xinclude_selected_path(&document, selected_node, meter).map_err(XIncludeFailure::Fatal)?;
     let chain_entry = XIncludeChainEntry {
         document: XIncludeDocumentIdentity::External(resource.identity.clone()),
-        selected_root: selected_root.unwrap_or_else(|| document.root()),
+        selected_root: selected_path,
+        selected_root_owned_bytes: selected_path_owned_bytes,
     };
     if traversal.chain.contains(&chain_entry) {
+        meter.release_owned_bytes(chain_entry.selected_root_owned_bytes);
         meter.release_owned_bytes(parsed_reservation);
         meter.release_owned_bytes(xml.temporary_bytes);
         meter.release_owned_bytes(resource.bytes.capacity());
@@ -4221,7 +4437,7 @@ fn resolve_xinclude(
         depth.saturating_add(1),
         selected_root,
     );
-    traversal.chain.pop();
+    traversal.chain.pop(meter);
     match expanded {
         Ok(mut expanded) => {
             let transferred_from_parse = retained_namespace_bytes.min(parsed_reservation);
@@ -5748,7 +5964,7 @@ impl function::Function for IdFunction {
             return Ok(SxdValue::Nodeset(nodeset::Nodeset::new()));
         };
         let mut result = nodeset::Nodeset::new();
-        let mut add_tokens = |value: &str| {
+        let mut add_tokens = |value: &str| -> std::result::Result<(), function::Error> {
             // XPath 1.0 id() splits on XML's four S characters, not the host language's wider
             // ASCII whitespace class: https://www.w3.org/TR/1999/REC-xpath-19991116/#function-id
             for token in value
@@ -5759,21 +5975,24 @@ impl function::Function for IdFunction {
                     && let Some(node) =
                         resolve_node_path(context.node.document().root().into(), path)
                 {
-                    result.add(node);
+                    result.add_metered(context, node)?;
                 }
             }
+            Ok(())
         };
         match &args[0] {
             SxdValue::Nodeset(nodes) => {
                 for node in nodes.iter() {
                     let value = node.string_value_with_context(context)?;
-                    add_tokens(&value);
+                    add_tokens(&value)?;
                 }
             }
-            SxdValue::String(value) | SxdValue::ResultTreeFragment(_, value) => add_tokens(value),
+            SxdValue::String(value) | SxdValue::ResultTreeFragment(_, value) => {
+                add_tokens(value)?;
+            }
             value => {
                 context.reserve_string_allocation(value.string_len())?;
-                add_tokens(&value.string());
+                add_tokens(&value.string())?;
             }
         }
         Ok(SxdValue::Nodeset(result))
@@ -6334,7 +6553,7 @@ impl function::Function for ExsltMathFunction {
                 let mut selected = nodeset::Nodeset::new();
                 for (node, value) in ordered.into_iter().zip(numbers) {
                     if value == target {
-                        selected.add(node);
+                        selected.add_metered(context, node)?;
                     }
                 }
                 SxdValue::Nodeset(selected)
@@ -6377,7 +6596,7 @@ impl function::Function for ExsltSetFunction {
             let mut result = nodeset::Nodeset::new();
             for node in ordered {
                 if seen.insert(node.string_value()) {
-                    result.add(node);
+                    result.add_metered(context, node)?;
                 }
             }
             return Ok(SxdValue::Nodeset(result));
@@ -6395,14 +6614,14 @@ impl function::Function for ExsltSetFunction {
             Self::Difference => {
                 for node in left.document_order_with_context(context)? {
                     if !right.contains(node.clone()) {
-                        result.add(node);
+                        result.add_metered(context, node)?;
                     }
                 }
             }
             Self::Intersection => {
                 for node in left.document_order_with_context(context)? {
                     if right.contains(node.clone()) {
-                        result.add(node);
+                        result.add_metered(context, node)?;
                     }
                 }
             }
@@ -6429,7 +6648,7 @@ impl function::Function for ExsltSetFunction {
                         && ((matches!(self, Self::Leading) && candidate < boundary)
                             || (matches!(self, Self::Trailing) && candidate > boundary))
                     {
-                        result.add(node);
+                        result.add_metered(context, node)?;
                     }
                 }
             }
@@ -8477,6 +8696,62 @@ mod tests {
         assert!(language_tag_matches("en", "EN"));
         assert!(!language_tag_matches("english", "en"));
         assert!(!language_tag_matches("fr", "en"));
+    }
+
+    #[test]
+    fn id_result_nodes_cross_the_xpath_allocation_gate() {
+        // A wide id() result is temporary XPath-owned storage even when its caller consumes only
+        // the first node. Every unique result insertion must therefore consume the shared gate.
+        let package = Package::new();
+        let document = package.as_document();
+        let documents = document.create_element("documents");
+        let logical_document = document.create_element("document");
+        let target = document.create_element("target");
+        document.root().append_child(documents);
+        documents.append_child(logical_document);
+        logical_document.append_child(target);
+        let index = vec![HashMap::from([(
+            "target".into(),
+            NodePath::Ordinary(vec![0, 0, 0]),
+        )])];
+        let function = IdFunction {
+            nodes_by_document: Rc::new(RefCell::new(index)),
+        };
+        let mut context = Context::new();
+        context.set_string_allocation_limit(0);
+        let evaluation =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&context, logical_document.into());
+
+        let error = function
+            .evaluate(&evaluation, vec![SxdValue::String("target".into())])
+            .expect_err("id() result storage must cross the allocation gate");
+        assert!(error.to_string().contains("allocation budget"));
+    }
+
+    #[test]
+    fn exslt_set_result_nodes_cross_the_xpath_allocation_gate() {
+        // EXSLT set operators retain a second node-set beside their ordered input workspace.
+        let package = Package::new();
+        let document = package.as_document();
+        let mut left = nodeset::Nodeset::new();
+        left.add(document.root());
+        let mut context = Context::new();
+        context.set_string_allocation_limit(
+            2 * std::mem::size_of::<nodeset::Node<'_>>() + std::mem::size_of::<Vec<usize>>(),
+        );
+        let evaluation =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+
+        let error = ExsltSetFunction::Difference
+            .evaluate(
+                &evaluation,
+                vec![
+                    SxdValue::Nodeset(left),
+                    SxdValue::Nodeset(nodeset::Nodeset::new()),
+                ],
+            )
+            .expect_err("EXSLT result storage must cross the allocation gate");
+        assert!(error.to_string().contains("allocation budget"));
     }
 
     #[test]

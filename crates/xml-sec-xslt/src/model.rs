@@ -1436,33 +1436,35 @@ impl Document {
         source: &Self,
         source_id: NodeId,
         mapping: &mut HashMap<NodeId, NodeId>,
-    ) -> NodeId {
+        meter: &mut Meter,
+    ) -> Result<NodeId> {
         let source_node = source.node(source_id).expect("source subtree node exists");
         let root = self
             .append_node_from(parent, source_node)
             .expect("source documents contain no empty text nodes");
         mapping.insert(source_id, root);
-        let mut pending = source_node
-            .children
-            .iter()
-            .rev()
-            .map(|child| (*child, root))
-            .collect::<Vec<_>>();
-        while let Some((source_id, target_parent)) = pending.pop() {
-            let source_node = source.node(source_id).expect("source subtree node exists");
-            let target = self
-                .append_node_from(target_parent, source_node)
-                .expect("source documents contain no empty text nodes");
-            mapping.insert(source_id, target);
-            pending.extend(
-                source_node
-                    .children
-                    .iter()
-                    .rev()
-                    .map(|child| (*child, target)),
-            );
-        }
-        root
+        let mut pending = Vec::new();
+        let mut pending_owned_bytes = 0usize;
+        let copied = (|| {
+            for child in source_node.children.iter().rev() {
+                reserve_temporary_vec_slot(&mut pending, meter, &mut pending_owned_bytes)?;
+                pending.push((*child, root));
+            }
+            while let Some((source_id, target_parent)) = pending.pop() {
+                let source_node = source.node(source_id).expect("source subtree node exists");
+                let target = self
+                    .append_node_from(target_parent, source_node)
+                    .expect("source documents contain no empty text nodes");
+                mapping.insert(source_id, target);
+                for child in source_node.children.iter().rev() {
+                    reserve_temporary_vec_slot(&mut pending, meter, &mut pending_owned_bytes)?;
+                    pending.push((*child, target));
+                }
+            }
+            Ok(root)
+        })();
+        meter.release_owned_bytes(pending_owned_bytes);
+        copied
     }
 
     pub(crate) fn remap_ids_from(
@@ -3959,6 +3961,53 @@ mod parser_boundary_tests {
             })
         ));
         assert_eq!(document.ids().count(), 0);
+    }
+
+    #[test]
+    fn subtree_copy_stack_crosses_the_execution_owned_bytes_gate() {
+        // The copied nodes and remap are retained separately by the caller; this test isolates
+        // the additional DFS stack that exists only while a wide subtree is being copied.
+        let source =
+            Document::parse("<root><a/><b/><c/><d/><e/></root>", None).expect("source parses");
+        let source_root = source
+            .node(source.root())
+            .and_then(|root| root.children.first())
+            .copied()
+            .expect("source has a document element");
+        let mut target = Document::empty(None);
+        let mut mapping = HashMap::new();
+        let mut meter = Meter::new(
+            ExecutionBudget {
+                source_bytes: usize::MAX,
+                external_documents: usize::MAX,
+                recursion_depth: usize::MAX,
+                xpath_evaluations: usize::MAX,
+                pattern_evaluations: usize::MAX,
+                template_applications: usize::MAX,
+                sort_comparisons: usize::MAX,
+                key_entries: usize::MAX,
+                result_nodes: usize::MAX,
+                serialized_bytes: usize::MAX,
+                messages: usize::MAX,
+                owned_bytes: 0,
+            },
+            0,
+        )
+        .expect("zero-byte meter initializes");
+
+        assert!(matches!(
+            target.append_subtree_from(
+                target.root(),
+                &source,
+                source_root,
+                &mut mapping,
+                &mut meter,
+            ),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            })
+        ));
     }
 
     fn parse_tree_with_oracle_stack(xml: &str, base_uri: Option<&str>) -> Result<Document> {

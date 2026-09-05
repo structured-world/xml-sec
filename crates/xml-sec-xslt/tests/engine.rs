@@ -5212,6 +5212,167 @@ fn xinclude_preserves_acquired_and_fallback_language() {
 }
 
 #[test]
+fn xinclude_materializes_required_top_level_xml_base_fixup() {
+    // XInclude 1.0 section 4.5.5 requires an xml:base attribute when an included element's base
+    // differs from its include parent's base. The attribute is part of the observable infoset.
+    // https://www.w3.org/TR/xinclude/#base
+    let resolver = Arc::new(MemoryResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert("included.xml".into(), "<included/>".into());
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="root/included/@xml:base"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="included.xml"/></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("source parses");
+    let result = stylesheet
+        .execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(4096),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        )
+        .expect("XInclude base fixup succeeds");
+
+    assert_eq!(result.serialized.bytes, b"memory:included.xml");
+}
+
+#[test]
+fn xinclude_base_fixup_replaces_stale_attributes_but_avoids_redundancy() {
+    // XInclude 1.0 section 4.5.5 replaces an existing xml:base with the acquired effective URI,
+    // but adds no attribute when that URI already equals the include parent's base.
+    // https://www.w3.org/TR/xinclude/#base
+    let resolver = Arc::new(ContextResolver::default());
+    let source_uri = "https://example.test/source.xml";
+    let included_uri = "https://example.test/included.xml";
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            ("included.xml".into(), Some(source_uri.into())),
+            ResolvedResource {
+                canonical_uri: included_uri.into(),
+                identity: ResourceIdentity("included-with-relative-base".into()),
+                bytes: br#"<included xml:base="nested/"/>"#.to_vec(),
+                media_type: None,
+                encoding: Some("UTF-8".into()),
+            },
+        );
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="root/included/@xml:base"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="included.xml"/></root>"#,
+        Some(source_uri),
+    )
+    .expect("source parses");
+    let replaced = stylesheet
+        .execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            resolver.clone(),
+            ExecutionOptions {
+                budget: execution_budget(4096),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        )
+        .expect("existing XInclude base is replaced");
+    assert_eq!(replaced.serialized.bytes, b"https://example.test/nested/");
+
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            ("included.xml".into(), Some(included_uri.into())),
+            ResolvedResource {
+                canonical_uri: included_uri.into(),
+                identity: ResourceIdentity("included-at-parent-base".into()),
+                bytes: b"<included/>".to_vec(),
+                media_type: None,
+                encoding: Some("UTF-8".into()),
+            },
+        );
+    let same_base = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="included.xml"/></root>"#,
+        Some(included_uri),
+    )
+    .expect("same-base source parses");
+    let unchanged = stylesheet
+        .execute_with_source_processing(
+            &same_base,
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(4096),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        )
+        .expect("equal bases need no fixup");
+    assert!(unchanged.serialized.bytes.is_empty());
+}
+
+#[test]
+fn external_xinclude_cycles_use_stable_resource_node_identity() {
+    // XInclude 1.0 section 4.2.7 makes a repeated include location plus selected subresource a
+    // fatal loop. Reparsed arena-local node IDs must not postpone detection to the depth budget.
+    // https://www.w3.org/TR/xinclude/#loops
+    let resolver = Arc::new(CountingResolver::default());
+    let mut resources = resolver.resources.lock().expect("resolver mutex");
+    resources.insert(
+        "a.xml".into(),
+        r#"<doc xmlns:xi="http://www.w3.org/2001/XInclude"><a><xi:include href="b.xml" xpointer="element(/1/1)"/></a></doc>"#.into(),
+    );
+    resources.insert(
+        "b.xml".into(),
+        r#"<doc xmlns:xi="http://www.w3.org/2001/XInclude"><b><xi:include href="a.xml" xpointer="element(/1/1)"/></b></doc>"#.into(),
+    );
+    drop(resources);
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#,
+    );
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="a.xml" xpointer="element(/1/1)"/></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("source parses");
+    let mut budget = execution_budget(4096);
+    budget.external_documents = 100;
+
+    let error = stylesheet
+        .execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            resolver.clone(),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        )
+        .expect_err("recursive external inclusion is fatal");
+
+    assert!(matches!(error, Error::Resolver { message, .. } if message.contains("cycle")));
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 3);
+}
+
+#[test]
 fn xinclude_text_strips_encoding_signatures() {
     // XInclude 1.0 section 4.3.3 requires an encoding signature to be interpreted and removed
     // before the text resource is included in the document.
@@ -5380,11 +5541,11 @@ fn xinclude_element_scheme_selects_only_the_addressed_element() {
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><xsl:copy-of select="."/></xsl:template></xsl:stylesheet>"#,
     );
 
-    for (pointer, expected) in [
-        ("element(/1/2/1)", "<leaf/>"),
-        ("element(anchor/1)", "<leaf/>"),
-        ("anchor", "<second xml:id=\"anchor\"><leaf/></second>"),
-        ("unknown(a(b)) element(/1/1)", "<first/>"),
+    for (pointer, expected_element) in [
+        ("element(/1/2/1)", "leaf"),
+        ("element(anchor/1)", "leaf"),
+        ("anchor", "second"),
+        ("unknown(a(b)) element(/1/1)", "first"),
     ] {
         let source = Document::parse(
             &format!(
@@ -5408,7 +5569,8 @@ fn xinclude_element_scheme_selects_only_the_addressed_element() {
             .expect("required element() scheme selects a subresource");
         let output = String::from_utf8(result.serialized.bytes).expect("result is UTF-8");
         assert!(
-            output.contains(expected),
+            output.contains(&format!("<{expected_element} "))
+                && output.contains("xml:base=\"memory:included.xml\""),
             "unexpected selection for {pointer}: {output}"
         );
         assert!(!output.contains("must-not-resolve"));
@@ -5528,7 +5690,7 @@ fn xinclude_element_scheme_budgets_only_the_selected_projection() {
     assert!(
         String::from_utf8(result.serialized.bytes)
             .expect("result is UTF-8")
-            .contains("<selected/>")
+            .contains("<selected xml:base=\"memory:included.xml\"/>")
     );
 }
 
@@ -5834,7 +5996,7 @@ fn xinclude_distinguishes_extension_content_from_reserved_children() {
         .expect("permitted extension children do not invalidate inclusion");
     assert_eq!(
         String::from_utf8(result.serialized.bytes).unwrap(),
-        "<root xmlns:xi=\"http://www.w3.org/2001/XInclude\"><included/></root>\n"
+        "<root xmlns:xi=\"http://www.w3.org/2001/XInclude\"><included xml:base=\"memory:included.xml\"/></root>\n"
     );
 
     let source = Document::parse(
@@ -6877,10 +7039,10 @@ fn sequential_xincludes_release_temporary_projection_memory() {
     let source = Document::parse(&source_xml, Some("memory:source.xml")).expect("source parses");
     let mut budget = execution_budget(source_xml.len());
     budget.external_documents = 64;
-    // Includes the conservative SXD arena/container estimate and the shared namespace arenas
-    // retained by the projected nodes, while remaining far below the aggregate footprint that
-    // retaining 64 complete parsed/projection temporaries would require.
-    budget.owned_bytes = 208 * 1024;
+    // Includes the conservative SXD arena/container estimate, required xml:base fixups, and the
+    // shared namespace arenas retained by projected nodes, while remaining far below the aggregate
+    // footprint that retaining 64 complete parsed/projection temporaries would require.
+    budget.owned_bytes = 512 * 1024;
     compile(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#,
     )
@@ -10764,6 +10926,41 @@ fn dynamic_map_preserves_boolean_lexical_values() {
         execute(stylesheet, "<root><item>1</item><item>2</item></root>"),
         "false|true"
     );
+}
+
+#[test]
+fn dynamic_map_node_accumulators_scale_the_owned_bytes_budget() {
+    // dyn:map retains its mapped node vector while projecting the rewritten XPath variable. A
+    // wide result must reject a budget that fits equivalent core XPath plus fixed extension
+    // overhead but not the mapped-node accumulator.
+    let baseline = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(root/item)"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let mapped = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:dyn="http://exslt.org/dynamic"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(dyn:map(root/item, '.'))"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source_xml = format!("<root>{}</root>", "<item/>".repeat(256));
+    let source = Document::parse(&source_xml, None).expect("wide source parses");
+    let baseline_bytes =
+        minimum_execution_owned_bytes_for_source(&baseline, &source, source_xml.len());
+    let mut budget = execution_budget(source_xml.len());
+    budget.owned_bytes = baseline_bytes + 1024;
+    assert!(matches!(
+        mapped.execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
 }
 
 #[test]
