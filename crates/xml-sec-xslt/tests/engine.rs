@@ -8198,10 +8198,10 @@ fn built_in_template_rules_consume_supplied_parameters_in_fragments() {
 fn html_uri_escaping_uses_element_attribute_pairs_and_expanded_names() {
     // URI escaping applies only to the pairs listed by the XSLT HTML output contract.
     // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
-    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:x="urn:foreign"><xsl:output method="html" indent="no"/><xsl:template match="/"><html><head profile="é path"/><body background="é path"><div href="é"/><foo src="é"/><a href="é path" x:href="é"/><object archive="é" classid="é" codebase="é" data="é"/></body></html></xsl:template></xsl:stylesheet>"#;
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:x="urn:foreign"><xsl:output method="html" indent="no"/><xsl:template match="/"><html><head profile="é path"/><body background="é path"><div href="é"/><foo src="é"/><a href="é path" x:href="é"/><object archive="é" classid="é" codebase="é" data="é"/><applet archive="é" codebase="é"/></body></html></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(stylesheet, "<source/>"),
-        "<html xmlns:x=\"urn:foreign\"><head profile=\"%C3%A9 path\"><meta charset=\"UTF-8\"></head><body background=\"%C3%A9 path\"><div href=\"é\"></div><foo src=\"é\"></foo><a href=\"%C3%A9%20path\" x:href=\"é\"></a><object archive=\"%C3%A9\" classid=\"%C3%A9\" codebase=\"%C3%A9\" data=\"%C3%A9\"></object></body></html>"
+        "<html xmlns:x=\"urn:foreign\"><head profile=\"%C3%A9 path\"><meta charset=\"UTF-8\"></head><body background=\"%C3%A9 path\"><div href=\"é\"></div><foo src=\"é\"></foo><a href=\"%C3%A9%20path\" x:href=\"é\"></a><object archive=\"%C3%A9\" classid=\"%C3%A9\" codebase=\"%C3%A9\" data=\"%C3%A9\"></object><applet archive=\"%C3%A9\" codebase=\"%C3%A9\"></applet></body></html>"
     );
 }
 
@@ -8916,6 +8916,50 @@ fn result_tree_fragment_clones_share_document_storage() {
 }
 
 #[test]
+fn divergent_document_clones_keep_distinct_result_tree_fragment_bindings() {
+    // Direct Document clones preserve source-node handles, but independently mutable temporary
+    // trees must still receive distinct adapter handles when bound as result-tree fragments.
+    let original =
+        Document::parse("<temporary token=' a  b '/>", None).expect("original document parses");
+    let mut clone = original.clone();
+    let clone_element = clone
+        .nodes()
+        .find_map(|(id, node)| matches!(node.kind, NodeKind::Element { .. }).then_some(id))
+        .expect("cloned element exists");
+    clone
+        .normalize_tokenized_attribute(clone_element, 0)
+        .expect("the cloned document mutates independently");
+    assert_ne!(original, clone);
+
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:exsl="http://exslt.org/common"><xsl:output method="text"/><xsl:param name="first"/><xsl:param name="second"/><xsl:template match="/"><xsl:text>[</xsl:text><xsl:value-of select="exsl:node-set($first)/*/@token"/><xsl:text>]|[</xsl:text><xsl:value-of select="exsl:node-set($second)/*/@token"/><xsl:text>]</xsl:text></xsl:template></xsl:stylesheet>"#,
+    );
+    let mut parameters = Parameters::new();
+    parameters.insert(
+        ExpandedName::new(None::<String>, "first"),
+        Value::ResultTreeFragment(Arc::new(original)),
+    );
+    parameters.insert(
+        ExpandedName::new(None::<String>, "second"),
+        Value::ResultTreeFragment(Arc::new(clone)),
+    );
+    let source = Document::parse("<source/>", None).expect("source parses");
+    let output = stylesheet
+        .execute(
+            &source,
+            &parameters,
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("both result-tree-fragment parameters execute");
+    assert_eq!(output.serialized.bytes, b"[ a  b ]|[a b]");
+}
+
+#[test]
 fn function_available_advertises_document() {
     // Capability introspection must agree with the registered XSLT document() function.
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="function-available('document')"/></xsl:template></xsl:stylesheet>"#;
@@ -9003,6 +9047,59 @@ fn deep_streaming_parser_expands_internal_general_entities() {
         "</n>".repeat(129)
     );
     assert!(matches!(Document::parse(&cyclic, None), Err(Error::Xml(_))));
+}
+
+#[test]
+fn compile_budget_controls_stylesheet_entity_expansion_depth() {
+    // XML 1.0 section 4.4.2 defines no fixed entity nesting ceiling, so stylesheet parsing must
+    // use the same caller-selected recursion budget as source parsing.
+    // https://www.w3.org/TR/xml/#included
+    let declarations = (0..12)
+        .map(|depth| {
+            let replacement = if depth == 11 {
+                "expanded".to_owned()
+            } else {
+                format!("&e{};", depth + 1)
+            };
+            format!(r#"<!ENTITY e{depth} "{replacement}">"#)
+        })
+        .collect::<String>();
+    let stylesheet = format!(
+        r#"<!DOCTYPE xsl:stylesheet [{declarations}]><xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/">&e0;</xsl:template></xsl:stylesheet>"#
+    );
+    let constrained = Compiler::new(
+        Arc::new(NoResolver),
+        CompileBudget::new(1 << 20, 0, 11, 1 << 20),
+    );
+    assert!(matches!(
+        constrained.compile(&stylesheet, None),
+        Err(Error::Budget {
+            kind: BudgetKind::RecursionDepth,
+            limit: 11,
+            actual: 12,
+        })
+    ));
+
+    let admitted = Compiler::new(
+        Arc::new(NoResolver),
+        CompileBudget::new(1 << 20, 0, 12, 1 << 20),
+    )
+    .compile(&stylesheet, None)
+    .expect("the compile budget admits the entity chain");
+    let source = Document::parse("<source/>", None).expect("source parses");
+    let output = admitted
+        .execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("the expanded stylesheet executes");
+    assert_eq!(output.serialized.bytes, b"expanded");
 }
 
 struct CanonicalIdentityResolver {

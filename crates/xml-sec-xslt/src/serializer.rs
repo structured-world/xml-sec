@@ -1694,8 +1694,13 @@ fn html_uri_escaping(element: &str, attribute: &str) -> Option<HtmlUriEscaping> 
     }
     ((attribute.eq_ignore_ascii_case("background") && element.eq_ignore_ascii_case("body"))
         || (attribute.eq_ignore_ascii_case("profile") && element.eq_ignore_ascii_case("head"))
-        || (ascii_eq_any(attribute, &["archive", "classid", "codebase", "data"])
-            && element.eq_ignore_ascii_case("object")))
+        || (ascii_eq_any(attribute, &["classid", "data"])
+            && element.eq_ignore_ascii_case("object"))
+        // HTML 4.01 section 13.4 defines APPLET codebase as a URI and archive as a URI list.
+        // XSLT 1.0 section 16.2 applies the same recommended non-ASCII escaping as OBJECT.
+        // https://www.w3.org/TR/html401/struct/objects.html#h-13.4
+        || (ascii_eq_any(attribute, &["archive", "codebase"])
+            && ascii_eq_any(element, &["applet", "object"])))
     .then_some(HtmlUriEscaping::NonAscii)
 }
 

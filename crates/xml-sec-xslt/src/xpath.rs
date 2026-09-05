@@ -50,6 +50,10 @@ pub(crate) trait VariableBindings {
     fn result_tree_fragment(&self, identity: u64) -> Option<Arc<Document>>;
 }
 
+fn result_tree_fragment_handle(document: &Arc<Document>) -> u64 {
+    Arc::as_ptr(document) as usize as u64
+}
+
 impl VariableBindings for HashMap<ExpandedName, Value> {
     fn get(&self, name: &ExpandedName) -> Option<&Value> {
         HashMap::get(self, name)
@@ -63,7 +67,9 @@ impl VariableBindings for HashMap<ExpandedName, Value> {
 
     fn result_tree_fragment(&self, identity: u64) -> Option<Arc<Document>> {
         self.values().find_map(|value| match value {
-            Value::ResultTreeFragment(document) if document.identity() == identity => {
+            Value::ResultTreeFragment(document)
+                if result_tree_fragment_handle(document) == identity =>
+            {
                 Some(Arc::clone(document))
             }
             _ => None,
@@ -109,7 +115,9 @@ impl VariableBindings for VariableOverlay<'_> {
         self.additions
             .values()
             .find_map(|value| match value {
-                Value::ResultTreeFragment(document) if document.identity() == identity => {
+                Value::ResultTreeFragment(document)
+                    if result_tree_fragment_handle(document) == identity =>
+                {
                     Some(Arc::clone(document))
                 }
                 _ => None,
@@ -505,7 +513,7 @@ impl CustomCallSession {
             .completed
             .iter()
             .filter_map(|completed| completed.fragment.as_ref())
-            .find(|document| document.identity() == identity)
+            .find(|document| result_tree_fragment_handle(document) == identity)
             .cloned()
     }
 
@@ -1149,7 +1157,7 @@ impl Evaluator {
             ),
             Value::ResultTreeFragment(document) => {
                 let deferred = DeferredXPathValue::ResultTreeFragment {
-                    identity: document.identity(),
+                    identity: result_tree_fragment_handle(&document),
                     value: document.string_value(document.root()),
                 };
                 (deferred, Some(document))
@@ -1159,10 +1167,10 @@ impl Evaluator {
 
     fn import_result_tree_fragment(
         &mut self,
-        fragment: &Document,
+        fragment: &Arc<Document>,
         meter: &mut Meter,
     ) -> Result<SourceNode> {
-        let identity = fragment.identity();
+        let identity = result_tree_fragment_handle(fragment);
         if let Some(root) = self.result_tree_fragments.get(&identity) {
             return Ok(root.clone());
         }
@@ -2106,7 +2114,7 @@ impl Evaluator {
                     context.set_variable(
                         qname,
                         SxdValue::ResultTreeFragment(
-                            document.identity(),
+                            result_tree_fragment_handle(document),
                             document.string_value_with_capacity(document.root(), length),
                         ),
                     );

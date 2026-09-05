@@ -581,9 +581,9 @@ impl Document {
             budget,
             nodes: 1,
             entity_references: 0,
-            entity_expansion: EntityExpansionMeter::with_reference_limit(
+            entity_expansion: EntityExpansionMeter::with_parse_budget(
                 ENTITY_EXPANSION_BYTE_CEILING,
-                budget.entity_references,
+                budget,
             ),
             namespace_scope_bytes: 0,
         };
@@ -1675,9 +1675,17 @@ fn normalized_xml_id(value: &str) -> Result<Cow<'_, str>> {
     Ok(normalized)
 }
 
-pub(crate) fn prepare_xml_frontend_bounded(xml: &str, limit: usize) -> Result<Cow<'_, str>> {
+pub(crate) fn prepare_xml_frontend_bounded(
+    xml: &str,
+    limit: usize,
+    recursion_depth: usize,
+) -> Result<Cow<'_, str>> {
     let mut entity_references = 0;
-    let mut entity_expansion = EntityExpansionMeter::new(limit.min(ENTITY_EXPANSION_BYTE_CEILING));
+    let mut entity_expansion = EntityExpansionMeter::with_limits(
+        limit.min(ENTITY_EXPANSION_BYTE_CEILING),
+        usize::MAX,
+        recursion_depth.min(ENTITY_EXPANSION_DEPTH_CEILING),
+    );
     let (parameter_expanded_xml, declarations) =
         internal_general_entities(xml, &mut entity_references, &mut entity_expansion)?;
     let expanded_xml = expand_document_entities(
@@ -2407,11 +2415,7 @@ fn internal_general_entities<'a>(
             Cow::Owned(next) => {
                 changed = true;
                 rounds += 1;
-                if rounds > ENTITY_EXPANSION_DEPTH_CEILING {
-                    return Err(Error::Xml(
-                        "parameter entity declaration depth limit exceeded".into(),
-                    ));
-                }
+                meter.check_depth(rounds)?;
                 expanded_subset = Cow::Owned(next);
             }
         }
@@ -3314,7 +3318,7 @@ fn normalize_predefined_entity_declaration(name: &str, value: String) -> Result<
 
 fn expand_parameter_entity_references<'a>(
     value: &'a str,
-    entities: &HashMap<String, String>,
+    entities: &'a HashMap<String, String>,
     excluded_declarations: &[(usize, usize)],
     depth: usize,
     references: &mut usize,
@@ -3326,39 +3330,49 @@ fn expand_parameter_entity_references<'a>(
     let reject_unresolved = excluded_declarations.is_empty() && entities.is_empty();
     meter.check(value.len())?;
     let mut output = String::with_capacity(value.len());
+    let mut active = [""; ENTITY_EXPANSION_DEPTH_CEILING];
+    let context = ParameterEntityExpansion {
+        entities,
+        reject_unresolved,
+    };
     let mut cursor = 0;
     for &(start, end) in excluded_declarations {
         expand_parameter_entity_references_into(
             &value[cursor..start],
-            entities,
+            &context,
             depth,
             references,
             meter,
             &mut output,
-            reject_unresolved,
+            &mut active,
         )?;
         cursor = end;
     }
     expand_parameter_entity_references_into(
         &value[cursor..],
-        entities,
+        &context,
         depth,
         references,
         meter,
         &mut output,
-        reject_unresolved,
+        &mut active,
     )?;
     Ok(Cow::Owned(output))
 }
 
-fn expand_parameter_entity_references_into(
+struct ParameterEntityExpansion<'entities> {
+    entities: &'entities HashMap<String, String>,
+    reject_unresolved: bool,
+}
+
+fn expand_parameter_entity_references_into<'entities>(
     value: &str,
-    entities: &HashMap<String, String>,
+    context: &ParameterEntityExpansion<'entities>,
     depth: usize,
     references: &mut usize,
     meter: &mut EntityExpansionMeter,
     output: &mut String,
-    reject_unresolved: bool,
+    active: &mut [&'entities str; ENTITY_EXPANSION_DEPTH_CEILING],
 ) -> Result<()> {
     let mut cursor = 0usize;
     while cursor < value.len() {
@@ -3399,27 +3413,34 @@ fn expand_parameter_entity_references_into(
             if !crate::lexical::is_xml_name(name) {
                 return Err(Error::Xml("invalid parameter entity reference name".into()));
             }
-            if let Some(replacement) = entities.get(name) {
+            if let Some((entity_name, replacement)) = context.entities.get_key_value(name) {
                 meter.charge_reference(references)?;
-                if depth >= ENTITY_EXPANSION_DEPTH_CEILING {
+                // XML 1.0 section 4.1 WFC No Recursion makes direct and indirect recursive entity
+                // references fatal independently of caller-selected resource budgets.
+                // https://www.w3.org/TR/xml/#norecursion
+                if active[..depth].contains(&name) {
                     return Err(Error::Xml(format!(
-                        "entity expansion depth limit exceeded at `%{name};`"
+                        "recursive parameter entity reference `%{name};`"
                     )));
                 }
+                meter.check_depth(depth + 1)?;
+                active[depth] = entity_name;
                 let replacement = decode_parameter_character_references(replacement, meter)?;
-                expand_parameter_entity_references_into(
+                let result = expand_parameter_entity_references_into(
                     replacement.as_ref(),
-                    entities,
+                    context,
                     depth + 1,
                     references,
                     meter,
                     output,
-                    reject_unresolved,
-                )?;
+                    active,
+                );
+                active[depth] = "";
+                result?;
                 cursor += end + 2;
                 continue;
             }
-            if reject_unresolved {
+            if context.reject_unresolved {
                 return Err(Error::Xml(format!(
                     "undeclared parameter entity `%{name};`"
                 )));
@@ -3609,7 +3630,7 @@ fn skip_xml_whitespace(value: &str, cursor: &mut usize) {
 
 fn expand_document_entities<'a>(
     xml: &'a str,
-    entities: &HashMap<String, String>,
+    entities: &'a HashMap<String, String>,
     references: &mut usize,
     meter: &mut EntityExpansionMeter,
 ) -> Result<Cow<'a, str>> {
@@ -3625,6 +3646,7 @@ fn expand_document_entities<'a>(
     }
     meter.check(xml.len())?;
     let mut expanded = String::with_capacity(xml.len());
+    let mut active = [""; ENTITY_EXPANSION_DEPTH_CEILING];
     meter.append(&mut expanded, &xml[..doctype_end])?;
     expand_entity_references_into(
         &xml[doctype_end..],
@@ -3633,13 +3655,14 @@ fn expand_document_entities<'a>(
         references,
         meter,
         &mut expanded,
+        &mut active,
     )?;
     Ok(Cow::Owned(expanded))
 }
 
 fn expand_entity_references<'a>(
     value: &'a str,
-    entities: &HashMap<String, String>,
+    entities: &'a HashMap<String, String>,
     depth: usize,
     references: &mut usize,
     meter: &mut EntityExpansionMeter,
@@ -3649,7 +3672,16 @@ fn expand_entity_references<'a>(
     }
     meter.check(value.len())?;
     let mut output = String::with_capacity(value.len());
-    expand_entity_references_into(value, entities, depth, references, meter, &mut output)?;
+    let mut active = [""; ENTITY_EXPANSION_DEPTH_CEILING];
+    expand_entity_references_into(
+        value,
+        entities,
+        depth,
+        references,
+        meter,
+        &mut output,
+        &mut active,
+    )?;
     Ok(Cow::Owned(output))
 }
 
@@ -3679,13 +3711,14 @@ fn general_entity_reference(value: &str) -> Option<(&str, usize)> {
     (after_ampersand.as_bytes()[end] == b';').then(|| (&after_ampersand[..end], end + 2))
 }
 
-fn expand_entity_references_into(
+fn expand_entity_references_into<'entities>(
     value: &str,
-    entities: &HashMap<String, String>,
+    entities: &'entities HashMap<String, String>,
     depth: usize,
     references: &mut usize,
     meter: &mut EntityExpansionMeter,
     output: &mut String,
+    active: &mut [&'entities str; ENTITY_EXPANSION_DEPTH_CEILING],
 ) -> Result<()> {
     let mut cursor = 0;
     while cursor < value.len() {
@@ -3712,22 +3745,28 @@ fn expand_entity_references_into(
             continue;
         }
         if let Some((name, consumed)) = general_entity_reference(tail)
-            && let Some(replacement) = entities.get(name)
+            && let Some((entity_name, replacement)) = entities.get_key_value(name)
         {
             meter.charge_reference(references)?;
-            if depth >= ENTITY_EXPANSION_DEPTH_CEILING {
-                return Err(Error::Xml(format!(
-                    "entity expansion depth limit exceeded at `{name}`"
-                )));
+            // XML 1.0 section 4.1 WFC No Recursion rejects cycles as malformed XML rather than
+            // reporting them as exhaustion of a caller-selected recursion budget.
+            // https://www.w3.org/TR/xml/#norecursion
+            if active[..depth].contains(&name) {
+                return Err(Error::Xml(format!("recursive entity reference `&{name};`")));
             }
-            expand_entity_references_into(
+            meter.check_depth(depth + 1)?;
+            active[depth] = entity_name;
+            let result = expand_entity_references_into(
                 replacement,
                 entities,
                 depth + 1,
                 references,
                 meter,
                 output,
-            )?;
+                active,
+            );
+            active[depth] = "";
+            result?;
             cursor += consumed;
             continue;
         }
@@ -3755,19 +3794,46 @@ struct EntityExpansionMeter {
     limit: usize,
     used: usize,
     reference_limit: usize,
+    depth_limit: usize,
 }
 
 impl EntityExpansionMeter {
+    #[cfg(test)]
     const fn new(limit: usize) -> Self {
         Self::with_reference_limit(limit, usize::MAX)
     }
 
+    #[cfg(test)]
     const fn with_reference_limit(limit: usize, reference_limit: usize) -> Self {
+        Self::with_limits(limit, reference_limit, ENTITY_EXPANSION_DEPTH_CEILING)
+    }
+
+    const fn with_parse_budget(limit: usize, budget: ParseBudget) -> Self {
+        Self::with_limits(
+            limit,
+            budget.entity_references,
+            if budget.recursion_depth < ENTITY_EXPANSION_DEPTH_CEILING {
+                budget.recursion_depth
+            } else {
+                ENTITY_EXPANSION_DEPTH_CEILING
+            },
+        )
+    }
+
+    const fn with_limits(limit: usize, reference_limit: usize, depth_limit: usize) -> Self {
         Self {
             limit,
             used: 0,
             reference_limit,
+            depth_limit,
         }
+    }
+
+    fn check_depth(&self, actual: usize) -> Result<()> {
+        // XML 1.0 section 4.4.2 defines recursive inclusion without a fixed depth ceiling. The
+        // caller's recursion budget governs it; the internal clamp only protects native frames.
+        // https://www.w3.org/TR/xml/#included
+        crate::budget::ensure(crate::BudgetKind::RecursionDepth, self.depth_limit, actual)
     }
 
     fn charge_reference(&self, references: &mut usize) -> Result<()> {
@@ -3872,7 +3938,7 @@ mod parser_boundary_tests {
         namespace_index, normalize_predefined_entity_declaration, parser_workspace_bytes,
         prepare_xml_frontend_bounded, set_namespace,
     };
-    use crate::budget::{ENTITY_EXPANSION_BYTE_CEILING, Meter};
+    use crate::budget::{ENTITY_EXPANSION_BYTE_CEILING, ENTITY_EXPANSION_DEPTH_CEILING, Meter};
     use crate::{BudgetKind, ExecutionBudget, ParseBudget};
 
     fn nested_xml(depth: usize, leaf: &str) -> String {
@@ -4131,6 +4197,38 @@ mod parser_boundary_tests {
         let admitted = ParseBudget::new(usize::MAX, usize::MAX, usize::MAX, 256, usize::MAX);
         Document::parse_with_budget(&xml, None, admitted)
             .expect("the caller-selected reference limit admits its exact boundary");
+    }
+
+    #[test]
+    fn parse_budget_controls_entity_expansion_depth() {
+        // XML 1.0 section 4.4.2 requires included replacement text to be processed in place and
+        // defines no fixed nesting ceiling; recursion is therefore a caller-selected budget.
+        // https://www.w3.org/TR/xml/#included
+        let declarations = (0..12)
+            .map(|depth| {
+                let replacement = if depth == 11 {
+                    "expanded".to_owned()
+                } else {
+                    format!("&e{};", depth + 1)
+                };
+                format!(r#"<!ENTITY e{depth} "{replacement}">"#)
+            })
+            .collect::<String>();
+        let xml = format!("<!DOCTYPE root [{declarations}]><root>&e0;</root>");
+        let constrained = ParseBudget::new(usize::MAX, usize::MAX, 11, usize::MAX, usize::MAX);
+        assert!(matches!(
+            Document::parse_with_budget(&xml, None, constrained),
+            Err(Error::Budget {
+                kind: BudgetKind::RecursionDepth,
+                limit: 11,
+                actual: 12,
+            })
+        ));
+
+        let admitted = ParseBudget::new(usize::MAX, usize::MAX, 12, usize::MAX, usize::MAX);
+        let document = Document::parse_with_budget(&xml, None, admitted)
+            .expect("the caller-selected depth admits the entity chain");
+        assert_eq!(document.string_value(document.root()), "expanded");
     }
 
     #[test]
@@ -4936,8 +5034,12 @@ mod parser_boundary_tests {
         };
         assert_eq!(attributes[0].value, "\"value\"");
 
-        let prepared = prepare_xml_frontend_bounded(xml, ENTITY_EXPANSION_BYTE_CEILING)
-            .expect("roxmltree frontend preparation expands the entity");
+        let prepared = prepare_xml_frontend_bounded(
+            xml,
+            ENTITY_EXPANSION_BYTE_CEILING,
+            ENTITY_EXPANSION_DEPTH_CEILING,
+        )
+        .expect("roxmltree frontend preparation expands the entity");
         let parsed = roxmltree::Document::parse(&prepared).expect("prepared XML parses");
         assert_eq!(parsed.root_element().attribute("attr"), Some("\"value\""));
     }
