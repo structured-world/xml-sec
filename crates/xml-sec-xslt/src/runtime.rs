@@ -349,6 +349,7 @@ struct Execution<'a> {
     building_keys: HashSet<(ExpandedName, NodeId)>,
     attribute_insert_position: Option<usize>,
     attribute_protected_names: Option<HashSet<ExpandedName>>,
+    result_is_temporary: bool,
 }
 
 #[derive(Default)]
@@ -416,6 +417,7 @@ struct ResultTreeState {
     output_stack: Vec<NodeId>,
     attribute_insert_position: Option<usize>,
     attribute_protected_names: Option<HashSet<ExpandedName>>,
+    was_temporary: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -577,6 +579,7 @@ impl<'a> Execution<'a> {
             building_keys: HashSet::new(),
             attribute_insert_position: None,
             attribute_protected_names: None,
+            result_is_temporary: false,
         };
         state.evaluator.initialize_xslt(
             Arc::clone(&stylesheet.decimal_formats),
@@ -1193,6 +1196,7 @@ impl<'a> Execution<'a> {
                             );
                         }
                         Instruction::Copy {
+                            base_uri,
                             body,
                             attribute_sets,
                         } => match &node {
@@ -1209,14 +1213,11 @@ impl<'a> Execution<'a> {
                                         namespaces,
                                         ..
                                     } => {
-                                        let target = self.push_node(
-                                            self.parent(),
-                                            NodeKind::Element {
-                                                name,
-                                                prefix,
-                                                attributes: vec![],
-                                                namespaces,
-                                            },
+                                        let target = self.push_xsl_copy_element(
+                                            name,
+                                            prefix,
+                                            namespaces,
+                                            base_uri.as_deref(),
                                         )?;
                                         self.output_stack.push(target);
                                         for set in attribute_sets {
@@ -1800,6 +1801,7 @@ impl<'a> Execution<'a> {
                 Ok(())
             }
             Instruction::Copy {
+                base_uri,
                 body,
                 attribute_sets,
             } => {
@@ -1814,14 +1816,11 @@ impl<'a> Execution<'a> {
                                     attributes: _,
                                     namespaces,
                                 } => {
-                                    let target = self.push_node(
-                                        self.parent(),
-                                        NodeKind::Element {
-                                            name,
-                                            prefix,
-                                            attributes: vec![],
-                                            namespaces,
-                                        },
+                                    let target = self.push_xsl_copy_element(
+                                        name,
+                                        prefix,
+                                        namespaces,
+                                        base_uri.as_deref(),
                                     )?;
                                     self.output_stack.push(target);
                                     for set in attribute_sets {
@@ -2177,7 +2176,7 @@ impl<'a> Execution<'a> {
                             &mut self.meter,
                         )?;
                     }
-                    let fragment = self.capture_fragment(
+                    let fragment = self.capture_output_tree(
                         body,
                         node,
                         ApplyFrame::new(position, size, depth + 1),
@@ -2746,10 +2745,7 @@ impl<'a> Execution<'a> {
         let depth = self.function_depth;
         let caller_scopes = self.scopes.split_off(1);
         self.scopes.push(VariableScope::default());
-        let temporary_result = self.empty_metered_result(None)?;
-        let temporary_root = temporary_result.root();
-        let previous_result = std::mem::replace(&mut self.result, temporary_result);
-        let previous_stack = std::mem::replace(&mut self.output_stack, vec![temporary_root]);
+        let previous_result = self.enter_result_tree(None, true)?;
         self.function_results.push(None);
         if binds_defaults {
             self.binding_function_defaults.push(function.name.clone());
@@ -2791,10 +2787,9 @@ impl<'a> Execution<'a> {
         });
         let value = self.function_results.pop().flatten();
         let generated_result_nodes = self.result.node_count() > 1;
-        let temporary_result = std::mem::replace(&mut self.result, previous_result);
+        let temporary_result = self.restore_result_tree(previous_result);
         self.meter
             .release_owned_bytes(metered_document_owned_bytes(&temporary_result));
-        self.output_stack = previous_stack;
         self.pop_scope();
         self.scopes.extend(caller_scopes);
         self.function_depth = self.function_depth.saturating_sub(1);
@@ -3132,7 +3127,7 @@ impl<'a> Execution<'a> {
         depth: usize,
         precedence: Option<usize>,
     ) -> Result<CapturedText> {
-        let previous = self.enter_temporary_result_tree(None)?;
+        let previous = self.enter_result_tree(None, true)?;
         let result =
             self.execute_scoped_sequence(body, node, position, size, depth + 1, precedence);
         let captured = result.and_then(|()| {
@@ -3189,7 +3184,30 @@ impl<'a> Execution<'a> {
         precedence: Option<usize>,
         base_uri: Option<&str>,
     ) -> Result<Document> {
-        let previous = self.enter_temporary_result_tree(base_uri)?;
+        self.capture_result_tree(body, node, frame, precedence, base_uri, true)
+    }
+
+    fn capture_output_tree(
+        &mut self,
+        body: &[Instruction],
+        node: &SourceNode,
+        frame: ApplyFrame,
+        precedence: Option<usize>,
+        base_uri: Option<&str>,
+    ) -> Result<Document> {
+        self.capture_result_tree(body, node, frame, precedence, base_uri, false)
+    }
+
+    fn capture_result_tree(
+        &mut self,
+        body: &[Instruction],
+        node: &SourceNode,
+        frame: ApplyFrame,
+        precedence: Option<usize>,
+        base_uri: Option<&str>,
+        is_temporary: bool,
+    ) -> Result<Document> {
+        let previous = self.enter_result_tree(base_uri, is_temporary)?;
         let result = self.execute_scoped_sequence(
             body,
             node,
@@ -3219,7 +3237,11 @@ impl<'a> Execution<'a> {
         Ok(document)
     }
 
-    fn enter_temporary_result_tree(&mut self, base_uri: Option<&str>) -> Result<ResultTreeState> {
+    fn enter_result_tree(
+        &mut self,
+        base_uri: Option<&str>,
+        is_temporary: bool,
+    ) -> Result<ResultTreeState> {
         let temporary = self.empty_metered_result(base_uri)?;
         let temporary_root = temporary.root();
         Ok(ResultTreeState {
@@ -3227,6 +3249,7 @@ impl<'a> Execution<'a> {
             output_stack: std::mem::replace(&mut self.output_stack, vec![temporary_root]),
             attribute_insert_position: self.attribute_insert_position.take(),
             attribute_protected_names: self.attribute_protected_names.take(),
+            was_temporary: std::mem::replace(&mut self.result_is_temporary, is_temporary),
         })
     }
 
@@ -3235,6 +3258,7 @@ impl<'a> Execution<'a> {
         self.output_stack = previous.output_stack;
         self.attribute_insert_position = previous.attribute_insert_position;
         self.attribute_protected_names = previous.attribute_protected_names;
+        self.result_is_temporary = previous.was_temporary;
         captured
     }
     fn copy_document(
@@ -3306,6 +3330,8 @@ impl<'a> Execution<'a> {
                 }
                 .ok_or_else(|| Error::Dynamic("stale copy-of source node".into()))?;
                 let child_count = source.children.len();
+                let children_use_instruction_base =
+                    current.use_instruction_base && matches!(source.kind, NodeKind::Root);
                 let target_parent = if matches!(source.kind, NodeKind::Root) {
                     current.target_parent
                 } else {
@@ -3346,7 +3372,7 @@ impl<'a> Execution<'a> {
                         source: child,
                         target_parent,
                         depth: current.depth.saturating_add(1),
-                        use_instruction_base: false,
+                        use_instruction_base: children_use_instruction_base,
                     });
                 }
             }
@@ -3499,6 +3525,27 @@ impl<'a> Execution<'a> {
         )?;
         Ok(self.result.push(parent, kind, base_uri))
     }
+
+    fn push_xsl_copy_element(
+        &mut self,
+        name: ExpandedName,
+        prefix: Option<String>,
+        namespaces: Arc<Vec<Namespace>>,
+        base_uri: Option<&str>,
+    ) -> Result<NodeId> {
+        // XSLT 1.0 section 3.2 assigns a copied element the base URI of the xsl:copy
+        // instruction that created it: https://www.w3.org/TR/1999/REC-xslt-19991116#base-uri
+        self.push_node_with_base(
+            self.parent(),
+            NodeKind::Element {
+                name,
+                prefix,
+                attributes: Vec::new(),
+                namespaces,
+            },
+            base_uri.map(str::to_owned),
+        )
+    }
     fn append_text(&mut self, value: &str, disable: bool) -> Result<()> {
         self.append_text_value(Cow::Borrowed(value), disable)
     }
@@ -3516,7 +3563,7 @@ impl<'a> Execution<'a> {
             &mut self.meter,
             parent,
             Cow::Borrowed(value),
-            disable,
+            disable && !self.result_is_temporary,
         )
     }
 
@@ -3539,13 +3586,19 @@ impl<'a> Execution<'a> {
             parent,
             value,
             reservation,
-            disable,
+            disable && !self.result_is_temporary,
         )
     }
 
     fn append_text_value(&mut self, value: Cow<'_, str>, disable: bool) -> Result<()> {
         let parent = self.parent();
-        append_result_text(&mut self.result, &mut self.meter, parent, value, disable)
+        append_result_text(
+            &mut self.result,
+            &mut self.meter,
+            parent,
+            value,
+            disable && !self.result_is_temporary,
+        )
     }
 
     fn add_attribute(&mut self, attribute: Attribute) -> Result<()> {

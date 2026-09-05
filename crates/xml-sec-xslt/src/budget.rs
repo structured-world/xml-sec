@@ -186,7 +186,14 @@ impl Meter {
                 )));
             }
         };
-        let actual = used.checked_add(amount).unwrap_or(usize::MAX);
+        let Some(actual) = used.checked_add(amount) else {
+            *used = usize::MAX;
+            return Err(Error::Budget {
+                kind,
+                limit,
+                actual: usize::MAX,
+            });
+        };
         ensure(kind, limit, actual)?;
         *used = actual;
         Ok(())
@@ -195,6 +202,19 @@ impl Meter {
     pub(crate) fn check_additional(&self, kind: BudgetKind, amount: usize) -> Result<()> {
         let (used, limit) = self.usage(kind)?;
         ensure(kind, limit, used.saturating_add(amount))
+    }
+
+    fn record_owned_allocation(&mut self, amount: usize) -> Result<()> {
+        let Some(actual) = self.owned_bytes.checked_add(amount) else {
+            self.owned_bytes = usize::MAX;
+            return Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                limit: self.limits.owned_bytes,
+                actual: usize::MAX,
+            });
+        };
+        self.owned_bytes = actual;
+        ensure(BudgetKind::OwnedBytes, self.limits.owned_bytes, actual)
     }
 
     pub(crate) fn release_owned_bytes(&mut self, amount: usize) {
@@ -266,13 +286,24 @@ pub(crate) fn reserve_temporary_vec_slot<T>(
         .capacity()
         .saturating_sub(old_capacity)
         .saturating_mul(std::mem::size_of::<T>());
+    reconcile_temporary_vec_growth(meter, reserved_owned_bytes, requested_bytes, actual_bytes)
+}
+
+fn reconcile_temporary_vec_growth(
+    meter: &mut Meter,
+    reserved_owned_bytes: &mut usize,
+    requested_bytes: usize,
+    actual_bytes: usize,
+) -> Result<()> {
     if actual_bytes < requested_bytes {
         meter.release_owned_bytes(requested_bytes - actual_bytes);
-    } else if actual_bytes > requested_bytes
-        && let Err(error) = meter.charge(BudgetKind::OwnedBytes, actual_bytes - requested_bytes)
-    {
-        meter.release_owned_bytes(requested_bytes);
-        return Err(error);
+    } else if actual_bytes > requested_bytes {
+        *reserved_owned_bytes = reserved_owned_bytes.saturating_add(actual_bytes);
+        // Vec may retain allocator-granted excess capacity and offers no guaranteed rollback.
+        // Record it even when it crosses the limit so a caller that catches the error cannot
+        // reuse unmetered storage; the over-limit meter then remains fail-closed.
+        meter.record_owned_allocation(actual_bytes - requested_bytes)?;
+        return Ok(());
     }
     *reserved_owned_bytes = reserved_owned_bytes.saturating_add(actual_bytes);
     Ok(())
@@ -321,5 +352,55 @@ mod tests {
                 actual: 8,
             })
         ));
+    }
+
+    #[test]
+    fn failed_vec_growth_shortfall_remains_accounted() {
+        // An allocator may grant more capacity than Vec::try_reserve_exact requests. Once that
+        // allocation exists, a failed shortfall charge must leave the meter fail-closed rather
+        // than making the retained capacity reusable without accounting.
+        let mut meter = Meter::new(execution_budget(10), 0).expect("meter initializes");
+        meter
+            .charge(BudgetKind::OwnedBytes, 8)
+            .expect("requested growth fits");
+        let mut reserved = 0;
+
+        assert!(matches!(
+            reconcile_temporary_vec_growth(&mut meter, &mut reserved, 8, 12),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                limit: 10,
+                actual: 12,
+            })
+        ));
+        assert_eq!(
+            meter
+                .usage(BudgetKind::OwnedBytes)
+                .expect("owned-byte usage is available"),
+            (12, 10)
+        );
+        assert_eq!(reserved, 12);
+        assert!(meter.charge(BudgetKind::OwnedBytes, 1).is_err());
+    }
+
+    #[test]
+    fn overflowing_owned_allocation_leaves_the_meter_fail_closed() {
+        let mut meter = Meter::new(execution_budget(usize::MAX), 1).expect("meter initializes");
+
+        assert!(matches!(
+            meter.record_owned_allocation(usize::MAX),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                limit: usize::MAX,
+                actual: usize::MAX,
+            })
+        ));
+        assert_eq!(
+            meter
+                .usage(BudgetKind::OwnedBytes)
+                .expect("owned-byte usage is available"),
+            (usize::MAX, usize::MAX)
+        );
+        assert!(meter.charge(BudgetKind::OwnedBytes, 1).is_err());
     }
 }

@@ -540,6 +540,107 @@ fn copy_of_uses_the_creating_instruction_base_uri() {
     assert_eq!(result.serialized.bytes, b"stylesheet|nested|stylesheet");
 }
 
+fn assert_imported_copy_uses_creating_base(instruction: &str) {
+    let resolver = Arc::new(ContextResolver::default());
+    let imported = format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template name="emit">{instruction}</xsl:template></xsl:stylesheet>"#
+    );
+    for (href, base, canonical, body) in [
+        (
+            "imported.xsl",
+            "https://example.test/styles/main.xsl",
+            "https://example.test/modules/imported.xsl",
+            imported.as_str(),
+        ),
+        (
+            "data.xml",
+            "https://example.test/styles/main.xsl",
+            "https://example.test/styles/data.xml",
+            "<doc>principal</doc>",
+        ),
+        (
+            "data.xml",
+            "https://example.test/modules/imported.xsl",
+            "https://example.test/modules/data.xml",
+            "<doc>module</doc>",
+        ),
+    ] {
+        resolver
+            .resources
+            .lock()
+            .expect("test resolver mutex is not poisoned")
+            .insert(
+                (href.into(), Some(base.into())),
+                ResolvedResource {
+                    canonical_uri: canonical.into(),
+                    identity: ResourceIdentity(canonical.into()),
+                    bytes: body.as_bytes().to_vec(),
+                    media_type: None,
+                    encoding: Some("UTF-8".into()),
+                },
+            );
+    }
+    let producer = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:import href="imported.xsl"/><xsl:template match="/"><xsl:call-template name="emit"/></xsl:template></xsl:stylesheet>"#,
+        Some("https://example.test/styles/main.xsl"),
+    )
+    .expect("stylesheet graph compiles");
+    let produced = producer
+        .execute(
+            &Document::parse("<root><copied/></root>", None).expect("source parses"),
+            &Parameters::new(),
+            resolver.clone(),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("copy instructions produce a reusable result document");
+    let consumer = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="document('data.xml', /root)/doc"/></xsl:template></xsl:stylesheet>"#,
+        Some("https://example.test/styles/main.xsl"),
+    )
+    .expect("consumer stylesheet compiles");
+    let result = consumer
+        .execute(
+            &produced.document,
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("copied nodes resolve against the imported module");
+    assert_eq!(result.serialized.bytes, b"module");
+}
+
+#[test]
+fn copy_of_document_uses_the_imported_creating_base_uri() {
+    // XSLT 1.0 section 3.2 binds a document root's copied children to the xsl:copy-of
+    // instruction that creates them: https://www.w3.org/TR/1999/REC-xslt-19991116#base-uri
+    assert_imported_copy_uses_creating_base(r#"<xsl:copy-of select="/"/>"#);
+}
+
+#[test]
+fn xsl_copy_uses_the_imported_creating_base_uri() {
+    // XSLT 1.0 section 3.2 assigns copied elements the base URI of their creating xsl:copy
+    // instruction: https://www.w3.org/TR/1999/REC-xslt-19991116#base-uri
+    assert_imported_copy_uses_creating_base(
+        r#"<xsl:for-each select="/root"><xsl:copy/></xsl:for-each>"#,
+    );
+}
+
 #[test]
 fn doctype_uses_the_first_element_qualified_name() {
     // Prolog nodes do not replace the document element, and a prefixed root requires the same
@@ -3018,12 +3119,25 @@ fn xpath_fast_paths_preserve_xpath_node_and_space_semantics() {
 
 #[test]
 fn adjacent_result_text_nodes_coalesce_without_crossing_doe_boundaries() {
-    // XPath sees one adjacent text node, while differing disable-output-escaping is metadata boundary.
+    // XSLT 1.0 section 16.4 requires DOE to be ignored in a temporary result tree, so adjacent
+    // text remains one XPath node: https://www.w3.org/TR/1999/REC-xslt-19991116#disable-output-escaping
     let coalesced = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:exsl="http://exslt.org/common"><xsl:output method="text"/><xsl:template match="/"><xsl:variable name="fragment"><xsl:text>a</xsl:text><xsl:text>b</xsl:text></xsl:variable><xsl:value-of select="count(exsl:node-set($fragment)/text())"/></xsl:template></xsl:stylesheet>"#;
     assert_eq!(execute(coalesced, "<source/>"), "1");
 
     let separated = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:exsl="http://exslt.org/common"><xsl:output method="text"/><xsl:template match="/"><xsl:variable name="fragment"><xsl:text>a</xsl:text><xsl:text disable-output-escaping="yes">b</xsl:text></xsl:variable><xsl:value-of select="count(exsl:node-set($fragment)/text())"/></xsl:template></xsl:stylesheet>"#;
-    assert_eq!(execute(separated, "<source/>"), "2");
+    assert_eq!(execute(separated, "<source/>"), "1");
+}
+
+#[test]
+fn temporary_result_trees_ignore_disable_output_escaping() {
+    // A serialization hint cannot survive a variable or parameter result-tree fragment and turn
+    // escaped text into markup after xsl:copy-of (XSLT 1.0 section 16.4).
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#disable-output-escaping
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><xsl:variable name="fragment"><xsl:text disable-output-escaping="yes">&lt;text/&gt;</xsl:text><xsl:value-of select="'&lt;value/&gt;'" disable-output-escaping="yes"/></xsl:variable><out><xsl:copy-of select="$fragment"/></out></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<source/>"),
+        "<out>&lt;text/&gt;&lt;value/&gt;</out>\n"
+    );
 }
 
 #[test]
@@ -5559,6 +5673,64 @@ fn xinclude_rejects_text_encoding_in_xml_mode_before_resolution() {
         );
     }
     assert_eq!(resolver.calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn xinclude_validates_attributes_and_missing_href_before_resolution() {
+    // XInclude 1.0 section 3.1 makes unknown unprefixed attributes fatal and requires xpointer
+    // whenever href is absent; neither syntax error may cross the resolver capability boundary.
+    // https://www.w3.org/TR/xinclude/#include_element
+    let resolver = Arc::new(CountingResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert("included.xml".into(), "<included/>".into());
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#,
+    );
+    for source in [
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="included.xml" typo="value"/></root>"#,
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include parse="text"><xi:fallback>masked</xi:fallback></xi:include></root>"#,
+    ] {
+        let source = Document::parse(source, Some("memory:source.xml"))
+            .expect("source parses before XInclude validation");
+        let error = stylesheet
+            .execute_with_source_processing(
+                &source,
+                &Parameters::new(),
+                resolver.clone(),
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+                SourceProcessing::XInclude,
+            )
+            .expect_err("invalid include syntax is fatal before resource acquisition");
+        assert!(matches!(error, Error::Xml(_)));
+    }
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 0);
+
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude" xmlns:ext="urn:extension"><xi:include href="included.xml" ext:metadata="allowed"/></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("foreign-namespaced attribute source parses");
+    stylesheet
+        .execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            resolver.clone(),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        )
+        .expect("foreign-namespaced attributes remain permitted");
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 1);
 }
 
 #[test]

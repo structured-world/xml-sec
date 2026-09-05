@@ -791,6 +791,7 @@ pub(crate) enum Instruction {
         base_uri: Option<String>,
     },
     Copy {
+        base_uri: Option<String>,
         body: InstructionSequence,
         attribute_sets: Vec<ExpandedName>,
     },
@@ -1938,6 +1939,7 @@ fn validate_attribute_sets_in_sequence(
             | Instruction::Copy {
                 body: children,
                 attribute_sets,
+                ..
             }
             | Instruction::Element {
                 body: children,
@@ -2632,6 +2634,7 @@ fn compile_instruction(
             }
         }
         "copy" => Instruction::Copy {
+            base_uri: effective_base_uri(node, context.static_base_uri.as_deref())?,
             body: sequence()?,
             attribute_sets: qname_list_attr(node, "use-attribute-sets")?,
         },

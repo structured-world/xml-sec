@@ -3961,6 +3961,21 @@ fn resolve_xinclude(
             )));
         }
     };
+    if let Some(attribute) = attributes.iter().find(|attribute| {
+        attribute.name.namespace.is_none()
+            && !matches!(
+                attribute.name.local.as_str(),
+                "href" | "parse" | "xpointer" | "encoding" | "accept" | "accept-language"
+            )
+    }) {
+        // XInclude 1.0 section 3.1 permits only the six named unprefixed attributes on
+        // xi:include; foreign-namespaced attributes remain extensible.
+        // https://www.w3.org/TR/xinclude/#include_element
+        return Err(XIncludeFailure::Fatal(Error::Xml(format!(
+            "unprefixed attribute {} is not permitted on xi:include",
+            attribute.name.local
+        ))));
+    }
     let attribute = |local: &str| {
         attributes
             .iter()
@@ -4000,11 +4015,12 @@ fn resolve_xinclude(
             "XInclude href must not contain a fragment identifier".into(),
         )));
     }
-    if parse == "xml" && href_attribute.is_none() && xpointer.is_none() {
-        // XInclude 1.0 section 3.1 requires xpointer when parse="xml" omits href.
+    if href_attribute.is_none() && xpointer.is_none() {
+        // XInclude 1.0 section 3.1 requires xpointer whenever href is omitted. Since xpointer
+        // is permitted only for parse="xml", omitting href is always fatal in text mode.
         // https://www.w3.org/TR/xinclude/#include_element
         return Err(XIncludeFailure::Fatal(Error::Xml(
-            "XInclude without href must provide xpointer when parse=\"xml\"".into(),
+            "XInclude without href must provide xpointer".into(),
         )));
     }
     if href.is_empty() && parse == "xml" {
