@@ -84,3 +84,9 @@ must do, the primary normative specification decides rather than reviewer or aut
 - Document intentional interoperability or security-policy departures honestly, including why the
   project diverges. If the normative text contradicts the implementation, change the code and
   replace the obsolete comment.
+
+## Review Fixture Scope
+
+Treat imported fixture payloads as test data, not review context. Do not read or review individual
+fixture files unless a changed importer, manifest/hash, failing test, or concrete finding requires
+that exact payload; review provenance, selection metadata, and harness behavior instead.

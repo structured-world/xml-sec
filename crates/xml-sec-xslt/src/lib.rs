@@ -9,7 +9,8 @@
 //! initial patterns, and explicit encoding metadata through [`Document::parse_bytes`]
 //! and [`Compiler::compile_bytes`]. Untrusted source documents use
 //! [`Document::parse_with_budget`] or [`Document::parse_bytes_with_budget`] so decoded bytes,
-//! arena nodes, and element depth are rejected before their corresponding allocations.
+//! arena nodes, element depth, entity references, and namespace-scope storage are rejected before
+//! their corresponding work or allocations.
 //!
 //! ```
 //! use std::sync::Arc;

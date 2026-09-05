@@ -4,13 +4,9 @@ use std::hash::{BuildHasher, Hash};
 use crate::{Error, Result};
 
 pub(crate) const ENTITY_EXPANSION_DEPTH_CEILING: usize = 10;
-pub(crate) const ENTITY_REFERENCE_CEILING: usize = 255;
 // This is an absolute parser safety ceiling, not a deployment policy default.
 // Caller budgets may reject smaller documents at the compile/execution boundary.
 pub(crate) const ENTITY_EXPANSION_BYTE_CEILING: usize = 16 * 1024 * 1024;
-// This bounds cumulative namespace-scope copies made while projecting an XML document.
-// Shared scopes avoid the charge until a descendant introduces a local declaration.
-pub(crate) const NAMESPACE_SCOPE_BYTE_CEILING: usize = 16 * 1024 * 1024;
 // Compilation still uses bounded native recursion while borrowing frontend nodes. This absolute
 // process-safety ceiling only tightens caller policy until module and instruction traversal are
 // represented entirely by explicit work stacks.
@@ -29,6 +25,8 @@ pub enum BudgetKind {
     StylesheetBytes,
     SourceBytes,
     SourceNodes,
+    EntityReferences,
+    NamespaceScopeBytes,
     ImportedModules,
     ExternalDocuments,
     RecursionDepth,
@@ -47,22 +45,38 @@ pub enum BudgetKind {
 /// Policy-neutral enforcement limits for parsing one caller-supplied XML document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParseBudget {
+    /// Maximum decoded XML bytes accepted for one document.
     pub source_bytes: usize,
+    /// Maximum semantic nodes, including the synthetic document root.
     pub source_nodes: usize,
+    /// Maximum element nesting depth.
     pub recursion_depth: usize,
+    /// Maximum declared general and parameter entity-reference occurrences expanded.
+    pub entity_references: usize,
+    /// Maximum peak bytes used to materialize inherited namespace scopes and their indexes.
+    pub namespace_scope_bytes: usize,
 }
 
 impl ParseBudget {
     #[must_use]
-    pub const fn new(source_bytes: usize, source_nodes: usize, recursion_depth: usize) -> Self {
+    pub const fn new(
+        source_bytes: usize,
+        source_nodes: usize,
+        recursion_depth: usize,
+        entity_references: usize,
+        namespace_scope_bytes: usize,
+    ) -> Self {
         Self {
             source_bytes,
             source_nodes,
             recursion_depth,
+            entity_references,
+            namespace_scope_bytes,
         }
     }
 
-    pub(crate) const UNBOUNDED: Self = Self::new(usize::MAX, usize::MAX, usize::MAX);
+    pub(crate) const UNBOUNDED: Self =
+        Self::new(usize::MAX, usize::MAX, usize::MAX, usize::MAX, usize::MAX);
 }
 
 /// Policy-neutral immutable enforcement limits for compiling a stylesheet graph.
