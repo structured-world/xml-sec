@@ -295,10 +295,11 @@ impl<R: Resolver> Compiler<R> {
             state.budget.imported_modules,
             state.imported_modules,
         )?;
-        let resolved = match self
-            .resolver
-            .resolve(href, effective_base.as_deref(), purpose)
-        {
+        let resolved = match self.resolver.resolve(crate::ResolveRequest::new(
+            href,
+            effective_base.as_deref(),
+            purpose,
+        )) {
             Ok(resource) => resource,
             Err(error) => {
                 state.release_owned(request_owned_bytes);
@@ -3957,12 +3958,8 @@ mod tests {
     }
 
     impl Resolver for RepeatedIncludeResolver {
-        fn resolve(
-            &self,
-            uri: &str,
-            _base_uri: Option<&str>,
-            purpose: ResolvePurpose,
-        ) -> Result<ResolvedResource> {
+        fn resolve(&self, request: crate::ResolveRequest<'_>) -> Result<ResolvedResource> {
+            let crate::ResolveRequest { uri, purpose, .. } = request;
             assert_eq!(uri, "module.xsl");
             assert_eq!(purpose, ResolvePurpose::Include);
             Ok(ResolvedResource {

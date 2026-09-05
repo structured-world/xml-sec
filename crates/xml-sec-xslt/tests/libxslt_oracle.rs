@@ -8,7 +8,7 @@ use std::{collections::HashSet, ops::Range};
 
 use xml_sec_xslt::{
     Attribute, BudgetKind, CompileBudget, Compiler, Document, Error, ErrorKind, ExecutionBudget,
-    ExecutionOptions, ExpandedName, Parameters, ResolvePurpose, ResolvedResource, Resolver,
+    ExecutionOptions, ExpandedName, Parameters, ResolveRequest, ResolvedResource, Resolver,
     ResourceIdentity, SourceProcessing, Value,
 };
 
@@ -123,12 +123,8 @@ fn percent_decode_uri_path(uri: &str) -> xml_sec_xslt::Result<String> {
 }
 
 impl Resolver for CorpusResolver {
-    fn resolve(
-        &self,
-        uri: &str,
-        base_uri: Option<&str>,
-        _purpose: ResolvePurpose,
-    ) -> xml_sec_xslt::Result<ResolvedResource> {
+    fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
+        let ResolveRequest { uri, base_uri, .. } = request;
         let path = self.resolve_path(uri, base_uri)?;
         let bytes = std::fs::read(&path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {

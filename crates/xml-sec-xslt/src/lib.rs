@@ -52,7 +52,9 @@ pub use error::{Error, ErrorKind, Result};
 pub use model::{
     Attribute, Document, ExpandedName, Namespace, Node, NodeId, NodeKind, NodeReference,
 };
-pub use resolver::{NoResolver, ResolvePurpose, ResolvedResource, Resolver, ResourceIdentity};
+pub use resolver::{
+    NoResolver, ResolvePurpose, ResolveRequest, ResolvedResource, Resolver, ResourceIdentity,
+};
 pub use runtime::{
     ExecutionOptions, Message, Parameters, SecondaryOutput, SourceProcessing, TransformResult,
 };

@@ -14,6 +14,37 @@ pub enum ResolvePurpose {
     XInclude,
 }
 
+/// One external-resource request passed across the caller-owned resolver boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolveRequest<'a> {
+    /// URI reference supplied by the stylesheet or source document.
+    pub uri: &'a str,
+    /// Base URI against which the reference is resolved, when known.
+    pub base_uri: Option<&'a str>,
+    /// Engine operation that requested the resource.
+    pub purpose: ResolvePurpose,
+    /// Preferred media types from XInclude's `accept` attribute, when present.
+    pub accept: Option<&'a str>,
+    /// Preferred languages from XInclude's `accept-language` attribute, when present.
+    pub accept_language: Option<&'a str>,
+}
+
+impl<'a> ResolveRequest<'a> {
+    pub(crate) const fn new(
+        uri: &'a str,
+        base_uri: Option<&'a str>,
+        purpose: ResolvePurpose,
+    ) -> Self {
+        Self {
+            uri,
+            base_uri,
+            purpose,
+            accept: None,
+            accept_language: None,
+        }
+    }
+}
+
 /// Immutable bytes and provenance supplied by a caller-owned resolver.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedResource {
@@ -31,12 +62,7 @@ pub trait Resolver: Send + Sync {
     /// Path-like fallback resolution preserves lexical `..` segments. A resolver
     /// that maps the result onto a filesystem must canonicalize it and enforce its
     /// configured root boundary before reading any bytes.
-    fn resolve(
-        &self,
-        uri: &str,
-        base_uri: Option<&str>,
-        purpose: ResolvePurpose,
-    ) -> Result<ResolvedResource>;
+    fn resolve(&self, request: ResolveRequest<'_>) -> Result<ResolvedResource>;
 }
 
 pub(crate) fn resolve_uri_reference(base: Option<&str>, reference: &str) -> Result<String> {
@@ -95,14 +121,9 @@ pub(crate) fn decode_resource(
 pub struct NoResolver;
 
 impl Resolver for NoResolver {
-    fn resolve(
-        &self,
-        uri: &str,
-        _base_uri: Option<&str>,
-        _purpose: ResolvePurpose,
-    ) -> Result<ResolvedResource> {
+    fn resolve(&self, request: ResolveRequest<'_>) -> Result<ResolvedResource> {
         Err(crate::Error::Resolver {
-            uri: uri.to_owned(),
+            uri: request.uri.to_owned(),
             message: "external resource access is not configured".into(),
         })
     }

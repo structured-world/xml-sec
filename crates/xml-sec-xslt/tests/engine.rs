@@ -6,8 +6,8 @@ use pretty_assertions::assert_eq;
 use xml_sec_xslt::{
     BudgetKind, Clock, CompileBudget, Compiler, Document, Error, ExecutionBudget,
     ExecutionEnvironment, ExecutionOptions, ExpandedName, ExtensionPolicy, FixedClock, NoResolver,
-    NodeKind, NodeReference, Parameters, ResolvePurpose, ResolvedResource, Resolver,
-    ResourceIdentity, SourceProcessing, Value,
+    NodeKind, NodeReference, Parameters, ResolvePurpose, ResolveRequest, ResolvedResource,
+    Resolver, ResourceIdentity, SourceProcessing, Value,
 };
 
 fn node_id_at(document: &Document, index: usize) -> xml_sec_xslt::NodeId {
@@ -1073,6 +1073,81 @@ fn xinclude_preserves_xpath_text_node_boundaries() {
     assert_eq!(result.serialized.bytes, b"1|beforeincludedafter");
 }
 
+#[derive(Default)]
+struct XIncludeNegotiationResolver {
+    requests: Mutex<Vec<XIncludeNegotiationRequest>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct XIncludeNegotiationRequest {
+    uri: String,
+    accept: Option<String>,
+    accept_language: Option<String>,
+}
+
+impl Resolver for XIncludeNegotiationResolver {
+    fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
+        self.requests
+            .lock()
+            .expect("test resolver mutex is not poisoned")
+            .push(XIncludeNegotiationRequest {
+                uri: request.uri.into(),
+                accept: request.accept.map(str::to_owned),
+                accept_language: request.accept_language.map(str::to_owned),
+            });
+        Ok(ResolvedResource {
+            canonical_uri: format!("memory:{}", request.uri),
+            identity: ResourceIdentity(request.uri.into()),
+            bytes: b"included".to_vec(),
+            media_type: Some("text/plain".into()),
+            encoding: Some("UTF-8".into()),
+        })
+    }
+}
+
+#[test]
+fn xinclude_passes_http_negotiation_metadata_to_the_resolver() {
+    // XInclude 1.0 section 3.1 asks processors to use accept and accept-language for HTTP
+    // negotiation. The transport-neutral resolver contract must preserve both values.
+    // https://www.w3.org/TR/xinclude/#include_element
+    let resolver = Arc::new(XIncludeNegotiationResolver::default());
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="root"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="value.txt" parse="text" accept="text/plain" accept-language="ro, en;q=0.5"/></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("XInclude source parses");
+
+    let result = stylesheet
+        .execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            resolver.clone(),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        )
+        .expect("negotiated text inclusion succeeds");
+
+    assert_eq!(result.serialized.bytes, b"included");
+    assert_eq!(
+        *resolver
+            .requests
+            .lock()
+            .expect("test resolver mutex is not poisoned"),
+        [XIncludeNegotiationRequest {
+            uri: "value.txt".into(),
+            accept: Some("text/plain".into()),
+            accept_language: Some("ro, en;q=0.5".into()),
+        }]
+    );
+}
+
 #[test]
 fn xinclude_preserves_principal_unparsed_entities() {
     // XInclude 1.0 section 4.5.1 preserves unparsed-entity metadata in the result infoset;
@@ -1278,12 +1353,8 @@ struct MemoryResolver {
 }
 
 impl Resolver for MemoryResolver {
-    fn resolve(
-        &self,
-        uri: &str,
-        _base_uri: Option<&str>,
-        _purpose: ResolvePurpose,
-    ) -> xml_sec_xslt::Result<ResolvedResource> {
+    fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
+        let uri = request.uri;
         let bytes = self
             .resources
             .lock()
@@ -3104,12 +3175,8 @@ fn included_module_document_is_retained_for_document_empty_uri() {
         calls: Mutex<Vec<ResolvePurpose>>,
     }
     impl Resolver for ModuleResolver {
-        fn resolve(
-            &self,
-            uri: &str,
-            _base_uri: Option<&str>,
-            purpose: ResolvePurpose,
-        ) -> xml_sec_xslt::Result<ResolvedResource> {
+        fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
+            let ResolveRequest { uri, purpose, .. } = request;
             self.calls.lock().expect("calls lock").push(purpose);
             assert_eq!(uri, "module.xsl");
             Ok(ResolvedResource {
@@ -3851,12 +3918,13 @@ struct ContextResolver {
 }
 
 impl Resolver for ContextResolver {
-    fn resolve(
-        &self,
-        uri: &str,
-        base_uri: Option<&str>,
-        purpose: ResolvePurpose,
-    ) -> xml_sec_xslt::Result<ResolvedResource> {
+    fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
+        let ResolveRequest {
+            uri,
+            base_uri,
+            purpose,
+            ..
+        } = request;
         let key = (uri.to_owned(), base_uri.map(str::to_owned));
         self.calls
             .lock()
@@ -6140,12 +6208,8 @@ fn missing_document_resolution_consumes_the_external_document_budget() {
     // A failed resolver attempt is still attacker-controlled external work.
     struct MissingResolver;
     impl Resolver for MissingResolver {
-        fn resolve(
-            &self,
-            uri: &str,
-            _base_uri: Option<&str>,
-            _purpose: ResolvePurpose,
-        ) -> xml_sec_xslt::Result<ResolvedResource> {
+        fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
+            let uri = request.uri;
             Err(Error::ResourceNotFound { uri: uri.into() })
         }
     }
@@ -6220,12 +6284,8 @@ fn format_number_localizes_generated_digits_without_rewriting_literals() {
 struct EncodedStylesheetResolver;
 
 impl Resolver for EncodedStylesheetResolver {
-    fn resolve(
-        &self,
-        uri: &str,
-        _base_uri: Option<&str>,
-        purpose: ResolvePurpose,
-    ) -> xml_sec_xslt::Result<ResolvedResource> {
+    fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
+        let ResolveRequest { uri, purpose, .. } = request;
         assert_eq!(uri, "latin1.xsl");
         assert_eq!(purpose, ResolvePurpose::Include);
         let source = b"<xsl:stylesheet version=\"1.0\" xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\"><xsl:template name=\"word\"><xsl:text>caf\xe9</xsl:text></xsl:template></xsl:stylesheet>";
@@ -6537,12 +6597,8 @@ struct IncludeChainResolver {
 }
 
 impl Resolver for IncludeChainResolver {
-    fn resolve(
-        &self,
-        uri: &str,
-        _base_uri: Option<&str>,
-        purpose: ResolvePurpose,
-    ) -> xml_sec_xslt::Result<ResolvedResource> {
+    fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
+        let ResolveRequest { uri, purpose, .. } = request;
         assert_eq!(purpose, ResolvePurpose::Include);
         *self
             .calls
@@ -6821,12 +6877,8 @@ struct CountingResolver {
 }
 
 impl Resolver for CountingResolver {
-    fn resolve(
-        &self,
-        uri: &str,
-        _base_uri: Option<&str>,
-        _purpose: ResolvePurpose,
-    ) -> xml_sec_xslt::Result<ResolvedResource> {
+    fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
+        let uri = request.uri;
         self.calls.fetch_add(1, Ordering::Relaxed);
         let bytes = self
             .resources
@@ -6901,12 +6953,7 @@ fn imported_stylesheets_charge_retained_resolver_metadata() {
     struct MetadataResolver;
 
     impl Resolver for MetadataResolver {
-        fn resolve(
-            &self,
-            _uri: &str,
-            _base_uri: Option<&str>,
-            _purpose: ResolvePurpose,
-        ) -> xml_sec_xslt::Result<ResolvedResource> {
+        fn resolve(&self, _request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
             let large = "m".repeat(2 << 20);
             Ok(ResolvedResource {
                 canonical_uri: "memory:included.xsl".into(),
@@ -6944,12 +6991,7 @@ fn runtime_resource_caches_charge_resolver_metadata_before_retaining_it() {
     struct MetadataResolver;
 
     impl Resolver for MetadataResolver {
-        fn resolve(
-            &self,
-            _uri: &str,
-            _base_uri: Option<&str>,
-            _purpose: ResolvePurpose,
-        ) -> xml_sec_xslt::Result<ResolvedResource> {
+        fn resolve(&self, _request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
             let metadata = "m".repeat(2 << 20);
             Ok(ResolvedResource {
                 canonical_uri: "memory:document.xml".into(),
@@ -8674,12 +8716,8 @@ struct ByteResolver {
 }
 
 impl Resolver for ByteResolver {
-    fn resolve(
-        &self,
-        uri: &str,
-        _base_uri: Option<&str>,
-        _purpose: ResolvePurpose,
-    ) -> xml_sec_xslt::Result<ResolvedResource> {
+    fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
+        let uri = request.uri;
         Ok(ResolvedResource {
             canonical_uri: format!("memory:{uri}"),
             identity: ResourceIdentity(uri.into()),
@@ -8971,12 +9009,7 @@ struct CanonicalIdentityResolver {
 }
 
 impl Resolver for CanonicalIdentityResolver {
-    fn resolve(
-        &self,
-        _uri: &str,
-        _base_uri: Option<&str>,
-        _purpose: ResolvePurpose,
-    ) -> xml_sec_xslt::Result<ResolvedResource> {
+    fn resolve(&self, _request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         Ok(ResolvedResource {
             canonical_uri: "memory:canonical.xml".into(),
@@ -11817,12 +11850,8 @@ struct EncodedDocumentResolver {
 }
 
 impl Resolver for EncodedDocumentResolver {
-    fn resolve(
-        &self,
-        uri: &str,
-        _base_uri: Option<&str>,
-        purpose: ResolvePurpose,
-    ) -> xml_sec_xslt::Result<ResolvedResource> {
+    fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
+        let ResolveRequest { uri, purpose, .. } = request;
         assert_eq!(uri, "encoded.xml");
         assert_eq!(purpose, ResolvePurpose::Document);
         Ok(ResolvedResource {
@@ -12594,15 +12623,10 @@ fn include_and_import_validate_content_before_resolving() {
     struct CountingResolver(AtomicUsize);
 
     impl Resolver for CountingResolver {
-        fn resolve(
-            &self,
-            uri: &str,
-            _base_uri: Option<&str>,
-            _purpose: ResolvePurpose,
-        ) -> xml_sec_xslt::Result<ResolvedResource> {
+        fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Err(Error::Resolver {
-                uri: uri.into(),
+                uri: request.uri.into(),
                 message: "resolver must not be reached".into(),
             })
         }

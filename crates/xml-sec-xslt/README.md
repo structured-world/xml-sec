@@ -28,8 +28,10 @@ fragments remain owned temporary trees rather than flattened text.
 
 Stylesheet modules and runtime `document()` resources use the same explicit
 resolver contract with purpose, base URI, stable resource identity, and byte
-budgeting. The XMLDSig transform adapter remains outside this crate so no
-XML-security types enter the reusable engine.
+budgeting. `ResolveRequest` also carries XInclude `accept` and `accept-language`
+preferences without allocating or interpreting transport policy inside the engine.
+The XMLDSig transform adapter remains outside this crate so no XML-security types
+enter the reusable engine.
 
 Resolver resources are byte-oriented. XML declarations, BOMs, UTF-16/UTF-32 initial
 patterns, and explicit resolver encoding metadata are honored without lossy

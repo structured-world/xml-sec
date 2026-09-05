@@ -20,8 +20,8 @@ use crate::resolver::decode_resource;
 use crate::runtime::{SourceProcessing, apply_whitespace_rules, expanded_name_owned_bytes};
 use crate::{
     Attribute, BudgetKind, Clock, Document, Error, ErrorKind, ExpandedName, ExtensionPolicy, Node,
-    NodeId, NodeKind, NodeReference, ResolvePurpose, ResolvedResource, Resolver, ResourceIdentity,
-    Result, Value,
+    NodeId, NodeKind, NodeReference, ResolvePurpose, ResolveRequest, ResolvedResource, Resolver,
+    ResourceIdentity, Result, Value,
 };
 
 pub(crate) type SourceNode = NodeReference;
@@ -2226,11 +2226,11 @@ impl Evaluator {
                 nodes.first().cloned()
             } else {
                 meter.charge(BudgetKind::ExternalDocuments, 1)?;
-                let resource = match self.resolver.resolve(
+                let resource = match self.resolver.resolve(ResolveRequest::new(
                     resource_uri,
                     request.base_uri.as_deref(),
                     ResolvePurpose::Document,
-                ) {
+                )) {
                     Ok(resource) => resource,
                     Err(Error::ResourceNotFound { .. }) => {
                         self.cache_document(resource_request.clone(), Vec::new(), meter)?;
@@ -4481,7 +4481,16 @@ fn resolve_xinclude(
         .charge(BudgetKind::ExternalDocuments, 1)
         .map_err(XIncludeFailure::Fatal)?;
     let resource = resolver
-        .resolve(href, node.base_uri.as_deref(), ResolvePurpose::XInclude)
+        .resolve(ResolveRequest {
+            uri: href,
+            base_uri: node.base_uri.as_deref(),
+            purpose: ResolvePurpose::XInclude,
+            // XInclude 1.0 section 3.1 defines these values as HTTP content-negotiation inputs.
+            // The engine preserves them without interpreting transport semantics.
+            // https://www.w3.org/TR/xinclude/#include_element
+            accept: attribute("accept"),
+            accept_language: attribute("accept-language"),
+        })
         .map_err(|error| match error {
             Error::ResourceNotFound { .. } | Error::Resolver { .. } => {
                 XIncludeFailure::Resource(error)
@@ -5059,10 +5068,12 @@ impl NodeMaps {
             SxdValue::Nodeset(mut nodes) => {
                 let node_count = nodes.size();
                 if node_count <= 64 {
-                    let mut projected = nodes
-                        .into_iter()
-                        .filter_map(|node| self.reverse.get(&typed_path_to(&node)).cloned())
-                        .collect::<Vec<_>>();
+                    let mut projected = projected_node_storage(node_count, meter)?;
+                    projected.extend(
+                        nodes
+                            .into_iter()
+                            .filter_map(|node| self.reverse.get(&typed_path_to(&node)).cloned()),
+                    );
                     projected.sort_by_key(|node| self.order.get(node).copied());
                     return Ok(XPathValue::NodeSet(projected));
                 }
@@ -8477,6 +8488,64 @@ mod tests {
     }
 
     #[test]
+    fn small_nodeset_projection_checks_its_vector_capacity() {
+        // XPath does not define resource ceilings. The engine's OwnedBytes contract must reject
+        // the second projection vector before allocation even on the <=64-node fast path.
+        let source_xml = format!("<root>{}</root>", "<item/>".repeat(32));
+        let source = Document::parse(&source_xml, None).expect("source parses");
+        let unlimited = || ExecutionBudget {
+            source_bytes: usize::MAX,
+            external_documents: usize::MAX,
+            recursion_depth: usize::MAX,
+            xpath_evaluations: usize::MAX,
+            extension_operations: usize::MAX,
+            pattern_evaluations: usize::MAX,
+            template_applications: usize::MAX,
+            sort_comparisons: usize::MAX,
+            key_entries: usize::MAX,
+            result_nodes: usize::MAX,
+            serialized_bytes: usize::MAX,
+            messages: usize::MAX,
+            owned_bytes: usize::MAX,
+        };
+        let mut setup_meter = Meter::new(unlimited(), 0).expect("setup meter initializes");
+        let package = project_semantic_document(&source, &mut setup_meter)
+            .expect("source projects into the XPath DOM");
+        let maps = NodeMaps::new(&source, &mut setup_meter).expect("node maps build");
+        let document = package.as_document();
+        let source_root = document.root().children()[0]
+            .element()
+            .expect("projection container exists")
+            .children()[0]
+            .element()
+            .expect("logical-document wrapper exists")
+            .children()[0]
+            .element()
+            .expect("source root exists");
+        let mut selected = nodeset::Nodeset::new();
+        for child in source_root.children() {
+            selected.add(child);
+        }
+        let required = 32usize.saturating_mul(std::mem::size_of::<SourceNode>());
+        let mut limits = unlimited();
+        limits.owned_bytes = required - 1;
+        let mut meter = Meter::new(limits, 0).expect("empty source fits");
+
+        assert!(matches!(
+            maps.project_value(
+                &source,
+                document.root().into(),
+                SxdValue::Nodeset(selected),
+                &mut meter,
+            ),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn principal_xinclude_remap_reports_its_retained_reservation() {
         // The remap is retained until public parameter node identities are translated. Its
         // reservation must travel with it so dropping the map releases the same budget charge.
@@ -8575,12 +8644,8 @@ mod tests {
     }
 
     impl Resolver for StaticResolver {
-        fn resolve(
-            &self,
-            uri: &str,
-            _base_uri: Option<&str>,
-            _purpose: ResolvePurpose,
-        ) -> Result<ResolvedResource> {
+        fn resolve(&self, request: ResolveRequest<'_>) -> Result<ResolvedResource> {
+            let uri = request.uri;
             Ok(ResolvedResource {
                 canonical_uri: format!("memory:{uri}"),
                 identity: ResourceIdentity(uri.into()),
