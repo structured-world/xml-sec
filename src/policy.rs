@@ -23,6 +23,7 @@ use crate::xmlenc::{
 pub(crate) mod resource_name {
     pub const XML_NODES: &str = "XML nodes";
     pub const XML_DEPTH: &str = "XML element depth";
+    pub const XML_NAMESPACE_BINDINGS: &str = "XML namespace bindings";
     pub const SIGNATURE_REFERENCES: &str = "signature references";
     pub const REFERENCE_TRANSFORMS: &str = "reference transforms";
     pub const XML_BASE_COMPONENTS: &str = "XML Base components";
@@ -381,6 +382,8 @@ pub struct ResourcePolicy {
     pub max_xml_nodes: usize,
     /// Maximum element nesting depth in one parsed document.
     pub max_xml_depth: usize,
+    /// Maximum namespace prefixes simultaneously bound while parsing XML.
+    pub max_xml_namespace_bindings: usize,
     /// Maximum references in one signature or manifest.
     pub max_references: usize,
     /// Maximum transforms in one reference.
@@ -449,6 +452,7 @@ impl Default for ResourcePolicy {
         Self {
             max_xml_nodes: crate::hard_limits::XML_DOCUMENT_NODE_CEILING as usize,
             max_xml_depth: crate::hard_limits::XML_DOCUMENT_DEPTH_CEILING,
+            max_xml_namespace_bindings: crate::hard_limits::XML_NAMESPACE_BINDING_CEILING,
             max_references: crate::hard_limits::SIGNATURE_REFERENCE_CEILING,
             max_transforms_per_reference: crate::hard_limits::REFERENCE_TRANSFORM_CEILING,
             max_xml_base_components: crate::hard_limits::XML_BASE_COMPONENT_CEILING,
@@ -500,6 +504,11 @@ impl ResourcePolicy {
             resource_name::XML_DEPTH,
             self.max_xml_depth,
             crate::hard_limits::XML_DOCUMENT_DEPTH_CEILING,
+        )?;
+        Self::within(
+            resource_name::XML_NAMESPACE_BINDINGS,
+            self.max_xml_namespace_bindings,
+            crate::hard_limits::XML_NAMESPACE_BINDING_CEILING,
         )?;
         Self::within(
             resource_name::CANONICALIZED_BYTES,
@@ -1235,6 +1244,11 @@ mod tests {
                 |p| &mut p.max_xml_depth,
             ),
             (
+                resource_name::XML_NAMESPACE_BINDINGS,
+                crate::hard_limits::XML_NAMESPACE_BINDING_CEILING,
+                |p| &mut p.max_xml_namespace_bindings,
+            ),
+            (
                 resource_name::SIGNATURE_REFERENCES,
                 crate::hard_limits::SIGNATURE_REFERENCE_CEILING,
                 |p| &mut p.max_references,
@@ -1409,6 +1423,7 @@ mod tests {
         let policy = ResourcePolicy {
             max_xml_nodes: 0,
             max_xml_depth: 0,
+            max_xml_namespace_bindings: 0,
             max_references: 0,
             max_transforms_per_reference: 0,
             max_xml_base_components: 0,

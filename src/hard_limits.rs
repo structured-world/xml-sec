@@ -13,6 +13,11 @@ pub(crate) const XML_SOURCE_POSITION_CEILING: usize = 2 * XML_DOCUMENT_NODE_CEIL
 pub(crate) const XML_ENTITY_EXPANSION_WORK_BYTE_CEILING: usize = 16 * XML_DOCUMENT_BYTE_CEILING;
 /// Maximum element nesting accepted by every XML parser backend.
 pub(crate) const XML_DOCUMENT_DEPTH_CEILING: usize = 256;
+/// Maximum user-declared namespace bindings simultaneously in scope.
+///
+/// Namespace resolution scans active bindings, so this bounds both retained
+/// namespace state and adversarial prefix-resolution work across all backends.
+pub(crate) const XML_NAMESPACE_BINDING_CEILING: usize = 1_024;
 
 /// Maximum inherited `xml:base` attributes considered for one URI resolution.
 pub(crate) const XML_BASE_COMPONENT_CEILING: usize = 64;
@@ -92,7 +97,7 @@ pub(crate) const XPATH_MIRROR_STRING_BYTE_CEILING: usize = 8 * 1024 * 1024;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const XPATH_STRING_WORK_BYTE_CEILING: usize = 512 * 1024 * 1024;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
-pub(crate) const XPATH_NAMESPACE_BINDING_CEILING: usize = 1_024;
+pub(crate) const XPATH_NAMESPACE_BINDING_CEILING: usize = XML_NAMESPACE_BINDING_CEILING;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const XPATH_NAMESPACE_BYTE_CEILING: usize = 64 * 1024;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]

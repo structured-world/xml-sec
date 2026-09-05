@@ -4,11 +4,8 @@ use std::{fmt, sync::Arc};
 
 use crate::xml::dom::{Document, Node};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use quick_xml::{
-    Writer,
-    events::{BytesEnd, BytesStart, BytesText, Event},
-};
 use rsa::RsaPublicKey;
+use xml_sec_xml_input::lexical::Writer;
 
 use crate::document::{
     DocumentParseSettings, XmlDocument, XmlDocumentError, XmlParseWorkBudget,
@@ -1031,37 +1028,39 @@ fn render_encrypted_data(
     ciphertext: &[u8],
 ) -> Result<String, XmlEncError> {
     let mut writer = Writer::new(Vec::new());
-    let mut root = BytesStart::new("xenc:EncryptedData");
-    root.push_attribute(("xmlns:xenc", XMLENC_NS));
-    root.push_attribute(("xmlns:xenc11", XMLENC11_NS));
-    root.push_attribute(("xmlns:ds", XMLDSIG_NS));
+    let mut root_attributes = vec![
+        ("xmlns:xenc", XMLENC_NS),
+        ("xmlns:xenc11", XMLENC11_NS),
+        ("xmlns:ds", XMLDSIG_NS),
+    ];
     if let Some(id) = id {
-        root.push_attribute(("Id", id));
+        root_attributes.push(("Id", id));
     }
+    let encrypted_type_uri;
     if let Some(encrypted_type) = encrypted_type {
-        let uri = match encrypted_type {
+        encrypted_type_uri = match encrypted_type {
             EncryptedDataType::Element => format!("{XMLENC_NS}Element"),
             EncryptedDataType::Content => format!("{XMLENC_NS}Content"),
             EncryptedDataType::Other(uri) => uri.clone(),
         };
-        root.push_attribute(("Type", uri.as_str()));
+        root_attributes.push(("Type", encrypted_type_uri.as_str()));
     }
-    write_event(&mut writer, Event::Start(root))?;
+    write_start(&mut writer, "xenc:EncryptedData", root_attributes)?;
     write_empty_with_algorithm(&mut writer, "xenc:EncryptionMethod", algorithm.uri())?;
 
     if direct_key_name.is_some() || !encrypted_keys.is_empty() {
-        write_event(&mut writer, Event::Start(BytesStart::new("ds:KeyInfo")))?;
+        write_start(&mut writer, "ds:KeyInfo", [])?;
         if let Some(key_name) = direct_key_name {
             write_text_element(&mut writer, "ds:KeyName", key_name)?;
         }
         for encrypted_key in encrypted_keys {
             write_encrypted_key(&mut writer, encrypted_key)?;
         }
-        write_event(&mut writer, Event::End(BytesEnd::new("ds:KeyInfo")))?;
+        write_end(&mut writer, "ds:KeyInfo")?;
     }
 
     write_cipher_data(&mut writer, ciphertext)?;
-    write_event(&mut writer, Event::End(BytesEnd::new("xenc:EncryptedData")))?;
+    write_end(&mut writer, "xenc:EncryptedData")?;
     String::from_utf8(writer.into_inner())
         .map_err(|error| XmlEncError::XmlSerialize(error.to_string()))
 }
@@ -1070,16 +1069,22 @@ fn write_encrypted_key(
     writer: &mut Writer<Vec<u8>>,
     encrypted_key: &WrappedKey,
 ) -> Result<(), XmlEncError> {
-    let mut start = BytesStart::new("xenc:EncryptedKey");
-    if let Some(recipient) = encrypted_key.recipient.as_deref() {
-        start.push_attribute(("Recipient", recipient));
-    }
-    write_event(writer, Event::Start(start))?;
+    write_start(
+        writer,
+        "xenc:EncryptedKey",
+        encrypted_key
+            .recipient
+            .as_deref()
+            .map(|recipient| vec![("Recipient", recipient)])
+            .unwrap_or_default(),
+    )?;
 
     if let Some(parameters) = encrypted_key.oaep.as_ref() {
-        let mut method = BytesStart::new("xenc:EncryptionMethod");
-        method.push_attribute(("Algorithm", encrypted_key.algorithm_uri));
-        write_event(writer, Event::Start(method))?;
+        write_start(
+            writer,
+            "xenc:EncryptionMethod",
+            [("Algorithm", encrypted_key.algorithm_uri)],
+        )?;
         if !parameters.label.is_empty() {
             write_text_element(
                 writer,
@@ -1093,24 +1098,24 @@ fn write_encrypted_key(
         {
             write_empty_with_algorithm(writer, "xenc11:MGF", parameters.mgf_digest.mgf_uri())?;
         }
-        write_event(writer, Event::End(BytesEnd::new("xenc:EncryptionMethod")))?;
+        write_end(writer, "xenc:EncryptionMethod")?;
     } else {
         write_empty_with_algorithm(writer, "xenc:EncryptionMethod", encrypted_key.algorithm_uri)?;
     }
 
     if let Some(key_name) = encrypted_key.key_name.as_deref() {
-        write_event(writer, Event::Start(BytesStart::new("ds:KeyInfo")))?;
+        write_start(writer, "ds:KeyInfo", [])?;
         write_text_element(writer, "ds:KeyName", key_name)?;
-        write_event(writer, Event::End(BytesEnd::new("ds:KeyInfo")))?;
+        write_end(writer, "ds:KeyInfo")?;
     }
     write_cipher_data(writer, &encrypted_key.ciphertext)?;
-    write_event(writer, Event::End(BytesEnd::new("xenc:EncryptedKey")))
+    write_end(writer, "xenc:EncryptedKey")
 }
 
 fn write_cipher_data(writer: &mut Writer<Vec<u8>>, value: &[u8]) -> Result<(), XmlEncError> {
-    write_event(writer, Event::Start(BytesStart::new("xenc:CipherData")))?;
+    write_start(writer, "xenc:CipherData", [])?;
     write_text_element(writer, "xenc:CipherValue", &STANDARD.encode(value))?;
-    write_event(writer, Event::End(BytesEnd::new("xenc:CipherData")))
+    write_end(writer, "xenc:CipherData")
 }
 
 fn write_empty_with_algorithm(
@@ -1118,9 +1123,9 @@ fn write_empty_with_algorithm(
     name: &str,
     algorithm: &str,
 ) -> Result<(), XmlEncError> {
-    let mut element = BytesStart::new(name);
-    element.push_attribute(("Algorithm", algorithm));
-    write_event(writer, Event::Empty(element))
+    writer
+        .empty(name, [("Algorithm", algorithm)])
+        .map_err(|error| XmlEncError::XmlSerialize(error.to_string()))
 }
 
 fn write_text_element(
@@ -1128,14 +1133,26 @@ fn write_text_element(
     name: &str,
     text: &str,
 ) -> Result<(), XmlEncError> {
-    write_event(writer, Event::Start(BytesStart::new(name)))?;
-    write_event(writer, Event::Text(BytesText::new(text)))?;
-    write_event(writer, Event::End(BytesEnd::new(name)))
+    write_start(writer, name, [])?;
+    writer
+        .text(text)
+        .map_err(|error| XmlEncError::XmlSerialize(error.to_string()))?;
+    write_end(writer, name)
 }
 
-fn write_event(writer: &mut Writer<Vec<u8>>, event: Event<'_>) -> Result<(), XmlEncError> {
+fn write_start<'a>(
+    writer: &mut Writer<Vec<u8>>,
+    name: &str,
+    attributes: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<(), XmlEncError> {
     writer
-        .write_event(event)
+        .start(name, attributes)
+        .map_err(|error| XmlEncError::XmlSerialize(error.to_string()))
+}
+
+fn write_end(writer: &mut Writer<Vec<u8>>, name: &str) -> Result<(), XmlEncError> {
+    writer
+        .end(name)
         .map_err(|error| XmlEncError::XmlSerialize(error.to_string()))
 }
 
