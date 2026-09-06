@@ -585,9 +585,15 @@ fn is_utf32_encoding(encoding: SelectedEncoding) -> bool {
     )
 }
 
+// XML 1.0 section 2.3 production [3] defines S as exactly these four bytes.
+// https://www.w3.org/TR/xml/#NT-S
+const fn is_xml_s_byte(byte: &u8) -> bool {
+    matches!(*byte, b' ' | b'\t' | b'\r' | b'\n')
+}
+
 fn declaration_from_ascii_bytes(bytes: &[u8]) -> Result<Option<(Range<usize>, &str)>, Error> {
     let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
-    if !bytes.starts_with(b"<?xml") || !bytes.get(5).is_some_and(u8::is_ascii_whitespace) {
+    if !bytes.starts_with(b"<?xml") || !bytes.get(5).is_some_and(is_xml_s_byte) {
         return Ok(None);
     }
     let end = bytes
@@ -611,7 +617,7 @@ fn declaration_from_text(xml: &str) -> Result<Option<Range<usize>>, Error> {
     let Some(rest) = xml.strip_prefix("<?xml") else {
         return Ok(None);
     };
-    if !rest.as_bytes().first().is_some_and(u8::is_ascii_whitespace) {
+    if !rest.as_bytes().first().is_some_and(is_xml_s_byte) {
         return Ok(None);
     }
     let end = rest
@@ -621,7 +627,7 @@ fn declaration_from_text(xml: &str) -> Result<Option<Range<usize>>, Error> {
     let mut cursor = 0;
     let mut encoding_range = None;
     while cursor < declaration.len() {
-        while declaration.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        while declaration.get(cursor).is_some_and(is_xml_s_byte) {
             cursor += 1;
         }
         if cursor == declaration.len() {
@@ -637,14 +643,14 @@ fn declaration_from_text(xml: &str) -> Result<Option<Range<usize>>, Error> {
             return Err(Error::MalformedDeclaration("invalid pseudo-attribute"));
         }
         let name = &declaration[name_start..cursor];
-        while declaration.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        while declaration.get(cursor).is_some_and(is_xml_s_byte) {
             cursor += 1;
         }
         if declaration.get(cursor) != Some(&b'=') {
             return Err(Error::MalformedDeclaration("missing `=`"));
         }
         cursor += 1;
-        while declaration.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        while declaration.get(cursor).is_some_and(is_xml_s_byte) {
             cursor += 1;
         }
         let &quote @ (b'\'' | b'"') = declaration
@@ -672,7 +678,7 @@ fn declaration_from_text(xml: &str) -> Result<Option<Range<usize>>, Error> {
         cursor = value_end + 1;
         if declaration
             .get(cursor)
-            .is_some_and(|byte| !byte.is_ascii_whitespace())
+            .is_some_and(|byte| !is_xml_s_byte(byte))
         {
             return Err(Error::MalformedDeclaration("missing whitespace"));
         }
@@ -784,6 +790,24 @@ mod tests {
             decode_xml(&utf16, None),
             Err(Error::MalformedDeclaration("missing `=`"))
         ));
+    }
+
+    #[test]
+    fn xml_declaration_rejects_non_xml_ascii_whitespace() {
+        // XML 1.0 section 2.3 production [3] limits S to space, tab, CR, and LF.
+        // https://www.w3.org/TR/xml/#NT-S
+        for whitespace in *b"\x0b\x0c" {
+            let source = [
+                b"<?xml".as_slice(),
+                &[whitespace],
+                b"version=\"1.0\" encoding=\"ISO-8859-1\"?><root>caf\xe9</root>".as_slice(),
+            ]
+            .concat();
+            assert!(matches!(
+                decode_xml(&source, None),
+                Err(Error::InvalidBytes("UTF-8"))
+            ));
+        }
     }
 
     #[test]

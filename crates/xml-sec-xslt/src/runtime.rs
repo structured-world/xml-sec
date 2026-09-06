@@ -2685,16 +2685,18 @@ impl<'a> Execution<'a> {
             "normalize-space(.)" => {
                 let mut capacity = 0usize;
                 let mut pending_space = false;
-                self.evaluator.visit_string_value(node, |value| {
-                    measure_normalized_xpath_space(value, &mut capacity, &mut pending_space);
-                });
+                self.evaluator
+                    .visit_string_value_metered(node, &mut self.meter, |value| {
+                        measure_normalized_xpath_space(value, &mut capacity, &mut pending_space);
+                    })?;
                 self.meter
                     .check_additional(BudgetKind::OwnedBytes, capacity)?;
                 let mut output = String::with_capacity(capacity);
                 let mut pending_space = false;
-                self.evaluator.visit_string_value(node, |value| {
-                    append_normalized_xpath_space(value, &mut output, &mut pending_space);
-                });
+                self.evaluator
+                    .visit_string_value_metered(node, &mut self.meter, |value| {
+                        append_normalized_xpath_space(value, &mut output, &mut pending_space);
+                    })?;
                 return Ok(Some(XPathValue::String(output)));
             }
             "concat('<',name(.),'>')" => {
@@ -6372,6 +6374,56 @@ mod tests {
             )]))
             .is_none()
         );
+    }
+
+    #[test]
+    fn normalize_space_fast_path_charges_descendant_traversal() {
+        let stylesheet = Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(1 << 20, 4, 16, 1 << 20),
+        )
+        .compile(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="normalize-space(.)"/></xsl:template></xsl:stylesheet>"#,
+            None,
+        )
+        .expect("stylesheet compiles");
+        let source =
+            Document::parse("<root><a>alpha</a><b>beta</b></root>", None).expect("source parses");
+        let budget = ExecutionBudget {
+            source_bytes: usize::MAX,
+            external_documents: usize::MAX,
+            recursion_depth: usize::MAX,
+            xpath_evaluations: usize::MAX,
+            xpath_operations: 1,
+            extension_operations: usize::MAX,
+            pattern_evaluations: usize::MAX,
+            template_applications: usize::MAX,
+            sort_comparisons: usize::MAX,
+            key_entries: usize::MAX,
+            result_nodes: usize::MAX,
+            serialized_bytes: usize::MAX,
+            messages: usize::MAX,
+            owned_bytes: usize::MAX,
+        };
+        let error = stylesheet
+            .execute(
+                &source,
+                &crate::Parameters::new(),
+                Arc::new(NoResolver),
+                crate::ExecutionOptions {
+                    budget,
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            )
+            .expect_err("descendant traversal exceeds the baseline XPath operation");
+        assert!(matches!(
+            error,
+            Error::Budget {
+                kind: BudgetKind::XPathOperations,
+                ..
+            }
+        ));
     }
 
     #[test]

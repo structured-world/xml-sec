@@ -2990,6 +2990,26 @@ impl Evaluator {
         }
     }
 
+    pub(crate) fn visit_string_value_metered(
+        &self,
+        node: &SourceNode,
+        meter: &mut Meter,
+        mut visit: impl FnMut(&str),
+    ) -> Result<()> {
+        match node {
+            SourceNode::Node(id) => self.source.try_visit_string_value(
+                *id,
+                || meter.charge(BudgetKind::XPathOperations, 1),
+                visit,
+            ),
+            SourceNode::Attribute { .. } | SourceNode::Namespace { .. } => {
+                meter.charge(BudgetKind::XPathOperations, 1)?;
+                self.visit_string_value(node, &mut visit);
+                Ok(())
+            }
+        }
+    }
+
     pub(crate) fn borrowed_leaf_string_value(&self, node: &SourceNode) -> Option<&str> {
         match node {
             SourceNode::Node(id) => self.source.node(*id).and_then(|node| match &node.kind {
@@ -6933,19 +6953,18 @@ impl function::Function for ExsltSetFunction {
                 return extension_argument_error("set:distinct() requires one node-set");
             };
             let ordered = nodes.document_order_with_context(context)?;
-            let value_bytes = ordered.iter().fold(0usize, |total, node| {
-                total.saturating_add(node.string_value_len())
-            });
-            // Reserve conservatively for the strings plus hash buckets at the standard maximum
-            // load. This keeps both allocations behind the same XPath owned-byte gate.
+            // Reserve conservatively for hash buckets at the standard maximum load. Each string
+            // is then traversed, reserved, and materialized exactly once by the extension-aware
+            // helper before it can enter the set.
             let bucket_bytes = ordered.len().saturating_mul(2).saturating_mul(
                 std::mem::size_of::<String>().saturating_add(std::mem::size_of::<usize>()),
             );
-            context.reserve_string_allocation(value_bytes.saturating_add(bucket_bytes))?;
+            context.reserve_string_allocation(bucket_bytes)?;
             let mut seen = std::collections::HashSet::with_capacity(ordered.len());
             let mut result = nodeset::Nodeset::new();
             for node in ordered {
-                if seen.insert(node.string_value()) {
+                let value = node.string_value_with_extension_context(context)?;
+                if seen.insert(value) {
                     result.add_metered(context, node)?;
                 }
             }
@@ -9841,6 +9860,26 @@ mod tests {
             .evaluate(&evaluation, vec![SxdValue::Nodeset(nodes)])
             .expect_err("distinct storage must cross the allocation gate");
         assert!(error.to_string().contains("allocation budget"));
+    }
+
+    #[test]
+    fn set_distinct_charges_descendant_string_traversal_as_extension_work() {
+        let package = Package::new();
+        let document = package.as_document();
+        let root = document.create_element("root");
+        root.append_child(document.create_text("alpha"));
+        document.root().append_child(root);
+        let mut nodes = nodeset::Nodeset::new();
+        nodes.add(root);
+        let mut context = Context::new();
+        context.set_extension_work_limit(0);
+        let evaluation =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+
+        let error = ExsltSetFunction::Distinct
+            .evaluate(&evaluation, vec![SxdValue::Nodeset(nodes)])
+            .expect_err("set:distinct string traversal requires extension work");
+        assert!(error.to_string().contains("extension work budget"));
     }
 
     #[test]
