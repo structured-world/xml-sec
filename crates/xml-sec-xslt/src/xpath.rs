@@ -2810,6 +2810,15 @@ impl Evaluator {
         {
             return Ok(None);
         }
+        // XPath 1.0 section 2.3 resolves node-test QNames from the expression context before
+        // matching; an empty intermediate axis cannot suppress an undeclared-prefix error.
+        // https://www.w3.org/TR/1999/REC-xpath-19991116/#node-tests
+        for step in steps
+            .clone()
+            .filter(|step| !matches!(*step, "*" | "text()" | "*|text()"))
+        {
+            pattern_name_namespace(step, &expression.namespaces)?;
+        }
 
         let mut selected = Vec::new();
         let mut selected_bytes = 0;
@@ -5381,16 +5390,27 @@ fn element_pattern_name_matches(
     name: &crate::ExpandedName,
     namespaces: &[(String, String)],
 ) -> Result<bool> {
-    if let Some((prefix, local)) = lexical.split_once(':') {
-        let namespace = namespaces
-            .iter()
-            .find_map(|(candidate, uri)| (candidate == prefix).then_some(uri))
-            .ok_or_else(|| Error::Static(format!("unbound pattern namespace prefix {prefix}")))?;
-        Ok(name.namespace.as_deref() == Some(namespace.as_str())
-            && (local == "*" || name.local == local))
+    if let Some((_, local)) = lexical.split_once(':') {
+        let namespace = pattern_name_namespace(lexical, namespaces)?
+            .expect("a prefixed lexical name resolves a namespace");
+        Ok(name.namespace.as_deref() == Some(namespace) && (local == "*" || name.local == local))
     } else {
         Ok(name.namespace.is_none() && name.local == lexical)
     }
+}
+
+fn pattern_name_namespace<'a>(
+    lexical: &str,
+    namespaces: &'a [(String, String)],
+) -> Result<Option<&'a str>> {
+    let Some((prefix, _)) = lexical.split_once(':') else {
+        return Ok(None);
+    };
+    namespaces
+        .iter()
+        .find_map(|(candidate, uri)| (candidate == prefix).then_some(uri.as_str()))
+        .map(Some)
+        .ok_or_else(|| Error::Static(format!("unbound pattern namespace prefix {prefix}")))
 }
 
 fn quoted_pattern_literal(value: &str) -> Option<&str> {
@@ -8591,6 +8611,62 @@ mod tests {
 
     struct StaticResolver {
         bytes: Vec<u8>,
+    }
+
+    #[test]
+    fn child_axis_fast_path_rejects_unbound_prefix_without_candidates() {
+        // XPath 1.0 section 2.3 resolves QName prefixes from the expression context; an
+        // undeclared prefix is an error even when the selected axis happens to be empty.
+        // https://www.w3.org/TR/1999/REC-xpath-19991116/#node-tests
+        let source = Document::parse("<root/>", None).expect("source parses");
+        let stylesheet = Document::parse("<stylesheet/>", None).expect("stylesheet parses");
+        let budget = ExecutionBudget {
+            source_bytes: usize::MAX,
+            external_documents: usize::MAX,
+            recursion_depth: usize::MAX,
+            xpath_evaluations: usize::MAX,
+            extension_operations: usize::MAX,
+            pattern_evaluations: usize::MAX,
+            template_applications: usize::MAX,
+            sort_comparisons: usize::MAX,
+            key_entries: usize::MAX,
+            result_nodes: usize::MAX,
+            serialized_bytes: usize::MAX,
+            messages: usize::MAX,
+            owned_bytes: usize::MAX,
+        };
+        let mut meter = Meter::new(budget, source.source_bytes()).expect("meter initializes");
+        let options = EvaluatorSourceOptions {
+            processing: SourceProcessing::Xml,
+            whitespace: Arc::from([]),
+            clock: Arc::new(crate::SystemClock),
+            extension_policy: crate::ExtensionPolicy::Compatible,
+        };
+        let prepared = prepare_evaluator_source(&source, &crate::NoResolver, &mut meter, &options)
+            .expect("source prepares");
+        let evaluator = Evaluator::new(
+            prepared,
+            &stylesheet,
+            None,
+            &[],
+            Arc::new(crate::NoResolver),
+            &mut meter,
+            options,
+        )
+        .expect("evaluator initializes");
+        let logical_root = evaluator.source.logical_roots()[0];
+        let empty_element = evaluator
+            .source
+            .node(logical_root)
+            .and_then(|node| node.children.first())
+            .copied()
+            .expect("source element exists");
+        let expression = Expression::generated("missing:item", Vec::new());
+
+        let error = evaluator
+            .select_child_axis(&expression, &SourceNode::Node(empty_element), &mut meter)
+            .expect_err("unbound QName prefix must fail before child traversal");
+        assert!(matches!(error, Error::Static(message) if message.contains("missing")));
     }
 
     #[test]

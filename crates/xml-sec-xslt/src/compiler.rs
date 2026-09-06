@@ -2383,7 +2383,11 @@ fn parse_semantic_document_metered(
             ))
     })?;
     state.charge_owned(projected_bytes)?;
-    Document::parse(xml, base_uri)
+    let parser_workspace = parser_workspace_bytes(xml);
+    state.charge_owned(parser_workspace)?;
+    let document = Document::parse(xml, base_uri);
+    state.release_owned(parser_workspace);
+    document
 }
 
 enum StylesheetModuleKind {
@@ -4324,6 +4328,35 @@ mod tests {
 
         assert!(matches!(
             with_frontend_document(&xml, &mut state, |_document, _state| Ok(())),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn semantic_projection_reserves_the_second_parser_workspace() {
+        // The semantic parse overlaps retained compile state, so its transient arena must fit the
+        // remaining peak budget rather than relying on the earlier frontend parse reservation.
+        let xml = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#;
+        let parsed = roxmltree::Document::parse(xml).expect("test stylesheet parses");
+        let retained = xml
+            .len()
+            .saturating_add(estimate_compiled_owned_bytes(&parsed));
+        let parser_workspace = parser_workspace_bytes(xml);
+        let mut state = CompileState::new(
+            CompileBudget::new(
+                xml.len(),
+                0,
+                8,
+                retained.saturating_add(parser_workspace).saturating_sub(1),
+            ),
+            xml.len(),
+        );
+
+        assert!(matches!(
+            parse_semantic_document_metered(xml, None, &mut state),
             Err(Error::Budget {
                 kind: BudgetKind::OwnedBytes,
                 ..

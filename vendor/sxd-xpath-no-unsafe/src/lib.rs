@@ -801,4 +801,15 @@ mod test {
             assert!(xpath.evaluate(&Context::new(), doc.root()).is_err());
         });
     }
+
+    #[test]
+    fn undeclared_node_test_prefix_fails_without_axis_candidates() {
+        // Namespace resolution is expression semantics, not a side effect of visiting a match.
+        with_document("<root/>", |doc| {
+            let xpath = Factory::new()
+                .build("/root/missing:item")
+                .expect("XPath syntax parses");
+            assert!(xpath.evaluate(&Context::new(), doc.root()).is_err());
+        });
+    }
 }

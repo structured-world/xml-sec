@@ -316,7 +316,7 @@ impl<'d> Node<'d> {
             })?;
             if required > result.capacity() {
                 let target_capacity = required.max(result.capacity().saturating_mul(2).max(8));
-                let additional = target_capacity - result.capacity();
+                let additional = target_capacity - result.len();
                 context.reserve_string_allocation(additional)?;
                 result.try_reserve_exact(additional).map_err(|_| {
                     crate::function::Error::Other {
@@ -1093,6 +1093,28 @@ mod test {
             Ok(String::new())
         );
         assert_eq!(context.string_allocation_exceeded(), None);
+    }
+
+    #[test]
+    fn string_value_growth_reserves_from_length_not_spare_capacity() {
+        let package = Package::new();
+        let doc = package.as_document();
+        let root = doc.create_element("root");
+        doc.root().append_child(root.clone());
+        root.append_child(doc.create_text("x"));
+        root.append_child(doc.create_text(&"y".repeat(1_024)));
+        let mut context = crate::context::Context::new();
+        // The first growth reserves 8 bytes. The second must reserve 1,024 bytes from len=1,
+        // rather than 1,017 from capacity=8 and letting push_str allocate outside the gate.
+        context.set_string_allocation_limit(1_025);
+        let evaluation = crate::context::Evaluation::new(&context, doc.root().into());
+
+        assert!(
+            into_node(root)
+                .string_value_with_context(&evaluation)
+                .is_err()
+        );
+        assert!(context.string_allocation_exceeded().is_some());
     }
 
     #[test]

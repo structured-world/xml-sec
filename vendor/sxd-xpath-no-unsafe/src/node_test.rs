@@ -7,6 +7,10 @@ use crate::expression::Error;
 use crate::nodeset::{self, OrderedNodes};
 
 pub trait NodeTest: fmt::Debug {
+    fn validate(&self, _context: &context::Evaluation<'_, '_>) -> Result<(), Error> {
+        Ok(())
+    }
+
     fn test<'c, 'd>(
         &self,
         context: &context::Evaluation<'c, 'd>,
@@ -18,6 +22,10 @@ impl<T: ?Sized> NodeTest for Box<T>
 where
     T: NodeTest,
 {
+    fn validate(&self, context: &context::Evaluation<'_, '_>) -> Result<(), Error> {
+        (**self).validate(context)
+    }
+
     fn test<'c, 'd>(
         &self,
         context: &context::Evaluation<'c, 'd>,
@@ -36,6 +44,17 @@ pub struct NameTest {
 }
 
 impl NameTest {
+    fn validate(&self, context: &context::Evaluation<'_, '_>) -> Result<(), Error> {
+        if let Some(prefix) = &self.prefix
+            && context.namespace_for(prefix).is_none()
+        {
+            return Err(Error::UnknownNamespace {
+                prefix: prefix.clone(),
+            });
+        }
+        Ok(())
+    }
+
     fn matches(
         &self,
         context: &context::Evaluation<'_, '_>,
@@ -75,6 +94,10 @@ impl Attribute {
 }
 
 impl NodeTest for Attribute {
+    fn validate(&self, context: &context::Evaluation<'_, '_>) -> Result<(), Error> {
+        self.name_test.validate(context)
+    }
+
     fn test<'c, 'd>(
         &self,
         context: &context::Evaluation<'c, 'd>,
@@ -105,6 +128,10 @@ impl Namespace {
 }
 
 impl NodeTest for Namespace {
+    fn validate(&self, context: &context::Evaluation<'_, '_>) -> Result<(), Error> {
+        self.name_test.validate(context)
+    }
+
     fn test<'c, 'd>(
         &self,
         context: &context::Evaluation<'c, 'd>,
@@ -133,6 +160,10 @@ impl Element {
 }
 
 impl NodeTest for Element {
+    fn validate(&self, context: &context::Evaluation<'_, '_>) -> Result<(), Error> {
+        self.name_test.validate(context)
+    }
+
     fn test<'c, 'd>(
         &self,
         context: &context::Evaluation<'c, 'd>,

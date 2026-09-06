@@ -2219,7 +2219,7 @@ impl<'a> Execution<'a> {
                     letter_value,
                     grouping_separator,
                     grouping_size,
-                    &self.meter,
+                    &mut self.meter,
                 )?;
                 self.meter.release_owned_bytes(values_owned_bytes);
                 self.append_owned_text(formatted, false)
@@ -5291,7 +5291,7 @@ fn format_number_sequence(
     _letter_value: Option<&str>,
     separator: Option<char>,
     size: Option<usize>,
-    meter: &Meter,
+    meter: &mut Meter,
 ) -> Result<String> {
     if values.is_empty() {
         return Ok(String::new());
@@ -5301,41 +5301,45 @@ fn format_number_sequence(
         .saturating_mul(std::mem::size_of::<(bool, &str)>())
         .saturating_add(formats.saturating_mul(std::mem::size_of::<&str>()))
         .saturating_add(separators.saturating_mul(std::mem::size_of::<&str>()));
-    meter.check_additional(BudgetKind::OwnedBytes, token_workspace)?;
-    let tokens = tokenize_number_format(format);
-    if tokens.formats.is_empty() {
+    meter.charge(BudgetKind::OwnedBytes, token_workspace)?;
+    let result = (|| {
+        let tokens = tokenize_number_format(format);
+        if tokens.formats.is_empty() {
+            let mut output = String::new();
+            append_metered(&mut output, tokens.prefix, meter)?;
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    append_metered(&mut output, ".", meter)?;
+                }
+                format_number_into(&mut output, *value, "1", separator, size, meter)?;
+            }
+            return Ok(output);
+        }
         let mut output = String::new();
         append_metered(&mut output, tokens.prefix, meter)?;
         for (index, value) in values.iter().enumerate() {
             if index > 0 {
-                append_metered(&mut output, ".", meter)?;
+                let separator = tokens
+                    .separators
+                    .get(index - 1)
+                    .or_else(|| tokens.separators.last())
+                    .copied()
+                    .unwrap_or(".");
+                append_metered(&mut output, separator, meter)?;
             }
-            format_number_into(&mut output, *value, "1", separator, size, meter)?;
-        }
-        return Ok(output);
-    }
-    let mut output = String::new();
-    append_metered(&mut output, tokens.prefix, meter)?;
-    for (index, value) in values.iter().enumerate() {
-        if index > 0 {
-            let separator = tokens
-                .separators
-                .get(index - 1)
-                .or_else(|| tokens.separators.last())
+            let token = tokens
+                .formats
+                .get(index)
+                .or_else(|| tokens.formats.last())
                 .copied()
-                .unwrap_or(".");
-            append_metered(&mut output, separator, meter)?;
+                .unwrap_or("1");
+            format_number_into(&mut output, *value, token, separator, size, meter)?;
         }
-        let token = tokens
-            .formats
-            .get(index)
-            .or_else(|| tokens.formats.last())
-            .copied()
-            .unwrap_or("1");
-        format_number_into(&mut output, *value, token, separator, size, meter)?;
-    }
-    append_metered(&mut output, tokens.suffix, meter)?;
-    Ok(output)
+        append_metered(&mut output, tokens.suffix, meter)?;
+        Ok(output)
+    })();
+    meter.release_owned_bytes(token_workspace);
+    result
 }
 
 fn append_metered(output: &mut String, value: &str, meter: &Meter) -> Result<()> {
@@ -6069,8 +6073,8 @@ mod tests {
 
     use super::{
         ApplyFrame, AttributeSetExpansion, EvaluatedParameters, SortKey, SourceNode, TemplateTask,
-        append_localized_decimal, apply_whitespace_rules, metered_node_id_snapshot,
-        validate_parameter_value, value_string,
+        append_localized_decimal, apply_whitespace_rules, format_number_sequence,
+        metered_node_id_snapshot, validate_parameter_value, value_string,
     };
     use crate::budget::Meter;
     use crate::compiler::Instruction;
@@ -6424,6 +6428,25 @@ mod tests {
             }
         ));
         assert!(rejected.is_empty(), "budget rejection precedes all writes");
+    }
+
+    #[test]
+    fn number_format_tokens_remain_reserved_while_output_is_built() {
+        // Token vectors and serialized output coexist; checking either allocation in isolation
+        // permits their combined peak to exceed OwnedBytes.
+        let format = "1.1.1.1";
+        let token_workspace = 7 * std::mem::size_of::<(bool, &str)>()
+            + 4 * std::mem::size_of::<&str>()
+            + 3 * std::mem::size_of::<&str>();
+        let mut meter = meter(token_workspace);
+
+        assert!(matches!(
+            format_number_sequence(&[1.0], format, None, None, None, None, &mut meter),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            })
+        ));
     }
 
     #[test]

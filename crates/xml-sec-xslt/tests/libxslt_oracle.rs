@@ -140,7 +140,9 @@ impl Resolver for CorpusResolver {
             path.extension().and_then(|value| value.to_str()),
             Some("xml" | "xsl")
         ) {
-            prepare_oracle_xml(&path, &self.root)?.text.into_bytes()
+            prepare_oracle_xml_bytes(&path, &self.root, &bytes)?
+                .text
+                .into_bytes()
         } else {
             bytes
         };
@@ -276,6 +278,25 @@ enum OracleEntity {
 
 fn prepare_oracle_xml(path: &Path, corpus_root: &Path) -> xml_sec_xslt::Result<PreparedXml> {
     let xml = read_xml(path)?;
+    prepare_oracle_xml_text(path, corpus_root, xml)
+}
+
+fn prepare_oracle_xml_bytes(
+    path: &Path,
+    corpus_root: &Path,
+    bytes: &[u8],
+) -> xml_sec_xslt::Result<PreparedXml> {
+    let xml = xml_sec_xml_input::decode_xml(bytes, None)
+        .map(|xml| xml.into_owned())
+        .map_err(|error| Error::Xml(format!("{}: {error}", path.display())))?;
+    prepare_oracle_xml_text(path, corpus_root, xml)
+}
+
+fn prepare_oracle_xml_text(
+    path: &Path,
+    corpus_root: &Path,
+    xml: String,
+) -> xml_sec_xslt::Result<PreparedXml> {
     let Some(range) = doctype_range(&xml)? else {
         return Ok(PreparedXml {
             text: xml,
@@ -1171,14 +1192,17 @@ fn assert_case(case: &Case) {
             "{}: transformation succeeded but upstream expects an error",
             case_name(case)
         ),
-        // The upstream runner has two negative cases that intentionally produce
-        // neither a result file nor a diagnostic golden. Absence of both files is
-        // still an expected failure, not permission to accept successful output.
+        // Upstream negative regressions may intentionally provide neither a result nor a
+        // diagnostic golden. Keep explicit success-only divergences out of that category.
         (Err(error), None)
-            if matches!(
-                error.kind(),
-                ErrorKind::Xml | ErrorKind::Static | ErrorKind::Dynamic | ErrorKind::Unsupported
-            ) => {}
+            if is_expected_failure_without_golden(case)
+                && matches!(
+                    error.kind(),
+                    ErrorKind::Xml
+                        | ErrorKind::Static
+                        | ErrorKind::Dynamic
+                        | ErrorKind::Unsupported
+                ) => {}
         (Err(error), Some(_)) if is_expected_strict_xslt_error(case, &error) => {}
         (Err(error), _) => panic!("{}: {error}", case_name(case)),
     }
@@ -1190,6 +1214,10 @@ fn is_standard_conformant_libxslt_divergence(case: &Case) -> bool {
     // https://www.w3.org/TR/REC-xml-names/#ns-decl
     // https://www.rfc-editor.org/rfc/rfc2396#section-4
     case.suite == "runtest" && case.stylesheet == Path::new("general/bug-154.xsl")
+}
+
+fn is_expected_failure_without_golden(case: &Case) -> bool {
+    case.output.is_none() && !is_standard_conformant_libxslt_divergence(case)
 }
 
 fn is_expected_message_only_success(case: &Case, result: &xml_sec_xslt::TransformResult) -> bool {
@@ -1955,6 +1983,24 @@ fn nonterminating_message_fixture_is_a_successful_transformation() {
         [("From main", false), ("From second import", false)]
     );
     assert!(is_expected_message_only_success(&case, &result));
+}
+
+#[test]
+fn only_the_negative_no_golden_case_may_fail() {
+    // Missing result/error goldens encode two distinct upstream outcomes; keep negative cases
+    // separate from the standards-conformant success-only namespace regression.
+    let cases = cases();
+    let negative = cases
+        .iter()
+        .find(|case| case.stylesheet == Path::new("general/bug-151.xsl"))
+        .expect("negative no-golden case exists");
+    let success = cases
+        .iter()
+        .find(|case| case.stylesheet == Path::new("general/bug-154.xsl"))
+        .expect("success-only no-golden case exists");
+
+    assert!(is_expected_failure_without_golden(negative));
+    assert!(!is_expected_failure_without_golden(success));
 }
 
 fn normalize_case_specific_oracle_output(case: &Case, bytes: Vec<u8>) -> Vec<u8> {

@@ -619,6 +619,7 @@ fn declaration_from_text(xml: &str) -> Result<Option<Range<usize>>, Error> {
         .ok_or(Error::MalformedDeclaration("unterminated declaration"))?;
     let declaration = &rest.as_bytes()[..end];
     let mut cursor = 0;
+    let mut encoding_range = None;
     while cursor < declaration.len() {
         while declaration.get(cursor).is_some_and(u8::is_ascii_whitespace) {
             cursor += 1;
@@ -666,7 +667,7 @@ fn declaration_from_text(xml: &str) -> Result<Option<Range<usize>>, Error> {
             if !is_xml_encoding_name_bytes(value) {
                 return Err(Error::MalformedDeclaration("invalid encoding name"));
             }
-            return Ok(Some((5 + value_start)..(5 + value_end)));
+            encoding_range = Some((5 + value_start)..(5 + value_end));
         }
         cursor = value_end + 1;
         if declaration
@@ -676,7 +677,10 @@ fn declaration_from_text(xml: &str) -> Result<Option<Range<usize>>, Error> {
             return Err(Error::MalformedDeclaration("missing whitespace"));
         }
     }
-    Ok(None)
+    // XML 1.0 section 2.8 production [23] makes EncodingDecl part of one complete XMLDecl;
+    // selection is valid only after every following pseudo-attribute has been checked.
+    // https://www.w3.org/TR/xml/#NT-XMLDecl
+    Ok(encoding_range)
 }
 
 /// Return whether a label satisfies XML 1.0's `EncName` production.
@@ -713,7 +717,10 @@ fn matches_ascii_case(value: &str, candidates: &[&str]) -> bool {
 mod tests {
     use std::borrow::Cow;
 
-    use super::{Error, decode_text, decode_xml, decode_xml_bounded};
+    use super::{
+        Error, declaration_from_ascii_bytes, declaration_from_text, decode_text, decode_xml,
+        decode_xml_bounded,
+    };
 
     fn encode_utf32(source: &str, little_endian: bool) -> Vec<u8> {
         source
@@ -753,6 +760,29 @@ mod tests {
         assert!(matches!(
             decode_xml(bytes, None),
             Err(Error::MalformedDeclaration("invalid encoding name"))
+        ));
+    }
+
+    #[test]
+    fn encoding_selection_requires_a_complete_well_formed_declaration() {
+        // XML 1.0 section 2.8 production [23] requires the declaration to match XMLDecl in full;
+        // finding EncodingDecl is not permission to ignore malformed trailing pseudo-attributes.
+        // https://www.w3.org/TR/xml/#NT-XMLDecl
+        let malformed = "<?xml version=\"1.0\" encoding=\"UTF-8\" trailing?><root/>";
+        assert!(matches!(
+            declaration_from_text(malformed),
+            Err(Error::MalformedDeclaration("missing `=`"))
+        ));
+        assert!(matches!(
+            declaration_from_ascii_bytes(malformed.as_bytes()),
+            Err(Error::MalformedDeclaration("missing `=`"))
+        ));
+
+        let mut utf16 = vec![0xFF, 0xFE];
+        utf16.extend(malformed.encode_utf16().flat_map(u16::to_le_bytes));
+        assert!(matches!(
+            decode_xml(&utf16, None),
+            Err(Error::MalformedDeclaration("missing `=`"))
         ));
     }
 

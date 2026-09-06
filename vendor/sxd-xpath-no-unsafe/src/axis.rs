@@ -82,6 +82,10 @@ impl AxisLike for Axis {
     ) -> Result<OrderedNodes<'d>, Error> {
         use self::Axis::*;
 
+        // XPath 1.0 section 2.3 expands a prefixed node-test QName from the expression context;
+        // that error is independent of whether this axis happens to contain candidate nodes.
+        // https://www.w3.org/TR/1999/REC-xpath-19991116/#node-tests
+        node_test.validate(context)?;
         let mut node_test = CompleteNodeTest::new(context, node_test);
 
         match *self {
