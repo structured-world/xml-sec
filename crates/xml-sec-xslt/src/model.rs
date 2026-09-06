@@ -1084,7 +1084,7 @@ impl Document {
     }
 
     /// Add a schema/DTD-defaulted attribute supplied by a trusted parser.
-    pub fn add_default_attribute(&mut self, owner: NodeId, attribute: Attribute) -> Result<()> {
+    pub fn add_default_attribute(&mut self, owner: NodeId, mut attribute: Attribute) -> Result<()> {
         let node = self
             .node(owner)
             .ok_or_else(|| Error::Xml("defaulted attribute owner is stale".into()))?;
@@ -1106,6 +1106,22 @@ impl Document {
         } else {
             None
         };
+        let xml_id = if attribute.name.namespace.as_deref() == Some(XML_NS)
+            && attribute.name.local == "id"
+        {
+            // xml:id 1.0 section 4 applies ID normalization and assignment to every xml:id,
+            // including attributes added to the infoset by default.
+            // https://www.w3.org/TR/xml-id/#processing
+            let normalized = normalized_xml_id(&attribute.value)?.into_owned();
+            attribute.value.clone_from(&normalized);
+            Some(normalized)
+        } else {
+            None
+        };
+        // Register before the infallible append so a rejected ID cannot partially mutate the DOM.
+        if let Some(value) = xml_id {
+            self.register_id_value(owner, value)?;
+        }
         let NodeKind::Element { attributes, .. } = &mut self
             .node_mut(owner)
             .expect("defaulted attribute owner remains present")
@@ -3719,6 +3735,7 @@ fn expand_document_entities<'a>(
         &mut EntityExpansionOutput {
             value: &mut expanded,
             document_position: Some(&mut position),
+            entity_nesting: None,
         },
         &mut active,
     )?;
@@ -3747,6 +3764,7 @@ fn expand_entity_references<'a>(
         &mut EntityExpansionOutput {
             value: &mut output,
             document_position: None,
+            entity_nesting: None,
         },
         &mut active,
     )?;
@@ -3821,6 +3839,32 @@ impl DocumentEntityPosition {
 struct EntityExpansionOutput<'output, 'position> {
     value: &'output mut String,
     document_position: Option<&'position mut DocumentEntityPosition>,
+    entity_nesting: Option<&'position mut EntityMarkupNesting>,
+}
+
+#[derive(Default)]
+struct EntityMarkupNesting {
+    depth: usize,
+}
+
+impl EntityMarkupNesting {
+    fn observe_markup(&mut self, markup: &str) -> Result<()> {
+        if markup.starts_with("<!--")
+            || markup.starts_with("<![CDATA[")
+            || markup.starts_with("<?")
+            || markup.starts_with("<!")
+        {
+            return Ok(());
+        }
+        if markup.starts_with("</") {
+            self.depth = self.depth.checked_sub(1).ok_or_else(|| {
+                Error::Xml("entity replacement closes markup opened outside the entity".into())
+            })?;
+        } else if !markup[..markup.len() - 1].trim_end().ends_with('/') {
+            self.depth += 1;
+        }
+        Ok(())
+    }
 }
 
 fn expand_entity_references_into<'entities>(
@@ -3849,6 +3893,9 @@ fn expand_entity_references_into<'entities>(
             if let Some(position) = output.document_position.as_deref_mut() {
                 position.observe_markup(markup);
             }
+            if let Some(nesting) = output.entity_nesting.as_deref_mut() {
+                nesting.observe_markup(markup)?;
+            }
             meter.append(output.value, markup)?;
             cursor += length;
             continue;
@@ -3859,6 +3906,9 @@ fn expand_entity_references_into<'entities>(
             let markup = &tail[..length];
             if let Some(position) = output.document_position.as_deref_mut() {
                 position.observe_markup(markup);
+            }
+            if let Some(nesting) = output.entity_nesting.as_deref_mut() {
+                nesting.observe_markup(markup)?;
             }
             meter.append(output.value, markup)?;
             cursor += length;
@@ -3888,6 +3938,7 @@ fn expand_entity_references_into<'entities>(
             }
             meter.check_depth(depth + 1)?;
             active[depth] = entity_name;
+            let mut entity_nesting = EntityMarkupNesting::default();
             let result = expand_entity_references_into(
                 replacement,
                 entities,
@@ -3896,12 +3947,18 @@ fn expand_entity_references_into<'entities>(
                 meter,
                 &mut EntityExpansionOutput {
                     value: output.value,
-                    document_position: None,
+                    document_position: output.document_position.as_deref_mut(),
+                    entity_nesting: Some(&mut entity_nesting),
                 },
                 active,
             );
             active[depth] = "";
             result?;
+            if entity_nesting.depth != 0 {
+                return Err(Error::Xml(
+                    "entity replacement leaves markup open across the entity boundary".into(),
+                ));
+            }
             cursor += consumed;
             continue;
         }
@@ -4377,6 +4434,29 @@ mod parser_boundary_tests {
     }
 
     #[test]
+    fn general_entity_markup_is_balanced_within_each_replacement() {
+        // XML 1.0 section 4.3.2 requires every referenced internal general entity replacement
+        // to match `content`; a tag cannot begin in one entity and end in another.
+        // https://www.w3.org/TR/xml/#wf-entities
+        for malformed in [
+            r#"<!DOCTYPE root [<!ENTITY e "</root>">]><root>&e;"#,
+            r#"<!DOCTYPE root [<!ENTITY e "<child>">]><root>&e;</child></root>"#,
+        ] {
+            assert!(
+                matches!(Document::parse(malformed, None), Err(Error::Xml(_))),
+                "cross-entity markup must remain malformed: {malformed}"
+            );
+        }
+
+        let valid = Document::parse(
+            r#"<!DOCTYPE root [<!ENTITY e "<child>ok</child>">]><root>&e;</root>"#,
+            None,
+        )
+        .expect("balanced replacement content parses");
+        assert_eq!(valid.string_value(valid.root()), "ok");
+    }
+
+    #[test]
     fn parse_budget_controls_entity_reference_occurrences() {
         // XML 1.0 section 4.1 defines reference syntax but no occurrence ceiling; this is a
         // caller-selected resource limit rather than malformed XML.
@@ -4544,6 +4624,56 @@ mod parser_boundary_tests {
         )
         .expect_err("the same ID on distinct owners remains invalid");
         assert!(error.to_string().contains("duplicate XML ID"));
+    }
+
+    #[test]
+    fn defaulted_xml_id_is_processed_atomically() {
+        // xml:id 1.0 section 4 applies to attributes added to the infoset by default and requires
+        // normalization before ID assignment: https://www.w3.org/TR/xml-id/#processing
+        let mut document = Document::parse("<root><first/><second/></root>", None)
+            .expect("source document parses");
+        let elements = document
+            .nodes()
+            .filter_map(|(id, node)| match &node.kind {
+                NodeKind::Element { name, .. } if name.local != "root" => Some(id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [first, second] = elements.as_slice() else {
+            panic!("two child elements exist");
+        };
+        let (first, second) = (*first, *second);
+        let xml_id = |value: &str| Attribute {
+            name: ExpandedName::new(Some("http://www.w3.org/XML/1998/namespace"), "id"),
+            prefix: Some("xml".into()),
+            value: value.into(),
+        };
+
+        document
+            .add_default_attribute(first, xml_id("  target  "))
+            .expect("defaulted xml:id is accepted");
+        assert!(document.ids().any(|(value, root, owner)| value == "target"
+            && root == document.root()
+            && owner == first));
+        let first_attributes = match &document.node(first).expect("first remains present").kind {
+            NodeKind::Element { attributes, .. } => attributes,
+            _ => panic!("first remains an element"),
+        };
+        assert_eq!(first_attributes[0].value, "target");
+
+        let invalid = document
+            .add_default_attribute(second, xml_id("not valid"))
+            .expect_err("invalid defaulted xml:id is rejected");
+        assert!(invalid.to_string().contains("NCName"));
+        let duplicate = document
+            .add_default_attribute(second, xml_id("target"))
+            .expect_err("duplicate defaulted xml:id is rejected");
+        assert!(duplicate.to_string().contains("duplicate XML ID"));
+        let second_attributes = match &document.node(second).expect("second remains present").kind {
+            NodeKind::Element { attributes, .. } => attributes,
+            _ => panic!("second remains an element"),
+        };
+        assert!(second_attributes.is_empty(), "failed additions are atomic");
     }
 
     #[test]

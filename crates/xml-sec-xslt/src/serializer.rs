@@ -425,6 +425,10 @@ fn render(
             text.push('\n');
         }
     }
+    // XSLT 1.0 section 16.1 says an effective indent=no "should not" add whitespace, rather
+    // than imposing a must-not requirement. Pinned libxslt appends this final newline when
+    // `indent` is omitted but suppresses it for explicit indent=no, so preserve that observable
+    // compatibility distinction: https://www.w3.org/TR/1999/REC-xslt-19991116#output
     if definition.method != OutputMethod::Text
         && !(definition.indent_explicit && !definition.indent)
     {

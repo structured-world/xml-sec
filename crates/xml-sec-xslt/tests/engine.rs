@@ -10826,6 +10826,26 @@ fn output_declarations_obey_content_and_forward_compatibility_rules() {
 }
 
 #[test]
+fn forward_compatible_output_ignores_the_whole_invalid_cdata_name_list() {
+    // XSLT 1.0 section 2.5 ignores an optional attribute whose value is not allowed in
+    // forward-compatible mode; no valid prefix of that one attribute may take effect.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#forwards
+    let strict = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output cdata-section-elements="valid missing:name"/></xsl:stylesheet>"#;
+    assert!(matches!(
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(4096, 0, 32, 64 * 1024),
+        )
+        .compile(strict, None),
+        Err(Error::Static(message)) if message.contains("unbound prefix")
+    ));
+
+    let forward = strict.replace("version=\"1.0\"", "version=\"2.0\"");
+    let output = compile(&forward).output_definition().clone();
+    assert!(output.cdata_section_elements.is_empty());
+}
+
+#[test]
 fn compiler_unions_cdata_output_names_across_import_precedence() {
     // XSLT 1.0 section 16 explicitly unions cdata-section-elements across every xsl:output;
     // unlike scalar output properties, lower-import-precedence values remain effective.

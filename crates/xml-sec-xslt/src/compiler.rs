@@ -3664,9 +3664,17 @@ fn merge_output(
         );
     }
     if let Some(v) = node.attribute("cdata-section-elements") {
-        for name in v.split_ascii_whitespace() {
-            out.cdata_section_elements
-                .insert(required_cdata_output_qname(node, name)?);
+        let names = v
+            .split_ascii_whitespace()
+            .map(|name| required_cdata_output_qname(node, name))
+            .collect::<Result<Vec<_>>>();
+        match names {
+            Ok(names) => out.cdata_section_elements.extend(names),
+            // Section 2.5 ignores the optional attribute as one property in FCP. Parsing before
+            // mutation prevents a valid prefix of an invalid QName list from leaking through.
+            // https://www.w3.org/TR/1999/REC-xslt-19991116#forwards
+            Err(_) if forward => {}
+            Err(error) => return Err(error),
         }
     }
     Ok(())

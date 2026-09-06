@@ -7,7 +7,6 @@
 
 use alloc::{
     borrow::{Cow, ToOwned},
-    collections::VecDeque,
     format,
     string::{String, ToString},
     vec::Vec,
@@ -175,7 +174,7 @@ pub enum Event<'a> {
 pub struct Scanner<'a> {
     input: &'a str,
     tokenizer: xmlparser::Tokenizer<'a>,
-    pending: VecDeque<Event<'a>>,
+    pending_text: Option<PendingText<'a>>,
     pending_start: Option<PendingStart<'a>>,
     dtd_start: Option<(usize, &'a str)>,
 }
@@ -184,6 +183,12 @@ struct PendingStart<'a> {
     name: Name<'a>,
     attributes: Vec<Attribute<'a>>,
     start: usize,
+}
+
+struct PendingText<'a> {
+    text: &'a str,
+    range: Range<usize>,
+    offset: usize,
 }
 
 fn validate_unique_attributes(attributes: &mut [Attribute<'_>]) -> Result<(), Error> {
@@ -226,7 +231,7 @@ impl<'a> Scanner<'a> {
         Self {
             input,
             tokenizer: xmlparser::Tokenizer::from(input),
-            pending: VecDeque::new(),
+            pending_text: None,
             pending_start: None,
             dtd_start: None,
         }
@@ -234,7 +239,7 @@ impl<'a> Scanner<'a> {
 
     /// Return the next event, or `None` at end of input.
     pub fn next_event(&mut self) -> Result<Option<Event<'a>>, Error> {
-        if let Some(event) = self.pending.pop_front() {
+        if let Some(event) = self.next_text_event()? {
             return Ok(Some(event));
         }
         loop {
@@ -369,8 +374,12 @@ impl<'a> Scanner<'a> {
                     }
                 },
                 Token::Text { text } => {
-                    self.split_text(text.as_str(), text.range())?;
-                    if let Some(event) = self.pending.pop_front() {
+                    self.pending_text = Some(PendingText {
+                        text: text.as_str(),
+                        range: text.range(),
+                        offset: 0,
+                    });
+                    if let Some(event) = self.next_text_event()? {
                         return Ok(Some(event));
                     }
                 }
@@ -384,36 +393,42 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    fn split_text(&mut self, text: &'a str, range: Range<usize>) -> Result<(), Error> {
-        let mut offset = 0;
-        while let Some(relative) = text[offset..].find('&') {
-            let start = offset + relative;
-            if start > offset {
-                self.pending.push_back(Event::Text {
-                    text: &text[offset..start],
-                    range: range.start + offset..range.start + start,
-                });
-            }
-            let Some(relative_end) = text[start + 1..].find(';') else {
-                self.pending.clear();
-                return Err(Error::malformed(
-                    "unterminated XML reference in character data",
-                ));
+    fn next_text_event(&mut self) -> Result<Option<Event<'a>>, Error> {
+        let Some(mut pending) = self.pending_text.take() else {
+            return Ok(None);
+        };
+        let tail = &pending.text[pending.offset..];
+        let Some(relative) = tail.find('&') else {
+            return Ok((!tail.is_empty()).then_some(Event::Text {
+                text: tail,
+                range: pending.range.start + pending.offset..pending.range.end,
+            }));
+        };
+        let start = pending.offset + relative;
+        if start > pending.offset {
+            let event = Event::Text {
+                text: &pending.text[pending.offset..start],
+                range: pending.range.start + pending.offset..pending.range.start + start,
             };
-            let end = start + 1 + relative_end;
-            self.pending.push_back(Event::Reference {
-                name: &text[start + 1..end],
-                range: range.start + start..range.start + end + 1,
-            });
-            offset = end + 1;
+            pending.offset = start;
+            self.pending_text = Some(pending);
+            return Ok(Some(event));
         }
-        if offset < text.len() {
-            self.pending.push_back(Event::Text {
-                text: &text[offset..],
-                range: range.start + offset..range.end,
-            });
+        let Some(relative_end) = pending.text[start + 1..].find(';') else {
+            return Err(Error::malformed(
+                "unterminated XML reference in character data",
+            ));
+        };
+        let end = start + 1 + relative_end;
+        let event = Event::Reference {
+            name: &pending.text[start + 1..end],
+            range: pending.range.start + start..pending.range.start + end + 1,
+        };
+        pending.offset = end + 1;
+        if pending.offset < pending.text.len() {
+            self.pending_text = Some(pending);
         }
-        Ok(())
+        Ok(Some(event))
     }
 
     /// Original scanner input.
@@ -727,6 +742,34 @@ mod tests {
         assert!(matches!(&events[3], Event::Reference { name: "#x62", .. }));
         assert!(matches!(&events[4], Event::CData { text: "c", .. }));
         assert!(matches!(&events[5], Event::End { .. }));
+    }
+
+    #[test]
+    fn scanner_streams_dense_reference_runs_without_buffering_events() {
+        // One borrowed lexical event must be produced per pull. A source-sized reference run
+        // cannot amplify into an event queue before the consumer sees its first reference.
+        let xml = format!("<root>{}</root>", "&amp;".repeat(4096));
+        let mut scanner = Scanner::new(&xml);
+        assert!(matches!(
+            scanner.next_event().expect("scan root start"),
+            Some(Event::Start(_))
+        ));
+        assert!(matches!(
+            scanner.next_event().expect("scan first reference"),
+            Some(Event::Reference { name: "amp", .. })
+        ));
+        assert_eq!(
+            scanner.pending_text.as_ref().map(|pending| pending.offset),
+            Some("&amp;".len()),
+            "the scanner retains only a cursor into the source token"
+        );
+        assert_eq!(
+            std::iter::from_fn(|| scanner.next_event().transpose())
+                .collect::<Result<Vec<_>, _>>()
+                .expect("remaining references scan")
+                .len(),
+            4096
+        );
     }
 
     #[test]
