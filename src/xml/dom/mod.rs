@@ -201,6 +201,13 @@ pub enum ParseError {
         /// First observed depth beyond the ceiling.
         actual: usize,
     },
+    /// The absolute in-scope namespace-binding ceiling was exceeded.
+    NamespaceBindingLimitReached {
+        /// Maximum accepted user-declared bindings in scope at once.
+        maximum: usize,
+        /// First in-scope binding count beyond the ceiling.
+        actual: usize,
+    },
     /// The selected backend rejected malformed XML.
     Backend {
         /// Compile-time selected backend name.
@@ -250,6 +257,10 @@ impl fmt::Display for ParseError {
                     "XML depth limit {maximum} exceeded at depth {actual}"
                 )
             }
+            Self::NamespaceBindingLimitReached { maximum, actual } => write!(
+                formatter,
+                "XML namespace binding limit {maximum} exceeded at {actual} active bindings"
+            ),
             Self::Backend { backend, message } => {
                 write!(formatter, "{backend} rejected XML: {message}")
             }

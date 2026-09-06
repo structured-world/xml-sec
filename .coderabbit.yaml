@@ -1,0 +1,4 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+reviews:
+  path_filters:
+    - "!crates/xml-sec-xslt/tests/fixtures/libxslt-1.1.45/upstream/**"
