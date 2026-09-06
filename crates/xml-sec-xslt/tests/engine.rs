@@ -87,6 +87,36 @@ fn xpath_internal_work_obeys_its_aggregate_budget() {
 }
 
 #[test]
+fn scalar_xpath_evaluation_consumes_operation_budget() {
+    // Even a scalar shortcut executes one XPath primitive and must not bypass a caller that denies
+    // all XPath operation work.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:if test="true()"><out/></xsl:if></xsl:template></xsl:stylesheet>"#,
+    );
+    let source_xml = "<root/>";
+    let source = Document::parse(source_xml, None).expect("source parses");
+    let mut budget = execution_budget(source_xml.len());
+    budget.xpath_operations = 0;
+
+    assert!(matches!(
+        stylesheet.execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::XPathOperations,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn identity_xpath_shortcuts_obey_the_operation_budget() {
     // Optimized identity selections must charge the same examined/inserted node work as the
     // general XPath evaluator instead of bypassing the operation policy.

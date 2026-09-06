@@ -2036,6 +2036,11 @@ impl Evaluator {
         let (xpath_operations, xpath_operations_limit) =
             meter.usage(BudgetKind::XPathOperations)?;
         context.set_evaluation_work_limit(xpath_operations_limit.saturating_sub(xpath_operations));
+        let (extension_operations, extension_operations_limit) =
+            meter.usage(BudgetKind::ExtensionOperations)?;
+        context.set_extension_work_limit(
+            extension_operations_limit.saturating_sub(extension_operations),
+        );
         for (prefix, uri) in expression.namespaces.iter() {
             context.set_namespace(prefix, uri);
         }
@@ -2219,11 +2224,22 @@ impl Evaluator {
         let generated_id_bytes_before = self.generated_ids.borrow().owned_bytes;
         let evaluation = xpath.evaluate(&context, context_node);
         meter.charge(BudgetKind::XPathOperations, context.evaluation_work_used())?;
+        meter.charge(
+            BudgetKind::ExtensionOperations,
+            context.extension_work_used(),
+        )?;
         if let Some(attempted) = context.evaluation_work_exceeded() {
             return Err(Error::Budget {
                 kind: BudgetKind::XPathOperations,
                 limit: xpath_operations_limit,
                 actual: xpath_operations.saturating_add(attempted),
+            });
+        }
+        if let Some(attempted) = context.extension_work_exceeded() {
+            return Err(Error::Budget {
+                kind: BudgetKind::ExtensionOperations,
+                limit: extension_operations_limit,
+                actual: extension_operations.saturating_add(attempted),
             });
         }
         let generated_id_bytes = self
@@ -6667,6 +6683,7 @@ impl function::Function for ExsltCryptoFunction {
                     })?;
                 context.reserve_string_allocation(workspace_bytes)?;
                 let value = value.into_string();
+                context.charge_extension_work(value.len())?;
                 let output = match self {
                     Self::Md5 => hex_encode(&md5::Md5::digest(value.as_bytes())),
                     Self::Sha1 => hex_encode(&sha1::Sha1::digest(value.as_bytes())),
@@ -6715,6 +6732,7 @@ impl function::Function for ExsltCryptoFunction {
                 context.reserve_string_allocation(workspace_bytes)?;
                 let key = key.into_string();
                 let input = input.into_string();
+                context.charge_extension_work(input.len().saturating_add(256))?;
                 let input = if matches!(self, Self::Rc4Decrypt) {
                     hex_decode(&input)?
                 } else {
@@ -7120,7 +7138,11 @@ impl function::Function for ExsltStringFunction {
                 let value = args.next().expect("arity checked above").into_string();
                 let escape_reserved = args.next().expect("arity checked above").into_boolean();
                 let encoding_label = args.next().map(SxdValue::into_string);
-                let encoding = uri_encoding(encoding_label.as_deref(), "str:encode-uri()")?;
+                let encoding = uri_encoding(
+                    encoding_label.as_deref(),
+                    "str:encode-uri()",
+                    UriEncodingCapability::Encode,
+                )?;
                 let Some(encoded_len) = percent_encoded_uri_len(&value, escape_reserved, encoding)?
                 else {
                     // EXSLT defines characters outside the requested encoding repertoire as a
@@ -7151,7 +7173,11 @@ impl function::Function for ExsltStringFunction {
                 let mut args = args.into_iter();
                 let value = args.next().expect("arity checked above").into_string();
                 let encoding_label = args.next().map(SxdValue::into_string);
-                let encoding = uri_encoding(encoding_label.as_deref(), "str:decode-uri()")?;
+                let encoding = uri_encoding(
+                    encoding_label.as_deref(),
+                    "str:decode-uri()",
+                    UriEncodingCapability::Decode,
+                )?;
                 let Some(decoded_len) = percent_decoded_uri_len(&value)? else {
                     // EXSLT defines malformed percent triplets as a successful empty result,
                     // rather than a dynamic XPath error or literal passthrough.
@@ -7359,15 +7385,28 @@ enum UriEncoding {
     Registered(xml_sec_xml_input::IanaSingleByteEncoding),
 }
 
+#[derive(Clone, Copy)]
+enum UriEncodingCapability {
+    Encode,
+    Decode,
+}
+
 fn uri_encoding(
     label: Option<&str>,
     function_name: &str,
+    capability: UriEncodingCapability,
 ) -> std::result::Result<UriEncoding, function::Error> {
     label.map_or(Ok(UriEncoding::Standard(encoding_rs::UTF_8)), |label| {
         if let Some(encoding) = xml_sec_xml_input::registered_single_byte_encoding(label) {
             return Ok(UriEncoding::Registered(encoding));
         }
-        encoding_rs::Encoding::for_label(label.as_bytes())
+        let encoding = match capability {
+            UriEncodingCapability::Encode => {
+                encoding_rs::Encoding::for_label_no_replacement(label.as_bytes())
+            }
+            UriEncodingCapability::Decode => encoding_rs::Encoding::for_label(label.as_bytes()),
+        };
+        encoding
             .filter(|encoding| xml_sec_xml_input::legacy_label_matches_encoding(label, encoding))
             .map(UriEncoding::Standard)
             .ok_or_else(|| function::Error::Other {
@@ -9992,6 +10031,39 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn uri_encoder_rejects_decoder_only_encodings() {
+        for label in ["replacement", "ISO-2022-KR"] {
+            assert!(
+                uri_encoding(
+                    Some(label),
+                    "str:encode-uri()",
+                    UriEncodingCapability::Encode,
+                )
+                .is_err(),
+                "accepted decoder-only encoding {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn exslt_hashes_charge_cryptographic_work() {
+        let package = Package::new();
+        let document = package.as_document();
+        let mut context = Context::new();
+        context.set_extension_work_limit(0);
+        let evaluation =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+
+        for function in [ExsltCryptoFunction::Md5, ExsltCryptoFunction::Sha1] {
+            assert!(
+                function
+                    .evaluate(&evaluation, vec![SxdValue::String("payload".into())])
+                    .is_err()
+            );
+        }
     }
 
     #[test]

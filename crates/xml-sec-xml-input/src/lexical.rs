@@ -668,6 +668,7 @@ impl<W: Write> Writer<W> {
     ) -> std::io::Result<()> {
         validate_writer_qname(name)?;
         let attributes = attributes.into_iter().collect::<Vec<_>>();
+        validate_writer_element_namespace(name, &attributes, &self.namespace_frames)?;
         validate_writer_attributes(&attributes, &self.namespace_frames)?;
         write!(self.output, "<{name}")?;
         for (attribute, value) in &attributes {
@@ -722,6 +723,7 @@ fn validate_writer_attributes(
     for (name, value) in attributes {
         validate_writer_qname(name)?;
         validate_writer_characters(value)?;
+        validate_writer_namespace_declaration(name, value)?;
     }
     if attributes.len() <= SMALL_TAG_ATTRIBUTES {
         for index in 1..attributes.len() {
@@ -763,11 +765,68 @@ fn validate_writer_attributes(
                     format!("unbound XML namespace prefix `{prefix}`"),
                 )
             })?;
+        if namespace.is_empty() {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                format!("unbound XML namespace prefix `{prefix}`"),
+            ));
+        }
         if !expanded.insert((Some(namespace), local)) {
             return duplicate_expanded_attribute(name);
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "std")]
+fn validate_writer_element_namespace(
+    name: &str,
+    attributes: &[(&str, &str)],
+    namespace_frames: &[Vec<(String, String)>],
+) -> std::io::Result<()> {
+    let Some((prefix, _)) = name.split_once(':') else {
+        return Ok(());
+    };
+    // Namespaces in XML 1.0 sections 2.2 and 5 require a non-empty namespace binding for every
+    // prefixed element name.
+    // https://www.w3.org/TR/xml-names/#iri-use https://www.w3.org/TR/xml-names/#ns-using
+    if prefix == "xmlns"
+        || resolve_writer_prefix(prefix, attributes, namespace_frames).is_none_or(str::is_empty)
+    {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            format!("unbound XML namespace prefix `{prefix}`"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "std")]
+fn validate_writer_namespace_declaration(name: &str, uri: &str) -> std::io::Result<()> {
+    const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
+    const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
+
+    let Some(prefix) = namespace_declaration(name) else {
+        return Ok(());
+    };
+    // Namespaces in XML 1.0 section 3 reserves both namespace names and their prefixes. Only the
+    // fixed xml -> XML namespace binding is legal; xmlns itself cannot be declared.
+    // https://www.w3.org/TR/xml-names/#ns-decl
+    let valid = if prefix == "xml" {
+        uri == XML_NAMESPACE
+    } else if prefix == "xmlns" {
+        false
+    } else {
+        uri != XML_NAMESPACE && uri != XMLNS_NAMESPACE && (prefix.is_empty() || !uri.is_empty())
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(IoError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid XML namespace declaration `{name}={uri}`"),
+        ))
+    }
 }
 
 #[cfg(feature = "std")]
@@ -1061,6 +1120,35 @@ mod tests {
                 ],
             )
             .expect("different expanded names remain legal");
+    }
+
+    #[test]
+    fn writer_rejects_invalid_element_namespace_bindings_before_output() {
+        // Namespaces in XML 1.0 sections 3 and 5 reserve xml/xmlns and require every other
+        // element prefix to be declared: https://www.w3.org/TR/xml-names/#ns-decl and
+        // https://www.w3.org/TR/xml-names/#ns-using
+        for (name, attributes) in [
+            ("p:root", Vec::new()),
+            ("root", vec![("xmlns:xml", "urn:wrong")]),
+            ("root", vec![("xmlns:xmlns", "urn:wrong")]),
+        ] {
+            let mut writer = Writer::new(Vec::new());
+            assert!(writer.empty(name, attributes).is_err(), "accepted {name}");
+            assert!(writer.into_inner().is_empty());
+        }
+
+        let mut writer = Writer::new(Vec::new());
+        writer
+            .empty("p:root", [("xmlns:p", "urn:bound")])
+            .expect("a same-tag namespace declaration binds the element prefix");
+
+        let mut writer = Writer::new(Vec::new());
+        writer
+            .start("root", [("xmlns:p", "urn:bound")])
+            .expect("parent namespace declaration is valid");
+        writer
+            .empty("p:child", [])
+            .expect("an inherited namespace declaration binds the child prefix");
     }
 
     #[test]

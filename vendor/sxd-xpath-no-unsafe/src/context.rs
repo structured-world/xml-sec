@@ -80,7 +80,8 @@ pub struct Context<'d> {
     variables: Variables<'d>,
     namespaces: Namespaces,
     string_allocations: StringAllocationBudget,
-    evaluation_work: EvaluationWorkBudget,
+    evaluation_work: WorkBudget,
+    extension_work: WorkBudget,
     document_root_resolver: Option<fn(Node<'d>) -> Node<'d>>,
 }
 
@@ -92,7 +93,7 @@ struct StringAllocationBudget {
 }
 
 #[derive(Default)]
-struct EvaluationWorkBudget {
+struct WorkBudget {
     limit: Option<usize>,
     used: Cell<usize>,
     exceeded: Cell<Option<usize>>,
@@ -113,7 +114,8 @@ impl<'d> Context<'d> {
             variables: Default::default(),
             namespaces: Default::default(),
             string_allocations: StringAllocationBudget::default(),
-            evaluation_work: EvaluationWorkBudget::default(),
+            evaluation_work: WorkBudget::default(),
+            extension_work: WorkBudget::default(),
             document_root_resolver: None,
         }
     }
@@ -154,6 +156,23 @@ impl<'d> Context<'d> {
     /// Return the first attempted total beyond the current work limit.
     pub fn evaluation_work_exceeded(&self) -> Option<usize> {
         self.evaluation_work.exceeded.get()
+    }
+
+    /// Limit work performed inside extension functions.
+    pub fn set_extension_work_limit(&mut self, limit: usize) {
+        self.extension_work.limit = Some(limit);
+        self.extension_work.used.set(0);
+        self.extension_work.exceeded.set(None);
+    }
+
+    /// Return extension work successfully charged by the current evaluation.
+    pub fn extension_work_used(&self) -> usize {
+        self.extension_work.used.get()
+    }
+
+    /// Return the first attempted total beyond the extension-work limit.
+    pub fn extension_work_exceeded(&self) -> Option<usize> {
+        self.extension_work.exceeded.get()
     }
 
     /// Reserve bytes in the context-scoped temporary allocation budget.
@@ -213,7 +232,8 @@ pub struct Evaluation<'c, 'd> {
     variables: &'c Variables<'d>,
     namespaces: &'c Namespaces,
     string_allocations: &'c StringAllocationBudget,
-    evaluation_work: &'c EvaluationWorkBudget,
+    evaluation_work: &'c WorkBudget,
+    extension_work: &'c WorkBudget,
     document_root_resolver: Option<fn(Node<'d>) -> Node<'d>>,
 }
 
@@ -230,6 +250,7 @@ impl<'c, 'd> Evaluation<'c, 'd> {
             namespaces: &context.namespaces,
             string_allocations: &context.string_allocations,
             evaluation_work: &context.evaluation_work,
+            extension_work: &context.extension_work,
             document_root_resolver: context.document_root_resolver,
             position: 1,
             size: 1,
@@ -286,21 +307,20 @@ impl<'c, 'd> Evaluation<'c, 'd> {
 
     /// Charge primitive XPath evaluation work before performing it.
     pub fn charge_work(&self, units: usize) -> Result<(), function::Error> {
-        let actual = self.evaluation_work.used.get().saturating_add(units);
-        if self
-            .evaluation_work
-            .limit
-            .is_some_and(|limit| actual > limit)
-        {
-            if self.evaluation_work.exceeded.get().is_none() {
-                self.evaluation_work.exceeded.set(Some(actual));
-            }
-            return Err(function::Error::Other {
-                what: "XPath evaluation work budget exceeded".into(),
-            });
-        }
-        self.evaluation_work.used.set(actual);
-        Ok(())
+        charge_work_budget(
+            self.evaluation_work,
+            units,
+            "XPath evaluation work budget exceeded",
+        )
+    }
+
+    /// Charge extension-internal work before performing it.
+    pub fn charge_extension_work(&self, units: usize) -> Result<(), function::Error> {
+        charge_work_budget(
+            self.extension_work,
+            units,
+            "XPath extension work budget exceeded",
+        )
     }
 
     /// Yields a new `Evaluation` context for each node in the nodeset.
@@ -312,6 +332,31 @@ impl<'c, 'd> Evaluation<'c, 'd> {
             size: sz,
         }
     }
+}
+
+fn charge_work_budget(
+    budget: &WorkBudget,
+    units: usize,
+    message: &'static str,
+) -> Result<(), function::Error> {
+    let Some(actual) = budget.used.get().checked_add(units) else {
+        if budget.exceeded.get().is_none() {
+            budget.exceeded.set(Some(usize::MAX));
+        }
+        return Err(function::Error::Other {
+            what: message.into(),
+        });
+    };
+    if budget.limit.is_some_and(|limit| actual > limit) {
+        if budget.exceeded.get().is_none() {
+            budget.exceeded.set(Some(actual));
+        }
+        return Err(function::Error::Other {
+            what: message.into(),
+        });
+    }
+    budget.used.set(actual);
+    Ok(())
 }
 
 fn reserve_allocation(
@@ -375,5 +420,28 @@ mod tests {
         assert!(evaluation.charge_work(5).is_err());
         assert!(evaluation.charge_work(9).is_err());
         assert_eq!(context.evaluation_work_exceeded(), Some(5));
+    }
+
+    #[test]
+    fn extension_work_budget_preserves_first_exceeded_total() {
+        let mut context = Context::new();
+        context.set_extension_work_limit(4);
+        let package = sxd_document_no_unsafe::Package::new();
+        let evaluation = super::Evaluation::new(&context, package.as_document().root().into());
+
+        assert!(evaluation.charge_extension_work(5).is_err());
+        assert!(evaluation.charge_extension_work(9).is_err());
+        assert_eq!(context.extension_work_exceeded(), Some(5));
+    }
+
+    #[test]
+    fn work_budget_rejects_counter_overflow() {
+        let mut context = Context::new();
+        context.set_evaluation_work_limit(usize::MAX);
+        let package = sxd_document_no_unsafe::Package::new();
+        let evaluation = super::Evaluation::new(&context, package.as_document().root().into());
+
+        assert!(evaluation.charge_work(usize::MAX).is_ok());
+        assert!(evaluation.charge_work(1).is_err());
     }
 }

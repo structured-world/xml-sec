@@ -587,7 +587,7 @@ fn is_utf32_encoding(encoding: SelectedEncoding) -> bool {
 
 fn declaration_from_ascii_bytes(bytes: &[u8]) -> Result<Option<(Range<usize>, &str)>, Error> {
     let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
-    if !bytes.starts_with(b"<?xml") {
+    if !bytes.starts_with(b"<?xml") || !bytes.get(5).is_some_and(u8::is_ascii_whitespace) {
         return Ok(None);
     }
     let end = bytes
@@ -784,6 +784,17 @@ mod tests {
             decode_xml(&utf16, None),
             Err(Error::MalformedDeclaration("missing `=`"))
         ));
+    }
+
+    #[test]
+    fn xml_prefixed_processing_instruction_is_not_a_declaration() {
+        // XML 1.0 sections 2.6 and 2.8 distinguish PI targets from XMLDecl by the mandatory
+        // whitespace after `xml`: https://www.w3.org/TR/xml/#sec-prolog-dtd
+        let bytes = b"<?xml-stylesheet title='caf\xE9'?><root/>";
+        assert_eq!(
+            decode_xml(bytes, Some("windows-1252")).expect("PI follows resolver encoding"),
+            "<?xml-stylesheet title='caf\u{e9}'?><root/>"
+        );
     }
 
     #[test]

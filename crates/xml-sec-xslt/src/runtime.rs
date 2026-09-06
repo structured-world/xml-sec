@@ -2400,6 +2400,7 @@ impl<'a> Execution<'a> {
         size: usize,
     ) -> Result<XPathValue> {
         self.meter.charge(BudgetKind::XPathEvaluations, 1)?;
+        self.meter.charge(BudgetKind::XPathOperations, 1)?;
         self.evaluate_after_charge(expression, node, position, size)
     }
 
@@ -2485,12 +2486,14 @@ impl<'a> Execution<'a> {
                 initialized?;
                 (variables, reserved_owned_bytes) = self.variables()?;
                 self.meter.charge(BudgetKind::XPathEvaluations, 1)?;
+                self.meter.charge(BudgetKind::XPathOperations, 1)?;
                 continue;
             }
             dynamic_variables.release(&mut self.meter);
             if let Some((key_slot, logical_root)) = self.evaluator.take_dynamic_key_request() {
                 self.build_key_slot(key_slot, logical_root)?;
                 self.meter.charge(BudgetKind::XPathEvaluations, 1)?;
+                self.meter.charge(BudgetKind::XPathOperations, 1)?;
                 continue;
             }
             if uses_key && self.evaluator.source.logical_roots().len() != document_count {
@@ -2531,6 +2534,7 @@ impl<'a> Execution<'a> {
             // Resuming replays the expression from its root. Account for every replay rather than
             // letting user-defined function count bypass the XPath evaluation budget.
             self.meter.charge(BudgetKind::XPathEvaluations, 1)?;
+            self.meter.charge(BudgetKind::XPathOperations, 1)?;
         }
     }
 
