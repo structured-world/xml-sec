@@ -821,11 +821,12 @@ impl Document {
                         "gt" => ">".into(),
                         "lt" => "<".into(),
                         "quot" => "\"".into(),
-                        value if value.starts_with("#x") => {
-                            decode_xml_character_reference(&value[2..], 16)?
-                        }
                         value if value.starts_with('#') => {
-                            decode_xml_character_reference(&value[1..], 10)?
+                            xml_sec_xml_input::lexical::decode_numeric_character_reference(
+                                &value[1..],
+                            )
+                            .map(String::from)
+                            .map_err(|_| Error::Xml("invalid character reference".into()))?
                         }
                         name => {
                             return Err(Error::Xml(format!(
@@ -1964,15 +1965,6 @@ fn push_escaped_xml_attribute_value(output: &mut String, value: &str) {
             _ => output.push(character),
         }
     }
-}
-
-fn decode_xml_character_reference(digits: &str, radix: u32) -> Result<String> {
-    u32::from_str_radix(digits, radix)
-        .ok()
-        .and_then(char::from_u32)
-        .filter(|character| crate::lexical::is_xml10_character(*character))
-        .map(String::from)
-        .ok_or_else(|| Error::Xml("invalid character reference".into()))
 }
 
 fn normalize_xml_line_endings(value: &str) -> String {
@@ -3233,10 +3225,8 @@ fn validate_attribute_value_references(value: &str) -> Result<()> {
                 Error::Xml("ATTLIST default value has an unterminated reference".into())
             })?;
         let reference = &value[cursor..end];
-        let valid = if let Some(digits) = reference.strip_prefix("#x") {
-            valid_xml_character_reference(digits, 16)
-        } else if let Some(digits) = reference.strip_prefix('#') {
-            valid_xml_character_reference(digits, 10)
+        let valid = if let Some(reference) = reference.strip_prefix('#') {
+            valid_xml_character_reference(reference)
         } else {
             crate::lexical::is_xml_name(reference)
         };
@@ -3391,10 +3381,8 @@ fn validate_entity_value(name: &str, value: &str, parameter: bool) -> Result<()>
             let reference = &value[cursor + 1..end];
             let valid = if character == '%' {
                 crate::lexical::is_xml_name(reference)
-            } else if let Some(digits) = reference.strip_prefix("#x") {
-                valid_xml_character_reference(digits, 16)
-            } else if let Some(digits) = reference.strip_prefix('#') {
-                valid_xml_character_reference(digits, 10)
+            } else if let Some(reference) = reference.strip_prefix('#') {
+                valid_xml_character_reference(reference)
             } else {
                 crate::lexical::is_xml_name(reference)
             };
@@ -3411,11 +3399,8 @@ fn validate_entity_value(name: &str, value: &str, parameter: bool) -> Result<()>
     Ok(())
 }
 
-fn valid_xml_character_reference(digits: &str, radix: u32) -> bool {
-    u32::from_str_radix(digits, radix)
-        .ok()
-        .and_then(char::from_u32)
-        .is_some_and(crate::lexical::is_xml10_character)
+fn valid_xml_character_reference(reference: &str) -> bool {
+    xml_sec_xml_input::lexical::decode_numeric_character_reference(reference).is_ok()
 }
 
 fn normalize_predefined_entity_declaration(name: &str, value: String) -> Result<String> {
@@ -3614,14 +3599,9 @@ fn decode_parameter_character_references<'a>(
                 Error::Xml("unterminated parameter entity character reference".into())
             })?;
         let reference = &value[start + 2..end];
-        let (digits, radix) = reference
-            .strip_prefix('x')
-            .map_or((reference, 10), |digits| (digits, 16));
-        let character = u32::from_str_radix(digits, radix)
-            .ok()
-            .and_then(char::from_u32)
-            .filter(|character| crate::lexical::is_xml10_character(*character))
-            .ok_or_else(|| Error::Xml("invalid parameter entity character reference".into()))?;
+        let character =
+            xml_sec_xml_input::lexical::decode_numeric_character_reference(reference)
+                .map_err(|_| Error::Xml("invalid parameter entity character reference".into()))?;
         output.push(character);
         cursor = end + 1;
     }
@@ -5306,6 +5286,8 @@ mod parser_boundary_tests {
             r#"<!DOCTYPE r [<!ENTITY % p "x &broken">]><r/>"#,
             r#"<!DOCTYPE r [<!ENTITY % p "x %broken">]><r/>"#,
             r#"<!DOCTYPE r [<!ENTITY % p "&#0;">]><r/>"#,
+            r#"<!DOCTYPE r [<!ENTITY e "&#+65;">]><r>&e;</r>"#,
+            r#"<!DOCTYPE r [<!ENTITY e "&#X41;">]><r>&e;</r>"#,
             "<!DOCTYPE r [<!ENTITY % p \"x\"\u{000b}>]><r/>",
             "<!DOCTYPE r [<!ENTITY % p \"x\"\u{000c}>]><r/>",
         ] {

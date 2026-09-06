@@ -302,13 +302,32 @@ impl<'d> Node<'d> {
         &self,
         context: &crate::context::Evaluation<'_, '_>,
     ) -> Result<String, crate::function::Error> {
+        self.string_value_with_meter(context, StringValueWork::XPath)
+    }
+
+    /// Returns the string value while charging traversal to extension-internal work.
+    pub fn string_value_with_extension_context(
+        &self,
+        context: &crate::context::Evaluation<'_, '_>,
+    ) -> Result<String, crate::function::Error> {
+        self.string_value_with_meter(context, StringValueWork::Extension)
+    }
+
+    fn string_value_with_meter(
+        &self,
+        context: &crate::context::Evaluation<'_, '_>,
+        work: StringValueWork,
+    ) -> Result<String, crate::function::Error> {
         if !matches!(self, Node::Root(_) | Node::Element(_)) {
             let length = self.string_value_len();
+            if work == StringValueWork::Extension {
+                context.charge_extension_work(length.max(1))?;
+            }
             context.reserve_string_allocation(length)?;
             return Ok(self.string_value_with_capacity(length));
         }
         let mut result = String::new();
-        visit_descendant_text_metered(self, context, |text| {
+        visit_descendant_text_metered(self, context, work, |text| {
             let required = result.len().checked_add(text.len()).ok_or_else(|| {
                 crate::function::Error::Other {
                     what: "XPath string value exceeds addressable memory".into(),
@@ -392,7 +411,7 @@ impl<'d> Node<'d> {
         let matches = match self {
             Node::Root(_) | Node::Element(_) => {
                 let mut matches = true;
-                visit_descendant_text_metered(self, context, |text| {
+                visit_descendant_text_metered(self, context, StringValueWork::XPath, |text| {
                     if matches {
                         matches = consume(context, text, &mut remaining)?;
                     }
@@ -516,11 +535,21 @@ fn visit_descendant_text(node: &Node<'_>, mut visit: impl FnMut(&str) -> bool) -
     true
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StringValueWork {
+    XPath,
+    Extension,
+}
+
 fn visit_descendant_text_metered(
     node: &Node<'_>,
     context: &crate::context::Evaluation<'_, '_>,
+    work: StringValueWork,
     mut visit: impl FnMut(&str) -> Result<bool, crate::function::Error>,
 ) -> Result<(), crate::function::Error> {
+    if work == StringValueWork::Extension {
+        context.charge_extension_work(1)?;
+    }
     let frame_bytes = std::mem::size_of::<(Node<'_>, usize)>();
     context.reserve_temporary_allocation(frame_bytes.saturating_mul(4))?;
     let mut stack = Vec::with_capacity(4);
@@ -531,7 +560,21 @@ fn visit_descendant_text_metered(
             continue;
         };
         *next_child += 1;
-        context.charge_work(1)?;
+        let units = if work == StringValueWork::Extension {
+            match &child {
+                Node::Text(text) => sxd_document_no_unsafe::as_str!(text.text())
+                    .len()
+                    .saturating_add(1),
+                _ => 1,
+            }
+        } else {
+            1
+        };
+        if work == StringValueWork::Extension {
+            context.charge_extension_work(units)?;
+        } else {
+            context.charge_work(units)?;
+        }
         match child {
             Node::Root(_) | Node::Element(_) => {
                 reserve_metered_vec_slot(&mut stack, context)?;

@@ -562,8 +562,7 @@ pub fn decode_references(value: &str) -> Result<Cow<'_, str>, Error> {
             "gt" => '>',
             "lt" => '<',
             "quot" => '"',
-            value if value.starts_with("#x") => decode_character(&value[2..], 16)?,
-            value if value.starts_with('#') => decode_character(&value[1..], 10)?,
+            value if value.starts_with('#') => decode_numeric_character_reference(&value[1..])?,
             _ => {
                 return Err(Error::malformed(format!(
                     "unresolved entity reference &{name};"
@@ -577,7 +576,22 @@ pub fn decode_references(value: &str) -> Result<Cow<'_, str>, Error> {
     Ok(Cow::Owned(output))
 }
 
-fn decode_character(digits: &str, radix: u32) -> Result<char, Error> {
+/// Decode the portion of an XML numeric character reference after `&#`.
+///
+/// XML 1.0 section 4.1 permits exactly decimal digits or a lowercase `x` followed by
+/// hexadecimal digits: https://www.w3.org/TR/xml/#sec-references
+pub fn decode_numeric_character_reference(reference: &str) -> Result<char, Error> {
+    let (digits, radix) = reference
+        .strip_prefix('x')
+        .map_or((reference, 10), |digits| (digits, 16));
+    let valid_digits = if radix == 16 {
+        digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+    } else {
+        digits.bytes().all(|byte| byte.is_ascii_digit())
+    };
+    if digits.is_empty() || !valid_digits {
+        return Err(Error::malformed("invalid XML character reference"));
+    }
     u32::from_str_radix(digits, radix)
         .ok()
         .and_then(char::from_u32)
@@ -628,7 +642,13 @@ fn escape(value: &str, attribute: bool) -> Cow<'_, str> {
 #[cfg(feature = "std")]
 pub struct Writer<W> {
     output: W,
-    namespace_frames: Vec<Vec<(String, String)>>,
+    frames: Vec<WriterFrame>,
+}
+
+#[cfg(feature = "std")]
+struct WriterFrame {
+    element_name: String,
+    namespaces: Vec<(String, String)>,
 }
 
 #[cfg(feature = "std")]
@@ -638,7 +658,7 @@ impl<W: Write> Writer<W> {
     pub const fn new(output: W) -> Self {
         Self {
             output,
-            namespace_frames: Vec::new(),
+            frames: Vec::new(),
         }
     }
 
@@ -668,21 +688,22 @@ impl<W: Write> Writer<W> {
     ) -> std::io::Result<()> {
         validate_writer_qname(name)?;
         let attributes = attributes.into_iter().collect::<Vec<_>>();
-        validate_writer_element_namespace(name, &attributes, &self.namespace_frames)?;
-        validate_writer_attributes(&attributes, &self.namespace_frames)?;
+        validate_writer_element_namespace(name, &attributes, &self.frames)?;
+        validate_writer_attributes(&attributes, &self.frames)?;
         write!(self.output, "<{name}")?;
         for (attribute, value) in &attributes {
             write!(self.output, " {attribute}=\"{}\"", escape_attribute(value))?;
         }
         self.output.write_all(if empty { b"/>" } else { b">" })?;
         if !empty {
-            self.namespace_frames.push(
-                attributes
+            self.frames.push(WriterFrame {
+                element_name: name.to_owned(),
+                namespaces: attributes
                     .iter()
                     .filter_map(|(name, uri)| namespace_declaration(name).map(|name| (name, *uri)))
                     .map(|(name, uri)| (name.to_owned(), uri.to_owned()))
                     .collect(),
-            );
+            });
         }
         Ok(())
     }
@@ -690,8 +711,22 @@ impl<W: Write> Writer<W> {
     /// Write a closing tag.
     pub fn end(&mut self, name: &str) -> std::io::Result<()> {
         validate_writer_qname(name)?;
+        // XML 1.0 section 3.1 requires the end-tag Name to match the corresponding start-tag:
+        // https://www.w3.org/TR/xml/#sec-starttags
+        let frame = self.frames.last().ok_or_else(|| {
+            IoError::new(ErrorKind::InvalidInput, "XML end tag has no open element")
+        })?;
+        if frame.element_name != name {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "XML end tag `{name}` does not match open element `{}`",
+                    frame.element_name
+                ),
+            ));
+        }
         write!(self.output, "</{name}>")?;
-        self.namespace_frames.pop();
+        self.frames.pop();
         Ok(())
     }
 
@@ -716,7 +751,7 @@ impl<W: Write> Writer<W> {
 #[cfg(feature = "std")]
 fn validate_writer_attributes(
     attributes: &[(&str, &str)],
-    namespace_frames: &[Vec<(String, String)>],
+    frames: &[WriterFrame],
 ) -> std::io::Result<()> {
     const SMALL_TAG_ATTRIBUTES: usize = 8;
 
@@ -758,13 +793,12 @@ fn validate_writer_attributes(
         if prefix == "xmlns" {
             continue;
         }
-        let namespace =
-            resolve_writer_prefix(prefix, attributes, namespace_frames).ok_or_else(|| {
-                IoError::new(
-                    ErrorKind::InvalidInput,
-                    format!("unbound XML namespace prefix `{prefix}`"),
-                )
-            })?;
+        let namespace = resolve_writer_prefix(prefix, attributes, frames).ok_or_else(|| {
+            IoError::new(
+                ErrorKind::InvalidInput,
+                format!("unbound XML namespace prefix `{prefix}`"),
+            )
+        })?;
         if namespace.is_empty() {
             return Err(IoError::new(
                 ErrorKind::InvalidInput,
@@ -782,7 +816,7 @@ fn validate_writer_attributes(
 fn validate_writer_element_namespace(
     name: &str,
     attributes: &[(&str, &str)],
-    namespace_frames: &[Vec<(String, String)>],
+    frames: &[WriterFrame],
 ) -> std::io::Result<()> {
     let Some((prefix, _)) = name.split_once(':') else {
         return Ok(());
@@ -791,7 +825,7 @@ fn validate_writer_element_namespace(
     // prefixed element name.
     // https://www.w3.org/TR/xml-names/#iri-use https://www.w3.org/TR/xml-names/#ns-using
     if prefix == "xmlns"
-        || resolve_writer_prefix(prefix, attributes, namespace_frames).is_none_or(str::is_empty)
+        || resolve_writer_prefix(prefix, attributes, frames).is_none_or(str::is_empty)
     {
         return Err(IoError::new(
             ErrorKind::InvalidInput,
@@ -842,7 +876,7 @@ fn namespace_declaration(name: &str) -> Option<&str> {
 fn resolve_writer_prefix<'a>(
     prefix: &str,
     attributes: &'a [(&str, &str)],
-    namespace_frames: &'a [Vec<(String, String)>],
+    frames: &'a [WriterFrame],
 ) -> Option<&'a str> {
     if prefix == "xml" {
         return Some("http://www.w3.org/XML/1998/namespace");
@@ -851,8 +885,9 @@ fn resolve_writer_prefix<'a>(
         .iter()
         .find_map(|(name, uri)| (namespace_declaration(name) == Some(prefix)).then_some(*uri))
         .or_else(|| {
-            namespace_frames.iter().rev().find_map(|frame| {
+            frames.iter().rev().find_map(|frame| {
                 frame
+                    .namespaces
                     .iter()
                     .rev()
                     .find_map(|(name, uri)| (name == prefix).then_some(uri.as_str()))
@@ -1073,6 +1108,38 @@ mod tests {
         assert!(writer.empty("root", [("a:b:c", "value")]).is_err());
         let mut writer = Writer::new(Vec::new());
         assert!(writer.end("root><injected").is_err());
+    }
+
+    #[test]
+    fn writer_rejects_orphan_and_mismatched_end_tags_without_mutation() {
+        // XML 1.0 section 3.1 requires every end-tag to match its open start-tag. Rejection must
+        // happen before output or stack mutation so the caller can still close the open element.
+        let mut orphan = Writer::new(Vec::new());
+        assert!(orphan.end("root").is_err());
+        assert!(orphan.into_inner().is_empty());
+
+        let mut writer = Writer::new(Vec::new());
+        writer.start("root", []).expect("root opens");
+        writer.start("child", []).expect("child opens");
+        assert!(writer.end("root").is_err());
+        writer.end("child").expect("mismatch preserves child frame");
+        writer.end("root").expect("root closes after child");
+        assert_eq!(writer.into_inner(), b"<root><child></child></root>");
+    }
+
+    #[test]
+    fn numeric_character_references_follow_the_exact_xml_grammar() {
+        for valid in ["65", "x41", "x10FFFF"] {
+            let reference = format!("&#{valid};");
+            assert!(decode_references(&reference).is_ok(), "rejected {valid}");
+        }
+        for malformed in ["", "x", "+65", "-1", "X41", "x+41", " 65"] {
+            let reference = format!("&#{malformed};");
+            assert!(
+                decode_references(&reference).is_err(),
+                "accepted {malformed}"
+            );
+        }
     }
 
     #[test]

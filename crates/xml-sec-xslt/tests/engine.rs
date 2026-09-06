@@ -7799,8 +7799,8 @@ fn xpath_sessions_do_not_clone_retained_result_tree_fragments() {
 
 #[test]
 fn generic_xpath_accounts_for_result_tree_fragment_projections() {
-    // A generic XPath context owns an SXD string projection for every in-scope RTF. The duplicate
-    // must fit beside the retained fragment even when the expression never reads that variable.
+    // A generic XPath context must project only variables referenced by the expression. An unused
+    // retained fragment must not add its complete string payload to the evaluation peak.
     let payload = "x".repeat(64 * 1024);
     let stylesheet = compile(&format!(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template name="baseline"><xsl:variable name="payload"><xsl:text>{payload}</xsl:text></xsl:variable></xsl:template><xsl:template name="xpath"><xsl:variable name="payload"><xsl:text>{payload}</xsl:text></xsl:variable><xsl:if test="1 + 1 = 2"/></xsl:template></xsl:stylesheet>"#
@@ -7809,8 +7809,8 @@ fn generic_xpath_accounts_for_result_tree_fragment_projections() {
     let baseline = minimum_execution_owned_bytes(&stylesheet, "baseline");
     let xpath = minimum_execution_owned_bytes(&stylesheet, "xpath");
     assert!(
-        xpath >= baseline + payload.len(),
-        "the SXD projection of every in-scope RTF must fit the peak-memory budget"
+        xpath < baseline + payload.len(),
+        "an unused RTF was eagerly projected into the generic XPath context"
     );
 }
 

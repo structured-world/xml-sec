@@ -1106,21 +1106,29 @@ fn decode_numeric_character_references_once(value: &str) -> xml_sec_xslt::Result
             return Err(Error::Xml("unterminated oracle character reference".into()));
         };
         let digits = &reference[..end];
-        let codepoint = digits
-            .strip_prefix(['x', 'X'])
-            .map_or_else(
-                || digits.parse::<u32>(),
-                |digits| u32::from_str_radix(digits, 16),
-            )
-            .map_err(|_| Error::Xml("invalid oracle character reference".into()))?;
         decoded.push(
-            char::from_u32(codepoint)
-                .ok_or_else(|| Error::Xml("invalid oracle character codepoint".into()))?,
+            xml_sec_xml_input::lexical::decode_numeric_character_reference(digits)
+                .map_err(|_| Error::Xml("invalid oracle character reference".into()))?,
         );
         remainder = &reference[end + 1..];
     }
     decoded.push_str(remainder);
     Ok(decoded)
+}
+
+#[test]
+fn oracle_character_reference_normalization_preserves_xml_grammar_errors() {
+    assert_eq!(
+        decode_numeric_character_references_once("&#65; &#x41;")
+            .expect("valid decimal and hexadecimal references decode"),
+        "A A"
+    );
+    for malformed in ["&#+65;", "&#-1;", "&#X41;", "&#x;"] {
+        assert!(
+            decode_numeric_character_references_once(malformed).is_err(),
+            "oracle accepted {malformed}"
+        );
+    }
 }
 
 fn case_name(case: &Case) -> String {
@@ -1811,11 +1819,10 @@ fn normalize_numeric_character_references(bytes: &[u8]) -> Vec<u8> {
         {
             let end = cursor + 2 + relative_end;
             let digits = &bytes[cursor + 2..end];
-            let parsed = digits.strip_prefix(b"x").map_or_else(
-                || std::str::from_utf8(digits).ok()?.parse::<u32>().ok(),
-                |digits| u32::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok(),
-            );
-            if let Some(character) = parsed.and_then(char::from_u32) {
+            let parsed = std::str::from_utf8(digits).ok().and_then(|digits| {
+                xml_sec_xml_input::lexical::decode_numeric_character_reference(digits).ok()
+            });
+            if let Some(character) = parsed {
                 let mut encoded = [0u8; 4];
                 output.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
                 cursor = end + 1;

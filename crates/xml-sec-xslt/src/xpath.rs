@@ -47,8 +47,6 @@ fn projected_node_storage(count: usize, meter: &Meter) -> Result<Vec<SourceNode>
 pub(crate) trait VariableBindings {
     fn get(&self, name: &ExpandedName) -> Option<&Value>;
 
-    fn visit(&self, visitor: &mut dyn FnMut(&ExpandedName, &Value));
-
     fn result_tree_fragment(&self, identity: u64) -> Option<Arc<Document>>;
 }
 
@@ -59,12 +57,6 @@ fn result_tree_fragment_handle(document: &Arc<Document>) -> u64 {
 impl VariableBindings for HashMap<ExpandedName, Value> {
     fn get(&self, name: &ExpandedName) -> Option<&Value> {
         HashMap::get(self, name)
-    }
-
-    fn visit(&self, visitor: &mut dyn FnMut(&ExpandedName, &Value)) {
-        for (name, value) in self {
-            visitor(name, value);
-        }
     }
 
     fn result_tree_fragment(&self, identity: u64) -> Option<Arc<Document>> {
@@ -100,17 +92,6 @@ impl<'a> VariableOverlay<'a> {
 impl VariableBindings for VariableOverlay<'_> {
     fn get(&self, name: &ExpandedName) -> Option<&Value> {
         self.additions.get(name).or_else(|| self.base.get(name))
-    }
-
-    fn visit(&self, visitor: &mut dyn FnMut(&ExpandedName, &Value)) {
-        self.base.visit(&mut |name, value| {
-            if !self.additions.contains_key(name) {
-                visitor(name, value);
-            }
-        });
-        for (name, value) in &self.additions {
-            visitor(name, value);
-        }
     }
 
     fn result_tree_fragment(&self, identity: u64) -> Option<Arc<Document>> {
@@ -2144,10 +2125,13 @@ impl Evaluator {
             }
         }
         let mut variable_projection_error = false;
-        variables.visit(&mut |name, value| {
+        for name in expression.variable_references.iter() {
             if variable_projection_error {
-                return;
+                break;
             }
+            let Some(value) = variables.get(name) else {
+                continue;
+            };
             let qname: sxd_xpath_no_unsafe::OwnedQName = name.namespace.as_deref().map_or_else(
                 || name.local.as_str().into(),
                 |namespace| (namespace, name.local.as_str()).into(),
@@ -2159,7 +2143,7 @@ impl Evaluator {
                     let reservation = context.reserve_temporary_allocation(value.len());
                     if reservation.is_err() {
                         variable_projection_error = true;
-                        return;
+                        continue;
                     }
                     context.set_variable(qname, value.clone());
                 }
@@ -2167,16 +2151,29 @@ impl Evaluator {
                     let reservation = context.reserve_temporary_allocation(value.len());
                     if reservation.is_err() {
                         variable_projection_error = true;
-                        return;
+                        continue;
                     }
                     context.set_variable(qname, value.clone())
                 }
                 Value::ResultTreeFragment(document) => {
+                    let nodes = document.node_count();
+                    for _ in 0..2 {
+                        if context.charge_work(nodes).is_err() {
+                            let attempted = context
+                                .evaluation_work_exceeded()
+                                .expect("failed XPath work charge records its attempted total");
+                            return Err(Error::Budget {
+                                kind: BudgetKind::XPathOperations,
+                                limit: xpath_operations_limit,
+                                actual: xpath_operations.saturating_add(attempted),
+                            });
+                        }
+                    }
                     let length = document.string_value_len(document.root());
                     let reservation = context.reserve_temporary_allocation(length);
                     if reservation.is_err() {
                         variable_projection_error = true;
-                        return;
+                        continue;
                     }
                     context.set_variable(
                         qname,
@@ -2195,7 +2192,7 @@ impl Evaluator {
                                     .reserve_temporary_allocation(std::mem::size_of_val(&node));
                                 if reservation.is_err() {
                                     variable_projection_error = true;
-                                    return;
+                                    break;
                                 }
                             }
                             set.add(node);
@@ -2204,8 +2201,9 @@ impl Evaluator {
                     context.set_variable(qname, set);
                 }
             }
-        });
+        }
         if variable_projection_error {
+            meter.charge(BudgetKind::XPathOperations, context.evaluation_work_used())?;
             let attempted = context
                 .string_allocation_exceeded()
                 .expect("failed XPath allocation records its attempted total");
@@ -6871,24 +6869,21 @@ impl function::Function for ExsltMathFunction {
             return extension_argument_error("EXSLT math node functions require one node-set");
         };
         let node_count = nodes.size();
+        context.charge_extension_work(node_count)?;
         let vector_bytes = node_count.saturating_mul(
             std::mem::size_of::<nodeset::Node<'_>>().saturating_add(std::mem::size_of::<f64>()),
         );
-        let value_bytes = nodes.iter().fold(0usize, |total, node| {
-            total.saturating_add(node.string_value_len())
-        });
         let selection_bytes = node_count.saturating_mul(2).saturating_mul(
             std::mem::size_of::<nodeset::Node<'_>>().saturating_add(std::mem::size_of::<u64>()),
         );
-        context.reserve_string_allocation(
-            vector_bytes
-                .saturating_add(value_bytes)
-                .saturating_add(selection_bytes),
-        )?;
+        context.reserve_string_allocation(vector_bytes.saturating_add(selection_bytes))?;
         let ordered = nodes.document_order_with_context(context)?;
         let numbers = ordered
             .iter()
-            .map(|node| SxdValue::String(node.string_value()).number(context))
+            .map(|node| {
+                node.string_value_with_extension_context(context)
+                    .and_then(|value| SxdValue::String(value).number(context))
+            })
             .collect::<std::result::Result<Vec<_>, _>>()?;
         if numbers.is_empty() || numbers.iter().any(|value| value.is_nan()) {
             return Ok(match self {
@@ -10094,6 +10089,35 @@ mod tests {
                 .evaluate(&evaluation, vec![SxdValue::Nodeset(nodes)])
                 .expect_err("math workspace must cross the allocation gate");
             assert!(error.to_string().contains("allocation budget"));
+        }
+    }
+
+    #[test]
+    fn math_node_functions_charge_descendant_string_traversal_as_extension_work() {
+        for function in [
+            ExsltMathFunction::Max,
+            ExsltMathFunction::Min,
+            ExsltMathFunction::Highest,
+            ExsltMathFunction::Lowest,
+        ] {
+            let package = Package::new();
+            let document = package.as_document();
+            let root = document.create_element("root");
+            document.root().append_child(root);
+            let child = document.create_element("item");
+            child.append_child(document.create_text("123456789"));
+            root.append_child(child);
+            let mut nodes = nodeset::Nodeset::new();
+            nodes.add(child);
+            let mut context = Context::new();
+            context.set_extension_work_limit(0);
+            let evaluation =
+                sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+
+            let error = function
+                .evaluate(&evaluation, vec![SxdValue::Nodeset(nodes)])
+                .expect_err("math string traversal must cross the extension-work gate");
+            assert!(error.to_string().contains("extension work budget"));
         }
     }
 

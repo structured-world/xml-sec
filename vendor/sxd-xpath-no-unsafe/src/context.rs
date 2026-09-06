@@ -158,6 +158,15 @@ impl<'d> Context<'d> {
         self.evaluation_work.exceeded.get()
     }
 
+    /// Charge primitive setup work performed while constructing this XPath context.
+    pub fn charge_work(&self, units: usize) -> Result<(), function::Error> {
+        charge_work_budget(
+            &self.evaluation_work,
+            units,
+            "XPath evaluation work budget exceeded",
+        )
+    }
+
     /// Limit work performed inside extension functions.
     pub fn set_extension_work_limit(&mut self, limit: usize) {
         self.extension_work.limit = Some(limit);
