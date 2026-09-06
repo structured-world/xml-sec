@@ -389,7 +389,7 @@ impl<R: Resolver> Compiler<R> {
         let version = root.attribute((XSLT_NS, "version")).ok_or_else(|| {
             Error::Static("literal result stylesheet requires xsl:version".into())
         })?;
-        let forward = parse_stylesheet_version(version)? > 1.0;
+        let forward = stylesheet_version_is_forward_compatible(version)?;
         let order = state.next_order();
         state.templates.push(Template {
             name: None,
@@ -485,9 +485,11 @@ impl<R: Resolver> Compiler<R> {
                             Error::Static("template priority must be a finite XPath number".into())
                         })
                     })
-                    .transpose()?;
-                // XSLT 1.0 section 6 says priority does not affect named-template invocation;
-                // unlike mode in section 5.7, it does not prohibit priority when match is absent.
+                    .transpose()?
+                    .filter(|_| !patterns.is_empty());
+                // XSLT 1.0 sections 5.5 and 6 define priority for template-rule conflict
+                // resolution, but explicitly make it irrelevant to named-template invocation.
+                // Validate the lexical value above, then discard it for a named-only template.
                 // https://www.w3.org/TR/1999/REC-xslt-19991116#named-templates
                 let mode = optional_qname_attr(node, "mode")?;
                 // XSLT 1.0 section 5.7 forbids mode when the template has no match rule.
@@ -528,7 +530,7 @@ impl<R: Resolver> Compiler<R> {
                         name,
                         pattern: None,
                         mode,
-                        priority: explicit_priority.unwrap_or(0.0),
+                        priority: 0.0,
                         precedence,
                         order,
                         params,
@@ -2314,7 +2316,7 @@ impl CompileContext {
 
     fn with_literal_version(mut self, node: roxmltree::Node<'_, '_>) -> Result<Self> {
         if let Some(version) = node.attribute((XSLT_NS, "version")) {
-            self.forward = parse_stylesheet_version(version)? > 1.0;
+            self.forward = stylesheet_version_is_forward_compatible(version)?;
         }
         Ok(self)
     }
@@ -2446,16 +2448,23 @@ fn stylesheet_module_root<'nodes, 'input>(
 
 fn module_forward_compatible(root: roxmltree::Node<'_, '_>) -> Result<bool> {
     match root.attribute("version") {
-        Some(version) => Ok(parse_stylesheet_version(version)? > 1.0),
+        Some(version) => stylesheet_version_is_forward_compatible(version),
         None => Err(Error::Static("xsl:stylesheet requires version".into())),
     }
+}
+
+fn stylesheet_version_is_forward_compatible(version: &str) -> Result<bool> {
+    // XSLT 1.0 sections 2.2 and 2.5 enable forwards-compatible processing whenever
+    // the version Number is not equal to 1.0, including values below 1.0.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#forwards
+    Ok(parse_stylesheet_version(version)? != 1.0)
 }
 
 fn parse_stylesheet_version(version: &str) -> Result<f64> {
     // XSLT 1.0 sections 2.2 and 2.3 define version as XPath's Number production;
     // host float syntax is wider: https://www.w3.org/TR/1999/REC-xpath-19991116/#exprlex
     crate::xpath::parse_xpath_number_token(version)
-        .filter(|value| value.is_finite() && *value >= 1.0)
+        .filter(|value| value.is_finite())
         .ok_or_else(|| Error::Static(format!("unsupported XSLT version {version}")))
 }
 
@@ -3112,9 +3121,8 @@ fn local_forward_compatible(node: roxmltree::Node<'_, '_>) -> Result<Option<bool
         node.attribute((XSLT_NS, "version"))
     };
     version
-        .map(parse_stylesheet_version)
+        .map(stylesheet_version_is_forward_compatible)
         .transpose()
-        .map(|version| version.map(|version| version > 1.0))
 }
 fn compile_literal_element(
     node: roxmltree::Node<'_, '_>,

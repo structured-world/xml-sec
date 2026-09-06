@@ -8443,27 +8443,18 @@ fn text_output_rejects_characters_unrepresentable_in_its_encoding() {
 }
 
 #[test]
-fn xml_output_rejects_unsupported_declaration_versions() {
-    // The serializer implements XML 1.0 and 1.1 character rules only; it must not emit a
-    // declaration for an unknown version while silently validating the result as XML 1.0.
+fn xml_output_falls_back_from_unsupported_declaration_versions() {
+    // XSLT 1.0 section 16.1 requires an unsupported requested XML version to fall back to a
+    // supported version, including in the emitted declaration and character validation.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#section-XML-Output-Method
     for version in ["", "2.0"] {
-        let stylesheet = compile(&format!(
+        let stylesheet = format!(
             r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="xml" version="{version}"/><xsl:template match="/"><out/></xsl:template></xsl:stylesheet>"#
-        ));
-        assert!(matches!(
-            stylesheet.execute(
-                &Document::parse("<source/>", None).expect("source parses"),
-                &Parameters::new(),
-                Arc::new(NoResolver),
-                ExecutionOptions {
-                    budget: execution_budget(1024),
-                    initial_mode: None,
-                    initial_template: None,
-                },
-            ),
-            Err(Error::Serialization(message))
-                if message.contains("XML output version") && message.contains(version)
-        ));
+        );
+        assert_eq!(
+            execute(&stylesheet, "<source/>"),
+            "<?xml version=\"1.0\"?>\n<out/>\n"
+        );
     }
 }
 
@@ -12835,13 +12826,32 @@ fn top_level_extensions_require_a_namespace() {
     .compile(valid, Some("memory:main.xsl"))
     .expect("namespaced top-level extensions remain valid");
 
-    let forward = r#"<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><future-declaration/></xsl:stylesheet>"#;
-    Compiler::new(
-        Arc::new(NoResolver),
-        CompileBudget::new(1 << 20, 0, 32, 1 << 20),
-    )
-    .compile(forward, Some("memory:main.xsl"))
-    .expect("forward-compatible processing ignores unknown top-level elements");
+    for version in ["0.9", "2.0"] {
+        let forward = format!(
+            r#"<xsl:stylesheet version="{version}" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><future-declaration/></xsl:stylesheet>"#
+        );
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(1 << 20, 0, 32, 1 << 20),
+        )
+        .compile(&forward, Some("memory:main.xsl"))
+        .expect("every non-1.0 version enables forward-compatible processing");
+    }
+}
+
+#[test]
+fn every_non_1_stylesheet_version_enables_forward_compatibility() {
+    // XSLT 1.0 sections 2.3 and 2.5 apply the same non-1.0 rule to simplified stylesheets and
+    // local xsl:version overrides as to xsl:stylesheet.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#forwards
+    let simplified = r#"<out xsl:version="0.9" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:future><xsl:fallback>fallback</xsl:fallback></xsl:future></out>"#;
+    assert_eq!(
+        execute(simplified, "<source/>"),
+        "<?xml version=\"1.0\"?>\n<out>fallback</out>\n"
+    );
+
+    let local = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><out xsl:version="0.9" xsl:future-option="yes"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(local, "<source/>"), "<out/>\n");
 }
 
 #[test]
@@ -12926,6 +12936,16 @@ fn named_only_templates_allow_priority_without_affecting_named_dispatch() {
     // https://www.w3.org/TR/1999/REC-xslt-19991116#named-templates
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template name="named" priority="1"><xsl:text>called</xsl:text></xsl:template><xsl:template match="/"><xsl:call-template name="named"/></xsl:template></xsl:stylesheet>"#;
     assert_eq!(execute(stylesheet, "<source/>"), "called");
+
+    let invalid = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template name="named" priority="not-a-number"/></xsl:stylesheet>"#;
+    assert!(matches!(
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(1 << 20, 0, 32, 1 << 20),
+        )
+        .compile(invalid, Some("memory:main.xsl")),
+        Err(Error::Static(message)) if message.contains("priority")
+    ));
 }
 
 #[test]

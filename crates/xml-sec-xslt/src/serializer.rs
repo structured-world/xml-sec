@@ -81,6 +81,7 @@ struct EffectiveOutputDefinition<'a> {
     source: &'a OutputDefinition,
     method: OutputMethod,
     indent: bool,
+    xml_version: &'a str,
 }
 
 impl Deref for EffectiveOutputDefinition<'_> {
@@ -243,6 +244,7 @@ pub(crate) fn serialize_fragment(document: &Document, meter: &mut Meter) -> Resu
     let definition = EffectiveOutputDefinition {
         method: definition.method,
         indent: definition.indent,
+        xml_version: supported_xml_version(&definition),
         source: &definition,
     };
     let (used, limit) = meter.usage(BudgetKind::OwnedBytes)?;
@@ -291,6 +293,7 @@ fn serialize_charged(
             definition.method
         },
         indent: infer_indent || definition.indent,
+        xml_version: supported_xml_version(definition),
     };
     serialize_with_definition(document, &effective, meter, budget_kind)
 }
@@ -301,14 +304,6 @@ fn serialize_with_definition(
     meter: &mut Meter,
     budget_kind: BudgetKind,
 ) -> Result<SerializedOutput> {
-    if definition.method == OutputMethod::Xml {
-        let version = definition.version.as_deref().unwrap_or("1.0");
-        if !matches!(version, "1.0" | "1.1") {
-            return Err(Error::Serialization(format!(
-                "unsupported XML output version `{version}`; supported versions are 1.0 and 1.1"
-            )));
-        }
-    }
     let encoding = OutputEncoding::new(&definition.encoding)?;
     let (used, limit) = meter.usage(budget_kind)?;
     let mut counter =
@@ -322,7 +317,7 @@ fn serialize_with_definition(
     render(document, definition, &encoding, &mut text, meter)?;
     let text = text.into_string();
     if definition.method == OutputMethod::Xml {
-        validate_xml_characters(&text, definition.version.as_deref().unwrap_or("1.0"))?;
+        validate_xml_characters(&text, definition.xml_version)?;
     }
     if definition.method == OutputMethod::Text {
         validate_text_encoding(&text, &encoding, &definition.encoding)?;
@@ -356,6 +351,16 @@ fn serialize_with_definition(
     })
 }
 
+fn supported_xml_version(definition: &OutputDefinition) -> &str {
+    // XSLT 1.0 section 16.1 requires an unsupported requested XML version to fall back to a
+    // version the processor supports. XML 1.0 is the deterministic compatibility fallback.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#section-XML-Output-Method
+    match definition.version.as_deref() {
+        Some(version @ ("1.0" | "1.1")) => version,
+        _ => "1.0",
+    }
+}
+
 fn render(
     document: &Document,
     definition: &EffectiveOutputDefinition<'_>,
@@ -365,7 +370,7 @@ fn render(
 ) -> Result<()> {
     if definition.method == OutputMethod::Xml && !definition.omit_xml_declaration {
         text.push_str("<?xml version=\"");
-        text.push_str(definition.version.as_deref().unwrap_or("1.0"));
+        text.push_str(definition.xml_version);
         text.push('"');
         // XSLT 1.0 section 16.1 recommends, but does not require, an encoding pseudo-attribute.
         // Match pinned libxslt output by emitting it only for an explicit xsl:output encoding.
@@ -1039,7 +1044,7 @@ fn serialize_node_tasks(
                 parent,
                 start,
                 end,
-                definition.version.as_deref().unwrap_or("1.0"),
+                definition.xml_version,
                 encoding,
                 output,
             )?;
@@ -1123,12 +1128,7 @@ fn serialize_node_tasks(
                     }
                     output.push_str(value);
                 } else if *disable_output_escaping {
-                    push_xml_raw_text(
-                        value,
-                        definition.version.as_deref().unwrap_or("1.0"),
-                        encoding,
-                        output,
-                    );
+                    push_xml_raw_text(value, definition.xml_version, encoding, output);
                 // XSLT 1.0 section 16.1 defines cdata-section-elements only for XML output;
                 // HTML has separate escaping rules in section 16.2:
                 // https://www.w3.org/TR/1999/REC-xslt-19991116#output
@@ -1136,19 +1136,9 @@ fn serialize_node_tasks(
                     && parent_name
                         .is_some_and(|name| definition.cdata_section_elements.contains(name))
                 {
-                    push_cdata(
-                        value,
-                        definition.version.as_deref().unwrap_or("1.0"),
-                        encoding,
-                        output,
-                    );
+                    push_cdata(value, definition.xml_version, encoding, output);
                 } else {
-                    escape_text(
-                        value,
-                        definition.version.as_deref().unwrap_or("1.0"),
-                        encoding,
-                        output,
-                    );
+                    escape_text(value, definition.xml_version, encoding, output);
                 }
             }
             NodeKind::Comment(value) if definition.method != OutputMethod::Text => {
@@ -1282,12 +1272,7 @@ fn serialize_node_tasks(
                         output.push_str(prefix);
                     }
                     output.push_str("=\"");
-                    escape_attribute(
-                        &namespace.uri,
-                        definition.version.as_deref().unwrap_or("1.0"),
-                        encoding,
-                        output,
-                    );
+                    escape_attribute(&namespace.uri, definition.xml_version, encoding, output);
                     output.push('"');
                     current_namespaces = workspace.extend_namespace_scope(
                         current_namespaces,
@@ -1330,7 +1315,7 @@ fn serialize_node_tasks(
                     } else {
                         escape_attribute(
                             &attribute.value,
-                            definition.version.as_deref().unwrap_or("1.0"),
+                            definition.xml_version,
                             encoding,
                             output,
                         );
@@ -1378,7 +1363,7 @@ fn serialize_node_tasks(
                         output.push_str("<meta charset=\"");
                         escape_attribute(
                             &definition.encoding,
-                            definition.version.as_deref().unwrap_or("1.0"),
+                            definition.xml_version,
                             encoding,
                             output,
                         );
@@ -1389,7 +1374,7 @@ fn serialize_node_tasks(
                         );
                         escape_attribute(
                             &definition.encoding,
-                            definition.version.as_deref().unwrap_or("1.0"),
+                            definition.xml_version,
                             encoding,
                             output,
                         );
@@ -1659,7 +1644,7 @@ fn reject_xml11_restricted_markup(
     kind: &str,
 ) -> Result<()> {
     if definition.method == OutputMethod::Xml
-        && definition.version.as_deref() == Some("1.1")
+        && definition.xml_version == "1.1"
         && value.chars().any(is_xml11_restricted)
     {
         return Err(Error::Serialization(format!(

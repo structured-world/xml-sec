@@ -857,6 +857,16 @@ fn mark_declared_ids(
     document: &mut Document,
     declarations: &[(String, String)],
 ) -> xml_sec_xslt::Result<()> {
+    for (owner, index) in declared_attribute_matches(document, declarations) {
+        document.mark_id_attribute(owner, index)?;
+    }
+    Ok(())
+}
+
+fn declared_attribute_matches(
+    document: &Document,
+    declarations: &[(String, String)],
+) -> Vec<(xml_sec_xslt::NodeId, usize)> {
     let mut matches = Vec::new();
     for (owner, node) in document.nodes() {
         let xml_sec_xslt::NodeKind::Element {
@@ -887,47 +897,14 @@ fn mark_declared_ids(
             );
         }
     }
-    for (owner, index) in matches {
-        document.mark_id_attribute(owner, index)?;
-    }
-    Ok(())
+    matches
 }
 
 fn normalize_tokenized_attributes(
     document: &mut Document,
     declarations: &[(String, String)],
 ) -> xml_sec_xslt::Result<()> {
-    let mut matches = Vec::new();
-    for (owner, node) in document.nodes() {
-        let xml_sec_xslt::NodeKind::Element {
-            name,
-            prefix,
-            attributes,
-            ..
-        } = &node.kind
-        else {
-            continue;
-        };
-        for (element, attribute) in declarations {
-            if !lexical_name_matches(element, prefix.as_deref(), &name.local) {
-                continue;
-            }
-            matches.extend(
-                attributes
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, candidate)| {
-                        lexical_name_matches(
-                            attribute,
-                            candidate.prefix.as_deref(),
-                            &candidate.name.local,
-                        )
-                        .then_some((owner, index))
-                    }),
-            );
-        }
-    }
-    for (owner, index) in matches {
+    for (owner, index) in declared_attribute_matches(document, declarations) {
         document.normalize_tokenized_attribute(owner, index)?;
     }
     Ok(())
