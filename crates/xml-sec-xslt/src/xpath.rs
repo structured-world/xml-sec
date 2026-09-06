@@ -4769,6 +4769,7 @@ fn parse_external_document_metered(
         meter.recursion_limit(),
         usize::MAX,
         remaining,
+        remaining,
     );
     let document = match Document::parse_with_budget(xml, base_uri, budget) {
         Ok(document) => document,

@@ -593,10 +593,7 @@ impl Document {
             budget,
             nodes: 1,
             entity_references: 0,
-            entity_expansion: EntityExpansionMeter::with_parse_budget(
-                ENTITY_EXPANSION_BYTE_CEILING,
-                budget,
-            ),
+            entity_expansion: EntityExpansionMeter::with_parse_budget(budget),
             namespace_scope_bytes: 0,
         };
         let (parameter_expanded_xml, declarations) = internal_general_entities(
@@ -1759,6 +1756,7 @@ pub(crate) fn prepare_xml_frontend_bounded(
 ) -> Result<Cow<'_, str>> {
     let mut entity_references = 0;
     let mut entity_expansion = EntityExpansionMeter::with_limits(
+        BudgetKind::OwnedBytes,
         limit.min(ENTITY_EXPANSION_BYTE_CEILING),
         usize::MAX,
         recursion_depth.min(ENTITY_EXPANSION_DEPTH_CEILING),
@@ -3983,6 +3981,7 @@ fn expand_entity_references_into<'entities>(
 }
 
 struct EntityExpansionMeter {
+    kind: BudgetKind,
     limit: usize,
     used: usize,
     reference_limit: usize,
@@ -3997,12 +3996,22 @@ impl EntityExpansionMeter {
 
     #[cfg(test)]
     const fn with_reference_limit(limit: usize, reference_limit: usize) -> Self {
-        Self::with_limits(limit, reference_limit, ENTITY_EXPANSION_DEPTH_CEILING)
+        Self::with_limits(
+            BudgetKind::EntityExpansionBytes,
+            limit,
+            reference_limit,
+            ENTITY_EXPANSION_DEPTH_CEILING,
+        )
     }
 
-    const fn with_parse_budget(limit: usize, budget: ParseBudget) -> Self {
+    const fn with_parse_budget(budget: ParseBudget) -> Self {
         Self::with_limits(
-            limit,
+            BudgetKind::EntityExpansionBytes,
+            if budget.entity_expansion_bytes < ENTITY_EXPANSION_BYTE_CEILING {
+                budget.entity_expansion_bytes
+            } else {
+                ENTITY_EXPANSION_BYTE_CEILING
+            },
             budget.entity_references,
             if budget.recursion_depth < ENTITY_EXPANSION_DEPTH_CEILING {
                 budget.recursion_depth
@@ -4012,8 +4021,14 @@ impl EntityExpansionMeter {
         )
     }
 
-    const fn with_limits(limit: usize, reference_limit: usize, depth_limit: usize) -> Self {
+    const fn with_limits(
+        kind: BudgetKind,
+        limit: usize,
+        reference_limit: usize,
+        depth_limit: usize,
+    ) -> Self {
         Self {
+            kind,
             limit,
             used: 0,
             reference_limit,
@@ -4046,16 +4061,12 @@ impl EntityExpansionMeter {
     }
 
     fn check(&self, amount: usize) -> Result<()> {
-        crate::budget::ensure(
-            crate::BudgetKind::OwnedBytes,
-            self.limit,
-            self.used.saturating_add(amount),
-        )
+        crate::budget::ensure(self.kind, self.limit, self.used.saturating_add(amount))
     }
 
     fn charge(&mut self, amount: usize) -> Result<()> {
         let actual = self.used.saturating_add(amount);
-        crate::budget::ensure(crate::BudgetKind::OwnedBytes, self.limit, actual)?;
+        crate::budget::ensure(self.kind, self.limit, actual)?;
         self.used = actual;
         Ok(())
     }
@@ -4399,7 +4410,14 @@ mod parser_boundary_tests {
         let body = format!("<leaf>{}</leaf>", "&e;".repeat(256));
         let xml = format!(r#"<!DOCTYPE n [<!ENTITY e "x">]>{}"#, nested_xml(65, &body));
 
-        let budget = ParseBudget::new(usize::MAX, usize::MAX, usize::MAX, 255, usize::MAX);
+        let budget = ParseBudget::new(
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            255,
+            usize::MAX,
+            usize::MAX,
+        );
         assert!(matches!(
             Document::parse_with_budget(&xml, None, budget),
             Err(Error::Budget {
@@ -4465,7 +4483,14 @@ mod parser_boundary_tests {
             r#"<!DOCTYPE root [<!ENTITY e "x">]><root>{}</root>"#,
             "&e;".repeat(256)
         );
-        let constrained = ParseBudget::new(usize::MAX, usize::MAX, usize::MAX, 255, usize::MAX);
+        let constrained = ParseBudget::new(
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            255,
+            usize::MAX,
+            usize::MAX,
+        );
         assert!(matches!(
             Document::parse_with_budget(&xml, None, constrained),
             Err(Error::Budget {
@@ -4475,9 +4500,44 @@ mod parser_boundary_tests {
             })
         ));
 
-        let admitted = ParseBudget::new(usize::MAX, usize::MAX, usize::MAX, 256, usize::MAX);
+        let admitted = ParseBudget::new(
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            256,
+            usize::MAX,
+            usize::MAX,
+        );
         Document::parse_with_budget(&xml, None, admitted)
             .expect("the caller-selected reference limit admits its exact boundary");
+    }
+
+    #[test]
+    fn parse_budget_bounds_entity_expansion_bytes() {
+        // XML 1.0 section 4.4.2 defines replacement-text inclusion but no byte ceiling, so the
+        // caller's typed resource budget must bound the materialized expansion.
+        // https://www.w3.org/TR/xml/#included
+        let xml = r#"<!DOCTYPE root [<!ENTITY a "0123456789"><!ENTITY b "&a;&a;&a;&a;">]><root>&b;</root>"#;
+        let budget = ParseBudget::new(xml.len(), usize::MAX, usize::MAX, usize::MAX, 1, usize::MAX);
+        assert!(matches!(
+            Document::parse_with_budget(xml, None, budget),
+            Err(Error::Budget {
+                kind: BudgetKind::EntityExpansionBytes,
+                limit: 1,
+                actual,
+            }) if actual > 1
+        ));
+
+        let admitted = ParseBudget::new(
+            xml.len(),
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            ENTITY_EXPANSION_BYTE_CEILING,
+            usize::MAX,
+        );
+        Document::parse_with_budget(xml, None, admitted)
+            .expect("a sufficient entity-expansion budget admits the same document");
     }
 
     #[test]
@@ -4496,7 +4556,14 @@ mod parser_boundary_tests {
             })
             .collect::<String>();
         let xml = format!("<!DOCTYPE root [{declarations}]><root>&e0;</root>");
-        let constrained = ParseBudget::new(usize::MAX, usize::MAX, 11, usize::MAX, usize::MAX);
+        let constrained = ParseBudget::new(
+            usize::MAX,
+            usize::MAX,
+            11,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+        );
         assert!(matches!(
             Document::parse_with_budget(&xml, None, constrained),
             Err(Error::Budget {
@@ -4506,7 +4573,14 @@ mod parser_boundary_tests {
             })
         ));
 
-        let admitted = ParseBudget::new(usize::MAX, usize::MAX, 12, usize::MAX, usize::MAX);
+        let admitted = ParseBudget::new(
+            usize::MAX,
+            usize::MAX,
+            12,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+        );
         let document = Document::parse_with_budget(&xml, None, admitted)
             .expect("the caller-selected depth admits the entity chain");
         assert_eq!(document.string_value(document.root()), "expanded");
@@ -4520,8 +4594,14 @@ mod parser_boundary_tests {
         let xml = "<root xmlns:p='urn:p'><p:child/></root>";
         let mut exact_limit = 0;
         loop {
-            let candidate =
-                ParseBudget::new(usize::MAX, usize::MAX, usize::MAX, usize::MAX, exact_limit);
+            let candidate = ParseBudget::new(
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                exact_limit,
+            );
             match Document::parse_with_budget(xml, None, candidate) {
                 Ok(_) => break,
                 Err(Error::Budget {
@@ -4540,6 +4620,7 @@ mod parser_boundary_tests {
             usize::MAX,
             usize::MAX,
             usize::MAX,
+            usize::MAX,
             exact_limit - 1,
         );
         assert!(matches!(
@@ -4551,8 +4632,14 @@ mod parser_boundary_tests {
             }) if actual == exact_limit
         ));
 
-        let admitted =
-            ParseBudget::new(usize::MAX, usize::MAX, usize::MAX, usize::MAX, exact_limit);
+        let admitted = ParseBudget::new(
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            exact_limit,
+        );
         Document::parse_with_budget(xml, None, admitted)
             .expect("the caller-selected namespace limit admits its exact boundary");
     }
@@ -5439,7 +5526,14 @@ mod parser_boundary_tests {
         let error = Document::parse_with_budget(
             "<root/>",
             None,
-            ParseBudget::new(6, usize::MAX, usize::MAX, usize::MAX, usize::MAX),
+            ParseBudget::new(
+                6,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+            ),
         )
         .expect_err("oversized source must be rejected");
         assert!(matches!(
@@ -5516,7 +5610,14 @@ mod parser_boundary_tests {
             Document::parse_with_budget(
                 "<root><child/></root>",
                 None,
-                ParseBudget::new(usize::MAX, 2, usize::MAX, usize::MAX, usize::MAX,),
+                ParseBudget::new(
+                    usize::MAX,
+                    2,
+                    usize::MAX,
+                    usize::MAX,
+                    usize::MAX,
+                    usize::MAX,
+                ),
             ),
             Err(Error::Budget {
                 kind: BudgetKind::SourceNodes,
@@ -5528,7 +5629,14 @@ mod parser_boundary_tests {
             Document::parse_with_budget(
                 "<root><child/></root>",
                 None,
-                ParseBudget::new(usize::MAX, usize::MAX, 1, usize::MAX, usize::MAX,),
+                ParseBudget::new(
+                    usize::MAX,
+                    usize::MAX,
+                    1,
+                    usize::MAX,
+                    usize::MAX,
+                    usize::MAX,
+                ),
             ),
             Err(Error::Budget {
                 kind: BudgetKind::RecursionDepth,
@@ -5549,7 +5657,14 @@ mod parser_boundary_tests {
             Document::parse_bytes_with_budget(
                 &bytes,
                 None,
-                ParseBudget::new(8, usize::MAX, usize::MAX, usize::MAX, usize::MAX),
+                ParseBudget::new(
+                    8,
+                    usize::MAX,
+                    usize::MAX,
+                    usize::MAX,
+                    usize::MAX,
+                    usize::MAX,
+                ),
             ),
             Err(Error::Budget {
                 kind: BudgetKind::SourceBytes,

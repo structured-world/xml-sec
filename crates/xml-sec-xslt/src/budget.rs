@@ -26,6 +26,7 @@ pub enum BudgetKind {
     SourceBytes,
     SourceNodes,
     EntityReferences,
+    EntityExpansionBytes,
     NamespaceScopeBytes,
     ImportedModules,
     ExternalDocuments,
@@ -53,6 +54,8 @@ pub struct ParseBudget {
     pub recursion_depth: usize,
     /// Maximum declared general and parameter entity-reference occurrences expanded.
     pub entity_references: usize,
+    /// Maximum aggregate bytes materialized while expanding entities.
+    pub entity_expansion_bytes: usize,
     /// Maximum peak bytes used to materialize inherited namespace scopes and their indexes.
     pub namespace_scope_bytes: usize,
 }
@@ -64,6 +67,7 @@ impl ParseBudget {
         source_nodes: usize,
         recursion_depth: usize,
         entity_references: usize,
+        entity_expansion_bytes: usize,
         namespace_scope_bytes: usize,
     ) -> Self {
         Self {
@@ -71,12 +75,19 @@ impl ParseBudget {
             source_nodes,
             recursion_depth,
             entity_references,
+            entity_expansion_bytes,
             namespace_scope_bytes,
         }
     }
 
-    pub(crate) const UNBOUNDED: Self =
-        Self::new(usize::MAX, usize::MAX, usize::MAX, usize::MAX, usize::MAX);
+    pub(crate) const UNBOUNDED: Self = Self::new(
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+    );
 }
 
 /// Policy-neutral immutable enforcement limits for compiling a stylesheet graph.

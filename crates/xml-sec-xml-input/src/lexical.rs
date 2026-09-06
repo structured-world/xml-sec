@@ -14,7 +14,10 @@ use alloc::{
 use core::ops::Range;
 
 #[cfg(feature = "std")]
-use std::io::{Error as IoError, ErrorKind, Write};
+use std::{
+    collections::HashSet,
+    io::{Error as IoError, ErrorKind, Write},
+};
 
 /// A lexical XML failure with a source position.
 #[derive(Debug, thiserror::Error)]
@@ -660,10 +663,10 @@ impl<W: Write> Writer<W> {
         empty: bool,
     ) -> std::io::Result<()> {
         validate_writer_qname(name)?;
+        let attributes = attributes.into_iter().collect::<Vec<_>>();
+        validate_writer_attributes(&attributes)?;
         write!(self.output, "<{name}")?;
         for (attribute, value) in attributes {
-            validate_writer_qname(attribute)?;
-            validate_writer_characters(value)?;
             write!(self.output, " {attribute}=\"{}\"", escape_attribute(value))?;
         }
         self.output.write_all(if empty { b"/>" } else { b">" })
@@ -691,6 +694,39 @@ impl<W: Write> Writer<W> {
     pub fn into_inner(self) -> W {
         self.output
     }
+}
+
+#[cfg(feature = "std")]
+fn validate_writer_attributes(attributes: &[(&str, &str)]) -> std::io::Result<()> {
+    const SMALL_TAG_ATTRIBUTES: usize = 8;
+
+    for (name, value) in attributes {
+        validate_writer_qname(name)?;
+        validate_writer_characters(value)?;
+    }
+    if attributes.len() <= SMALL_TAG_ATTRIBUTES {
+        for index in 1..attributes.len() {
+            if attributes[..index]
+                .iter()
+                .any(|(name, _)| *name == attributes[index].0)
+            {
+                return Err(IoError::new(
+                    ErrorKind::InvalidInput,
+                    format!("duplicate XML attribute `{}`", attributes[index].0),
+                ));
+            }
+        }
+        return Ok(());
+    }
+
+    let mut names = HashSet::with_capacity(attributes.len());
+    if let Some((duplicate, _)) = attributes.iter().find(|(name, _)| !names.insert(*name)) {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            format!("duplicate XML attribute `{duplicate}`"),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "std")]
@@ -898,6 +934,19 @@ mod tests {
         assert!(writer.empty("root", [("a:b:c", "value")]).is_err());
         let mut writer = Writer::new(Vec::new());
         assert!(writer.end("root><injected").is_err());
+    }
+
+    #[test]
+    fn writer_rejects_duplicate_attributes_before_emitting_markup() {
+        // XML 1.0 section 3.1 forbids an attribute name from appearing more than once in the
+        // same start-tag: https://www.w3.org/TR/xml/#sec-starttags
+        let mut writer = Writer::new(Vec::new());
+        assert!(
+            writer
+                .empty("root", [("id", "one"), ("id", "two")])
+                .is_err()
+        );
+        assert!(writer.into_inner().is_empty());
     }
 
     #[test]
