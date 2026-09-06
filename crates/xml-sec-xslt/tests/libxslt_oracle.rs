@@ -1218,15 +1218,20 @@ fn is_standard_conformant_libxslt_divergence(case: &Case) -> bool {
 }
 
 fn is_expected_failure_without_golden(case: &Case) -> bool {
-    case.output.is_none() && !is_standard_conformant_libxslt_divergence(case)
+    case.output.is_none()
+        && !is_standard_conformant_libxslt_divergence(case)
+        && !is_message_only_success_fixture(case)
+}
+
+fn is_message_only_success_fixture(case: &Case) -> bool {
+    case.suite == "runtest" && case.stylesheet == Path::new("general/bug-156.xsl")
 }
 
 fn is_expected_message_only_success(case: &Case, result: &xml_sec_xslt::TransformResult) -> bool {
     // The donor stores nonterminating xsl:message text in `.err` but has no `.out` file.
     // The transform succeeds normatively; our serializer also emits the default XML declaration
     // for its otherwise empty result tree, so validate both that output and the messages exactly.
-    case.suite == "runtest"
-        && case.stylesheet == Path::new("general/bug-156.xsl")
+    is_message_only_success_fixture(case)
         && result.serialized.bytes == b"<?xml version=\"1.0\"?>\n\n"
         && result
             .messages
@@ -1999,9 +2004,14 @@ fn only_the_negative_no_golden_case_may_fail() {
         .iter()
         .find(|case| case.stylesheet == Path::new("general/bug-154.xsl"))
         .expect("success-only no-golden case exists");
+    let message_only = cases
+        .iter()
+        .find(|case| case.stylesheet == Path::new("general/bug-156.xsl"))
+        .expect("message-only error-golden case exists");
 
     assert!(is_expected_failure_without_golden(negative));
     assert!(!is_expected_failure_without_golden(success));
+    assert!(!is_expected_failure_without_golden(message_only));
 }
 
 fn normalize_case_specific_oracle_output(case: &Case, bytes: Vec<u8>) -> Vec<u8> {

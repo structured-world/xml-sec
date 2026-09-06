@@ -628,6 +628,7 @@ fn escape(value: &str, attribute: bool) -> Cow<'_, str> {
 #[cfg(feature = "std")]
 pub struct Writer<W> {
     output: W,
+    namespace_frames: Vec<Vec<(String, String)>>,
 }
 
 #[cfg(feature = "std")]
@@ -635,7 +636,10 @@ impl<W: Write> Writer<W> {
     /// Wrap an output sink.
     #[must_use]
     pub const fn new(output: W) -> Self {
-        Self { output }
+        Self {
+            output,
+            namespace_frames: Vec::new(),
+        }
     }
 
     /// Write an opening tag and escaped attributes.
@@ -664,18 +668,30 @@ impl<W: Write> Writer<W> {
     ) -> std::io::Result<()> {
         validate_writer_qname(name)?;
         let attributes = attributes.into_iter().collect::<Vec<_>>();
-        validate_writer_attributes(&attributes)?;
+        validate_writer_attributes(&attributes, &self.namespace_frames)?;
         write!(self.output, "<{name}")?;
-        for (attribute, value) in attributes {
+        for (attribute, value) in &attributes {
             write!(self.output, " {attribute}=\"{}\"", escape_attribute(value))?;
         }
-        self.output.write_all(if empty { b"/>" } else { b">" })
+        self.output.write_all(if empty { b"/>" } else { b">" })?;
+        if !empty {
+            self.namespace_frames.push(
+                attributes
+                    .iter()
+                    .filter_map(|(name, uri)| namespace_declaration(name).map(|name| (name, *uri)))
+                    .map(|(name, uri)| (name.to_owned(), uri.to_owned()))
+                    .collect(),
+            );
+        }
+        Ok(())
     }
 
     /// Write a closing tag.
     pub fn end(&mut self, name: &str) -> std::io::Result<()> {
         validate_writer_qname(name)?;
-        write!(self.output, "</{name}>")
+        write!(self.output, "</{name}>")?;
+        self.namespace_frames.pop();
+        Ok(())
     }
 
     /// Write escaped character data.
@@ -697,7 +713,10 @@ impl<W: Write> Writer<W> {
 }
 
 #[cfg(feature = "std")]
-fn validate_writer_attributes(attributes: &[(&str, &str)]) -> std::io::Result<()> {
+fn validate_writer_attributes(
+    attributes: &[(&str, &str)],
+    namespace_frames: &[Vec<(String, String)>],
+) -> std::io::Result<()> {
     const SMALL_TAG_ATTRIBUTES: usize = 8;
 
     for (name, value) in attributes {
@@ -716,17 +735,78 @@ fn validate_writer_attributes(attributes: &[(&str, &str)]) -> std::io::Result<()
                 ));
             }
         }
-        return Ok(());
+    } else {
+        let mut names = HashSet::with_capacity(attributes.len());
+        if let Some((duplicate, _)) = attributes.iter().find(|(name, _)| !names.insert(*name)) {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                format!("duplicate XML attribute `{duplicate}`"),
+            ));
+        }
     }
 
-    let mut names = HashSet::with_capacity(attributes.len());
-    if let Some((duplicate, _)) = attributes.iter().find(|(name, _)| !names.insert(*name)) {
-        return Err(IoError::new(
-            ErrorKind::InvalidInput,
-            format!("duplicate XML attribute `{duplicate}`"),
-        ));
+    let mut expanded = HashSet::with_capacity(attributes.len());
+    for (name, _) in attributes {
+        let Some((prefix, local)) = name.split_once(':') else {
+            if name != &"xmlns" && !expanded.insert((None, *name)) {
+                return duplicate_expanded_attribute(name);
+            }
+            continue;
+        };
+        if prefix == "xmlns" {
+            continue;
+        }
+        let namespace =
+            resolve_writer_prefix(prefix, attributes, namespace_frames).ok_or_else(|| {
+                IoError::new(
+                    ErrorKind::InvalidInput,
+                    format!("unbound XML namespace prefix `{prefix}`"),
+                )
+            })?;
+        if !expanded.insert((Some(namespace), local)) {
+            return duplicate_expanded_attribute(name);
+        }
     }
     Ok(())
+}
+
+#[cfg(feature = "std")]
+fn namespace_declaration(name: &str) -> Option<&str> {
+    if name == "xmlns" {
+        Some("")
+    } else {
+        name.strip_prefix("xmlns:")
+    }
+}
+
+#[cfg(feature = "std")]
+fn resolve_writer_prefix<'a>(
+    prefix: &str,
+    attributes: &'a [(&str, &str)],
+    namespace_frames: &'a [Vec<(String, String)>],
+) -> Option<&'a str> {
+    if prefix == "xml" {
+        return Some("http://www.w3.org/XML/1998/namespace");
+    }
+    attributes
+        .iter()
+        .find_map(|(name, uri)| (namespace_declaration(name) == Some(prefix)).then_some(*uri))
+        .or_else(|| {
+            namespace_frames.iter().rev().find_map(|frame| {
+                frame
+                    .iter()
+                    .rev()
+                    .find_map(|(name, uri)| (name == prefix).then_some(uri.as_str()))
+            })
+        })
+}
+
+#[cfg(feature = "std")]
+fn duplicate_expanded_attribute(name: &str) -> std::io::Result<()> {
+    Err(IoError::new(
+        ErrorKind::InvalidInput,
+        format!("duplicate expanded XML attribute `{name}`"),
+    ))
 }
 
 #[cfg(feature = "std")]
@@ -947,6 +1027,40 @@ mod tests {
                 .is_err()
         );
         assert!(writer.into_inner().is_empty());
+    }
+
+    #[test]
+    fn writer_rejects_duplicate_expanded_attribute_names() {
+        // Namespaces in XML 1.0 section 6.3 makes expanded names, not lexical prefixes, unique.
+        // https://www.w3.org/TR/xml-names/#uniqAttrs
+        let mut writer = Writer::new(Vec::new());
+        assert!(
+            writer
+                .empty(
+                    "root",
+                    [
+                        ("xmlns:a", "urn:shared"),
+                        ("xmlns:b", "urn:shared"),
+                        ("a:id", "one"),
+                        ("b:id", "two"),
+                    ],
+                )
+                .is_err()
+        );
+        assert!(writer.into_inner().is_empty());
+
+        let mut writer = Writer::new(Vec::new());
+        writer
+            .empty(
+                "root",
+                [
+                    ("xmlns:a", "urn:first"),
+                    ("xmlns:b", "urn:second"),
+                    ("a:id", "one"),
+                    ("b:id", "two"),
+                ],
+            )
+            .expect("different expanded names remain legal");
     }
 
     #[test]

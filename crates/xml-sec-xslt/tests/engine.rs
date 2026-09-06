@@ -86,6 +86,63 @@ fn xpath_internal_work_obeys_its_aggregate_budget() {
     ));
 }
 
+#[test]
+fn identity_xpath_shortcuts_obey_the_operation_budget() {
+    // Optimized identity selections must charge the same examined/inserted node work as the
+    // general XPath evaluator instead of bypassing the operation policy.
+    let cases = [
+        (
+            "node()",
+            "<root><child/></root>",
+            r#"<xsl:apply-templates select="node()"/>"#,
+        ),
+        (
+            "@*",
+            "<root id='value'/>",
+            r#"<xsl:for-each select="root"><xsl:copy-of select="@*"/></xsl:for-each>"#,
+        ),
+        (
+            "@*|node()",
+            "<root id='value'><child/></root>",
+            r#"<xsl:for-each select="root"><xsl:copy-of select="@*|node()"/></xsl:for-each>"#,
+        ),
+        (
+            ".",
+            "<root/>",
+            r#"<xsl:for-each select="root"><xsl:copy-of select="."/></xsl:for-each>"#,
+        ),
+    ];
+
+    for (selection, source_xml, instruction) in cases {
+        let stylesheet = compile(&format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/">{instruction}</xsl:template></xsl:stylesheet>"#
+        ));
+        let source = Document::parse(source_xml, None).expect("source parses");
+        let mut budget = execution_budget(source_xml.len());
+        budget.xpath_operations = 0;
+
+        assert!(
+            matches!(
+                stylesheet.execute(
+                    &source,
+                    &Parameters::new(),
+                    Arc::new(NoResolver),
+                    ExecutionOptions {
+                        budget,
+                        initial_mode: None,
+                        initial_template: None,
+                    },
+                ),
+                Err(Error::Budget {
+                    kind: BudgetKind::XPathOperations,
+                    ..
+                })
+            ),
+            "identity shortcut {selection} bypassed XPathOperations"
+        );
+    }
+}
+
 fn minimum_execution_owned_bytes_with_parameters(
     stylesheet: &xml_sec_xslt::Stylesheet,
     initial_template: &str,

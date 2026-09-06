@@ -2684,7 +2684,7 @@ impl Evaluator {
         ))
     }
 
-    pub(crate) fn children(&self, node: &SourceNode, meter: &Meter) -> Result<Vec<SourceNode>> {
+    pub(crate) fn children(&self, node: &SourceNode, meter: &mut Meter) -> Result<Vec<SourceNode>> {
         let children = match node {
             SourceNode::Node(id) => self
                 .source
@@ -2693,12 +2693,17 @@ impl Evaluator {
                 .unwrap_or_default(),
             SourceNode::Attribute { .. } | SourceNode::Namespace { .. } => &[],
         };
+        meter.charge(BudgetKind::XPathOperations, children.len())?;
         let mut projected = projected_node_storage(children.len(), meter)?;
         projected.extend(children.iter().copied().map(SourceNode::Node));
         Ok(projected)
     }
 
-    pub(crate) fn attributes(&self, node: &SourceNode, meter: &Meter) -> Result<Vec<SourceNode>> {
+    pub(crate) fn attributes(
+        &self,
+        node: &SourceNode,
+        meter: &mut Meter,
+    ) -> Result<Vec<SourceNode>> {
         let SourceNode::Node(owner) = node else {
             return Ok(Vec::new());
         };
@@ -2710,6 +2715,7 @@ impl Evaluator {
                 _ => None,
             })
             .unwrap_or_default();
+        meter.charge(BudgetKind::XPathOperations, count)?;
         let mut projected = projected_node_storage(count, meter)?;
         projected.extend((0..count).map(|index| SourceNode::Attribute {
             owner: *owner,
@@ -2721,7 +2727,7 @@ impl Evaluator {
     pub(crate) fn attributes_and_children(
         &self,
         node: &SourceNode,
-        meter: &Meter,
+        meter: &mut Meter,
     ) -> Result<Vec<SourceNode>> {
         let SourceNode::Node(owner) = node else {
             return Ok(Vec::new());
@@ -2733,8 +2739,9 @@ impl Evaluator {
             NodeKind::Element { attributes, .. } => attributes.len(),
             _ => 0,
         };
-        let mut projected =
-            projected_node_storage(attribute_count.saturating_add(source.children.len()), meter)?;
+        let count = attribute_count.saturating_add(source.children.len());
+        meter.charge(BudgetKind::XPathOperations, count)?;
+        let mut projected = projected_node_storage(count, meter)?;
         projected.extend((0..attribute_count).map(|index| SourceNode::Attribute {
             owner: *owner,
             index,
@@ -2747,8 +2754,9 @@ impl Evaluator {
         &self,
         node: &SourceNode,
         include: bool,
-        meter: &Meter,
+        meter: &mut Meter,
     ) -> Result<Vec<SourceNode>> {
+        meter.charge(BudgetKind::XPathOperations, usize::from(include))?;
         let mut projected = projected_node_storage(usize::from(include), meter)?;
         if include {
             projected.push(node.clone());
@@ -2759,7 +2767,7 @@ impl Evaluator {
     pub(crate) fn preceding_nonempty_comment(
         &self,
         node: &SourceNode,
-        meter: &Meter,
+        meter: &mut Meter,
     ) -> Result<Vec<SourceNode>> {
         let SourceNode::Node(id) = node else {
             return Ok(Vec::new());
@@ -2773,22 +2781,25 @@ impl Evaluator {
         let Some(position) = parent.children.iter().position(|child| child == id) else {
             return Ok(Vec::new());
         };
-        let candidate = parent.children[..position]
-            .iter()
-            .rev()
-            .find(|candidate| {
-                !self
+        let mut candidate = None;
+        for id in parent.children[..position].iter().rev().copied() {
+            meter.charge(BudgetKind::XPathOperations, 1)?;
+            if !self
+                .source
+                .string_value(id)
+                .trim_matches(crate::lexical::is_xml_whitespace)
+                .is_empty()
+            {
+                if self
                     .source
-                    .string_value(**candidate)
-                    .trim_matches(crate::lexical::is_xml_whitespace)
-                    .is_empty()
-            })
-            .filter(|candidate| {
-                self.source
-                    .node(**candidate)
+                    .node(id)
                     .is_some_and(|node| matches!(node.kind, NodeKind::Comment(_)))
-            })
-            .copied();
+                {
+                    candidate = Some(id);
+                }
+                break;
+            }
+        }
         let mut projected = projected_node_storage(usize::from(candidate.is_some()), meter)?;
         projected.extend(candidate.map(SourceNode::Node));
         Ok(projected)

@@ -375,11 +375,16 @@ impl<'d> Node<'d> {
             actual: &str,
             remaining: &mut &str,
         ) -> Result<bool, crate::function::Error> {
-            context.charge_work(actual.len())?;
-            let Some(rest) = remaining.strip_prefix(actual) else {
+            if actual.len() > remaining.len() {
                 return Ok(false);
-            };
-            *remaining = rest;
+            }
+            for (actual, expected) in actual.bytes().zip(remaining.bytes()) {
+                context.charge_work(1)?;
+                if actual != expected {
+                    return Ok(false);
+                }
+            }
+            *remaining = &remaining[actual.len()..];
             Ok(true)
         }
 
@@ -1112,7 +1117,7 @@ mod test {
         let doc = package.as_document();
         let root = doc.create_element("root");
         doc.root().append_child(root.clone());
-        root.append_child(doc.create_text("x"));
+        root.append_child(doc.create_text(&"x".repeat(1_024)));
         for _ in 0..1_024 {
             root.append_child(doc.create_element("unrelated"));
         }

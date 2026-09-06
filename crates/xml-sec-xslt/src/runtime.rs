@@ -1526,7 +1526,7 @@ impl<'a> Execution<'a> {
                 let kind = self.evaluator.source.node(*id).map(|source| &source.kind);
                 match kind {
                     Some(NodeKind::Root | NodeKind::Element { .. }) => {
-                        let children = self.evaluator.children(&node, &self.meter)?;
+                        let children = self.evaluator.children(&node, &mut self.meter)?;
                         let built_in_params = Arc::new(EvaluatedParameters::default());
                         self.push_apply_batch(
                             tasks,
@@ -2423,12 +2423,12 @@ impl<'a> Execution<'a> {
                 return Ok(XPathValue::NodeSet(self.evaluator.singleton(
                     node,
                     true,
-                    &self.meter,
+                    &mut self.meter,
                 )?));
             }
             "@*" => {
                 return Ok(XPathValue::NodeSet(
-                    self.evaluator.attributes(node, &self.meter)?,
+                    self.evaluator.attributes(node, &mut self.meter)?,
                 ));
             }
             _ => {}
@@ -2658,7 +2658,7 @@ impl<'a> Execution<'a> {
     }
 
     fn evaluate_scalar_fast(
-        &self,
+        &mut self,
         expression: &Expression,
         node: &SourceNode,
     ) -> Result<Option<XPathValue>> {
@@ -2668,14 +2668,14 @@ impl<'a> Execution<'a> {
                 return Ok(Some(XPathValue::NodeSet(self.evaluator.singleton(
                     node,
                     self.evaluator.is_text_node(node),
-                    &self.meter,
+                    &mut self.meter,
                 )?)));
             }
             "self::*" => {
                 return Ok(Some(XPathValue::NodeSet(self.evaluator.singleton(
                     node,
                     self.evaluator.is_element_node(node),
-                    &self.meter,
+                    &mut self.meter,
                 )?)));
             }
             "normalize-space(.)" => {
@@ -2982,14 +2982,18 @@ impl<'a> Execution<'a> {
             // These are the two hot selections used by identity transforms. They
             // are context child-axis expressions, so projecting them through the
             // general XPath engine for every source node is unnecessary work.
-            "node()" => return self.evaluator.children(node, &self.meter),
-            "." => return self.evaluator.singleton(node, true, &self.meter),
-            "@*" => return self.evaluator.attributes(node, &self.meter),
+            "node()" => return self.evaluator.children(node, &mut self.meter),
+            "." => return self.evaluator.singleton(node, true, &mut self.meter),
+            "@*" => return self.evaluator.attributes(node, &mut self.meter),
             "preceding-sibling::node()[normalize-space()][1][self::comment()]" => {
-                return self.evaluator.preceding_nonempty_comment(node, &self.meter);
+                return self
+                    .evaluator
+                    .preceding_nonempty_comment(node, &mut self.meter);
             }
             "@*|node()" | "node()|@*" => {
-                return self.evaluator.attributes_and_children(node, &self.meter);
+                return self
+                    .evaluator
+                    .attributes_and_children(node, &mut self.meter);
             }
             _ => {}
         }

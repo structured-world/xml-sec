@@ -500,19 +500,13 @@ impl<R: Resolver> Compiler<R> {
                         "xsl:template mode requires a match attribute".into(),
                     ));
                 }
+                let context =
+                    CompileContext::new(forward, depth, state.budget.recursion_depth, base_uri)?;
                 let mut children = node.children().peekable();
                 let mut params = Vec::new();
                 while let Some(child) = children.peek().copied() {
                     if child.has_tag_name((XSLT_NS, "param")) {
-                        params.push(compile_variable(
-                            child,
-                            CompileContext::new(
-                                forward,
-                                depth,
-                                state.budget.recursion_depth,
-                                base_uri,
-                            )?,
-                        )?);
+                        params.push(compile_variable(child, context.clone())?);
                         children.next();
                     } else if is_ignorable_stylesheet_child(child) {
                         children.next();
@@ -520,10 +514,7 @@ impl<R: Resolver> Compiler<R> {
                         break;
                     }
                 }
-                let body: Arc<[Instruction]> = compile_sequence(
-                    children,
-                    CompileContext::new(forward, depth, state.budget.recursion_depth, base_uri)?,
-                )?;
+                let body: Arc<[Instruction]> = compile_sequence(children, context)?;
                 let params: Arc<[Variable]> = params.into();
                 let order = state.next_order();
                 if patterns.is_empty() {
@@ -2298,10 +2289,12 @@ struct CompileContext {
     static_base_uri: Option<Arc<str>>,
     namespace_snapshot: NamespaceSnapshot,
     base_uri_snapshot: BaseUriSnapshot,
+    local_bindings: LocalBindingIndex,
 }
 
 type NamespaceSnapshot = Rc<RefCell<Option<(roxmltree::NodeId, Weak<Vec<(String, String)>>)>>>;
 type BaseUriSnapshot = Rc<RefCell<Option<(roxmltree::NodeId, Option<Arc<str>>)>>>;
+type LocalBindingIndex = Rc<RefCell<HashMap<roxmltree::NodeId, HashSet<ExpandedName>>>>;
 
 impl CompileContext {
     fn new(
@@ -2319,6 +2312,7 @@ impl CompileContext {
             static_base_uri: static_base_uri.map(Arc::from),
             namespace_snapshot: Rc::new(RefCell::new(None)),
             base_uri_snapshot: Rc::new(RefCell::new(None)),
+            local_bindings: Rc::new(RefCell::new(HashMap::new())),
         })
     }
 
@@ -2363,6 +2357,36 @@ impl CompileContext {
             static_base_uri,
             self.max_depth,
         )
+    }
+
+    fn has_visible_local_binding(
+        &self,
+        node: roxmltree::Node<'_, '_>,
+        name: &ExpandedName,
+    ) -> bool {
+        let bindings = self.local_bindings.borrow();
+        let mut cursor = node;
+        while let Some(parent) = cursor.parent_element() {
+            if bindings
+                .get(&parent.id())
+                .is_some_and(|names| names.contains(name))
+            {
+                return true;
+            }
+            cursor = parent;
+        }
+        false
+    }
+
+    fn register_local_binding(&self, node: roxmltree::Node<'_, '_>, name: ExpandedName) {
+        let Some(parent) = node.parent_element() else {
+            return;
+        };
+        self.local_bindings
+            .borrow_mut()
+            .entry(parent.id())
+            .or_default()
+            .insert(name);
     }
 
     fn with_literal_version(mut self, node: roxmltree::Node<'_, '_>) -> Result<Self> {
@@ -3378,7 +3402,11 @@ fn visit_namespace_prefix_attribute(
     }
     Ok(())
 }
-fn validate_local_binding_scope(node: roxmltree::Node<'_, '_>, name: &ExpandedName) -> Result<()> {
+fn validate_local_binding_scope(
+    node: roxmltree::Node<'_, '_>,
+    name: &ExpandedName,
+    context: &CompileContext,
+) -> Result<()> {
     // This also rejects duplicate leading xsl:param declarations: the first parameter is visible
     // to the second under XSLT 1.0 section 11.5, even when different prefixes expand to one name.
     // https://www.w3.org/TR/1999/REC-xslt-19991116#local-variables
@@ -3392,37 +3420,11 @@ fn validate_local_binding_scope(node: roxmltree::Node<'_, '_>, name: &ExpandedNa
         return Ok(());
     }
 
-    let mut cursor = node;
-    loop {
-        for sibling in cursor
-            .prev_siblings()
-            .skip(1)
-            .filter(roxmltree::Node::is_element)
-        {
-            if (sibling.has_tag_name((XSLT_NS, "variable"))
-                || sibling.has_tag_name((XSLT_NS, "param")))
-                && required_qname_attr(sibling, "name")? == *name
-            {
-                return Err(Error::Static(format!(
-                    "local binding {} shadows a still-visible template variable",
-                    name.local
-                )));
-            }
-        }
-        let Some(parent) = cursor.parent_element() else {
-            break;
-        };
-        let parent_is_top_level = parent.parent_element().is_some_and(|grandparent| {
-            grandparent.has_tag_name((XSLT_NS, "stylesheet"))
-                || grandparent.has_tag_name((XSLT_NS, "transform"))
-        });
-        if parent.has_tag_name((XSLT_NS, "template"))
-            || parent.has_tag_name((EXSLT_FUNCTIONS_NS, "function"))
-            || parent_is_top_level
-        {
-            break;
-        }
-        cursor = parent;
+    if context.has_visible_local_binding(node, name) {
+        return Err(Error::Static(format!(
+            "local binding {} shadows a still-visible template variable",
+            name.local
+        )));
     }
     Ok(())
 }
@@ -3430,24 +3432,26 @@ fn validate_local_binding_scope(node: roxmltree::Node<'_, '_>, name: &ExpandedNa
 fn compile_variable(node: roxmltree::Node<'_, '_>, context: CompileContext) -> Result<Variable> {
     validate_instruction_attributes(node, context.forward)?;
     let name = required_qname_attr(node, "name")?;
-    validate_local_binding_scope(node, &name)?;
+    validate_local_binding_scope(node, &name, &context)?;
     let select = node
         .attribute("select")
         .map(|value| context.expression(value, node))
         .transpose()?;
     let base_uri = effective_base_uri(node, context.static_base_uri.as_deref())?;
-    let content = compile_sequence(node.children(), context)?;
+    let content = compile_sequence(node.children(), context.clone())?;
     if select.is_some() && !content.is_empty() {
         return Err(Error::Static(
             "variable with select cannot have content".into(),
         ));
     }
-    Ok(Variable {
+    let variable = Variable {
         name,
         select,
         content,
         base_uri,
-    })
+    };
+    context.register_local_binding(node, variable.name.clone());
+    Ok(variable)
 }
 
 fn compile_sort(node: roxmltree::Node<'_, '_>, context: &CompileContext) -> Result<Sort> {
@@ -4125,6 +4129,28 @@ mod tests {
             ids.0, ids.1
         )
         .into_bytes()
+    }
+
+    #[test]
+    fn many_distinct_local_bindings_compile_with_one_scope_index() {
+        // A wide lexical scope must use the incremental binding index rather than rescanning all
+        // preceding siblings for every declaration.
+        let mut body = String::new();
+        for index in 0..2_048 {
+            use std::fmt::Write as _;
+            write!(body, r#"<xsl:variable name="v{index}" select="{index}"/>"#)
+                .expect("writing to a String succeeds");
+        }
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/">{body}</xsl:template></xsl:stylesheet>"#
+        );
+
+        Compiler::new(
+            Arc::new(crate::NoResolver),
+            CompileBudget::new(8 << 20, 4, 32, 16 << 20),
+        )
+        .compile(&stylesheet, None)
+        .expect("distinct bindings compile without repeated sibling scans");
     }
 
     #[test]

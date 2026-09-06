@@ -50,7 +50,6 @@ struct CompleteNodeTest<'c, 'd> {
     context: &'c context::Evaluation<'c, 'd>,
     node_test: &'c dyn NodeTest,
     result: OrderedNodes<'d>,
-    error: Option<Error>,
 }
 
 impl<'c, 'd> CompleteNodeTest<'c, 'd> {
@@ -59,22 +58,15 @@ impl<'c, 'd> CompleteNodeTest<'c, 'd> {
             context,
             node_test,
             result: OrderedNodes::new(),
-            error: None,
         }
     }
 
-    fn run(&mut self, node: Node<'d>) {
-        if self.error.is_some() {
-            return;
-        }
-        if let Err(source) = self.context.charge_work(1) {
-            self.error = Some(Error::FunctionEvaluation { source });
-            return;
-        }
+    fn run(&mut self, node: Node<'d>) -> Result<(), Error> {
+        self.context
+            .charge_work(1)
+            .map_err(|source| Error::FunctionEvaluation { source })?;
         let new_context = self.context.new_context_for(node);
-        if let Err(error) = self.node_test.test(&new_context, &mut self.result) {
-            self.error = Some(error);
-        }
+        self.node_test.test(&new_context, &mut self.result)
     }
 }
 
@@ -93,12 +85,12 @@ impl AxisLike for Axis {
         let mut node_test = CompleteNodeTest::new(context, node_test);
 
         match *self {
-            Ancestor => each_parent(context.node.clone(), |n| node_test.run(n)),
-            AncestorOrSelf => node_and_each_parent(context.node.clone(), |n| node_test.run(n)),
+            Ancestor => each_parent(context.node.clone(), |n| node_test.run(n))?,
+            AncestorOrSelf => node_and_each_parent(context.node.clone(), |n| node_test.run(n))?,
             Attribute => {
                 if let Node::Element(ref e) = context.node {
                     for attr in e.attributes() {
-                        node_test.run(Node::Attribute(attr));
+                        node_test.run(Node::Attribute(attr))?;
                     }
                 }
             }
@@ -115,7 +107,7 @@ impl AxisLike for Axis {
                             uri: sxd_document_no_unsafe::to_ns_str!(ns.uri()),
                         });
 
-                        node_test.run(ns);
+                        node_test.run(ns)?;
                     }
                 }
             }
@@ -125,7 +117,7 @@ impl AxisLike for Axis {
                         .node
                         .child_at(index)
                         .expect("child index is within the observed length");
-                    node_test.run(child);
+                    node_test.run(child)?;
                 }
             }
             Descendant => {
@@ -142,29 +134,24 @@ impl AxisLike for Axis {
             }
             Parent => {
                 if let Some(parent) = context.node.parent() {
-                    node_test.run(parent);
+                    node_test.run(parent)?;
                 }
             }
             PrecedingSibling => {
-                each_preceding_sibling(&context.node, |sibling| node_test.run(sibling));
+                each_preceding_sibling(&context.node, |sibling| node_test.run(sibling))?;
             }
             FollowingSibling => {
-                each_following_sibling(&context.node, |sibling| node_test.run(sibling));
+                each_following_sibling(&context.node, |sibling| node_test.run(sibling))?;
             }
             Preceding => node_and_each_parent_before(
                 context.node.clone(),
                 context.document_root_for(context.node.clone()),
                 |node| {
                     each_preceding_sibling(&node, |sibling| {
-                        if node_test.error.is_none()
-                            && let Err(error) =
-                                postorder_right_to_left(context, sibling, |n| node_test.run(n))
-                        {
-                            node_test.error = Some(error);
-                        }
-                    });
+                        postorder_right_to_left(context, sibling, |n| node_test.run(n))
+                    })
                 },
-            ),
+            )?,
             Following => {
                 let document_root = context.document_root_for(context.node.clone());
                 let mut traversal_root = context.node.clone();
@@ -184,19 +171,14 @@ impl AxisLike for Axis {
                 }
                 node_and_each_parent_before(traversal_root, document_root, |node| {
                     each_following_sibling(&node, |sibling| {
-                        if node_test.error.is_none()
-                            && let Err(error) =
-                                preorder_left_to_right(context, sibling, |n| node_test.run(n))
-                        {
-                            node_test.error = Some(error);
-                        }
-                    });
-                });
+                        preorder_left_to_right(context, sibling, |n| node_test.run(n))
+                    })
+                })?;
             }
-            SelfAxis => node_test.run(context.node.clone()),
+            SelfAxis => node_test.run(context.node.clone())?,
         }
 
-        node_test.error.map_or(Ok(node_test.result), Err)
+        Ok(node_test.result)
     }
 
     fn principal_node_type(&self) -> PrincipalNodeType {
@@ -215,13 +197,13 @@ fn preorder_left_to_right<'c, 'd, F>(
     mut f: F,
 ) -> Result<(), Error>
 where
-    F: FnMut(Node<'d>),
+    F: FnMut(Node<'d>) -> Result<(), Error>,
 {
     let mut stack = Vec::new();
     push_traversal_frame(&mut stack, context, (node, 0))?;
     while let Some((current, next_child)) = stack.last_mut() {
         if *next_child == 0 {
-            f(current.clone());
+            f(current.clone())?;
         }
         if let Some(child) = current.child_at(*next_child) {
             *next_child += 1;
@@ -239,7 +221,7 @@ fn postorder_right_to_left<'c, 'd, F>(
     mut f: F,
 ) -> Result<(), Error>
 where
-    F: FnMut(Node<'d>),
+    F: FnMut(Node<'d>) -> Result<(), Error>,
 {
     let last_child = node.children_len();
     let mut stack = Vec::new();
@@ -254,7 +236,7 @@ where
             push_traversal_frame(&mut stack, context, (child, last_child))?;
         } else {
             let (current, _) = stack.pop().expect("stack is known to be non-empty");
-            f(current);
+            f(current)?;
         }
     }
     Ok(())
@@ -284,22 +266,30 @@ fn push_traversal_frame<'c, 'd>(
     Ok(())
 }
 
-fn each_preceding_sibling<'d>(node: &Node<'d>, mut f: impl FnMut(Node<'d>)) {
+fn each_preceding_sibling<'d>(
+    node: &Node<'d>,
+    mut f: impl FnMut(Node<'d>) -> Result<(), Error>,
+) -> Result<(), Error> {
     let Some((parent, index)) = child_position(node) else {
-        return;
+        return Ok(());
     };
     for index in (0..index).rev() {
-        f(parent.child_at(index).expect("sibling index is in bounds"));
+        f(parent.child_at(index).expect("sibling index is in bounds"))?;
     }
+    Ok(())
 }
 
-fn each_following_sibling<'d>(node: &Node<'d>, mut f: impl FnMut(Node<'d>)) {
+fn each_following_sibling<'d>(
+    node: &Node<'d>,
+    mut f: impl FnMut(Node<'d>) -> Result<(), Error>,
+) -> Result<(), Error> {
     let Some((parent, index)) = child_position(node) else {
-        return;
+        return Ok(());
     };
     for index in index + 1..parent.children_len() {
-        f(parent.child_at(index).expect("sibling index is in bounds"));
+        f(parent.child_at(index).expect("sibling index is in bounds"))?;
     }
+    Ok(())
 }
 
 fn child_position<'d>(node: &Node<'d>) -> Option<(Node<'d>, usize)> {
@@ -315,40 +305,48 @@ fn child_position<'d>(node: &Node<'d>) -> Option<(Node<'d>, usize)> {
         .map(|index| (parent, index))
 }
 
-fn node_and_each_parent<'d, F>(node: Node<'d>, mut f: F)
+fn node_and_each_parent<'d, F>(node: Node<'d>, mut f: F) -> Result<(), Error>
 where
-    F: FnMut(Node<'d>),
+    F: FnMut(Node<'d>) -> Result<(), Error>,
 {
     let n = node.clone();
-    f(n);
-    each_parent(node, f);
+    f(n)?;
+    each_parent(node, f)
 }
 
-fn node_and_each_parent_before<'d, F>(mut node: Node<'d>, boundary: Node<'d>, mut f: F)
+fn node_and_each_parent_before<'d, F>(
+    mut node: Node<'d>,
+    boundary: Node<'d>,
+    mut f: F,
+) -> Result<(), Error>
 where
-    F: FnMut(Node<'d>),
+    F: FnMut(Node<'d>) -> Result<(), Error>,
 {
     while node != boundary {
-        f(node.clone());
+        f(node.clone())?;
         let Some(parent) = node.parent() else {
             break;
         };
         node = parent;
     }
+    Ok(())
 }
 
-fn each_parent<'d, F>(mut node: Node<'d>, mut f: F)
+fn each_parent<'d, F>(mut node: Node<'d>, mut f: F) -> Result<(), Error>
 where
-    F: FnMut(Node<'d>),
+    F: FnMut(Node<'d>) -> Result<(), Error>,
 {
     while let Some(parent) = node.parent() {
         node = parent.clone();
-        f(parent);
+        f(parent)?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod test {
+    use std::cell::Cell;
+
     use sxd_document_no_unsafe::Package;
     use sxd_document_no_unsafe::dom;
 
@@ -415,6 +413,33 @@ mod test {
                 .select_nodes(&evaluation, &RejectNodeTest)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn traversal_stops_at_the_first_callback_error() {
+        // A budget or node-test failure must abort traversal rather than merely suppressing
+        // subsequent callbacks while the remaining document is still walked.
+        let package = Package::new();
+        let document = package.as_document();
+        let root = document.root();
+        root.append_child(document.create_element("first"));
+        root.append_child(document.create_element("second"));
+        let context = Context::without_core_functions();
+        let evaluation = context::Evaluation::new(&context, root.into());
+        let visits = Cell::new(0);
+
+        let error = preorder_left_to_right(&evaluation, root.into(), |_| {
+            visits.set(visits.get() + 1);
+            Err(Error::FunctionEvaluation {
+                source: crate::function::Error::Other {
+                    what: "stop traversal".into(),
+                },
+            })
+        })
+        .expect_err("the visitor error propagates immediately");
+
+        assert!(matches!(error, Error::FunctionEvaluation { .. }));
+        assert_eq!(visits.get(), 1);
     }
 
     #[test]

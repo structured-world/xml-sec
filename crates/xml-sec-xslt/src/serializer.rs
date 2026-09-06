@@ -128,7 +128,7 @@ impl OutputEncoding {
         } else if let Some(encoding) = xml_sec_xml_input::registered_single_byte_encoding(label) {
             Ok(Self::Registered(encoding))
         } else {
-            encoding_rs::Encoding::for_label(label.as_bytes())
+            encoding_rs::Encoding::for_label_no_replacement(label.as_bytes())
                 .and_then(|encoding| {
                     xml_sec_xml_input::legacy_label_matches_encoding(label, encoding).then_some(
                         Self::Other {
@@ -2046,6 +2046,18 @@ mod tests {
                 .count(),
             representable.len()
         );
+    }
+
+    #[test]
+    fn decoder_only_output_encodings_are_rejected() {
+        // encoding_rs exposes these labels for decoding compatibility but cannot encode output;
+        // accepting them here would reach an internal unreachable branch during serialization.
+        for label in ["replacement", "ISO-2022-KR"] {
+            assert!(
+                matches!(OutputEncoding::new(label), Err(crate::Error::Serialization(message)) if message.contains(label)),
+                "accepted decoder-only encoding {label}"
+            );
+        }
     }
 
     #[test]

@@ -279,6 +279,7 @@ fn compare_equality_values<'c, 'd>(
         }
         (Value::Nodeset(nodes), Number(value)) | (Number(value), Value::Nodeset(nodes)) => {
             for node in nodes.iter() {
+                context.charge_work(1).context(FunctionEvaluation)?;
                 let string = materialize_node_string(context, &node)?;
                 if comparison.numbers(crate::str_to_num(&string), *value) {
                     return Ok(true);
@@ -640,6 +641,7 @@ fn compare_relational_values(
             if left.size() <= right.size() {
                 let left = collect_node_numbers(context, left)?;
                 for right in right.iter() {
+                    context.charge_work(1).context(FunctionEvaluation)?;
                     let right = crate::node_to_num_with_context(context, &right)
                         .context(FunctionEvaluation)?;
                     for left in &left {
@@ -652,6 +654,7 @@ fn compare_relational_values(
             } else {
                 let right = collect_node_numbers(context, right)?;
                 for left in left.iter() {
+                    context.charge_work(1).context(FunctionEvaluation)?;
                     let left = crate::node_to_num_with_context(context, &left)
                         .context(FunctionEvaluation)?;
                     for right in &right {
@@ -711,6 +714,7 @@ fn collect_node_numbers(
         .context(FunctionEvaluation)?;
     let mut values = Vec::with_capacity(nodes.size());
     for node in nodes.iter() {
+        context.charge_work(1).context(FunctionEvaluation)?;
         values.push(crate::node_to_num_with_context(context, &node).context(FunctionEvaluation)?);
     }
     Ok(values)
@@ -952,11 +956,11 @@ mod test {
     fn nodeset_equality_charges_each_candidate_comparison() {
         let package = Package::new();
         let mut setup = Setup::new(&package);
-        let left = setup.doc.create_text("left");
-        let right = setup.doc.create_text("right");
+        let left = setup.doc.create_text("");
+        let right = setup.doc.create_text("different");
         setup.context.set_variable("left", crate::nodeset![left]);
         setup.context.set_variable("right", crate::nodeset![right]);
-        setup.context.set_evaluation_work_limit(1);
+        setup.context.set_evaluation_work_limit(0);
         let expression = Equal::new(
             Box::new(Variable {
                 name: "left".into(),
@@ -970,6 +974,42 @@ mod test {
             expression.evaluate(&setup.context()),
             Err(Error::FunctionEvaluation { .. })
         ));
+    }
+
+    #[test]
+    fn numeric_nodeset_conversions_consume_evaluation_work() {
+        // Numeric comparison materializes each candidate's XPath string-value and must therefore
+        // cross the same work gate as string comparisons.
+        let package = Package::new();
+        let mut setup = Setup::new(&package);
+        let value = setup.doc.create_text("");
+        setup.context.set_variable("value", crate::nodeset![value]);
+        setup.context.set_variable("empty", crate::nodeset![]);
+        setup.context.set_evaluation_work_limit(0);
+
+        let equality = Equal::new(
+            Box::new(Variable {
+                name: "value".into(),
+            }),
+            Box::new(Literal {
+                value: Value::Number(1.0),
+            }),
+        );
+        let relational = Relational::less_than(
+            Box::new(Variable {
+                name: "value".into(),
+            }),
+            Box::new(Variable {
+                name: "empty".into(),
+            }),
+        );
+
+        for expression in [equality, relational] {
+            assert!(matches!(
+                expression.evaluate(&setup.context()),
+                Err(Error::FunctionEvaluation { .. })
+            ));
+        }
     }
 
     #[derive(Debug)]
