@@ -325,7 +325,7 @@ impl<'d> Node<'d> {
                 })?;
             }
             result.push_str(text);
-            Ok(())
+            Ok(true)
         })?;
         Ok(result)
     }
@@ -364,39 +364,60 @@ impl<'d> Node<'d> {
         }
     }
 
-    /// Compares this node's XPath string value without materializing an intermediate `String`.
-    pub(crate) fn string_value_eq(&self, expected: &str) -> bool {
-        use self::Node::*;
-
-        fn consume(actual: &str, remaining: &mut &str) -> bool {
+    /// Compare a node string value while charging traversal and compared bytes as XPath work.
+    pub(crate) fn string_value_eq_with_context(
+        &self,
+        context: &crate::context::Evaluation<'_, '_>,
+        expected: &str,
+    ) -> Result<bool, crate::function::Error> {
+        fn consume(
+            context: &crate::context::Evaluation<'_, '_>,
+            actual: &str,
+            remaining: &mut &str,
+        ) -> Result<bool, crate::function::Error> {
+            context.charge_work(actual.len())?;
             let Some(rest) = remaining.strip_prefix(actual) else {
-                return false;
+                return Ok(false);
             };
             *remaining = rest;
-            true
+            Ok(true)
         }
 
         let mut remaining = expected;
         let matches = match self {
-            Root(_) | Element(_) => {
-                visit_descendant_text(self, |text| consume(text, &mut remaining))
+            Node::Root(_) | Node::Element(_) => {
+                let mut matches = true;
+                visit_descendant_text_metered(self, context, |text| {
+                    if matches {
+                        matches = consume(context, text, &mut remaining)?;
+                    }
+                    Ok(matches)
+                })?;
+                matches
             }
-            Attribute(attribute) => consume(
+            Node::Attribute(attribute) => consume(
+                context,
                 sxd_document_no_unsafe::as_str!(attribute.value()),
                 &mut remaining,
-            ),
-            ProcessingInstruction(instruction) => consume(
+            )?,
+            Node::ProcessingInstruction(instruction) => consume(
+                context,
                 sxd_document_no_unsafe::as_opt_str!(instruction.value()).unwrap_or(""),
                 &mut remaining,
-            ),
-            Comment(comment) => consume(
+            )?,
+            Node::Comment(comment) => consume(
+                context,
                 sxd_document_no_unsafe::as_str!(comment.text()),
                 &mut remaining,
-            ),
-            Text(text) => consume(sxd_document_no_unsafe::as_str!(text.text()), &mut remaining),
-            Namespace(namespace) => consume(namespace.uri(), &mut remaining),
+            )?,
+            Node::Text(text) => consume(
+                context,
+                sxd_document_no_unsafe::as_str!(text.text()),
+                &mut remaining,
+            )?,
+            Node::Namespace(namespace) => consume(context, namespace.uri(), &mut remaining)?,
         };
-        matches && remaining.is_empty()
+        Ok(matches && remaining.is_empty())
     }
 
     /// Returns the number of Unicode code points in this node's string value without building it.
@@ -493,7 +514,7 @@ fn visit_descendant_text(node: &Node<'_>, mut visit: impl FnMut(&str) -> bool) -
 fn visit_descendant_text_metered(
     node: &Node<'_>,
     context: &crate::context::Evaluation<'_, '_>,
-    mut visit: impl FnMut(&str) -> Result<(), crate::function::Error>,
+    mut visit: impl FnMut(&str) -> Result<bool, crate::function::Error>,
 ) -> Result<(), crate::function::Error> {
     let frame_bytes = std::mem::size_of::<(Node<'_>, usize)>();
     context.reserve_temporary_allocation(frame_bytes.saturating_mul(4))?;
@@ -505,12 +526,15 @@ fn visit_descendant_text_metered(
             continue;
         };
         *next_child += 1;
+        context.charge_work(1)?;
         match child {
             Node::Root(_) | Node::Element(_) => {
                 reserve_metered_vec_slot(&mut stack, context)?;
                 stack.push((child, 0));
             }
-            Node::Text(text) => visit(sxd_document_no_unsafe::as_str!(text.text()))?,
+            Node::Text(text) if !visit(sxd_document_no_unsafe::as_str!(text.text()))? => {
+                return Ok(());
+            }
             _ => {}
         }
     }
@@ -598,6 +622,7 @@ impl<'d> Nodeset<'d> {
         node: Node<'d>,
     ) -> Result<(), crate::function::Error> {
         if !self.nodes.contains(&node) {
+            context.charge_work(1)?;
             // The context counter is the embedding's shared temporary-allocation budget; strings
             // and node containers must consume the same allowance.
             context.reserve_string_allocation(std::mem::size_of::<Node<'d>>())?;
@@ -833,6 +858,7 @@ impl<'d> OrderedNodes<'d> {
         context: &crate::context::Evaluation<'_, 'd>,
         node: Node<'d>,
     ) -> Result<(), crate::function::Error> {
+        context.charge_work(1)?;
         context.reserve_string_allocation(std::mem::size_of::<Node<'d>>())?;
         self.0.push(node);
         Ok(())
@@ -1067,11 +1093,37 @@ mod test {
         }
         parent.append_child(doc.create_text("deep"));
         let node = into_node(root);
+        let mut context = crate::context::Context::new();
+        context.set_evaluation_work_limit(32_768);
+        let evaluation = crate::context::Evaluation::new(&context, doc.root().into());
 
         assert_eq!(node.string_value_len(), 4);
         assert_eq!(node.string_value_char_len(), 4);
-        assert!(node.string_value_eq("deep"));
+        assert_eq!(
+            node.string_value_eq_with_context(&evaluation, "deep"),
+            Ok(true)
+        );
         assert_eq!(node.string_value(), "deep");
+    }
+
+    #[test]
+    fn string_value_mismatch_stops_before_unrelated_descendants() {
+        let package = Package::new();
+        let doc = package.as_document();
+        let root = doc.create_element("root");
+        doc.root().append_child(root.clone());
+        root.append_child(doc.create_text("x"));
+        for _ in 0..1_024 {
+            root.append_child(doc.create_element("unrelated"));
+        }
+        let mut context = crate::context::Context::new();
+        context.set_evaluation_work_limit(2);
+        let evaluation = crate::context::Evaluation::new(&context, doc.root().into());
+
+        assert_eq!(
+            into_node(root).string_value_eq_with_context(&evaluation, "y"),
+            Ok(false)
+        );
     }
 
     #[test]

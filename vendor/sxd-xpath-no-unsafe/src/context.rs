@@ -80,11 +80,19 @@ pub struct Context<'d> {
     variables: Variables<'d>,
     namespaces: Namespaces,
     string_allocations: StringAllocationBudget,
+    evaluation_work: EvaluationWorkBudget,
     document_root_resolver: Option<fn(Node<'d>) -> Node<'d>>,
 }
 
 #[derive(Default)]
 struct StringAllocationBudget {
+    limit: Option<usize>,
+    used: Cell<usize>,
+    exceeded: Cell<Option<usize>>,
+}
+
+#[derive(Default)]
+struct EvaluationWorkBudget {
     limit: Option<usize>,
     used: Cell<usize>,
     exceeded: Cell<Option<usize>>,
@@ -105,6 +113,7 @@ impl<'d> Context<'d> {
             variables: Default::default(),
             namespaces: Default::default(),
             string_allocations: StringAllocationBudget::default(),
+            evaluation_work: EvaluationWorkBudget::default(),
             document_root_resolver: None,
         }
     }
@@ -128,6 +137,23 @@ impl<'d> Context<'d> {
     /// Return the first attempted total that exceeded the current context-scoped limit.
     pub fn string_allocation_exceeded(&self) -> Option<usize> {
         self.string_allocations.exceeded.get()
+    }
+
+    /// Limit primitive traversal, predicate, comparison, and result-insertion work.
+    pub fn set_evaluation_work_limit(&mut self, limit: usize) {
+        self.evaluation_work.limit = Some(limit);
+        self.evaluation_work.used.set(0);
+        self.evaluation_work.exceeded.set(None);
+    }
+
+    /// Return work successfully charged by the current evaluation.
+    pub fn evaluation_work_used(&self) -> usize {
+        self.evaluation_work.used.get()
+    }
+
+    /// Return the first attempted total beyond the current work limit.
+    pub fn evaluation_work_exceeded(&self) -> Option<usize> {
+        self.evaluation_work.exceeded.get()
     }
 
     /// Reserve bytes in the context-scoped temporary allocation budget.
@@ -187,6 +213,7 @@ pub struct Evaluation<'c, 'd> {
     variables: &'c Variables<'d>,
     namespaces: &'c Namespaces,
     string_allocations: &'c StringAllocationBudget,
+    evaluation_work: &'c EvaluationWorkBudget,
     document_root_resolver: Option<fn(Node<'d>) -> Node<'d>>,
 }
 
@@ -202,6 +229,7 @@ impl<'c, 'd> Evaluation<'c, 'd> {
             variables: &context.variables,
             namespaces: &context.namespaces,
             string_allocations: &context.string_allocations,
+            evaluation_work: &context.evaluation_work,
             document_root_resolver: context.document_root_resolver,
             position: 1,
             size: 1,
@@ -254,6 +282,25 @@ impl<'c, 'd> Evaluation<'c, 'd> {
     /// Reserve bytes in the context-scoped temporary allocation budget.
     pub fn reserve_temporary_allocation(&self, bytes: usize) -> Result<(), function::Error> {
         reserve_allocation(self.string_allocations, bytes)
+    }
+
+    /// Charge primitive XPath evaluation work before performing it.
+    pub fn charge_work(&self, units: usize) -> Result<(), function::Error> {
+        let actual = self.evaluation_work.used.get().saturating_add(units);
+        if self
+            .evaluation_work
+            .limit
+            .is_some_and(|limit| actual > limit)
+        {
+            if self.evaluation_work.exceeded.get().is_none() {
+                self.evaluation_work.exceeded.set(Some(actual));
+            }
+            return Err(function::Error::Other {
+                what: "XPath evaluation work budget exceeded".into(),
+            });
+        }
+        self.evaluation_work.used.set(actual);
+        Ok(())
     }
 
     /// Yields a new `Evaluation` context for each node in the nodeset.
@@ -316,5 +363,17 @@ mod tests {
         assert!(context.reserve_temporary_allocation(5).is_err());
         assert!(context.reserve_temporary_allocation(9).is_err());
         assert_eq!(context.string_allocation_exceeded(), Some(5));
+    }
+
+    #[test]
+    fn work_budget_preserves_first_exceeded_total() {
+        let mut context = Context::new();
+        context.set_evaluation_work_limit(4);
+        let package = sxd_document_no_unsafe::Package::new();
+        let evaluation = super::Evaluation::new(&context, package.as_document().root().into());
+
+        assert!(evaluation.charge_work(5).is_err());
+        assert!(evaluation.charge_work(9).is_err());
+        assert_eq!(context.evaluation_work_exceeded(), Some(5));
     }
 }

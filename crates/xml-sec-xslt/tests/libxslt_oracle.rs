@@ -189,6 +189,7 @@ fn execution_budget() -> ExecutionBudget {
         external_documents: 512,
         recursion_depth: 2_048,
         xpath_evaluations: 10_000_000,
+        xpath_operations: 100_000_000,
         extension_operations: 100_000_000,
         pattern_evaluations: 100_000_000,
         template_applications: 10_000_000,

@@ -67,6 +67,10 @@ impl<'c, 'd> CompleteNodeTest<'c, 'd> {
         if self.error.is_some() {
             return;
         }
+        if let Err(source) = self.context.charge_work(1) {
+            self.error = Some(Error::FunctionEvaluation { source });
+            return;
+        }
         let new_context = self.context.new_context_for(node);
         if let Err(error) = self.node_test.test(&new_context, &mut self.result) {
             self.error = Some(error);

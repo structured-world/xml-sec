@@ -32,6 +32,7 @@ pub enum BudgetKind {
     ExternalDocuments,
     RecursionDepth,
     XPathEvaluations,
+    XPathOperations,
     ExtensionOperations,
     PatternEvaluations,
     TemplateApplications,
@@ -123,6 +124,8 @@ pub struct ExecutionBudget {
     pub external_documents: usize,
     pub recursion_depth: usize,
     pub xpath_evaluations: usize,
+    /// Maximum primitive traversal, predicate, comparison, and node-set insertion operations.
+    pub xpath_operations: usize,
     /// Internal work performed by extension functions after one XPath call is dispatched.
     pub extension_operations: usize,
     pub pattern_evaluations: usize,
@@ -139,6 +142,7 @@ pub struct ExecutionBudget {
 pub(crate) struct Meter {
     limits: ExecutionBudget,
     xpath_evaluations: usize,
+    xpath_operations: usize,
     extension_operations: usize,
     pattern_evaluations: usize,
     template_applications: usize,
@@ -158,6 +162,7 @@ impl Meter {
         Ok(Self {
             limits,
             xpath_evaluations: 0,
+            xpath_operations: 0,
             extension_operations: 0,
             pattern_evaluations: 0,
             template_applications: 0,
@@ -194,6 +199,9 @@ impl Meter {
             }
             BudgetKind::XPathEvaluations => {
                 (&mut self.xpath_evaluations, self.limits.xpath_evaluations)
+            }
+            BudgetKind::XPathOperations => {
+                (&mut self.xpath_operations, self.limits.xpath_operations)
             }
             BudgetKind::ExtensionOperations => (
                 &mut self.extension_operations,
@@ -255,6 +263,9 @@ impl Meter {
             }
             BudgetKind::XPathEvaluations => {
                 Ok((self.xpath_evaluations, self.limits.xpath_evaluations))
+            }
+            BudgetKind::XPathOperations => {
+                Ok((self.xpath_operations, self.limits.xpath_operations))
             }
             BudgetKind::ExtensionOperations => {
                 Ok((self.extension_operations, self.limits.extension_operations))
@@ -451,6 +462,7 @@ mod tests {
             external_documents: 0,
             recursion_depth: 1,
             xpath_evaluations: 0,
+            xpath_operations: 0,
             extension_operations: 0,
             pattern_evaluations: 0,
             template_applications: 0,

@@ -2033,6 +2033,9 @@ impl Evaluator {
                 .saturating_sub(owned_bytes)
                 .saturating_sub(adapter_workspace),
         );
+        let (xpath_operations, xpath_operations_limit) =
+            meter.usage(BudgetKind::XPathOperations)?;
+        context.set_evaluation_work_limit(xpath_operations_limit.saturating_sub(xpath_operations));
         for (prefix, uri) in expression.namespaces.iter() {
             context.set_namespace(prefix, uri);
         }
@@ -2215,6 +2218,14 @@ impl Evaluator {
             .expect("compiled XPath was inserted into the execution cache");
         let generated_id_bytes_before = self.generated_ids.borrow().owned_bytes;
         let evaluation = xpath.evaluate(&context, context_node);
+        meter.charge(BudgetKind::XPathOperations, context.evaluation_work_used())?;
+        if let Some(attempted) = context.evaluation_work_exceeded() {
+            return Err(Error::Budget {
+                kind: BudgetKind::XPathOperations,
+                limit: xpath_operations_limit,
+                actual: xpath_operations.saturating_add(attempted),
+            });
+        }
         let generated_id_bytes = self
             .generated_ids
             .borrow()
@@ -2352,19 +2363,19 @@ impl Evaluator {
                         meter.release_owned_bytes(reservation);
                     }
                     meter.release_owned_bytes(xml.temporary_bytes);
-                    if identity_is_new {
-                        charge_resource_identity_cache_entry(&resource, meter)?;
-                        self.resource_identities
-                            .insert(resource.identity.clone(), resource.clone());
+                    let resource_identity = if identity_is_new {
+                        cache_new_resource_identity(&mut self.resource_identities, resource, meter)?
                     } else {
+                        let resource_identity = resource.identity.clone();
                         meter.release_owned_bytes(resource.bytes.capacity());
-                    }
+                        resource_identity
+                    };
                     meter.charge(
                         BudgetKind::OwnedBytes,
-                        resource_document_cache_entry_owned_bytes(&resource.identity),
+                        resource_document_cache_entry_owned_bytes(&resource_identity),
                     )?;
                     self.resource_documents
-                        .insert(resource.identity, root.clone());
+                        .insert(resource_identity, root.clone());
                     self.cache_document(resource_request.clone(), vec![root.clone()], meter)?;
                     Some(root)
                 }
@@ -2839,6 +2850,7 @@ impl Evaluator {
                     continue;
                 };
                 for id in children.iter().copied() {
+                    meter.charge(BudgetKind::XPathOperations, 1)?;
                     let Some(candidate) = self.source.node(id) else {
                         continue;
                     };
@@ -4951,6 +4963,17 @@ fn charge_resource_identity_cache_entry(
     meter.charge(BudgetKind::OwnedBytes, additional)
 }
 
+fn cache_new_resource_identity(
+    identities: &mut HashMap<ResourceIdentity, ResolvedResource>,
+    resource: ResolvedResource,
+    meter: &mut Meter,
+) -> Result<ResourceIdentity> {
+    charge_resource_identity_cache_entry(&resource, meter)?;
+    let identity = resource.identity.clone();
+    identities.insert(identity.clone(), resource);
+    Ok(identity)
+}
+
 fn resource_document_cache_entry_owned_bytes(identity: &ResourceIdentity) -> usize {
     hash_entry_storage::<ResourceIdentity, NodeReference>().saturating_add(identity.0.len())
 }
@@ -6491,7 +6514,7 @@ struct DocumentFunction {
     roots: Rc<RefCell<HashMap<DocumentRequest, Vec<NodePath>>>>,
     pending: Rc<RefCell<PendingDocumentRequests>>,
     node_base_uris: Rc<RefCell<HashMap<NodePath, Option<String>>>>,
-    static_base_uri: Option<String>,
+    static_base_uri: Option<Arc<str>>,
 }
 
 enum DocumentBaseSelection {
@@ -6504,10 +6527,10 @@ enum DocumentBaseSelection {
 
 fn clone_metered_optional_string(
     context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
-    value: Option<&String>,
+    value: Option<&str>,
 ) -> std::result::Result<Option<String>, function::Error> {
-    context.reserve_temporary_allocation(value.map_or(0, String::len))?;
-    Ok(value.cloned())
+    context.reserve_temporary_allocation(value.map_or(0, str::len))?;
+    Ok(value.map(str::to_owned))
 }
 
 fn register_exslt_functions(
@@ -7443,7 +7466,10 @@ impl function::Function for DocumentFunction {
             DocumentBaseSelection::Explicit {
                 base_uri: clone_metered_optional_string(
                     context,
-                    base_uris.get(&path).and_then(Option::as_ref),
+                    base_uris
+                        .get(&path)
+                        .and_then(Option::as_ref)
+                        .map(String::as_str),
                 )?,
                 logical_document: path.ordinary().get(1).copied(),
             }
@@ -7497,7 +7523,7 @@ impl function::Function for DocumentFunction {
                             base_uri,
                             logical_document,
                         } => (
-                            clone_metered_optional_string(context, base_uri.as_ref())?,
+                            clone_metered_optional_string(context, base_uri.as_deref())?,
                             *logical_document,
                         ),
                         DocumentBaseSelection::Omitted => {
@@ -7505,7 +7531,10 @@ impl function::Function for DocumentFunction {
                             (
                                 clone_metered_optional_string(
                                     context,
-                                    base_uris.get(&path).and_then(Option::as_ref),
+                                    base_uris
+                                        .get(&path)
+                                        .and_then(Option::as_ref)
+                                        .map(String::as_str),
                                 )?,
                                 path.ordinary().get(1).copied(),
                             )
@@ -7526,11 +7555,11 @@ impl function::Function for DocumentFunction {
                         base_uri,
                         logical_document,
                     } => (
-                        clone_metered_optional_string(context, base_uri.as_ref())?,
+                        clone_metered_optional_string(context, base_uri.as_deref())?,
                         *logical_document,
                     ),
                     DocumentBaseSelection::Omitted => (
-                        clone_metered_optional_string(context, self.static_base_uri.as_ref())?,
+                        clone_metered_optional_string(context, self.static_base_uri.as_deref())?,
                         None,
                     ),
                 };
@@ -8625,6 +8654,7 @@ mod tests {
             external_documents: usize::MAX,
             recursion_depth: usize::MAX,
             xpath_evaluations: usize::MAX,
+            xpath_operations: usize::MAX,
             extension_operations: usize::MAX,
             pattern_evaluations: usize::MAX,
             template_applications: usize::MAX,
@@ -8704,6 +8734,7 @@ mod tests {
             external_documents: usize::MAX,
             recursion_depth: usize::MAX,
             xpath_evaluations: usize::MAX,
+            xpath_operations: usize::MAX,
             extension_operations: usize::MAX,
             pattern_evaluations: usize::MAX,
             template_applications: usize::MAX,
@@ -8763,6 +8794,7 @@ mod tests {
                 external_documents: 0,
                 recursion_depth: usize::MAX,
                 xpath_evaluations: usize::MAX,
+                xpath_operations: usize::MAX,
                 extension_operations: usize::MAX,
                 pattern_evaluations: usize::MAX,
                 template_applications: usize::MAX,
@@ -8812,6 +8844,7 @@ mod tests {
                 external_documents: 0,
                 recursion_depth: usize::MAX,
                 xpath_evaluations: usize::MAX,
+                xpath_operations: usize::MAX,
                 extension_operations: usize::MAX,
                 pattern_evaluations: usize::MAX,
                 template_applications: usize::MAX,
@@ -8880,6 +8913,52 @@ mod tests {
     }
 
     #[test]
+    fn identity_cache_takes_ownership_of_resolver_payload() {
+        let resource = ResolvedResource {
+            canonical_uri: "memory:resource.xml".into(),
+            identity: ResourceIdentity("resource".into()),
+            bytes: vec![7; 4_096],
+            media_type: Some("application/xml".into()),
+            encoding: Some("UTF-8".into()),
+        };
+        let payload = resource.bytes.as_ptr();
+        let mut identities = HashMap::new();
+        let mut meter = Meter::new(
+            ExecutionBudget {
+                source_bytes: usize::MAX,
+                external_documents: usize::MAX,
+                recursion_depth: usize::MAX,
+                xpath_evaluations: usize::MAX,
+                xpath_operations: usize::MAX,
+                extension_operations: usize::MAX,
+                pattern_evaluations: usize::MAX,
+                template_applications: usize::MAX,
+                sort_comparisons: usize::MAX,
+                key_entries: usize::MAX,
+                result_nodes: usize::MAX,
+                serialized_bytes: usize::MAX,
+                messages: usize::MAX,
+                owned_bytes: usize::MAX,
+            },
+            0,
+        )
+        .expect("meter initializes");
+
+        let identity = cache_new_resource_identity(&mut identities, resource, &mut meter)
+            .expect("new identity is cached");
+
+        assert_eq!(
+            identities
+                .get(&identity)
+                .expect("resource is retained")
+                .bytes
+                .as_ptr(),
+            payload,
+            "cache insertion must move rather than clone resolver bytes"
+        );
+    }
+
+    #[test]
     fn unparsed_entity_index_accounts_for_retained_containers() {
         // Names and URIs are only the payload: the per-document vector and hash-table capacity
         // remain live for the evaluator lifetime and must cross the same OwnedBytes gate.
@@ -8894,6 +8973,7 @@ mod tests {
                 external_documents: 0,
                 recursion_depth: 1,
                 xpath_evaluations: 0,
+                xpath_operations: 0,
                 extension_operations: 0,
                 pattern_evaluations: 0,
                 template_applications: 0,
@@ -8951,6 +9031,7 @@ mod tests {
                 external_documents: 1,
                 recursion_depth: 16,
                 xpath_evaluations: 1,
+                xpath_operations: usize::MAX,
                 extension_operations: 1,
                 pattern_evaluations: 1,
                 template_applications: 1,
@@ -9314,6 +9395,7 @@ mod tests {
                 external_documents: 0,
                 recursion_depth: 0,
                 xpath_evaluations: 0,
+                xpath_operations: 0,
                 extension_operations: 0,
                 pattern_evaluations: 0,
                 template_applications: 0,
@@ -9346,6 +9428,7 @@ mod tests {
                 external_documents: usize::MAX,
                 recursion_depth: 32,
                 xpath_evaluations: usize::MAX,
+                xpath_operations: usize::MAX,
                 extension_operations: usize::MAX,
                 pattern_evaluations: usize::MAX,
                 template_applications: usize::MAX,
@@ -9389,6 +9472,7 @@ mod tests {
                 external_documents: 0,
                 recursion_depth: 0,
                 xpath_evaluations: 0,
+                xpath_operations: 0,
                 extension_operations: 0,
                 pattern_evaluations: 0,
                 template_applications: 0,
@@ -9432,6 +9516,7 @@ mod tests {
                 external_documents: usize::MAX,
                 recursion_depth: usize::MAX,
                 xpath_evaluations: usize::MAX,
+                xpath_operations: usize::MAX,
                 extension_operations: usize::MAX,
                 pattern_evaluations: usize::MAX,
                 template_applications: usize::MAX,
@@ -9474,6 +9559,7 @@ mod tests {
             external_documents: usize::MAX,
             recursion_depth: usize::MAX,
             xpath_evaluations: usize::MAX,
+            xpath_operations: usize::MAX,
             extension_operations: usize::MAX,
             pattern_evaluations: usize::MAX,
             template_applications: usize::MAX,
@@ -9525,6 +9611,7 @@ mod tests {
             external_documents: usize::MAX,
             recursion_depth: usize::MAX,
             xpath_evaluations: usize::MAX,
+            xpath_operations: usize::MAX,
             extension_operations: usize::MAX,
             pattern_evaluations: usize::MAX,
             template_applications: usize::MAX,
@@ -9571,6 +9658,7 @@ mod tests {
             external_documents: usize::MAX,
             recursion_depth: usize::MAX,
             xpath_evaluations: usize::MAX,
+            xpath_operations: usize::MAX,
             extension_operations: usize::MAX,
             pattern_evaluations: usize::MAX,
             template_applications: usize::MAX,
@@ -9615,6 +9703,7 @@ mod tests {
             external_documents: usize::MAX,
             recursion_depth: usize::MAX,
             xpath_evaluations: usize::MAX,
+            xpath_operations: usize::MAX,
             extension_operations: usize::MAX,
             pattern_evaluations: usize::MAX,
             template_applications: usize::MAX,
@@ -9658,6 +9747,7 @@ mod tests {
             external_documents: usize::MAX,
             recursion_depth: usize::MAX,
             xpath_evaluations: usize::MAX,
+            xpath_operations: usize::MAX,
             extension_operations: usize::MAX,
             pattern_evaluations: usize::MAX,
             template_applications: usize::MAX,
@@ -9868,6 +9958,7 @@ mod tests {
                 external_documents: usize::MAX,
                 recursion_depth: usize::MAX,
                 xpath_evaluations: usize::MAX,
+                xpath_operations: usize::MAX,
                 extension_operations: 2,
                 pattern_evaluations: usize::MAX,
                 template_applications: usize::MAX,

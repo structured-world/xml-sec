@@ -90,9 +90,7 @@ impl<R: Resolver> Compiler<R> {
                     error => Error::Xml(error.to_string()),
                 }
             })?;
-        let decoded_workspace = matches!(xml, Cow::Owned(_))
-            .then_some(xml.len())
-            .unwrap_or(0);
+        let (xml, decoded_workspace) = classify_decoded_workspace(xml);
         self.compile_with_workspace(&xml, base_uri, decoded_workspace)
     }
 
@@ -111,7 +109,7 @@ impl<R: Resolver> Compiler<R> {
             depth,
         )?;
         with_frontend_document(xml, state, |document, state| {
-            state.charge_owned(estimate_compiled_owned_bytes(document))?;
+            state.charge_owned(estimate_compiled_owned_bytes(document, base_uri))?;
             let root = stylesheet_module_root(document, fragment)?;
             let StylesheetModuleKind::Standard { forward } = stylesheet_module_kind(root)? else {
                 let precedence = inherited_precedence.unwrap_or_else(|| state.next_precedence());
@@ -234,7 +232,10 @@ impl<R: Resolver> Compiler<R> {
                     with_frontend_document(source.as_str(), state, |document, state| {
                         // Every include occurrence produces distinct retained declarations even
                         // when the decoded module and parser input are cached.
-                        state.charge_owned(estimate_compiled_owned_bytes(document))?;
+                        state.charge_owned(estimate_compiled_owned_bytes(
+                            document,
+                            Some(&module.resource.canonical_uri),
+                        ))?;
                         let included_root = stylesheet_module_root(document, module.fragment)?;
                         match stylesheet_module_kind(included_root)? {
                             StylesheetModuleKind::Standard {
@@ -654,6 +655,14 @@ impl<R: Resolver> Compiler<R> {
     }
 }
 
+fn classify_decoded_workspace(xml: Cow<'_, str>) -> (Cow<'_, str>, usize) {
+    let workspace = match &xml {
+        Cow::Owned(xml) => xml.capacity(),
+        Cow::Borrowed(_) => 0,
+    };
+    (xml, workspace)
+}
+
 fn validate_standard_stylesheet_content(root: roxmltree::Node<'_, '_>) -> Result<()> {
     // XSLT 1.0 section 2.2 permits only template top-level declarations after stylesheet
     // whitespace stripping; other character data is a static error.
@@ -743,7 +752,7 @@ pub(crate) struct Expression {
     /// Expanded references let execution initialize only globals on the reached XPath path.
     pub variable_references: Arc<[ExpandedName]>,
     /// Static base of the stylesheet module that owns this expression.
-    pub static_base_uri: Option<String>,
+    pub static_base_uri: Option<Arc<str>>,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct Pattern {
@@ -960,6 +969,16 @@ impl Expression {
         static_base_uri: Option<&str>,
         max_depth: usize,
     ) -> Result<Self> {
+        let static_base_uri = effective_base_uri(node, static_base_uri)?.map(Arc::from);
+        Self::new_with_namespaces_and_base(source, namespaces, static_base_uri, max_depth)
+    }
+
+    fn new_with_namespaces_and_base(
+        source: &str,
+        namespaces: Arc<Vec<(String, String)>>,
+        static_base_uri: Option<Arc<str>>,
+        max_depth: usize,
+    ) -> Result<Self> {
         validate_xpath_prefixes(source, &namespaces)?;
         let normalized = normalize_xpath_for_sxd(source);
         let normalized = crate::xpath::rewrite_absolute_paths_for_validation(&normalized);
@@ -972,7 +991,7 @@ impl Expression {
         Ok(Self::from_parts(
             source.to_owned(),
             namespaces,
-            effective_base_uri(node, static_base_uri)?,
+            static_base_uri,
         ))
     }
 
@@ -991,7 +1010,7 @@ impl Expression {
     fn from_parts(
         source: String,
         namespaces: Arc<Vec<(String, String)>>,
-        static_base_uri: Option<String>,
+        static_base_uri: Option<Arc<str>>,
     ) -> Self {
         let variable_references = referenced_variables(&source, &namespaces).into();
         Self {
@@ -2088,7 +2107,10 @@ fn validate_attribute_sets_in_sequence(
     Ok(())
 }
 
-fn estimate_compiled_owned_bytes(document: &roxmltree::Document<'_>) -> usize {
+fn estimate_compiled_owned_bytes(
+    document: &roxmltree::Document<'_>,
+    module_base_uri: Option<&str>,
+) -> usize {
     document.descendants().fold(0usize, |total, node| {
         // Compilation retains both a normalized semantic node and, conservatively, one IR
         // instruction for each frontend node. Child IDs, attributes, and namespaces live in
@@ -2138,11 +2160,27 @@ fn estimate_compiled_owned_bytes(document: &roxmltree::Document<'_>) -> usize {
             } else {
                 0
             };
+            // One shared Arc<str> is retained by all expressions compiled from this node. URL
+            // serialization may percent-encode every byte, so three times the lexical inputs is
+            // a conservative pre-allocation bound that requires no unmetered URI construction.
+            let expression_base_uri_bytes = if expression_count != 0 {
+                node.ancestors()
+                    .filter(roxmltree::Node::is_element)
+                    .filter_map(|ancestor| {
+                        ancestor.attribute(("http://www.w3.org/XML/1998/namespace", "base"))
+                    })
+                    .map(str::len)
+                    .fold(module_base_uri.map_or(0, str::len), usize::saturating_add)
+                    .saturating_mul(3)
+            } else {
+                0
+            };
             structural_bytes
                 .saturating_add(name_bytes)
                 .saturating_add(attribute_bytes)
                 .saturating_add(namespace_bytes)
                 .saturating_add(expression_namespace_bytes)
+                .saturating_add(expression_base_uri_bytes)
         } else {
             structural_bytes.saturating_add(node.text().map_or(0, str::len))
         };
@@ -2257,11 +2295,13 @@ struct CompileContext {
     depth: usize,
     max_depth: usize,
     inside_function: bool,
-    static_base_uri: Option<String>,
+    static_base_uri: Option<Arc<str>>,
     namespace_snapshot: NamespaceSnapshot,
+    base_uri_snapshot: BaseUriSnapshot,
 }
 
 type NamespaceSnapshot = Rc<RefCell<Option<(roxmltree::NodeId, Weak<Vec<(String, String)>>)>>>;
+type BaseUriSnapshot = Rc<RefCell<Option<(roxmltree::NodeId, Option<Arc<str>>)>>>;
 
 impl CompileContext {
     fn new(
@@ -2276,8 +2316,9 @@ impl CompileContext {
             depth,
             max_depth,
             inside_function: false,
-            static_base_uri: static_base_uri.map(str::to_owned),
+            static_base_uri: static_base_uri.map(Arc::from),
             namespace_snapshot: Rc::new(RefCell::new(None)),
+            base_uri_snapshot: Rc::new(RefCell::new(None)),
         })
     }
 
@@ -2305,11 +2346,21 @@ impl CompileContext {
                 *snapshot = Some((node.id(), Arc::downgrade(&namespaces)));
                 namespaces
             });
-        Expression::new_with_namespaces(
+        let mut base_snapshot = self.base_uri_snapshot.borrow_mut();
+        let static_base_uri = if let Some((id, base_uri)) = base_snapshot.as_ref()
+            && *id == node.id()
+        {
+            base_uri.clone()
+        } else {
+            let base_uri =
+                effective_base_uri(node, self.static_base_uri.as_deref())?.map(Arc::from);
+            *base_snapshot = Some((node.id(), base_uri.clone()));
+            base_uri
+        };
+        Expression::new_with_namespaces_and_base(
             source,
-            node,
             namespaces,
-            self.static_base_uri.as_deref(),
+            static_base_uri,
             self.max_depth,
         )
     }
@@ -2375,7 +2426,7 @@ fn parse_semantic_document_metered(
     let projected_bytes = with_frontend_document(xml, state, |parsed, _state| {
         Ok(xml
             .len()
-            .saturating_add(estimate_compiled_owned_bytes(parsed))
+            .saturating_add(estimate_compiled_owned_bytes(parsed, base_uri))
             .saturating_add(
                 base_uri
                     .map_or(0, str::len)
@@ -4222,7 +4273,8 @@ mod tests {
         let source = r#"<root xmlns:p="urn:namespace"/>"#;
         let document = roxmltree::Document::parse(source).expect("stylesheet fragment parses");
         let root = document.root_element();
-        let context = CompileContext::new(false, 0, 8, None).expect("context is valid");
+        let context = CompileContext::new(false, 0, 8, Some("memory:shared-base/"))
+            .expect("context is valid");
         let first = context
             .expression("p:first", root)
             .expect("expression compiles");
@@ -4231,6 +4283,31 @@ mod tests {
             .expect("expression compiles");
 
         assert!(Arc::ptr_eq(&first.namespaces, &second.namespaces));
+        assert!(Arc::ptr_eq(
+            first
+                .static_base_uri
+                .as_ref()
+                .expect("base URI is retained"),
+            second
+                .static_base_uri
+                .as_ref()
+                .expect("base URI is retained"),
+        ));
+    }
+
+    #[test]
+    fn decoded_workspace_uses_live_string_capacity() {
+        let mut decoded = String::with_capacity(4_096);
+        decoded.push_str("<xsl:stylesheet/>");
+        let capacity = decoded.capacity();
+
+        let (decoded, workspace) = classify_decoded_workspace(Cow::Owned(decoded));
+        assert_eq!(workspace, capacity);
+        assert_eq!(decoded.as_ref(), "<xsl:stylesheet/>");
+
+        let (decoded, workspace) = classify_decoded_workspace(Cow::Borrowed("<x/>"));
+        assert_eq!(workspace, 0);
+        assert_eq!(decoded.as_ref(), "<x/>");
     }
 
     #[test]
@@ -4343,7 +4420,7 @@ mod tests {
         let parsed = roxmltree::Document::parse(xml).expect("test stylesheet parses");
         let retained = xml
             .len()
-            .saturating_add(estimate_compiled_owned_bytes(&parsed));
+            .saturating_add(estimate_compiled_owned_bytes(&parsed, None));
         let parser_workspace = parser_workspace_bytes(xml);
         let mut state = CompileState::new(
             CompileBudget::new(

@@ -33,6 +33,7 @@ fn execution_budget(source_bytes: usize) -> ExecutionBudget {
         external_documents: 8,
         recursion_depth: 256,
         xpath_evaluations: 100_000,
+        xpath_operations: 100_000_000,
         extension_operations: 100_000_000,
         pattern_evaluations: 100_000_000,
         template_applications: 100_000,
@@ -50,6 +51,39 @@ fn minimum_execution_owned_bytes(
     initial_template: &str,
 ) -> usize {
     minimum_execution_owned_bytes_with_parameters(stylesheet, initial_template, &Parameters::new())
+}
+
+#[test]
+fn xpath_internal_work_obeys_its_aggregate_budget() {
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><out><xsl:value-of select="root/item"/></out></xsl:template></xsl:stylesheet>"#,
+    );
+    let source_xml = "<root><item>value</item></root>";
+    let source = Document::parse(source_xml, None).expect("source parses");
+    let mut budget = execution_budget(source_xml.len());
+    budget.xpath_operations = 0;
+
+    let error = stylesheet
+        .execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            xml_sec_xslt::ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect_err("child-axis work must cross the XPath operation gate");
+
+    assert!(matches!(
+        error,
+        Error::Budget {
+            kind: BudgetKind::XPathOperations,
+            limit: 0,
+            actual: 1,
+        }
+    ));
 }
 
 fn minimum_execution_owned_bytes_with_parameters(
@@ -1005,6 +1039,7 @@ fn malformed_stylesheet_and_budget_exhaustion_are_typed() {
                     external_documents: 0,
                     recursion_depth: 1,
                     xpath_evaluations: 1,
+                    xpath_operations: 1,
                     extension_operations: 1,
                     pattern_evaluations: 1,
                     template_applications: 1,

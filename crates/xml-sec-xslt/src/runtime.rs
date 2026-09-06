@@ -2414,12 +2414,9 @@ impl<'a> Execution<'a> {
         let uses_key = xpath_calls_key(&expression.source);
         if let Some(name) = direct_variable_reference(expression)?
             && let Some(value) = self.scopes.iter().rev().find_map(|scope| scope.get(&name))
+            && let Some(value) = clone_allocation_free_variable_value(value)
         {
-            let value = match value.clone() {
-                Value::NodeSet(nodes) => Value::NodeSet(self.evaluator.document_order(nodes)),
-                value => value,
-            };
-            return Ok(public_to_xpath(value));
+            return Ok(value);
         }
         match expression.source.trim() {
             "." => {
@@ -5126,17 +5123,6 @@ fn xpath_value_kind(value: &XPathValue) -> &'static str {
     }
 }
 
-fn public_to_xpath(value: Value) -> XPathValue {
-    match value {
-        Value::NodeSet(nodes) => XPathValue::NodeSet(nodes),
-        Value::ResultTreeFragment(document) => XPathValue::ResultTreeFragment(document),
-        Value::Boolean(value) => XPathValue::Boolean(value),
-        Value::Number(value) => XPathValue::Number(value),
-        Value::String(value) => XPathValue::String(value),
-        Value::StoredExpression(value) => XPathValue::StoredExpression(value),
-    }
-}
-
 fn direct_variable_reference(
     expression: &crate::compiler::Expression,
 ) -> Result<Option<ExpandedName>> {
@@ -5148,6 +5134,17 @@ fn direct_variable_reference(
         return Ok(None);
     }
     expanded_variable_name(lexical, &expression.namespaces).map(Some)
+}
+
+fn clone_allocation_free_variable_value(value: &Value) -> Option<XPathValue> {
+    match value {
+        Value::Boolean(value) => Some(XPathValue::Boolean(*value)),
+        Value::Number(value) => Some(XPathValue::Number(*value)),
+        Value::ResultTreeFragment(document) => {
+            Some(XPathValue::ResultTreeFragment(Arc::clone(document)))
+        }
+        Value::NodeSet(_) | Value::String(_) | Value::StoredExpression(_) => None,
+    }
 }
 
 fn expanded_variable_name(lexical: &str, namespaces: &[(String, String)]) -> Result<ExpandedName> {
@@ -6073,8 +6070,8 @@ mod tests {
 
     use super::{
         ApplyFrame, AttributeSetExpansion, EvaluatedParameters, SortKey, SourceNode, TemplateTask,
-        append_localized_decimal, apply_whitespace_rules, format_number_sequence,
-        metered_node_id_snapshot, validate_parameter_value, value_string,
+        append_localized_decimal, apply_whitespace_rules, clone_allocation_free_variable_value,
+        format_number_sequence, metered_node_id_snapshot, validate_parameter_value, value_string,
     };
     use crate::budget::Meter;
     use crate::compiler::Instruction;
@@ -6090,6 +6087,7 @@ mod tests {
                 external_documents: usize::MAX,
                 recursion_depth: usize::MAX,
                 xpath_evaluations: usize::MAX,
+                xpath_operations: usize::MAX,
                 extension_operations: usize::MAX,
                 pattern_evaluations: usize::MAX,
                 template_applications: usize::MAX,
@@ -6115,6 +6113,7 @@ mod tests {
                 external_documents: usize::MAX,
                 recursion_depth: usize::MAX,
                 xpath_evaluations: usize::MAX,
+                xpath_operations: usize::MAX,
                 extension_operations: usize::MAX,
                 pattern_evaluations: usize::MAX,
                 template_applications: usize::MAX,
@@ -6321,6 +6320,7 @@ mod tests {
             external_documents: usize::MAX,
             recursion_depth: usize::MAX,
             xpath_evaluations: usize::MAX,
+            xpath_operations: usize::MAX,
             extension_operations: usize::MAX,
             pattern_evaluations: usize::MAX,
             template_applications: usize::MAX,
@@ -6351,6 +6351,19 @@ mod tests {
                 actual: 3,
             }
         ));
+    }
+
+    #[test]
+    fn direct_variable_fast_path_never_clones_owned_payloads() {
+        assert!(clone_allocation_free_variable_value(&Value::Boolean(true)).is_some());
+        assert!(clone_allocation_free_variable_value(&Value::Number(1.0)).is_some());
+        assert!(clone_allocation_free_variable_value(&Value::String("payload".into())).is_none());
+        assert!(
+            clone_allocation_free_variable_value(&Value::NodeSet(vec![NodeReference::Node(
+                crate::NodeId::test(0),
+            )]))
+            .is_none()
+        );
     }
 
     #[test]

@@ -232,20 +232,36 @@ fn compare_nodesets<'c, 'd>(
     };
     for node in materialized.iter() {
         let value = materialize_node_string(context, &node)?;
-        if compared
-            .iter()
-            .any(|candidate| comparison.result(candidate.string_value_eq(&value)))
-        {
-            return Ok(true);
+        for candidate in compared.iter() {
+            context.charge_work(1).context(FunctionEvaluation)?;
+            if comparison.result(
+                candidate
+                    .string_value_eq_with_context(context, &value)
+                    .context(FunctionEvaluation)?,
+            ) {
+                return Ok(true);
+            }
         }
     }
     Ok(false)
 }
 
-fn compare_nodes_with_string(nodes: &Nodeset<'_>, value: &str, comparison: Equality) -> bool {
-    nodes
-        .iter()
-        .any(|node| comparison.result(node.string_value_eq(value)))
+fn compare_nodes_with_string(
+    context: &context::Evaluation<'_, '_>,
+    nodes: &Nodeset<'_>,
+    value: &str,
+    comparison: Equality,
+) -> Result<bool, Error> {
+    for node in nodes.iter() {
+        context.charge_work(1).context(FunctionEvaluation)?;
+        if comparison.result(
+            node.string_value_eq_with_context(context, value)
+                .context(FunctionEvaluation)?,
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn compare_equality_values<'c, 'd>(
@@ -272,11 +288,11 @@ fn compare_equality_values<'c, 'd>(
         }
         (Value::Nodeset(nodes), Value::String(value))
         | (Value::String(value), Value::Nodeset(nodes)) => {
-            compare_nodes_with_string(nodes, value, comparison)
+            compare_nodes_with_string(context, nodes, value, comparison)?
         }
         (Value::Nodeset(nodes), Value::ResultTreeFragment(_, value))
         | (Value::ResultTreeFragment(_, value), Value::Nodeset(nodes)) => {
-            compare_nodes_with_string(nodes, value, comparison)
+            compare_nodes_with_string(context, nodes, value, comparison)?
         }
         (Boolean(_), _) | (_, Boolean(_)) => comparison.booleans(left.boolean(), right.boolean()),
         (Number(_), _) | (_, Number(_)) => comparison.numbers(
@@ -626,8 +642,11 @@ fn compare_relational_values(
                 for right in right.iter() {
                     let right = crate::node_to_num_with_context(context, &right)
                         .context(FunctionEvaluation)?;
-                    if left.iter().any(|left| operation(*left, right)) {
-                        return Ok(true);
+                    for left in &left {
+                        context.charge_work(1).context(FunctionEvaluation)?;
+                        if operation(*left, right) {
+                            return Ok(true);
+                        }
                     }
                 }
             } else {
@@ -635,8 +654,11 @@ fn compare_relational_values(
                 for left in left.iter() {
                     let left = crate::node_to_num_with_context(context, &left)
                         .context(FunctionEvaluation)?;
-                    if right.iter().any(|right| operation(left, *right)) {
-                        return Ok(true);
+                    for right in &right {
+                        context.charge_work(1).context(FunctionEvaluation)?;
+                        if operation(left, *right) {
+                            return Ok(true);
+                        }
                     }
                 }
             }
@@ -645,6 +667,7 @@ fn compare_relational_values(
         (Value::Nodeset(left), right) => {
             let right = right.number(context).context(FunctionEvaluation)?;
             for left in left.iter() {
+                context.charge_work(1).context(FunctionEvaluation)?;
                 let left =
                     crate::node_to_num_with_context(context, &left).context(FunctionEvaluation)?;
                 if operation(left, right) {
@@ -656,6 +679,7 @@ fn compare_relational_values(
         (left, Value::Nodeset(right)) => {
             let left = left.number(context).context(FunctionEvaluation)?;
             for right in right.iter() {
+                context.charge_work(1).context(FunctionEvaluation)?;
                 let right =
                     crate::node_to_num_with_context(context, &right).context(FunctionEvaluation)?;
                 if operation(left, right) {
@@ -740,6 +764,7 @@ impl Predicate {
     }
 
     fn matches(&self, context: &context::Evaluation<'_, '_>) -> Result<bool, Error> {
+        context.charge_work(1).context(FunctionEvaluation)?;
         let value = self.expression.evaluate(context)?;
 
         let v = match value {
@@ -836,7 +861,11 @@ impl Expression for Union {
         let mut left_nodes = as_nodes(&self.left)?;
         let right_nodes = as_nodes(&self.right)?;
 
-        left_nodes.extend(right_nodes);
+        for node in right_nodes {
+            left_nodes
+                .add_metered(context, node)
+                .context(FunctionEvaluation)?;
+        }
         Ok(Value::Nodeset(left_nodes))
     }
 
@@ -894,6 +923,54 @@ mod test {
     use crate::nodeset::OrderedNodes;
 
     use super::*;
+
+    #[test]
+    fn union_reserves_growth_before_combining_variables() {
+        let package = Package::new();
+        let mut setup = Setup::new(&package);
+        let left = setup.doc.create_element("left");
+        let right = setup.doc.create_element("right");
+        setup.context.set_variable("left", crate::nodeset![left]);
+        setup.context.set_variable("right", crate::nodeset![right]);
+        setup.context.set_string_allocation_limit(0);
+        let expression = Union::new(
+            Box::new(Variable {
+                name: "left".into(),
+            }),
+            Box::new(Variable {
+                name: "right".into(),
+            }),
+        );
+
+        assert!(matches!(
+            expression.evaluate(&setup.context()),
+            Err(Error::FunctionEvaluation { .. })
+        ));
+    }
+
+    #[test]
+    fn nodeset_equality_charges_each_candidate_comparison() {
+        let package = Package::new();
+        let mut setup = Setup::new(&package);
+        let left = setup.doc.create_text("left");
+        let right = setup.doc.create_text("right");
+        setup.context.set_variable("left", crate::nodeset![left]);
+        setup.context.set_variable("right", crate::nodeset![right]);
+        setup.context.set_evaluation_work_limit(1);
+        let expression = Equal::new(
+            Box::new(Variable {
+                name: "left".into(),
+            }),
+            Box::new(Variable {
+                name: "right".into(),
+            }),
+        );
+
+        assert!(matches!(
+            expression.evaluate(&setup.context()),
+            Err(Error::FunctionEvaluation { .. })
+        ));
+    }
 
     #[derive(Debug)]
     struct FailExpression;
