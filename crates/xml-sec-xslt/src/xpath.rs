@@ -2922,9 +2922,19 @@ impl Evaluator {
         node: &SourceNode,
         meter: &mut Meter,
     ) -> Result<(String, usize)> {
-        let length = self.string_value_len(node);
+        let mut length = 0usize;
+        self.visit_string_value_metered(node, meter, |value| {
+            length = length.saturating_add(value.len());
+        })?;
         meter.charge(BudgetKind::OwnedBytes, length)?;
-        Ok((self.string_value_with_capacity(node, length), length))
+        let mut output = String::with_capacity(length);
+        if let Err(error) = self.visit_string_value_metered(node, meter, |value| {
+            output.push_str(value);
+        }) {
+            meter.release_owned_bytes(length);
+            return Err(error);
+        }
+        Ok((output, length))
     }
 
     fn string_value_with_capacity(&self, node: &SourceNode, capacity: usize) -> String {
@@ -3647,18 +3657,9 @@ impl XPathValue {
                 let Some(node) = nodes.first() else {
                     return Ok((String::new(), 0));
                 };
-                let length = evaluator.string_value_len(node);
-                meter.charge(BudgetKind::OwnedBytes, length)?;
-                Ok((evaluator.string_value_with_capacity(node, length), length))
+                evaluator.materialize_temporary_string_value(node, meter)
             }
-            Self::ResultTreeFragment(document) => {
-                let length = document.string_value_len(document.root());
-                meter.charge(BudgetKind::OwnedBytes, length)?;
-                Ok((
-                    document.string_value_with_capacity(document.root(), length),
-                    length,
-                ))
-            }
+            Self::ResultTreeFragment(document) => temporary_document_string(&document, meter),
             Self::Boolean(value) => {
                 let value = if value { "true" } else { "false" };
                 meter.charge(BudgetKind::OwnedBytes, value.len())?;
@@ -3692,19 +3693,60 @@ impl XPathValue {
             value => value.into_temporary_string(evaluator, meter),
         }
     }
-    pub(crate) fn number(&self, evaluator: &Evaluator) -> f64 {
+    pub(crate) fn into_number(self, evaluator: &Evaluator, meter: &mut Meter) -> Result<f64> {
         match self {
-            Self::Number(value) => *value,
-            Self::Boolean(true) => 1.0,
-            Self::Boolean(false) => 0.0,
-            Self::String(value) => xpath_number(value),
-            Self::StoredExpression(value) => xpath_number(value),
-            Self::NodeSet(_) => xpath_number(&self.string(evaluator)),
+            Self::Number(value) => Ok(value),
+            Self::Boolean(true) => Ok(1.0),
+            Self::Boolean(false) => Ok(0.0),
+            Self::String(value) | Self::StoredExpression(value) => {
+                metered_xpath_number(&value, meter)
+            }
+            Self::NodeSet(nodes) => {
+                let Some(node) = nodes.first() else {
+                    return Ok(f64::NAN);
+                };
+                if let Some(value) = evaluator.borrowed_leaf_string_value(node) {
+                    return metered_xpath_number(value, meter);
+                }
+                let (value, temporary_bytes) =
+                    evaluator.materialize_temporary_string_value(node, meter)?;
+                let number = metered_xpath_number(&value, meter);
+                meter.release_owned_bytes(temporary_bytes);
+                number
+            }
             Self::ResultTreeFragment(document) => {
-                xpath_number(&document.string_value(document.root()))
+                let (value, temporary_bytes) = temporary_document_string(&document, meter)?;
+                let number = metered_xpath_number(&value, meter);
+                meter.release_owned_bytes(temporary_bytes);
+                number
             }
         }
     }
+}
+
+fn temporary_document_string(document: &Document, meter: &mut Meter) -> Result<(String, usize)> {
+    let mut length = 0usize;
+    document.try_visit_string_value(
+        document.root(),
+        || meter.charge(BudgetKind::XPathOperations, 1),
+        |value| length = length.saturating_add(value.len()),
+    )?;
+    meter.charge(BudgetKind::OwnedBytes, length)?;
+    let mut output = String::with_capacity(length);
+    if let Err(error) = document.try_visit_string_value(
+        document.root(),
+        || meter.charge(BudgetKind::XPathOperations, 1),
+        |value| output.push_str(value),
+    ) {
+        meter.release_owned_bytes(length);
+        return Err(error);
+    }
+    Ok((output, length))
+}
+
+fn metered_xpath_number(value: &str, meter: &mut Meter) -> Result<f64> {
+    meter.charge(BudgetKind::XPathOperations, value.len())?;
+    Ok(xpath_number(value))
 }
 
 pub(crate) fn xpath_number(value: &str) -> f64 {
@@ -5256,6 +5298,7 @@ impl NodeMaps {
                     // projected and semantic trees directly. Materializing one full path per
                     // selected node makes retained workspace quadratic on deep result sets.
                     loop {
+                        meter.charge(BudgetKind::XPathOperations, 1)?;
                         if nodes.remove(&node)
                             && let Some(id) = source_id
                         {
@@ -5274,6 +5317,7 @@ impl NodeMaps {
                             for (index, attribute) in
                                 attributes.unwrap_or_default().iter().enumerate()
                             {
+                                meter.charge(BudgetKind::XPathOperations, 1)?;
                                 let Some(attribute) = element.attribute(QName::with_namespace_uri(
                                     attribute.name.namespace.as_deref(),
                                     &attribute.name.local,
@@ -5328,15 +5372,20 @@ impl NodeMaps {
                     // the SXD DOM. They are uncommon, so only those remaining after the tree walk
                     // need the path-based fallback.
                     for node in nodes {
-                        let path = typed_path_to(&node);
-                        if let Some(source) = self.reverse.get(&path) {
-                            reserve_temporary_vec_slot(
-                                &mut projected,
-                                meter,
-                                &mut temporary_bytes,
-                            )?;
-                            projected.push(source.clone());
-                        }
+                        let (path, path_bytes) = typed_path_to_metered(&node, meter)?;
+                        let result = (|| {
+                            if let Some(source) = self.reverse.get(&path) {
+                                reserve_temporary_vec_slot(
+                                    &mut projected,
+                                    meter,
+                                    &mut temporary_bytes,
+                                )?;
+                                projected.push(source.clone());
+                            }
+                            Ok(())
+                        })();
+                        meter.release_owned_bytes(path_bytes);
+                        result?;
                     }
                     projected.sort_by_key(|node| self.order.get(node).copied());
                     Ok(XPathValue::NodeSet(projected))
@@ -5734,6 +5783,14 @@ fn token_document(
     kind: ExtensionCallKind,
     meter: &mut Meter,
 ) -> Result<Document> {
+    let scan_work = match kind {
+        ExtensionCallKind::Tokenize => input.len().saturating_mul(delimiters.len().max(1)),
+        ExtensionCallKind::Split => input.len().saturating_add(delimiters.len()),
+        _ => unreachable!("token documents are produced only by split and tokenize"),
+    };
+    // Tokenize tests every input character against the delimiter set, while split scans for one
+    // delimiter string. Charge a conservative byte upper bound before either scan starts.
+    meter.charge(BudgetKind::ExtensionOperations, scan_work)?;
     let mut document = Document::empty(None);
     meter.charge(
         BudgetKind::OwnedBytes,
@@ -8071,6 +8128,89 @@ fn typed_path_to(node: &nodeset::Node<'_>) -> NodePath {
     }
 }
 
+fn typed_path_to_metered(node: &nodeset::Node<'_>, meter: &mut Meter) -> Result<(NodePath, usize)> {
+    let mut reserved = 0usize;
+    let result = (|| {
+        let path = match node {
+            nodeset::Node::Attribute(attribute) => {
+                let parent = attribute.parent();
+                let parent = parent.map(nodeset::Node::Element);
+                let parent = parent.as_ref().map_or_else(
+                    || Ok(Vec::new()),
+                    |parent| path_to_metered(parent, meter, &mut reserved),
+                )?;
+                let name = attribute.name();
+                let name = name.get();
+                let namespace = name.namespace_uri();
+                let string_bytes = namespace
+                    .map_or(0, str::len)
+                    .saturating_add(name.local_part().len());
+                meter.charge(BudgetKind::OwnedBytes, string_bytes)?;
+                reserved = reserved.saturating_add(string_bytes);
+                NodePath::Attribute {
+                    parent,
+                    namespace: namespace.map(str::to_owned),
+                    local: name.local_part().to_owned(),
+                }
+            }
+            nodeset::Node::Namespace(namespace) => {
+                let parent = path_to_metered(
+                    &nodeset::Node::Element(namespace.parent),
+                    meter,
+                    &mut reserved,
+                )?;
+                let string_bytes = namespace
+                    .prefix()
+                    .len()
+                    .saturating_add(namespace.uri().len());
+                meter.charge(BudgetKind::OwnedBytes, string_bytes)?;
+                reserved = reserved.saturating_add(string_bytes);
+                NodePath::Namespace {
+                    parent,
+                    prefix: namespace.prefix().to_owned(),
+                    uri: namespace.uri().to_owned(),
+                }
+            }
+            _ => NodePath::Ordinary(path_to_metered(node, meter, &mut reserved)?),
+        };
+        Ok(path)
+    })();
+    match result {
+        Ok(path) => Ok((path, reserved)),
+        Err(error) => {
+            meter.release_owned_bytes(reserved);
+            Err(error)
+        }
+    }
+}
+
+fn path_to_metered(
+    node: &nodeset::Node<'_>,
+    meter: &mut Meter,
+    reserved: &mut usize,
+) -> Result<Vec<usize>> {
+    let mut current = node.clone();
+    let mut path = Vec::new();
+    while let Some(parent) = current.parent() {
+        let mut index = 0usize;
+        loop {
+            meter.charge(BudgetKind::XPathOperations, 1)?;
+            let child = parent.child_at(index).ok_or_else(|| {
+                Error::Dynamic("XPath projection node is detached from its parent".into())
+            })?;
+            if child == current {
+                break;
+            }
+            index = index.saturating_add(1);
+        }
+        reserve_temporary_vec_slot(&mut path, meter, reserved)?;
+        path.push(index);
+        current = parent;
+    }
+    path.reverse();
+    Ok(path)
+}
+
 type KeyIndex = HashMap<(ExpandedName, String, usize), Vec<NodePath>>;
 
 struct KeyFunction {
@@ -9537,7 +9677,7 @@ mod tests {
                 recursion_depth: 0,
                 xpath_evaluations: 0,
                 xpath_operations: 0,
-                extension_operations: 0,
+                extension_operations: usize::MAX,
                 pattern_evaluations: 0,
                 template_applications: 0,
                 sort_comparisons: 0,

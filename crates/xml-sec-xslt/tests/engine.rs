@@ -117,6 +117,78 @@ fn scalar_xpath_evaluation_consumes_operation_budget() {
 }
 
 #[test]
+fn numeric_nodeset_coercion_reserves_its_temporary_string() {
+    // XPath 1.0 section 3.4 converts a node-set to a number through its string-value. That
+    // transient copy must remain inside the execution memory budget even when the number itself
+    // is tiny. https://www.w3.org/TR/1999/REC-xpath-19991116/#numbers
+    let source_xml = format!("<root>{}</root>", "7".repeat(32 * 1024));
+    let source = Document::parse(&source_xml, None).expect("source parses");
+    let scalar = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:number value="1"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let nodeset = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:number value="/root"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let scalar_minimum =
+        minimum_execution_owned_bytes_for_source(&scalar, &source, source_xml.len());
+    let mut budget = execution_budget(source_xml.len());
+    budget.owned_bytes = scalar_minimum + 4 * 1024;
+
+    assert!(matches!(
+        nodeset.execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn numeric_sort_keys_reserve_their_temporary_strings() {
+    // Numeric xsl:sort performs the same XPath node-set-to-number conversion as xsl:number, so
+    // descendant text materialization must remain inside the execution memory budget there too.
+    let payload = "7".repeat(32 * 1024);
+    let source_xml = format!("<root><item>{payload}</item></root>");
+    let source = Document::parse(&source_xml, None).expect("source parses");
+    let scalar_sort = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><out><xsl:for-each select="root/item"><xsl:sort select="1" data-type="number"/><xsl:value-of select="position()"/></xsl:for-each></out></xsl:template></xsl:stylesheet>"#,
+    );
+    let numeric_sort = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><out><xsl:for-each select="root/item"><xsl:sort select="." data-type="number"/><xsl:value-of select="position()"/></xsl:for-each></out></xsl:template></xsl:stylesheet>"#,
+    );
+    let scalar_minimum =
+        minimum_execution_owned_bytes_for_source(&scalar_sort, &source, source_xml.len());
+    let mut budget = execution_budget(source_xml.len());
+    budget.owned_bytes = scalar_minimum + 4 * 1024;
+
+    assert!(matches!(
+        numeric_sort.execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn identity_xpath_shortcuts_obey_the_operation_budget() {
     // Optimized identity selections must charge the same examined/inserted node work as the
     // general XPath evaluator instead of bypassing the operation policy.
@@ -5367,39 +5439,47 @@ fn xinclude_text_distinguishes_unavailable_encodings_from_invalid_bytes() {
         assert!(matches!(error, Error::Xml(_)));
     }
 
-    resolver
-        .resources
-        .lock()
-        .expect("test resolver mutex is not poisoned")
-        .insert(
-            ("unsupported.txt".into(), Some("memory:source.xml".into())),
-            ResolvedResource {
-                canonical_uri: "memory:unsupported.txt".into(),
-                identity: ResourceIdentity("unsupported.txt".into()),
-                bytes: b"text".to_vec(),
-                media_type: Some("text/plain".into()),
-                encoding: Some("X-NOT-AVAILABLE".into()),
-            },
-        );
-    let source = Document::parse(
-        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="unsupported.txt" parse="text"><xi:fallback>fallback</xi:fallback></xi:include></root>"#,
-        Some("memory:source.xml"),
-    )
-    .expect("XInclude source parses");
-    let result = stylesheet
-        .execute_with_source_processing(
-            &source,
-            &Parameters::new(),
-            resolver.clone(),
-            ExecutionOptions {
-                budget: execution_budget(1024),
-                initial_mode: None,
-                initial_template: None,
-            },
-            SourceProcessing::XInclude,
+    for (href, encoding) in [
+        ("unsupported.txt", "X-NOT-AVAILABLE"),
+        ("replacement.txt", "replacement"),
+        ("iso-2022-kr.txt", "ISO-2022-KR"),
+    ] {
+        resolver
+            .resources
+            .lock()
+            .expect("test resolver mutex is not poisoned")
+            .insert(
+                (href.into(), Some("memory:source.xml".into())),
+                ResolvedResource {
+                    canonical_uri: format!("memory:{href}"),
+                    identity: ResourceIdentity(href.into()),
+                    bytes: Vec::new(),
+                    media_type: Some("text/plain".into()),
+                    encoding: Some(encoding.into()),
+                },
+            );
+        let source = Document::parse(
+            &format!(
+                r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="{href}" parse="text"><xi:fallback>fallback</xi:fallback></xi:include></root>"#
+            ),
+            Some("memory:source.xml"),
         )
-        .expect("unsupported encoding activates fallback");
-    assert_eq!(result.serialized.bytes, b"fallback");
+        .expect("XInclude source parses");
+        let result = stylesheet
+            .execute_with_source_processing(
+                &source,
+                &Parameters::new(),
+                resolver.clone(),
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+                SourceProcessing::XInclude,
+            )
+            .expect("unsupported encoding activates fallback");
+        assert_eq!(result.serialized.bytes, b"fallback");
+    }
 
     resolver
         .resources
@@ -8716,6 +8796,36 @@ fn exslt_token_arguments_count_temporary_string_values() {
 }
 
 #[test]
+fn exslt_tokenization_obeys_the_extension_work_budget() {
+    // Token scanning is extension-internal work even when it emits no result nodes.
+    let source = Document::parse("<source/>", None).expect("source parses");
+    for function in ["split", "tokenize"] {
+        let stylesheet = compile(&format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(str:{function}('aaaaaaaa', 'z'))"/></xsl:template></xsl:stylesheet>"#,
+        ));
+        let mut budget = execution_budget(1024);
+        budget.extension_operations = 0;
+
+        assert!(matches!(
+            stylesheet.execute(
+                &source,
+                &Parameters::new(),
+                Arc::new(NoResolver),
+                ExecutionOptions {
+                    budget,
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            ),
+            Err(Error::Budget {
+                kind: BudgetKind::ExtensionOperations,
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
 fn xml_doctype_rejects_invalid_public_identifier_characters() {
     // XML output must never serialize a PUBLIC literal outside the XML PubidChar grammar.
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes" doctype-public="bad&lt;id" doctype-system="result.dtd"/><xsl:template match="/"><root/></xsl:template></xsl:stylesheet>"#;
@@ -9870,6 +9980,50 @@ fn generic_large_nodeset_projection_preserves_deep_document_order() {
 
     assert!(output.starts_with("1|2|3|"));
     assert!(output.ends_with(&format!("{depth}|")));
+}
+
+#[test]
+fn generic_large_nodeset_projection_charges_unselected_tree_walks() {
+    // A caller-provided set can select only 65 nodes while forcing the generic reverse projection
+    // to inspect a much larger unrelated tree. The aggregate XPath work budget must cover that
+    // walk rather than only the selected result size.
+    let source_xml = format!("<root>{}</root>", "<item/>".repeat(2_048));
+    let source = Document::parse(&source_xml, None).expect("wide source parses");
+    let selected = source
+        .nodes()
+        .filter_map(|(id, node)| {
+            matches!(node.kind, NodeKind::Element { .. }).then_some(NodeReference::Node(id))
+        })
+        .skip(1)
+        .take(65)
+        .collect();
+    let mut parameters = Parameters::new();
+    parameters.insert(
+        ExpandedName::new(None::<String>, "selected"),
+        Value::NodeSet(selected),
+    );
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:param name="selected"/><xsl:template match="/"><out><xsl:copy-of select="$selected"/></out></xsl:template></xsl:stylesheet>"#,
+    );
+    let mut budget = execution_budget(source_xml.len());
+    budget.xpath_operations = 512;
+
+    assert!(matches!(
+        stylesheet.execute(
+            &source,
+            &parameters,
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::XPathOperations,
+            ..
+        })
+    ));
 }
 
 #[test]

@@ -413,7 +413,10 @@ fn parse_encoding(label: &str) -> Result<SelectedEncoding, Error> {
     // requested IANA label was redirected to a Windows extension with different C1 bytes.
     // XML 1.0 section 4.3.3 requires registered labels to retain their IANA meaning.
     // https://www.w3.org/TR/xml/#charencoding
-    let encoding = encoding_rs::Encoding::for_label(label.as_bytes())
+    // XInclude 1.0 sections 4.2-4.3 make an unsupported text encoding a resource error.
+    // Decoder-only WHATWG labels must therefore not select the replacement decoder.
+    // https://www.w3.org/TR/xinclude/#text_included
+    let encoding = encoding_rs::Encoding::for_label_no_replacement(label.as_bytes())
         .ok_or_else(|| Error::UnsupportedEncoding(label.into()))?;
     if !legacy_label_matches_encoding(label, encoding) {
         return Err(Error::UnsupportedEncoding(label.into()));
@@ -1050,6 +1053,19 @@ mod tests {
             Some(encoding_rs::ISO_8859_2)
         );
         assert_eq!(encoding_rs::ISO_8859_2.name(), "ISO-8859-2");
+    }
+
+    #[test]
+    fn decoder_only_labels_are_reported_as_unsupported() {
+        // XInclude 1.0 sections 4.2-4.3 classify an unsupported text encoding as a resource
+        // error, so decoder-only WHATWG labels must not reach the replacement decoder.
+        // https://www.w3.org/TR/xinclude/#text_included
+        for label in ["replacement", "ISO-2022-KR"] {
+            assert!(matches!(
+                decode_text(b"", label),
+                Err(Error::UnsupportedEncoding(rejected)) if rejected == label
+            ));
+        }
     }
 
     #[test]

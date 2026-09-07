@@ -2127,7 +2127,7 @@ impl<'a> Execution<'a> {
                 let explicit_value = if let Some(expression) = &number.value {
                     Some(
                         self.evaluate(expression, node, position, size)?
-                            .number(&self.evaluator),
+                            .into_number(&self.evaluator, &mut self.meter)?,
                     )
                 } else {
                     None
@@ -3249,7 +3249,7 @@ impl<'a> Execution<'a> {
                 for (sort, spec) in sorts.iter().zip(&specs) {
                     let value = self.evaluate(&sort.select, node, index + 1, nodes.len())?;
                     let key = if spec.data_type == "number" {
-                        SortKey::Number(value.number(&self.evaluator))
+                        SortKey::Number(value.into_number(&self.evaluator, &mut self.meter)?)
                     } else {
                         let (value, reservation) = value.into_fully_metered_temporary_string(
                             &self.evaluator,
