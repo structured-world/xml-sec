@@ -646,8 +646,18 @@ impl Connections {
     {
         let parent_r = unsafe { &mut *self.root };
         let child = child.into();
-        child.remove_parent();
-        parent_r.children.retain(|&x| x != child);
+        let mut removed = false;
+        parent_r.children.retain(|&x| {
+            if x == child {
+                removed = true;
+                false
+            } else {
+                true
+            }
+        });
+        if removed {
+            child.remove_parent();
+        }
     }
 
     pub fn remove_element_child<C>(&self, parent: *mut Element, child: C)
@@ -656,8 +666,19 @@ impl Connections {
     {
         let parent_r = unsafe { &mut *parent };
         let child = child.into();
-        child.remove_parent();
-        parent_r.children.retain(|&x| x != child);
+        let mut removed = false;
+        parent_r.children.retain(|&x| {
+            if x == child {
+                removed = true;
+                false
+            } else {
+                true
+            }
+        });
+        // Preserve the reverse edge when the requested parent did not own this child.
+        if removed {
+            child.remove_parent();
+        }
     }
 
     pub fn clear_root_children(&self) {

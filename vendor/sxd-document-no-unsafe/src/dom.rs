@@ -1448,6 +1448,27 @@ mod test {
     }
 
     #[test]
+    fn removing_nonchild_preserves_parent_and_cycle_checks() {
+        // Removal through an unrelated handle must leave both topology edges intact.
+        let package = Package::new();
+        let doc = package.as_document();
+        let parent = doc.create_element("parent");
+        let child = doc.create_element("child");
+        parent.append_child(child);
+        doc.create_element("unrelated").remove_child(child);
+        assert_eq!(child.parent().and_then(|node| node.element()), Some(parent));
+        doc.root().remove_child(child);
+        assert_eq!(child.parent().and_then(|node| node.element()), Some(parent));
+        assert_eq!(parent.children().len(), 1);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                child.append_child(parent);
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn namespace_visitor_isolated_from_reentrant_registration() {
         // Rehashing during a callback must not invalidate the borrowed declaration snapshot.
         let package = Package::new();

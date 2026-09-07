@@ -10,17 +10,69 @@ use crate::token::{AxisName, NodeTestName, Token};
 use crate::tokenizer::{self, TokenResult};
 
 #[allow(missing_copy_implementations)]
-pub struct Parser {
+pub struct Parser<'a> {
     nesting: Cell<usize>,
+    budget: Option<&'a crate::ParseBudget>,
 }
 
 const MAX_EXPRESSION_NESTING: usize = 256;
 
-impl Parser {
-    pub fn new() -> Parser {
+impl<'a> Parser<'a> {
+    pub fn new() -> Self {
         Parser {
             nesting: Cell::new(0),
+            budget: None,
         }
+    }
+
+    pub fn with_budget(budget: &'a crate::ParseBudget) -> Self {
+        Self {
+            budget: Some(budget),
+            ..Self::new()
+        }
+    }
+
+    fn charge(&self, bytes: usize) -> Result<(), Error> {
+        self.budget.map_or(Ok(()), |budget| budget.charge(bytes))
+    }
+
+    fn boxed<T>(&self, value: T) -> Result<Box<T>, Error> {
+        self.charge(std::mem::size_of::<T>())?;
+        Ok(Box::new(value))
+    }
+
+    fn push<T>(&self, values: &mut Vec<T>, value: T) -> Result<(), Error> {
+        if values.len() == values.capacity() {
+            let (capacity, bytes) = self.vector_growth::<T>(values.capacity())?;
+            self.charge(bytes)?;
+            // Allocate beside the old buffer so the reservation models the real overlap.
+            let mut replacement = Vec::with_capacity(capacity);
+            replacement.append(values);
+            let old_bytes = values.capacity() * std::mem::size_of::<T>();
+            *values = replacement;
+            if let Some(budget) = self.budget {
+                budget.release(old_bytes);
+            }
+        }
+        values.push(value);
+        Ok(())
+    }
+
+    fn vector_growth<T>(&self, old_capacity: usize) -> Result<(usize, usize), Error> {
+        let overflow = || Error::AllocationLimit {
+            limit: self.budget.map_or(usize::MAX, |budget| budget.limit),
+            actual: usize::MAX,
+        };
+        let capacity = old_capacity.checked_mul(2).ok_or_else(overflow)?.max(4);
+        let bytes = capacity
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(overflow)?;
+        // Vec allocations must fit Layout's signed pointer-offset bound, even with no
+        // caller-selected limit. Never turn arithmetic overflow into an allocation request.
+        if bytes > isize::MAX as usize {
+            return Err(overflow());
+        }
+        Ok((capacity, bytes))
     }
 
     fn with_nesting<T>(&self, parse: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
@@ -37,6 +89,8 @@ impl Parser {
 #[snafu(context(suffix(false)))]
 #[cfg_attr(test, snafu(visibility(pub(crate))))]
 pub enum Error {
+    /// live parser heap payload would exceed the caller's allowance
+    AllocationLimit { limit: usize, actual: usize },
     /// XPath was empty
     NoXPath,
     /// empty predicate
@@ -66,10 +120,11 @@ type BinaryExpressionBuilder = fn(SubExpression, SubExpression) -> SubExpression
 struct BinaryRule {
     token: Token,
     builder: BinaryExpressionBuilder,
+    allocation_bytes: usize,
 }
 
-struct LeftAssociativeBinaryParser {
-    rules: Vec<BinaryRule>,
+struct LeftAssociativeBinaryParser<'a> {
+    rules: &'a [BinaryRule],
 }
 
 type TokenSource<'a, I> = &'a mut Peekable<I>;
@@ -126,12 +181,17 @@ macro_rules! next_token_is(
     );
 );
 
-impl LeftAssociativeBinaryParser {
-    fn new(rules: Vec<BinaryRule>) -> LeftAssociativeBinaryParser {
+impl<'a> LeftAssociativeBinaryParser<'a> {
+    fn new(rules: &'a [BinaryRule]) -> Self {
         LeftAssociativeBinaryParser { rules }
     }
 
-    fn parse<F, I>(&self, source: TokenSource<'_, I>, child_parse: F) -> ParseResult
+    fn parse<F, I>(
+        &self,
+        owner: &Parser<'_>,
+        source: TokenSource<'_, I>,
+        child_parse: F,
+    ) -> ParseResult
     where
         F: Fn(TokenSource<'_, I>) -> ParseResult,
         I: Iterator<Item = TokenResult>,
@@ -147,7 +207,7 @@ impl LeftAssociativeBinaryParser {
         while source.has_more_tokens() {
             let mut found = false;
 
-            for rule in &self.rules {
+            for rule in self.rules {
                 if source.next_token_is(&rule.token) {
                     source.consume(&rule.token)?;
 
@@ -156,6 +216,7 @@ impl LeftAssociativeBinaryParser {
                     let next_depth = 1usize.saturating_add(left_depth.max(right.ast_depth()));
                     ensure!(next_depth <= MAX_EXPRESSION_NESTING, NestingLimit);
 
+                    owner.charge(rule.allocation_bytes)?;
                     left = (rule.builder)(left, right);
                     left_depth = next_depth;
 
@@ -188,7 +249,7 @@ where
     Ok(None)
 }
 
-impl Parser {
+impl Parser<'_> {
     fn parse_axis<I>(&self, source: TokenSource<'_, I>) -> Result<Axis, Error>
     where
         I: Iterator<Item = TokenResult>,
@@ -224,12 +285,12 @@ impl Parser {
             let name = consume_value!(source, Token::NodeTest);
 
             match name {
-                NodeTestName::Node => Ok(Some(Box::new(node_test::Node))),
-                NodeTestName::Text => Ok(Some(Box::new(node_test::Text))),
-                NodeTestName::Comment => Ok(Some(Box::new(node_test::Comment))),
-                NodeTestName::ProcessingInstruction(target) => Ok(Some(Box::new(
-                    node_test::ProcessingInstruction::new(target),
-                ))),
+                NodeTestName::Node => Ok(Some(self.boxed(node_test::Node)?)),
+                NodeTestName::Text => Ok(Some(self.boxed(node_test::Text)?)),
+                NodeTestName::Comment => Ok(Some(self.boxed(node_test::Comment)?)),
+                NodeTestName::ProcessingInstruction(target) => Ok(Some(
+                    self.boxed(node_test::ProcessingInstruction::new(target))?,
+                )),
             }
         } else {
             Ok(None)
@@ -248,9 +309,9 @@ impl Parser {
             let name = consume_value!(source, Token::NameTest);
 
             let test: SubNodeTest = match axis.principal_node_type() {
-                PrincipalNodeType::Attribute => Box::new(node_test::Attribute::new(name)),
-                PrincipalNodeType::Element => Box::new(node_test::Element::new(name)),
-                PrincipalNodeType::Namespace => Box::new(node_test::Namespace::new(name)),
+                PrincipalNodeType::Attribute => self.boxed(node_test::Attribute::new(name))?,
+                PrincipalNodeType::Element => self.boxed(node_test::Element::new(name))?,
+                PrincipalNodeType::Namespace => self.boxed(node_test::Namespace::new(name))?,
             };
 
             Ok(Some(test))
@@ -279,7 +340,7 @@ impl Parser {
     {
         if next_token_is!(source, Token::Variable) {
             let name = consume_value!(source, Token::Variable);
-            Ok(Some(Box::new(expression::Variable { name })))
+            Ok(Some(self.boxed(expression::Variable { name })?))
         } else {
             Ok(None)
         }
@@ -291,9 +352,9 @@ impl Parser {
     {
         if next_token_is!(source, Token::Literal) {
             let value = consume_value!(source, Token::Literal);
-            Ok(Some(Box::new(expression::Literal::from(Value::String(
-                value,
-            )))))
+            Ok(Some(
+                self.boxed(expression::Literal::from(Value::String(value)))?,
+            ))
         } else {
             Ok(None)
         }
@@ -305,9 +366,9 @@ impl Parser {
     {
         if next_token_is!(source, Token::Number) {
             let value = consume_value!(source, Token::Number);
-            Ok(Some(Box::new(expression::Literal::from(Value::Number(
-                value,
-            )))))
+            Ok(Some(
+                self.boxed(expression::Literal::from(Value::Number(value)))?,
+            ))
         } else {
             Ok(None)
         }
@@ -325,7 +386,7 @@ impl Parser {
             source.consume(&Token::Comma)?;
 
             let arg = self.parse_expression(source)?.context(ArgumentMissing)?;
-            arguments.push(arg);
+            self.push(&mut arguments, arg)?;
         }
 
         Ok(arguments)
@@ -341,7 +402,7 @@ impl Parser {
         let mut arguments = Vec::new();
 
         match self.parse_expression(source)? {
-            Some(arg) => arguments.push(arg),
+            Some(arg) => self.push(&mut arguments, arg)?,
             None => return Ok(arguments),
         }
 
@@ -359,7 +420,7 @@ impl Parser {
             let arguments = self.parse_function_args(source)?;
             source.consume(&Token::RightParen)?;
 
-            Ok(Some(Box::new(expression::Function { name, arguments })))
+            Ok(Some(self.boxed(expression::Function { name, arguments })?))
         } else {
             Ok(None)
         }
@@ -395,14 +456,22 @@ impl Parser {
         }
     }
 
-    fn parse_predicates<I>(&self, source: TokenSource<'_, I>) -> Result<Vec<SubExpression>, Error>
+    fn parse_predicates<I>(
+        &self,
+        source: TokenSource<'_, I>,
+    ) -> Result<Vec<expression::Predicate>, Error>
     where
         I: Iterator<Item = TokenResult>,
     {
         let mut predicates = Vec::new();
 
         while let Some(predicate) = self.parse_predicate_expression(source)? {
-            predicates.push(predicate)
+            self.push(
+                &mut predicates,
+                expression::Predicate {
+                    expression: predicate,
+                },
+            )?;
         }
 
         Ok(predicates)
@@ -426,7 +495,9 @@ impl Parser {
 
         let predicates = self.parse_predicates(source)?;
 
-        Ok(Some(expression::Step::new(axis, node_test, predicates)))
+        Ok(Some(expression::Step::from_predicates(
+            axis, node_test, predicates,
+        )))
     }
 
     fn parse_relative_location_path_raw<I>(
@@ -439,15 +510,17 @@ impl Parser {
     {
         match self.parse_step(source)? {
             Some(step) => {
-                let mut steps = vec![step];
+                let mut steps = Vec::new();
+                self.push(&mut steps, step)?;
 
                 while source.next_token_is(&Token::Slash) {
                     source.consume(&Token::Slash)?;
 
                     let next = self.parse_step(source)?.context(TrailingSlash)?;
-                    steps.push(next);
+                    self.push(&mut steps, next)?;
                 }
 
+                self.charge(std::mem::size_of::<expression::Path>())?;
                 Ok(Some(expression::Path::new(start_point, steps)))
             }
             None => Ok(None),
@@ -458,7 +531,7 @@ impl Parser {
     where
         I: Iterator<Item = TokenResult>,
     {
-        let start_point = Box::new(expression::ContextNode);
+        let start_point = self.boxed(expression::ContextNode)?;
         self.parse_relative_location_path_raw(source, start_point)
     }
 
@@ -469,10 +542,10 @@ impl Parser {
         if source.next_token_is(&Token::Slash) {
             source.consume(&Token::Slash)?;
 
-            let start_point = Box::new(expression::RootNode);
+            let start_point = self.boxed(expression::RootNode)?;
             match self.parse_relative_location_path_raw(source, start_point)? {
                 Some(expr) => Ok(Some(expr)),
-                None => Ok(Some(Box::new(expression::RootNode))),
+                None => Ok(Some(self.boxed(expression::RootNode)?)),
             }
         } else {
             Ok(None)
@@ -498,15 +571,21 @@ impl Parser {
         match self.parse_primary_expression(source)? {
             Some(expr) => {
                 let predicates = self.parse_predicates(source)?;
+                let predicate_bytes =
+                    predicates.capacity() * std::mem::size_of::<expression::Predicate>();
 
                 let mut expression = expr;
                 let mut expression_depth = expression.ast_depth();
                 for predicate in predicates {
-                    let next_depth =
-                        1usize.saturating_add(expression_depth.max(predicate.ast_depth()));
+                    let next_depth = 1usize
+                        .saturating_add(expression_depth.max(predicate.expression.ast_depth()));
                     ensure!(next_depth <= MAX_EXPRESSION_NESTING, NestingLimit);
-                    expression = expression::Filter::new(expression, predicate);
+                    self.charge(std::mem::size_of::<expression::Filter>())?;
+                    expression = expression::Filter::new(expression, predicate.expression);
                     expression_depth = next_depth;
+                }
+                if let Some(budget) = self.budget {
+                    budget.release(predicate_bytes);
                 }
                 Ok(Some(expression))
             }
@@ -544,13 +623,14 @@ impl Parser {
     where
         I: Iterator<Item = TokenResult>,
     {
-        let rules = vec![BinaryRule {
+        let rules = [BinaryRule {
             token: Token::Pipe,
             builder: expression::Union::new,
+            allocation_bytes: std::mem::size_of::<expression::Union>(),
         }];
 
-        let parser = LeftAssociativeBinaryParser::new(rules);
-        parser.parse(source, |source| self.parse_path_expression(source))
+        let parser = LeftAssociativeBinaryParser::new(&rules);
+        parser.parse(self, source, |source| self.parse_path_expression(source))
     }
 
     fn parse_unary_expression<I>(&self, source: TokenSource<'_, I>) -> ParseResult
@@ -568,7 +648,7 @@ impl Parser {
             let expression = self
                 .with_nesting(|| self.parse_unary_expression(source))?
                 .context(RightHandSideExpressionMissing)?;
-            let expression: SubExpression = Box::new(expression::Negation { expression });
+            let expression: SubExpression = self.boxed(expression::Negation { expression })?;
             Ok(Some(expression))
         } else {
             Ok(None)
@@ -579,42 +659,47 @@ impl Parser {
     where
         I: Iterator<Item = TokenResult>,
     {
-        let rules = vec![
+        let rules = [
             BinaryRule {
                 token: Token::Multiply,
                 builder: expression::Math::multiplication,
+                allocation_bytes: std::mem::size_of::<expression::Math>(),
             },
             BinaryRule {
                 token: Token::Divide,
                 builder: expression::Math::division,
+                allocation_bytes: std::mem::size_of::<expression::Math>(),
             },
             BinaryRule {
                 token: Token::Remainder,
                 builder: expression::Math::remainder,
+                allocation_bytes: std::mem::size_of::<expression::Math>(),
             },
         ];
 
-        let parser = LeftAssociativeBinaryParser::new(rules);
-        parser.parse(source, |source| self.parse_unary_expression(source))
+        let parser = LeftAssociativeBinaryParser::new(&rules);
+        parser.parse(self, source, |source| self.parse_unary_expression(source))
     }
 
     fn parse_additive_expression<I>(&self, source: TokenSource<'_, I>) -> ParseResult
     where
         I: Iterator<Item = TokenResult>,
     {
-        let rules = vec![
+        let rules = [
             BinaryRule {
                 token: Token::PlusSign,
                 builder: expression::Math::addition,
+                allocation_bytes: std::mem::size_of::<expression::Math>(),
             },
             BinaryRule {
                 token: Token::MinusSign,
                 builder: expression::Math::subtraction,
+                allocation_bytes: std::mem::size_of::<expression::Math>(),
             },
         ];
 
-        let parser = LeftAssociativeBinaryParser::new(rules);
-        parser.parse(source, |source| {
+        let parser = LeftAssociativeBinaryParser::new(&rules);
+        parser.parse(self, source, |source| {
             self.parse_multiplicative_expression(source)
         })
     }
@@ -623,72 +708,86 @@ impl Parser {
     where
         I: Iterator<Item = TokenResult>,
     {
-        let rules = vec![
+        let rules = [
             BinaryRule {
                 token: Token::LessThan,
                 builder: expression::Relational::less_than,
+                allocation_bytes: std::mem::size_of::<expression::Relational>(),
             },
             BinaryRule {
                 token: Token::LessThanOrEqual,
                 builder: expression::Relational::less_than_or_equal,
+                allocation_bytes: std::mem::size_of::<expression::Relational>(),
             },
             BinaryRule {
                 token: Token::GreaterThan,
                 builder: expression::Relational::greater_than,
+                allocation_bytes: std::mem::size_of::<expression::Relational>(),
             },
             BinaryRule {
                 token: Token::GreaterThanOrEqual,
                 builder: expression::Relational::greater_than_or_equal,
+                allocation_bytes: std::mem::size_of::<expression::Relational>(),
             },
         ];
 
-        let parser = LeftAssociativeBinaryParser::new(rules);
-        parser.parse(source, |source| self.parse_additive_expression(source))
+        let parser = LeftAssociativeBinaryParser::new(&rules);
+        parser.parse(self, source, |source| {
+            self.parse_additive_expression(source)
+        })
     }
 
     fn parse_equality_expression<I>(&self, source: TokenSource<'_, I>) -> ParseResult
     where
         I: Iterator<Item = TokenResult>,
     {
-        let rules = vec![
+        let rules = [
             BinaryRule {
                 token: Token::Equal,
                 builder: expression::Equal::new,
+                allocation_bytes: std::mem::size_of::<expression::Equal>(),
             },
             BinaryRule {
                 token: Token::NotEqual,
                 builder: expression::NotEqual::new,
+                allocation_bytes: std::mem::size_of::<expression::NotEqual>(),
             },
         ];
 
-        let parser = LeftAssociativeBinaryParser::new(rules);
-        parser.parse(source, |source| self.parse_relational_expression(source))
+        let parser = LeftAssociativeBinaryParser::new(&rules);
+        parser.parse(self, source, |source| {
+            self.parse_relational_expression(source)
+        })
     }
 
     fn parse_and_expression<I>(&self, source: TokenSource<'_, I>) -> ParseResult
     where
         I: Iterator<Item = TokenResult>,
     {
-        let rules = vec![BinaryRule {
+        let rules = [BinaryRule {
             token: Token::And,
             builder: expression::And::new,
+            allocation_bytes: std::mem::size_of::<expression::And>(),
         }];
 
-        let parser = LeftAssociativeBinaryParser::new(rules);
-        parser.parse(source, |source| self.parse_equality_expression(source))
+        let parser = LeftAssociativeBinaryParser::new(&rules);
+        parser.parse(self, source, |source| {
+            self.parse_equality_expression(source)
+        })
     }
 
     fn parse_or_expression<I>(&self, source: TokenSource<'_, I>) -> ParseResult
     where
         I: Iterator<Item = TokenResult>,
     {
-        let rules = vec![BinaryRule {
+        let rules = [BinaryRule {
             token: Token::Or,
             builder: expression::Or::new,
+            allocation_bytes: std::mem::size_of::<expression::Or>(),
         }];
 
-        let parser = LeftAssociativeBinaryParser::new(rules);
-        parser.parse(source, |source| self.parse_and_expression(source))
+        let parser = LeftAssociativeBinaryParser::new(&rules);
+        parser.parse(self, source, |source| self.parse_and_expression(source))
     }
 
     fn parse_expression<I>(&self, source: TokenSource<'_, I>) -> ParseResult
@@ -716,6 +815,49 @@ impl Parser {
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn vector_growth_charges_overlap_then_releases_old_capacity() {
+        // The fifth u64 needs an eight-slot buffer beside the existing four-slot buffer.
+        for limit in [95, 96] {
+            let budget = crate::ParseBudget::new(limit);
+            let parser = super::Parser::with_budget(&budget);
+            let mut values = Vec::new();
+            for value in 0u64..4 {
+                parser.push(&mut values, value).unwrap();
+            }
+            assert_eq!(budget.used.get(), 32);
+            let result = parser.push(&mut values, 4);
+            if limit == 95 {
+                assert!(matches!(
+                    result,
+                    Err(super::Error::AllocationLimit { actual: 96, .. })
+                ));
+                assert_eq!(values, [0, 1, 2, 3]);
+                assert_eq!(budget.used.get(), 32);
+            } else {
+                result.unwrap();
+                assert_eq!(values.capacity(), 8);
+                assert_eq!(budget.used.get(), 64);
+            }
+        }
+    }
+
+    #[test]
+    fn vector_growth_rejects_overflow_before_allocation() {
+        // Even an unlimited public factory must not wrap a capacity or exceed Layout bounds.
+        let parser = super::Parser::new();
+        for capacity in [usize::MAX, isize::MAX as usize / 8] {
+            assert!(matches!(
+                parser.vector_growth::<u64>(capacity),
+                Err(super::Error::AllocationLimit {
+                    actual: usize::MAX,
+                    ..
+                })
+            ));
+        }
+        assert_eq!(parser.vector_growth::<u64>(4), Ok((8, 64)));
+    }
+
     use snafu::ResultExt;
     use std::borrow::ToOwned;
     use sxd_document_no_unsafe::Package;
@@ -834,7 +976,7 @@ mod test {
     struct Exercise<'d> {
         doc: &'d TestDoc<'d>,
         context: Context<'d>,
-        parser: Parser,
+        parser: Parser<'static>,
     }
 
     impl<'d> Exercise<'d> {

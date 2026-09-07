@@ -359,14 +359,18 @@ impl<'d> Value<'d> {
         self.boolean()
     }
 
-    /// Convert this value to an XPath number under the evaluator's allocation budget.
+    /// Convert this value to an XPath number under the evaluator's work and allocation budgets.
     pub fn number(&self, context: &context::Evaluation<'_, '_>) -> Result<f64, function::Error> {
         use crate::Value::*;
+        let parse_text = |value: &str| {
+            context.charge_work(value.len())?;
+            Ok(str_to_num(value))
+        };
         match self {
             Boolean(value) => Ok(if *value { 1.0 } else { 0.0 }),
             Number(value) => Ok(*value),
-            String(value) => Ok(str_to_num(value)),
-            ResultTreeFragment(_, value) => Ok(str_to_num(value)),
+            String(value) => parse_text(value),
+            ResultTreeFragment(_, value) => parse_text(value),
             Nodeset(nodes) => match nodes.document_order_first_with_context(context)? {
                 Some(node) => node_to_num_with_context(context, &node),
                 None => Ok(f64::NAN),
@@ -501,7 +505,51 @@ impl XPath {
 /// The primary entrypoint to convert an XPath represented as a string
 /// to a structure that can be evaluated.
 pub struct Factory {
-    parser: Parser,
+    parser: Parser<'static>,
+}
+
+// A build owns its account on the stack. Successful token payloads and AST allocations remain
+// live until that build returns; temporary vector replacements release their old capacity.
+pub(crate) struct ParseBudget {
+    limit: usize,
+    used: std::cell::Cell<usize>,
+    failure: std::cell::Cell<Option<(usize, usize)>>,
+}
+
+impl ParseBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            used: std::cell::Cell::new(0),
+            failure: std::cell::Cell::new(None),
+        }
+    }
+
+    pub(crate) fn charge(&self, bytes: usize) -> Result<(), parser::Error> {
+        if let Some((limit, actual)) = self.failure.get() {
+            return Err(parser::Error::AllocationLimit { limit, actual });
+        }
+        let actual = self.used.get().checked_add(bytes);
+        if actual.is_none_or(|actual| actual > self.limit) {
+            let actual = actual.unwrap_or(usize::MAX);
+            self.failure.set(Some((self.limit, actual)));
+            return Err(parser::Error::AllocationLimit {
+                limit: self.limit,
+                actual,
+            });
+        }
+        self.used.set(actual.expect("checked allocation sum"));
+        Ok(())
+    }
+
+    pub(crate) fn release(&self, bytes: usize) {
+        self.used.set(
+            self.used
+                .get()
+                .checked_sub(bytes)
+                .expect("released parser allocation was charged"),
+        );
+    }
 }
 
 impl Factory {
@@ -521,6 +569,27 @@ impl Factory {
             .map(XPath)
             .map_err(Into::into)
     }
+
+    /// Compile with a maximum live heap-payload budget for token and AST storage.
+    ///
+    /// The input is borrowed. Fixed-size stack workspaces and allocator metadata are not heap
+    /// payload. Every owned payload, AST node and vector capacity is checked before allocation;
+    /// a failed build does not consume the allowance of subsequent builds. The returned AST
+    /// remains owned by the caller; this limit is not an evaluator allocation budget.
+    pub fn build_bounded(&self, xpath: &str, owned_bytes: usize) -> Result<XPath, ParserError> {
+        let budget = ParseBudget::new(owned_bytes);
+        let tokenizer = Tokenizer::with_budget(xpath, &budget);
+        let result = Parser::with_budget(&budget).parse(TokenDeabbreviator::new(tokenizer));
+        // Parser lookahead deliberately treats an erroneous token as a non-match. A failed
+        // allocation must survive that syntax-error path rather than becoming ExtraUnparsedTokens.
+        if let Some((limit, actual)) = budget.failure.get() {
+            return Err(ParserError(parser::Error::AllocationLimit {
+                limit,
+                actual,
+            }));
+        }
+        result.map(XPath).map_err(Into::into)
+    }
 }
 
 impl Default for Factory {
@@ -539,9 +608,67 @@ pub fn expression_uses_attribute_axis(xpath: &str) -> bool {
         .any(|token| matches!(token, Ok(Token::Axis(AxisName::Attribute))))
 }
 
+/// Inspect the attribute axis with bounded transient token storage. Tokens are discarded after
+/// inspection; their payload allowance is reusable for the next token rather than cumulative.
+pub fn expression_uses_attribute_axis_bounded(
+    xpath: &str,
+    owned_bytes: usize,
+) -> Result<bool, ParserError> {
+    let budget = ParseBudget::new(owned_bytes);
+    let tokens = TokenDeabbreviator::new(Tokenizer::with_budget(xpath, &budget));
+    for token in tokens {
+        if let Some((limit, actual)) = budget.failure.get() {
+            return Err(ParserError(parser::Error::AllocationLimit {
+                limit,
+                actual,
+            }));
+        }
+        let attribute = matches!(&token, Ok(Token::Axis(AxisName::Attribute)));
+        drop(token);
+        budget.release(budget.used.get());
+        if attribute {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Errors that may occur when parsing an XPath
 #[derive(Debug, Snafu, Clone, PartialEq)]
 pub struct ParserError(parser::Error);
+
+impl ParserError {
+    /// Heap payload retained by this diagnostic, excluding the error value itself.
+    /// Callers formatting an owned message must account for overlap with this payload.
+    #[must_use]
+    pub fn owned_bytes(&self) -> usize {
+        match &self.0 {
+            parser::Error::UnexpectedToken { token } => match token {
+                Token::Literal(value) => value.capacity(),
+                Token::Function(name) | Token::Variable(name) => {
+                    name.prefix.as_ref().map_or(0, String::capacity) + name.local_part.capacity()
+                }
+                Token::NameTest(name) => {
+                    name.prefix.as_ref().map_or(0, String::capacity) + name.local_part.capacity()
+                }
+                Token::NodeTest(token::NodeTestName::ProcessingInstruction(value)) => {
+                    value.as_ref().map_or(0, String::capacity)
+                }
+                _ => 0,
+            },
+            _ => 0,
+        }
+    }
+
+    /// The owned-byte limit and attempted live payload, if allocation was refused.
+    #[must_use]
+    pub fn allocation_limit(&self) -> Option<(usize, usize)> {
+        match self.0 {
+            parser::Error::AllocationLimit { limit, actual } => Some((limit, actual)),
+            _ => None,
+        }
+    }
+}
 
 /// Errors that may occur when executing an XPath
 #[derive(Debug, Snafu, Clone, PartialEq)]
@@ -592,6 +719,15 @@ pub fn evaluate_xpath<'d>(document: &'d Document<'d>, xpath: &str) -> Result<Val
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn parser_budget_overflow_remains_a_sticky_failure() {
+        // Arithmetic overflow must fail even when the caller requests usize::MAX bytes.
+        let budget = super::ParseBudget::new(usize::MAX);
+        assert!(budget.charge(usize::MAX).is_ok());
+        assert!(budget.charge(1).is_err());
+        assert!(budget.charge(0).is_err());
+    }
+
     use std::borrow::ToOwned;
 
     use sxd_document_no_unsafe::{self, Package, dom};
@@ -606,6 +742,46 @@ mod test {
         value
             .number(&evaluation)
             .expect("test numeric conversion fits the default budget")
+    }
+
+    #[test]
+    fn string_and_fragment_numbers_precharge_lexical_work() {
+        // Trimming and numeric validation inspect attacker-controlled text even for NaN.
+        // Both owned strings and shared RTF strings must cross the same work gate first.
+        let package = Package::new();
+        let document = package.as_document();
+        for text in [" 1.5 ", "not-a-number", "\u{a0}1"] {
+            for value in [
+                Value::String(text.into()),
+                Value::ResultTreeFragment(1, std::sync::Arc::new(text.into())),
+            ] {
+                for limit in [text.len() - 1, text.len()] {
+                    let mut context = Context::without_core_functions();
+                    context.set_evaluation_work_limit(limit);
+                    let evaluation = context::Evaluation::new(&context, document.root().into());
+                    let result = value.number(&evaluation);
+                    if limit < text.len() {
+                        assert!(result.is_err());
+                        assert_eq!(context.evaluation_work_exceeded(), Some(text.len()));
+                        assert_eq!(context.evaluation_work_used(), 0);
+                    } else {
+                        let result = result.expect("exact lexical work fits");
+                        if text == " 1.5 " {
+                            assert_eq!(result, 1.5);
+                        } else {
+                            assert!(result.is_nan());
+                        }
+                        assert_eq!(context.evaluation_work_used(), text.len());
+                    }
+                }
+            }
+        }
+        let mut context = Context::without_core_functions();
+        context.set_evaluation_work_limit(0);
+        let evaluation = context::Evaluation::new(&context, document.root().into());
+        assert_eq!(Value::Boolean(true).number(&evaluation).unwrap(), 1.0);
+        assert_eq!(Value::Number(2.0).number(&evaluation).unwrap(), 2.0);
+        assert_eq!(context.evaluation_work_used(), 0);
     }
 
     #[test]
@@ -782,6 +958,56 @@ mod test {
         let mut tokens = TokenDeabbreviator::new(Tokenizer::new("\u{0}"));
         assert!(tokens.next().expect("one tokenizer result").is_err());
         assert!(tokens.next().is_none());
+    }
+
+    #[test]
+    fn bounded_parser_charges_literal_payload_not_lexical_length_times_nodes() {
+        // One large literal owns one payload and one AST node, regardless of its contents.
+        let payload = " / * ".repeat(200_000);
+        let source = format!("'{payload}'");
+        let required = payload.len() + std::mem::size_of::<expression::Literal>();
+        let factory = Factory::new();
+        assert!(factory.build_bounded(&source, required).is_ok());
+        let error = factory.build_bounded(&source, required - 1).unwrap_err();
+        assert_eq!(error.allocation_limit(), Some((required - 1, required)));
+        assert!(factory.build("1").is_ok());
+    }
+
+    #[test]
+    fn bounded_parser_checks_ast_and_vector_growth_and_preserves_errors() {
+        // Allocation failures must be typed, including failures hidden by token lookahead.
+        let factory = Factory::new();
+        for source in [
+            "1",
+            "$name",
+            "a/b/c",
+            "f(1,2,3,4,5)",
+            "a[1][2]",
+            "1+2",
+            "//a",
+        ] {
+            assert!(
+                factory
+                    .build_bounded(source, 0)
+                    .unwrap_err()
+                    .allocation_limit()
+                    .is_some()
+            );
+            assert!(factory.build_bounded(source, 16_384).is_ok());
+        }
+        for source in ["'unterminated", "f(1,)", "a/", "1 +", "!"] {
+            assert_eq!(
+                factory.build(source).unwrap_err(),
+                factory.build_bounded(source, 16_384).unwrap_err()
+            );
+        }
+        // Parentheses allocate no AST nodes and must not accumulate per-rule heap charges.
+        let nested = format!("{}1{}", "(".repeat(32), ")".repeat(32));
+        assert!(
+            factory
+                .build_bounded(&nested, std::mem::size_of::<expression::Literal>())
+                .is_ok()
+        );
     }
 
     #[test]

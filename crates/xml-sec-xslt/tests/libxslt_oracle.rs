@@ -211,6 +211,13 @@ fn read_xml(path: &Path) -> xml_sec_xslt::Result<String> {
 }
 
 fn execute(case: &Case) -> xml_sec_xslt::Result<xml_sec_xslt::TransformResult> {
+    execute_with_stylesheet(case, |stylesheet| stylesheet)
+}
+
+fn execute_with_stylesheet(
+    case: &Case,
+    prepare_stylesheet: impl FnOnce(String) -> String,
+) -> xml_sec_xslt::Result<xml_sec_xslt::TransformResult> {
     let root = upstream_tests().canonicalize().expect("corpus root exists");
     let resolver = Arc::new(CorpusResolver { root: root.clone() });
     let stylesheet_path = root.join(&case.stylesheet);
@@ -242,6 +249,7 @@ fn execute(case: &Case) -> xml_sec_xslt::Result<xml_sec_xslt::TransformResult> {
             .map_err(|error| Error::Static(format!("stylesheet input: {error}")))?
             .text
     };
+    let stylesheet = prepare_stylesheet(stylesheet);
     let compiled = Compiler::new(
         resolver.clone(),
         CompileBudget::new(16 << 20, 512, 4_096, 256 << 20),
@@ -1212,6 +1220,31 @@ fn assert_case(case: &Case) {
                         | ErrorKind::Dynamic
                         | ErrorKind::Unsupported
                 ) => {}
+        (Err(Error::Serialization(message)), Some(expected))
+            if case.suite == "runtest" && case.stylesheet == Path::new("exslt/math/max.3.xsl") =>
+        {
+            // XSLT 1.0 section 16.1, erratum E4, requires a document when standalone
+            // is emitted. This donor emits standalone="yes" followed only by text.
+            // https://www.w3.org/1999/11/REC-xslt-19991116-errata/#E4
+            assert_eq!(
+                message,
+                "standalone/DOCTYPE output requires one document element and no top-level character data"
+            );
+            // Also execute its complete math/function workload with only the inapplicable
+            // standalone attribute removed. No fixture or expected computation is skipped.
+            let result = execute_with_stylesheet(case, |stylesheet| {
+                assert_eq!(stylesheet.matches(" standalone=\"yes\"").count(), 1);
+                stylesheet.replacen(" standalone=\"yes\"", "", 1)
+            })
+            .expect("the same workload produces a legal external parsed entity");
+            let expected = String::from_utf8(expected)
+                .expect("ASCII donor result")
+                .replacen(" standalone=\"yes\"", "", 1);
+            assert_eq!(
+                normalize_xml_lexical_forms(&result.serialized.bytes),
+                normalize_xml_lexical_forms(expected.as_bytes())
+            );
+        }
         (Err(error), Some(_)) if is_expected_strict_xslt_error(case, &error) => {}
         (Err(error), _) => panic!("{}: {error}", case_name(case)),
     }

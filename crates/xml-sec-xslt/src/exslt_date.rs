@@ -692,7 +692,10 @@ impl DateValue {
             .map_or((body, None), |(date, time)| (date, Some(time)));
         let (year, tail) = parse_year(date)?;
         let Some(tail) = tail.strip_prefix('-') else {
-            return (time.is_none()).then_some(Self {
+            // XSD 1.0 section 3.2.11.1 permits only a timezone after the year digits;
+            // split_timezone already consumed that suffix, so no other remainder is valid.
+            // https://www.w3.org/TR/2004/REC-xmlschema-2-20041028/#gYear-lexical-repr
+            return (tail.is_empty() && time.is_none()).then_some(Self {
                 year: Some(year),
                 kind: DateKind::Year,
                 ..empty
@@ -948,8 +951,10 @@ fn split_timezone(input: &str) -> Option<(&str, Option<i32>)> {
             return Some((input, None));
         };
         if matches!(suffix.as_bytes()[0], b'+' | b'-') && suffix.as_bytes()[3] == b':' {
-            let hours = suffix[1..3].parse::<i32>().ok()?;
-            let minutes = suffix[4..6].parse::<i32>().ok()?;
+            // XSD 1.0 section 3.2.7.3: hh and mm are two-digit numerals, not signed integers.
+            // https://www.w3.org/TR/2004/REC-xmlschema-2-20041028/#dateTime-timezones
+            let hours = i32::from(parse_two(&suffix[1..3])?);
+            let minutes = i32::from(parse_two(&suffix[4..6])?);
             if hours > 14 || minutes > 59 || (hours == 14 && minutes != 0) {
                 return None;
             }
@@ -1198,6 +1203,28 @@ fn argument_error<T>(message: &str) -> std::result::Result<T, function::Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn date_lexical_components_require_complete_unsigned_fields() {
+        // Reject trailing year garbage and signed timezone components, not valid timezone signs.
+        for input in [
+            "2000garbage",
+            "2000 ",
+            "2000-01-01+00:-1",
+            "2000-01-01+-1:00",
+            "2000-01-01+00:+1",
+        ] {
+            assert!(super::DateValue::parse(input).is_none(), "accepted {input}");
+        }
+        for input in [
+            "2000",
+            "-2000",
+            "2000Z",
+            "2000-01-01+14:00",
+            "2000-01-01-00:01",
+        ] {
+            assert!(super::DateValue::parse(input).is_some(), "rejected {input}");
+        }
+    }
     use super::{DateFunction, DateValue, DurationValue, Operation, split_timezone};
     use sxd_document_no_unsafe::Package;
     use sxd_xpath_no_unsafe::{Context, Value, function::Function, nodeset};

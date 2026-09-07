@@ -143,16 +143,16 @@ impl AxisLike for Axis {
                 }
             }
             PrecedingSibling => {
-                each_preceding_sibling(&context.node, |sibling| node_test.run(sibling))?;
+                each_preceding_sibling(context, &context.node, |sibling| node_test.run(sibling))?;
             }
             FollowingSibling => {
-                each_following_sibling(&context.node, |sibling| node_test.run(sibling))?;
+                each_following_sibling(context, &context.node, |sibling| node_test.run(sibling))?;
             }
             Preceding => node_and_each_parent_before(
                 context.node.clone(),
                 context.document_root_for(context.node.clone()),
                 |node| {
-                    each_preceding_sibling(&node, |sibling| {
+                    each_preceding_sibling(context, &node, |sibling| {
                         postorder_right_to_left(context, sibling, |n| node_test.run(n))
                     })
                 },
@@ -175,7 +175,7 @@ impl AxisLike for Axis {
                     traversal_root = owner;
                 }
                 node_and_each_parent_before(traversal_root, document_root, |node| {
-                    each_following_sibling(&node, |sibling| {
+                    each_following_sibling(context, &node, |sibling| {
                         preorder_left_to_right(context, sibling, |n| node_test.run(n))
                     })
                 })?;
@@ -272,10 +272,11 @@ fn push_traversal_frame<'c, 'd>(
 }
 
 fn each_preceding_sibling<'d>(
+    context: &context::Evaluation<'_, 'd>,
     node: &Node<'d>,
     mut f: impl FnMut(Node<'d>) -> Result<(), Error>,
 ) -> Result<(), Error> {
-    let Some((parent, index)) = child_position(node) else {
+    let Some((parent, index)) = child_position(context, node)? else {
         return Ok(());
     };
     for index in (0..index).rev() {
@@ -285,10 +286,11 @@ fn each_preceding_sibling<'d>(
 }
 
 fn each_following_sibling<'d>(
+    context: &context::Evaluation<'_, 'd>,
     node: &Node<'d>,
     mut f: impl FnMut(Node<'d>) -> Result<(), Error>,
 ) -> Result<(), Error> {
-    let Some((parent, index)) = child_position(node) else {
+    let Some((parent, index)) = child_position(context, node)? else {
         return Ok(());
     };
     for index in index + 1..parent.children_len() {
@@ -297,17 +299,30 @@ fn each_following_sibling<'d>(
     Ok(())
 }
 
-fn child_position<'d>(node: &Node<'d>) -> Option<(Node<'d>, usize)> {
+fn child_position<'d>(
+    context: &context::Evaluation<'_, 'd>,
+    node: &Node<'d>,
+) -> Result<Option<(Node<'d>, usize)>, Error> {
     if matches!(
         node,
         Node::Root(_) | Node::Attribute(_) | Node::Namespace(_)
     ) {
-        return None;
+        return Ok(None);
     }
-    let parent = node.parent()?;
-    (0..parent.children_len())
-        .find(|index| parent.child_at(*index).as_ref() == Some(node))
-        .map(|index| (parent, index))
+    let Some(parent) = node.parent() else {
+        return Ok(None);
+    };
+    // Position discovery is work even when the requested axis has no candidates.
+    // Charge each inspected sibling before reading it, including ancestor-level scans.
+    for index in 0..parent.children_len() {
+        context
+            .charge_work(1)
+            .map_err(|source| Error::FunctionEvaluation { source })?;
+        if parent.child_at(index).as_ref() == Some(node) {
+            return Ok(Some((parent, index)));
+        }
+    }
+    Ok(None)
 }
 
 fn node_and_each_parent<'d, F>(node: Node<'d>, mut f: F) -> Result<(), Error>
@@ -398,6 +413,30 @@ mod test {
 
         axis.select_nodes(&context, node_test)
             .expect("test node selection succeeds")
+    }
+
+    #[test]
+    fn empty_following_axes_meter_search_work() {
+        // Selecting no nodes still scans siblings to find the context node. The
+        // work gate must run before that scan, not only inside the node-test callback.
+        let package = Package::new();
+        let document = package.as_document();
+        let root = document.create_element("root");
+        document.root().append_child(root);
+        for _ in 0..128 {
+            root.append_child(document.create_element("sibling"));
+        }
+        let last = document.create_element("last");
+        root.append_child(last);
+        for axis in [FollowingSibling, Following] {
+            let mut context = Context::without_core_functions();
+            context.set_evaluation_work_limit(0);
+            let evaluation = context::Evaluation::new(&context, last.into());
+            assert!(
+                axis.select_nodes(&evaluation, &RejectNodeTest).is_err(),
+                "{axis:?}"
+            );
+        }
     }
 
     #[test]

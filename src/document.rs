@@ -186,7 +186,7 @@ impl DocumentParseSettings {
 
 /// Monotonic parser-work allowance shared by one XML Security operation.
 ///
-/// Every byte handed to the XML parser is charged before parsing, including
+/// Encoded input decoding and every byte handed to the XML parser are charged before work, including
 /// structural-validation candidates, staged copies, retries, and committed
 /// document generations. Failed work remains charged so nested helpers cannot
 /// reset or reuse the allowance.
@@ -1219,6 +1219,9 @@ impl XmlDocument {
             DocumentParseSettings {
                 nodes_limit: validation_nodes_limit,
                 depth_limit: settings.depth_limit.saturating_add(1),
+                // Nonoverlapping wrappers contribute at most one simultaneously active binding.
+                // The committed candidate is still checked against the caller's unmodified limit.
+                namespace_bindings_limit: settings.namespace_bindings_limit.saturating_add(1),
                 max_bytes: projected,
                 ..settings
             },
@@ -1715,6 +1718,7 @@ impl XmlDocument {
                 // Wrapper markup is validation scaffolding, not document input.
                 // The committed candidate is checked against the real ceiling.
                 depth_limit: settings.depth_limit.saturating_add(1),
+                namespace_bindings_limit: settings.namespace_bindings_limit.saturating_add(1),
                 max_bytes: projected,
                 ..settings
             },
@@ -4460,6 +4464,39 @@ mod tests {
             .replace_content(target, "text")
             .expect("validation-only wrapper must not consume caller depth");
         assert_eq!(document.as_xml(), "<root><target>text</target></root>");
+    }
+
+    #[test]
+    fn validation_wrapper_does_not_consume_namespace_allowance() {
+        // Scaffolding contributes one active namespace, but committed user markup contributes none.
+        for batch in [false, true] {
+            let mut document = XmlDocument::parse_with_settings(
+                "<root/>".into(),
+                DocumentParseSettings {
+                    namespace_bindings_limit: 0,
+                    ..DocumentParseSettings::default()
+                },
+            )
+            .expect("namespace-free input");
+            let root = document.with_view(|view| view.root_element());
+            if batch {
+                document
+                    .replace_contents(&[(root, "text".into())])
+                    .expect("namespace-free batch");
+            } else {
+                document
+                    .replace_content(root, "text")
+                    .expect("namespace-free replacement");
+            }
+            assert_eq!(document.as_xml(), "<root>text</root>");
+            let root = document.with_view(|view| view.root_element());
+            assert!(
+                document
+                    .replace_content(root, "<p:e xmlns:p='urn:p'/>")
+                    .is_err()
+            );
+            assert_eq!(document.as_xml(), "<root>text</root>");
+        }
     }
 
     #[test]

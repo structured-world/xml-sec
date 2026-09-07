@@ -10,7 +10,8 @@ use sxd_xpath_no_unsafe::{Context, Factory, Value as SxdValue, XPath, function, 
 
 use crate::budget::{
     Meter, ParseBudget, XINCLUDE_RECURSION_DEPTH_CEILING, reserve_retained_hash_map_slot,
-    reserve_retained_hash_set_slot, reserve_temporary_vec_slot, retained_hash_storage,
+    reserve_retained_hash_set_slot, reserve_retained_vec_slot, reserve_temporary_vec_slot,
+    retained_hash_storage,
 };
 use crate::compiler::{
     DecimalFormat, Expression, KeyDeclaration, NameTest, Pattern, normalize_xpath_for_sxd,
@@ -628,6 +629,7 @@ pub(crate) struct Evaluator {
     generated_ids: Rc<RefCell<GeneratedIdCache>>,
     id_index: Rc<RefCell<IdIndex>>,
     key_index: Rc<RefCell<KeyIndex>>,
+    key_index_bytes: usize,
     key_declarations: Arc<[KeyDeclaration]>,
     key_name_indices: Arc<[usize]>,
     ready_key_indexes: Rc<RefCell<HashSet<(usize, usize)>>>,
@@ -802,6 +804,7 @@ impl Evaluator {
             generated_ids: Rc::new(RefCell::new(GeneratedIdCache::default())),
             id_index: Rc::new(RefCell::new(id_index)),
             key_index: Rc::new(RefCell::new(HashMap::new())),
+            key_index_bytes: 0,
             key_declarations: Arc::from([]),
             key_name_indices: Arc::from([]),
             ready_key_indexes: Rc::new(RefCell::new(HashSet::new())),
@@ -878,7 +881,7 @@ impl Evaluator {
 
     pub(crate) fn append_key_entry(
         &mut self,
-        name: &ExpandedName,
+        key_slot: usize,
         value: String,
         value_reservation: usize,
         node: &SourceNode,
@@ -916,55 +919,32 @@ impl Evaluator {
                 return Err(error);
             }
         };
-        let name_bytes = name
-            .local
-            .len()
-            .saturating_add(name.namespace.as_deref().map_or(0, str::len));
-        if let Err(error) = meter.charge(BudgetKind::OwnedBytes, name_bytes) {
+        let result = (|| {
+            meter.charge(BudgetKind::KeyEntries, 1)?;
+            let mut index = self.key_index.borrow_mut();
+            let group = (key_slot, document_index);
+            if !index.contains_key(&group) {
+                reserve_retained_hash_map_slot(&mut index, meter, &mut self.key_index_bytes)?;
+            }
+            let values = index.entry(group).or_default();
+            if let Some(paths) = values.get_mut(value.as_str()) {
+                reserve_retained_vec_slot(paths, meter)?;
+                paths.push(path);
+                // Duplicate values borrow the existing map key; only the new path survives.
+                meter.release_owned_bytes(value_reservation);
+            } else {
+                reserve_retained_hash_map_slot(values, meter, &mut self.key_index_bytes)?;
+                let mut paths = Vec::new();
+                reserve_retained_vec_slot(&mut paths, meter)?;
+                paths.push(path);
+                values.insert(value, paths);
+            }
+            Ok(())
+        })();
+        if result.is_err() {
             meter.release_owned_bytes(value_reservation.saturating_add(path_reservation));
-            return Err(error);
         }
-        let owned_name = name.clone();
-        if let Err(error) = meter.charge(BudgetKind::KeyEntries, 1) {
-            meter.release_owned_bytes(
-                name_bytes
-                    .saturating_add(value_reservation)
-                    .saturating_add(path_reservation),
-            );
-            return Err(error);
-        }
-        let path_bytes = path.owned_bytes().saturating_sub(path_reservation);
-        let unreserved_value_bytes = value.len().saturating_sub(value_reservation);
-        let mut index = self.key_index.borrow_mut();
-        match index.entry((owned_name, value, document_index)) {
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                if let Err(error) = meter.charge(BudgetKind::OwnedBytes, path_bytes) {
-                    meter.release_owned_bytes(
-                        name_bytes
-                            .saturating_add(value_reservation)
-                            .saturating_add(path_reservation),
-                    );
-                    return Err(error);
-                }
-                entry.get_mut().push(path);
-                meter.release_owned_bytes(name_bytes.saturating_add(value_reservation));
-            }
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                let additional = std::mem::size_of::<(ExpandedName, String, usize)>()
-                    .saturating_add(unreserved_value_bytes)
-                    .saturating_add(path_bytes);
-                if let Err(error) = meter.charge(BudgetKind::OwnedBytes, additional) {
-                    meter.release_owned_bytes(
-                        name_bytes
-                            .saturating_add(value_reservation)
-                            .saturating_add(path_reservation),
-                    );
-                    return Err(error);
-                }
-                entry.insert(vec![path]);
-            }
-        }
-        Ok(())
+        result
     }
 
     #[expect(
@@ -5521,137 +5501,6 @@ fn quoted_pattern_literal(value: &str) -> Option<&str> {
     (!literal.as_bytes().contains(&quote)).then_some(literal)
 }
 
-fn rewrite_absolute_paths(source: &str, logical_root_index: usize) -> std::borrow::Cow<'_, str> {
-    if !contains_absolute_path(source) {
-        return std::borrow::Cow::Borrowed(source);
-    }
-    let logical_root = format!(
-        "/{DOCUMENTS_ELEMENT}/{DOCUMENT_ELEMENT}[{}]",
-        logical_root_index + 1
-    );
-    if source.trim_matches(crate::lexical::is_xml_whitespace) == "/" {
-        return std::borrow::Cow::Owned(logical_root);
-    }
-    let mut output = String::with_capacity(source.len());
-    let mut quote = None;
-    let mut previous_non_whitespace = None;
-    let mut characters = source.chars().peekable();
-    while let Some(character) = characters.next() {
-        if let Some(active) = quote {
-            output.push(character);
-            if character == active {
-                quote = None;
-            }
-            continue;
-        }
-        if matches!(character, '\'' | '"') {
-            quote = Some(character);
-            output.push(character);
-            previous_non_whitespace = Some(character);
-            continue;
-        }
-        if character == '/' && absolute_path_can_start(&output, previous_non_whitespace) {
-            output.push_str(&logical_root);
-            if characters
-                .clone()
-                .find(|candidate| !crate::lexical::is_xml_whitespace(*candidate))
-                .is_none_or(|next| {
-                    matches!(next, ')' | ']' | ',' | '|' | '=' | '<' | '>' | '+' | '-')
-                })
-            {
-                previous_non_whitespace = Some(']');
-                continue;
-            }
-        }
-        output.push(character);
-        if !crate::lexical::is_xml_whitespace(character) {
-            previous_non_whitespace = Some(character);
-        }
-    }
-    if output == source {
-        std::borrow::Cow::Borrowed(source)
-    } else {
-        std::borrow::Cow::Owned(output)
-    }
-}
-
-fn contains_absolute_path(source: &str) -> bool {
-    let mut quote = None;
-    let mut previous_non_whitespace = None;
-    for (offset, character) in source.char_indices() {
-        if let Some(active) = quote {
-            if character == active {
-                quote = None;
-            }
-            continue;
-        }
-        if matches!(character, '\'' | '"') {
-            quote = Some(character);
-            previous_non_whitespace = Some(character);
-            continue;
-        }
-        if character == '/' && absolute_path_can_start(&source[..offset], previous_non_whitespace) {
-            return true;
-        }
-        if !crate::lexical::is_xml_whitespace(character) {
-            previous_non_whitespace = Some(character);
-        }
-    }
-    false
-}
-
-fn absolute_path_can_start(output: &str, previous: Option<char>) -> bool {
-    if previous.is_none_or(|previous| {
-        matches!(
-            previous,
-            '(' | '[' | ',' | '|' | '=' | '<' | '>' | '+' | '-'
-        )
-    }) {
-        return true;
-    }
-    if previous == Some('*') && multiplication_operator_ends(output) {
-        return true;
-    }
-    let trimmed = output.trim_end_matches(crate::lexical::is_xml_whitespace);
-    ["and", "or", "div", "mod"].iter().any(|operator| {
-        trimmed.strip_suffix(operator).is_some_and(|prefix| {
-            let Some(boundary) = prefix.chars().next_back() else {
-                return false;
-            };
-            if crate::lexical::is_xml_whitespace(boundary) {
-                return !prefix
-                    .trim_end_matches(crate::lexical::is_xml_whitespace)
-                    .is_empty();
-            }
-            boundary.is_ascii_digit() || matches!(boundary, ')' | ']' | '\'' | '"')
-        })
-    })
-}
-
-fn multiplication_operator_ends(output: &str) -> bool {
-    let Some(prefix) = output
-        .trim_end_matches(crate::lexical::is_xml_whitespace)
-        .strip_suffix('*')
-    else {
-        return false;
-    };
-    let Some(previous) = prefix
-        .trim_end_matches(crate::lexical::is_xml_whitespace)
-        .chars()
-        .next_back()
-    else {
-        return false;
-    };
-    !matches!(
-        previous,
-        '/' | ':' | '@' | '(' | '[' | ',' | '|' | '=' | '<' | '>' | '+' | '-' | '*'
-    )
-}
-
-pub(crate) fn rewrite_absolute_paths_for_validation(source: &str) -> String {
-    rewrite_absolute_paths(source, 0).into_owned()
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ExtensionCallKind {
     NodeSet,
@@ -6290,8 +6139,8 @@ impl function::Function for LangFunction {
             });
         }
         let requested = args.into_iter().next().expect("arity checked above");
-        context.reserve_string_allocation(sxd_string_materialization_bytes(&requested))?;
-        let requested = requested.into_string();
+        let requested = function::string_argument_view(&requested, context)?;
+        context.charge_work(requested.len())?;
         let mut current = context
             .node
             .element()
@@ -6570,21 +6419,12 @@ impl function::Function for UnparsedEntityUriFunction {
             .ok_or_else(|| function::Error::Other {
                 what: "unparsed-entity-uri() context has no logical document".into(),
             })?;
-        reserve_sxd_string_arguments(
-            context,
-            &args,
-            &[0],
-            "unparsed-entity-uri() string allocation length overflow",
-        )?;
-        let name = args
-            .into_iter()
-            .next()
-            .expect("argument count was checked")
-            .into_string();
+        let name = function::string_argument_view(&args[0], context)?;
+        context.charge_work(name.len())?;
         let documents = self.documents.borrow();
         let uri = documents
             .get(document_index)
-            .and_then(|entities| entities.get(&name));
+            .and_then(|entities| entities.get(name.as_ref()));
         context.reserve_string_allocation(uri.map_or(0, String::len))?;
         Ok(SxdValue::String(uri.cloned().unwrap_or_default()))
     }
@@ -6679,23 +6519,20 @@ impl function::Function for IdentityStringFunction {
         context: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
         args: Vec<SxdValue<'d>>,
     ) -> std::result::Result<SxdValue<'d>, function::Error> {
-        if args.len() != 1 {
+        let Ok([value]) = <[SxdValue<'d>; 1]>::try_from(args) else {
             return Err(function::Error::Other {
                 what: "libxslt test function requires one argument".into(),
             });
+        };
+        if let SxdValue::String(text) = value {
+            context.charge_extension_work(text.len().max(1))?;
+            return Ok(SxdValue::String(text));
         }
-        reserve_sxd_string_arguments(
-            context,
-            &args,
-            &[0],
-            "libxslt test function string allocation length overflow",
-        )?;
-        Ok(SxdValue::String(
-            args.into_iter()
-                .next()
-                .expect("argument count was checked")
-                .into_string(),
-        ))
+        let text = extension_string(context, &value)?;
+        if matches!(text, Cow::Borrowed(_)) {
+            context.reserve_string_allocation(text.len())?;
+        }
+        Ok(SxdValue::String(text.into_owned()))
     }
 }
 
@@ -6721,7 +6558,8 @@ impl function::Function for ExsltCryptoFunction {
                         what: "EXSLT hash function requires one argument".into(),
                     });
                 };
-                if value.string_len() == 0 {
+                let value = extension_string(context, &value)?;
+                if value.is_empty() {
                     return Ok(SxdValue::String(String::new()));
                 }
                 let output_len = match self {
@@ -6729,14 +6567,7 @@ impl function::Function for ExsltCryptoFunction {
                     Self::Sha1 => 40,
                     _ => unreachable!(),
                 };
-                let workspace_bytes = sxd_string_materialization_bytes(&value)
-                    .checked_add(output_len)
-                    .ok_or_else(|| function::Error::Other {
-                        what: "EXSLT hash allocation length overflow".into(),
-                    })?;
-                context.reserve_string_allocation(workspace_bytes)?;
-                let value = value.into_string();
-                context.charge_extension_work(value.len())?;
+                context.reserve_string_allocation(output_len)?;
                 let output = match self {
                     Self::Md5 => hex_encode(&md5::Md5::digest(value.as_bytes())),
                     Self::Sha1 => hex_encode(&sha1::Sha1::digest(value.as_bytes())),
@@ -6750,46 +6581,32 @@ impl function::Function for ExsltCryptoFunction {
                         what: "EXSLT RC4 function requires key and data".into(),
                     });
                 };
-                let key_len = key.string_len();
-                if key_len == 0 {
+                let key = extension_string(context, &key)?;
+                if key.is_empty() {
                     return Ok(SxdValue::String(String::new()));
                 }
-                let input_len = input.string_len();
-                let coercion_bytes = sxd_string_materialization_bytes(&key)
-                    .checked_add(sxd_string_materialization_bytes(&input))
-                    .ok_or_else(|| function::Error::Other {
-                        what: "EXSLT RC4 allocation length overflow".into(),
-                    })?;
+                let input = extension_string(context, &input)?;
+                let input_len = input.len();
                 let workspace_bytes = if matches!(self, Self::Rc4Decrypt) {
                     if !input_len.is_multiple_of(2) {
                         return Err(function::Error::Other {
                             what: "EXSLT RC4 ciphertext must contain complete hex octets".into(),
                         });
                     }
-                    coercion_bytes
-                        .checked_add(input_len)
-                        .ok_or_else(|| function::Error::Other {
-                            what: "EXSLT RC4 allocation length overflow".into(),
-                        })?
+                    input_len
                 } else {
-                    coercion_bytes
-                        .checked_add(input_len.checked_mul(3).ok_or_else(|| {
-                            function::Error::Other {
-                                what: "EXSLT RC4 allocation length overflow".into(),
-                            }
-                        })?)
+                    input_len
+                        .checked_mul(3)
                         .ok_or_else(|| function::Error::Other {
                             what: "EXSLT RC4 allocation length overflow".into(),
                         })?
                 };
                 context.reserve_string_allocation(workspace_bytes)?;
-                let key = key.into_string();
-                let input = input.into_string();
                 context.charge_extension_work(input.len().saturating_add(256))?;
                 let input = if matches!(self, Self::Rc4Decrypt) {
-                    hex_decode(&input)?
+                    Cow::Owned(hex_decode(&input)?)
                 } else {
-                    input.into_bytes()
+                    Cow::Borrowed(input.as_bytes())
                 };
                 let mut padded_key = [0_u8; 128];
                 let key_bytes = key.as_bytes();
@@ -6808,29 +6625,6 @@ impl function::Function for ExsltCryptoFunction {
             }
         }
     }
-}
-
-fn sxd_string_materialization_bytes(value: &SxdValue<'_>) -> usize {
-    match value {
-        SxdValue::String(_) | SxdValue::ResultTreeFragment(..) => 0,
-        value => value.string_len(),
-    }
-}
-
-fn reserve_sxd_string_arguments(
-    context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
-    args: &[SxdValue<'_>],
-    indices: &[usize],
-    overflow_message: &str,
-) -> std::result::Result<(), function::Error> {
-    let bytes = indices.iter().try_fold(0usize, |bytes, &index| {
-        bytes
-            .checked_add(args.get(index).map_or(0, sxd_string_materialization_bytes))
-            .ok_or_else(|| function::Error::Other {
-                what: overflow_message.into(),
-            })
-    })?;
-    context.reserve_string_allocation(bytes)
 }
 
 pub(crate) fn extension_string<'a>(
@@ -7116,17 +6910,13 @@ impl function::Function for ExsltStringFunction {
                 if !(2..=3).contains(&args.len()) {
                     return extension_argument_error("str:align() requires two or three arguments");
                 }
-                reserve_sxd_string_arguments(
-                    context,
-                    &args,
-                    &[0, 1, 2],
-                    "str:align() allocation length overflow",
-                )?;
-                let mut args = args.into_iter();
-                let value = args.next().expect("arity checked above").into_string();
-                let padding = args.next().expect("arity checked above").into_string();
-                let alignment = args.next().map(SxdValue::into_string).unwrap_or_default();
-                context.charge_extension_work(padding.len().saturating_add(value.len()))?;
+                let value = extension_string(context, &args[0])?;
+                let padding = extension_string(context, &args[1])?;
+                let alignment = args
+                    .get(2)
+                    .map(|value| extension_string(context, value))
+                    .transpose()?
+                    .unwrap_or(Cow::Borrowed(""));
                 let width = padding.chars().count();
                 let value_width = value.chars().count();
                 if value_width >= width {
@@ -7137,7 +6927,7 @@ impl function::Function for ExsltStringFunction {
                     return Ok(SxdValue::String(value[..output_bytes].to_owned()));
                 }
                 let missing = width - value_width;
-                let left = match alignment.as_str() {
+                let left = match alignment.as_ref() {
                     "right" => missing,
                     "center" => missing / 2,
                     _ => 0,
@@ -8030,17 +7820,16 @@ fn one_qname_argument(
             what: format!("{function}() requires one argument"),
         });
     }
-    reserve_sxd_string_arguments(
-        context,
-        &args,
-        &[0],
-        "capability-query QName coercion length overflow",
-    )?;
-    let lexical = args
-        .into_iter()
-        .next()
-        .expect("argument count was checked")
-        .into_string();
+    qname_argument(context, &args[0], namespaces)
+}
+
+fn qname_argument(
+    context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
+    value: &SxdValue<'_>,
+    namespaces: &[(String, String)],
+) -> std::result::Result<ExpandedName, function::Error> {
+    let lexical = function::string_argument_view(value, context)?;
+    context.charge_work(lexical.len())?;
     let retained_bytes = lexical.len().saturating_add(
         lexical
             .split_once(':')
@@ -8199,7 +7988,9 @@ fn build_node_path<E>(
     })
 }
 
-type KeyIndex = HashMap<(ExpandedName, String, usize), Vec<NodePath>>;
+// Compiled key slots already identify expanded names. Grouping by slot/document lets
+// lookups borrow scalar values instead of cloning a QName/string tuple per candidate.
+type KeyIndex = HashMap<(usize, usize), HashMap<String, Vec<NodePath>>>;
 
 struct KeyFunction {
     index: Rc<RefCell<KeyIndex>>,
@@ -8220,8 +8011,7 @@ impl function::Function for KeyFunction {
                 what: "key() requires exactly two arguments".into(),
             });
         }
-        context.reserve_temporary_allocation(args[0].string_len())?;
-        let name = resolve_lexical_name(&args[0].string(), &self.namespaces)?;
+        let name = qname_argument(context, &args[0], &self.namespaces)?;
         let document_index = typed_path_to_with_context(&context.node, context)?
             .ordinary()
             .get(1)
@@ -8229,10 +8019,11 @@ impl function::Function for KeyFunction {
             .ok_or_else(|| function::Error::Other {
                 what: "key() context has no logical document".into(),
             })?;
-        if let Some(key_slot) = self
+        let key_slot = self
             .name_indices
             .iter()
-            .position(|index| self.declarations[*index].name == name)
+            .position(|index| self.declarations[*index].name == name);
+        if let Some(key_slot) = key_slot
             && !self.ready.borrow().contains(&(key_slot, document_index))
         {
             let mut pending = self.pending.borrow_mut();
@@ -8243,8 +8034,10 @@ impl function::Function for KeyFunction {
         }
         let mut result = nodeset::Nodeset::new();
         let index = self.index.borrow();
-        let mut lookup = |value: String| -> std::result::Result<(), function::Error> {
-            if let Some(paths) = index.get(&(name.clone(), value, document_index)) {
+        let values = key_slot.and_then(|slot| index.get(&(slot, document_index)));
+        let mut lookup = |value: &str| -> std::result::Result<(), function::Error> {
+            context.charge_work(value.len())?;
+            if let Some(paths) = values.and_then(|values| values.get(value)) {
                 for path in paths {
                     if let Some(node) = resolve_node_path(context, path)? {
                         result.add_metered(context, node)?;
@@ -8256,12 +8049,11 @@ impl function::Function for KeyFunction {
         match &args[1] {
             SxdValue::Nodeset(nodes) => {
                 for node in nodes.iter() {
-                    lookup(node.string_value_with_context(context)?)?;
+                    lookup(&node.string_value_with_context(context)?)?;
                 }
             }
             value => {
-                context.reserve_temporary_allocation(value.string_len())?;
-                lookup(value.string())?;
+                lookup(&function::string_argument_view(value, context)?)?;
             }
         }
         Ok(SxdValue::Nodeset(result))
@@ -8869,6 +8661,104 @@ impl function::Function for CurrentNode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn string_consumers_gate_nodeset_work_before_allocation() {
+        // All argument consumers must reject traversal before attempting string allocation.
+        let package =
+            sxd_document_no_unsafe::parser::parse("<root><a>payload</a></root>").expect("test XML");
+        let document = package.as_document();
+        let root = document.root().children()[0]
+            .element()
+            .expect("root element");
+        for extension in [true, false] {
+            let mut context = Context::new();
+            context.set_string_allocation_limit(0);
+            if extension {
+                context.set_extension_work_limit(0);
+            } else {
+                context.set_evaluation_work_limit(0);
+            }
+            let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&context, root.into());
+            let mut nodes = nodeset::Nodeset::new();
+            nodes.add(root);
+            let result = if extension {
+                ExsltCryptoFunction::Md5.evaluate(&evaluation, vec![SxdValue::Nodeset(nodes)])
+            } else {
+                one_qname_argument(
+                    &evaluation,
+                    vec![SxdValue::Nodeset(nodes)],
+                    &[],
+                    "system-property",
+                )
+                .map(|_| SxdValue::Boolean(true))
+            };
+            assert!(result.is_err());
+            assert_eq!(
+                context.string_allocation_exceeded(),
+                None,
+                "work must be rejected before materialization (extension={extension})"
+            );
+            assert!(if extension {
+                context.extension_work_exceeded().is_some()
+            } else {
+                context.evaluation_work_exceeded().is_some()
+            });
+        }
+    }
+
+    #[test]
+    fn key_name_coercion_rejects_work_before_lookup() {
+        // key() must share QName coercion with availability/property queries, before index work.
+        let package =
+            sxd_document_no_unsafe::parser::parse("<root>payload</root>").expect("test XML");
+        let document = package.as_document();
+        let mut context = Context::new();
+        context.set_evaluation_work_limit(0);
+        context.set_string_allocation_limit(0);
+        let evaluation =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+        let mut nodes = nodeset::Nodeset::new();
+        nodes.add(document.root());
+        let key = KeyFunction {
+            index: Rc::new(RefCell::new(HashMap::new())),
+            namespaces: Arc::new(Vec::new()),
+            declarations: Arc::from([]),
+            name_indices: Arc::from([]),
+            ready: Rc::new(RefCell::new(HashSet::new())),
+            pending: Rc::new(RefCell::new(None)),
+        };
+        assert!(
+            key.evaluate(
+                &evaluation,
+                vec![SxdValue::Nodeset(nodes), SxdValue::Number(1.0)]
+            )
+            .is_err()
+        );
+        assert!(context.evaluation_work_exceeded().is_some());
+        assert_eq!(context.string_allocation_exceeded(), None);
+        assert!(key.pending.borrow().is_none());
+    }
+
+    #[test]
+    fn identity_extension_moves_owned_string_without_allocation() {
+        // An identity operation consumes an already-owned argument instead of copying it.
+        let package = Package::new();
+        let document = package.as_document();
+        let mut context = Context::new();
+        context.set_string_allocation_limit(0);
+        let evaluation =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+        let text = String::from("identity");
+        let pointer = text.as_ptr();
+        let SxdValue::String(result) = IdentityStringFunction
+            .evaluate(&evaluation, vec![SxdValue::String(text)])
+            .expect("existing owned text needs no allocation")
+        else {
+            panic!("string result")
+        };
+        assert_eq!(result, "identity");
+        assert_eq!(result.as_ptr(), pointer);
+    }
     use super::*;
     use crate::ExecutionBudget;
     use sxd_xpath_no_unsafe::function::Function;
@@ -9321,14 +9211,34 @@ mod tests {
     }
 
     #[test]
-    fn absolute_path_rewrite_distinguishes_div_name_tests_from_operators() {
-        for path in ["div/span", "root/div/span"] {
-            assert_eq!(rewrite_absolute_paths_for_validation(path), path);
+    fn xpath_parser_distinguishes_div_name_tests_from_operators() {
+        // XPath 1.0 section 3.7 distinguishes operator names lexically; validation
+        // must use that parser rather than rewriting '/' based on string suffixes.
+        // https://www.w3.org/TR/xpath/#exprlex
+        let package =
+            sxd_document_no_unsafe::parser::parse("<root><div><span>2</span></div></root>")
+                .expect("fixture parses");
+        let document = package.as_document();
+        let context = Context::new();
+        let root = document.root().children()[0]
+            .element()
+            .expect("root element exists");
+        for (source, node, expected) in [
+            ("div/span", nodeset::Node::Element(root), 2.0),
+            ("root/div/span", nodeset::Node::Root(document.root()), 2.0),
+            ("1 div /root", nodeset::Node::Root(document.root()), 0.5),
+        ] {
+            let expression = Factory::new().build(source).expect("valid XPath");
+            let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&context, node.clone());
+            assert_eq!(
+                expression
+                    .evaluate(&context, node)
+                    .expect("expression evaluates")
+                    .number(&evaluation)
+                    .expect("number conversion fits"),
+                expected
+            );
         }
-        assert_ne!(
-            rewrite_absolute_paths_for_validation("1 div /root"),
-            "1 div /root"
-        );
     }
 
     #[test]
@@ -9814,6 +9724,39 @@ mod tests {
                 .evaluate(&evaluation, vec![SxdValue::Nodeset(nodes)]),
             Err(function::Error::Other { what }) if what.contains("budget")
         ));
+    }
+
+    #[test]
+    fn key_lookup_borrows_scalar_payload() {
+        // An already-owned scalar argument needs no payload copy for a hash lookup.
+        // Keep enough room for the context path/QName, but not for another large string.
+        let package = Package::new();
+        let document = package.as_document();
+        let documents = document.create_element("documents");
+        let logical = document.create_element("logical");
+        document.root().append_child(documents);
+        documents.append_child(logical);
+        let mut context = Context::new();
+        context.set_string_allocation_limit(512);
+        let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&context, logical.into());
+        let key = KeyFunction {
+            index: Rc::new(RefCell::new(HashMap::new())),
+            namespaces: Arc::new(Vec::new()),
+            declarations: Arc::from([]),
+            name_indices: Arc::from([]),
+            ready: Rc::new(RefCell::new(HashSet::new())),
+            pending: Rc::new(RefCell::new(None)),
+        };
+        let result = key
+            .evaluate(
+                &evaluation,
+                vec![
+                    SxdValue::String("missing".into()),
+                    SxdValue::String("x".repeat(65_536)),
+                ],
+            )
+            .expect("lookup borrows its argument");
+        assert_eq!(result, SxdValue::Nodeset(nodeset::Nodeset::new()));
     }
 
     #[test]

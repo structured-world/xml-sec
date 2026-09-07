@@ -1,21 +1,95 @@
-use peresil::{self, Identifier, ParseMaster, Recoverable, StringPoint, try_parse};
+use peresil::{self, Identifier, Recoverable, StringPoint, try_parse};
 use snafu::Snafu;
 use std::borrow::ToOwned;
-use std::collections::VecDeque;
-use std::string;
 use sxd_document_no_unsafe::parser::XmlParseExt;
 
 use crate::node_test;
 use crate::token::{AxisName, NodeTestName, Token};
 
-pub struct Tokenizer {
-    xpath: string::String,
+pub struct Tokenizer<'a> {
+    xpath: &'a str,
+    budget: Option<&'a crate::ParseBudget>,
     start: usize,
     prefer_recognition_of_operator_names: bool,
 }
 
-type XPathMaster<'a> = ParseMaster<StringPoint<'a>, Error>;
 type XPathProgress<'a, T, E> = peresil::Progress<StringPoint<'a>, T, E>;
+
+// The old ParseMaster accumulated every diagnostic and raw_next_token retained only the last
+// one at the furthest position. Keep precisely that selection without a diagnostic Vec.
+struct XPathMaster<'a> {
+    failure: Option<(StringPoint<'a>, Error)>,
+    budget: Option<&'a crate::ParseBudget>,
+}
+
+impl<'a> XPathMaster<'a> {
+    fn consume<T>(&mut self, progress: XPathProgress<'a, T, Error>) {
+        if let peresil::Status::Failure(error) = progress.status
+            && (!error.recoverable()
+                || self
+                    .failure
+                    .as_ref()
+                    .is_none_or(|(point, _)| progress.point >= *point))
+        {
+            self.failure = Some((progress.point, error));
+        }
+    }
+
+    fn alternate<T>(&mut self) -> XPathAlternate<'_, 'a, T> {
+        XPathAlternate {
+            master: self,
+            current: None,
+        }
+    }
+
+    fn finish<T>(&mut self, progress: XPathProgress<'a, T, Error>) -> XPathProgress<'a, T, Error> {
+        if matches!(progress.status, peresil::Status::Success(_)) {
+            return progress;
+        }
+        self.consume(progress);
+        let (point, error) = self
+            .failure
+            .take()
+            .expect("failed alternative supplies a diagnostic");
+        peresil::Progress::failure(point, error)
+    }
+
+    fn reserve(&self, point: StringPoint<'a>, bytes: usize) -> XPathProgress<'a, (), Error> {
+        if self
+            .budget
+            .is_some_and(|budget| budget.charge(bytes).is_err())
+        {
+            peresil::Progress::failure(point, Error::AllocationLimit)
+        } else {
+            peresil::Progress::success(point, ())
+        }
+    }
+}
+
+struct XPathAlternate<'m, 'a, T> {
+    master: &'m mut XPathMaster<'a>,
+    current: Option<XPathProgress<'a, T, Error>>,
+}
+
+impl<'a, T> XPathAlternate<'_, 'a, T> {
+    fn one(
+        mut self,
+        parser: impl FnOnce(&mut XPathMaster<'a>) -> XPathProgress<'a, T, Error>,
+    ) -> Self {
+        if self.current.as_ref().is_none_or(|progress| matches!(&progress.status, peresil::Status::Failure(error) if error.recoverable())) {
+            let next = parser(self.master);
+            if let Some(previous) = self.current.take() {
+                self.master.consume(previous);
+            }
+            self.current = Some(next);
+        }
+        self
+    }
+
+    fn finish(self) -> XPathProgress<'a, T, Error> {
+        self.current.expect("at least one alternative")
+    }
+}
 
 pub type TokenResult = Result<Token, Error>;
 
@@ -23,6 +97,8 @@ pub type TokenResult = Result<Token, Error>;
 #[snafu(context(suffix(false)))]
 #[cfg_attr(test, snafu(visibility(pub(crate))))]
 pub enum Error {
+    /// token payload allocation exceeded the build budget
+    AllocationLimit,
     /// expected a single or double quote
     ExpectedQuote,
     /// expected a number
@@ -59,7 +135,7 @@ impl Recoverable for Error {
     fn recoverable(&self) -> bool {
         use self::Error::*;
         match *self {
-            MismatchedQuoteCharacters | UnableToCreateToken => false,
+            AllocationLimit | MismatchedQuoteCharacters | UnableToCreateToken => false,
             _ => true,
         }
     }
@@ -174,7 +250,9 @@ fn parse_quoted_literal<'a>(
     pm: &mut XPathMaster<'a>,
     p: StringPoint<'a>,
 ) -> XPathProgress<'a, Token, Error> {
-    parse_literal(pm, p).map(|v| Token::Literal(v.to_owned()))
+    let (p, value) = try_parse!(parse_literal(pm, p));
+    try_parse!(pm.reserve(p, value.len()));
+    peresil::Progress::success(p, Token::Literal(value.to_owned()))
 }
 
 fn parse_number<'a>(
@@ -260,31 +338,45 @@ fn parse_node_type<'a>(
         peresil::Progress::success(p, Token::NodeTest(node_type))
     }
 
-    fn with_arg<'a>(pm: &mut XPathMaster<'a>, p: StringPoint<'a>) -> XPathProgress<'a, Token, ()> {
-        let (p, _) = try_parse!(p.consume_literal("processing-instruction"));
+    fn with_arg<'a>(
+        pm: &mut XPathMaster<'a>,
+        p: StringPoint<'a>,
+    ) -> XPathProgress<'a, Token, Error> {
+        let (p, _) = try_parse!(
+            p.consume_literal("processing-instruction")
+                .context(ExpectedNodeTest)
+        );
         let (p, _) = p.consume_space().optional(p);
-        let (p, _) = try_parse!(p.consume_literal("("));
+        let (p, _) = try_parse!(p.consume_literal("(").context(ExpectedNodeTest));
         let (p, _) = p.consume_space().optional(p);
-        let (p, arg) = try_parse!(parse_literal(pm, p).map_err(|_| ()));
+        let (p, arg) = try_parse!(parse_literal(pm, p).context(ExpectedNodeTest));
         let (p, _) = p.consume_space().optional(p);
-        let (p, _) = try_parse!(p.consume_literal(")"));
+        let (p, _) = try_parse!(p.consume_literal(")").context(ExpectedNodeTest));
 
+        try_parse!(pm.reserve(p, arg.len()));
         let name = NodeTestName::ProcessingInstruction(Some(arg.to_owned()));
         peresil::Progress::success(p, Token::NodeTest(name))
     }
 
     pm.alternate()
         .one(|_| without_arg(p).context(ExpectedNodeTest))
-        .one(|pm| with_arg(pm, p).context(ExpectedNodeTest))
+        .one(|pm| with_arg(pm, p))
         .finish()
 }
 
-fn parse_function_call(p: StringPoint<'_>) -> XPathProgress<'_, Token, Error> {
+fn parse_function_call<'a>(
+    pm: &XPathMaster<'a>,
+    p: StringPoint<'a>,
+) -> XPathProgress<'a, Token, Error> {
     let (p, name) = try_parse!(p.consume_prefixed_name().context(ExpectedPrefixedName));
     // Do not advance the point here. We want to know if there *is* a
     // left-paren, but do not want to actually consume it here.
     try_parse!(p.consume_literal("(").context(ExpectedLeftParenthesis));
 
+    try_parse!(pm.reserve(
+        p,
+        name.prefix().map_or(0, str::len) + name.local_part().len()
+    ));
     peresil::Progress::success(p, Token::Function(name.into()))
 }
 
@@ -292,8 +384,9 @@ fn parse_name_test<'a>(
     pm: &mut XPathMaster<'a>,
     p: StringPoint<'a>,
 ) -> XPathProgress<'a, Token, Error> {
-    fn wildcard(p: StringPoint<'_>) -> XPathProgress<'_, Token, ()> {
-        let (p, wc) = try_parse!(p.consume_literal("*"));
+    fn wildcard<'a>(pm: &XPathMaster<'a>, p: StringPoint<'a>) -> XPathProgress<'a, Token, Error> {
+        let (p, wc) = try_parse!(p.consume_literal("*").context(ExpectedNameTest));
+        try_parse!(pm.reserve(p, wc.len()));
 
         let name = node_test::NameTest {
             prefix: None,
@@ -302,10 +395,14 @@ fn parse_name_test<'a>(
         peresil::Progress::success(p, Token::NameTest(name))
     }
 
-    fn prefixed_wildcard(p: StringPoint<'_>) -> XPathProgress<'_, Token, ()> {
-        let (p, prefix) = try_parse!(p.consume_ncname());
-        let (p, _) = try_parse!(p.consume_literal(":"));
-        let (p, wc) = try_parse!(p.consume_literal("*"));
+    fn prefixed_wildcard<'a>(
+        pm: &XPathMaster<'a>,
+        p: StringPoint<'a>,
+    ) -> XPathProgress<'a, Token, Error> {
+        let (p, prefix) = try_parse!(p.consume_ncname().context(ExpectedNameTest));
+        let (p, _) = try_parse!(p.consume_literal(":").context(ExpectedNameTest));
+        let (p, wc) = try_parse!(p.consume_literal("*").context(ExpectedNameTest));
+        try_parse!(pm.reserve(p, prefix.len() + wc.len()));
 
         let name = node_test::NameTest {
             prefix: Some(prefix.to_owned()),
@@ -314,35 +411,59 @@ fn parse_name_test<'a>(
         peresil::Progress::success(p, Token::NameTest(name))
     }
 
-    fn prefixed_name(p: StringPoint<'_>) -> XPathProgress<'_, Token, ()> {
-        p.consume_prefixed_name().map(|name| {
+    fn prefixed_name<'a>(
+        pm: &XPathMaster<'a>,
+        p: StringPoint<'a>,
+    ) -> XPathProgress<'a, Token, Error> {
+        let (p, name) = try_parse!(p.consume_prefixed_name().context(ExpectedNameTest));
+        try_parse!(pm.reserve(
+            p,
+            name.prefix().map_or(0, str::len) + name.local_part().len()
+        ));
+        peresil::Progress::success(
+            p,
             Token::NameTest(node_test::NameTest {
                 prefix: name.prefix().map(|p| p.to_owned()),
                 local_part: name.local_part().to_owned(),
-            })
-        })
+            }),
+        )
     }
 
     pm.alternate()
-        .one(|_| wildcard(p).context(ExpectedNameTest))
-        .one(|_| prefixed_wildcard(p).context(ExpectedNameTest))
-        .one(|_| prefixed_name(p).context(ExpectedNameTest))
+        .one(|pm| wildcard(pm, p))
+        .one(|pm| prefixed_wildcard(pm, p))
+        .one(|pm| prefixed_name(pm, p))
         .finish()
 }
 
-fn parse_variable_reference(p: StringPoint<'_>) -> XPathProgress<'_, Token, Error> {
+fn parse_variable_reference<'a>(
+    pm: &XPathMaster<'a>,
+    p: StringPoint<'a>,
+) -> XPathProgress<'a, Token, Error> {
     let (p, _) = try_parse!(p.consume_literal("$").context(ExpectedVariableReference));
     let (p, name) = try_parse!(p.consume_prefixed_name().context(ExpectedPrefixedName));
 
+    try_parse!(pm.reserve(
+        p,
+        name.prefix().map_or(0, str::len) + name.local_part().len()
+    ));
     peresil::Progress::success(p, Token::Variable(name.into()))
 }
 
-impl Tokenizer {
-    pub fn new(xpath: &str) -> Tokenizer {
+impl<'input> Tokenizer<'input> {
+    pub fn new(xpath: &'input str) -> Self {
         Tokenizer {
-            xpath: xpath.to_owned(),
+            xpath,
+            budget: None,
             start: 0,
             prefer_recognition_of_operator_names: false,
+        }
+    }
+
+    pub fn with_budget(xpath: &'input str, budget: &'input crate::ParseBudget) -> Self {
+        Self {
+            budget: Some(budget),
+            ..Self::new(xpath)
         }
     }
 
@@ -373,9 +494,9 @@ impl Tokenizer {
                 .one(|_| parse_named_operators(p, self.prefer_recognition_of_operator_names))
                 .one(|_| parse_axis_specifier(p))
                 .one(|pm| parse_node_type(pm, p))
-                .one(|_| parse_function_call(p))
+                .one(|pm| parse_function_call(pm, p))
                 .one(|pm| parse_name_test(pm, p))
-                .one(|_| parse_variable_reference(p))
+                .one(|pm| parse_variable_reference(pm, p))
                 .finish()
         });
 
@@ -385,7 +506,10 @@ impl Tokenizer {
     }
 
     fn raw_next_token(&mut self) -> TokenResult {
-        let mut pm = ParseMaster::new();
+        let mut pm = XPathMaster {
+            failure: None,
+            budget: self.budget,
+        };
         let p = StringPoint {
             s: &self.xpath[self.start..],
             offset: self.start,
@@ -401,14 +525,13 @@ impl Tokenizer {
                 Ok(data)
             }
             peresil::Progress {
-                status: peresil::Status::Failure(mut e),
+                status: peresil::Status::Failure(error),
                 point,
             } => {
                 if point.offset == self.start {
                     UnableToCreateToken.fail()
                 } else {
-                    // Should always have one error, otherwise we wouldn't be here!
-                    Err(e.pop().expect("Unknown error while parsing"))
+                    Err(error)
                 }
             }
         }
@@ -428,7 +551,7 @@ impl Tokenizer {
     }
 }
 
-impl Iterator for Tokenizer {
+impl Iterator for Tokenizer<'_> {
     type Item = TokenResult;
 
     fn next(&mut self) -> Option<TokenResult> {
@@ -446,14 +569,16 @@ impl Iterator for Tokenizer {
 
 pub struct TokenDeabbreviator<I> {
     source: I,
-    buffer: VecDeque<Token>,
+    buffer: [Option<Token>; 3],
 }
 
 // Avoid adding the first element to the buffer, but keep the
 // expansion values nicely co-located.
 macro_rules! deabbrev {
     ($this:expr, $head:expr $(, $tail:expr)*) => {{
-        $this.buffer.extend([$( $tail, )*].iter().cloned());
+        for (slot, token) in $this.buffer.iter_mut().zip([$( $tail, )*]) {
+            *slot = Some(token);
+        }
         $head
     }}
 }
@@ -462,7 +587,7 @@ impl<I> TokenDeabbreviator<I> {
     pub fn new(source: I) -> TokenDeabbreviator<I> {
         TokenDeabbreviator {
             source,
-            buffer: Default::default(),
+            buffer: [None, None, None],
         }
     }
 
@@ -498,7 +623,8 @@ where
     type Item = TokenResult;
 
     fn next(&mut self) -> Option<TokenResult> {
-        if let Some(tok) = self.buffer.pop_front() {
+        if let Some(tok) = self.buffer[0].take() {
+            self.buffer.rotate_left(1);
             return Some(Ok(tok));
         }
 
@@ -513,6 +639,52 @@ where
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn diagnostic_collector_keeps_furthest_latest_and_fatal_errors() {
+        // Freeze the collector's selection independently of both factory entrypoints.
+        let start = peresil::StringPoint::new("ab");
+        let later = start.consume_literal("a").point;
+        let mut master = super::XPathMaster {
+            failure: None,
+            budget: None,
+        };
+        master.consume::<()>(peresil::Progress::failure(
+            later,
+            super::Error::ExpectedNumber,
+        ));
+        master.consume::<()>(peresil::Progress::failure(
+            start,
+            super::Error::ExpectedQuote,
+        ));
+        assert_eq!(master.failure, Some((later, super::Error::ExpectedNumber)));
+        master.consume::<()>(peresil::Progress::failure(
+            later,
+            super::Error::ExpectedAxis,
+        ));
+        assert_eq!(master.failure, Some((later, super::Error::ExpectedAxis)));
+        master.consume::<()>(peresil::Progress::failure(
+            start,
+            super::Error::MismatchedQuoteCharacters,
+        ));
+        assert_eq!(
+            master.failure,
+            Some((start, super::Error::MismatchedQuoteCharacters))
+        );
+    }
+
+    #[test]
+    fn diagnostic_selection_has_independent_expected_errors() {
+        // Explicit lexer contracts, not a comparison of two callers of the same lexer:
+        // nonrecoverable quote errors win; no progress produces UnableToCreateToken.
+        for (source, expected) in [
+            ("!", super::Error::UnableToCreateToken),
+            ("'unterminated", super::Error::MismatchedQuoteCharacters),
+            ("\"unterminated", super::Error::MismatchedQuoteCharacters),
+        ] {
+            assert_eq!(super::Tokenizer::new(source).next(), Some(Err(expected)));
+        }
+    }
+
     use std::borrow::ToOwned;
 
     use crate::node_test;

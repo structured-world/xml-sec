@@ -408,7 +408,9 @@ impl Function for TwoStringPredicate {
     }
 }
 
-fn string_argument_view<'a>(
+/// Borrow existing string values or coerce under the evaluation's traversal and memory limits.
+/// Consumers must additionally charge their own lexical processing of the returned text.
+pub fn string_argument_view<'a>(
     value: &'a Value<'_>,
     context: &context::Evaluation<'_, '_>,
 ) -> Result<std::borrow::Cow<'a, str>, Error> {

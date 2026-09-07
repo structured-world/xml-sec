@@ -1146,6 +1146,9 @@ fn execute_transform_chain<'s, 'e, 'd>(
         // returns only owned digest bytes. Every C14N output is charged before
         // recursion, so these retained buffers remain a bounded subset of the
         // signature-wide canonicalization work budget.
+        // Decoding is a separate input pass, including malformed-input failures. Reserve it
+        // before any transcoding; the subsequent parser charges its own decoded-byte passes.
+        context.budget.xml_parse_work.charge_policy(bytes.len())?;
         let xml =
             crate::encoding::decode_xml_octets(&bytes, context.budget.xml_parse_settings.max_bytes)
                 .map_err(map_transform_xml_decode_error)?;
@@ -2703,6 +2706,33 @@ mod tests {
     }
 
     #[test]
+    fn binary_adapter_gates_decode_even_when_input_is_malformed() {
+        // Failed decoding is operation work too; denial must precede UTF-16 traversal/allocation.
+        let signature_document = Document::parse("<Signature/>").unwrap();
+        let resources = crate::policy::ResourcePolicy {
+            max_xml_parse_work_bytes: 0,
+            ..crate::policy::ResourcePolicy::default()
+        };
+        let budget = TransformExecutionBudget::from_resources(&resources);
+        let error = execute_transforms_with_options_and_budget(
+            signature_document.root_element(),
+            TransformData::Binary(vec![0xff, 0xfe, 0x00, 0xd8]),
+            &[Transform::XPath(XPathExpression::new("true()"))],
+            TransformOptions::default(),
+            &budget,
+        )
+        .expect_err("zero work must reject before malformed decoding");
+        assert!(matches!(
+            error,
+            TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
+                maximum: 0,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn recursive_binary_adapters_share_xml_parse_work() {
         // Binary-to-node-set adaptation can recur across references and nested
         // transform execution. Each decoded document must consume the same
@@ -2710,8 +2740,10 @@ mod tests {
         let signature_document = Document::parse("<Signature/>").unwrap();
         let xml = b"<root/>";
         let parser_passes = crate::document::selected_parser_passes();
+        // Encoded-byte decoding precedes all decoded-text parser passes, even for UTF-8.
+        let adapter_work = xml.len() * (1 + parser_passes);
         let resources = crate::policy::ResourcePolicy {
-            max_xml_parse_work_bytes: xml.len() * parser_passes,
+            max_xml_parse_work_bytes: adapter_work,
             ..crate::policy::ResourcePolicy::default()
         };
         let budget = TransformExecutionBudget::from_resources(&resources);
@@ -2740,8 +2772,8 @@ mod tests {
                 resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
                 maximum,
                 actual,
-            }) if maximum == xml.len() * parser_passes
-                && actual == xml.len() * (parser_passes + 1)
+            }) if maximum == adapter_work
+                && actual == adapter_work + xml.len()
         ));
     }
 

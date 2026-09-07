@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
@@ -108,8 +108,7 @@ impl<R: Resolver> Compiler<R> {
             state.budget.recursion_depth,
             depth,
         )?;
-        with_frontend_document(xml, state, |document, state| {
-            state.charge_owned(estimate_compiled_owned_bytes(document, base_uri))?;
+        with_compiler_document(xml, base_uri, state, |document, state| {
             let root = stylesheet_module_root(document, fragment)?;
             let StylesheetModuleKind::Standard { forward } = stylesheet_module_kind(root)? else {
                 let precedence = inherited_precedence.unwrap_or_else(|| state.next_precedence());
@@ -229,35 +228,34 @@ impl<R: Resolver> Compiler<R> {
                     self.resolve_module(child, base_uri, ResolvePurpose::Include, state)?;
                 self.enter_resource(&module.resource, state, |state| {
                     let source = resource_source(&module.resource, state)?;
-                    with_frontend_document(source.as_str(), state, |document, state| {
-                        // Every include occurrence produces distinct retained declarations even
-                        // when the decoded module and parser input are cached.
-                        state.charge_owned(estimate_compiled_owned_bytes(
-                            document,
-                            Some(&module.resource.canonical_uri),
-                        ))?;
-                        let included_root = stylesheet_module_root(document, module.fragment)?;
-                        match stylesheet_module_kind(included_root)? {
-                            StylesheetModuleKind::Standard {
-                                forward: included_forward,
-                            } => self.compile_effective_declarations(
-                                included_root,
-                                Some(&module.resource.canonical_uri),
-                                precedence,
-                                included_forward,
-                                state,
-                                depth + 1,
-                            ),
-                            StylesheetModuleKind::Simplified => self
-                                .compile_literal_result_stylesheet(
+                    with_compiler_document(
+                        source.as_str(),
+                        Some(&module.resource.canonical_uri),
+                        state,
+                        |document, state| {
+                            let included_root = stylesheet_module_root(document, module.fragment)?;
+                            match stylesheet_module_kind(included_root)? {
+                                StylesheetModuleKind::Standard {
+                                    forward: included_forward,
+                                } => self.compile_effective_declarations(
                                     included_root,
                                     Some(&module.resource.canonical_uri),
                                     precedence,
+                                    included_forward,
                                     state,
                                     depth + 1,
                                 ),
-                        }
-                    })
+                                StylesheetModuleKind::Simplified => self
+                                    .compile_literal_result_stylesheet(
+                                        included_root,
+                                        Some(&module.resource.canonical_uri),
+                                        precedence,
+                                        state,
+                                        depth + 1,
+                                    ),
+                            }
+                        },
+                    )
                 })?;
                 continue;
             }
@@ -394,7 +392,7 @@ impl<R: Resolver> Compiler<R> {
         let order = state.next_order();
         state.templates.push(Template {
             name: None,
-            pattern: Some(Pattern::new("/", root)?),
+            pattern: Some(Pattern::new("/", root, state.workspace())?),
             mode: None,
             priority: 0.5,
             precedence,
@@ -402,7 +400,13 @@ impl<R: Resolver> Compiler<R> {
             params: Arc::from([]),
             body: vec![compile_literal_element(
                 root,
-                CompileContext::new(forward, depth, state.budget.recursion_depth, base_uri)?,
+                CompileContext::new(
+                    forward,
+                    depth,
+                    state.budget.recursion_depth,
+                    base_uri,
+                    state.workspace(),
+                )?,
             )?]
             .into(),
         });
@@ -420,9 +424,14 @@ impl<R: Resolver> Compiler<R> {
     ) -> Result<()> {
         if is_exslt_function_declaration(node)? {
             validate_exslt_function_result_structure(node)?;
-            let context =
-                CompileContext::new(forward, depth, state.budget.recursion_depth, base_uri)?
-                    .inside_function();
+            let context = CompileContext::new(
+                forward,
+                depth,
+                state.budget.recursion_depth,
+                base_uri,
+                state.workspace(),
+            )?
+            .inside_function();
             let mut children = node.children().peekable();
             let mut params = Vec::new();
             while let Some(child) = children.peek().copied() {
@@ -472,7 +481,7 @@ impl<R: Resolver> Compiler<R> {
                 let name = optional_qname_attr(node, "name")?;
                 let patterns = node
                     .attribute("match")
-                    .map(|value| Pattern::template_branches(value, node))
+                    .map(|value| Pattern::template_branches(value, node, state.workspace()))
                     .transpose()?
                     .unwrap_or_default();
                 if name.is_none() && patterns.is_empty() {
@@ -500,8 +509,13 @@ impl<R: Resolver> Compiler<R> {
                         "xsl:template mode requires a match attribute".into(),
                     ));
                 }
-                let context =
-                    CompileContext::new(forward, depth, state.budget.recursion_depth, base_uri)?;
+                let context = CompileContext::new(
+                    forward,
+                    depth,
+                    state.budget.recursion_depth,
+                    base_uri,
+                    state.workspace(),
+                )?;
                 let mut children = node.children().peekable();
                 let mut params = Vec::new();
                 while let Some(child) = children.peek().copied() {
@@ -529,11 +543,14 @@ impl<R: Resolver> Compiler<R> {
                         body,
                     });
                 } else {
+                    let pattern_buffer_bytes = patterns.capacity() * std::mem::size_of::<Pattern>();
                     for (index, pattern) in patterns.into_iter().enumerate() {
                         state.templates.push(Template {
                             name: (index == 0).then(|| name.clone()).flatten(),
-                            priority: explicit_priority
-                                .unwrap_or_else(|| pattern.default_priority()),
+                            priority: match explicit_priority {
+                                Some(priority) => priority,
+                                None => pattern.default_priority(state.workspace())?,
+                            },
                             pattern: Some(pattern),
                             mode: mode.clone(),
                             precedence,
@@ -542,12 +559,19 @@ impl<R: Resolver> Compiler<R> {
                             body: Arc::clone(&body),
                         });
                     }
+                    state.workspace().release(pattern_buffer_bytes);
                 }
             }
             "variable" | "param" => {
                 let variable = compile_variable(
                     node,
-                    CompileContext::new(forward, depth, state.budget.recursion_depth, base_uri)?,
+                    CompileContext::new(
+                        forward,
+                        depth,
+                        state.budget.recursion_depth,
+                        base_uri,
+                        state.workspace(),
+                    )?,
                 )?;
                 let order = state.next_order();
                 state.globals.push(GlobalVariable {
@@ -593,16 +617,25 @@ impl<R: Resolver> Compiler<R> {
                 require_empty_instruction(node)?;
                 let match_pattern = required_attr(node, "match")?;
                 let use_expression = required_attr(node, "use")?;
-                validate_key_dependency_expression("match", match_pattern)?;
-                validate_key_dependency_expression("use", use_expression)?;
+                validate_key_dependency_expression(
+                    "match",
+                    match_pattern,
+                    state.workspace().pending_source(match_pattern, node),
+                )?;
+                validate_key_dependency_expression(
+                    "use",
+                    use_expression,
+                    state.workspace().pending_source(use_expression, node),
+                )?;
                 state.keys.push(KeyDeclaration {
                     name: required_qname_attr(node, "name")?,
-                    match_pattern: Pattern::new(match_pattern, node)?,
+                    match_pattern: Pattern::new(match_pattern, node, state.workspace())?,
                     use_expression: Expression::new(
                         use_expression,
                         node,
                         base_uri,
                         state.budget.recursion_depth,
+                        state.workspace(),
                     )?,
                 });
             }
@@ -634,7 +667,13 @@ impl<R: Resolver> Compiler<R> {
                 let order = state.next_order();
                 state.attribute_sets.push(AttributeSet::parse(
                     node,
-                    CompileContext::new(forward, depth, state.budget.recursion_depth, base_uri)?,
+                    CompileContext::new(
+                        forward,
+                        depth,
+                        state.budget.recursion_depth,
+                        base_uri,
+                        state.workspace(),
+                    )?,
                     precedence,
                     order,
                 )?)
@@ -943,13 +982,16 @@ impl Expression {
         node: roxmltree::Node<'_, '_>,
         static_base_uri: Option<&str>,
         max_depth: usize,
+        workspace: CompileWorkspace<'_>,
     ) -> Result<Self> {
+        workspace.retain(namespace_copy_bytes(node, true, workspace)?)?;
         Self::new_with_namespaces(
             source,
             node,
             Arc::new(namespaces(node)),
             static_base_uri,
             max_depth,
+            workspace,
         )
     }
 
@@ -959,9 +1001,17 @@ impl Expression {
         namespaces: Arc<Vec<(String, String)>>,
         static_base_uri: Option<&str>,
         max_depth: usize,
+        workspace: CompileWorkspace<'_>,
     ) -> Result<Self> {
         let static_base_uri = effective_base_uri(node, static_base_uri)?.map(Arc::from);
-        Self::new_with_namespaces_and_base(source, namespaces, static_base_uri, max_depth)
+        Self::new_with_namespaces_and_base(
+            source,
+            namespaces,
+            static_base_uri,
+            max_depth,
+            workspace,
+            workspace.pending_source(source, node),
+        )
     }
 
     fn new_with_namespaces_and_base(
@@ -969,21 +1019,27 @@ impl Expression {
         namespaces: Arc<Vec<(String, String)>>,
         static_base_uri: Option<Arc<str>>,
         max_depth: usize,
+        workspace: CompileWorkspace<'_>,
+        validation_workspace: CompileWorkspace<'_>,
     ) -> Result<Self> {
-        validate_xpath_prefixes(source, &namespaces)?;
-        let normalized = normalize_xpath_for_sxd(source);
-        let normalized = crate::xpath::rewrite_absolute_paths_for_validation(&normalized);
-        let parsed = sxd_xpath_no_unsafe::Factory::new()
-            .build(&normalized)
-            .map_err(|error| {
-                Error::Static(format!("invalid XPath expression `{source}`: {error}"))
-            })?;
-        ensure(BudgetKind::RecursionDepth, max_depth, parsed.ast_depth())?;
-        Ok(Self::from_parts(
-            source.to_owned(),
+        validate_xpath_prefixes(source, &namespaces, validation_workspace)?;
+        {
+            let (normalized, workspace) = validation_workspace.normalize(source)?;
+            // This AST is only syntax-checked, never evaluated. Logical-document root rewriting
+            // belongs to execution; adding those synthetic steps here wastes memory and depth.
+            let parsed = workspace.parse_xpath(&normalized, source, false)?;
+            ensure(BudgetKind::RecursionDepth, max_depth, parsed.ast_depth())?;
+        }
+        if validation_workspace.occupied == workspace.occupied {
+            workspace.retain(source.len())?;
+        }
+        let variable_references = referenced_variables_bounded(source, &namespaces, workspace)?;
+        Ok(Self {
+            source: source.to_owned(),
             namespaces,
             static_base_uri,
-        ))
+            variable_references,
+        })
     }
 
     pub(crate) fn derived(&self, source: impl Into<String>) -> Self {
@@ -1014,7 +1070,26 @@ impl Expression {
 }
 
 fn referenced_variables(source: &str, namespaces: &[(String, String)]) -> Vec<ExpandedName> {
-    let mut output = Vec::new();
+    let mut count = 0usize;
+    visit_referenced_variables(source, namespaces, |_, _| count += 1);
+    let mut output = Vec::with_capacity(count);
+    visit_referenced_variables(source, namespaces, |namespace, local| {
+        output.push(ExpandedName::new(namespace, local));
+    });
+    output.sort_unstable_by(|left, right| {
+        left.namespace
+            .cmp(&right.namespace)
+            .then_with(|| left.local.cmp(&right.local))
+    });
+    output.dedup();
+    output
+}
+
+fn visit_referenced_variables<'a>(
+    source: &'a str,
+    namespaces: &'a [(String, String)],
+    mut visit: impl FnMut(Option<&'a str>, &'a str),
+) {
     let mut quote = None;
     let mut characters = source.char_indices().peekable();
     while let Some((_, character)) = characters.next() {
@@ -1051,18 +1126,51 @@ fn referenced_variables(source: &str, namespaces: &[(String, String)]) -> Vec<Ex
                 namespaces
                     .iter()
                     .find(|(candidate, _)| candidate == prefix)
-                    .map(|(_, namespace)| namespace.clone())
+                    .map(|(_, namespace)| namespace.as_str())
             });
-            output.push(ExpandedName::new(namespace, local));
+            visit(namespace, local);
         }
     }
-    output.sort_by(|left, right| {
-        left.namespace
-            .cmp(&right.namespace)
-            .then_with(|| left.local.cmp(&right.local))
+}
+
+fn referenced_variables_bounded(
+    source: &str,
+    namespaces: &[(String, String)],
+    workspace: CompileWorkspace<'_>,
+) -> Result<Arc<[ExpandedName]>> {
+    let mut count = 0usize;
+    let mut payload = Some(0usize);
+    visit_referenced_variables(source, namespaces, |namespace, local| {
+        count += 1; // Each reference consumes at least one distinct source byte.
+        payload = payload
+            .and_then(|bytes| bytes.checked_add(local.len()))
+            .and_then(|bytes| bytes.checked_add(namespace.map_or(0, str::len)));
     });
-    output.dedup();
-    output
+    let vector_bytes = count
+        .checked_mul(std::mem::size_of::<ExpandedName>())
+        .filter(|bytes| *bytes <= isize::MAX as usize)
+        .ok_or_else(|| workspace.overflow())?;
+    let payload = payload.ok_or_else(|| workspace.overflow())?;
+    let bytes = vector_bytes
+        .checked_add(payload)
+        .ok_or_else(|| workspace.overflow())?;
+    workspace.retain(bytes)?;
+    let references = referenced_variables(source, namespaces);
+    let retained_payload = references.iter().fold(0usize, |bytes, name| {
+        bytes + name.local.capacity() + name.namespace.as_ref().map_or(0, String::capacity)
+    });
+    workspace.release(payload - retained_payload);
+    let arc_bytes = references
+        .len()
+        .checked_mul(std::mem::size_of::<ExpandedName>())
+        .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<usize>()))
+        .filter(|bytes| *bytes <= isize::MAX as usize)
+        .ok_or_else(|| workspace.overflow())?;
+    // Vec's buffer and the new Arc allocation overlap during conversion; strings move intact.
+    workspace.retain(arc_bytes)?;
+    let references = references.into();
+    workspace.release(vector_bytes);
+    Ok(references)
 }
 
 fn is_lexical_qname(value: &str) -> bool {
@@ -1073,71 +1181,88 @@ fn is_lexical_qname(value: &str) -> bool {
     is_ncname(first) && parts.next().is_none_or(is_ncname) && parts.next().is_none()
 }
 impl Pattern {
-    fn new(source: &str, node: roxmltree::Node<'_, '_>) -> Result<Self> {
+    fn new(
+        source: &str,
+        node: roxmltree::Node<'_, '_>,
+        workspace: CompileWorkspace<'_>,
+    ) -> Result<Self> {
+        let validation_workspace = workspace.pending_source(source, node);
         if trim_xml_whitespace(source).is_empty() {
-            return Err(Error::Static("empty template pattern".into()));
+            return Err(validation_workspace.static_error(format_args!("empty template pattern")));
         }
         if contains_variable_reference(source) {
-            return Err(Error::Static(format!(
+            return Err(validation_workspace.static_error(format_args!(
                 "XSLT 1.0 match pattern `{source}` must not contain a variable reference"
             )));
         }
+        workspace.retain(namespace_copy_bytes(node, false, workspace)?)?;
+        let namespaces = namespaces(node);
         for branch in split_pattern_branches(source) {
             let branch = trim_xml_whitespace(branch);
-            validate_xslt_pattern_branch(branch)?;
-            validate_xpath_prefixes(branch, &namespaces(node))?;
-            let normalized = normalize_xpath_for_sxd(branch);
-            let expression = if normalized.starts_with('/')
-                || normalized.starts_with("id(")
-                || normalized.starts_with("key(")
-            {
-                normalized
-            } else {
-                Cow::Owned(format!("//{normalized}"))
-            };
-            let expression = crate::xpath::rewrite_absolute_paths_for_validation(&expression);
-            sxd_xpath_no_unsafe::Factory::new()
-                .build(&expression)
-                .map_err(|error| {
-                    Error::Static(format!("invalid match pattern `{branch}`: {error}"))
-                })?;
+            let (normalized, branch_workspace) = validation_workspace.normalize(branch)?;
+            validate_xslt_pattern_branch(&normalized, branch_workspace)?;
+            validate_xpath_prefixes(branch, &namespaces, branch_workspace)?;
+            branch_workspace.parse_xpath(&normalized, branch, true)?;
+        }
+        let matches_attributes = {
+            let (normalized, workspace) = validation_workspace.normalize(source)?;
+            sxd_xpath_no_unsafe::expression_uses_attribute_axis_bounded(
+                &normalized,
+                workspace.remaining(),
+            )
+            .map_err(|error| workspace.parser_error(error, source, true))?
+        };
+        if validation_workspace.occupied == workspace.occupied {
+            workspace.retain(source.len())?;
         }
         Ok(Self {
             source: source.to_owned(),
-            namespaces: namespaces(node),
-            matches_attributes: sxd_xpath_no_unsafe::expression_uses_attribute_axis(
-                &normalize_xpath_for_sxd(source),
-            ),
+            namespaces,
+            matches_attributes,
         })
     }
 
-    fn template_branches(source: &str, node: roxmltree::Node<'_, '_>) -> Result<Vec<Self>> {
-        split_pattern_branches(source)
-            .into_iter()
-            .map(|branch| Self::new(trim_xml_whitespace(branch), node))
-            .collect()
+    fn template_branches(
+        source: &str,
+        node: roxmltree::Node<'_, '_>,
+        workspace: CompileWorkspace<'_>,
+    ) -> Result<Vec<Self>> {
+        let count = split_pattern_branches(source).count();
+        let bytes = count
+            .checked_mul(std::mem::size_of::<Self>())
+            .filter(|bytes| *bytes <= isize::MAX as usize)
+            .ok_or_else(|| workspace.overflow())?;
+        workspace.retain(bytes)?;
+        let mut patterns = Vec::with_capacity(count);
+        for branch in split_pattern_branches(source) {
+            patterns.push(Self::new(trim_xml_whitespace(branch), node, workspace)?);
+        }
+        Ok(patterns)
     }
-    fn default_priority(&self) -> f64 {
-        let normalized = normalize_xpath_for_sxd(trim_xml_whitespace(&self.source));
+    fn default_priority(&self, workspace: CompileWorkspace<'_>) -> Result<f64> {
+        let (normalized, _) = workspace.normalize(trim_xml_whitespace(&self.source))?;
         let value = normalized
             .strip_prefix("child::")
             .or_else(|| normalized.strip_prefix("attribute::"))
             .unwrap_or(&normalized);
         let single_step = !value.contains(['/', '[', '|', '(', ')']);
         let node_test = pattern_node_test(value);
-        if matches!(value, "*" | "@*") || node_test == Some(PatternNodeTest::Generic) {
-            -0.5
-        // XSLT 1.0 section 5.5 assigns -0.25 only to a single NCName:* StepPattern;
-        // a LocationPath containing that step has the complex-pattern priority 0.5.
-        // https://www.w3.org/TR/1999/REC-xslt-19991116#conflict
-        } else if single_step && value.ends_with(":*") {
-            -0.25
-        } else if single_step || node_test == Some(PatternNodeTest::ProcessingInstructionWithTarget)
-        {
-            0.0
-        } else {
-            0.5
-        }
+        Ok(
+            if matches!(value, "*" | "@*") || node_test == Some(PatternNodeTest::Generic) {
+                -0.5
+            // XSLT 1.0 section 5.5 assigns -0.25 only to a single NCName:* StepPattern;
+            // a LocationPath containing that step has the complex-pattern priority 0.5.
+            // https://www.w3.org/TR/1999/REC-xslt-19991116#conflict
+            } else if single_step && value.ends_with(":*") {
+                -0.25
+            } else if single_step
+                || node_test == Some(PatternNodeTest::ProcessingInstructionWithTarget)
+            {
+                0.0
+            } else {
+                0.5
+            },
+        )
     }
 }
 
@@ -1157,50 +1282,51 @@ fn contains_variable_reference(source: &str) -> bool {
     false
 }
 
-fn validate_xpath_prefixes(source: &str, namespaces: &[(String, String)]) -> Result<()> {
-    let characters = source.chars().collect::<Vec<_>>();
+fn validate_xpath_prefixes(
+    source: &str,
+    namespaces: &[(String, String)],
+    workspace: CompileWorkspace<'_>,
+) -> Result<()> {
+    let mut characters = source.char_indices().peekable();
     let mut quote = None;
-    let mut cursor = 0;
-    while cursor < characters.len() {
-        let character = characters[cursor];
+    while let Some((start, character)) = characters.next() {
         if let Some(active) = quote {
             if character == active {
                 quote = None;
             }
-            cursor += 1;
             continue;
         }
         if matches!(character, '\'' | '"') {
             quote = Some(character);
-            cursor += 1;
             continue;
         }
         if !is_ncname_start(character) {
-            cursor += 1;
             continue;
         }
-        let start = cursor;
-        cursor += 1;
-        while cursor < characters.len() && is_ncname_char(characters[cursor]) {
-            cursor += 1;
+        while characters
+            .peek()
+            .is_some_and(|(_, next)| is_ncname_char(*next))
+        {
+            characters.next();
         }
-        if cursor >= characters.len()
-            || characters[cursor] != ':'
-            || characters.get(cursor + 1) == Some(&':')
-            || !characters
-                .get(cursor + 1)
-                .copied()
-                .is_some_and(|character| character == '*' || is_ncname_start(character))
+        let Some(&(end, ':')) = characters.peek() else {
+            continue;
+        };
+        let mut following = characters.clone();
+        following.next();
+        if !following
+            .next()
+            .is_some_and(|(_, next)| next == '*' || is_ncname_start(next))
         {
             continue;
         }
-        let prefix = characters[start..cursor].iter().collect::<String>();
-        if prefix != "xml" && !namespaces.iter().any(|(declared, _)| declared == &prefix) {
-            return Err(Error::Static(format!(
+        let prefix = &source[start..end];
+        if prefix != "xml" && !namespaces.iter().any(|(declared, _)| declared == prefix) {
+            return Err(workspace.static_error(format_args!(
                 "XPath expression `{source}` uses unbound namespace prefix `{prefix}`"
             )));
         }
-        cursor += 1;
+        characters.next();
     }
     Ok(())
 }
@@ -1211,135 +1337,129 @@ pub(crate) fn normalize_xpath_for_sxd(source: &str) -> Cow<'_, str> {
     if !source.chars().any(crate::lexical::is_xml_whitespace) && !source.contains('*') {
         return Cow::Borrowed(source);
     }
-    let characters = source.chars().collect::<Vec<_>>();
-    let mut output = String::with_capacity(source.len());
+    let mut length = 0usize;
+    let changed = visit_normalized_xpath(source, |part| length += part.len());
+    if !changed {
+        return Cow::Borrowed(source);
+    }
+    let mut output = String::with_capacity(length);
+    visit_normalized_xpath(source, |part| output.push_str(part));
+    debug_assert_eq!(output.len(), length);
+    Cow::Owned(output)
+}
+
+// The measuring and writing passes share token handling; neither materializes a character array.
+fn visit_normalized_xpath(source: &str, mut emit: impl FnMut(&str)) -> bool {
+    let mut characters = source.char_indices().peekable();
     let mut quote = None;
-    let mut index = 0;
-    while index < characters.len() {
-        let character = characters[index];
+    let mut previous = None;
+    let mut previous_non_whitespace = None;
+    let mut changed = false;
+    while let Some((index, character)) = characters.next() {
+        let literal = &source[index..index + character.len_utf8()];
         if let Some(active) = quote {
-            output.push(character);
+            emit(literal);
+            previous = Some(character);
+            if !is_xml_whitespace(character) {
+                previous_non_whitespace = Some(character);
+            }
             if character == active {
                 quote = None;
             }
-            index += 1;
             continue;
         }
         if matches!(character, '\'' | '"') {
             quote = Some(character);
-            output.push(character);
-            index += 1;
+            emit(literal);
+            previous = Some(character);
+            previous_non_whitespace = Some(character);
             continue;
         }
-        if crate::lexical::is_xml_whitespace(character)
-            && output
-                .chars()
-                .next_back()
-                .is_some_and(|character| character == ':' || is_ncname_char(character))
+        if is_xml_whitespace(character)
+            && previous.is_some_and(|character| character == ':' || is_ncname_char(character))
         {
-            let mut next = index + 1;
-            while next < characters.len() && crate::lexical::is_xml_whitespace(characters[next]) {
-                next += 1;
+            let mut following = characters.clone();
+            while following
+                .peek()
+                .is_some_and(|(_, next)| is_xml_whitespace(*next))
+            {
+                following.next();
             }
-            if next < characters.len() && characters[next] == '(' {
-                index = next;
-                continue;
-            }
-            if characters.get(next..next + 2) == Some(&[':', ':']) {
-                index = next;
+            let suffix = following
+                .peek()
+                .map_or("", |(offset, _)| &source[*offset..]);
+            if suffix.starts_with('(') || suffix.starts_with("::") {
+                characters = following;
+                changed = true;
                 continue;
             }
         }
-        if character == ':' && characters.get(index + 1) == Some(&':') {
-            output.push_str("::");
-            index += 2;
-            while index < characters.len() && crate::lexical::is_xml_whitespace(characters[index]) {
-                index += 1;
+        if character == ':' && characters.peek().is_some_and(|(_, next)| *next == ':') {
+            emit("::");
+            previous = Some(':');
+            previous_non_whitespace = Some(':');
+            characters.next();
+            while characters
+                .peek()
+                .is_some_and(|(_, next)| is_xml_whitespace(*next))
+            {
+                characters.next();
+                changed = true;
             }
             continue;
         }
-        if character == '*'
-            && output
-                .chars()
-                .rev()
-                .find(|candidate| !crate::lexical::is_xml_whitespace(*candidate))
-                .is_some_and(|previous| matches!(previous, '(' | ','))
-        {
-            let next = characters[index + 1..]
-                .iter()
-                .copied()
-                .find(|candidate| !crate::lexical::is_xml_whitespace(*candidate));
-            if next.is_some_and(|next| matches!(next, ')' | ',')) {
-                output.push_str("child::*");
-                index += 1;
+        if character == '*' && matches!(previous_non_whitespace, Some('(' | ',')) {
+            let next = characters
+                .clone()
+                .find(|(_, next)| !is_xml_whitespace(*next));
+            if matches!(next, Some((_, ')' | ','))) {
+                emit("child::*");
+                previous = Some('*');
+                previous_non_whitespace = Some('*');
+                changed = true;
                 continue;
             }
         }
-        output.push(character);
-        index += 1;
+        emit(literal);
+        previous = Some(character);
+        if !is_xml_whitespace(character) {
+            previous_non_whitespace = Some(character);
+        }
     }
-    if output == source {
-        Cow::Borrowed(source)
-    } else {
-        Cow::Owned(output)
-    }
+    changed
 }
 
-fn split_pattern_branches(source: &str) -> Vec<&str> {
-    let mut branches = Vec::new();
-    let mut start = 0;
-    let mut depth = 0usize;
-    let mut quote = None;
-    for (index, character) in source.char_indices() {
-        if let Some(active) = quote {
-            if character == active {
-                quote = None;
-            }
-            continue;
-        }
-        match character {
-            '\'' | '"' => quote = Some(character),
-            '(' | '[' => depth += 1,
-            ')' | ']' => depth = depth.saturating_sub(1),
-            '|' if depth == 0 => {
-                branches.push(&source[start..index]);
-                start = index + 1;
-            }
-            _ => {}
-        }
-    }
-    branches.push(&source[start..]);
-    branches
+fn split_pattern_branches(source: &str) -> impl Iterator<Item = &str> {
+    split_top_level(source, '|')
 }
 
-fn validate_xslt_pattern_branch(branch: &str) -> Result<()> {
-    let normalized = normalize_xpath_for_sxd(branch);
-    let branch = normalized.as_ref();
+// The caller has normalized and reserved the input; the pattern grammar scans borrow it.
+fn validate_xslt_pattern_branch(branch: &str, workspace: CompileWorkspace<'_>) -> Result<()> {
     if branch == "/" {
         return Ok(());
     }
-    let relative = if let Some(relative) = strip_id_key_pattern(branch)? {
+    let relative = if let Some(relative) = strip_id_key_pattern(branch, workspace)? {
         if relative.is_empty() {
             return Ok(());
         }
         relative
             .strip_prefix("//")
             .or_else(|| relative.strip_prefix('/'))
-            .ok_or_else(|| invalid_match_pattern(branch))?
+            .ok_or_else(|| invalid_match_pattern(branch, workspace))?
     } else {
         branch
             .strip_prefix("//")
             .or_else(|| branch.strip_prefix('/'))
             .unwrap_or(branch)
     };
-    let steps = split_pattern_steps(relative).ok_or_else(|| invalid_match_pattern(branch))?;
-    if steps.is_empty() || steps.iter().any(|step| !valid_pattern_step(step)) {
-        return Err(invalid_match_pattern(branch));
-    }
+    validate_pattern_steps(relative).ok_or_else(|| invalid_match_pattern(branch, workspace))?;
     Ok(())
 }
 
-fn strip_id_key_pattern(branch: &str) -> Result<Option<&str>> {
+fn strip_id_key_pattern<'a>(
+    branch: &'a str,
+    workspace: CompileWorkspace<'_>,
+) -> Result<Option<&'a str>> {
     let (name, expected_arguments) = if branch.starts_with("id(") {
         ("id", 1)
     } else if branch.starts_with("key(") {
@@ -1349,22 +1469,25 @@ fn strip_id_key_pattern(branch: &str) -> Result<Option<&str>> {
     };
     let open = name.len();
     let Some(close) = matching_delimiter(branch, open, '(', ')') else {
-        return Err(invalid_match_pattern(branch));
+        return Err(invalid_match_pattern(branch, workspace));
     };
-    let arguments = split_top_level(&branch[open + 1..close], ',');
-    if arguments.len() != expected_arguments
-        || arguments.iter().any(|value| !is_xpath_literal(value))
-    {
-        return Err(invalid_match_pattern(branch));
+    let mut count = 0;
+    for argument in split_top_level(&branch[open + 1..close], ',') {
+        count += 1;
+        if count > expected_arguments || !is_xpath_literal(argument) {
+            return Err(invalid_match_pattern(branch, workspace));
+        }
+    }
+    if count != expected_arguments {
+        return Err(invalid_match_pattern(branch, workspace));
     }
     Ok(Some(branch[close + 1..].trim_matches(is_xml_whitespace)))
 }
 
-fn split_pattern_steps(source: &str) -> Option<Vec<&str>> {
+fn validate_pattern_steps(source: &str) -> Option<()> {
     if source.trim().is_empty() {
         return None;
     }
-    let mut steps = Vec::new();
     let mut start = 0usize;
     let mut brackets = 0usize;
     let mut parentheses = 0usize;
@@ -1385,10 +1508,9 @@ fn split_pattern_steps(source: &str) -> Option<Vec<&str>> {
             ')' => parentheses = parentheses.checked_sub(1)?,
             '/' if brackets == 0 && parentheses == 0 => {
                 let step = source[start..index].trim();
-                if step.is_empty() {
+                if step.is_empty() || !valid_pattern_step(step) {
                     return None;
                 }
-                steps.push(step);
                 if characters.peek().is_some_and(|(_, next)| *next == '/') {
                     let (second, _) = characters.next().expect("peeked path separator exists");
                     start = second + 1;
@@ -1403,11 +1525,10 @@ fn split_pattern_steps(source: &str) -> Option<Vec<&str>> {
         return None;
     }
     let final_step = source[start..].trim();
-    if final_step.is_empty() {
+    if final_step.is_empty() || !valid_pattern_step(final_step) {
         return None;
     }
-    steps.push(final_step);
-    Some(steps)
+    Some(())
 }
 
 fn valid_pattern_step(step: &str) -> bool {
@@ -1433,8 +1554,6 @@ fn valid_pattern_step(step: &str) -> bool {
 }
 
 fn valid_pattern_node_test(node_test: &str) -> bool {
-    let normalized = normalize_xpath_for_sxd(node_test);
-    let node_test = normalized.as_ref();
     let (node_test, explicit_axis) = match node_test.split_once("::") {
         Some((axis, test))
             if matches!(axis.trim_matches(is_xml_whitespace), "child" | "attribute") =>
@@ -1527,39 +1646,46 @@ fn matching_delimiter(source: &str, open: usize, left: char, right: char) -> Opt
     None
 }
 
-fn split_top_level(source: &str, separator: char) -> Vec<&str> {
-    let mut output = Vec::new();
+fn split_top_level(source: &str, separator: char) -> impl Iterator<Item = &str> {
     let mut start = 0usize;
     let mut depth = 0usize;
     let mut quote = None;
-    for (index, character) in source.char_indices() {
-        if let Some(active) = quote {
-            if character == active {
-                quote = None;
-            }
-            continue;
+    let mut characters = source.char_indices();
+    let mut finished = false;
+    std::iter::from_fn(move || {
+        if finished {
+            return None;
         }
-        match character {
-            '\'' | '"' => quote = Some(character),
-            '(' | '[' => depth += 1,
-            ')' | ']' => depth = depth.saturating_sub(1),
-            value if value == separator && depth == 0 => {
-                output.push(source[start..index].trim_matches(is_xml_whitespace));
-                start = index + character.len_utf8();
+        for (index, character) in characters.by_ref() {
+            if let Some(active) = quote {
+                if character == active {
+                    quote = None;
+                }
+                continue;
             }
-            _ => {}
+            match character {
+                '\'' | '"' => quote = Some(character),
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth = depth.saturating_sub(1),
+                value if value == separator && depth == 0 => {
+                    let part = source[start..index].trim_matches(is_xml_whitespace);
+                    start = index + character.len_utf8();
+                    return Some(part);
+                }
+                _ => {}
+            }
         }
-    }
-    output.push(source[start..].trim_matches(is_xml_whitespace));
-    output
+        finished = true;
+        Some(source[start..].trim_matches(is_xml_whitespace))
+    })
 }
 
 fn is_xpath_literal(value: &str) -> bool {
     xpath_string_literal(value).is_some()
 }
 
-fn invalid_match_pattern(pattern: &str) -> Error {
-    Error::Static(format!(
+fn invalid_match_pattern(pattern: &str, workspace: CompileWorkspace<'_>) -> Error {
+    workspace.static_error(format_args!(
         "invalid XSLT 1.0 match pattern `{pattern}`: expected a Pattern location path"
     ))
 }
@@ -1671,10 +1797,18 @@ struct CompileState {
     imported_modules: usize,
     stylesheet_bytes: usize,
     owned_bytes: usize,
+    xpath_owned_bytes: Cell<usize>,
     precedence: usize,
     order: usize,
 }
 impl CompileState {
+    fn workspace(&self) -> CompileWorkspace<'_> {
+        CompileWorkspace {
+            limit: self.budget.owned_bytes,
+            occupied: self.owned_bytes,
+            retained: &self.xpath_owned_bytes,
+        }
+    }
     fn new(mut budget: CompileBudget, stylesheet_bytes: usize) -> Self {
         budget.recursion_depth = budget.recursion_depth.min(COMPILE_RECURSION_DEPTH_CEILING);
         Self {
@@ -1699,6 +1833,7 @@ impl CompileState {
             imported_modules: 0,
             stylesheet_bytes,
             owned_bytes: 0,
+            xpath_owned_bytes: Cell::new(0),
             precedence: 0,
             order: 0,
         }
@@ -1712,19 +1847,12 @@ impl CompileState {
         self.order
     }
     fn charge_owned(&mut self, amount: usize) -> Result<()> {
-        self.owned_bytes = self.owned_bytes.checked_add(amount).ok_or(Error::Budget {
-            kind: BudgetKind::OwnedBytes,
-            limit: self.budget.owned_bytes,
-            actual: usize::MAX,
-        })?;
-        ensure(
-            BudgetKind::OwnedBytes,
-            self.budget.owned_bytes,
-            self.owned_bytes,
-        )
+        let workspace = self.workspace().reserve(amount)?;
+        self.owned_bytes = workspace.occupied;
+        Ok(())
     }
     fn remaining_owned_bytes(&self) -> usize {
-        self.budget.owned_bytes.saturating_sub(self.owned_bytes)
+        self.workspace().remaining()
     }
     fn release_owned(&mut self, amount: usize) {
         self.owned_bytes = self
@@ -2137,20 +2265,8 @@ fn estimate_compiled_owned_bytes(
                     ),
                 )
             });
-            let expression_namespace_bytes = if expression_count != 0 {
-                node.namespaces()
-                    .fold(0usize, |sum, namespace| {
-                        sum.saturating_add(std::mem::size_of::<(String, String)>())
-                            .saturating_add(namespace.name().map_or(0, str::len))
-                            .saturating_add(namespace.uri().len())
-                    })
-                    .saturating_add(
-                        expression_count
-                            .saturating_mul(std::mem::size_of::<Arc<Vec<(String, String)>>>()),
-                    )
-            } else {
-                0
-            };
+            // XPath namespace snapshots are charged at their actual construction sites, not
+            // once per element: patterns copy them and expressions may share them through Arc.
             // One shared Arc<str> is retained by all expressions compiled from this node. URL
             // serialization may percent-encode every byte, so three times the lexical inputs is
             // a conservative pre-allocation bound that requires no unmetered URI construction.
@@ -2170,7 +2286,6 @@ fn estimate_compiled_owned_bytes(
                 .saturating_add(name_bytes)
                 .saturating_add(attribute_bytes)
                 .saturating_add(namespace_bytes)
-                .saturating_add(expression_namespace_bytes)
                 .saturating_add(expression_base_uri_bytes)
         } else {
             structural_bytes.saturating_add(node.text().map_or(0, str::len))
@@ -2219,6 +2334,175 @@ fn with_frontend_document<T>(
     state.release_owned(expanded_owned_bytes);
     state.release_owned(lexical_reserved);
     result
+}
+
+fn with_compiler_document<T>(
+    xml: &str,
+    base_uri: Option<&str>,
+    state: &mut CompileState,
+    compile: impl FnOnce(&roxmltree::Document<'_>, &mut CompileState) -> Result<T>,
+) -> Result<T> {
+    with_frontend_document(xml, state, |document, state| {
+        // Each include occurrence retains distinct IR even when its source is cached.
+        state.charge_owned(estimate_compiled_owned_bytes(document, base_uri))?;
+        compile(document, state)
+    })
+}
+
+// Module IR is precharged; XPath-owned namespace/reference copies are charged when constructed.
+// All snapshots share that retained counter, while lexical parser reservations are scoped and
+// reusable. No XPath object retains a borrow of this compile-only accounting state.
+#[derive(Debug, Clone, Copy)]
+struct CompileWorkspace<'a> {
+    limit: usize,
+    occupied: usize,
+    retained: &'a Cell<usize>,
+}
+
+impl CompileWorkspace<'_> {
+    fn overflow(self) -> Error {
+        Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            limit: self.limit,
+            actual: usize::MAX,
+        }
+    }
+
+    fn reserve(self, bytes: usize) -> Result<Self> {
+        let occupied = self
+            .occupied
+            .checked_add(bytes)
+            .ok_or_else(|| self.overflow())?;
+        let actual = occupied
+            .checked_add(self.retained.get())
+            .ok_or_else(|| self.overflow())?;
+        ensure(BudgetKind::OwnedBytes, self.limit, actual)?;
+        Ok(Self { occupied, ..self })
+    }
+
+    fn retain(self, bytes: usize) -> Result<()> {
+        self.reserve(bytes)?;
+        self.retained.set(self.retained.get() + bytes);
+        Ok(())
+    }
+
+    fn release(self, bytes: usize) {
+        self.retained.set(
+            self.retained
+                .get()
+                .checked_sub(bytes)
+                .expect("released XPath storage was reserved"),
+        );
+    }
+
+    fn remaining(self) -> usize {
+        self.limit - self.occupied - self.retained.get()
+    }
+
+    fn pending_source(self, source: &str, node: roxmltree::Node<'_, '_>) -> Self {
+        // Module IR precharges attribute values. Only a borrowed slice of this node's attribute
+        // may reuse its own future source allocation; generated defaults receive no credit.
+        let start = source.as_ptr() as usize;
+        let belongs_to_attribute = node.attributes().any(|attribute| {
+            let value = attribute.value();
+            let base = value.as_ptr() as usize;
+            start >= base
+                && start - base <= value.len()
+                && source.len() <= value.len() - (start - base)
+        });
+        if belongs_to_attribute {
+            Self {
+                occupied: self
+                    .occupied
+                    .checked_sub(source.len())
+                    .expect("attribute source was precharged by module compilation"),
+                ..self
+            }
+        } else {
+            self
+        }
+    }
+
+    fn static_error(self, arguments: std::fmt::Arguments<'_>) -> Error {
+        use std::fmt::Write;
+        struct Length(usize);
+        impl std::fmt::Write for Length {
+            fn write_str(&mut self, value: &str) -> std::fmt::Result {
+                self.0 = self.0.checked_add(value.len()).ok_or(std::fmt::Error)?;
+                Ok(())
+            }
+        }
+        let mut length = Length(0);
+        if length.write_fmt(arguments).is_err() || length.0 > isize::MAX as usize {
+            return self.overflow();
+        }
+        if let Err(error) = self.reserve(length.0) {
+            return error;
+        }
+        let mut message = String::with_capacity(length.0);
+        message
+            .write_fmt(arguments)
+            .expect("formatting to String cannot fail");
+        debug_assert_eq!(message.len(), length.0);
+        Error::Static(message)
+    }
+
+    fn normalize(self, source: &str) -> Result<(Cow<'_, str>, Self)> {
+        let mut length = Some(0usize);
+        let changed = visit_normalized_xpath(source, |part| {
+            length = length.and_then(|length| length.checked_add(part.len()));
+        });
+        if !changed {
+            return Ok((Cow::Borrowed(source), self));
+        }
+        let length = length
+            .filter(|length| *length <= isize::MAX as usize)
+            .ok_or_else(|| self.overflow())?;
+        let workspace = self.reserve(length)?;
+        let mut normalized = String::with_capacity(length);
+        visit_normalized_xpath(source, |part| normalized.push_str(part));
+        Ok((Cow::Owned(normalized), workspace))
+    }
+
+    fn parse_xpath(
+        self,
+        normalized: &str,
+        source: &str,
+        pattern: bool,
+    ) -> Result<sxd_xpath_no_unsafe::XPath> {
+        sxd_xpath_no_unsafe::Factory::new()
+            .build_bounded(normalized, self.remaining())
+            .map_err(|error| self.parser_error(error, source, pattern))
+    }
+
+    fn parser_error(
+        self,
+        error: sxd_xpath_no_unsafe::ParserError,
+        source: &str,
+        pattern: bool,
+    ) -> Error {
+        if let Some((_, actual)) = error.allocation_limit() {
+            return Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                limit: self.limit,
+                actual: self
+                    .occupied
+                    .saturating_add(self.retained.get())
+                    .saturating_add(actual),
+            };
+        }
+        let kind = if pattern {
+            "match pattern"
+        } else {
+            "XPath expression"
+        };
+        match self.reserve(error.owned_bytes()) {
+            Ok(workspace) => {
+                workspace.static_error(format_args!("invalid {kind} `{source}`: {error}"))
+            }
+            Err(error) => error,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2281,10 +2565,11 @@ fn module_source_cache_entry_bytes(identity: &ResourceIdentity) -> usize {
 }
 
 #[derive(Debug, Clone)]
-struct CompileContext {
+struct CompileContext<'a> {
     forward: bool,
     depth: usize,
     max_depth: usize,
+    workspace: CompileWorkspace<'a>,
     inside_function: bool,
     static_base_uri: Option<Arc<str>>,
     namespace_snapshot: NamespaceSnapshot,
@@ -2296,18 +2581,20 @@ type NamespaceSnapshot = Rc<RefCell<Option<(roxmltree::NodeId, Weak<Vec<(String,
 type BaseUriSnapshot = Rc<RefCell<Option<(roxmltree::NodeId, Option<Arc<str>>)>>>;
 type LocalBindingIndex = Rc<RefCell<HashMap<roxmltree::NodeId, HashSet<ExpandedName>>>>;
 
-impl CompileContext {
+impl<'a> CompileContext<'a> {
     fn new(
         forward: bool,
         depth: usize,
         max_depth: usize,
         static_base_uri: Option<&str>,
+        workspace: CompileWorkspace<'a>,
     ) -> Result<Self> {
         ensure(BudgetKind::RecursionDepth, max_depth, depth)?;
         Ok(Self {
             forward,
             depth,
             max_depth,
+            workspace,
             inside_function: false,
             static_base_uri: static_base_uri.map(Arc::from),
             namespace_snapshot: Rc::new(RefCell::new(None)),
@@ -2331,15 +2618,19 @@ impl CompileContext {
 
     fn expression(&self, source: &str, node: roxmltree::Node<'_, '_>) -> Result<Expression> {
         let mut snapshot = self.namespace_snapshot.borrow_mut();
-        let namespaces = snapshot
+        let cached = snapshot
             .as_ref()
             .filter(|(id, _)| *id == node.id())
-            .and_then(|(_, namespaces)| namespaces.upgrade())
-            .unwrap_or_else(|| {
-                let namespaces = Arc::new(namespaces(node));
-                *snapshot = Some((node.id(), Arc::downgrade(&namespaces)));
-                namespaces
-            });
+            .and_then(|(_, namespaces)| namespaces.upgrade());
+        let namespaces = if let Some(namespaces) = cached {
+            namespaces
+        } else {
+            self.workspace
+                .retain(namespace_copy_bytes(node, true, self.workspace)?)?;
+            let namespaces = Arc::new(namespaces(node));
+            *snapshot = Some((node.id(), Arc::downgrade(&namespaces)));
+            namespaces
+        };
         let mut base_snapshot = self.base_uri_snapshot.borrow_mut();
         let static_base_uri = if let Some((id, base_uri)) = base_snapshot.as_ref()
             && *id == node.id()
@@ -2356,6 +2647,8 @@ impl CompileContext {
             namespaces,
             static_base_uri,
             self.max_depth,
+            self.workspace,
+            self.workspace.pending_source(source, node),
         )
     }
 
@@ -2427,7 +2720,10 @@ fn resource_source(resource: &ResolvedResource, state: &mut CompileState) -> Res
                     xml_sec_xml_input::Error::DecodedLimit { actual, .. } => Error::Budget {
                         kind: BudgetKind::OwnedBytes,
                         limit: state.budget.owned_bytes,
-                        actual: state.owned_bytes.saturating_add(actual),
+                        actual: state
+                            .owned_bytes
+                            .saturating_add(state.xpath_owned_bytes.get())
+                            .saturating_add(actual),
                     },
                     error => Error::Xml(error.to_string()),
                 });
@@ -3502,11 +3798,11 @@ fn compile_number(
             .transpose()?,
         count: node
             .attribute("count")
-            .map(|v| Pattern::new(v, node))
+            .map(|v| Pattern::new(v, node, context.workspace))
             .transpose()?,
         from: node
             .attribute("from")
-            .map(|v| Pattern::new(v, node))
+            .map(|v| Pattern::new(v, node, context.workspace))
             .transpose()?,
         level: level.into(),
         format: parse_avt(node.attribute("format").unwrap_or("1"), node, context)?,
@@ -3537,7 +3833,7 @@ fn parse_avt(
     let mut parts = vec![];
     let mut literal = String::new();
     let mut chars = value.char_indices().peekable();
-    while let Some((_, ch)) = chars.next() {
+    while let Some((start, ch)) = chars.next() {
         match ch {
             '{' if chars.peek().is_some_and(|(_, c)| *c == '{') => {
                 chars.next();
@@ -3551,13 +3847,12 @@ fn parse_avt(
                 if !literal.is_empty() {
                     parts.push(AvtPart::Literal(std::mem::take(&mut literal)));
                 }
-                let mut expression = String::new();
                 let mut quote = None;
-                loop {
-                    let Some((_, c)) = chars.next() else {
-                        return Err(Error::Static(
-                            "unterminated attribute value template".into(),
-                        ));
+                let end = loop {
+                    let Some((end, c)) = chars.next() else {
+                        return Err(context
+                            .workspace
+                            .static_error(format_args!("unterminated attribute value template")));
                     };
                     if matches!(c, '\'' | '"') {
                         if quote == Some(c) {
@@ -3567,21 +3862,20 @@ fn parse_avt(
                         }
                     }
                     if c == '}' && quote.is_none() {
-                        break;
+                        break end;
                     }
-                    expression.push(c)
-                }
+                };
                 // XPath 1.0 section 3.7 recognizes only XML S around tokens; Unicode trim
                 // would silently reinterpret NBSP and other expression characters as layout.
                 // https://www.w3.org/TR/1999/REC-xpath-19991116#exprlex
                 parts.push(AvtPart::Expression(
-                    context.expression(trim_xml_whitespace(&expression), node)?,
+                    context.expression(trim_xml_whitespace(&value[start + 1..end]), node)?,
                 ));
             }
             '}' => {
-                return Err(Error::Static(
-                    "unescaped } in attribute value template".into(),
-                ));
+                return Err(context
+                    .workspace
+                    .static_error(format_args!("unescaped }} in attribute value template")));
             }
             _ => literal.push(ch),
         }
@@ -3893,16 +4187,18 @@ impl DecimalFormat {
     }
 }
 
-fn validate_key_dependency_expression(attribute: &str, source: &str) -> Result<()> {
+fn validate_key_dependency_expression(
+    attribute: &str,
+    source: &str,
+    workspace: CompileWorkspace<'_>,
+) -> Result<()> {
     if contains_variable_reference(source) {
-        return Err(Error::Static(format!(
+        return Err(workspace.static_error(format_args!(
             "xsl:key {attribute} must not contain a variable reference"
         )));
     }
     if crate::expression::has_unprefixed_function_call(source, "key") {
-        return Err(Error::Static(format!(
-            "xsl:key {attribute} must not call key()"
-        )));
+        return Err(workspace.static_error(format_args!("xsl:key {attribute} must not call key()")));
     }
     Ok(())
 }
@@ -3953,9 +4249,44 @@ impl AttributeSet {
     }
 }
 fn namespaces(node: roxmltree::Node<'_, '_>) -> Vec<(String, String)> {
-    node.namespaces()
-        .filter_map(|n| n.name().map(|p| (p.into(), n.uri().into())))
-        .collect()
+    let count = node
+        .namespaces()
+        .filter(|namespace| namespace.name().is_some())
+        .count();
+    let mut result = Vec::with_capacity(count);
+    for namespace in node.namespaces() {
+        if let Some(prefix) = namespace.name() {
+            result.push((prefix.into(), namespace.uri().into()));
+        }
+    }
+    result
+}
+
+fn namespace_copy_bytes(
+    node: roxmltree::Node<'_, '_>,
+    shared: bool,
+    workspace: CompileWorkspace<'_>,
+) -> Result<usize> {
+    let mut bytes = 0usize;
+    for namespace in node.namespaces() {
+        if let Some(prefix) = namespace.name() {
+            bytes = bytes
+                .checked_add(std::mem::size_of::<(String, String)>())
+                .and_then(|bytes| bytes.checked_add(prefix.len()))
+                .and_then(|bytes| bytes.checked_add(namespace.uri().len()))
+                .ok_or_else(|| workspace.overflow())?;
+        }
+    }
+    if shared {
+        bytes = bytes
+            .checked_add(std::mem::size_of::<Vec<(String, String)>>())
+            .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<usize>()))
+            .ok_or_else(|| workspace.overflow())?;
+    }
+    if bytes > isize::MAX as usize {
+        return Err(workspace.overflow());
+    }
+    Ok(bytes)
 }
 
 fn computed_element_namespaces(node: roxmltree::Node<'_, '_>) -> Vec<(String, String)> {
@@ -4081,6 +4412,304 @@ fn optional_yes_no(value: &str, forward_compatible: bool) -> Result<Option<bool>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xpath_diagnostics_reserve_the_exact_formatted_length() {
+        // Prefix diagnostics preserve their text when it fits and fail before formatting otherwise.
+        let source = "missing:item";
+        let expected = "XPath expression `missing:item` uses unbound namespace prefix `missing`";
+        let retained = std::cell::Cell::new(0);
+        for limit in [expected.len() - 1, expected.len()] {
+            let workspace = CompileWorkspace {
+                limit,
+                occupied: 0,
+                retained: &retained,
+            };
+            let error = validate_xpath_prefixes(source, &[], workspace)
+                .expect_err("unbound prefix produces a static or budget error");
+            if limit == expected.len() {
+                assert!(matches!(error, Error::Static(message) if message == expected));
+            } else {
+                assert!(matches!(error, Error::Budget { actual, .. } if actual == expected.len()));
+            }
+        }
+    }
+
+    #[test]
+    fn xpath_parser_diagnostic_accounts_for_owned_token_and_escaping() {
+        // Debug escaping expands a token. Measure the rendered diagnostic, not source length,
+        // and keep the unexpected token's string charged until formatting finishes.
+        let source = "f(1 'a\nb')";
+        let error = sxd_xpath_no_unsafe::Factory::new()
+            .build(source)
+            .expect_err("missing argument separator leaves an unexpected literal token");
+        assert_eq!(error.owned_bytes(), 3);
+        let message = format!("invalid XPath expression `{source}`: {error}");
+        let required = message.len() + error.owned_bytes();
+        let retained = Cell::new(0);
+        let workspace = CompileWorkspace {
+            limit: required - 1,
+            occupied: 0,
+            retained: &retained,
+        };
+        assert!(
+            matches!(workspace.parser_error(error.clone(), source, false),
+            Error::Budget { actual, .. } if actual == required)
+        );
+        let workspace = CompileWorkspace {
+            limit: required,
+            ..workspace
+        };
+        assert!(matches!(workspace.parser_error(error, source, false),
+            Error::Static(actual) if actual == message));
+    }
+
+    #[test]
+    fn xpath_namespace_copies_and_reference_conversion_are_charged() {
+        // Each pattern owns a namespace copy. References duplicate namespace strings, but dedup
+        // frees duplicates before the Vec-to-Arc overlap and retained charge are calculated.
+        let document = roxmltree::Document::parse(r#"<root xmlns:p="urn:namespace"/>"#)
+            .expect("namespace accounting fixture parses");
+        let node = document.root_element();
+        let retained = Cell::new(0);
+        let workspace = CompileWorkspace {
+            limit: 16_384,
+            occupied: 0,
+            retained: &retained,
+        };
+        let namespaces = namespaces(node);
+        let copy_bytes = namespaces.capacity() * std::mem::size_of::<(String, String)>()
+            + namespaces
+                .iter()
+                .map(|(prefix, uri)| prefix.capacity() + uri.capacity())
+                .sum::<usize>();
+        assert_eq!(
+            namespace_copy_bytes(node, false, workspace)
+                .expect("namespace copy size fits the workspace"),
+            copy_bytes
+        );
+        let first =
+            Pattern::new("p:a", node, workspace).expect("first pattern and namespace copy fit");
+        let second = Pattern::new("p:b", node, workspace)
+            .expect("second pattern and namespace copy fit alongside the first");
+        assert_eq!(
+            retained.get(),
+            2 * copy_bytes + first.source.capacity() + second.source.capacity()
+        );
+
+        let names = [("p".to_owned(), "urn:namespace".to_owned())];
+        let unit = std::mem::size_of::<ExpandedName>();
+        let payload = "urn:namespace".len() + 1;
+        let arc = 2 * unit + 2 * std::mem::size_of::<usize>();
+        let peak = (3 * unit + 3 * payload).max(3 * unit + 2 * payload + arc);
+        for limit in [peak - 1, peak] {
+            let retained = Cell::new(0);
+            let workspace = CompileWorkspace {
+                limit,
+                occupied: 0,
+                retained: &retained,
+            };
+            let result = referenced_variables_bounded("$p:a + $p:a + $p:b", &names, workspace);
+            if limit == peak {
+                assert_eq!(
+                    result.expect("exact reference-conversion peak fits").len(),
+                    2
+                );
+                assert_eq!(retained.get(), arc + 2 * payload);
+            } else {
+                assert!(matches!(result, Err(Error::Budget { actual, .. }) if actual == peak));
+            }
+        }
+    }
+
+    #[test]
+    fn included_literal_reuses_future_source_storage_during_validation() {
+        // Import discovery and compilation share one decode. The validation literal and retained
+        // expression source are not live together and must not require a seventh payload copy.
+        let payload = "x".repeat(64 * 1024);
+        let module = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:variable name="payload" select="'{payload}'"/></xsl:stylesheet>"#
+        );
+        let principal = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:include href="module.xsl"/></xsl:stylesheet>"#;
+        Compiler::new(
+            Arc::new(RepeatedIncludeResolver {
+                module: module.into_bytes(),
+                encoding: None,
+            }),
+            CompileBudget::new(1 << 20, 8, 256, 450 * 1024),
+        )
+        .compile(principal, Some("memory:main.xsl"))
+        .expect("one decoded source and nonoverlapping XPath storage fit");
+    }
+
+    #[test]
+    fn xpath_source_credit_is_limited_to_its_borrowed_attribute_slice() {
+        // Equal text is not proof of precharged storage. Generated defaults and independent
+        // strings cannot borrow another attribute's reservation, even if their values match.
+        let document = roxmltree::Document::parse(r#"<root select="'payload'"/>"#)
+            .expect("source-credit fixture parses");
+        let node = document.root_element();
+        let source = node
+            .attribute("select")
+            .expect("fixture has a select attribute");
+        let retained = Cell::new(0);
+        let workspace = CompileWorkspace {
+            limit: 4096,
+            occupied: source.len(),
+            retained: &retained,
+        };
+        assert_eq!(workspace.pending_source(source, node).occupied, 0);
+        assert_eq!(workspace.pending_source(&source[1..8], node).occupied, 2);
+        let independent = source.to_owned();
+        assert_eq!(
+            workspace.pending_source(&independent, node).occupied,
+            source.len()
+        );
+        assert_eq!(
+            workspace.pending_source("node()", node).occupied,
+            source.len()
+        );
+    }
+
+    #[test]
+    fn xpath_prefix_scan_preserves_unicode_axes_and_literals() {
+        // Byte offsets must remain UTF-8 boundaries; axes and quoted colons are not prefixes.
+        let retained = Cell::new(0);
+        let workspace = CompileWorkspace {
+            limit: 4096,
+            occupied: 0,
+            retained: &retained,
+        };
+        let namespaces = vec![("\u{3c0}".into(), "urn:test".into())];
+        for source in [
+            "child::\u{3c0}:item/@xml:lang",
+            "\u{3c0}:*",
+            "concat('missing:name', \"other:*\")",
+        ] {
+            validate_xpath_prefixes(source, &namespaces, workspace)
+                .expect("bound prefixes are accepted");
+        }
+        let source = "child::\u{3bb}:item";
+        assert!(matches!(
+            validate_xpath_prefixes(source, &namespaces, workspace),
+            Err(Error::Static(message)) if message == format!(
+                "XPath expression `{source}` uses unbound namespace prefix `\u{3bb}`"
+            )
+        ));
+    }
+
+    #[test]
+    fn xpath_normalization_preserves_tokens_and_bounds_capacity() {
+        // Preserve literals and non-XML whitespace while adapting axes, calls and wildcards.
+        for (source, expected) in [
+            ("child \t:: \n\u{3c0}:item", "child::\u{3c0}:item"),
+            ("count \r( * )", "count( child::* )"),
+            ("f(*, *, ' * :: ( ')", "f(child::*, child::*, ' * :: ( ')"),
+            ("2 * 3", "2 * 3"),
+            ("f\u{a0}(*)", "f\u{a0}(child::*)"),
+        ] {
+            let normalized = normalize_xpath_for_sxd(source);
+            assert_eq!(normalized.as_ref(), expected);
+            if let Cow::Owned(output) = normalized {
+                assert_eq!(output.capacity(), expected.len());
+            }
+        }
+        for source in ["\u{3c0}:item", "' * :: ( '", "2 * 3"] {
+            assert!(matches!(normalize_xpath_for_sxd(source), Cow::Borrowed(_)));
+        }
+    }
+
+    #[test]
+    fn large_literal_attributes_do_not_reserve_xpath_grammar_workspace() {
+        // Neither a literal AVT nor one quoted XPath literal represents a million AST nodes.
+        let payload = "x".repeat(1 << 20);
+        for value in [payload.clone(), format!("{{'{payload}'}}")] {
+            let xml = format!(
+                r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><out value="{value}"/></xsl:template></xsl:stylesheet>"#
+            );
+            Compiler::new(
+                Arc::new(crate::NoResolver),
+                CompileBudget::new(2 << 20, 0, 32, 32 << 20),
+            )
+            .compile(&xml, None)
+            .expect("literal storage fits without fictitious grammar work");
+        }
+    }
+
+    #[test]
+    fn small_compile_budgets_preserve_static_error_contracts() {
+        // This previously failed at the speculative module reservation before syntax checking.
+        let xml = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:apply-templates>invalid</xsl:apply-templates></xsl:template></xsl:stylesheet>"#;
+        assert!(
+            matches!(Compiler::new(Arc::new(crate::NoResolver), CompileBudget::new(4096, 0, 32, 16_384)).compile(xml, None), Err(Error::Static(message)) if message == "xsl:apply-templates accepts only xsl:sort and xsl:with-param")
+        );
+    }
+
+    #[test]
+    fn xpath_compile_workspace_precedes_validation_and_is_released() {
+        // Actual token/AST allocations, not a module estimate, must cross the allocation gate.
+        let retained = Cell::new(0);
+        let workspace = CompileWorkspace {
+            limit: 128,
+            occupied: 128,
+            retained: &retained,
+        };
+        assert!(matches!(
+            workspace.parse_xpath("'payload'", "'payload'", false),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                limit: 128,
+                actual: 135
+            })
+        ));
+        let workspace = CompileWorkspace {
+            limit: 4096,
+            occupied: 128,
+            retained: &retained,
+        };
+        for _ in 0..100 {
+            workspace
+                .parse_xpath("'payload'", "'payload'", false)
+                .expect("dropped AST releases its allowance");
+            assert!(matches!(
+                workspace.parse_xpath("1 +", "1 +", false),
+                Err(Error::Static(_))
+            ));
+        }
+        assert_eq!(workspace.occupied, 128);
+    }
+
+    #[test]
+    fn xpath_compile_workspace_covers_patterns_keys_and_avts() {
+        // Direct Pattern/Expression constructors and context-based AVTs must share the gate.
+        for body in [
+            r#"<xsl:template match="child :: item[count( * )]"/>"#,
+            r#"<xsl:key name="k" match="item" use="count( * )"/>"#,
+            r#"<xsl:template match="/"><out value="{count( * )}"/></xsl:template>"#,
+            r#"<xsl:template match="/"><xsl:number count="child :: item"/></xsl:template>"#,
+        ] {
+            let xml = format!(
+                r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">{body}</xsl:stylesheet>"#
+            );
+            let document = roxmltree::Document::parse(&xml).expect("XML parses");
+            let required =
+                parser_workspace_bytes(&xml) + estimate_compiled_owned_bytes(&document, None);
+            assert!(matches!(
+                Compiler::new(
+                    Arc::new(crate::NoResolver),
+                    CompileBudget::new(xml.len(), 0, 32, required),
+                ).compile(&xml, None),
+                Err(Error::Budget { kind: BudgetKind::OwnedBytes, actual, .. })
+                    if actual > required
+            ));
+            Compiler::new(
+                Arc::new(crate::NoResolver),
+                CompileBudget::new(xml.len(), 0, 32, 4 << 20),
+            )
+            .compile(&xml, None)
+            .expect("the same source compiles with sufficient workspace");
+        }
+    }
 
     struct RepeatedIncludeResolver {
         module: Vec<u8>,
@@ -4299,8 +4928,19 @@ mod tests {
         let source = r#"<root xmlns:p="urn:namespace"/>"#;
         let document = roxmltree::Document::parse(source).expect("stylesheet fragment parses");
         let root = document.root_element();
-        let context = CompileContext::new(false, 0, 8, Some("memory:shared-base/"))
-            .expect("context is valid");
+        let retained = Cell::new(0);
+        let context = CompileContext::new(
+            false,
+            0,
+            8,
+            Some("memory:shared-base/"),
+            CompileWorkspace {
+                limit: 16_384,
+                occupied: 0,
+                retained: &retained,
+            },
+        )
+        .expect("context is valid");
         let first = context
             .expression("p:first", root)
             .expect("expression compiles");

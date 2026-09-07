@@ -590,10 +590,20 @@ impl Connections {
         C: Into<ChildOfRoot>,
     {
         let child = child.into();
-        self.clear_child_parent(storage, child.into());
+        let mut removed = false;
         storage.roots.borrow_mut()[self.root.idx]
             .children
-            .retain(|&x| x != child);
+            .retain(|&x| {
+                if x == child {
+                    removed = true;
+                    false
+                } else {
+                    true
+                }
+            });
+        if removed {
+            self.clear_child_parent(storage, child.into());
+        }
     }
 
     pub fn remove_element_child<C>(&self, storage: &Storage, parent: Index<Element>, child: C)
@@ -601,10 +611,21 @@ impl Connections {
         C: Into<ChildOfElement>,
     {
         let child = child.into();
-        self.clear_child_parent(storage, child);
+        let mut removed = false;
         storage.elements.borrow_mut()[parent.idx]
             .children
-            .retain(|&x| x != child);
+            .retain(|&x| {
+                if x == child {
+                    removed = true;
+                    false
+                } else {
+                    true
+                }
+            });
+        // Only the owning edge can clear the reverse link; unrelated removals are no-ops.
+        if removed {
+            self.clear_child_parent(storage, child);
+        }
     }
 
     pub fn clear_root_children(&self, storage: &Storage) {

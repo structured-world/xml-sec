@@ -2070,6 +2070,13 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
                     .ok_or(SignatureVerificationPipelineError::InvalidStructure {
                         reason: "KeyInfoReference external resource is unavailable",
                     })?;
+                // External KeyInfo bytes share the operation's work allowance even if decoding
+                // fails before a document exists. Parsing the decoded text is a separate pass.
+                context
+                    .budgets
+                    .execution
+                    .xml_parse_work()
+                    .charge_policy(bytes.len())?;
                 let xml = crate::encoding::decode_xml_octets(
                     bytes,
                     context.policy.resources().max_xml_document_bytes,

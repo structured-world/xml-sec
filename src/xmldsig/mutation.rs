@@ -925,18 +925,28 @@ fn replace_element_content(
     namespace_attributes: &str,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<String, XmlMutationError> {
-    let replacement = render_element_content(&xml[range.clone()], content, namespace_attributes)?;
-    validate_projected_replacement_len(xml, range.len(), replacement.len(), policy)?;
-    let mut output = xml.to_owned();
-    output.replace_range(range, &replacement);
+    let element = xml
+        .get(range.clone())
+        .ok_or(XmlMutationError::InvalidAppendTarget)?;
+    let parts = element_content_parts(element, content, namespace_attributes)?;
+    let replacement_len = replacement_parts_len(&parts, policy)?;
+    let projected = validate_projected_replacement_len(xml, range.len(), replacement_len, policy)?;
+    let mut output = String::with_capacity(projected);
+    output.push_str(&xml[..range.start]);
+    for part in parts {
+        output.push_str(part);
+    }
+    output.push_str(&xml[range.end..]);
     Ok(output)
 }
 
-fn render_element_content(
-    element: &str,
-    content: &str,
-    namespace_attributes: &str,
-) -> Result<String, XmlMutationError> {
+// Describe the splice with borrowed segments. Sizing and emission share this representation,
+// so even a rejected large replacement never materializes an intermediate XML string.
+fn element_content_parts<'a>(
+    element: &'a str,
+    content: &'a str,
+    namespace_attributes: &'a str,
+) -> Result<[&'a str; 7], XmlMutationError> {
     if element.trim_end().ends_with("/>") {
         let name_end = element[1..]
             .find(|character: char| {
@@ -948,27 +958,42 @@ fn render_element_content(
         let empty_end = element
             .rfind("/>")
             .ok_or(XmlMutationError::InvalidAppendTarget)?;
-        Ok(format!(
-            "{}{}>{}</{}>",
+        Ok([
             &element[..empty_end],
             namespace_attributes,
+            ">",
             content,
-            qualified_name
-        ))
+            "</",
+            qualified_name,
+            ">",
+        ])
     } else {
         let content_start =
             element_opening_end(element).ok_or(XmlMutationError::InvalidAppendTarget)?;
         let content_end = element
             .rfind("</")
             .ok_or(XmlMutationError::InvalidAppendTarget)?;
-        Ok(format!(
-            "{}{}>{}{}",
+        Ok([
             &element[..content_start - 1],
             namespace_attributes,
+            ">",
             content,
-            &element[content_end..]
-        ))
+            &element[content_end..],
+            "",
+            "",
+        ])
     }
+}
+
+fn replacement_parts_len(
+    parts: &[&str],
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<usize, XmlMutationError> {
+    parts.iter().try_fold(0usize, |length, part| {
+        length
+            .checked_add(part.len())
+            .ok_or_else(|| projected_xml_length_overflow(policy))
+    })
 }
 
 fn replace_element_contents<'a>(
@@ -976,24 +1001,28 @@ fn replace_element_contents<'a>(
     replacements: impl IntoIterator<Item = (Range<usize>, &'a String)>,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<String, XmlMutationError> {
-    let mut rendered = replacements
+    let mut planned = replacements
         .into_iter()
         .map(|(range, content)| {
-            let replacement = render_element_content(&xml[range.clone()], content, "")?;
-            Ok((range, replacement))
+            let element = xml
+                .get(range.clone())
+                .ok_or(XmlMutationError::InvalidAppendTarget)?;
+            let parts = element_content_parts(element, content, "")?;
+            Ok((range, parts))
         })
         .collect::<Result<Vec<_>, XmlMutationError>>()?;
-    rendered.sort_by_key(|(range, _)| range.start);
+    planned.sort_unstable_by_key(|(range, _)| range.start);
 
     let mut projected = xml.len();
     let mut previous_end = 0usize;
-    for (range, replacement) in &rendered {
+    for (range, parts) in &planned {
         if range.start < previous_end || range.end > xml.len() {
             return Err(XmlMutationError::InvalidAppendTarget);
         }
+        let replacement_len = replacement_parts_len(parts, policy)?;
         projected = projected
             .checked_sub(range.len())
-            .and_then(|length| length.checked_add(replacement.len()))
+            .and_then(|length| length.checked_add(replacement_len))
             .ok_or_else(|| projected_xml_length_overflow(policy))?;
         previous_end = range.end;
     }
@@ -1003,9 +1032,11 @@ fn replace_element_contents<'a>(
 
     let mut output = String::with_capacity(projected);
     let mut copied = 0usize;
-    for (range, replacement) in rendered {
+    for (range, parts) in planned {
         output.push_str(&xml[copied..range.start]);
-        output.push_str(&replacement);
+        for part in parts {
+            output.push_str(part);
+        }
         copied = range.end;
     }
     output.push_str(&xml[copied..]);
@@ -1292,6 +1323,34 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn replacement_splices_borrow_payload_and_render_exact_capacity() {
+        // Sizing may inspect slices but must not copy the large replacement before the gate.
+        let content = "value".repeat(1024);
+        for element in ["<p:e/>", "<p:e old='x'>discarded</p:e>"] {
+            let parts =
+                element_content_parts(element, &content, " xmlns:p='urn:p'").expect("parts");
+            assert_eq!(parts[3].as_ptr(), content.as_ptr());
+            let expected = parts.concat();
+            let output = replace_element_content(
+                element,
+                0..element.len(),
+                &content,
+                " xmlns:p='urn:p'",
+                None,
+            )
+            .expect("splice");
+            assert_eq!(output, expected);
+            assert_eq!(output.capacity(), output.len());
+        }
+        let xml = "<r><a/><b>old</b></r>";
+        let a = String::from("A");
+        let b = String::from("B");
+        let output = replace_element_contents(xml, [(7..17, &b), (3..7, &a)], None).expect("batch");
+        assert_eq!(output, "<r><a>A</a><b>B</b></r>");
+        assert_eq!(output.capacity(), output.len());
+    }
 
     fn template(reference_count: usize) -> String {
         let mut builder = SignatureBuilder::new(

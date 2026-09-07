@@ -14,8 +14,9 @@ pub(crate) const COMPILE_RECURSION_DEPTH_CEILING: usize = 256;
 // XInclude resolution currently retains one small native frame per nested acquired document.
 // This absolute process-safety ceiling only tightens the caller's execution policy.
 pub(crate) const XINCLUDE_RECURSION_DEPTH_CEILING: usize = 256;
-// Global initialization, attribute-set expansion, and stylesheet-defined functions retain native
-// Rust frames. This process-safety ceiling only tightens the caller's execution policy.
+// Global initialization, capture constructors, attribute-set expansion, and stylesheet-defined
+// functions retain native Rust frames. This process-safety ceiling only tightens caller policy;
+// iterative template depth is independent of the count of live native sequence frames.
 pub(crate) const EXECUTION_RECURSION_DEPTH_CEILING: usize = 256;
 
 /// Independently metered XSLT resource dimensions.
@@ -403,6 +404,12 @@ where
         .saturating_add(actual_bytes);
     meter.release_owned_bytes(old_bytes);
     Ok(())
+}
+
+/// Grow retained vector storage through the same peak-allocation gate as temporary vectors.
+pub(crate) fn reserve_retained_vec_slot<T>(items: &mut Vec<T>, meter: &mut Meter) -> Result<()> {
+    let mut reserved_owned_bytes = items.capacity().saturating_mul(std::mem::size_of::<T>());
+    reserve_temporary_vec_slot(items, meter, &mut reserved_owned_bytes)
 }
 
 pub(crate) fn reserve_retained_hash_map_slot<K, V, S>(

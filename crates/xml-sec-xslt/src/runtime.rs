@@ -11,7 +11,7 @@ use icu_locale::Locale;
 
 use crate::budget::{
     EXECUTION_RECURSION_DEPTH_CEILING, Meter, reserve_retained_hash_set_slot,
-    reserve_temporary_vec_slot,
+    reserve_retained_vec_slot, reserve_temporary_vec_slot,
 };
 use crate::compiler::{
     AttributeSet, AttributeValueTemplate, AvtPart, Expression, ExsltFunction, Instruction,
@@ -378,6 +378,7 @@ struct Execution<'a> {
     modes: Vec<Option<ExpandedName>>,
     function_results: Vec<Option<Value>>,
     function_depth: usize,
+    native_sequence_depth: usize,
     binding_function_defaults: Vec<ExpandedName>,
     building_keys: HashSet<(usize, NodeId)>,
     building_key_index_bytes: usize,
@@ -648,6 +649,7 @@ impl<'a> Execution<'a> {
             modes: vec![None],
             function_results: vec![],
             function_depth: 0,
+            native_sequence_depth: 0,
             binding_function_defaults: vec![],
             building_keys: HashSet::new(),
             building_key_index_bytes: 0,
@@ -803,9 +805,15 @@ impl<'a> Execution<'a> {
                         )?;
                         pending.push(child);
                     }
-                    self.append_key_values(declaration, SourceNode::Node(id), &variables)?;
+                    self.append_key_values(
+                        key_slot,
+                        declaration,
+                        SourceNode::Node(id),
+                        &variables,
+                    )?;
                     for index in 0..attribute_count {
                         self.append_key_values(
+                            key_slot,
                             declaration,
                             SourceNode::Attribute { owner: id, index },
                             &variables,
@@ -828,6 +836,7 @@ impl<'a> Execution<'a> {
 
     fn append_key_values(
         &mut self,
+        key_slot: usize,
         declaration: &crate::compiler::KeyDeclaration,
         node: SourceNode,
         variables: &HashMap<ExpandedName, Value>,
@@ -842,7 +851,7 @@ impl<'a> Execution<'a> {
                         .evaluator
                         .materialize_temporary_string_value(selected, &mut self.meter)?;
                     self.evaluator.append_key_entry(
-                        &declaration.name,
+                        key_slot,
                         value,
                         value_reservation,
                         &node,
@@ -854,7 +863,7 @@ impl<'a> Execution<'a> {
                 let (value, value_reservation) =
                     value.into_fully_metered_temporary_string(&self.evaluator, &mut self.meter)?;
                 self.evaluator.append_key_entry(
-                    &declaration.name,
+                    key_slot,
                     value,
                     value_reservation,
                     &node,
@@ -1000,13 +1009,10 @@ impl<'a> Execution<'a> {
         self.meter
             .charge(BudgetKind::OwnedBytes, reserved_owned_bytes)?;
         let mut variables = HashMap::with_capacity(capacity);
-        for scope in &self.scopes {
-            variables.extend(
-                scope
-                    .iter()
-                    .map(|(name, value)| (name.clone(), value.clone())),
-            );
-        }
+        variables.extend(
+            visible_variable_bindings(&self.scopes)
+                .map(|(name, value)| (name.clone(), value.clone())),
+        );
         Ok((variables, reserved_owned_bytes))
     }
 
@@ -1058,10 +1064,48 @@ impl<'a> Execution<'a> {
     }
 
     fn run_template_tasks(&mut self, initial: TemplateTask) -> Result<()> {
+        let scope_depth = self.scopes.len();
+        let mode_depth = self.modes.len();
+        let output_depth = self.output_stack.len();
         let mut tasks = TemplateTaskStack::default();
         let result = tasks
             .push(initial, &mut self.meter)
             .and_then(|()| self.run_template_task_stack(&mut tasks));
+        if result.is_err() {
+            // Pending instructions must not run during unwinding. Restore only
+            // frames that were actually entered; a queued PushScope may never
+            // have executed, so replaying PopScope would corrupt caller state.
+            while let Some(task) = tasks.pop() {
+                match task {
+                    TemplateTask::RestoreScopes(caller_scopes) => {
+                        while self.scopes.len() > 1 {
+                            self.pop_scope();
+                        }
+                        self.scopes.extend(caller_scopes);
+                    }
+                    TemplateTask::ApplyBatch {
+                        params,
+                        reserved_owned_bytes,
+                        ..
+                    } => {
+                        self.release_parameters_if_last(&params);
+                        self.meter.release_owned_bytes(reserved_owned_bytes);
+                    }
+                    TemplateTask::ForEachBatch {
+                        reserved_owned_bytes,
+                        ..
+                    } => {
+                        self.meter.release_owned_bytes(reserved_owned_bytes);
+                    }
+                    _ => {}
+                }
+            }
+            while self.scopes.len() > scope_depth {
+                self.pop_scope();
+            }
+            self.modes.truncate(mode_depth);
+            self.output_stack.truncate(output_depth);
+        }
         tasks.release(&mut self.meter);
         result
     }
@@ -1317,6 +1361,23 @@ impl<'a> Execution<'a> {
                                 tasks,
                                 &mut self.meter,
                                 Arc::clone(children),
+                                node,
+                                ApplyFrame::new(position, size, depth + 1),
+                                precedence,
+                            )?;
+                        }
+                        Instruction::Element { body, .. } => {
+                            self.begin_computed_element(
+                                instruction,
+                                &node,
+                                ApplyFrame::new(position, size, depth),
+                                precedence,
+                            )?;
+                            tasks.push(TemplateTask::PopOutput, &mut self.meter)?;
+                            push_scoped_sequence(
+                                tasks,
+                                &mut self.meter,
+                                Arc::clone(body),
                                 node,
                                 ApplyFrame::new(position, size, depth + 1),
                                 precedence,
@@ -1624,7 +1685,15 @@ impl<'a> Execution<'a> {
             ..
         } = frame;
         self.meter.recursion(depth)?;
+        // Reserve the restoration record before changing scope ownership. Every
+        // subsequent fallible parameter/body operation can then unwind safely.
+        reserve_temporary_vec_slot(
+            &mut tasks.items,
+            &mut self.meter,
+            &mut tasks.reserved_owned_bytes,
+        )?;
         let caller_scopes = self.scopes.split_off(1);
+        tasks.items.push(TemplateTask::RestoreScopes(caller_scopes));
         self.scopes.push(VariableScope::default());
         for parameter in program.parameters.iter() {
             let retained = if let Some(value) = params.get(&parameter.name) {
@@ -1658,7 +1727,6 @@ impl<'a> Execution<'a> {
                 );
         }
         self.release_parameters_if_last(&params);
-        tasks.push(TemplateTask::RestoreScopes(caller_scopes), &mut self.meter)?;
         tasks.push(
             TemplateTask::Sequence {
                 instructions: program.body,
@@ -1673,6 +1741,58 @@ impl<'a> Execution<'a> {
         )
     }
 
+    fn begin_computed_element(
+        &mut self,
+        instruction: &Instruction,
+        node: &SourceNode,
+        frame: ApplyFrame,
+        precedence: Option<usize>,
+    ) -> Result<()> {
+        let Instruction::Element {
+            base_uri,
+            name,
+            namespace,
+            namespaces: static_namespaces,
+            attribute_sets,
+            ..
+        } = instruction
+        else {
+            unreachable!("computed-element instruction")
+        };
+        // Both execution paths share QName/namespace semantics; only their continuation
+        // scheduling differs. The body must not add native frames in the task-stack path.
+        let lexical = self.evaluate_avt(name, node, frame.position, frame.size)?;
+        let (prefix, local) = split_name(&lexical)?;
+        let namespace = namespace
+            .as_ref()
+            .map(|value| self.evaluate_avt(value, node, frame.position, frame.size))
+            .transpose()?
+            .or_else(|| computed_element_namespace(static_namespaces, prefix.as_deref()));
+        let (prefix, namespace) = normalize_computed_namespace(prefix, namespace, &lexical)?;
+        require_bound_computed_prefix(prefix.as_deref(), namespace.as_deref(), &lexical)?;
+        let namespaces = namespace
+            .as_ref()
+            .map(|uri| {
+                vec![Namespace {
+                    prefix: prefix.clone(),
+                    uri: uri.clone(),
+                }]
+            })
+            .unwrap_or_default();
+        let id = self.push_node_with_base(
+            self.parent(),
+            NodeKind::Element {
+                name: ExpandedName::new(namespace, local),
+                prefix,
+                namespaces: namespaces.into(),
+                attributes: vec![],
+            },
+            base_uri.clone(),
+        )?;
+        self.output_stack.push(id);
+        self.apply_attribute_sets(attribute_sets, node, frame, precedence)
+    }
+
     fn execute_sequence(
         &mut self,
         instructions: &[Instruction],
@@ -1683,10 +1803,18 @@ impl<'a> Execution<'a> {
         current_precedence: Option<usize>,
     ) -> Result<()> {
         self.meter.recursion(depth)?;
-        for instruction in instructions {
-            self.execute_instruction(instruction, node, position, size, depth, current_precedence)?;
-        }
-        Ok(())
+        // Capture constructors still enter native frames. Count those independently of
+        // semantic template depth, which the explicit task stack may safely make much larger.
+        self.meter.recursion_with_ceiling(
+            self.native_sequence_depth + 1,
+            EXECUTION_RECURSION_DEPTH_CEILING,
+        )?;
+        self.native_sequence_depth += 1;
+        let result = instructions.iter().try_for_each(|instruction| {
+            self.execute_instruction(instruction, node, position, size, depth, current_precedence)
+        });
+        self.native_sequence_depth -= 1;
+        result
     }
 
     fn execute_scoped_sequence(
@@ -2000,46 +2128,9 @@ impl<'a> Execution<'a> {
                 }
                 Ok(())
             }
-            Instruction::Element {
-                base_uri,
-                name,
-                namespace,
-                namespaces: static_namespaces,
-                body,
-                attribute_sets,
-            } => {
-                let lexical = self.evaluate_avt(name, node, position, size)?;
-                let (prefix, local) = split_name(&lexical)?;
-                let namespace = namespace
-                    .as_ref()
-                    .map(|value| self.evaluate_avt(value, node, position, size))
-                    .transpose()?
-                    .or_else(|| computed_element_namespace(static_namespaces, prefix.as_deref()));
-                let (prefix, namespace) =
-                    normalize_computed_namespace(prefix, namespace, &lexical)?;
-                require_bound_computed_prefix(prefix.as_deref(), namespace.as_deref(), &lexical)?;
-                let namespaces = namespace
-                    .as_ref()
-                    .map(|uri| {
-                        vec![Namespace {
-                            prefix: prefix.clone(),
-                            uri: uri.clone(),
-                        }]
-                    })
-                    .unwrap_or_default();
-                let id = self.push_node_with_base(
-                    self.parent(),
-                    NodeKind::Element {
-                        name: ExpandedName::new(namespace, local),
-                        prefix,
-                        namespaces: namespaces.into(),
-                        attributes: vec![],
-                    },
-                    base_uri.clone(),
-                )?;
-                self.output_stack.push(id);
-                self.apply_attribute_sets(
-                    attribute_sets,
+            Instruction::Element { body, .. } => {
+                self.begin_computed_element(
+                    instruction,
                     node,
                     ApplyFrame::new(position, size, depth),
                     current_precedence,
@@ -2746,14 +2837,9 @@ impl<'a> Execution<'a> {
             && let Some(variable) = lexical_variable_name(variable)
             && let Some(increment) = parse_xpath_number(increment)
         {
-            let value = self.variable_value(variable, &expression.namespaces)?;
-            let number = match value {
-                Value::Boolean(value) => f64::from(u8::from(*value)),
-                Value::Number(value) => *value,
-                Value::String(value) | Value::StoredExpression(value) => xpath_number(value),
-                Value::NodeSet(_) | Value::ResultTreeFragment(_) => {
-                    xpath_number(&self.value_string(value, 0)?)
-                }
+            let Some(number) = self.scalar_variable_number(variable, &expression.namespaces)?
+            else {
+                return Ok(None);
             };
             return Ok(Some(XPathValue::Number(number + increment)));
         }
@@ -2771,12 +2857,20 @@ impl<'a> Execution<'a> {
             && let Some(variable) = lexical_variable_name(variable)
             && let Some(factor) = parse_xpath_number(factor)
         {
-            let length =
-                xpath_number(&self.variable_string(variable, &expression.namespaces, 0)?) * factor;
+            let Some(number) = self.scalar_variable_number(variable, &expression.namespaces)?
+            else {
+                return Ok(None);
+            };
+            let length = number * factor;
             let take = length.round().max(1.0) as usize - 1;
-            return Ok(Some(XPathValue::String(
-                literal.chars().take(take).collect(),
-            )));
+            self.meter
+                .charge(BudgetKind::XPathOperations, literal.len())?;
+            let end = literal
+                .char_indices()
+                .nth(take)
+                .map_or(literal.len(), |(offset, _)| offset);
+            self.meter.check_additional(BudgetKind::OwnedBytes, end)?;
+            return Ok(Some(XPathValue::String(literal[..end].to_owned())));
         }
         if let Some(variable) = source
             .strip_prefix("string-length($")
@@ -2886,6 +2980,35 @@ impl<'a> Execution<'a> {
             .rev()
             .find_map(|scope| scope.get(&name))
             .ok_or_else(|| Error::Dynamic(format!("undefined variable ${lexical}")))
+    }
+
+    fn scalar_variable_number(
+        &mut self,
+        lexical: &str,
+        namespaces: &[(String, String)],
+    ) -> Result<Option<f64>> {
+        let name = expanded_variable_name(lexical, namespaces)?;
+        let value = self
+            .scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(&name))
+            .ok_or_else(|| Error::Dynamic(format!("undefined variable ${lexical}")))?;
+        // XPath 1.0 section 4.4 converts typed Booleans directly. Tree coercion stays with the
+        // general evaluator, whose traversal is metered; scalar lexical scans are charged here.
+        // https://www.w3.org/TR/1999/REC-xpath-19991116/#function-number
+        Ok(Some(match value {
+            Value::Boolean(value) => f64::from(u8::from(*value)),
+            Value::Number(value) => *value,
+            Value::String(value) => {
+                self.meter
+                    .charge(BudgetKind::XPathOperations, value.len())?;
+                xpath_number(value)
+            }
+            Value::StoredExpression(_) | Value::NodeSet(_) | Value::ResultTreeFragment(_) => {
+                return Ok(None);
+            }
+        }))
     }
 
     fn variable_string<'value>(
@@ -4210,6 +4333,10 @@ impl<'a> Execution<'a> {
             }
         };
         while let Some(id) = cursor {
+            if let Err(error) = self.meter.charge(BudgetKind::XPathOperations, 1) {
+                self.meter.release_owned_bytes(lineage_owned_bytes);
+                return Err(error);
+            }
             if let Err(error) =
                 reserve_temporary_vec_slot(&mut lineage, &mut self.meter, &mut lineage_owned_bytes)
             {
@@ -4290,6 +4417,7 @@ impl<'a> Execution<'a> {
                     let mut pending = Vec::with_capacity(1);
                     pending.push(logical_root);
                     while let Some(id) = pending.pop() {
+                        self.meter.charge(BudgetKind::XPathOperations, 1)?;
                         if let Some(source) = self.evaluator.source.node(id) {
                             let required = pending.len().saturating_add(source.children.len());
                             if required > pending.capacity() {
@@ -5033,11 +5161,6 @@ fn secondary_output_property_retains_value(name: &str) -> Result<bool> {
     }
 }
 
-fn reserve_retained_vec_slot<T>(items: &mut Vec<T>, meter: &mut Meter) -> Result<()> {
-    let mut reserved_owned_bytes = items.capacity().saturating_mul(std::mem::size_of::<T>());
-    reserve_temporary_vec_slot(items, meter, &mut reserved_owned_bytes)
-}
-
 fn metered_node_id_snapshot(nodes: &[NodeId], meter: &mut Meter) -> Result<(Vec<NodeId>, usize)> {
     let mut snapshot = Vec::new();
     let mut reserved_owned_bytes = 0;
@@ -5431,27 +5554,30 @@ fn append_result_text(
             )
         })
     {
-        let temporary_bytes = matches!(&value, Cow::Owned(_)).then_some(value.len());
+        let temporary_bytes = match &value {
+            Cow::Owned(value) => Some(value.capacity()),
+            Cow::Borrowed(_) => None,
+        };
         if let Some(bytes) = temporary_bytes {
             meter.charge(BudgetKind::OwnedBytes, bytes)?;
         }
-        if let Err(error) = meter.charge(BudgetKind::OwnedBytes, value.len()) {
-            if let Some(bytes) = temporary_bytes {
-                meter.release_owned_bytes(bytes);
-            }
-            return Err(error);
-        }
-        if let Some(NodeKind::Text { value: current, .. }) =
+        let appended = if let Some(NodeKind::Text { value: current, .. }) =
             result.node_mut(previous).map(|node| &mut node.kind)
         {
-            current.push_str(&value);
-        }
+            append_metered_text(current, &value, meter)
+        } else {
+            unreachable!("previous node was checked as text")
+        };
         if let Some(bytes) = temporary_bytes {
             meter.release_owned_bytes(bytes);
         }
-        return Ok(());
+        return appended;
     }
-    meter.check_additional(BudgetKind::OwnedBytes, value.len())?;
+    let retained = match &value {
+        Cow::Owned(value) => value.capacity(),
+        Cow::Borrowed(value) => value.len(),
+    };
+    meter.check_additional(BudgetKind::OwnedBytes, retained)?;
     push_result_node(
         result,
         meter,
@@ -5491,17 +5617,15 @@ fn append_precharged_result_text(
             )
         })
     {
-        if let Err(error) = meter.charge(BudgetKind::OwnedBytes, value.len()) {
-            meter.release_owned_bytes(reservation);
-            return Err(error);
-        }
-        if let Some(NodeKind::Text { value: current, .. }) =
+        let appended = if let Some(NodeKind::Text { value: current, .. }) =
             result.node_mut(previous).map(|node| &mut node.kind)
         {
-            current.push_str(&value);
-        }
+            append_metered_text(current, &value, meter)
+        } else {
+            unreachable!("previous node was checked as text")
+        };
         meter.release_owned_bytes(reservation);
-        return Ok(());
+        return appended;
     }
 
     let base_uri = result.node(parent).and_then(|node| node.base_uri.clone());
@@ -5525,6 +5649,32 @@ fn append_precharged_result_text(
         meter.release_owned_bytes(reservation);
     }
     insertion.map(|_| ())
+}
+
+fn append_metered_text(current: &mut String, suffix: &str, meter: &mut Meter) -> Result<()> {
+    let required = current
+        .len()
+        .checked_add(suffix.len())
+        .filter(|length| *length <= isize::MAX as usize)
+        .ok_or_else(|| Error::Dynamic("result text is too large".into()))?;
+    if required > current.capacity() {
+        // Allocate beside the old buffer: both remain live during copying. Geometric growth
+        // stays amortized linear; near the memory limit reserve only available headroom.
+        meter.check_additional(BudgetKind::OwnedBytes, required)?;
+        debug_assert!(current.capacity() <= isize::MAX as usize);
+        let capacity = (current.capacity() * 2)
+            .max(required)
+            .min(isize::MAX as usize)
+            .min(meter.remaining_owned_bytes());
+        meter.charge(BudgetKind::OwnedBytes, capacity)?;
+        let mut replacement = String::with_capacity(capacity);
+        replacement.push_str(current);
+        let old_capacity = current.capacity();
+        *current = replacement;
+        meter.release_owned_bytes(old_capacity);
+    }
+    current.push_str(suffix);
+    Ok(())
 }
 
 fn push_result_node(
@@ -5558,7 +5708,7 @@ fn namespace_owned_bytes(namespace: &Namespace) -> usize {
 fn node_kind_owned_bytes(kind: &NodeKind) -> usize {
     match kind {
         NodeKind::Root => 0,
-        NodeKind::Text { value, .. } | NodeKind::Comment(value) => value.len(),
+        NodeKind::Text { value, .. } | NodeKind::Comment(value) => value.capacity(),
         NodeKind::ProcessingInstruction { target, value } => target
             .len()
             .saturating_add(value.as_ref().map_or(0, String::len)),
@@ -5759,19 +5909,11 @@ fn binding_owned_bytes(name: &ExpandedName, value: &Value) -> usize {
 fn visible_variable_snapshot_size(scopes: &[VariableScope]) -> (usize, usize) {
     let mut count = 0usize;
     let mut payload = 0usize;
-    for (scope_index, scope) in scopes.iter().enumerate() {
-        for (name, value) in scope.iter() {
-            if scopes[scope_index + 1..]
-                .iter()
-                .any(|inner| inner.contains_key(name))
-            {
-                continue;
-            }
-            count = count.saturating_add(1);
-            payload = payload
-                .saturating_add(expanded_name_owned_bytes(name))
-                .saturating_add(value_owned_bytes(value));
-        }
+    for (name, value) in visible_variable_bindings(scopes) {
+        count = count.saturating_add(1);
+        payload = payload
+            .saturating_add(expanded_name_owned_bytes(name))
+            .saturating_add(value_owned_bytes(value));
     }
     // Account conservatively for hash-table control bytes and spare capacity in addition to
     // cloned key/value payloads. The reservation is transient and released after XPath returns.
@@ -5779,6 +5921,20 @@ fn visible_variable_snapshot_size(scopes: &[VariableScope]) -> (usize, usize) {
         .saturating_mul(std::mem::size_of::<(ExpandedName, Value)>())
         .saturating_mul(2);
     (count, payload.saturating_add(table))
+}
+
+// Reservation and construction must use exactly the same visibility rule. Copying outer
+// bindings before overwriting them with inner ones creates unreserved transient allocations.
+fn visible_variable_bindings(
+    scopes: &[VariableScope],
+) -> impl Iterator<Item = (&ExpandedName, &Value)> {
+    scopes.iter().enumerate().flat_map(move |(index, scope)| {
+        scope.iter().filter(move |(name, _)| {
+            !scopes[index + 1..]
+                .iter()
+                .any(|inner| inner.contains_key(*name))
+        })
+    })
 }
 
 fn tokenize_number_format(format: &str) -> NumberFormatTokens<'_> {
@@ -6118,6 +6274,41 @@ mod tests {
         NoResolver, NodeKind, NodeReference, Value,
     };
 
+    #[test]
+    fn variable_snapshot_borrows_only_visible_bindings() {
+        // Shadowed values must not be cloned temporarily: reservation and construction
+        // need exactly the same bindings, regardless of hidden payload size.
+        let name = ExpandedName::new(None::<String>, "value");
+        let scopes = [
+            super::VariableScope {
+                values: std::collections::HashMap::from([(
+                    name.clone(),
+                    Value::String("x".repeat(100_000)),
+                )]),
+                retained_owned_bytes: 0,
+            },
+            super::VariableScope {
+                values: std::collections::HashMap::from([(
+                    name.clone(),
+                    Value::String("visible".into()),
+                )]),
+                retained_owned_bytes: 0,
+            },
+        ];
+        let bindings: Vec<_> = super::visible_variable_bindings(&scopes).collect();
+        assert_eq!(bindings.len(), 1);
+        assert!(std::ptr::eq(
+            bindings[0].1,
+            scopes[1].get(&name).expect("inner binding exists")
+        ));
+        let (count, bytes) = super::visible_variable_snapshot_size(&scopes);
+        assert_eq!(count, 1);
+        assert!(
+            bytes < 1000,
+            "hidden payload must not be reserved or copied"
+        );
+    }
+
     fn meter(owned_bytes: usize) -> Meter {
         Meter::new(
             ExecutionBudget {
@@ -6181,6 +6372,63 @@ mod tests {
             }
         }
         accepted
+    }
+
+    #[test]
+    fn appended_text_accounts_for_retained_capacity() {
+        // One extra byte can double String capacity. Both ordinary and already-reserved
+        // append paths must retain that capacity charge, not only the logical text length.
+        for precharged in [false, true] {
+            let mut document = Document::parse("<r>12345678</r>", None).expect("fixture parses");
+            let parent = document
+                .node(document.root())
+                .expect("document root exists")
+                .children[0];
+            let text = document.node(parent).expect("element exists").children[0];
+            let NodeKind::Text { value, .. } = &document.node(text).expect("text exists").kind
+            else {
+                panic!("text")
+            };
+            let mut meter = meter(1000);
+            meter
+                .charge(BudgetKind::OwnedBytes, value.capacity())
+                .expect("initial text fits");
+            if precharged {
+                meter
+                    .charge(BudgetKind::OwnedBytes, 1)
+                    .expect("suffix fits");
+                super::append_precharged_result_text(
+                    &mut document,
+                    &mut meter,
+                    parent,
+                    "x".into(),
+                    1,
+                    false,
+                )
+                .expect("precharged append fits");
+            } else {
+                super::append_result_text(
+                    &mut document,
+                    &mut meter,
+                    parent,
+                    std::borrow::Cow::Borrowed("x"),
+                    false,
+                )
+                .expect("ordinary append fits");
+            }
+            let NodeKind::Text { value, .. } = &document.node(text).expect("text remains").kind
+            else {
+                panic!("text")
+            };
+            assert_eq!(value, "12345678x");
+            assert_eq!(
+                meter
+                    .usage(BudgetKind::OwnedBytes)
+                    .expect("owned bytes are metered")
+                    .0,
+                value.capacity()
+            );
+        }
     }
 
     #[test]
@@ -6493,6 +6741,28 @@ mod tests {
             execution
                 .evaluator
                 .preceding_nonempty_comment(&target, &mut execution.meter),
+            Err(Error::Budget {
+                kind: BudgetKind::XPathOperations,
+                ..
+            })
+        ));
+        // Implicit count/from patterns must not bypass the work gate while level="any"
+        // traverses preceding nodes, even though no XPath expression is evaluated.
+        execution.meter = Meter::new(budget, 0).expect("fresh work meter");
+        let instruction = crate::compiler::NumberInstruction {
+            value: None,
+            count: None,
+            from: None,
+            level: "any".into(),
+            format: crate::compiler::AttributeValueTemplate(Vec::new()),
+            lang: None,
+            letter_value: None,
+            grouping_separator: None,
+            grouping_size: None,
+            forward_compatible: false,
+        };
+        assert!(matches!(
+            execution.number_sequence(&instruction, &target),
             Err(Error::Budget {
                 kind: BudgetKind::XPathOperations,
                 ..

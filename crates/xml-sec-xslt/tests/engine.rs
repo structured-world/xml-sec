@@ -2584,6 +2584,13 @@ fn compound_substring_length_uses_the_general_xpath_evaluator() {
 }
 
 #[test]
+fn substring_scalar_shortcut_preserves_boolean_number_conversion() {
+    // XPath 1.0 section 4.4 converts Boolean true to 1, not the string "true" to NaN.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:param name="b" select="true()"/><xsl:template match="/"><xsl:value-of select="substring ('ABC',0,$b*2)"/><xsl:text>|</xsl:text><xsl:value-of select="substring('ABC',0,number($b)*2)"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<r/>"), "A|A");
+}
+
+#[test]
 fn compound_substring_variables_use_the_general_xpath_evaluator() {
     // Scalar fast paths may capture only a lexical variable QName. XPath operators in either
     // captured operand must fall through so the general evaluator preserves XPath 1.0 semantics.
@@ -4595,6 +4602,109 @@ fn flat_xpath_ast_obeys_the_compile_recursion_budget() {
             ..
         })
     ));
+}
+
+#[test]
+fn computed_element_template_recursion_uses_the_task_stack() {
+    // Computed element constructors must use the same explicit continuation stack as
+    // literal elements; caller-selected depth cannot select native recursion instead.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><xsl:call-template name="nested"><xsl:with-param name="n" select="1000"/></xsl:call-template></xsl:template><xsl:template name="nested"><xsl:param name="n"/><xsl:if test="$n &gt; 0"><xsl:element name="e"><xsl:call-template name="nested"><xsl:with-param name="n" select="$n - 1"/></xsl:call-template></xsl:element></xsl:if></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse("<source/>", None).unwrap();
+    let mut budget = execution_budget(1024);
+    budget.recursion_depth = 8192;
+    let result = stylesheet
+        .execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("computed element depth is handled iteratively");
+    let text = String::from_utf8(result.serialized.bytes).unwrap();
+    assert_eq!(
+        text,
+        format!("{}<e/>{}\n", "<e>".repeat(999), "</e>".repeat(999))
+    );
+}
+
+#[test]
+fn recursive_capture_has_an_absolute_native_stack_ceiling() {
+    // Capture constructors still use native frames. A permissive semantic-depth budget
+    // must not disable their independent, non-configurable process-safety ceiling.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:call-template name="nested"/></xsl:template><xsl:template name="nested"><xsl:comment><xsl:call-template name="nested"/></xsl:comment></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse("<source/>", None).unwrap();
+    let mut budget = execution_budget(1024);
+    budget.recursion_depth = usize::MAX;
+    let error = stylesheet
+        .execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect_err("native recursion is bounded");
+    assert!(
+        matches!(
+            error,
+            Error::Budget {
+                kind: BudgetKind::RecursionDepth,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn function_allocation_failures_unwind_capture_scopes() {
+    // Exercise allocation denials throughout function entry inside a capture. Every
+    // failure must remain a budget error, never an underflow of the caller's scopes.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" xmlns:f="urn:functions" extension-element-prefixes="func"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><xsl:comment><xsl:value-of select="f:value()"/></xsl:comment></xsl:template><func:function name="f:value"><func:result select="'value'"/></func:function></xsl:stylesheet>"#,
+    );
+    let source = Document::parse("<source/>", None).unwrap();
+    let mut rejected = false;
+    let mut accepted = false;
+    for owned_bytes in (0..65_536).step_by(64) {
+        let mut budget = execution_budget(1024);
+        budget.owned_bytes = owned_bytes;
+        match stylesheet.execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ) {
+            Ok(result) => {
+                assert_eq!(result.serialized.bytes, b"<!--value-->\n");
+                accepted = true;
+            }
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            }) => rejected = true,
+            Err(error) => panic!("unexpected failure at {owned_bytes}: {error}"),
+        }
+    }
+    assert!(
+        rejected && accepted,
+        "cover both resource denial and successful execution"
+    );
 }
 
 #[test]

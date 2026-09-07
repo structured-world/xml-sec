@@ -282,6 +282,17 @@ impl<'a> Scanner<'a> {
                     span,
                     ..
                 } => {
+                    // XML 1.0 section 2.8, production [26], requires one or more digits after
+                    // `1.`. The tokenizer accepts an empty suffix; enforce the grammar here
+                    // so every semantic parser receives the same valid declaration token.
+                    // https://www.w3.org/TR/xml/#NT-VersionNum
+                    let digits = version
+                        .as_str()
+                        .strip_prefix("1.")
+                        .ok_or_else(|| Error::malformed("invalid XML version"))?;
+                    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+                        return Err(Error::malformed("invalid XML version"));
+                    }
                     return Ok(Some(Event::Declaration {
                         version: version.as_str(),
                         standalone,
@@ -945,6 +956,19 @@ fn validate_writer_characters(value: &str) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn xml_version_requires_digits_after_the_period() {
+        // XML 1.0 production [26] allows 1.x, but requires at least one digit after the dot.
+        assert!(
+            super::Scanner::new("<?xml version='1.'?><r/>")
+                .next_event()
+                .is_err()
+        );
+        for version in ["1.0", "1.1", "1.23"] {
+            let xml = format!("<?xml version='{version}'?><r/>");
+            assert!(super::Scanner::new(&xml).next_event().is_ok());
+        }
+    }
     use super::*;
 
     #[test]

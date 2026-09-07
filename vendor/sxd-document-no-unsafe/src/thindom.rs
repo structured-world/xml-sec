@@ -1,4 +1,4 @@
-use std::{fmt, hash, marker::PhantomData, slice};
+use std::{fmt, hash, marker::PhantomData};
 
 use super::{QName, raw};
 
@@ -153,73 +153,90 @@ impl<'d> Connections<'d> {
     }
 
     pub fn root_children(&self) -> RootChildren<'_> {
-        // This is safe because we disallow mutation while this borrow is active.
         RootChildren {
-            iter: self.connections.root_children().iter(),
-            identity: self.identity,
+            snapshot: Snapshot::new(self.connections.root_children().to_vec(), self.identity),
         }
     }
 
     pub fn element_children(&self, parent: Element<'_>) -> ElementChildren<'_> {
         parent.assert_identity(self.identity);
-        // This is safe because we disallow mutation while this borrow is active.
         ElementChildren {
-            iter: self.connections.element_children(parent.node).iter(),
-            identity: self.identity,
+            snapshot: Snapshot::new(
+                self.connections.element_children(parent.node).to_vec(),
+                self.identity,
+            ),
         }
     }
 
     pub fn element_preceding_siblings(&self, element: Element<'_>) -> Siblings<'_> {
         element.assert_identity(self.identity);
-        // This is safe because we disallow mutation while this borrow is active.
         Siblings {
-            iter: self.connections.element_preceding_siblings(element.node),
-            identity: self.identity,
+            snapshot: Snapshot::new(
+                self.connections
+                    .element_preceding_siblings(element.node)
+                    .collect(),
+                self.identity,
+            ),
         }
     }
 
     pub fn element_following_siblings(&self, element: Element<'_>) -> Siblings<'_> {
         element.assert_identity(self.identity);
-        // This is safe because we disallow mutation while this borrow is active.
         Siblings {
-            iter: self.connections.element_following_siblings(element.node),
-            identity: self.identity,
+            snapshot: Snapshot::new(
+                self.connections
+                    .element_following_siblings(element.node)
+                    .collect(),
+                self.identity,
+            ),
         }
     }
 
     pub fn text_preceding_siblings(&self, text: Text<'_>) -> Siblings<'_> {
         text.assert_identity(self.identity);
-        // This is safe because we disallow mutation while this borrow is active.
         Siblings {
-            iter: self.connections.text_preceding_siblings(text.node),
-            identity: self.identity,
+            snapshot: Snapshot::new(
+                self.connections
+                    .text_preceding_siblings(text.node)
+                    .collect(),
+                self.identity,
+            ),
         }
     }
 
     pub fn text_following_siblings(&self, text: Text<'_>) -> Siblings<'_> {
         text.assert_identity(self.identity);
-        // This is safe because we disallow mutation while this borrow is active.
         Siblings {
-            iter: self.connections.text_following_siblings(text.node),
-            identity: self.identity,
+            snapshot: Snapshot::new(
+                self.connections
+                    .text_following_siblings(text.node)
+                    .collect(),
+                self.identity,
+            ),
         }
     }
 
     pub fn comment_preceding_siblings(&self, comment: Comment<'_>) -> Siblings<'_> {
         comment.assert_identity(self.identity);
-        // This is safe because we disallow mutation while this borrow is active.
         Siblings {
-            iter: self.connections.comment_preceding_siblings(comment.node),
-            identity: self.identity,
+            snapshot: Snapshot::new(
+                self.connections
+                    .comment_preceding_siblings(comment.node)
+                    .collect(),
+                self.identity,
+            ),
         }
     }
 
     pub fn comment_following_siblings(&self, comment: Comment<'_>) -> Siblings<'_> {
         comment.assert_identity(self.identity);
-        // This is safe because we disallow mutation while this borrow is active.
         Siblings {
-            iter: self.connections.comment_following_siblings(comment.node),
-            identity: self.identity,
+            snapshot: Snapshot::new(
+                self.connections
+                    .comment_following_siblings(comment.node)
+                    .collect(),
+                self.identity,
+            ),
         }
     }
 
@@ -228,12 +245,13 @@ impl<'d> Connections<'d> {
         pi: ProcessingInstruction<'_>,
     ) -> Siblings<'_> {
         pi.assert_identity(self.identity);
-        // This is safe because we disallow mutation while this borrow is active.
         Siblings {
-            iter: self
-                .connections
-                .processing_instruction_preceding_siblings(pi.node),
-            identity: self.identity,
+            snapshot: Snapshot::new(
+                self.connections
+                    .processing_instruction_preceding_siblings(pi.node)
+                    .collect(),
+                self.identity,
+            ),
         }
     }
 
@@ -242,12 +260,13 @@ impl<'d> Connections<'d> {
         pi: ProcessingInstruction<'_>,
     ) -> Siblings<'_> {
         pi.assert_identity(self.identity);
-        // This is safe because we disallow mutation while this borrow is active.
         Siblings {
-            iter: self
-                .connections
-                .processing_instruction_following_siblings(pi.node),
-            identity: self.identity,
+            snapshot: Snapshot::new(
+                self.connections
+                    .processing_instruction_following_siblings(pi.node)
+                    .collect(),
+                self.identity,
+            ),
         }
     }
 
@@ -260,11 +279,11 @@ impl<'d> Connections<'d> {
 
     pub fn attributes(&self, parent: Element<'d>) -> Attributes<'d> {
         parent.assert_identity(self.identity);
-        // This is safe because we disallow mutation while this borrow is active
-        // TODO: Test that
         Attributes {
-            iter: self.connections.attributes(parent.node).iter(),
-            identity: self.identity,
+            snapshot: Snapshot::new(
+                self.connections.attributes(parent.node).to_vec(),
+                self.identity,
+            ),
         }
     }
 
@@ -283,63 +302,82 @@ impl<'d> Connections<'d> {
     }
 }
 
-pub struct RootChildren<'d> {
-    iter: slice::Iter<'d, raw::ChildOfRoot>,
+// Connections can be obtained more than once from a Package. A borrow of one handle cannot
+// exclude mutations through another, so iterators retain snapshots of handles, never references
+// into a mutable Vec. The lifetime still binds every yielded handle to the original arena.
+struct Snapshot<'d, T> {
+    iter: std::vec::IntoIter<T>,
     identity: usize,
+    lifetime: PhantomData<&'d raw::Connections>,
+}
+
+impl<T> Snapshot<'_, T> {
+    fn new(values: Vec<T>, identity: usize) -> Self {
+        Self {
+            iter: values.into_iter(),
+            identity,
+            lifetime: PhantomData,
+        }
+    }
+}
+
+pub struct RootChildren<'d> {
+    snapshot: Snapshot<'d, raw::ChildOfRoot>,
 }
 
 impl<'d> Iterator for RootChildren<'d> {
     type Item = ChildOfRoot<'d>;
 
     fn next(&mut self) -> Option<ChildOfRoot<'d>> {
-        self.iter
+        self.snapshot
+            .iter
             .next()
-            .map(|&child| ChildOfRoot::wrap(child, self.identity))
+            .map(|child| ChildOfRoot::wrap(child, self.snapshot.identity))
     }
 }
 
 pub struct ElementChildren<'d> {
-    iter: slice::Iter<'d, raw::ChildOfElement>,
-    identity: usize,
+    snapshot: Snapshot<'d, raw::ChildOfElement>,
 }
 
 impl<'d> Iterator for ElementChildren<'d> {
     type Item = ChildOfElement<'d>;
 
     fn next(&mut self) -> Option<ChildOfElement<'d>> {
-        self.iter
+        self.snapshot
+            .iter
             .next()
-            .map(|&child| ChildOfElement::wrap(child, self.identity))
+            .map(|child| ChildOfElement::wrap(child, self.snapshot.identity))
     }
 }
 
 pub struct Attributes<'d> {
-    iter: slice::Iter<'d, *mut raw::Attribute>,
-    identity: usize,
+    snapshot: Snapshot<'d, *mut raw::Attribute>,
 }
 
 impl<'d> Iterator for Attributes<'d> {
     type Item = Attribute<'d>;
 
     fn next(&mut self) -> Option<Attribute<'d>> {
-        self.iter
+        self.snapshot
+            .iter
             .next()
-            .map(|&attribute| Attribute::wrap(attribute, self.identity))
+            .map(|attribute| Attribute::wrap(attribute, self.snapshot.identity))
     }
 }
 
 pub struct Siblings<'d> {
-    iter: raw::SiblingIter<'d>,
-    identity: usize,
+    snapshot: Snapshot<'d, raw::ChildOfElement>,
 }
 
 impl<'d> Iterator for Siblings<'d> {
     type Item = ChildOfElement<'d>;
 
     fn next(&mut self) -> Option<ChildOfElement<'d>> {
-        self.iter
+        self.snapshot
+            .iter
             .next()
-            .map(|child| ChildOfElement::wrap(child, self.identity))
+            .map(|child| ChildOfElement::wrap(child, self.snapshot.identity))
     }
 }
 
@@ -831,6 +869,51 @@ mod test {
         c.set_attribute(element, attr);
 
         assert_eq!(Some("world"), c.attribute_value(element, "hello"));
+    }
+
+    #[test]
+    fn iterators_survive_mutation_through_another_connection() {
+        // A second connection is legal. Iterators must isolate their pointer-vector storage
+        // from its mutations; running this against borrowed Vec iterators would invoke UB.
+        let package = Package::new();
+        let (storage, mut reader) = package.as_thin_document();
+        let (_, mut writer) = package.as_thin_document();
+        let parent = storage.create_element("parent");
+        let first = storage.create_element("first");
+        let second = storage.create_element("second");
+        reader.append_root_child(parent);
+        reader.append_element_child(parent, first);
+        reader.append_element_child(parent, second);
+        let original = storage.create_attribute("original", "value");
+        reader.set_attribute(parent, original);
+        let attributes = reader.attributes(parent);
+        let children = reader.element_children(parent);
+        let siblings = reader.element_following_siblings(first);
+        let roots = reader.root_children();
+        for index in 0..128 {
+            writer.set_attribute(
+                parent,
+                storage.create_attribute(format!("new{index}").as_str(), "value"),
+            );
+            writer.append_element_child(parent, storage.create_element("new"));
+            writer.append_root_child(storage.create_comment("new"));
+        }
+        assert_eq!(attributes.collect::<Vec<_>>(), vec![original]);
+        assert_eq!(
+            children.collect::<Vec<_>>(),
+            vec![
+                ChildOfElement::Element(first),
+                ChildOfElement::Element(second)
+            ]
+        );
+        assert_eq!(
+            siblings.collect::<Vec<_>>(),
+            vec![ChildOfElement::Element(second)]
+        );
+        assert_eq!(
+            roots.collect::<Vec<_>>(),
+            vec![ChildOfRoot::Element(parent)]
+        );
     }
 
     #[test]

@@ -1864,14 +1864,19 @@ pub(crate) fn prepare_xml_frontend_bounded(
             .get(start.name.qualified().as_ref())
             .map_or(&[][..], Vec::as_slice);
         for attribute in &start.attributes {
-            if !contains_expandable_entity_reference(attribute.value, &declarations.general) {
-                continue;
-            }
             let name = attribute.name.qualified();
             let is_cdata = defaults
                 .iter()
                 .find(|declaration| declaration.name == name)
                 .is_none_or(|declaration| declaration.attribute_type.is_cdata());
+            // XML 1.0 section 3.3.3 requires tokenized normalization even without
+            // entity references; removing the DTD otherwise loses this type information.
+            // https://www.w3.org/TR/xml/#AVNormalize
+            if is_cdata
+                && !contains_expandable_entity_reference(attribute.value, &declarations.general)
+            {
+                continue;
+            }
             let value = prepare_attribute_value(
                 name.as_ref(),
                 attribute.value,
@@ -1970,6 +1975,9 @@ fn escaped_xml_attribute_value_len(value: &str) -> Option<usize> {
             '&' => "&amp;".len(),
             '<' => "&lt;".len(),
             '"' => "&quot;".len(),
+            '\t' => "&#9;".len(),
+            '\n' => "&#10;".len(),
+            '\r' => "&#13;".len(),
             _ => character.len_utf8(),
         })
     })
@@ -1981,6 +1989,12 @@ fn push_escaped_xml_attribute_value(output: &mut String, value: &str) {
             '&' => output.push_str("&amp;"),
             '<' => output.push_str("&lt;"),
             '"' => output.push_str("&quot;"),
+            // Preserve the normalized value across reparsing: literal whitespace
+            // would normalize again under XML 1.0 section 3.3.3.
+            // https://www.w3.org/TR/xml/#AVNormalize
+            '\t' => output.push_str("&#9;"),
+            '\n' => output.push_str("&#10;"),
+            '\r' => output.push_str("&#13;"),
             _ => output.push(character),
         }
     }
@@ -2540,7 +2554,7 @@ fn internal_general_entities<'a>(
     let mut changed = false;
     let mut rounds = 0usize;
     let declarations = loop {
-        let declarations = collect_internal_entity_declarations(expanded_subset.as_ref())?;
+        let declarations = collect_internal_entity_declarations(expanded_subset.as_ref(), meter)?;
         let next = expand_parameter_entity_references(
             expanded_subset.as_ref(),
             &declarations.parameter,
@@ -2734,7 +2748,10 @@ impl InternalAttributeType {
     }
 }
 
-fn collect_internal_entity_declarations(subset: &str) -> Result<InternalEntityDeclarations> {
+fn collect_internal_entity_declarations(
+    subset: &str,
+    meter: &EntityExpansionMeter,
+) -> Result<InternalEntityDeclarations> {
     let mut declarations = InternalEntityDeclarations::default();
     let mut cursor = 0;
     while cursor < subset.len() {
@@ -2866,7 +2883,18 @@ fn collect_internal_entity_declarations(subset: &str) -> Result<InternalEntityDe
                 .push((declaration_start, cursor));
         }
         if !parameter {
-            value = normalize_predefined_entity_declaration(name, value)?;
+            if matches!(name, "amp" | "apos" | "gt" | "lt" | "quot") {
+                value = normalize_predefined_entity_declaration(name, value)?;
+            } else {
+                // XML 1.0 section 4.5 constructs replacement text by expanding character
+                // references, but leaves general references for their eventual context.
+                // https://www.w3.org/TR/xml/#intern-replacement
+                if let Cow::Owned(replacement) =
+                    decode_parameter_character_references(&value, meter)?
+                {
+                    value = replacement;
+                }
+            }
         }
         if parameter {
             declarations
@@ -3470,6 +3498,14 @@ fn require_dtd_whitespace(subset: &str, cursor: &mut usize, context: &str) -> Re
 }
 
 fn validate_entity_value(name: &str, value: &str, parameter: bool) -> Result<()> {
+    // This collector reads only the internal subset. XML 1.0 section 2.8 WFC PEs
+    // in Internal Subset forbids PE references inside declarations, including literals.
+    // https://www.w3.org/TR/xml/#wfc-PEinInternalSubset
+    if value.contains('%') {
+        return Err(Error::Xml(format!(
+            "parameter entity reference inside internal entity declaration `{name}`"
+        )));
+    }
     // XML 1.0 production [9] applies to both general and parameter entity declarations. Validate
     // it before preprocessing erases the declaration from the downstream tokenizer:
     // https://www.w3.org/TR/xml/#NT-EntityValue
@@ -4580,6 +4616,32 @@ mod parser_boundary_tests {
     }
 
     #[test]
+    fn entity_replacement_normalizes_character_references_before_parsing() {
+        // XML 1.0 section 4.5 expands character references when constructing replacement
+        // text, so an encoded '<' can introduce markup when the entity is referenced.
+        let document = Document::parse(r#"<!DOCTYPE r [<!ENTITY e "&#60;a/>">]><r>&e;</r>"#, None)
+            .expect("replacement markup is well formed");
+        assert_eq!(document.string_value(document.root()), "");
+        assert!(document.nodes().any(|(_, node)| matches!(&node.kind,
+            super::NodeKind::Element { name, .. } if name.local == "a")));
+    }
+
+    #[test]
+    fn internal_entity_values_reject_parameter_references() {
+        // XML 1.0 section 2.8 WFC PEs in Internal Subset forbids references inside
+        // declarations, including EntityValue, before any expansion erases their origin.
+        for xml in [
+            r#"<!DOCTYPE r [<!ENTITY % p "x"><!ENTITY e "%p;">]><r>&e;</r>"#,
+            r#"<!DOCTYPE r [<!ENTITY % p "x"><!ENTITY % q "%p;">]><r/>"#,
+        ] {
+            assert!(
+                matches!(Document::parse(xml, None), Err(Error::Xml(_))),
+                "{xml}"
+            );
+        }
+    }
+
+    #[test]
     fn general_entity_markup_is_balanced_within_each_replacement() {
         // XML 1.0 section 4.3.2 requires every referenced internal general entity replacement
         // to match `content`; a tag cannot begin in one entity and end in another.
@@ -5122,7 +5184,11 @@ mod parser_boundary_tests {
                 "iterative accepted {declaration}"
             );
             assert!(
-                super::collect_internal_entity_declarations(declaration).is_err(),
+                super::collect_internal_entity_declarations(
+                    declaration,
+                    &EntityExpansionMeter::new(ENTITY_EXPANSION_BYTE_CEILING),
+                )
+                .is_err(),
                 "preprocessor accepted {declaration}"
             );
         }
@@ -5293,7 +5359,7 @@ mod parser_boundary_tests {
             r#"<!DOCTYPE r [<!NOTATION png SYSTEM "image/png">]><r/>"#,
             r#"<!DOCTYPE r [<!NOTATION png PUBLIC "image/png">]><r/>"#,
             r#"<!DOCTYPE r [<!NOTATION png PUBLIC "image/png" "png.viewer">]><r/>"#,
-            r#"<!DOCTYPE r [<!ENTITY % p "parameter"><!ENTITY e "%p; &amp; &#37;">]><r>&e;</r>"#,
+            r#"<!DOCTYPE r [<!ENTITY e "parameter &amp; &#37;">]><r>&e;</r>"#,
         ] {
             Document::parse_iterative(valid, None)
                 .expect("well-formed markup declaration must be accepted");
@@ -5301,6 +5367,8 @@ mod parser_boundary_tests {
 
         for malformed in [
             r#"<!DOCTYPE r [<!ELEMENT r (a||b)>]><r/>"#,
+            // PE references within internal declarations violate XML 1.0 section 2.8.
+            r#"<!DOCTYPE r [<!ENTITY % p "parameter"><!ENTITY e "%p; &amp; &#37;">]><r>&e;</r>"#,
             r#"<!DOCTYPE r [<!ELEMENT r (a,b|c)>]><r/>"#,
             r#"<!DOCTYPE r [<!ELEMENT r (#PCDATA|item)>]><r/>"#,
             r#"<!DOCTYPE r [<!ELEMENT r EMPTY extra>]><r/>"#,
@@ -5591,6 +5659,27 @@ mod parser_boundary_tests {
         let parameter = Document::parse_iterative(&parameter_xml, None)
             .expect("a long parameter entity name remains valid XML");
         assert_eq!(parameter.string_value(parameter.root()), "expanded");
+    }
+
+    #[test]
+    fn frontend_preserves_declared_attribute_normalization() {
+        // XML 1.0 section 3.3.3: tokenized values collapse spaces, while character
+        // references in CDATA defaults retain their referenced whitespace.
+        for (xml, expected) in [
+            (
+                r#"<!DOCTYPE r [<!ATTLIST r a NMTOKENS #IMPLIED>]><r a="  one   two  "/>"#,
+                "one two",
+            ),
+            (
+                r#"<!DOCTYPE r [<!ATTLIST r a CDATA "&#9;&#10;&#13;">]><r/>"#,
+                "\t\n\r",
+            ),
+        ] {
+            let prepared = super::prepare_xml_frontend_bounded(xml, 100_000, 64)
+                .expect("DTD preprocessing succeeds");
+            let document = roxmltree::Document::parse(&prepared).expect("prepared XML parses");
+            assert_eq!(document.root_element().attribute("a"), Some(expected));
+        }
     }
 
     #[test]

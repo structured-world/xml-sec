@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::ops::Deref;
 
@@ -280,9 +280,7 @@ fn serialize_charged(
     meter: &mut Meter,
     budget_kind: BudgetKind,
 ) -> Result<SerializedOutput> {
-    let infer_html_method = !definition.method_explicit
-        && first_element(document)
-            .is_some_and(|node| matches!(&node.kind, NodeKind::Element { name, .. } if name.namespace.is_none() && name.local.eq_ignore_ascii_case("html")));
+    let infer_html_method = !definition.method_explicit && infer_html_output(document);
     let infer_indent = (infer_html_method || definition.method == OutputMethod::Html)
         && !definition.indent_explicit;
     let effective = EffectiveOutputDefinition {
@@ -304,6 +302,12 @@ fn serialize_with_definition(
     meter: &mut Meter,
     budget_kind: BudgetKind,
 ) -> Result<SerializedOutput> {
+    if definition.method == OutputMethod::Xml
+        && ((!definition.omit_xml_declaration && definition.standalone.is_some())
+            || definition.doctype_system.is_some())
+    {
+        validate_document_output_shape(document)?;
+    }
     let encoding = OutputEncoding::new(&definition.encoding)?;
     let (used, limit) = meter.usage(budget_kind)?;
     let mut counter =
@@ -794,17 +798,11 @@ struct RenderContext {
     parent: Option<NodeId>,
     parent_mixed: bool,
     html_whitespace_sensitive: bool,
-    in_scope_namespaces: Option<usize>,
 }
 
-enum NamespaceBinding {
-    Document { element: NodeId, index: usize },
-    EmptyDefault,
-}
-
-struct NamespaceScope {
-    binding: NamespaceBinding,
-    parent: Option<usize>,
+struct NamespaceRollback<'document> {
+    prefix: Option<&'document str>,
+    previous_uri: Option<&'document str>,
 }
 
 impl RenderContext {
@@ -814,54 +812,8 @@ impl RenderContext {
             parent: None,
             parent_mixed: false,
             html_whitespace_sensitive: false,
-            in_scope_namespaces: None,
         }
     }
-}
-
-fn namespace_in_scope<'a>(
-    document: &'a Document,
-    scopes: &[NamespaceScope],
-    scope: Option<usize>,
-    prefix: Option<&str>,
-) -> Option<&'a str> {
-    let mut current = scope;
-    while let Some(index) = current {
-        let frame = &scopes[index];
-        match frame.binding {
-            NamespaceBinding::EmptyDefault if prefix.is_none() => return Some(""),
-            NamespaceBinding::Document { element, index } => {
-                let namespace = document.node(element).and_then(|node| match &node.kind {
-                    NodeKind::Element { namespaces, .. } => namespaces.get(index),
-                    _ => None,
-                });
-                if let Some(namespace) = namespace
-                    && namespace.prefix.as_deref() == prefix
-                {
-                    return Some(namespace.uri.as_str());
-                }
-            }
-            NamespaceBinding::EmptyDefault => {}
-        }
-        current = frame.parent;
-    }
-    None
-}
-
-fn extend_namespace_scope(
-    scopes: &mut Vec<NamespaceScope>,
-    scope: Option<usize>,
-    binding: NamespaceBinding,
-    meter: &mut Meter,
-    reserved_owned_bytes: &mut usize,
-) -> Result<Option<usize>> {
-    crate::budget::reserve_temporary_vec_slot(scopes, meter, reserved_owned_bytes)?;
-    let index = scopes.len();
-    scopes.push(NamespaceScope {
-        binding,
-        parent: scope,
-    });
-    Ok(Some(index))
 }
 
 enum RenderTask {
@@ -886,22 +838,26 @@ enum RenderTask {
         html_whitespace_sensitive: bool,
         has_element_child: bool,
         html_void: bool,
-        namespace_scope_len: usize,
+        namespace_rollback_len: usize,
     },
 }
 
-struct RenderWorkspace {
+struct RenderWorkspace<'document> {
     tasks: Vec<RenderTask>,
-    namespace_scopes: Vec<NamespaceScope>,
+    active_namespaces: HashMap<Option<&'document str>, &'document str>,
+    namespace_rollbacks: Vec<NamespaceRollback<'document>>,
     reserved_owned_bytes: usize,
+    namespace_index_bytes: usize,
 }
 
-impl RenderWorkspace {
-    const fn new() -> Self {
+impl<'document> RenderWorkspace<'document> {
+    fn new() -> Self {
         Self {
             tasks: Vec::new(),
-            namespace_scopes: Vec::new(),
+            active_namespaces: HashMap::new(),
+            namespace_rollbacks: Vec::new(),
             reserved_owned_bytes: 0,
+            namespace_index_bytes: 0,
         }
     }
 
@@ -915,19 +871,44 @@ impl RenderWorkspace {
         Ok(())
     }
 
-    fn extend_namespace_scope(
+    fn bind_namespace(
         &mut self,
-        scope: Option<usize>,
-        binding: NamespaceBinding,
+        prefix: Option<&'document str>,
+        uri: &'document str,
         meter: &mut Meter,
-    ) -> Result<Option<usize>> {
-        extend_namespace_scope(
-            &mut self.namespace_scopes,
-            scope,
-            binding,
+    ) -> Result<()> {
+        crate::budget::reserve_temporary_vec_slot(
+            &mut self.namespace_rollbacks,
             meter,
             &mut self.reserved_owned_bytes,
-        )
+        )?;
+        if !self.active_namespaces.contains_key(&prefix) {
+            crate::budget::reserve_retained_hash_map_slot(
+                &mut self.active_namespaces,
+                meter,
+                &mut self.namespace_index_bytes,
+            )?;
+        }
+        let previous_uri = self.active_namespaces.insert(prefix, uri);
+        self.namespace_rollbacks.push(NamespaceRollback {
+            prefix,
+            previous_uri,
+        });
+        Ok(())
+    }
+
+    fn rollback_namespaces(&mut self, checkpoint: usize) {
+        while self.namespace_rollbacks.len() > checkpoint {
+            let rollback = self
+                .namespace_rollbacks
+                .pop()
+                .expect("namespace rollback checkpoint is valid");
+            if let Some(uri) = rollback.previous_uri {
+                self.active_namespaces.insert(rollback.prefix, uri);
+            } else {
+                self.active_namespaces.remove(&rollback.prefix);
+            }
+        }
     }
 }
 
@@ -950,17 +931,21 @@ fn serialize_node(
         meter,
         &mut workspace,
     );
-    meter.release_owned_bytes(workspace.reserved_owned_bytes);
+    meter.release_owned_bytes(
+        workspace
+            .reserved_owned_bytes
+            .saturating_add(workspace.namespace_index_bytes),
+    );
     result
 }
 
-fn serialize_node_tasks(
-    document: &Document,
+fn serialize_node_tasks<'document>(
+    document: &'document Document,
     definition: &EffectiveOutputDefinition<'_>,
     encoding: &OutputEncoding,
     output: &mut RenderBuffer,
     meter: &mut Meter,
-    workspace: &mut RenderWorkspace,
+    workspace: &mut RenderWorkspace<'document>,
 ) -> Result<()> {
     while let Some(task) = workspace.tasks.pop() {
         output.ensure_within_limit()?;
@@ -1062,7 +1047,7 @@ fn serialize_node_tasks(
             html_whitespace_sensitive,
             has_element_child,
             html_void,
-            namespace_scope_len,
+            namespace_rollback_len,
         } = task
         {
             if definition.indent
@@ -1086,7 +1071,7 @@ fn serialize_node_tasks(
                 push_name(prefix.as_deref(), &name.local, encoding, output)?;
                 output.push('>');
             }
-            workspace.namespace_scopes.truncate(namespace_scope_len);
+            workspace.rollback_namespaces(namespace_rollback_len);
             continue;
         }
         let RenderTask::Node(id, context) = task else {
@@ -1206,14 +1191,8 @@ fn serialize_node_tasks(
                 }
                 output.push('<');
                 push_name(prefix.as_deref(), &name.local, encoding, output)?;
-                let namespace_scope_len = workspace.namespace_scopes.len();
-                let mut current_namespaces = context.in_scope_namespaces;
-                let inherited_default_namespace = namespace_in_scope(
-                    document,
-                    &workspace.namespace_scopes,
-                    current_namespaces,
-                    None,
-                );
+                let namespace_rollback_len = workspace.namespace_rollbacks.len();
+                let inherited_default_namespace = workspace.active_namespaces.get(&None).copied();
                 let inherits_empty_default_namespace =
                     inherited_default_namespace.is_none_or(str::is_empty);
                 if name.namespace.is_none()
@@ -1223,11 +1202,7 @@ fn serialize_node_tasks(
                         .any(|namespace| namespace.prefix.is_none() && namespace.uri.is_empty())
                 {
                     output.push_str(" xmlns=\"\"");
-                    current_namespaces = workspace.extend_namespace_scope(
-                        current_namespaces,
-                        NamespaceBinding::EmptyDefault,
-                        meter,
-                    )?;
+                    workspace.bind_namespace(None, "", meter)?;
                 }
                 let element_namespace_index = prefix.as_ref().and_then(|_| {
                     namespaces.iter().position(|namespace| {
@@ -1247,7 +1222,7 @@ fn serialize_node_tasks(
                                     .then_some((index, namespace))
                             }),
                     );
-                for (namespace_index, namespace) in ordered_namespaces {
+                for (_namespace_index, namespace) in ordered_namespaces {
                     if namespace.prefix.as_deref() == Some("xml")
                         && namespace.uri == "http://www.w3.org/XML/1998/namespace"
                     {
@@ -1259,13 +1234,11 @@ fn serialize_node_tasks(
                     {
                         continue;
                     }
-                    if namespace_in_scope(
-                        document,
-                        &workspace.namespace_scopes,
-                        current_namespaces,
-                        namespace.prefix.as_deref(),
-                    )
-                    .is_some_and(|uri| uri == namespace.uri)
+                    if workspace
+                        .active_namespaces
+                        .get(&namespace.prefix.as_deref())
+                        .copied()
+                        .is_some_and(|uri| uri == namespace.uri)
                     {
                         continue;
                     }
@@ -1278,12 +1251,9 @@ fn serialize_node_tasks(
                     output.push_str("=\"");
                     escape_attribute(&namespace.uri, definition.xml_version, encoding, output);
                     output.push('"');
-                    current_namespaces = workspace.extend_namespace_scope(
-                        current_namespaces,
-                        NamespaceBinding::Document {
-                            element: id,
-                            index: namespace_index,
-                        },
+                    workspace.bind_namespace(
+                        namespace.prefix.as_deref(),
+                        namespace.uri.as_str(),
                         meter,
                     )?;
                 }
@@ -1314,9 +1284,12 @@ fn serialize_node_tasks(
                     };
                     if let Some(escaping) = html_uri_escaping {
                         escape_html_uri_attribute(&attribute.value, escaping, encoding, output);
-                    } else if definition.method == OutputMethod::Html {
+                    } else if definition.method == OutputMethod::Html && name.namespace.is_none() {
                         escape_html_attribute(&attribute.value, encoding, output);
                     } else {
+                        // XSLT 1.0 section 16.2 recommends XML output for namespaced elements;
+                        // XML escaping preserves their attribute values under the HTML method.
+                        // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
                         escape_attribute(
                             &attribute.value,
                             definition.xml_version,
@@ -1339,7 +1312,7 @@ fn serialize_node_tasks(
                             "/>"
                         },
                     );
-                    workspace.namespace_scopes.truncate(namespace_scope_len);
+                    workspace.rollback_namespaces(namespace_rollback_len);
                     continue;
                 }
                 output.push('>');
@@ -1403,7 +1376,6 @@ fn serialize_node_tasks(
                     parent: Some(id),
                     parent_mixed: context.parent_mixed || mixed,
                     html_whitespace_sensitive,
-                    in_scope_namespaces: current_namespaces,
                 };
                 let html_void = definition.method == OutputMethod::Html
                     && name.namespace.is_none()
@@ -1427,7 +1399,7 @@ fn serialize_node_tasks(
                             )
                         }),
                         html_void,
-                        namespace_scope_len,
+                        namespace_rollback_len,
                     },
                     meter,
                 )?;
@@ -1523,7 +1495,7 @@ impl<'a> CdataWriter<'a> {
                 // required to preserve the result-tree character across reparsing.
                 // https://www.w3.org/TR/xml/#sec-line-ends
                 Some(false)
-            } else if self.version == "1.1" && is_xml11_restricted(character) {
+            } else if self.version == "1.1" && xml11_requires_reference(character) {
                 Some(true)
             } else if !self.encoding.represents(character) {
                 Some(false)
@@ -1622,7 +1594,7 @@ fn push_xml_raw_text(
     output: &mut RenderBuffer,
 ) {
     for character in value.chars() {
-        if version == "1.1" && is_xml11_restricted(character) {
+        if version == "1.1" && xml11_requires_reference(character) {
             push_hex_reference(output, character);
         } else if !encoding.represents(character) {
             push_decimal_reference(output, character);
@@ -1755,7 +1727,7 @@ fn push_name(
 
 fn escape_text(value: &str, version: &str, encoding: &OutputEncoding, output: &mut RenderBuffer) {
     for character in value.chars() {
-        if version == "1.1" && is_xml11_restricted(character) {
+        if version == "1.1" && xml11_requires_reference(character) {
             push_hex_reference(output, character);
             continue;
         } else if !encoding.represents(character) {
@@ -1779,7 +1751,7 @@ fn escape_attribute(
     output: &mut RenderBuffer,
 ) {
     for character in value.chars() {
-        if version == "1.1" && is_xml11_restricted(character) {
+        if version == "1.1" && xml11_requires_reference(character) {
             push_hex_reference(output, character);
             continue;
         } else if !encoding.represents(character) {
@@ -1803,6 +1775,14 @@ fn is_xml11_restricted(character: char) -> bool {
         u32::from(character),
         0x1..=0x8 | 0xB..=0xC | 0xE..=0x1F | 0x7F..=0x84 | 0x86..=0x9F
     )
+}
+
+fn xml11_requires_reference(character: char) -> bool {
+    // XML 1.1 sections 2.2 and 2.11: restricted characters require references; literal NEL/LS
+    // undergo end-of-line normalization, including inside CDATA, and cannot preserve the value.
+    // https://www.w3.org/TR/xml11/#charsets
+    // https://www.w3.org/TR/xml11/#sec-line-ends
+    is_xml11_restricted(character) || matches!(character, '\u{85}' | '\u{2028}')
 }
 
 fn is_html_boolean_attribute(element: &str, attribute: &str) -> bool {
@@ -1947,13 +1927,50 @@ fn validate_text_encoding(value: &str, encoding: &OutputEncoding, label: &str) -
     Ok(())
 }
 
-fn first_element(document: &Document) -> Option<&crate::Node> {
-    document
-        .node(document.root())?
-        .children
-        .iter()
-        .filter_map(|id| document.node(*id))
-        .find(|node| matches!(node.kind, NodeKind::Element { .. }))
+fn infer_html_output(document: &Document) -> bool {
+    // XSLT 1.0 section 16 also requires no preceding non-whitespace text children.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#output
+    let Some(root) = document.node(document.root()) else {
+        return false;
+    };
+    for child in &root.children {
+        match document.node(*child).map(|node| &node.kind) {
+            Some(NodeKind::Text { value, .. })
+                if !value.chars().all(crate::lexical::is_xml_whitespace) =>
+            {
+                return false;
+            }
+            Some(NodeKind::Element { name, .. }) => {
+                return name.namespace.is_none() && name.local.eq_ignore_ascii_case("html");
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn validate_document_output_shape(document: &Document) -> Result<()> {
+    // XSLT 1.0 section 16.1, erratum E4 requires a document rather than a parsed entity when
+    // standalone or DOCTYPE is emitted. Ordinary XML fragment output remains permitted.
+    // https://www.w3.org/1999/11/REC-xslt-19991116-errata/#E4
+    let root = document
+        .node(document.root())
+        .ok_or_else(|| Error::Serialization("missing result root".into()))?;
+    let mut has_element = false;
+    for child in &root.children {
+        match document.node(*child).map(|node| &node.kind) {
+            Some(NodeKind::Element { .. }) if !has_element => has_element = true,
+            Some(NodeKind::Comment(_) | NodeKind::ProcessingInstruction { .. }) => {},
+            Some(NodeKind::Text { value, .. }) if value.chars().all(crate::lexical::is_xml_whitespace) => {},
+            _ => return Err(Error::Serialization("standalone/DOCTYPE output requires one document element and no top-level character data".into())),
+        }
+    }
+    if !has_element {
+        return Err(Error::Serialization(
+            "standalone/DOCTYPE output requires a document element".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_xml_characters(value: &str, version: &str) -> Result<()> {
@@ -1981,6 +1998,145 @@ mod tests {
     };
     use crate::budget::Meter;
     use crate::{BudgetKind, Document, ExecutionBudget, ExpandedName, NodeKind};
+
+    fn serialize_audit_document(
+        document: &Document,
+        definition: &OutputDefinition,
+    ) -> crate::Result<Vec<u8>> {
+        let limits = ExecutionBudget {
+            source_bytes: 0,
+            external_documents: 0,
+            recursion_depth: 128,
+            xpath_evaluations: 0,
+            xpath_operations: 100_000,
+            extension_operations: 0,
+            pattern_evaluations: 0,
+            template_applications: 0,
+            sort_comparisons: 0,
+            key_entries: 0,
+            result_nodes: 0,
+            serialized_bytes: 100_000,
+            messages: 0,
+            owned_bytes: 100_000,
+        };
+        let mut meter = Meter::new(limits, 0)?;
+        serialize(document, definition, &mut meter).map(|output| output.bytes)
+    }
+
+    #[test]
+    fn html_inference_requires_no_preceding_nonwhitespace_text() {
+        // XSLT 1.0 section 16: an html element alone does not determine the default method.
+        let mut document = Document::parse("<html><br/></html>", None).expect("XML");
+        let root = document.root();
+        let text = document.push(
+            root,
+            NodeKind::Text {
+                value: "X".into(),
+                disable_output_escaping: false,
+            },
+            None,
+        );
+        document
+            .node_mut(root)
+            .expect("root")
+            .children
+            .rotate_right(1);
+        let definition = OutputDefinition {
+            omit_xml_declaration: true,
+            indent_explicit: true,
+            ..OutputDefinition::default()
+        };
+        assert_eq!(
+            serialize_audit_document(&document, &definition).expect("serializes"),
+            b"X<html><br/></html>"
+        );
+        if let NodeKind::Text { value, .. } = &mut document.node_mut(text).expect("text").kind {
+            *value = " ".into();
+        }
+        assert_eq!(
+            serialize_audit_document(&document, &definition).expect("serializes"),
+            b" <html><br></html>"
+        );
+    }
+
+    #[test]
+    fn html_namespaced_attributes_preserve_xml_values() {
+        // Namespaced elements retain XML escaping even under the HTML output method.
+        let document = Document::parse("<e xmlns='urn:e' a='&lt;&#10;'/>", None).expect("XML");
+        let definition = OutputDefinition {
+            method: OutputMethod::Html,
+            method_explicit: true,
+            ..OutputDefinition::default()
+        };
+        let output = serialize_audit_document(&document, &definition).expect("serializes");
+        assert!(
+            String::from_utf8(output)
+                .expect("UTF-8")
+                .contains("a=\"&lt;&#10;\"")
+        );
+    }
+
+    #[test]
+    fn standalone_and_doctype_output_require_a_document() {
+        // XSLT erratum E4 strengthens the shape contract only when these declarations are emitted.
+        let mut document = Document::parse("<a/>", None).expect("XML");
+        let first = document.node(document.root()).expect("root").children[0];
+        let extra = document.node(first).expect("element").kind.clone();
+        document.push(document.root(), extra, None);
+        for definition in [
+            OutputDefinition {
+                standalone: Some(true),
+                ..OutputDefinition::default()
+            },
+            OutputDefinition {
+                standalone: Some(false),
+                ..OutputDefinition::default()
+            },
+            OutputDefinition {
+                doctype_system: Some("urn:example:dtd".into()),
+                ..OutputDefinition::default()
+            },
+        ] {
+            assert!(matches!(
+                serialize_audit_document(&document, &definition),
+                Err(crate::Error::Serialization(_))
+            ));
+        }
+        assert!(serialize_audit_document(&document, &OutputDefinition::default()).is_ok());
+        let suppressed = OutputDefinition {
+            standalone: Some(true),
+            omit_xml_declaration: true,
+            ..OutputDefinition::default()
+        };
+        assert!(serialize_audit_document(&document, &suppressed).is_ok());
+    }
+
+    #[test]
+    fn xml11_line_end_characters_are_referenced_in_all_text_modes() {
+        // Literal NEL/LS normalize on XML 1.1 input; escaping must preserve the result value.
+        let document =
+            Document::parse("<e a='&#x85;&#x2028;'>&#x85;&#x2028;</e>", None).expect("XML");
+        let mut definition = OutputDefinition {
+            version: Some("1.1".into()),
+            ..OutputDefinition::default()
+        };
+        for cdata in [false, true] {
+            if cdata {
+                definition
+                    .cdata_section_elements
+                    .insert(ExpandedName::new(None::<String>, "e"));
+            }
+            let output = String::from_utf8(
+                serialize_audit_document(&document, &definition).expect("serializes"),
+            )
+            .expect("UTF-8");
+            assert!(!output.contains(['\u{85}', '\u{2028}']), "{output}");
+            assert!(
+                output.contains("&#x85;") && output.contains("&#x2028;"),
+                "{output}"
+            );
+        }
+    }
 
     #[test]
     fn inferred_html_output_does_not_clone_caller_owned_output_metadata() {

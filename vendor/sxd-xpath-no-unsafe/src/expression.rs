@@ -188,11 +188,22 @@ enum Equality {
 }
 
 impl Equality {
-    fn strings(self, left: &str, right: &str) -> bool {
-        match self {
+    fn strings(
+        self,
+        context: &context::Evaluation<'_, '_>,
+        left: &str,
+        right: &str,
+    ) -> Result<bool, Error> {
+        if left.len() != right.len() {
+            return Ok(self.result(false));
+        }
+        context
+            .charge_work(left.len())
+            .context(FunctionEvaluation)?;
+        Ok(match self {
             Self::Equal => left == right,
             Self::NotEqual => left != right,
-        }
+        })
     }
 
     fn numbers(self, left: f64, right: f64) -> bool {
@@ -306,15 +317,15 @@ fn compare_equality_values<'c, 'd>(
             left.number(context).context(FunctionEvaluation)?,
             right.number(context).context(FunctionEvaluation)?,
         ),
-        (Value::String(left), Value::String(right)) => comparison.strings(left, right),
+        (Value::String(left), Value::String(right)) => comparison.strings(context, left, right)?,
         (Value::String(left), Value::ResultTreeFragment(_, right)) => {
-            comparison.strings(left, right)
+            comparison.strings(context, left, right)?
         }
         (Value::ResultTreeFragment(_, left), Value::String(right)) => {
-            comparison.strings(left, right)
+            comparison.strings(context, left, right)?
         }
         (Value::ResultTreeFragment(_, left), Value::ResultTreeFragment(_, right)) => {
-            comparison.strings(left, right)
+            comparison.strings(context, left, right)?
         }
     };
     Ok(result)
@@ -333,11 +344,22 @@ impl Expression for Function {
             .function_for_name(name)
             .context(UnknownFunction { name: &self.name })
             .and_then(|fun| {
-                let args = self
+                let bytes = self
                     .arguments
-                    .iter()
-                    .map(|arg| arg.evaluate(context))
-                    .collect::<Result<_, _>>()?;
+                    .len()
+                    .checked_mul(std::mem::size_of::<Value<'_>>())
+                    .filter(|bytes| *bytes <= isize::MAX as usize)
+                    .ok_or_else(|| crate::function::Error::Other {
+                        what: "XPath argument storage exceeds addressable memory".into(),
+                    })
+                    .context(FunctionEvaluation)?;
+                context
+                    .reserve_temporary_allocation(bytes)
+                    .context(FunctionEvaluation)?;
+                let mut args = Vec::with_capacity(self.arguments.len());
+                for argument in &self.arguments {
+                    args.push(argument.evaluate(context)?);
+                }
                 fun.evaluate(context, args).context(FunctionEvaluation)
             })
     }
@@ -751,14 +773,20 @@ impl Expression for RootNode {
         // XPath 1.0 section 2.1 roots an absolute location path in the document containing
         // the current context node, which an embedding may project into a larger package.
         // https://www.w3.org/TR/1999/REC-xpath-19991116/#location-paths
-        Ok(Value::Nodeset(nodeset![
-            context.document_root_for(context.node.clone())
-        ]))
+        let node = context
+            .node
+            .clone_with_context(context)
+            .context(FunctionEvaluation)?;
+        let mut nodes = Nodeset::new();
+        nodes
+            .add_metered(context, context.document_root_for(node))
+            .context(FunctionEvaluation)?;
+        Ok(Value::Nodeset(nodes))
     }
 }
 
 #[derive(Debug)]
-struct Predicate {
+pub(crate) struct Predicate {
     pub expression: SubExpression,
 }
 
@@ -806,19 +834,17 @@ impl<A> ParameterizedStep<A>
 where
     A: AxisLike,
 {
-    pub fn new(
+    // The bounded parser builds the final predicate representation directly, avoiding an
+    // overlapping conversion allocation whose capacity would otherwise need a second charge.
+    pub(crate) fn from_predicates(
         axis: A,
         node_test: StepTest,
-        predicates: Vec<SubExpression>,
-    ) -> ParameterizedStep<A> {
-        let preds = predicates
-            .into_iter()
-            .map(|p| Predicate { expression: p })
-            .collect();
+        predicates: Vec<Predicate>,
+    ) -> Self {
         ParameterizedStep {
             axis,
             node_test,
-            predicates: preds,
+            predicates,
         }
     }
 
@@ -943,6 +969,63 @@ mod test {
     use crate::nodeset::OrderedNodes;
 
     use super::*;
+
+    #[test]
+    fn evaluator_containers_reserve_before_materialization() {
+        // Both a root singleton and an argument vector allocate before any result
+        // escapes; even an eventual arity error must not bypass the allocation gate.
+        for source in ["/", "count(0,0,0,0,0,0,0,0)"] {
+            let package = Package::new();
+            let mut context = Context::new();
+            context.set_string_allocation_limit(0);
+            let expression = crate::Factory::new().build(source).expect("valid syntax");
+            let error = expression
+                .evaluate(&context, package.as_document().root())
+                .expect_err("container requires storage");
+            assert!(
+                error.to_string().contains("allocation budget"),
+                "{source}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn fragment_equality_reserves_lexical_work() {
+        // Arc-backed values clone without scanning; comparison must charge its own bytes.
+        let package = Package::new();
+        let mut context = Context::new();
+        context.set_variable(
+            "left",
+            Value::ResultTreeFragment(1, std::sync::Arc::new("x".repeat(4096))),
+        );
+        context.set_variable(
+            "right",
+            Value::ResultTreeFragment(2, std::sync::Arc::new("x".repeat(4096))),
+        );
+        context.set_evaluation_work_limit(0);
+        let expression = crate::Factory::new()
+            .build("$left = $right")
+            .expect("valid equality");
+        let error = expression
+            .evaluate(&context, package.as_document().root())
+            .expect_err("comparison needs work");
+        assert!(error.to_string().contains("budget"));
+
+        // Unequal lengths decide equality without traversing either string.
+        let mut context = Context::new();
+        context.set_evaluation_work_limit(0);
+        let evaluation = context::Evaluation::new(&context, package.as_document().root().into());
+        assert!(
+            !Equality::Equal
+                .strings(&evaluation, "x", "longer")
+                .expect("length gate")
+        );
+        assert!(
+            Equality::NotEqual
+                .strings(&evaluation, "x", "longer")
+                .expect("length gate")
+        );
+    }
 
     #[test]
     fn union_reserves_growth_before_combining_variables() {
@@ -1609,7 +1692,7 @@ mod test {
         let axis = MockAxis::new();
         let node_test = DummyNodeTest;
 
-        let expr = ParameterizedStep::new(axis.clone(), Box::new(node_test), vec![]);
+        let expr = ParameterizedStep::from_predicates(axis.clone(), Box::new(node_test), vec![]);
 
         let context = setup.context();
         expr.evaluate(&context, nodeset![context.node.clone()])
