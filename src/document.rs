@@ -410,6 +410,8 @@ struct ParsedDocument<'input> {
     node_count: usize,
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     max_depth: usize,
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    peak_namespace_bindings: usize,
 }
 
 self_cell!(
@@ -685,10 +687,10 @@ impl XmlDocument {
                 actual: xml.len(),
             });
         }
-        preflight_document_limits(&xml, settings, budget)?;
+        let peak_namespace_bindings = preflight_document_limits(&xml, settings, budget)?;
         #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
         let requires_internal_dtd = document_requires_internal_dtd(&xml, settings, budget)?;
-        let cell = build_cell_after_preflight(xml, settings, budget)?;
+        let cell = build_cell_after_preflight(xml, settings, budget, peak_namespace_bindings)?;
         let identity = allocate_document_identity(&NEXT_DOCUMENT_ID)?;
         Ok(Self {
             identity,
@@ -744,6 +746,16 @@ impl XmlDocument {
         self.validate_xml_input_policy(xml.allow_internal_dtd)?;
         resources.validate_xml_document_len(self.as_xml().len())?;
         self.with_view(|view| {
+            // Retain lexical preflight metrics per generation, including entity expansion and
+            // DTD defaults. A later stricter operation policy must not trust parse-time limits.
+            let actual = view.parsed.peak_namespace_bindings;
+            if actual > resources.max_xml_namespace_bindings {
+                return Err(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_NAMESPACE_BINDINGS,
+                    maximum: resources.max_xml_namespace_bindings,
+                    actual,
+                });
+            }
             let node_count = view.node_count();
             if node_count > resources.effective_xml_nodes() as usize {
                 return Err(crate::policy::PolicyViolation::ResourceLimit {
@@ -2022,23 +2034,27 @@ fn build_cell(
     settings: DocumentParseSettings,
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<DocumentCell, XmlDocumentError> {
-    preflight_document_limits(&xml, settings, budget)?;
-    build_cell_after_preflight(xml, settings, budget)
+    let peak_namespace_bindings = preflight_document_limits(&xml, settings, budget)?;
+    build_cell_after_preflight(xml, settings, budget, peak_namespace_bindings)
 }
 
 fn build_cell_after_preflight(
     xml: String,
     settings: DocumentParseSettings,
     budget: Option<&XmlParseWorkBudget>,
+    peak_namespace_bindings: usize,
 ) -> Result<DocumentCell, XmlDocumentError> {
     charge_semantic_parser_work(budget, xml.len())?;
-    build_semantic_cell(xml, settings)
+    build_semantic_cell(xml, settings, peak_namespace_bindings)
 }
 
 fn build_semantic_cell(
     xml: String,
     settings: DocumentParseSettings,
+    peak_namespace_bindings: usize,
 ) -> Result<DocumentCell, XmlDocumentError> {
+    #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
+    let _ = peak_namespace_bindings;
     DocumentCell::try_new(xml, |source| {
         let (document, metrics) = parse_semantic_document(source, settings)?;
         let indexes = DocumentIndexes::build(&document);
@@ -2048,6 +2064,8 @@ fn build_semantic_cell(
             node_count: metrics.node_count,
             #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
             max_depth: metrics.max_depth,
+            #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+            peak_namespace_bindings,
         })
     })
 }
@@ -2067,7 +2085,7 @@ fn preflight_document_limits(
     xml: &str,
     settings: DocumentParseSettings,
     budget: Option<&XmlParseWorkBudget>,
-) -> Result<(), XmlDocumentError> {
+) -> Result<usize, XmlDocumentError> {
     // This bounded lexical pass is the first parser stage for every entry
     // point, before either backend is allowed to construct a DOM.
     if xml.len() > settings.max_bytes {
@@ -2088,7 +2106,8 @@ fn preflight_document_limits(
         &mut state,
         budget,
         true,
-    )
+    )?;
+    Ok(state.peak_namespace_bindings)
 }
 
 #[derive(Default)]
@@ -2099,6 +2118,7 @@ struct DocumentPreflightState {
     entity_expansions: u32,
     entity_expansion_work: usize,
     active_namespace_bindings: HashSet<String>,
+    peak_namespace_bindings: usize,
     namespace_scopes: Vec<Vec<(String, bool)>>,
 }
 
@@ -2655,6 +2675,7 @@ fn apply_preflight_namespace_declarations(
         changes.push((declaration.prefix, was_active));
     }
     let actual = state.active_namespace_bindings.len();
+    state.peak_namespace_bindings = state.peak_namespace_bindings.max(actual);
     if actual > maximum {
         return Err(XmlDocumentError::Parse(
             ParseError::NamespaceBindingLimitReached { maximum, actual },
@@ -2852,7 +2873,7 @@ pub(crate) fn preflight_dom_limits(
         max_bytes: crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
     };
     match preflight_document_limits(xml, settings, None) {
-        Ok(()) => Ok(effective),
+        Ok(_) => Ok(effective),
         Err(XmlDocumentError::Parse(error)) => Err(error),
         Err(XmlDocumentError::DocumentTooDeep { maximum, actual }) => {
             Err(ParseError::DepthLimitReached { maximum, actual })
@@ -3411,6 +3432,68 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    fn review_owned_document_enforces_namespace_policy() {
+        // A retained parse cannot grant authority beyond the current operation policy.
+        let document = XmlDocument::parse(r#"<root xmlns:a="urn:a" xmlns:b="urn:b"/>"#)
+            .expect("permissive parse accepts both namespace bindings");
+        let resources = crate::policy::ResourcePolicy {
+            max_xml_namespace_bindings: 1,
+            ..Default::default()
+        };
+        assert!(matches!(
+            document
+                .validate_operation_policy(&crate::policy::XmlInputPolicy::default(), &resources),
+            Err(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_NAMESPACE_BINDINGS,
+                actual: 2,
+                maximum: 1
+            })
+        ));
+    }
+
+    #[test]
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    fn namespace_policy_tracks_peak_scope_and_mutations() {
+        // Disjoint sibling scopes are not cumulative; replacing a node must refresh the
+        // retained peak, so a previously accepted document cannot bypass stricter policy.
+        let mut document = XmlDocument::parse(
+            r#"<root><a xmlns:p="urn:p" ID="target"/><b xmlns:q="urn:q"/></root>"#,
+        )
+        .expect("disjoint namespace scopes parse");
+        let resources = crate::policy::ResourcePolicy {
+            max_xml_namespace_bindings: 1,
+            ..Default::default()
+        };
+        let policy = crate::policy::XmlInputPolicy::default();
+        document
+            .validate_operation_policy(&policy, &resources)
+            .expect("sibling scopes fit a one-binding limit");
+        let target =
+            document.with_view(|view| view.node_for_id("target", &[]).expect("target is indexed"));
+        document
+            .replace_element(
+                target,
+                r#"<a xmlns:p="urn:p" xmlns:q="urn:q" ID="target"/>"#,
+            )
+            .expect("replacement fits the original parse settings");
+        assert!(matches!(
+            document.validate_operation_policy(&policy, &resources),
+            Err(crate::policy::PolicyViolation::ResourceLimit { actual: 2, .. })
+        ));
+        let target = document.with_view(|view| {
+            view.node_for_id("target", &[])
+                .expect("replacement target is indexed")
+        });
+        document
+            .replace_element(target, "<a/>")
+            .expect("bindings can be removed");
+        document
+            .validate_operation_policy(&policy, &resources)
+            .expect("removed namespace bindings do not remain in the peak metric");
+    }
+
+    #[test]
     fn byte_input_decoding_is_identical_for_every_semantic_backend() {
         // Encoding is resolved before backend selection, so parser choice cannot
         // change which external XML byte sequences are accepted or interpreted.
@@ -3450,7 +3533,7 @@ mod tests {
         let settings = DocumentParseSettings::default();
         let xml =
             r#"<root xmlns:p="urn:test"><p:item ID="target"><![CDATA[value]]></p:item></root>"#;
-        let retained = build_semantic_cell(xml.to_owned(), settings)
+        let retained = build_semantic_cell(xml.to_owned(), settings, 1)
             .expect("selected backend semantic projection must parse");
         retained.with_dependent(|_, parsed| {
             assert!(parsed.indexes.default_ids.contains_key("target"));
@@ -4009,11 +4092,11 @@ mod tests {
     fn selected_backend_enforces_exact_depth_boundary() {
         let settings = DocumentParseSettings::new_with_depth(false, 128, 2, 4_096);
         let accepted = nested_document(2);
-        build_semantic_cell(accepted, settings).expect("exact depth must parse");
+        build_semantic_cell(accepted, settings, 0).expect("exact depth must parse");
 
         let rejected = nested_document(3);
         assert!(matches!(
-            build_semantic_cell(rejected, settings),
+            build_semantic_cell(rejected, settings, 0),
             Err(XmlDocumentError::DocumentTooDeep {
                 maximum: 2,
                 actual: 3,

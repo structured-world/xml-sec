@@ -79,12 +79,11 @@ enum Operation {
 
 struct DateFunction(Operation, Arc<dyn Clock>, ExtensionPolicy);
 
-fn xpath_string(
+fn xpath_string<'a>(
     context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
-    value: &Value<'_>,
-) -> std::result::Result<String, function::Error> {
-    context.reserve_temporary_allocation(value.string_len())?;
-    Ok(value.string())
+    value: &'a Value<'_>,
+) -> std::result::Result<std::borrow::Cow<'a, str>, function::Error> {
+    crate::xpath::extension_string(context, value)
 }
 
 impl function::Function for DateFunction {
@@ -116,10 +115,10 @@ impl function::Function for DateFunction {
                 let input = if let Some(value) = args.first() {
                     let input = xpath_string(context, value)?;
                     current = input;
-                    current.as_str()
+                    current.as_ref()
                 } else {
-                    current = current_datetime_for_operation(self.1.as_ref(), self.2)?;
-                    current.as_str()
+                    current = current_datetime_for_operation(self.1.as_ref(), self.2)?.into();
+                    current.as_ref()
                 };
                 let Some(mut date) = DateValue::parse(input) else {
                     return Ok(Value::String(String::new()));
@@ -139,8 +138,9 @@ impl function::Function for DateFunction {
                 }
                 let mut total = DurationValue::default();
                 for node in nodes.document_order_with_context(context)? {
-                    context.reserve_temporary_allocation(node.string_value_len())?;
-                    let Some(value) = DurationValue::parse(&node.string_value()) else {
+                    let text = node.string_value_with_extension_context(context)?;
+                    context.charge_extension_work(text.len().max(1))?;
+                    let Some(value) = DurationValue::parse(&text) else {
                         return Ok(Value::String(String::new()));
                     };
                     let Some(sum) = total.checked_add(value) else {

@@ -30,8 +30,14 @@ Stylesheet modules and runtime `document()` resources use the same explicit
 resolver contract with purpose, base URI, stable resource identity, and byte
 budgeting. `ResolveRequest` also carries XInclude `accept` and `accept-language`
 preferences without allocating or interpreting transport policy inside the engine.
+Both preferences must contain only printable ASCII (XInclude 1.0 section 3.1);
+invalid values are fatal before resolution and cannot select fallback content.
 The XMLDSig transform adapter remains outside this crate so no XML-security types
 enter the reusable engine.
+
+Execution budgets cover internal work, not just output: node-set string traversal,
+EXSLT date parsing and URI conversion, and both small and large XPath projections
+are metered. Existing string arguments are borrowed rather than copied for conversion.
 
 Resolver resources are byte-oriented. XML declarations, BOMs, UTF-16/UTF-32 initial
 patterns, and explicit resolver encoding metadata are honored without lossy

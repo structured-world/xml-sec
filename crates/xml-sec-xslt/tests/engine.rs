@@ -1272,6 +1272,73 @@ struct XIncludeNegotiationResolver {
     requests: Mutex<Vec<XIncludeNegotiationRequest>>,
 }
 
+#[test]
+fn review_negotiation_is_validated_before_resolution() {
+    // XInclude 1.0 section 3.1 requires printable ASCII for both negotiation attributes,
+    // with a fatal error even when fallback could otherwise recover resource acquisition.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#,
+    );
+    for name in ["accept", "accept-language"] {
+        for value in ["text/é", "&#x7f;", "&#xA;"] {
+            let resolver = Arc::new(XIncludeNegotiationResolver::default());
+            let source = Document::parse(&format!(r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="value.txt" parse="text" {name}="{value}"><xi:fallback/></xi:include></root>"#), None).unwrap();
+            let result = stylesheet.execute_with_source_processing(
+                &source,
+                &Parameters::new(),
+                resolver.clone(),
+                ExecutionOptions {
+                    budget: execution_budget(4096),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+                SourceProcessing::XInclude,
+            );
+            assert!(matches!(result, Err(Error::Xml(_))));
+            assert!(resolver.requests.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn review_date_and_uri_functions_obey_extension_work() {
+    // Denying extension work must gate scalar parsing, node traversal and URI transcoding alike.
+    for expression in [
+        "date:sum(/root)",
+        "date:year(/root)",
+        "date:year('2001-01-01')",
+        "str:encode-uri('abc', true())",
+        "str:decode-uri('%41')",
+    ] {
+        let stylesheet = compile(&format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:date="http://exslt.org/dates-and-times" xmlns:str="http://exslt.org/strings"><xsl:template match="/"><xsl:value-of select="{expression}"/></xsl:template></xsl:stylesheet>"#
+        ));
+        let source = Document::parse("<root><a>P1D</a></root>", None).unwrap();
+        let mut budget = execution_budget(4096);
+        budget.extension_operations = 0;
+        let result = stylesheet.execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        );
+        assert!(
+            matches!(
+                result,
+                Err(Error::Budget {
+                    kind: BudgetKind::ExtensionOperations,
+                    ..
+                })
+            ),
+            "{expression}: {result:?}"
+        );
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct XIncludeNegotiationRequest {
     uri: String,
@@ -9984,46 +10051,48 @@ fn generic_large_nodeset_projection_preserves_deep_document_order() {
 
 #[test]
 fn generic_large_nodeset_projection_charges_unselected_tree_walks() {
-    // A caller-provided set can select only 65 nodes while forcing the generic reverse projection
-    // to inspect a much larger unrelated tree. The aggregate XPath work budget must cover that
-    // walk rather than only the selected result size.
+    // Small and large caller-provided sets can force reverse projection to inspect many
+    // unselected siblings. Both sides of the 64-node cutoff must meter those walks rather
+    // than only the selected result size.
     let source_xml = format!("<root>{}</root>", "<item/>".repeat(2_048));
     let source = Document::parse(&source_xml, None).expect("wide source parses");
-    let selected = source
-        .nodes()
-        .filter_map(|(id, node)| {
-            matches!(node.kind, NodeKind::Element { .. }).then_some(NodeReference::Node(id))
-        })
-        .skip(1)
-        .take(65)
-        .collect();
-    let mut parameters = Parameters::new();
-    parameters.insert(
-        ExpandedName::new(None::<String>, "selected"),
-        Value::NodeSet(selected),
-    );
-    let stylesheet = compile(
-        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:param name="selected"/><xsl:template match="/"><out><xsl:copy-of select="$selected"/></out></xsl:template></xsl:stylesheet>"#,
-    );
-    let mut budget = execution_budget(source_xml.len());
-    budget.xpath_operations = 512;
+    for selected_count in [1, 64, 65] {
+        let selected = source
+            .nodes()
+            .filter_map(|(id, node)| {
+                matches!(node.kind, NodeKind::Element { .. }).then_some(NodeReference::Node(id))
+            })
+            .skip(2_049 - selected_count)
+            .take(selected_count)
+            .collect();
+        let mut parameters = Parameters::new();
+        parameters.insert(
+            ExpandedName::new(None::<String>, "selected"),
+            Value::NodeSet(selected),
+        );
+        let stylesheet = compile(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:param name="selected"/><xsl:template match="/"><out><xsl:copy-of select="$selected"/></out></xsl:template></xsl:stylesheet>"#,
+        );
+        let mut budget = execution_budget(source_xml.len());
+        budget.xpath_operations = 512;
 
-    assert!(matches!(
-        stylesheet.execute(
-            &source,
-            &parameters,
-            Arc::new(NoResolver),
-            ExecutionOptions {
-                budget,
-                initial_mode: None,
-                initial_template: None,
-            },
-        ),
-        Err(Error::Budget {
-            kind: BudgetKind::XPathOperations,
-            ..
-        })
-    ));
+        assert!(matches!(
+            stylesheet.execute(
+                &source,
+                &parameters,
+                Arc::new(NoResolver),
+                ExecutionOptions {
+                    budget,
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            ),
+            Err(Error::Budget {
+                kind: BudgetKind::XPathOperations,
+                ..
+            })
+        ));
+    }
 }
 
 #[test]

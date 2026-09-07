@@ -1434,7 +1434,12 @@ impl Evaluator {
                         match value {
                             XPathValue::NodeSet(nodes) => Value::NodeSet(nodes),
                             value => {
-                                let fragment = text_document(&value.string(self), meter)?;
+                                let (text, text_bytes) =
+                                    value.into_temporary_string(self, meter)?;
+                                let fragment = text_document(&text, meter);
+                                drop(text);
+                                meter.release_owned_bytes(text_bytes);
+                                let fragment = fragment?;
                                 let root = self.import_document(&fragment, meter)?;
                                 let nodes = self.children(&root, meter)?;
                                 Value::NodeSet(nodes)
@@ -1680,7 +1685,7 @@ impl Evaluator {
                             "saxon:expression() requires one argument".into(),
                         ));
                     }
-                    let stored = self
+                    let (stored, stored_bytes) = self
                         .evaluate_core(
                             &expression.derived(call.arguments[0].clone()),
                             node,
@@ -1690,7 +1695,8 @@ impl Evaluator {
                             meter,
                             custom_calls,
                         )?
-                        .string(self);
+                        .into_fully_metered_temporary_string(self, meter)?;
+                    *reserved_owned_bytes = reserved_owned_bytes.saturating_add(stored_bytes);
                     validate_dynamic_expression(&stored, &expression.namespaces)?;
                     Value::StoredExpression(stored)
                 }
@@ -1758,7 +1764,7 @@ impl Evaluator {
                     else {
                         return Err(Error::Dynamic("dyn:map() requires a node-set".into()));
                     };
-                    let dynamic_source = self
+                    let (dynamic_source, dynamic_source_bytes) = self
                         .evaluate_core(
                             &expression.derived(call.arguments[1].clone()),
                             node,
@@ -1768,14 +1774,17 @@ impl Evaluator {
                             meter,
                             custom_calls,
                         )?
-                        .string(self);
+                        .into_fully_metered_temporary_string(self, meter)?;
+                    *reserved_owned_bytes =
+                        reserved_owned_bytes.saturating_add(dynamic_source_bytes);
+                    let dynamic_expression = expression.derived(dynamic_source);
                     let nodes = self.document_order(nodes);
                     let mut result_nodes = Vec::new();
                     let mut scalars = Vec::new();
                     let total = nodes.len();
                     for (index, mapped_node) in nodes.iter().enumerate() {
                         let value = match self.evaluate_dynamic(
-                            &expression.derived(dynamic_source.clone()),
+                            &dynamic_expression,
                             mapped_node,
                             index + 1,
                             total,
@@ -1896,10 +1905,10 @@ impl Evaluator {
                 XPathValue::NodeSet(nodes) => {
                     for node in self.document_order(nodes) {
                         reserve_temporary_vec_slot(&mut values, meter, &mut reserved_owned_bytes)?;
-                        let length = self.string_value_len(&node);
-                        meter.charge(BudgetKind::OwnedBytes, length)?;
-                        reserved_owned_bytes = reserved_owned_bytes.saturating_add(length);
-                        values.push(self.string_value_with_capacity(&node, length));
+                        let (value, value_bytes) =
+                            self.materialize_temporary_string_value(&node, meter)?;
+                        reserved_owned_bytes = reserved_owned_bytes.saturating_add(value_bytes);
+                        values.push(value);
                     }
                 }
                 value => {
@@ -2913,10 +2922,6 @@ impl Evaluator {
         Ok(Some(selected))
     }
 
-    pub(crate) fn string_value(&self, node: &SourceNode) -> String {
-        self.string_value_with_capacity(node, 0)
-    }
-
     pub(crate) fn materialize_temporary_string_value(
         &self,
         node: &SourceNode,
@@ -2935,43 +2940,6 @@ impl Evaluator {
             return Err(error);
         }
         Ok((output, length))
-    }
-
-    fn string_value_with_capacity(&self, node: &SourceNode, capacity: usize) -> String {
-        let mut output = String::with_capacity(capacity);
-        match node {
-            SourceNode::Node(id) => return self.source.string_value_with_capacity(*id, capacity),
-            SourceNode::Attribute { owner, index } => self
-                .source
-                .node(*owner)
-                .and_then(|node| match &node.kind {
-                    NodeKind::Element { attributes, .. } => attributes
-                        .get(*index)
-                        .map(|attribute| attribute.value.as_str()),
-                    _ => None,
-                })
-                .map(|value| output.push_str(value)),
-            SourceNode::Namespace { owner, index } => self
-                .source
-                .node(*owner)
-                .and_then(|node| match &node.kind {
-                    NodeKind::Element { namespaces, .. } => namespaces
-                        .get(*index)
-                        .map(|namespace| namespace.uri.as_str()),
-                    _ => None,
-                })
-                .map(|value| output.push_str(value)),
-        };
-        output
-    }
-
-    pub(crate) fn string_value_len(&self, node: &SourceNode) -> usize {
-        let mut length = 0usize;
-        self.visit_string_value(node, |value| {
-            debug_assert!(length.checked_add(value.len()).is_some());
-            length += value.len();
-        });
-        length
     }
 
     pub(crate) fn visit_string_value(&self, node: &SourceNode, mut visit: impl FnMut(&str)) {
@@ -3630,20 +3598,6 @@ impl XPathValue {
             Self::Number(value) => *value != 0.0 && !value.is_nan(),
             Self::String(value) => !value.is_empty(),
             Self::StoredExpression(value) => !value.is_empty(),
-        }
-    }
-    pub(crate) fn string(&self, evaluator: &Evaluator) -> String {
-        match self {
-            Self::NodeSet(nodes) => nodes
-                .first()
-                .map(|node| evaluator.string_value(node))
-                .unwrap_or_default(),
-            Self::ResultTreeFragment(document) => document.string_value(document.root()),
-            Self::Boolean(true) => "true".into(),
-            Self::Boolean(false) => "false".into(),
-            Self::Number(value) => crate::value::format_xpath_number(*value),
-            Self::String(value) => value.clone(),
-            Self::StoredExpression(value) => value.clone(),
         }
     }
     pub(crate) fn into_temporary_string(
@@ -4564,6 +4518,20 @@ fn resolve_xinclude(
             .map(|attribute| attribute.value.as_str())
     };
     let href_attribute = attribute("href");
+    // XInclude 1.0 section 3.1 requires printable ASCII negotiation values, even for
+    // same-document includes: https://www.w3.org/TR/xinclude/#include_element
+    for name in ["accept", "accept-language"] {
+        if let Some(value) = attribute(name) {
+            meter
+                .charge(BudgetKind::XPathOperations, value.len())
+                .map_err(XIncludeFailure::Fatal)?;
+            if !value.bytes().all(|byte| (0x20..=0x7e).contains(&byte)) {
+                return Err(XIncludeFailure::Fatal(Error::Xml(format!(
+                    "XInclude {name} must contain only printable ASCII"
+                ))));
+            }
+        }
+    }
     let href = href_attribute.unwrap_or_default();
     let parse = attribute("parse").unwrap_or("xml");
     if !matches!(parse, "xml" | "text") {
@@ -5278,11 +5246,15 @@ impl NodeMaps {
                 let node_count = nodes.size();
                 if node_count <= 64 {
                     let mut projected = projected_node_storage(node_count, meter)?;
-                    projected.extend(
-                        nodes
-                            .into_iter()
-                            .filter_map(|node| self.reverse.get(&typed_path_to(&node)).cloned()),
-                    );
+                    for node in nodes {
+                        // Small result sets can still require long ancestor/sibling walks.
+                        // Their lookup must obey the same budget as the bulk projection.
+                        let (path, path_bytes) = typed_path_to_metered(&node, meter)?;
+                        if let Some(source) = self.reverse.get(&path) {
+                            projected.push(source.clone());
+                        }
+                        meter.release_owned_bytes(path_bytes);
+                    }
                     projected.sort_by_key(|node| self.order.get(node).copied());
                     return Ok(XPathValue::NodeSet(projected));
                 }
@@ -6855,6 +6827,31 @@ fn reserve_sxd_string_arguments(
     context.reserve_string_allocation(bytes)
 }
 
+pub(crate) fn extension_string<'a>(
+    context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
+    value: &'a SxdValue<'_>,
+) -> std::result::Result<Cow<'a, str>, function::Error> {
+    let text = match value {
+        SxdValue::String(text) | SxdValue::ResultTreeFragment(_, text) => {
+            Cow::Borrowed(text.as_str())
+        }
+        SxdValue::Nodeset(nodes) => {
+            context.charge_extension_work(nodes.size())?;
+            match nodes.document_order_first_with_context(context)? {
+                Some(node) => Cow::Owned(node.string_value_with_extension_context(context)?),
+                None => Cow::Borrowed(""),
+            }
+        }
+        _ => {
+            context.reserve_temporary_allocation(value.string_len())?;
+            Cow::Owned(value.string())
+        }
+    };
+    // Reserve the consumer's linear lexical processing before it inspects argument bytes.
+    context.charge_extension_work(text.len().max(1))?;
+    Ok(text)
+}
+
 fn rc4(key: &[u8], input: &[u8]) -> Vec<u8> {
     let mut state = [0_u8; 256];
     for (index, value) in state.iter_mut().enumerate() {
@@ -7199,16 +7196,13 @@ impl function::Function for ExsltStringFunction {
                         "str:encode-uri() requires two or three arguments",
                     );
                 }
-                reserve_sxd_string_arguments(
-                    context,
-                    &args,
-                    &[0, 2],
-                    "str:encode-uri() allocation length overflow",
-                )?;
-                let mut args = args.into_iter();
-                let value = args.next().expect("arity checked above").into_string();
-                let escape_reserved = args.next().expect("arity checked above").into_boolean();
-                let encoding_label = args.next().map(SxdValue::into_string);
+                let value = extension_string(context, &args[0])?;
+                let escape_reserved = args[1].boolean();
+                let encoding_label = args
+                    .get(2)
+                    .map(|value| extension_string(context, value))
+                    .transpose()?;
+                context.charge_extension_work(value.len())?;
                 let encoding = uri_encoding(
                     encoding_label.as_deref(),
                     "str:encode-uri()",
@@ -7235,15 +7229,12 @@ impl function::Function for ExsltStringFunction {
                         "str:decode-uri() requires one or two arguments",
                     );
                 }
-                reserve_sxd_string_arguments(
-                    context,
-                    &args,
-                    &[0, 1],
-                    "str:decode-uri() allocation length overflow",
-                )?;
-                let mut args = args.into_iter();
-                let value = args.next().expect("arity checked above").into_string();
-                let encoding_label = args.next().map(SxdValue::into_string);
+                let value = extension_string(context, &args[0])?;
+                let encoding_label = args
+                    .get(1)
+                    .map(|value| extension_string(context, value))
+                    .transpose()?;
+                context.charge_extension_work(value.len().saturating_mul(2))?;
                 let encoding = uri_encoding(
                     encoding_label.as_deref(),
                     "str:decode-uri()",
