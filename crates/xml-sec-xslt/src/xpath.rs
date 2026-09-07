@@ -3080,6 +3080,7 @@ impl Evaluator {
                 if step == "." {
                     continue;
                 }
+                meter.charge(BudgetKind::XPathOperations, selected.len())?;
                 let mut next = Vec::new();
                 match step {
                     ".." => {
@@ -3100,6 +3101,7 @@ impl Evaluator {
                             let Some(parent) = self.source.node(*parent) else {
                                 continue;
                             };
+                            meter.charge(BudgetKind::XPathOperations, parent.children.len())?;
                             for child in &parent.children {
                                 let candidate = SourceNode::Node(*child);
                                 if self.is_text_node(&candidate) {
@@ -3125,6 +3127,7 @@ impl Evaluator {
                                     NodeKind::Element { attributes, .. } => attributes.len(),
                                     _ => 0,
                                 });
+                            meter.charge(BudgetKind::XPathOperations, attribute_count)?;
                             for index in 0..attribute_count {
                                 let candidate = SourceNode::Attribute { owner, index };
                                 if self.attribute_name_matches(&candidate, lexical, namespaces)? {
@@ -3146,6 +3149,7 @@ impl Evaluator {
                             let Some(parent) = self.source.node(*parent) else {
                                 continue;
                             };
+                            meter.charge(BudgetKind::XPathOperations, parent.children.len())?;
                             for child in &parent.children {
                                 let matches = self.source.node(*child).is_some_and(|node| {
                                     matches!(&node.kind, NodeKind::Element { name, .. } if element_pattern_name_matches(lexical, name, namespaces).unwrap_or(false))
@@ -6214,10 +6218,13 @@ impl function::Function for IdFunction {
         let mut add_tokens = |value: &str| -> std::result::Result<(), function::Error> {
             // XPath 1.0 id() splits on XML's four S characters, not the host language's wider
             // ASCII whitespace class: https://www.w3.org/TR/1999/REC-xpath-19991116/#function-id
+            context.charge_work(value.len())?;
             for token in value
                 .split(crate::lexical::is_xml_whitespace)
                 .filter(|token| !token.is_empty())
             {
+                context.charge_work(token.len())?;
+                context.charge_work(1)?;
                 if let Some(path) = nodes.get(token)
                     && let Some(node) = resolve_node_path(context, path)?
                 {
@@ -6734,6 +6741,7 @@ impl function::Function for ExsltMathFunction {
             if args.len() != 2 {
                 return extension_argument_error("math:power() requires two arguments");
             }
+            context.charge_extension_work(1)?;
             return Ok(SxdValue::Number(
                 args[0].number(context)?.powf(args[1].number(context)?),
             ));
@@ -8825,6 +8833,85 @@ mod tests {
     }
 
     #[test]
+    fn relative_node_fast_path_charges_rejected_candidates() {
+        // The current()-relative shortcut must charge every candidate it inspects, including
+        // children rejected by the name test without producing result storage.
+        let xml = format!("<root>{}</root>", "<other/>".repeat(64));
+        let source = Document::parse(&xml, None).expect("source parses");
+        let stylesheet = Document::parse("<stylesheet/>", None).expect("stylesheet parses");
+        let mut setup_meter = Meter::new(
+            ExecutionBudget {
+                source_bytes: usize::MAX,
+                external_documents: usize::MAX,
+                recursion_depth: usize::MAX,
+                xpath_evaluations: usize::MAX,
+                xpath_operations: usize::MAX,
+                extension_operations: usize::MAX,
+                pattern_evaluations: usize::MAX,
+                template_applications: usize::MAX,
+                sort_comparisons: usize::MAX,
+                key_entries: usize::MAX,
+                result_nodes: usize::MAX,
+                serialized_bytes: usize::MAX,
+                messages: usize::MAX,
+                owned_bytes: usize::MAX,
+            },
+            source.source_bytes(),
+        )
+        .expect("setup meter initializes");
+        let options = EvaluatorSourceOptions {
+            processing: SourceProcessing::Xml,
+            whitespace: Arc::from([]),
+            clock: Arc::new(crate::SystemClock),
+            extension_policy: crate::ExtensionPolicy::Compatible,
+        };
+        let prepared =
+            prepare_evaluator_source(&source, &crate::NoResolver, &mut setup_meter, &options)
+                .expect("source prepares");
+        let evaluator = Evaluator::new(
+            prepared,
+            &stylesheet,
+            None,
+            &[],
+            Arc::new(crate::NoResolver),
+            &mut setup_meter,
+            options,
+        )
+        .expect("evaluator initializes");
+        let root = evaluator.source.logical_roots()[0];
+        let element = evaluator.source.node(root).expect("logical root").children[0];
+        let mut work_budget = ExecutionBudget {
+            source_bytes: usize::MAX,
+            external_documents: usize::MAX,
+            recursion_depth: usize::MAX,
+            xpath_evaluations: usize::MAX,
+            xpath_operations: usize::MAX,
+            extension_operations: usize::MAX,
+            pattern_evaluations: usize::MAX,
+            template_applications: usize::MAX,
+            sort_comparisons: usize::MAX,
+            key_entries: usize::MAX,
+            result_nodes: usize::MAX,
+            serialized_bytes: usize::MAX,
+            messages: usize::MAX,
+            owned_bytes: usize::MAX,
+        };
+        work_budget.xpath_operations = 1;
+        let mut meter = Meter::new(work_budget, 0).expect("work meter initializes");
+
+        let error = evaluator
+            .relative_nodes("missing", &SourceNode::Node(element), &[], &mut meter)
+            .expect_err("candidate scans must cross the XPath work gate");
+        assert!(matches!(
+            error,
+            Error::Budget {
+                kind: BudgetKind::XPathOperations,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn current_namespace_identity_charges_binding_resolution() {
         // current() must use the same metered binding lookup as continuation restoration.
         let package = Package::new();
@@ -9483,6 +9570,51 @@ mod tests {
             .evaluate(&evaluation, vec![SxdValue::String("target".into())])
             .expect_err("id() result storage must cross the allocation gate");
         assert!(error.to_string().contains("allocation budget"));
+    }
+
+    #[test]
+    fn id_string_tokenization_obeys_work_budget() {
+        // Existing String values avoid coercion, but splitting and hashing their ID tokens is
+        // still attacker-controlled XPath work even when every lookup misses.
+        let package = Package::new();
+        let document = package.as_document();
+        let documents = document.create_element("documents");
+        let logical_document = document.create_element("document");
+        document.root().append_child(documents);
+        documents.append_child(logical_document);
+        let function = IdFunction {
+            nodes_by_document: Rc::new(RefCell::new(vec![HashMap::new()])),
+        };
+        let mut context = Context::new();
+        context.set_evaluation_work_limit(8);
+        let evaluation =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&context, logical_document.into());
+
+        let error = function
+            .evaluate(&evaluation, vec![SxdValue::String("x ".repeat(128))])
+            .expect_err("ID token scans must cross the XPath work gate");
+        assert!(error.to_string().contains("work budget"));
+    }
+
+    #[test]
+    fn scalar_math_extension_obeys_extension_work_budget() {
+        // Scalar EXSLT math has no node traversal to charge implicitly; the intrinsic operation
+        // itself must still be denied when extension work is disabled.
+        let package = Package::new();
+        let mut context = Context::new();
+        context.set_extension_work_limit(0);
+        let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(
+            &context,
+            package.as_document().root().into(),
+        );
+
+        let error = ExsltMathFunction::Power
+            .evaluate(
+                &evaluation,
+                vec![SxdValue::Number(2.0), SxdValue::Number(1024.0)],
+            )
+            .expect_err("math:power must cross the extension work gate");
+        assert!(error.to_string().contains("extension work budget"));
     }
 
     #[test]

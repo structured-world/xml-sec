@@ -5492,6 +5492,44 @@ fn execution_budgets_abort_sorting_and_charge_result_payloads() {
 }
 
 #[test]
+fn text_sort_comparison_scans_obey_xpath_work_budget() {
+    // Sorting text keys with long common prefixes must charge the bytes inspected by each
+    // comparison, not only one SortComparisons unit per comparator invocation. A shared external
+    // string isolates comparator work from source-node string-value traversal.
+    let items = (0..32).map(|_| "<item/>".to_owned()).collect::<String>();
+    let source_xml = format!("<root>{items}</root>");
+    let source = Document::parse(&source_xml, None).expect("source parses");
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:param name="key"/><xsl:output method="text"/><xsl:template match="/"><xsl:for-each select="root/item"><xsl:sort select="$key"/><xsl:value-of select="position()"/></xsl:for-each></xsl:template></xsl:stylesheet>"#,
+    );
+    let mut parameters = Parameters::new();
+    parameters.insert(
+        ExpandedName::new(None::<String>, "key"),
+        Value::String("a".repeat(4096)),
+    );
+    let mut budget = execution_budget(source_xml.len());
+    budget.xpath_operations = 4_096;
+    budget.owned_bytes = 32 << 20;
+
+    assert!(matches!(
+        stylesheet.execute(
+            &source,
+            &parameters,
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::XPathOperations,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn numeric_sort_workspace_is_metered_before_allocation() {
     // Numeric keys have no string payload, but their structural vectors and merge buffers are
     // still attacker-sized execution-owned allocations.

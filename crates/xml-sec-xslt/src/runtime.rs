@@ -3420,8 +3420,12 @@ impl<'a> Execution<'a> {
                 let right = &keyed[*right];
                 self.meter.charge(BudgetKind::SortComparisons, 1)?;
                 for ((l, r), spec) in left.1.iter().zip(&right.1).zip(&specs) {
-                    let mut ordering =
-                        l.compare(r, spec.case_order.as_deref(), spec.collator.as_ref());
+                    let mut ordering = l.compare(
+                        r,
+                        spec.case_order.as_deref(),
+                        spec.collator.as_ref(),
+                        &mut self.meter,
+                    )?;
                     if spec.order == "descending" {
                         ordering = ordering.reverse()
                     }
@@ -4980,7 +4984,8 @@ impl SortKey {
         other: &Self,
         case_order: Option<&str>,
         collator: Option<&CollatorBorrowed<'static>>,
-    ) -> Ordering {
+        meter: &mut Meter,
+    ) -> Result<Ordering> {
         match (self, other) {
             (
                 Self::Text {
@@ -4993,27 +4998,35 @@ impl SortKey {
                 },
             ) => {
                 if let Some(collator) = collator {
-                    return collator.compare(left, right);
+                    meter.charge(BudgetKind::XPathOperations, left.len())?;
+                    meter.charge(BudgetKind::XPathOperations, right.len())?;
+                    return Ok(collator.compare(left, right));
                 }
+                meter.charge(BudgetKind::XPathOperations, left_key.len())?;
+                meter.charge(BudgetKind::XPathOperations, right_key.len())?;
                 let primary = left_key.cmp(right_key);
                 if primary != Ordering::Equal {
-                    return primary;
+                    return Ok(primary);
                 }
+                meter.charge(BudgetKind::XPathOperations, left.len())?;
+                meter.charge(BudgetKind::XPathOperations, right.len())?;
                 let secondary = left
                     .chars()
                     .flat_map(char::to_lowercase)
                     .cmp(right.chars().flat_map(char::to_lowercase));
                 if secondary != Ordering::Equal {
-                    return secondary;
+                    return Ok(secondary);
                 }
-                match case_order {
+                meter.charge(BudgetKind::XPathOperations, left.len())?;
+                meter.charge(BudgetKind::XPathOperations, right.len())?;
+                Ok(match case_order {
                     Some("upper-first") => left.cmp(right),
                     Some("lower-first") => right.cmp(left),
                     _ => left.cmp(right),
-                }
+                })
             }
             (Self::Number(left), Self::Number(right)) => {
-                left.partial_cmp(right).unwrap_or_else(|| {
+                Ok(left.partial_cmp(right).unwrap_or_else(|| {
                     if left.is_nan() && right.is_nan() {
                         Ordering::Equal
                     } else if left.is_nan() {
@@ -5021,9 +5034,9 @@ impl SortKey {
                     } else {
                         Ordering::Greater
                     }
-                })
+                }))
             }
-            _ => Ordering::Equal,
+            _ => Ok(Ordering::Equal),
         }
     }
 }
@@ -6955,8 +6968,10 @@ mod tests {
         let right =
             SortKey::text_precharged(right_value.clone(), right_value.len(), &mut right_meter)
                 .expect("right key fits");
+        let mut comparison_meter = meter(0);
         assert_eq!(
-            left.compare(&right, Some("lower-first"), None),
+            left.compare(&right, Some("lower-first"), None, &mut comparison_meter,)
+                .expect("comparison work fits"),
             Ordering::Less
         );
     }
