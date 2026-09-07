@@ -433,15 +433,54 @@ struct RetainedValue {
     retained_owned_bytes: usize,
 }
 
-struct CapturedText {
+struct MeteredString {
     value: String,
     retained_owned_bytes: usize,
 }
 
-impl CapturedText {
+impl MeteredString {
+    const fn new() -> Self {
+        Self {
+            value: String::new(),
+            retained_owned_bytes: 0,
+        }
+    }
+
+    fn push_str(&mut self, value: &str, meter: &mut Meter) -> Result<()> {
+        append_metered_text(&mut self.value, value, meter)?;
+        self.retained_owned_bytes = self.value.capacity();
+        Ok(())
+    }
+
     fn transfer(self, meter: &mut Meter) -> String {
         meter.release_owned_bytes(self.retained_owned_bytes);
         self.value
+    }
+
+    fn release(self, meter: &mut Meter) {
+        meter.release_owned_bytes(self.retained_owned_bytes);
+    }
+
+    fn into_parts(self) -> (String, usize) {
+        (self.value, self.retained_owned_bytes)
+    }
+
+    fn as_str(&self) -> &str {
+        &self.value
+    }
+}
+
+impl Deref for MeteredString {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl std::fmt::Display for MeteredString {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.value.fmt(formatter)
     }
 }
 
@@ -1350,6 +1389,7 @@ impl<'a> Execution<'a> {
                                     &attribute.name,
                                     attribute.prefix.as_deref(),
                                 );
+                                let value = value.transfer(&mut self.meter);
                                 self.add_literal_attribute(Attribute {
                                     name,
                                     prefix,
@@ -1766,8 +1806,17 @@ impl<'a> Execution<'a> {
         let namespace = namespace
             .as_ref()
             .map(|value| self.evaluate_avt(value, node, frame.position, frame.size))
-            .transpose()?
-            .or_else(|| computed_element_namespace(static_namespaces, prefix.as_deref()));
+            .transpose()?;
+        let (namespace, namespace_reservation) = match namespace {
+            Some(namespace) => {
+                let (namespace, reservation) = namespace.into_parts();
+                (Some(namespace), reservation)
+            }
+            None => (
+                computed_element_namespace(static_namespaces, prefix.as_deref()),
+                0,
+            ),
+        };
         let (prefix, namespace) = normalize_computed_namespace(prefix, namespace, &lexical)?;
         require_bound_computed_prefix(prefix.as_deref(), namespace.as_deref(), &lexical)?;
         let namespaces = namespace
@@ -1779,6 +1828,8 @@ impl<'a> Execution<'a> {
                 }]
             })
             .unwrap_or_default();
+        lexical.release(&mut self.meter);
+        self.meter.release_owned_bytes(namespace_reservation);
         let id = self.push_node_with_base(
             self.parent(),
             NodeKind::Element {
@@ -1892,6 +1943,7 @@ impl<'a> Execution<'a> {
                     let value = self.evaluate_avt(&attribute.value, node, position, size)?;
                     let (name, prefix) =
                         self.alias_attribute_name(&attribute.name, attribute.prefix.as_deref());
+                    let value = value.transfer(&mut self.meter);
                     self.add_literal_attribute(Attribute {
                         name,
                         prefix,
@@ -2157,12 +2209,19 @@ impl<'a> Execution<'a> {
                 let namespace = namespace
                     .as_ref()
                     .map(|value| self.evaluate_avt(value, node, position, size))
-                    .transpose()?
-                    .or_else(|| {
+                    .transpose()?;
+                let (namespace, namespace_reservation) = match namespace {
+                    Some(namespace) => {
+                        let (namespace, reservation) = namespace.into_parts();
+                        (Some(namespace), reservation)
+                    }
+                    None => (
                         prefix
                             .as_deref()
-                            .and_then(|prefix| static_namespace(static_namespaces, prefix))
-                    });
+                            .and_then(|prefix| static_namespace(static_namespaces, prefix)),
+                        0,
+                    ),
+                };
                 let (prefix, namespace) =
                     normalize_computed_namespace(prefix, namespace, &lexical)?;
                 validate_computed_attribute_name(prefix.as_deref(), &local, namespace.as_deref())?;
@@ -2170,6 +2229,8 @@ impl<'a> Execution<'a> {
                 let value =
                     self.capture_text(body, node, position, size, depth, current_precedence)?;
                 let value = value.transfer(&mut self.meter);
+                lexical.release(&mut self.meter);
+                self.meter.release_owned_bytes(namespace_reservation);
                 self.add_attribute(Attribute {
                     name: ExpandedName::new(namespace, local),
                     prefix,
@@ -2205,6 +2266,7 @@ impl<'a> Execution<'a> {
                 if value.contains("?>") {
                     return Err(Error::Dynamic("processing instruction contains ?>".into()));
                 }
+                let target = target.transfer(&mut self.meter);
                 self.push_node(
                     self.parent(),
                     NodeKind::ProcessingInstruction {
@@ -2244,11 +2306,13 @@ impl<'a> Execution<'a> {
                     // https://www.w3.org/TR/1999/REC-xslt-19991116#number
                     return self.append_text(&crate::value::format_xpath_number(*value), false);
                 }
-                let grouping_separator = number
+                let grouping_separator_value = number
                     .grouping_separator
                     .as_ref()
                     .map(|value| self.evaluate_avt(value, node, position, size))
-                    .transpose()?
+                    .transpose()?;
+                let grouping_separator = grouping_separator_value
+                    .as_ref()
                     .map(|value| {
                         let mut characters = value.chars();
                         let Some(first) = characters.next() else {
@@ -2269,12 +2333,14 @@ impl<'a> Execution<'a> {
                 // XSLT 1.0 sections 7.7 and 7.7.1 define `grouping-size` as a numeric AVT;
                 // libxslt converts its positive Number to an integral width by truncation.
                 // https://www.w3.org/TR/1999/REC-xslt-19991116#number
-                let grouping_size = number
+                let grouping_size_value = number
                     .grouping_size
                     .as_ref()
                     .map(|value| self.evaluate_avt(value, node, position, size))
-                    .transpose()?
-                    .and_then(|value| parse_xpath_number(&value))
+                    .transpose()?;
+                let grouping_size = grouping_size_value
+                    .as_ref()
+                    .and_then(|value| parse_xpath_number(value))
                     .filter(|value| value.is_finite())
                     .filter(|value| *value > 0.0)
                     .map(|value| value as usize)
@@ -2294,7 +2360,7 @@ impl<'a> Execution<'a> {
                 // requires an invalid optional value to be ignored in forwards-compatible mode.
                 // https://www.w3.org/TR/1999/REC-xslt-19991116#number
                 // https://www.w3.org/TR/1999/REC-xslt-19991116#forwards
-                let letter_value = match letter_value.as_deref() {
+                let effective_letter_value = match letter_value.as_deref() {
                     None | Some("alphabetic" | "traditional") => letter_value.as_deref(),
                     Some(_) if number.forward_compatible => None,
                     Some(value) => {
@@ -2307,12 +2373,25 @@ impl<'a> Execution<'a> {
                     values,
                     &format,
                     lang.as_deref(),
-                    letter_value,
+                    effective_letter_value,
                     grouping_separator,
                     grouping_size,
                     &mut self.meter,
-                )?;
+                );
+                grouping_separator_value
+                    .into_iter()
+                    .for_each(|value| value.release(&mut self.meter));
+                grouping_size_value
+                    .into_iter()
+                    .for_each(|value| value.release(&mut self.meter));
+                format.release(&mut self.meter);
+                lang.into_iter()
+                    .for_each(|value| value.release(&mut self.meter));
+                letter_value
+                    .into_iter()
+                    .for_each(|value| value.release(&mut self.meter));
                 self.meter.release_owned_bytes(values_owned_bytes);
+                let formatted = formatted?;
                 self.append_owned_text(formatted, false)
             }
             Instruction::Variable(variable) => {
@@ -2369,11 +2448,16 @@ impl<'a> Execution<'a> {
                         "secondary-output URI must not be empty".into(),
                     ));
                 }
-                if self.secondary_output_uris.contains(&uri) {
+                if self
+                    .secondary_output_uris
+                    .iter()
+                    .any(|candidate| candidate.as_str() == uri.as_str())
+                {
                     return Err(Error::Dynamic(format!(
-                        "secondary-output URI {uri:?} was produced more than once"
+                        "secondary-output URI `{uri}` was produced more than once"
                     )));
                 }
+                let uri = uri.transfer(&mut self.meter);
                 let uri_owned_bytes = uri.capacity().saturating_add(
                     std::mem::size_of::<String>()
                         .saturating_add(2usize.saturating_mul(std::mem::size_of::<usize>())),
@@ -2393,6 +2477,7 @@ impl<'a> Execution<'a> {
                 let output = (|| {
                     for (name, value) in properties {
                         let value = self.evaluate_avt(value, node, position, size)?;
+                        let value = value.transfer(&mut self.meter);
                         apply_secondary_output_property(
                             &mut definition,
                             name,
@@ -2887,6 +2972,17 @@ impl<'a> Execution<'a> {
             && let Some(variable) = lexical_variable_name(variable)
             && let Some(delimiter) = xpath_string_literal(delimiter)
         {
+            let value_len = match self.variable_value(variable, &expression.namespaces)? {
+                Value::String(value) | Value::StoredExpression(value) => value.len(),
+                Value::Boolean(true) => "true".len(),
+                Value::Boolean(false) => "false".len(),
+                Value::Number(_) | Value::NodeSet(_) | Value::ResultTreeFragment(_) => {
+                    return Ok(None);
+                }
+            };
+            self.meter.charge(BudgetKind::XPathOperations, value_len)?;
+            self.meter
+                .charge(BudgetKind::XPathOperations, delimiter.len())?;
             let value = self.variable_string(variable, &expression.namespaces, 0)?;
             let head = value.split_once(delimiter).map_or("", |(head, _)| head);
             let value_workspace = if matches!(&value, Cow::Owned(_)) {
@@ -3276,16 +3372,12 @@ impl<'a> Execution<'a> {
         node: &SourceNode,
         position: usize,
         size: usize,
-    ) -> Result<String> {
-        let mut output = String::new();
+    ) -> Result<MeteredString> {
+        let mut output = MeteredString::new();
         for part in &avt.0 {
             match part {
                 AvtPart::Literal(value) => {
-                    self.meter.check_additional(
-                        BudgetKind::OwnedBytes,
-                        output.len().saturating_add(value.len()),
-                    )?;
-                    output.push_str(value);
+                    output.push_str(value, &mut self.meter)?;
                 }
                 AvtPart::Expression(expression) => {
                     let value = self.evaluate(expression, node, position, size)?;
@@ -3324,18 +3416,23 @@ impl<'a> Execution<'a> {
                         self.evaluate_avt(value, context_node, context_position, context_size)
                     })
                     .transpose()?;
-                let case_order = match case_order {
-                    Some(value) if matches!(value.as_str(), "upper-first" | "lower-first") => {
-                        Some(value)
-                    }
-                    Some(_) if sort.forward_compatible => None,
-                    Some(value) => {
+                let mut case_order = case_order;
+                if case_order
+                    .as_ref()
+                    .is_some_and(|value| !matches!(value.as_str(), "upper-first" | "lower-first"))
+                {
+                    if sort.forward_compatible {
+                        case_order
+                            .take()
+                            .expect("invalid case-order is present")
+                            .release(&mut self.meter);
+                    } else {
+                        let value = case_order.as_ref().expect("invalid case-order is present");
                         return Err(Error::Dynamic(format!(
                             "xsl:sort case-order must evaluate to `upper-first` or `lower-first`, got `{value}`"
                         )));
                     }
-                    None => None,
-                };
+                }
                 let lang = sort
                     .lang
                     .as_ref()
@@ -3351,8 +3448,8 @@ impl<'a> Execution<'a> {
                 )?;
                 if !matches!(data_type.as_str(), "text" | "number") {
                     if sort.forward_compatible {
-                        data_type.clear();
-                        data_type.push_str("text");
+                        data_type.value.clear();
+                        data_type.push_str("text", &mut self.meter)?;
                     } else {
                         return Err(Error::Dynamic(format!(
                             "xsl:sort data-type must evaluate to `text` or `number`, got `{data_type}`"
@@ -3371,22 +3468,35 @@ impl<'a> Execution<'a> {
                     self.evaluate_avt(&sort.order, context_node, context_position, context_size)?;
                 if !matches!(order.as_str(), "ascending" | "descending") {
                     if sort.forward_compatible {
-                        order.clear();
-                        order.push_str("ascending");
+                        order.value.clear();
+                        order.push_str("ascending", &mut self.meter)?;
                     } else {
                         return Err(Error::Dynamic(format!(
                             "xsl:sort order must evaluate to `ascending` or `descending`, got `{order}`"
                         )));
                     }
                 }
+                lang.into_iter()
+                    .for_each(|value| value.release(&mut self.meter));
+                let (data_type, data_type_bytes) = data_type.into_parts();
+                let (order, order_bytes) = order.into_parts();
+                let (case_order, case_order_bytes) = case_order.map_or_else(
+                    || (None, 0),
+                    |value| {
+                        let (value, bytes) = value.into_parts();
+                        (Some(value), bytes)
+                    },
+                );
                 let spec = EvaluatedSort {
                     data_type,
                     order,
                     case_order,
                     collator,
                 };
-                let bytes = spec.owned_bytes();
-                self.meter.charge(BudgetKind::OwnedBytes, bytes)?;
+                let bytes = data_type_bytes
+                    .saturating_add(order_bytes)
+                    .saturating_add(case_order_bytes);
+                debug_assert_eq!(bytes, spec.owned_bytes());
                 retained_bytes = retained_bytes
                     .checked_add(bytes)
                     .expect("charged sort storage fits usize");
@@ -3452,7 +3562,7 @@ impl<'a> Execution<'a> {
         size: usize,
         depth: usize,
         precedence: Option<usize>,
-    ) -> Result<CapturedText> {
+    ) -> Result<MeteredString> {
         let previous = self.enter_result_tree(None, true)?;
         let result =
             self.execute_scoped_sequence(body, node, position, size, depth + 1, precedence);
@@ -3481,7 +3591,7 @@ impl<'a> Execution<'a> {
                     captured.push_str(value);
                 }
             }
-            Ok(CapturedText {
+            Ok(MeteredString {
                 value: captured,
                 retained_owned_bytes: bytes,
             })
@@ -4623,23 +4733,15 @@ fn effective_globals<'a>(
 }
 
 fn append_avt_expression_value(
-    output: &mut String,
+    output: &mut MeteredString,
     value: XPathValue,
     evaluator: &Evaluator,
     meter: &mut Meter,
 ) -> Result<()> {
     let (value, temporary_bytes) = value.into_temporary_string(evaluator, meter)?;
-    let check = meter.check_additional(
-        BudgetKind::OwnedBytes,
-        output.len().saturating_add(value.len()),
-    );
-    if let Err(error) = check {
-        meter.release_owned_bytes(temporary_bytes);
-        return Err(error);
-    }
-    output.push_str(&value);
+    let appended = output.push_str(&value, meter);
     meter.release_owned_bytes(temporary_bytes);
-    Ok(())
+    appended
 }
 
 fn remap_parameter_value(value: &Value, remap: &HashMap<NodeId, NodeId>) -> Value {
@@ -4955,15 +5057,23 @@ struct EvaluatedSort {
 impl EvaluatedSort {
     fn owned_bytes(&self) -> usize {
         self.data_type
-            .len()
-            .saturating_add(self.order.len())
-            .saturating_add(self.case_order.as_ref().map_or(0, String::len))
+            .capacity()
+            .saturating_add(self.order.capacity())
+            .saturating_add(self.case_order.as_ref().map_or(0, String::capacity))
     }
 }
 impl SortKey {
     fn text_precharged(value: String, reservation: usize, meter: &mut Meter) -> Result<Self> {
         debug_assert_eq!(reservation, value.len());
+        if let Err(error) = meter.charge(BudgetKind::XPathOperations, value.len()) {
+            meter.release_owned_bytes(reservation);
+            return Err(error);
+        }
         let key_bytes = default_collation_key_bytes(&value);
+        if let Err(error) = meter.charge(BudgetKind::XPathOperations, value.len()) {
+            meter.release_owned_bytes(reservation);
+            return Err(error);
+        }
         if let Err(error) = meter.charge(BudgetKind::OwnedBytes, key_bytes) {
             meter.release_owned_bytes(reservation);
             return Err(error);
@@ -6323,13 +6433,17 @@ mod tests {
     }
 
     fn meter(owned_bytes: usize) -> Meter {
+        meter_with_xpath_operations(owned_bytes, usize::MAX)
+    }
+
+    fn meter_with_xpath_operations(owned_bytes: usize, xpath_operations: usize) -> Meter {
         Meter::new(
             ExecutionBudget {
                 source_bytes: usize::MAX,
                 external_documents: usize::MAX,
                 recursion_depth: usize::MAX,
                 xpath_evaluations: usize::MAX,
-                xpath_operations: usize::MAX,
+                xpath_operations,
                 extension_operations: usize::MAX,
                 pattern_evaluations: usize::MAX,
                 template_applications: usize::MAX,
@@ -6951,6 +7065,48 @@ mod tests {
             .expect("source value fits");
         SortKey::text_precharged(value.clone(), value.len(), &mut accepted)
             .expect("the exact retained sort-key payload fits");
+    }
+
+    #[test]
+    fn text_sort_key_construction_obeys_xpath_work_budget() {
+        // Default collation computes the lowercased key in two complete passes. Both passes must
+        // cross the work gate before scanning a caller-controlled sort value.
+        let value = "A_".repeat(1_024);
+        let mut meter = meter_with_xpath_operations(value.len() * 3, value.len());
+        meter
+            .charge(BudgetKind::OwnedBytes, value.len())
+            .expect("source value fits");
+
+        assert!(matches!(
+            SortKey::text_precharged(value.clone(), value.len(), &mut meter),
+            Err(Error::Budget {
+                kind: BudgetKind::XPathOperations,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn avt_buffer_retains_and_releases_its_capacity_charge() {
+        // Every AVT part is evaluated while the prefix buffer remains live. Its actual capacity
+        // must stay charged until ownership is explicitly transferred to the consumer.
+        let mut meter = meter(16);
+        let mut output = super::MeteredString::new();
+        output
+            .push_str("12345678", &mut meter)
+            .expect("prefix fits");
+        assert!(matches!(
+            meter.charge(BudgetKind::OwnedBytes, 9),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            })
+        ));
+
+        assert_eq!(output.transfer(&mut meter), "12345678");
+        meter
+            .charge(BudgetKind::OwnedBytes, 16)
+            .expect("consuming the AVT releases its complete capacity");
     }
 
     #[test]

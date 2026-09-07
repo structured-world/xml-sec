@@ -7455,6 +7455,7 @@ impl function::Function for DocumentFunction {
                         }
                     };
                     let href = node.string_value_with_context(context)?;
+                    context.charge_work(href.len())?;
                     context.reserve_temporary_allocation(std::mem::size_of::<DocumentRequest>())?;
                     process(DocumentRequest::relative_to(
                         href,
@@ -7477,8 +7478,11 @@ impl function::Function for DocumentFunction {
                         None,
                     ),
                 };
-                context.reserve_temporary_allocation(value.string_len())?;
+                let href_len = value.string_len();
+                context.charge_work(href_len)?;
+                context.reserve_temporary_allocation(href_len)?;
                 let href = value.string();
+                context.charge_work(href.len())?;
                 context.reserve_temporary_allocation(std::mem::size_of::<DocumentRequest>())?;
                 process(DocumentRequest::relative_to(
                     href,
@@ -9856,6 +9860,30 @@ mod tests {
                 .evaluate(&evaluation, vec![SxdValue::Nodeset(nodes)]),
             Err(function::Error::Other { what }) if what.contains("budget")
         ));
+    }
+
+    #[test]
+    fn document_scalar_uri_obeys_the_xpath_work_budget() {
+        // An existing scalar avoids string coercion allocation, but URI materialization and the
+        // document-cache probe must still charge the caller-controlled URI bytes.
+        let package = Package::new();
+        let document = package.as_document();
+        let logical = document.create_element("logical");
+        document.root().append_child(logical);
+        let mut context = Context::new();
+        context.set_evaluation_work_limit(0);
+        let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&context, logical.into());
+        let document_function = DocumentFunction {
+            roots: Rc::new(RefCell::new(HashMap::new())),
+            pending: Rc::new(RefCell::new(PendingDocumentRequests::default())),
+            node_base_uris: Rc::new(RefCell::new(HashMap::new())),
+            static_base_uri: None,
+        };
+
+        let error = document_function
+            .evaluate(&evaluation, vec![SxdValue::String("x".repeat(4_096))])
+            .expect_err("scalar document URI work must cross the XPath work gate");
+        assert!(error.to_string().contains("work budget"));
     }
 
     #[test]

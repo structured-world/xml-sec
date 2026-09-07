@@ -2303,6 +2303,41 @@ fn scalar_arithmetic_fast_path_preserves_variable_types() {
 }
 
 #[test]
+fn substring_before_scalar_fast_path_obeys_xpath_work_budget() {
+    // A pre-owned string parameter avoids coercion, but the optimized substring search must
+    // still charge the complete haystack and delimiter before scanning.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:param name="value"/><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="substring-before($value, '!')"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source_xml = "<source/>";
+    let source = Document::parse(source_xml, None).expect("source parses");
+    let mut parameters = Parameters::new();
+    parameters.insert(
+        ExpandedName::new(None::<String>, "value"),
+        Value::String("x".repeat(4_096)),
+    );
+    let mut budget = execution_budget(source_xml.len());
+    budget.xpath_operations = 128;
+
+    assert!(matches!(
+        stylesheet.execute(
+            &source,
+            &parameters,
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::XPathOperations,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn result_tree_fragment_preceding_sibling_count_uses_the_full_node_set() {
     // The union of preceding siblings for repeated matches is determined by the last match.
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:exsl="http://exslt.org/common"><xsl:output method="text"/><xsl:template match="/"><xsl:variable name="fragment"><a/><b/><a/></xsl:variable><xsl:value-of select="count(exsl:node-set($fragment)/*[name() = 'a']/preceding-sibling::*)"/></xsl:template></xsl:stylesheet>"#;
