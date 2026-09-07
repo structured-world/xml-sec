@@ -1594,7 +1594,8 @@ mod tests {
             .expect_err("1025 active namespace bindings must fail during shared preflight");
         assert!(matches!(
             error,
-            XmlMutationError::XmlParse(dom::ParseError::NamespaceBindingLimitReached {
+            XmlMutationError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_NAMESPACE_BINDINGS,
                 maximum: 1_024,
                 actual: 1_025,
             })

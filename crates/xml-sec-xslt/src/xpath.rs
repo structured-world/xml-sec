@@ -516,19 +516,15 @@ impl function::Function for DeferredStylesheetFunction {
         context: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
         arguments: Vec<SxdValue<'d>>,
     ) -> std::result::Result<SxdValue<'d>, function::Error> {
-        context.reserve_string_allocation(deferred_call_size(
-            &self.name,
-            &context.node,
-            &arguments,
-        ))?;
+        context.reserve_string_allocation(deferred_call_size(&self.name, &arguments))?;
         let call = DeferredCustomCall {
             name: self.name.clone(),
-            node: typed_path_to(&context.node),
+            node: typed_path_to_with_context(&context.node, context)?,
             position: context.position,
             size: context.size,
             arguments: arguments
                 .into_iter()
-                .map(defer_sxd_value)
+                .map(|value| defer_sxd_value(value, context))
                 .collect::<std::result::Result<Vec<_>, _>>()?,
         };
         let mut state = self.session.borrow_mut();
@@ -554,15 +550,10 @@ impl function::Function for DeferredStylesheetFunction {
     }
 }
 
-fn deferred_call_size(
-    name: &ExpandedName,
-    node: &nodeset::Node<'_>,
-    arguments: &[SxdValue<'_>],
-) -> usize {
+fn deferred_call_size(name: &ExpandedName, arguments: &[SxdValue<'_>]) -> usize {
     std::mem::size_of::<DeferredCustomCall>()
         .saturating_add(name.local.len())
         .saturating_add(name.namespace.as_deref().map_or(0, str::len))
-        .saturating_add(sxd_node_path_size(node))
         .saturating_add(arguments.iter().map(deferred_sxd_value_size).sum::<usize>())
 }
 
@@ -571,38 +562,13 @@ fn deferred_sxd_value_size(value: &SxdValue<'_>) -> usize {
         SxdValue::Boolean(_) | SxdValue::Number(_) => 0,
         // Scalar payloads move out of the argument values; only their enum slots are new here.
         SxdValue::String(_) | SxdValue::ResultTreeFragment(_, _) => 0,
-        SxdValue::Nodeset(nodes) => nodes.iter().map(|node| sxd_node_path_size(&node)).sum(),
+        SxdValue::Nodeset(nodes) => nodes.size().saturating_mul(std::mem::size_of::<NodePath>()),
     })
-}
-
-fn sxd_node_path_size(node: &nodeset::Node<'_>) -> usize {
-    let mut depth = 0usize;
-    let mut current = match node {
-        nodeset::Node::Attribute(attribute) => attribute.parent().map(nodeset::Node::Element),
-        nodeset::Node::Namespace(namespace) => Some(nodeset::Node::Element(namespace.parent)),
-        node => Some(node.clone()),
-    };
-    while let Some(node) = current {
-        current = node.parent();
-        if current.is_some() {
-            depth = depth.saturating_add(1);
-        }
-    }
-    std::mem::size_of::<NodePath>()
-        .saturating_add(depth.saturating_mul(std::mem::size_of::<usize>()))
-        .saturating_add(match node {
-            nodeset::Node::Attribute(attribute) => {
-                let name = attribute.name();
-                let name = name.get();
-                name.namespace_uri().map_or(0, str::len) + name.local_part().len()
-            }
-            nodeset::Node::Namespace(namespace) => namespace.prefix().len() + namespace.uri().len(),
-            _ => 0,
-        })
 }
 
 fn defer_sxd_value(
     value: SxdValue<'_>,
+    context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
 ) -> std::result::Result<DeferredXPathValue, function::Error> {
     Ok(match value {
         SxdValue::Boolean(value) => DeferredXPathValue::Boolean(value),
@@ -611,9 +577,13 @@ fn defer_sxd_value(
         SxdValue::ResultTreeFragment(identity, value) => {
             DeferredXPathValue::ResultTreeFragment { identity, value }
         }
-        SxdValue::Nodeset(nodes) => {
-            DeferredXPathValue::NodeSet(nodes.document_order().iter().map(typed_path_to).collect())
-        }
+        SxdValue::Nodeset(nodes) => DeferredXPathValue::NodeSet(
+            nodes
+                .document_order_with_context(context)?
+                .iter()
+                .map(|node| typed_path_to_with_context(node, context))
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        ),
     })
 }
 
@@ -934,27 +904,41 @@ impl Evaluator {
                 return Err(error);
             }
         };
-        let path = typed_path_to(&sxd);
+        let (path, path_reservation) = match typed_path_to_metered(&sxd, meter) {
+            Ok(path) => path,
+            Err(error) => {
+                meter.release_owned_bytes(value_reservation);
+                return Err(error);
+            }
+        };
         let name_bytes = name
             .local
             .len()
             .saturating_add(name.namespace.as_deref().map_or(0, str::len));
         if let Err(error) = meter.charge(BudgetKind::OwnedBytes, name_bytes) {
-            meter.release_owned_bytes(value_reservation);
+            meter.release_owned_bytes(value_reservation.saturating_add(path_reservation));
             return Err(error);
         }
         let owned_name = name.clone();
         if let Err(error) = meter.charge(BudgetKind::KeyEntries, 1) {
-            meter.release_owned_bytes(name_bytes.saturating_add(value_reservation));
+            meter.release_owned_bytes(
+                name_bytes
+                    .saturating_add(value_reservation)
+                    .saturating_add(path_reservation),
+            );
             return Err(error);
         }
-        let path_bytes = path.owned_bytes();
+        let path_bytes = path.owned_bytes().saturating_sub(path_reservation);
         let unreserved_value_bytes = value.len().saturating_sub(value_reservation);
         let mut index = self.key_index.borrow_mut();
         match index.entry((owned_name, value, document_index)) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 if let Err(error) = meter.charge(BudgetKind::OwnedBytes, path_bytes) {
-                    meter.release_owned_bytes(name_bytes.saturating_add(value_reservation));
+                    meter.release_owned_bytes(
+                        name_bytes
+                            .saturating_add(value_reservation)
+                            .saturating_add(path_reservation),
+                    );
                     return Err(error);
                 }
                 entry.get_mut().push(path);
@@ -965,7 +949,11 @@ impl Evaluator {
                     .saturating_add(unreserved_value_bytes)
                     .saturating_add(path_bytes);
                 if let Err(error) = meter.charge(BudgetKind::OwnedBytes, additional) {
-                    meter.release_owned_bytes(name_bytes.saturating_add(value_reservation));
+                    meter.release_owned_bytes(
+                        name_bytes
+                            .saturating_add(value_reservation)
+                            .saturating_add(path_reservation),
+                    );
                     return Err(error);
                 }
                 entry.insert(vec![path]);
@@ -1977,11 +1965,24 @@ impl Evaluator {
         custom_calls: Option<&CustomCallSession>,
     ) -> Result<XPathValue> {
         let document = self.package.as_document();
+        let context_path = self
+            .maps
+            .forward
+            .get(node)
+            .ok_or_else(|| Error::Dynamic("XPath context node is stale".into()))?;
+        meter.charge(BudgetKind::XPathOperations, context_path.ordinary().len())?;
         let context_node = self
             .maps
-            .to_sxd(document.root().into(), node)
+            .resolve(document.root().into(), context_path)
             .ok_or_else(|| Error::Dynamic("XPath context node is stale".into()))?;
-        let adapter_workspace = xpath_adapter_workspace_upper_bound(expression);
+        let uses_current =
+            crate::expression::has_unprefixed_function_call(&expression.source, "current");
+        let adapter_workspace =
+            xpath_adapter_workspace_upper_bound(expression).saturating_add(if uses_current {
+                context_path.owned_bytes()
+            } else {
+                0
+            });
         meter.check_additional(BudgetKind::OwnedBytes, adapter_workspace)?;
         let normalized = normalize_xpath_for_sxd(&expression.source);
         let isolated = hide_projection_elements_from_axes(&normalized);
@@ -2040,12 +2041,16 @@ impl Evaluator {
             context.set_variable((namespace.as_ref(), "position"), position as f64);
             context.set_variable((namespace.as_ref(), "last"), size as f64);
         }
-        context.set_function(
-            "current",
-            CurrentNode {
-                path: typed_path_to(&context_node),
-            },
-        );
+        if uses_current {
+            // Reuse projected identity instead of rescanning siblings for every evaluation.
+            // Its retained clone belongs to the preflighted adapter workspace above.
+            context.set_function(
+                "current",
+                CurrentNode {
+                    path: context_path.clone(),
+                },
+            );
+        }
         // XPath function objects must own their static namespace context. Share one
         // materialization across all functions registered for this evaluation.
         let function_namespaces = Arc::clone(&expression.namespaces);
@@ -5207,22 +5212,13 @@ impl NodeMaps {
     fn resolve<'d>(&self, root: nodeset::Node<'d>, path: &NodePath) -> Option<nodeset::Node<'d>> {
         let mut node = root;
         for index in path.ordinary() {
-            node = node.children().get(*index)?.clone();
+            node = node.child_at(*index)?;
         }
         match path {
             NodePath::Ordinary(_) => Some(node),
             NodePath::Attribute {
                 namespace, local, ..
-            } => node
-                .element()?
-                .attributes()
-                .into_iter()
-                .find(|attribute| {
-                    let name = attribute.name();
-                    let name = name.get();
-                    name.local_part() == local && name.namespace_uri() == namespace.as_deref()
-                })
-                .map(nodeset::Node::Attribute),
+            } => resolve_attribute_node(node, namespace.as_deref(), local),
             NodePath::Namespace { prefix, uri, .. } => resolve_namespace_node(node, prefix, uri),
         }
     }
@@ -5509,22 +5505,6 @@ fn quoted_pattern_literal(value: &str) -> Option<&str> {
     }
     let literal = &value[1..value.len().checked_sub(1)?];
     (!literal.as_bytes().contains(&quote)).then_some(literal)
-}
-
-fn path_to(node: &nodeset::Node<'_>) -> Vec<usize> {
-    let mut current = node.clone();
-    let mut path = vec![];
-    while let Some(parent) = current.parent() {
-        let index = parent
-            .children()
-            .iter()
-            .position(|child| *child == current)
-            .unwrap_or(0);
-        path.push(index);
-        current = parent;
-    }
-    path.reverse();
-    path
 }
 
 fn rewrite_absolute_paths(source: &str, logical_root_index: usize) -> std::borrow::Cow<'_, str> {
@@ -6119,7 +6099,11 @@ impl function::Function for GenerateId {
         let Some(node) = nodes.document_order_first_with_context(context)? else {
             return Ok(SxdValue::String(String::new()));
         };
-        let id = assign_generated_id(context, &self.assigned, typed_path_to(&node))?;
+        let id = assign_generated_id(
+            context,
+            &self.assigned,
+            typed_path_to_with_context(&node, context)?,
+        )?;
         Ok(SxdValue::String(format!("id{id}")))
     }
 }
@@ -6348,7 +6332,7 @@ impl function::Function for IdFunction {
         // XPath 1.0 section 4.1 binds id() to the document containing the dynamic context node.
         // Every projected logical document occupies root/containers/document[index].
         // https://www.w3.org/TR/1999/REC-xpath-19991116/#function-id
-        let context_path = typed_path_to(&context.node);
+        let context_path = typed_path_to_with_context(&context.node, context)?;
         let nodes_by_document = self.nodes_by_document.borrow();
         let Some(nodes) = context_path
             .ordinary()
@@ -6557,13 +6541,13 @@ impl function::Function for UnparsedEntityUriFunction {
                 what: "unparsed-entity-uri() requires one argument".into(),
             });
         }
-        let document_index =
-            path_to(&context.node)
-                .get(1)
-                .copied()
-                .ok_or_else(|| function::Error::Other {
-                    what: "unparsed-entity-uri() context has no logical document".into(),
-                })?;
+        let document_index = typed_path_to_with_context(&context.node, context)?
+            .ordinary()
+            .get(1)
+            .copied()
+            .ok_or_else(|| function::Error::Other {
+                what: "unparsed-entity-uri() context has no logical document".into(),
+            })?;
         reserve_sxd_string_arguments(
             context,
             &args,
@@ -7573,7 +7557,7 @@ impl function::Function for DocumentFunction {
             else {
                 return Ok(SxdValue::Nodeset(nodeset::Nodeset::new()));
             };
-            let path = typed_path_to(&node);
+            let path = typed_path_to_with_context(&node, context)?;
             let base_uris = self.node_base_uris.borrow();
             DocumentBaseSelection::Explicit {
                 base_uri: clone_metered_optional_string(
@@ -7628,8 +7612,7 @@ impl function::Function for DocumentFunction {
         match &args[0] {
             SxdValue::Nodeset(nodes) => {
                 for node in nodes.iter() {
-                    let path = typed_path_to(&node);
-                    context.reserve_temporary_allocation(path.owned_bytes())?;
+                    let path = typed_path_to_with_context(&node, context)?;
                     let (base_uri, logical_document) = match &base_selection {
                         DocumentBaseSelection::Explicit {
                             base_uri,
@@ -8093,79 +8076,21 @@ impl NodePath {
     }
 }
 
+#[cfg(test)]
 fn typed_path_to(node: &nodeset::Node<'_>) -> NodePath {
-    match node {
-        nodeset::Node::Attribute(attribute) => {
-            let parent = attribute.parent();
-            let name = attribute.name();
-            let name = name.get();
-            NodePath::Attribute {
-                parent: parent
-                    .map(|parent| path_to(&nodeset::Node::Element(parent)))
-                    .unwrap_or_default(),
-                namespace: name.namespace_uri().map(str::to_owned),
-                local: name.local_part().to_owned(),
-            }
-        }
-        nodeset::Node::Namespace(namespace) => {
-            let parent = namespace.parent;
-            NodePath::Namespace {
-                parent: path_to(&nodeset::Node::Element(parent)),
-                prefix: namespace.prefix().to_owned(),
-                uri: namespace.uri().to_owned(),
-            }
-        }
-        _ => NodePath::Ordinary(path_to(node)),
-    }
+    build_node_path(node, &mut |_, _| Ok::<_, std::convert::Infallible>(()))
+        .expect("unlimited fixture path")
 }
 
 fn typed_path_to_metered(node: &nodeset::Node<'_>, meter: &mut Meter) -> Result<(NodePath, usize)> {
     let mut reserved = 0usize;
-    let result = (|| {
-        let path = match node {
-            nodeset::Node::Attribute(attribute) => {
-                let parent = attribute.parent();
-                let parent = parent.map(nodeset::Node::Element);
-                let parent = parent.as_ref().map_or_else(
-                    || Ok(Vec::new()),
-                    |parent| path_to_metered(parent, meter, &mut reserved),
-                )?;
-                let name = attribute.name();
-                let name = name.get();
-                let namespace = name.namespace_uri();
-                let string_bytes = namespace
-                    .map_or(0, str::len)
-                    .saturating_add(name.local_part().len());
-                meter.charge(BudgetKind::OwnedBytes, string_bytes)?;
-                reserved = reserved.saturating_add(string_bytes);
-                NodePath::Attribute {
-                    parent,
-                    namespace: namespace.map(str::to_owned),
-                    local: name.local_part().to_owned(),
-                }
-            }
-            nodeset::Node::Namespace(namespace) => {
-                let parent = path_to_metered(
-                    &nodeset::Node::Element(namespace.parent),
-                    meter,
-                    &mut reserved,
-                )?;
-                let string_bytes = namespace
-                    .prefix()
-                    .len()
-                    .saturating_add(namespace.uri().len());
-                meter.charge(BudgetKind::OwnedBytes, string_bytes)?;
-                reserved = reserved.saturating_add(string_bytes);
-                NodePath::Namespace {
-                    parent,
-                    prefix: namespace.prefix().to_owned(),
-                    uri: namespace.uri().to_owned(),
-                }
-            }
-            _ => NodePath::Ordinary(path_to_metered(node, meter, &mut reserved)?),
-        };
-        Ok(path)
-    })();
+    let result = build_node_path(node, &mut |kind, amount| {
+        meter.charge(kind, amount)?;
+        if kind == BudgetKind::OwnedBytes {
+            reserved += amount;
+        }
+        Ok(())
+    });
     match result {
         Ok(path) => Ok((path, reserved)),
         Err(error) => {
@@ -8175,31 +8100,82 @@ fn typed_path_to_metered(node: &nodeset::Node<'_>, meter: &mut Meter) -> Result<
     }
 }
 
-fn path_to_metered(
+fn typed_path_to_with_context(
     node: &nodeset::Node<'_>,
-    meter: &mut Meter,
-    reserved: &mut usize,
-) -> Result<Vec<usize>> {
-    let mut current = node.clone();
-    let mut path = Vec::new();
-    while let Some(parent) = current.parent() {
-        let mut index = 0usize;
+    context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
+) -> std::result::Result<NodePath, function::Error> {
+    build_node_path(node, &mut |kind, amount| match kind {
+        BudgetKind::OwnedBytes => context.reserve_temporary_allocation(amount),
+        _ => context.charge_work(amount),
+    })
+}
+
+// Both runtime budget domains gate the same builder. Count depth without allocation, reserve
+// exactly one path buffer, then use indexed children rather than materializing sibling vectors.
+fn build_node_path<E>(
+    node: &nodeset::Node<'_>,
+    charge: &mut impl FnMut(BudgetKind, usize) -> std::result::Result<(), E>,
+) -> std::result::Result<NodePath, E> {
+    let owner = match node {
+        nodeset::Node::Attribute(attribute) => attribute.parent().map(nodeset::Node::Element),
+        nodeset::Node::Namespace(namespace) => Some(nodeset::Node::Element(namespace.parent)),
+        node => Some(node.clone()),
+    };
+    let mut depth = 0;
+    let mut current = owner.clone();
+    while let Some(node) = current {
+        charge(BudgetKind::XPathOperations, 1)?;
+        current = node.parent();
+        if current.is_some() {
+            depth += 1;
+        }
+    }
+    charge(BudgetKind::OwnedBytes, depth * std::mem::size_of::<usize>())?;
+    let mut path = Vec::with_capacity(depth);
+    let mut current = owner;
+    while let Some(node) = current {
+        let Some(parent) = node.parent() else {
+            break;
+        };
+        let mut index = 0;
         loop {
-            meter.charge(BudgetKind::XPathOperations, 1)?;
-            let child = parent.child_at(index).ok_or_else(|| {
-                Error::Dynamic("XPath projection node is detached from its parent".into())
-            })?;
-            if child == current {
+            charge(BudgetKind::XPathOperations, 1)?;
+            if parent.child_at(index).as_ref() == Some(&node) {
                 break;
             }
-            index = index.saturating_add(1);
+            index += 1;
         }
-        reserve_temporary_vec_slot(&mut path, meter, reserved)?;
         path.push(index);
-        current = parent;
+        current = Some(parent);
     }
     path.reverse();
-    Ok(path)
+    Ok(match node {
+        nodeset::Node::Attribute(attribute) => {
+            let name = attribute.name();
+            let name = name.get();
+            charge(
+                BudgetKind::OwnedBytes,
+                name.namespace_uri().map_or(0, str::len) + name.local_part().len(),
+            )?;
+            NodePath::Attribute {
+                parent: path,
+                namespace: name.namespace_uri().map(str::to_owned),
+                local: name.local_part().to_owned(),
+            }
+        }
+        nodeset::Node::Namespace(namespace) => {
+            charge(
+                BudgetKind::OwnedBytes,
+                namespace.prefix().len() + namespace.uri().len(),
+            )?;
+            NodePath::Namespace {
+                parent: path,
+                prefix: namespace.prefix().to_owned(),
+                uri: namespace.uri().to_owned(),
+            }
+        }
+        _ => NodePath::Ordinary(path),
+    })
 }
 
 type KeyIndex = HashMap<(ExpandedName, String, usize), Vec<NodePath>>;
@@ -8225,13 +8201,13 @@ impl function::Function for KeyFunction {
         }
         context.reserve_temporary_allocation(args[0].string_len())?;
         let name = resolve_lexical_name(&args[0].string(), &self.namespaces)?;
-        let document_index =
-            path_to(&context.node)
-                .get(1)
-                .copied()
-                .ok_or_else(|| function::Error::Other {
-                    what: "key() context has no logical document".into(),
-                })?;
+        let document_index = typed_path_to_with_context(&context.node, context)?
+            .ordinary()
+            .get(1)
+            .copied()
+            .ok_or_else(|| function::Error::Other {
+                what: "key() context has no logical document".into(),
+            })?;
         if let Some(key_slot) = self
             .name_indices
             .iter()
@@ -8359,7 +8335,7 @@ fn resolve_lexical_name(
 
 fn follow_path<'d>(mut node: nodeset::Node<'d>, path: &[usize]) -> Option<nodeset::Node<'d>> {
     for index in path {
-        node = node.children().get(*index).cloned()?;
+        node = node.child_at(*index)?;
     }
     Some(node)
 }
@@ -8370,18 +8346,26 @@ fn resolve_node_path<'d>(root: nodeset::Node<'d>, path: &NodePath) -> Option<nod
         NodePath::Ordinary(_) => Some(node),
         NodePath::Attribute {
             namespace, local, ..
-        } => node
-            .element()?
-            .attributes()
-            .into_iter()
-            .find(|attribute| {
-                let name = attribute.name();
-                let name = name.get();
-                name.local_part() == local && name.namespace_uri() == namespace.as_deref()
-            })
-            .map(nodeset::Node::Attribute),
+        } => resolve_attribute_node(node, namespace.as_deref(), local),
         NodePath::Namespace { prefix, uri, .. } => resolve_namespace_node(node, prefix, uri),
     }
+}
+
+fn resolve_attribute_node<'d>(
+    node: nodeset::Node<'d>,
+    namespace: Option<&str>,
+    local: &str,
+) -> Option<nodeset::Node<'d>> {
+    let element = node.element()?;
+    for index in 0..element.attributes_len() {
+        let attribute = element.attribute_at(index)?;
+        let name = attribute.name();
+        let name = name.get();
+        if name.local_part() == local && name.namespace_uri() == namespace {
+            return Some(nodeset::Node::Attribute(attribute));
+        }
+    }
+    None
 }
 
 fn resolve_namespace_node<'d>(
@@ -8784,10 +8768,9 @@ impl function::Function for CurrentNode {
         let path = self.path.ordinary();
         let mut node = nodeset::Node::Root(context.node.document().root());
         for index in path {
+            context.charge_work(1)?;
             node = node
-                .children()
-                .get(*index)
-                .cloned()
+                .child_at(*index)
                 .ok_or_else(|| function::Error::Other {
                     what: "current() context is stale".into(),
                 })?;
@@ -8800,18 +8783,20 @@ impl function::Function for CurrentNode {
                 let element = node.element().ok_or_else(|| function::Error::Other {
                     what: "current() owner is stale".into(),
                 })?;
-                let attribute = element
-                    .attributes()
-                    .into_iter()
-                    .find(|attribute| {
-                        let name = attribute.name();
-                        let name = name.get();
-                        name.local_part() == local && name.namespace_uri() == namespace.as_deref()
-                    })
-                    .ok_or_else(|| function::Error::Other {
-                        what: "current() attribute is stale".into(),
+                context.charge_work(
+                    element.attributes_len().saturating_mul(
+                        local
+                            .len()
+                            .saturating_add(namespace.as_deref().map_or(0, str::len))
+                            .max(1),
+                    ),
+                )?;
+                node =
+                    resolve_attribute_node(node, namespace.as_deref(), local).ok_or_else(|| {
+                        function::Error::Other {
+                            what: "current() attribute is stale".into(),
+                        }
                     })?;
-                node = nodeset::Node::Attribute(attribute);
             }
             NodePath::Namespace { prefix, uri, .. } => {
                 node = resolve_namespace_node(node, prefix, uri).ok_or_else(|| {
@@ -8822,7 +8807,7 @@ impl function::Function for CurrentNode {
             }
         }
         let mut set = nodeset::Nodeset::new();
-        set.add(node);
+        set.add_metered(context, node)?;
         Ok(SxdValue::Nodeset(set))
     }
 }
@@ -9488,6 +9473,32 @@ mod tests {
             .evaluate(&evaluation, vec![SxdValue::String("target".into())])
             .expect_err("id() result storage must cross the allocation gate");
         assert!(error.to_string().contains("allocation budget"));
+    }
+
+    #[test]
+    fn runtime_node_paths_obey_work_budget() {
+        // id() needs document identity even for an empty lookup; finding it must not scan
+        // arbitrarily many preceding siblings outside the evaluation work allowance.
+        let package = Package::new();
+        let document = package.as_document();
+        let root = document.create_element("root");
+        document.root().append_child(root);
+        for _ in 0..128 {
+            root.append_child(document.create_element("sibling"));
+        }
+        let target = document.create_element("target");
+        root.append_child(target);
+        let function = IdFunction {
+            nodes_by_document: Rc::new(RefCell::new(Vec::new())),
+        };
+        let mut context = Context::new();
+        context.set_evaluation_work_limit(0);
+        let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&context, target.into());
+        assert!(
+            function
+                .evaluate(&evaluation, vec![SxdValue::String(String::new())])
+                .is_err()
+        );
     }
 
     #[test]

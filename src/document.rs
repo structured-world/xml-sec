@@ -518,6 +518,13 @@ impl XmlDocumentError {
                     actual: settings.nodes_limit as usize + 1,
                 }
             }
+            Self::Parse(ParseError::NamespaceBindingLimitReached { maximum, actual }) => {
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_NAMESPACE_BINDINGS,
+                    maximum,
+                    actual,
+                }
+            }
             error => return Err(error),
         };
         Ok(violation)
@@ -3430,6 +3437,27 @@ fn element_opening_end(element: &str) -> Result<usize, XmlDocumentError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    fn namespace_preflight_error_is_a_policy_violation() {
+        // Initial parsing and retained-document validation must report the same typed limit.
+        let settings = DocumentParseSettings {
+            namespace_bindings_limit: 1,
+            ..Default::default()
+        };
+        let error =
+            preflight_document_limits(r#"<root xmlns:a="urn:a" xmlns:b="urn:b"/>"#, settings, None)
+                .expect_err("namespace ceiling must be enforced");
+        assert!(matches!(
+            error.into_policy_violation(settings),
+            Ok(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_NAMESPACE_BINDINGS,
+                maximum: 1,
+                actual: 2,
+            })
+        ));
+    }
 
     #[test]
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]

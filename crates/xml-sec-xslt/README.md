@@ -37,7 +37,9 @@ enter the reusable engine.
 
 Execution budgets cover internal work, not just output: node-set string traversal,
 EXSLT date parsing and URI conversion, and both small and large XPath projections
-are metered. Existing string arguments are borrowed rather than copied for conversion.
+are metered, including runtime identity paths and optimized result-fragment scans.
+`current()` reuses indexed projection identity rather than rescanning sibling lists.
+Existing string arguments are borrowed rather than copied for conversion.
 
 Resolver resources are byte-oriented. XML declarations, BOMs, UTF-16/UTF-32 initial
 patterns, and explicit resolver encoding metadata are honored without lossy

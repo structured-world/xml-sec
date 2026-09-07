@@ -974,6 +974,40 @@ fn rtf_order_compares_every_node_selected_from_current() {
 }
 
 #[test]
+fn rtf_order_scan_obeys_work_budget() {
+    // Constructing literal nodes costs result work, but scanning their names costs XPath work.
+    // A large retained fragment must not be traversed under a tiny XPath allowance.
+    let stylesheet = compile(&format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:exsl="http://exslt.org/common"><xsl:output method="text"/><xsl:template match="/"><xsl:variable name="v">{}</xsl:variable><xsl:value-of select="count(exsl:node-set($v)/*[name() = name(current())]/preceding-sibling::*)"/></xsl:template></xsl:stylesheet>"#,
+        "<a/>".repeat(2048)
+    ));
+    let source = Document::parse("<root/>", None).expect("source parses");
+    let mut budget = execution_budget(100_000);
+    budget.owned_bytes = 128 * 1024 * 1024;
+    budget.xpath_operations = 128;
+    let result = stylesheet.execute(
+        &source,
+        &Parameters::new(),
+        Arc::new(NoResolver),
+        ExecutionOptions {
+            budget,
+            initial_mode: None,
+            initial_template: None,
+        },
+    );
+    assert!(
+        matches!(
+            result,
+            Err(Error::Budget {
+                kind: BudgetKind::XPathOperations,
+                ..
+            })
+        ),
+        "{result:?}"
+    );
+}
+
+#[test]
 fn rtf_order_fast_path_requires_the_exslt_common_namespace() {
     // XPath resolves function QNames through the expression's namespace context; a lexical
     // `exsl` prefix bound elsewhere must not acquire EXSLT semantics.

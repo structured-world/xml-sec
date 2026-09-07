@@ -2620,6 +2620,22 @@ impl<'a> Execution<'a> {
             _ => return Ok(None),
         };
         let result = (|| {
+            self.meter
+                .charge(BudgetKind::XPathOperations, targets.len())?;
+            let max_target_bytes = targets.iter().map(String::len).max().unwrap_or(0);
+            let comparisons = targets
+                .len()
+                .checked_ilog2()
+                .map_or(0, |power| power as usize + 1);
+            // The shortcut still sorts names and compares bytes; reserve a conservative
+            // comparison bound before sorting, then charge every examined fragment child.
+            self.meter.charge(
+                BudgetKind::XPathOperations,
+                targets
+                    .len()
+                    .saturating_mul(comparisons)
+                    .saturating_mul(max_target_bytes.max(1)),
+            )?;
             targets.sort_unstable();
             targets.dedup();
             let Some(root) = fragment.node(fragment.root()) else {
@@ -2628,10 +2644,21 @@ impl<'a> Execution<'a> {
             let mut preceding = 0usize;
             let mut union_count = 0usize;
             for child in &root.children {
+                self.meter.charge(BudgetKind::XPathOperations, 1)?;
                 let Some(candidate) = fragment.node(*child) else {
                     continue;
                 };
                 if let NodeKind::Element { name, prefix, .. } = &candidate.kind {
+                    self.meter.charge(
+                        BudgetKind::XPathOperations,
+                        comparisons.saturating_mul(
+                            max_target_bytes
+                                .max(name.local.len().saturating_add(
+                                    prefix.as_deref().map_or(0, |value| value.len() + 1),
+                                ))
+                                .max(1),
+                        ),
+                    )?;
                     // XPath 1.0 section 3.4 defines string-to-node-set equality as true when any
                     // selected node has the same string-value; reducing current()/path to its first
                     // node would change predicate semantics.
