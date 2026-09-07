@@ -1007,6 +1007,19 @@ impl Connections {
         None
     }
 
+    pub fn try_visit_element_namespace_declarations<E>(
+        &self,
+        storage: &Storage,
+        element: Index<Element>,
+        mut visit: impl FnMut(&str, &str) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let elements = storage.elements.borrow();
+        for (prefix, uri) in elements[element.idx].prefix_to_namespace.iter() {
+            visit(prefix, uri)?;
+        }
+        Ok(())
+    }
+
     pub fn element_namespaces_in_scope(
         &self,
         storage: &Storage,

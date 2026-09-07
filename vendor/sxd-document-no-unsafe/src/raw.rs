@@ -1001,6 +1001,19 @@ impl Connections {
         None
     }
 
+    pub fn try_visit_element_namespace_declarations<'a, E>(
+        &'a self,
+        element: *mut Element,
+        mut visit: impl FnMut(&'a str, &'a str) -> Result<(), E>,
+    ) -> Result<(), E> {
+        if let Some(element) = self.element_parents(element).next() {
+            for (prefix, uri) in element.prefix_to_namespace.iter() {
+                visit(prefix.as_slice(), uri.as_slice())?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn element_namespaces_in_scope(&self, element: *mut Element) -> NamespacesInScope<'_> {
         let mut namespaces = Vec::new();
 

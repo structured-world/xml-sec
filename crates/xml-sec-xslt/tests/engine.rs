@@ -10902,6 +10902,56 @@ fn namespace_generate_ids_are_stable_and_injective() {
 }
 
 #[test]
+fn extension_string_and_set_work_reaches_the_operation_budget() {
+    // Public execution must forward the same extension budget into scalar string creation
+    // and set membership, even when no extension result tree is constructed.
+    let source = Document::parse("<root><a/><b/></root>", None).expect("source parses");
+    for (expression, expected) in [
+        ("str:padding(5, 'éx')", "éxéxé"),
+        ("set:has-same-node(root/*, root/a)", "true"),
+        ("set:has-same-node(root/a, root/b)", "false"),
+        ("count(set:leading(root/*, root/b))", "1"),
+        ("count(set:trailing(root/*, root/a))", "1"),
+    ] {
+        let stylesheet = compile(&format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings" xmlns:set="http://exslt.org/sets"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="{expression}"/></xsl:template></xsl:stylesheet>"#,
+        ));
+        for extension_operations in [0, 4096] {
+            let mut budget = execution_budget(1024);
+            budget.extension_operations = extension_operations;
+            let result = stylesheet.execute(
+                &source,
+                &Parameters::new(),
+                Arc::new(NoResolver),
+                ExecutionOptions {
+                    budget,
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            );
+            if extension_operations == 0 {
+                assert!(
+                    matches!(
+                        result,
+                        Err(Error::Budget {
+                            kind: BudgetKind::ExtensionOperations,
+                            ..
+                        })
+                    ),
+                    "{expression}: {result:?}"
+                );
+            } else {
+                assert_eq!(
+                    result.expect("sufficient budget").serialized.bytes,
+                    expected.as_bytes(),
+                    "{expression}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn exslt_replace_is_metered_before_multiplicative_expansion() {
     // The replacement result can be the product of two individually bounded strings. The
     // execution budget must reject that product before the result String reserves its capacity.

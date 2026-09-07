@@ -454,7 +454,7 @@ enum DeferredXPathValue {
     Boolean(bool),
     Number(u64),
     String(String),
-    ResultTreeFragment { identity: u64, value: String },
+    ResultTreeFragment { identity: u64, value: Arc<String> },
     NodeSet(Vec<NodePath>),
 }
 
@@ -477,7 +477,10 @@ impl DeferredXPathValue {
     fn owned_bytes(&self) -> usize {
         std::mem::size_of::<Self>().saturating_add(match self {
             Self::Boolean(_) | Self::Number(_) => 0,
-            Self::String(value) | Self::ResultTreeFragment { value, .. } => value.len(),
+            Self::String(value) => value.len(),
+            Self::ResultTreeFragment { value, .. } => value
+                .len()
+                .saturating_add(std::mem::size_of::<String>() + 2 * std::mem::size_of::<usize>()),
             Self::NodeSet(paths) => paths.iter().map(NodePath::owned_bytes).sum(),
         })
     }
@@ -599,7 +602,6 @@ fn restore_sxd_value<'d>(
             SxdValue::String(value.clone())
         }
         DeferredXPathValue::ResultTreeFragment { identity, value } => {
-            context.reserve_string_allocation(value.len())?;
             SxdValue::ResultTreeFragment(*identity, value.clone())
         }
         DeferredXPathValue::NodeSet(paths) => {
@@ -1185,7 +1187,7 @@ impl Evaluator {
             Value::ResultTreeFragment(document) => {
                 let deferred = DeferredXPathValue::ResultTreeFragment {
                     identity: result_tree_fragment_handle(&document),
-                    value: document.string_value(document.root()),
+                    value: Arc::new(document.string_value(document.root())),
                 };
                 (deferred, Some(document))
             }
@@ -2187,7 +2189,9 @@ impl Evaluator {
                         }
                     }
                     let length = document.string_value_len(document.root());
-                    let reservation = context.reserve_temporary_allocation(length);
+                    let reservation = context.reserve_temporary_allocation(length.saturating_add(
+                        std::mem::size_of::<String>() + 2 * std::mem::size_of::<usize>(),
+                    ));
                     if reservation.is_err() {
                         variable_projection_error = true;
                         continue;
@@ -2196,7 +2200,7 @@ impl Evaluator {
                         qname,
                         SxdValue::ResultTreeFragment(
                             result_tree_fragment_handle(document),
-                            document.string_value_with_capacity(document.root(), length),
+                            Arc::new(document.string_value_with_capacity(document.root(), length)),
                         ),
                     );
                 }
@@ -2809,18 +2813,22 @@ impl Evaluator {
         let Some(parent) = self.source.node(parent) else {
             return Ok(Vec::new());
         };
+        meter.charge(BudgetKind::XPathOperations, parent.children.len())?;
         let Some(position) = parent.children.iter().position(|child| child == id) else {
             return Ok(Vec::new());
         };
         let mut candidate = None;
         for id in parent.children[..position].iter().rev().copied() {
             meter.charge(BudgetKind::XPathOperations, 1)?;
-            if !self
-                .source
-                .string_value(id)
-                .trim_matches(crate::lexical::is_xml_whitespace)
-                .is_empty()
-            {
+            let mut nonempty = false;
+            self.visit_string_value_metered(&SourceNode::Node(id), meter, |text| {
+                if !nonempty {
+                    nonempty = text
+                        .bytes()
+                        .any(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n'));
+                }
+            })?;
+            if nonempty {
                 if self
                     .source
                     .node(id)
@@ -2985,11 +2993,14 @@ impl Evaluator {
         match node {
             SourceNode::Node(id) => self.source.try_visit_string_value(
                 *id,
-                || meter.charge(BudgetKind::XPathOperations, 1),
+                |work| meter.charge(BudgetKind::XPathOperations, work),
                 visit,
             ),
             SourceNode::Attribute { .. } | SourceNode::Namespace { .. } => {
                 meter.charge(BudgetKind::XPathOperations, 1)?;
+                let mut bytes = 0;
+                self.visit_string_value(node, |value| bytes = value.len());
+                meter.charge(BudgetKind::XPathOperations, bytes)?;
                 self.visit_string_value(node, &mut visit);
                 Ok(())
             }
@@ -3690,14 +3701,14 @@ fn temporary_document_string(document: &Document, meter: &mut Meter) -> Result<(
     let mut length = 0usize;
     document.try_visit_string_value(
         document.root(),
-        || meter.charge(BudgetKind::XPathOperations, 1),
+        |work| meter.charge(BudgetKind::XPathOperations, work),
         |value| length = length.saturating_add(value.len()),
     )?;
     meter.charge(BudgetKind::OwnedBytes, length)?;
     let mut output = String::with_capacity(length);
     if let Err(error) = document.try_visit_string_value(
         document.root(),
-        || meter.charge(BudgetKind::XPathOperations, 1),
+        |work| meter.charge(BudgetKind::XPathOperations, work),
         |value| output.push_str(value),
     ) {
         meter.release_owned_bytes(length);
@@ -6373,7 +6384,10 @@ impl function::Function for IdFunction {
                     add_tokens(&value)?;
                 }
             }
-            SxdValue::String(value) | SxdValue::ResultTreeFragment(_, value) => {
+            SxdValue::String(value) => {
+                add_tokens(value)?;
+            }
+            SxdValue::ResultTreeFragment(_, value) => {
                 add_tokens(value)?;
             }
             value => {
@@ -6824,9 +6838,8 @@ pub(crate) fn extension_string<'a>(
     value: &'a SxdValue<'_>,
 ) -> std::result::Result<Cow<'a, str>, function::Error> {
     let text = match value {
-        SxdValue::String(text) | SxdValue::ResultTreeFragment(_, text) => {
-            Cow::Borrowed(text.as_str())
-        }
+        SxdValue::String(text) => Cow::Borrowed(text.as_str()),
+        SxdValue::ResultTreeFragment(_, text) => Cow::Borrowed(text.as_str()),
         SxdValue::Nodeset(nodes) => {
             context.charge_extension_work(nodes.size())?;
             match nodes.document_order_first_with_context(context)? {
@@ -7020,49 +7033,54 @@ impl function::Function for ExsltSetFunction {
             return extension_argument_error("EXSLT set function requires two node-sets");
         };
         if matches!(self, Self::HasSameNode) {
-            return Ok(SxdValue::Boolean(
-                left.iter().any(|node| right.contains(node)),
-            ));
+            for node in left.iter_ref() {
+                context.charge_extension_work(1)?;
+                if right.contains_ref(node) {
+                    return Ok(SxdValue::Boolean(true));
+                }
+            }
+            return Ok(SxdValue::Boolean(false));
         }
         let mut result = nodeset::Nodeset::new();
         match self {
             Self::Difference => {
-                for node in left.document_order_with_context(context)? {
-                    if !right.contains(node.clone()) {
-                        result.add_metered(context, node)?;
+                for node in left.iter_ref() {
+                    context.charge_extension_work(1)?;
+                    if !right.contains_ref(node) {
+                        result.add_metered(context, node.clone_with_context(context)?)?;
                     }
                 }
             }
             Self::Intersection => {
-                for node in left.document_order_with_context(context)? {
-                    if right.contains(node.clone()) {
-                        result.add_metered(context, node)?;
+                for node in left.iter_ref() {
+                    context.charge_extension_work(1)?;
+                    if right.contains_ref(node) {
+                        result.add_metered(context, node.clone_with_context(context)?)?;
                     }
                 }
             }
             Self::Leading | Self::Trailing => {
                 let Some(boundary) = right.document_order_first_with_context(context)? else {
-                    return Ok(SxdValue::Nodeset(left.clone()));
+                    // The caller already transferred ownership; identity needs no new hash table.
+                    return Ok(args.into_iter().next().expect("arity checked above"));
                 };
                 // EXSLT Sets defines a non-member boundary as an empty result, even when nodes
                 // from the first set precede it in document order. This membership condition is
                 // intentionally stricter than a plain document-order partition.
-                if !left.contains(boundary.clone()) {
+                context.charge_extension_work(1)?;
+                if !left.contains_ref(&boundary) {
                     return Ok(SxdValue::Nodeset(nodeset::Nodeset::new()));
                 }
-                let mut combined = nodeset::Nodeset::new();
-                combined.extend(left.iter());
-                combined.extend(right.iter());
-                let order = combined.document_order_with_context(context)?;
-                let boundary = order
-                    .iter()
-                    .position(|node| node == &boundary)
-                    .unwrap_or(usize::MAX);
-                for (candidate, node) in order.into_iter().enumerate() {
-                    if left.contains(node.clone())
-                        && ((matches!(self, Self::Leading) && candidate < boundary)
-                            || (matches!(self, Self::Trailing) && candidate > boundary))
-                    {
+                // Only the first right node matters, and it belongs to left. Ordering the
+                // union adds no information but used to allocate another unmetered hash table.
+                let mut after_boundary = false;
+                for node in left.document_order_with_context(context)? {
+                    context.charge_extension_work(1)?;
+                    if node == boundary {
+                        after_boundary = true;
+                        continue;
+                    }
+                    if matches!(self, Self::Trailing) == after_boundary {
                         result.add_metered(context, node)?;
                     }
                 }
@@ -7146,43 +7164,37 @@ impl function::Function for ExsltStringFunction {
                 if !(1..=2).contains(&args.len()) {
                     return extension_argument_error("str:padding() requires one or two arguments");
                 }
-                reserve_sxd_string_arguments(
-                    context,
-                    &args,
-                    &[1],
-                    "str:padding() allocation length overflow",
-                )?;
                 let requested = args[0].number(context)?.floor().max(0.0);
                 let length = if requested.is_finite() && requested <= usize::MAX as f64 {
                     requested as usize
                 } else {
                     usize::MAX
                 };
-                let pattern = args
-                    .get(1)
-                    .map(SxdValue::string)
-                    .unwrap_or_else(|| " ".into());
+                let pattern = match args.get(1) {
+                    Some(value) => extension_string(context, value)?,
+                    None => Cow::Borrowed(" "),
+                };
+                context.charge_extension_work(pattern.len())?;
                 let pattern_characters = pattern.chars().count();
                 if pattern_characters == 0 || length == 0 {
                     return Ok(SxdValue::String(String::new()));
                 }
                 let complete = length / pattern_characters;
                 let remainder = length % pattern_characters;
+                context.charge_extension_work(pattern.len())?;
+                let suffix_bytes = utf8_prefix_bytes(&pattern, remainder);
                 let bytes = pattern
                     .len()
                     .checked_mul(complete)
-                    .and_then(|bytes| {
-                        pattern
-                            .chars()
-                            .take(remainder)
-                            .try_fold(bytes, |total, character| {
-                                total.checked_add(character.len_utf8())
-                            })
-                    })
+                    .and_then(|bytes| bytes.checked_add(suffix_bytes))
                     .unwrap_or(usize::MAX);
+                context.charge_extension_work(bytes)?;
                 context.reserve_string_allocation(bytes)?;
-                let mut output = pattern.repeat(complete);
-                output.extend(pattern.chars().take(remainder));
+                let mut output = String::with_capacity(bytes);
+                for _ in 0..complete {
+                    output.push_str(&pattern);
+                }
+                output.push_str(&pattern[..suffix_bytes]);
                 Ok(SxdValue::String(output))
             }
             Self::EncodeUri => {
@@ -8292,11 +8304,15 @@ impl function::Function for FormatNumberFunction {
                 });
             };
         let pattern = args.pop_string(context)?;
+        // Bound all linear picture passes and digit rendering before either scans or allocation.
+        // Work is a product limit, not an additional XSLT picture-syntax restriction.
+        context.charge_work(pattern.len().saturating_mul(32).saturating_add(2_048))?;
         context.reserve_string_allocation(decimal_render_workspace_bytes(&pattern))?;
         Ok(SxdValue::String(render_decimal(
             args.pop_number(context)?,
             &pattern,
             format,
+            context,
         )?))
     }
 }
@@ -8439,29 +8455,21 @@ fn resolve_namespace_node<'d>(
     uri: &str,
 ) -> Option<nodeset::Node<'d>> {
     let element = node.element()?;
-    if prefix.is_empty()
-        && element
-            .recursive_default_namespace_uri()
-            .as_deref()
-            .is_some_and(|namespace| namespace == uri)
-    {
-        return Some(nodeset::Node::Namespace(nodeset::Namespace {
-            parent: element,
-            prefix: sxd_document_no_unsafe::to_ns_str!(prefix),
-            uri: sxd_document_no_unsafe::to_ns_str!(uri),
-        }));
+    // Resolving a known identity needs one binding, not a materialized namespace axis.
+    let matches = if prefix == "xml" {
+        uri == "http://www.w3.org/XML/1998/namespace"
+    } else {
+        (prefix.is_empty() && element.recursive_default_namespace_uri().as_deref() == Some(uri))
+            || element.namespace_uri_for_prefix(prefix).as_deref() == Some(uri)
+    };
+    if !matches {
+        return None;
     }
-    element
-        .namespaces_in_scope()
-        .into_iter()
-        .find(|namespace| namespace.prefix() == prefix && namespace.uri() == uri)
-        .map(|namespace| {
-            nodeset::Node::Namespace(nodeset::Namespace {
-                parent: element,
-                prefix: sxd_document_no_unsafe::to_ns_str!(namespace.prefix()),
-                uri: sxd_document_no_unsafe::to_ns_str!(namespace.uri()),
-            })
-        })
+    Some(nodeset::Node::Namespace(nodeset::Namespace {
+        parent: element,
+        prefix: sxd_document_no_unsafe::to_ns_str!(prefix),
+        uri: sxd_document_no_unsafe::to_ns_str!(uri),
+    }))
 }
 
 fn default_decimal_format() -> DecimalFormat {
@@ -8486,8 +8494,12 @@ fn render_decimal(
     value: f64,
     pattern: &str,
     format: &DecimalFormat,
+    context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
 ) -> std::result::Result<String, function::Error> {
     if value.is_nan() {
+        // Symbols belong to the decimal format, not the picture-based workspace bound.
+        context.charge_work(format.nan.len())?;
+        context.reserve_string_allocation(format.nan.len())?;
         return Ok(format.nan.clone());
     }
     let alternatives = tokenize_decimal_pattern(pattern, format)?;
@@ -8519,7 +8531,18 @@ fn render_decimal(
     let (affix_first, affix_last) = decimal_pattern_bounds(affix_pattern, format)?;
     let scaled = value.abs() * multiplier;
     if scaled.is_infinite() {
-        let mut output = String::new();
+        context.charge_work(format.infinity.len())?;
+        context.reserve_string_allocation(format.infinity.len())?;
+        let mut output = String::with_capacity(
+            format
+                .infinity
+                .len()
+                .checked_add(pattern.len())
+                .and_then(|length| length.checked_add(format.minus_sign.len_utf8()))
+                .ok_or_else(|| function::Error::Other {
+                    what: "decimal output size overflow".into(),
+                })?,
+        );
         if negative && !negative_subpattern {
             output.push(format.minus_sign);
         }
@@ -8575,10 +8598,11 @@ fn render_decimal(
         scaled
     };
     let mut rendered = format!("{rounded:.maximum_fraction$}");
-    if maximum_fraction > minimum_fraction && rendered.contains('.') {
-        while rendered.ends_with('0')
-            && rendered.split('.').nth(1).map_or(0, str::len) > minimum_fraction
-        {
+    if maximum_fraction > minimum_fraction
+        && let Some(decimal) = rendered.find('.')
+    {
+        let minimum_len = decimal + 1 + minimum_fraction;
+        while rendered.len() > minimum_len && rendered.ends_with('0') {
             rendered.pop();
         }
         if rendered.ends_with('.') {
@@ -8607,16 +8631,19 @@ fn render_decimal(
                     && matches!(token.value, value if value == format.zero_digit || value == format.digit)
             })
             .count();
-        if size > 0 {
-            let chars = integer.chars().rev().collect::<Vec<_>>();
-            integer = chars
-                .chunks(size)
-                .map(|chunk| chunk.iter().collect::<String>())
-                .collect::<Vec<_>>()
-                .join(&format.grouping_separator.to_string())
-                .chars()
-                .rev()
-                .collect();
+        if let Some(size) = std::num::NonZeroUsize::new(size) {
+            let digits = integer.chars().count();
+            let separators = digits.saturating_sub(1) / size;
+            let mut grouped = String::with_capacity(
+                integer.len() + separators * format.grouping_separator.len_utf8(),
+            );
+            for (index, digit) in integer.chars().enumerate() {
+                if index != 0 && (digits - index).is_multiple_of(size.get()) {
+                    grouped.push(format.grouping_separator);
+                }
+                grouped.push(digit);
+            }
+            integer = grouped;
         }
     }
     let mut output = String::new();
@@ -8830,47 +8857,10 @@ impl function::Function for CurrentNode {
                 actual: args.len(),
             });
         }
-        let path = self.path.ordinary();
-        let mut node = nodeset::Node::Root(context.node.document().root());
-        for index in path {
-            context.charge_work(1)?;
-            node = node
-                .child_at(*index)
-                .ok_or_else(|| function::Error::Other {
-                    what: "current() context is stale".into(),
-                })?;
-        }
-        match &self.path {
-            NodePath::Ordinary(_) => {}
-            NodePath::Attribute {
-                namespace, local, ..
-            } => {
-                let element = node.element().ok_or_else(|| function::Error::Other {
-                    what: "current() owner is stale".into(),
-                })?;
-                context.charge_work(
-                    element.attributes_len().saturating_mul(
-                        local
-                            .len()
-                            .saturating_add(namespace.as_deref().map_or(0, str::len))
-                            .max(1),
-                    ),
-                )?;
-                node =
-                    resolve_attribute_node(node, namespace.as_deref(), local).ok_or_else(|| {
-                        function::Error::Other {
-                            what: "current() attribute is stale".into(),
-                        }
-                    })?;
-            }
-            NodePath::Namespace { prefix, uri, .. } => {
-                node = resolve_namespace_node(node, prefix, uri).ok_or_else(|| {
-                    function::Error::Other {
-                        what: "current() owner is stale".into(),
-                    }
-                })?;
-            }
-        }
+        let node =
+            resolve_node_path(context, &self.path)?.ok_or_else(|| function::Error::Other {
+                what: "current() context identity is stale".into(),
+            })?;
         let mut set = nodeset::Nodeset::new();
         set.add_metered(context, node)?;
         Ok(SxdValue::Nodeset(set))
@@ -8942,6 +8932,29 @@ mod tests {
             .select_child_axis(&expression, &SourceNode::Node(empty_element), &mut meter)
             .expect_err("unbound QName prefix must fail before child traversal");
         assert!(matches!(error, Error::Static(message) if message.contains("missing")));
+    }
+
+    #[test]
+    fn current_namespace_identity_charges_binding_resolution() {
+        // current() must use the same metered binding lookup as continuation restoration.
+        let package = Package::new();
+        let document = package.as_document();
+        let root = document.create_element("root");
+        let prefix = "p".repeat(128);
+        root.register_prefix(&prefix, "urn:test");
+        document.root().append_child(root);
+        let function = CurrentNode {
+            path: NodePath::Namespace {
+                parent: vec![0],
+                prefix,
+                uri: "urn:test".into(),
+            },
+        };
+        let mut context = Context::new();
+        context.set_evaluation_work_limit(2);
+        let evaluation =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+        assert!(function.evaluate(&evaluation, vec![]).is_err());
     }
 
     #[test]
@@ -9590,8 +9603,8 @@ mod tests {
 
     #[test]
     fn restored_function_results_obey_evaluation_budgets() {
-        // The retained continuation result and its replay copy are simultaneously
-        // live. A cached result cannot make the second allocation or traversal free.
+        // Owned strings/node projections require replay storage; immutable RTF projections
+        // must instead preserve shared ownership without copying their retained payload.
         let package = Package::new();
         let document = package.as_document();
         let root = document.create_element("root");
@@ -9600,11 +9613,15 @@ mod tests {
             DeferredXPathValue::String("x".repeat(4096)),
             DeferredXPathValue::ResultTreeFragment {
                 identity: 1,
-                value: "x".repeat(4096),
+                value: Arc::new("x".repeat(4096)),
             },
             DeferredXPathValue::NodeSet(vec![NodePath::Ordinary(vec![0])]),
         ];
         for result in results {
+            let shared = match &result {
+                DeferredXPathValue::ResultTreeFragment { value, .. } => Some(Arc::clone(value)),
+                _ => None,
+            };
             let name = ExpandedName {
                 namespace: None,
                 local: "f".into(),
@@ -9632,10 +9649,21 @@ mod tests {
             context.set_evaluation_work_limit(1);
             let evaluation =
                 sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
-            let error = function
-                .evaluate(&evaluation, vec![])
-                .expect_err("restoring the cached result must cross the remaining budget");
-            assert!(error.to_string().contains("budget"));
+            let result = function.evaluate(&evaluation, vec![]);
+            if let Some(shared) = shared {
+                let SxdValue::ResultTreeFragment(identity, value) =
+                    result.expect("shared RTF replay")
+                else {
+                    panic!("RTF expected");
+                };
+                assert_eq!(identity, 1);
+                assert!(Arc::ptr_eq(&shared, &value));
+            } else {
+                let error = result.expect_err(
+                    "copying or resolving the cached result must cross the remaining budget",
+                );
+                assert!(error.to_string().contains("budget"));
+            }
         }
     }
 
@@ -9715,15 +9743,13 @@ mod tests {
 
     #[test]
     fn exslt_set_result_nodes_cross_the_xpath_allocation_gate() {
-        // EXSLT set operators retain a second node-set beside their ordered input workspace.
+        // Difference allocates its result, but no longer allocates an unnecessary sorted input.
         let package = Package::new();
         let document = package.as_document();
         let mut left = nodeset::Nodeset::new();
         left.add(document.root());
         let mut context = Context::new();
-        context.set_string_allocation_limit(
-            2 * std::mem::size_of::<nodeset::Node<'_>>() + std::mem::size_of::<Vec<usize>>(),
-        );
+        context.set_string_allocation_limit(0);
         let evaluation =
             sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
 
@@ -10534,6 +10560,128 @@ mod tests {
             )
             .expect_err("aligned output must cross the allocation gate");
         assert!(error.to_string().contains("allocation budget"));
+    }
+
+    #[test]
+    fn padding_obeys_extension_work() {
+        // Owned arguments must not bypass work accounting inside extension functions.
+        let package = Package::new();
+        let document = package.as_document();
+        let mut context = Context::new();
+        context.set_extension_work_limit(0);
+        let evaluation =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+        let error = ExsltStringFunction::Padding
+            .evaluate(
+                &evaluation,
+                vec![SxdValue::Number(4096.0), SxdValue::String("λx".into())],
+            )
+            .expect_err("padding must charge work before rendering");
+        assert!(error.to_string().contains("extension work budget"));
+    }
+
+    #[test]
+    fn set_membership_obeys_extension_work() {
+        // A disjoint membership scan must consume extension work even with owned arguments.
+        let package = Package::new();
+        let document = package.as_document();
+        let mut context = Context::new();
+        context.set_extension_work_limit(0);
+        let evaluation =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+        let mut left = nodeset::Nodeset::new();
+        left.add(document.root());
+        let error = ExsltSetFunction::HasSameNode
+            .evaluate(
+                &evaluation,
+                vec![
+                    SxdValue::Nodeset(left),
+                    SxdValue::Nodeset(nodeset::Nodeset::new()),
+                ],
+            )
+            .expect_err("membership scan must charge extension work");
+        assert!(error.to_string().contains("extension work budget"));
+    }
+
+    #[test]
+    fn set_partition_reuses_owned_input_for_empty_boundary() {
+        // An empty boundary is the identity operation, so it needs neither a copy nor work.
+        let package = Package::new();
+        let document = package.as_document();
+        for function in [ExsltSetFunction::Leading, ExsltSetFunction::Trailing] {
+            let mut left = nodeset::Nodeset::new();
+            left.add(document.root());
+            let mut context = Context::new();
+            context.set_string_allocation_limit(0);
+            context.set_extension_work_limit(0);
+            let evaluation =
+                sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+            let value = function
+                .evaluate(
+                    &evaluation,
+                    vec![
+                        SxdValue::Nodeset(left),
+                        SxdValue::Nodeset(nodeset::Nodeset::new()),
+                    ],
+                )
+                .expect("identity transfer needs no new allocation");
+            let SxdValue::Nodeset(nodes) = value else {
+                panic!("expected node-set")
+            };
+            assert_eq!(nodes.size(), 1);
+            assert!(nodes.contains(document.root()));
+        }
+    }
+
+    #[test]
+    fn format_number_obeys_picture_work_budget() {
+        // Runtime pictures are untrusted even when coercion can move an existing string.
+        let package = Package::new();
+        let document = package.as_document();
+        let mut context = Context::new();
+        context.set_evaluation_work_limit(0);
+        let evaluation =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+        let function = FormatNumberFunction {
+            formats: Arc::from([]),
+            namespaces: Arc::new(Vec::new()),
+        };
+        let error = function
+            .evaluate(
+                &evaluation,
+                vec![SxdValue::Number(1.25), SxdValue::String("0.0000".into())],
+            )
+            .expect_err("picture rendering must charge XPath work");
+        assert!(error.to_string().contains("work budget"));
+    }
+
+    #[test]
+    fn format_number_special_values_obey_allocation_budget() {
+        // Decimal-format symbols can exceed the picture-based workspace bound.
+        let package = Package::new();
+        let document = package.as_document();
+        for value in [f64::NAN, f64::INFINITY] {
+            let mut format = default_decimal_format();
+            format.nan = "N".repeat(16_384);
+            format.infinity = "I".repeat(16_384);
+            let function = FormatNumberFunction {
+                formats: Arc::from([format]),
+                namespaces: Arc::new(Vec::new()),
+            };
+            let mut context = Context::new();
+            context.set_string_allocation_limit(4096);
+            let evaluation =
+                sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+            assert!(
+                function
+                    .evaluate(
+                        &evaluation,
+                        vec![SxdValue::Number(value), SxdValue::String("0".into())]
+                    )
+                    .is_err()
+            );
+            assert!(context.string_allocation_exceeded().is_some());
+        }
     }
 
     #[test]

@@ -4424,6 +4424,7 @@ impl<'a> Execution<'a> {
             | SiblingAxis::Namespaces { count, .. } => count,
         };
         for index in 0..sibling_count {
+            self.meter.charge(BudgetKind::XPathOperations, 1)?;
             let sibling = match axis {
                 SiblingAxis::Children { parent, .. } => {
                     let Some(child) = self
@@ -6401,6 +6402,102 @@ mod tests {
             )]))
             .is_none()
         );
+    }
+
+    #[test]
+    fn sibling_and_comment_fast_paths_charge_traversal() {
+        // Reset only the work meter after setup, isolating execution from projection cost.
+        let stylesheet = Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(1 << 20, 4, 16, 1 << 20),
+        )
+        .compile(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"/>"#,
+            None,
+        )
+        .expect("stylesheet compiles");
+        let source = Document::parse("<root><a><nested>payload</nested></a><a/></root>", None)
+            .expect("source parses");
+        let mut initial_meter = meter(usize::MAX);
+        let source_options = super::EvaluatorSourceOptions {
+            processing: super::SourceProcessing::Xml,
+            whitespace: Arc::from([]),
+            clock: Arc::new(crate::SystemClock),
+            extension_policy: crate::ExtensionPolicy::Compatible,
+        };
+        let prepared = super::prepare_evaluator_source(
+            &source,
+            &NoResolver,
+            &mut initial_meter,
+            &source_options,
+        )
+        .expect("source prepares");
+        let mut execution = super::Execution::new(
+            &stylesheet,
+            prepared,
+            &super::Parameters::new(),
+            super::PreparedParameters {
+                effective_globals: std::collections::HashMap::new(),
+                source_remap: super::SourceParameterRemap {
+                    mapping: None,
+                    owned_bytes: 0,
+                },
+            },
+            crate::ExecutionEnvironment::new(Arc::new(NoResolver)),
+            initial_meter,
+            source_options,
+        )
+        .expect("execution initializes");
+        let root = execution.evaluator.source.logical_roots()[0];
+        let element = execution
+            .evaluator
+            .source
+            .node(root)
+            .expect("logical root")
+            .children[0];
+        let last = *execution
+            .evaluator
+            .source
+            .node(element)
+            .expect("element")
+            .children
+            .last()
+            .expect("last child");
+        let target = super::SourceNode::Node(last);
+        let budget = ExecutionBudget {
+            source_bytes: usize::MAX,
+            external_documents: usize::MAX,
+            recursion_depth: usize::MAX,
+            xpath_evaluations: usize::MAX,
+            xpath_operations: 1,
+            extension_operations: usize::MAX,
+            pattern_evaluations: usize::MAX,
+            template_applications: usize::MAX,
+            sort_comparisons: usize::MAX,
+            key_entries: usize::MAX,
+            result_nodes: usize::MAX,
+            serialized_bytes: usize::MAX,
+            messages: usize::MAX,
+            owned_bytes: usize::MAX,
+        };
+        execution.meter = Meter::new(budget, 0).expect("fresh work meter");
+        assert!(matches!(
+            execution.sibling_number(&target, &mut |_, _| Ok(true)),
+            Err(Error::Budget {
+                kind: BudgetKind::XPathOperations,
+                ..
+            })
+        ));
+        execution.meter = Meter::new(budget, 0).expect("fresh work meter");
+        assert!(matches!(
+            execution
+                .evaluator
+                .preceding_nonempty_comment(&target, &mut execution.meter),
+            Err(Error::Budget {
+                kind: BudgetKind::XPathOperations,
+                ..
+            })
+        ));
     }
 
     #[test]

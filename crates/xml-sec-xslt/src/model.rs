@@ -1603,24 +1603,28 @@ impl Document {
     }
 
     pub(crate) fn visit_string_value(&self, id: NodeId, mut visit: impl FnMut(&str)) {
-        self.try_visit_string_value(id, || Ok::<_, core::convert::Infallible>(()), &mut visit)
+        self.try_visit_string_value(id, |_| Ok::<_, core::convert::Infallible>(()), &mut visit)
             .unwrap_or_else(|never| match never {});
     }
 
     pub(crate) fn try_visit_string_value<E>(
         &self,
         id: NodeId,
-        mut inspect: impl FnMut() -> core::result::Result<(), E>,
+        mut inspect: impl FnMut(usize) -> core::result::Result<(), E>,
         mut visit: impl FnMut(&str),
     ) -> core::result::Result<(), E> {
         let Some(node) = self.node(id) else {
             return Ok(());
         };
-        inspect()?;
+        inspect(1)?;
         match &node.kind {
-            NodeKind::Text { value, .. } | NodeKind::Comment(value) => visit(value),
+            NodeKind::Text { value, .. } | NodeKind::Comment(value) => {
+                inspect(value.len())?;
+                visit(value);
+            }
             NodeKind::ProcessingInstruction { value, .. } => {
                 if let Some(value) = value {
+                    inspect(value.len())?;
                     visit(value);
                 }
             }
@@ -1632,8 +1636,10 @@ impl Document {
                     let Some(current) = self.node(current_id) else {
                         return Ok(());
                     };
-                    inspect()?;
+                    inspect(1)?;
                     if let NodeKind::Text { value, .. } = &current.kind {
+                        // Reserve lexical work before a consumer scans or copies this chunk.
+                        inspect(value.len())?;
                         visit(value);
                     }
                     let Some(next) = self.next_descendant(id, current_id) else {

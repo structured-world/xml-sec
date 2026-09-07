@@ -2662,6 +2662,12 @@ fn namespace_value_expands_to_empty<'a>(
             return Ok(false);
         };
         let name = &reference[..end];
+        // XML 1.0 sections 4.1 and 4.6: these references denote a character,
+        // never an empty replacement or a caller-defined namespace undeclaration.
+        // https://www.w3.org/TR/REC-xml/#sec-predefined-ent
+        if name.starts_with('#') || matches!(name, "amp" | "lt" | "gt" | "apos" | "quot") {
+            return Ok(false);
+        }
         let Some(replacement) = dtd.entities.get(name) else {
             return Ok(false);
         };
@@ -3681,6 +3687,25 @@ mod tests {
             build_cell(xml.to_owned(), settings, Some(&budget)),
             Err(XmlDocumentError::Parse(ParseError::NodesLimitReached))
         ));
+    }
+
+    #[test]
+    fn namespace_predefined_references_do_not_expand_dtd_declarations() {
+        // Predefined/numeric references always yield a character, never an undeclaration.
+        // Even a declared predefined entity must not consume DTD expansion work here.
+        let mut dtd = InternalDtd::default();
+        dtd.entities.insert("amp".into(), "&#38;#38;".into());
+        for value in [
+            "&amp;", "&#38;", "&#x26;", "&lt;", "&gt;", "&quot;", "&apos;",
+        ] {
+            let mut state = DocumentPreflightState::default();
+            let budget = XmlParseWorkBudget::with_limit(0);
+            assert!(
+                !namespace_value_expands_to_empty(value, &dtd, &mut state, Some(&budget))
+                    .expect("character references require no DTD expansion")
+            );
+            assert_eq!(state.entity_expansion_work, 0);
+        }
     }
 
     #[test]

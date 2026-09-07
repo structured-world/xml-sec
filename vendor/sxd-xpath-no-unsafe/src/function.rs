@@ -133,10 +133,25 @@ impl<'d> Args<'d> {
     /// Removes the **last** argument and ensures it is a string. If
     /// the argument is not a string, it is converted to one.
     pub fn pop_string(&mut self, context: &context::Evaluation<'_, '_>) -> Result<String, Error> {
-        let v = self.0.last().ok_or(Error::ArgumentMissing)?;
-        reserve_string_conversion(context, v)?;
-        let v = self.0.pop().expect("argument presence was checked");
-        Ok(v.into_string())
+        match self.0.pop().ok_or(Error::ArgumentMissing)? {
+            Value::String(value) => Ok(value),
+            Value::ResultTreeFragment(_, value) => match std::sync::Arc::try_unwrap(value) {
+                Ok(value) => Ok(value),
+                Err(value) => {
+                    context.charge_work(value.len())?;
+                    context.reserve_string_allocation(value.len())?;
+                    Ok(value.as_ref().clone())
+                }
+            },
+            Value::Nodeset(nodes) => match nodes.document_order_first_with_context(context)? {
+                Some(node) => node.string_value_with_context(context),
+                None => Ok(String::new()),
+            },
+            value => {
+                context.reserve_string_allocation(value.string_len())?;
+                Ok(value.into_string())
+            }
+        }
     }
 
     /// Removes the **last** argument and ensures it is a nodeset. If
@@ -176,30 +191,16 @@ impl<'d> Args<'d> {
         }
     }
 
-    /// Removes the **last** argument if it is a nodeset. If no
-    /// argument is present, the context node is added to a nodeset
-    /// and returned. If there is an argument but it is not a nodeset,
-    /// a type mismatch error is returned.
-    fn pop_nodeset_or_context_node<'c>(
+    /// Select the first argument node, or the context identity without a singleton allocation.
+    fn pop_first_node_or_context<'c>(
         &mut self,
         context: &context::Evaluation<'c, 'd>,
-    ) -> Result<Nodeset<'d>, Error> {
+    ) -> Result<Option<crate::nodeset::Node<'d>>, Error> {
         match self.0.pop() {
-            Some(Value::Nodeset(ns)) => Ok(ns),
+            Some(Value::Nodeset(ns)) => ns.document_order_first_with_context(context),
             Some(arg) => Err(Error::not_a_nodeset(&arg)),
-            None => Ok(nodeset![context.node.clone()]),
+            None => context.node.clone_with_context(context).map(Some),
         }
-    }
-}
-
-fn reserve_string_conversion(
-    context: &context::Evaluation<'_, '_>,
-    value: &Value<'_>,
-) -> Result<(), Error> {
-    if matches!(value, Value::String(_) | Value::ResultTreeFragment(..)) {
-        Ok(())
-    } else {
-        context.reserve_string_allocation(value.string_len())
     }
 }
 
@@ -264,11 +265,10 @@ impl Function for LocalName {
     ) -> Result<Value<'d>, Error> {
         let mut args = Args(args);
         args.at_most(1)?;
-        let arg = args.pop_nodeset_or_context_node(context)?;
-        let name = arg
-            .document_order_first_with_context(context)?
-            .and_then(|n| n.expanded_name())
-            .map(|q| q.local_part().to_owned())
+        let name = args
+            .pop_first_node_or_context(context)?
+            .map(|node| node.name_with_context(crate::nodeset::NamePart::Local, context))
+            .transpose()?
             .unwrap_or_default();
         Ok(Value::String(name))
     }
@@ -284,11 +284,10 @@ impl Function for NamespaceUri {
     ) -> Result<Value<'d>, Error> {
         let mut args = Args(args);
         args.at_most(1)?;
-        let arg = args.pop_nodeset_or_context_node(context)?;
-        let name = arg
-            .document_order_first_with_context(context)?
-            .and_then(|n| n.expanded_name())
-            .and_then(|q| q.namespace_uri().map(|s| s.to_owned()))
+        let name = args
+            .pop_first_node_or_context(context)?
+            .map(|node| node.name_with_context(crate::nodeset::NamePart::Namespace, context))
+            .transpose()?
             .unwrap_or_default();
         Ok(Value::String(name))
     }
@@ -304,11 +303,11 @@ impl Function for Name {
     ) -> Result<Value<'d>, Error> {
         let mut args = Args(args);
         args.at_most(1)?;
-        let arg = args.pop_nodeset_or_context_node(context)?;
-        let name = arg
-            .document_order_first_with_context(context)?
-            .and_then(|n| n.prefixed_name())
-            .unwrap_or_else(String::new);
+        let name = args
+            .pop_first_node_or_context(context)?
+            .map(|node| node.name_with_context(crate::nodeset::NamePart::Qualified, context))
+            .transpose()?
+            .unwrap_or_default();
         Ok(Value::String(name))
     }
 }
@@ -339,18 +338,56 @@ impl Function for Concat {
     ) -> Result<Value<'d>, Error> {
         let args = Args(args);
         args.at_least(2)?;
-        let length = args
-            .0
-            .iter()
-            .try_fold(0usize, |total, value| total.checked_add(value.string_len()))
-            .unwrap_or(usize::MAX);
-        context.reserve_string_allocation(length)?;
-        let mut output = String::with_capacity(length);
+        let mut output = String::new();
         for value in args.0 {
-            value.append_string(&mut output);
+            match value {
+                Value::String(text) => {
+                    append_metered_string(&mut output, &text, context)?;
+                }
+                Value::ResultTreeFragment(_, text) => {
+                    append_metered_string(&mut output, &text, context)?;
+                }
+                Value::Nodeset(nodes) => {
+                    if let Some(node) = nodes.document_order_first_with_context(context)? {
+                        node.visit_string_value_with_context(context, |text| {
+                            append_metered_string(&mut output, text, context)?;
+                            Ok(true)
+                        })?;
+                    }
+                }
+                value => {
+                    context.reserve_temporary_allocation(value.string_len())?;
+                    append_metered_string(&mut output, &value.into_string(), context)?;
+                }
+            }
         }
         Ok(Value::String(output))
     }
+}
+
+fn append_metered_string(
+    output: &mut String,
+    text: &str,
+    context: &context::Evaluation<'_, '_>,
+) -> Result<(), Error> {
+    context.charge_work(text.len())?;
+    let required = output
+        .len()
+        .checked_add(text.len())
+        .ok_or_else(|| Error::Other {
+            what: "XPath string size overflow".into(),
+        })?;
+    if required > output.capacity() {
+        let capacity = required.max(output.capacity().saturating_mul(2));
+        context.reserve_string_allocation(capacity - output.capacity())?;
+        output
+            .try_reserve_exact(capacity - output.len())
+            .map_err(|_| Error::Other {
+                what: "XPath string allocation failed".into(),
+            })?;
+    }
+    output.push_str(text);
+    Ok(())
 }
 
 struct TwoStringPredicate(fn(&str, &str) -> bool);
@@ -361,12 +398,32 @@ impl Function for TwoStringPredicate {
         context: &context::Evaluation<'c, 'd>,
         args: Vec<Value<'d>>,
     ) -> Result<Value<'d>, Error> {
-        let mut args = Args(args);
+        let args = Args(args);
         args.exactly(2)?;
-        let second = args.pop_string(context)?;
-        let first = args.pop_string(context)?;
+        let second = string_argument_view(&args[1], context)?;
+        let first = string_argument_view(&args[0], context)?;
+        context.charge_work(first.len().saturating_add(second.len()))?;
         let v = self.0(&first, &second);
         Ok(Value::Boolean(v))
+    }
+}
+
+fn string_argument_view<'a>(
+    value: &'a Value<'_>,
+    context: &context::Evaluation<'_, '_>,
+) -> Result<std::borrow::Cow<'a, str>, Error> {
+    use std::borrow::Cow;
+    match value {
+        Value::String(text) => Ok(Cow::Borrowed(text)),
+        Value::ResultTreeFragment(_, text) => Ok(Cow::Borrowed(text)),
+        Value::Nodeset(nodes) => match nodes.document_order_first_with_context(context)? {
+            Some(node) => node.string_value_with_context(context).map(Cow::Owned),
+            None => Ok(Cow::Borrowed("")),
+        },
+        _ => {
+            context.reserve_temporary_allocation(value.string_len())?;
+            Ok(Cow::Owned(value.string()))
+        }
     }
 }
 
@@ -395,6 +452,7 @@ impl Function for SubstringCommon {
         args.exactly(2)?;
         let second = args.pop_string(context)?;
         let first = args.pop_string(context)?;
+        context.charge_work(first.len().saturating_mul(2).saturating_add(second.len()))?;
         let s = self.0(&first, &second);
         context.reserve_string_allocation(s.len())?;
         Ok(Value::String(s.to_owned()))
@@ -443,6 +501,7 @@ impl Function for Substring {
         let start = args.pop_number(context)?;
         let start = round_ties_to_positive_infinity(start);
         let s = args.pop_string(context)?;
+        context.charge_work(s.len().saturating_mul(2))?;
         context.reserve_string_allocation(s.len())?;
 
         let mut selected_chars = String::with_capacity(s.len());
@@ -469,8 +528,20 @@ impl Function for StringLength {
     ) -> Result<Value<'d>, Error> {
         let mut args = Args(args);
         args.at_most(1)?;
-        let arg = args.pop_value_or_context_node(context);
-        Ok(Value::Number(arg.string_char_len() as f64))
+        let length = match args.0.pop() {
+            None => context.node.string_value_char_len_with_context(context)?,
+            Some(Value::Nodeset(nodes)) => {
+                match nodes.document_order_first_with_context(context)? {
+                    Some(node) => node.string_value_char_len_with_context(context)?,
+                    None => 0,
+                }
+            }
+            Some(value) => {
+                context.charge_work(value.string_len())?;
+                value.string_char_len()
+            }
+        };
+        Ok(Value::Number(length as f64))
     }
 }
 
@@ -485,6 +556,7 @@ impl Function for NormalizeSpace {
         let mut args = Args(args);
         args.at_most(1)?;
         let arg = args.pop_string_value_or_context_node(context)?;
+        context.charge_work(arg.len().saturating_mul(2))?;
         let length = arg
             .split(XmlChar::is_space_char)
             .filter(|part| !part.is_empty())
@@ -522,17 +594,25 @@ impl Function for Translate {
         let mut args = Args(args);
         args.exactly(3)?;
 
-        let source_bytes = args.0[0].string_len();
-        let map_capacity = args.0[1].string_len();
+        let to = args.pop_string(context)?;
+        let from = args.pop_string(context)?;
+        let s = args.pop_string(context)?;
+        let source_bytes = s.len();
+        let map_capacity = from.len();
         let map_bytes =
             map_capacity.saturating_mul(std::mem::size_of::<(char, usize, Option<char>)>());
         let result_bytes = source_bytes.saturating_mul(char::MAX.len_utf8());
         context.reserve_string_allocation(map_bytes.saturating_add(result_bytes))?;
 
-        let to = args.pop_string(context)?;
-        let from = args.pop_string(context)?;
-        let s = args.pop_string(context)?;
-
+        // Sorting and per-character binary lookup are O((map + input) log(map)).
+        // Byte lengths bound Unicode scalar counts without an uncharged counting pass.
+        let levels = (usize::BITS - from.len().leading_zeros()) as usize + 1;
+        context.charge_work(
+            from.len()
+                .saturating_add(s.len())
+                .saturating_mul(levels.saturating_mul(2))
+                .saturating_add(to.len()),
+        )?;
         let mut replacements = Vec::with_capacity(from.chars().count());
         let mut to = to.chars();
         replacements.extend(
@@ -1146,6 +1226,86 @@ mod test {
     #[test]
     fn translate_replaces_characters() {
         assert_eq!("イエ", translate_test("いえ", "あいうえお", "アイウエオ"));
+    }
+
+    #[test]
+    fn name_functions_reserve_output_before_materializing() {
+        // QName access must not clone strings or construct a default node-set outside the gate.
+        let package = Package::new();
+        let document = package.as_document();
+        let node = document.create_element(sxd_document_no_unsafe::QName::with_namespace_uri(
+            Some("urn:test"),
+            "element",
+        ));
+        node.register_prefix("p", "urn:test");
+        document.root().append_child(node);
+        for function in [
+            Box::new(LocalName) as Box<dyn Function>,
+            Box::new(NamespaceUri),
+            Box::new(Name),
+        ] {
+            let mut context = crate::Context::new();
+            context.set_string_allocation_limit(0);
+            let evaluation = context::Evaluation::new(&context, node.into());
+            assert!(function.evaluate(&evaluation, vec![]).is_err());
+        }
+    }
+
+    #[test]
+    fn core_string_functions_obey_work_on_owned_arguments() {
+        // Coercion-free arguments still require scanning/copying inside each core function.
+        let cases: Vec<(Box<dyn super::Function>, Vec<Value<'_>>)> = vec![
+            (Box::new(super::Concat), args!["abc", "def"]),
+            (Box::new(super::starts_with()), args!["abc", "ab"]),
+            (Box::new(super::contains()), args!["abc", "bc"]),
+            (Box::new(super::substring_before()), args!["abc", "b"]),
+            (Box::new(super::substring_after()), args!["abc", "b"]),
+            (Box::new(super::Substring), args!["abc", 1.0]),
+            (Box::new(super::StringLength), args!["abc"]),
+            (Box::new(super::NormalizeSpace), args![" a b "]),
+        ];
+        let package = Package::new();
+        let document = package.as_document();
+        for (function, args) in cases {
+            let mut context = crate::Context::new();
+            context.set_evaluation_work_limit(0);
+            let evaluation = context::Evaluation::new(&context, document.root().into());
+            assert!(
+                function.evaluate(&evaluation, args).is_err(),
+                "core string work must not bypass the gate"
+            );
+        }
+    }
+
+    #[test]
+    fn node_string_arguments_obey_work_before_coercion() {
+        // Every function using Args must use the metered node string visitor, not string_len().
+        let package = Package::new();
+        let document = package.as_document();
+        let root = document.create_element("root");
+        root.append_child(document.create_text("payload"));
+        document.root().append_child(root);
+        let mut setup = Setup::new();
+        setup.context.set_evaluation_work_limit(0);
+        let evaluation = context::Evaluation::new(&setup.context, document.root().into());
+        let mut args = super::Args(vec![Value::Nodeset(nodeset![root])]);
+        assert!(
+            args.pop_string(&evaluation).is_err(),
+            "coercion must reject before traversing"
+        );
+    }
+
+    #[test]
+    fn translate_obeys_work_budget() {
+        // Pre-owned strings still require map construction and per-character searches.
+        let package = Package::new();
+        let document = package.as_document();
+        let mut setup = Setup::new();
+        setup.context.set_evaluation_work_limit(0);
+        let error = setup
+            .evaluate(document.root(), Translate, args!["abc", "abc", "xyz"])
+            .expect_err("translate must charge work before building its map");
+        assert!(error.to_string().contains("work budget"));
     }
 
     #[test]

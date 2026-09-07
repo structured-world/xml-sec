@@ -336,6 +336,16 @@ impl<'d> Element<'d> {
         )
     }
 
+    /// Visit declarations on this element without collecting or cloning them; errors stop visits.
+    pub fn try_visit_namespace_declarations<E>(
+        &self,
+        visit: impl FnMut(&'d str, &'d str) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.document
+            .connections
+            .try_visit_element_namespace_declarations(self.node, visit)
+    }
+
     /// Retrieve all namespaces that are in scope, recursively walking
     /// up the document tree.
     pub fn namespaces_in_scope(&self) -> Vec<Namespace<'d>> {

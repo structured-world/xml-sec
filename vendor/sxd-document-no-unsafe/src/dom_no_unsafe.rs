@@ -320,6 +320,17 @@ impl<'d> Element<'d> {
         )
     }
 
+    /// Visit declarations on this element without collecting or cloning them. The callback
+    /// cannot mutate the document while its namespace storage is borrowed; errors stop visits.
+    pub fn try_visit_namespace_declarations<E>(
+        &self,
+        visit: impl FnMut(&str, &str) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.document
+            .connections
+            .try_visit_element_namespace_declarations(self.document.storage, self.node, visit)
+    }
+
     pub fn namespaces_in_scope(&self) -> Vec<Namespace> {
         self.document
             .connections

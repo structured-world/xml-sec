@@ -26,6 +26,12 @@ pub enum Error {
     FunctionEvaluation { source: function::Error },
 }
 
+impl From<function::Error> for Error {
+    fn from(source: function::Error) -> Self {
+        Self::FunctionEvaluation { source }
+    }
+}
+
 fn value_into_nodeset(v: Value<'_>) -> Result<Nodeset<'_>, Error> {
     match v {
         Value::Nodeset(ns) => Ok(ns),
@@ -300,10 +306,14 @@ fn compare_equality_values<'c, 'd>(
             left.number(context).context(FunctionEvaluation)?,
             right.number(context).context(FunctionEvaluation)?,
         ),
-        (Value::String(left), Value::String(right))
-        | (Value::String(left), Value::ResultTreeFragment(_, right))
-        | (Value::ResultTreeFragment(_, left), Value::String(right))
-        | (Value::ResultTreeFragment(_, left), Value::ResultTreeFragment(_, right)) => {
+        (Value::String(left), Value::String(right)) => comparison.strings(left, right),
+        (Value::String(left), Value::ResultTreeFragment(_, right)) => {
+            comparison.strings(left, right)
+        }
+        (Value::ResultTreeFragment(_, left), Value::String(right)) => {
+            comparison.strings(left, right)
+        }
+        (Value::ResultTreeFragment(_, left), Value::ResultTreeFragment(_, right)) => {
             comparison.strings(left, right)
         }
     };
@@ -355,8 +365,10 @@ impl From<LiteralValue> for Literal {
 }
 
 impl Expression for Literal {
-    fn evaluate<'c, 'd>(&self, _: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
-        Ok(self.value.clone())
+    fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
+        self.value
+            .clone_with_context(context)
+            .context(FunctionEvaluation)
     }
 }
 
@@ -905,8 +917,12 @@ impl Expression for Variable {
 
         context
             .value_of(name)
-            .cloned()
             .context(UnknownVariable { name: &self.name })
+            .and_then(|value| {
+                value
+                    .clone_with_context(context)
+                    .context(FunctionEvaluation)
+            })
     }
 }
 
@@ -1173,7 +1189,9 @@ mod test {
         let mut insufficient = Context::without_core_functions();
         insufficient.set_variable("left", nodeset![left_value.clone()]);
         insufficient.set_variable("right", nodeset![right_value.clone()]);
-        insufficient.set_string_allocation_limit(3);
+        // Each variable owns a copied one-node SwissTable before comparison starts.
+        let variable_storage = 2 * (4 * (std::mem::size_of::<crate::nodeset::Node<'_>>() + 1) + 16);
+        insufficient.set_string_allocation_limit(variable_storage + 3);
         let context_node = document.create_element("test");
         let evaluation = context::Evaluation::new(&insufficient, context_node.clone().into());
         assert!(matches!(
@@ -1185,7 +1203,7 @@ mod test {
         let mut exact = Context::without_core_functions();
         exact.set_variable("left", nodeset![left_value]);
         exact.set_variable("right", nodeset![right_value]);
-        exact.set_string_allocation_limit(4);
+        exact.set_string_allocation_limit(variable_storage + 4);
         let evaluation = context::Evaluation::new(&exact, context_node.into());
         assert_eq!(expression.evaluate(&evaluation), Ok(Boolean(true)));
     }
@@ -1234,7 +1252,7 @@ mod test {
         let first = setup.doc.create_text("first");
         let matching = setup.doc.create_text("matching");
         let nodes = Value::Nodeset(nodeset![first, matching]);
-        let fragment = Value::ResultTreeFragment(1, "matching".into());
+        let fragment = Value::ResultTreeFragment(1, std::sync::Arc::new("matching".into()));
         let context = setup.context();
         assert_eq!(
             compare_equality_values(&context, &nodes, &fragment, Equality::Equal),

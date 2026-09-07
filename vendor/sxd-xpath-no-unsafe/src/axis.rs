@@ -89,26 +89,31 @@ impl AxisLike for Axis {
             AncestorOrSelf => node_and_each_parent(context.node.clone(), |n| node_test.run(n))?,
             Attribute => {
                 if let Node::Element(ref e) = context.node {
-                    for attr in e.attributes() {
+                    for index in 0..e.attributes_len() {
+                        let attr = e
+                            .attribute_at(index)
+                            .expect("attribute index is within the observed length");
                         node_test.run(Node::Attribute(attr))?;
                     }
                 }
             }
             Namespace => {
                 if let Node::Element(ref e) = context.node {
-                    for ns in e
-                        .namespaces_in_scope()
-                        .into_iter()
-                        .filter(|namespace| !namespace.uri().is_empty())
-                    {
-                        let ns = Node::Namespace(nodeset::Namespace {
+                    nodeset::visit_namespace_bindings(*e, context, |prefix, uri| {
+                        if cfg!(feature = "no-unsafe") {
+                            context
+                                .reserve_temporary_allocation(
+                                    prefix.len().saturating_add(uri.len()),
+                                )
+                                .map_err(|source| Error::FunctionEvaluation { source })?;
+                        }
+                        node_test.run(Node::Namespace(nodeset::Namespace {
                             parent: *e,
-                            prefix: sxd_document_no_unsafe::to_ns_str!(ns.prefix()),
-                            uri: sxd_document_no_unsafe::to_ns_str!(ns.uri()),
-                        });
-
-                        node_test.run(ns)?;
-                    }
+                            prefix: sxd_document_no_unsafe::to_ns_str!(prefix),
+                            uri: sxd_document_no_unsafe::to_ns_str!(uri),
+                        }))?;
+                        Ok::<_, Error>(std::ops::ControlFlow::Continue(()))
+                    })?;
                 }
             }
             Child => {
@@ -443,6 +448,24 @@ mod test {
     }
 
     #[test]
+    fn namespace_workspace_is_metered_even_when_no_nodes_match() {
+        // A rejecting node test must not hide namespace collection and copied-prefix storage.
+        let package = Package::new();
+        let document = package.as_document();
+        let root = document.create_element("root");
+        root.register_prefix("p", "urn:visible");
+        document.root().append_child(root);
+        let mut context = Context::without_core_functions();
+        context.set_string_allocation_limit(0);
+        let evaluation = context::Evaluation::new(&context, root.into());
+        assert!(
+            Namespace
+                .select_nodes(&evaluation, &RejectNodeTest)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn ancestor_includes_parents() {
         let package = Package::new();
         let doc = package.as_document();
@@ -524,6 +547,39 @@ mod test {
         doc.root().append_child(parent);
 
         assert_eq!(execute(Namespace, child).size(), 2);
+    }
+
+    #[test]
+    fn namespace_axis_preserves_nearest_bindings_and_implicit_xml() {
+        // The visitor must preserve namespace shadowing while deduplicating borrowed declarations.
+        let package = Package::new();
+        let document = package.as_document();
+        let parent = document.create_element("parent");
+        parent.register_prefix("p", "urn:old");
+        parent.register_prefix("q", "urn:inherited");
+        let child = document.create_element("child");
+        child.register_prefix("p", "urn:new");
+        parent.append_child(child);
+        document.root().append_child(parent);
+        let result: Vec<_> = execute(Namespace, child).into();
+        let mut bindings: Vec<_> = result
+            .iter()
+            .map(|node| {
+                let Node::Namespace(namespace) = node else {
+                    panic!("namespace expected");
+                };
+                (namespace.prefix(), namespace.uri())
+            })
+            .collect();
+        bindings.sort_unstable();
+        assert_eq!(
+            bindings,
+            vec![
+                ("p", "urn:new"),
+                ("q", "urn:inherited"),
+                ("xml", "http://www.w3.org/XML/1998/namespace")
+            ]
+        );
     }
 
     #[test]

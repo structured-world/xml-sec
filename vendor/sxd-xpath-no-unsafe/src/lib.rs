@@ -255,7 +255,7 @@ pub enum Value<'d> {
     /// A string
     String(string::String),
     /// An XSLT 1.0 result-tree fragment. It is truthy but is not navigable as a node-set.
-    ResultTreeFragment(u64, string::String),
+    ResultTreeFragment(u64, std::sync::Arc<string::String>),
     /// A collection of unique nodes
     Nodeset(nodeset::Nodeset<'d>),
 }
@@ -287,6 +287,27 @@ pub(crate) fn node_to_num_with_context(
 }
 
 impl<'d> Value<'d> {
+    /// Materialize an evaluation-owned value only after reserving its copies and containers.
+    pub(crate) fn clone_with_context(
+        &self,
+        context: &context::Evaluation<'_, 'd>,
+    ) -> Result<Self, function::Error> {
+        let copy_string = |text: &str| {
+            context.charge_work(text.len())?;
+            context.reserve_temporary_allocation(text.len())?;
+            Ok::<_, function::Error>(text.to_owned())
+        };
+        Ok(match self {
+            Self::Boolean(value) => Self::Boolean(*value),
+            Self::Number(value) => Self::Number(*value),
+            Self::String(text) => Self::String(copy_string(text)?),
+            Self::Nodeset(nodes) => Self::Nodeset(nodes.clone_with_context(context)?),
+            Self::ResultTreeFragment(identity, text) => {
+                Self::ResultTreeFragment(*identity, std::sync::Arc::clone(text))
+            }
+        })
+    }
+
     /// Return the UTF-8 byte length of this value's XPath string conversion without allocating it.
     pub fn string_len(&self) -> usize {
         match self {
@@ -297,7 +318,8 @@ impl<'d> Value<'d> {
                 write_xpath_number(&mut length, *number).expect("length sink cannot fail");
                 length.0
             }
-            Value::String(value) | Value::ResultTreeFragment(_, value) => value.len(),
+            Value::String(value) => value.len(),
+            Value::ResultTreeFragment(_, value) => value.len(),
             Value::Nodeset(nodes) => nodes
                 .document_order_first()
                 .map_or(0, |node| node.string_value_len()),
@@ -314,25 +336,11 @@ impl<'d> Value<'d> {
                 write_xpath_number(&mut length, *number).expect("length sink cannot fail");
                 length.0
             }
-            Value::String(value) | Value::ResultTreeFragment(_, value) => value.chars().count(),
+            Value::String(value) => value.chars().count(),
+            Value::ResultTreeFragment(_, value) => value.chars().count(),
             Value::Nodeset(nodes) => nodes
                 .document_order_first()
                 .map_or(0, |node| node.string_value_char_len()),
-        }
-    }
-
-    pub(crate) fn append_string(self, output: &mut String) {
-        match self {
-            Value::Boolean(value) => output.push_str(if value { "true" } else { "false" }),
-            Value::Number(number) => {
-                write_xpath_number(output, number).expect("String formatting cannot fail");
-            }
-            Value::String(value) | Value::ResultTreeFragment(_, value) => output.push_str(&value),
-            Value::Nodeset(nodes) => {
-                if let Some(node) = nodes.document_order_first() {
-                    node.append_string_value(output);
-                }
-            }
         }
     }
 
@@ -357,7 +365,8 @@ impl<'d> Value<'d> {
         match self {
             Boolean(value) => Ok(if *value { 1.0 } else { 0.0 }),
             Number(value) => Ok(*value),
-            String(value) | ResultTreeFragment(_, value) => Ok(str_to_num(value)),
+            String(value) => Ok(str_to_num(value)),
+            ResultTreeFragment(_, value) => Ok(str_to_num(value)),
             Nodeset(nodes) => match nodes.document_order_first_with_context(context)? {
                 Some(node) => node_to_num_with_context(context, &node),
                 None => Ok(f64::NAN),
@@ -375,7 +384,7 @@ impl<'d> Value<'d> {
                 value
             }
             String(ref val) => val.clone(),
-            ResultTreeFragment(_, ref val) => val.clone(),
+            ResultTreeFragment(_, ref val) => val.as_ref().clone(),
             Nodeset(ref ns) => match ns.document_order_first() {
                 Some(n) => n.string_value(),
                 None => "".to_owned(),
@@ -387,7 +396,9 @@ impl<'d> Value<'d> {
         use crate::Value::*;
         match self {
             String(val) => val,
-            ResultTreeFragment(_, val) => val,
+            ResultTreeFragment(_, val) => {
+                std::sync::Arc::try_unwrap(val).unwrap_or_else(|value| value.as_ref().clone())
+            }
             other => other.string(),
         }
     }

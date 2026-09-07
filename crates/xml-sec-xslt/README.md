@@ -43,6 +43,12 @@ and node-set growth. `lang()` ancestor visits and `str:align()` Unicode scans co
 their respective XPath and extension work allowances before execution.
 `current()` reuses indexed projection identity rather than rescanning sibling lists.
 Existing string arguments are borrowed rather than copied for conversion.
+Result-fragment string projections are shared immutably across XPath evaluations;
+the fragment's tree identity is retained independently. Actual value copies and
+node-set/container capacity growth are reserved before allocation. Namespace-axis
+and name-function evaluation visit borrowed declarations with shadowing preserved,
+without first materializing every in-scope namespace. String construction, number
+formatting, set membership, and default numbering also consume work allowances.
 
 Resolver resources are byte-oriented. XML declarations, BOMs, UTF-16/UTF-32 initial
 patterns, and explicit resolver encoding metadata are honored without lossy
