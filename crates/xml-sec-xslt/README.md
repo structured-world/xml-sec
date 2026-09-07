@@ -38,6 +38,9 @@ enter the reusable engine.
 Execution budgets cover internal work, not just output: node-set string traversal,
 EXSLT date parsing and URI conversion, and both small and large XPath projections
 are metered, including runtime identity paths and optimized result-fragment scans.
+Cached stylesheet-function results also charge replay copies, identity resolution,
+and node-set growth. `lang()` ancestor visits and `str:align()` Unicode scans consume
+their respective XPath and extension work allowances before execution.
 `current()` reuses indexed projection identity rather than rescanning sibling lists.
 Existing string arguments are borrowed rather than copied for conversion.
 

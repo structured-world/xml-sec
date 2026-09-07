@@ -1343,6 +1343,8 @@ fn review_date_and_uri_functions_obey_extension_work() {
         "date:year('2001-01-01')",
         "str:encode-uri('abc', true())",
         "str:decode-uri('%41')",
+        "str:align('λ', '....')",
+        "str:align('λλλλ', '.')",
     ] {
         let stylesheet = compile(&format!(
             r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:date="http://exslt.org/dates-and-times" xmlns:str="http://exslt.org/strings"><xsl:template match="/"><xsl:value-of select="{expression}"/></xsl:template></xsl:stylesheet>"#

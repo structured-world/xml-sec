@@ -536,7 +536,7 @@ impl function::Function for DeferredStylesheetFunction {
                     what: "stylesheet function continuation diverged".into(),
                 });
             }
-            return restore_sxd_value(&completed.result, context.node.document().root().into());
+            return restore_sxd_value(&completed.result, context);
         }
         if state.pending.is_some() {
             return Err(function::Error::Other {
@@ -589,24 +589,27 @@ fn defer_sxd_value(
 
 fn restore_sxd_value<'d>(
     value: &DeferredXPathValue,
-    root: nodeset::Node<'d>,
+    context: &sxd_xpath_no_unsafe::context::Evaluation<'_, 'd>,
 ) -> std::result::Result<SxdValue<'d>, function::Error> {
     Ok(match value {
         DeferredXPathValue::Boolean(value) => SxdValue::Boolean(*value),
         DeferredXPathValue::Number(bits) => SxdValue::Number(f64::from_bits(*bits)),
-        DeferredXPathValue::String(value) => SxdValue::String(value.clone()),
+        DeferredXPathValue::String(value) => {
+            context.reserve_string_allocation(value.len())?;
+            SxdValue::String(value.clone())
+        }
         DeferredXPathValue::ResultTreeFragment { identity, value } => {
+            context.reserve_string_allocation(value.len())?;
             SxdValue::ResultTreeFragment(*identity, value.clone())
         }
         DeferredXPathValue::NodeSet(paths) => {
             let mut nodes = nodeset::Nodeset::new();
             for path in paths {
-                let node = resolve_node_path(root.clone(), path).ok_or_else(|| {
-                    function::Error::Other {
+                let node =
+                    resolve_node_path(context, path)?.ok_or_else(|| function::Error::Other {
                         what: "stylesheet function continuation node is stale".into(),
-                    }
-                })?;
-                nodes.add(node);
+                    })?;
+                nodes.add_metered(context, node)?;
             }
             SxdValue::Nodeset(nodes)
         }
@@ -6283,17 +6286,23 @@ impl function::Function for LangFunction {
             .element()
             .or_else(|| context.node.parent().and_then(|node| node.element()));
         while let Some(element) = current {
-            let language = element.attributes().into_iter().find_map(|attribute| {
+            context.charge_work(1)?;
+            for index in 0..element.attributes_len() {
+                context.charge_work(1)?;
+                let attribute = element
+                    .attribute_at(index)
+                    .expect("attribute index is in range");
                 let name = attribute.name();
                 let name = name.get();
-                (name.namespace_uri() == Some("http://www.w3.org/XML/1998/namespace")
-                    && name.local_part() == "lang")
-                    .then(|| attribute.value())
-            });
-            if let Some(language) = language {
-                return Ok(SxdValue::Boolean(language_tag_matches(
-                    &language, &requested,
-                )));
+                if name.local_part() == "lang"
+                    && name.namespace_uri() == Some("http://www.w3.org/XML/1998/namespace")
+                {
+                    let language = attribute.value();
+                    context.charge_work(requested.len().min(language.len()).saturating_mul(2))?;
+                    return Ok(SxdValue::Boolean(language_tag_matches(
+                        &language, &requested,
+                    )));
+                }
             }
             current = element.parent().and_then(|node| node.element());
         }
@@ -6350,8 +6359,7 @@ impl function::Function for IdFunction {
                 .filter(|token| !token.is_empty())
             {
                 if let Some(path) = nodes.get(token)
-                    && let Some(node) =
-                        resolve_node_path(context.node.document().root().into(), path)
+                    && let Some(node) = resolve_node_path(context, path)?
                 {
                     result.add_metered(context, node)?;
                 }
@@ -7100,10 +7108,13 @@ impl function::Function for ExsltStringFunction {
                 let value = args.next().expect("arity checked above").into_string();
                 let padding = args.next().expect("arity checked above").into_string();
                 let alignment = args.next().map(SxdValue::into_string).unwrap_or_default();
+                context.charge_extension_work(padding.len().saturating_add(value.len()))?;
                 let width = padding.chars().count();
                 let value_width = value.chars().count();
                 if value_width >= width {
+                    context.charge_extension_work(value.len())?;
                     let output_bytes = utf8_prefix_bytes(&value, width);
+                    context.charge_extension_work(output_bytes)?;
                     context.reserve_string_allocation(output_bytes)?;
                     return Ok(SxdValue::String(value[..output_bytes].to_owned()));
                 }
@@ -7113,21 +7124,21 @@ impl function::Function for ExsltStringFunction {
                     "center" => missing / 2,
                     _ => 0,
                 };
-                let right = missing - left;
                 // EXSLT overlays the value on the padding string by character position. Retain
                 // borrowed UTF-8 slices and meter the exact output before its sole allocation:
                 // https://exslt.github.io/str/functions/align/index.html
+                context.charge_extension_work(padding.len())?;
                 let left_end = utf8_prefix_bytes(&padding, left);
-                let right_start = utf8_prefix_bytes(&padding, left + value_width);
+                let right_start = left_end + utf8_prefix_bytes(&padding[left_end..], value_width);
                 let output_bytes = left_end
                     .checked_add(value.len())
                     .and_then(|bytes| bytes.checked_add(padding.len() - right_start))
                     .unwrap_or(usize::MAX);
                 context.reserve_string_allocation(output_bytes)?;
+                context.charge_extension_work(output_bytes)?;
                 let mut result = String::with_capacity(output_bytes);
                 result.push_str(&padding[..left_end]);
                 result.push_str(&value);
-                debug_assert_eq!(padding[right_start..].chars().count(), right);
                 result.push_str(&padding[right_start..]);
                 Ok(SxdValue::String(result))
             }
@@ -7572,7 +7583,6 @@ impl function::Function for DocumentFunction {
         } else {
             DocumentBaseSelection::Omitted
         };
-        let root: nodeset::Node<'d> = context.node.document().root().into();
         let mut result = nodeset::Nodeset::new();
         let roots = self.roots.borrow();
         let mut process = |request: DocumentRequest| -> std::result::Result<(), function::Error> {
@@ -7600,11 +7610,10 @@ impl function::Function for DocumentFunction {
                 return Ok(());
             };
             for path in paths {
-                let node = resolve_node_path(root.clone(), path).ok_or_else(|| {
-                    function::Error::Other {
+                let node =
+                    resolve_node_path(context, path)?.ok_or_else(|| function::Error::Other {
                         what: format!("document resource `{}` is stale", request.href),
-                    }
-                })?;
+                    })?;
                 result.add_metered(context, node)?;
             }
             Ok(())
@@ -8225,9 +8234,7 @@ impl function::Function for KeyFunction {
         let mut lookup = |value: String| -> std::result::Result<(), function::Error> {
             if let Some(paths) = index.get(&(name.clone(), value, document_index)) {
                 for path in paths {
-                    if let Some(node) =
-                        resolve_node_path(context.node.document().root().into(), path)
-                    {
+                    if let Some(node) = resolve_node_path(context, path)? {
                         result.add_metered(context, node)?;
                     }
                 }
@@ -8340,14 +8347,72 @@ fn follow_path<'d>(mut node: nodeset::Node<'d>, path: &[usize]) -> Option<nodese
     Some(node)
 }
 
-fn resolve_node_path<'d>(root: nodeset::Node<'d>, path: &NodePath) -> Option<nodeset::Node<'d>> {
-    let node = follow_path(root, path.ordinary())?;
+fn resolve_node_path<'d>(
+    context: &sxd_xpath_no_unsafe::context::Evaluation<'_, 'd>,
+    path: &NodePath,
+) -> std::result::Result<Option<nodeset::Node<'d>>, function::Error> {
+    // Cached identity is not cached execution: each replay resolves its path
+    // under the current evaluation's remaining work and allocation allowance.
+    context.charge_work(path.ordinary().len().max(1))?;
+    let Some(node) = follow_path(context.node.document().root().into(), path.ordinary()) else {
+        return Ok(None);
+    };
     match path {
-        NodePath::Ordinary(_) => Some(node),
+        NodePath::Ordinary(_) => Ok(Some(node)),
         NodePath::Attribute {
             namespace, local, ..
-        } => resolve_attribute_node(node, namespace.as_deref(), local),
-        NodePath::Namespace { prefix, uri, .. } => resolve_namespace_node(node, prefix, uri),
+        } => {
+            let Some(element) = node.element() else {
+                return Ok(None);
+            };
+            for index in 0..element.attributes_len() {
+                context.charge_work(1)?;
+                let attribute = element
+                    .attribute_at(index)
+                    .expect("attribute index is in range");
+                let name = attribute.name();
+                let name = name.get();
+                context.charge_work(
+                    local
+                        .len()
+                        .saturating_add(namespace.as_deref().map_or(0, str::len)),
+                )?;
+                if name.local_part() == local && name.namespace_uri() == namespace.as_deref() {
+                    return Ok(Some(nodeset::Node::Attribute(attribute)));
+                }
+            }
+            Ok(None)
+        }
+        NodePath::Namespace { prefix, uri, .. } => {
+            let Some(element) = node.element() else {
+                return Ok(None);
+            };
+            // A single-prefix lookup avoids allocating the complete inherited
+            // namespace axis. Charge its ancestor/hash probes before lookup.
+            context.charge_work(
+                path.ordinary()
+                    .len()
+                    .saturating_add(1)
+                    .saturating_mul(prefix.len().max(1))
+                    .saturating_add(uri.len()),
+            )?;
+            let matches = if prefix == "xml" {
+                uri == "http://www.w3.org/XML/1998/namespace"
+            } else if prefix.is_empty() {
+                element.recursive_default_namespace_uri().as_deref() == Some(uri.as_str())
+            } else {
+                element.namespace_uri_for_prefix(prefix).as_deref() == Some(uri.as_str())
+            };
+            if !matches {
+                return Ok(None);
+            }
+            context.reserve_temporary_allocation(prefix.len().saturating_add(uri.len()))?;
+            Ok(Some(nodeset::Node::Namespace(nodeset::Namespace {
+                parent: element,
+                prefix: sxd_document_no_unsafe::to_ns_str!(prefix.as_str()),
+                uri: sxd_document_no_unsafe::to_ns_str!(uri.as_str()),
+            })))
+        }
     }
 }
 
@@ -9446,6 +9511,28 @@ mod tests {
     }
 
     #[test]
+    fn lang_ancestor_search_obeys_work_budget() {
+        // Even a failed lookup must charge ancestor and attribute visits without
+        // materializing an attribute vector at every level.
+        let package = Package::new();
+        let document = package.as_document();
+        let root = document.create_element("root");
+        document.root().append_child(root);
+        root.set_attribute_value("other", "value");
+        let child = document.create_element("child");
+        root.append_child(child);
+        for limit in [0, 1, 2] {
+            let mut context = Context::new();
+            context.set_evaluation_work_limit(limit);
+            let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&context, child.into());
+            let error = LangFunction
+                .evaluate(&evaluation, vec![SxdValue::String("en".into())])
+                .expect_err("ancestor and attribute visits must cross the work gate");
+            assert!(error.to_string().contains("work budget"));
+        }
+    }
+
+    #[test]
     fn id_result_nodes_cross_the_xpath_allocation_gate() {
         // A wide id() result is temporary XPath-owned storage even when its caller consumes only
         // the first node. Every unique result insertion must therefore consume the shared gate.
@@ -9498,6 +9585,131 @@ mod tests {
             function
                 .evaluate(&evaluation, vec![SxdValue::String(String::new())])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn restored_function_results_obey_evaluation_budgets() {
+        // The retained continuation result and its replay copy are simultaneously
+        // live. A cached result cannot make the second allocation or traversal free.
+        let package = Package::new();
+        let document = package.as_document();
+        let root = document.create_element("root");
+        document.root().append_child(root);
+        let results = [
+            DeferredXPathValue::String("x".repeat(4096)),
+            DeferredXPathValue::ResultTreeFragment {
+                identity: 1,
+                value: "x".repeat(4096),
+            },
+            DeferredXPathValue::NodeSet(vec![NodePath::Ordinary(vec![0])]),
+        ];
+        for result in results {
+            let name = ExpandedName {
+                namespace: None,
+                local: "f".into(),
+            };
+            let call = DeferredCustomCall {
+                name: name.clone(),
+                node: NodePath::Ordinary(vec![]),
+                position: 1,
+                size: 1,
+                arguments: vec![],
+            };
+            let function = DeferredStylesheetFunction {
+                name,
+                session: Rc::new(RefCell::new(CustomCallState {
+                    completed: vec![CompletedCustomCall {
+                        call: Rc::new(call),
+                        result,
+                        fragment: None,
+                    }],
+                    ..CustomCallState::default()
+                })),
+            };
+            let mut context = Context::new();
+            context.set_string_allocation_limit(1024);
+            context.set_evaluation_work_limit(1);
+            let evaluation =
+                sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+            let error = function
+                .evaluate(&evaluation, vec![])
+                .expect_err("restoring the cached result must cross the remaining budget");
+            assert!(error.to_string().contains("budget"));
+        }
+    }
+
+    #[test]
+    fn restored_nodes_preserve_identity_and_enforce_both_budgets() {
+        // Replay must retain ordinary, attribute and namespace identities without
+        // enumerating the entire namespace axis; stale paths remain errors.
+        let package = Package::new();
+        let document = package.as_document();
+        let root = document.create_element("root");
+        document.root().append_child(root);
+        root.set_attribute_value("id", "value");
+        root.register_prefix("p", "urn:p");
+        root.set_default_namespace_uri(Some("urn:default"));
+        let paths = vec![
+            NodePath::Ordinary(vec![0]),
+            NodePath::Attribute {
+                parent: vec![0],
+                namespace: None,
+                local: "id".into(),
+            },
+            NodePath::Namespace {
+                parent: vec![0],
+                prefix: "p".into(),
+                uri: "urn:p".into(),
+            },
+            NodePath::Namespace {
+                parent: vec![0],
+                prefix: String::new(),
+                uri: "urn:default".into(),
+            },
+            NodePath::Namespace {
+                parent: vec![0],
+                prefix: "xml".into(),
+                uri: "http://www.w3.org/XML/1998/namespace".into(),
+            },
+        ];
+        for path in paths {
+            let value = DeferredXPathValue::NodeSet(vec![path.clone()]);
+            for (memory, work) in [(0, usize::MAX), (usize::MAX, 0), (usize::MAX, usize::MAX)] {
+                let mut context = Context::new();
+                context.set_string_allocation_limit(memory);
+                context.set_evaluation_work_limit(work);
+                let evaluation =
+                    sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+                let result = restore_sxd_value(&value, &evaluation);
+                if memory == 0 || work == 0 {
+                    assert!(
+                        result
+                            .expect_err("replay obeys both independent gates")
+                            .to_string()
+                            .contains("budget")
+                    );
+                } else {
+                    let SxdValue::Nodeset(nodes) = result.expect("unlimited replay") else {
+                        panic!("node-set expected")
+                    };
+                    assert_eq!(nodes.size(), 1);
+                    assert_eq!(
+                        typed_path_to(&nodes.iter().next().expect("one restored node")),
+                        path
+                    );
+                }
+            }
+        }
+        let context = Context::new();
+        let evaluation =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+        let stale = DeferredXPathValue::NodeSet(vec![NodePath::Ordinary(vec![99])]);
+        assert!(
+            restore_sxd_value(&stale, &evaluation)
+                .expect_err("missing child must be a stale identity")
+                .to_string()
+                .contains("stale")
         );
     }
 
@@ -10322,6 +10534,68 @@ mod tests {
             )
             .expect_err("aligned output must cross the allocation gate");
         assert!(error.to_string().contains("allocation budget"));
+    }
+
+    #[test]
+    fn string_align_scans_obey_extension_work_budget() {
+        // Already-owned strings need no coercion but their Unicode scans still
+        // consume extension work, including the truncation path.
+        let package = Package::new();
+        let document = package.as_document();
+        for (value, padding) in [("λ", "...."), ("λλλλ", ".")] {
+            let mut context = Context::new();
+            context.set_extension_work_limit(0);
+            let evaluation =
+                sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+            let error = ExsltStringFunction::Align
+                .evaluate(
+                    &evaluation,
+                    vec![
+                        SxdValue::String(value.into()),
+                        SxdValue::String(padding.into()),
+                    ],
+                )
+                .expect_err("character scans must cross the extension-work gate");
+            assert!(error.to_string().contains("extension work budget"));
+        }
+    }
+
+    #[test]
+    fn string_align_work_boundary_preserves_unicode_output() {
+        // Both padding and truncation are character-based, not byte-based;
+        // exact work succeeds while one unit less cannot copy the result.
+        let package = Package::new();
+        let document = package.as_document();
+        for (value, padding, expected, required) in
+            [("λ", "....", "λ...", 15), ("λλλλ", ".", "λ", 19)]
+        {
+            for limit in [required - 1, required] {
+                let mut context = Context::new();
+                context.set_extension_work_limit(limit);
+                let evaluation =
+                    sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+                let result = ExsltStringFunction::Align.evaluate(
+                    &evaluation,
+                    vec![
+                        SxdValue::String(value.into()),
+                        SxdValue::String(padding.into()),
+                    ],
+                );
+                if limit < required {
+                    assert!(
+                        result
+                            .expect_err("copy exceeds remaining work")
+                            .to_string()
+                            .contains("extension work budget")
+                    );
+                } else {
+                    assert_eq!(
+                        result.expect("exact work allowance"),
+                        SxdValue::String(expected.into())
+                    );
+                }
+            }
+        }
     }
 
     #[test]

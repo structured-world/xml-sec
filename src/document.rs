@@ -581,7 +581,7 @@ impl XmlDocument {
     /// strict and bounded before the normalized UTF-8 document is retained.
     pub fn parse_bytes(bytes: &[u8]) -> Result<Self, XmlDocumentError> {
         let settings = DocumentParseSettings::default();
-        Self::parse_with_settings(decode_owned_xml(bytes, settings.max_bytes)?, settings)
+        Self::parse_with_settings(decode_owned_xml(bytes, settings.max_bytes, None)?, settings)
     }
 
     /// Decode and parse XML bytes with an explicitly selected semantic backend.
@@ -590,7 +590,7 @@ impl XmlDocument {
         backend: XmlBackend,
     ) -> Result<Self, XmlDocumentError> {
         let settings = DocumentParseSettings::default().with_backend(backend);
-        Self::parse_with_settings(decode_owned_xml(bytes, settings.max_bytes)?, settings)
+        Self::parse_with_settings(decode_owned_xml(bytes, settings.max_bytes, None)?, settings)
     }
 
     /// Parse and own XML with an explicitly selected compiled parser backend.
@@ -630,7 +630,7 @@ impl XmlDocument {
         let resources = policy.resource_policy();
         resources.validate()?;
         let budget = XmlParseWorkBudget::from_resources(resources);
-        let xml = decode_owned_xml(bytes, resources.max_xml_document_bytes)?;
+        let xml = decode_owned_xml(bytes, resources.max_xml_document_bytes, Some(&budget))?;
         Self::parse_with_settings_and_optional_budget(
             xml,
             DocumentParseSettings::from_policy(policy.xml_input_policy(), resources),
@@ -667,7 +667,7 @@ impl XmlDocument {
         let resources = policy.resource_policy();
         resources.validate()?;
         let budget = XmlParseWorkBudget::from_resources(resources);
-        let xml = decode_owned_xml(bytes, resources.max_xml_document_bytes)?;
+        let xml = decode_owned_xml(bytes, resources.max_xml_document_bytes, Some(&budget))?;
         Self::parse_with_settings_and_optional_budget(
             xml,
             DocumentParseSettings::from_policy(policy.xml_input_policy(), resources)
@@ -2503,18 +2503,29 @@ fn scan_preflight_event(
         return Ok((event, end + 1));
     }
     if let Some(reference) = remaining.strip_prefix('&') {
-        return Ok(reference
-            .find(';')
-            .map_or((PreflightEvent::Done, remaining.len()), |end| {
-                let name = &reference[..end];
-                (
-                    PreflightEvent::GeneralRef {
-                        name: Some(name.to_owned()),
-                        is_character_reference: is_character_reference(name),
-                    },
-                    end + 2,
-                )
-            }));
+        // XML 1.0 sections 4.4.2 and 4.5 require replacement markup to be
+        // processed after character-reference normalization. This conservative
+        // resource scan must not swallow markup after a malformed reference;
+        // the semantic parser remains responsible for well-formedness.
+        // https://www.w3.org/TR/REC-xml/#intern-replacement
+        if let Some(end) = reference.find([';', '<', '&'])
+            && reference.as_bytes()[end] == b';'
+        {
+            let name = &reference[..end];
+            return Ok((
+                PreflightEvent::GeneralRef {
+                    name: Some(name.to_owned()),
+                    is_character_reference: is_character_reference(name),
+                },
+                end + 2,
+            ));
+        }
+        return Ok((
+            PreflightEvent::CharacterData {
+                xml_whitespace: false,
+            },
+            1,
+        ));
     }
     let end = remaining.find(['<', '&']).unwrap_or(remaining.len());
     let text = &remaining[..end];
@@ -3254,13 +3265,21 @@ fn own_bounded_xml(
     Ok(xml.into())
 }
 
-fn decode_owned_xml(bytes: &[u8], maximum: usize) -> Result<String, XmlDocumentError> {
+fn decode_owned_xml(
+    bytes: &[u8],
+    maximum: usize,
+    budget: Option<&XmlParseWorkBudget>,
+) -> Result<String, XmlDocumentError> {
     if bytes.len() > maximum {
         return Err(XmlDocumentError::DocumentTooLarge {
             maximum,
             actual: bytes.len(),
         });
     }
+    // Decoding is an input-sized pass, not free preparation for XML parsing.
+    // Charge it before encoding detection/transcoding and retain that charge
+    // in the same sticky budget used by preflight and semantic construction.
+    charge_parse_work(budget, bytes.len())?;
     xml_sec_xml_input::decode_xml_bounded(bytes, None, maximum)
         .map(|xml| xml.into_owned())
         .map_err(|error| match error {
@@ -3553,6 +3572,63 @@ mod tests {
                     xml_sec_xml_input::Error::ConflictingEncoding(_)
                 ))
             ));
+        }
+    }
+
+    #[cfg(feature = "xmldsig")]
+    #[test]
+    fn byte_decoding_work_is_rejected_before_encoding_validation() {
+        // An exhausted operation must reject before even invalid UTF-16 is
+        // decoded, for both default and explicitly selected backends.
+        let bytes = [0xff, 0xfe, 0];
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_xml_parse_work_bytes = 0;
+        let assert_work_error = |result: Result<XmlDocument, XmlDocumentError>| {
+            assert!(matches!(
+                result,
+                Err(XmlDocumentError::Policy(
+                    crate::policy::PolicyViolation::ResourceLimit {
+                        resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
+                        maximum: 0,
+                        actual: 3,
+                    }
+                ))
+            ));
+        };
+        assert_work_error(XmlDocument::parse_bytes_with_policy(&bytes, &policy));
+        for backend in XmlBackend::available() {
+            assert_work_error(XmlDocument::parse_bytes_with_policy_and_backend(
+                &bytes, &policy, backend,
+            ));
+        }
+    }
+
+    #[cfg(feature = "xmldsig")]
+    #[test]
+    fn byte_decoding_and_parsing_share_one_work_allowance() {
+        // UTF-16 decoding consumes its source bytes; preflight and the two
+        // parser/projection passes then consume normalized UTF-8 bytes.
+        let xml = "<r/>";
+        let mut bytes = vec![0xff, 0xfe];
+        bytes.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
+        let required = bytes.len() + 3 * xml.len();
+        for backend in XmlBackend::available() {
+            let mut policy = crate::policy::VerificationPolicy::default();
+            policy.resources.max_xml_parse_work_bytes = required - 1;
+            assert!(matches!(
+                XmlDocument::parse_bytes_with_policy_and_backend(&bytes, &policy, backend),
+                Err(XmlDocumentError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
+                    maximum, actual,
+                })) if maximum == required - 1 && actual == required
+            ));
+            policy.resources.max_xml_parse_work_bytes = required;
+            assert_eq!(
+                XmlDocument::parse_bytes_with_policy_and_backend(&bytes, &policy, backend)
+                    .expect("exact aggregate work must suffice")
+                    .as_xml(),
+                xml
+            );
         }
     }
 
@@ -3867,6 +3943,25 @@ mod tests {
                 actual: 3,
             })
         ));
+    }
+
+    #[test]
+    fn depth_preflight_does_not_stop_at_generated_ampersands() {
+        // An incomplete reference in replacement text must not hide the markup
+        // that follows it from the pre-DOM resource checks.
+        for replacement in ["&#38;<a><b/></a>", "&#38;<a><b/>&amp;</a>"] {
+            let xml = format!(
+                "<!DOCTYPE root [<!ENTITY generated \"{replacement}\">]><root>&generated;</root>"
+            );
+            let settings = DocumentParseSettings::new_with_depth(true, 16, 2, xml.len());
+            assert!(matches!(
+                preflight_document_limits(&xml, settings, None),
+                Err(XmlDocumentError::DocumentTooDeep {
+                    maximum: 2,
+                    actual: 3
+                })
+            ));
+        }
     }
 
     #[test]
