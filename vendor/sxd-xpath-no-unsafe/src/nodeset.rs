@@ -137,6 +137,7 @@ pub(crate) fn visit_namespace_bindings<'d, E: From<crate::function::Error>>(
     let mut current = Some(owner);
     while let Some(element) = current {
         context.charge_work(1)?;
+        context.reserve_temporary_allocation(element.namespace_declaration_workspace_bytes())?;
         match element.try_visit_namespace_declarations(&mut emit) {
             Err(None) => return Ok(()),
             Err(Some(error)) => return Err(error),
@@ -1083,11 +1084,19 @@ pub(crate) fn reserve_hashset_slot<T: Eq + std::hash::Hash>(
     if values.len() < values.capacity() {
         return Ok(());
     }
+    context.reserve_temporary_allocation(hashset_growth_bytes::<T>(values.len())?)?;
+    values
+        .try_reserve(1)
+        .map_err(|_| crate::function::Error::Other {
+            what: "XPath set allocation failed".into(),
+        })
+}
+
+pub(crate) fn hashset_growth_bytes<T>(current_len: usize) -> Result<usize, crate::function::Error> {
     // std's SwissTable uses power-of-two buckets at at most 7/8 occupancy, plus
     // a control byte per bucket and a SIMD control group. Charge the whole new
     // allocation: the old table remains live during rehash, not just its delta.
-    let bytes = values
-        .len()
+    current_len
         .checked_add(1)
         .and_then(|entries| entries.checked_mul(8))
         .and_then(|scaled| scaled.checked_add(6))
@@ -1097,12 +1106,6 @@ pub(crate) fn reserve_hashset_slot<T: Eq + std::hash::Hash>(
         .and_then(|bytes| bytes.checked_add(16))
         .ok_or_else(|| crate::function::Error::Other {
             what: "XPath set capacity overflow".into(),
-        })?;
-    context.reserve_temporary_allocation(bytes)?;
-    values
-        .try_reserve(1)
-        .map_err(|_| crate::function::Error::Other {
-            what: "XPath set allocation failed".into(),
         })
 }
 

@@ -113,6 +113,8 @@ pub enum Event<'a> {
     Declaration {
         /// Declared XML version.
         version: &'a str,
+        /// Standalone declaration, if supplied; significant for XML entity constraints.
+        standalone: Option<bool>,
         /// Complete declaration range.
         range: Range<usize>,
     },
@@ -274,9 +276,15 @@ impl<'a> Scanner<'a> {
                 _ => {}
             }
             match token {
-                Token::Declaration { version, span, .. } => {
+                Token::Declaration {
+                    version,
+                    standalone,
+                    span,
+                    ..
+                } => {
                     return Ok(Some(Event::Declaration {
                         version: version.as_str(),
+                        standalone,
                         range: span.range(),
                     }));
                 }

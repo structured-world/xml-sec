@@ -559,6 +559,26 @@ impl Connections {
         C: Into<ChildOfElement>,
     {
         let child = child.into();
+        if let ChildOfElement::Element(child) = child {
+            assert!(parent != child, "cannot insert an element into itself");
+            let elements = storage.elements.borrow();
+            // A leaf cannot be an ancestor; preserve O(1) insertion during tree construction.
+            let mut ancestor = if elements[child.idx].children.is_empty() {
+                None
+            } else {
+                Some(parent)
+            };
+            while let Some(node) = ancestor {
+                assert!(
+                    node != child,
+                    "cannot insert an element into its own subtree"
+                );
+                ancestor = match elements[node.idx].parent {
+                    Some(ParentOfChild::Element(parent)) => Some(parent),
+                    _ => None,
+                };
+            }
+        }
         self.replace_element_child_parent(storage, parent, child);
         storage.elements.borrow_mut()[parent.idx]
             .children
@@ -932,10 +952,14 @@ impl Connections {
         };
         {
             let mut elements = storage.elements.borrow_mut();
-            let attrs_ref = storage.attributes.borrow();
-            elements[parent.idx]
-                .attributes
-                .retain(|&a| attrs_ref[a.idx].name.as_qname() != attr_name.as_qname());
+            let mut attrs_ref = storage.attributes.borrow_mut();
+            elements[parent.idx].attributes.retain(|&a| {
+                let keep = attrs_ref[a.idx].name.as_qname() != attr_name.as_qname();
+                if !keep {
+                    attrs_ref[a.idx].parent = None;
+                }
+                keep
+            });
         }
         storage.elements.borrow_mut()[parent.idx]
             .attributes

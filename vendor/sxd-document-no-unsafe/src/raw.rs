@@ -615,9 +615,28 @@ impl Connections {
         C: Into<ChildOfElement>,
     {
         let child = child.into();
-        let parent_r = unsafe { &mut *parent };
-
+        if let ChildOfElement::Element(child) = child {
+            assert!(parent != child, "cannot insert an element into itself");
+            // A leaf cannot be an ancestor; preserve O(1) insertion during tree construction.
+            let mut ancestor = if unsafe { (*child).children.is_empty() } {
+                None
+            } else {
+                Some(parent)
+            };
+            while let Some(node) = ancestor {
+                assert!(
+                    node != child,
+                    "cannot insert an element into its own subtree"
+                );
+                ancestor = match unsafe { (*node).parent } {
+                    Some(ParentOfChild::Element(parent)) => Some(parent),
+                    _ => None,
+                };
+            }
+        }
+        // Reparent before borrowing the destination: it may already own this child.
         child.replace_parent(parent);
+        let parent_r = unsafe { &mut *parent };
         parent_r.children.push(child);
     }
 
@@ -935,7 +954,6 @@ impl Connections {
     }
 
     pub fn set_attribute(&self, parent: *mut Element, attribute: *mut Attribute) {
-        let parent_r = unsafe { &mut *parent };
         let attr_r = unsafe { &mut *attribute };
 
         if let Some(prev_parent) = attr_r.parent {
@@ -943,9 +961,14 @@ impl Connections {
             prev_parent_r.attributes.retain(|&a| a != attribute);
         }
 
+        let parent_r = unsafe { &mut *parent };
         parent_r.attributes.retain(|a| {
-            let a_r: &Attribute = unsafe { &**a };
-            a_r.name.as_qname() != attr_r.name.as_qname()
+            let a_r: &mut Attribute = unsafe { &mut **a };
+            let keep = a_r.name.as_qname() != attr_r.name.as_qname();
+            if !keep {
+                a_r.parent = None;
+            }
+            keep
         });
         parent_r.attributes.push(attribute);
         attr_r.parent = Some(parent);
@@ -1001,15 +1024,24 @@ impl Connections {
         None
     }
 
+    pub fn element_namespace_declaration_workspace_bytes(&self, element: *mut Element) -> usize {
+        // The iterator's exact upper bound comes from HashMap::Iter without traversal.
+        let count = unsafe { (*element).prefix_to_namespace.iter().size_hint().0 };
+        count * std::mem::size_of::<(&str, &str)>()
+    }
+
     pub fn try_visit_element_namespace_declarations<'a, E>(
         &'a self,
         element: *mut Element,
         mut visit: impl FnMut(&'a str, &'a str) -> Result<(), E>,
     ) -> Result<(), E> {
-        if let Some(element) = self.element_parents(element).next() {
-            for (prefix, uri) in element.prefix_to_namespace.iter() {
-                visit(prefix.as_slice(), uri.as_slice())?;
-            }
+        // Interned bytes live for the document. End every map/element borrow before
+        // user code can register a prefix and reallocate the map through another handle.
+        let source = unsafe { (*element).prefix_to_namespace.iter() };
+        let mut declarations = Vec::with_capacity(source.size_hint().0);
+        declarations.extend(source.map(|(prefix, uri)| (prefix.as_slice(), uri.as_slice())));
+        for (prefix, uri) in declarations {
+            visit(prefix, uri)?;
         }
         Ok(())
     }

@@ -336,7 +336,15 @@ impl<'d> Element<'d> {
         )
     }
 
-    /// Visit declarations on this element without collecting or cloning them; errors stop visits.
+    /// Temporary bytes needed by the namespace visitor's borrowed-pair snapshot.
+    pub fn namespace_declaration_workspace_bytes(&self) -> usize {
+        self.document
+            .connections
+            .element_namespace_declaration_workspace_bytes(self.node)
+    }
+
+    /// Visit a snapshot of declarations without cloning strings; errors stop visits.
+    /// Callbacks may mutate the document without invalidating the snapshot.
     pub fn try_visit_namespace_declarations<E>(
         &self,
         visit: impl FnMut(&'d str, &'d str) -> Result<(), E>,
@@ -1409,10 +1417,60 @@ mod test {
 
         let element = doc.create_element("element");
 
-        element.set_attribute_value("hello", "world");
+        let displaced = element.set_attribute_value("hello", "world");
         element.set_attribute_value("hello", "galaxy");
 
         assert_eq!(Some("galaxy"), element.attribute_value("hello"));
+        // A detached handle must not keep a stale link to its former owner.
+        assert!(displaced.parent().is_none());
+    }
+
+    #[test]
+    fn cyclic_insertion_preserves_the_tree() {
+        // Rejected mutations must preserve both sides of the parent/child relationship.
+        let package = Package::new();
+        let doc = package.as_document();
+        let parent = doc.create_element("parent");
+        let child = doc.create_element("child");
+        parent.append_child(child);
+        for target in [parent, child] {
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    target.append_child(parent);
+                }))
+                .is_err()
+            );
+            assert!(parent.parent().is_none());
+            assert_eq!(child.parent().and_then(|node| node.element()), Some(parent));
+            assert_eq!(parent.children().len(), 1);
+            assert!(child.children().is_empty());
+        }
+    }
+
+    #[test]
+    fn namespace_visitor_isolated_from_reentrant_registration() {
+        // Rehashing during a callback must not invalidate the borrowed declaration snapshot.
+        let package = Package::new();
+        let doc = package.as_document();
+        let element = doc.create_element("element");
+        element.register_prefix("original", "urn:original");
+        assert_eq!(
+            element.namespace_declaration_workspace_bytes(),
+            std::mem::size_of::<(&str, &str)>()
+        );
+        let mut visits = 0;
+        element
+            .try_visit_namespace_declarations::<()>(|prefix, uri| {
+                for index in 0..128 {
+                    element.register_prefix(&format!("p{index}"), "urn:new");
+                }
+                assert_eq!((prefix, uri), ("original", "urn:original"));
+                visits += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(visits, 1);
+        assert_eq!(element.namespace_uri_for_prefix("p127"), Some("urn:new"));
     }
 
     #[test]

@@ -85,6 +85,42 @@ must do, the primary normative specification decides rather than reviewer or aut
   project diverges. If the normative text contradicts the implementation, change the code and
   replace the obsolete comment.
 
+### Pinned Normative Baseline (checked 2026-09-07)
+
+Use the following editions, their applicable updates, and verified errata. A newer language
+version is not a silent replacement for the version selected by the document/algorithm contract.
+These are reference requirements, not a claim that every feature of every document is implemented.
+
+| Contract | Edition |
+| --- | --- |
+| XML / Namespaces | XML 1.0 Fifth Edition (2008-11-26); Namespaces in XML 1.0 Third Edition (2009-12-08) |
+| XML 1.1 comparison | XML 1.1 and Namespaces in XML 1.1 Second Editions (2006-08-16); do not apply 1.1 character or namespace rules to a 1.0 document |
+| XPath / XSLT | 1.0 Recommendations (1999-11-16), including errata; XPath 3.1 (2017-03-21) and XSLT 3.0 (2017-06-08) are newer languages, not this engine's contract |
+| XInclude / XML Base / xml:id | XInclude 1.0 Second Edition (2006-11-15); XML Base Second Edition (2009-01-28); xml:id (2005-09-09) |
+| XPointer | Framework and element() Scheme (2003-03-25) |
+| Canonicalization | C14N 1.0 (2001-03-15), C14N 1.1 (2008-05-02), Exclusive C14N 1.0 (2002-07-18), selected by algorithm URI |
+| XML Security | XMLDSig 1.1 and XMLEnc 1.1 (2013-04-11); XPath Filter 2.0 (2002-11-08); RFC 9231 (2022-07), which obsoletes RFC 6931 |
+| XSLT serialization / EXSLT date types | HTML 4.01 (1999-12-24); XML Schema Datatypes 1.0 Second Edition (2004-10-28); do not substitute XSD 1.1 year semantics |
+| ASN.1 BER/CER/DER | ITU-T X.690 (2021-02), identical to ISO/IEC 8825-1:2021, plus Erratum 1 (2021-09) |
+| Certificates | RFC 5280 (2008-05), with Updates 6818, 9549 (replaces 8399), 9598 (replaces 8398), 9608, 9618, 9925, 10007; apply each only to its defined scope |
+| Crypto encodings | RFC 3394, 4055 + 5756, 5758, 5958, 7468, 8017 (PKCS #1 v2.2), 8018 + 9879 (replaces 9579; PKCS #5 v2.1 / PBMAC1), 8410 + 9295 |
+| URI / text encodings | RFC 3986 + 8820 (supersedes 7320), RFC 2781, RFC 4648; use historical RFC 2396 only where an older normative contract explicitly incorporates it |
+| Names / requirements | RFC 4514, RFC 9525; BCP 14 = RFC 2119 + RFC 8174 |
+
+Exact dated publisher URLs are in [`docs/standards-sources.tsv`](docs/standards-sources.tsv).
+Run `bash scripts/fetch-standards.sh` to download publisher texts and RFC status metadata into
+gitignored `.refs/standards/`, with retrieval time and SHA-256 checksums. Preserve notices; do not
+commit third-party full texts. Check `obsoleted_by`, `updated_by`, and errata status before relying
+on an RFC: a reported erratum is not automatically a normative correction.
+
+Charset editions include ISO/IEC 8859-1:1998, 8859-2:1999, 8859-9:1999, and 8859-11:2001.
+Their ISO full texts were not obtained (the publisher catalogue returned HTTP 403; this
+does not establish the reason for the access failure). Open Unicode Consortium mapping tables
+can verify byte-to-Unicode mappings but are not substitutes for the full normative text:
+https://www.unicode.org/Public/MAPPINGS/ISO8859/DatedVersions/ .
+Do not claim that the ISO text has been audited. The freely
+published ITU-T X.690 text and its erratum are available for ASN.1 auditing.
+
 ## Review Fixture Scope
 
 Treat imported fixture payloads as test data, not review context. Do not read or review individual

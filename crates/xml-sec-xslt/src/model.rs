@@ -2559,6 +2559,30 @@ fn internal_general_entities<'a>(
             }
         }
     };
+    let mut header = doctype.start + "<!DOCTYPE".len();
+    skip_xml_whitespace(xml, &mut header);
+    parse_dtd_name(xml, &mut header, "DOCTYPE name")?;
+    skip_xml_whitespace(xml, &mut header);
+    let external_subset =
+        xml[header..].starts_with("SYSTEM") || xml[header..].starts_with("PUBLIC");
+    let standalone = if xml.trim_start_matches('\u{feff}').starts_with("<?xml") {
+        matches!(
+            Scanner::new(xml)
+                .next_event()
+                .map_err(|error| Error::Xml(error.to_string()))?,
+            Some(Event::Declaration {
+                standalone: Some(true),
+                ..
+            })
+        )
+    } else {
+        false
+    };
+    validate_unused_entity_graph(
+        &declarations,
+        standalone || (!external_subset && !changed),
+        meter,
+    )?;
     validate_attribute_default_entities(&declarations)?;
     if !changed {
         return Ok((Cow::Borrowed(xml), declarations));
@@ -2573,6 +2597,77 @@ fn internal_general_entities<'a>(
     expanded_xml.push_str(expanded_subset.as_ref());
     expanded_xml.push_str(&xml[subset_end..]);
     Ok((Cow::Owned(expanded_xml), declarations))
+}
+
+fn validate_unused_entity_graph(
+    declarations: &InternalEntityDeclarations,
+    require_declared: bool,
+    meter: &mut EntityExpansionMeter,
+) -> Result<()> {
+    // XML 1.0 Fifth Edition sections 4.1 (Entity Declared / No Recursion) and 5.1:
+    // check declarations even when unused, but do not impose the validity-only declaration
+    // constraint when an external subset/PE can supply bindings and standalone is not yes.
+    // https://www.w3.org/TR/2008/REC-xml-20081126/#wf-entdeclared
+    // https://www.w3.org/TR/2008/REC-xml-20081126/#norecursion
+    type Entry<'a> = (&'a str, &'a str, usize, u8);
+    let count = declarations.general.len();
+    meter.charge(count.saturating_mul(std::mem::size_of::<Entry<'_>>()))?;
+    let mut entries: Vec<Entry<'_>> = Vec::with_capacity(count);
+    entries.extend(
+        declarations
+            .general
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str(), 0, 0)),
+    );
+    entries.sort_unstable_by_key(|entry| entry.0);
+    // Iterative, memoized DFS: visit each replacement once without expanding its text.
+    let mut active = [0usize; ENTITY_EXPANSION_DEPTH_CEILING];
+    for root in 0..entries.len() {
+        if entries[root].3 != 0 {
+            continue;
+        }
+        meter.check_depth(1)?;
+        entries[root].3 = 1;
+        active[0] = root;
+        let mut depth = 1;
+        while depth != 0 {
+            let index = active[depth - 1];
+            let (_, value, cursor, _) = entries[index];
+            let Some(offset) = value[cursor..].find('&') else {
+                entries[index].3 = 2;
+                depth -= 1;
+                continue;
+            };
+            let start = cursor + offset;
+            let (name, consumed) = general_entity_reference(&value[start..])
+                .ok_or_else(|| Error::Xml("invalid entity reference in declaration".into()))?;
+            entries[index].2 = start + consumed;
+            if name.starts_with('#') || matches!(name, "amp" | "lt" | "gt" | "apos" | "quot") {
+                continue;
+            }
+            if declarations.unparsed.contains_key(name) {
+                return Err(Error::Xml(format!(
+                    "reference to unparsed entity `&{name};`"
+                )));
+            }
+            let Ok(target) = entries.binary_search_by_key(&name, |entry| entry.0) else {
+                if require_declared && !declarations.declared_general.contains(name) {
+                    return Err(Error::Xml(format!("undeclared entity `&{name};`")));
+                }
+                continue;
+            };
+            match entries[target].3 {
+                1 => return Err(Error::Xml(format!("recursive entity reference `&{name};`"))),
+                2 => continue,
+                _ => {}
+            }
+            meter.check_depth(depth + 1)?;
+            entries[target].3 = 1;
+            active[depth] = target;
+            depth += 1;
+        }
+    }
+    Ok(())
 }
 
 fn validate_attribute_default_entities(declarations: &InternalEntityDeclarations) -> Result<()> {
@@ -2755,19 +2850,16 @@ fn collect_internal_entity_declarations(subset: &str) -> Result<InternalEntityDe
         let mut value = subset[value_start..cursor].to_owned();
         cursor += 1;
         validate_entity_value(name, &value, parameter)?;
-        if parameter {
-            // XML 1.0 Fifth Edition section 4.2, production [72], permits only optional XML S
-            // between PEDef and `>`: https://www.w3.org/TR/xml/#sec-entity-decl
-            skip_xml_whitespace(subset, &mut cursor);
-            if subset.as_bytes().get(cursor) != Some(&b'>') {
-                return Err(Error::Xml(format!(
-                    "parameter entity declaration `{name}` has content after its definition"
-                )));
-            }
-            cursor += 1;
-        } else {
-            cursor = declaration_end(subset, cursor)?;
+        // XML 1.0 Fifth Edition section 4.2, [70]-[74], permits only XML S before `>`
+        // after an internal EntityValue, for both general and parameter entities.
+        // https://www.w3.org/TR/2008/REC-xml-20081126/#sec-entity-decl
+        skip_xml_whitespace(subset, &mut cursor);
+        if subset.as_bytes().get(cursor) != Some(&b'>') {
+            return Err(Error::Xml(format!(
+                "entity declaration `{name}` has content after its definition"
+            )));
         }
+        cursor += 1;
         if parameter {
             declarations
                 .parameter_spans
@@ -3275,7 +3367,12 @@ fn parse_external_entity_declaration(
         require_dtd_whitespace(subset, &mut cursor, "before entity system identifier")?;
         parse_dtd_system_literal(subset, &mut cursor, "entity system identifier")?
     } else {
-        return Ok((declaration_end(subset, cursor)?, None));
+        // XML 1.0 Fifth Edition section 4.2 [71]/[74]: an unquoted definition must
+        // be ExternalID, not an arbitrary token ignored until the closing bracket.
+        // https://www.w3.org/TR/2008/REC-xml-20081126/#sec-entity-decl
+        return Err(Error::Xml(
+            "entity definition must be a quoted value, SYSTEM, or PUBLIC".into(),
+        ));
     };
     let spacing_start = cursor;
     skip_xml_whitespace(subset, &mut cursor);
@@ -3722,29 +3819,6 @@ fn scan_doctype_end(doctype: &str) -> Result<(usize, Option<(usize, usize)>)> {
         }
     }
     Err(Error::Xml("unterminated document type declaration".into()))
-}
-
-fn declaration_end(subset: &str, mut cursor: usize) -> Result<usize> {
-    let mut quote = None;
-    while cursor < subset.len() {
-        let ch = subset[cursor..]
-            .chars()
-            .next()
-            .expect("cursor remains on a character boundary");
-        cursor += ch.len_utf8();
-        if let Some(active) = quote {
-            if ch == active {
-                quote = None;
-            }
-        } else {
-            match ch {
-                '\'' | '"' => quote = Some(ch),
-                '>' => return Ok(cursor),
-                _ => {}
-            }
-        }
-    }
-    Err(Error::Xml("unterminated entity declaration".into()))
 }
 
 fn skip_xml_whitespace(value: &str, cursor: &mut usize) {
@@ -5027,6 +5101,58 @@ mod parser_boundary_tests {
         // quoted SystemLiteral: https://www.w3.org/TR/xml/#NT-doctypedecl
         let xml = r#"<!DOCTYPE r SYSTEM "[<!ENTITY e 'ok'>]"><r>&e;</r>"#;
         assert!(Document::parse_iterative(xml, None).is_err());
+    }
+
+    #[test]
+    fn unused_entity_definitions_reject_invalid_grammar() {
+        // XML 1.0 [70]-[74]: unused declarations still need a complete EntityDef/PEDef.
+        for declaration in [
+            "<!ENTITY e BOGUS>",
+            "<!ENTITY % e BOGUS>",
+            "<!ENTITY e 'value' BOGUS>",
+            "<!ENTITY e 'value' NDATA notation>",
+        ] {
+            let xml = format!("<!DOCTYPE root [{declaration}]><root/>");
+            assert!(
+                Document::parse(&xml, None).is_err(),
+                "accepted {declaration}"
+            );
+            assert!(
+                Document::parse_iterative(&xml, None).is_err(),
+                "iterative accepted {declaration}"
+            );
+            assert!(
+                super::collect_internal_entity_declarations(declaration).is_err(),
+                "preprocessor accepted {declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn unused_entity_graphs_obey_well_formedness() {
+        // XML 1.0 section 4.1 applies Entity Declared and No Recursion to unused declarations.
+        for subset in [
+            "<!ENTITY a '&missing;'>",
+            "<!ENTITY a '&a;'>",
+            "<!ENTITY a '&b;'><!ENTITY b '&a;'>",
+        ] {
+            let xml = format!("<!DOCTYPE root [{subset}]><root/>");
+            assert!(Document::parse(&xml, None).is_err(), "accepted {subset}");
+        }
+        // Forward references between general entities are legal; unused text is not expanded.
+        Document::parse(
+            "<!DOCTYPE root [<!ENTITY a '&b;'><!ENTITY b 'ok'>]><root/>",
+            None,
+        )
+        .expect("acyclic forward reference is valid");
+        Document::parse(
+            "<!DOCTYPE root SYSTEM 'memory:external.dtd' [<!ENTITY a '&external;'>]><root/>",
+            None,
+        )
+        .expect("non-validating processor need not read an external declaration");
+        assert!(Document::parse("<?xml version='1.0' standalone='yes'?><!DOCTYPE root SYSTEM 'memory:external.dtd' [<!ENTITY a '&external;'>]><root/>", None).is_err());
+        Document::parse("<!DOCTYPE root [<!ENTITY a '&amp;missing;'>]><root/>", None)
+            .expect("escaped ampersand does not declare a dependency");
     }
 
     #[test]

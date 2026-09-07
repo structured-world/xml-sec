@@ -320,6 +320,11 @@ impl<'d> Element<'d> {
         )
     }
 
+    /// Temporary bytes needed by the visitor (zero for the borrow-guarded backend).
+    pub fn namespace_declaration_workspace_bytes(&self) -> usize {
+        0
+    }
+
     /// Visit declarations on this element without collecting or cloning them. The callback
     /// cannot mutate the document while its namespace storage is borrowed; errors stop visits.
     pub fn try_visit_namespace_declarations<E>(
@@ -1398,9 +1403,33 @@ mod test {
         let package = Package::new();
         let doc = package.as_document();
         let element = doc.create_element("element");
-        element.set_attribute_value("hello", "world");
+        let displaced = element.set_attribute_value("hello", "world");
         element.set_attribute_value("hello", "galaxy");
         assert_eq!(element.attribute_value("hello").as_deref(), Some("galaxy"));
+        // A detached handle must not keep a stale link to its former owner.
+        assert!(displaced.parent().is_none());
+    }
+
+    #[test]
+    fn cyclic_insertion_preserves_the_tree() {
+        // Rejected mutations must preserve both sides of the parent/child relationship.
+        let package = Package::new();
+        let doc = package.as_document();
+        let parent = doc.create_element("parent");
+        let child = doc.create_element("child");
+        parent.append_child(child);
+        for target in [parent, child] {
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    target.append_child(parent);
+                }))
+                .is_err()
+            );
+            assert!(parent.parent().is_none());
+            assert_eq!(child.parent().and_then(|node| node.element()), Some(parent));
+            assert_eq!(parent.children().len(), 1);
+            assert!(child.children().is_empty());
+        }
     }
 
     #[test]
