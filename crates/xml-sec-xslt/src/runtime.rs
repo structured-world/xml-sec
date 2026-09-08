@@ -2321,6 +2321,12 @@ impl<'a> Execution<'a> {
                             return Ok(None);
                         };
                         if characters.next().is_some() {
+                            // XSLT 1.0 section 2.5 requires an unsupported optional attribute
+                            // value to be ignored while forwards-compatible processing is active.
+                            // https://www.w3.org/TR/1999/REC-xslt-19991116#forwards
+                            if number.forward_compatible {
+                                return Ok(None);
+                            }
                             return Err(Error::Dynamic(
                                 "xsl:number grouping-separator must evaluate to at most one character"
                                     .into(),
@@ -5064,7 +5070,7 @@ impl EvaluatedSort {
 }
 impl SortKey {
     fn text_precharged(value: String, reservation: usize, meter: &mut Meter) -> Result<Self> {
-        debug_assert_eq!(reservation, value.len());
+        debug_assert_eq!(reservation, value.capacity());
         if let Err(error) = meter.charge(BudgetKind::XPathOperations, value.len()) {
             meter.release_owned_bytes(reservation);
             return Err(error);
@@ -5079,12 +5085,24 @@ impl SortKey {
             return Err(error);
         }
         let default_key = default_collation_key(&value, key_bytes);
+        let mut key_reservation = key_bytes;
+        if let Err(error) = reconcile_temporary_capacity(
+            meter,
+            &mut key_reservation,
+            key_bytes,
+            default_key.capacity(),
+        ) {
+            meter.release_owned_bytes(reservation.saturating_add(key_reservation));
+            return Err(error);
+        }
         Ok(Self::Text { value, default_key })
     }
 
     fn owned_bytes(&self) -> usize {
         match self {
-            Self::Text { value, default_key } => value.len().saturating_add(default_key.len()),
+            Self::Text { value, default_key } => {
+                value.capacity().saturating_add(default_key.capacity())
+            }
             Self::Number(_) => 0,
         }
     }
@@ -5721,7 +5739,7 @@ fn append_precharged_result_text(
     reservation: usize,
     disable: bool,
 ) -> Result<()> {
-    debug_assert_eq!(reservation, value.len());
+    debug_assert_eq!(reservation, value.capacity());
     if value.is_empty() {
         meter.release_owned_bytes(reservation);
         return Ok(());
@@ -6007,7 +6025,7 @@ fn value_owned_bytes(value: &Value) -> usize {
             .len()
             .saturating_mul(std::mem::size_of::<NodeReference>()),
         Value::Boolean(_) | Value::Number(_) => 0,
-        Value::String(value) | Value::StoredExpression(value) => value.len(),
+        Value::String(value) | Value::StoredExpression(value) => value.capacity(),
         Value::ResultTreeFragment(_) => std::mem::size_of::<Arc<Document>>(),
     }
 }

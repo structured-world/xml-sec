@@ -887,7 +887,7 @@ impl Evaluator {
         node: &SourceNode,
         meter: &mut Meter,
     ) -> Result<()> {
-        debug_assert_eq!(value_reservation, value.len());
+        debug_assert_eq!(value_reservation, value.capacity());
         let Some(sxd) = self
             .maps
             .to_sxd(self.package.as_document().root().into(), node)
@@ -1095,7 +1095,7 @@ impl Evaluator {
     fn deferred_public_value_size(&self, value: &Value) -> Result<usize> {
         let payload = match value {
             Value::Boolean(_) | Value::Number(_) => 0,
-            Value::String(value) | Value::StoredExpression(value) => value.len(),
+            Value::String(value) | Value::StoredExpression(value) => value.capacity(),
             Value::NodeSet(nodes) => nodes.iter().try_fold(0usize, |total, node| {
                 let path = self.maps.forward.get(node).ok_or_else(|| {
                     Error::Dynamic("stylesheet function result node is stale".into())
@@ -2929,13 +2929,14 @@ impl Evaluator {
         })?;
         meter.charge(BudgetKind::OwnedBytes, length)?;
         let mut output = String::with_capacity(length);
+        let retained = reconcile_owned_string_capacity(meter, length, output.capacity())?;
         if let Err(error) = self.visit_string_value_metered(node, meter, |value| {
             output.push_str(value);
         }) {
-            meter.release_owned_bytes(length);
+            meter.release_owned_bytes(retained);
             return Err(error);
         }
-        Ok((output, length))
+        Ok((output, retained))
     }
 
     pub(crate) fn visit_string_value(&self, node: &SourceNode, mut visit: impl FnMut(&str)) {
@@ -3620,7 +3621,10 @@ impl XPathValue {
             Self::Boolean(value) => {
                 let value = if value { "true" } else { "false" };
                 meter.charge(BudgetKind::OwnedBytes, value.len())?;
-                Ok((value.into(), value.len()))
+                let value = String::from(value);
+                let retained =
+                    reconcile_owned_string_capacity(meter, value.len(), value.capacity())?;
+                Ok((value, retained))
             }
             Self::Number(value) => {
                 // XPath decimal expansion of a finite f64 needs at most 327 bytes (the negative
@@ -3628,9 +3632,8 @@ impl XPathValue {
                 const MAX_XPATH_F64_BYTES: usize = 327;
                 meter.charge(BudgetKind::OwnedBytes, MAX_XPATH_F64_BYTES)?;
                 let value = crate::value::format_xpath_number(value);
-                let retained = value.len();
-                debug_assert!(retained <= MAX_XPATH_F64_BYTES);
-                meter.release_owned_bytes(MAX_XPATH_F64_BYTES - retained);
+                let retained =
+                    reconcile_owned_string_capacity(meter, MAX_XPATH_F64_BYTES, value.capacity())?;
                 Ok((value, retained))
             }
         }
@@ -3643,9 +3646,9 @@ impl XPathValue {
     ) -> Result<(String, usize)> {
         match self {
             Self::String(value) | Self::StoredExpression(value) => {
-                meter.charge(BudgetKind::OwnedBytes, value.len())?;
-                let length = value.len();
-                Ok((value, length))
+                let retained = value.capacity();
+                meter.charge(BudgetKind::OwnedBytes, retained)?;
+                Ok((value, retained))
             }
             value => value.into_temporary_string(evaluator, meter),
         }
@@ -3690,15 +3693,32 @@ fn temporary_document_string(document: &Document, meter: &mut Meter) -> Result<(
     )?;
     meter.charge(BudgetKind::OwnedBytes, length)?;
     let mut output = String::with_capacity(length);
+    let retained = reconcile_owned_string_capacity(meter, length, output.capacity())?;
     if let Err(error) = document.try_visit_string_value(
         document.root(),
         |work| meter.charge(BudgetKind::XPathOperations, work),
         |value| output.push_str(value),
     ) {
-        meter.release_owned_bytes(length);
+        meter.release_owned_bytes(retained);
         return Err(error);
     }
-    Ok((output, length))
+    Ok((output, retained))
+}
+
+fn reconcile_owned_string_capacity(
+    meter: &mut Meter,
+    expected: usize,
+    actual: usize,
+) -> Result<usize> {
+    if actual < expected {
+        meter.release_owned_bytes(expected - actual);
+    } else if actual > expected
+        && let Err(error) = meter.charge(BudgetKind::OwnedBytes, actual - expected)
+    {
+        meter.release_owned_bytes(expected);
+        return Err(error);
+    }
+    Ok(actual)
 }
 
 fn metered_xpath_number(value: &str, meter: &mut Meter) -> Result<f64> {
@@ -8777,6 +8797,66 @@ mod tests {
 
     struct StaticResolver {
         bytes: Vec<u8>,
+    }
+
+    #[test]
+    fn fully_metered_owned_string_charges_retained_capacity() {
+        // SXD string functions can return a short value in a source-sized allocation. Callers
+        // retain that allocation, so the reservation must describe capacity rather than length.
+        let source = Document::parse("<root/>", None).expect("source parses");
+        let stylesheet = Document::parse("<stylesheet/>", None).expect("stylesheet parses");
+        let unlimited = ExecutionBudget {
+            source_bytes: usize::MAX,
+            external_documents: usize::MAX,
+            recursion_depth: usize::MAX,
+            xpath_evaluations: usize::MAX,
+            xpath_operations: usize::MAX,
+            extension_operations: usize::MAX,
+            pattern_evaluations: usize::MAX,
+            template_applications: usize::MAX,
+            sort_comparisons: usize::MAX,
+            key_entries: usize::MAX,
+            result_nodes: usize::MAX,
+            serialized_bytes: usize::MAX,
+            messages: usize::MAX,
+            owned_bytes: usize::MAX,
+        };
+        let options = EvaluatorSourceOptions {
+            processing: SourceProcessing::Xml,
+            whitespace: Arc::from([]),
+            clock: Arc::new(crate::SystemClock),
+            extension_policy: crate::ExtensionPolicy::Compatible,
+        };
+        let mut setup_meter = Meter::new(unlimited, source.source_bytes()).expect("setup meter");
+        let prepared =
+            prepare_evaluator_source(&source, &crate::NoResolver, &mut setup_meter, &options)
+                .expect("source prepares");
+        let evaluator = Evaluator::new(
+            prepared,
+            &stylesheet,
+            None,
+            &[],
+            Arc::new(crate::NoResolver),
+            &mut setup_meter,
+            options,
+        )
+        .expect("evaluator initializes");
+        let mut value = String::with_capacity(4096);
+        value.push('x');
+        let capacity = value.capacity();
+        let mut limits = unlimited;
+        limits.owned_bytes = capacity - 1;
+        let mut meter = Meter::new(limits, 0).expect("meter initializes");
+
+        assert!(matches!(
+            XPathValue::String(value)
+                .into_fully_metered_temporary_string(&evaluator, &mut meter),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                actual,
+                ..
+            }) if actual == capacity
+        ));
     }
 
     #[test]

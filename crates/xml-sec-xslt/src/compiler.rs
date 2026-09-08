@@ -9,7 +9,7 @@ use crate::lexical::{
     is_ncname, is_ncname_char, is_ncname_start, is_xml_whitespace, strip_xpath_attribute_axis,
     unicode_decimal_value, xpath_string_literal,
 };
-use crate::model::{parser_workspace_bytes, prepare_xml_frontend_bounded};
+use crate::model::{normalized_xml_id, parser_workspace_bytes, prepare_xml_frontend_bounded};
 use crate::resolver::decode_resource;
 use crate::{
     BudgetKind, CompileBudget, Document, Error, ExpandedName, Namespace, OutputDefinition,
@@ -18,6 +18,7 @@ use crate::{
 
 pub(crate) const XSLT_NS: &str = "http://www.w3.org/1999/XSL/Transform";
 pub(crate) const EXSLT_FUNCTIONS_NS: &str = "http://exslt.org/functions";
+const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 const SAXON_NS: &str = "http://icl.com/saxon";
 const XT_NS: &str = "http://www.jclark.com/xt";
 const XALAN_REDIRECT_NS: &str = "org.apache.xalan.xslt.extensions.Redirect";
@@ -2797,20 +2798,28 @@ fn stylesheet_module_root<'nodes, 'input>(
     // XSLT 1.0 sections 2.6 and 2.7 allow a URI reference to identify an embedded
     // xsl:stylesheet by its ID. Module selection is per reference, not per fetched resource.
     // https://www.w3.org/TR/1999/REC-xslt-19991116#embedded
-    let mut matches = document
-        .descendants()
-        .filter(roxmltree::Node::is_element)
-        .filter(|node| node.attribute("id") == Some(fragment));
-    let selected = matches.next().ok_or_else(|| {
+    let mut selected = None;
+    for node in document.descendants().filter(roxmltree::Node::is_element) {
+        let unqualified_match = node.attribute("id") == Some(fragment);
+        let xml_id_match = node
+            .attribute((XML_NS, "id"))
+            .map(normalized_xml_id)
+            .transpose()?
+            .is_some_and(|value| value == fragment);
+        if !unqualified_match && !xml_id_match {
+            continue;
+        }
+        if selected.replace(node).is_some() {
+            return Err(Error::Static(format!(
+                "stylesheet module fragment #{fragment} is not unique"
+            )));
+        }
+    }
+    let selected = selected.ok_or_else(|| {
         Error::Static(format!(
             "stylesheet module fragment #{fragment} does not identify an element"
         ))
     })?;
-    if matches.next().is_some() {
-        return Err(Error::Static(format!(
-            "stylesheet module fragment #{fragment} is not unique"
-        )));
-    }
     if selected.tag_name().namespace() != Some(XSLT_NS)
         || !matches!(selected.tag_name().name(), "stylesheet" | "transform")
     {
@@ -2847,7 +2856,6 @@ fn effective_base_uri(
     node: roxmltree::Node<'_, '_>,
     module_base: Option<&str>,
 ) -> Result<Option<String>> {
-    const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
     let mut base = module_base.map(str::to_owned);
     let mut ancestors = node
         .ancestors()
@@ -2895,7 +2903,6 @@ fn compile_sequence<'a>(
 }
 
 fn stylesheet_space_is_preserved(node: roxmltree::Node<'_, '_>) -> bool {
-    const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
     node.ancestors()
         .filter(roxmltree::Node::is_element)
         .find_map(|ancestor| ancestor.attribute((XML_NS, "space")))
@@ -4814,6 +4821,31 @@ mod tests {
     }
 
     #[test]
+    fn include_and_import_resolve_normalized_xml_id_fragments() {
+        // xml:id 1.0 section 4 assigns ID type after ID whitespace normalization, so embedded
+        // stylesheet lookup must not depend on an unqualified compatibility `id` attribute.
+        // https://www.w3.org/TR/2005/REC-xml-id-20050909/#processing
+        for instruction in ["include", "import"] {
+            let principal = format!(
+                r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:{instruction} href="module.xml#target"/></xsl:stylesheet>"#
+            );
+            let module = br#"<bundle xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:stylesheet xml:id="  target  " version="1.0"><xsl:template name="selected"/></xsl:stylesheet></bundle>"#.to_vec();
+            let stylesheet = Compiler::new(
+                Arc::new(FragmentModuleResolver { module }),
+                CompileBudget::new(1 << 20, 4, 16, 1 << 20),
+            )
+            .compile(&principal, Some("memory:main.xsl"))
+            .expect("normalized xml:id identifies the embedded stylesheet");
+
+            assert!(
+                stylesheet
+                    .named_template_index
+                    .contains_key(&ExpandedName::new(None::<String>, "selected"))
+            );
+        }
+    }
+
+    #[test]
     fn stylesheet_fragment_must_identify_one_unique_element() {
         let compile = |module, fragment| {
             Compiler::new(
@@ -4834,6 +4866,13 @@ mod tests {
         ));
         assert!(matches!(
             compile(embedded_stylesheet_module(("same", "same")), "same"),
+            Err(Error::Static(message)) if message.contains("not unique")
+        ));
+        assert!(matches!(
+            compile(
+                br#"<bundle xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:stylesheet id="same" version="1.0"/><xsl:stylesheet xml:id="same" version="1.0"/></bundle>"#.to_vec(),
+                "same"
+            ),
             Err(Error::Static(message)) if message.contains("not unique")
         ));
         assert!(matches!(

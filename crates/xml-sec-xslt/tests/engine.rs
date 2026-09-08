@@ -3887,6 +3887,16 @@ fn number_rejects_multi_character_grouping_separator() {
 }
 
 #[test]
+fn forward_compatible_number_ignores_invalid_grouping_separator() {
+    // XSLT 1.0 section 2.5 requires an unsupported optional attribute value to be ignored in
+    // forwards-compatible mode; section 7.7 defines grouping-separator as one character.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#forwards
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#number
+    let stylesheet = r#"<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:number value="1234" grouping-separator=".." grouping-size="3"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "1234");
+}
+
+#[test]
 fn number_converts_grouping_size_through_xpath_number_semantics() {
     // XSLT 1.0 sections 7.7 and 7.7.1 define grouping-size as a numeric AVT used by decimal
     // numbering. libxslt accepts decimal spellings and truncates fractional group widths.

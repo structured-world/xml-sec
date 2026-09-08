@@ -1810,7 +1810,7 @@ impl Document {
     }
 }
 
-fn normalized_xml_id(value: &str) -> Result<Cow<'_, str>> {
+pub(crate) fn normalized_xml_id(value: &str) -> Result<Cow<'_, str>> {
     let normalized = collapse_xml_whitespace(value);
     // xml:id 1.0 section 4 requires validation after whitespace normalization.
     // https://www.w3.org/TR/xml-id/#processing
