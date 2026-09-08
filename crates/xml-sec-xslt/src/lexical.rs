@@ -95,7 +95,10 @@ impl<'a> ValidatedXPointerFragment<'a> {
 }
 
 fn next_percent_decoded_byte(bytes: &[u8], cursor: &mut usize) -> Result<u8> {
-    let byte = bytes[*cursor];
+    let byte = bytes
+        .get(*cursor)
+        .copied()
+        .ok_or_else(|| Error::Unsupported("URI fragment has a truncated percent escape".into()))?;
     if byte != b'%' {
         *cursor += 1;
         return Ok(byte);
@@ -221,4 +224,21 @@ pub(crate) fn is_ncname_char(ch: char) -> bool {
             ch,
             '-' | '.' | '0'..='9' | '\u{B7}' | '\u{0300}'..='\u{036F}' | '\u{203F}'..='\u{2040}'
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ValidatedXPointerFragment;
+
+    #[test]
+    fn truncated_multibyte_xpointer_escape_is_rejected_without_panicking() {
+        // A complete leading UTF-8 octet still needs encoded continuation octets. The validator
+        // must report a truncated fragment rather than indexing beyond the source buffer.
+        for fragment in ["%C3", "%F0%9F"] {
+            assert!(
+                ValidatedXPointerFragment::new(fragment).is_err(),
+                "accepted truncated XPointer fragment {fragment}"
+            );
+        }
+    }
 }

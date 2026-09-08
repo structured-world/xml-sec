@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use sxd_document_no_unsafe::dom::{Document as SxdDocument, Element as SxdElement};
 use sxd_document_no_unsafe::{Package, QName, StorageRequirements};
@@ -188,6 +188,30 @@ pub(crate) struct EvaluatorSourceOptions {
     pub(crate) whitespace: Arc<[(NameTest, bool, usize, usize)]>,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) extension_policy: ExtensionPolicy,
+}
+
+struct OperationClock {
+    source: Arc<dyn Clock>,
+    value: OnceLock<time::OffsetDateTime>,
+}
+
+impl OperationClock {
+    fn new(source: Arc<dyn Clock>) -> Self {
+        Self {
+            source,
+            value: OnceLock::new(),
+        }
+    }
+}
+
+impl Clock for OperationClock {
+    fn now_local(&self) -> Result<time::OffsetDateTime> {
+        if let Some(value) = self.value.get().copied() {
+            return Ok(value);
+        }
+        let current = self.source.now_local()?;
+        Ok(*self.value.get_or_init(|| current))
+    }
 }
 
 pub(crate) struct PreparedEvaluatorSource {
@@ -836,7 +860,7 @@ impl Evaluator {
             dynamic_evaluation_depth: 0,
             source_processing: source_options.processing,
             whitespace: source_options.whitespace,
-            clock: source_options.clock,
+            clock: Arc::new(OperationClock::new(source_options.clock)),
             extension_policy: source_options.extension_policy,
         })
     }
@@ -7061,11 +7085,13 @@ impl function::Function for ExsltStringFunction {
                     .map(|value| extension_string(context, value))
                     .transpose()?;
                 context.charge_extension_work(value.len())?;
-                let encoding = uri_encoding(
-                    encoding_label.as_deref(),
-                    "str:encode-uri()",
-                    UriEncodingCapability::Encode,
-                )?;
+                let Some(encoding) =
+                    uri_encoding(encoding_label.as_deref(), UriEncodingCapability::Encode)
+                else {
+                    // EXSLT str:encode-uri requires an empty string for an unsupported encoding.
+                    // https://exslt.github.io/str/functions/encode-uri/str.encode-uri.html
+                    return Ok(SxdValue::String(String::new()));
+                };
                 let Some(encoded_len) = percent_encoded_uri_len(&value, escape_reserved, encoding)?
                 else {
                     // EXSLT defines characters outside the requested encoding repertoire as a
@@ -7093,11 +7119,14 @@ impl function::Function for ExsltStringFunction {
                     .map(|value| extension_string(context, value))
                     .transpose()?;
                 context.charge_extension_work(value.len().saturating_mul(2))?;
-                let encoding = uri_encoding(
-                    encoding_label.as_deref(),
-                    "str:decode-uri()",
-                    UriEncodingCapability::Decode,
-                )?;
+                let Some(encoding) =
+                    uri_encoding(encoding_label.as_deref(), UriEncodingCapability::Decode)
+                else {
+                    // EXSLT str:decode-uri requires an empty string when the encoding is empty or
+                    // unsupported.
+                    // https://exslt.github.io/str/functions/decode-uri/str.decode-uri.html
+                    return Ok(SxdValue::String(String::new()));
+                };
                 let Some(decoded_len) = percent_decoded_uri_len(&value)? else {
                     // EXSLT defines malformed percent triplets as a successful empty result,
                     // rather than a dynamic XPath error or literal passthrough.
@@ -7311,14 +7340,13 @@ enum UriEncodingCapability {
     Decode,
 }
 
-fn uri_encoding(
-    label: Option<&str>,
-    function_name: &str,
-    capability: UriEncodingCapability,
-) -> std::result::Result<UriEncoding, function::Error> {
-    label.map_or(Ok(UriEncoding::Standard(encoding_rs::UTF_8)), |label| {
+fn uri_encoding(label: Option<&str>, capability: UriEncodingCapability) -> Option<UriEncoding> {
+    label.map_or(Some(UriEncoding::Standard(encoding_rs::UTF_8)), |label| {
+        if label.is_empty() {
+            return None;
+        }
         if let Some(encoding) = xml_sec_xml_input::registered_single_byte_encoding(label) {
-            return Ok(UriEncoding::Registered(encoding));
+            return Some(UriEncoding::Registered(encoding));
         }
         let encoding = match capability {
             UriEncodingCapability::Encode => {
@@ -7329,9 +7357,6 @@ fn uri_encoding(
         encoding
             .filter(|encoding| xml_sec_xml_input::legacy_label_matches_encoding(label, encoding))
             .map(UriEncoding::Standard)
-            .ok_or_else(|| function::Error::Other {
-                what: format!("{function_name} has unknown encoding `{label}`"),
-            })
     })
 }
 
@@ -7712,7 +7737,7 @@ fn xpath_axis_node_test_end(source: &str, mut cursor: usize) -> Option<usize> {
     while source[cursor..]
         .chars()
         .next()
-        .is_some_and(char::is_whitespace)
+        .is_some_and(is_xml_whitespace)
     {
         cursor += source[cursor..].chars().next()?.len_utf8();
     }
@@ -7732,7 +7757,7 @@ fn xpath_axis_node_test_end(source: &str, mut cursor: usize) -> Option<usize> {
     while source[cursor..]
         .chars()
         .next()
-        .is_some_and(char::is_whitespace)
+        .is_some_and(is_xml_whitespace)
     {
         cursor += source[cursor..].chars().next()?.len_utf8();
     }
@@ -10955,16 +10980,37 @@ mod tests {
     }
 
     #[test]
-    fn uri_encoder_rejects_decoder_only_encodings() {
+    fn uri_encoder_does_not_select_decoder_only_encodings() {
         for label in ["replacement", "ISO-2022-KR"] {
             assert!(
-                uri_encoding(
-                    Some(label),
-                    "str:encode-uri()",
-                    UriEncodingCapability::Encode,
-                )
-                .is_err(),
+                uri_encoding(Some(label), UriEncodingCapability::Encode).is_none(),
                 "accepted decoder-only encoding {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_exslt_uri_encodings_return_empty_strings() {
+        let package = Package::new();
+        let document = package.as_document();
+        let context = Context::new();
+        let evaluation =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+
+        for function in [
+            ExsltStringFunction::EncodeUri,
+            ExsltStringFunction::DecodeUri,
+        ] {
+            let mut arguments = vec![SxdValue::String("value".into())];
+            if matches!(function, ExsltStringFunction::EncodeUri) {
+                arguments.push(SxdValue::Boolean(true));
+            }
+            arguments.push(SxdValue::String("not-a-real-encoding".into()));
+            assert_eq!(
+                function
+                    .evaluate(&evaluation, arguments)
+                    .expect("unsupported encodings produce a successful empty result"),
+                SxdValue::String(String::new())
             );
         }
     }

@@ -3134,13 +3134,22 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 fn parse_internal_general_entity(declaration: &str) -> Option<(&str, &str)> {
-    let declaration = declaration.trim_start();
-    if declaration.starts_with('%') {
+    let bytes = declaration.as_bytes();
+    let mut offset = 0usize;
+    skip_dtd_whitespace(bytes, &mut offset);
+    if bytes.get(offset) == Some(&b'%') {
         return None;
     }
-    let name_end = declaration.find(char::is_whitespace)?;
-    let name = &declaration[..name_end];
-    let definition = declaration[name_end..].trim_start();
+    // XML 1.0 section 2.10 production S contains only SP, TAB, CR, and LF. Unicode whitespace
+    // remains part of a legal Name and must not split the declaration.
+    // https://www.w3.org/TR/xml/#sec-white-space
+    let name = consume_dtd_token(declaration, &mut offset)?;
+    let separator = offset;
+    skip_dtd_whitespace(bytes, &mut offset);
+    if offset == separator {
+        return None;
+    }
+    let definition = &declaration[offset..];
     let quote = definition.as_bytes().first().copied()?;
     if !matches!(quote, b'\'' | b'"') {
         // External entities have no replacement text without an explicit
@@ -3733,6 +3742,17 @@ mod tests {
                 }
             ))
         ));
+    }
+
+    #[test]
+    fn internal_entity_names_use_xml_whitespace_delimiters_only() {
+        // XML 1.0 sections 2.3 and 2.10 make U+1680 a Name character, not production S.
+        // https://www.w3.org/TR/xml/#NT-Name
+        // https://www.w3.org/TR/xml/#sec-white-space
+        assert_eq!(
+            parse_internal_general_entity(" \u{1680} 'value'"),
+            Some(("\u{1680}", "value"))
+        );
     }
 
     #[test]

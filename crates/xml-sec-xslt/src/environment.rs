@@ -5,6 +5,10 @@ use time::OffsetDateTime;
 use crate::{Resolver, Result};
 
 /// Time source used by zero-argument EXSLT date functions during one execution.
+///
+/// The engine snapshots the first successful value for the execution. This keeps all date
+/// functions deterministic across lazy document-loading retries without repeatedly consulting an
+/// ambient clock.
 pub trait Clock: Send + Sync {
     fn now_local(&self) -> Result<OffsetDateTime>;
 }

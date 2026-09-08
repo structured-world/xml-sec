@@ -1699,6 +1699,50 @@ impl Resolver for MemoryResolver {
 }
 
 #[test]
+fn document_retry_replays_nondeterministic_extension_values() {
+    #[derive(Debug)]
+    struct OneShotClock(AtomicUsize);
+
+    impl Clock for OneShotClock {
+        fn now_local(&self) -> xml_sec_xslt::Result<time::OffsetDateTime> {
+            if self.0.fetch_add(1, Ordering::Relaxed) == 0 {
+                Ok(time::OffsetDateTime::UNIX_EPOCH)
+            } else {
+                Err(Error::Dynamic("clock was evaluated more than once".into()))
+            }
+        }
+    }
+
+    let resolver = Arc::new(MemoryResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            "doc-0.xml".into(),
+            "<root><value>stable</value></root>".into(),
+        );
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:date="http://exslt.org/dates-and-times"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="document(concat('doc-', date:seconds(), '.xml'))/root/value"/><xsl:text>|</xsl:text><xsl:value-of select="date:seconds()"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let clock = Arc::new(OneShotClock(AtomicUsize::new(0)));
+    let result = stylesheet
+        .execute_with_environment(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            ExecutionEnvironment::new(resolver).with_clock(clock.clone()),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("hidden document retry reuses the first clock value");
+    assert_eq!(result.serialized.bytes, b"stable|0");
+    assert_eq!(clock.0.load(Ordering::Relaxed), 1);
+}
+
+#[test]
 fn document_function_resolves_dynamic_uris_without_cross_document_leaks() {
     // External trees share stable semantic node identities, but ordinary absolute
     // paths remain confined to the logical document of the current context node.
@@ -2861,6 +2905,7 @@ fn xpath_normalization_rejects_non_xml_whitespace() {
     for stylesheet in [
         "<xsl:stylesheet version=\"1.0\" xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\"><xsl:template match=\"/\"><xsl:value-of select=\"count\u{a0}(*)\"/></xsl:template></xsl:stylesheet>",
         "<xsl:stylesheet version=\"1.0\" xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\"><xsl:template match=\"/\"><xsl:value-of select=\"/\u{a0}\"/></xsl:template></xsl:stylesheet>",
+        "<xsl:stylesheet version=\"1.0\" xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\"><xsl:template match=\"/\"><xsl:value-of select=\"child::\u{a0}node()\"/></xsl:template></xsl:stylesheet>",
     ] {
         assert!(matches!(
             Compiler::new(
@@ -6989,22 +7034,19 @@ fn exslt_decode_uri_honors_the_requested_encoding() {
     let strict_iana = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="str:decode-uri('%80', 'ISO-8859-9')"/><xsl:text>|</xsl:text><xsl:value-of select="str:decode-uri('%80', 'windows-1254')"/></xsl:template></xsl:stylesheet>"#;
     assert_eq!(execute(strict_iana, "<source/>"), "\u{80}|€");
 
-    let unsupported = compile(
-        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:template match="/"><xsl:value-of select="str:decode-uri('%E9', 'not-an-encoding')"/></xsl:template></xsl:stylesheet>"#,
-    );
-    assert!(matches!(
-        unsupported.execute(
-            &Document::parse("<source/>", None).expect("source parses"),
-            &Parameters::new(),
-            Arc::new(NoResolver),
-            ExecutionOptions {
-                budget: execution_budget(1024),
-                initial_mode: None,
-                initial_template: None,
-            },
-        ),
-        Err(Error::Dynamic(message)) if message.contains("unknown encoding")
-    ));
+    // EXSLT str:decode-uri requires an empty result for empty or unsupported encodings.
+    // https://exslt.github.io/str/functions/decode-uri/str.decode-uri.html
+    for encoding in ["", "not-an-encoding"] {
+        assert_eq!(
+            execute(
+                &format!(
+                    r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="str:decode-uri('%E9', '{encoding}')"/></xsl:template></xsl:stylesheet>"#
+                ),
+                "<source/>",
+            ),
+            ""
+        );
+    }
 }
 
 #[test]
@@ -7044,22 +7086,13 @@ fn exslt_encode_uri_honors_the_optional_encoding() {
       </xsl:stylesheet>"#;
     assert_eq!(execute(stylesheet, "<source/>"), "%C3%A9|%E9");
 
-    let unsupported = compile(
-        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:template match="/"><xsl:value-of select="str:encode-uri('é', true(), 'not-an-encoding')"/></xsl:template></xsl:stylesheet>"#,
-    );
-    assert!(matches!(
-        unsupported.execute(
-            &Document::parse("<source/>", None).expect("source parses"),
-            &Parameters::new(),
-            Arc::new(NoResolver),
-            ExecutionOptions {
-                budget: execution_budget(1024),
-                initial_mode: None,
-                initial_template: None,
-            },
+    assert_eq!(
+        execute(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="str:encode-uri('é', true(), 'not-an-encoding')"/></xsl:template></xsl:stylesheet>"#,
+            "<source/>",
         ),
-        Err(Error::Dynamic(message)) if message.contains("unknown encoding")
-    ));
+        ""
+    );
 
     // EXSLT specifies an empty string when the requested encoding cannot represent a character.
     // Cover both the built-in single-byte registry and the encoding_rs path.
@@ -7452,6 +7485,23 @@ fn forward_compatible_sort_ignores_invalid_optional_values() {
         ),
         "ab|102|ab|ab"
     );
+}
+
+#[test]
+fn empty_sort_language_uses_the_default_collation() {
+    // XSLT 1.0 section 10 gives lang the xml:lang value space; XML 1.0 section 2.12 defines an
+    // empty value as no language information, so both literal and computed empties are valid.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#sorting
+    // https://www.w3.org/TR/xml/#sec-lang-tag
+    for lang in [r#"lang="""#, r#"lang="{$missing}""#] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:param name="missing" select="''"/><xsl:output method="text"/><xsl:template match="/"><xsl:for-each select="root/item"><xsl:sort {lang}/><xsl:value-of select="."/></xsl:for-each></xsl:template></xsl:stylesheet>"#
+        );
+        assert_eq!(
+            execute(&stylesheet, "<root><item>b</item><item>a</item></root>"),
+            "ab"
+        );
+    }
 }
 
 #[test]

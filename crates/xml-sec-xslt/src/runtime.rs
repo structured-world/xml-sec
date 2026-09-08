@@ -2538,11 +2538,7 @@ impl<'a> Execution<'a> {
                         "secondary-output URI must not be empty".into(),
                     ));
                 }
-                if self
-                    .secondary_output_uris
-                    .iter()
-                    .any(|candidate| candidate.as_str() == uri.as_str())
-                {
+                if self.secondary_output_uris.contains(&uri.value) {
                     return Err(Error::Dynamic(format!(
                         "secondary-output URI `{uri}` was produced more than once"
                     )));
@@ -3545,7 +3541,11 @@ impl<'a> Execution<'a> {
                         )));
                     }
                 }
-                let collator = match lang.as_deref() {
+                let collator = match lang.as_deref().filter(|lang| !lang.is_empty()) {
+                    // XSLT 1.0 section 10 gives lang the xml:lang value space; XML 1.0
+                    // section 2.12 defines an empty value as no language information.
+                    // https://www.w3.org/TR/1999/REC-xslt-19991116#sorting
+                    // https://www.w3.org/TR/xml/#sec-lang-tag
                     Some(lang) => match locale_collator(lang, case_order.as_deref()) {
                         Ok(collator) => Some(collator),
                         Err(_) if sort.forward_compatible => None,
