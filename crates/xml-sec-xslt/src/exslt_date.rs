@@ -107,6 +107,7 @@ impl function::Function for DateFunction {
         }
         match self.0 {
             DateTime => Ok(Value::String(current_datetime_for_operation(
+                context,
                 self.1.as_ref(),
                 self.2,
             )?)),
@@ -117,7 +118,8 @@ impl function::Function for DateFunction {
                     current = input;
                     current.as_ref()
                 } else {
-                    current = current_datetime_for_operation(self.1.as_ref(), self.2)?.into();
+                    current =
+                        current_datetime_for_operation(context, self.1.as_ref(), self.2)?.into();
                     current.as_ref()
                 };
                 let Some(mut date) = DateValue::parse(input) else {
@@ -169,7 +171,7 @@ impl function::Function for DateFunction {
                 let seconds = if let Some(value) = args.first() {
                     value.number(context)?
                 } else {
-                    current_seconds_for_operation(self.1.as_ref(), self.2)?
+                    current_seconds_for_operation(context, self.1.as_ref(), self.2)?
                 };
                 let duration = DurationValue::from_seconds(seconds).render();
                 Ok(Value::String(duration))
@@ -180,6 +182,7 @@ impl function::Function for DateFunction {
                 // https://exslt.github.io/date/functions/seconds/date.seconds.html
                 let Some(value) = args.first() else {
                     return Ok(Value::Number(current_seconds_for_operation(
+                        context,
                         self.1.as_ref(),
                         self.2,
                     )?));
@@ -225,7 +228,7 @@ impl function::Function for DateFunction {
                 let input = if let Some(input) = input.as_deref() {
                     input
                 } else {
-                    current = current_datetime_for_operation(self.1.as_ref(), self.2)?;
+                    current = current_datetime_for_operation(context, self.1.as_ref(), self.2)?;
                     &current
                 };
                 evaluate_component(operation, Some(input))
@@ -235,23 +238,27 @@ impl function::Function for DateFunction {
 }
 
 fn current_datetime_for_operation(
+    context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
     clock: &dyn Clock,
     extension_policy: ExtensionPolicy,
 ) -> std::result::Result<String, function::Error> {
     Ok(render_current_datetime(current_time_for_operation(
+        context,
         clock,
         extension_policy,
     )?))
 }
 
 fn current_seconds_for_operation(
+    context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
     clock: &dyn Clock,
     extension_policy: ExtensionPolicy,
 ) -> std::result::Result<f64, function::Error> {
-    Ok(current_time_for_operation(clock, extension_policy)?.unix_timestamp() as f64)
+    Ok(current_time_for_operation(context, clock, extension_policy)?.unix_timestamp() as f64)
 }
 
 fn current_time_for_operation(
+    context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
     clock: &dyn Clock,
     extension_policy: ExtensionPolicy,
 ) -> std::result::Result<time::OffsetDateTime, function::Error> {
@@ -260,6 +267,7 @@ fn current_time_for_operation(
             "zero-argument EXSLT date functions are disabled by the execution extension policy",
         );
     }
+    context.charge_extension_work(1)?;
     let current = clock.now_local().map_err(|error| function::Error::Other {
         what: error.to_string(),
     })?;

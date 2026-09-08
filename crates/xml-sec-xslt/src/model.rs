@@ -3096,10 +3096,10 @@ fn parse_dtd_children_content(subset: &str, mut cursor: usize) -> Result<usize> 
             }
             Some(b')') => {
                 let group = groups.pop().expect("the current content group exists");
-                if group.items == 0
-                    || group.expects_item
-                    || group.connector == Some(b'|') && group.items < 2
-                {
+                // XML 1.0 Fifth Edition section 3.2.1 productions [47], [49], and [50]
+                // require both choice and sequence groups to contain a connector and another
+                // content particle: https://www.w3.org/TR/2008/REC-xml-20081126/#sec-element-content
+                if group.items < 2 || group.expects_item || group.connector.is_none() {
                     return Err(Error::Xml("ELEMENT content group is incomplete".into()));
                 }
                 cursor += 1;
@@ -5396,6 +5396,26 @@ mod parser_boundary_tests {
         ] {
             Document::parse_iterative(malformed, None)
                 .expect_err("malformed markup declaration must be rejected");
+        }
+    }
+
+    #[test]
+    fn element_children_groups_require_a_choice_or_sequence_connector() {
+        for malformed in [
+            r#"<!DOCTYPE r [<!ELEMENT r (a)>]><r/>"#,
+            r#"<!DOCTYPE r [<!ELEMENT r (a?)>]><r/>"#,
+            r#"<!DOCTYPE r [<!ELEMENT r ((a,b))>]><r/>"#,
+        ] {
+            Document::parse_iterative(malformed, None)
+                .expect_err("children content must be a choice or sequence");
+        }
+
+        for valid in [
+            r#"<!DOCTYPE r [<!ELEMENT r (a,b)>]><r/>"#,
+            r#"<!DOCTYPE r [<!ELEMENT r (a|b)>]><r/>"#,
+        ] {
+            Document::parse_iterative(valid, None)
+                .expect("choice and sequence content groups remain valid");
         }
     }
 

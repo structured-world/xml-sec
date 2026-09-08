@@ -2468,6 +2468,62 @@ fn execution_environment_controls_exslt_current_time() {
 }
 
 #[test]
+fn zero_argument_exslt_date_functions_charge_work_before_clock_access() {
+    #[derive(Debug)]
+    struct CountingClock(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Clock for CountingClock {
+        fn now_local(&self) -> xml_sec_xslt::Result<time::OffsetDateTime> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(time::OffsetDateTime::UNIX_EPOCH)
+        }
+    }
+
+    let source = Document::parse("<source/>", None).expect("source parses");
+    for expression in [
+        "date:date-time()",
+        "date:date()",
+        "date:year()",
+        "date:seconds()",
+        "date:duration()",
+    ] {
+        let stylesheet = compile(&format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:date="http://exslt.org/dates-and-times"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="{expression}"/></xsl:template></xsl:stylesheet>"#,
+        ));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut budget = execution_budget(1024);
+        budget.extension_operations = 0;
+        let result = stylesheet.execute_with_environment(
+            &source,
+            &Parameters::new(),
+            ExecutionEnvironment::new(Arc::new(NoResolver))
+                .with_clock(Arc::new(CountingClock(Arc::clone(&calls)))),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(Error::Budget {
+                    kind: BudgetKind::ExtensionOperations,
+                    ..
+                })
+            ),
+            "{expression}: {result:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "{expression} must cross the work gate before clock access"
+        );
+    }
+}
+
+#[test]
 fn exslt_current_time_rejects_non_xsd_timezone_offsets() {
     // XML Schema 1.0 Part 2 section 3.2.7.3 permits only minute-aligned offsets through +/-14:00.
     // https://www.w3.org/TR/2004/REC-xmlschema-2-20041028/#dateTime-timezones
