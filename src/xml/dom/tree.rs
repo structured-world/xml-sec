@@ -978,6 +978,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn every_backend_enforces_the_same_active_namespace_ceiling() {
+        // Backend selection must not change whether an adversarial namespace
+        // stack is accepted. The 1024th binding is valid; the 1025th is not.
+        let declarations = (0..1_023)
+            .map(|index| format!(r#" xmlns:n{index}="urn:namespace:{index}""#))
+            .collect::<String>();
+        let accepted = format!(r#"<root{declarations}><child xmlns:p="urn:p"/></root>"#);
+        let rejected = format!(
+            r#"<root{declarations} xmlns:overflow="urn:overflow"><child xmlns:p="urn:p"/></root>"#
+        );
+
+        for backend in XmlBackend::available() {
+            Document::parse_with_backend(&accepted, backend)
+                .unwrap_or_else(|error| panic!("{backend:?} rejected the ceiling: {error}"));
+            assert_eq!(
+                Document::parse_with_backend(&rejected, backend)
+                    .expect_err("the 1025th active binding must be rejected"),
+                ParseError::NamespaceBindingLimitReached {
+                    maximum: 1_024,
+                    actual: 1_025,
+                },
+                "{backend:?} must share the lexical namespace contract"
+            );
+        }
+    }
+
     #[cfg(feature = "xml-backend-differential")]
     #[test]
     fn compatibility_feature_selects_differential_by_default() {

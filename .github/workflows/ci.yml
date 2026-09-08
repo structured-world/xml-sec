@@ -93,6 +93,23 @@ jobs:
     steps:
       - run: test "${{ needs.build-matrix.result }}" = "success"
 
+  alloc-only:
+    name: alloc-only XML input
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.92.0"
+          targets: thumbv7em-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo +1.92.0 check -p xml-sec-xml-input --no-default-features
+      - run: >-
+          cargo +1.92.0 check -p xml-sec-xml-input --no-default-features
+          --target thumbv7em-none-eabihf
+
   test-matrix:
     name: test-matrix (${{ matrix.rust }}, ${{ matrix.xml-backend }})
     runs-on: ubuntu-latest
@@ -153,10 +170,42 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
-    needs: test-matrix
+    needs: [test-matrix, xslt-oracle]
     if: ${{ always() }}
     steps:
       - run: test "${{ needs.test-matrix.result }}" = "success"
+      - run: test "${{ needs.xslt-oracle.result }}" = "success"
+
+  xslt-oracle:
+    name: XSLT oracle (libxslt 1.1.45)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Read pinned XSLT oracle revisions
+        id: xslt-oracle-revisions
+        run: |
+          libxslt_commit="$(cat compatibility/libxslt-1.1.45-donor-commit.txt)"
+          [[ "$libxslt_commit" =~ ^[0-9a-f]{40}$ ]]
+          echo "libxslt=$libxslt_commit" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        with:
+          repository: GNOME/libxslt
+          ref: ${{ steps.xslt-oracle-revisions.outputs.libxslt }}
+          path: donors/libxslt
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.92.0"
+      - uses: taiki-e/install-action@nextest
+      - name: Verify vendored oracle fixtures
+        env:
+          LIBXSLT_SOURCE_DIR: ${{ github.workspace }}/donors/libxslt
+        run: scripts/import-libxslt-oracle-fixtures.sh --check
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Rust engine against pinned libxslt golden corpus
+        run: cargo nextest run -p xml-sec-xslt --test libxslt_oracle --no-fail-fast
 
   clippy-matrix:
     name: clippy (${{ matrix.xml-backend }})
