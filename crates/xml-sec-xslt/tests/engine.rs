@@ -13694,7 +13694,7 @@ fn empty_document_uris_preserve_their_logical_document_origin() {
     let result = stylesheet
         .execute(
             &Document::parse(
-                r#"<source origin="source"><uri/></source>"#,
+                r#"<source origin="source"><uri xml:base="nested/"/></source>"#,
                 Some("memory:source.xml"),
             )
             .expect("source parses"),

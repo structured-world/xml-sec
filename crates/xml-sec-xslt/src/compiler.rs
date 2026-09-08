@@ -156,7 +156,7 @@ impl<R: Resolver> Compiler<R> {
                     depth + 1,
                 )?;
                 let module = self.resolve_module(child, base_uri, ResolvePurpose::Import, state)?;
-                self.enter_resource(&module.resource, state, |state| {
+                self.enter_resource(&module.resource, module.fragment, state, |state| {
                     let source = resource_source(&module.resource, state)?;
                     self.compile_module(
                         source.as_str(),
@@ -175,7 +175,7 @@ impl<R: Resolver> Compiler<R> {
                 )?;
                 let module =
                     self.resolve_module(child, base_uri, ResolvePurpose::Include, state)?;
-                self.enter_resource(&module.resource, state, |state| {
+                self.enter_resource(&module.resource, module.fragment, state, |state| {
                     let source = resource_source(&module.resource, state)?;
                     with_frontend_document(source.as_str(), state, |document, state| {
                         let included_root = stylesheet_module_root(document, module.fragment)?;
@@ -228,7 +228,7 @@ impl<R: Resolver> Compiler<R> {
                 )?;
                 let module =
                     self.resolve_module(child, base_uri, ResolvePurpose::Include, state)?;
-                self.enter_resource(&module.resource, state, |state| {
+                self.enter_resource(&module.resource, module.fragment, state, |state| {
                     let source = resource_source(&module.resource, state)?;
                     with_compiler_document(
                         source.as_str(),
@@ -360,22 +360,39 @@ impl<R: Resolver> Compiler<R> {
     fn enter_resource<T>(
         &self,
         resource: &Arc<ResolvedResource>,
+        fragment: Option<&str>,
         state: &mut CompileState,
         compile: impl FnOnce(&mut CompileState) -> Result<T>,
     ) -> Result<T> {
-        if state
-            .active_resources
-            .iter()
-            .any(|active| active.identity == resource.identity)
-        {
+        if state.active_resources.iter().any(|active| {
+            active.resource.identity == resource.identity && active.fragment.as_deref() == fragment
+        }) {
             return Err(Error::Static(format!(
-                "stylesheet include/import cycle at {}",
-                resource.canonical_uri
+                "stylesheet include/import cycle at {}{}",
+                resource.canonical_uri,
+                fragment.map_or(String::new(), |fragment| format!("#{fragment}"))
             )));
         }
-        state.active_resources.push(Arc::clone(resource));
+        // XSLT 1.0 section 2.7 makes the fragment part of an embedded stylesheet module's
+        // identity. Distinct modules in one XML resource must not alias in the active set.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#embedded
+        let fragment_bytes = fragment.map_or(0, str::len);
+        state.charge_owned(fragment_bytes)?;
+        if let Err(error) = state.push_active_resource(ActiveResource {
+            resource: Arc::clone(resource),
+            fragment: fragment.map(Into::into),
+        }) {
+            state.release_owned(fragment_bytes);
+            return Err(error);
+        }
         let result = compile(state);
-        state.active_resources.pop();
+        let active = state
+            .active_resources
+            .pop()
+            .expect("the active stylesheet module was pushed before compilation");
+        let fragment_bytes = active.fragment.as_ref().map_or(0, |value| value.len());
+        drop(active);
+        state.release_owned(fragment_bytes);
         result
     }
 
@@ -1805,6 +1822,11 @@ struct OutputPropertyPrecedence {
     media_type: Option<usize>,
 }
 
+struct ActiveResource {
+    resource: Arc<ResolvedResource>,
+    fragment: Option<Box<str>>,
+}
+
 struct CompileState {
     budget: CompileBudget,
     templates: Vec<Template>,
@@ -1819,7 +1841,7 @@ struct CompileState {
     attribute_sets: Vec<AttributeSet>,
     functions: Vec<ExsltFunction>,
     resources: Vec<ResourceIdentity>,
-    active_resources: Vec<Arc<ResolvedResource>>,
+    active_resources: Vec<ActiveResource>,
     resolved_requests: HashMap<ResolveRequest, Arc<ResolvedResource>>,
     resolved_identities: HashMap<ResourceIdentity, Arc<ResolvedResource>>,
     module_sources: HashMap<ResourceIdentity, Arc<String>>,
@@ -1889,6 +1911,44 @@ impl CompileState {
             .owned_bytes
             .checked_sub(amount)
             .expect("released compiler workspace was previously charged");
+    }
+    fn push_active_resource(&mut self, resource: ActiveResource) -> Result<()> {
+        if self.active_resources.len() == self.active_resources.capacity() {
+            let old_capacity = self.active_resources.capacity();
+            let target_capacity = old_capacity.saturating_add(old_capacity.max(4));
+            let target_bytes =
+                target_capacity.saturating_mul(std::mem::size_of::<ActiveResource>());
+            self.charge_owned(target_bytes)?;
+
+            let mut replacement = Vec::new();
+            if let Err(error) = replacement.try_reserve_exact(target_capacity) {
+                self.release_owned(target_bytes);
+                return Err(Error::Static(format!(
+                    "failed to reserve active stylesheet module storage: {error}"
+                )));
+            }
+            let actual_bytes = replacement
+                .capacity()
+                .saturating_mul(std::mem::size_of::<ActiveResource>());
+            if actual_bytes > target_bytes {
+                if let Err(error) = self.charge_owned(actual_bytes - target_bytes) {
+                    self.release_owned(target_bytes);
+                    return Err(error);
+                }
+            } else {
+                self.release_owned(target_bytes - actual_bytes);
+            }
+
+            replacement.append(&mut self.active_resources);
+            std::mem::swap(&mut self.active_resources, &mut replacement);
+            self.release_owned(
+                replacement
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ActiveResource>()),
+            );
+        }
+        self.active_resources.push(resource);
+        Ok(())
     }
     fn charge_stylesheet(&mut self, amount: usize) -> Result<()> {
         self.stylesheet_bytes = self
@@ -4463,6 +4523,39 @@ mod tests {
     }
 
     #[test]
+    fn active_module_stack_is_bounded_before_growth() {
+        let slot_bytes = std::mem::size_of::<ActiveResource>();
+        let budget = CompileBudget::new(4096, 0, 32, slot_bytes * 4 - 1);
+        let compiler = Compiler::new(Arc::new(crate::NoResolver), budget);
+        let resource = Arc::new(ResolvedResource {
+            canonical_uri: "memory:module.xsl".into(),
+            identity: ResourceIdentity("module".into()),
+            bytes: Vec::new(),
+            media_type: None,
+            encoding: None,
+        });
+        let mut state = CompileState::new(budget, 0);
+        let entered = Cell::new(false);
+
+        let error = compiler
+            .enter_resource(&resource, None, &mut state, |_| {
+                entered.set(true);
+                Ok(())
+            })
+            .expect_err("active module storage must cross the compile-owned budget first");
+
+        assert!(!entered.get());
+        assert!(matches!(
+            error,
+            Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                actual,
+                ..
+            } if actual == slot_bytes * 4
+        ));
+    }
+
+    #[test]
     fn xpath_diagnostics_reserve_the_exact_formatted_length() {
         // Prefix diagnostics preserve their text when it fits and fail before formatting otherwise.
         let source = "missing:item";
@@ -4860,6 +4953,39 @@ mod tests {
                     .contains_key(&ExpandedName::new(None::<String>, "ignored"))
             );
         }
+    }
+
+    #[test]
+    fn embedded_stylesheet_cycles_are_keyed_by_selected_fragment() {
+        // XSLT 1.0 section 2.7 permits multiple embedded stylesheet modules in one resource.
+        // Distinct fragments may include each other, but returning to an active fragment is a
+        // cycle. https://www.w3.org/TR/1999/REC-xslt-19991116#embedded
+        let principal = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:include href="module.xml#a"/></xsl:stylesheet>"#;
+        let acyclic = br#"<bundle xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:stylesheet id="a" version="1.0"><xsl:include href="module.xml#b"/><xsl:template name="a"/></xsl:stylesheet><xsl:stylesheet id="b" version="1.0"><xsl:template name="b"/></xsl:stylesheet></bundle>"#;
+        let stylesheet = Compiler::new(
+            Arc::new(FragmentModuleResolver {
+                module: acyclic.to_vec(),
+            }),
+            CompileBudget::new(1 << 20, 4, 16, 1 << 20),
+        )
+        .compile(principal, Some("memory:main.xsl"))
+        .expect("distinct embedded modules in one resource are acyclic");
+        assert!(
+            stylesheet
+                .named_template_index
+                .contains_key(&ExpandedName::new(None::<String>, "b"))
+        );
+
+        let cyclic = br#"<bundle xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:stylesheet id="a" version="1.0"><xsl:include href="module.xml#b"/></xsl:stylesheet><xsl:stylesheet id="b" version="1.0"><xsl:include href="module.xml#a"/></xsl:stylesheet></bundle>"#;
+        let error = Compiler::new(
+            Arc::new(FragmentModuleResolver {
+                module: cyclic.to_vec(),
+            }),
+            CompileBudget::new(1 << 20, 4, 16, 1 << 20),
+        )
+        .compile(principal, Some("memory:main.xsl"))
+        .expect_err("returning to the active embedded module is a cycle");
+        assert!(matches!(error, Error::Static(message) if message.contains("cycle")));
     }
 
     #[test]

@@ -357,10 +357,18 @@ impl DocumentRequest {
         let empty_resource = href
             .find('#')
             .map_or(href.is_empty(), |fragment| fragment == 0);
+        let empty_document = empty_resource.then_some(logical_document).flatten();
         Self {
             href,
-            base_uri,
-            empty_document: empty_resource.then_some(logical_document).flatten(),
+            // XSLT 1.0 section 12.1 identifies an empty reference by the logical document that
+            // contains the supplying node. Its effective xml:base cannot distinguish cache keys.
+            // https://www.w3.org/TR/1999/REC-xslt-19991116#document
+            base_uri: if empty_document.is_some() {
+                None
+            } else {
+                base_uri
+            },
+            empty_document,
         }
     }
 
@@ -793,11 +801,11 @@ impl Evaluator {
             meter,
         )?;
         let source_root = source.root();
-        let source_request = DocumentRequest {
-            href: String::new(),
-            base_uri: source_base_uri(&source, &SourceNode::Node(source_root)),
-            empty_document: source.logical_roots().binary_search(&source_root).ok(),
-        };
+        let source_request = DocumentRequest::relative_to(
+            String::new(),
+            source_base_uri(&source, &SourceNode::Node(source_root)),
+            source.logical_roots().binary_search(&source_root).ok(),
+        );
         seed_document_cache(
             source_request,
             source_root,
@@ -2348,11 +2356,11 @@ impl Evaluator {
             let fragment_offset = request.href.find('#').map(|index| index + 1);
             let resource_uri =
                 fragment_offset.map_or(request.href.as_str(), |offset| &request.href[..offset - 1]);
-            let resource_request = DocumentRequest {
-                href: resource_uri.to_owned(),
-                base_uri: request.base_uri.clone(),
-                empty_document: request.empty_document.filter(|_| resource_uri.is_empty()),
-            };
+            let resource_request = DocumentRequest::relative_to(
+                resource_uri.to_owned(),
+                request.base_uri.clone(),
+                request.empty_document,
+            );
             let root = if let Some(nodes) = self.documents.get(&resource_request) {
                 nodes.first().cloned()
             } else {
@@ -4005,15 +4013,15 @@ fn expand_xinclude_document_in_chain(
                 continue;
             };
             if preserve_context {
-                retained_owned_bytes =
-                    retained_owned_bytes.saturating_add(preserve_xinclude_context(
-                        source,
-                        source_id,
-                        &mut output,
-                        target_parent,
-                        target,
-                        meter,
-                    )?);
+                preserve_xinclude_context(
+                    source,
+                    source_id,
+                    &mut output,
+                    target_parent,
+                    target,
+                    meter,
+                )?
+                .apply(&mut retained_owned_bytes);
             }
             principal_mapping.insert(source_id, target);
             pending.extend(node.children.iter().rev().map(|child| PendingXIncludeNode {
@@ -4056,15 +4064,15 @@ fn expand_xinclude_document_in_chain(
                             &mut included_mapping,
                             meter,
                         )?;
-                        retained_owned_bytes =
-                            retained_owned_bytes.saturating_add(preserve_xinclude_context(
-                                &included.document,
-                                child,
-                                &mut output,
-                                target_parent,
-                                target,
-                                meter,
-                            )?);
+                        preserve_xinclude_context(
+                            &included.document,
+                            child,
+                            &mut output,
+                            target_parent,
+                            target,
+                            meter,
+                        )?
+                        .apply(&mut retained_owned_bytes);
                     }
                 }
                 output.remap_ids_from(&included.document, &included_mapping)?;
@@ -4139,6 +4147,21 @@ fn effective_xml_language(document: &Document, mut id: NodeId) -> Option<&str> {
     }
 }
 
+#[derive(Default)]
+struct RetainedBytesDelta {
+    added: usize,
+    removed: usize,
+}
+
+impl RetainedBytesDelta {
+    fn apply(self, retained: &mut usize) {
+        *retained = retained
+            .checked_sub(self.removed)
+            .and_then(|value| value.checked_add(self.added))
+            .expect("XInclude retained-byte delta matches live cloned storage");
+    }
+}
+
 fn preserve_xinclude_context(
     source: &Document,
     source_id: NodeId,
@@ -4146,11 +4169,18 @@ fn preserve_xinclude_context(
     target_parent: NodeId,
     target: NodeId,
     meter: &mut Meter,
-) -> Result<usize> {
-    let base_bytes =
+) -> Result<RetainedBytesDelta> {
+    let mut delta =
         preserve_xinclude_base(source, source_id, output, target_parent, target, meter)?;
-    preserve_xinclude_language(source, source_id, output, target_parent, target, meter)
-        .map(|language_bytes| base_bytes.saturating_add(language_bytes))
+    delta.added = delta.added.saturating_add(preserve_xinclude_language(
+        source,
+        source_id,
+        output,
+        target_parent,
+        target,
+        meter,
+    )?);
+    Ok(delta)
 }
 
 fn preserve_xinclude_base(
@@ -4160,24 +4190,24 @@ fn preserve_xinclude_base(
     target_parent: NodeId,
     target: NodeId,
     meter: &mut Meter,
-) -> Result<usize> {
+) -> Result<RetainedBytesDelta> {
     if !matches!(
         output.node(target).map(|node| &node.kind),
         Some(NodeKind::Element { .. })
     ) {
-        return Ok(0);
+        return Ok(RetainedBytesDelta::default());
     }
     let Some(acquired_base) = source
         .node(source_id)
         .and_then(|node| node.base_uri.as_deref())
     else {
-        return Ok(0);
+        return Ok(RetainedBytesDelta::default());
     };
     let parent_base = output
         .node(target_parent)
         .and_then(|node| node.base_uri.as_deref());
     if parent_base == Some(acquired_base) {
-        return Ok(0);
+        return Ok(RetainedBytesDelta::default());
     }
 
     // XInclude 1.0 section 4.5.5 requires a real xml:base attribute on each top-level included
@@ -4200,8 +4230,14 @@ fn preserve_xinclude_base(
         let NodeKind::Element { attributes, .. } = &mut node.kind else {
             unreachable!("XInclude base fixup target was checked as an element");
         };
-        attributes[index].value = value;
-        return Ok(acquired_base.len());
+        let retired = std::mem::replace(&mut attributes[index].value, value);
+        let removed = retired.len();
+        drop(retired);
+        meter.release_owned_bytes(removed);
+        return Ok(RetainedBytesDelta {
+            added: acquired_base.len(),
+            removed,
+        });
     }
 
     let bytes = std::mem::size_of::<Attribute>()
@@ -4218,7 +4254,10 @@ fn preserve_xinclude_base(
             value: acquired_base.to_owned(),
         },
     )?;
-    Ok(bytes)
+    Ok(RetainedBytesDelta {
+        added: bytes,
+        removed: 0,
+    })
 }
 
 fn preserve_xinclude_language(
@@ -5114,9 +5153,21 @@ fn decode_resource_metered_inner(
         .usage(BudgetKind::OwnedBytes)
         .map_err(MeteredDecodeError::Budget)?;
     debug_assert!(source_owned_bytes >= bytes.len());
-    let available = limit
-        .saturating_sub(used)
-        .saturating_sub(source_owned_bytes);
+    let Some(source_total) = used.checked_add(source_owned_bytes) else {
+        return Err(MeteredDecodeError::Budget(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            limit,
+            actual: usize::MAX,
+        }));
+    };
+    if source_total > limit {
+        return Err(MeteredDecodeError::Budget(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            limit,
+            actual: source_total,
+        }));
+    }
+    let available = limit - source_total;
     let maximum_decoded = available / decoded_copies;
     let decoded = decode_resource(bytes, encoding, parsed_xml, maximum_decoded).map_err(
         |error| match error {
@@ -9496,6 +9547,73 @@ mod tests {
     }
 
     #[test]
+    fn replacing_xinclude_xml_base_releases_discarded_storage() {
+        // A copied xml:base value is already part of the retained clone reservation. Replacing it
+        // must transfer that reservation to the acquired URI rather than retaining both strings.
+        let source = Document::parse(
+            r#"<included xml:base="source/"/>"#,
+            Some("memory:external.xml"),
+        )
+        .expect("included source parses");
+        let mut output = Document::parse(
+            r#"<included xml:base="discarded/"/>"#,
+            Some("memory:principal.xml"),
+        )
+        .expect("copied output parses");
+        let target = output
+            .node(output.root())
+            .expect("output root exists")
+            .children[0];
+        let target_parent = output.root();
+        let source_element = source
+            .node(source.root())
+            .expect("source root exists")
+            .children[0];
+        let retained_before = output.estimated_clone_bytes();
+        let mut meter = Meter::new(
+            ExecutionBudget {
+                source_bytes: usize::MAX,
+                external_documents: usize::MAX,
+                recursion_depth: usize::MAX,
+                xpath_evaluations: usize::MAX,
+                xpath_operations: usize::MAX,
+                extension_operations: usize::MAX,
+                pattern_evaluations: usize::MAX,
+                template_applications: usize::MAX,
+                sort_comparisons: usize::MAX,
+                key_entries: usize::MAX,
+                result_nodes: usize::MAX,
+                serialized_bytes: usize::MAX,
+                messages: usize::MAX,
+                owned_bytes: usize::MAX,
+            },
+            0,
+        )
+        .expect("meter initializes");
+        meter
+            .charge(BudgetKind::OwnedBytes, retained_before)
+            .expect("initial clone reservation fits");
+        let delta = preserve_xinclude_base(
+            &source,
+            source_element,
+            &mut output,
+            target_parent,
+            target,
+            &mut meter,
+        )
+        .expect("XInclude base fixup succeeds");
+        let mut retained = retained_before;
+        delta.apply(&mut retained);
+
+        assert_eq!(
+            meter.usage(BudgetKind::OwnedBytes).expect("valid kind").0,
+            output.estimated_clone_bytes(),
+            "the meter must retain only the replacement allocation"
+        );
+        assert_eq!(retained, output.estimated_clone_bytes());
+    }
+
+    #[test]
     fn node_remap_composition_reuses_the_first_allocation() {
         // Both input maps are retained before composition. Updating the first in place keeps peak
         // memory flat and releases the second map's complete reservation when it is consumed.
@@ -10618,6 +10736,56 @@ mod tests {
             .expect("resolver byte allocation fits");
         charge_resource_identity_cache_entry(&resource, &mut exact)
             .expect("exact metadata reservation fits");
+    }
+
+    #[test]
+    fn xinclude_rejects_resolver_capacity_before_decode_or_fallback() {
+        // Resolver-owned capacity is live before decoding starts. An unavailable encoding is a
+        // recoverable XInclude resource error, but it must not hide an already-exceeded memory
+        // budget or activate fallback.
+        let mut bytes = Vec::with_capacity(64);
+        bytes.extend_from_slice(b"payload");
+        let resource = ResolvedResource {
+            canonical_uri: "memory:oversized.txt".into(),
+            identity: ResourceIdentity("oversized".into()),
+            bytes,
+            media_type: Some("text/plain".into()),
+            encoding: Some("unsupported-encoding".into()),
+        };
+        let mut meter = Meter::new(
+            ExecutionBudget {
+                source_bytes: usize::MAX,
+                external_documents: usize::MAX,
+                recursion_depth: usize::MAX,
+                xpath_evaluations: usize::MAX,
+                xpath_operations: usize::MAX,
+                extension_operations: usize::MAX,
+                pattern_evaluations: usize::MAX,
+                template_applications: usize::MAX,
+                sort_comparisons: usize::MAX,
+                key_entries: usize::MAX,
+                result_nodes: usize::MAX,
+                serialized_bytes: usize::MAX,
+                messages: usize::MAX,
+                owned_bytes: resource.bytes.capacity() - 1,
+            },
+            0,
+        )
+        .expect("meter initializes below the resolver allocation");
+
+        assert!(matches!(
+            decode_xinclude_resource(
+                &resource,
+                resource.encoding.as_deref(),
+                &mut meter,
+                XIncludeParseMode::Text,
+            ),
+            Err(XIncludeFailure::Fatal(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                actual,
+                ..
+            })) if actual == resource.bytes.capacity()
+        ));
     }
 
     #[test]

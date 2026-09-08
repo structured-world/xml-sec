@@ -70,8 +70,15 @@ pub(crate) fn resolve_uri_reference(base: Option<&str>, reference: &str) -> Resu
         return Ok(absolute.to_string());
     }
     if let Some(base) = base {
-        if let Ok(joined) = url::Url::parse(base).and_then(|base| base.join(reference)) {
-            return Ok(joined.to_string());
+        if let Ok(base_url) = url::Url::parse(base) {
+            if let Ok(joined) = base_url.join(reference) {
+                return Ok(joined.to_string());
+            }
+            if base_url.cannot_be_a_base()
+                && let Some(joined) = resolve_rootless_absolute_uri(&base_url, reference)
+            {
+                return Ok(joined);
+            }
         }
         if reference.is_empty() {
             return Ok(base
@@ -96,6 +103,29 @@ pub(crate) fn resolve_uri_reference(base: Option<&str>, reference: &str) -> Resu
         }
     }
     Ok(reference.to_owned())
+}
+
+fn resolve_rootless_absolute_uri(base: &url::Url, reference: &str) -> Option<String> {
+    // XML Base section 4 uses RFC 3986 section 5.2 reference resolution. `url` deliberately
+    // treats a rootless absolute URI as opaque, so provide a temporary hierarchical path to reuse
+    // its merge and dot-segment removal, then restore the RFC rootless result form.
+    // https://www.rfc-editor.org/rfc/rfc3986#section-5.2
+    let mut synthetic = url::Url::parse(&format!(
+        "{}:/{}",
+        base.scheme(),
+        base.path().strip_prefix('/').unwrap_or(base.path())
+    ))
+    .ok()?;
+    synthetic.set_query(base.query());
+    synthetic.set_fragment(base.fragment());
+    let mut joined = synthetic.join(reference).ok()?.to_string();
+    if reference.starts_with('/') {
+        return Some(joined);
+    }
+    let synthetic_root = base.scheme().len() + 1;
+    debug_assert_eq!(joined.as_bytes().get(synthetic_root), Some(&b'/'));
+    joined.remove(synthetic_root);
+    Some(joined)
 }
 
 pub(crate) fn decode_resource(
@@ -170,6 +200,22 @@ mod tests {
             resolve_uri_reference(Some("styles/main.xsl?mirror=/old/file#part"), "sub/")
                 .expect("path resolution succeeds"),
             "styles/sub/"
+        );
+    }
+
+    #[test]
+    fn rootless_absolute_base_preserves_its_scheme_and_path() {
+        // XML Base section 4 delegates this merge to RFC 3986 section 5.2.2: a relative
+        // reference inherits the scheme and merges with the rootless base path.
+        assert_eq!(
+            resolve_uri_reference(Some("memory:styles/main.xsl"), "../modules/shared.xsl")
+                .expect("rootless absolute URI resolution succeeds"),
+            "memory:modules/shared.xsl"
+        );
+        assert_eq!(
+            resolve_uri_reference(Some("memory:main.xsl?old=yes#part"), "modules/")
+                .expect("rootless absolute URI resolution succeeds"),
+            "memory:modules/"
         );
     }
 
