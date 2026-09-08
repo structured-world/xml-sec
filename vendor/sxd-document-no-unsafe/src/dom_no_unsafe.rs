@@ -320,13 +320,15 @@ impl<'d> Element<'d> {
         )
     }
 
-    /// Temporary bytes needed by the visitor (zero for the borrow-guarded backend).
+    /// Temporary bytes needed by the namespace visitor's shared-string snapshot.
     pub fn namespace_declaration_workspace_bytes(&self) -> usize {
-        0
+        self.document
+            .connections
+            .element_namespace_declaration_workspace_bytes(self.document.storage, self.node)
     }
 
-    /// Visit declarations on this element without collecting or cloning them. The callback
-    /// cannot mutate the document while its namespace storage is borrowed; errors stop visits.
+    /// Visit a snapshot of declarations without copying string data; errors stop visits.
+    /// Callbacks may mutate the document without invalidating the snapshot.
     pub fn try_visit_namespace_declarations<E>(
         &self,
         visit: impl FnMut(&str, &str) -> Result<(), E>,
@@ -1451,6 +1453,36 @@ mod test {
                 child.append_child(parent);
             }))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn namespace_visitor_isolated_from_reentrant_registration() {
+        // A visitor callback is user code and may mutate the same document through another
+        // copy of the element handle; the declaration snapshot must not retain a storage borrow.
+        let package = Package::new();
+        let doc = package.as_document();
+        let element = doc.create_element("element");
+        element.register_prefix("original", "urn:original");
+        assert_eq!(
+            element.namespace_declaration_workspace_bytes(),
+            std::mem::size_of::<(super::super::InternedString, super::super::InternedString)>()
+        );
+        let mut visits = 0;
+        element
+            .try_visit_namespace_declarations::<()>(|prefix, uri| {
+                for index in 0..128 {
+                    element.register_prefix(&format!("p{index}"), "urn:new");
+                }
+                assert_eq!((prefix, uri), ("original", "urn:original"));
+                visits += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(visits, 1);
+        assert_eq!(
+            element.namespace_uri_for_prefix("p127").as_deref(),
+            Some("urn:new")
         );
     }
 

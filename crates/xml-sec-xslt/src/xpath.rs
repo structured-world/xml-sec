@@ -4440,11 +4440,9 @@ fn select_xpointer_element(document: &Document, pointer: &str) -> Result<Option<
         {
             return Ok(Some(selected));
         }
-        if cursor < bytes.len() && !byte_is_xml_whitespace(bytes[cursor]) {
-            return Err(Error::Unsupported(
-                "XInclude xpointer parts must be separated by XML whitespace".into(),
-            ));
-        }
+        // XPointer Framework section 3.3 defines `PointerPart (S? PointerPart)*`, so the next
+        // scheme may begin immediately after this closing parenthesis.
+        // https://www.w3.org/TR/2003/REC-xptr-framework-20030325/#scheme
     }
     if !saw_part {
         return Err(Error::Unsupported("XInclude xpointer is empty".into()));
@@ -9379,6 +9377,22 @@ mod tests {
                 XIncludeFailure::Fatal(_)
             ));
         }
+    }
+
+    #[test]
+    fn xpointer_accepts_adjacent_pointer_parts() {
+        // XPointer Framework section 3.3 defines `PointerPart (S? PointerPart)*`: XML
+        // whitespace between parts is optional, and evaluation continues after an empty part.
+        // https://www.w3.org/TR/2003/REC-xptr-framework-20030325/#scheme
+        let document = Document::parse("<root><selected/></root>", None).expect("source parses");
+        let selected = select_xpointer_element(&document, "element(/1/9)element(/1/1)")
+            .expect("adjacent pointer parts parse")
+            .expect("second pointer part selects an element");
+
+        assert!(matches!(
+            &document.node(selected).expect("selected node exists").kind,
+            NodeKind::Element { name, .. } if name.local == "selected"
+        ));
     }
 
     #[test]

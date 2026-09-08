@@ -1058,11 +1058,33 @@ impl Connections {
         element: Index<Element>,
         mut visit: impl FnMut(&str, &str) -> Result<(), E>,
     ) -> Result<(), E> {
-        let elements = storage.elements.borrow();
-        for (prefix, uri) in elements[element.idx].prefix_to_namespace.iter() {
+        // Interned strings are shared Rc slices, so cloning the handles isolates callbacks from
+        // RefCell borrows without copying namespace text.
+        let declarations = {
+            let elements = storage.elements.borrow();
+            let source = elements[element.idx].prefix_to_namespace.iter();
+            let mut declarations = Vec::with_capacity(source.size_hint().0);
+            declarations.extend(source.map(|(prefix, uri)| (prefix.clone(), uri.clone())));
+            declarations
+        };
+        for (prefix, uri) in &declarations {
             visit(prefix, uri)?;
         }
         Ok(())
+    }
+
+    pub fn element_namespace_declaration_workspace_bytes(
+        &self,
+        storage: &Storage,
+        element: Index<Element>,
+    ) -> usize {
+        let elements = storage.elements.borrow();
+        elements[element.idx]
+            .prefix_to_namespace
+            .iter()
+            .size_hint()
+            .0
+            .saturating_mul(std::mem::size_of::<(InternedString, InternedString)>())
     }
 
     pub fn element_namespaces_in_scope(
