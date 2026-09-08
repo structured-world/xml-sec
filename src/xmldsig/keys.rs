@@ -1270,6 +1270,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use base64::{Engine, engine::general_purpose::STANDARD};
+    use rcgen::{
+        CertificateRevocationListParams, Issuer, KeyIdMethod, KeyPair, KeyUsagePurpose,
+        RevokedCertParams, SerialNumber, date_time_ymd,
+    };
     use rsa::{pkcs8::DecodePublicKey, traits::PublicKeyParts};
 
     use super::*;
@@ -1556,6 +1560,59 @@ mod tests {
             params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
         }
         params
+    }
+
+    fn authorized_revoked_chain() -> (X509DataInfo, Vec<u8>) {
+        let mut root_params = generated_certificate_params("revocation root", true);
+        root_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let root = rcgen::CertifiedIssuer::self_signed(
+            root_params,
+            KeyPair::generate().expect("root key generation should succeed"),
+        )
+        .expect("root should be self-signable");
+
+        let issuer_key = KeyPair::generate().expect("issuer key generation should succeed");
+        let mut issuer_params = generated_certificate_params("revocation issuer", true);
+        issuer_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let issuer_certificate = issuer_params
+            .signed_by(&issuer_key, &root)
+            .expect("root should sign issuer certificate");
+        let issuer = Issuer::new(issuer_params, issuer_key);
+
+        let mut leaf_params = generated_certificate_params("revoked signer", false);
+        leaf_params.serial_number = Some(SerialNumber::from(42_u64));
+        leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        let leaf = leaf_params
+            .signed_by(
+                &KeyPair::generate().expect("leaf key generation should succeed"),
+                &issuer,
+            )
+            .expect("issuer should sign leaf certificate");
+        let crl = CertificateRevocationListParams {
+            this_update: date_time_ymd(2026, 3, 15),
+            next_update: date_time_ymd(2026, 4, 15),
+            crl_number: SerialNumber::from(1_u64),
+            issuing_distribution_point: None,
+            revoked_certs: vec![RevokedCertParams {
+                serial_number: SerialNumber::from(42_u64),
+                revocation_time: date_time_ymd(2026, 3, 16),
+                reason_code: None,
+                invalidity_date: None,
+            }],
+            key_identifier_method: KeyIdMethod::Sha256,
+        }
+        .signed_by(&issuer)
+        .expect("issuer should sign CRL");
+        let mut info = x509_info(
+            vec![
+                leaf.der().to_vec(),
+                issuer_certificate.der().to_vec(),
+                root.der().to_vec(),
+            ],
+            0,
+        );
+        info.crls.push(crl.der().to_vec());
+        (info, root.der().to_vec())
     }
 
     fn x509_info(certificates: Vec<Vec<u8>>, signing_index: usize) -> X509DataInfo {
@@ -2753,6 +2810,46 @@ mod tests {
             error,
             DsigError::KeyResolution(KeyResolutionError::Chain(
                 super::super::X509ChainError::Provider(_)
+            ))
+        ));
+    }
+
+    #[test]
+    fn resolver_rejects_revoked_leaf_with_authorized_crl_issuer() {
+        // Keep revoked-serial enforcement covered independently from the cRLSign authorization
+        // failure exercised by the legacy fixture above.
+        let (mut info, root) = authorized_revoked_chain();
+        let issuer = info.certificates[1].clone();
+        info.certificates.truncate(1);
+        info.parsed_certificates.truncate(1);
+        let key_info = KeyInfo {
+            sources: vec![KeyInfoSource::X509Data(info)],
+        };
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            lookup_certs: vec![issuer],
+            trusted_certs: vec![root],
+            ..KeyResolverConfig::default()
+        });
+        let policy = verification_policy_with_trust(crate::policy::KeyTrustPolicy {
+            check_crls: true,
+            max_x509_chain_depth: 3,
+            ..chain_policy_at(
+                SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_773_964_800),
+            )
+        });
+
+        let error = match resolver.resolve_with_policy(
+            Some(&key_info),
+            SignatureAlgorithm::EcdsaSha256,
+            &policy,
+        ) {
+            Ok(_) => panic!("an authenticated CRL must reject its revoked leaf"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            DsigError::KeyResolution(KeyResolutionError::Chain(
+                super::super::X509ChainError::Revoked(0)
             ))
         ));
     }

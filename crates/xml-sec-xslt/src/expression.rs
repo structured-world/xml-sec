@@ -313,7 +313,7 @@ fn is_xpath_space(character: char) -> bool {
 }
 
 fn split_function_arguments(source: &str) -> Vec<String> {
-    if source.trim().is_empty() {
+    if source.trim_matches(is_xpath_space).is_empty() {
         return Vec::new();
     }
     let mut arguments = Vec::new();
@@ -332,13 +332,17 @@ fn split_function_arguments(source: &str) -> Vec<String> {
             '(' | '[' => depth += 1,
             ')' | ']' => depth = depth.saturating_sub(1),
             ',' if depth == 0 => {
-                arguments.push(source[start..offset].trim().to_owned());
+                arguments.push(
+                    source[start..offset]
+                        .trim_matches(is_xpath_space)
+                        .to_owned(),
+                );
                 start = offset + 1;
             }
             _ => {}
         }
     }
-    arguments.push(source[start..].trim().to_owned());
+    arguments.push(source[start..].trim_matches(is_xpath_space).to_owned());
     arguments
 }
 
@@ -395,6 +399,14 @@ mod tests {
         // must not activate the core function's compile-time or runtime behavior.
         assert!(unprefixed_function_calls("x:key()", "key").is_empty());
         assert_eq!(unprefixed_function_calls("key()", "key").len(), 1);
+    }
+
+    #[test]
+    fn function_arguments_preserve_non_xpath_whitespace() {
+        // XPath 1.0 section 3.7 limits ExprWhitespace to XML S; NBSP remains expression input.
+        // https://www.w3.org/TR/1999/REC-xpath-19991116/#exprlex
+        let calls = unprefixed_function_calls("key(\u{a0}'value')", "key");
+        assert_eq!(calls[0].arguments, ["\u{a0}'value'"]);
     }
 
     #[test]

@@ -168,6 +168,10 @@ impl Stylesheet {
     }
 
     /// Execute with explicit source preprocessing semantics.
+    ///
+    /// This is a standalone-engine capability boundary. XML-security adapters must derive the
+    /// selection from their compiled operation policy rather than expose document-controlled or
+    /// independently configured XInclude permission.
     pub fn execute_with_source_processing<R: Resolver + 'static>(
         &self,
         source: &Document,
@@ -186,6 +190,10 @@ impl Stylesheet {
     }
 
     /// Execute with explicit environment and source preprocessing semantics.
+    ///
+    /// This is a standalone-engine capability boundary. XML-security adapters must derive the
+    /// selection from their compiled operation policy rather than expose document-controlled or
+    /// independently configured XInclude permission.
     pub fn execute_with_environment_and_source_processing<R: Resolver + 'static>(
         &self,
         source: &Document,
@@ -4692,8 +4700,6 @@ impl<'a> Execution<'a> {
         #[derive(Clone, Copy)]
         enum SiblingAxis {
             Children { parent: NodeId, count: usize },
-            Attributes { owner: NodeId, count: usize },
-            Namespaces { owner: NodeId, count: usize },
         }
 
         let axis = match node {
@@ -4709,58 +4715,30 @@ impl<'a> Execution<'a> {
                     .map_or(0, |node| node.children.len());
                 SiblingAxis::Children { parent, count }
             }
-            SourceNode::Attribute { owner, .. } => {
-                let count = self
-                    .evaluator
-                    .source
-                    .node(*owner)
-                    .map_or(0, |node| match &node.kind {
-                        NodeKind::Element { attributes, .. } => attributes.len(),
-                        _ => 0,
-                    });
-                SiblingAxis::Attributes {
-                    owner: *owner,
-                    count,
-                }
-            }
-            SourceNode::Namespace { owner, .. } => {
-                let count = self
-                    .evaluator
-                    .source
-                    .node(*owner)
-                    .map_or(0, |node| match &node.kind {
-                        NodeKind::Element { namespaces, .. } => namespaces.len(),
-                        _ => 0,
-                    });
-                SiblingAxis::Namespaces {
-                    owner: *owner,
-                    count,
-                }
+            SourceNode::Attribute { .. } | SourceNode::Namespace { .. } => {
+                // XPath 1.0 sections 5.2 and 5.3 define no sibling axis for attribute or
+                // namespace nodes, so xsl:number can count only the current node here.
+                // https://www.w3.org/TR/1999/REC-xpath-19991116/#attribute-nodes
+                self.meter.charge(BudgetKind::XPathOperations, 1)?;
+                return Ok(usize::from(matches(self, node)?));
             }
         };
         let mut count = 0;
-        let sibling_count = match axis {
-            SiblingAxis::Children { count, .. }
-            | SiblingAxis::Attributes { count, .. }
-            | SiblingAxis::Namespaces { count, .. } => count,
-        };
+        let SiblingAxis::Children {
+            parent,
+            count: sibling_count,
+        } = axis;
         for index in 0..sibling_count {
             self.meter.charge(BudgetKind::XPathOperations, 1)?;
-            let sibling = match axis {
-                SiblingAxis::Children { parent, .. } => {
-                    let Some(child) = self
-                        .evaluator
-                        .source
-                        .node(parent)
-                        .and_then(|node| node.children.get(index))
-                    else {
-                        break;
-                    };
-                    SourceNode::Node(*child)
-                }
-                SiblingAxis::Attributes { owner, .. } => SourceNode::Attribute { owner, index },
-                SiblingAxis::Namespaces { owner, .. } => SourceNode::Namespace { owner, index },
+            let Some(child) = self
+                .evaluator
+                .source
+                .node(parent)
+                .and_then(|node| node.children.get(index))
+            else {
+                break;
             };
+            let sibling = SourceNode::Node(*child);
             if matches(self, &sibling)? {
                 count += 1;
             }

@@ -372,7 +372,14 @@ fn reserve_allocation(
     budget: &StringAllocationBudget,
     bytes: usize,
 ) -> Result<(), function::Error> {
-    let actual = budget.used.get().saturating_add(bytes);
+    let Some(actual) = budget.used.get().checked_add(bytes) else {
+        if budget.exceeded.get().is_none() {
+            budget.exceeded.set(Some(usize::MAX));
+        }
+        return Err(function::Error::Other {
+            what: "XPath string allocation budget exceeded".into(),
+        });
+    };
     if budget.limit.is_some_and(|limit| actual > limit) {
         if budget.exceeded.get().is_none() {
             budget.exceeded.set(Some(actual));
@@ -452,5 +459,16 @@ mod tests {
 
         assert!(evaluation.charge_work(usize::MAX).is_ok());
         assert!(evaluation.charge_work(1).is_err());
+    }
+
+    #[test]
+    fn allocation_budget_rejects_counter_overflow() {
+        let mut context = Context::new();
+        context.set_string_allocation_limit(usize::MAX);
+        let package = sxd_document_no_unsafe::Package::new();
+        let evaluation = super::Evaluation::new(&context, package.as_document().root().into());
+
+        assert!(evaluation.reserve_temporary_allocation(usize::MAX).is_ok());
+        assert!(evaluation.reserve_temporary_allocation(1).is_err());
     }
 }

@@ -722,7 +722,7 @@ fn matches_ascii_case(value: &str, candidates: &[&str]) -> bool {
         .any(|candidate| value.eq_ignore_ascii_case(candidate))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use std::borrow::Cow;
 

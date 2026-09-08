@@ -21,7 +21,10 @@ while IFS=$'\t' read -r name url; do
         mv "$destination/$rfc.json.part" "$destination/$rfc.json"
     fi
 done < "$root/docs/standards-sources.tsv"
-find "$destination" -type f ! -name '*.part' ! -name SHA256SUMS ! -name retrieved-at.txt \
-    -exec shasum -a 256 {} + > "$destination/SHA256SUMS"
+(
+    cd "$destination"
+    find . -type f ! -name '*.part' ! -name SHA256SUMS ! -name retrieved-at.txt \
+        -exec shasum -a 256 {} + > SHA256SUMS
+)
 date -u '+%Y-%m-%dT%H:%M:%SZ' > "$destination/retrieved-at.txt"
 printf 'Reference corpus: %s\n' "$destination"

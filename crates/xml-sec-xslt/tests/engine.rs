@@ -2354,41 +2354,18 @@ fn result_tree_fragment_order_fast_path_accounts_for_target_strings() {
     let stylesheet = compile(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:exsl="http://exslt.org/common"><xsl:output method="text"/><xsl:template name="baseline"><xsl:variable name="fragment"><a/><b/></xsl:variable><xsl:value-of select="count(exsl:node-set($fragment)/*)"/></xsl:template><xsl:template name="targets"><xsl:variable name="fragment"><a/><b/></xsl:variable><xsl:value-of select="count(exsl:node-set($fragment)/*[name() = current()/source/target]/preceding-sibling::*)"/></xsl:template></xsl:stylesheet>"#,
     );
-    let minimum = |initial_template: &str| {
-        let succeeds = |owned_bytes| {
-            let mut budget = execution_budget(source_xml.len());
-            budget.owned_bytes = owned_bytes;
-            stylesheet
-                .execute(
-                    &source,
-                    &Parameters::new(),
-                    Arc::new(NoResolver),
-                    ExecutionOptions {
-                        budget,
-                        initial_mode: None,
-                        initial_template: Some(ExpandedName::new(None::<String>, initial_template)),
-                    },
-                )
-                .is_ok()
-        };
-        let mut rejected = 0;
-        let mut accepted = 1;
-        while !succeeds(accepted) {
-            rejected = accepted;
-            accepted *= 2;
-        }
-        while rejected + 1 < accepted {
-            let candidate = rejected + (accepted - rejected) / 2;
-            if succeeds(candidate) {
-                accepted = candidate;
-            } else {
-                rejected = candidate;
-            }
-        }
-        accepted
-    };
-    let baseline = minimum("baseline");
-    let targets = minimum("targets");
+    let baseline = minimum_execution_owned_bytes_for_named_source(
+        &stylesheet,
+        &source,
+        source_xml.len(),
+        "baseline",
+    );
+    let targets = minimum_execution_owned_bytes_for_named_source(
+        &stylesheet,
+        &source,
+        source_xml.len(),
+        "targets",
+    );
     assert!(
         targets + 16 * 1024 >= baseline + payload.len(),
         "baseline={baseline}, targets={targets}, payload={}",
@@ -4954,41 +4931,10 @@ fn result_tree_container_capacity_consumes_owned_memory_budget() {
     };
     let source_xml = format!("<source>{}</source>", "<i/>".repeat(128));
     let source = Document::parse(&source_xml, None).expect("source parses");
-    let minimum = |stylesheet: &xml_sec_xslt::Stylesheet| {
-        let succeeds = |owned_bytes| {
-            let mut budget = execution_budget(source_xml.len());
-            budget.owned_bytes = owned_bytes;
-            stylesheet
-                .execute(
-                    &source,
-                    &Parameters::new(),
-                    Arc::new(NoResolver),
-                    ExecutionOptions {
-                        budget,
-                        initial_mode: None,
-                        initial_template: None,
-                    },
-                )
-                .is_ok()
-        };
-        let mut rejected = 0;
-        let mut accepted = 1;
-        while !succeeds(accepted) {
-            rejected = accepted;
-            accepted *= 2;
-        }
-        while rejected + 1 < accepted {
-            let candidate = rejected + (accepted - rejected) / 2;
-            if succeeds(candidate) {
-                accepted = candidate;
-            } else {
-                rejected = candidate;
-            }
-        }
-        accepted
-    };
-    let empty = minimum(&stylesheet(""));
-    let elements = minimum(&stylesheet("<a/>"));
+    let empty =
+        minimum_execution_owned_bytes_for_source(&stylesheet(""), &source, source_xml.len());
+    let elements =
+        minimum_execution_owned_bytes_for_source(&stylesheet("<a/>"), &source, source_xml.len());
 
     assert!(
         elements >= empty + 8 * 1024,
@@ -10188,6 +10134,28 @@ fn explicit_axis_node_tests_keep_their_default_priority() {
 }
 
 #[test]
+fn abbreviated_attribute_node_test_uses_node_test_priority() {
+    // XSLT 1.0 section 5.5 assigns -0.5 to a NodeTest with an AttributeAxisSpecifier.
+    // Equal-priority @* must therefore win by its later document order.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#conflict
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:apply-templates select="root/@*"/></xsl:template><xsl:template match="@node()">node|</xsl:template><xsl:template match="@*">wildcard|</xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<root a=\"\" b=\"\"/>"),
+        "wildcard|wildcard|"
+    );
+}
+
+#[test]
+fn attribute_numbering_has_no_sibling_axis() {
+    // XPath 1.0 section 2.2 makes preceding-sibling empty for attributes, so XSLT 1.0
+    // section 7.7 numbers each matching attribute as the first node in its sibling list.
+    // https://www.w3.org/TR/1999/REC-xpath-19991116/#axes
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#number
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:apply-templates select="root/@*"/></xsl:template><xsl:template match="@*"><xsl:number level="single" count="@*"/><xsl:text>|</xsl:text></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<root a=\"\" b=\"\"/>"), "1|1|");
+}
+
+#[test]
 fn node_tests_allow_xpath_whitespace_before_the_closing_parenthesis() {
     // XPath 1.0 section 3.7 permits ExprWhitespace between grammar tokens, including here.
     // https://www.w3.org/TR/1999/REC-xpath-19991116/#exprlex
@@ -10261,47 +10229,34 @@ fn apply_templates_retains_selected_nodes_inside_owned_memory_budget() {
     ));
     let source_xml = format!("<root>{}</root>", "<item/>".repeat(256));
     let source = Document::parse(&source_xml, None).expect("source parses");
-    let minimum = |initial_template: &str| {
-        let succeeds = |owned_bytes| {
-            let mut budget = execution_budget(source_xml.len());
-            budget.owned_bytes = owned_bytes;
-            stylesheet
-                .execute(
-                    &source,
-                    &Parameters::new(),
-                    Arc::new(NoResolver),
-                    ExecutionOptions {
-                        budget,
-                        initial_mode: None,
-                        initial_template: Some(ExpandedName::new(None::<String>, initial_template)),
-                    },
-                )
-                .is_ok()
-        };
-        let mut rejected = 0;
-        let mut accepted = 1;
-        while !succeeds(accepted) {
-            rejected = accepted;
-            accepted *= 2;
-        }
-        while rejected + 1 < accepted {
-            let candidate = rejected + (accepted - rejected) / 2;
-            if succeeds(candidate) {
-                accepted = candidate;
-            } else {
-                rejected = candidate;
-            }
-        }
-        accepted
-    };
-    let one = minimum("one");
-    let many = minimum("many");
+    let one = minimum_execution_owned_bytes_for_named_source(
+        &stylesheet,
+        &source,
+        source_xml.len(),
+        "one",
+    );
+    let many = minimum_execution_owned_bytes_for_named_source(
+        &stylesheet,
+        &source,
+        source_xml.len(),
+        "many",
+    );
     assert!(
         many >= one + 128 * std::mem::size_of::<NodeReference>(),
         "one={one}, many={many}"
     );
-    let for_one = minimum("for-one");
-    let for_many = minimum("for-many");
+    let for_one = minimum_execution_owned_bytes_for_named_source(
+        &stylesheet,
+        &source,
+        source_xml.len(),
+        "for-one",
+    );
+    let for_many = minimum_execution_owned_bytes_for_named_source(
+        &stylesheet,
+        &source,
+        source_xml.len(),
+        "for-many",
+    );
     assert!(
         for_many >= for_one + 128 * std::mem::size_of::<NodeReference>(),
         "for_one={for_one}, for_many={for_many}"
@@ -11987,41 +11942,18 @@ fn key_index_traversal_accounts_for_its_wide_pending_stack() {
     let stylesheet = compile(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:key name="none" match="missing" use="."/><xsl:output method="text"/><xsl:template name="baseline">ok</xsl:template><xsl:template name="key"><xsl:value-of select="count(key('none', 'x'))"/></xsl:template></xsl:stylesheet>"#,
     );
-    let minimum = |template: &str| {
-        let succeeds = |owned_bytes| {
-            let mut budget = execution_budget(source_xml.len());
-            budget.owned_bytes = owned_bytes;
-            stylesheet
-                .execute(
-                    &source,
-                    &Parameters::new(),
-                    Arc::new(NoResolver),
-                    ExecutionOptions {
-                        budget,
-                        initial_mode: None,
-                        initial_template: Some(ExpandedName::new(None::<String>, template)),
-                    },
-                )
-                .is_ok()
-        };
-        let mut rejected = 0;
-        let mut accepted = 1;
-        while !succeeds(accepted) {
-            rejected = accepted;
-            accepted *= 2;
-        }
-        while rejected + 1 < accepted {
-            let candidate = rejected + (accepted - rejected) / 2;
-            if succeeds(candidate) {
-                accepted = candidate;
-            } else {
-                rejected = candidate;
-            }
-        }
-        accepted
-    };
-    let baseline = minimum("baseline");
-    let keyed = minimum("key");
+    let baseline = minimum_execution_owned_bytes_for_named_source(
+        &stylesheet,
+        &source,
+        source_xml.len(),
+        "baseline",
+    );
+    let keyed = minimum_execution_owned_bytes_for_named_source(
+        &stylesheet,
+        &source,
+        source_xml.len(),
+        "key",
+    );
     assert!(
         keyed + 4 * 1024 >= baseline + 4_096 * std::mem::size_of::<xml_sec_xslt::NodeId>(),
         "baseline={baseline}, keyed={keyed}"
@@ -13039,41 +12971,18 @@ fn wide_sibling_numbering_does_not_require_a_copied_sibling_set() {
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template name="baseline"><xsl:apply-templates select="root/item[last()]" mode="baseline"/></xsl:template><xsl:template name="number"><xsl:apply-templates select="root/item[last()]" mode="number"/></xsl:template><xsl:template match="item" mode="baseline">4096</xsl:template><xsl:template match="item" mode="number"><xsl:number/></xsl:template></xsl:stylesheet>"#,
     );
     let source = Document::parse(&source_xml, None).expect("wide source parses");
-    let minimum = |initial_template: &str| {
-        let succeeds = |owned_bytes| {
-            let mut budget = execution_budget(source_xml.len());
-            budget.owned_bytes = owned_bytes;
-            stylesheet
-                .execute(
-                    &source,
-                    &Parameters::new(),
-                    Arc::new(NoResolver),
-                    ExecutionOptions {
-                        budget,
-                        initial_mode: None,
-                        initial_template: Some(ExpandedName::new(None::<String>, initial_template)),
-                    },
-                )
-                .is_ok()
-        };
-        let mut rejected = 0;
-        let mut accepted = 1;
-        while !succeeds(accepted) {
-            rejected = accepted;
-            accepted *= 2;
-        }
-        while rejected + 1 < accepted {
-            let candidate = rejected + (accepted - rejected) / 2;
-            if succeeds(candidate) {
-                accepted = candidate;
-            } else {
-                rejected = candidate;
-            }
-        }
-        accepted
-    };
-    let baseline = minimum("baseline");
-    let numbering = minimum("number");
+    let baseline = minimum_execution_owned_bytes_for_named_source(
+        &stylesheet,
+        &source,
+        source_xml.len(),
+        "baseline",
+    );
+    let numbering = minimum_execution_owned_bytes_for_named_source(
+        &stylesheet,
+        &source,
+        source_xml.len(),
+        "number",
+    );
     assert!(
         numbering <= baseline + 8 * 1024,
         "baseline={baseline}, numbering={numbering}"

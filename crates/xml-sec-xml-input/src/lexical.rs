@@ -282,16 +282,13 @@ impl<'a> Scanner<'a> {
                     span,
                     ..
                 } => {
-                    // XML 1.0 section 2.8, production [26], requires one or more digits after
-                    // `1.`. The tokenizer accepts an empty suffix; enforce the grammar here
-                    // so every semantic parser receives the same valid declaration token.
-                    // https://www.w3.org/TR/xml/#NT-VersionNum
-                    let digits = version
-                        .as_str()
-                        .strip_prefix("1.")
-                        .ok_or_else(|| Error::malformed("invalid XML version"))?;
-                    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-                        return Err(Error::malformed("invalid XML version"));
+                    // XML 1.0 Fifth Edition section 2.8 allows later 1.x declarations only when
+                    // the processor implements that version's complete syntax and character
+                    // model. This scanner currently implements XML 1.0, so accepting XML 1.1
+                    // here would silently apply the wrong character rules downstream.
+                    // https://www.w3.org/TR/xml/#sec-prolog-dtd
+                    if version.as_str() != "1.0" {
+                        return Err(Error::malformed("unsupported XML version"));
                     }
                     return Ok(Some(Event::Declaration {
                         version: version.as_str(),
@@ -954,20 +951,31 @@ fn validate_writer_characters(value: &str) -> std::io::Result<()> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     #[test]
     fn xml_version_requires_digits_after_the_period() {
-        // XML 1.0 production [26] allows 1.x, but requires at least one digit after the dot.
+        // The scanner implements the XML 1.0 character and grammar contract only.
         assert!(
             super::Scanner::new("<?xml version='1.'?><r/>")
                 .next_event()
                 .is_err()
         );
-        for version in ["1.0", "1.1", "1.23"] {
-            let xml = format!("<?xml version='{version}'?><r/>");
-            assert!(super::Scanner::new(&xml).next_event().is_ok());
-        }
+        assert!(
+            super::Scanner::new("<?xml version='1.0'?><r/>")
+                .next_event()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn scanner_rejects_xml_11_until_character_rules_are_version_aware() {
+        // Accepting an XML version means applying that version's complete character model.
+        assert!(
+            super::Scanner::new("<?xml version='1.1'?><r>&#x1;</r>")
+                .next_event()
+                .is_err()
+        );
     }
     use super::*;
 

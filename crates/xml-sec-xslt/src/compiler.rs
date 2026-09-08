@@ -1274,10 +1274,11 @@ impl Pattern {
             .strip_prefix("child::")
             .or_else(|| normalized.strip_prefix("attribute::"))
             .unwrap_or(&normalized);
+        let value = value.strip_prefix('@').unwrap_or(value);
         let single_step = !value.contains(['/', '[', '|', '(', ')']);
         let node_test = pattern_node_test(value);
         Ok(
-            if matches!(value, "*" | "@*") || node_test == Some(PatternNodeTest::Generic) {
+            if value == "*" || node_test == Some(PatternNodeTest::Generic) {
                 -0.5
             // XSLT 1.0 section 5.5 assigns -0.25 only to a single NCName:* StepPattern;
             // a LocationPath containing that step has the complex-pattern priority 0.5.
