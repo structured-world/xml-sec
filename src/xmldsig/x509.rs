@@ -1714,19 +1714,7 @@ fn verify_crls(
             // Extension semantics can reject an applicable CRL, but unrelated
             // untrusted CRL material must not influence the selected path.
             validate_crl_extensions(crl, *crl_index)?;
-            if issuer
-                .key_usage()
-                .map_err(|error| X509ChainError::InvalidDer {
-                    kind: "certificate KeyUsage",
-                    message: error.to_string(),
-                })?
-                .is_some_and(|usage| !usage.value.crl_sign())
-            {
-                return Err(X509ChainError::InvalidKeyUsage {
-                    position: position + 1,
-                    required: "cRLSign",
-                });
-            }
+            validate_crl_issuer_key_usage(issuer, position + 1)?;
             // RFC 5280 requires conforming CRL issuers to provide nextUpdate;
             // without it this verifier cannot establish a bounded freshness window.
             let time_valid = crl.next_update().is_some_and(|next| {
@@ -1746,6 +1734,33 @@ fn verify_crls(
     Ok(())
 }
 
+/// Enforce the certificate-version-specific authorization for an authenticated CRL.
+fn validate_crl_issuer_key_usage(
+    issuer: &X509Certificate<'_>,
+    position: usize,
+) -> Result<(), X509ChainError> {
+    // RFC 10007 section 4 updates RFC 5280 6.3.3(f): v3 requires both
+    // KeyUsage and cRLSign; v1/v2 have no extensions field and are exempt.
+    // https://www.rfc-editor.org/rfc/rfc10007.html#section-4
+    let usage = issuer
+        .key_usage()
+        .map_err(|error| X509ChainError::InvalidDer {
+            kind: "certificate KeyUsage",
+            message: error.to_string(),
+        })?;
+    let authorized = match usage {
+        Some(usage) => usage.value.crl_sign(),
+        None => issuer.version() != x509_parser::x509::X509Version::V3,
+    };
+    if !authorized {
+        return Err(X509ChainError::InvalidKeyUsage {
+            position,
+            required: "cRLSign",
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr as _;
@@ -1758,6 +1773,33 @@ mod tests {
     use signature::hazmat::PrehashSigner;
     use std::time::Duration;
     use x509_parser::oid_registry::{OID_SIG_ECDSA_WITH_SHA256, OID_SIG_ECDSA_WITH_SHA384, Oid};
+
+    #[test]
+    fn crl_key_usage_absence_depends_on_certificate_version() {
+        // Isolate RFC 10007's v1/v2 exemption from the chain's separate CA constraints.
+        let params = rcgen::CertificateParams::new(Vec::new()).expect("empty SANs are valid");
+        let certificate = params
+            .self_signed(&rcgen::KeyPair::generate().expect("test key generation"))
+            .expect("test certificate signing");
+        let (_, mut parsed) =
+            X509Certificate::from_der(certificate.der()).expect("generated certificate DER");
+        assert!(parsed.key_usage().expect("generated extensions").is_none());
+        for version in [
+            x509_parser::x509::X509Version::V1,
+            x509_parser::x509::X509Version::V2,
+        ] {
+            parsed.tbs_certificate.version = version;
+            assert_eq!(validate_crl_issuer_key_usage(&parsed, 1), Ok(()));
+        }
+        parsed.tbs_certificate.version = x509_parser::x509::X509Version::V3;
+        assert_eq!(
+            validate_crl_issuer_key_usage(&parsed, 1),
+            Err(X509ChainError::InvalidKeyUsage {
+                position: 1,
+                required: "cRLSign"
+            })
+        );
+    }
 
     fn generated_certificate_params(common_name: &str, is_ca: bool) -> rcgen::CertificateParams {
         let mut params = rcgen::CertificateParams::new(Vec::new())

@@ -2,7 +2,7 @@
 
 use std::ops::Range;
 
-use quick_xml::{Reader, events::Event};
+use xml_sec_xml_input::lexical::{Event, Scanner};
 
 use super::ParseError;
 
@@ -29,72 +29,66 @@ pub(super) struct LexicalPreflight {
 
 impl LexicalPreflight {
     pub(super) fn scan(input: &str, allow_dtd: bool) -> Result<Self, ParseError> {
-        let mut reader = Reader::from_str(input);
+        let mut reader = Scanner::new(input);
         let mut nodes: Vec<SourceNode> = Vec::new();
         let mut elements = Vec::new();
         #[cfg(feature = "xml-backend-roxmltree")]
         let mut doctype = None;
-        loop {
-            let start = source_offset(reader.buffer_position())?;
-            let event = reader.read_event().map_err(|error| ParseError::Backend {
-                backend: "xml-preflight",
-                message: error.to_string(),
-            })?;
-            let end = source_offset(reader.buffer_position())?;
+        while let Some(event) = reader.next_event().map_err(|error| ParseError::Backend {
+            backend: "xml-preflight",
+            message: error.to_string(),
+        })? {
             match event {
-                Event::Start(_) => {
+                Event::Start(element) => {
                     let depth = elements.len() + 1;
                     enforce_depth(depth)?;
                     let index = nodes.len();
                     nodes.push(SourceNode {
                         kind: SourceKind::Element,
-                        range: start..end,
+                        range: element.range.clone(),
                     });
                     elements.push(index);
                 }
-                Event::Empty(_) => {
+                Event::Empty(element) => {
                     enforce_depth(elements.len() + 1)?;
                     nodes.push(SourceNode {
                         kind: SourceKind::Element,
-                        range: start..end,
+                        range: element.range,
                     });
                 }
-                Event::End(_) => {
+                Event::End { range, .. } => {
                     if let Some(index) = elements.pop() {
-                        nodes[index].range.end = end;
+                        nodes[index].range.end = range.end;
                     }
                 }
                 // Both supported DOMs omit whitespace outside the document
                 // element, so it must not shift the semantic sidecar.
-                Event::Text(_) if !elements.is_empty() => {
-                    push_text_position(&mut nodes, start..end);
+                Event::Text { range, .. } if !elements.is_empty() => {
+                    push_text_position(&mut nodes, range);
                 }
-                Event::Text(_) => {}
-                Event::CData(_) => nodes.push(SourceNode {
+                Event::Text { .. } => {}
+                Event::CData { range, .. } => nodes.push(SourceNode {
                     kind: SourceKind::CData,
-                    range: start..end,
+                    range,
                 }),
-                Event::GeneralRef(reference)
-                    if is_builtin_or_character_reference(reference.as_ref()) =>
-                {
-                    push_text_position(&mut nodes, start..end);
+                Event::Reference { name, range } if is_builtin_or_character_reference(name) => {
+                    push_text_position(&mut nodes, range);
                 }
-                Event::GeneralRef(_) => nodes.push(SourceNode {
+                Event::Reference { range, .. } => nodes.push(SourceNode {
                     kind: SourceKind::EntityRef,
-                    range: start..end,
+                    range,
                 }),
-                Event::Comment(_) => nodes.push(SourceNode {
+                Event::Comment { range, .. } => nodes.push(SourceNode {
                     kind: SourceKind::Comment,
-                    range: start..end,
+                    range,
                 }),
-                Event::PI(_) => nodes.push(SourceNode {
+                Event::ProcessingInstruction { range, .. } => nodes.push(SourceNode {
                     kind: SourceKind::Pi,
-                    range: start..end,
+                    range,
                 }),
-                Event::DocType(_) if !allow_dtd => return Err(ParseError::DtdDetected),
+                Event::DocType { .. } if !allow_dtd => return Err(ParseError::DtdDetected),
                 #[cfg(feature = "xml-backend-roxmltree")]
-                Event::DocType(_) => doctype = Some(start..end),
-                Event::Eof => break,
+                Event::DocType { range, .. } => doctype = Some(range),
                 _ => {}
             }
             let actual = nodes.len();
@@ -179,15 +173,8 @@ fn push_text_position(nodes: &mut Vec<SourceNode>, range: Range<usize>) {
     }
 }
 
-fn is_builtin_or_character_reference(reference: &[u8]) -> bool {
-    reference.starts_with(b"#") || matches!(reference, b"amp" | b"lt" | b"gt" | b"apos" | b"quot")
-}
-
-fn source_offset(offset: u64) -> Result<usize, ParseError> {
-    usize::try_from(offset).map_err(|_| ParseError::Backend {
-        backend: "xml-preflight",
-        message: "XML source offset exceeds the platform address space".to_owned(),
-    })
+fn is_builtin_or_character_reference(reference: &str) -> bool {
+    reference.starts_with('#') || matches!(reference, "amp" | "lt" | "gt" | "apos" | "quot")
 }
 
 #[cfg(feature = "xml-backend-xmloxide")]

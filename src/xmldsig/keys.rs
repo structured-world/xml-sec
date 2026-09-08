@@ -2721,10 +2721,16 @@ mod tests {
             .key_resolver(&resolver)
             .verify(&xml)
             .expect_err("selector lookup must retain and enforce the supplied CRL");
+        // RFC 10007 section 4: the tracked v3 CA lacks KeyUsage, so CRL
+        // authorization now fails before its revoked-serial list is consumed.
+        // https://www.rfc-editor.org/rfc/rfc10007.html#section-4
         assert!(matches!(
             error,
             DsigError::KeyResolution(KeyResolutionError::Chain(
-                super::super::X509ChainError::Revoked(0)
+                super::super::X509ChainError::InvalidKeyUsage {
+                    position: 1,
+                    required: "cRLSign"
+                }
             ))
         ));
 

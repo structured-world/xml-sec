@@ -7072,7 +7072,10 @@ fn explicit_certificate_verification_honors_embedded_crls() {
         .unwrap();
     assert!(!checked.status.success());
     assert!(
-        String::from_utf8_lossy(&checked.stderr).contains("CRL"),
+        // RFC 10007 section 4 rejects this legacy v3 issuer's absent KeyUsage
+        // before consulting the authenticated CRL's revoked serials.
+        String::from_utf8_lossy(&checked.stderr)
+            .contains("certificate at chain position 1 does not permit cRLSign"),
         "{}",
         String::from_utf8_lossy(&checked.stderr)
     );
