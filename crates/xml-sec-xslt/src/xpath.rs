@@ -2829,7 +2829,7 @@ impl Evaluator {
         expression: &Expression,
         node: &SourceNode,
         meter: &mut Meter,
-    ) -> Result<Option<Vec<SourceNode>>> {
+    ) -> Result<Option<(Vec<SourceNode>, usize)>> {
         let source = expression.source.trim();
         if source.contains('|') && source != "*|text()" {
             return Ok(None);
@@ -2914,8 +2914,7 @@ impl Evaluator {
             selected = next;
             selected_bytes = next_bytes;
         }
-        meter.release_owned_bytes(selected_bytes);
-        Ok(Some(selected))
+        Ok(Some((selected, selected_bytes)))
     }
 
     pub(crate) fn materialize_temporary_string_value(
@@ -4037,15 +4036,21 @@ fn expand_xinclude_document_in_chain(
                 retained_namespace_bytes =
                     retained_namespace_bytes.saturating_add(included.retained_namespace_bytes);
             }
-            Ok(XIncludeContent::Text(value, base_uri)) => {
-                output.push_coalesced(
-                    target_parent,
-                    NodeKind::Text {
+            Ok(XIncludeContent::Text {
+                value,
+                value_reservation,
+                base_uri,
+                base_uri_reservation,
+            }) => {
+                retained_owned_bytes =
+                    retained_owned_bytes.saturating_add(output.push_precharged_text_coalesced(
+                        target_parent,
                         value,
-                        disable_output_escaping: false,
-                    },
-                    Some(base_uri),
-                );
+                        value_reservation,
+                        base_uri,
+                        base_uri_reservation,
+                        meter,
+                    )?);
             }
             Err(XIncludeFailure::Fatal(error)) => return Err(error),
             Err(XIncludeFailure::Resource(error)) => {
@@ -4503,7 +4508,12 @@ fn xinclude_remap_bytes(node_count: usize) -> usize {
 
 enum XIncludeContent {
     Xml(ExpandedXIncludeDocument),
-    Text(String, String),
+    Text {
+        value: String,
+        value_reservation: usize,
+        base_uri: String,
+        base_uri_reservation: usize,
+    },
 }
 
 enum XIncludeFailure {
@@ -4689,7 +4699,14 @@ fn resolve_xinclude(
                 u32::from(character)
             ))));
         }
+        let expected_uri_bytes = resource.canonical_uri.len();
+        meter
+            .charge(BudgetKind::OwnedBytes, expected_uri_bytes)
+            .map_err(XIncludeFailure::Fatal)?;
         let canonical_uri = resource.canonical_uri.clone();
+        let canonical_uri_reservation =
+            reconcile_owned_string_capacity(meter, expected_uri_bytes, canonical_uri.capacity())
+                .map_err(XIncludeFailure::Fatal)?;
         if identity_is_new {
             charge_resource_identity_cache_entry(&resource, meter)
                 .map_err(XIncludeFailure::Fatal)?;
@@ -4697,7 +4714,12 @@ fn resolve_xinclude(
         } else {
             meter.release_owned_bytes(resource.bytes.capacity());
         }
-        return Ok(XIncludeContent::Text(value.value, canonical_uri));
+        return Ok(XIncludeContent::Text {
+            value: value.value,
+            value_reservation: value.temporary_bytes,
+            base_uri: canonical_uri,
+            base_uri_reservation: canonical_uri_reservation,
+        });
     }
     let xml = decode_xinclude_resource(
         &resource,
@@ -6083,19 +6105,11 @@ impl function::Function for NodeNameFunction {
             Self::Qualified => qualified_node_name(context, &node)?,
             Self::Local => node.expanded_name().map_or_else(
                 || Ok(String::new()),
-                |name| {
-                    let value = name.local_part();
-                    context.reserve_string_allocation(value.len())?;
-                    Ok(value.to_owned())
-                },
+                |name| materialize_node_name(context, name.local_part()),
             )?,
             Self::NamespaceUri => node.expanded_name().map_or_else(
                 || Ok(String::new()),
-                |name| {
-                    let value = name.namespace_uri().unwrap_or_default();
-                    context.reserve_string_allocation(value.len())?;
-                    Ok(value.to_owned())
-                },
+                |name| materialize_node_name(context, name.namespace_uri().unwrap_or_default()),
             )?,
         };
         Ok(SxdValue::String(value))
@@ -6119,13 +6133,11 @@ fn qualified_node_name(
         }
         nodeset::Node::ProcessingInstruction(instruction) => {
             let value = instruction.target();
-            context.reserve_string_allocation(value.len())?;
-            Ok(value.to_string())
+            materialize_node_name(context, &value)
         }
         nodeset::Node::Namespace(namespace) => {
             let value = namespace.prefix();
-            context.reserve_string_allocation(value.len())?;
-            Ok(value.to_owned())
+            materialize_node_name(context, value)
         }
         _ => Ok(String::new()),
     }
@@ -6138,6 +6150,7 @@ fn materialize_qualified_node_name(
 ) -> std::result::Result<String, function::Error> {
     let prefix = prefix.filter(|prefix| !prefix.is_empty());
     let output_len = prefix.map_or(local.len(), |prefix| prefix.len() + 1 + local.len());
+    context.charge_work(output_len)?;
     context.reserve_string_allocation(output_len)?;
     let Some(prefix) = prefix else {
         return Ok(local.to_owned());
@@ -6147,6 +6160,15 @@ fn materialize_qualified_node_name(
     output.push(':');
     output.push_str(local);
     Ok(output)
+}
+
+fn materialize_node_name(
+    context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
+    value: &str,
+) -> std::result::Result<String, function::Error> {
+    context.charge_work(value.len())?;
+    context.reserve_string_allocation(value.len())?;
+    Ok(value.to_owned())
 }
 
 struct LangFunction;
@@ -8917,6 +8939,97 @@ mod tests {
     }
 
     #[test]
+    fn child_axis_fast_path_retains_its_node_storage_reservation() {
+        let source_xml = format!("<root>{}</root>", "<item/>".repeat(32));
+        let source = Document::parse(&source_xml, None).expect("source parses");
+        let stylesheet = Document::parse("<stylesheet/>", None).expect("stylesheet parses");
+        let budget = ExecutionBudget {
+            source_bytes: usize::MAX,
+            external_documents: usize::MAX,
+            recursion_depth: usize::MAX,
+            xpath_evaluations: usize::MAX,
+            xpath_operations: usize::MAX,
+            extension_operations: usize::MAX,
+            pattern_evaluations: usize::MAX,
+            template_applications: usize::MAX,
+            sort_comparisons: usize::MAX,
+            key_entries: usize::MAX,
+            result_nodes: usize::MAX,
+            serialized_bytes: usize::MAX,
+            messages: usize::MAX,
+            owned_bytes: usize::MAX,
+        };
+        let mut meter = Meter::new(budget, source.source_bytes()).expect("meter initializes");
+        let options = EvaluatorSourceOptions {
+            processing: SourceProcessing::Xml,
+            whitespace: Arc::from([]),
+            clock: Arc::new(crate::SystemClock),
+            extension_policy: crate::ExtensionPolicy::Compatible,
+        };
+        let prepared = prepare_evaluator_source(&source, &crate::NoResolver, &mut meter, &options)
+            .expect("source prepares");
+        let evaluator = Evaluator::new(
+            prepared,
+            &stylesheet,
+            None,
+            &[],
+            Arc::new(crate::NoResolver),
+            &mut meter,
+            options,
+        )
+        .expect("evaluator initializes");
+        let root = evaluator.source.logical_roots()[0];
+        let document_element = evaluator
+            .source
+            .node(root)
+            .expect("logical root remains present")
+            .children[0];
+        let before = meter
+            .usage(BudgetKind::OwnedBytes)
+            .expect("owned-byte usage is available")
+            .0;
+        let (selected, selected_reservation) = evaluator
+            .select_child_axis(
+                &Expression::generated("item", Vec::new()),
+                &SourceNode::Node(document_element),
+                &mut meter,
+            )
+            .expect("selection succeeds")
+            .expect("child-axis shortcut applies");
+        let retained = selected
+            .capacity()
+            .saturating_mul(std::mem::size_of::<SourceNode>());
+
+        assert_eq!(selected_reservation, retained);
+        assert_eq!(
+            meter
+                .usage(BudgetKind::OwnedBytes)
+                .expect("owned-byte usage is available")
+                .0
+                - before,
+            retained
+        );
+        meter.release_owned_bytes(selected_reservation);
+    }
+
+    #[test]
+    fn node_name_functions_charge_copied_bytes_as_xpath_work() {
+        let package = Package::new();
+        let document = package.as_document();
+        let element = document.create_element("long-element-name");
+        document.root().append_child(element);
+        let mut context = Context::new();
+        context.set_evaluation_work_limit(0);
+        let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&context, element.into());
+
+        assert!(
+            NodeNameFunction::Local
+                .evaluate(&evaluation, vec![])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn relative_node_fast_path_charges_rejected_candidates() {
         // The current()-relative shortcut must charge every candidate it inspects, including
         // children rejected by the name test without producing result storage.
@@ -9143,6 +9256,67 @@ mod tests {
         assert!(
             prepared.remap_owned_bytes > 0,
             "retained mapping bytes must remain attributable to the map owner"
+        );
+    }
+
+    #[test]
+    fn xinclude_text_transfers_decoded_storage_to_the_expanded_document() {
+        let resolver = StaticResolver {
+            bytes: vec![b'x'; 64 * 1024],
+        };
+        let source = Document::parse(
+            r#"<root xmlns:xi="http://www.w3.org/2001/XInclude">before<xi:include href="value.txt" parse="text"/></root>"#,
+            Some("memory:source.xml"),
+        )
+        .expect("XInclude source parses");
+        let mut meter = Meter::new(
+            ExecutionBudget {
+                source_bytes: usize::MAX,
+                external_documents: 1,
+                recursion_depth: 16,
+                xpath_evaluations: usize::MAX,
+                xpath_operations: usize::MAX,
+                extension_operations: usize::MAX,
+                pattern_evaluations: usize::MAX,
+                template_applications: usize::MAX,
+                sort_comparisons: usize::MAX,
+                key_entries: usize::MAX,
+                result_nodes: usize::MAX,
+                serialized_bytes: usize::MAX,
+                messages: usize::MAX,
+                owned_bytes: usize::MAX,
+            },
+            source.source_bytes(),
+        )
+        .expect("meter initializes");
+        let before = meter
+            .usage(BudgetKind::OwnedBytes)
+            .expect("owned-byte usage is available")
+            .0;
+        let mut identities = HashMap::new();
+        let expanded = expand_xinclude_document(
+            &source,
+            &XIncludeDocumentIdentity::InMemory(&source as *const Document as usize),
+            &resolver,
+            &mut meter,
+            &mut identities,
+            0,
+            None,
+        )
+        .expect("text inclusion succeeds");
+        let cache_bytes = identities
+            .values()
+            .map(resource_identity_cache_entry_owned_bytes)
+            .sum::<usize>();
+
+        assert_eq!(
+            meter
+                .usage(BudgetKind::OwnedBytes)
+                .expect("owned-byte usage is available")
+                .0
+                - before,
+            expanded.retained_owned_bytes + cache_bytes,
+            "all live owned bytes must belong to an explicit retained owner"
         );
     }
 

@@ -341,6 +341,45 @@ pub(crate) fn reserve_temporary_vec_slot<T>(
     Ok(())
 }
 
+pub(crate) fn append_metered_string(
+    current: &mut String,
+    suffix: &str,
+    meter: &mut Meter,
+) -> Result<()> {
+    let required = current
+        .len()
+        .checked_add(suffix.len())
+        .filter(|length| *length <= isize::MAX as usize)
+        .ok_or_else(|| Error::Dynamic("text value is too large".into()))?;
+    if required <= current.capacity() {
+        current.push_str(suffix);
+        return Ok(());
+    }
+
+    meter.check_additional(BudgetKind::OwnedBytes, required)?;
+    debug_assert!(current.capacity() <= isize::MAX as usize);
+    let target_capacity = (current.capacity() * 2)
+        .max(required)
+        .min(isize::MAX as usize)
+        .min(meter.remaining_owned_bytes());
+    meter.charge(BudgetKind::OwnedBytes, target_capacity)?;
+    let mut replacement = String::new();
+    if let Err(error) = replacement.try_reserve_exact(target_capacity) {
+        meter.release_owned_bytes(target_capacity);
+        return Err(Error::Dynamic(format!(
+            "failed to reserve metered text storage: {error}"
+        )));
+    }
+    let actual_capacity = replacement.capacity();
+    reconcile_replacement_growth(meter, target_capacity, actual_capacity)?;
+    replacement.push_str(current);
+    replacement.push_str(suffix);
+    let old_capacity = current.capacity();
+    *current = replacement;
+    meter.release_owned_bytes(old_capacity);
+    Ok(())
+}
+
 fn reconcile_replacement_growth(
     meter: &mut Meter,
     requested_bytes: usize,
@@ -548,6 +587,28 @@ mod tests {
                 .expect("owned-byte usage is available"),
             (usize::MAX - 2, usize::MAX)
         );
+    }
+
+    #[test]
+    fn metered_string_growth_fails_before_replacing_the_live_buffer() {
+        let mut value = String::with_capacity(8);
+        value.push_str("12345678");
+        let original_capacity = value.capacity();
+        let mut meter =
+            Meter::new(execution_budget(original_capacity + 4), 0).expect("meter initializes");
+        meter
+            .charge(BudgetKind::OwnedBytes, original_capacity)
+            .expect("existing allocation is retained");
+
+        assert!(matches!(
+            append_metered_string(&mut value, "5678", &mut meter),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            })
+        ));
+        assert_eq!(value, "12345678");
+        assert_eq!(value.capacity(), original_capacity);
     }
 
     #[test]

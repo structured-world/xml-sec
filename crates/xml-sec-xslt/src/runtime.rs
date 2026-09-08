@@ -10,8 +10,8 @@ use icu_collator::{Collator, CollatorBorrowed, CollatorPreferences, options::Col
 use icu_locale::Locale;
 
 use crate::budget::{
-    EXECUTION_RECURSION_DEPTH_CEILING, Meter, reserve_retained_hash_set_slot,
-    reserve_retained_vec_slot, reserve_temporary_vec_slot,
+    EXECUTION_RECURSION_DEPTH_CEILING, Meter, append_metered_string,
+    reserve_retained_hash_set_slot, reserve_retained_vec_slot, reserve_temporary_vec_slot,
 };
 use crate::compiler::{
     AttributeSet, AttributeValueTemplate, AvtPart, Expression, ExsltFunction, Instruction,
@@ -447,7 +447,7 @@ impl MeteredString {
     }
 
     fn push_str(&mut self, value: &str, meter: &mut Meter) -> Result<()> {
-        append_metered_text(&mut self.value, value, meter)?;
+        append_metered_string(&mut self.value, value, meter)?;
         self.retained_owned_bytes = self.value.capacity();
         Ok(())
     }
@@ -1313,12 +1313,31 @@ impl<'a> Execution<'a> {
                             sorts,
                             parameters,
                         } => {
-                            let mut nodes = self.select_nodes(select, &node, position, size)?;
-                            self.sort_nodes(&mut nodes, sorts, &node, position, size)?;
-                            let supplied = Arc::new(self.evaluate_with_params(
+                            let (mut nodes, node_reservation) =
+                                self.select_nodes(select, &node, position, size)?;
+                            if let Err(error) =
+                                self.sort_nodes(&mut nodes, sorts, &node, position, size)
+                            {
+                                self.meter.release_owned_bytes(node_reservation);
+                                return Err(error);
+                            }
+                            let supplied = match self.evaluate_with_params(
                                 parameters, &node, position, size, depth, precedence,
-                            )?);
-                            self.push_apply_batch(tasks, nodes, mode.clone(), supplied, depth + 1)?;
+                            ) {
+                                Ok(supplied) => Arc::new(supplied),
+                                Err(error) => {
+                                    self.meter.release_owned_bytes(node_reservation);
+                                    return Err(error);
+                                }
+                            };
+                            self.push_apply_batch(
+                                tasks,
+                                nodes,
+                                node_reservation,
+                                mode.clone(),
+                                supplied,
+                                depth + 1,
+                            )?;
                         }
                         Instruction::ApplyImports => {
                             let current_rule_precedence = precedence.ok_or_else(|| {
@@ -1498,9 +1517,21 @@ impl<'a> Execution<'a> {
                             sorts,
                             body,
                         } => {
-                            let mut nodes = self.select_nodes(select, &node, position, size)?;
-                            self.sort_nodes(&mut nodes, sorts, &node, position, size)?;
-                            self.push_for_each_batch(tasks, nodes, Arc::clone(body), depth + 1)?;
+                            let (mut nodes, node_reservation) =
+                                self.select_nodes(select, &node, position, size)?;
+                            if let Err(error) =
+                                self.sort_nodes(&mut nodes, sorts, &node, position, size)
+                            {
+                                self.meter.release_owned_bytes(node_reservation);
+                                return Err(error);
+                            }
+                            self.push_for_each_batch(
+                                tasks,
+                                nodes,
+                                node_reservation,
+                                Arc::clone(body),
+                                depth + 1,
+                            )?;
                         }
                         Instruction::If { test, body } => {
                             if self.evaluate(test, &node, position, size)?.boolean() {
@@ -1628,10 +1659,16 @@ impl<'a> Execution<'a> {
                 match kind {
                     Some(NodeKind::Root | NodeKind::Element { .. }) => {
                         let children = self.evaluator.children(&node, &mut self.meter)?;
+                        let child_reservation = children
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<SourceNode>());
+                        self.meter
+                            .charge(BudgetKind::OwnedBytes, child_reservation)?;
                         let built_in_params = Arc::new(EvaluatedParameters::default());
                         self.push_apply_batch(
                             tasks,
                             children,
+                            child_reservation,
                             mode,
                             built_in_params,
                             frame.depth + 1,
@@ -1650,26 +1687,33 @@ impl<'a> Execution<'a> {
         &mut self,
         tasks: &mut TemplateTaskStack,
         nodes: Vec<SourceNode>,
+        node_reservation: usize,
         mode: Option<ExpandedName>,
         params: Arc<EvaluatedParameters>,
         depth: usize,
     ) -> Result<()> {
         if nodes.is_empty() {
+            self.meter.release_owned_bytes(node_reservation);
             self.release_parameters_if_last(&params);
             return Ok(());
         }
-        let node_bytes = nodes
-            .capacity()
-            .saturating_mul(std::mem::size_of::<SourceNode>());
+        debug_assert_eq!(
+            node_reservation,
+            nodes
+                .capacity()
+                .saturating_mul(std::mem::size_of::<SourceNode>())
+        );
         // The batch retains one mode while one serial application can hold a second clone.
         let mode_bytes = mode
             .as_ref()
             .map_or(0, expanded_name_owned_bytes)
             .saturating_mul(2);
-        let reserved_owned_bytes = node_bytes.saturating_add(mode_bytes);
-        self.meter
-            .charge(BudgetKind::OwnedBytes, reserved_owned_bytes)?;
-        tasks.push(
+        if let Err(error) = self.meter.charge(BudgetKind::OwnedBytes, mode_bytes) {
+            self.meter.release_owned_bytes(node_reservation);
+            return Err(error);
+        }
+        let reserved_owned_bytes = node_reservation.saturating_add(mode_bytes);
+        if let Err(error) = tasks.push(
             TemplateTask::ApplyBatch {
                 nodes,
                 next: 0,
@@ -1679,34 +1723,45 @@ impl<'a> Execution<'a> {
                 reserved_owned_bytes,
             },
             &mut self.meter,
-        )
+        ) {
+            self.meter.release_owned_bytes(reserved_owned_bytes);
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn push_for_each_batch(
         &mut self,
         tasks: &mut TemplateTaskStack,
         nodes: Vec<SourceNode>,
+        node_reservation: usize,
         body: InstructionSequence,
         depth: usize,
     ) -> Result<()> {
         if nodes.is_empty() {
+            self.meter.release_owned_bytes(node_reservation);
             return Ok(());
         }
-        let reserved_owned_bytes = nodes
-            .capacity()
-            .saturating_mul(std::mem::size_of::<SourceNode>());
-        self.meter
-            .charge(BudgetKind::OwnedBytes, reserved_owned_bytes)?;
-        tasks.push(
+        debug_assert_eq!(
+            node_reservation,
+            nodes
+                .capacity()
+                .saturating_mul(std::mem::size_of::<SourceNode>())
+        );
+        if let Err(error) = tasks.push(
             TemplateTask::ForEachBatch {
                 nodes,
                 next: 0,
                 body,
                 depth,
-                reserved_owned_bytes,
+                reserved_owned_bytes: node_reservation,
             },
             &mut self.meter,
-        )
+        ) {
+            self.meter.release_owned_bytes(node_reservation);
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn push_template_tasks(
@@ -1967,27 +2022,35 @@ impl<'a> Execution<'a> {
                 sorts,
                 parameters,
             } => {
-                let mut nodes = self.select_nodes(select, node, position, size)?;
-                self.sort_nodes(&mut nodes, sorts, node, position, size)?;
-                let supplied = Arc::new(self.evaluate_with_params(
-                    parameters,
-                    node,
-                    position,
-                    size,
-                    depth,
-                    current_precedence,
-                )?);
-                let total = nodes.len();
-                for (index, selected) in nodes.into_iter().enumerate() {
-                    self.apply_one(
-                        selected,
-                        mode.as_ref(),
-                        Arc::clone(&supplied),
-                        ApplyFrame::new(index + 1, total, depth + 1),
-                    )?
-                }
-                self.release_parameters_if_last(&supplied);
-                Ok(())
+                let (mut nodes, node_reservation) =
+                    self.select_nodes(select, node, position, size)?;
+                let result = (|| {
+                    self.sort_nodes(&mut nodes, sorts, node, position, size)?;
+                    let supplied = Arc::new(self.evaluate_with_params(
+                        parameters,
+                        node,
+                        position,
+                        size,
+                        depth,
+                        current_precedence,
+                    )?);
+                    let total = nodes.len();
+                    let applied = (|| {
+                        for (index, selected) in nodes.drain(..).enumerate() {
+                            self.apply_one(
+                                selected,
+                                mode.as_ref(),
+                                Arc::clone(&supplied),
+                                ApplyFrame::new(index + 1, total, depth + 1),
+                            )?;
+                        }
+                        Ok(())
+                    })();
+                    self.release_parameters_if_last(&supplied);
+                    applied
+                })();
+                self.meter.release_owned_bytes(node_reservation);
+                result
             }
             Instruction::ApplyImports => {
                 let current_rule_precedence = current_precedence.ok_or_else(|| {
@@ -2028,17 +2091,28 @@ impl<'a> Execution<'a> {
                 sorts,
                 body,
             } => {
-                let mut nodes = self.select_nodes(select, node, position, size)?;
-                self.sort_nodes(&mut nodes, sorts, node, position, size)?;
-                let total = nodes.len();
-                for (index, selected) in nodes.iter().enumerate() {
-                    self.scopes.push(VariableScope::default());
-                    let result =
-                        self.execute_sequence(body, selected, index + 1, total, depth + 1, None);
-                    self.pop_scope();
-                    result?
-                }
-                Ok(())
+                let (mut nodes, node_reservation) =
+                    self.select_nodes(select, node, position, size)?;
+                let result = (|| {
+                    self.sort_nodes(&mut nodes, sorts, node, position, size)?;
+                    let total = nodes.len();
+                    for (index, selected) in nodes.iter().enumerate() {
+                        self.scopes.push(VariableScope::default());
+                        let result = self.execute_sequence(
+                            body,
+                            selected,
+                            index + 1,
+                            total,
+                            depth + 1,
+                            None,
+                        );
+                        self.pop_scope();
+                        result?;
+                    }
+                    Ok(())
+                })();
+                self.meter.release_owned_bytes(node_reservation);
+                result
             }
             Instruction::If { test, body } => {
                 if self.evaluate(test, node, position, size)?.boolean() {
@@ -2615,12 +2689,6 @@ impl<'a> Execution<'a> {
                 ));
             }
             _ => {}
-        }
-        if let Some(nodes) = self
-            .evaluator
-            .select_child_axis(expression, node, &mut self.meter)?
-        {
-            return Ok(XPathValue::NodeSet(nodes));
         }
         if let Some(value) = self.evaluate_scalar_fast(expression, node)? {
             return Ok(value);
@@ -3234,41 +3302,46 @@ impl<'a> Execution<'a> {
         node: &SourceNode,
         position: usize,
         size: usize,
-    ) -> Result<Vec<SourceNode>> {
+    ) -> Result<(Vec<SourceNode>, usize)> {
         self.meter.charge(BudgetKind::XPathEvaluations, 1)?;
-        match expression.source.trim() {
+        let nodes = match expression.source.trim() {
             // These are the two hot selections used by identity transforms. They
             // are context child-axis expressions, so projecting them through the
             // general XPath engine for every source node is unnecessary work.
-            "node()" => return self.evaluator.children(node, &mut self.meter),
-            "." => return self.evaluator.singleton(node, true, &mut self.meter),
-            "@*" => return self.evaluator.attributes(node, &mut self.meter),
-            "preceding-sibling::node()[normalize-space()][1][self::comment()]" => {
-                return self
-                    .evaluator
-                    .preceding_nonempty_comment(node, &mut self.meter);
+            "node()" => self.evaluator.children(node, &mut self.meter)?,
+            "." => self.evaluator.singleton(node, true, &mut self.meter)?,
+            "@*" => self.evaluator.attributes(node, &mut self.meter)?,
+            "preceding-sibling::node()[normalize-space()][1][self::comment()]" => self
+                .evaluator
+                .preceding_nonempty_comment(node, &mut self.meter)?,
+            "@*|node()" | "node()|@*" => self
+                .evaluator
+                .attributes_and_children(node, &mut self.meter)?,
+            _ => {
+                if let Some(selected) =
+                    self.evaluator
+                        .select_child_axis(expression, node, &mut self.meter)?
+                {
+                    return Ok(selected);
+                }
+                match self.evaluate_after_charge(expression, node, position, size)? {
+                    XPathValue::NodeSet(nodes) => nodes,
+                    value => {
+                        return Err(Error::Dynamic(format!(
+                            "XPath `{}` must return a node-set, received {}",
+                            expression.source,
+                            xpath_value_kind(&value),
+                        )));
+                    }
+                }
             }
-            "@*|node()" | "node()|@*" => {
-                return self
-                    .evaluator
-                    .attributes_and_children(node, &mut self.meter);
-            }
-            _ => {}
-        }
-        if let Some(nodes) = self
-            .evaluator
-            .select_child_axis(expression, node, &mut self.meter)?
-        {
-            return Ok(nodes);
-        }
-        match self.evaluate_after_charge(expression, node, position, size)? {
-            XPathValue::NodeSet(nodes) => Ok(nodes),
-            value => Err(Error::Dynamic(format!(
-                "XPath `{}` must return a node-set, received {}",
-                expression.source,
-                xpath_value_kind(&value),
-            ))),
-        }
+        };
+        let reserved_owned_bytes = nodes
+            .capacity()
+            .saturating_mul(std::mem::size_of::<SourceNode>());
+        self.meter
+            .charge(BudgetKind::OwnedBytes, reserved_owned_bytes)?;
+        Ok((nodes, reserved_owned_bytes))
     }
     fn evaluate_variable(
         &mut self,
@@ -5705,7 +5778,7 @@ fn append_result_text(
         let appended = if let Some(NodeKind::Text { value: current, .. }) =
             result.node_mut(previous).map(|node| &mut node.kind)
         {
-            append_metered_text(current, &value, meter)
+            append_metered_string(current, &value, meter)
         } else {
             unreachable!("previous node was checked as text")
         };
@@ -5761,7 +5834,7 @@ fn append_precharged_result_text(
         let appended = if let Some(NodeKind::Text { value: current, .. }) =
             result.node_mut(previous).map(|node| &mut node.kind)
         {
-            append_metered_text(current, &value, meter)
+            append_metered_string(current, &value, meter)
         } else {
             unreachable!("previous node was checked as text")
         };
@@ -5790,32 +5863,6 @@ fn append_precharged_result_text(
         meter.release_owned_bytes(reservation);
     }
     insertion.map(|_| ())
-}
-
-fn append_metered_text(current: &mut String, suffix: &str, meter: &mut Meter) -> Result<()> {
-    let required = current
-        .len()
-        .checked_add(suffix.len())
-        .filter(|length| *length <= isize::MAX as usize)
-        .ok_or_else(|| Error::Dynamic("result text is too large".into()))?;
-    if required > current.capacity() {
-        // Allocate beside the old buffer: both remain live during copying. Geometric growth
-        // stays amortized linear; near the memory limit reserve only available headroom.
-        meter.check_additional(BudgetKind::OwnedBytes, required)?;
-        debug_assert!(current.capacity() <= isize::MAX as usize);
-        let capacity = (current.capacity() * 2)
-            .max(required)
-            .min(isize::MAX as usize)
-            .min(meter.remaining_owned_bytes());
-        meter.charge(BudgetKind::OwnedBytes, capacity)?;
-        let mut replacement = String::with_capacity(capacity);
-        replacement.push_str(current);
-        let old_capacity = current.capacity();
-        *current = replacement;
-        meter.release_owned_bytes(old_capacity);
-    }
-    current.push_str(suffix);
-    Ok(())
 }
 
 fn push_result_node(

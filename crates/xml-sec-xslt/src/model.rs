@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use xml_sec_xml_input::lexical::{Event, Scanner};
 
 use crate::budget::{
-    ENTITY_EXPANSION_BYTE_CEILING, ENTITY_EXPANSION_DEPTH_CEILING, Meter, ensure,
-    reserve_temporary_vec_slot,
+    ENTITY_EXPANSION_BYTE_CEILING, ENTITY_EXPANSION_DEPTH_CEILING, Meter, append_metered_string,
+    ensure, reserve_temporary_vec_slot,
 };
 use crate::{BudgetKind, Error, ParseBudget, Result};
 
@@ -1427,39 +1427,52 @@ impl Document {
         id
     }
 
-    pub(crate) fn push_coalesced(
+    pub(crate) fn push_precharged_text_coalesced(
         &mut self,
         parent: NodeId,
-        kind: NodeKind,
-        base_uri: Option<String>,
-    ) -> Option<NodeId> {
-        let NodeKind::Text {
-            value,
-            disable_output_escaping,
-        } = kind
-        else {
-            return Some(self.push(parent, kind, base_uri));
-        };
+        value: String,
+        value_reservation: usize,
+        base_uri: String,
+        base_uri_reservation: usize,
+        meter: &mut Meter,
+    ) -> Result<usize> {
+        debug_assert_eq!(value_reservation, value.capacity());
+        debug_assert_eq!(base_uri_reservation, base_uri.capacity());
+        let input_reservation = value_reservation.saturating_add(base_uri_reservation);
         if value.is_empty() {
-            return None;
+            meter.release_owned_bytes(input_reservation);
+            return Ok(0);
         }
-        if let Some(last_child) = self.coalescible_text_child(parent, disable_output_escaping) {
+        if let Some(last_child) = self.coalescible_text_child(parent, false) {
             let NodeKind::Text {
                 value: existing, ..
             } = &mut self.nodes[last_child.0].kind
             else {
                 unreachable!("coalescible_text_child returns only text nodes");
             };
-            existing.push_str(&value);
-            return Some(last_child);
+            let old_capacity = existing.capacity();
+            let appended = append_metered_string(existing, &value, meter);
+            meter.release_owned_bytes(input_reservation);
+            appended?;
+            return Ok(existing.capacity().saturating_sub(old_capacity));
         }
-        Some(self.push(
+
+        let containers_before = self.retained_tree_container_bytes();
+        if let Err(error) = self.reserve_metered_push_containers(parent, meter) {
+            meter.release_owned_bytes(input_reservation);
+            return Err(error);
+        }
+        self.push(
             parent,
             NodeKind::Text {
                 value,
-                disable_output_escaping,
+                disable_output_escaping: false,
             },
-            base_uri,
+            Some(base_uri),
+        );
+        Ok(input_reservation.saturating_add(
+            self.retained_tree_container_bytes()
+                .saturating_sub(containers_before),
         ))
     }
 
@@ -2592,12 +2605,9 @@ fn internal_general_entities<'a>(
     } else {
         false
     };
-    validate_unused_entity_graph(
-        &declarations,
-        standalone || (!external_subset && !changed),
-        meter,
-    )?;
-    validate_attribute_default_entities(&declarations)?;
+    let require_declared = standalone || (!external_subset && !changed);
+    validate_unused_entity_graph(&declarations, require_declared, meter)?;
+    validate_attribute_default_entities(&declarations, require_declared)?;
     if !changed {
         return Ok((Cow::Borrowed(xml), declarations));
     }
@@ -2684,7 +2694,10 @@ fn validate_unused_entity_graph(
     Ok(())
 }
 
-fn validate_attribute_default_entities(declarations: &InternalEntityDeclarations) -> Result<()> {
+fn validate_attribute_default_entities(
+    declarations: &InternalEntityDeclarations,
+    require_declared: bool,
+) -> Result<()> {
     for declaration in declarations.attributes.values().flatten() {
         let Some(default) = declaration.default.as_deref() else {
             continue;
@@ -2702,9 +2715,11 @@ fn validate_attribute_default_entities(declarations: &InternalEntityDeclarations
             if !name.starts_with('#')
                 && !matches!(name, "amp" | "apos" | "gt" | "lt" | "quot")
                 && !declarations.general.contains_key(name)
+                && require_declared
             {
-                // XML 1.0 section 4.1 applies Entity Declared even when a default is unused.
-                // https://www.w3.org/TR/xml/#wf-entdeclared
+                // XML 1.0 Fifth Edition section 4.1 applies Entity Declared to unused defaults,
+                // subject to its external-subset exception for non-validating processors.
+                // https://www.w3.org/TR/2008/REC-xml-20081126/#wf-entdeclared
                 return Err(Error::Xml(format!(
                     "ATTLIST default references undeclared entity `&{name};`"
                 )));
@@ -5549,6 +5564,26 @@ mod parser_boundary_tests {
             None,
         )
         .expect("a forward-resolved default entity remains valid");
+    }
+
+    #[test]
+    fn external_subset_may_declare_unused_attribute_default_entities() {
+        // XML 1.0 Fifth Edition section 4.1 does not require a non-validating processor to read
+        // the external subset unless standalone="yes"; an undeclared reference may therefore be
+        // supplied externally: https://www.w3.org/TR/2008/REC-xml-20081126/#wf-entdeclared
+        Document::parse_iterative(
+            r#"<!DOCTYPE r SYSTEM "memory:external.dtd" [<!ATTLIST unused value CDATA "&external;">]><r/>"#,
+            None,
+        )
+        .expect("a non-standalone document may rely on an external entity declaration");
+
+        for xml in [
+            r#"<!DOCTYPE r [<!ATTLIST unused value CDATA "&external;">]><r/>"#,
+            r#"<?xml version="1.0" standalone="yes"?><!DOCTYPE r SYSTEM "memory:external.dtd" [<!ATTLIST unused value CDATA "&external;">]><r/>"#,
+        ] {
+            Document::parse_iterative(xml, None)
+                .expect_err("the entity declaration is required without the external exception");
+        }
     }
 
     #[test]
