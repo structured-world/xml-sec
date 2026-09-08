@@ -1,4 +1,4 @@
-use crate::lexical::{is_ncname_char, is_ncname_start};
+use crate::lexical::{is_ncname_char, is_ncname_start, is_xml_whitespace, trim_xml_whitespace};
 
 pub(crate) struct FunctionCall {
     pub start: usize,
@@ -97,7 +97,7 @@ pub(crate) fn innermost_namespaced_call(
             continue;
         }
         let mut open = cursor;
-        while open < source.len() && source[open..].chars().next().is_some_and(is_xpath_space) {
+        while open < source.len() && source[open..].chars().next().is_some_and(is_xml_whitespace) {
             open += source[open..].chars().next()?.len_utf8();
         }
         if !source[open..].starts_with('(') {
@@ -178,7 +178,12 @@ pub(crate) fn has_unprefixed_function_call(source: &str, name: &str) -> bool {
         if qualified || &source[start..cursor] != name {
             continue;
         }
-        while cursor < source.len() && source[cursor..].chars().next().is_some_and(is_xpath_space) {
+        while cursor < source.len()
+            && source[cursor..]
+                .chars()
+                .next()
+                .is_some_and(is_xml_whitespace)
+        {
             cursor += source[cursor..]
                 .chars()
                 .next()
@@ -247,7 +252,7 @@ fn scan_unprefixed_function_calls(
             continue;
         }
         let mut open = cursor;
-        while open < source.len() && source[open..].chars().next().is_some_and(is_xpath_space) {
+        while open < source.len() && source[open..].chars().next().is_some_and(is_xml_whitespace) {
             open += source[open..]
                 .chars()
                 .next()
@@ -308,12 +313,8 @@ fn lexical_name_end(source: &str, start: usize) -> Option<(usize, bool)> {
     Some((cursor, qualified))
 }
 
-fn is_xpath_space(character: char) -> bool {
-    matches!(character, ' ' | '\t' | '\r' | '\n')
-}
-
 fn split_function_arguments(source: &str) -> Vec<String> {
-    if source.trim_matches(is_xpath_space).is_empty() {
+    if trim_xml_whitespace(source).is_empty() {
         return Vec::new();
     }
     let mut arguments = Vec::new();
@@ -332,17 +333,13 @@ fn split_function_arguments(source: &str) -> Vec<String> {
             '(' | '[' => depth += 1,
             ')' | ']' => depth = depth.saturating_sub(1),
             ',' if depth == 0 => {
-                arguments.push(
-                    source[start..offset]
-                        .trim_matches(is_xpath_space)
-                        .to_owned(),
-                );
+                arguments.push(trim_xml_whitespace(&source[start..offset]).to_owned());
                 start = offset + 1;
             }
             _ => {}
         }
     }
-    arguments.push(source[start..].trim_matches(is_xpath_space).to_owned());
+    arguments.push(trim_xml_whitespace(&source[start..]).to_owned());
     arguments
 }
 

@@ -17,7 +17,9 @@ use crate::compiler::{
     DecimalFormat, Expression, KeyDeclaration, NameTest, Pattern, normalize_xpath_for_sxd,
 };
 use crate::expression::innermost_namespaced_call;
-use crate::lexical::{is_ncname, is_ncname_char, is_xml_whitespace};
+use crate::lexical::{
+    ValidatedXPointerFragment, is_ncname, is_ncname_char, is_xml_whitespace, trim_xml_whitespace,
+};
 use crate::model::parser_workspace_bytes;
 use crate::resolver::decode_resource;
 use crate::runtime::{SourceProcessing, apply_whitespace_rules, expanded_name_owned_bytes};
@@ -984,7 +986,7 @@ impl Evaluator {
             let outcome = (|| {
                 let (prepared_expression, augmented) = prepared.parts();
                 let value = if let Some(name) = variable_reference_name(
-                    prepared_expression.source.trim(),
+                    trim_xml_whitespace(&prepared_expression.source),
                     &prepared_expression.namespaces,
                 ) && let Some(Value::StoredExpression(source)) = augmented.get(&name)
                 {
@@ -1398,7 +1400,7 @@ impl Evaluator {
                             "exsl:node-set() requires one argument".into(),
                         ));
                     }
-                    let argument = call.arguments[0].trim();
+                    let argument = trim_xml_whitespace(&call.arguments[0]);
                     if let Some(name) = variable_reference_name(argument, &expression.namespaces)
                         && let Some(Value::ResultTreeFragment(fragment)) = augmented.get(&name)
                     {
@@ -1437,7 +1439,7 @@ impl Evaluator {
                             "exsl:object-type() requires one argument".into(),
                         ));
                     }
-                    let argument = call.arguments[0].trim();
+                    let argument = trim_xml_whitespace(&call.arguments[0]);
                     let declared_name = variable_reference_name(argument, &expression.namespaces);
                     let declared = declared_name.as_ref().and_then(|name| augmented.get(name));
                     let object_type = if declared_name.as_ref().is_some_and(|name| {
@@ -1688,9 +1690,10 @@ impl Evaluator {
                     if call.arguments.len() != 1 {
                         return Err(Error::Dynamic("saxon:eval() requires one argument".into()));
                     }
-                    let Some(name) =
-                        variable_reference_name(call.arguments[0].trim(), &expression.namespaces)
-                    else {
+                    let Some(name) = variable_reference_name(
+                        trim_xml_whitespace(&call.arguments[0]),
+                        &expression.namespaces,
+                    ) else {
                         return Err(Error::Dynamic(
                             "saxon:eval() requires a stored expression".into(),
                         ));
@@ -2476,7 +2479,7 @@ impl Evaluator {
         variables: &HashMap<ExpandedName, Value>,
         meter: &mut Meter,
     ) -> Result<bool> {
-        let source = pattern.source.trim();
+        let source = trim_xml_whitespace(&pattern.source);
         if source == "/" {
             return Ok(self
                 .source
@@ -2488,7 +2491,7 @@ impl Evaluator {
             .logical_root_for(node)
             .ok_or_else(|| Error::Dynamic("template candidate has no logical document".into()))?;
         for branch in split_pattern_branches(source) {
-            let branch = branch.trim();
+            let branch = trim_xml_whitespace(branch);
             if let Some(matches) =
                 self.matches_simple_node_pattern(branch, &pattern.namespaces, node)?
             {
@@ -2565,7 +2568,7 @@ impl Evaluator {
         node: &SourceNode,
     ) -> Result<bool> {
         let mut saw_definitive_branch = false;
-        for branch in split_pattern_branches(pattern.source.trim()) {
+        for branch in split_pattern_branches(trim_xml_whitespace(&pattern.source)) {
             let terminal = terminal_pattern_node_test(branch);
             if terminal.is_empty() {
                 return Ok(false);
@@ -2625,9 +2628,9 @@ impl Evaluator {
             let (lexical, predicate) = value.split_once("[@")?;
             (!predicate.contains(['[', ']'])).then_some((lexical, predicate))
         }) && let Some((attribute_name, expected)) = predicate.split_once('=')
-            && let attribute_name = attribute_name.trim()
+            && let attribute_name = trim_xml_whitespace(attribute_name)
             && is_ncname(attribute_name)
-            && let Some(expected) = quoted_pattern_literal(expected.trim())
+            && let Some(expected) = quoted_pattern_literal(trim_xml_whitespace(expected))
         {
             let NodeKind::Element {
                 name, attributes, ..
@@ -2841,7 +2844,7 @@ impl Evaluator {
         node: &SourceNode,
         meter: &mut Meter,
     ) -> Result<Option<(Vec<SourceNode>, usize)>> {
-        let source = expression.source.trim();
+        let source = trim_xml_whitespace(&expression.source);
         if source.contains('|') && source != "*|text()" {
             return Ok(None);
         }
@@ -3343,7 +3346,7 @@ fn import_stylesheet_document(
 }
 
 fn terminal_pattern_node_test(branch: &str) -> &str {
-    let branch = branch.trim();
+    let branch = trim_xml_whitespace(branch);
     let mut quote = None;
     let mut predicate_depth = 0usize;
     let mut parenthesis_depth = 0usize;
@@ -3374,7 +3377,7 @@ fn terminal_pattern_node_test(branch: &str) -> &str {
             _ => {}
         }
     }
-    branch[terminal_start..terminal_end].trim()
+    trim_xml_whitespace(&branch[terminal_start..terminal_end])
 }
 
 fn simple_absolute_element_pattern_path(pattern: &str) -> Option<&str> {
@@ -4452,64 +4455,19 @@ fn decode_document_fragment<'a>(
     fragment: &'a str,
     meter: &mut Meter,
 ) -> Result<(Cow<'a, str>, usize)> {
-    if !fragment.as_bytes().contains(&b'%') {
-        return Ok((Cow::Borrowed(fragment), 0));
-    }
-
-    let bytes = fragment.as_bytes();
-    let mut cursor = 0usize;
-    let mut decoded_len = 0usize;
-    while cursor < bytes.len() {
-        if bytes[cursor] == b'%' {
-            let encoded = bytes.get(cursor + 1..cursor + 3).ok_or_else(|| {
-                Error::Unsupported("document fragment has a truncated percent escape".into())
-            })?;
-            if !encoded.iter().all(u8::is_ascii_hexdigit) {
-                return Err(Error::Unsupported(
-                    "document fragment has an invalid percent escape".into(),
-                ));
-            }
-            cursor += 3;
-        } else {
-            cursor += 1;
-        }
-        decoded_len = decoded_len.checked_add(1).ok_or_else(|| {
-            Error::Unsupported("document fragment decoded length overflow".into())
-        })?;
-    }
+    let fragment = ValidatedXPointerFragment::new(fragment)?;
+    let Some(decoded_len) = fragment.decoded_len() else {
+        return Ok((Cow::Borrowed(fragment.source()), 0));
+    };
 
     meter.charge(BudgetKind::OwnedBytes, decoded_len)?;
     let mut decoded = Vec::with_capacity(decoded_len);
-    let mut cursor = 0usize;
-    while cursor < bytes.len() {
-        if bytes[cursor] == b'%' {
-            let high = hex_value(bytes[cursor + 1]);
-            let low = hex_value(bytes[cursor + 2]);
-            decoded.push((high << 4) | low);
-            cursor += 3;
-        } else {
-            decoded.push(bytes[cursor]);
-            cursor += 1;
-        }
-    }
-    // XPointer Framework appendix B encodes pointer characters as UTF-8 octets;
-    // RFC 3986 section 2.1 defines each percent triplet as one encoded octet.
-    // https://www.w3.org/TR/xptr-framework/#escaping
-    // https://www.rfc-editor.org/rfc/rfc3986#section-2.1
+    fragment.write_decoded_bytes(&mut decoded);
     let decoded = String::from_utf8(decoded).map_err(|_| {
         meter.release_owned_bytes(decoded_len);
-        Error::Unsupported("document fragment percent escapes are not valid UTF-8".into())
+        Error::Unsupported("validated URI fragment became invalid UTF-8".into())
     })?;
     Ok((Cow::Owned(decoded), decoded_len))
-}
-
-fn hex_value(byte: u8) -> u8 {
-    match byte {
-        b'0'..=b'9' => byte - b'0',
-        b'a'..=b'f' => byte - b'a' + 10,
-        b'A'..=b'F' => byte - b'A' + 10,
-        _ => unreachable!("percent escape was validated before decoding"),
-    }
 }
 
 fn xinclude_pending_bytes(node_count: usize) -> usize {
@@ -5612,7 +5570,7 @@ enum ExtensionCallKind {
 }
 
 fn variable_reference_name(source: &str, namespaces: &[(String, String)]) -> Option<ExpandedName> {
-    let lexical = source.trim().strip_prefix('$')?;
+    let lexical = trim_xml_whitespace(source).strip_prefix('$')?;
     if let Some((prefix, local)) = lexical.split_once(':') {
         let namespace = namespaces
             .iter()
@@ -7724,7 +7682,7 @@ fn hide_projection_elements_from_axes(source: &str) -> std::borrow::Cow<'_, str>
         if let Some(axis) = axis
             && let Some(end) = xpath_axis_node_test_end(source, cursor + axis.len() + 2)
         {
-            let node_test = source[cursor + axis.len() + 2..end].trim();
+            let node_test = trim_xml_whitespace(&source[cursor + axis.len() + 2..end]);
             output.push_str(&source[cursor..end]);
             // The package root and its `documents` container are implementation nodes.
             // A per-document wrapper represents the XPath root node and remains visible only
@@ -7807,13 +7765,13 @@ fn xpath_axis_node_test_end(source: &str, mut cursor: usize) -> Option<usize> {
 fn xpath_test_matches_root(node_test: &str) -> bool {
     let Some(arguments) = node_test
         .strip_prefix("node")
-        .map(str::trim_start)
+        .map(|value| value.trim_start_matches(is_xml_whitespace))
         .and_then(|value| value.strip_prefix('('))
         .and_then(|value| value.strip_suffix(')'))
     else {
         return false;
     };
-    arguments.trim().is_empty()
+    trim_xml_whitespace(arguments).is_empty()
 }
 
 struct FunctionAvailable {
@@ -8762,6 +8720,18 @@ impl function::Function for CurrentNode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn variable_references_preserve_non_xpath_whitespace() {
+        // XPath 1.0 production [1] limits expression whitespace to XML S. A host-language trim
+        // must not turn NBSP-prefixed input into a bound variable reference.
+        // https://www.w3.org/TR/1999/REC-xpath-19991116/#NT-ExprWhitespace
+        assert_eq!(variable_reference_name("\u{a0}$value", &[]), None);
+        assert_eq!(
+            variable_reference_name(" \t\r\n$value \t\r\n", &[]),
+            Some(ExpandedName::new(None::<String>, "value"))
+        );
+    }
+
     #[test]
     fn string_consumers_gate_nodeset_work_before_allocation() {
         // All argument consumers must reject traversal before attempting string allocation.

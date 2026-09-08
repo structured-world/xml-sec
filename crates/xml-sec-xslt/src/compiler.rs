@@ -6,8 +6,8 @@ use std::sync::{Arc, Weak};
 
 use crate::budget::{COMPILE_RECURSION_DEPTH_CEILING, ensure};
 use crate::lexical::{
-    is_ncname, is_ncname_char, is_ncname_start, is_xml_whitespace, strip_xpath_attribute_axis,
-    unicode_decimal_value, xpath_string_literal,
+    ValidatedXPointerFragment, is_ncname, is_ncname_char, is_ncname_start, is_xml_whitespace,
+    strip_xpath_attribute_axis, trim_xml_whitespace, unicode_decimal_value, xpath_string_literal,
 };
 use crate::model::{normalized_xml_id, parser_workspace_bytes, prepare_xml_frontend_bounded};
 use crate::resolver::decode_resource;
@@ -1515,7 +1515,7 @@ fn strip_id_key_pattern<'a>(
 }
 
 fn validate_pattern_steps(source: &str) -> Option<()> {
-    if source.trim().is_empty() {
+    if trim_xml_whitespace(source).is_empty() {
         return None;
     }
     let mut start = 0usize;
@@ -1537,7 +1537,7 @@ fn validate_pattern_steps(source: &str) -> Option<()> {
             '(' => parentheses = parentheses.checked_add(1)?,
             ')' => parentheses = parentheses.checked_sub(1)?,
             '/' if brackets == 0 && parentheses == 0 => {
-                let step = source[start..index].trim();
+                let step = trim_xml_whitespace(&source[start..index]);
                 if step.is_empty() || !valid_pattern_step(step) {
                     return None;
                 }
@@ -1554,7 +1554,7 @@ fn validate_pattern_steps(source: &str) -> Option<()> {
     if quote.is_some() || brackets != 0 || parentheses != 0 {
         return None;
     }
-    let final_step = source[start..].trim();
+    let final_step = trim_xml_whitespace(&source[start..]);
     if final_step.is_empty() || !valid_pattern_step(final_step) {
         return None;
     }
@@ -1563,11 +1563,11 @@ fn validate_pattern_steps(source: &str) -> Option<()> {
 
 fn valid_pattern_step(step: &str) -> bool {
     let predicate_start = first_top_level_character(step, '[').unwrap_or(step.len());
-    let node_test = step[..predicate_start].trim();
+    let node_test = trim_xml_whitespace(&step[..predicate_start]);
     if !valid_pattern_node_test(node_test) {
         return false;
     }
-    let mut remainder = step[predicate_start..].trim();
+    let mut remainder = trim_xml_whitespace(&step[predicate_start..]);
     while !remainder.is_empty() {
         if !remainder.starts_with('[') {
             return false;
@@ -1575,10 +1575,10 @@ fn valid_pattern_step(step: &str) -> bool {
         let Some(close) = matching_delimiter(remainder, 0, '[', ']') else {
             return false;
         };
-        if remainder[1..close].trim().is_empty() {
+        if trim_xml_whitespace(&remainder[1..close]).is_empty() {
             return false;
         }
-        remainder = remainder[close + 1..].trim();
+        remainder = trim_xml_whitespace(&remainder[close + 1..]);
     }
     true
 }
@@ -2821,39 +2821,42 @@ fn stylesheet_module_root<'nodes, 'input>(
     document: &'nodes roxmltree::Document<'input>,
     fragment: Option<&str>,
 ) -> Result<roxmltree::Node<'nodes, 'input>> {
-    let Some(fragment) = fragment else {
+    let Some(raw_fragment) = fragment else {
         return Ok(document.root_element());
     };
     // XSLT 1.0 sections 2.6 and 2.7 allow a URI reference to identify an embedded
     // xsl:stylesheet by its ID. Module selection is per reference, not per fetched resource.
     // https://www.w3.org/TR/1999/REC-xslt-19991116#embedded
+    let fragment = ValidatedXPointerFragment::new(raw_fragment)?;
     let mut selected = None;
     for node in document.descendants().filter(roxmltree::Node::is_element) {
-        let unqualified_match = node.attribute("id") == Some(fragment);
+        let unqualified_match = node
+            .attribute("id")
+            .is_some_and(|candidate| fragment.equals(candidate));
         let xml_id_match = node
             .attribute((XML_NS, "id"))
             .map(normalized_xml_id)
             .transpose()?
-            .is_some_and(|value| value == fragment);
+            .is_some_and(|value| fragment.equals(&value));
         if !unqualified_match && !xml_id_match {
             continue;
         }
         if selected.replace(node).is_some() {
             return Err(Error::Static(format!(
-                "stylesheet module fragment #{fragment} is not unique"
+                "stylesheet module fragment #{raw_fragment} is not unique"
             )));
         }
     }
     let selected = selected.ok_or_else(|| {
         Error::Static(format!(
-            "stylesheet module fragment #{fragment} does not identify an element"
+            "stylesheet module fragment #{raw_fragment} does not identify an element"
         ))
     })?;
     if selected.tag_name().namespace() != Some(XSLT_NS)
         || !matches!(selected.tag_name().name(), "stylesheet" | "transform")
     {
         return Err(Error::Static(format!(
-            "stylesheet module fragment #{fragment} does not identify xsl:stylesheet"
+            "stylesheet module fragment #{raw_fragment} does not identify xsl:stylesheet"
         )));
     }
     Ok(selected)
@@ -3299,10 +3302,6 @@ fn is_xml_whitespace_only(value: &str) -> bool {
     value
         .bytes()
         .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
-}
-
-fn trim_xml_whitespace(value: &str) -> &str {
-    value.trim_matches(|character| matches!(character, ' ' | '\t' | '\r' | '\n'))
 }
 
 fn is_ignorable_stylesheet_text(node: roxmltree::Node<'_, '_>) -> bool {
@@ -4884,6 +4883,58 @@ mod tests {
                 stylesheet
                     .named_template_index
                     .contains_key(&ExpandedName::new(None::<String>, "selected"))
+            );
+        }
+    }
+
+    #[test]
+    fn include_and_import_decode_utf8_embedded_stylesheet_fragments() {
+        // XPointer Framework appendix B encodes non-ASCII pointer characters as UTF-8 octets;
+        // module selection must compare the decoded identifier.
+        // https://www.w3.org/TR/2003/REC-xptr-framework-20030325/#escaping
+        for instruction in ["include", "import"] {
+            let principal = format!(
+                r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:{instruction} href="module.xml#caf%C3%A9"/></xsl:stylesheet>"#
+            );
+            let stylesheet = Compiler::new(
+                Arc::new(FragmentModuleResolver {
+                    module: embedded_stylesheet_module(("other", "café")),
+                }),
+                CompileBudget::new(1 << 20, 4, 16, 1 << 20),
+            )
+            .compile(&principal, Some("memory:main.xsl"))
+            .expect("percent-encoded UTF-8 fragment selects the embedded stylesheet");
+
+            assert!(
+                stylesheet
+                    .named_template_index
+                    .contains_key(&ExpandedName::new(None::<String>, "selected"))
+            );
+        }
+    }
+
+    #[test]
+    fn stylesheet_module_fragments_reject_malformed_percent_encoding() {
+        for (fragment, expected) in [
+            ("truncated%", "truncated percent escape"),
+            ("incomplete%C3%", "truncated percent escape"),
+            ("invalid%GG", "invalid percent escape"),
+            ("%FF", "not valid UTF-8"),
+        ] {
+            let principal = format!(
+                r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:include href="module.xml#{fragment}"/></xsl:stylesheet>"#
+            );
+            let error = Compiler::new(
+                Arc::new(FragmentModuleResolver {
+                    module: embedded_stylesheet_module(("other", "target")),
+                }),
+                CompileBudget::new(1 << 20, 4, 16, 1 << 20),
+            )
+            .compile(&principal, Some("memory:main.xsl"))
+            .expect_err("malformed fragment must be rejected");
+            assert!(
+                error.to_string().contains(expected),
+                "fragment {fragment:?} returned unexpected error: {error}"
             );
         }
     }

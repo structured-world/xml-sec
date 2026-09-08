@@ -46,6 +46,32 @@ fn execution_budget(source_bytes: usize) -> ExecutionBudget {
     }
 }
 
+#[test]
+fn xpath_extension_arguments_preserve_non_xpath_whitespace() {
+    // XPath 1.0 production [1] recognizes only XML S between tokens. U+00A0 must remain part of
+    // the argument and make this expression invalid rather than exposing the bound fragment.
+    // https://www.w3.org/TR/1999/REC-xpath-19991116/#NT-ExprWhitespace
+    let source = "<xsl:stylesheet version=\"1.0\" xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\" xmlns:exsl=\"http://exslt.org/common\"><xsl:template match=\"/\"><xsl:variable name=\"fragment\"><item/></xsl:variable><xsl:value-of select=\"count(exsl:node-set(\u{a0}$fragment)/*)\"/></xsl:template></xsl:stylesheet>";
+    assert!(
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(1 << 20, 16, 256, 4 << 20),
+        )
+        .compile(source, Some("memory:main.xsl"))
+        .is_err(),
+        "non-XPath whitespace must not be normalized into a valid variable reference"
+    );
+}
+
+#[test]
+fn template_patterns_preserve_non_xpath_whitespace_names() {
+    // XML 1.0 production [4] admits U+1680 in NameStartChar, while XPath pattern whitespace is
+    // limited to XML S. https://www.w3.org/TR/xml/#NT-NameStartChar
+    let stylesheet = "<xsl:stylesheet version=\"1.0\" xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\"><xsl:output method=\"text\"/><xsl:template match=\"/\"><xsl:apply-templates/></xsl:template><xsl:template match=\"\u{1680}\">matched</xsl:template></xsl:stylesheet>";
+
+    assert_eq!(execute(stylesheet, "<\u{1680}/>"), "matched");
+}
+
 fn minimum_execution_owned_bytes(
     stylesheet: &xml_sec_xslt::Stylesheet,
     initial_template: &str,
@@ -10946,7 +10972,11 @@ fn document_function_decodes_uri_escaped_shorthand_pointers() {
         .expect("escaped shorthand pointer resolves through the decoded XML ID");
     assert_eq!(result.serialized.bytes, b"selected");
 
-    for fragment in ["bad%", "%GG", "%FF"] {
+    for (fragment, expected_error) in [
+        ("bad%", "URI fragment has a truncated percent escape"),
+        ("%GG", "URI fragment has an invalid percent escape"),
+        ("%FF", "URI fragment percent escapes are not valid UTF-8"),
+    ] {
         let stylesheet = Compiler::new(
             resolver.clone(),
             CompileBudget::new(1 << 20, 8, 256, 1 << 20),
@@ -10958,8 +10988,8 @@ fn document_function_decodes_uri_escaped_shorthand_pointers() {
             Some("memory:main.xsl"),
         )
         .expect("malformed fragment remains a runtime URI error");
-        assert!(matches!(
-            stylesheet.execute(
+        let error = stylesheet
+            .execute(
                 &Document::parse("<source/>", None).expect("source parses"),
                 &Parameters::new(),
                 resolver.clone(),
@@ -10968,9 +10998,12 @@ fn document_function_decodes_uri_escaped_shorthand_pointers() {
                     initial_mode: None,
                     initial_template: None,
                 },
-            ),
-            Err(Error::Unsupported(message)) if message.contains("document fragment")
-        ));
+            )
+            .expect_err("malformed percent encoding must be rejected");
+        match error {
+            Error::Unsupported(message) => assert_eq!(message, expected_error),
+            other => panic!("unexpected malformed-fragment error: {other:?}"),
+        }
     }
 }
 

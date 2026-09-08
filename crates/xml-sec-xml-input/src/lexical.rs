@@ -458,7 +458,13 @@ impl<'a> Scanner<'a> {
 }
 
 fn validate_qualified_lexeme(source: &str) -> Result<(), Error> {
-    let source = source.trim_start_matches(['<', '/']).trim_start();
+    // XML 1.0 productions [40] and [42] place Name immediately after `<` or `</`; applying
+    // Unicode whitespace trimming here would erase legal non-ASCII NameStartChar values.
+    // https://www.w3.org/TR/xml/#NT-STag
+    let source = source
+        .strip_prefix("</")
+        .or_else(|| source.strip_prefix('<'))
+        .unwrap_or(source);
     let name = source
         .split(|character: char| {
             character.is_ascii_whitespace() || matches!(character, '=' | '/' | '>')
@@ -1058,6 +1064,19 @@ mod tests {
         for xml in ["<:root/>", "<root: />", "<a:b:c/>"] {
             assert!(Scanner::new(xml).next_event().is_err(), "accepted {xml}");
         }
+    }
+
+    #[test]
+    fn scanner_preserves_non_ascii_name_start_characters() {
+        // XML 1.0 production [4] admits U+1680 as NameStartChar; it is not markup whitespace.
+        // https://www.w3.org/TR/xml/#NT-NameStartChar
+        let Some(Event::Empty(tag)) = Scanner::new("<\u{1680}/>")
+            .next_event()
+            .expect("valid non-ASCII name scans")
+        else {
+            panic!("empty element must produce one empty-tag event");
+        };
+        assert_eq!(tag.name.local(), "\u{1680}");
     }
 
     #[test]

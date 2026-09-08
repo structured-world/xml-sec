@@ -13,7 +13,7 @@ use p521::SecretKey as P521SecretKey;
 use rand_chacha::{ChaCha8Rng, rand_core::SeedableRng as _};
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateRevocationListParams, IsCa, Issuer,
-    KeyIdMethod, KeyPair, KeyUsagePurpose, RevokedCertParams, SerialNumber, date_time_ymd,
+    KeyIdMethod, KeyPair, KeyUsagePurpose, RevokedCertParams, SerialNumber,
 };
 use rsa::{
     RsaPrivateKey, RsaPublicKey,
@@ -22,6 +22,7 @@ use rsa::{
     },
     traits::PublicKeyParts as _,
 };
+use time::{Duration, OffsetDateTime};
 use x509_parser::{extensions::ParsedExtension, prelude::FromDer as _};
 use xml_sec::{
     c14n::{C14nAlgorithm, C14nMode},
@@ -7125,14 +7126,15 @@ fn explicit_certificate_verification_reports_revoked_leaf() {
     let leaf = leaf_params
         .signed_by(&leaf_key, &issuer)
         .expect("issuer should sign leaf certificate");
+    let verification_window = OffsetDateTime::now_utc();
     let crl = CertificateRevocationListParams {
-        this_update: date_time_ymd(2026, 1, 1),
-        next_update: date_time_ymd(2027, 1, 1),
+        this_update: verification_window - Duration::days(1),
+        next_update: verification_window + Duration::days(1),
         crl_number: SerialNumber::from(1_u64),
         issuing_distribution_point: None,
         revoked_certs: vec![RevokedCertParams {
             serial_number: SerialNumber::from(42_u64),
-            revocation_time: date_time_ymd(2026, 1, 2),
+            revocation_time: verification_window - Duration::hours(1),
             reason_code: None,
             invalidity_date: None,
         }],

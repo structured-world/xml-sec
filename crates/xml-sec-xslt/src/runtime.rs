@@ -17,7 +17,9 @@ use crate::compiler::{
     AttributeSet, AttributeValueTemplate, AvtPart, Expression, ExsltFunction, Instruction,
     InstructionSequence, NameTest, NamespaceAlias, Sort, Stylesheet, Template, Variable,
 };
-use crate::lexical::{is_ncname, is_xml_whitespace, unicode_decimal_value, xpath_string_literal};
+use crate::lexical::{
+    is_ncname, is_xml_whitespace, trim_xml_whitespace, unicode_decimal_value, xpath_string_literal,
+};
 use crate::serializer::{serialize, serialize_fragment};
 use crate::xpath::{
     CustomCallSession, EXSLT_COMMON_NS, Evaluator, EvaluatorSourceOptions, PreparedEvaluatorSource,
@@ -2683,7 +2685,7 @@ impl<'a> Execution<'a> {
         {
             return Ok(value);
         }
-        match expression.source.trim() {
+        match trim_xml_whitespace(&expression.source) {
             "." => {
                 return Ok(XPathValue::NodeSet(self.evaluator.singleton(
                     node,
@@ -2810,7 +2812,7 @@ impl<'a> Execution<'a> {
         }
         let Some(remainder) = expression
             .source
-            .trim()
+            .trim_matches(is_xml_whitespace)
             .strip_prefix("count(exsl:node-set($")
         else {
             return Ok(None);
@@ -2848,7 +2850,7 @@ impl<'a> Execution<'a> {
         else {
             return Ok(None);
         };
-        let (mut targets, reserved_owned_bytes) = match target_expression.trim() {
+        let (mut targets, reserved_owned_bytes) = match trim_xml_whitespace(target_expression) {
             "name(current())" => collect_metered_strings(
                 std::slice::from_ref(node),
                 &self.evaluator,
@@ -2951,7 +2953,7 @@ impl<'a> Execution<'a> {
         expression: &Expression,
         node: &SourceNode,
     ) -> Result<Option<XPathValue>> {
-        let source = expression.source.trim();
+        let source = trim_xml_whitespace(&expression.source);
         match source {
             "self::text()" => {
                 return Ok(Some(XPathValue::NodeSet(self.evaluator.singleton(
@@ -3016,9 +3018,9 @@ impl<'a> Execution<'a> {
             && let Some((literal, remainder)) = arguments.split_once(',')
             && let Some(literal) = xpath_string_literal(literal)
             && let Some((start, length)) = remainder.split_once(',')
-            && start.trim() == "0"
+            && trim_xml_whitespace(start) == "0"
             && let Some((variable, factor)) = length
-                .trim()
+                .trim_matches(is_xml_whitespace)
                 .strip_prefix('$')
                 .and_then(|value| value.split_once('*'))
             && let Some(variable) = lexical_variable_name(variable)
@@ -3083,10 +3085,10 @@ impl<'a> Execution<'a> {
             .and_then(|value| value.strip_suffix(')'))
             && let Some((variable, offset)) = arguments.split_once(',')
             && let Some(variable) = lexical_variable_name(variable)
-            && let Some(offset) = offset.trim().strip_prefix("string-length($")
+            && let Some(offset) = trim_xml_whitespace(offset).strip_prefix("string-length($")
             && let Some((length_variable, increment)) = offset.split_once(")+")
             && let Some(length_variable) = lexical_variable_name(length_variable)
-            && let Ok(increment) = increment.trim().parse::<usize>()
+            && let Ok(increment) = trim_xml_whitespace(increment).parse::<usize>()
         {
             let value = self.variable_string(variable, &expression.namespaces, 0)?;
             let value_workspace = if matches!(&value, Cow::Owned(_)) {
@@ -3312,7 +3314,7 @@ impl<'a> Execution<'a> {
         size: usize,
     ) -> Result<(Vec<SourceNode>, usize)> {
         self.meter.charge(BudgetKind::XPathEvaluations, 1)?;
-        let nodes = match expression.source.trim() {
+        let nodes = match trim_xml_whitespace(&expression.source) {
             // These are the two hot selections used by identity transforms. They
             // are context child-axis expressions, so projecting them through the
             // general XPath engine for every source node is unnecessary work.
@@ -5479,7 +5481,7 @@ fn xpath_value_kind(value: &XPathValue) -> &'static str {
 fn direct_variable_reference(
     expression: &crate::compiler::Expression,
 ) -> Result<Option<ExpandedName>> {
-    let source = expression.source.trim();
+    let source = trim_xml_whitespace(&expression.source);
     let Some(lexical) = source.strip_prefix('$') else {
         return Ok(None);
     };
