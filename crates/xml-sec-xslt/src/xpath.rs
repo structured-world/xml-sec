@@ -14,7 +14,8 @@ use crate::budget::{
     retained_hash_storage,
 };
 use crate::compiler::{
-    DecimalFormat, Expression, KeyDeclaration, NameTest, Pattern, normalize_xpath_for_sxd,
+    DecimalFormat, Expression, KeyDeclaration, ModuleDocument, NameTest, Pattern,
+    StylesheetDocumentId, normalize_xpath_for_sxd,
 };
 use crate::expression::innermost_namespaced_call;
 use crate::lexical::{
@@ -345,19 +346,25 @@ fn clear_pattern_cache(
 struct DocumentRequest {
     href: String,
     base_uri: Option<String>,
-    empty_document: Option<usize>,
+    empty_document: Option<EmptyDocumentId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum EmptyDocumentId {
+    Logical(usize),
+    Stylesheet(StylesheetDocumentId),
 }
 
 impl DocumentRequest {
     fn relative_to(
         href: String,
         base_uri: Option<String>,
-        logical_document: Option<usize>,
+        empty_document: Option<EmptyDocumentId>,
     ) -> Self {
         let empty_resource = href
             .find('#')
             .map_or(href.is_empty(), |fragment| fragment == 0);
-        let empty_document = empty_resource.then_some(logical_document).flatten();
+        let empty_document = empty_resource.then_some(empty_document).flatten();
         Self {
             href,
             // XSLT 1.0 section 12.1 identifies an empty reference by the logical document that
@@ -736,8 +743,8 @@ impl Evaluator {
     pub(crate) fn new<R: Resolver + 'static>(
         prepared_source: PreparedEvaluatorSource,
         principal_stylesheet: &Document,
-        principal_base_uri: Option<&str>,
-        module_documents: &[(String, Document)],
+        _principal_base_uri: Option<&str>,
+        module_documents: &[ModuleDocument],
         resolver: Arc<R>,
         meter: &mut Meter,
         source_options: EvaluatorSourceOptions,
@@ -759,14 +766,14 @@ impl Evaluator {
             meter,
         )?;
         let mut module_roots = Vec::with_capacity(module_documents.len());
-        for (uri, document) in module_documents {
+        for module in module_documents {
             let root = import_stylesheet_document(
                 &mut source,
-                document,
+                &module.document,
                 &source_options.whitespace,
                 meter,
             )?;
-            module_roots.push((uri.clone(), root));
+            module_roots.push((module.id, root));
         }
         let package = project_semantic_document(&source, meter)?;
         let maps = NodeMaps::new(&source, meter)?;
@@ -785,8 +792,8 @@ impl Evaluator {
         let node_base_uris = Rc::new(RefCell::new(node_base_uris));
         let principal_request = DocumentRequest {
             href: String::new(),
-            base_uri: clone_request_base_uri(principal_base_uri, meter)?,
-            empty_document: None,
+            base_uri: None,
+            empty_document: Some(EmptyDocumentId::Stylesheet(StylesheetDocumentId::PRINCIPAL)),
         };
         let mut document_root_entries = HashMap::new();
         let mut documents = HashMap::new();
@@ -804,7 +811,11 @@ impl Evaluator {
         let source_request = DocumentRequest::relative_to(
             String::new(),
             source_base_uri(&source, &SourceNode::Node(source_root)),
-            source.logical_roots().binary_search(&source_root).ok(),
+            source
+                .logical_roots()
+                .binary_search(&source_root)
+                .ok()
+                .map(EmptyDocumentId::Logical),
         );
         seed_document_cache(
             source_request,
@@ -815,11 +826,11 @@ impl Evaluator {
             &mut document_cache_index_bytes,
             meter,
         )?;
-        for (uri, root) in module_roots {
+        for (id, root) in module_roots {
             let request = DocumentRequest {
                 href: String::new(),
-                base_uri: Some(uri),
-                empty_document: None,
+                base_uri: None,
+                empty_document: Some(EmptyDocumentId::Stylesheet(id)),
             };
             seed_document_cache(
                 request,
@@ -1283,7 +1294,7 @@ impl Evaluator {
         let empty_uri = DocumentRequest::relative_to(
             String::new(),
             source_base_uri(&self.source, &root),
-            Some(logical_document),
+            Some(EmptyDocumentId::Logical(logical_document)),
         );
         self.cache_document(empty_uri, vec![root.clone()], meter)?;
         Ok(root)
@@ -2149,6 +2160,7 @@ impl Evaluator {
             "document",
             DocumentFunction {
                 static_base_uri: expression.static_base_uri.clone(),
+                static_document: expression.stylesheet_document,
                 roots: Rc::clone(&self.document_roots),
                 pending: Rc::clone(&self.pending_document_requests),
                 node_base_uris: Rc::clone(&self.node_base_uris),
@@ -3257,11 +3269,6 @@ impl Evaluator {
     }
 }
 
-fn clone_request_base_uri(value: Option<&str>, meter: &Meter) -> Result<Option<String>> {
-    meter.check_additional(BudgetKind::OwnedBytes, value.map_or(0, str::len))?;
-    Ok(value.map(str::to_owned))
-}
-
 fn xpath_adapter_workspace_upper_bound(expression: &Expression) -> usize {
     let source = expression.source.as_str();
     let source_bytes = source.len();
@@ -3345,12 +3352,12 @@ fn hash_table_entry_bytes<T>() -> usize {
 
 fn reserve_stylesheet_imports(
     principal_stylesheet: &Document,
-    module_documents: &[(String, Document)],
+    module_documents: &[ModuleDocument],
     meter: &mut Meter,
 ) -> Result<()> {
     let clone_bytes = module_documents.iter().fold(
         principal_stylesheet.estimated_clone_bytes(),
-        |total, (_, document)| total.saturating_add(document.estimated_clone_bytes()),
+        |total, module| total.saturating_add(module.document.estimated_clone_bytes()),
     );
     meter.charge(BudgetKind::OwnedBytes, clone_bytes)
 }
@@ -6568,6 +6575,7 @@ struct DocumentFunction {
     pending: Rc<RefCell<PendingDocumentRequests>>,
     node_base_uris: Rc<RefCell<HashMap<Vec<usize>, Option<String>>>>,
     static_base_uri: Option<Arc<str>>,
+    static_document: StylesheetDocumentId,
 }
 
 enum DocumentBaseSelection {
@@ -7581,7 +7589,7 @@ impl function::Function for DocumentFunction {
                     process(DocumentRequest::relative_to(
                         href,
                         base_uri,
-                        logical_document,
+                        logical_document.map(EmptyDocumentId::Logical),
                     ))?;
                 }
             }
@@ -7592,11 +7600,11 @@ impl function::Function for DocumentFunction {
                         logical_document,
                     } => (
                         clone_metered_optional_string(context, base_uri.as_deref())?,
-                        *logical_document,
+                        logical_document.map(EmptyDocumentId::Logical),
                     ),
                     DocumentBaseSelection::Omitted => (
                         clone_metered_optional_string(context, self.static_base_uri.as_deref())?,
-                        None,
+                        Some(EmptyDocumentId::Stylesheet(self.static_document)),
                     ),
                 };
                 let href_len = value.string_len();
@@ -8918,34 +8926,28 @@ mod tests {
 
     #[test]
     fn request_base_uri_is_rejected_before_clone_when_budget_is_exhausted() {
-        let meter = Meter::new(
-            ExecutionBudget {
-                source_bytes: 0,
-                external_documents: 0,
-                recursion_depth: 0,
-                xpath_evaluations: 0,
-                xpath_operations: 0,
-                extension_operations: 0,
-                pattern_evaluations: 0,
-                template_applications: 0,
-                sort_comparisons: 0,
-                key_entries: 0,
-                result_nodes: 0,
-                serialized_bytes: 0,
-                messages: 0,
-                owned_bytes: 0,
-            },
-            0,
-        )
-        .expect("empty meter initializes");
+        let package = Package::new();
+        let document = package.as_document();
+        let root = document.create_element("root");
+        document.root().append_child(root);
+        let mut context = Context::new();
+        context.set_string_allocation_limit(0);
+        let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&context, root.into());
+        let function = DocumentFunction {
+            roots: Rc::new(RefCell::new(HashMap::new())),
+            pending: Rc::new(RefCell::new(PendingDocumentRequests::default())),
+            node_base_uris: Rc::new(RefCell::new(HashMap::new())),
+            static_base_uri: Some(Arc::from("memory:principal.xsl")),
+            static_document: StylesheetDocumentId::PRINCIPAL,
+        };
 
-        assert!(matches!(
-            clone_request_base_uri(Some("memory:principal.xsl"), &meter),
-            Err(Error::Budget {
-                kind: BudgetKind::OwnedBytes,
-                ..
-            })
-        ));
+        assert!(
+            function
+                .evaluate(&evaluation, vec![SxdValue::String(String::new())])
+                .expect_err("static base URI must cross the allocation gate")
+                .to_string()
+                .contains("allocation budget")
+        );
     }
 
     #[test]
@@ -10415,6 +10417,7 @@ mod tests {
             pending: Rc::new(RefCell::new(PendingDocumentRequests::default())),
             node_base_uris: Rc::new(RefCell::new(HashMap::new())),
             static_base_uri: None,
+            static_document: StylesheetDocumentId::PRINCIPAL,
         };
         assert!(matches!(
             document_function
@@ -10439,6 +10442,7 @@ mod tests {
             pending: Rc::new(RefCell::new(PendingDocumentRequests::default())),
             node_base_uris: Rc::new(RefCell::new(HashMap::new())),
             static_base_uri: None,
+            static_document: StylesheetDocumentId::PRINCIPAL,
         };
 
         let error = document_function
@@ -10896,10 +10900,13 @@ mod tests {
         let principal = Document::parse("<stylesheet/>", None).expect("principal parses");
         let module =
             Document::parse("<stylesheet><node/></stylesheet>", None).expect("module parses");
-        let modules = [("memory:module.xsl".to_owned(), module)];
+        let modules = [ModuleDocument {
+            id: StylesheetDocumentId(1),
+            document: module,
+        }];
         let required = principal
             .estimated_clone_bytes()
-            .saturating_add(modules[0].1.estimated_clone_bytes());
+            .saturating_add(modules[0].document.estimated_clone_bytes());
         let limits = ExecutionBudget {
             source_bytes: usize::MAX,
             external_documents: usize::MAX,
@@ -11100,6 +11107,7 @@ mod tests {
                 Some(base_uri.clone()),
             )]))),
             static_base_uri: None,
+            static_document: StylesheetDocumentId::PRINCIPAL,
         };
         let mut nodes = nodeset::Nodeset::new();
         nodes.add(base);

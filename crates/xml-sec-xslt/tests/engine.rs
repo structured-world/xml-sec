@@ -3689,6 +3689,58 @@ fn included_module_document_is_retained_for_document_empty_uri() {
 }
 
 #[test]
+fn module_document_identity_disambiguates_equal_canonical_uris() {
+    // XSLT 1.0 section 12.1 defines document('') as the stylesheet document containing the
+    // expression. A resolver's canonical URI is an address, not that document's provenance.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#document
+    struct AliasingResolver;
+
+    impl Resolver for AliasingResolver {
+        fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
+            let (identity, template, marker) = match request.uri {
+                "first.xsl" => ("first", "read-first", "first"),
+                "second.xsl" => ("second", "read-second", "second"),
+                uri => panic!("unexpected module request: {uri}"),
+            };
+            Ok(ResolvedResource {
+                canonical_uri: "memory:shared-canonical-uri.xsl".into(),
+                identity: ResourceIdentity(identity.into()),
+                bytes: format!(
+                    r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:meta="urn:metadata"><meta:marker>{marker}</meta:marker><xsl:template name="{template}"><xsl:value-of select="document('')/*/meta:marker"/></xsl:template></xsl:stylesheet>"#
+                )
+                .into_bytes(),
+                media_type: Some("application/xslt+xml".into()),
+                encoding: Some("UTF-8".into()),
+            })
+        }
+    }
+
+    let resolver = Arc::new(AliasingResolver);
+    let stylesheet = Compiler::new(
+        Arc::clone(&resolver),
+        CompileBudget::new(1 << 20, 8, 256, 4 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:include href="first.xsl"/><xsl:include href="second.xsl"/><xsl:output method="text"/><xsl:template match="/"><xsl:call-template name="read-first"/><xsl:text>|</xsl:text><xsl:call-template name="read-second"/></xsl:template></xsl:stylesheet>"#,
+        Some("memory:main.xsl"),
+    )
+    .expect("distinct module identities may share a canonical URI");
+    let result = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("each expression resolves its own stylesheet document");
+    assert_eq!(result.serialized.bytes, b"first|second");
+}
+
+#[test]
 fn principal_stylesheet_document_obeys_whitespace_rules() {
     // XSLT 1.0 sections 3.4 and 12.1 make the stylesheet tree returned by document('') a source
     // tree, so the effective strip-space rules apply before XPath can inspect it.

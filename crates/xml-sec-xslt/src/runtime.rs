@@ -379,7 +379,8 @@ struct Execution<'a> {
     // A global leaves this map before evaluation, so recursive access is detected without
     // replaying side effects or retrying a failed initializer.
     pending_globals: HashMap<ExpandedName, &'a crate::compiler::GlobalVariable>,
-    initializing_globals: Vec<ExpandedName>,
+    initializing_globals: Vec<&'a ExpandedName>,
+    initializing_globals_reserved_owned_bytes: usize,
     meter: Meter,
     messages: Vec<Message>,
     secondary_outputs: Vec<SecondaryOutput>,
@@ -690,6 +691,7 @@ impl<'a> Execution<'a> {
             scopes: vec![VariableScope::default()],
             pending_globals: HashMap::new(),
             initializing_globals: Vec::new(),
+            initializing_globals_reserved_owned_bytes: 0,
             meter,
             messages: vec![],
             secondary_outputs: vec![],
@@ -994,6 +996,11 @@ impl<'a> Execution<'a> {
         })();
         drop(order);
         self.meter.release_owned_bytes(order_reservation);
+        debug_assert!(self.initializing_globals.is_empty());
+        self.initializing_globals.clear();
+        self.meter
+            .release_owned_bytes(self.initializing_globals_reserved_owned_bytes);
+        self.initializing_globals_reserved_owned_bytes = 0;
         initialized
     }
 
@@ -1001,21 +1008,12 @@ impl<'a> Execution<'a> {
         if self.scopes[0].contains_key(name) {
             return Ok(());
         }
-        if self
-            .initializing_globals
-            .iter()
-            .any(|active| active == name)
-        {
-            let mut names = self
-                .initializing_globals
-                .iter()
-                .map(|active| active.local.as_str())
-                .collect::<Vec<_>>();
-            names.push(name.local.as_str());
-            return Err(Error::Dynamic(format!(
-                "circular global variable dependency: {}",
-                names.join(" -> ")
-            )));
+        if self.initializing_globals.contains(&name) {
+            return circular_global_dependency_error(
+                &self.initializing_globals,
+                name,
+                &mut self.meter,
+            );
         }
         let Some(global) = self.pending_globals.remove(name) else {
             return Ok(());
@@ -1024,7 +1022,12 @@ impl<'a> Execution<'a> {
             self.initializing_globals.len().saturating_add(1),
             EXECUTION_RECURSION_DEPTH_CEILING,
         )?;
-        self.initializing_globals.push(name.clone());
+        push_initializing_global(
+            &mut self.initializing_globals,
+            &global.variable.name,
+            &mut self.meter,
+            &mut self.initializing_globals_reserved_owned_bytes,
+        )?;
         let value = self.evaluate_variable(
             &global.variable,
             &SourceNode::Node(self.evaluator.source.root()),
@@ -4087,8 +4090,25 @@ impl<'a> Execution<'a> {
     ) -> Result<NodeId> {
         // XSLT 1.0 section 3.2 assigns a copied element the base URI of the xsl:copy
         // instruction that created it: https://www.w3.org/TR/1999/REC-xslt-19991116#base-uri
-        self.push_node_with_base(
-            self.parent(),
+        let parent = self.parent();
+        self.result
+            .reserve_metered_push_containers(parent, &mut self.meter)?;
+        let owned_bytes = expanded_name_owned_bytes(&name)
+            .saturating_add(prefix.as_ref().map_or(0, String::len))
+            .saturating_add(base_uri.map_or(0, str::len));
+        self.meter
+            .check_additional(BudgetKind::OwnedBytes, owned_bytes)?;
+        self.meter.check_additional(
+            BudgetKind::ResultNodes,
+            1usize.saturating_add(namespaces.len()),
+        )?;
+        self.meter.charge(BudgetKind::OwnedBytes, owned_bytes)?;
+        self.meter.charge(
+            BudgetKind::ResultNodes,
+            1usize.saturating_add(namespaces.len()),
+        )?;
+        Ok(self.result.push(
+            parent,
             NodeKind::Element {
                 name,
                 prefix,
@@ -4096,7 +4116,7 @@ impl<'a> Execution<'a> {
                 namespaces,
             },
             base_uri.map(str::to_owned),
-        )
+        ))
     }
     fn append_text(&mut self, value: &str, disable: bool) -> Result<()> {
         self.append_text_value(Cow::Borrowed(value), disable)
@@ -4225,7 +4245,7 @@ impl<'a> Execution<'a> {
                 "attribute cannot be added after result children".into(),
             ));
         }
-        let namespaces = Arc::make_mut(namespaces);
+        let namespaces = make_namespaces_mut_metered(namespaces, &mut self.meter)?;
         let generated_namespace = fixup_attribute_namespace(&mut attribute, namespaces);
         if generated_namespace.is_some() {
             self.meter.charge(BudgetKind::ResultNodes, 1)?;
@@ -4365,7 +4385,7 @@ impl<'a> Execution<'a> {
                     "namespace requires an element result".into(),
                 ));
             };
-            let namespaces = Arc::make_mut(namespaces);
+            let namespaces = make_namespaces_mut_metered(namespaces, &mut self.meter)?;
             let existing_index = namespaces
                 .iter()
                 .position(|existing| existing.prefix == namespace.prefix);
@@ -5873,6 +5893,22 @@ fn namespace_owned_bytes(namespace: &Namespace) -> usize {
         .saturating_add(namespace.uri.len())
 }
 
+fn make_namespaces_mut_metered<'a>(
+    namespaces: &'a mut Arc<Vec<Namespace>>,
+    meter: &mut Meter,
+) -> Result<&'a mut Vec<Namespace>> {
+    if Arc::strong_count(namespaces) > 1 {
+        let cloned_bytes = namespaces
+            .len()
+            .saturating_mul(std::mem::size_of::<Namespace>())
+            .saturating_add(namespaces.iter().fold(0usize, |total, namespace| {
+                total.saturating_add(namespace_owned_bytes(namespace))
+            }));
+        meter.charge(BudgetKind::OwnedBytes, cloned_bytes)?;
+    }
+    Ok(Arc::make_mut(namespaces))
+}
+
 fn node_kind_owned_bytes(kind: &NodeKind) -> usize {
     match kind {
         NodeKind::Root => 0,
@@ -6012,18 +6048,40 @@ fn metered_document_string<'a>(
     }
 }
 
+fn push_initializing_global<'a>(
+    active: &mut Vec<&'a ExpandedName>,
+    name: &'a ExpandedName,
+    meter: &mut Meter,
+    reserved_owned_bytes: &mut usize,
+) -> Result<()> {
+    reserve_temporary_vec_slot(active, meter, reserved_owned_bytes)?;
+    active.push(name);
+    Ok(())
+}
+
+fn circular_global_dependency_error(
+    active: &[&ExpandedName],
+    repeated: &ExpandedName,
+    meter: &mut Meter,
+) -> Result<()> {
+    let mut message = String::new();
+    append_metered_string(&mut message, "circular global variable dependency: ", meter)?;
+    for (index, name) in active.iter().enumerate() {
+        if index != 0 {
+            append_metered_string(&mut message, " -> ", meter)?;
+        }
+        append_metered_string(&mut message, &name.local, meter)?;
+    }
+    append_metered_string(&mut message, " -> ", meter)?;
+    append_metered_string(&mut message, &repeated.local, meter)?;
+    Err(Error::Dynamic(message))
+}
+
 fn clone_for_xsl_copy(kind: &NodeKind, meter: &Meter) -> Result<NodeKind> {
     let copied_bytes = match kind {
-        NodeKind::Element {
-            name,
-            prefix,
-            namespaces,
-            ..
-        } => expanded_name_owned_bytes(name)
-            .saturating_add(prefix.as_ref().map_or(0, String::len))
-            .saturating_add(namespaces.iter().fold(0usize, |total, namespace| {
-                total.saturating_add(namespace_owned_bytes(namespace))
-            })),
+        NodeKind::Element { name, prefix, .. } => {
+            expanded_name_owned_bytes(name).saturating_add(prefix.as_ref().map_or(0, String::len))
+        }
         kind => node_kind_owned_bytes(kind),
     };
     meter.check_additional(BudgetKind::OwnedBytes, copied_bytes)?;
@@ -6475,6 +6533,79 @@ mod tests {
             bytes < 1000,
             "hidden payload must not be reserved or copied"
         );
+    }
+
+    #[test]
+    fn xsl_copy_does_not_charge_shared_namespace_storage_twice() {
+        let kind = NodeKind::Element {
+            name: ExpandedName::new(Some("urn:element"), "item"),
+            prefix: Some("p".into()),
+            attributes: Vec::new(),
+            namespaces: Arc::new(vec![crate::Namespace {
+                prefix: Some("large".into()),
+                uri: format!("urn:{}", "x".repeat(4096)),
+            }]),
+        };
+        let unique_bytes = match &kind {
+            NodeKind::Element { name, prefix, .. } => super::expanded_name_owned_bytes(name)
+                .saturating_add(prefix.as_ref().map_or(0, String::len)),
+            _ => unreachable!(),
+        };
+
+        super::clone_for_xsl_copy(&kind, &meter(unique_bytes))
+            .expect("Arc namespace storage remains shared by xsl:copy");
+    }
+
+    #[test]
+    fn namespace_copy_on_write_crosses_budget_before_cloning() {
+        let retained = Arc::new(vec![crate::Namespace {
+            prefix: Some("p".into()),
+            uri: "urn:namespace".into(),
+        }]);
+        let required = std::mem::size_of::<crate::Namespace>()
+            + retained[0].prefix.as_deref().map_or(0, str::len)
+            + retained[0].uri.len();
+        let mut shared = Arc::clone(&retained);
+        assert!(matches!(
+            super::make_namespaces_mut_metered(&mut shared, &mut meter(required - 1)),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            })
+        ));
+        assert!(Arc::ptr_eq(&shared, &retained));
+
+        super::make_namespaces_mut_metered(&mut shared, &mut meter(required))
+            .expect("an exact COW reservation permits the namespace clone");
+        assert!(!Arc::ptr_eq(&shared, &retained));
+    }
+
+    #[test]
+    fn global_initialization_stack_and_cycle_diagnostic_are_metered() {
+        let first = ExpandedName::new(None::<String>, "first");
+        let second = ExpandedName::new(None::<String>, "second");
+        let mut active = Vec::new();
+        let mut reservation = 0;
+        assert!(matches!(
+            super::push_initializing_global(&mut active, &first, &mut meter(0), &mut reservation,),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            })
+        ));
+        assert!(
+            active.is_empty(),
+            "failed reservation cannot mutate the stack"
+        );
+
+        let active = [&first, &second];
+        assert!(matches!(
+            super::circular_global_dependency_error(&active, &first, &mut meter(1)),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            })
+        ));
     }
 
     fn meter(owned_bytes: usize) -> Meter {

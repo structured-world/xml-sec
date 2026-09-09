@@ -319,36 +319,43 @@ impl<R: Resolver> Compiler<R> {
                 return Err(error);
             }
         };
-        let (resource, new_identity) =
+        let (resource, document_id, new_identity) =
             if let Some(previous) = state.resolved_identities.get(&resolved.identity) {
-                if previous.as_ref() != &resolved {
+                if previous.resource.as_ref() != &resolved {
                     state.release_owned(request_owned_bytes);
                     return Err(Error::StaleResource {
                         identity: resolved.identity,
                     });
                 }
-                (Arc::clone(previous), false)
+                (Arc::clone(&previous.resource), previous.document_id, false)
             } else {
                 state.check_stylesheet(resolved.bytes.len())?;
                 state.charge_owned(new_resolved_identity_retained_bytes(&resolved))?;
-                (Arc::new(resolved), true)
+                let document_id = StylesheetDocumentId(state.module_documents.len() + 1);
+                (Arc::new(resolved), document_id, true)
             };
-        if !state.module_documents.contains_key(&resource.canonical_uri) {
-            state.charge_owned(module_document_cache_entry_bytes(&resource.canonical_uri))?;
+        if new_identity {
+            state.charge_owned(module_document_cache_entry_bytes())?;
             let source = resource_source(&resource, state)?;
             let document = parse_semantic_document_metered(
                 source.as_str(),
                 Some(&resource.canonical_uri),
                 state,
             )?;
-            state
-                .module_documents
-                .insert(resource.canonical_uri.clone(), document);
-        }
-        if new_identity {
-            state
-                .resolved_identities
-                .insert(resource.identity.clone(), Arc::clone(&resource));
+            state.module_documents.insert(
+                document_id,
+                ModuleDocument {
+                    id: document_id,
+                    document,
+                },
+            );
+            state.resolved_identities.insert(
+                resource.identity.clone(),
+                ResolvedIdentity {
+                    resource: Arc::clone(&resource),
+                    document_id,
+                },
+            );
             state.resources.push(resource.identity.clone());
         }
         state
@@ -424,6 +431,7 @@ impl<R: Resolver> Compiler<R> {
                     depth,
                     state.budget.recursion_depth,
                     base_uri,
+                    state.current_stylesheet_document(),
                     state.workspace(),
                 )?,
             )?]
@@ -448,6 +456,7 @@ impl<R: Resolver> Compiler<R> {
                 depth,
                 state.budget.recursion_depth,
                 base_uri,
+                state.current_stylesheet_document(),
                 state.workspace(),
             )?
             .inside_function();
@@ -533,6 +542,7 @@ impl<R: Resolver> Compiler<R> {
                     depth,
                     state.budget.recursion_depth,
                     base_uri,
+                    state.current_stylesheet_document(),
                     state.workspace(),
                 )?;
                 let mut children = node.children().peekable();
@@ -589,6 +599,7 @@ impl<R: Resolver> Compiler<R> {
                         depth,
                         state.budget.recursion_depth,
                         base_uri,
+                        state.current_stylesheet_document(),
                         state.workspace(),
                     )?,
                 )?;
@@ -653,6 +664,7 @@ impl<R: Resolver> Compiler<R> {
                         use_expression,
                         node,
                         base_uri,
+                        state.current_stylesheet_document(),
                         state.budget.recursion_depth,
                         state.workspace(),
                     )?,
@@ -691,6 +703,7 @@ impl<R: Resolver> Compiler<R> {
                         depth,
                         state.budget.recursion_depth,
                         base_uri,
+                        state.current_stylesheet_document(),
                         state.workspace(),
                     )?,
                     precedence,
@@ -759,7 +772,7 @@ fn validate_standard_stylesheet_content(root: roxmltree::Node<'_, '_>) -> Result
 pub struct Stylesheet {
     pub(crate) principal_document: Document,
     pub(crate) principal_base_uri: Option<String>,
-    pub(crate) module_documents: Arc<[(String, Document)]>,
+    pub(crate) module_documents: Arc<[ModuleDocument]>,
     pub(crate) templates: Arc<[Template]>,
     pub(crate) named_template_index: Arc<HashMap<ExpandedName, usize>>,
     pub(crate) globals: Arc<[GlobalVariable]>,
@@ -775,6 +788,19 @@ pub struct Stylesheet {
     pub(crate) functions: Arc<[ExsltFunction]>,
     pub(crate) function_names: Arc<HashSet<ExpandedName>>,
     pub(crate) resource_identities: Arc<[ResourceIdentity]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct StylesheetDocumentId(pub(crate) usize);
+
+impl StylesheetDocumentId {
+    pub(crate) const PRINCIPAL: Self = Self(0);
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ModuleDocument {
+    pub(crate) id: StylesheetDocumentId,
+    pub(crate) document: Document,
 }
 
 impl Stylesheet {
@@ -829,6 +855,8 @@ pub(crate) struct Expression {
     pub variable_references: Arc<[ExpandedName]>,
     /// Static base of the stylesheet module that owns this expression.
     pub static_base_uri: Option<Arc<str>>,
+    /// Stable identity of the stylesheet document containing this expression.
+    pub(crate) stylesheet_document: StylesheetDocumentId,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct Pattern {
@@ -1027,6 +1055,7 @@ impl Expression {
         source: &str,
         node: roxmltree::Node<'_, '_>,
         static_base_uri: Option<&str>,
+        stylesheet_document: StylesheetDocumentId,
         max_depth: usize,
         workspace: CompileWorkspace<'_>,
     ) -> Result<Self> {
@@ -1036,6 +1065,7 @@ impl Expression {
             node,
             Arc::new(namespaces(node)),
             static_base_uri,
+            stylesheet_document,
             max_depth,
             workspace,
         )
@@ -1046,6 +1076,7 @@ impl Expression {
         node: roxmltree::Node<'_, '_>,
         namespaces: Arc<Vec<(String, String)>>,
         static_base_uri: Option<&str>,
+        stylesheet_document: StylesheetDocumentId,
         max_depth: usize,
         workspace: CompileWorkspace<'_>,
     ) -> Result<Self> {
@@ -1054,6 +1085,7 @@ impl Expression {
             source,
             namespaces,
             static_base_uri,
+            stylesheet_document,
             max_depth,
             workspace,
             workspace.pending_source(source, node),
@@ -1064,6 +1096,7 @@ impl Expression {
         source: &str,
         namespaces: Arc<Vec<(String, String)>>,
         static_base_uri: Option<Arc<str>>,
+        stylesheet_document: StylesheetDocumentId,
         max_depth: usize,
         workspace: CompileWorkspace<'_>,
         validation_workspace: CompileWorkspace<'_>,
@@ -1084,6 +1117,7 @@ impl Expression {
             source: source.to_owned(),
             namespaces,
             static_base_uri,
+            stylesheet_document,
             variable_references,
         })
     }
@@ -1093,17 +1127,24 @@ impl Expression {
             source.into(),
             self.namespaces.clone(),
             self.static_base_uri.clone(),
+            self.stylesheet_document,
         )
     }
 
     pub(crate) fn generated(source: impl Into<String>, namespaces: Vec<(String, String)>) -> Self {
-        Self::from_parts(source.into(), Arc::new(namespaces), None)
+        Self::from_parts(
+            source.into(),
+            Arc::new(namespaces),
+            None,
+            StylesheetDocumentId::PRINCIPAL,
+        )
     }
 
     fn from_parts(
         source: String,
         namespaces: Arc<Vec<(String, String)>>,
         static_base_uri: Option<Arc<str>>,
+        stylesheet_document: StylesheetDocumentId,
     ) -> Self {
         let variable_references = referenced_variables(&source, &namespaces).into();
         Self {
@@ -1111,6 +1152,7 @@ impl Expression {
             namespaces,
             variable_references,
             static_base_uri,
+            stylesheet_document,
         }
     }
 }
@@ -1843,9 +1885,9 @@ struct CompileState {
     resources: Vec<ResourceIdentity>,
     active_resources: Vec<ActiveResource>,
     resolved_requests: HashMap<ResolveRequest, Arc<ResolvedResource>>,
-    resolved_identities: HashMap<ResourceIdentity, Arc<ResolvedResource>>,
+    resolved_identities: HashMap<ResourceIdentity, ResolvedIdentity>,
     module_sources: HashMap<ResourceIdentity, Arc<String>>,
-    module_documents: HashMap<String, Document>,
+    module_documents: HashMap<StylesheetDocumentId, ModuleDocument>,
     imported_modules: usize,
     stylesheet_bytes: usize,
     owned_bytes: usize,
@@ -1897,6 +1939,14 @@ impl CompileState {
     fn next_order(&mut self) -> usize {
         self.order += 1;
         self.order
+    }
+
+    fn current_stylesheet_document(&self) -> StylesheetDocumentId {
+        self.active_resources
+            .last()
+            .map_or(StylesheetDocumentId::PRINCIPAL, |active| {
+                self.resolved_identities[&active.resource.identity].document_id
+            })
     }
     fn charge_owned(&mut self, amount: usize) -> Result<()> {
         let workspace = self.workspace().reserve(amount)?;
@@ -2140,7 +2190,11 @@ impl CompileState {
         Ok(Stylesheet {
             principal_document: Document::empty(None),
             principal_base_uri: None,
-            module_documents: self.module_documents.into_iter().collect::<Vec<_>>().into(),
+            module_documents: self
+                .module_documents
+                .into_values()
+                .collect::<Vec<_>>()
+                .into(),
             templates: self.templates.into(),
             named_template_index: Arc::new(named_template_index),
             globals: self.globals.into(),
@@ -2607,6 +2661,11 @@ struct ResolvedModule<'input> {
     fragment: Option<&'input str>,
 }
 
+struct ResolvedIdentity {
+    resource: Arc<ResolvedResource>,
+    document_id: StylesheetDocumentId,
+}
+
 fn hash_entry_storage<K, V>() -> usize {
     // Hash tables retain control bytes and spare buckets. Two entry widths conservatively model
     // the standard maximum load without depending on the allocator implementation.
@@ -2632,7 +2691,7 @@ fn resolved_resource_owned_bytes(resource: &ResolvedResource) -> usize {
 fn new_resolved_identity_retained_bytes(resource: &ResolvedResource) -> usize {
     resolved_resource_owned_bytes(resource)
         .saturating_add(
-            hash_entry_storage::<ResourceIdentity, Arc<ResolvedResource>>()
+            hash_entry_storage::<ResourceIdentity, ResolvedIdentity>()
                 .saturating_add(resource.identity.0.len()),
         )
         .saturating_add(
@@ -2643,8 +2702,8 @@ fn new_resolved_identity_retained_bytes(resource: &ResolvedResource) -> usize {
         .saturating_add(std::mem::size_of::<Arc<ResolvedResource>>().saturating_mul(2))
 }
 
-fn module_document_cache_entry_bytes(canonical_uri: &str) -> usize {
-    hash_entry_storage::<String, Document>().saturating_add(canonical_uri.len())
+fn module_document_cache_entry_bytes() -> usize {
+    hash_entry_storage::<StylesheetDocumentId, ModuleDocument>()
 }
 
 fn module_source_cache_entry_bytes(identity: &ResourceIdentity) -> usize {
@@ -2662,6 +2721,7 @@ struct CompileContext<'a> {
     workspace: CompileWorkspace<'a>,
     inside_function: bool,
     static_base_uri: Option<Arc<str>>,
+    stylesheet_document: StylesheetDocumentId,
     namespace_snapshot: NamespaceSnapshot,
     base_uri_snapshot: BaseUriSnapshot,
     local_bindings: LocalBindingIndex,
@@ -2677,6 +2737,7 @@ impl<'a> CompileContext<'a> {
         depth: usize,
         max_depth: usize,
         static_base_uri: Option<&str>,
+        stylesheet_document: StylesheetDocumentId,
         workspace: CompileWorkspace<'a>,
     ) -> Result<Self> {
         ensure(BudgetKind::RecursionDepth, max_depth, depth)?;
@@ -2687,6 +2748,7 @@ impl<'a> CompileContext<'a> {
             workspace,
             inside_function: false,
             static_base_uri: static_base_uri.map(Arc::from),
+            stylesheet_document,
             namespace_snapshot: Rc::new(RefCell::new(None)),
             base_uri_snapshot: Rc::new(RefCell::new(None)),
             local_bindings: Rc::new(RefCell::new(HashMap::new())),
@@ -2736,6 +2798,7 @@ impl<'a> CompileContext<'a> {
             source,
             namespaces,
             static_base_uri,
+            self.stylesheet_document,
             self.max_depth,
             self.workspace,
             self.workspace.pending_source(source, node),
@@ -5193,6 +5256,7 @@ mod tests {
             0,
             8,
             Some("memory:shared-base/"),
+            StylesheetDocumentId::PRINCIPAL,
             CompileWorkspace {
                 limit: 16_384,
                 occupied: 0,
