@@ -8132,6 +8132,30 @@ fn prepared_extension_calls_borrow_the_visible_variable_snapshot() {
 }
 
 #[test]
+fn prepared_extension_rewrite_charges_its_namespace_snapshot() {
+    let namespace_payload = "x".repeat(2048);
+    let namespaces = (0..64)
+        .map(|index| format!(r#" xmlns:n{index}="urn:{index}:{namespace_payload}""#))
+        .collect::<String>();
+    let stylesheet = compile(&format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:exsl="http://exslt.org/common"{namespaces}>
+          <xsl:output method="text"/>
+          <xsl:template name="baseline"><xsl:value-of select="1"/></xsl:template>
+          <xsl:template name="extension"><xsl:value-of select="exsl:object-type('x')"/></xsl:template>
+        </xsl:stylesheet>"#,
+    ));
+    let baseline = minimum_execution_owned_bytes(&stylesheet, "baseline");
+    let extension = minimum_execution_owned_bytes(&stylesheet, "extension");
+    let namespace_storage = namespaces.len();
+
+    assert!(
+        extension >= baseline.saturating_add(namespace_storage),
+        "extension rewrite required {extension} bytes versus {baseline} for the baseline; \
+         the {namespace_storage}-byte namespace snapshot was not charged"
+    );
+}
+
+#[test]
 fn value_of_transfers_owned_xpath_string_without_transient_copies() {
     // The evaluated concat result can move directly into a new text node. The execution must not
     // require simultaneous source, conversion, and result-tree copies of the same string.

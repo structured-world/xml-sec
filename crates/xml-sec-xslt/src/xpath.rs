@@ -1401,18 +1401,71 @@ impl Evaluator {
                 variables,
             });
         }
+        let extension_prefix_bytes = unused_internal_name_owned_len(
+            expression
+                .namespaces
+                .iter()
+                .map(|(prefix, _)| prefix.as_str()),
+            "__xml_sec_ext",
+            '_',
+        );
+        let extension_namespace_bytes = unused_internal_name_owned_len(
+            expression
+                .namespaces
+                .iter()
+                .map(|(_, namespace)| namespace.as_str()),
+            EXTENSION_CONTEXT_NS,
+            ':',
+        );
+        let rewrite_bytes = expression
+            .source
+            .len()
+            .saturating_add(
+                expression
+                    .namespaces
+                    .len()
+                    .saturating_add(1)
+                    .saturating_mul(std::mem::size_of::<(String, String)>()),
+            )
+            .saturating_add(expression.namespaces.iter().fold(
+                0usize,
+                |total, (prefix, namespace)| {
+                    total
+                        .saturating_add(prefix.len())
+                        .saturating_add(namespace.len())
+                },
+            ))
+            .saturating_add(extension_prefix_bytes)
+            .saturating_add(extension_namespace_bytes)
+            .saturating_add(std::mem::size_of::<Vec<(String, String)>>())
+            .saturating_add(2 * std::mem::size_of::<usize>());
+        meter.charge(BudgetKind::OwnedBytes, rewrite_bytes)?;
+        *reserved_owned_bytes = reserved_owned_bytes.saturating_add(rewrite_bytes);
         let (extension_prefix, extension_namespace) = unused_internal_namespace(
             &expression.namespaces,
             "__xml_sec_ext",
             EXTENSION_CONTEXT_NS,
         );
-        let extension_prefix = extension_prefix.into_owned();
-        let extension_namespace = extension_namespace.into_owned();
-        let mut prepared_expression = expression.clone();
-        Arc::make_mut(&mut prepared_expression.namespaces)
-            .push((extension_prefix.clone(), extension_namespace.clone()));
-        let expression = &prepared_expression;
+        let mut namespaces = Vec::with_capacity(expression.namespaces.len().saturating_add(1));
+        namespaces.extend(expression.namespaces.iter().cloned());
+        namespaces.push((
+            extension_prefix.into_owned(),
+            extension_namespace.into_owned(),
+        ));
+        let prepared_expression = Expression {
+            source: String::new(),
+            namespaces: Arc::new(namespaces),
+            variable_references: Arc::clone(&expression.variable_references),
+            static_base_uri: expression.static_base_uri.clone(),
+            stylesheet_document: expression.stylesheet_document,
+        };
         let mut source = expression.source.clone();
+        let expression = &prepared_expression;
+        let (extension_prefix, extension_namespace) = expression
+            .namespaces
+            .last()
+            .map(|(prefix, namespace)| (prefix.as_str(), namespace.as_str()))
+            .expect("generated extension namespace was appended");
         let mut augmented = VariableOverlay::new(variables);
         let mut stored_expressions = HashSet::new();
         let mut variable_index = 0usize;
@@ -1883,14 +1936,12 @@ impl Evaluator {
             let local = format!("value{variable_index}");
             variable_index += 1;
             augmented.insert(
-                ExpandedName::new(Some(extension_namespace.as_str()), local.clone()),
+                ExpandedName::new(Some(extension_namespace), local.clone()),
                 value,
             );
             if is_stored_expression {
-                stored_expressions.insert(ExpandedName::new(
-                    Some(extension_namespace.as_str()),
-                    local.clone(),
-                ));
+                stored_expressions
+                    .insert(ExpandedName::new(Some(extension_namespace), local.clone()));
             }
             source.replace_range(
                 call.start..call.end,
@@ -5965,6 +6016,21 @@ fn unused_internal_name<'existing, 'preferred>(
         unique.push(padding);
     }
     Cow::Owned(unique)
+}
+
+fn unused_internal_name_owned_len<'existing>(
+    existing: impl Iterator<Item = &'existing str> + Clone,
+    preferred: &str,
+    padding: char,
+) -> usize {
+    if existing.clone().all(|value| value != preferred) {
+        return preferred.len();
+    }
+    existing
+        .map(str::len)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(padding.len_utf8())
 }
 
 fn rewrite_outer_context_functions<'a>(source: &'a str, prefix: &str) -> Cow<'a, str> {
