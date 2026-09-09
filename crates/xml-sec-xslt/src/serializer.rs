@@ -1324,9 +1324,8 @@ fn serialize_node_tasks<'document>(
                                 .doctype_public
                                 .as_deref()
                                 .is_some_and(|public| public.contains("XHTML"))));
-                // XSLT 1.0 section 16.2 recommends generated content-type metadata immediately
-                // after HEAD. Its legacy http-equiv markup is an example, not a required lexical
-                // form; pinned libxslt 1.1.45 emits the equivalent HTML5 charset form used here.
+                // XSLT 1.0 section 16.2 requires generated HTML content-type metadata immediately
+                // after HEAD and identifies the HTML 4 META http-equiv form for that contract.
                 // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
                 if definition.inject_content_type && html_head {
                     if definition.indent {
@@ -1336,27 +1335,20 @@ fn serialize_node_tasks<'document>(
                             context.depth.saturating_add(1).saturating_mul(2),
                         )?;
                     }
-                    if definition.method == OutputMethod::Html {
-                        output.push_str("<meta charset=\"");
-                        escape_attribute(
-                            &definition.encoding,
-                            definition.xml_version,
-                            encoding,
-                            output,
-                        );
-                        output.push_str("\">");
+                    output.push_str(
+                        "<meta http-equiv=\"Content-Type\" content=\"text/html; charset=",
+                    );
+                    escape_attribute(
+                        &definition.encoding,
+                        definition.xml_version,
+                        encoding,
+                        output,
+                    );
+                    output.push_str(if definition.method == OutputMethod::Html {
+                        "\">"
                     } else {
-                        output.push_str(
-                            "<meta http-equiv=\"Content-Type\" content=\"text/html; charset=",
-                        );
-                        escape_attribute(
-                            &definition.encoding,
-                            definition.xml_version,
-                            encoding,
-                            output,
-                        );
-                        output.push_str("\" />");
-                    }
+                        "\" />"
+                    });
                 }
                 let cdata = definition.method == OutputMethod::Xml
                     && definition.cdata_section_elements.contains(name);

@@ -47,11 +47,6 @@ mod tests {
                 true,
                 true,
             ),
-            utf16_bytes(
-                "<?xml version='1.0' encoding='UTF-16BE'?><root/>",
-                false,
-                true,
-            ),
             b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><root>caf\xe9</root>".to_vec(),
         ] {
             let decoded =
@@ -78,6 +73,16 @@ mod tests {
         );
         assert!(matches!(
             decode_xml_octets(&conflicting, 1_024),
+            Err(XmlEncodingError::ConflictingEncoding(_))
+        ));
+
+        let forbidden_signature = utf16_bytes(
+            "<?xml version=\"1.0\" encoding=\"UTF-16BE\"?><root/>",
+            false,
+            true,
+        );
+        assert!(matches!(
+            decode_xml_octets(&forbidden_signature, 1_024),
             Err(XmlEncodingError::ConflictingEncoding(_))
         ));
 

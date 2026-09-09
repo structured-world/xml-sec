@@ -2232,22 +2232,27 @@ fn serializer_honors_doctype_cdata_html_and_text_contracts() {
     let html_meta = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="html" indent="no"/><xsl:template match="/"><html><head/></html></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(html_meta, "<source/>"),
-        r#"<html><head><meta charset="UTF-8"></head></html>"#
+        r#"<html><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8"></head></html>"#
     );
 
-    // XSLT 1.0 section 16.2 recommends generated content-type metadata. The pinned libxslt
-    // contract uses HTML5 syntax and replaces its legacy equivalent, while unrelated metadata
-    // remains intact.
+    // XSLT 1.0 section 16.2 requires the generated HTML 4 META to identify the encoding actually
+    // used, and replaces an existing Content-Type equivalent while preserving unrelated metadata.
     // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
     let existing_html_meta = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="html" indent="no"/><xsl:template match="/"><html><head><meta http-equiv="Content-Type" content="text/plain; charset=ISO-8859-1" data-owner="caller"/></head></html></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(existing_html_meta, "<source/>"),
-        r#"<html><head><meta charset="UTF-8"></head></html>"#,
+        r#"<html><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8"></head></html>"#,
     );
     let existing_charset_meta = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="html" indent="no"/><xsl:template match="/"><html><head><meta charset="ISO-8859-1" data-owner="caller"/></head></html></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(existing_charset_meta, "<source/>"),
-        r#"<html><head><meta charset="UTF-8"><meta charset="ISO-8859-1" data-owner="caller"></head></html>"#,
+        r#"<html><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8"><meta charset="ISO-8859-1" data-owner="caller"></head></html>"#,
+    );
+
+    let latin1_meta = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="html" encoding="ISO-8859-1" indent="no"/><xsl:template match="/"><html><head/></html></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(latin1_meta, "<source/>"),
+        r#"<html><head><meta http-equiv="Content-Type" content="text/html; charset=ISO-8859-1"></head></html>"#,
     );
 
     let foreign_head = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:f="urn:foreign"><xsl:output method="html" indent="no"/><xsl:template match="/"><f:head><f:meta charset="kept"/></f:head></xsl:template></xsl:stylesheet>"#;
@@ -2259,7 +2264,7 @@ fn serializer_honors_doctype_cdata_html_and_text_contracts() {
     let legacy_html_namespace = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="html" indent="no"/><xsl:template match="/"><head xmlns="http://www.w3.org/TR/REC-html40"/></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(legacy_html_namespace, "<source/>"),
-        r#"<head xmlns="http://www.w3.org/TR/REC-html40"><meta charset="UTF-8"></head>"#
+        r#"<head xmlns="http://www.w3.org/TR/REC-html40"><meta http-equiv="Content-Type" content="text/html; charset=UTF-8"></head>"#
     );
 
     let xhtml = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns="http://www.w3.org/1999/xhtml"><xsl:output method="xml" omit-xml-declaration="yes" indent="no"/><xsl:template match="/"><html><link/></html></xsl:template></xsl:stylesheet>"#;
@@ -9034,7 +9039,7 @@ fn html_uri_escaping_uses_element_attribute_pairs_and_expanded_names() {
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:x="urn:foreign"><xsl:output method="html" indent="no"/><xsl:template match="/"><html><head profile="é path"/><body background="é path"><div href="é"/><foo src="é"/><a href="é path" x:href="é"/><object archive="é" classid="é" codebase="é" data="é"/><applet archive="é" codebase="é"/></body></html></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(stylesheet, "<source/>"),
-        "<html xmlns:x=\"urn:foreign\"><head profile=\"%C3%A9 path\"><meta charset=\"UTF-8\"></head><body background=\"%C3%A9 path\"><div href=\"é\"></div><foo src=\"é\"></foo><a href=\"%C3%A9%20path\" x:href=\"é\"></a><object archive=\"%C3%A9\" classid=\"%C3%A9\" codebase=\"%C3%A9\" data=\"%C3%A9\"></object><applet archive=\"%C3%A9\" codebase=\"%C3%A9\"></applet></body></html>"
+        "<html xmlns:x=\"urn:foreign\"><head profile=\"%C3%A9 path\"><meta http-equiv=\"Content-Type\" content=\"text/html; charset=UTF-8\"></head><body background=\"%C3%A9 path\"><div href=\"é\"></div><foo src=\"é\"></foo><a href=\"%C3%A9%20path\" x:href=\"é\"></a><object archive=\"%C3%A9\" classid=\"%C3%A9\" codebase=\"%C3%A9\" data=\"%C3%A9\"></object><applet archive=\"%C3%A9\" codebase=\"%C3%A9\"></applet></body></html>"
     );
 }
 

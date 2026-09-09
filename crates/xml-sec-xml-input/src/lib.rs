@@ -234,6 +234,15 @@ pub fn decode_xml_bounded<'a>(
         .filter(|_| !explicit_utf16 && !explicit_utf32)
         .map(parse_encoding)
         .transpose()?;
+    if physical.is_some_and(|(_, bom_len)| bom_len > 0)
+        && let Some(explicit) = explicit
+        && is_utf16_encoding(explicit)
+    {
+        // RFC 2781 section 4.3 forbids a byte-order signature when the charset label fixes the
+        // UTF-16 byte order. Reject it before the common decoder path can consume the signature.
+        // https://www.rfc-editor.org/rfc/rfc2781#section-4.3
+        return Err(Error::ConflictingEncoding(explicit.name().into()));
+    }
     if explicit_utf16
         && !physical.is_some_and(|(encoding, bom_len)| is_utf16_encoding(encoding) && bom_len > 0)
     {
@@ -302,6 +311,12 @@ pub fn decode_xml_bounded<'a>(
             }
         } else {
             let declared = parse_encoding(label)?;
+            if physical.is_some_and(|(_, bom_len)| bom_len > 0) && is_utf16_encoding(declared) {
+                // RFC 2781 section 4.3 applies equally when the endian-specific charset label is
+                // carried by the XML declaration rather than external metadata.
+                // https://www.rfc-editor.org/rfc/rfc2781#section-4.3
+                return Err(Error::ConflictingEncoding(declared.name().into()));
+            }
             if !encodings_compatible(selected, declared, false) {
                 return Err(Error::ConflictingEncoding(label.into()));
             }
@@ -357,7 +372,15 @@ pub fn decode_text_bounded<'a>(
         }
         return Err(Error::MissingUtf16ByteOrder);
     }
-    decode_selected(bytes, parse_encoding(encoding)?, maximum_decoded_bytes)
+    let selected = parse_encoding(encoding)?;
+    if is_utf16_encoding(selected)
+        && (bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]))
+    {
+        // RFC 2781 section 4.3 forbids a byte-order signature when the charset label fixes the
+        // UTF-16 byte order. https://www.rfc-editor.org/rfc/rfc2781#section-4.3
+        return Err(Error::ConflictingEncoding(selected.name().into()));
+    }
+    decode_selected(bytes, selected, maximum_decoded_bytes)
 }
 
 fn physical_encoding(bytes: &[u8]) -> Result<Option<(SelectedEncoding, usize)>, Error> {
@@ -959,6 +982,33 @@ mod tests {
             decode_xml(&bytes, Some("UTF-16LE")).unwrap(),
             "<root>lambda</root>"
         );
+    }
+
+    #[test]
+    fn endian_specific_utf16_rejects_a_byte_order_mark() {
+        // RFC 2781 section 4.3 requires a byte-order signature to be absent when the charset
+        // label itself fixes the byte order. https://www.rfc-editor.org/rfc/rfc2781#section-4.3
+        let mut metadata = vec![0xFF, 0xFE];
+        metadata.extend("<root/>".encode_utf16().flat_map(u16::to_le_bytes));
+        assert!(matches!(
+            decode_xml(&metadata, Some("UTF-16LE")),
+            Err(Error::ConflictingEncoding(label)) if label == "UTF-16LE"
+        ));
+        assert!(matches!(
+            decode_text(&metadata, "UTF-16LE"),
+            Err(Error::ConflictingEncoding(label)) if label == "UTF-16LE"
+        ));
+
+        let mut declaration = vec![0xFE, 0xFF];
+        declaration.extend(
+            "<?xml version=\"1.0\" encoding=\"UTF-16BE\"?><root/>"
+                .encode_utf16()
+                .flat_map(u16::to_be_bytes),
+        );
+        assert!(matches!(
+            decode_xml(&declaration, None),
+            Err(Error::ConflictingEncoding(label)) if label == "UTF-16BE"
+        ));
     }
 
     #[test]
