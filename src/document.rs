@@ -153,6 +153,7 @@ impl DocumentParseSettings {
         )
     }
 
+    #[cfg(test)]
     pub(crate) const fn new_with_depth(
         allow_dtd: bool,
         nodes_limit: u32,
@@ -175,6 +176,18 @@ impl DocumentParseSettings {
     ) -> Self {
         Self {
             allow_dtd: xml.allow_internal_dtd,
+            nodes_limit: resources.effective_xml_nodes(),
+            depth_limit: resources.max_xml_depth,
+            namespace_bindings_limit: resources.max_xml_namespace_bindings,
+            max_bytes: resources.max_xml_document_bytes,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn for_transform_output(resources: &crate::policy::ResourcePolicy) -> Self {
+        Self {
+            allow_dtd: false,
             nodes_limit: resources.effective_xml_nodes(),
             depth_limit: resources.max_xml_depth,
             namespace_bindings_limit: resources.max_xml_namespace_bindings,

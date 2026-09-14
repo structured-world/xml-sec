@@ -1117,6 +1117,9 @@ fn serialize_node_tasks<'document>(
                     }
                     output.push_str(value);
                 } else if *disable_output_escaping {
+                    if definition.method == OutputMethod::Xml {
+                        validate_xml_characters(value, definition.xml_version)?;
+                    }
                     push_xml_raw_text(value, definition.xml_version, encoding, output);
                 // XSLT 1.0 section 16.1 defines cdata-section-elements only for XML output;
                 // HTML has separate escaping rules in section 16.2:
@@ -1125,9 +1128,16 @@ fn serialize_node_tasks<'document>(
                     && parent_name
                         .is_some_and(|name| definition.cdata_section_elements.contains(name))
                 {
+                    validate_xml_characters(value, definition.xml_version)?;
                     push_cdata(value, definition.xml_version, encoding, output);
                 } else {
-                    escape_text(value, definition.xml_version, encoding, output);
+                    escape_text(
+                        value,
+                        definition.xml_version,
+                        encoding,
+                        definition.method == OutputMethod::Xml,
+                        output,
+                    )?;
                 }
             }
             NodeKind::Comment(value) if definition.method != OutputMethod::Text => {
@@ -1249,7 +1259,13 @@ fn serialize_node_tasks<'document>(
                         output.push_str(prefix);
                     }
                     output.push_str("=\"");
-                    escape_attribute(&namespace.uri, definition.xml_version, encoding, output);
+                    escape_attribute(
+                        &namespace.uri,
+                        definition.xml_version,
+                        encoding,
+                        definition.method == OutputMethod::Xml,
+                        output,
+                    )?;
                     output.push('"');
                     workspace.bind_namespace(
                         namespace.prefix.as_deref(),
@@ -1294,8 +1310,9 @@ fn serialize_node_tasks<'document>(
                             &attribute.value,
                             definition.xml_version,
                             encoding,
+                            definition.method == OutputMethod::Xml,
                             output,
-                        );
+                        )?;
                     }
                     output.push('"');
                 }
@@ -1342,8 +1359,9 @@ fn serialize_node_tasks<'document>(
                         &definition.encoding,
                         definition.xml_version,
                         encoding,
+                        definition.method == OutputMethod::Xml,
                         output,
-                    );
+                    )?;
                     output.push_str(if definition.method == OutputMethod::Html {
                         "\">"
                     } else {
@@ -1717,8 +1735,17 @@ fn push_name(
     Ok(())
 }
 
-fn escape_text(value: &str, version: &str, encoding: &OutputEncoding, output: &mut RenderBuffer) {
+fn escape_text(
+    value: &str,
+    version: &str,
+    encoding: &OutputEncoding,
+    validate_xml: bool,
+    output: &mut RenderBuffer,
+) -> Result<()> {
     for character in value.chars() {
+        if validate_xml {
+            validate_xml_character(character, version)?;
+        }
         if version == "1.1" && xml11_requires_reference(character) {
             push_hex_reference(output, character);
             continue;
@@ -1734,15 +1761,20 @@ fn escape_text(value: &str, version: &str, encoding: &OutputEncoding, output: &m
             _ => output.push(character),
         }
     }
+    Ok(())
 }
 
 fn escape_attribute(
     value: &str,
     version: &str,
     encoding: &OutputEncoding,
+    validate_xml: bool,
     output: &mut RenderBuffer,
-) {
+) -> Result<()> {
     for character in value.chars() {
+        if validate_xml {
+            validate_xml_character(character, version)?;
+        }
         if version == "1.1" && xml11_requires_reference(character) {
             push_hex_reference(output, character);
             continue;
@@ -1760,6 +1792,7 @@ fn escape_attribute(
             _ => output.push(character),
         }
     }
+    Ok(())
 }
 
 fn is_xml11_restricted(character: char) -> bool {
@@ -1967,17 +2000,25 @@ fn validate_document_output_shape(document: &Document) -> Result<()> {
 
 fn validate_xml_characters(value: &str, version: &str) -> Result<()> {
     for character in value.chars() {
-        let code = u32::from(character);
-        let valid = if version == "1.1" {
-            matches!(code, 0x1..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF)
-        } else {
-            crate::lexical::is_xml10_character(character)
-        };
-        if !valid {
-            return Err(Error::Serialization(format!(
-                "character U+{code:04X} is forbidden by XML {version}"
-            )));
-        }
+        validate_xml_character(character, version)?;
+    }
+    Ok(())
+}
+
+fn validate_xml_character(character: char, version: &str) -> Result<()> {
+    let code = u32::from(character);
+    let valid = if version == "1.1" {
+        matches!(code, 0x1..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF)
+    } else {
+        crate::lexical::is_xml10_character(character)
+    };
+    if !valid {
+        // XML 1.0 section 4.1 requires a character reference to denote a Char too. Validate
+        // before an output encoding can turn the forbidden scalar into otherwise valid markup.
+        // https://www.w3.org/TR/2008/REC-xml-20081126/#wf-Legalchar
+        return Err(Error::Serialization(format!(
+            "character U+{code:04X} is forbidden by XML {version}"
+        )));
     }
     Ok(())
 }

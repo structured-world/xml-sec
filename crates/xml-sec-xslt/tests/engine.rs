@@ -4459,6 +4459,37 @@ fn us_ascii_output_is_strict_for_markup_and_text() {
 }
 
 #[test]
+fn legacy_xml_encoding_rejects_forbidden_result_characters_before_escaping() {
+    // XML 1.0 section 4.1 requires the scalar denoted by a character reference to satisfy Char;
+    // converting a forbidden result-tree scalar to ASCII markup must not bypass that constraint.
+    // https://www.w3.org/TR/2008/REC-xml-20081126/#wf-Legalchar
+    let source = Document::parse("<source/>", None).expect("source parses");
+    let mut parameters = Parameters::new();
+    parameters.insert(
+        ExpandedName::new(None::<String>, "value"),
+        Value::String("\u{fffe}".into()),
+    );
+    for stylesheet in [
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output encoding="US-ASCII" omit-xml-declaration="yes"/><xsl:param name="value"/><xsl:template match="/"><root><xsl:value-of select="$value"/></root></xsl:template></xsl:stylesheet>"#,
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output encoding="US-ASCII" omit-xml-declaration="yes"/><xsl:param name="value"/><xsl:template match="/"><root value="{$value}"/></xsl:template></xsl:stylesheet>"#,
+    ] {
+        let error = compile(stylesheet)
+            .execute(
+                &source,
+                &parameters,
+                Arc::new(NoResolver),
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            )
+            .expect_err("forbidden XML scalar must fail before numeric-reference escaping");
+        assert!(matches!(error, Error::Serialization(message) if message.contains("U+FFFE")));
+    }
+}
+
+#[test]
 fn xslt_capability_and_include_contracts_match_execution() {
     // Advertised functions and textual include precedence are executable contracts.
     let available = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="function-available('current')"/></xsl:template></xsl:stylesheet>"#;
@@ -12260,6 +12291,41 @@ fn dynamic_map_node_accumulators_scale_the_owned_bytes_budget() {
             ..
         })
     ));
+}
+
+#[test]
+fn dynamic_map_releases_temporary_documents_after_import() {
+    // Each scalar dyn:map result is imported into the evaluator's retained source tree. The
+    // intermediate semantic document must stop consuming budget after that import, so a second
+    // call adds only retained projection storage rather than another permanent temporary tree.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:dyn="http://exslt.org/dynamic"><xsl:output method="text"/><xsl:template name="baseline">ok</xsl:template><xsl:template name="one"><xsl:value-of select="count(dyn:map(root/item, '. = 1'))"/></xsl:template><xsl:template name="two"><xsl:value-of select="count(dyn:map(root/item, '. = 1')) + count(dyn:map(root/item, '. = 2'))"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source_xml = format!("<root>{}</root>", "<item/>".repeat(128));
+    let source = Document::parse(&source_xml, None).expect("source parses");
+    let baseline = minimum_execution_owned_bytes_for_named_source(
+        &stylesheet,
+        &source,
+        source_xml.len(),
+        "baseline",
+    );
+    let one = minimum_execution_owned_bytes_for_named_source(
+        &stylesheet,
+        &source,
+        source_xml.len(),
+        "one",
+    );
+    let two = minimum_execution_owned_bytes_for_named_source(
+        &stylesheet,
+        &source,
+        source_xml.len(),
+        "two",
+    );
+
+    assert!(
+        two.saturating_sub(one) < one.saturating_sub(baseline),
+        "baseline={baseline}, one={one}, two={two}"
+    );
 }
 
 #[test]

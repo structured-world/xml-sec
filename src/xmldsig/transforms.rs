@@ -392,12 +392,7 @@ impl TransformExecutionBudget {
                 resources.effective_xml_base_resolution_bytes(),
             ),
             xml_parse_work: XmlParseWorkBudget::from_resources(resources),
-            xml_parse_settings: DocumentParseSettings::new_with_depth(
-                false,
-                resources.effective_xml_nodes(),
-                resources.max_xml_depth,
-                resources.max_xml_document_bytes,
-            ),
+            xml_parse_settings: DocumentParseSettings::for_transform_output(resources),
             state: TransformChainState::default(),
         }
     }
@@ -2838,6 +2833,37 @@ mod tests {
                 resource: crate::policy::resource_name::XML_DEPTH,
                 maximum: 2,
                 actual: 3,
+            })
+        ));
+    }
+
+    #[test]
+    fn binary_to_node_set_adapter_enforces_operation_namespace_limit() {
+        // Transform-produced XML is reparsed under the same compiled namespace-binding policy as
+        // the operation's initial document; the hard parser ceiling must not replace that limit.
+        let signature_document = Document::parse("<Signature/>").unwrap();
+        let resources = crate::policy::ResourcePolicy {
+            max_xml_namespace_bindings: 1,
+            ..crate::policy::ResourcePolicy::default()
+        };
+        let budget = TransformExecutionBudget::from_resources(&resources);
+        let transforms = [Transform::XPath(XPathExpression::new("true()"))];
+
+        let error = execute_transforms_with_options_and_budget(
+            signature_document.root_element(),
+            TransformData::Binary(b"<root xmlns:a=\"urn:a\" xmlns:b=\"urn:b\"/>".to_vec()),
+            &transforms,
+            TransformOptions::default(),
+            &budget,
+        )
+        .expect_err("detached XML must inherit the operation namespace-binding limit");
+
+        assert!(matches!(
+            error,
+            TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_NAMESPACE_BINDINGS,
+                maximum: 1,
+                actual: 2,
             })
         ));
     }

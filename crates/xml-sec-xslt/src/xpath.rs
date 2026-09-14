@@ -1914,8 +1914,11 @@ impl Evaluator {
                         }
                     }
                     if !scalars.is_empty() {
-                        let fragment = dynamic_map_document(&scalars, meter)?;
-                        let root = self.import_document(&fragment, meter)?;
+                        let (fragment, fragment_owned_bytes) =
+                            dynamic_map_document(&scalars, meter)?;
+                        let imported = self.import_document(&fragment, meter);
+                        meter.release_owned_bytes(fragment_owned_bytes);
+                        let root = imported?;
                         if let SourceNode::Node(root) = root
                             && let Some(root) = self.source.node(root)
                         {
@@ -5959,7 +5962,10 @@ fn visit_exslt_tokens(
     Ok(())
 }
 
-fn dynamic_map_document(values: &[(&str, String)], meter: &mut Meter) -> Result<Document> {
+fn dynamic_map_document(values: &[(&str, String)], meter: &mut Meter) -> Result<(Document, usize)> {
+    const RESULT_PREFIX: &str = "exsl";
+
+    let owned_bytes_before = meter.usage(BudgetKind::OwnedBytes)?.0;
     let mut document = Document::empty(None);
     meter.charge(
         BudgetKind::OwnedBytes,
@@ -5969,17 +5975,24 @@ fn dynamic_map_document(values: &[(&str, String)], meter: &mut Meter) -> Result<
         meter.charge(BudgetKind::ResultNodes, 2)?;
         meter.charge(
             BudgetKind::OwnedBytes,
-            local.len() + EXSLT_COMMON_NS.len() + value.len(),
+            local
+                .len()
+                .saturating_add(value.len())
+                .saturating_add(2usize.saturating_mul(RESULT_PREFIX.len()))
+                .saturating_add(2usize.saturating_mul(EXSLT_COMMON_NS.len()))
+                .saturating_add(std::mem::size_of::<Vec<crate::Namespace>>())
+                .saturating_add(2usize.saturating_mul(std::mem::size_of::<usize>()))
+                .saturating_add(std::mem::size_of::<crate::Namespace>()),
         )?;
         document.reserve_metered_push_containers(document.root(), meter)?;
         let element = document.push(
             document.root(),
             NodeKind::Element {
                 name: ExpandedName::new(Some(EXSLT_COMMON_NS), *local),
-                prefix: Some("exsl".into()),
+                prefix: Some(RESULT_PREFIX.into()),
                 attributes: Vec::new(),
                 namespaces: Arc::new(vec![crate::Namespace {
-                    prefix: Some("exsl".into()),
+                    prefix: Some(RESULT_PREFIX.into()),
                     uri: EXSLT_COMMON_NS.into(),
                 }]),
             },
@@ -5995,7 +6008,13 @@ fn dynamic_map_document(values: &[(&str, String)], meter: &mut Meter) -> Result<
             None,
         );
     }
-    Ok(document)
+    let owned_bytes_after = meter.usage(BudgetKind::OwnedBytes)?.0;
+    Ok((
+        document,
+        owned_bytes_after
+            .checked_sub(owned_bytes_before)
+            .expect("dynamic-map owned-byte usage is monotonic while constructing its document"),
+    ))
 }
 
 fn text_document(value: &str, meter: &mut Meter) -> Result<Document> {
@@ -8967,6 +8986,43 @@ impl function::Function for CurrentNode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dynamic_map_document_accounts_for_all_retained_storage() {
+        // The temporary EXSLT result tree owns expanded names, prefixes, namespace declarations,
+        // and text. Its reservation must cover the complete tree before it can be imported.
+        let budget = ExecutionBudget {
+            source_bytes: usize::MAX,
+            external_documents: usize::MAX,
+            recursion_depth: usize::MAX,
+            xpath_evaluations: usize::MAX,
+            xpath_operations: usize::MAX,
+            extension_operations: usize::MAX,
+            pattern_evaluations: usize::MAX,
+            template_applications: usize::MAX,
+            sort_comparisons: usize::MAX,
+            key_entries: usize::MAX,
+            result_nodes: usize::MAX,
+            serialized_bytes: usize::MAX,
+            messages: usize::MAX,
+            owned_bytes: usize::MAX,
+        };
+        let mut meter = Meter::new(budget, 0).expect("empty meter initializes");
+        let (document, reservation) =
+            dynamic_map_document(&[("boolean", "true".into())], &mut meter)
+                .expect("dynamic map document builds");
+        let charged = meter
+            .usage(BudgetKind::OwnedBytes)
+            .expect("owned-byte usage exists")
+            .0;
+
+        assert!(
+            charged >= document.estimated_owned_bytes(),
+            "charged={charged}, retained={}",
+            document.estimated_owned_bytes()
+        );
+        assert_eq!(reservation, charged);
+    }
+
     #[test]
     fn xinclude_identity_clone_crosses_the_owned_bytes_gate() {
         // Resolver provenance is retained once per active include-chain entry. The clone must be

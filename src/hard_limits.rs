@@ -57,7 +57,7 @@ pub(crate) const ENCRYPTION_RECIPIENT_CEILING: usize = 64;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const KEY_CANDIDATE_CEILING: usize = 64;
 /// Maximum nested `KeyInfoReference` dereference depth.
-#[cfg(feature = "xmldsig")]
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const KEY_INFO_REFERENCE_DEPTH_CEILING: usize = 8;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const ENCRYPTION_METADATA_BYTE_CEILING: usize = 4 * 1024;
