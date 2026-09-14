@@ -463,6 +463,12 @@ impl MeteredString {
         Ok(())
     }
 
+    fn from_borrowed(value: &str, meter: &mut Meter) -> Result<Self> {
+        let mut output = Self::new();
+        output.push_str(value, meter)?;
+        Ok(output)
+    }
+
     fn transfer(self, meter: &mut Meter) -> String {
         meter.release_owned_bytes(self.retained_owned_bytes);
         self.value
@@ -1875,30 +1881,39 @@ impl<'a> Execution<'a> {
             .as_ref()
             .map(|value| self.evaluate_avt(value, node, frame.position, frame.size))
             .transpose()?;
+        let namespace = match namespace {
+            Some(namespace) => Some(namespace),
+            None => computed_element_namespace(static_namespaces, prefix.as_deref())
+                .map(|uri| MeteredString::from_borrowed(uri, &mut self.meter))
+                .transpose()?,
+        };
         let (namespace, namespace_reservation) = match namespace {
             Some(namespace) => {
                 let (namespace, reservation) = namespace.into_parts();
                 (Some(namespace), reservation)
             }
-            None => (
-                computed_element_namespace(static_namespaces, prefix.as_deref()),
-                0,
-            ),
+            None => (None, 0),
         };
         let (prefix, namespace) = normalize_computed_namespace(prefix, namespace, &lexical)?;
         require_bound_computed_prefix(prefix.as_deref(), namespace.as_deref(), &lexical)?;
-        let namespaces = namespace
-            .as_ref()
-            .map(|uri| {
-                vec![Namespace {
+        let (namespaces, namespace_clone_reservation) = match namespace.as_ref() {
+            Some(uri) => {
+                self.meter.charge(BudgetKind::OwnedBytes, uri.len())?;
+                let namespaces = vec![Namespace {
                     prefix: prefix.clone(),
                     uri: uri.clone(),
-                }]
-            })
-            .unwrap_or_default();
+                }];
+                let reservation = namespaces[0].uri.capacity();
+                if reservation > uri.len() {
+                    self.meter
+                        .charge(BudgetKind::OwnedBytes, reservation - uri.len())?;
+                }
+                (namespaces, reservation)
+            }
+            None => (Vec::new(), 0),
+        };
         lexical.release(&mut self.meter);
-        self.meter.release_owned_bytes(namespace_reservation);
-        let id = self.push_node_with_base(
+        let pushed = self.push_node_with_base(
             self.parent(),
             NodeKind::Element {
                 name: ExpandedName::new(namespace, local),
@@ -1907,7 +1922,10 @@ impl<'a> Execution<'a> {
                 attributes: vec![],
             },
             base_uri.clone(),
-        )?;
+        );
+        self.meter
+            .release_owned_bytes(namespace_reservation.saturating_add(namespace_clone_reservation));
+        let id = pushed?;
         self.output_stack.push(id);
         self.apply_attribute_sets(attribute_sets, node, frame, precedence)
     }
@@ -2297,17 +2315,20 @@ impl<'a> Execution<'a> {
                     .as_ref()
                     .map(|value| self.evaluate_avt(value, node, position, size))
                     .transpose()?;
+                let namespace = match namespace {
+                    Some(namespace) => Some(namespace),
+                    None => prefix
+                        .as_deref()
+                        .and_then(|prefix| static_namespace(static_namespaces, prefix))
+                        .map(|uri| MeteredString::from_borrowed(uri, &mut self.meter))
+                        .transpose()?,
+                };
                 let (namespace, namespace_reservation) = match namespace {
                     Some(namespace) => {
                         let (namespace, reservation) = namespace.into_parts();
                         (Some(namespace), reservation)
                     }
-                    None => (
-                        prefix
-                            .as_deref()
-                            .and_then(|prefix| static_namespace(static_namespaces, prefix)),
-                        0,
-                    ),
+                    None => (None, 0),
                 };
                 let (prefix, namespace) =
                     normalize_computed_namespace(prefix, namespace, &lexical)?;
@@ -5009,6 +5030,7 @@ fn literal_key_names(
         let namespace = prefix
             .map(|prefix| {
                 static_namespace(namespaces, prefix)
+                    .map(str::to_owned)
                     .ok_or_else(|| Error::Dynamic(format!("unbound key prefix {prefix}")))
             })
             .transpose()?;
@@ -5610,18 +5632,18 @@ fn copied_node_base_uri(kind: &NodeKind, inherited: Option<&str>) -> Result<Opti
     )
 }
 
-fn static_namespace(namespaces: &[(String, String)], prefix: &str) -> Option<String> {
+fn static_namespace<'a>(namespaces: &'a [(String, String)], prefix: &str) -> Option<&'a str> {
     namespaces
         .iter()
         .rev()
         .find(|(candidate, _)| candidate == prefix)
-        .map(|(_, uri)| uri.clone())
+        .map(|(_, uri)| uri.as_str())
 }
 
-fn computed_element_namespace(
-    namespaces: &[(String, String)],
+fn computed_element_namespace<'a>(
+    namespaces: &'a [(String, String)],
     prefix: Option<&str>,
-) -> Option<String> {
+) -> Option<&'a str> {
     // XSLT 1.0 section 7.1.2 explicitly includes the default namespace when expanding an
     // unprefixed xsl:element name. This intentionally differs from xsl:attribute (section 7.1.3).
     // https://www.w3.org/TR/1999/REC-xslt-19991116#creating-elements-with-xsl-element
@@ -5734,14 +5756,14 @@ struct NumberFormatTokens<'a> {
 pub(crate) fn expanded_name_owned_bytes(name: &ExpandedName) -> usize {
     name.namespace
         .as_ref()
-        .map_or(0, String::len)
-        .saturating_add(name.local.len())
+        .map_or(0, String::capacity)
+        .saturating_add(name.local.capacity())
 }
 
 fn attribute_owned_bytes(attribute: &Attribute) -> usize {
     expanded_name_owned_bytes(&attribute.name)
-        .saturating_add(attribute.prefix.as_ref().map_or(0, String::len))
-        .saturating_add(attribute.value.len())
+        .saturating_add(attribute.prefix.as_ref().map_or(0, String::capacity))
+        .saturating_add(attribute.value.capacity())
 }
 
 fn append_result_text(
@@ -5890,8 +5912,8 @@ fn namespace_owned_bytes(namespace: &Namespace) -> usize {
     namespace
         .prefix
         .as_ref()
-        .map_or(0, String::len)
-        .saturating_add(namespace.uri.len())
+        .map_or(0, String::capacity)
+        .saturating_add(namespace.uri.capacity())
 }
 
 fn make_namespaces_mut_metered<'a>(
@@ -5915,8 +5937,8 @@ fn node_kind_owned_bytes(kind: &NodeKind) -> usize {
         NodeKind::Root => 0,
         NodeKind::Text { value, .. } | NodeKind::Comment(value) => value.capacity(),
         NodeKind::ProcessingInstruction { target, value } => target
-            .len()
-            .saturating_add(value.as_ref().map_or(0, String::len)),
+            .capacity()
+            .saturating_add(value.as_ref().map_or(0, String::capacity)),
         NodeKind::Element {
             name,
             prefix,
@@ -5926,7 +5948,7 @@ fn node_kind_owned_bytes(kind: &NodeKind) -> usize {
             .iter()
             .fold(
                 expanded_name_owned_bytes(name)
-                    .saturating_add(prefix.as_ref().map_or(0, String::len))
+                    .saturating_add(prefix.as_ref().map_or(0, String::capacity))
                     .saturating_add(
                         attributes
                             .capacity()
@@ -7365,6 +7387,30 @@ mod tests {
         assert!(
             validate_parameter_value(&Value::NodeSet(vec![NodeReference::Node(removed)]), &source,)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn retained_attributes_charge_allocated_string_capacities() {
+        // AVT construction may leave spare capacity in every retained string. Accounting the
+        // logical lengths would let repeated attributes retain more memory than OwnedBytes.
+        let mut local = String::with_capacity(64);
+        local.push('n');
+        let mut namespace = String::with_capacity(128);
+        namespace.push('u');
+        let mut prefix = String::with_capacity(32);
+        prefix.push('p');
+        let mut value = String::with_capacity(256);
+        value.push('v');
+        let attribute = crate::Attribute {
+            name: ExpandedName::new(Some(namespace), local),
+            prefix: Some(prefix),
+            value,
+        };
+
+        assert_eq!(
+            super::attribute_owned_bytes(&attribute),
+            64 + 128 + 32 + 256
         );
     }
 }

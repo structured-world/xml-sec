@@ -234,15 +234,6 @@ pub fn decode_xml_bounded<'a>(
         .filter(|_| !explicit_utf16 && !explicit_utf32)
         .map(parse_encoding)
         .transpose()?;
-    if physical.is_some_and(|(_, bom_len)| bom_len > 0)
-        && let Some(explicit) = explicit
-        && is_utf16_encoding(explicit)
-    {
-        // RFC 2781 section 4.3 forbids a byte-order signature when the charset label fixes the
-        // UTF-16 byte order. Reject it before the common decoder path can consume the signature.
-        // https://www.rfc-editor.org/rfc/rfc2781#section-4.3
-        return Err(Error::ConflictingEncoding(explicit.name().into()));
-    }
     if explicit_utf16
         && !physical.is_some_and(|(encoding, bom_len)| is_utf16_encoding(encoding) && bom_len > 0)
     {
@@ -311,12 +302,6 @@ pub fn decode_xml_bounded<'a>(
             }
         } else {
             let declared = parse_encoding(label)?;
-            if physical.is_some_and(|(_, bom_len)| bom_len > 0) && is_utf16_encoding(declared) {
-                // RFC 2781 section 4.3 applies equally when the endian-specific charset label is
-                // carried by the XML declaration rather than external metadata.
-                // https://www.rfc-editor.org/rfc/rfc2781#section-4.3
-                return Err(Error::ConflictingEncoding(declared.name().into()));
-            }
             if !encodings_compatible(selected, declared, false) {
                 return Err(Error::ConflictingEncoding(label.into()));
             }
@@ -373,13 +358,24 @@ pub fn decode_text_bounded<'a>(
         return Err(Error::MissingUtf16ByteOrder);
     }
     let selected = parse_encoding(encoding)?;
-    if is_utf16_encoding(selected)
-        && (bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]))
-    {
-        // RFC 2781 section 4.3 forbids a byte-order signature when the charset label fixes the
-        // UTF-16 byte order. https://www.rfc-editor.org/rfc/rfc2781#section-4.3
-        return Err(Error::ConflictingEncoding(selected.name().into()));
-    }
+    let bytes = match selected {
+        // RFC 2781 sections 4.1 and 4.2 define a matching signature as ignorable for
+        // deserialization and the opposite-order signature as an error.
+        // https://www.rfc-editor.org/rfc/rfc2781#section-4.1
+        SelectedEncoding::Standard(value) if value == encoding_rs::UTF_16LE => {
+            if bytes.starts_with(&[0xFE, 0xFF]) {
+                return Err(Error::ConflictingEncoding(selected.name().into()));
+            }
+            bytes.strip_prefix(&[0xFF, 0xFE]).unwrap_or(bytes)
+        }
+        SelectedEncoding::Standard(value) if value == encoding_rs::UTF_16BE => {
+            if bytes.starts_with(&[0xFF, 0xFE]) {
+                return Err(Error::ConflictingEncoding(selected.name().into()));
+            }
+            bytes.strip_prefix(&[0xFE, 0xFF]).unwrap_or(bytes)
+        }
+        _ => bytes,
+    };
     decode_selected(bytes, selected, maximum_decoded_bytes)
 }
 
@@ -985,19 +981,13 @@ mod tests {
     }
 
     #[test]
-    fn endian_specific_utf16_rejects_a_byte_order_mark() {
-        // RFC 2781 section 4.3 requires a byte-order signature to be absent when the charset
-        // label itself fixes the byte order. https://www.rfc-editor.org/rfc/rfc2781#section-4.3
+    fn endian_specific_utf16_accepts_a_matching_byte_order_mark() {
+        // RFC 2781 sections 4.1 and 4.2 require a matching signature to be consumed without
+        // affecting deserialization. https://www.rfc-editor.org/rfc/rfc2781#section-4.1
         let mut metadata = vec![0xFF, 0xFE];
         metadata.extend("<root/>".encode_utf16().flat_map(u16::to_le_bytes));
-        assert!(matches!(
-            decode_xml(&metadata, Some("UTF-16LE")),
-            Err(Error::ConflictingEncoding(label)) if label == "UTF-16LE"
-        ));
-        assert!(matches!(
-            decode_text(&metadata, "UTF-16LE"),
-            Err(Error::ConflictingEncoding(label)) if label == "UTF-16LE"
-        ));
+        assert_eq!(decode_xml(&metadata, Some("UTF-16LE")).unwrap(), "<root/>");
+        assert_eq!(decode_text(&metadata, "UTF-16LE").unwrap(), "<root/>");
 
         let mut declaration = vec![0xFE, 0xFF];
         declaration.extend(
@@ -1005,10 +995,10 @@ mod tests {
                 .encode_utf16()
                 .flat_map(u16::to_be_bytes),
         );
-        assert!(matches!(
-            decode_xml(&declaration, None),
-            Err(Error::ConflictingEncoding(label)) if label == "UTF-16BE"
-        ));
+        assert_eq!(
+            decode_xml(&declaration, None).unwrap(),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><root/>"
+        );
     }
 
     #[test]

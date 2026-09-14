@@ -76,15 +76,12 @@ mod tests {
             Err(XmlEncodingError::ConflictingEncoding(_))
         ));
 
-        let forbidden_signature = utf16_bytes(
+        let matching_signature = utf16_bytes(
             "<?xml version=\"1.0\" encoding=\"UTF-16BE\"?><root/>",
             false,
             true,
         );
-        assert!(matches!(
-            decode_xml_octets(&forbidden_signature, 1_024),
-            Err(XmlEncodingError::ConflictingEncoding(_))
-        ));
+        assert!(decode_xml_octets(&matching_signature, 1_024).is_ok());
 
         let bomless_generic = utf16_bytes(
             "<?xml version=\"1.0\" encoding=\"UTF-16\"?><root/>",

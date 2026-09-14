@@ -3889,6 +3889,7 @@ enum XIncludeDocumentIdentity {
 #[derive(Debug)]
 struct XIncludeChainEntry {
     document: XIncludeDocumentIdentity,
+    document_owned_bytes: usize,
     selected_root: Vec<usize>,
     selected_root_owned_bytes: usize,
 }
@@ -3908,15 +3909,30 @@ struct XIncludeChain {
 }
 
 impl XIncludeChain {
-    fn contains(&self, entry: &XIncludeChainEntry) -> bool {
-        self.entries.contains(entry)
+    fn contains(&self, document: &XIncludeDocumentIdentity, selected_root: &[usize]) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| &entry.document == document && entry.selected_root == selected_root)
+    }
+
+    fn contains_external(&self, identity: &ResourceIdentity, selected_root: &[usize]) -> bool {
+        self.entries.iter().any(|entry| {
+            matches!(
+                &entry.document,
+                XIncludeDocumentIdentity::External(candidate) if candidate == identity
+            ) && entry.selected_root == selected_root
+        })
     }
 
     fn push(&mut self, entry: XIncludeChainEntry, meter: &mut Meter) -> Result<()> {
         if let Err(error) =
             reserve_temporary_vec_slot(&mut self.entries, meter, &mut self.reserved_owned_bytes)
         {
-            meter.release_owned_bytes(entry.selected_root_owned_bytes);
+            meter.release_owned_bytes(
+                entry
+                    .document_owned_bytes
+                    .saturating_add(entry.selected_root_owned_bytes),
+            );
             return Err(error);
         }
         self.entries.push(entry);
@@ -3925,8 +3941,42 @@ impl XIncludeChain {
 
     fn pop(&mut self, meter: &mut Meter) {
         let entry = self.entries.pop().expect("XInclude chain entry was pushed");
-        meter.release_owned_bytes(entry.selected_root_owned_bytes);
+        meter.release_owned_bytes(
+            entry
+                .document_owned_bytes
+                .saturating_add(entry.selected_root_owned_bytes),
+        );
     }
+}
+
+fn clone_xinclude_identity(
+    identity: &XIncludeDocumentIdentity,
+    meter: &mut Meter,
+) -> Result<(XIncludeDocumentIdentity, usize)> {
+    if let XIncludeDocumentIdentity::External(identity) = identity {
+        let (identity, retained) = clone_resource_identity(identity, meter)?;
+        return Ok((XIncludeDocumentIdentity::External(identity), retained));
+    }
+    Ok((identity.clone(), 0))
+}
+
+fn clone_resource_identity(
+    identity: &ResourceIdentity,
+    meter: &mut Meter,
+) -> Result<(ResourceIdentity, usize)> {
+    let estimated = identity.0.len();
+    meter.charge(BudgetKind::OwnedBytes, estimated)?;
+    let cloned = identity.clone();
+    let retained = cloned.0.capacity();
+    if retained > estimated {
+        if let Err(error) = meter.charge(BudgetKind::OwnedBytes, retained - estimated) {
+            meter.release_owned_bytes(estimated);
+            return Err(error);
+        }
+    } else {
+        meter.release_owned_bytes(estimated - retained);
+    }
+    Ok((cloned, retained))
 }
 
 fn xinclude_selected_path(
@@ -4699,13 +4749,11 @@ fn resolve_xinclude(
         };
         let (selected_path, selected_path_owned_bytes) =
             xinclude_selected_path(source, selected_root, meter).map_err(XIncludeFailure::Fatal)?;
-        let entry = XIncludeChainEntry {
-            document: traversal.source_identity.clone(),
-            selected_root: selected_path,
-            selected_root_owned_bytes: selected_path_owned_bytes,
-        };
-        if traversal.chain.contains(&entry) {
-            meter.release_owned_bytes(entry.selected_root_owned_bytes);
+        if traversal
+            .chain
+            .contains(traversal.source_identity, &selected_path)
+        {
+            meter.release_owned_bytes(selected_path_owned_bytes);
             // XInclude 1.0 section 4.2.7 identifies a loop by the include location and XPointer,
             // not by the resource alone. The selected node is the semantic identity of that pair,
             // including equivalent XPointer spellings: https://www.w3.org/TR/xinclude/#loops
@@ -4713,6 +4761,17 @@ fn resolve_xinclude(
                 "XInclude same-document cycle detected".into(),
             )));
         }
+        let (document, document_owned_bytes) =
+            clone_xinclude_identity(traversal.source_identity, meter).map_err(|error| {
+                meter.release_owned_bytes(selected_path_owned_bytes);
+                XIncludeFailure::Fatal(error)
+            })?;
+        let entry = XIncludeChainEntry {
+            document,
+            document_owned_bytes,
+            selected_root: selected_path,
+            selected_root_owned_bytes: selected_path_owned_bytes,
+        };
         traversal
             .chain
             .push(entry, meter)
@@ -4841,14 +4900,20 @@ fn resolve_xinclude(
     };
     let selected_node = selected_root.unwrap_or_else(|| document.root());
     let (selected_path, selected_path_owned_bytes) =
-        xinclude_selected_path(&document, selected_node, meter).map_err(XIncludeFailure::Fatal)?;
-    let chain_entry = XIncludeChainEntry {
-        document: XIncludeDocumentIdentity::External(resource.identity.clone()),
-        selected_root: selected_path,
-        selected_root_owned_bytes: selected_path_owned_bytes,
-    };
-    if traversal.chain.contains(&chain_entry) {
-        meter.release_owned_bytes(chain_entry.selected_root_owned_bytes);
+        match xinclude_selected_path(&document, selected_node, meter) {
+            Ok(selected) => selected,
+            Err(error) => {
+                meter.release_owned_bytes(parsed_reservation);
+                meter.release_owned_bytes(xml.temporary_bytes);
+                meter.release_owned_bytes(resource.bytes.capacity());
+                return Err(XIncludeFailure::Fatal(error));
+            }
+        };
+    if traversal
+        .chain
+        .contains_external(&resource.identity, &selected_path)
+    {
+        meter.release_owned_bytes(selected_path_owned_bytes);
         meter.release_owned_bytes(parsed_reservation);
         meter.release_owned_bytes(xml.temporary_bytes);
         meter.release_owned_bytes(resource.bytes.capacity());
@@ -4857,21 +4922,72 @@ fn resolve_xinclude(
             message: "XInclude cycle detected".into(),
         }));
     }
-    let retained_namespace_bytes = document
-        .retained_namespace_arena_bytes(selected_root, meter)
-        .map_err(XIncludeFailure::Fatal)?;
-    let resource_identity = resource.identity.clone();
+    let retained_namespace_bytes =
+        match document.retained_namespace_arena_bytes(selected_root, meter) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                meter.release_owned_bytes(selected_path_owned_bytes);
+                meter.release_owned_bytes(parsed_reservation);
+                meter.release_owned_bytes(xml.temporary_bytes);
+                meter.release_owned_bytes(resource.bytes.capacity());
+                return Err(XIncludeFailure::Fatal(error));
+            }
+        };
+    let (resource_identity, resource_identity_owned_bytes) =
+        match clone_resource_identity(&resource.identity, meter) {
+            Ok(identity) => identity,
+            Err(error) => {
+                meter.release_owned_bytes(selected_path_owned_bytes);
+                meter.release_owned_bytes(parsed_reservation);
+                meter.release_owned_bytes(xml.temporary_bytes);
+                meter.release_owned_bytes(resource.bytes.capacity());
+                return Err(XIncludeFailure::Fatal(error));
+            }
+        };
+    let external_identity = XIncludeDocumentIdentity::External(resource_identity);
+    let (document_identity, document_owned_bytes) =
+        match clone_xinclude_identity(&external_identity, meter) {
+            Ok(identity) => identity,
+            Err(error) => {
+                meter.release_owned_bytes(resource_identity_owned_bytes);
+                meter.release_owned_bytes(selected_path_owned_bytes);
+                meter.release_owned_bytes(parsed_reservation);
+                meter.release_owned_bytes(xml.temporary_bytes);
+                meter.release_owned_bytes(resource.bytes.capacity());
+                return Err(XIncludeFailure::Fatal(error));
+            }
+        };
+    let chain_entry = XIncludeChainEntry {
+        document: document_identity,
+        document_owned_bytes,
+        selected_root: selected_path,
+        selected_root_owned_bytes: selected_path_owned_bytes,
+    };
     if identity_is_new {
-        charge_resource_identity_cache_entry(&resource, meter).map_err(XIncludeFailure::Fatal)?;
+        if let Err(error) = charge_resource_identity_cache_entry(&resource, meter) {
+            meter.release_owned_bytes(
+                resource_identity_owned_bytes
+                    .saturating_add(chain_entry.document_owned_bytes)
+                    .saturating_add(chain_entry.selected_root_owned_bytes),
+            );
+            meter.release_owned_bytes(parsed_reservation);
+            meter.release_owned_bytes(xml.temporary_bytes);
+            meter.release_owned_bytes(resource.bytes.capacity());
+            return Err(XIncludeFailure::Fatal(error));
+        }
+        let XIncludeDocumentIdentity::External(resource_identity) = &external_identity else {
+            unreachable!("external XInclude identity")
+        };
         identities.insert(resource_identity.clone(), resource);
     } else {
         meter.release_owned_bytes(resource.bytes.capacity());
     }
-    traversal
-        .chain
-        .push(chain_entry, meter)
-        .map_err(XIncludeFailure::Fatal)?;
-    let external_identity = XIncludeDocumentIdentity::External(resource_identity);
+    if let Err(error) = traversal.chain.push(chain_entry, meter) {
+        meter.release_owned_bytes(resource_identity_owned_bytes);
+        meter.release_owned_bytes(parsed_reservation);
+        meter.release_owned_bytes(xml.temporary_bytes);
+        return Err(XIncludeFailure::Fatal(error));
+    }
     let expanded = expand_xinclude_document_in_chain(
         &document,
         resolver,
@@ -4885,6 +5001,7 @@ fn resolve_xinclude(
         selected_root,
     );
     traversal.chain.pop(meter);
+    meter.release_owned_bytes(resource_identity_owned_bytes);
     match expanded {
         Ok(mut expanded) => {
             let transferred_from_parse = retained_namespace_bytes.min(parsed_reservation);
@@ -8464,7 +8581,6 @@ fn resolve_namespace_node<'d>(
 fn default_decimal_format() -> DecimalFormat {
     DecimalFormat {
         name: None,
-        precedence: 0,
         decimal_separator: '.',
         grouping_separator: ',',
         infinity: "Infinity".into(),
@@ -8475,7 +8591,6 @@ fn default_decimal_format() -> DecimalFormat {
         zero_digit: '0',
         digit: '#',
         pattern_separator: ';',
-        specified: 0,
     }
 }
 
@@ -8858,6 +8973,41 @@ impl function::Function for CurrentNode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn xinclude_identity_clone_crosses_the_owned_bytes_gate() {
+        // Resolver provenance is retained once per active include-chain entry. The clone must be
+        // rejected before allocation when no owned-memory budget remains.
+        let identity = XIncludeDocumentIdentity::External(ResourceIdentity("identity".into()));
+        let mut meter = Meter::new(
+            ExecutionBudget {
+                source_bytes: usize::MAX,
+                external_documents: usize::MAX,
+                recursion_depth: usize::MAX,
+                xpath_evaluations: usize::MAX,
+                xpath_operations: usize::MAX,
+                extension_operations: usize::MAX,
+                pattern_evaluations: usize::MAX,
+                template_applications: usize::MAX,
+                sort_comparisons: usize::MAX,
+                key_entries: usize::MAX,
+                result_nodes: usize::MAX,
+                serialized_bytes: usize::MAX,
+                messages: usize::MAX,
+                owned_bytes: 0,
+            },
+            0,
+        )
+        .expect("empty meter initializes");
+
+        assert!(matches!(
+            clone_xinclude_identity(&identity, &mut meter),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn variable_references_preserve_non_xpath_whitespace() {
         // XPath 1.0 production [1] limits expression whitespace to XML S. A host-language trim

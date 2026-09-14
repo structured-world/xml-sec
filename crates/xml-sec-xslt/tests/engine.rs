@@ -1182,27 +1182,14 @@ fn whitespace_aliases_and_decimal_formats_affect_results() {
 }
 
 #[test]
-fn equal_precedence_decimal_formats_merge_explicit_properties() {
-    // XSLT 1.0 section 12.3 merges declarations with the same name and precedence
-    // property by property; defaults must not conflict with separately declared values.
+fn repeated_decimal_formats_require_identical_effective_values() {
+    // XSLT 1.0 section 12.3 permits repeated declarations only when every effective attribute,
+    // including defaults, has the same value. Import precedence does not alter this constraint.
     // https://www.w3.org/TR/1999/REC-xslt-19991116#format-number
-    let stylesheet = r#"
-      <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
-        <xsl:output method="text"/>
-        <xsl:decimal-format name="d" infinity="Inf"/>
-        <xsl:decimal-format name="d" NaN="Not a Number"/>
-        <xsl:template match="/">
-          <xsl:value-of select="format-number(1 div 0, '0', 'd')"/>
-          <xsl:text>|</xsl:text>
-          <xsl:value-of select="format-number(0 div 0, '0', 'd')"/>
-        </xsl:template>
-      </xsl:stylesheet>"#;
-    assert_eq!(execute(stylesheet, "<root/>"), "Inf|Not a Number");
-
     let conflict = r#"
       <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
         <xsl:decimal-format name="d" infinity="Inf"/>
-        <xsl:decimal-format name="d" infinity="Infinite"/>
+        <xsl:decimal-format name="d" NaN="Not a Number"/>
       </xsl:stylesheet>"#;
     assert!(matches!(
         Compiler::new(
@@ -1212,6 +1199,43 @@ fn equal_precedence_decimal_formats_merge_explicit_properties() {
             .compile(conflict, None),
         Err(Error::Static(message)) if message.contains("conflicting xsl:decimal-format")
     ));
+
+    let identical = r#"
+      <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+        <xsl:decimal-format name="d" infinity="Inf"/>
+        <xsl:decimal-format name="d" infinity="Inf"/>
+      </xsl:stylesheet>"#;
+    Compiler::new(
+        Arc::new(NoResolver),
+        CompileBudget::new(1 << 20, 0, 64, 1 << 20),
+    )
+    .compile(identical, None)
+    .expect("identical effective decimal formats may be repeated");
+
+    let resolver = Arc::new(MemoryResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            "imported.xsl".into(),
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:decimal-format name="d" decimal-separator="," grouping-separator="."/></xsl:stylesheet>"#.into(),
+        );
+    let cross_precedence = r#"
+      <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+        <xsl:import href="imported.xsl"/>
+        <xsl:decimal-format name="d" infinity="Inf"/>
+      </xsl:stylesheet>"#;
+    let result = Compiler::new(resolver, CompileBudget::new(1 << 20, 8, 64, 1 << 20))
+        .compile(cross_precedence, Some("memory:main.xsl"));
+    assert!(
+        matches!(
+            result,
+            Err(Error::Static(ref message))
+                if message.contains("conflicting xsl:decimal-format")
+        ),
+        "unexpected compile result: {result:?}"
+    );
 }
 
 #[test]
