@@ -2,18 +2,14 @@ use std::sync::Arc;
 
 use sxd_xpath_no_unsafe::{Context, Value, function};
 
-use crate::{Clock, ExtensionPolicy};
+use crate::Clock;
 
 pub(crate) const NAMESPACE: &str = "http://exslt.org/dates-and-times";
-pub(crate) fn register(
-    context: &mut Context<'_>,
-    clock: Arc<dyn Clock>,
-    extension_policy: ExtensionPolicy,
-) {
+pub(crate) fn register(context: &mut Context<'_>, clock: Option<Arc<dyn Clock>>) {
     for &(name, operation) in FUNCTIONS {
         context.set_function(
             (NAMESPACE, name),
-            DateFunction(operation, Arc::clone(&clock), extension_policy),
+            DateFunction(operation, clock.as_ref().map(Arc::clone)),
         );
     }
 }
@@ -77,7 +73,7 @@ enum Operation {
     Difference,
 }
 
-struct DateFunction(Operation, Arc<dyn Clock>, ExtensionPolicy);
+struct DateFunction(Operation, Option<Arc<dyn Clock>>);
 
 fn xpath_string<'a>(
     context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
@@ -108,8 +104,7 @@ impl function::Function for DateFunction {
         match self.0 {
             DateTime => Ok(Value::String(current_datetime_for_operation(
                 context,
-                self.1.as_ref(),
-                self.2,
+                self.1.as_deref(),
             )?)),
             Date => {
                 let current;
@@ -118,8 +113,7 @@ impl function::Function for DateFunction {
                     current = input;
                     current.as_ref()
                 } else {
-                    current =
-                        current_datetime_for_operation(context, self.1.as_ref(), self.2)?.into();
+                    current = current_datetime_for_operation(context, self.1.as_deref())?.into();
                     current.as_ref()
                 };
                 let Some(mut date) = DateValue::parse(input) else {
@@ -172,20 +166,19 @@ impl function::Function for DateFunction {
                     context.charge_extension_work(1)?;
                     value.number(context)?
                 } else {
-                    current_seconds_for_operation(context, self.1.as_ref(), self.2)?
+                    current_seconds_for_operation(context, self.1.as_deref())?
                 };
                 let duration = DurationValue::from_seconds(seconds).render();
                 Ok(Value::String(duration))
             }
             Seconds => {
                 // Omitted date:seconds input defaults to date:date-time, so it shares the same
-                // controlled clock and deterministic-policy gate.
+                // explicitly supplied operation clock.
                 // https://exslt.github.io/date/functions/seconds/date.seconds.html
                 let Some(value) = args.first() else {
                     return Ok(Value::Number(current_seconds_for_operation(
                         context,
-                        self.1.as_ref(),
-                        self.2,
+                        self.1.as_deref(),
                     )?));
                 };
                 let input = xpath_string(context, value)?;
@@ -229,7 +222,7 @@ impl function::Function for DateFunction {
                 let input = if let Some(input) = input.as_deref() {
                     input
                 } else {
-                    current = current_datetime_for_operation(context, self.1.as_ref(), self.2)?;
+                    current = current_datetime_for_operation(context, self.1.as_deref())?;
                     &current
                 };
                 evaluate_component(operation, Some(input))
@@ -240,34 +233,28 @@ impl function::Function for DateFunction {
 
 fn current_datetime_for_operation(
     context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
-    clock: &dyn Clock,
-    extension_policy: ExtensionPolicy,
+    clock: Option<&dyn Clock>,
 ) -> std::result::Result<String, function::Error> {
     Ok(render_current_datetime(current_time_for_operation(
-        context,
-        clock,
-        extension_policy,
+        context, clock,
     )?))
 }
 
 fn current_seconds_for_operation(
     context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
-    clock: &dyn Clock,
-    extension_policy: ExtensionPolicy,
+    clock: Option<&dyn Clock>,
 ) -> std::result::Result<f64, function::Error> {
-    Ok(current_time_for_operation(context, clock, extension_policy)?.unix_timestamp() as f64)
+    Ok(current_time_for_operation(context, clock)?.unix_timestamp() as f64)
 }
 
 fn current_time_for_operation(
     context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
-    clock: &dyn Clock,
-    extension_policy: ExtensionPolicy,
+    clock: Option<&dyn Clock>,
 ) -> std::result::Result<time::OffsetDateTime, function::Error> {
-    if extension_policy == ExtensionPolicy::Deterministic {
-        return argument_error(
-            "zero-argument EXSLT date functions are disabled by the execution extension policy",
-        );
-    }
+    let clock = clock.ok_or_else(|| function::Error::Other {
+        what: "ambient clock capability is not available for zero-argument EXSLT date function"
+            .into(),
+    })?;
     context.charge_extension_work(1)?;
     let current = clock.now_local().map_err(|error| function::Error::Other {
         what: error.to_string(),
@@ -1259,8 +1246,9 @@ mod tests {
             sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
         let error = DateFunction(
             Operation::Date,
-            std::sync::Arc::new(crate::FixedClock::new(time::OffsetDateTime::UNIX_EPOCH)),
-            crate::ExtensionPolicy::Compatible,
+            Some(std::sync::Arc::new(crate::FixedClock::new(
+                time::OffsetDateTime::UNIX_EPOCH,
+            ))),
         )
         .evaluate(&evaluation, vec![Value::Nodeset(nodes)])
         .expect_err("date input coercion must cross the allocation gate");

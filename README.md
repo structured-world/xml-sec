@@ -172,8 +172,9 @@ surface and operation behavior with source and test evidence.
 [`xml-sec-xslt`](crates/xml-sec-xslt) is an XML-security-neutral XSLT 1.0 compiler and runtime. It
 owns stylesheet compilation, XPath/XSLT semantics, template execution, result-tree construction,
 deterministic budgets, and XML/HTML/text serialization. Its `ExecutionEnvironment` makes resolver
-access, operation time, and extensions explicit, allowing fixed clocks or disabled nondeterministic
-EXSLT date functions.
+access, XInclude processing, and operation time explicit. The default grants no XInclude or ambient
+clock access; callers may supply a fixed clock for reproducible EXSLT date functions or explicitly
+request host-clock compatibility.
 
 ```sh
 cargo add xml-sec-xslt

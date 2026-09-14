@@ -8,8 +8,8 @@ use std::{collections::HashSet, ops::Range};
 
 use xml_sec_xslt::{
     Attribute, BudgetKind, CompileBudget, Compiler, Document, Error, ErrorKind, ExecutionBudget,
-    ExecutionOptions, ExpandedName, Parameters, ResolveRequest, ResolvedResource, Resolver,
-    ResourceIdentity, SourceProcessing, Value,
+    ExecutionEnvironment, ExecutionOptions, ExpandedName, Parameters, ResolveRequest,
+    ResolvedResource, Resolver, ResourceIdentity, SystemClock, Value,
 };
 
 #[derive(Debug)]
@@ -255,19 +255,20 @@ fn execute_with_stylesheet(
         CompileBudget::new(16 << 20, 512, 4_096, 256 << 20),
     )
     .compile(&stylesheet, stylesheet_path.to_str())?;
-    compiled.execute_with_source_processing(
+    let environment = ExecutionEnvironment::new(resolver).with_clock(Arc::new(SystemClock));
+    let environment = if case.kind == "xinclude" {
+        environment.with_xinclude()
+    } else {
+        environment
+    };
+    compiled.execute_with_environment(
         &document,
         &parameters(case),
-        resolver,
+        environment,
         ExecutionOptions {
             budget: execution_budget(),
             initial_mode: None,
             initial_template: None,
-        },
-        if case.kind == "xinclude" {
-            SourceProcessing::XInclude
-        } else {
-            SourceProcessing::Xml
         },
     )
 }

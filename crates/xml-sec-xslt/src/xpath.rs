@@ -23,11 +23,11 @@ use crate::lexical::{
 };
 use crate::model::parser_workspace_bytes;
 use crate::resolver::decode_resource;
-use crate::runtime::{SourceProcessing, apply_whitespace_rules, expanded_name_owned_bytes};
+use crate::runtime::{apply_whitespace_rules, expanded_name_owned_bytes};
 use crate::{
-    Attribute, BudgetKind, Clock, Document, Error, ErrorKind, ExpandedName, ExtensionPolicy, Node,
-    NodeId, NodeKind, NodeReference, ResolvePurpose, ResolveRequest, ResolvedResource, Resolver,
-    ResourceIdentity, Result, Value,
+    Attribute, BudgetKind, Clock, Document, Error, ErrorKind, ExpandedName, Node, NodeId, NodeKind,
+    NodeReference, ResolvePurpose, ResolveRequest, ResolvedResource, Resolver, ResourceIdentity,
+    Result, Value,
 };
 
 pub(crate) type SourceNode = NodeReference;
@@ -185,10 +185,9 @@ fn is_prepared_extension_call(namespace: &str, local: &str) -> bool {
 }
 
 pub(crate) struct EvaluatorSourceOptions {
-    pub(crate) processing: SourceProcessing,
+    pub(crate) process_xinclude: bool,
     pub(crate) whitespace: Arc<[(NameTest, bool, usize, usize)]>,
-    pub(crate) clock: Arc<dyn Clock>,
-    pub(crate) extension_policy: ExtensionPolicy,
+    pub(crate) clock: Option<Arc<dyn Clock>>,
 }
 
 struct OperationClock {
@@ -229,7 +228,7 @@ pub(crate) fn prepare_evaluator_source(
     options: &EvaluatorSourceOptions,
 ) -> Result<PreparedEvaluatorSource> {
     let mut resource_identities = HashMap::new();
-    let (mut document, include_remap) = if options.processing == SourceProcessing::XInclude {
+    let (mut document, include_remap) = if options.process_xinclude {
         let expanded = expand_xinclude_document(
             source,
             &XIncludeDocumentIdentity::InMemory(source as *const Document as usize),
@@ -693,10 +692,9 @@ pub(crate) struct Evaluator {
     result_tree_fragment_index_bytes: usize,
     node_base_uri_index_bytes: usize,
     dynamic_evaluation_depth: usize,
-    source_processing: SourceProcessing,
+    process_xinclude: bool,
     whitespace: Arc<[(NameTest, bool, usize, usize)]>,
-    clock: Arc<dyn Clock>,
-    extension_policy: ExtensionPolicy,
+    clock: Option<Arc<dyn Clock>>,
 }
 
 struct TemporaryStrings {
@@ -877,10 +875,11 @@ impl Evaluator {
             result_tree_fragment_index_bytes: 0,
             node_base_uri_index_bytes,
             dynamic_evaluation_depth: 0,
-            source_processing: source_options.processing,
+            process_xinclude: source_options.process_xinclude,
             whitespace: source_options.whitespace,
-            clock: Arc::new(OperationClock::new(source_options.clock)),
-            extension_policy: source_options.extension_policy,
+            clock: source_options
+                .clock
+                .map(|clock| Arc::new(OperationClock::new(clock)) as Arc<dyn Clock>),
         })
     }
 
@@ -2199,7 +2198,7 @@ impl Evaluator {
             },
         );
         context.set_function("lang", LangFunction);
-        register_exslt_functions(&mut context, Arc::clone(&self.clock), self.extension_policy);
+        register_exslt_functions(&mut context, self.clock.as_ref().map(Arc::clone));
         context.set_function(
             "function-available",
             FunctionAvailable {
@@ -2460,21 +2459,20 @@ impl Evaluator {
                         Some(&resource.canonical_uri),
                         meter,
                     )?;
-                    let (mut document, expanded_reservation) =
-                        if self.source_processing == SourceProcessing::XInclude {
-                            let expanded = expand_xinclude_document(
-                                &document,
-                                &XIncludeDocumentIdentity::External(resource.identity.clone()),
-                                self.resolver.as_ref(),
-                                meter,
-                                &mut self.resource_identities,
-                                1,
-                                None,
-                            )?;
-                            (expanded.document, Some(expanded.retained_owned_bytes))
-                        } else {
-                            (document, None)
-                        };
+                    let (mut document, expanded_reservation) = if self.process_xinclude {
+                        let expanded = expand_xinclude_document(
+                            &document,
+                            &XIncludeDocumentIdentity::External(resource.identity.clone()),
+                            self.resolver.as_ref(),
+                            meter,
+                            &mut self.resource_identities,
+                            1,
+                            None,
+                        )?;
+                        (expanded.document, Some(expanded.retained_owned_bytes))
+                    } else {
+                        (document, None)
+                    };
                     if let Some((remap, remap_owned_bytes)) =
                         apply_whitespace_rules(&mut document, &self.whitespace, meter)?
                     {
@@ -6767,17 +6765,13 @@ fn clone_metered_optional_string(
     Ok(value.map(str::to_owned))
 }
 
-fn register_exslt_functions(
-    context: &mut Context<'_>,
-    clock: Arc<dyn Clock>,
-    extension_policy: ExtensionPolicy,
-) {
+fn register_exslt_functions(context: &mut Context<'_>, clock: Option<Arc<dyn Clock>>) {
     macro_rules! register {
         ($namespace:expr, $name:expr, $function:expr) => {{
             context.set_function(($namespace, $name), $function);
         }};
     }
-    crate::exslt_date::register(context, clock, extension_policy);
+    crate::exslt_date::register(context, clock);
     register!(EXSLT_MATH_NS, "max", ExsltMathFunction::Max);
     register!(EXSLT_MATH_NS, "min", ExsltMathFunction::Min);
     register!(EXSLT_MATH_NS, "highest", ExsltMathFunction::Highest);
@@ -9276,10 +9270,9 @@ mod tests {
             owned_bytes: usize::MAX,
         };
         let options = EvaluatorSourceOptions {
-            processing: SourceProcessing::Xml,
+            process_xinclude: false,
             whitespace: Arc::from([]),
-            clock: Arc::new(crate::SystemClock),
-            extension_policy: crate::ExtensionPolicy::Compatible,
+            clock: Some(Arc::new(crate::SystemClock)),
         };
         let mut setup_meter = Meter::new(unlimited, source.source_bytes()).expect("setup meter");
         let prepared =
@@ -9338,10 +9331,9 @@ mod tests {
         };
         let mut meter = Meter::new(budget, source.source_bytes()).expect("meter initializes");
         let options = EvaluatorSourceOptions {
-            processing: SourceProcessing::Xml,
+            process_xinclude: false,
             whitespace: Arc::from([]),
-            clock: Arc::new(crate::SystemClock),
-            extension_policy: crate::ExtensionPolicy::Compatible,
+            clock: Some(Arc::new(crate::SystemClock)),
         };
         let prepared = prepare_evaluator_source(&source, &crate::NoResolver, &mut meter, &options)
             .expect("source prepares");
@@ -9393,10 +9385,9 @@ mod tests {
         };
         let mut meter = Meter::new(budget, source.source_bytes()).expect("meter initializes");
         let options = EvaluatorSourceOptions {
-            processing: SourceProcessing::Xml,
+            process_xinclude: false,
             whitespace: Arc::from([]),
-            clock: Arc::new(crate::SystemClock),
-            extension_policy: crate::ExtensionPolicy::Compatible,
+            clock: Some(Arc::new(crate::SystemClock)),
         };
         let prepared = prepare_evaluator_source(&source, &crate::NoResolver, &mut meter, &options)
             .expect("source prepares");
@@ -9489,10 +9480,9 @@ mod tests {
         )
         .expect("setup meter initializes");
         let options = EvaluatorSourceOptions {
-            processing: SourceProcessing::Xml,
+            process_xinclude: false,
             whitespace: Arc::from([]),
-            clock: Arc::new(crate::SystemClock),
-            extension_policy: crate::ExtensionPolicy::Compatible,
+            clock: Some(Arc::new(crate::SystemClock)),
         };
         let prepared =
             prepare_evaluator_source(&source, &crate::NoResolver, &mut setup_meter, &options)
@@ -9693,10 +9683,9 @@ mod tests {
             &crate::NoResolver,
             &mut meter,
             &EvaluatorSourceOptions {
-                processing: SourceProcessing::XInclude,
+                process_xinclude: true,
                 whitespace: Arc::from([]),
-                clock: Arc::new(crate::SystemClock),
-                extension_policy: crate::ExtensionPolicy::Compatible,
+                clock: Some(Arc::new(crate::SystemClock)),
             },
         )
         .expect("XInclude preprocessing succeeds without external resources");
@@ -11084,10 +11073,9 @@ mod tests {
         };
         let mut meter = Meter::new(limits, 0).expect("zero lexical bytes fit");
         let options = EvaluatorSourceOptions {
-            processing: SourceProcessing::Xml,
+            process_xinclude: false,
             whitespace: Arc::from([]),
-            clock: Arc::new(crate::SystemClock),
-            extension_policy: ExtensionPolicy::Compatible,
+            clock: Some(Arc::new(crate::SystemClock)),
         };
 
         assert!(matches!(

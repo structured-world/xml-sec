@@ -48,7 +48,7 @@ mod xpath;
 
 pub use budget::{BudgetKind, CompileBudget, ExecutionBudget, ParseBudget};
 pub use compiler::{Compiler, Stylesheet};
-pub use environment::{Clock, ExecutionEnvironment, ExtensionPolicy, FixedClock, SystemClock};
+pub use environment::{Clock, ExecutionEnvironment, FixedClock, SystemClock};
 pub use error::{Error, ErrorKind, Result};
 pub use model::{
     Attribute, Document, ExpandedName, Namespace, Node, NodeId, NodeKind, NodeReference,
@@ -56,8 +56,6 @@ pub use model::{
 pub use resolver::{
     NoResolver, ResolvePurpose, ResolveRequest, ResolvedResource, Resolver, ResourceIdentity,
 };
-pub use runtime::{
-    ExecutionOptions, Message, Parameters, SecondaryOutput, SourceProcessing, TransformResult,
-};
+pub use runtime::{ExecutionOptions, Message, Parameters, SecondaryOutput, TransformResult};
 pub use serializer::{OutputDefinition, OutputMethod, SerializedOutput};
 pub use value::Value;

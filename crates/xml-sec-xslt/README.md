@@ -10,12 +10,12 @@ Compilation produces an immutable `Stylesheet` that can be shared and executed
 repeatedly. Callers provide explicit compile/execution budgets and a resolver
 contract; `NoResolver` denies external access.
 
-Execution capabilities are explicit through `ExecutionEnvironment`: a caller-owned
-resolver, clock, and typed extension policy. The compatibility entry point uses the
-host local clock. Security-sensitive or reproducible transforms can inject
-`FixedClock`, while `ExtensionPolicy::Deterministic` rejects zero-argument EXSLT date
-functions that depend on ambient time. Extension capability therefore does not imply
-permission to use nondeterministic behavior.
+Execution capabilities are explicit through `ExecutionEnvironment`. The default grants a
+caller-owned resolver but neither XInclude processing nor ambient clock access. Callers may grant
+XInclude with `with_xinclude()` and may inject `FixedClock` for reproducible zero-argument EXSLT
+date functions or `SystemClock` for conventional compatibility behavior. XML-security adapters
+derive those grants from the operation's single compiled policy rather than exposing a second
+policy surface.
 
 The engine implements template matching and precedence, modes, named templates,
 variables and parameters, keys, whitespace declarations, decimal formats,

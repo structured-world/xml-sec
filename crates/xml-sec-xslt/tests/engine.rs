@@ -5,10 +5,42 @@ use std::{collections::HashMap, sync::Mutex};
 use pretty_assertions::assert_eq;
 use xml_sec_xslt::{
     Attribute, BudgetKind, Clock, CompileBudget, Compiler, Document, Error, ExecutionBudget,
-    ExecutionEnvironment, ExecutionOptions, ExpandedName, ExtensionPolicy, FixedClock, NoResolver,
-    NodeKind, NodeReference, Parameters, ResolvePurpose, ResolveRequest, ResolvedResource,
-    Resolver, ResourceIdentity, SourceProcessing, Value,
+    ExecutionEnvironment, ExecutionOptions, ExpandedName, FixedClock, NoResolver, NodeKind,
+    NodeReference, Parameters, ResolvePurpose, ResolveRequest, ResolvedResource, Resolver,
+    ResourceIdentity, SystemClock, TransformResult, Value,
 };
+
+#[derive(Clone, Copy)]
+enum SourceProcessing {
+    XInclude,
+}
+
+trait ExecuteWithSourceProcessing {
+    fn execute_with_source_processing<R: Resolver + 'static>(
+        &self,
+        source: &Document,
+        parameters: &Parameters,
+        resolver: Arc<R>,
+        options: ExecutionOptions,
+        processing: SourceProcessing,
+    ) -> xml_sec_xslt::Result<TransformResult>;
+}
+
+impl ExecuteWithSourceProcessing for xml_sec_xslt::Stylesheet {
+    fn execute_with_source_processing<R: Resolver + 'static>(
+        &self,
+        source: &Document,
+        parameters: &Parameters,
+        resolver: Arc<R>,
+        options: ExecutionOptions,
+        processing: SourceProcessing,
+    ) -> xml_sec_xslt::Result<TransformResult> {
+        let environment = match processing {
+            SourceProcessing::XInclude => ExecutionEnvironment::new(resolver).with_xinclude(),
+        };
+        self.execute_with_environment(source, parameters, environment, options)
+    }
+}
 
 fn node_id_at(document: &Document, index: usize) -> xml_sec_xslt::NodeId {
     document
@@ -390,10 +422,10 @@ fn minimum_execution_owned_bytes_for_named_source(
 
 fn execute(stylesheet: &str, source: &str) -> String {
     let result = compile(stylesheet)
-        .execute(
+        .execute_with_environment(
             &Document::parse(source, Some("memory:source.xml")).expect("source must parse"),
             &Parameters::new(),
-            Arc::new(NoResolver),
+            ExecutionEnvironment::new(Arc::new(NoResolver)).with_clock(Arc::new(SystemClock)),
             ExecutionOptions {
                 budget: execution_budget(1 << 20),
                 initial_mode: None,
@@ -2525,21 +2557,20 @@ fn execution_environment_controls_exslt_current_time() {
     );
 
     let error = stylesheet
-        .execute_with_environment(
+        .execute(
             &Document::parse("<source/>", None).expect("source parses"),
             &Parameters::new(),
-            ExecutionEnvironment::new(Arc::new(NoResolver))
-                .with_extension_policy(ExtensionPolicy::Deterministic),
+            Arc::new(NoResolver),
             ExecutionOptions {
                 budget: execution_budget(1024),
                 initial_mode: None,
                 initial_template: None,
             },
         )
-        .expect_err("deterministic policy rejects ambient current time");
+        .expect_err("the default environment does not grant ambient clock access");
     assert!(matches!(
         error,
-        Error::Dynamic(message) if message.contains("disabled") && message.contains("extension policy")
+        Error::Dynamic(message) if message.contains("clock") && message.contains("not available")
     ));
 }
 
@@ -2640,9 +2671,9 @@ fn exslt_current_time_rejects_non_xsd_timezone_offsets() {
 }
 
 #[test]
-fn zero_argument_exslt_seconds_uses_the_execution_clock_and_policy() {
+fn zero_argument_exslt_seconds_requires_an_execution_clock() {
     // EXSLT date:seconds defines an omitted argument as the current local date-time, so the
-    // operation must use the configured clock and reject ambient time in deterministic mode.
+    // operation must use an explicitly configured clock and reject implicit ambient time.
     // https://exslt.github.io/date/functions/seconds/date.seconds.html
     let stylesheet = compile(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:date="http://exslt.org/dates-and-times"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="date:seconds()"/></xsl:template></xsl:stylesheet>"#,
@@ -2665,27 +2696,24 @@ fn zero_argument_exslt_seconds_uses_the_execution_clock_and_policy() {
     assert_eq!(result.serialized.bytes, b"0");
 
     let error = stylesheet
-        .execute_with_environment(
+        .execute(
             &source,
             &Parameters::new(),
-            ExecutionEnvironment::new(Arc::new(NoResolver))
-                .with_extension_policy(ExtensionPolicy::Deterministic),
+            Arc::new(NoResolver),
             ExecutionOptions {
                 budget: execution_budget(1024),
                 initial_mode: None,
                 initial_template: None,
             },
         )
-        .expect_err("deterministic execution rejects current-time access");
-    assert!(
-        matches!(error, Error::Dynamic(message) if message.contains("execution extension policy"))
-    );
+        .expect_err("execution without a clock rejects current-time access");
+    assert!(matches!(error, Error::Dynamic(message) if message.contains("clock capability")));
 }
 
 #[test]
-fn zero_argument_exslt_duration_uses_the_execution_clock_and_policy() {
+fn zero_argument_exslt_duration_requires_an_execution_clock() {
     // EXSLT date:duration defines its omitted argument as date:seconds(), so both functions must
-    // share the configured operation clock and deterministic-policy gate.
+    // share the configured operation clock and explicit capability gate.
     // https://exslt.github.io/date/functions/duration/date.duration.html
     let stylesheet = compile(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:date="http://exslt.org/dates-and-times"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="date:duration()"/></xsl:template></xsl:stylesheet>"#,
@@ -2708,21 +2736,18 @@ fn zero_argument_exslt_duration_uses_the_execution_clock_and_policy() {
     assert_eq!(result.serialized.bytes, b"P1D");
 
     let error = stylesheet
-        .execute_with_environment(
+        .execute(
             &source,
             &Parameters::new(),
-            ExecutionEnvironment::new(Arc::new(NoResolver))
-                .with_extension_policy(ExtensionPolicy::Deterministic),
+            Arc::new(NoResolver),
             ExecutionOptions {
                 budget: execution_budget(1024),
                 initial_mode: None,
                 initial_template: None,
             },
         )
-        .expect_err("deterministic execution rejects current-time access");
-    assert!(
-        matches!(error, Error::Dynamic(message) if message.contains("execution extension policy"))
-    );
+        .expect_err("execution without a clock rejects current-time access");
+    assert!(matches!(error, Error::Dynamic(message) if message.contains("clock capability")));
 }
 
 #[test]
@@ -2845,7 +2870,7 @@ fn exslt_duration_arithmetic_rejects_unrenderable_results() {
 }
 
 #[test]
-fn exslt_current_date_functions_share_the_execution_clock_and_policy() {
+fn exslt_current_date_functions_share_the_execution_clock_capability() {
     // Core EXSLT current-date functions must be discoverable and use the same controlled clock
     // as zero-argument component functions; deterministic execution rejects ambient time access.
     let stylesheet = compile(
@@ -2872,21 +2897,18 @@ fn exslt_current_date_functions_share_the_execution_clock_and_policy() {
     );
 
     let error = stylesheet
-        .execute_with_environment(
+        .execute(
             &source,
             &Parameters::new(),
-            ExecutionEnvironment::new(Arc::new(NoResolver))
-                .with_extension_policy(ExtensionPolicy::Deterministic),
+            Arc::new(NoResolver),
             ExecutionOptions {
                 budget: execution_budget(1024),
                 initial_mode: None,
                 initial_template: None,
             },
         )
-        .expect_err("deterministic execution rejects current-date functions");
-    assert!(
-        matches!(error, Error::Dynamic(message) if message.contains("execution extension policy"))
-    );
+        .expect_err("execution without a clock rejects current-date functions");
+    assert!(matches!(error, Error::Dynamic(message) if message.contains("clock capability")));
 }
 
 #[test]
@@ -5821,7 +5843,7 @@ fn xinclude_fallback_never_swallows_security_budget_failures() {
                 initial_mode: None,
                 initial_template: None,
             },
-            xml_sec_xslt::SourceProcessing::XInclude,
+            SourceProcessing::XInclude,
         ),
         Err(Error::Budget {
             kind: BudgetKind::ExternalDocuments,
@@ -5861,7 +5883,7 @@ fn xinclude_fallback_never_swallows_security_budget_failures() {
                 initial_mode: None,
                 initial_template: None,
             },
-            xml_sec_xslt::SourceProcessing::XInclude,
+            SourceProcessing::XInclude,
         ),
         Err(Error::StaleResource { .. })
     ));
@@ -6080,16 +6102,15 @@ fn xinclude_fallback_handles_only_resource_errors() {
     )
     .expect("source parses");
     let error = stylesheet
-        .execute_with_source_processing(
+        .execute_with_environment(
             &source,
             &Parameters::new(),
-            resolver,
+            ExecutionEnvironment::new(resolver).with_xinclude(),
             ExecutionOptions {
                 budget: execution_budget(1024),
                 initial_mode: None,
                 initial_template: None,
             },
-            SourceProcessing::XInclude,
         )
         .expect_err("non-well-formed included XML is fatal before fallback");
     assert!(matches!(error, Error::Xml(_)));
@@ -7929,7 +7950,7 @@ fn xinclude_budget_is_checked_before_resolver_access() {
                 &Parameters::new(),
                 resolver.clone(),
                 ExecutionOptions { budget, initial_mode: None, initial_template: None },
-                xml_sec_xslt::SourceProcessing::XInclude,
+                SourceProcessing::XInclude,
             ),
         Err(Error::Budget { kind: BudgetKind::ExternalDocuments, .. })
     ));
@@ -9039,7 +9060,7 @@ fn whitespace_rules_apply_to_every_loaded_source_document() {
                 initial_mode: None,
                 initial_template: None,
             },
-            xml_sec_xslt::SourceProcessing::XInclude,
+            SourceProcessing::XInclude,
         )
         .expect("expanded source transforms");
     assert_eq!(result.serialized.bytes, b"0");
@@ -9507,7 +9528,7 @@ fn xinclude_preserves_principal_and_included_id_metadata() {
                 initial_mode: None,
                 initial_template: None,
             },
-            xml_sec_xslt::SourceProcessing::XInclude,
+            SourceProcessing::XInclude,
         )
         .expect("XInclude transform succeeds");
     assert_eq!(result.serialized.bytes, b"1|1");

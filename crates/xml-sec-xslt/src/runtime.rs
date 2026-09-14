@@ -98,16 +98,6 @@ pub struct ExecutionOptions {
     pub initial_template: Option<ExpandedName>,
 }
 
-/// Optional preprocessing applied to source and `document()` resources.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SourceProcessing {
-    /// Parse XML without expanding XInclude elements.
-    #[default]
-    Xml,
-    /// Expand XInclude elements through the caller-provided resolver.
-    XInclude,
-}
-
 /// One `xsl:message` emitted during execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
@@ -143,66 +133,21 @@ impl Stylesheet {
         resolver: Arc<R>,
         options: ExecutionOptions,
     ) -> Result<TransformResult> {
-        self.execute_with_environment_and_source_processing(
+        self.execute_with_environment(
             source,
             parameters,
             ExecutionEnvironment::new(resolver),
             options,
-            SourceProcessing::Xml,
         )
     }
 
-    /// Execute with explicit resolver, clock, and extension permissions.
+    /// Execute with an explicit resolver and operation capabilities.
     pub fn execute_with_environment<R: Resolver + 'static>(
         &self,
         source: &Document,
         parameters: &Parameters,
         environment: ExecutionEnvironment<R>,
         options: ExecutionOptions,
-    ) -> Result<TransformResult> {
-        self.execute_with_environment_and_source_processing(
-            source,
-            parameters,
-            environment,
-            options,
-            SourceProcessing::Xml,
-        )
-    }
-
-    /// Execute with explicit source preprocessing semantics.
-    ///
-    /// This is a standalone-engine capability boundary. XML-security adapters must derive the
-    /// selection from their compiled operation policy rather than expose document-controlled or
-    /// independently configured XInclude permission.
-    pub fn execute_with_source_processing<R: Resolver + 'static>(
-        &self,
-        source: &Document,
-        parameters: &Parameters,
-        resolver: Arc<R>,
-        options: ExecutionOptions,
-        source_processing: SourceProcessing,
-    ) -> Result<TransformResult> {
-        self.execute_with_environment_and_source_processing(
-            source,
-            parameters,
-            ExecutionEnvironment::new(resolver),
-            options,
-            source_processing,
-        )
-    }
-
-    /// Execute with explicit environment and source preprocessing semantics.
-    ///
-    /// This is a standalone-engine capability boundary. XML-security adapters must derive the
-    /// selection from their compiled operation policy rather than expose document-controlled or
-    /// independently configured XInclude permission.
-    pub fn execute_with_environment_and_source_processing<R: Resolver + 'static>(
-        &self,
-        source: &Document,
-        parameters: &Parameters,
-        environment: ExecutionEnvironment<R>,
-        options: ExecutionOptions,
-        source_processing: SourceProcessing,
     ) -> Result<TransformResult> {
         let source_bytes = source.source_bytes();
         let mut meter = Meter::new(options.budget, source_bytes)?;
@@ -219,10 +164,9 @@ impl Stylesheet {
             }
         }
         let source_options = EvaluatorSourceOptions {
-            processing: source_processing,
+            process_xinclude: environment.process_xinclude,
             whitespace: Arc::clone(&self.whitespace),
-            clock: Arc::clone(&environment.clock),
-            extension_policy: environment.extension_policy,
+            clock: environment.clock.as_ref().map(Arc::clone),
         };
         let mut prepared = prepare_evaluator_source(
             source,
@@ -6994,10 +6938,9 @@ mod tests {
             .expect("source parses");
         let mut initial_meter = meter(usize::MAX);
         let source_options = super::EvaluatorSourceOptions {
-            processing: super::SourceProcessing::Xml,
+            process_xinclude: false,
             whitespace: Arc::from([]),
-            clock: Arc::new(crate::SystemClock),
-            extension_policy: crate::ExtensionPolicy::Compatible,
+            clock: Some(Arc::new(crate::SystemClock)),
         };
         let prepared = super::prepare_evaluator_source(
             &source,
