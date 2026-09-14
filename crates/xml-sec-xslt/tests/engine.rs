@@ -6726,10 +6726,10 @@ fn xinclude_rejects_fallback_outside_include_before_resolution() {
 }
 
 #[test]
-fn xinclude_defers_validation_inside_unused_fallback() {
-    // XInclude 1.0 section 3.2 says apparent fatal errors inside fallback content must not be
-    // reported unless a resource error activates that fallback. Misplaced fallback outside the
-    // direct fallback subtree remains fatal before resource acquisition.
+fn xinclude_ignores_extension_children_and_unused_fallback_contents() {
+    // XInclude 1.0 sections 3.1 and 3.2 require foreign extension children and unused fallback
+    // content to remain unexamined. A nested include/fallback in either subtree must not run.
+    // https://www.w3.org/TR/xinclude/#syntax
     // https://www.w3.org/TR/xinclude/#fallback_element
     let resolver = Arc::new(CountingResolver::default());
     resolver
@@ -6741,11 +6741,11 @@ fn xinclude_defers_validation_inside_unused_fallback() {
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#,
     );
     let source = Document::parse(
-        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude" xmlns:ext="urn:extension"><xi:include href="included.xml"><ext:wrapper><xi:fallback/></ext:wrapper></xi:include></root>"#,
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude" xmlns:ext="urn:extension"><xi:include href="included.xml"><ext:wrapper><xi:include href="nested.xml"><xi:fallback><unused/></xi:fallback></xi:include></ext:wrapper></xi:include></root>"#,
         Some("memory:source.xml"),
     )
     .expect("source parses before XInclude validation");
-    let error = stylesheet
+    stylesheet
         .execute_with_source_processing(
             &source,
             &Parameters::new(),
@@ -6757,9 +6757,8 @@ fn xinclude_defers_validation_inside_unused_fallback() {
             },
             SourceProcessing::XInclude,
         )
-        .expect_err("fallback outside the direct fallback subtree is fatal");
-    assert!(matches!(error, Error::Xml(message) if message.contains("direct child")));
-    assert_eq!(resolver.calls.load(Ordering::Relaxed), 0);
+        .expect("foreign extension content is ignored");
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 1);
 
     let source = Document::parse(
         r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="included.xml"><xi:fallback><xi:fallback/></xi:fallback></xi:include></root>"#,
@@ -6779,7 +6778,7 @@ fn xinclude_defers_validation_inside_unused_fallback() {
             SourceProcessing::XInclude,
         )
         .expect("invalid content in an unused fallback is ignored");
-    assert_eq!(resolver.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 2);
 }
 
 #[test]
@@ -9414,8 +9413,9 @@ fn global_dependencies_follow_nested_attribute_sets_on_all_consumers() {
 
 #[test]
 fn computed_elements_use_the_default_and_prefixed_static_namespaces() {
-    // Unlike xsl:attribute, XSLT 1.0 expands an unprefixed xsl:element name through the default
-    // namespace in scope on the instruction; explicit prefixes use the same static context.
+    // Unlike xsl:attribute, XSLT 1.0 section 7.1.2 explicitly includes the default namespace
+    // when expanding an unprefixed xsl:element name; explicit prefixes use the same context.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#creating-elements-with-xsl-element
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns="urn:stylesheet" xmlns:p="urn:result" xmlns:r="urn:wrapper"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><r:wrapper><xsl:element name="out"/><xsl:element name="p:out"/></r:wrapper></xsl:template></xsl:stylesheet>"#;
     let output = execute(stylesheet, "<source/>");
     let output = Document::parse(&output, None).expect("serialized result parses");

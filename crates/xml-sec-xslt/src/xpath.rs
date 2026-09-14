@@ -4399,21 +4399,11 @@ fn validate_xinclude_children(source: &Document, include: &Node) -> Result<Optio
             // https://www.w3.org/TR/xinclude/#fallback_element
             continue;
         }
-        if source.descendants(*child).any(|(_, descendant)| {
-            matches!(
-                &descendant.kind,
-                NodeKind::Element { name, .. }
-                    if name.namespace.as_deref() == Some(XINCLUDE_NS)
-                        && name.local == "fallback"
-            )
-        }) {
-            // XInclude 1.0 section 3.2 makes xi:fallback anywhere except a direct child of
-            // xi:include fatal, including under otherwise ignored extension content.
-            // https://www.w3.org/TR/xinclude/#fallback_element
-            return Err(Error::Xml(
-                "xi:fallback must be a direct child of xi:include".into(),
-            ));
-        }
+        // XInclude 1.0 sections 3.1 and 3.2 permit extension children and require their content
+        // to remain unexamined. A fallback encountered by normal traversal is still rejected
+        // unless its direct include parent consumed it here.
+        // https://www.w3.org/TR/xinclude/#syntax
+        // https://www.w3.org/TR/xinclude/#fallback_element
     }
     Ok(fallback)
 }

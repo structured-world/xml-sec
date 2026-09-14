@@ -5622,8 +5622,9 @@ fn computed_element_namespace(
     namespaces: &[(String, String)],
     prefix: Option<&str>,
 ) -> Option<String> {
-    // XSLT 1.0 section 7.1.2 includes the default namespace when expanding an unprefixed
-    // xsl:element name. This intentionally differs from xsl:attribute (section 7.1.3).
+    // XSLT 1.0 section 7.1.2 explicitly includes the default namespace when expanding an
+    // unprefixed xsl:element name. This intentionally differs from xsl:attribute (section 7.1.3).
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#creating-elements-with-xsl-element
     static_namespace(namespaces, prefix.unwrap_or_default())
 }
 
