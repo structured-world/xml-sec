@@ -1,11 +1,15 @@
 //! Shared compilation and execution state for one XML Security operation.
 
+#[cfg(not(feature = "xmldsig"))]
+use std::marker::PhantomData;
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeSet, HashSet},
 };
 
-use crate::{DocumentIdentity, DocumentView, NodeIdentity, XmlDocument};
+#[cfg(feature = "xmldsig")]
+use crate::NodeIdentity;
+use crate::{DocumentIdentity, DocumentView, XmlDocument};
 
 /// Stable identifier assigned in deterministic discovery order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -23,9 +27,12 @@ impl OperationNodeId {
 pub(crate) enum OperationStage {
     Parse,
     Resolve,
+    #[cfg(feature = "xmldsig")]
     Digest,
+    #[cfg(feature = "xmldsig")]
     Canonicalization,
     Crypto,
+    #[cfg(feature = "xmldsig")]
     AuthenticatedDependency,
     Evidence,
     Mutation,
@@ -35,9 +42,18 @@ pub(crate) enum OperationStage {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OperationNodeKind {
     Document,
-    Manifest { index: usize },
-    Key { index: usize },
-    Digest { index: usize },
+    #[cfg(feature = "xmldsig")]
+    Manifest {
+        index: usize,
+    },
+    Key {
+        index: usize,
+    },
+    #[cfg(feature = "xmldsig")]
+    Digest {
+        index: usize,
+    },
+    #[cfg(feature = "xmldsig")]
     Canonicalization,
     Crypto,
     Evidence,
@@ -47,8 +63,13 @@ pub(crate) enum OperationNodeKind {
 /// Identity whose provenance must remain stable for the complete operation.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum OperationResourceIdentity {
+    #[cfg(feature = "xmldsig")]
     DocumentNode(NodeIdentity),
-    External { uri: String, fingerprint: [u8; 32] },
+    External {
+        uri: String,
+        fingerprint: [u8; 32],
+    },
+    #[cfg(feature = "xmldsig")]
     Generated(&'static str, usize),
 }
 
@@ -224,6 +245,7 @@ impl CompiledOperationPlan {
         self.nodes[id.index()].resource.as_ref()
     }
 
+    #[cfg(feature = "xmldsig")]
     fn builder(&self) -> OperationPlanBuilder {
         OperationPlanBuilder {
             nodes: self.nodes.clone(),
@@ -235,11 +257,15 @@ impl CompiledOperationPlan {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OperationDecisionReason {
     Completed,
+    #[cfg(feature = "xmldsig")]
     ReferenceDigestVerified,
+    #[cfg(feature = "xmldsig")]
     ReferenceDigestRejected,
     KeyResolved,
+    #[cfg(feature = "xmldsig")]
     KeyUnavailable,
     SignatureVerified,
+    #[cfg(feature = "xmldsig")]
     SignatureRejected,
     EvidenceFinalized,
     MutationCommitted,
@@ -259,12 +285,16 @@ pub(crate) struct OperationDecision {
 /// Single owner of immutable policy, cumulative budgets, identity state and
 /// execution evidence for one operation.
 pub(crate) struct OperationExecutionContext<P, B> {
+    #[cfg(feature = "xmldsig")]
     policy: P,
+    #[cfg(not(feature = "xmldsig"))]
+    _policy: PhantomData<P>,
     budgets: B,
     builder: Option<OperationPlanBuilder>,
     plan: Option<CompiledOperationPlan>,
     document: Option<(DocumentIdentity, Cell<u64>)>,
     executed: RefCell<HashSet<OperationNodeId>>,
+    #[cfg(feature = "xmldsig")]
     authenticated_nodes: RefCell<HashSet<NodeIdentity>>,
     decisions: RefCell<Vec<OperationDecision>>,
     first_failure: RefCell<Option<OperationDecision>>,
@@ -272,19 +302,26 @@ pub(crate) struct OperationExecutionContext<P, B> {
 
 impl<P, B> OperationExecutionContext<P, B> {
     pub(crate) fn new(policy: P, budgets: B, document: Option<(DocumentIdentity, u64)>) -> Self {
+        #[cfg(not(feature = "xmldsig"))]
+        drop(policy);
         Self {
+            #[cfg(feature = "xmldsig")]
             policy,
+            #[cfg(not(feature = "xmldsig"))]
+            _policy: PhantomData,
             budgets,
             builder: Some(OperationPlanBuilder::default()),
             plan: None,
             document: document.map(|(identity, generation)| (identity, Cell::new(generation))),
             executed: RefCell::new(HashSet::new()),
+            #[cfg(feature = "xmldsig")]
             authenticated_nodes: RefCell::new(HashSet::new()),
             decisions: RefCell::new(Vec::new()),
             first_failure: RefCell::new(None),
         }
     }
 
+    #[cfg(feature = "xmldsig")]
     pub(crate) fn policy(&self) -> &P {
         &self.policy
     }
@@ -293,6 +330,7 @@ impl<P, B> OperationExecutionContext<P, B> {
         &self.budgets
     }
 
+    #[cfg(feature = "xmldsig")]
     pub(crate) fn budgets_mut(&mut self) -> &mut B {
         &mut self.budgets
     }
@@ -338,6 +376,7 @@ impl<P, B> OperationExecutionContext<P, B> {
     /// Reopens a compiled plan so authenticated structure discovered after a
     /// successful cryptographic gate can be added without replacing operation
     /// policy, budgets, identity bindings, or accumulated evidence.
+    #[cfg(feature = "xmldsig")]
     pub(crate) fn extend(&mut self) {
         let plan = self
             .plan
@@ -397,13 +436,15 @@ impl<P, B> OperationExecutionContext<P, B> {
     fn completion_reason(&self, node: OperationNodeId) -> OperationDecisionReason {
         match self.plan().kind(node) {
             OperationNodeKind::Key { .. } => OperationDecisionReason::KeyResolved,
+            #[cfg(feature = "xmldsig")]
             OperationNodeKind::Digest { .. } => OperationDecisionReason::ReferenceDigestVerified,
             OperationNodeKind::Crypto => OperationDecisionReason::SignatureVerified,
             OperationNodeKind::Evidence => OperationDecisionReason::EvidenceFinalized,
             OperationNodeKind::Mutation => OperationDecisionReason::MutationCommitted,
-            OperationNodeKind::Document | OperationNodeKind::Manifest { .. } => {
-                OperationDecisionReason::Completed
-            }
+            OperationNodeKind::Document => OperationDecisionReason::Completed,
+            #[cfg(feature = "xmldsig")]
+            OperationNodeKind::Manifest { .. } => OperationDecisionReason::Completed,
+            #[cfg(feature = "xmldsig")]
             OperationNodeKind::Canonicalization => OperationDecisionReason::Completed,
         }
     }
@@ -420,6 +461,7 @@ impl<P, B> OperationExecutionContext<P, B> {
         self.run_ready(node, action)
     }
 
+    #[cfg(feature = "xmldsig")]
     pub(crate) fn run_with_budgets<T, E>(
         &mut self,
         node: OperationNodeId,
@@ -496,6 +538,7 @@ impl<P, B> OperationExecutionContext<P, B> {
         self.run_document_transition_nodes(&[node], document, action)
     }
 
+    #[cfg(feature = "xmldsig")]
     pub(crate) fn run_document_transition_batch_with_budgets<T, E>(
         &mut self,
         nodes: &[OperationNodeId],
@@ -567,14 +610,17 @@ impl<P, B> OperationExecutionContext<P, B> {
         }
     }
 
+    #[cfg(feature = "xmldsig")]
     pub(crate) fn authenticate(&self, node: NodeIdentity) {
         self.authenticated_nodes.borrow_mut().insert(node);
     }
 
+    #[cfg(feature = "xmldsig")]
     pub(crate) fn is_authenticated(&self, node: NodeIdentity) -> bool {
         self.authenticated_nodes.borrow().contains(&node)
     }
 
+    #[cfg(feature = "xmldsig")]
     pub(crate) fn is_executed(&self, node: OperationNodeId) -> bool {
         self.executed.borrow().contains(&node)
     }
@@ -598,6 +644,7 @@ impl<P, B> OperationExecutionContext<P, B> {
         self.decisions.borrow_mut().push(decision);
     }
 
+    #[cfg(feature = "xmldsig")]
     pub(crate) fn set_outcome(
         &self,
         node: OperationNodeId,
@@ -617,6 +664,7 @@ impl<P, B> OperationExecutionContext<P, B> {
         }
     }
 
+    #[cfg(feature = "xmldsig")]
     pub(crate) fn first_failure(&self) -> Option<OperationDecision> {
         self.first_failure.borrow().clone()
     }

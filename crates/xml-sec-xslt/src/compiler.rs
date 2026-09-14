@@ -9,11 +9,12 @@ use crate::lexical::{
     ValidatedXPointerFragment, is_ncname, is_ncname_char, is_ncname_start, is_xml_whitespace,
     strip_xpath_attribute_axis, trim_xml_whitespace, unicode_decimal_value, xpath_string_literal,
 };
-use crate::model::{normalized_xml_id, parser_workspace_bytes, prepare_xml_frontend_bounded};
+use crate::model::{parser_workspace_bytes, prepare_xml_frontend_bounded};
 use crate::resolver::decode_resource;
 use crate::{
-    BudgetKind, CompileBudget, Document, Error, ExpandedName, Namespace, OutputDefinition,
-    OutputMethod, ResolvePurpose, ResolvedResource, Resolver, ResourceIdentity, Result,
+    BudgetKind, CompileBudget, Document, Error, ExpandedName, Namespace, NodeKind,
+    OutputDefinition, OutputMethod, ResolvePurpose, ResolvedResource, Resolver, ResourceIdentity,
+    Result,
 };
 
 pub(crate) const XSLT_NS: &str = "http://www.w3.org/1999/XSL/Transform";
@@ -111,7 +112,7 @@ impl<R: Resolver> Compiler<R> {
             depth,
         )?;
         with_compiler_document(xml, base_uri, state, |document, state| {
-            let root = stylesheet_module_root(document, fragment)?;
+            let root = stylesheet_module_root(document, fragment, state.current_module_document())?;
             let StylesheetModuleKind::Standard { forward } = stylesheet_module_kind(root)? else {
                 let precedence = inherited_precedence.unwrap_or_else(|| state.next_precedence());
                 return self
@@ -178,7 +179,11 @@ impl<R: Resolver> Compiler<R> {
                 self.enter_resource(&module.resource, module.fragment, state, |state| {
                     let source = resource_source(&module.resource, state)?;
                     with_frontend_document(source.as_str(), state, |document, state| {
-                        let included_root = stylesheet_module_root(document, module.fragment)?;
+                        let included_root = stylesheet_module_root(
+                            document,
+                            module.fragment,
+                            state.current_module_document(),
+                        )?;
                         match stylesheet_module_kind(included_root)? {
                             StylesheetModuleKind::Standard { forward } => {
                                 validate_standard_stylesheet_content(included_root)?;
@@ -235,7 +240,11 @@ impl<R: Resolver> Compiler<R> {
                         Some(&module.resource.canonical_uri),
                         state,
                         |document, state| {
-                            let included_root = stylesheet_module_root(document, module.fragment)?;
+                            let included_root = stylesheet_module_root(
+                                document,
+                                module.fragment,
+                                state.current_module_document(),
+                            )?;
                             match stylesheet_module_kind(included_root)? {
                                 StylesheetModuleKind::Standard {
                                     forward: included_forward,
@@ -1953,6 +1962,12 @@ impl CompileState {
                 self.resolved_identities[&active.resource.identity].document_id
             })
     }
+
+    fn current_module_document(&self) -> Option<&Document> {
+        self.module_documents
+            .get(&self.current_stylesheet_document())
+            .map(|module| &module.document)
+    }
     fn charge_owned(&mut self, amount: usize) -> Result<()> {
         let workspace = self.workspace().reserve(amount)?;
         self.owned_bytes = workspace.occupied;
@@ -2948,6 +2963,7 @@ fn stylesheet_module_kind(root: roxmltree::Node<'_, '_>) -> Result<StylesheetMod
 fn stylesheet_module_root<'nodes, 'input>(
     document: &'nodes roxmltree::Document<'input>,
     fragment: Option<&str>,
+    semantic_document: Option<&Document>,
 ) -> Result<roxmltree::Node<'nodes, 'input>> {
     let Some(raw_fragment) = fragment else {
         return Ok(document.root_element());
@@ -2956,17 +2972,41 @@ fn stylesheet_module_root<'nodes, 'input>(
     // xsl:stylesheet by its ID. Module selection is per reference, not per fetched resource.
     // https://www.w3.org/TR/1999/REC-xslt-19991116#embedded
     let fragment = ValidatedXPointerFragment::new(raw_fragment)?;
-    let mut selected = None;
+    let semantic_ordinal = semantic_document
+        .map(|semantic| {
+            semantic
+                .ids()
+                .find_map(|(value, _root, owner)| {
+                    fragment
+                        .equals(value)
+                        .then(|| semantic_element_ordinal(semantic, owner))
+                })
+                .transpose()
+        })
+        .transpose()?
+        .flatten();
+    let mut selected = semantic_ordinal
+        .map(|ordinal| {
+            document
+                .descendants()
+                .filter(roxmltree::Node::is_element)
+                .nth(ordinal)
+                .ok_or_else(|| {
+                    Error::Xml("semantic and frontend XML element order diverged".into())
+                })
+        })
+        .transpose()?;
+
+    // XML 1.0 section 3.3.1 assigns ID semantics from the declared type, not from an
+    // attribute name. XPointer Framework section 3.2 resolves shorthand pointers through that
+    // typed ID index. The unqualified `id` scan below is retained only as a compatibility
+    // extension for historical stylesheets. https://www.w3.org/TR/xml/#id
+    // https://www.w3.org/TR/2003/REC-xptr-framework-20030325/#shorthand
     for node in document.descendants().filter(roxmltree::Node::is_element) {
         let unqualified_match = node
             .attribute("id")
             .is_some_and(|candidate| fragment.equals(candidate));
-        let xml_id_match = node
-            .attribute((XML_NS, "id"))
-            .map(normalized_xml_id)
-            .transpose()?
-            .is_some_and(|value| fragment.equals(&value));
-        if !unqualified_match && !xml_id_match {
+        if !unqualified_match || selected == Some(node) {
             continue;
         }
         if selected.replace(node).is_some() {
@@ -2988,6 +3028,14 @@ fn stylesheet_module_root<'nodes, 'input>(
         )));
     }
     Ok(selected)
+}
+
+fn semantic_element_ordinal(document: &Document, owner: crate::NodeId) -> Result<usize> {
+    document
+        .nodes()
+        .filter(|(_, node)| matches!(node.kind, NodeKind::Element { .. }))
+        .position(|(id, _)| id == owner)
+        .ok_or_else(|| Error::Xml("stylesheet ID owner is not an element".into()))
 }
 
 fn module_forward_compatible(root: roxmltree::Node<'_, '_>) -> Result<bool> {
@@ -5020,6 +5068,41 @@ mod tests {
             )
             .compile(&principal, Some("memory:main.xsl"))
             .expect("normalized xml:id identifies the embedded stylesheet");
+
+            assert!(
+                stylesheet
+                    .named_template_index
+                    .contains_key(&ExpandedName::new(None::<String>, "selected"))
+            );
+        }
+    }
+
+    #[test]
+    fn include_and_import_resolve_dtd_declared_id_fragments() {
+        // XML 1.0 section 3.3.1 assigns ID semantics through the declared attribute type,
+        // independently of the attribute's lexical name. XPointer shorthand then selects the
+        // element carrying that ID. https://www.w3.org/TR/xml/#id
+        // https://www.w3.org/TR/2003/REC-xptr-framework-20030325/#shorthand
+        for instruction in ["include", "import"] {
+            let principal = format!(
+                r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:{instruction} href="module.xml#target"/></xsl:stylesheet>"#
+            );
+            let module = br#"<!DOCTYPE bundle [
+                <!ATTLIST xsl:stylesheet ext:module-key ID #IMPLIED>
+            ]>
+            <bundle xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+                    xmlns:ext="urn:example:module-metadata">
+                <xsl:stylesheet ext:module-key="target" version="1.0">
+                    <xsl:template name="selected"/>
+                </xsl:stylesheet>
+            </bundle>"#
+                .to_vec();
+            let stylesheet = Compiler::new(
+                Arc::new(FragmentModuleResolver { module }),
+                CompileBudget::new(1 << 20, 4, 16, 1 << 20),
+            )
+            .compile(&principal, Some("memory:main.xsl"))
+            .expect("a DTD-declared ID identifies the embedded stylesheet");
 
             assert!(
                 stylesheet
