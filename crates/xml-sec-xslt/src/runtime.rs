@@ -376,25 +376,14 @@ impl VariableScope {
         retained: RetainedValue,
         meter: &mut Meter,
     ) -> Result<()> {
-        if self.values.contains_key(name) {
-            retained.release(meter);
-            return Err(Error::Dynamic(format!(
-                "duplicate variable binding for {}",
-                name.local
-            )));
-        }
-        if let Err(error) =
-            reserve_retained_hash_map_slot(&mut self.values, meter, &mut self.retained_owned_bytes)
-        {
-            retained.release(meter);
-            return Err(error);
-        }
-        self.retained_owned_bytes = self
-            .retained_owned_bytes
-            .checked_add(retained.retained_owned_bytes)
-            .expect("charged variable-scope storage fits usize");
-        self.values.insert(name.clone(), retained.value);
-        Ok(())
+        insert_retained_binding(
+            &mut self.values,
+            &mut self.retained_owned_bytes,
+            name,
+            retained,
+            meter,
+            "variable",
+        )
     }
 
     fn release(self, meter: &mut Meter) {
@@ -419,6 +408,32 @@ impl DerefMut for VariableScope {
 struct RetainedValue {
     value: Value,
     retained_owned_bytes: usize,
+}
+
+fn insert_retained_binding(
+    values: &mut HashMap<ExpandedName, Value>,
+    retained_owned_bytes: &mut usize,
+    name: &ExpandedName,
+    retained: RetainedValue,
+    meter: &mut Meter,
+    kind: &str,
+) -> Result<()> {
+    if values.contains_key(name) {
+        retained.release(meter);
+        return Err(Error::Dynamic(format!(
+            "duplicate {kind} binding for {}",
+            name.local
+        )));
+    }
+    if let Err(error) = reserve_retained_hash_map_slot(values, meter, retained_owned_bytes) {
+        retained.release(meter);
+        return Err(error);
+    }
+    *retained_owned_bytes = retained_owned_bytes
+        .checked_add(retained.retained_owned_bytes)
+        .expect("charged retained binding storage fits usize");
+    values.insert(name.clone(), retained.value);
+    Ok(())
 }
 
 impl RetainedValue {
@@ -568,6 +583,28 @@ impl Deref for EvaluatedParameters {
 
     fn deref(&self) -> &Self::Target {
         &self.values
+    }
+}
+
+impl EvaluatedParameters {
+    fn insert_retained(
+        &mut self,
+        name: &ExpandedName,
+        retained: RetainedValue,
+        meter: &mut Meter,
+    ) -> Result<()> {
+        insert_retained_binding(
+            &mut self.values,
+            &mut self.retained_owned_bytes,
+            name,
+            retained,
+            meter,
+            "xsl:with-param",
+        )
+    }
+
+    fn release(self, meter: &mut Meter) {
+        meter.release_owned_bytes(self.retained_owned_bytes);
     }
 }
 
@@ -3477,20 +3514,26 @@ impl<'a> Execution<'a> {
     ) -> Result<EvaluatedParameters> {
         let mut evaluated = EvaluatedParameters::default();
         for parameter in parameters {
-            let retained = self.evaluate_variable(
+            let retained = match self.evaluate_variable(
                 &parameter.variable,
                 node,
                 position,
                 size,
                 depth,
                 current_rule_precedence,
-            )?;
-            evaluated.retained_owned_bytes = evaluated
-                .retained_owned_bytes
-                .saturating_add(retained.retained_owned_bytes);
-            evaluated
-                .values
-                .insert(parameter.variable.name.clone(), retained.value);
+            ) {
+                Ok(retained) => retained,
+                Err(error) => {
+                    evaluated.release(&mut self.meter);
+                    return Err(error);
+                }
+            };
+            if let Err(error) =
+                evaluated.insert_retained(&parameter.variable.name, retained, &mut self.meter)
+            {
+                evaluated.release(&mut self.meter);
+                return Err(error);
+            }
         }
         Ok(evaluated)
     }
@@ -6633,6 +6676,79 @@ mod tests {
         scope.release(&mut meter);
         assert_eq!(
             meter
+                .usage(BudgetKind::OwnedBytes)
+                .expect("owned-byte usage is available")
+                .0,
+            0
+        );
+    }
+
+    #[test]
+    fn evaluated_parameters_retain_their_hash_storage_charge() {
+        // Staged with-param values can outlive this frame through template-task Arcs, so their
+        // backing table must remain charged until the last owner releases the parameter set.
+        let mut parameters = EvaluatedParameters::default();
+        let mut unlimited_meter = meter(usize::MAX);
+        let name = ExpandedName::new(None::<String>, "value");
+        let payload_bytes = super::expanded_name_owned_bytes(&name);
+        unlimited_meter
+            .charge(BudgetKind::OwnedBytes, payload_bytes)
+            .expect("parameter payload fits the test budget");
+        parameters
+            .insert_retained(
+                &name,
+                super::RetainedValue {
+                    value: Value::Boolean(true),
+                    retained_owned_bytes: payload_bytes,
+                },
+                &mut unlimited_meter,
+            )
+            .expect("parameter table fits the test budget");
+        let index_bytes = crate::budget::retained_hash_storage::<(ExpandedName, Value)>(
+            parameters.values.capacity(),
+        );
+
+        assert!(index_bytes > 0);
+        assert_eq!(parameters.retained_owned_bytes, payload_bytes + index_bytes);
+        assert_eq!(
+            unlimited_meter
+                .usage(BudgetKind::OwnedBytes)
+                .expect("owned-byte usage is available")
+                .0,
+            payload_bytes + index_bytes
+        );
+        parameters.release(&mut unlimited_meter);
+        assert_eq!(
+            unlimited_meter
+                .usage(BudgetKind::OwnedBytes)
+                .expect("owned-byte usage is available")
+                .0,
+            0
+        );
+
+        let mut constrained = meter(payload_bytes);
+        constrained
+            .charge(BudgetKind::OwnedBytes, payload_bytes)
+            .expect("parameter payload alone fits the constrained budget");
+        let mut rejected = EvaluatedParameters::default();
+        assert!(matches!(
+            rejected.insert_retained(
+                &name,
+                super::RetainedValue {
+                    value: Value::Boolean(true),
+                    retained_owned_bytes: payload_bytes,
+                },
+                &mut constrained,
+            ),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            })
+        ));
+        assert!(rejected.values.is_empty());
+        assert_eq!(rejected.values.capacity(), 0);
+        assert_eq!(
+            constrained
                 .usage(BudgetKind::OwnedBytes)
                 .expect("owned-byte usage is available")
                 .0,
