@@ -1987,6 +1987,14 @@ fn owned_document_policy_violation(
 ) -> Result<crate::policy::PolicyViolation, XmlDocumentError> {
     match error {
         XmlDocumentError::Policy(error) => Ok(error),
+        XmlDocumentError::Parse(crate::xml::dom::ParseError::NamespaceBindingLimitReached {
+            maximum,
+            actual,
+        }) => Ok(crate::policy::PolicyViolation::ResourceLimit {
+            resource: crate::policy::resource_name::XML_NAMESPACE_BINDINGS,
+            maximum,
+            actual,
+        }),
         XmlDocumentError::DocumentTooLarge { maximum, actual } => {
             Ok(crate::policy::PolicyViolation::ResourceLimit {
                 resource: crate::policy::resource_name::XML_DOCUMENT,
@@ -3559,6 +3567,49 @@ mod error_conversion_tests {
                 modulus: vec![0x80; 256],
                 exponent: vec![1, 0, 1],
             })
+        }
+    }
+
+    #[test]
+    fn namespace_exhaustion_preserves_typed_signing_errors() {
+        // Template and builder conversions share the same typed namespace-budget refusal.
+        let make_error = || {
+            XmlDocumentError::Parse(crate::xml::dom::ParseError::NamespaceBindingLimitReached {
+                maximum: 2,
+                actual: 3,
+            })
+        };
+        assert!(matches!(
+            owned_document_policy_violation(make_error()),
+            Ok(PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_NAMESPACE_BINDINGS,
+                maximum: 2,
+                actual: 3,
+            })
+        ));
+        let mut policy = crate::policy::SigningPolicy::default();
+        policy.resources.max_xml_namespace_bindings = 0;
+        let context = SignContext::new(&RejectingSigningKey).policy(policy);
+        let builder = SignatureBuilder::new(
+            crate::c14n::C14nAlgorithm::new(crate::c14n::C14nMode::Exclusive1_0, false),
+            SignatureAlgorithm::RsaSha256,
+        );
+        let xml = "<root xmlns:p='urn:p'/>";
+        for result in [
+            context.sign_template(xml),
+            context.sign_with_builder(xml, &builder),
+        ] {
+            assert!(
+                matches!(
+                    result,
+                    Err(SigningError::Policy(PolicyViolation::ResourceLimit {
+                        resource: crate::policy::resource_name::XML_NAMESPACE_BINDINGS,
+                        maximum: 0,
+                        actual: 1,
+                    }))
+                ),
+                "unexpected signing result: {result:?}"
+            );
         }
     }
 
