@@ -198,8 +198,9 @@ fn execution_budget() -> ExecutionBudget {
         result_nodes: 10_000_000,
         serialized_bytes: 64 << 20,
         messages: 100_000,
-        // The full XSLTMark workload retains large result fragments and a metered source clone.
-        owned_bytes: 512 << 20,
+        // The full XSLTMark workload retains large result fragments, a metered source clone, and
+        // exact backing storage for its XPath source/reverse/order indexes.
+        owned_bytes: 640 << 20,
     }
 }
 

@@ -415,10 +415,7 @@ impl EncryptedDataBuilder {
                     ReplacementMode::ReplaceElement,
                     operation.policy().resources.effective_xml_nodes() as usize,
                 )?;
-                let settings = DocumentParseSettings::from_policy(
-                    &operation.policy().xml,
-                    &operation.policy().resources,
-                );
+                let settings = self.document_parse_settings();
                 let mutation = require_encryption_mutation(generated.mutation)?;
                 operation.run_document_transition(mutation, document, |document, budgets| {
                     document
@@ -475,10 +472,7 @@ impl EncryptedDataBuilder {
                     ReplacementMode::ReplaceContent,
                     operation.policy().resources.effective_xml_nodes() as usize,
                 )?;
-                let settings = DocumentParseSettings::from_policy(
-                    &operation.policy().xml,
-                    &operation.policy().resources,
-                );
+                let settings = self.document_parse_settings();
                 let mutation = require_encryption_mutation(generated.mutation)?;
                 operation.run_document_transition(mutation, document, |document, budgets| {
                     document

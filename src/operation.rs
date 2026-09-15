@@ -686,6 +686,7 @@ mod tests {
         builder.add_node(OperationNodeKind::Document, stage, None)
     }
 
+    #[cfg(feature = "xmldsig")]
     #[test]
     fn compile_is_deterministic_and_rejects_cycles() {
         // Stable discovery order makes equal-priority nodes deterministic while
@@ -714,6 +715,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "xmldsig")]
     #[test]
     fn execution_requires_dependencies_and_preserves_first_failure() {
         // Out-of-order execution and later failures cannot replace the first
@@ -774,6 +776,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "xmldsig")]
     #[test]
     fn authenticated_extension_preserves_state_and_rejects_cycles() {
         // Authenticated nested structures extend the original plan only after
@@ -857,6 +860,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "xmldsig")]
     #[test]
     fn resource_identity_is_checked_before_the_action_runs() {
         let expected = OperationResourceIdentity::external("urn:test", b"expected");
@@ -880,6 +884,7 @@ mod tests {
         assert!(!ran.get(), "stale resource identity must gate the action");
     }
 
+    #[cfg(feature = "xmldsig")]
     #[test]
     fn resource_bound_node_requires_an_observed_identity() {
         // A caller cannot accidentally bypass provenance validation by using the

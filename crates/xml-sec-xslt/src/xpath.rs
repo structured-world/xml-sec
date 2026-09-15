@@ -2215,6 +2215,10 @@ impl Evaluator {
                 .insert(rewritten.as_ref().to_owned(), xpath);
         }
         let mut context = Context::new();
+        // XPath 1.0 section 2.2 confines `following` and `preceding` to the same document as the
+        // context node. Each projected logical document therefore supplies its wrapper as the
+        // evaluator root instead of exposing sibling source/module projections.
+        // https://www.w3.org/TR/1999/REC-xpath-19991116#axes
         context.set_document_root_resolver(projected_document_root);
         let (owned_bytes, owned_bytes_limit) = meter.usage(BudgetKind::OwnedBytes)?;
         context.set_string_allocation_limit(
@@ -2517,158 +2521,169 @@ impl Evaluator {
         meter: &mut Meter,
     ) -> Result<()> {
         let mut fragments = Vec::new();
-        for request in requested {
-            if self.documents.contains_key(&request) {
-                continue;
-            }
-            let fragment_offset = request.href.find('#').map(|index| index + 1);
-            let resource_uri =
-                fragment_offset.map_or(request.href.as_str(), |offset| &request.href[..offset - 1]);
-            let resource_request = DocumentRequest::relative_to(
-                resource_uri.to_owned(),
-                request.base_uri.clone(),
-                request.empty_document,
-            );
-            let root = if let Some(nodes) = self.documents.get(&resource_request) {
-                nodes.first().cloned()
-            } else {
-                meter.charge(BudgetKind::ExternalDocuments, 1)?;
-                let resource = match self.resolver.resolve(ResolveRequest::new(
-                    resource_uri,
-                    request.base_uri.as_deref(),
-                    ResolvePurpose::Document,
-                )) {
-                    Ok(resource) => resource,
-                    Err(Error::ResourceNotFound { .. }) => {
-                        self.cache_document(resource_request.clone(), Vec::new(), meter)?;
-                        self.cache_document(request, Vec::new(), meter)?;
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                };
-                let identity_is_new = match self.resource_identities.get(&resource.identity) {
-                    Some(previous) if previous != &resource => {
-                        return Err(Error::StaleResource {
-                            identity: resource.identity,
-                        });
-                    }
-                    Some(_) => false,
-                    None => true,
-                };
-                if let Some(root) = self.resource_documents.get(&resource.identity).cloned() {
-                    self.cache_document(resource_request.clone(), vec![root.clone()], meter)?;
-                    Some(root)
+        let mut fragments_owned_bytes = 0usize;
+        let result = (|| {
+            for request in requested {
+                if self.documents.contains_key(&request) {
+                    continue;
+                }
+                let fragment_offset = request.href.find('#').map(|index| index + 1);
+                let resource_uri = fragment_offset
+                    .map_or(request.href.as_str(), |offset| &request.href[..offset - 1]);
+                let resource_request = DocumentRequest::relative_to(
+                    resource_uri.to_owned(),
+                    request.base_uri.clone(),
+                    request.empty_document,
+                );
+                let root = if let Some(nodes) = self.documents.get(&resource_request) {
+                    nodes.first().cloned()
                 } else {
-                    let xml = decode_resource_for_xml_parse(&resource, meter)?;
-                    let (document, parsed_reservation) = parse_external_document_metered(
-                        &xml.value,
-                        Some(&resource.canonical_uri),
-                        meter,
-                    )?;
-                    let (mut document, expanded_reservation) = if self.process_xinclude {
-                        let expanded = expand_xinclude_document(
-                            &document,
-                            &XIncludeDocumentIdentity::External(resource.identity.clone()),
-                            self.resolver.as_ref(),
+                    meter.charge(BudgetKind::ExternalDocuments, 1)?;
+                    let resource = match self.resolver.resolve(ResolveRequest::new(
+                        resource_uri,
+                        request.base_uri.as_deref(),
+                        ResolvePurpose::Document,
+                    )) {
+                        Ok(resource) => resource,
+                        Err(Error::ResourceNotFound { .. }) => {
+                            self.cache_document(resource_request.clone(), Vec::new(), meter)?;
+                            self.cache_document(request, Vec::new(), meter)?;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    let identity_is_new = match self.resource_identities.get(&resource.identity) {
+                        Some(previous) if previous != &resource => {
+                            return Err(Error::StaleResource {
+                                identity: resource.identity,
+                            });
+                        }
+                        Some(_) => false,
+                        None => true,
+                    };
+                    if let Some(root) = self.resource_documents.get(&resource.identity).cloned() {
+                        self.cache_document(resource_request.clone(), vec![root.clone()], meter)?;
+                        Some(root)
+                    } else {
+                        let xml = decode_resource_for_xml_parse(&resource, meter)?;
+                        let (document, parsed_reservation) = parse_external_document_metered(
+                            &xml.value,
+                            Some(&resource.canonical_uri),
                             meter,
-                            &mut self.resource_identities,
-                            1,
-                            None,
                         )?;
-                        (expanded.document, Some(expanded.retained_owned_bytes))
-                    } else {
-                        (document, None)
-                    };
-                    if let Some((remap, remap_owned_bytes)) =
-                        apply_source_whitespace_rules(&mut document, &self.whitespace, meter)?
-                    {
-                        drop(remap);
-                        meter.release_owned_bytes(remap_owned_bytes);
+                        let (mut document, expanded_reservation) = if self.process_xinclude {
+                            let expanded = expand_xinclude_document(
+                                &document,
+                                &XIncludeDocumentIdentity::External(resource.identity.clone()),
+                                self.resolver.as_ref(),
+                                meter,
+                                &mut self.resource_identities,
+                                1,
+                                None,
+                            )?;
+                            (expanded.document, Some(expanded.retained_owned_bytes))
+                        } else {
+                            (document, None)
+                        };
+                        if let Some((remap, remap_owned_bytes)) =
+                            apply_source_whitespace_rules(&mut document, &self.whitespace, meter)?
+                        {
+                            drop(remap);
+                            meter.release_owned_bytes(remap_owned_bytes);
+                        }
+                        let root = self.import_document(&document, meter)?;
+                        meter.release_owned_bytes(parsed_reservation);
+                        if let Some(reservation) = expanded_reservation {
+                            meter.release_owned_bytes(reservation);
+                        }
+                        meter.release_owned_bytes(xml.temporary_bytes);
+                        let resource_identity = if identity_is_new {
+                            cache_new_resource_identity(
+                                &mut self.resource_identities,
+                                resource,
+                                meter,
+                            )?
+                        } else {
+                            let resource_identity = resource.identity.clone();
+                            meter.release_owned_bytes(resource.bytes.capacity());
+                            resource_identity
+                        };
+                        meter.charge(
+                            BudgetKind::OwnedBytes,
+                            resource_document_cache_entry_owned_bytes(&resource_identity),
+                        )?;
+                        self.resource_documents
+                            .insert(resource_identity, root.clone());
+                        self.cache_document(resource_request.clone(), vec![root.clone()], meter)?;
+                        Some(root)
                     }
-                    let root = self.import_document(&document, meter)?;
-                    meter.release_owned_bytes(parsed_reservation);
-                    if let Some(reservation) = expanded_reservation {
-                        meter.release_owned_bytes(reservation);
-                    }
-                    meter.release_owned_bytes(xml.temporary_bytes);
-                    let resource_identity = if identity_is_new {
-                        cache_new_resource_identity(&mut self.resource_identities, resource, meter)?
-                    } else {
-                        let resource_identity = resource.identity.clone();
-                        meter.release_owned_bytes(resource.bytes.capacity());
-                        resource_identity
-                    };
-                    meter.charge(
-                        BudgetKind::OwnedBytes,
-                        resource_document_cache_entry_owned_bytes(&resource_identity),
-                    )?;
-                    self.resource_documents
-                        .insert(resource_identity, root.clone());
-                    self.cache_document(resource_request.clone(), vec![root.clone()], meter)?;
-                    Some(root)
-                }
-            };
-            let Some(root) = root else {
-                self.cache_document(request, Vec::new(), meter)?;
-                continue;
-            };
-            if let Some(fragment_offset) = fragment_offset {
-                fragments.push((request, root, fragment_offset));
-            } else if request != resource_request {
-                self.cache_document(request, vec![root], meter)?;
-            }
-        }
-        for (request, root, fragment_offset) in fragments {
-            let raw_fragment = &request.href[fragment_offset..];
-            let (fragment, reserved_bytes) = decode_document_fragment(raw_fragment, meter)?;
-            let Some(expression) = fragment
-                .strip_prefix("xpointer(")
-                .and_then(|fragment| fragment.strip_suffix(')'))
-            else {
-                if !is_ncname(&fragment) {
-                    meter.release_owned_bytes(reserved_bytes);
-                    return Err(Error::Unsupported(format!(
-                        "document fragment `{fragment}`"
-                    )));
-                }
-                let SourceNode::Node(logical_root) = root else {
-                    meter.release_owned_bytes(reserved_bytes);
-                    return Err(Error::Dynamic(
-                        "document fragment root is not a document node".into(),
-                    ));
                 };
-                let selected = self
-                    .source
-                    .ids()
-                    .find_map(|(value, root, owner)| {
-                        (root == logical_root && value == fragment)
-                            .then_some(SourceNode::Node(owner))
-                    })
-                    .into_iter()
-                    .collect();
+                let Some(root) = root else {
+                    self.cache_document(request, Vec::new(), meter)?;
+                    continue;
+                };
+                if let Some(fragment_offset) = fragment_offset {
+                    reserve_temporary_vec_slot(&mut fragments, meter, &mut fragments_owned_bytes)?;
+                    fragments.push((request, root, fragment_offset));
+                } else if request != resource_request {
+                    self.cache_document(request, vec![root], meter)?;
+                }
+            }
+            for (request, root, fragment_offset) in fragments.drain(..) {
+                let raw_fragment = &request.href[fragment_offset..];
+                let (fragment, reserved_bytes) = decode_document_fragment(raw_fragment, meter)?;
+                let Some(expression) = fragment
+                    .strip_prefix("xpointer(")
+                    .and_then(|fragment| fragment.strip_suffix(')'))
+                else {
+                    if !is_ncname(&fragment) {
+                        meter.release_owned_bytes(reserved_bytes);
+                        return Err(Error::Unsupported(format!(
+                            "document fragment `{fragment}`"
+                        )));
+                    }
+                    let SourceNode::Node(logical_root) = root else {
+                        meter.release_owned_bytes(reserved_bytes);
+                        return Err(Error::Dynamic(
+                            "document fragment root is not a document node".into(),
+                        ));
+                    };
+                    let selected = self
+                        .source
+                        .ids()
+                        .find_map(|(value, root, owner)| {
+                            (root == logical_root && value == fragment)
+                                .then_some(SourceNode::Node(owner))
+                        })
+                        .into_iter()
+                        .collect();
+                    meter.release_owned_bytes(reserved_bytes);
+                    self.cache_document(request, selected, meter)?;
+                    continue;
+                };
+                let selected = self.evaluate_core(
+                    &Expression::generated(expression, Vec::new()),
+                    &root,
+                    1,
+                    1,
+                    variables,
+                    meter,
+                    None,
+                );
                 meter.release_owned_bytes(reserved_bytes);
-                self.cache_document(request, selected, meter)?;
-                continue;
-            };
-            let selected = self.evaluate_core(
-                &Expression::generated(expression, Vec::new()),
-                &root,
-                1,
-                1,
-                variables,
-                meter,
-                None,
-            );
-            meter.release_owned_bytes(reserved_bytes);
-            let selected = selected?;
-            let XPathValue::NodeSet(nodes) = selected else {
-                return Err(Error::Dynamic(format!(
-                    "document fragment `{fragment}` did not select nodes"
-                )));
-            };
-            self.cache_document(request, nodes, meter)?;
-        }
-        Ok(())
+                let selected = selected?;
+                let XPathValue::NodeSet(nodes) = selected else {
+                    return Err(Error::Dynamic(format!(
+                        "document fragment `{fragment}` did not select nodes"
+                    )));
+                };
+                self.cache_document(request, nodes, meter)?;
+            }
+            Ok(())
+        })();
+        drop(fragments);
+        meter.release_owned_bytes(fragments_owned_bytes);
+        result
     }
 
     pub(crate) fn matches(
@@ -5498,6 +5513,9 @@ struct NodeMaps {
     forward: HashMap<SourceNode, NodePath>,
     reverse: HashMap<NodePath, SourceNode>,
     order: HashMap<SourceNode, NodeOrder>,
+    forward_index_bytes: usize,
+    reverse_index_bytes: usize,
+    order_index_bytes: usize,
     next_order: usize,
 }
 
@@ -5510,6 +5528,9 @@ impl NodeMaps {
             forward: HashMap::new(),
             reverse: HashMap::new(),
             order: HashMap::new(),
+            forward_index_bytes: 0,
+            reverse_index_bytes: 0,
+            order_index_bytes: 0,
             next_order: 0,
         };
         maps.extend(source, 0, meter)?;
@@ -5517,82 +5538,105 @@ impl NodeMaps {
     }
 
     fn extend(&mut self, source: &Document, first_node: usize, meter: &mut Meter) -> Result<()> {
-        let paths = semantic_node_paths_from(source, first_node, meter)?;
-        let order_base = self.next_order;
-        self.next_order = self.next_order.saturating_add(paths.len());
-        for (id, node) in source.nodes().skip(first_node) {
-            let (path, rank) = paths.get(&id).cloned().ok_or_else(|| {
-                Error::Dynamic(format!("semantic node {id:?} has no document path"))
-            })?;
-            let path = NodePath::Ordinary(path);
-            let key = SourceNode::Node(id);
-            meter_node_map_entry(&path, meter)?;
-            self.forward.insert(key.clone(), path.clone());
-            self.reverse.insert(path.clone(), key.clone());
-            let rank = order_base.saturating_add(rank);
-            self.order
-                .insert(key.clone(), NodeOrder(rank.saturating_mul(3), 0, 0));
-            if let NodeKind::Element {
-                attributes,
-                namespaces,
-                ..
-            } = &node.kind
-            {
-                for (index, source_attribute) in attributes.iter().enumerate() {
-                    meter.check_additional(
-                        BudgetKind::OwnedBytes,
-                        path.ordinary()
-                            .len()
-                            .saturating_mul(std::mem::size_of::<usize>()),
-                    )?;
-                    let attribute_path = NodePath::Attribute {
-                        parent: path.ordinary().to_vec(),
-                        namespace: source_attribute.name.namespace.clone(),
-                        local: source_attribute.name.local.clone(),
-                    };
-                    let key = SourceNode::Attribute { owner: id, index };
-                    meter_node_map_entry(&attribute_path, meter)?;
-                    self.forward.insert(key.clone(), attribute_path.clone());
-                    self.reverse.insert(attribute_path, key.clone());
-                    self.order
-                        .insert(key.clone(), NodeOrder(rank.saturating_mul(3), 2, index));
-                }
-                for (index, namespace) in namespaces
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, namespace)| xpath_namespace_is_visible(namespace))
+        let MeteredSemanticPaths {
+            paths,
+            reserved_owned_bytes,
+        } = semantic_node_paths_from(source, first_node, meter)?;
+        let result = (|| {
+            let order_base = self.next_order;
+            self.next_order = self.next_order.saturating_add(paths.len());
+            for (id, node) in source.nodes().skip(first_node) {
+                let (path, rank) = paths.get(&id).ok_or_else(|| {
+                    Error::Dynamic(format!("semantic node {id:?} has no document path"))
+                })?;
+                self.reserve_entry(
+                    path.len().saturating_mul(std::mem::size_of::<usize>()),
+                    meter,
+                )?;
+                let key = SourceNode::Node(id);
+                self.forward
+                    .insert(key.clone(), NodePath::Ordinary(path.to_vec()));
+                self.reverse
+                    .insert(NodePath::Ordinary(path.to_vec()), key.clone());
+                let rank = order_base.saturating_add(*rank);
+                self.order
+                    .insert(key.clone(), NodeOrder(rank.saturating_mul(3), 0, 0));
+                if let NodeKind::Element {
+                    attributes,
+                    namespaces,
+                    ..
+                } = &node.kind
                 {
-                    meter.check_additional(
-                        BudgetKind::OwnedBytes,
-                        path.ordinary()
+                    for (index, source_attribute) in attributes.iter().enumerate() {
+                        let path_owned_bytes = path
                             .len()
-                            .saturating_mul(std::mem::size_of::<usize>()),
-                    )?;
-                    let namespace_path = NodePath::Namespace {
-                        parent: path.ordinary().to_vec(),
-                        prefix: namespace.prefix.clone().unwrap_or_default(),
-                        uri: namespace.uri.clone(),
-                    };
-                    let key = SourceNode::Namespace { owner: id, index };
-                    meter_node_map_entry(&namespace_path, meter)?;
-                    self.forward.insert(key.clone(), namespace_path.clone());
-                    self.reverse.insert(namespace_path, key.clone());
-                    // XPath 1.0 leaves namespace-axis order implementation-defined.
-                    // libxml2 exposes the implicit `xml` binding first and the
-                    // remaining declarations newest-first.
-                    let namespace_order = if namespace.prefix.as_deref() == Some("xml") {
-                        0
-                    } else {
-                        namespaces.len().saturating_sub(index).saturating_add(1)
-                    };
-                    self.order.insert(
-                        key.clone(),
-                        NodeOrder(rank.saturating_mul(3), 1, namespace_order),
-                    );
+                            .saturating_mul(std::mem::size_of::<usize>())
+                            .saturating_add(
+                                source_attribute
+                                    .name
+                                    .namespace
+                                    .as_deref()
+                                    .map_or(0, str::len),
+                            )
+                            .saturating_add(source_attribute.name.local.len());
+                        self.reserve_entry(path_owned_bytes, meter)?;
+                        let attribute_path = NodePath::Attribute {
+                            parent: path.to_vec(),
+                            namespace: source_attribute.name.namespace.clone(),
+                            local: source_attribute.name.local.clone(),
+                        };
+                        let key = SourceNode::Attribute { owner: id, index };
+                        self.forward.insert(key.clone(), attribute_path.clone());
+                        self.reverse.insert(attribute_path, key.clone());
+                        self.order
+                            .insert(key.clone(), NodeOrder(rank.saturating_mul(3), 2, index));
+                    }
+                    for (index, namespace) in namespaces
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, namespace)| xpath_namespace_is_visible(namespace))
+                    {
+                        let path_owned_bytes = path
+                            .len()
+                            .saturating_mul(std::mem::size_of::<usize>())
+                            .saturating_add(namespace.prefix.as_deref().map_or(0, str::len))
+                            .saturating_add(namespace.uri.len());
+                        self.reserve_entry(path_owned_bytes, meter)?;
+                        let namespace_path = NodePath::Namespace {
+                            parent: path.to_vec(),
+                            prefix: namespace.prefix.clone().unwrap_or_default(),
+                            uri: namespace.uri.clone(),
+                        };
+                        let key = SourceNode::Namespace { owner: id, index };
+                        self.forward.insert(key.clone(), namespace_path.clone());
+                        self.reverse.insert(namespace_path, key.clone());
+                        // XPath 1.0 leaves namespace-axis order implementation-defined.
+                        // libxml2 exposes the implicit `xml` binding first and the
+                        // remaining declarations newest-first.
+                        let namespace_order = if namespace.prefix.as_deref() == Some("xml") {
+                            0
+                        } else {
+                            namespaces.len().saturating_sub(index).saturating_add(1)
+                        };
+                        self.order.insert(
+                            key.clone(),
+                            NodeOrder(rank.saturating_mul(3), 1, namespace_order),
+                        );
+                    }
                 }
             }
-        }
-        Ok(())
+            Ok(())
+        })();
+        drop(paths);
+        meter.release_owned_bytes(reserved_owned_bytes);
+        result
+    }
+
+    fn reserve_entry(&mut self, path_owned_bytes: usize, meter: &mut Meter) -> Result<()> {
+        reserve_retained_hash_map_slot(&mut self.forward, meter, &mut self.forward_index_bytes)?;
+        reserve_retained_hash_map_slot(&mut self.reverse, meter, &mut self.reverse_index_bytes)?;
+        reserve_retained_hash_map_slot(&mut self.order, meter, &mut self.order_index_bytes)?;
+        meter.charge(BudgetKind::OwnedBytes, path_owned_bytes.saturating_mul(2))
     }
 
     fn to_sxd<'d>(&self, root: nodeset::Node<'d>, node: &SourceNode) -> Option<nodeset::Node<'d>> {
@@ -5786,57 +5830,67 @@ fn xpath_namespace_is_visible(namespace: &crate::Namespace) -> bool {
     !namespace.uri.is_empty()
 }
 
+struct MeteredSemanticPaths {
+    paths: HashMap<NodeId, (Vec<usize>, usize)>,
+    reserved_owned_bytes: usize,
+}
+
 fn semantic_node_paths_from(
     source: &Document,
     first_node: usize,
     meter: &mut Meter,
-) -> Result<HashMap<NodeId, (Vec<usize>, usize)>> {
+) -> Result<MeteredSemanticPaths> {
     let mut paths = HashMap::new();
-    let mut rank = 0usize;
-    for (document_index, logical_root) in source.logical_roots().iter().copied().enumerate() {
-        if logical_root.0 < first_node {
-            continue;
-        }
-        meter.charge(
-            BudgetKind::OwnedBytes,
-            2usize.saturating_mul(std::mem::size_of::<usize>()),
-        )?;
-        let root_path = vec![0, document_index];
-        let mut pending = vec![(logical_root, root_path)];
-        while let Some((parent, parent_path)) = pending.pop() {
-            meter.charge(
-                BudgetKind::OwnedBytes,
-                std::mem::size_of::<(NodeId, Vec<usize>, usize)>(),
-            )?;
-            paths.insert(parent, (parent_path.clone(), rank));
-            rank = rank.saturating_add(1);
-            let node = source.node(parent).ok_or_else(|| {
-                Error::Dynamic(format!("stale semantic node {parent:?} in document path"))
-            })?;
-            for (index, child) in node.children.iter().copied().enumerate().rev() {
-                meter.charge(
-                    BudgetKind::OwnedBytes,
-                    parent_path
-                        .len()
-                        .saturating_add(1)
-                        .saturating_mul(std::mem::size_of::<usize>()),
-                )?;
-                let mut child_path = parent_path.clone();
-                child_path.push(index);
-                pending.push((child, child_path));
+    let mut reserved_owned_bytes = 0usize;
+    let result = (|| {
+        let mut rank = 0usize;
+        for (document_index, logical_root) in source.logical_roots().iter().copied().enumerate() {
+            if logical_root.0 < first_node {
+                continue;
+            }
+            let mut root_path = Vec::new();
+            for component in [0, document_index] {
+                reserve_temporary_vec_slot(&mut root_path, meter, &mut reserved_owned_bytes)?;
+                root_path.push(component);
+            }
+            let mut pending = Vec::new();
+            reserve_temporary_vec_slot(&mut pending, meter, &mut reserved_owned_bytes)?;
+            pending.push((logical_root, root_path));
+            while let Some((parent, parent_path)) = pending.pop() {
+                let node = source.node(parent).ok_or_else(|| {
+                    Error::Dynamic(format!("stale semantic node {parent:?} in document path"))
+                })?;
+                for (index, child) in node.children.iter().copied().enumerate().rev() {
+                    let mut child_path = Vec::new();
+                    for component in parent_path.iter().copied() {
+                        reserve_temporary_vec_slot(
+                            &mut child_path,
+                            meter,
+                            &mut reserved_owned_bytes,
+                        )?;
+                        child_path.push(component);
+                    }
+                    reserve_temporary_vec_slot(&mut child_path, meter, &mut reserved_owned_bytes)?;
+                    child_path.push(index);
+                    reserve_temporary_vec_slot(&mut pending, meter, &mut reserved_owned_bytes)?;
+                    pending.push((child, child_path));
+                }
+                reserve_retained_hash_map_slot(&mut paths, meter, &mut reserved_owned_bytes)?;
+                paths.insert(parent, (parent_path, rank));
+                rank = rank.saturating_add(1);
             }
         }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        drop(paths);
+        meter.release_owned_bytes(reserved_owned_bytes);
+        return Err(error);
     }
-    Ok(paths)
-}
-
-fn meter_node_map_entry(path: &NodePath, meter: &mut Meter) -> Result<()> {
-    let retained = path
-        .owned_bytes()
-        .saturating_mul(2)
-        .saturating_add(std::mem::size_of::<SourceNode>().saturating_mul(3))
-        .saturating_add(std::mem::size_of::<NodeOrder>());
-    meter.charge(BudgetKind::OwnedBytes, retained)
+    Ok(MeteredSemanticPaths {
+        paths,
+        reserved_owned_bytes,
+    })
 }
 
 fn extend_node_base_uri_entries<'a>(
@@ -6430,7 +6484,7 @@ impl function::Function for GenerateId {
         context.reserve_string_allocation(output_len)?;
         let mut output = String::new();
         if output.try_reserve_exact(output_len).is_err() {
-            context.release_temporary_allocation(output_len);
+            context.release_temporary_allocation(output_len)?;
             return Err(function::Error::Other {
                 what: "failed to reserve generated-ID result storage".into(),
             });
@@ -6440,7 +6494,7 @@ impl function::Function for GenerateId {
             && let Err(error) =
                 context.reserve_string_allocation(actual_bytes.saturating_sub(output_len))
         {
-            context.release_temporary_allocation(output_len);
+            context.release_temporary_allocation(output_len)?;
             return Err(error);
         }
         write!(&mut output, "id{id}").expect("writing to String cannot fail");
@@ -6462,7 +6516,7 @@ fn assign_generated_id(
         .saturating_add(std::mem::size_of::<(NodePath, usize)>());
     context.reserve_string_allocation(entry_bytes)?;
     if let Err(error) = reserve_generated_id_slot(context, &mut cache) {
-        context.release_temporary_allocation(entry_bytes);
+        context.release_temporary_allocation(entry_bytes)?;
         return Err(error);
     }
     let id = cache.assigned.len() + 1;
@@ -6487,7 +6541,7 @@ fn reserve_generated_id_slot(
     context.reserve_string_allocation(requested_bytes)?;
     let mut replacement = HashMap::new();
     if replacement.try_reserve(target_capacity).is_err() {
-        context.release_temporary_allocation(requested_bytes);
+        context.release_temporary_allocation(requested_bytes)?;
         return Err(function::Error::Other {
             what: "failed to reserve generated-ID cache storage".into(),
         });
@@ -6495,15 +6549,15 @@ fn reserve_generated_id_slot(
     let actual_bytes = retained_hash_storage::<(NodePath, usize)>(replacement.capacity());
     if actual_bytes > requested_bytes {
         if let Err(error) = context.reserve_string_allocation(actual_bytes - requested_bytes) {
-            context.release_temporary_allocation(requested_bytes);
+            context.release_temporary_allocation(requested_bytes)?;
             return Err(error);
         }
     } else {
-        context.release_temporary_allocation(requested_bytes - actual_bytes);
+        context.release_temporary_allocation(requested_bytes - actual_bytes)?;
     }
     replacement.extend(cache.assigned.drain());
     cache.assigned = replacement;
-    context.release_temporary_allocation(old_bytes);
+    context.release_temporary_allocation(old_bytes)?;
     cache.owned_bytes = cache
         .owned_bytes
         .checked_sub(old_bytes)
@@ -9586,6 +9640,57 @@ mod tests {
                     .saturating_mul(std::mem::size_of::<HashMap<String, String>>()),
             );
         assert!(charged >= retained_outer_capacity);
+    }
+
+    #[test]
+    fn node_maps_release_semantic_path_workspace_after_projection() {
+        // Semantic paths are only construction workspace. Once the permanent indexes own their
+        // path payloads, the workspace reservation must be released rather than retained for the
+        // rest of the transformation. Hash-table backing storage already includes each inline
+        // `NodePath`; only its heap payload needs a separate charge.
+        let source = Document::parse("<root><first><nested/></first><second/></root>", None)
+            .expect("source parses");
+        let mut meter = Meter::new(
+            ExecutionBudget {
+                source_bytes: source.source_bytes(),
+                external_documents: 0,
+                recursion_depth: 8,
+                xpath_evaluations: 0,
+                xpath_operations: 0,
+                extension_operations: 0,
+                pattern_evaluations: 0,
+                template_applications: 0,
+                sort_comparisons: 0,
+                key_entries: 0,
+                result_nodes: 0,
+                serialized_bytes: 0,
+                messages: 0,
+                owned_bytes: usize::MAX,
+            },
+            source.source_bytes(),
+        )
+        .expect("meter initializes");
+        let before = meter.usage(BudgetKind::OwnedBytes).expect("valid kind").0;
+
+        let maps = NodeMaps::new(&source, &mut meter).expect("node maps build");
+
+        let expected_retained = maps
+            .forward
+            .values()
+            .fold(0usize, |total, path| {
+                total.saturating_add(
+                    path.owned_bytes()
+                        .saturating_sub(std::mem::size_of::<NodePath>())
+                        .saturating_mul(2),
+                )
+            })
+            .saturating_add(maps.forward_index_bytes)
+            .saturating_add(maps.reverse_index_bytes)
+            .saturating_add(maps.order_index_bytes);
+        assert_eq!(
+            meter.usage(BudgetKind::OwnedBytes).expect("valid kind").0,
+            before.saturating_add(expected_retained)
+        );
     }
 
     #[test]

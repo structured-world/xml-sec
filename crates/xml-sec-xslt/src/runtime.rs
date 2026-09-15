@@ -73,6 +73,37 @@ impl<'a> AttributeSetExpansion<'a> {
     }
 }
 
+fn select_attribute_set_declarations<'a>(
+    declarations: &'a [AttributeSet],
+    name: &ExpandedName,
+    meter: &mut Meter,
+) -> Result<(Vec<&'a AttributeSet>, usize)> {
+    let mut selected = Vec::new();
+    let mut reserved_owned_bytes = 0usize;
+    let result = (|| {
+        for declaration in declarations.iter().filter(|set| &set.name == name) {
+            reserve_temporary_vec_slot(&mut selected, meter, &mut reserved_owned_bytes)?;
+            selected.push(declaration);
+        }
+        if selected.is_empty() {
+            return Err(Error::Static(format!(
+                "undefined attribute-set {}",
+                name.local
+            )));
+        }
+        // `order` is unique, so unstable sorting avoids a merge buffer while preserving the
+        // complete XSLT declaration order.
+        selected.sort_unstable_by_key(|set| (std::cmp::Reverse(set.precedence), set.order));
+        Ok(())
+    })();
+    if let Err(error) = result {
+        drop(selected);
+        meter.release_owned_bytes(reserved_owned_bytes);
+        return Err(error);
+    }
+    Ok((selected, reserved_owned_bytes))
+}
+
 #[derive(Clone, Copy)]
 enum CopyDocument<'a> {
     Source,
@@ -4077,33 +4108,17 @@ impl<'a> Execution<'a> {
         expansion: &mut AttributeSetExpansion<'s>,
     ) -> Result<()> {
         expansion.push(name, &mut self.meter)?;
-        let mut sets = Vec::new();
-        let mut sets_reservation = 0usize;
-        for set in expansion
-            .declarations
-            .iter()
-            .filter(|set| &set.name == name)
-        {
-            if let Err(error) =
-                reserve_temporary_vec_slot(&mut sets, &mut self.meter, &mut sets_reservation)
-            {
+        let (sets, sets_reservation) = match select_attribute_set_declarations(
+            expansion.declarations,
+            name,
+            &mut self.meter,
+        ) {
+            Ok(selected) => selected,
+            Err(error) => {
                 expansion.active.pop();
-                self.meter.release_owned_bytes(sets_reservation);
                 return Err(error);
             }
-            sets.push(set);
-        }
-        if sets.is_empty() {
-            expansion.active.pop();
-            self.meter.release_owned_bytes(sets_reservation);
-            return Err(Error::Static(format!(
-                "undefined attribute-set {}",
-                name.local
-            )));
-        }
-        // `order` is unique, so unstable sorting preserves the complete XSLT declaration order
-        // without allocating the merge buffer used by stable slice sorting.
-        sets.sort_unstable_by_key(|set| (std::cmp::Reverse(set.precedence), set.order));
+        };
         let mut previous_protected = self.attribute_protected_names.take();
         let mut outer_protected = None;
         let result = (|| {
@@ -6637,10 +6652,10 @@ mod tests {
         ApplyFrame, AttributeSetExpansion, EvaluatedParameters, SortKey, SourceNode, TemplateTask,
         append_localized_decimal, apply_source_whitespace_rules,
         clone_allocation_free_variable_value, format_number_sequence, metered_node_id_snapshot,
-        validate_parameter_value, value_string,
+        select_attribute_set_declarations, validate_parameter_value, value_string,
     };
     use crate::budget::Meter;
-    use crate::compiler::Instruction;
+    use crate::compiler::{AttributeSet, Instruction};
     use crate::{
         BudgetKind, CompileBudget, Compiler, Document, Error, ExecutionBudget, ExpandedName,
         NoResolver, NodeId, NodeKind, NodeReference, Value,
@@ -6755,6 +6770,47 @@ mod tests {
                 .0,
             0
         );
+    }
+
+    #[test]
+    fn attribute_set_selection_reserves_pointer_storage_before_growth() {
+        let name = ExpandedName::new(None::<String>, "attrs");
+        let declarations = (0..256)
+            .map(|order| AttributeSet {
+                name: name.clone(),
+                uses: Vec::new(),
+                attributes: Vec::new().into(),
+                precedence: 0,
+                order,
+            })
+            .collect::<Vec<_>>();
+        let required = declarations
+            .len()
+            .saturating_mul(std::mem::size_of::<&AttributeSet>());
+        let peak_growth = required.saturating_add(required / 2);
+        let mut insufficient = meter(peak_growth - 1);
+
+        assert!(matches!(
+            select_attribute_set_declarations(&declarations, &name, &mut insufficient),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            })
+        ));
+        assert_eq!(
+            insufficient
+                .usage(BudgetKind::OwnedBytes)
+                .expect("owned-byte usage is available")
+                .0,
+            0
+        );
+
+        let mut exact = meter(peak_growth);
+        let (selected, reserved) =
+            select_attribute_set_declarations(&declarations, &name, &mut exact)
+                .expect("exact pointer-storage budget fits");
+        assert_eq!(selected.len(), declarations.len());
+        assert_eq!(reserved, required);
     }
 
     #[test]

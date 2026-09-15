@@ -315,8 +315,8 @@ impl<'c, 'd> Evaluation<'c, 'd> {
     }
 
     /// Release bytes after temporary extension storage is destroyed or superseded.
-    pub fn release_temporary_allocation(&self, bytes: usize) {
-        release_allocation(self.string_allocations, bytes);
+    pub fn release_temporary_allocation(&self, bytes: usize) -> Result<(), function::Error> {
+        release_allocation(self.string_allocations, bytes)
     }
 
     /// Charge primitive XPath evaluation work before performing it.
@@ -397,13 +397,17 @@ fn reserve_allocation(
     Ok(())
 }
 
-fn release_allocation(budget: &StringAllocationBudget, bytes: usize) {
-    let retained = budget
-        .used
-        .get()
-        .checked_sub(bytes)
-        .expect("released XPath allocation must have been reserved");
+fn release_allocation(
+    budget: &StringAllocationBudget,
+    bytes: usize,
+) -> Result<(), function::Error> {
+    let Some(retained) = budget.used.get().checked_sub(bytes) else {
+        return Err(function::Error::Other {
+            what: "released XPath allocation exceeds reserved allocation".into(),
+        });
+    };
     budget.used.set(retained);
+    Ok(())
 }
 
 /// An iterator for the contexts of each node in a nodeset
@@ -496,8 +500,23 @@ mod tests {
         evaluation
             .reserve_temporary_allocation(8)
             .expect("initial temporary allocation fits");
-        evaluation.release_temporary_allocation(8);
+        evaluation
+            .release_temporary_allocation(8)
+            .expect("reserved temporary allocation can be released");
 
         assert!(evaluation.reserve_temporary_allocation(8).is_ok());
+    }
+
+    #[test]
+    fn allocation_budget_rejects_releasing_unreserved_storage() {
+        let context = Context::new();
+        let package = sxd_document_no_unsafe::Package::new();
+        let evaluation = super::Evaluation::new(&context, package.as_document().root().into());
+
+        let error = evaluation
+            .release_temporary_allocation(1)
+            .expect_err("unreserved storage must return an evaluation error");
+
+        assert!(error.to_string().contains("exceeds reserved allocation"));
     }
 }
