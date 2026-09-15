@@ -5291,13 +5291,14 @@ fn recursive_named_templates_accumulate_result_tree_fragment_parameters() {
 }
 
 #[test]
-fn html_uri_serialization_drops_only_leading_xml_whitespace() {
-    // Match libxslt's HTML serializer: leading XML whitespace is ignored,
-    // while interior and trailing URI spaces are percent-encoded.
+fn html_uri_serialization_preserves_and_escapes_all_spaces() {
+    // XSLT 1.0 section 16.2 escapes URI attribute data but does not permit the HTML serializer to
+    // trim the result-tree value, unlike libxslt's treatment of leading XML whitespace.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="html" omit-xml-declaration="yes"/><xsl:template match="/"><a href="  a b  ">x</a></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(stylesheet, "<root/>"),
-        "<a href=\"a%20b%20%20\">x</a>\n"
+        "<a href=\"%20%20a%20b%20%20\">x</a>\n"
     );
 }
 

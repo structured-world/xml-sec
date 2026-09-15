@@ -1683,10 +1683,10 @@ fn escape_html_uri_attribute(
     encoding: &OutputEncoding,
     output: &mut RenderBuffer,
 ) {
-    // XSLT 1.0 section 16.2 requires non-ASCII URI bytes to be escaped. libxslt also
-    // escapes ASCII spaces for its historical URI table, but not for all HTML URI pairs.
+    // XSLT 1.0 section 16.2 requires non-ASCII URI bytes to be escaped without changing the
+    // result-tree value. libxslt also escapes ASCII spaces for its historical URI table, but not
+    // for all HTML URI pairs; leading whitespace is therefore processed rather than trimmed.
     // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
-    let value = value.trim_start_matches([' ', '\t', '\r', '\n']);
     let escape_spaces = matches!(escaping, HtmlUriEscaping::NonAsciiAndSpaces);
     let mut plain_start = 0;
     for (index, character) in value.char_indices() {
@@ -2108,6 +2108,22 @@ mod tests {
             String::from_utf8(output)
                 .expect("UTF-8")
                 .contains("a=\"&lt;&#10;\"")
+        );
+    }
+
+    #[test]
+    fn html_uri_attributes_preserve_leading_whitespace() {
+        // XSLT 1.0 section 16.2 permits URI escaping, not trimming the result-tree value.
+        let document = Document::parse("<a href='  relative'/>", None).expect("XML");
+        let definition = OutputDefinition {
+            method: OutputMethod::Html,
+            method_explicit: true,
+            ..OutputDefinition::default()
+        };
+
+        assert_eq!(
+            serialize_audit_document(&document, &definition).expect("serializes"),
+            b"<a href=\"%20%20relative\"></a>\n"
         );
     }
 

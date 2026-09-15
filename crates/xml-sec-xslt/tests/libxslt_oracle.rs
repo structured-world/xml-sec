@@ -2194,22 +2194,29 @@ fn normalize_stale_docbook_quotes(mut bytes: Vec<u8>) -> Vec<u8> {
 }
 
 fn normalize_stale_gdp_uri_whitespace(bytes: Vec<u8>) -> Vec<u8> {
-    // Current libxslt preserves this source's leading CDATA whitespace for XML
-    // methods, while the historical DocBook goldens stripped it. HTML already
-    // strips the prefix in its URI serializer.
-    let prefix = b"           http";
-    let mut normalized = Vec::with_capacity(bytes.len());
-    let mut remainder = bytes.as_slice();
-    while let Some(offset) = remainder
-        .windows(prefix.len())
-        .position(|window| window == prefix)
-    {
-        normalized.extend_from_slice(&remainder[..offset]);
-        normalized.extend_from_slice(b"http");
-        remainder = &remainder[offset + prefix.len()..];
+    // The historical DocBook golden strips this source's leading CDATA whitespace. Current
+    // libxslt preserves it for XML output but still strips it in HTML URI attributes; the strict
+    // engine preserves and percent-escapes it as required by XSLT 1.0 section 16.2.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
+    let mut bytes = bytes;
+    for prefix in [
+        b"           http".as_slice(),
+        b"%20%20%20%20%20%20%20%20%20%20%20http".as_slice(),
+    ] {
+        let mut normalized = Vec::with_capacity(bytes.len());
+        let mut remainder = bytes.as_slice();
+        while let Some(offset) = remainder
+            .windows(prefix.len())
+            .position(|window| window == prefix)
+        {
+            normalized.extend_from_slice(&remainder[..offset]);
+            normalized.extend_from_slice(b"http");
+            remainder = &remainder[offset + prefix.len()..];
+        }
+        normalized.extend_from_slice(remainder);
+        bytes = normalized;
     }
-    normalized.extend_from_slice(remainder);
-    normalized
+    bytes
 }
 
 #[test]
@@ -2224,9 +2231,9 @@ fn stale_kwrite_quote_normalization_is_fixture_specific_and_encoding_agnostic() 
 fn stale_gdp_uri_normalization_removes_only_the_known_leading_prefix() {
     assert_eq!(
         normalize_stale_gdp_uri_whitespace(
-            b"<a href=\"           http://example.test/a b\">".to_vec()
+            b"<a href=\"           http://example.test/a b\"><a href=\"%20%20%20%20%20%20%20%20%20%20%20http://example.test/c d\">".to_vec()
         ),
-        b"<a href=\"http://example.test/a b\">"
+        b"<a href=\"http://example.test/a b\"><a href=\"http://example.test/c d\">"
     );
 }
 
