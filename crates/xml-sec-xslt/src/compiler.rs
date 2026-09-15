@@ -4014,32 +4014,47 @@ fn visit_namespace_prefix_attribute(
     let Some(value) = value else {
         return Ok(());
     };
-    let mut tokens = value.split_ascii_whitespace().peekable();
-    if tokens.peek().is_none() {
-        // XSLT 1.0 sections 7.1.1 and 14.1 define these attributes as token lists, so an
-        // explicitly present value must contain a prefix token.
-        // https://www.w3.org/TR/1999/REC-xslt-19991116#literal-result-element
-        return Err(Error::Static(format!(
-            "{attribute} requires at least one namespace prefix token"
-        )));
-    }
-    if tokens.clone().any(|token| token == "#all") {
-        // XSLT 1.0 section 7.1.1 permits QName tokens and #default only. Section 2.5
-        // makes an unsupported optional attribute value ignorable as a whole in FCP.
-        // https://www.w3.org/TR/1999/REC-xslt-19991116#literal-result-element
+    let validate = || -> Result<()> {
+        let mut tokens = value.split_ascii_whitespace().peekable();
+        if tokens.peek().is_none() {
+            return Err(Error::Static(format!(
+                "{attribute} requires at least one namespace prefix token"
+            )));
+        }
+        for token in tokens {
+            if token == "#all" {
+                return Err(Error::Static(format!(
+                    "{attribute} does not permit #all in XSLT 1.0"
+                )));
+            }
+            if token != "#default" && !is_ncname(token) {
+                return Err(Error::Static(format!(
+                    "{attribute} contains invalid prefix token {token}"
+                )));
+            }
+            let prefix = (token != "#default").then_some(token);
+            if node.lookup_namespace_uri(prefix).is_none() {
+                return Err(Error::Static(format!(
+                    "{attribute} prefix {token} is not bound"
+                )));
+            }
+        }
+        Ok(())
+    };
+    if let Err(error) = validate() {
+        // XSLT 1.0 section 2.5 treats this token list as one optional attribute: an unsupported
+        // value is ignored as a whole in forwards-compatible mode, without partial effects.
         // https://www.w3.org/TR/1999/REC-xslt-19991116#forwards
         if forward_compatible {
             return Ok(());
         }
-        return Err(Error::Static(format!(
-            "{attribute} does not permit #all in XSLT 1.0"
-        )));
+        return Err(error);
     }
-    for token in tokens {
+    for token in value.split_ascii_whitespace() {
         let prefix = (token != "#default").then_some(token);
         let namespace = node
             .lookup_namespace_uri(prefix)
-            .ok_or_else(|| Error::Static(format!("{attribute} prefix {token} is not bound")))?;
+            .expect("namespace prefix list was validated before visitation");
         visit(namespace);
     }
     Ok(())

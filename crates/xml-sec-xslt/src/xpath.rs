@@ -545,6 +545,20 @@ struct CustomCallState {
     retained_bytes: usize,
 }
 
+impl CustomCallState {
+    fn reserve_completed_slot(&mut self, meter: &mut Meter) -> Result<()> {
+        let old_capacity = self.completed.capacity();
+        reserve_retained_vec_slot(&mut self.completed, meter)?;
+        let capacity_growth = self
+            .completed
+            .capacity()
+            .saturating_sub(old_capacity)
+            .saturating_mul(std::mem::size_of::<CompletedCustomCall>());
+        self.retained_bytes = self.retained_bytes.saturating_add(capacity_growth);
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DeferredCustomCall {
     name: ExpandedName,
@@ -1204,12 +1218,24 @@ impl Evaluator {
     ) -> Result<()> {
         let retained = self.deferred_public_value_size(&value)?;
         meter.charge(BudgetKind::OwnedBytes, retained)?;
+        let (result, fragment) = match self.defer_public_value(value) {
+            Ok(value) => value,
+            Err(error) => {
+                meter.release_owned_bytes(retained);
+                return Err(error);
+            }
+        };
         let mut state = session.state.borrow_mut();
-        let call = state
-            .last_requested
-            .take()
-            .ok_or_else(|| Error::Dynamic("stylesheet function continuation is missing".into()))?;
-        let (result, fragment) = self.defer_public_value(value)?;
+        let Some(call) = state.last_requested.take() else {
+            meter.release_owned_bytes(retained);
+            return Err(Error::Dynamic(
+                "stylesheet function continuation is missing".into(),
+            ));
+        };
+        if let Err(error) = state.reserve_completed_slot(meter) {
+            meter.release_owned_bytes(retained);
+            return Err(error);
+        }
         state.retained_bytes = state.retained_bytes.saturating_add(retained);
         state.completed.push(CompletedCustomCall {
             call,
@@ -6415,10 +6441,45 @@ fn assign_generated_id(
         .owned_bytes()
         .saturating_add(std::mem::size_of::<(NodePath, usize)>());
     context.reserve_string_allocation(entry_bytes)?;
+    reserve_generated_id_slot(context, &mut cache)?;
     let id = cache.assigned.len() + 1;
     cache.assigned.insert(path, id);
     cache.owned_bytes = cache.owned_bytes.saturating_add(entry_bytes);
     Ok(id)
+}
+
+fn reserve_generated_id_slot(
+    context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
+    cache: &mut GeneratedIdCache,
+) -> std::result::Result<(), function::Error> {
+    if cache.assigned.len() < cache.assigned.capacity() {
+        return Ok(());
+    }
+    let old_bytes = retained_hash_storage::<(NodePath, usize)>(cache.assigned.capacity());
+    let old_capacity = cache.assigned.capacity();
+    let target_capacity = old_capacity.saturating_add(old_capacity.max(4));
+    let requested_bytes = retained_hash_storage::<(NodePath, usize)>(target_capacity);
+    // The old and replacement tables coexist during growth, so the XPath allocation gate must
+    // reserve the complete replacement before its allocator is invoked.
+    context.reserve_string_allocation(requested_bytes)?;
+    let mut replacement = HashMap::new();
+    replacement
+        .try_reserve(target_capacity)
+        .map_err(|error| function::Error::Other {
+            what: format!("failed to reserve generated-ID cache storage: {error}"),
+        })?;
+    let actual_bytes = retained_hash_storage::<(NodePath, usize)>(replacement.capacity());
+    if actual_bytes > requested_bytes {
+        context.reserve_string_allocation(actual_bytes - requested_bytes)?;
+    }
+    replacement.extend(cache.assigned.drain());
+    cache.assigned = replacement;
+    cache.owned_bytes = cache
+        .owned_bytes
+        .checked_sub(old_bytes)
+        .expect("generated-ID hash capacity was previously accounted")
+        .saturating_add(actual_bytes);
+    Ok(())
 }
 
 enum NodeNameFunction {
@@ -9089,6 +9150,77 @@ impl function::Function for CurrentNode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn generated_id_cache_accounts_for_hash_table_storage() {
+        // Distinct generate-id() calls retain both each path and the backing hash table. The
+        // execution reservation transferred after XPath evaluation must cover both allocations.
+        let package = Package::new();
+        let document = package.as_document();
+        let context = Context::new();
+        let evaluation =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+        let cache = RefCell::new(GeneratedIdCache::default());
+        let path = NodePath::Ordinary(vec![0]);
+        let payload = path
+            .owned_bytes()
+            .saturating_add(std::mem::size_of::<(NodePath, usize)>());
+
+        assign_generated_id(&evaluation, &cache, path).expect("generated ID is assigned");
+
+        let cache = cache.borrow();
+        let table = retained_hash_storage::<(NodePath, usize)>(cache.assigned.capacity());
+        assert_eq!(cache.owned_bytes, payload.saturating_add(table));
+    }
+
+    #[test]
+    fn completed_custom_calls_account_for_vector_storage() {
+        // The continuation session survives every replay, so its released reservation must
+        // include the completed-call vector even when the cached call carries no heap payload.
+        let call = Rc::new(DeferredCustomCall {
+            name: ExpandedName::new(None::<String>, "f"),
+            node: NodePath::Ordinary(Vec::new()),
+            position: 1,
+            size: 1,
+            arguments: Vec::new(),
+        });
+        let completed_call = CompletedCustomCall {
+            call,
+            result: DeferredXPathValue::Boolean(true),
+            fragment: None,
+        };
+        let budget = ExecutionBudget {
+            source_bytes: usize::MAX,
+            external_documents: usize::MAX,
+            recursion_depth: usize::MAX,
+            xpath_evaluations: usize::MAX,
+            xpath_operations: usize::MAX,
+            extension_operations: usize::MAX,
+            pattern_evaluations: usize::MAX,
+            template_applications: usize::MAX,
+            sort_comparisons: usize::MAX,
+            key_entries: usize::MAX,
+            result_nodes: usize::MAX,
+            serialized_bytes: usize::MAX,
+            messages: usize::MAX,
+            owned_bytes: usize::MAX,
+        };
+        let mut meter = Meter::new(budget, 0).expect("empty meter initializes");
+        let mut state = CustomCallState::default();
+        state
+            .reserve_completed_slot(&mut meter)
+            .expect("completed-call slot fits");
+        state.completed.push(completed_call);
+        let vector_bytes = state
+            .completed
+            .capacity()
+            .saturating_mul(std::mem::size_of::<CompletedCustomCall>());
+        let session = CustomCallSession {
+            state: Rc::new(RefCell::new(state)),
+        };
+
+        assert_eq!(session.retained_bytes(), vector_bytes);
+    }
+
     #[test]
     fn dynamic_map_document_accounts_for_all_retained_storage() {
         // The temporary EXSLT result tree owns expanded names, prefixes, namespace declarations,

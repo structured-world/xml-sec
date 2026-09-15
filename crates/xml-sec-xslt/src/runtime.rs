@@ -10,7 +10,7 @@ use icu_collator::{Collator, CollatorBorrowed, CollatorPreferences, options::Col
 use icu_locale::Locale;
 
 use crate::budget::{
-    EXECUTION_RECURSION_DEPTH_CEILING, Meter, append_metered_string,
+    EXECUTION_RECURSION_DEPTH_CEILING, Meter, append_metered_string, reserve_metered_string,
     reserve_retained_hash_map_slot, reserve_retained_hash_set_slot, reserve_retained_vec_slot,
     reserve_temporary_vec_slot,
 };
@@ -530,6 +530,12 @@ impl MeteredString {
 
     fn push_str(&mut self, value: &str, meter: &mut Meter) -> Result<()> {
         append_metered_string(&mut self.value, value, meter)?;
+        self.retained_owned_bytes = self.value.capacity();
+        Ok(())
+    }
+
+    fn reserve(&mut self, additional: usize, meter: &mut Meter) -> Result<()> {
+        reserve_metered_string(&mut self.value, additional, meter)?;
         self.retained_owned_bytes = self.value.capacity();
         Ok(())
     }
@@ -2599,7 +2605,8 @@ impl<'a> Execution<'a> {
                     .for_each(|value| value.release(&mut self.meter));
                 self.meter.release_owned_bytes(values_owned_bytes);
                 let formatted = formatted?;
-                self.append_owned_text(formatted, false)
+                let (formatted, reservation) = formatted.into_parts();
+                self.append_precharged_text(formatted, reservation, false)
             }
             Instruction::Variable(variable) => {
                 let retained = self.evaluate_variable(
@@ -4228,10 +4235,6 @@ impl<'a> Execution<'a> {
     fn append_text(&mut self, value: &str, disable: bool) -> Result<()> {
         self.append_text_value(Cow::Borrowed(value), disable)
     }
-    fn append_owned_text(&mut self, value: String, disable: bool) -> Result<()> {
-        self.append_text_value(Cow::Owned(value), disable)
-    }
-
     fn append_source_leaf_text(&mut self, node: &SourceNode, disable: bool) -> Result<()> {
         let parent = self.parent();
         let Some(value) = self.evaluator.borrowed_leaf_string_value(node) else {
@@ -5754,6 +5757,12 @@ fn copied_node_base_uri(kind: &NodeKind, inherited: Option<&str>) -> Result<Opti
 }
 
 fn static_namespace<'a>(namespaces: &'a [(String, String)], prefix: &str) -> Option<&'a str> {
+    if prefix == "xml" {
+        // Namespaces in XML 1.0 section 3 binds `xml` by definition and permits its declaration
+        // to be omitted. Every QName expansion path must therefore expose the implicit binding.
+        // https://www.w3.org/TR/2009/REC-xml-names-20091208/#ns-decl
+        return Some("http://www.w3.org/XML/1998/namespace");
+    }
     namespaces
         .iter()
         .rev()
@@ -5808,9 +5817,9 @@ fn format_number_sequence(
     separator: Option<char>,
     size: Option<usize>,
     meter: &mut Meter,
-) -> Result<String> {
+) -> Result<MeteredString> {
     if values.is_empty() {
-        return Ok(String::new());
+        return Ok(MeteredString::new());
     }
     let (runs, formats, separators) = number_format_run_counts(format);
     let token_workspace = runs
@@ -5821,7 +5830,7 @@ fn format_number_sequence(
     let result = (|| {
         let tokens = tokenize_number_format(format);
         if tokens.formats.is_empty() {
-            let mut output = String::new();
+            let mut output = MeteredString::new();
             append_metered(&mut output, tokens.prefix, meter)?;
             for (index, value) in values.iter().enumerate() {
                 if index > 0 {
@@ -5831,7 +5840,7 @@ fn format_number_sequence(
             }
             return Ok(output);
         }
-        let mut output = String::new();
+        let mut output = MeteredString::new();
         append_metered(&mut output, tokens.prefix, meter)?;
         for (index, value) in values.iter().enumerate() {
             if index > 0 {
@@ -5858,13 +5867,8 @@ fn format_number_sequence(
     result
 }
 
-fn append_metered(output: &mut String, value: &str, meter: &Meter) -> Result<()> {
-    meter.check_additional(
-        BudgetKind::OwnedBytes,
-        output.len().saturating_add(value.len()),
-    )?;
-    output.push_str(value);
-    Ok(())
+fn append_metered(output: &mut MeteredString, value: &str, meter: &mut Meter) -> Result<()> {
+    output.push_str(value, meter)
 }
 
 struct NumberFormatTokens<'a> {
@@ -6379,12 +6383,12 @@ fn number_format_run_counts(format: &str) -> (usize, usize, usize) {
     (runs, formats, separators)
 }
 fn format_number_into(
-    output: &mut String,
+    output: &mut MeteredString,
     value: f64,
     format: &str,
     separator: Option<char>,
     size: Option<usize>,
-    meter: &Meter,
+    meter: &mut Meter,
 ) -> Result<()> {
     debug_assert!(value.is_nan() || value.round() > 0.0);
     if value.is_nan() {
@@ -6451,13 +6455,13 @@ fn decimal_zero(token: &str) -> char {
 }
 
 fn append_localized_decimal(
-    output: &mut String,
+    output: &mut MeteredString,
     ascii: &str,
     width: usize,
     zero: char,
     separator: Option<char>,
     size: Option<usize>,
-    meter: &Meter,
+    meter: &mut Meter,
 ) -> Result<()> {
     let ascii_digits = ascii.chars().count();
     let digits = width.max(ascii_digits);
@@ -6479,11 +6483,7 @@ fn append_localized_decimal(
             )
         }));
     let additional = digit_bytes.saturating_add(separator_bytes);
-    meter.check_additional(
-        BudgetKind::OwnedBytes,
-        output.len().saturating_add(additional),
-    )?;
-    output.reserve(additional);
+    output.reserve(additional, meter)?;
     let mut characters = std::iter::repeat_n(zero, padding).chain(ascii.chars().map(|character| {
         character
             .to_digit(10)
@@ -6495,9 +6495,10 @@ fn append_localized_decimal(
             && let Some((separator, size)) = separator.zip(grouping_size)
             && (digits - index).is_multiple_of(size)
         {
-            output.push(separator);
+            output.value.push(separator);
         }
-        output.push(characters.next().expect("decimal width matches iterator"));
+        let character = characters.next().expect("decimal width matches iterator");
+        output.value.push(character);
     }
     Ok(())
 }
@@ -7524,7 +7525,8 @@ mod tests {
 
     #[test]
     fn grouped_decimal_writer_checks_before_writing() {
-        let mut rejected = String::new();
+        let mut rejected = super::MeteredString::new();
+        let mut meter = meter(4096);
         let error = append_localized_decimal(
             &mut rejected,
             "1",
@@ -7532,7 +7534,7 @@ mod tests {
             '0',
             Some(','),
             Some(1),
-            &meter(4096),
+            &mut meter,
         )
         .expect_err("wide grouped number exceeds its allocation budget");
         assert!(matches!(
@@ -7562,6 +7564,29 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn number_format_output_retains_its_actual_capacity_charge() {
+        // The formatter hands its allocation directly to the result tree, so the meter must
+        // retain the actual String capacity rather than merely checking the logical length.
+        let mut meter = meter(4096);
+        let output = format_number_sequence(
+            &[1.0, 2.0, 3.0, 4.0],
+            "1.1.1.1",
+            None,
+            None,
+            None,
+            None,
+            &mut meter,
+        )
+        .expect("number sequence fits");
+        let charged = meter
+            .usage(BudgetKind::OwnedBytes)
+            .expect("owned-byte usage exists")
+            .0;
+
+        assert_eq!(charged, output.retained_owned_bytes);
     }
 
     #[test]

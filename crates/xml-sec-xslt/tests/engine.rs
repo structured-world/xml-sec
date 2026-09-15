@@ -9786,6 +9786,17 @@ fn computed_names_enforce_reserved_prefix_namespace_pairs() {
 }
 
 #[test]
+fn computed_attribute_honors_the_implicit_xml_namespace_binding() {
+    // Namespaces in XML 1.0 section 3 binds `xml` by definition without requiring a declaration;
+    // XSLT 1.0 section 7.1.3 expands the computed attribute QName in that namespace context.
+    // https://www.w3.org/TR/2009/REC-xml-names-20091208/#ns-decl
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#creating-attributes-with-xsl-attribute
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><out><xsl:attribute name="xml:lang">en</xsl:attribute></out></xsl:template></xsl:stylesheet>"#;
+
+    assert_eq!(execute(stylesheet, "<source/>"), "<out xml:lang=\"en\"/>\n");
+}
+
+#[test]
 fn computed_names_reject_unbound_xmlns_prefix() {
     // XSLT 1.0 sections 7.1.2 and 7.1.3 require a QName prefix to resolve through the namespace
     // declarations in scope when no namespace AVT supplies the expanded name.
@@ -10798,6 +10809,30 @@ fn forward_compatible_all_prefix_value_is_ignored_consistently() {
         execute(stylesheet, "<source/>"),
         r#"<app:result xmlns:app="urn:app"/>"#.to_owned() + "\n",
     );
+}
+
+#[test]
+fn forward_compatible_invalid_prefix_lists_are_ignored_as_a_whole() {
+    // XSLT 1.0 section 2.5 ignores the complete optional attribute when its value is outside
+    // the 1.0 value space; valid tokens before an invalid token must not partially take effect.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#forwards
+    for value in ["", "#bogus", "p missing", "p:bad"] {
+        let excluded = format!(
+            r#"<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:p="urn:p" exclude-result-prefixes="{value}"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><p:out/></xsl:template></xsl:stylesheet>"#,
+        );
+        assert_eq!(
+            execute(&excluded, "<source/>"),
+            "<p:out xmlns:p=\"urn:p\"/>\n"
+        );
+
+        let extensions = format!(
+            r#"<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:p="urn:p" extension-element-prefixes="{value}"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><p:out/></xsl:template></xsl:stylesheet>"#,
+        );
+        assert_eq!(
+            execute(&extensions, "<source/>"),
+            "<p:out xmlns:p=\"urn:p\"/>\n"
+        );
+    }
 }
 
 #[test]

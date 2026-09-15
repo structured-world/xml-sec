@@ -346,13 +346,22 @@ pub(crate) fn append_metered_string(
     suffix: &str,
     meter: &mut Meter,
 ) -> Result<()> {
+    reserve_metered_string(current, suffix.len(), meter)?;
+    current.push_str(suffix);
+    Ok(())
+}
+
+pub(crate) fn reserve_metered_string(
+    current: &mut String,
+    additional: usize,
+    meter: &mut Meter,
+) -> Result<()> {
     let required = current
         .len()
-        .checked_add(suffix.len())
+        .checked_add(additional)
         .filter(|length| *length <= isize::MAX as usize)
         .ok_or_else(|| Error::Dynamic("text value is too large".into()))?;
     if required <= current.capacity() {
-        current.push_str(suffix);
         return Ok(());
     }
 
@@ -373,7 +382,6 @@ pub(crate) fn append_metered_string(
     let actual_capacity = replacement.capacity();
     reconcile_replacement_growth(meter, target_capacity, actual_capacity)?;
     replacement.push_str(current);
-    replacement.push_str(suffix);
     let old_capacity = current.capacity();
     *current = replacement;
     meter.release_owned_bytes(old_capacity);
