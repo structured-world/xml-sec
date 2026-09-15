@@ -1748,9 +1748,20 @@ fn validate_crl_issuer_key_usage(
             kind: "certificate KeyUsage",
             message: error.to_string(),
         })?;
-    let authorized = match usage {
-        Some(usage) => usage.value.crl_sign(),
-        None => issuer.version() != x509_parser::x509::X509Version::V3,
+    let authorized = match issuer.version() {
+        x509_parser::x509::X509Version::V1 | x509_parser::x509::X509Version::V2 => {
+            usage.is_none_or(|usage| usage.value.crl_sign())
+        }
+        x509_parser::x509::X509Version::V3 => usage.is_some_and(|usage| usage.value.crl_sign()),
+        version => {
+            // RFC 5280 section 4.1.2.1 defines only v1, v2, and v3. An unknown value cannot
+            // inherit RFC 10007 section 4's narrowly defined v1/v2 KeyUsage exemption.
+            // https://www.rfc-editor.org/rfc/rfc5280.html#section-4.1.2.1
+            return Err(X509ChainError::InvalidDer {
+                kind: "certificate version",
+                message: format!("unsupported X.509 version value {}", version.0),
+            });
+        }
     };
     if !authorized {
         return Err(X509ChainError::InvalidKeyUsage {
@@ -1799,6 +1810,14 @@ mod tests {
                 required: "cRLSign"
             })
         );
+        parsed.tbs_certificate.version = x509_parser::x509::X509Version(3);
+        assert!(matches!(
+            validate_crl_issuer_key_usage(&parsed, 1),
+            Err(X509ChainError::InvalidDer {
+                kind: "certificate version",
+                ..
+            })
+        ));
     }
 
     fn generated_certificate_params(common_name: &str, is_ca: bool) -> rcgen::CertificateParams {

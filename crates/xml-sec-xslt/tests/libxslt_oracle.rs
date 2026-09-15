@@ -1372,15 +1372,28 @@ fn assert_strict_xslt_output_deviation(case: &Case, actual: &[u8], expected: &[u
             assert!(!actual.contains("found"));
             true
         }
-        // element-available() reports executable instructions. xsl:decimal-format is a top-level
-        // declaration and libxslt:debug has no executable engine implementation, although
-        // libxslt advertises both names.
+        // XSLT 1.0 section 16.2 emits an HTML doctype only when doctype-public or
+        // doctype-system is specified. libxslt extends version="5" into an HTML5 doctype.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
+        "general/bug-206.xsl" => {
+            assert_eq!(actual, "<html></html>");
+            true
+        }
+        // element-available() reports executable instructions. Structural children and
+        // declarations are not instructions, and libxslt:debug has no engine implementation,
+        // although libxslt advertises all of these names.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#element-available
         "extensions/list.xsl" => {
             let expected = String::from_utf8_lossy(expected);
             assert_eq!(
                 actual.as_ref(),
                 expected
+                    .replace("xsl:sort available\n", "")
+                    .replace("xsl:param available\n", "")
+                    .replace("xsl:with-param available\n", "")
                     .replace("xsl:decimal-format available\n", "")
+                    .replace("xsl:when available\n", "")
+                    .replace("xsl:otherwise available\n", "")
                     .replace("libxslt:debug available\n", "")
             );
             true

@@ -7865,17 +7865,12 @@ impl function::Function for ElementAvailable {
                     | "message"
                     | "number"
                     | "processing-instruction"
-                    // XSLT 1.0 section 15 limits this function to instructions, but libxslt
-                    // deliberately advertises these executable structural children as well.
+                    // XSLT 1.0 section 15 returns true only for instructions. Structural
+                    // children such as sort, with-param, when, and otherwise are excluded.
                     // https://www.w3.org/TR/1999/REC-xslt-19991116#element-available
-                    | "sort"
                     | "text"
                     | "value-of"
                     | "variable"
-                    | "param"
-                    | "with-param"
-                    | "when"
-                    | "otherwise"
             ))
             || (name.namespace.as_deref() == Some(crate::compiler::EXSLT_FUNCTIONS_NS)
                 && name.local == "result")

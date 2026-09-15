@@ -448,9 +448,11 @@ fn render_doctype(
     encoding: &OutputEncoding,
     text: &mut RenderBuffer,
 ) -> Result<()> {
+    // XSLT 1.0 section 16.2 emits an HTML document type declaration only when
+    // doctype-public or doctype-system is specified; version alone is not a declaration request.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
     if definition.doctype_system.is_none()
-        && !(definition.method == OutputMethod::Html
-            && (definition.doctype_public.is_some() || definition.version.as_deref() == Some("5")))
+        && !(definition.method == OutputMethod::Html && definition.doctype_public.is_some())
     {
         return Ok(());
     }

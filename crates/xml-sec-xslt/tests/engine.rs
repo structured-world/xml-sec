@@ -955,6 +955,15 @@ fn html_doctype_uses_the_html_name_for_a_non_html_root() {
 }
 
 #[test]
+fn unsupported_html_version_does_not_invent_a_doctype() {
+    // XSLT 1.0 section 16.2 emits an HTML doctype only when a public or system identifier is
+    // requested; the version property alone does not supply either identifier.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="html" version="5" indent="no"/><xsl:template match="/"><html/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "<html></html>");
+}
+
+#[test]
 fn text_output_ignores_doctype_properties() {
     // XSLT 1.0 section 16.3 emits only result-tree text-node string-values; DOCTYPE properties
     // are not applicable to the text method.
@@ -12142,12 +12151,15 @@ fn capability_queries_distinguish_instructions_and_declarations() {
 }
 
 #[test]
-fn element_available_preserves_libxslt_structural_child_compatibility() {
-    // XSLT 1.0 section 15 describes instruction names, while libxslt also advertises these
-    // executable structural children. The compatibility engine intentionally matches libxslt.
+fn element_available_reports_only_executable_instructions() {
+    // XSLT 1.0 section 15 requires true only for instruction names. Structural children and
+    // parameter declarations cannot independently be instantiated as instructions.
     // https://www.w3.org/TR/1999/REC-xslt-19991116#element-available
-    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="element-available('xsl:if')"/><xsl:text>|</xsl:text><xsl:value-of select="element-available('xsl:when')"/><xsl:text>|</xsl:text><xsl:value-of select="element-available('xsl:otherwise')"/><xsl:text>|</xsl:text><xsl:value-of select="element-available('xsl:sort')"/><xsl:text>|</xsl:text><xsl:value-of select="element-available('xsl:with-param')"/></xsl:template></xsl:stylesheet>"#;
-    assert_eq!(execute(stylesheet, "<source/>"), "true|true|true|true|true");
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="element-available('xsl:if')"/><xsl:text>|</xsl:text><xsl:value-of select="element-available('xsl:when')"/><xsl:text>|</xsl:text><xsl:value-of select="element-available('xsl:otherwise')"/><xsl:text>|</xsl:text><xsl:value-of select="element-available('xsl:sort')"/><xsl:text>|</xsl:text><xsl:value-of select="element-available('xsl:param')"/><xsl:text>|</xsl:text><xsl:value-of select="element-available('xsl:with-param')"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<source/>"),
+        "true|false|false|false|false|false"
+    );
 }
 
 #[test]
