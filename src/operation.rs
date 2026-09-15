@@ -1,6 +1,6 @@
 //! Shared compilation and execution state for one XML Security operation.
 
-#[cfg(not(feature = "xmldsig"))]
+#[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
 use std::marker::PhantomData;
 use std::{
     cell::{Cell, RefCell},
@@ -285,9 +285,9 @@ pub(crate) struct OperationDecision {
 /// Single owner of immutable policy, cumulative budgets, identity state and
 /// execution evidence for one operation.
 pub(crate) struct OperationExecutionContext<P, B> {
-    #[cfg(feature = "xmldsig")]
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     policy: P,
-    #[cfg(not(feature = "xmldsig"))]
+    #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
     _policy: PhantomData<P>,
     budgets: B,
     builder: Option<OperationPlanBuilder>,
@@ -302,12 +302,12 @@ pub(crate) struct OperationExecutionContext<P, B> {
 
 impl<P, B> OperationExecutionContext<P, B> {
     pub(crate) fn new(policy: P, budgets: B, document: Option<(DocumentIdentity, u64)>) -> Self {
-        #[cfg(not(feature = "xmldsig"))]
+        #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
         drop(policy);
         Self {
-            #[cfg(feature = "xmldsig")]
+            #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
             policy,
-            #[cfg(not(feature = "xmldsig"))]
+            #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
             _policy: PhantomData,
             budgets,
             builder: Some(OperationPlanBuilder::default()),
@@ -321,7 +321,7 @@ impl<P, B> OperationExecutionContext<P, B> {
         }
     }
 
-    #[cfg(feature = "xmldsig")]
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     pub(crate) fn policy(&self) -> &P {
         &self.policy
     }
@@ -673,6 +673,14 @@ impl<P, B> OperationExecutionContext<P, B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "xmlenc")]
+    #[test]
+    fn xml_encryption_operation_retains_its_policy_snapshot() {
+        let context = OperationExecutionContext::new("xmlenc-policy", (), None);
+
+        assert_eq!(*context.policy(), "xmlenc-policy");
+    }
 
     fn node(builder: &mut OperationPlanBuilder, stage: OperationStage) -> OperationNodeId {
         builder.add_node(OperationNodeKind::Document, stage, None)

@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
@@ -6424,7 +6425,26 @@ impl function::Function for GenerateId {
             &self.assigned,
             typed_path_to_with_context(&node, context)?,
         )?;
-        Ok(SxdValue::String(format!("id{id}")))
+        let digits = id.checked_ilog10().unwrap_or(0) as usize + 1;
+        let output_len = 2usize.saturating_add(digits);
+        context.reserve_string_allocation(output_len)?;
+        let mut output = String::new();
+        if output.try_reserve_exact(output_len).is_err() {
+            context.release_temporary_allocation(output_len);
+            return Err(function::Error::Other {
+                what: "failed to reserve generated-ID result storage".into(),
+            });
+        }
+        let actual_bytes = output.capacity();
+        if actual_bytes > output_len
+            && let Err(error) =
+                context.reserve_string_allocation(actual_bytes.saturating_sub(output_len))
+        {
+            context.release_temporary_allocation(output_len);
+            return Err(error);
+        }
+        write!(&mut output, "id{id}").expect("writing to String cannot fail");
+        Ok(SxdValue::String(output))
     }
 }
 
@@ -6441,7 +6461,10 @@ fn assign_generated_id(
         .owned_bytes()
         .saturating_add(std::mem::size_of::<(NodePath, usize)>());
     context.reserve_string_allocation(entry_bytes)?;
-    reserve_generated_id_slot(context, &mut cache)?;
+    if let Err(error) = reserve_generated_id_slot(context, &mut cache) {
+        context.release_temporary_allocation(entry_bytes);
+        return Err(error);
+    }
     let id = cache.assigned.len() + 1;
     cache.assigned.insert(path, id);
     cache.owned_bytes = cache.owned_bytes.saturating_add(entry_bytes);
@@ -6463,17 +6486,24 @@ fn reserve_generated_id_slot(
     // reserve the complete replacement before its allocator is invoked.
     context.reserve_string_allocation(requested_bytes)?;
     let mut replacement = HashMap::new();
-    replacement
-        .try_reserve(target_capacity)
-        .map_err(|error| function::Error::Other {
-            what: format!("failed to reserve generated-ID cache storage: {error}"),
-        })?;
+    if replacement.try_reserve(target_capacity).is_err() {
+        context.release_temporary_allocation(requested_bytes);
+        return Err(function::Error::Other {
+            what: "failed to reserve generated-ID cache storage".into(),
+        });
+    }
     let actual_bytes = retained_hash_storage::<(NodePath, usize)>(replacement.capacity());
     if actual_bytes > requested_bytes {
-        context.reserve_string_allocation(actual_bytes - requested_bytes)?;
+        if let Err(error) = context.reserve_string_allocation(actual_bytes - requested_bytes) {
+            context.release_temporary_allocation(requested_bytes);
+            return Err(error);
+        }
+    } else {
+        context.release_temporary_allocation(requested_bytes - actual_bytes);
     }
     replacement.extend(cache.assigned.drain());
     cache.assigned = replacement;
+    context.release_temporary_allocation(old_bytes);
     cache.owned_bytes = cache
         .owned_bytes
         .checked_sub(old_bytes)
@@ -9150,6 +9180,81 @@ impl function::Function for CurrentNode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn generated_id_result_crosses_the_allocation_gate_before_formatting() {
+        // The cached path itself requires no new storage here, leaving only the three-byte
+        // generate-id() result to exercise the XPath result-allocation gate.
+        let package = Package::new();
+        let document = package.as_document();
+        let root = document.root();
+        let path = typed_path_to(&nodeset::Node::Root(root));
+        let mut assigned = HashMap::new();
+        assigned.insert(path, 1);
+        let function = GenerateId {
+            assigned: Rc::new(RefCell::new(GeneratedIdCache {
+                assigned,
+                owned_bytes: 0,
+            })),
+        };
+        let mut nodes = nodeset::Nodeset::new();
+        nodes.add(root);
+        let mut context = Context::new();
+        context.set_string_allocation_limit(2);
+        let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&context, root.into());
+
+        let error = function
+            .evaluate(&evaluation, vec![SxdValue::Nodeset(nodes)])
+            .expect_err("three-byte generated ID must cross the two-byte gate");
+
+        assert!(error.to_string().contains("allocation budget"));
+        assert_eq!(context.string_allocation_exceeded(), Some(3));
+    }
+
+    #[test]
+    fn generated_id_table_growth_charges_peak_live_storage() {
+        // Replaced hash tables die after each growth. A live-memory gate must retain the current
+        // table, not accumulate every superseded table from the evaluation.
+        const ENTRIES: usize = 64;
+        let package = Package::new();
+        let document = package.as_document();
+        let unlimited = Context::new();
+        let probe_evaluation =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&unlimited, document.root().into());
+        let probe = RefCell::new(GeneratedIdCache::default());
+        let mut entry_bytes = 0usize;
+        let mut peak_live_bytes = 0usize;
+
+        for index in 0..ENTRIES {
+            let path = NodePath::Ordinary(vec![index]);
+            let new_entry_bytes = path
+                .owned_bytes()
+                .saturating_add(std::mem::size_of::<(NodePath, usize)>());
+            let old_capacity = probe.borrow().assigned.capacity();
+            assign_generated_id(&probe_evaluation, &probe, path)
+                .expect("probe generated ID is assigned");
+            entry_bytes = entry_bytes.saturating_add(new_entry_bytes);
+            let new_capacity = probe.borrow().assigned.capacity();
+            let live_bytes = if new_capacity == old_capacity {
+                entry_bytes.saturating_add(retained_hash_storage::<(NodePath, usize)>(new_capacity))
+            } else {
+                entry_bytes
+                    .saturating_add(retained_hash_storage::<(NodePath, usize)>(old_capacity))
+                    .saturating_add(retained_hash_storage::<(NodePath, usize)>(new_capacity))
+            };
+            peak_live_bytes = peak_live_bytes.max(live_bytes);
+        }
+
+        let mut bounded = Context::new();
+        bounded.set_string_allocation_limit(peak_live_bytes);
+        let bounded_evaluation =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&bounded, document.root().into());
+        let cache = RefCell::new(GeneratedIdCache::default());
+        for index in 0..ENTRIES {
+            assign_generated_id(&bounded_evaluation, &cache, NodePath::Ordinary(vec![index]))
+                .expect("peak-live allocation budget must permit every table growth");
+        }
+    }
+
     #[test]
     fn generated_id_cache_accounts_for_hash_table_storage() {
         // Distinct generate-id() calls retain both each path and the backing hash table. The

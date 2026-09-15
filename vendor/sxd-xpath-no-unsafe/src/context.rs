@@ -314,6 +314,11 @@ impl<'c, 'd> Evaluation<'c, 'd> {
         reserve_allocation(self.string_allocations, bytes)
     }
 
+    /// Release bytes after temporary extension storage is destroyed or superseded.
+    pub fn release_temporary_allocation(&self, bytes: usize) {
+        release_allocation(self.string_allocations, bytes);
+    }
+
     /// Charge primitive XPath evaluation work before performing it.
     pub fn charge_work(&self, units: usize) -> Result<(), function::Error> {
         charge_work_budget(
@@ -390,6 +395,15 @@ fn reserve_allocation(
     }
     budget.used.set(actual);
     Ok(())
+}
+
+fn release_allocation(budget: &StringAllocationBudget, bytes: usize) {
+    let retained = budget
+        .used
+        .get()
+        .checked_sub(bytes)
+        .expect("released XPath allocation must have been reserved");
+    budget.used.set(retained);
 }
 
 /// An iterator for the contexts of each node in a nodeset
@@ -470,5 +484,20 @@ mod tests {
 
         assert!(evaluation.reserve_temporary_allocation(usize::MAX).is_ok());
         assert!(evaluation.reserve_temporary_allocation(1).is_err());
+    }
+
+    #[test]
+    fn allocation_budget_reuses_released_temporary_storage() {
+        let mut context = Context::new();
+        context.set_string_allocation_limit(8);
+        let package = sxd_document_no_unsafe::Package::new();
+        let evaluation = super::Evaluation::new(&context, package.as_document().root().into());
+
+        evaluation
+            .reserve_temporary_allocation(8)
+            .expect("initial temporary allocation fits");
+        evaluation.release_temporary_allocation(8);
+
+        assert!(evaluation.reserve_temporary_allocation(8).is_ok());
     }
 }

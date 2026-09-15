@@ -276,7 +276,7 @@ impl EncryptedDataBuilder {
         validate_xml_plaintext(
             xml,
             &self.encrypted_type,
-            &self.policy,
+            operation.policy(),
             &operation.budgets().xml_parse,
             self.xml_backend,
         )?;
@@ -288,7 +288,7 @@ impl EncryptedDataBuilder {
         )?;
         validate_standalone_encrypted_data_nodes(
             generated.xml_nodes,
-            self.policy.resources.effective_xml_nodes() as usize,
+            operation.policy().resources.effective_xml_nodes() as usize,
         )?;
         Ok(generated.result)
     }
@@ -312,7 +312,7 @@ impl EncryptedDataBuilder {
             self.encrypt_payload_with_operation(data, encrypted_type, &mut operation, false)?;
         validate_standalone_encrypted_data_nodes(
             generated.xml_nodes,
-            self.policy.resources.effective_xml_nodes() as usize,
+            operation.policy().resources.effective_xml_nodes() as usize,
         )?;
         Ok(generated.result)
     }
@@ -406,16 +406,19 @@ impl EncryptedDataBuilder {
                     document.as_xml().len(),
                     source.len(),
                     result.encrypted_data_xml.len(),
-                    self.policy.resources.max_xml_document_bytes,
+                    operation.policy().resources.max_xml_document_bytes,
                 )?;
                 validate_replacement_node_counts(
                     document_nodes,
                     selected_nodes,
                     generated.xml_nodes,
                     ReplacementMode::ReplaceElement,
-                    self.policy.resources.effective_xml_nodes() as usize,
+                    operation.policy().resources.effective_xml_nodes() as usize,
                 )?;
-                let settings = self.document_parse_settings();
+                let settings = DocumentParseSettings::from_policy(
+                    &operation.policy().xml,
+                    &operation.policy().resources,
+                );
                 let mutation = require_encryption_mutation(generated.mutation)?;
                 operation.run_document_transition(mutation, document, |document, budgets| {
                     document
@@ -463,16 +466,19 @@ impl EncryptedDataBuilder {
                     document.as_xml().len(),
                     removed,
                     inserted,
-                    self.policy.resources.max_xml_document_bytes,
+                    operation.policy().resources.max_xml_document_bytes,
                 )?;
                 validate_replacement_node_counts(
                     document_nodes,
                     selected_nodes,
                     generated.xml_nodes,
                     ReplacementMode::ReplaceContent,
-                    self.policy.resources.effective_xml_nodes() as usize,
+                    operation.policy().resources.effective_xml_nodes() as usize,
                 )?;
-                let settings = self.document_parse_settings();
+                let settings = DocumentParseSettings::from_policy(
+                    &operation.policy().xml,
+                    &operation.policy().resources,
+                );
                 let mutation = require_encryption_mutation(generated.mutation)?;
                 operation.run_document_transition(mutation, document, |document, budgets| {
                     document
@@ -504,8 +510,11 @@ impl EncryptedDataBuilder {
     ) -> Result<GeneratedEncryption, XmlEncError> {
         // Bound caller-controlled inputs before hashing or allocating one plan
         // node per recipient. The compiled graph then gates all accepted work.
-        self.validate_plaintext_len(plaintext.len())?;
-        self.validate_configuration()?;
+        validate_plaintext_len(
+            plaintext.len(),
+            operation.policy().resources.max_encryption_plaintext_bytes,
+        )?;
+        self.validate_configuration_with_policy(operation.policy())?;
         let input_resource = OperationResourceIdentity::external("encryption-input", plaintext);
         let plan = compile_encryption_plan(
             operation,
@@ -548,10 +557,13 @@ impl EncryptedDataBuilder {
                 &encrypted_keys,
                 &ciphertext,
             )?;
-            self.validate_document_len(encrypted_data_xml.len())?;
+            validate_document_len(
+                encrypted_data_xml.len(),
+                operation.policy().resources.max_xml_document_bytes,
+            )?;
             let xml_nodes = count_generated_encrypted_data_nodes(
                 &encrypted_data_xml,
-                &self.policy,
+                operation.policy(),
                 &operation.budgets().xml_parse,
                 self.xml_backend,
             )?;
@@ -573,13 +585,16 @@ impl EncryptedDataBuilder {
         })
     }
 
-    fn validate_configuration(&self) -> Result<(), XmlEncError> {
-        self.policy.validate()?;
+    fn validate_configuration_with_policy(
+        &self,
+        policy: &crate::policy::EncryptionPolicy,
+    ) -> Result<(), XmlEncError> {
+        policy.validate()?;
+        let metadata_limit = policy.resources.max_encryption_metadata_bytes;
         if let EncryptedDataType::Other(uri) = &self.encrypted_type {
-            self.validate_metadata("EncryptedData Type", Some(uri))?;
+            validate_metadata("EncryptedData Type", Some(uri), metadata_limit)?;
         }
-        if self
-            .policy
+        if policy
             .data_algorithms
             .as_ref()
             .is_some_and(|allowed| !allowed.contains(&self.algorithm))
@@ -590,25 +605,27 @@ impl EncryptedDataBuilder {
             }
             .into());
         }
-        if self.recipients.len() > self.policy.resources.max_encryption_recipients {
+        if self.recipients.len() > policy.resources.max_encryption_recipients {
             return Err(crate::policy::PolicyViolation::ResourceLimit {
                 resource: crate::policy::resource_name::ENCRYPTION_RECIPIENTS,
-                maximum: self.policy.resources.max_encryption_recipients,
+                maximum: policy.resources.max_encryption_recipients,
                 actual: self.recipients.len(),
             }
             .into());
         }
         let key_candidates = self.recipients.len() + usize::from(self.direct_key.is_some());
-        self.policy
-            .resources
-            .validate_key_candidates(key_candidates)?;
-        self.validate_metadata("EncryptedData Id", self.id.as_deref())?;
+        policy.resources.validate_key_candidates(key_candidates)?;
+        validate_metadata("EncryptedData Id", self.id.as_deref(), metadata_limit)?;
         if self.id.as_deref().is_some_and(|id| !is_xml_ncname(id)) {
             return Err(XmlEncError::InvalidEncryptionConfig(
                 "EncryptedData Id must be an XML NCName".into(),
             ));
         }
-        self.validate_key_name("direct KeyName", self.direct_key_name.as_deref())?;
+        validate_key_name(
+            "direct KeyName",
+            self.direct_key_name.as_deref(),
+            metadata_limit,
+        )?;
         for recipient in &self.recipients {
             match recipient {
                 EncryptionRecipient::RsaOaep {
@@ -617,9 +634,8 @@ impl EncryptedDataBuilder {
                     recipient,
                     key_name,
                 } => {
-                    validate_key_transport_recipient(public_key.as_ref(), &self.policy)?;
-                    if self
-                        .policy
+                    validate_key_transport_recipient(public_key.as_ref(), policy)?;
+                    if policy
                         .key_transport_algorithms
                         .as_ref()
                         .is_some_and(|allowed| !allowed.contains(&parameters.algorithm))
@@ -630,7 +646,7 @@ impl EncryptedDataBuilder {
                         }
                         .into());
                     }
-                    if let Some(allowed) = &self.policy.oaep_digests {
+                    if let Some(allowed) = &policy.oaep_digests {
                         let rejected_uri = if !allowed.contains(&parameters.digest) {
                             Some(parameters.digest.uri())
                         } else if !allowed.contains(&parameters.mgf_digest) {
@@ -646,9 +662,13 @@ impl EncryptedDataBuilder {
                             .into());
                         }
                     }
-                    self.validate_metadata("EncryptedKey Recipient", recipient.as_deref())?;
-                    self.validate_key_name("EncryptedKey KeyName", key_name.as_deref())?;
-                    self.validate_metadata_len(parameters.label.len())?;
+                    validate_metadata(
+                        "EncryptedKey Recipient",
+                        recipient.as_deref(),
+                        metadata_limit,
+                    )?;
+                    validate_key_name("EncryptedKey KeyName", key_name.as_deref(), metadata_limit)?;
+                    validate_metadata_len(parameters.label.len(), metadata_limit)?;
                 }
                 EncryptionRecipient::AesKeyWrap {
                     kek,
@@ -656,8 +676,7 @@ impl EncryptedDataBuilder {
                     recipient,
                     key_name,
                 } => {
-                    if self
-                        .policy
+                    if policy
                         .key_wrap_algorithms
                         .as_ref()
                         .is_some_and(|allowed| !allowed.contains(algorithm))
@@ -676,8 +695,12 @@ impl EncryptedDataBuilder {
                             kek.len()
                         )));
                     }
-                    self.validate_metadata("EncryptedKey Recipient", recipient.as_deref())?;
-                    self.validate_key_name("EncryptedKey KeyName", key_name.as_deref())?;
+                    validate_metadata(
+                        "EncryptedKey Recipient",
+                        recipient.as_deref(),
+                        metadata_limit,
+                    )?;
+                    validate_key_name("EncryptedKey KeyName", key_name.as_deref(), metadata_limit)?;
                 }
             }
         }
@@ -695,34 +718,6 @@ impl EncryptedDataBuilder {
             }
             _ => Ok(()),
         }
-    }
-
-    fn validate_metadata(
-        &self,
-        field: &'static str,
-        value: Option<&str>,
-    ) -> Result<(), XmlEncError> {
-        validate_metadata(
-            field,
-            value,
-            self.policy.resources.max_encryption_metadata_bytes,
-        )
-    }
-
-    fn validate_key_name(
-        &self,
-        field: &'static str,
-        value: Option<&str>,
-    ) -> Result<(), XmlEncError> {
-        validate_key_name(
-            field,
-            value,
-            self.policy.resources.max_encryption_metadata_bytes,
-        )
-    }
-
-    fn validate_metadata_len(&self, actual: usize) -> Result<(), XmlEncError> {
-        validate_metadata_len(actual, self.policy.resources.max_encryption_metadata_bytes)
     }
 
     fn validate_plaintext_len(&self, actual: usize) -> Result<(), XmlEncError> {
@@ -1588,7 +1583,7 @@ mod tests {
             .recipient_aes_kw([0x44; 32], KeyWrapAlgorithm::AesKw128);
 
         assert!(matches!(
-            builder.validate_configuration(),
+            builder.validate_configuration_with_policy(&builder.policy),
             Err(XmlEncError::InvalidEncryptionConfig(_))
         ));
     }
@@ -1664,7 +1659,7 @@ mod tests {
             .add_recipient(EncryptionRecipient::rsa_oaep(public).oaep_parameters(parameters));
 
         assert!(matches!(
-            builder.validate_configuration(),
+            builder.validate_configuration_with_policy(&builder.policy),
             Err(XmlEncError::Policy(
                 crate::policy::PolicyViolation::Algorithm { algorithm, .. }
             )) if algorithm == OaepDigestAlgorithm::Sha384.mgf_uri()
