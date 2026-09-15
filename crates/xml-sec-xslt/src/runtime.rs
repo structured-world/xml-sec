@@ -11,7 +11,8 @@ use icu_locale::Locale;
 
 use crate::budget::{
     EXECUTION_RECURSION_DEPTH_CEILING, Meter, append_metered_string,
-    reserve_retained_hash_set_slot, reserve_retained_vec_slot, reserve_temporary_vec_slot,
+    reserve_retained_hash_map_slot, reserve_retained_hash_set_slot, reserve_retained_vec_slot,
+    reserve_temporary_vec_slot,
 };
 use crate::compiler::{
     AttributeSet, AttributeValueTemplate, AvtPart, Expression, ExsltFunction, Instruction,
@@ -340,10 +341,9 @@ struct Execution<'a> {
     secondary_output_uris: HashSet<Arc<String>>,
     secondary_output_uri_index_bytes: usize,
     modes: Vec<Option<ExpandedName>>,
-    function_results: Vec<Option<Value>>,
+    exslt_calls: ExsltCallStack,
     function_depth: usize,
     native_sequence_depth: usize,
-    binding_function_defaults: Vec<ExpandedName>,
     building_keys: HashSet<(usize, NodeId)>,
     building_key_index_bytes: usize,
     attribute_insert_position: Option<usize>,
@@ -370,11 +370,35 @@ struct VariableScope {
 }
 
 impl VariableScope {
-    fn insert_retained(&mut self, name: ExpandedName, value: Value, retained_owned_bytes: usize) {
+    fn insert_retained(
+        &mut self,
+        name: &ExpandedName,
+        retained: RetainedValue,
+        meter: &mut Meter,
+    ) -> Result<()> {
+        if self.values.contains_key(name) {
+            retained.release(meter);
+            return Err(Error::Dynamic(format!(
+                "duplicate variable binding for {}",
+                name.local
+            )));
+        }
+        if let Err(error) =
+            reserve_retained_hash_map_slot(&mut self.values, meter, &mut self.retained_owned_bytes)
+        {
+            retained.release(meter);
+            return Err(error);
+        }
         self.retained_owned_bytes = self
             .retained_owned_bytes
-            .saturating_add(retained_owned_bytes);
-        self.values.insert(name, value);
+            .checked_add(retained.retained_owned_bytes)
+            .expect("charged variable-scope storage fits usize");
+        self.values.insert(name.clone(), retained.value);
+        Ok(())
+    }
+
+    fn release(self, meter: &mut Meter) {
+        meter.release_owned_bytes(self.retained_owned_bytes);
     }
 }
 
@@ -395,6 +419,85 @@ impl DerefMut for VariableScope {
 struct RetainedValue {
     value: Value,
     retained_owned_bytes: usize,
+}
+
+impl RetainedValue {
+    fn release(self, meter: &mut Meter) {
+        meter.release_owned_bytes(self.retained_owned_bytes);
+    }
+}
+
+#[derive(Default)]
+struct ExsltCallStack {
+    results: Vec<Option<Value>>,
+    results_reserved_owned_bytes: usize,
+    binding_defaults: Vec<DefaultBindingFrame>,
+    binding_defaults_reserved_owned_bytes: usize,
+}
+
+struct DefaultBindingFrame {
+    name: ExpandedName,
+    charged_owned_bytes: usize,
+}
+
+impl ExsltCallStack {
+    fn binds_defaults(&self, name: &ExpandedName) -> bool {
+        self.binding_defaults
+            .iter()
+            .any(|active| &active.name == name)
+    }
+
+    fn enter(&mut self, default_name: Option<&ExpandedName>, meter: &mut Meter) -> Result<()> {
+        reserve_temporary_vec_slot(
+            &mut self.results,
+            meter,
+            &mut self.results_reserved_owned_bytes,
+        )?;
+        let default_name = if let Some(name) = default_name {
+            reserve_temporary_vec_slot(
+                &mut self.binding_defaults,
+                meter,
+                &mut self.binding_defaults_reserved_owned_bytes,
+            )?;
+            let owned_bytes = expanded_name_owned_bytes(name);
+            meter.charge(BudgetKind::OwnedBytes, owned_bytes)?;
+            Some(DefaultBindingFrame {
+                name: name.clone(),
+                charged_owned_bytes: owned_bytes,
+            })
+        } else {
+            None
+        };
+        self.results.push(None);
+        if let Some(frame) = default_name {
+            self.binding_defaults.push(frame);
+        }
+        Ok(())
+    }
+
+    fn result_is_pending(&self) -> Option<bool> {
+        self.results.last().map(Option::is_none)
+    }
+
+    fn set_result(&mut self, value: Value) {
+        *self
+            .results
+            .last_mut()
+            .expect("function result frame was checked") = Some(value);
+    }
+
+    fn leave(&mut self, bound_defaults: bool, meter: &mut Meter) -> Option<Value> {
+        if bound_defaults {
+            let frame = self
+                .binding_defaults
+                .pop()
+                .expect("default-binding function frame remains present");
+            meter.release_owned_bytes(frame.charged_owned_bytes);
+        }
+        self.results
+            .pop()
+            .expect("EXSLT function result frame remains present")
+    }
 }
 
 struct MeteredString {
@@ -657,10 +760,9 @@ impl<'a> Execution<'a> {
             secondary_output_uris: HashSet::new(),
             secondary_output_uri_index_bytes: 0,
             modes: vec![None],
-            function_results: vec![],
+            exslt_calls: ExsltCallStack::default(),
             function_depth: 0,
             native_sequence_depth: 0,
-            binding_function_defaults: vec![],
             building_keys: HashSet::new(),
             building_key_index_bytes: 0,
             attribute_insert_position: None,
@@ -943,7 +1045,14 @@ impl<'a> Execution<'a> {
                         |remap| remap_parameter_value(value, remap),
                     );
                     self.meter.charge(BudgetKind::OwnedBytes, owned_bytes)?;
-                    self.scopes[0].insert_retained(name.clone(), value, owned_bytes);
+                    self.scopes[0].insert_retained(
+                        name,
+                        RetainedValue {
+                            value,
+                            retained_owned_bytes: owned_bytes,
+                        },
+                        &mut self.meter,
+                    )?;
                     effective.remove(name);
                 }
             }
@@ -997,7 +1106,7 @@ impl<'a> Execution<'a> {
         );
         self.initializing_globals.pop();
         let retained = value?;
-        self.scopes[0].insert_retained(name.clone(), retained.value, retained.retained_owned_bytes);
+        self.scopes[0].insert_retained(name, retained, &mut self.meter)?;
         Ok(())
     }
 
@@ -1032,7 +1141,7 @@ impl<'a> Execution<'a> {
             .scopes
             .pop()
             .expect("scope stack retains its global scope");
-        self.meter.release_owned_bytes(scope.retained_owned_bytes);
+        scope.release(&mut self.meter);
     }
 
     fn release_parameters_if_last(&mut self, parameters: &Arc<EvaluatedParameters>) {
@@ -1787,11 +1896,7 @@ impl<'a> Execution<'a> {
             self.scopes
                 .last_mut()
                 .expect("template parameter scope exists")
-                .insert_retained(
-                    parameter.name.clone(),
-                    retained.value,
-                    retained.retained_owned_bytes,
-                );
+                .insert_retained(&parameter.name, retained, &mut self.meter)?;
         }
         self.release_parameters_if_last(&params);
         tasks.push(
@@ -2473,11 +2578,7 @@ impl<'a> Execution<'a> {
                 self.scopes
                     .last_mut()
                     .ok_or_else(|| Error::Dynamic("missing variable scope".into()))?
-                    .insert_retained(
-                        variable.name.clone(),
-                        retained.value,
-                        retained.retained_owned_bytes,
-                    );
+                    .insert_retained(&variable.name, retained, &mut self.meter)?;
                 Ok(())
             }
             Instruction::Message { terminate, body } => {
@@ -2608,22 +2709,19 @@ impl<'a> Execution<'a> {
                     )?))
                 };
                 self.ensure_function_result_is_pending()?;
-                *self
-                    .function_results
-                    .last_mut()
-                    .expect("function result frame was checked") = Some(value);
+                self.exslt_calls.set_result(value);
                 Ok(())
             }
         }
     }
 
     fn ensure_function_result_is_pending(&self) -> Result<()> {
-        let Some(result) = self.function_results.last() else {
+        let Some(is_pending) = self.exslt_calls.result_is_pending() else {
             return Err(Error::Dynamic(
                 "func:result executed outside an EXSLT function".into(),
             ));
         };
-        if result.is_some() {
+        if !is_pending {
             return Err(Error::Dynamic(
                 "EXSLT function produced more than one result".into(),
             ));
@@ -3204,29 +3302,29 @@ impl<'a> Execution<'a> {
             )));
         }
         let binds_defaults = arguments.len() < function.params.len();
-        if binds_defaults
-            && self
-                .binding_function_defaults
-                .iter()
-                .any(|name| name == &function.name)
-        {
+        if binds_defaults && self.exslt_calls.binds_defaults(&function.name) {
             return Err(Error::Dynamic(format!(
                 "circular default parameter evaluation in EXSLT function {}",
                 function.name.local
             )));
         }
-        self.function_depth = self.function_depth.saturating_add(1);
-        let depth = self.function_depth;
+        debug_assert!(self.function_depth < usize::MAX);
+        let depth = self.function_depth + 1;
+        self.meter
+            .recursion_with_ceiling(depth, EXECUTION_RECURSION_DEPTH_CEILING)?;
+        self.exslt_calls
+            .enter(binds_defaults.then_some(&function.name), &mut self.meter)?;
+        let previous_result = match self.enter_result_tree(None, true) {
+            Ok(previous) => previous,
+            Err(error) => {
+                self.exslt_calls.leave(binds_defaults, &mut self.meter);
+                return Err(error);
+            }
+        };
+        self.function_depth = depth;
         let caller_scopes = self.scopes.split_off(1);
         self.scopes.push(VariableScope::default());
-        let previous_result = self.enter_result_tree(None, true)?;
-        self.function_results.push(None);
-        if binds_defaults {
-            self.binding_function_defaults.push(function.name.clone());
-        }
         let parameters = (|| {
-            self.meter
-                .recursion_with_ceiling(depth, EXECUTION_RECURSION_DEPTH_CEILING)?;
             for (index, parameter) in function.params.iter().enumerate() {
                 let retained = if let Some(value) = arguments.get(index) {
                     let retained_owned_bytes = binding_owned_bytes(&parameter.name, value);
@@ -3245,28 +3343,22 @@ impl<'a> Execution<'a> {
                 self.scopes
                     .last_mut()
                     .expect("function parameter scope exists")
-                    .insert_retained(
-                        parameter.name.clone(),
-                        retained.value,
-                        retained.retained_owned_bytes,
-                    );
+                    .insert_retained(&parameter.name, retained, &mut self.meter)?;
             }
             Ok(())
         })();
-        if binds_defaults {
-            self.binding_function_defaults.pop();
-        }
         let execution = parameters.and_then(|()| {
             self.execute_sequence(&function.body, node, position, size, depth + 1, None)
         });
-        let value = self.function_results.pop().flatten();
+        let value = self.exslt_calls.leave(binds_defaults, &mut self.meter);
         let generated_result_nodes = self.result.node_count() > 1;
         let temporary_result = self.restore_result_tree(previous_result);
         self.meter
             .release_owned_bytes(metered_document_owned_bytes(&temporary_result));
         self.pop_scope();
         self.scopes.extend(caller_scopes);
-        self.function_depth = self.function_depth.saturating_sub(1);
+        debug_assert!(self.function_depth > 0);
+        self.function_depth -= 1;
         execution?;
         // EXSLT func:function, "Function Results", makes generated result nodes an error and
         // defines an absent func:result as an empty string:
@@ -6476,6 +6568,87 @@ mod tests {
         BudgetKind, CompileBudget, Compiler, Document, Error, ExecutionBudget, ExpandedName,
         NoResolver, NodeKind, NodeReference, Value,
     };
+
+    #[test]
+    fn variable_scope_retains_its_hash_storage_charge() {
+        // Scope payload accounting must include the backing table until the scope is dropped.
+        let mut scope = super::VariableScope::default();
+        let mut meter = meter(usize::MAX);
+        let name = ExpandedName::new(None::<String>, "value");
+        scope
+            .insert_retained(
+                &name,
+                super::RetainedValue {
+                    value: Value::Boolean(true),
+                    retained_owned_bytes: 0,
+                },
+                &mut meter,
+            )
+            .expect("scope insertion remains within budget");
+        let index_bytes =
+            crate::budget::retained_hash_storage::<(ExpandedName, Value)>(scope.values.capacity());
+
+        assert!(index_bytes > 0);
+        assert_eq!(scope.retained_owned_bytes, index_bytes);
+        assert_eq!(
+            meter
+                .usage(BudgetKind::OwnedBytes)
+                .expect("owned-byte usage is available")
+                .0,
+            index_bytes
+        );
+        scope.release(&mut meter);
+        assert_eq!(
+            meter
+                .usage(BudgetKind::OwnedBytes)
+                .expect("owned-byte usage is available")
+                .0,
+            0
+        );
+    }
+
+    #[test]
+    fn exslt_call_stack_meters_capacity_and_active_default_names() {
+        // Unwinding releases active frame payloads, but not live reusable vector allocations.
+        let mut calls = super::ExsltCallStack::default();
+        let mut meter = meter(usize::MAX);
+        let names = (0..32)
+            .map(|index| {
+                ExpandedName::new(
+                    Some("urn:functions"),
+                    format!("function_{index}_{}", "x".repeat(128)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let names_owned_bytes = names
+            .iter()
+            .map(super::expanded_name_owned_bytes)
+            .sum::<usize>();
+
+        for name in &names {
+            calls
+                .enter(Some(name), &mut meter)
+                .expect("call-stack entry remains within budget");
+        }
+        let active_owned_bytes = meter
+            .usage(BudgetKind::OwnedBytes)
+            .expect("owned-byte usage is available")
+            .0;
+        assert!(active_owned_bytes > names_owned_bytes);
+
+        for _ in &names {
+            assert_eq!(calls.leave(true, &mut meter), None);
+        }
+        let retained_capacity_bytes = meter
+            .usage(BudgetKind::OwnedBytes)
+            .expect("owned-byte usage is available")
+            .0;
+        assert_eq!(
+            active_owned_bytes - retained_capacity_bytes,
+            names_owned_bytes,
+            "unwinding releases names but not still-allocated vector capacity"
+        );
+    }
 
     #[test]
     fn variable_snapshot_borrows_only_visible_bindings() {
