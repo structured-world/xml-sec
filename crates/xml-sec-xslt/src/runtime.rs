@@ -1036,23 +1036,21 @@ impl<'a> Execution<'a> {
                 if global.is_parameter
                     && let Some(value) = parameters.get(name)
                 {
-                    let owned_bytes = expanded_name_owned_bytes(name)
-                        .saturating_add(parameter_value_owned_bytes(value, source_remap));
+                    let name_owned_bytes = expanded_name_owned_bytes(name);
                     self.meter
-                        .check_additional(BudgetKind::OwnedBytes, owned_bytes)?;
-                    let value = source_remap.map_or_else(
-                        || value.clone(),
-                        |remap| remap_parameter_value(value, remap),
-                    );
-                    self.meter.charge(BudgetKind::OwnedBytes, owned_bytes)?;
-                    self.scopes[0].insert_retained(
-                        name,
-                        RetainedValue {
-                            value,
-                            retained_owned_bytes: owned_bytes,
-                        },
-                        &mut self.meter,
-                    )?;
+                        .charge(BudgetKind::OwnedBytes, name_owned_bytes)?;
+                    let mut retained =
+                        match clone_parameter_value(value, source_remap, &mut self.meter) {
+                            Ok(retained) => retained,
+                            Err(error) => {
+                                self.meter.release_owned_bytes(name_owned_bytes);
+                                return Err(error);
+                            }
+                        };
+                    retained.retained_owned_bytes = retained
+                        .retained_owned_bytes
+                        .saturating_add(name_owned_bytes);
+                    self.scopes[0].insert_retained(name, retained, &mut self.meter)?;
                     effective.remove(name);
                 }
             }
@@ -4889,16 +4887,51 @@ fn append_avt_expression_value(
     appended
 }
 
-fn remap_parameter_value(value: &Value, remap: &HashMap<NodeId, NodeId>) -> Value {
-    let Value::NodeSet(nodes) = value else {
-        return value.clone();
+fn clone_parameter_value(
+    value: &Value,
+    remap: Option<&HashMap<NodeId, NodeId>>,
+    meter: &mut Meter,
+) -> Result<RetainedValue> {
+    let requested_owned_bytes = parameter_value_owned_bytes(value, remap);
+    meter.charge(BudgetKind::OwnedBytes, requested_owned_bytes)?;
+    let cloned = match (value, remap) {
+        (Value::NodeSet(nodes), Some(remap)) => {
+            let retained_nodes = nodes
+                .iter()
+                .filter(|node| remap_parameter_node(node, remap).is_some())
+                .count();
+            let mut output = Vec::new();
+            if let Err(error) = output.try_reserve_exact(retained_nodes) {
+                meter.release_owned_bytes(requested_owned_bytes);
+                return Err(Error::Dynamic(format!(
+                    "failed to reserve remapped parameter storage: {error}"
+                )));
+            }
+            output.extend(
+                nodes
+                    .iter()
+                    .filter_map(|node| remap_parameter_node(node, remap)),
+            );
+            Value::NodeSet(output)
+        }
+        _ => value.clone(),
     };
-    Value::NodeSet(
-        nodes
-            .iter()
-            .filter_map(|node| remap_parameter_node(node, remap))
-            .collect(),
-    )
+    let actual_owned_bytes = value_owned_bytes(&cloned);
+    if actual_owned_bytes > requested_owned_bytes {
+        if let Err(error) = meter.charge(
+            BudgetKind::OwnedBytes,
+            actual_owned_bytes - requested_owned_bytes,
+        ) {
+            meter.release_owned_bytes(requested_owned_bytes);
+            return Err(error);
+        }
+    } else {
+        meter.release_owned_bytes(requested_owned_bytes - actual_owned_bytes);
+    }
+    Ok(RetainedValue {
+        value: cloned,
+        retained_owned_bytes: actual_owned_bytes,
+    })
 }
 
 fn validate_parameter_value(value: &Value, source: &Document) -> Result<()> {
@@ -6175,7 +6208,7 @@ fn clone_for_xsl_copy(kind: &NodeKind, meter: &Meter) -> Result<NodeKind> {
 fn value_owned_bytes(value: &Value) -> usize {
     match value {
         Value::NodeSet(nodes) => nodes
-            .len()
+            .capacity()
             .saturating_mul(std::mem::size_of::<NodeReference>()),
         Value::Boolean(_) | Value::Number(_) => 0,
         Value::String(value) | Value::StoredExpression(value) => value.capacity(),
@@ -6566,7 +6599,7 @@ mod tests {
     use crate::compiler::Instruction;
     use crate::{
         BudgetKind, CompileBudget, Compiler, Document, Error, ExecutionBudget, ExpandedName,
-        NoResolver, NodeKind, NodeReference, Value,
+        NoResolver, NodeId, NodeKind, NodeReference, Value,
     };
 
     #[test]
@@ -6600,6 +6633,53 @@ mod tests {
         scope.release(&mut meter);
         assert_eq!(
             meter
+                .usage(BudgetKind::OwnedBytes)
+                .expect("owned-byte usage is available")
+                .0,
+            0
+        );
+    }
+
+    #[test]
+    fn remapped_parameter_accounting_matches_retained_capacity() {
+        // Remapping must reserve the exact backing allocation before it is retained by a scope;
+        // logical node count alone cannot account for an implicitly grown Vec.
+        let source = NodeId::test(1);
+        let target = NodeId::test(2);
+        let value = Value::NodeSet(vec![NodeReference::Node(source)]);
+        let remap = std::collections::HashMap::from([(source, target)]);
+
+        let mut unlimited_meter = meter(usize::MAX);
+        let remapped = super::clone_parameter_value(&value, Some(&remap), &mut unlimited_meter)
+            .expect("remapping fits the test budget");
+        let Value::NodeSet(nodes) = &remapped.value else {
+            unreachable!("node-set remapping preserves the value kind")
+        };
+        assert_eq!(
+            super::parameter_value_owned_bytes(&value, Some(&remap)),
+            nodes
+                .capacity()
+                .saturating_mul(std::mem::size_of::<NodeReference>())
+        );
+        assert_eq!(
+            remapped.retained_owned_bytes,
+            unlimited_meter
+                .usage(BudgetKind::OwnedBytes)
+                .expect("owned-byte usage is available")
+                .0
+        );
+
+        let required = super::parameter_value_owned_bytes(&value, Some(&remap));
+        let mut constrained = meter(required - 1);
+        assert!(matches!(
+            super::clone_parameter_value(&value, Some(&remap), &mut constrained),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            })
+        ));
+        assert_eq!(
+            constrained
                 .usage(BudgetKind::OwnedBytes)
                 .expect("owned-byte usage is available")
                 .0,

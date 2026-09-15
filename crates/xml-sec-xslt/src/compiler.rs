@@ -425,26 +425,25 @@ impl<R: Resolver> Compiler<R> {
         })?;
         let forward = stylesheet_version_is_forward_compatible(version)?;
         let order = state.next_order();
+        let pattern = Pattern::new("/", root, state.workspace())?;
+        let context = CompileContext::new(
+            forward,
+            depth,
+            state.budget.recursion_depth,
+            base_uri,
+            state.current_stylesheet_document(),
+            state.workspace(),
+        )?;
+        let body = vec![compile_literal_element(root, context)?].into();
         state.templates.push(Template {
             name: None,
-            pattern: Some(Pattern::new("/", root, state.workspace())?),
+            pattern: Some(pattern),
             mode: None,
             priority: 0.5,
             precedence,
             order,
             params: Arc::from([]),
-            body: vec![compile_literal_element(
-                root,
-                CompileContext::new(
-                    forward,
-                    depth,
-                    state.budget.recursion_depth,
-                    base_uri,
-                    state.current_stylesheet_document(),
-                    state.workspace(),
-                )?,
-            )?]
-            .into(),
+            body,
         });
         Ok(())
     }
@@ -712,19 +711,16 @@ impl<R: Resolver> Compiler<R> {
             }
             "attribute-set" => {
                 let order = state.next_order();
-                state.attribute_sets.push(AttributeSet::parse(
-                    node,
-                    CompileContext::new(
-                        forward,
-                        depth,
-                        state.budget.recursion_depth,
-                        base_uri,
-                        state.current_stylesheet_document(),
-                        state.workspace(),
-                    )?,
-                    precedence,
-                    order,
-                )?)
+                let context = CompileContext::new(
+                    forward,
+                    depth,
+                    state.budget.recursion_depth,
+                    base_uri,
+                    state.current_stylesheet_document(),
+                    state.workspace(),
+                )?;
+                let attribute_set = AttributeSet::parse(node, context, precedence, order)?;
+                state.attribute_sets.push(attribute_set)
             }
             _unknown if forward => {}
             unknown => return Err(Error::Static(format!("unknown top-level xsl:{unknown}"))),
@@ -2744,12 +2740,150 @@ struct CompileContext<'a> {
     stylesheet_document: StylesheetDocumentId,
     namespace_snapshot: NamespaceSnapshot,
     base_uri_snapshot: BaseUriSnapshot,
-    local_bindings: LocalBindingIndex,
+    local_bindings: Rc<RefCell<LocalBindingIndex<'a>>>,
 }
 
 type NamespaceSnapshot = Rc<RefCell<Option<(roxmltree::NodeId, Weak<Vec<(String, String)>>)>>>;
 type BaseUriSnapshot = Rc<RefCell<Option<(roxmltree::NodeId, Option<Arc<str>>)>>>;
-type LocalBindingIndex = Rc<RefCell<HashMap<roxmltree::NodeId, HashSet<ExpandedName>>>>;
+#[derive(Debug)]
+struct LocalBindingIndex<'a> {
+    entries: HashMap<roxmltree::NodeId, HashSet<ExpandedName>>,
+    workspace: CompileWorkspace<'a>,
+    retained_owned_bytes: usize,
+}
+
+impl LocalBindingIndex<'_> {
+    fn new(workspace: CompileWorkspace<'_>) -> LocalBindingIndex<'_> {
+        LocalBindingIndex {
+            entries: HashMap::new(),
+            workspace,
+            retained_owned_bytes: 0,
+        }
+    }
+
+    fn reserve_outer_slot(&mut self) -> Result<()> {
+        if self.entries.len() < self.entries.capacity() {
+            return Ok(());
+        }
+        let old_capacity = self.entries.capacity();
+        let target_capacity = old_capacity.saturating_add(old_capacity.max(4));
+        let requested = target_capacity
+            .saturating_mul(hash_entry_storage::<roxmltree::NodeId, HashSet<ExpandedName>>());
+        self.workspace.retain(requested)?;
+        let mut replacement = HashMap::new();
+        if let Err(error) = replacement.try_reserve(target_capacity) {
+            self.workspace.release(requested);
+            return Err(Error::Static(format!(
+                "failed to reserve local-binding index storage: {error}"
+            )));
+        }
+        let actual = replacement
+            .capacity()
+            .saturating_mul(hash_entry_storage::<roxmltree::NodeId, HashSet<ExpandedName>>());
+        reconcile_compile_reservation(self.workspace, requested, actual)?;
+        replacement.extend(self.entries.drain());
+        std::mem::swap(&mut self.entries, &mut replacement);
+        let old = replacement
+            .capacity()
+            .saturating_mul(hash_entry_storage::<roxmltree::NodeId, HashSet<ExpandedName>>());
+        self.retained_owned_bytes = self
+            .retained_owned_bytes
+            .checked_sub(old)
+            .expect("local-binding map capacity was previously charged")
+            .saturating_add(actual);
+        self.workspace.release(old);
+        Ok(())
+    }
+
+    fn insert(&mut self, parent: roxmltree::NodeId, name: &ExpandedName) -> Result<()> {
+        if !self.entries.contains_key(&parent) {
+            self.reserve_outer_slot()?;
+            self.entries.insert(parent, HashSet::new());
+        }
+        let names = self
+            .entries
+            .get_mut(&parent)
+            .expect("local-binding parent was inserted");
+        if names.contains(name) {
+            return Ok(());
+        }
+        reserve_compile_hash_set_slot(names, self.workspace, &mut self.retained_owned_bytes)?;
+        let requested = name
+            .namespace
+            .as_ref()
+            .map_or(0, String::len)
+            .saturating_add(name.local.len());
+        self.workspace.retain(requested)?;
+        let retained_name = name.clone();
+        let actual = retained_name
+            .namespace
+            .as_ref()
+            .map_or(0, String::capacity)
+            .saturating_add(retained_name.local.capacity());
+        reconcile_compile_reservation(self.workspace, requested, actual)?;
+        self.retained_owned_bytes = self.retained_owned_bytes.saturating_add(actual);
+        names.insert(retained_name);
+        Ok(())
+    }
+}
+
+impl Drop for LocalBindingIndex<'_> {
+    fn drop(&mut self) {
+        self.workspace.release(self.retained_owned_bytes);
+    }
+}
+
+fn reconcile_compile_reservation(
+    workspace: CompileWorkspace<'_>,
+    requested: usize,
+    actual: usize,
+) -> Result<()> {
+    if actual > requested {
+        if let Err(error) = workspace.retain(actual - requested) {
+            workspace.release(requested);
+            return Err(error);
+        }
+    } else {
+        workspace.release(requested - actual);
+    }
+    Ok(())
+}
+
+fn reserve_compile_hash_set_slot(
+    names: &mut HashSet<ExpandedName>,
+    workspace: CompileWorkspace<'_>,
+    retained_owned_bytes: &mut usize,
+) -> Result<()> {
+    if names.len() < names.capacity() {
+        return Ok(());
+    }
+    let old_capacity = names.capacity();
+    let target_capacity = old_capacity.saturating_add(old_capacity.max(4));
+    let requested = target_capacity.saturating_mul(hash_entry_storage::<ExpandedName, ()>());
+    workspace.retain(requested)?;
+    let mut replacement = HashSet::new();
+    if let Err(error) = replacement.try_reserve(target_capacity) {
+        workspace.release(requested);
+        return Err(Error::Static(format!(
+            "failed to reserve local-binding set storage: {error}"
+        )));
+    }
+    let actual = replacement
+        .capacity()
+        .saturating_mul(hash_entry_storage::<ExpandedName, ()>());
+    reconcile_compile_reservation(workspace, requested, actual)?;
+    replacement.extend(names.drain());
+    std::mem::swap(names, &mut replacement);
+    let old = replacement
+        .capacity()
+        .saturating_mul(hash_entry_storage::<ExpandedName, ()>());
+    *retained_owned_bytes = retained_owned_bytes
+        .checked_sub(old)
+        .expect("local-binding set capacity was previously charged")
+        .saturating_add(actual);
+    workspace.release(old);
+    Ok(())
+}
 
 impl<'a> CompileContext<'a> {
     fn new(
@@ -2771,7 +2905,7 @@ impl<'a> CompileContext<'a> {
             stylesheet_document,
             namespace_snapshot: Rc::new(RefCell::new(None)),
             base_uri_snapshot: Rc::new(RefCell::new(None)),
-            local_bindings: Rc::new(RefCell::new(HashMap::new())),
+            local_bindings: Rc::new(RefCell::new(LocalBindingIndex::new(workspace))),
         })
     }
 
@@ -2834,6 +2968,7 @@ impl<'a> CompileContext<'a> {
         let mut cursor = node;
         while let Some(parent) = cursor.parent_element() {
             if bindings
+                .entries
                 .get(&parent.id())
                 .is_some_and(|names| names.contains(name))
             {
@@ -2844,15 +2979,15 @@ impl<'a> CompileContext<'a> {
         false
     }
 
-    fn register_local_binding(&self, node: roxmltree::Node<'_, '_>, name: ExpandedName) {
+    fn register_local_binding(
+        &self,
+        node: roxmltree::Node<'_, '_>,
+        name: &ExpandedName,
+    ) -> Result<()> {
         let Some(parent) = node.parent_element() else {
-            return;
+            return Ok(());
         };
-        self.local_bindings
-            .borrow_mut()
-            .entry(parent.id())
-            .or_default()
-            .insert(name);
+        self.local_bindings.borrow_mut().insert(parent.id(), name)
     }
 
     fn with_literal_version(mut self, node: roxmltree::Node<'_, '_>) -> Result<Self> {
@@ -3957,7 +4092,7 @@ fn compile_variable(node: roxmltree::Node<'_, '_>, context: CompileContext) -> R
         content,
         base_uri,
     };
-    context.register_local_binding(node, variable.name.clone());
+    context.register_local_binding(node, &variable.name)?;
     Ok(variable)
 }
 
@@ -4986,6 +5121,66 @@ mod tests {
         )
         .compile(&stylesheet, None)
         .expect("distinct bindings compile without repeated sibling scans");
+    }
+
+    #[test]
+    fn local_binding_index_reserves_and_releases_compile_workspace() {
+        // The temporary scope index is attacker-controlled compiler state and must remain charged
+        // for exactly the lifetime of the shared index.
+        let retained = Cell::new(0usize);
+        let workspace = CompileWorkspace {
+            limit: usize::MAX,
+            occupied: 0,
+            retained: &retained,
+        };
+        let document = roxmltree::Document::parse(
+            r#"<xsl:stylesheet xmlns:xsl="http://www.w3.org/1999/XSL/Transform" version="1.0"><xsl:template match="/"><xsl:variable name="value"/></xsl:template></xsl:stylesheet>"#,
+        )
+        .expect("stylesheet parses");
+        let variable = document
+            .descendants()
+            .find(|node| node.has_tag_name((XSLT_NS, "variable")))
+            .expect("variable exists");
+        let context = CompileContext::new(
+            false,
+            1,
+            16,
+            None,
+            StylesheetDocumentId::PRINCIPAL,
+            workspace,
+        )
+        .expect("compile context is valid");
+
+        context
+            .register_local_binding(variable, &ExpandedName::new(None::<String>, "value"))
+            .expect("binding index fits the workspace");
+        assert!(retained.get() > 0, "the live index must reserve workspace");
+        drop(context);
+        assert_eq!(retained.get(), 0, "dropping the index releases workspace");
+
+        let constrained_retained = Cell::new(0usize);
+        let constrained = CompileWorkspace {
+            limit: 0,
+            occupied: 0,
+            retained: &constrained_retained,
+        };
+        let context = CompileContext::new(
+            false,
+            1,
+            16,
+            None,
+            StylesheetDocumentId::PRINCIPAL,
+            constrained,
+        )
+        .expect("empty compile context fits");
+        assert!(matches!(
+            context.register_local_binding(variable, &ExpandedName::new(None::<String>, "value")),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            })
+        ));
+        assert_eq!(constrained_retained.get(), 0);
     }
 
     #[test]

@@ -311,34 +311,104 @@ fn source_base_uri(source: &Document, node: &SourceNode) -> Option<String> {
 
 type PatternCacheKey = (String, Vec<(String, String)>, NodeId);
 
-fn pattern_cache_entry_owned_bytes(key: &PatternCacheKey, node_count: usize) -> usize {
+fn pattern_cache_key_owned_bytes(key: &PatternCacheKey) -> usize {
     let namespace_bytes = key.1.iter().fold(0usize, |total, (prefix, uri)| {
         total
-            .saturating_add(std::mem::size_of::<(String, String)>())
-            .saturating_add(prefix.len())
-            .saturating_add(uri.len())
+            .saturating_add(prefix.capacity())
+            .saturating_add(uri.capacity())
     });
-    std::mem::size_of::<PatternCacheKey>()
-        .saturating_add(key.0.len())
-        .saturating_add(namespace_bytes)
-        // Hash tables retain control bytes and spare capacity in addition to each node value.
+    key.0
+        .capacity()
         .saturating_add(
-            node_count
-                .saturating_mul(std::mem::size_of::<SourceNode>())
-                .saturating_mul(2),
+            key.1
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(String, String)>()),
         )
+        .saturating_add(namespace_bytes)
+}
+
+fn clone_pattern_cache_key(
+    expression: &str,
+    namespaces: &[(String, String)],
+    logical_root: NodeId,
+    meter: &mut Meter,
+) -> Result<(PatternCacheKey, usize)> {
+    let requested = expression.len().saturating_add(
+        namespaces
+            .len()
+            .saturating_mul(std::mem::size_of::<(String, String)>())
+            .saturating_add(namespaces.iter().fold(0usize, |total, (prefix, uri)| {
+                total.saturating_add(prefix.len()).saturating_add(uri.len())
+            })),
+    );
+    meter.charge(BudgetKind::OwnedBytes, requested)?;
+    let key = (expression.to_owned(), namespaces.to_vec(), logical_root);
+    let actual = pattern_cache_key_owned_bytes(&key);
+    if actual > requested {
+        if let Err(error) = meter.charge(BudgetKind::OwnedBytes, actual - requested) {
+            meter.release_owned_bytes(requested);
+            return Err(error);
+        }
+    } else {
+        meter.release_owned_bytes(requested - actual);
+    }
+    Ok((key, actual))
+}
+
+fn pattern_cache_retained_owned_bytes(
+    cache: &HashMap<PatternCacheKey, HashSet<SourceNode>>,
+) -> usize {
+    cache.iter().fold(
+        retained_hash_storage::<(PatternCacheKey, HashSet<SourceNode>)>(cache.capacity()),
+        |total, (key, nodes)| {
+            total
+                .saturating_add(pattern_cache_key_owned_bytes(key))
+                .saturating_add(retained_hash_storage::<SourceNode>(nodes.capacity()))
+        },
+    )
 }
 
 fn clear_pattern_cache(
     cache: &mut HashMap<PatternCacheKey, HashSet<SourceNode>>,
+    index_owned_bytes: &mut usize,
     meter: &mut Meter,
 ) {
     let retired = std::mem::take(cache);
-    let released = retired.iter().fold(0usize, |total, (key, nodes)| {
-        total.saturating_add(pattern_cache_entry_owned_bytes(key, nodes.len()))
-    });
+    let released = pattern_cache_retained_owned_bytes(&retired);
     drop(retired);
+    *index_owned_bytes = 0;
     meter.release_owned_bytes(released);
+}
+
+fn insert_pattern_cache_entry(
+    cache: &mut HashMap<PatternCacheKey, HashSet<SourceNode>>,
+    index_owned_bytes: &mut usize,
+    key: PatternCacheKey,
+    key_owned_bytes: usize,
+    nodes: impl IntoIterator<Item = SourceNode>,
+    meter: &mut Meter,
+) -> Result<()> {
+    if let Err(error) = reserve_retained_hash_map_slot(cache, meter, index_owned_bytes) {
+        meter.release_owned_bytes(key_owned_bytes);
+        return Err(error);
+    }
+
+    let mut retained_nodes = HashSet::new();
+    let mut node_index_owned_bytes = 0usize;
+    for node in nodes {
+        if retained_nodes.contains(&node) {
+            continue;
+        }
+        if let Err(error) =
+            reserve_retained_hash_set_slot(&mut retained_nodes, meter, &mut node_index_owned_bytes)
+        {
+            meter.release_owned_bytes(key_owned_bytes.saturating_add(node_index_owned_bytes));
+            return Err(error);
+        }
+        retained_nodes.insert(node);
+    }
+    cache.insert(key, retained_nodes);
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -666,6 +736,7 @@ pub(crate) struct Evaluator {
     node_base_uris: Rc<RefCell<HashMap<Vec<usize>, Option<String>>>>,
     expressions: RefCell<HashMap<String, XPath>>,
     pattern_matches: HashMap<PatternCacheKey, HashSet<SourceNode>>,
+    pattern_match_index_bytes: usize,
     generated_ids: Rc<RefCell<GeneratedIdCache>>,
     id_index: Rc<RefCell<IdIndex>>,
     key_index: Rc<RefCell<KeyIndex>>,
@@ -849,6 +920,7 @@ impl Evaluator {
             node_base_uris,
             expressions: RefCell::new(HashMap::new()),
             pattern_matches: HashMap::new(),
+            pattern_match_index_bytes: 0,
             generated_ids: Rc::new(RefCell::new(GeneratedIdCache::default())),
             id_index: Rc::new(RefCell::new(id_index)),
             key_index: Rc::new(RefCell::new(HashMap::new())),
@@ -926,7 +998,11 @@ impl Evaluator {
         reserve_retained_hash_set_slot(&mut ready, meter, &mut self.ready_key_index_bytes)?;
         ready.insert((key_slot, document_index));
         drop(ready);
-        clear_pattern_cache(&mut self.pattern_matches, meter);
+        clear_pattern_cache(
+            &mut self.pattern_matches,
+            &mut self.pattern_match_index_bytes,
+            meter,
+        );
         Ok(())
     }
 
@@ -2613,21 +2689,39 @@ impl Evaluator {
                 format!("//{branch}")
             };
             let uses_current = crate::expression::has_unprefixed_function_call(branch, "current");
-            let cache_key = (!branch.contains('$') && !uses_current)
-                .then(|| (expression.clone(), pattern.namespaces.clone(), logical_root));
-            if let Some(cached) = cache_key
-                .as_ref()
-                .and_then(|key| self.pattern_matches.get(key))
+            let cache_key = if !branch.contains('$') && !uses_current {
+                Some(clone_pattern_cache_key(
+                    &expression,
+                    &pattern.namespaces,
+                    logical_root,
+                    meter,
+                )?)
+            } else {
+                None
+            };
+            if let Some((_, key_owned_bytes, cached)) =
+                cache_key.as_ref().and_then(|(key, key_owned_bytes)| {
+                    self.pattern_matches
+                        .get(key)
+                        .map(|cached| (key, *key_owned_bytes, cached))
+                })
             {
-                if cached.contains(node) {
+                let matches = cached.contains(node);
+                meter.release_owned_bytes(key_owned_bytes);
+                if matches {
                     return Ok(true);
                 }
                 continue;
             }
             let root_node = SourceNode::Node(logical_root);
             let evaluation_node = if uses_current { node } else { &root_node };
-            meter.charge(BudgetKind::XPathEvaluations, 1)?;
-            let value = self.evaluate(
+            if let Err(error) = meter.charge(BudgetKind::XPathEvaluations, 1) {
+                if let Some((_, key_owned_bytes)) = cache_key {
+                    meter.release_owned_bytes(key_owned_bytes);
+                }
+                return Err(error);
+            }
+            let value = match self.evaluate(
                 &Expression::generated(expression, pattern.namespaces.clone()),
                 evaluation_node,
                 1,
@@ -2635,21 +2729,34 @@ impl Evaluator {
                 variables,
                 meter,
                 None,
-            )?;
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    if let Some((_, key_owned_bytes)) = cache_key {
+                        meter.release_owned_bytes(key_owned_bytes);
+                    }
+                    return Err(error);
+                }
+            };
             if let XPathValue::NodeSet(nodes) = value {
                 let matches = nodes.contains(node);
-                if let Some(cache_key) = cache_key {
-                    meter.charge(
-                        BudgetKind::OwnedBytes,
-                        pattern_cache_entry_owned_bytes(&cache_key, nodes.len()),
+                if let Some((cache_key, key_owned_bytes)) = cache_key {
+                    insert_pattern_cache_entry(
+                        &mut self.pattern_matches,
+                        &mut self.pattern_match_index_bytes,
+                        cache_key,
+                        key_owned_bytes,
+                        nodes,
+                        meter,
                     )?;
-                    self.pattern_matches
-                        .insert(cache_key, nodes.into_iter().collect());
                 }
                 if matches {
                     return Ok(true);
                 }
             } else {
+                if let Some((_, key_owned_bytes)) = cache_key {
+                    meter.release_owned_bytes(key_owned_bytes);
+                }
                 return Err(Error::Dynamic(format!(
                     "template pattern `{branch}` did not select a node-set"
                 )));
@@ -10867,8 +10974,8 @@ mod tests {
             SourceNode::Node(NodeId::test(1)),
             SourceNode::Node(NodeId::test(2)),
         ]);
-        let reserved = pattern_cache_entry_owned_bytes(&key, nodes.len());
-        let mut cache = HashMap::from([(key, nodes)]);
+        let mut cache = HashMap::new();
+        let mut index_owned_bytes = 0usize;
         let mut meter = Meter::new(
             ExecutionBudget {
                 source_bytes: usize::MAX,
@@ -10889,16 +10996,74 @@ mod tests {
             0,
         )
         .expect("empty source fits the test budget");
+        let key_owned_bytes = pattern_cache_key_owned_bytes(&key);
         meter
-            .charge(BudgetKind::OwnedBytes, reserved)
-            .expect("cache reservation fits");
+            .charge(BudgetKind::OwnedBytes, key_owned_bytes)
+            .expect("key reservation fits");
+        insert_pattern_cache_entry(
+            &mut cache,
+            &mut index_owned_bytes,
+            key,
+            key_owned_bytes,
+            nodes,
+            &mut meter,
+        )
+        .expect("cache insertion fits");
+        let reserved = pattern_cache_retained_owned_bytes(&cache);
+        assert_eq!(
+            meter.usage(BudgetKind::OwnedBytes).expect("valid kind").0,
+            reserved
+        );
 
-        clear_pattern_cache(&mut cache, &mut meter);
+        clear_pattern_cache(&mut cache, &mut index_owned_bytes, &mut meter);
 
         assert!(cache.is_empty());
         assert_eq!(cache.capacity(), 0);
+        assert_eq!(index_owned_bytes, 0);
         assert_eq!(
             meter.usage(BudgetKind::OwnedBytes).expect("valid kind").0,
+            0
+        );
+
+        let namespaces = [("p".repeat(64), "urn:retained".repeat(64))];
+        let required = "//p:item".len()
+            + namespaces.len() * std::mem::size_of::<(String, String)>()
+            + namespaces
+                .iter()
+                .map(|(prefix, uri)| prefix.len() + uri.len())
+                .sum::<usize>();
+        let mut constrained = Meter::new(
+            ExecutionBudget {
+                source_bytes: usize::MAX,
+                external_documents: usize::MAX,
+                recursion_depth: usize::MAX,
+                xpath_evaluations: usize::MAX,
+                xpath_operations: usize::MAX,
+                extension_operations: usize::MAX,
+                pattern_evaluations: usize::MAX,
+                template_applications: usize::MAX,
+                sort_comparisons: usize::MAX,
+                key_entries: usize::MAX,
+                result_nodes: usize::MAX,
+                serialized_bytes: usize::MAX,
+                messages: usize::MAX,
+                owned_bytes: required - 1,
+            },
+            0,
+        )
+        .expect("empty source fits the test budget");
+        assert!(matches!(
+            clone_pattern_cache_key("//p:item", &namespaces, NodeId::test(0), &mut constrained),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            })
+        ));
+        assert_eq!(
+            constrained
+                .usage(BudgetKind::OwnedBytes)
+                .expect("valid kind")
+                .0,
             0
         );
     }
