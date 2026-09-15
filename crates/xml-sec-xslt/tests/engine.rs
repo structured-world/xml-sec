@@ -3541,9 +3541,10 @@ fn stylesheet_static_context_is_module_and_instruction_local() {
 }
 
 #[test]
-fn whitespace_rules_honor_namespaces_specificity_and_inherited_xml_space() {
+fn source_strip_space_does_not_override_inherited_xml_space_preserve() {
     // Import precedence and NameTest priority apply before declaration order. XSLT 1.0 section
-    // 3.4 independently preserves whitespace beneath inherited xml:space="preserve".
+    // 3.4 independently preserves source whitespace beneath inherited xml:space="preserve";
+    // libxslt 1.1.45 diverges by stripping that final text node.
     // https://www.w3.org/TR/1999/REC-xslt-19991116#strip
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:n="urn:n"><xsl:output method="text"/><xsl:strip-space elements="*"/><xsl:preserve-space elements="n:keep"/><xsl:template match="/"><xsl:value-of select="count(n:root/text())"/><xsl:text>|</xsl:text><xsl:value-of select="count(n:root/n:keep/text())"/><xsl:text>|</xsl:text><xsl:value-of select="count(n:root/n:drop/n:child/text())"/></xsl:template></xsl:stylesheet>"#;
     assert_eq!(

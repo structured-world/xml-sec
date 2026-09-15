@@ -23,7 +23,7 @@ use crate::lexical::{
 };
 use crate::model::parser_workspace_bytes;
 use crate::resolver::decode_resource;
-use crate::runtime::{apply_whitespace_rules, expanded_name_owned_bytes};
+use crate::runtime::{apply_source_whitespace_rules, expanded_name_owned_bytes};
 use crate::{
     Attribute, BudgetKind, Clock, Document, Error, ErrorKind, ExpandedName, Node, NodeId, NodeKind,
     NodeReference, ResolvePurpose, ResolveRequest, ResolvedResource, Resolver, ResourceIdentity,
@@ -249,7 +249,7 @@ pub(crate) fn prepare_evaluator_source(
         (source.clone(), None)
     };
     let (whitespace_remap, whitespace_remap_owned_bytes) =
-        apply_whitespace_rules(&mut document, &options.whitespace, meter)?
+        apply_source_whitespace_rules(&mut document, &options.whitespace, meter)?
             .map_or((None, 0), |(remap, bytes)| (Some(remap), bytes));
     let (include_remap, include_remap_owned_bytes) =
         include_remap.map_or((None, 0), |(remap, bytes)| (Some(remap), bytes));
@@ -2477,7 +2477,7 @@ impl Evaluator {
                         (document, None)
                     };
                     if let Some((remap, remap_owned_bytes)) =
-                        apply_whitespace_rules(&mut document, &self.whitespace, meter)?
+                        apply_source_whitespace_rules(&mut document, &self.whitespace, meter)?
                     {
                         drop(remap);
                         meter.release_owned_bytes(remap_owned_bytes);
@@ -3427,7 +3427,8 @@ fn import_stylesheet_document(
     let clone_bytes = source.estimated_clone_bytes();
     meter.charge(BudgetKind::OwnedBytes, clone_bytes)?;
     let mut prepared = source.clone();
-    if let Some((_, remap_owned_bytes)) = apply_whitespace_rules(&mut prepared, whitespace, meter)?
+    if let Some((_, remap_owned_bytes)) =
+        apply_source_whitespace_rules(&mut prepared, whitespace, meter)?
     {
         meter.release_owned_bytes(remap_owned_bytes);
     }

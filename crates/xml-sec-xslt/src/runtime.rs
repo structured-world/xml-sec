@@ -218,7 +218,7 @@ impl Stylesheet {
     }
 }
 
-pub(crate) fn apply_whitespace_rules(
+pub(crate) fn apply_source_whitespace_rules(
     document: &mut Document,
     rules: &[(NameTest, bool, usize, usize)],
     meter: &mut Meter,
@@ -235,7 +235,7 @@ pub(crate) fn apply_whitespace_rules(
             meter.release_owned_bytes(stripped_reservation);
             return Err(error);
         }
-        match should_strip_whitespace(document, node, rules, meter) {
+        match should_strip_source_whitespace(document, node, rules, meter) {
             Ok(strip) => stripped.push(u8::from(strip)),
             Err(error) => {
                 meter.release_owned_bytes(stripped_reservation);
@@ -253,7 +253,7 @@ pub(crate) fn apply_whitespace_rules(
     retained.map(Some)
 }
 
-fn should_strip_whitespace(
+fn should_strip_source_whitespace(
     document: &Document,
     node: &crate::model::Node,
     rules: &[(NameTest, bool, usize, usize)],
@@ -274,29 +274,7 @@ fn should_strip_whitespace(
     let NodeKind::Element { name, .. } = &parent.kind else {
         return Ok(false);
     };
-    // XSLT 1.0 section 3.4 makes inherited xml:space="preserve" an independent
-    // preservation condition, so a matching xsl:strip-space rule cannot override it.
-    // https://www.w3.org/TR/1999/REC-xslt-19991116#strip
-    let xml_space = node.parent.and_then(|mut ancestor| {
-        loop {
-            let current = document.node(ancestor)?;
-            if let NodeKind::Element { attributes, .. } = &current.kind
-                && let Some(value) = attributes.iter().find_map(|attribute| {
-                    (attribute.name.namespace.as_deref()
-                        == Some("http://www.w3.org/XML/1998/namespace")
-                        && attribute.name.local == "space")
-                        .then_some(attribute.value.as_str())
-                })
-            {
-                break Some(value);
-            }
-            ancestor = current.parent?;
-        }
-    });
-    // XSLT 1.0 section 3.4 says a whitespace text node is preserved if *any* listed condition
-    // applies; inherited xml:space="preserve" is therefore independent of xsl:strip-space.
-    // https://www.w3.org/TR/1999/REC-xslt-19991116#strip
-    if xml_space == Some("preserve") {
+    if source_xml_space_preserves_whitespace(document, node.parent) {
         return Ok(false);
     }
     let mut decision: Option<&(NameTest, bool, usize, usize)> = None;
@@ -312,6 +290,37 @@ fn should_strip_whitespace(
         }
     }
     Ok(matches!(decision, Some((_, false, _, _))))
+}
+
+// XSLT 1.0 section 3.4 applies stripping to source and stylesheet documents and preserves a
+// whitespace-only text node if any listed condition applies. Inherited xml:space="preserve" is
+// therefore independent of the source element-name set controlled by xsl:strip-space. libxslt
+// 1.1.45 strips this case; this engine intentionally follows the normative rule instead.
+// https://www.w3.org/TR/1999/REC-xslt-19991116#strip
+fn source_xml_space_preserves_whitespace(
+    document: &Document,
+    mut ancestor: Option<NodeId>,
+) -> bool {
+    while let Some(id) = ancestor {
+        let Some(current) = document.node(id) else {
+            return false;
+        };
+        if let NodeKind::Element { attributes, .. } = &current.kind {
+            for attribute in attributes {
+                if attribute.name.namespace.as_deref()
+                    != Some("http://www.w3.org/XML/1998/namespace")
+                {
+                    continue;
+                }
+                if attribute.name.local != "space" {
+                    continue;
+                }
+                return attribute.value == "preserve";
+            }
+        }
+        ancestor = current.parent;
+    }
+    false
 }
 
 struct Execution<'a> {
@@ -6457,8 +6466,9 @@ mod tests {
 
     use super::{
         ApplyFrame, AttributeSetExpansion, EvaluatedParameters, SortKey, SourceNode, TemplateTask,
-        append_localized_decimal, apply_whitespace_rules, clone_allocation_free_variable_value,
-        format_number_sequence, metered_node_id_snapshot, validate_parameter_value, value_string,
+        append_localized_decimal, apply_source_whitespace_rules,
+        clone_allocation_free_variable_value, format_number_sequence, metered_node_id_snapshot,
+        validate_parameter_value, value_string,
     };
     use crate::budget::Meter;
     use crate::compiler::Instruction;
@@ -7106,7 +7116,7 @@ mod tests {
         let mut document = Document::parse(&source_xml, None).expect("wide source parses");
         let mut unbounded = meter(usize::MAX);
         let (remap, retained_bytes) =
-            apply_whitespace_rules(&mut document, &stylesheet.whitespace, &mut unbounded)
+            apply_source_whitespace_rules(&mut document, &stylesheet.whitespace, &mut unbounded)
                 .expect("workspace fits")
                 .expect("whitespace nodes are removed");
         assert_eq!(
@@ -7131,7 +7141,7 @@ mod tests {
             Document::parse(&source_xml, None).expect("wide source parses again");
         let mut constrained = meter(retained_bytes - 1);
         assert!(matches!(
-            apply_whitespace_rules(
+            apply_source_whitespace_rules(
                 &mut constrained_document,
                 &stylesheet.whitespace,
                 &mut constrained,
