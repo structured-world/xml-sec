@@ -388,7 +388,7 @@ pub(crate) fn reserve_metered_string(
     Ok(())
 }
 
-fn reconcile_replacement_growth(
+pub(crate) fn reconcile_replacement_growth(
     meter: &mut Meter,
     requested_bytes: usize,
     actual_bytes: usize,

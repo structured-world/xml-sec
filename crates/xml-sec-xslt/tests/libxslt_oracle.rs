@@ -1165,28 +1165,21 @@ fn assert_case(case: &Case) {
                     || media_type.ends_with("/xml")
                     || media_type.ends_with("+xml")
             });
-            let actual = if actual_is_html {
-                normalize_html_indentation(&actual.bytes).into_bytes()
+            let (actual, expected) = if actual_is_html {
+                normalize_html_oracle_pair(&actual.bytes, &expected)
             } else if actual_is_xml {
-                normalize_xml_lexical_forms(&actual.bytes)
+                (
+                    normalize_xml_lexical_forms(&actual.bytes),
+                    normalize_xml_lexical_forms(&expected),
+                )
             } else {
-                actual.bytes
+                (actual.bytes, expected)
             };
-            let actual = normalize_text_quote_references(&normalize_case_specific_oracle_output(
-                case,
-                normalize_generated_ids(&actual),
-            ));
-            let expected = if actual_is_html {
-                normalize_html_indentation(&expected).into_bytes()
-            } else if actual_is_xml {
-                normalize_xml_lexical_forms(&expected)
-            } else {
-                expected
-            };
-            let expected = normalize_text_quote_references(&normalize_case_specific_oracle_output(
-                case,
-                normalize_generated_ids(&expected),
-            ));
+            let actual = normalize_case_specific_oracle_output(case, actual);
+            let expected = normalize_case_specific_oracle_output(case, expected);
+            let (actual, expected) = normalize_generated_id_pairs(&actual, &expected);
+            let actual = normalize_text_quote_references(&actual);
+            let expected = normalize_text_quote_references(&expected);
             if assert_strict_xslt_output_deviation(case, &actual, &expected) {
                 return;
             }
@@ -1615,6 +1608,17 @@ fn normalize_xml_lexical_forms(bytes: &[u8]) -> Vec<u8> {
     normalized
 }
 
+#[test]
+fn xml_oracle_normalization_preserves_attribute_reference_semantics() {
+    // XML 1.0 section 3.3.3 distinguishes a referenced line feed from a literal one in an
+    // attribute value; an oracle comparison must not erase a serializer round-trip defect.
+    // https://www.w3.org/TR/2008/REC-xml-20081126/#AVNormalize
+    assert_ne!(
+        normalize_xml_lexical_forms(b"<root value=\"&#10;\"/>"),
+        normalize_xml_lexical_forms(b"<root value=\"\n\"/>")
+    );
+}
+
 fn normalize_comment_only_element_indentation(bytes: &[u8]) -> Vec<u8> {
     let mut output = Vec::with_capacity(bytes.len());
     let mut cursor = 0usize;
@@ -1842,22 +1846,8 @@ fn normalize_numeric_character_references(bytes: &[u8]) -> Vec<u8> {
     let mut output = Vec::with_capacity(bytes.len());
     let mut cursor = 0usize;
     while cursor < bytes.len() {
-        let opaque_end = [
-            (b"<![CDATA[".as_slice(), b"]]>".as_slice()),
-            (b"<!--".as_slice(), b"-->".as_slice()),
-            (b"<?".as_slice(), b"?>".as_slice()),
-        ]
-        .into_iter()
-        .find_map(|(start, end)| {
-            bytes[cursor..].starts_with(start).then(|| {
-                bytes[cursor + start.len()..]
-                    .windows(end.len())
-                    .position(|window| window == end)
-                    .map(|offset| cursor + start.len() + offset + end.len())
-                    .unwrap_or(bytes.len())
-            })
-        });
-        if let Some(end) = opaque_end {
+        if bytes[cursor] == b'<' {
+            let end = serialized_markup_end(bytes, cursor);
             output.extend_from_slice(&bytes[cursor..end]);
             cursor = end;
             continue;
@@ -1913,8 +1903,8 @@ fn every_multiple_output_matches_the_libxslt_oracle() {
             .unwrap_or_else(|| panic!("secondary output {uri} exists"));
         let expected = std::fs::read(&path).expect("oracle secondary output is readable");
         assert_eq!(
-            normalize_html_indentation(&actual.serialized.bytes),
-            normalize_html_indentation(&expected),
+            normalize_multiple_output_indentation(&actual.serialized.bytes),
+            normalize_multiple_output_indentation(&expected),
             "secondary output {uri} differs from libxslt"
         );
     }
@@ -1922,23 +1912,147 @@ fn every_multiple_output_matches_the_libxslt_oracle() {
 
 fn normalize_html_indentation(bytes: &[u8]) -> String {
     let input = normalize_legacy_html_content_type(&String::from_utf8_lossy(bytes));
+    input.trim_end().to_owned()
+}
+
+fn normalize_html_oracle_pair(actual: &[u8], expected: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let actual = normalize_html_indentation(actual).into_bytes();
+    let expected = normalize_html_indentation(expected).into_bytes();
+    let Some(actual_layout) = intertag_layout(&actual) else {
+        return (actual, expected);
+    };
+    let Some(expected_layout) = intertag_layout(&expected) else {
+        return (actual, expected);
+    };
+    if actual_layout.tags != expected_layout.tags
+        || actual_layout.gaps.len() != expected_layout.gaps.len()
+    {
+        return (actual, expected);
+    }
+    let serializer_is_indenting =
+        actual_layout
+            .gaps
+            .iter()
+            .zip(&expected_layout.gaps)
+            .any(|(actual_gap, expected_gap)| {
+                actual_gap
+                    .as_ref()
+                    .is_some_and(|range| serializer_indentation(&actual[range.clone()]))
+                    || expected_gap
+                        .as_ref()
+                        .is_some_and(|range| serializer_indentation(&expected[range.clone()]))
+            });
+
+    let mut actual_replacements = Vec::new();
+    let mut expected_replacements = Vec::new();
+    for (actual_gap, expected_gap) in actual_layout.gaps.iter().zip(&expected_layout.gaps) {
+        let (Some(actual_gap), Some(expected_gap)) = (actual_gap, expected_gap) else {
+            continue;
+        };
+        let actual_space = &actual[actual_gap.clone()];
+        let expected_space = &expected[expected_gap.clone()];
+        if actual_space == expected_space {
+            continue;
+        }
+        let actual_indented = serializer_indentation(actual_space);
+        let expected_indented = serializer_indentation(expected_space);
+        if !actual_indented && !expected_indented && !serializer_is_indenting {
+            continue;
+        }
+        let canonical = if !actual_indented {
+            actual_space.to_vec()
+        } else if !expected_indented {
+            expected_space.to_vec()
+        } else {
+            b"\n".to_vec()
+        };
+        actual_replacements.push((actual_gap.clone(), canonical.clone()));
+        expected_replacements.push((expected_gap.clone(), canonical));
+    }
+    (
+        apply_replacements(&actual, &actual_replacements),
+        apply_replacements(&expected, &expected_replacements),
+    )
+}
+
+struct IntertagLayout {
+    tags: Vec<Vec<u8>>,
+    gaps: Vec<Option<std::ops::Range<usize>>>,
+}
+
+fn intertag_layout(bytes: &[u8]) -> Option<IntertagLayout> {
+    let mut tags = Vec::new();
+    let mut gaps = Vec::new();
+    let mut cursor = 0usize;
+    let mut previous_end = None;
+    while let Some(relative_start) = bytes[cursor..].iter().position(|byte| *byte == b'<') {
+        let start = cursor + relative_start;
+        if let Some(end) = previous_end {
+            let range = end..start;
+            gaps.push(
+                bytes[range.clone()]
+                    .iter()
+                    .all(u8::is_ascii_whitespace)
+                    .then_some(range),
+            );
+        }
+        let end = serialized_markup_end(bytes, start);
+        if end <= start || end > bytes.len() {
+            return None;
+        }
+        let name_start = start
+            + if bytes.get(start + 1) == Some(&b'/') {
+                2
+            } else {
+                1
+            };
+        let name_end = bytes[name_start..end]
+            .iter()
+            .position(|byte| byte.is_ascii_whitespace() || matches!(*byte, b'/' | b'>'))
+            .map_or(end, |offset| name_start + offset);
+        tags.push(bytes[name_start..name_end].to_vec());
+        previous_end = Some(end);
+        cursor = end;
+    }
+    Some(IntertagLayout { tags, gaps })
+}
+
+fn serializer_indentation(bytes: &[u8]) -> bool {
+    bytes.contains(&b'\n') && bytes.iter().any(|byte| matches!(*byte, b' ' | b'\t'))
+}
+
+fn normalize_multiple_output_indentation(bytes: &[u8]) -> String {
+    let input = normalize_html_indentation(bytes);
     let mut output = String::with_capacity(input.len());
     let mut characters = input.chars().peekable();
     while let Some(character) = characters.next() {
-        if character == '>' {
-            output.push(character);
-            let mut whitespace = String::new();
-            while characters.peek().is_some_and(|next| next.is_whitespace()) {
-                whitespace.push(characters.next().expect("peeked character exists"));
-            }
-            if characters.peek() != Some(&'<') {
-                output.push_str(&whitespace);
-            }
-        } else {
-            output.push(character);
+        output.push(character);
+        if character != '>' {
+            continue;
+        }
+        let mut whitespace = String::new();
+        while characters.peek().is_some_and(|next| next.is_whitespace()) {
+            whitespace.push(characters.next().expect("peeked character exists"));
+        }
+        // The pinned multiple-output fixture differs only in serializer-added line indentation.
+        // Keep the generic oracle strict because inter-element whitespace can be source text.
+        if characters.peek() != Some(&'<') || !whitespace.contains(['\r', '\n']) {
+            output.push_str(&whitespace);
         }
     }
-    output.trim_end().to_owned()
+    output
+}
+
+#[test]
+fn html_oracle_normalization_preserves_inter_element_text() {
+    assert_ne!(
+        normalize_html_indentation(b"<span>a</span> <span>b</span>"),
+        normalize_html_indentation(b"<span>a</span><span>b</span>")
+    );
+    assert_ne!(
+        normalize_html_indentation(b"<span>a</span>\n<span>b</span>"),
+        normalize_html_indentation(b"<span>a</span><span>b</span>")
+    );
 }
 
 fn normalize_legacy_html_content_type(input: &str) -> String {
@@ -1978,53 +2092,250 @@ fn html_content_type_charset(tag: &str) -> Option<&str> {
     Some(&tag[start..end])
 }
 
-fn normalize_generated_ids(bytes: &[u8]) -> Vec<u8> {
-    let mut assigned = std::collections::HashMap::<Vec<u8>, usize>::new();
-    let mut output = Vec::with_capacity(bytes.len());
+fn normalize_generated_id_pairs(actual: &[u8], expected: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let actual_slots = attribute_value_slots(actual);
+    let expected_slots = attribute_value_slots(expected);
+    if actual_slots.len() != expected_slots.len() {
+        return (actual.to_vec(), expected.to_vec());
+    }
+
+    let mut pairs = Vec::new();
+    for ((actual_name, actual_range), (expected_name, expected_range)) in
+        actual_slots.iter().zip(&expected_slots)
+    {
+        if actual_name != expected_name {
+            return (actual.to_vec(), expected.to_vec());
+        }
+        let actual_ids = generated_ids_in_range(actual, actual_range.clone(), b"id");
+        if actual_ids.is_empty() {
+            continue;
+        }
+        let expected_ids = generated_ids_in_range(expected, expected_range.clone(), b"id");
+        if actual_ids.len() != expected_ids.len() {
+            return (actual.to_vec(), expected.to_vec());
+        }
+        pairs.extend(actual_ids.into_iter().zip(expected_ids));
+    }
+    let actual_text = text_value_slots(actual);
+    let expected_text = text_value_slots(expected);
+    if actual_text.len() != expected_text.len() {
+        return (actual.to_vec(), expected.to_vec());
+    }
+    for (actual_range, expected_range) in actual_text.into_iter().zip(expected_text) {
+        let actual_ids = generated_ids_in_range(actual, actual_range, b"id");
+        if actual_ids.is_empty() {
+            continue;
+        }
+        let expected_ids = generated_ids_in_range(expected, expected_range, b"id");
+        if actual_ids.len() != expected_ids.len() {
+            return (actual.to_vec(), expected.to_vec());
+        }
+        pairs.extend(actual_ids.into_iter().zip(expected_ids));
+    }
+    // One isolated id-shaped token is indistinguishable from literal result text. Normalize only
+    // when the output supplies correlation across multiple structural slots; this is enough to
+    // identify generated references without teaching the oracle that every `id123` is volatile.
+    if pairs.len() < 2
+        && !pairs.first().is_some_and(|(_, expected_range)| {
+            donor_generated_id_is_pointer_shaped(&expected[expected_range.clone()])
+        })
+    {
+        return (actual.to_vec(), expected.to_vec());
+    }
+    pairs.sort_unstable_by_key(|(actual, _)| actual.start);
+
+    let mut identities = std::collections::HashMap::<Vec<u8>, (Vec<u8>, usize)>::new();
+    let mut actual_replacements = Vec::with_capacity(pairs.len());
+    let mut expected_replacements = Vec::with_capacity(pairs.len());
+    for (actual_range, expected_range) in pairs {
+        let actual_id = &actual[actual_range.clone()];
+        let expected_id = &expected[expected_range.clone()];
+        let next = identities.len() + 1;
+        let entry = identities
+            .entry(actual_id.to_vec())
+            .or_insert_with(|| (expected_id.to_vec(), next));
+        if entry.0 != expected_id {
+            return (actual.to_vec(), expected.to_vec());
+        }
+        let canonical = format!("xmlsec-generated-id-{}", entry.1).into_bytes();
+        actual_replacements.push((actual_range, canonical.clone()));
+        expected_replacements.push((expected_range, canonical));
+    }
+
+    (
+        apply_replacements(actual, &actual_replacements),
+        apply_replacements(expected, &expected_replacements),
+    )
+}
+
+fn donor_generated_id_is_pointer_shaped(value: &[u8]) -> bool {
+    value.starts_with(b"idp")
+        || value
+            .strip_prefix(b"id")
+            .is_some_and(|digits| digits.len() >= 6 && digits.iter().all(u8::is_ascii_digit))
+}
+
+fn attribute_value_slots(bytes: &[u8]) -> Vec<(Vec<u8>, std::ops::Range<usize>)> {
+    let mut slots = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(start) = bytes[cursor..].iter().position(|byte| *byte == b'<') {
+        cursor += start + 1;
+        if bytes
+            .get(cursor)
+            .is_some_and(|byte| matches!(*byte, b'/' | b'!' | b'?'))
+        {
+            continue;
+        }
+        while bytes
+            .get(cursor)
+            .is_some_and(|byte| !byte.is_ascii_whitespace() && !matches!(*byte, b'>' | b'/'))
+        {
+            cursor += 1;
+        }
+        loop {
+            while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                cursor += 1;
+            }
+            if bytes
+                .get(cursor)
+                .is_none_or(|byte| matches!(*byte, b'>' | b'/'))
+            {
+                break;
+            }
+            let name_start = cursor;
+            while bytes.get(cursor).is_some_and(|byte| {
+                !byte.is_ascii_whitespace() && !matches!(*byte, b'=' | b'>' | b'/')
+            }) {
+                cursor += 1;
+            }
+            let name = bytes[name_start..cursor].to_vec();
+            while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                cursor += 1;
+            }
+            if bytes.get(cursor) != Some(&b'=') {
+                continue;
+            }
+            cursor += 1;
+            while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                cursor += 1;
+            }
+            let Some(quote @ (b'\'' | b'"')) = bytes.get(cursor).copied() else {
+                continue;
+            };
+            cursor += 1;
+            let value_start = cursor;
+            while bytes.get(cursor).is_some_and(|byte| *byte != quote) {
+                cursor += 1;
+            }
+            slots.push((name, value_start..cursor));
+            cursor += usize::from(cursor < bytes.len());
+        }
+    }
+    slots
+}
+
+fn text_value_slots(bytes: &[u8]) -> Vec<std::ops::Range<usize>> {
+    let mut slots = Vec::new();
     let mut cursor = 0usize;
     while cursor < bytes.len() {
-        let starts_id = bytes.get(cursor..cursor + 2) == Some(b"id")
-            && cursor
-                .checked_sub(1)
-                .and_then(|index| bytes.get(index))
-                .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_');
-        let mut end = cursor + 2;
-        if bytes.get(end) == Some(&b'p') {
-            end += 1;
-        }
-        let digit_start = end;
-        while bytes.get(end).is_some_and(u8::is_ascii_digit) {
-            end += 1;
-        }
-        if bytes.get(end..end + 2) == Some(b"ns") {
-            end += 2;
-            while bytes.get(end).is_some_and(u8::is_ascii_hexdigit) {
-                end += 1;
+        let Some(markup_start) = bytes[cursor..].iter().position(|byte| *byte == b'<') else {
+            if cursor < bytes.len() {
+                slots.push(cursor..bytes.len());
             }
+            break;
+        };
+        let markup_start = cursor + markup_start;
+        if cursor < markup_start {
+            slots.push(cursor..markup_start);
         }
-        if starts_id && end > digit_start {
-            let next = assigned.len() + 1;
-            let id = *assigned.entry(bytes[cursor..end].to_vec()).or_insert(next);
-            output.extend_from_slice(format!("id{id}").as_bytes());
+        let markup_end = serialized_markup_end(bytes, markup_start);
+        cursor = markup_end;
+    }
+    slots
+}
+
+fn generated_ids_in_range(
+    bytes: &[u8],
+    range: std::ops::Range<usize>,
+    prefix: &[u8],
+) -> Vec<std::ops::Range<usize>> {
+    let mut ids = Vec::new();
+    let mut cursor = range.start;
+    while cursor < range.end {
+        if let Some(end) = generated_id_end(bytes, cursor, prefix).filter(|end| *end <= range.end) {
+            ids.push(cursor..end);
             cursor = end;
         } else {
-            output.push(bytes[cursor]);
             cursor += 1;
         }
     }
+    ids
+}
+
+fn apply_replacements(bytes: &[u8], replacements: &[(std::ops::Range<usize>, Vec<u8>)]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut cursor = 0usize;
+    for (range, replacement) in replacements {
+        output.extend_from_slice(&bytes[cursor..range.start]);
+        output.extend_from_slice(replacement);
+        cursor = range.end;
+    }
+    output.extend_from_slice(&bytes[cursor..]);
     output
+}
+
+fn generated_id_end(bytes: &[u8], cursor: usize, prefix: &[u8]) -> Option<usize> {
+    let boundary = |byte: &u8| !byte.is_ascii_alphanumeric() && !matches!(*byte, b'_' | b'-');
+    if !bytes.get(cursor..)?.starts_with(prefix)
+        || cursor
+            .checked_sub(1)
+            .and_then(|index| bytes.get(index))
+            .is_some_and(|byte| !boundary(byte))
+    {
+        return None;
+    }
+    let mut end = cursor + prefix.len();
+    if prefix == b"id" && bytes.get(end) == Some(&b'p') {
+        end += 1;
+    }
+    let digit_start = end;
+    while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+        end += 1;
+    }
+    if end == digit_start {
+        return None;
+    }
+    if prefix == b"id" && bytes.get(end..end + 2) == Some(b"ns") {
+        end += 2;
+        while bytes.get(end).is_some_and(u8::is_ascii_hexdigit) {
+            end += 1;
+        }
+    }
+    bytes.get(end).is_none_or(boundary).then_some(end)
 }
 
 #[test]
 fn generated_id_normalization_accepts_libxslt_pointer_ids() {
-    assert_eq!(
-        normalize_generated_ids(b"idp106373348418272 id7 idp106373348418272"),
-        b"id1 id2 id1"
+    let (actual, expected) = normalize_generated_id_pairs(
+        b"<a id=\"id1\" href=\"#id2\"/><b id=\"id1\"/>",
+        b"<a id=\"idp106373348418272\" href=\"#id7\"/><b id=\"idp106373348418272\"/>",
     );
-    assert_eq!(
-        normalize_generated_ids(b"id1 id2 id2ns id2nsC3A9 id3"),
-        b"id1 id2 id3 id4 id5"
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn generated_id_normalization_preserves_literal_id_shaped_data() {
+    let (actual, expected) = normalize_generated_id_pairs(b"<out>id123</out>", b"<out>id999</out>");
+    assert_ne!(actual, expected);
+}
+
+#[test]
+fn generated_id_normalization_correlates_text_nodes() {
+    let (actual, expected) = normalize_generated_id_pairs(
+        b"<result><id>id1</id></result>",
+        b"<result><id>id1</id></result>",
     );
+    assert_eq!(actual, expected);
 }
 
 #[test]

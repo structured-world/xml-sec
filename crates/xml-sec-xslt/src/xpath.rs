@@ -10,9 +10,9 @@ use sxd_document_no_unsafe::{Package, QName, StorageRequirements};
 use sxd_xpath_no_unsafe::{Context, Factory, Value as SxdValue, XPath, function, nodeset};
 
 use crate::budget::{
-    Meter, ParseBudget, XINCLUDE_RECURSION_DEPTH_CEILING, reserve_retained_hash_map_slot,
-    reserve_retained_hash_set_slot, reserve_retained_vec_slot, reserve_temporary_vec_slot,
-    retained_hash_storage,
+    Meter, ParseBudget, XINCLUDE_RECURSION_DEPTH_CEILING, reconcile_replacement_growth,
+    reserve_retained_hash_map_slot, reserve_retained_hash_set_slot, reserve_retained_vec_slot,
+    reserve_temporary_vec_slot, retained_hash_storage,
 };
 use crate::compiler::{
     DecimalFormat, Expression, KeyDeclaration, ModuleDocument, NameTest, Pattern,
@@ -2175,8 +2175,15 @@ impl Evaluator {
             .ok_or_else(|| Error::Dynamic("XPath context node is stale".into()))?;
         let uses_current =
             crate::expression::has_unprefixed_function_call(&expression.source, "current");
-        let adapter_workspace =
-            xpath_adapter_workspace_upper_bound(expression).saturating_add(if uses_current {
+        let context_workspace = xpath_context_workspace_upper_bound(
+            expression,
+            custom_calls
+                .is_some()
+                .then_some(self.stylesheet_functions.as_ref()),
+        );
+        let adapter_workspace = xpath_adapter_workspace_upper_bound(expression)
+            .saturating_add(context_workspace)
+            .saturating_add(if uses_current {
                 context_path.owned_bytes()
             } else {
                 0
@@ -2214,6 +2221,10 @@ impl Evaluator {
                 .borrow_mut()
                 .insert(rewritten.as_ref().to_owned(), xpath);
         }
+        // Context construction owns QName indexes, registered function objects, namespace
+        // strings, and variable slots. Their complete representation bound is included in the
+        // adapter preflight above, before any of these allocations can occur. Runtime QName
+        // lookup is borrowed and allocation-free in the vendored XPath engine.
         let mut context = Context::new();
         // XPath 1.0 section 2.2 confines `following` and `preceding` to the same document as the
         // context node. Each projected logical document therefore supplies its wrapper as the
@@ -2341,6 +2352,15 @@ impl Evaluator {
                 );
             }
         }
+        debug_assert!(
+            context.function_count()
+                <= 96usize.saturating_add(if custom_calls.is_some() {
+                    self.stylesheet_functions.len()
+                } else {
+                    0
+                }),
+            "fixed XPath function registrations exceeded their preflighted representation bound"
+        );
         let mut variable_projection_error = false;
         for name in expression.variable_references.iter() {
             if variable_projection_error {
@@ -2506,12 +2526,19 @@ impl Evaluator {
                 })
                 .ok_or_else(|| Error::Dynamic("stale result-tree-fragment identity".into()));
         }
-        self.maps.project_value(
+        // The XPath value and its projected XSLT value coexist during conversion. Transfer the
+        // context-owned side into the operation meter for that interval so a caller cannot fund
+        // the two live representations from independent copies of the same remaining budget.
+        let live_context_bytes = context_workspace.saturating_add(context.string_allocation_used());
+        meter.charge(BudgetKind::OwnedBytes, live_context_bytes)?;
+        let projected = self.maps.project_value(
             &self.source,
             self.package.as_document().root().into(),
             value,
             meter,
-        )
+        );
+        meter.release_owned_bytes(live_context_bytes);
+        projected
     }
 
     fn prepare_document_requests(
@@ -3545,6 +3572,58 @@ fn xpath_adapter_workspace_upper_bound(expression: &Expression) -> usize {
             .saturating_add(namespace_bytes)
             .saturating_add(internal_prefix_bytes.saturating_mul(2)),
     )
+}
+
+fn xpath_context_workspace_upper_bound(
+    expression: &Expression,
+    stylesheet_functions: Option<&HashSet<ExpandedName>>,
+) -> usize {
+    // The fixed library currently registers fewer than 96 core, XSLT, and EXSLT functions.
+    // Keep representation slack explicit so additions fail the regression below rather than
+    // silently escaping the preflight. Each QNameMap entry owns a collision bucket and a boxed
+    // function; four words per hash slot conservatively covers table control/spare capacity.
+    const FIXED_FUNCTION_SLOTS: usize = 96;
+    const FIXED_FUNCTION_NAME_BYTES: usize = 8 * 1024;
+    const FUNCTION_OBJECT_BYTES: usize = 128;
+    let stylesheet_function_count = stylesheet_functions.map_or(0, HashSet::len);
+    let function_slots = FIXED_FUNCTION_SLOTS.saturating_add(stylesheet_function_count);
+    let variable_slots = expression.variable_references.len().saturating_add(2);
+    let namespace_slots = expression.namespaces.len().saturating_add(2);
+    let dynamic_name_bytes = expression
+        .variable_references
+        .iter()
+        .chain(stylesheet_functions.into_iter().flatten())
+        .fold(0usize, |bytes, name| {
+            bytes
+                .saturating_add(name.namespace.as_deref().map_or(0, str::len))
+                .saturating_add(name.local.len())
+        });
+    let namespace_bytes = expression
+        .namespaces
+        .iter()
+        .fold(0usize, |bytes, (prefix, uri)| {
+            bytes.saturating_add(prefix.len()).saturating_add(uri.len())
+        });
+    function_slots
+        .saturating_mul(
+            std::mem::size_of::<(sxd_xpath_no_unsafe::OwnedQName, Box<dyn function::Function>)>()
+                .saturating_add(std::mem::size_of::<Vec<()>>())
+                .saturating_mul(2)
+                .saturating_add(FUNCTION_OBJECT_BYTES),
+        )
+        .saturating_add(
+            variable_slots.saturating_mul(
+                std::mem::size_of::<(sxd_xpath_no_unsafe::OwnedQName, SxdValue<'static>)>()
+                    .saturating_add(std::mem::size_of::<Vec<()>>())
+                    .saturating_mul(2),
+            ),
+        )
+        .saturating_add(
+            namespace_slots.saturating_mul(hash_table_entry_bytes::<(String, String)>()),
+        )
+        .saturating_add(FIXED_FUNCTION_NAME_BYTES)
+        .saturating_add(dynamic_name_bytes)
+        .saturating_add(namespace_bytes)
 }
 
 fn hash_table_entry_bytes<T>() -> usize {
@@ -5191,14 +5270,15 @@ fn normalize_xinclude_text_line_endings(
     }
 
     let requested = value.value.len();
-    meter.check_additional(BudgetKind::OwnedBytes, requested)?;
+    meter.charge(BudgetKind::OwnedBytes, requested)?;
     let mut normalized = String::new();
-    normalized.try_reserve_exact(requested).map_err(|error| {
-        Error::Dynamic(format!(
+    if let Err(error) = normalized.try_reserve_exact(requested) {
+        meter.release_owned_bytes(requested);
+        return Err(Error::Dynamic(format!(
             "failed to reserve XInclude line-normalization storage: {error}"
-        ))
-    })?;
-    meter.charge(BudgetKind::OwnedBytes, normalized.capacity())?;
+        )));
+    }
+    reconcile_replacement_growth(meter, requested, normalized.capacity())?;
 
     let mut characters = value.value.chars().peekable();
     while let Some(character) = characters.next() {
@@ -6448,8 +6528,14 @@ fn is_lexical_qname(value: &str) -> bool {
 
 #[derive(Default)]
 struct GeneratedIdCache {
-    assigned: HashMap<NodePath, usize>,
+    assigned: HashMap<GeneratedNodeIdentity, usize>,
     owned_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GeneratedNodeIdentity {
+    document: sxd_document_no_unsafe::dom::DocumentIdentity,
+    path: NodePath,
 }
 
 struct GenerateId {
@@ -6477,7 +6563,10 @@ impl function::Function for GenerateId {
         let id = assign_generated_id(
             context,
             &self.assigned,
-            typed_path_to_with_context(&node, context)?,
+            GeneratedNodeIdentity {
+                document: node.document().identity(),
+                path: typed_path_to_with_context(&node, context)?,
+            },
         )?;
         let digits = id.checked_ilog10().unwrap_or(0) as usize + 1;
         let output_len = 2usize.saturating_add(digits);
@@ -6505,22 +6594,23 @@ impl function::Function for GenerateId {
 fn assign_generated_id(
     context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
     assigned: &RefCell<GeneratedIdCache>,
-    path: NodePath,
+    identity: GeneratedNodeIdentity,
 ) -> std::result::Result<usize, function::Error> {
     let mut cache = assigned.borrow_mut();
-    if let Some(id) = cache.assigned.get(&path) {
+    if let Some(id) = cache.assigned.get(&identity) {
         return Ok(*id);
     }
-    let entry_bytes = path
+    let entry_bytes = identity
+        .path
         .owned_bytes()
-        .saturating_add(std::mem::size_of::<(NodePath, usize)>());
+        .saturating_add(std::mem::size_of::<(GeneratedNodeIdentity, usize)>());
     context.reserve_string_allocation(entry_bytes)?;
     if let Err(error) = reserve_generated_id_slot(context, &mut cache) {
         context.release_temporary_allocation(entry_bytes)?;
         return Err(error);
     }
     let id = cache.assigned.len() + 1;
-    cache.assigned.insert(path, id);
+    cache.assigned.insert(identity, id);
     cache.owned_bytes = cache.owned_bytes.saturating_add(entry_bytes);
     Ok(id)
 }
@@ -6532,10 +6622,11 @@ fn reserve_generated_id_slot(
     if cache.assigned.len() < cache.assigned.capacity() {
         return Ok(());
     }
-    let old_bytes = retained_hash_storage::<(NodePath, usize)>(cache.assigned.capacity());
+    let old_bytes =
+        retained_hash_storage::<(GeneratedNodeIdentity, usize)>(cache.assigned.capacity());
     let old_capacity = cache.assigned.capacity();
     let target_capacity = old_capacity.saturating_add(old_capacity.max(4));
-    let requested_bytes = retained_hash_storage::<(NodePath, usize)>(target_capacity);
+    let requested_bytes = retained_hash_storage::<(GeneratedNodeIdentity, usize)>(target_capacity);
     // The old and replacement tables coexist during growth, so the XPath allocation gate must
     // reserve the complete replacement before its allocator is invoked.
     context.reserve_string_allocation(requested_bytes)?;
@@ -6546,7 +6637,8 @@ fn reserve_generated_id_slot(
             what: "failed to reserve generated-ID cache storage".into(),
         });
     }
-    let actual_bytes = retained_hash_storage::<(NodePath, usize)>(replacement.capacity());
+    let actual_bytes =
+        retained_hash_storage::<(GeneratedNodeIdentity, usize)>(replacement.capacity());
     if actual_bytes > requested_bytes {
         if let Err(error) = context.reserve_string_allocation(actual_bytes - requested_bytes) {
             context.release_temporary_allocation(requested_bytes)?;
@@ -9234,16 +9326,65 @@ impl function::Function for CurrentNode {
 
 #[cfg(test)]
 mod tests {
+    fn owned_byte_budget(owned_bytes: usize) -> ExecutionBudget {
+        ExecutionBudget {
+            source_bytes: usize::MAX,
+            external_documents: usize::MAX,
+            recursion_depth: usize::MAX,
+            xpath_evaluations: usize::MAX,
+            xpath_operations: usize::MAX,
+            extension_operations: usize::MAX,
+            pattern_evaluations: usize::MAX,
+            template_applications: usize::MAX,
+            sort_comparisons: usize::MAX,
+            key_entries: usize::MAX,
+            result_nodes: usize::MAX,
+            serialized_bytes: usize::MAX,
+            messages: usize::MAX,
+            owned_bytes,
+        }
+    }
+
+    #[test]
+    fn xinclude_line_normalization_replaces_accounted_storage() {
+        let mut text = String::with_capacity(8);
+        text.push_str("a\r\nb");
+        let old_capacity = text.capacity();
+        let mut value = MeteredDecodedResource {
+            value: text,
+            temporary_bytes: old_capacity,
+        };
+        let mut meter =
+            Meter::new(owned_byte_budget(old_capacity + 4), 0).expect("empty meter initializes");
+        meter
+            .charge(BudgetKind::OwnedBytes, old_capacity)
+            .expect("decoded text is already accounted");
+
+        normalize_xinclude_text_line_endings(&mut value, &mut meter)
+            .expect("replacement fits its provisional allocation");
+
+        assert_eq!(value.value, "a\nb");
+        assert_eq!(
+            meter.usage(BudgetKind::OwnedBytes).expect("valid kind").0,
+            value.value.capacity(),
+            "the dropped source buffer must leave the live-memory budget"
+        );
+    }
+
     #[test]
     fn generated_id_result_crosses_the_allocation_gate_before_formatting() {
-        // The cached path itself requires no new storage here, leaving only the three-byte
+        // The cached identity itself requires no new storage here, leaving only the rendered
         // generate-id() result to exercise the XPath result-allocation gate.
         let package = Package::new();
         let document = package.as_document();
         let root = document.root();
         let path = typed_path_to(&nodeset::Node::Root(root));
+        let identity = GeneratedNodeIdentity {
+            document: document.identity(),
+            path,
+        };
         let mut assigned = HashMap::new();
-        assigned.insert(path, 1);
+        assigned.insert(identity, 1);
         let function = GenerateId {
             assigned: Rc::new(RefCell::new(GeneratedIdCache {
                 assigned,
@@ -9258,7 +9399,7 @@ mod tests {
 
         let error = function
             .evaluate(&evaluation, vec![SxdValue::Nodeset(nodes)])
-            .expect_err("three-byte generated ID must cross the two-byte gate");
+            .expect_err("generated ID must cross the two-byte gate");
 
         assert!(error.to_string().contains("allocation budget"));
         assert_eq!(context.string_allocation_exceeded(), Some(3));
@@ -9280,20 +9421,31 @@ mod tests {
 
         for index in 0..ENTRIES {
             let path = NodePath::Ordinary(vec![index]);
-            let new_entry_bytes = path
+            let identity = GeneratedNodeIdentity {
+                document: document.identity(),
+                path,
+            };
+            let new_entry_bytes = identity
+                .path
                 .owned_bytes()
-                .saturating_add(std::mem::size_of::<(NodePath, usize)>());
+                .saturating_add(std::mem::size_of::<(GeneratedNodeIdentity, usize)>());
             let old_capacity = probe.borrow().assigned.capacity();
-            assign_generated_id(&probe_evaluation, &probe, path)
+            assign_generated_id(&probe_evaluation, &probe, identity)
                 .expect("probe generated ID is assigned");
             entry_bytes = entry_bytes.saturating_add(new_entry_bytes);
             let new_capacity = probe.borrow().assigned.capacity();
             let live_bytes = if new_capacity == old_capacity {
-                entry_bytes.saturating_add(retained_hash_storage::<(NodePath, usize)>(new_capacity))
+                entry_bytes.saturating_add(retained_hash_storage::<(GeneratedNodeIdentity, usize)>(
+                    new_capacity,
+                ))
             } else {
                 entry_bytes
-                    .saturating_add(retained_hash_storage::<(NodePath, usize)>(old_capacity))
-                    .saturating_add(retained_hash_storage::<(NodePath, usize)>(new_capacity))
+                    .saturating_add(retained_hash_storage::<(GeneratedNodeIdentity, usize)>(
+                        old_capacity,
+                    ))
+                    .saturating_add(retained_hash_storage::<(GeneratedNodeIdentity, usize)>(
+                        new_capacity,
+                    ))
             };
             peak_live_bytes = peak_live_bytes.max(live_bytes);
         }
@@ -9304,8 +9456,15 @@ mod tests {
             sxd_xpath_no_unsafe::context::Evaluation::new(&bounded, document.root().into());
         let cache = RefCell::new(GeneratedIdCache::default());
         for index in 0..ENTRIES {
-            assign_generated_id(&bounded_evaluation, &cache, NodePath::Ordinary(vec![index]))
-                .expect("peak-live allocation budget must permit every table growth");
+            assign_generated_id(
+                &bounded_evaluation,
+                &cache,
+                GeneratedNodeIdentity {
+                    document: document.identity(),
+                    path: NodePath::Ordinary(vec![index]),
+                },
+            )
+            .expect("peak-live allocation budget must permit every table growth");
         }
     }
 
@@ -9320,15 +9479,55 @@ mod tests {
             sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
         let cache = RefCell::new(GeneratedIdCache::default());
         let path = NodePath::Ordinary(vec![0]);
-        let payload = path
+        let identity = GeneratedNodeIdentity {
+            document: document.identity(),
+            path,
+        };
+        let payload = identity
+            .path
             .owned_bytes()
-            .saturating_add(std::mem::size_of::<(NodePath, usize)>());
+            .saturating_add(std::mem::size_of::<(GeneratedNodeIdentity, usize)>());
 
-        assign_generated_id(&evaluation, &cache, path).expect("generated ID is assigned");
+        assign_generated_id(&evaluation, &cache, identity).expect("generated ID is assigned");
 
         let cache = cache.borrow();
-        let table = retained_hash_storage::<(NodePath, usize)>(cache.assigned.capacity());
+        let table =
+            retained_hash_storage::<(GeneratedNodeIdentity, usize)>(cache.assigned.capacity());
         assert_eq!(cache.owned_bytes, payload.saturating_add(table));
+    }
+
+    #[test]
+    fn generated_id_distinguishes_equal_paths_in_different_documents() {
+        let first = Package::new();
+        let second = Package::new();
+        let first_document = first.as_document();
+        let second_document = second.as_document();
+        let context = Context::new();
+        let evaluation =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&context, first_document.root().into());
+        let cache = RefCell::new(GeneratedIdCache::default());
+        let path = NodePath::Ordinary(Vec::new());
+
+        let first_id = assign_generated_id(
+            &evaluation,
+            &cache,
+            GeneratedNodeIdentity {
+                document: first_document.identity(),
+                path: path.clone(),
+            },
+        )
+        .expect("first document ID is assigned");
+        let second_id = assign_generated_id(
+            &evaluation,
+            &cache,
+            GeneratedNodeIdentity {
+                document: second_document.identity(),
+                path,
+            },
+        )
+        .expect("second document ID is assigned");
+
+        assert_ne!(first_id, second_id);
     }
 
     #[test]

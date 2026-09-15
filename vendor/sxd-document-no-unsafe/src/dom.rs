@@ -10,8 +10,15 @@ type SiblingFn<T> = unsafe fn(&raw::Connections, T) -> raw::SiblingIter<'_>;
 /// An XML document
 #[derive(Copy, Clone)]
 pub struct Document<'d> {
+    identity: DocumentIdentity,
     storage: &'d raw::Storage,
     connections: &'d raw::Connections,
+}
+
+/// Process-local identity for one document arena.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct DocumentIdentity {
+    value: usize,
 }
 
 macro_rules! wrapper(
@@ -34,8 +41,13 @@ impl<'d> Document<'d> {
     wrapper!(wrap_pi, ProcessingInstruction, raw::ProcessingInstruction);
 
     #[doc(hidden)]
-    pub fn new(storage: &'d raw::Storage, connections: &'d raw::Connections) -> Document<'d> {
+    pub fn new(
+        identity: usize,
+        storage: &'d raw::Storage,
+        connections: &'d raw::Connections,
+    ) -> Document<'d> {
         Document {
+            identity: DocumentIdentity { value: identity },
             storage,
             connections,
         }
@@ -71,6 +83,11 @@ impl<'d> Document<'d> {
 
     pub fn root(self) -> Root<'d> {
         self.wrap_root(self.connections.root())
+    }
+
+    /// Returns an identity that distinguishes nodes with the same path in different documents.
+    pub fn identity(self) -> DocumentIdentity {
+        self.identity
     }
 
     pub fn create_element<'n, N>(self, name: N) -> Element<'d>
@@ -109,20 +126,13 @@ impl<'d> Document<'d> {
 
 impl<'d> PartialEq for Document<'d> {
     fn eq(&self, other: &Document<'d>) -> bool {
-        (
-            self.storage as *const raw::Storage,
-            self.connections as *const raw::Connections,
-        ) == (
-            other.storage as *const raw::Storage,
-            other.connections as *const raw::Connections,
-        )
+        self.identity == other.identity
     }
 }
 
 impl hash::Hash for Document<'_> {
     fn hash<H: hash::Hasher>(&self, state: &mut H) {
-        std::ptr::hash(self.storage, state);
-        std::ptr::hash(self.connections, state);
+        self.identity.hash(state);
     }
 }
 

@@ -59,7 +59,20 @@ compile_error!("select either `no-unsafe` or `raw-pointer-backend`");
 #[macro_use]
 extern crate peresil;
 
-use std::fmt;
+use std::{
+    fmt,
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
+static NEXT_PACKAGE_IDENTITY: AtomicUsize = AtomicUsize::new(1);
+
+fn next_package_identity() -> usize {
+    NEXT_PACKAGE_IDENTITY
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |identity| {
+            identity.checked_add(1)
+        })
+        .expect("document identity space exhausted")
+}
 
 /// Node and edge counts used to reserve storage before projecting into this DOM.
 #[derive(Debug, Clone, Copy, Default)]
@@ -293,6 +306,7 @@ impl<'s> From<&'s str> for QName<'s> {
 /// This is an opaque structure that stores the internal details of
 /// the XML document. Modify the document via `as_document`.
 pub struct Package {
+    identity: usize,
     storage: raw::Storage,
     connections: raw::Connections,
 }
@@ -302,6 +316,7 @@ impl Default for Package {
         let s = raw::Storage::new();
         let root = s.create_root();
         Package {
+            identity: next_package_identity(),
             storage: s,
             connections: raw::Connections::new(root),
         }
@@ -314,7 +329,7 @@ impl Package {
     }
 
     pub fn as_document(&self) -> dom::Document<'_> {
-        dom::Document::new(&self.storage, &self.connections)
+        dom::Document::new(self.identity, &self.storage, &self.connections)
     }
 
     #[doc(hidden)]

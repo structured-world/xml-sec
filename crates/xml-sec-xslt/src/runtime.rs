@@ -7218,8 +7218,10 @@ mod tests {
             minimum_execution_owned_bytes(&avt, &source)
                 .saturating_sub(minimum_execution_owned_bytes(&literal, &source))
         };
-        let small_payload_bytes = 256;
-        let large_payload_bytes = 64 * 1_024;
+        // Keep both probes above the bounded XPath-context baseline so this assertion measures
+        // the payload-dependent slope rather than the fixed context setup cost.
+        let small_payload_bytes = 32 * 1_024;
+        let large_payload_bytes = 128 * 1_024;
         let small_delta = minimum_delta(small_payload_bytes);
         let large_delta = minimum_delta(large_payload_bytes);
         // Compare the marginal slope because the two execution paths have different fixed-size

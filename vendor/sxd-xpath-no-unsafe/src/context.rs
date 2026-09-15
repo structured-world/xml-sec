@@ -4,7 +4,8 @@
 use sxd_document_no_unsafe::QName;
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::RandomState};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::iter;
 
 use crate::function;
@@ -12,11 +13,60 @@ use crate::nodeset::{Node, OrderedNodes};
 use crate::{OwnedQName, Value};
 
 /// A mapping of names to XPath functions.
-type Functions = HashMap<OwnedQName, Box<dyn function::Function + 'static>>;
+type Functions = QNameMap<Box<dyn function::Function + 'static>>;
 /// A mapping of names to XPath variables.
-type Variables<'d> = HashMap<OwnedQName, Value<'d>>;
+type Variables<'d> = QNameMap<Value<'d>>;
 /// A mapping of namespace prefixes to namespace URIs.
 type Namespaces = HashMap<String, String>;
+
+struct QNameMap<V> {
+    buckets: HashMap<u64, Vec<(OwnedQName, V)>>,
+    names: RandomState,
+}
+
+impl<V> Default for QNameMap<V> {
+    fn default() -> Self {
+        Self {
+            buckets: HashMap::new(),
+            names: RandomState::new(),
+        }
+    }
+}
+
+impl<V> QNameMap<V> {
+    fn len(&self) -> usize {
+        self.buckets.values().map(Vec::len).sum()
+    }
+
+    fn hash(&self, namespace: Option<&str>, local: &str) -> u64 {
+        let mut hasher = self.names.build_hasher();
+        namespace.hash(&mut hasher);
+        local.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn insert(&mut self, name: OwnedQName, value: V) {
+        let hash = self.hash(name.namespace_uri(), name.local_part());
+        let bucket = self.buckets.entry(hash).or_default();
+        if let Some((_, previous)) = bucket.iter_mut().find(|(candidate, _)| candidate == &name) {
+            *previous = value;
+        } else {
+            bucket.push((name, value));
+        }
+    }
+
+    fn get(&self, name: QName<'_>) -> Option<&V> {
+        let hash = self.hash(name.namespace_uri(), name.local_part());
+        self.buckets
+            .get(&hash)?
+            .iter()
+            .find_map(|(candidate, value)| {
+                (candidate.namespace_uri() == name.namespace_uri()
+                    && candidate.local_part() == name.local_part())
+                .then_some(value)
+            })
+    }
+}
 
 /// Contains the context in which XPath expressions are executed. The
 /// context contains functions, variables, and namespace mappings.
@@ -141,6 +191,12 @@ impl<'d> Context<'d> {
         self.string_allocations.exceeded.get()
     }
 
+    /// Return allocation bytes retained by values produced during evaluation.
+    #[doc(hidden)]
+    pub fn string_allocation_used(&self) -> usize {
+        self.string_allocations.used.get()
+    }
+
     /// Limit primitive traversal, predicate, comparison, and result-insertion work.
     pub fn set_evaluation_work_limit(&mut self, limit: usize) {
         self.evaluation_work.limit = Some(limit);
@@ -211,6 +267,12 @@ impl<'d> Context<'d> {
     pub fn set_namespace(&mut self, prefix: &str, uri: &str) {
         self.namespaces.insert(prefix.into(), uri.into());
     }
+
+    /// Number of distinct registered functions, for embedding allocation-bound assertions.
+    #[doc(hidden)]
+    pub fn function_count(&self) -> usize {
+        self.functions.len()
+    }
 }
 
 impl<'d> Default for Context<'d> {
@@ -279,16 +341,12 @@ impl<'c, 'd> Evaluation<'c, 'd> {
 
     /// Looks up the function with the given name
     pub fn function_for_name(&self, name: QName<'_>) -> Option<&'c dyn function::Function> {
-        // FIXME: remove allocation
-        let name = name.into();
-        self.functions.get(&name).map(AsRef::as_ref)
+        self.functions.get(name).map(AsRef::as_ref)
     }
 
     /// Looks up the value of the variable
     pub fn value_of(&self, name: QName<'_>) -> Option<&Value<'d>> {
-        // FIXME: remove allocation
-        let name = name.into();
-        self.variables.get(&name)
+        self.variables.get(name)
     }
 
     /// Looks up the namespace URI for the given prefix
@@ -433,6 +491,19 @@ impl<'c, 'd> Iterator for EvaluationNodesetIter<'c, 'd> {
 #[cfg(test)]
 mod tests {
     use super::Context;
+
+    #[test]
+    fn qname_lookup_does_not_allocate() {
+        let mut context = Context::new();
+        context.set_variable(("urn:test", "value"), 1.0);
+        context.set_string_allocation_limit(0);
+        let package = sxd_document_no_unsafe::Package::new();
+        let evaluation = super::Evaluation::new(&context, package.as_document().root().into());
+        let name = sxd_document_no_unsafe::QName::with_namespace_uri(Some("urn:test"), "value");
+
+        assert!(evaluation.value_of(name).is_some());
+        assert_eq!(context.string_allocation_exceeded(), None);
+    }
 
     #[test]
     fn allocation_budget_preserves_first_exceeded_total() {
