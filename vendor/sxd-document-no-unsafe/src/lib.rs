@@ -67,11 +67,56 @@ use std::{
 static NEXT_PACKAGE_IDENTITY: AtomicUsize = AtomicUsize::new(1);
 
 fn next_package_identity() -> usize {
-    NEXT_PACKAGE_IDENTITY
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |identity| {
-            identity.checked_add(1)
-        })
-        .expect("document identity space exhausted")
+    allocate_package_identity(&NEXT_PACKAGE_IDENTITY)
+}
+
+fn allocate_package_identity(counter: &AtomicUsize) -> usize {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current
+            .checked_add(1)
+            .expect("document identity space exhausted");
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return current,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn exhausted_identity_space_does_not_wrap() {
+        let counter = AtomicUsize::new(usize::MAX);
+        let result = std::panic::catch_unwind(|| allocate_package_identity(&counter));
+        assert!(result.is_err());
+        assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
+    }
+
+    #[test]
+    fn concurrent_allocations_remain_unique() {
+        let counter = AtomicUsize::new(1);
+        let identities = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        (0..128)
+                            .map(|_| allocate_package_identity(&counter))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let unique: std::collections::HashSet<_> = identities.iter().copied().collect();
+        assert_eq!(unique.len(), 8 * 128);
+        assert_eq!(counter.load(Ordering::Relaxed), 1 + 8 * 128);
+    }
 }
 
 /// Node and edge counts used to reserve storage before projecting into this DOM.
