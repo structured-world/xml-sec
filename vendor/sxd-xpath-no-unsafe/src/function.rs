@@ -715,9 +715,12 @@ impl Function for Sum {
         args.exactly(1)?;
         let arg = args.pop_nodeset()?;
         let mut r = 0.0;
-        for node in arg.iter() {
-            r += node_to_num_with_context(context, &node)?;
-        }
+        // A node-set has no iteration order; floating-point addition is order-sensitive.
+        // Use document order so sum() is deterministic for the same XPath input.
+        arg.visit_document_order_with_context(context, |node| {
+            r += node_to_num_with_context(context, node)?;
+            Ok(())
+        })?;
         Ok(Value::Number(r))
     }
 }
@@ -1398,6 +1401,27 @@ mod test {
         let r = setup.evaluate(doc.root(), Sum, args![nodeset![c, t]]);
 
         assert_eq!(Ok(Value::Number(66.7)), r);
+    }
+
+    #[test]
+    fn sum_uses_document_order_independent_of_nodeset_hash_seed() {
+        let package = Package::new();
+        let doc = package.as_document();
+        let elements = ["10000000000000000", "1", "-10000000000000000"].map(|value| {
+            let element = doc.create_element("n");
+            element.append_child(doc.create_text(value));
+            doc.root().append_child(element);
+            element
+        });
+        let setup = Setup::new();
+        for _ in 0..100 {
+            let result = setup.evaluate(
+                doc.root(),
+                Sum,
+                args![nodeset![elements[0], elements[1], elements[2]]],
+            );
+            assert_eq!(Ok(Value::Number(0.0)), result);
+        }
     }
 
     /// By default, NaN != NaN and -0.0 == 0.0. We don't want either

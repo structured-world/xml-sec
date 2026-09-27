@@ -64,12 +64,14 @@ impl OutputDefinition {
             .saturating_add(self.doctype_public.as_ref().map_or(0, String::len))
             .saturating_add(self.doctype_system.as_ref().map_or(0, String::len))
             .saturating_add(self.media_type.as_ref().map_or(0, String::len))
+            .saturating_add(crate::budget::retained_hash_storage::<crate::ExpandedName>(
+                self.cdata_section_elements.capacity(),
+            ))
             .saturating_add(
                 self.cdata_section_elements
                     .iter()
                     .fold(0usize, |total, name| {
                         total
-                            .saturating_add(std::mem::size_of::<crate::ExpandedName>())
                             .saturating_add(name.namespace.as_ref().map_or(0, String::len))
                             .saturating_add(name.local.len())
                     }),
@@ -2036,6 +2038,27 @@ mod tests {
     };
     use crate::budget::Meter;
     use crate::{BudgetKind, Document, ExecutionBudget, ExpandedName, NodeKind};
+
+    #[test]
+    fn output_definition_accounts_for_retained_cdata_hash_capacity() {
+        let plain = OutputDefinition::default();
+        let mut with_cdata = plain.clone();
+        with_cdata.cdata_section_elements = std::collections::HashSet::with_capacity(64);
+        with_cdata
+            .cdata_section_elements
+            .insert(ExpandedName::new(None::<String>, "e"));
+        let storage = crate::budget::retained_hash_storage::<ExpandedName>(
+            with_cdata.cdata_section_elements.capacity(),
+        );
+        assert!(
+            with_cdata.owned_bytes()
+                >= plain
+                    .owned_bytes()
+                    .saturating_add(storage)
+                    .saturating_add(1),
+            "CDATA hash buckets and owned name strings must be reserved before cloning"
+        );
+    }
 
     fn serialize_audit_document(
         document: &Document,

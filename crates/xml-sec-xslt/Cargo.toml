@@ -1,6 +1,6 @@
 [package]
 name = "xml-sec-xslt"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.92"
 license = "Apache-2.0"
@@ -16,7 +16,7 @@ md-5 = "0.11"
 roxmltree = { version = "0.21", features = ["positions"] }
 sha1 = "0.11"
 sxd-document-no-unsafe = { package = "xml-sec-sxd-document", version = "0.1.0", path = "../../vendor/sxd-document-no-unsafe", default-features = false, features = ["no-unsafe"] }
-sxd-xpath-no-unsafe = { package = "xml-sec-sxd-xpath", version = "0.1.0", path = "../../vendor/sxd-xpath-no-unsafe", default-features = false, features = ["no-unsafe"] }
+sxd-xpath-no-unsafe = { package = "xml-sec-sxd-xpath", version = "0.1.1", path = "../../vendor/sxd-xpath-no-unsafe", default-features = false, features = ["no-unsafe"] }
 thiserror = "2"
 time = { version = "0.3.55", features = ["local-offset"] }
 url = "2"

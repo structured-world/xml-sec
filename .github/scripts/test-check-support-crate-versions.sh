@@ -26,6 +26,15 @@ if (cd "$fixture" && bash "$script" "$base"); then
   exit 1
 fi
 
+printf '[package]\nname = "xml-sec-xslt"\nversion = "0.0.9"\n' > "$fixture/crates/xml-sec-xslt/Cargo.toml"
+printf '[package]\nname = "consumer"\nversion = "0.1.0"\n[dependencies]\nxml-sec-xslt = { version = "0.0.9", path = "../crates/xml-sec-xslt" }\n' > "$fixture/consumer/Cargo.toml"
+git -C "$fixture" add .
+git -C "$fixture" commit -qm downgraded
+if (cd "$fixture" && bash "$script" "$base"); then
+  echo "support-crate version downgrade was accepted" >&2
+  exit 1
+fi
+
 printf '[package]\nname = "xml-sec-xslt"\nversion = "0.1.1"\n' > "$fixture/crates/xml-sec-xslt/Cargo.toml"
 git -C "$fixture" add .
 git -C "$fixture" commit -qm bumped

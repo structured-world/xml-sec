@@ -23,8 +23,30 @@ for manifest in \
     echo "cannot determine support-crate version in ${manifest}" >&2
     exit 1
   fi
-  if [[ "${old_version}" == "${new_version}" ]]; then
-    echo "${directory} changed without a version bump (${new_version}); crates.io versions are immutable" >&2
+  if ! jq -ne --arg old "$old_version" --arg new "$new_version" '
+    def parsed:
+      capture("^(?<major>0|[1-9][0-9]*)\\.(?<minor>0|[1-9][0-9]*)\\.(?<patch>0|[1-9][0-9]*)(?:-(?<pre>[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*))?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$")
+      | {core: [.major, .minor, .patch] | map(tonumber), pre: (.pre // "" | if . == "" then [] else split(".") end)};
+    def prerelease_lt($a; $b):
+      if ($a | length) == 0 then false
+      elif ($b | length) == 0 then true
+      else
+        (reduce range(0; [($a | length), ($b | length)] | min) as $i
+          (0; if . != 0 then . else
+            ($a[$i] | test("^(0|[1-9][0-9]*)$")) as $an
+            | ($b[$i] | test("^(0|[1-9][0-9]*)$")) as $bn
+            | if $a[$i] == $b[$i] then 0
+              elif $an and $bn then (($a[$i] | tonumber) < ($b[$i] | tonumber) | if . then -1 else 1 end)
+              elif $an then -1 elif $bn then 1
+              elif $a[$i] < $b[$i] then -1 elif $a[$i] > $b[$i] then 1 else 0 end
+          end)) as $order
+        | if $order == 0 then ($a | length) < ($b | length) else $order < 0 end
+      end;
+    try (($old | parsed) as $a | ($new | parsed) as $b |
+      if $a.core == $b.core then prerelease_lt($a.pre; $b.pre)
+      else $a.core < $b.core end) catch false
+  ' >/dev/null; then
+    echo "${directory} changed without a higher version (${old_version} -> ${new_version}); crates.io versions are immutable" >&2
     exit 1
   fi
 done

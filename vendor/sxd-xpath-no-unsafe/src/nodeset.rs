@@ -960,13 +960,39 @@ impl<'d> Nodeset<'d> {
         &self,
         context: &crate::context::Evaluation<'_, '_>,
     ) -> Result<Vec<Node<'d>>, crate::function::Error> {
+        let keyed = self.sorted_document_order_with_context(context)?;
+        context.reserve_temporary_allocation(
+            self.size().saturating_mul(std::mem::size_of::<Node<'d>>()),
+        )?;
+        let mut ordered = Vec::with_capacity(self.size());
+        for (node, _) in keyed {
+            ordered.push(node.clone_with_context(context)?);
+        }
+        Ok(ordered)
+    }
+
+    pub(crate) fn visit_document_order_with_context(
+        &self,
+        context: &crate::context::Evaluation<'_, '_>,
+        mut visit: impl FnMut(&Node<'d>) -> Result<(), crate::function::Error>,
+    ) -> Result<(), crate::function::Error> {
+        for (node, _) in self.sorted_document_order_with_context(context)? {
+            visit(node)?;
+        }
+        Ok(())
+    }
+
+    fn sorted_document_order_with_context<'a>(
+        &'a self,
+        context: &crate::context::Evaluation<'_, '_>,
+    ) -> Result<Vec<(&'a Node<'d>, Vec<OrderStep>)>, crate::function::Error> {
         context.reserve_temporary_allocation(self.size().saturating_mul(
-            std::mem::size_of::<Node<'d>>().saturating_add(std::mem::size_of::<Vec<OrderStep>>()),
+            std::mem::size_of::<&Node<'d>>().saturating_add(std::mem::size_of::<Vec<OrderStep>>()),
         ))?;
         let mut keyed = Vec::with_capacity(self.size());
         for node in self.iter_ref() {
             let path = order_path_with_context(node, Some(context))?;
-            keyed.push((node.clone_with_context(context)?, path));
+            keyed.push((node, path));
         }
         let comparison_bytes = keyed
             .iter()
@@ -983,12 +1009,7 @@ impl<'d> Nodeset<'d> {
         )?;
         // Unique node identities have a total order; unstable sort avoids an extra merge buffer.
         keyed.sort_unstable_by(|(_, left), (_, right)| left.cmp(right));
-        context.reserve_temporary_allocation(
-            keyed.len().saturating_mul(std::mem::size_of::<Node<'d>>()),
-        )?;
-        let mut ordered = Vec::with_capacity(keyed.len());
-        ordered.extend(keyed.into_iter().map(|(node, _)| node));
-        Ok(ordered)
+        Ok(keyed)
     }
 }
 

@@ -1359,17 +1359,37 @@ fn assert_strict_xslt_output_deviation(case: &Case, actual: &[u8], expected: &[u
         // libxslt applies numbering tokens to negative and zero values. XSLT 1.0 requires the
         // XPath string form for values below 0.5, independent of the requested token.
         "general/bug-187.xsl" => {
-            assert_eq!(actual.matches("<number>-123.456</number>").count(), 3);
-            assert_eq!(actual.matches("<number>0</number>").count(), 2);
+            let expected = std::str::from_utf8(expected).expect("numbering oracle is UTF-8");
+            let parts = expected.split("<number>0</number>").collect::<Vec<_>>();
+            assert_eq!(parts.len(), 6, "the pinned oracle has five zero values");
+            let mut normalized = String::with_capacity(expected.len() + 24);
+            normalized.push_str(parts[0]);
+            for (index, part) in parts.iter().enumerate().skip(1) {
+                normalized.push_str(if matches!(index, 1 | 2 | 4) {
+                    "<number>-123.456</number>"
+                } else {
+                    "<number>0</number>"
+                });
+                normalized.push_str(part);
+            }
+            assert_eq!(actual, normalized);
             true
         }
         "general/bug-219.xsl" => {
-            let zero_values = actual.matches("<value v=\"0\">").count();
-            assert!(zero_values > 1);
-            assert_eq!(
-                zero_values,
-                actual.matches("<value v=\"0\">0</value>").count()
-            );
+            let expected = std::str::from_utf8(expected).expect("numbering oracle is UTF-8");
+            let mut normalized = String::with_capacity(expected.len());
+            let mut remainder = expected;
+            let mut zero_values = 0;
+            while let Some((before, tail)) = remainder.split_once("<value v=\"0\">") {
+                let (_, after) = tail.split_once("</value>").expect("zero value is closed");
+                normalized.push_str(before);
+                normalized.push_str("<value v=\"0\">0</value>");
+                remainder = after;
+                zero_values += 1;
+            }
+            assert_eq!(zero_values, 13, "the pinned oracle has 13 zero values");
+            normalized.push_str(remainder);
+            assert_eq!(actual, normalized);
             true
         }
         // libxslt leaves `@` unescaped in true mode and `[]` unescaped in false mode. EXSLT's
@@ -2668,6 +2688,56 @@ fn strict_numeric_oracle_comparison_preserves_structure_and_rejects_large_deltas
         "<v>1664.4800000000002</v>",
         b"<v>1664.48</v>"
     ));
+}
+
+#[test]
+fn numbering_divergences_still_compare_the_complete_oracle_output() {
+    for stylesheet in ["general/bug-187.xsl", "general/bug-219.xsl"] {
+        let case = cases()
+            .into_iter()
+            .find(|case| case.stylesheet == Path::new(stylesheet))
+            .expect("numbering fixture is registered");
+        let expected = std::fs::read(upstream_tests().join(case.output.as_ref().unwrap()))
+            .expect("oracle output exists");
+        let expected = String::from_utf8(expected).expect("oracle output is UTF-8");
+        let actual = if stylesheet.ends_with("bug-187.xsl") {
+            let parts = expected.split("<number>0</number>").collect::<Vec<_>>();
+            assert_eq!(parts.len(), 6);
+            let mut result = parts[0].to_owned();
+            for (index, part) in parts.iter().enumerate().skip(1) {
+                result.push_str(if matches!(index, 1 | 2 | 4) {
+                    "<number>-123.456</number>"
+                } else {
+                    "<number>0</number>"
+                });
+                result.push_str(part);
+            }
+            result
+        } else {
+            let mut result = expected.clone();
+            for line in expected
+                .lines()
+                .filter(|line| line.contains("<value v=\"0\">"))
+            {
+                let start = line.find('>').unwrap() + 1;
+                let end = line.find("</value>").unwrap();
+                result = result.replacen(line, &format!("{}0{}", &line[..start], &line[end..]), 1);
+            }
+            result
+        };
+        let truncated = actual
+            .trim_end_matches("</result>\n")
+            .trim_end_matches("</results>\n");
+        assert!(
+            std::panic::catch_unwind(|| assert_strict_xslt_output_deviation(
+                &case,
+                truncated.as_bytes(),
+                expected.as_bytes()
+            ))
+            .is_err(),
+            "{stylesheet}: a truncated output must not pass the oracle exception"
+        );
+    }
 }
 
 fn first_difference(actual: &[u8], expected: &[u8]) -> String {
