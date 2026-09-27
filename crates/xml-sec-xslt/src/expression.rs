@@ -1,4 +1,8 @@
 use crate::lexical::{is_ncname_char, is_ncname_start, is_xml_whitespace, trim_xml_whitespace};
+use crate::{
+    Result,
+    budget::{Meter, reserve_temporary_vec_slot},
+};
 
 pub(crate) struct FunctionCall {
     pub start: usize,
@@ -116,20 +120,84 @@ pub(crate) fn innermost_namespaced_call(
     None
 }
 
-pub(crate) fn unprefixed_function_calls(source: &str, name: &str) -> Vec<FunctionCall> {
-    let mut calls = Vec::new();
-    scan_unprefixed_function_calls(source, name, |start, open, close| {
-        calls.push(FunctionCall {
-            start,
-            end: close + 1,
-            arguments: split_function_arguments(&source[open + 1..close]),
-            namespace: String::new(),
-            local: name.to_owned(),
-            display_name: name.to_owned(),
-        });
-        false
-    });
-    calls
+pub(crate) fn metered_unprefixed_call_arguments<'a>(
+    source: &'a str,
+    name: &str,
+    meter: &mut Meter,
+) -> Result<(Vec<(usize, &'a str)>, usize)> {
+    let mut parentheses = Vec::<Option<(usize, usize)>>::new();
+    let mut parentheses_bytes = 0;
+    let mut arguments = Vec::<(usize, &str)>::new();
+    let mut arguments_bytes = 0;
+    let result = (|| {
+        let mut quote = None;
+        let mut cursor = 0;
+        while cursor < source.len() {
+            let character = source[cursor..].chars().next().expect("character boundary");
+            if let Some(active) = quote {
+                if character == active {
+                    quote = None;
+                }
+                cursor += character.len_utf8();
+                continue;
+            }
+            if matches!(character, '\'' | '"') {
+                quote = Some(character);
+                cursor += character.len_utf8();
+                continue;
+            }
+            if character == '(' {
+                reserve_temporary_vec_slot(&mut parentheses, meter, &mut parentheses_bytes)?;
+                parentheses.push(None);
+                cursor += 1;
+                continue;
+            }
+            if character == ')' {
+                if let Some(Some((start, open))) = parentheses.pop() {
+                    reserve_temporary_vec_slot(&mut arguments, meter, &mut arguments_bytes)?;
+                    arguments.push((start, &source[open + 1..cursor]));
+                }
+                cursor += 1;
+                continue;
+            }
+            if !is_ncname_start(character) {
+                cursor += character.len_utf8();
+                continue;
+            }
+            let start = cursor;
+            let Some((end, qualified)) = lexical_name_end(source, start) else {
+                break;
+            };
+            cursor = end;
+            if qualified || &source[start..end] != name {
+                continue;
+            }
+            let mut open = cursor;
+            while open < source.len()
+                && source[open..].chars().next().is_some_and(is_xml_whitespace)
+            {
+                open += source[open..]
+                    .chars()
+                    .next()
+                    .expect("character boundary")
+                    .len_utf8();
+            }
+            if source[open..].starts_with('(') {
+                reserve_temporary_vec_slot(&mut parentheses, meter, &mut parentheses_bytes)?;
+                parentheses.push(Some((start, open)));
+                cursor = open + 1;
+            }
+        }
+        arguments.sort_unstable_by_key(|(start, _)| *start);
+        Ok(())
+    })();
+    drop(parentheses);
+    meter.release_owned_bytes(parentheses_bytes);
+    if let Err(error) = result {
+        meter.release_owned_bytes(arguments_bytes);
+        return Err(error);
+    }
+    Ok((arguments, arguments_bytes))
 }
 
 pub(crate) fn has_unprefixed_function_call(source: &str, name: &str) -> bool {
@@ -194,84 +262,6 @@ pub(crate) fn has_unprefixed_function_call(source: &str, name: &str) -> bool {
             depth += 1;
             candidate_depth = Some(depth);
             cursor += 1;
-        }
-    }
-    false
-}
-
-fn scan_unprefixed_function_calls(
-    source: &str,
-    name: &str,
-    mut visit: impl FnMut(usize, usize, usize) -> bool,
-) -> bool {
-    let mut calls = Vec::<(usize, usize, Option<usize>)>::new();
-    let mut parentheses = Vec::<Option<usize>>::new();
-    let mut quote = None;
-    let mut cursor = 0;
-    while cursor < source.len() {
-        let Some(character) = source[cursor..].chars().next() else {
-            break;
-        };
-        if let Some(active) = quote {
-            if character == active {
-                quote = None;
-            }
-            cursor += character.len_utf8();
-            continue;
-        }
-        if matches!(character, '\'' | '"') {
-            quote = Some(character);
-            cursor += character.len_utf8();
-            continue;
-        }
-        if character == '(' {
-            parentheses.push(None);
-            cursor += 1;
-            continue;
-        }
-        if character == ')' {
-            cursor += 1;
-            if let Some(Some(call)) = parentheses.pop() {
-                calls[call].2 = Some(cursor - 1);
-            }
-            continue;
-        }
-        if !is_ncname_start(character) {
-            cursor += character.len_utf8();
-            continue;
-        }
-        let start = cursor;
-        let Some((end, qualified)) = lexical_name_end(source, start) else {
-            break;
-        };
-        cursor = end;
-        if qualified {
-            continue;
-        }
-        if &source[start..cursor] != name {
-            continue;
-        }
-        let mut open = cursor;
-        while open < source.len() && source[open..].chars().next().is_some_and(is_xml_whitespace) {
-            open += source[open..]
-                .chars()
-                .next()
-                .expect("cursor is inside source")
-                .len_utf8();
-        }
-        if !source[open..].starts_with('(') {
-            continue;
-        }
-        let call = calls.len();
-        calls.push((start, open, None));
-        parentheses.push(Some(call));
-        cursor = open + 1;
-    }
-    for (start, open, close) in calls {
-        if let Some(close) = close
-            && visit(start, open, close)
-        {
-            return true;
         }
     }
     false
@@ -346,8 +336,36 @@ fn split_function_arguments(source: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        has_unprefixed_function_call, innermost_namespaced_call, unprefixed_function_calls,
+        has_unprefixed_function_call, innermost_namespaced_call, metered_unprefixed_call_arguments,
     };
+    use crate::budget::{ExecutionBudget, Meter};
+
+    fn metered_calls<'a>(source: &'a str, name: &str) -> Vec<(usize, &'a str)> {
+        let mut meter = Meter::new(
+            ExecutionBudget {
+                source_bytes: usize::MAX,
+                external_documents: usize::MAX,
+                recursion_depth: usize::MAX,
+                xpath_evaluations: usize::MAX,
+                xpath_operations: usize::MAX,
+                extension_operations: usize::MAX,
+                pattern_evaluations: usize::MAX,
+                template_applications: usize::MAX,
+                sort_comparisons: usize::MAX,
+                key_entries: usize::MAX,
+                result_nodes: usize::MAX,
+                serialized_bytes: usize::MAX,
+                messages: usize::MAX,
+                owned_bytes: usize::MAX,
+            },
+            0,
+        )
+        .expect("test meter");
+        let (calls, reservation) = metered_unprefixed_call_arguments(source, name, &mut meter)
+            .expect("call scan fits the test budget");
+        meter.release_owned_bytes(reservation);
+        calls
+    }
 
     #[test]
     fn namespaced_call_discovery_is_iterative_at_extreme_depth() {
@@ -394,16 +412,16 @@ mod tests {
     fn unprefixed_call_discovery_excludes_qualified_names() {
         // A prefixed extension function whose local name matches a core function
         // must not activate the core function's compile-time or runtime behavior.
-        assert!(unprefixed_function_calls("x:key()", "key").is_empty());
-        assert_eq!(unprefixed_function_calls("key()", "key").len(), 1);
+        assert!(metered_calls("x:key()", "key").is_empty());
+        assert_eq!(metered_calls("key()", "key").len(), 1);
     }
 
     #[test]
     fn function_arguments_preserve_non_xpath_whitespace() {
         // XPath 1.0 section 3.7 limits ExprWhitespace to XML S; NBSP remains expression input.
         // https://www.w3.org/TR/1999/REC-xpath-19991116/#exprlex
-        let calls = unprefixed_function_calls("key(\u{a0}'value')", "key");
-        assert_eq!(calls[0].arguments, ["\u{a0}'value'"]);
+        let calls = metered_calls("key(\u{a0}'value')", "key");
+        assert_eq!(calls[0].1, "\u{a0}'value'");
     }
 
     #[test]
@@ -431,10 +449,39 @@ mod tests {
     fn unprefixed_call_discovery_is_linear_at_extreme_depth() {
         // Deep caller-controlled expressions must not trigger one complete rescan per call.
         let source = format!("{}1{}", "key(".repeat(1_000), ")".repeat(1_000));
-        let calls = unprefixed_function_calls(&source, "key");
+        let calls = metered_calls(&source, "key");
         assert_eq!(calls.len(), 1_000);
-        assert_eq!(&source[calls[0].start..calls[0].end], source);
+        assert_eq!(calls[0].0, 0);
         let innermost = calls.last().expect("nested expression has calls");
-        assert_eq!(&source[innermost.start..innermost.end], "key(1)");
+        assert_eq!(innermost.1, "1");
+    }
+
+    #[test]
+    fn key_call_scan_reserves_temporary_stack_before_growing() {
+        let mut budget = ExecutionBudget {
+            source_bytes: 0,
+            external_documents: 0,
+            recursion_depth: 0,
+            xpath_evaluations: 0,
+            xpath_operations: 0,
+            extension_operations: 0,
+            pattern_evaluations: 0,
+            template_applications: 0,
+            sort_comparisons: 0,
+            key_entries: 0,
+            result_nodes: 0,
+            serialized_bytes: 0,
+            messages: 0,
+            owned_bytes: 0,
+        };
+        let mut meter = Meter::new(budget, 0).expect("zero-size source");
+        assert!(metered_unprefixed_call_arguments("key('name', /)", "key", &mut meter).is_err());
+        budget.owned_bytes = 1024;
+        let mut meter = Meter::new(budget, 0).expect("meter");
+        let (calls, reservation) =
+            metered_unprefixed_call_arguments("key('name', /)", "key", &mut meter)
+                .expect("sufficient budget");
+        assert_eq!(calls, [(0, "'name', /")]);
+        meter.release_owned_bytes(reservation);
     }
 }

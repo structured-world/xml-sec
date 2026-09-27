@@ -875,18 +875,7 @@ impl<'a> Execution<'a> {
             .source
             .logical_root_for(context)
             .ok_or_else(|| Error::Dynamic("key() context has no logical document".into()))?;
-        if let Some(requested) = literal_key_names(source, namespaces)? {
-            for name in requested {
-                self.build_key(&name, logical_root)?;
-            }
-        } else {
-            let keys = Arc::clone(&self.stylesheet.keys);
-            let indices = Arc::clone(&self.stylesheet.key_name_indices);
-            for index in indices.iter().copied() {
-                self.build_key(&keys[index].name, logical_root)?;
-            }
-        }
-        Ok(())
+        self.ensure_key_indexes_for_roots(source, namespaces, std::slice::from_ref(&logical_root))
     }
 
     fn ensure_key_indexes_for_all_documents(
@@ -896,39 +885,52 @@ impl<'a> Execution<'a> {
     ) -> Result<()> {
         let (roots, roots_reservation) =
             metered_node_id_snapshot(self.evaluator.source.logical_roots(), &mut self.meter)?;
-        let result = (|| {
-            if let Some(requested) = literal_key_names(source, namespaces)? {
-                for root in roots.iter().copied() {
-                    for name in &requested {
-                        self.build_key(name, root)?;
-                    }
-                }
-            } else {
-                let keys = Arc::clone(&self.stylesheet.keys);
-                let indices = Arc::clone(&self.stylesheet.key_name_indices);
-                for root in roots.iter().copied() {
-                    for index in indices.iter().copied() {
-                        self.build_key(&keys[index].name, root)?;
-                    }
-                }
-            }
-            Ok(())
-        })();
+        let result = self.ensure_key_indexes_for_roots(source, namespaces, &roots);
         drop(roots);
         self.meter.release_owned_bytes(roots_reservation);
         result
     }
 
-    fn build_key(&mut self, name: &ExpandedName, logical_root: NodeId) -> Result<()> {
-        let Some(key_slot) = self
-            .stylesheet
-            .key_name_indices
-            .iter()
-            .position(|index| self.stylesheet.keys[*index].name == *name)
-        else {
-            return Ok(());
-        };
-        self.build_key_slot(key_slot, logical_root)
+    fn ensure_key_indexes_for_roots(
+        &mut self,
+        source: &str,
+        namespaces: &[(String, String)],
+        roots: &[NodeId],
+    ) -> Result<()> {
+        let (calls, reservation) =
+            crate::expression::metered_unprefixed_call_arguments(source, "key", &mut self.meter)?;
+        let result = (|| {
+            if calls
+                .iter()
+                .all(|(_, arguments)| literal_key_name(arguments, namespaces).is_some())
+            {
+                for root in roots.iter().copied() {
+                    for (_, arguments) in &calls {
+                        let (namespace, local) = literal_key_name(arguments, namespaces)
+                            .expect("all key names are literals")?;
+                        if let Some(slot) = self.key_slot(namespace, local) {
+                            self.build_key_slot(slot, root)?;
+                        }
+                    }
+                }
+            } else {
+                for root in roots.iter().copied() {
+                    for slot in 0..self.stylesheet.key_name_indices.len() {
+                        self.build_key_slot(slot, root)?;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        self.meter.release_owned_bytes(reservation);
+        result
+    }
+
+    fn key_slot(&self, namespace: Option<&str>, local: &str) -> Option<usize> {
+        self.stylesheet.key_name_indices.iter().position(|index| {
+            let name = &self.stylesheet.keys[*index].name;
+            name.namespace.as_deref() == namespace && name.local == local
+        })
     }
 
     fn build_key_slot(&mut self, key_slot: usize, logical_root: NodeId) -> Result<()> {
@@ -5149,37 +5151,46 @@ fn xpath_calls_key(source: &str) -> bool {
     crate::expression::has_unprefixed_function_call(source, "key")
 }
 
-fn literal_key_names(
-    source: &str,
-    namespaces: &[(String, String)],
-) -> Result<Option<Vec<ExpandedName>>> {
-    let mut names = Vec::new();
-    for call in crate::expression::unprefixed_function_calls(source, "key") {
-        let Some(argument) = call.arguments.first() else {
-            return Ok(None);
-        };
-        let Some(lexical) = xpath_string_literal(argument) else {
-            return Ok(None);
-        };
-        let (prefix, local) = lexical
-            .split_once(':')
-            .map_or((None, lexical), |(prefix, local)| (Some(prefix), local));
-        if local.is_empty() || local.contains(':') {
-            return Err(Error::Dynamic(format!("invalid key QName {lexical}")));
+fn literal_key_name<'a>(
+    arguments: &'a str,
+    namespaces: &'a [(String, String)],
+) -> Option<Result<(Option<&'a str>, &'a str)>> {
+    let mut quote = None;
+    let mut depth = 0usize;
+    let mut end = arguments.len();
+    for (index, character) in arguments.char_indices() {
+        if let Some(active) = quote {
+            if character == active {
+                quote = None;
+            }
+            continue;
         }
-        let namespace = prefix
-            .map(|prefix| {
-                static_namespace(namespaces, prefix)
-                    .map(str::to_owned)
-                    .ok_or_else(|| Error::Dynamic(format!("unbound key prefix {prefix}")))
-            })
-            .transpose()?;
-        let name = ExpandedName::new(namespace, local);
-        if !names.contains(&name) {
-            names.push(name);
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                end = index;
+                break;
+            }
+            _ => {}
         }
     }
-    Ok(Some(names))
+    let lexical = xpath_string_literal(trim_xml_whitespace(&arguments[..end]))?;
+    let (prefix, local) = lexical
+        .split_once(':')
+        .map_or((None, lexical), |(prefix, local)| (Some(prefix), local));
+    if local.is_empty() || local.contains(':') {
+        return Some(Err(Error::Dynamic(format!("invalid key QName {lexical}"))));
+    }
+    let namespace = match prefix {
+        Some(prefix) => match static_namespace(namespaces, prefix) {
+            Some(namespace) => Some(namespace),
+            None => return Some(Err(Error::Dynamic(format!("unbound key prefix {prefix}")))),
+        },
+        None => None,
+    };
+    Some(Ok((namespace, local)))
 }
 
 fn fixup_attribute_namespace(

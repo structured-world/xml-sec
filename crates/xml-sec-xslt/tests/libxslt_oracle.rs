@@ -1280,6 +1280,28 @@ fn assert_strict_xslt_output_deviation(case: &Case, actual: &[u8], expected: &[u
     let stylesheet = case.stylesheet.to_string_lossy();
     let actual = String::from_utf8_lossy(actual);
     match stylesheet.as_ref() {
+        // libxslt injects HTML Content-Type metadata for explicit XML output with an XHTML
+        // doctype. XSLT 1.0 section 16.2 confines this behavior to the HTML output method.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
+        "documents/bredfort.xsl" | "general/bug-152.xsl" => {
+            let expected = String::from_utf8_lossy(expected);
+            let charset = if stylesheet == "documents/bredfort.xsl" {
+                "iso-8859-1"
+            } else {
+                "US-ASCII"
+            };
+            let marker = format!(
+                "<meta content=\"text/html; charset={charset}\" http-equiv=\"Content-Type\"/>"
+            );
+            assert_eq!(expected.matches(&marker).count(), 1);
+            let expected = if stylesheet == "general/bug-152.xsl" {
+                expected.replacen(&format!("    {marker}\n"), "", 1)
+            } else {
+                expected.replacen(&marker, "", 1)
+            };
+            assert_eq!(actual.as_ref(), expected);
+            true
+        }
         // libxslt rejects the XML Schema end-of-day lexical form in this fixture. XML Schema
         // Part 2 sections 3.2.7.1 and 3.2.8.1 require 24:00:00 to normalize to midnight, so
         // compare every other byte while accepting only that four-field normative delta.
@@ -1324,7 +1346,14 @@ fn assert_strict_xslt_output_deviation(case: &Case, actual: &[u8], expected: &[u
             true
         }
         "exslt/common/node-set.6.xsl" => {
-            assert!(actual.contains("<cells/>"));
+            let expected = String::from_utf8_lossy(expected);
+            let (prefix, rest) = expected
+                .split_once("<cells>")
+                .expect("donor output contains the parameter-dependent cells");
+            let (_, suffix) = rest
+                .split_once("</cells>")
+                .expect("donor output closes the parameter-dependent cells");
+            assert_eq!(actual.as_ref(), format!("{prefix}<cells/>{suffix}"));
             true
         }
         // libxslt applies numbering tokens to negative and zero values. XSLT 1.0 requires the
@@ -1363,7 +1392,7 @@ fn assert_strict_xslt_output_deviation(case: &Case, actual: &[u8], expected: &[u
         // libxslt resolves an unprefixed QName as an XSLT instruction here. XSLT 1.0
         // requires the argument to expand into the XSLT namespace, so no text is emitted.
         "general/bug-200.xsl" => {
-            assert!(!actual.contains("found"));
+            assert_eq!(actual.as_ref(), "<?xml version=\"1.0\"?>\n");
             true
         }
         // XSLT 1.0 section 16.2 emits an HTML doctype only when doctype-public or
@@ -1685,7 +1714,9 @@ fn normalize_comment_only_element_indentation(bytes: &[u8]) -> Vec<u8> {
         let closes_same_element = bytes.get(close_start..close_name_start) == Some(b"</")
             && bytes.get(close_name_start..close_name_start + open_name.len()) == Some(open_name)
             && bytes.get(close_name_start + open_name.len()) == Some(&b'>');
-        if closes_same_element {
+        let before_is_indentation = bytes[before..comment_start].contains(&b'\n');
+        let after_is_indentation = bytes[comment_end..close_start].contains(&b'\n');
+        if closes_same_element && before_is_indentation && after_is_indentation {
             output.extend_from_slice(&bytes[cursor..before]);
             output.extend_from_slice(&bytes[comment_start..comment_end]);
             cursor = close_start;
@@ -1705,6 +1736,10 @@ fn xml_oracle_normalization_ignores_serializer_indent_around_comment_only_conten
             b"<root><item>\n  <!--marker-->\n </item><p>a <!--kept--> b</p></root>"
         ),
         b"<root><item><!--marker--></item><p>a <!--kept--> b</p></root>"
+    );
+    assert_eq!(
+        normalize_comment_only_element_indentation(b"<item> <!--marker--> </item>"),
+        b"<item> <!--marker--> </item>"
     );
 }
 
@@ -2457,19 +2492,67 @@ fn normalize_libxslt_missing_xinclude_base(mut bytes: Vec<u8>) -> Vec<u8> {
     // XInclude 1.0 section 4.5.5 requires the included top-level element to expose an xml:base
     // fixup. libxslt's e.xml oracle omits it, so normalize only that known donor deviation.
     // https://www.w3.org/TR/xinclude/#base
-    let marker = b" xml:base=\"";
+    let included_uri = upstream_tests()
+        .canonicalize()
+        .expect("oracle corpus exists")
+        .join("xinclude/x2.xml");
+    let expected = format!("<foo xml:base=\"{}\">", included_uri.display());
     let Some(start) = bytes
-        .windows(marker.len())
-        .position(|window| window == marker)
+        .windows(expected.len())
+        .position(|window| window == expected.as_bytes())
     else {
+        assert!(
+            !bytes
+                .windows(b" xml:base=\"".len())
+                .any(|window| window == b" xml:base=\""),
+            "unexpected XInclude xml:base value or owner"
+        );
         return bytes;
     };
-    let value_start = start + marker.len();
-    let Some(value_end) = bytes[value_start..].iter().position(|byte| *byte == b'\"') else {
-        return bytes;
-    };
-    bytes.drain(start..value_start + value_end + 1);
+    assert_eq!(
+        bytes
+            .windows(b" xml:base=\"".len())
+            .filter(|window| *window == b" xml:base=\"")
+            .count(),
+        1,
+        "only the included top-level element may carry the normalized fixup"
+    );
+    assert!(
+        bytes[..start]
+            .windows(b"<element>x1</element>".len())
+            .any(|window| window == b"<element>x1</element>")
+    );
+    assert!(
+        bytes[start + expected.len()..]
+            .windows(b"<element>x2</element>".len())
+            .any(|window| window == b"<element>x2</element>")
+    );
+    bytes.drain(start + "<foo".len()..start + expected.len() - 1);
     bytes
+}
+
+#[test]
+fn xinclude_oracle_normalization_rejects_wrong_base_or_owner() {
+    let wrong_value =
+        b"<foo><element>x1</element><foo xml:base=\"wrong.xml\"><element>x2</element></foo></foo>";
+    assert!(
+        std::panic::catch_unwind(|| normalize_libxslt_missing_xinclude_base(wrong_value.to_vec()))
+            .is_err()
+    );
+    let wrong_owner = format!(
+        "<foo xml:base=\"{}\"><element>x1</element><foo><element>x2</element></foo></foo>",
+        upstream_tests()
+            .canonicalize()
+            .unwrap()
+            .join("xinclude/x2.xml")
+            .display()
+    );
+    assert!(
+        std::panic::catch_unwind(|| normalize_libxslt_missing_xinclude_base(
+            wrong_owner.into_bytes()
+        ))
+        .is_err()
+    );
 }
 
 fn normalize_libxslt_scientific_xpath_numbers(mut bytes: Vec<u8>) -> Vec<u8> {

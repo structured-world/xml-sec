@@ -1335,9 +1335,9 @@ fn serialize_node_tasks<'document>(
                     continue;
                 }
                 output.push('>');
-                let html_head = name.local.eq_ignore_ascii_case("head")
-                    && ((definition.method == OutputMethod::Html
-                        && is_html_output_namespace(name.namespace.as_deref()))
+                let html_head = definition.method == OutputMethod::Html
+                    && name.local.eq_ignore_ascii_case("head")
+                    && (is_html_output_namespace(name.namespace.as_deref())
                         || (name.namespace.as_deref() == Some("http://www.w3.org/1999/xhtml")
                             && definition
                                 .doctype_public
@@ -1715,7 +1715,7 @@ fn is_replaceable_legacy_content_type_meta(node: &crate::Node) -> bool {
     else {
         return false;
     };
-    (name.namespace.is_none() || name.namespace.as_deref() == Some("http://www.w3.org/1999/xhtml"))
+    name.namespace.is_none()
         && name.local.eq_ignore_ascii_case("meta")
         && attributes.iter().any(|attribute| {
             attribute.name.namespace.is_none()

@@ -2314,6 +2314,19 @@ fn serializer_honors_doctype_cdata_html_and_text_contracts() {
         r#"<html><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8"><meta charset="ISO-8859-1" data-owner="caller"></head></html>"#,
     );
 
+    // Explicit XML output never applies HTML-only metadata replacement, even with an XHTML doctype.
+    let xml_xhtml_head = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:x="http://www.w3.org/1999/xhtml"><xsl:output method="xml" doctype-public="-//W3C//DTD XHTML 1.0 Strict//EN" doctype-system="http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd" omit-xml-declaration="yes" indent="no"/><xsl:template match="/"><x:html><x:head><x:meta http-equiv="Content-Type" content="application/xhtml+xml"/></x:head></x:html></xsl:template></xsl:stylesheet>"#;
+    let xml_result = execute(xml_xhtml_head, "<source/>");
+    assert_eq!(xml_result.matches("<x:meta").count(), 1);
+    assert!(!xml_result.contains("text/html; charset="));
+
+    // HTML output may replace only unnamespaced META, not an XHTML element.
+    let namespaced_meta = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:x="http://www.w3.org/1999/xhtml"><xsl:output method="html" indent="no"/><xsl:template match="/"><html><head><x:meta http-equiv="Content-Type" content="application/xhtml+xml"/></head></html></xsl:template></xsl:stylesheet>"#;
+    let html_result = execute(namespaced_meta, "<source/>");
+    assert!(html_result.contains("text/html; charset=UTF-8"));
+    assert!(html_result.contains("<x:meta"));
+    assert!(html_result.contains("application/xhtml+xml"));
+
     let latin1_meta = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="html" encoding="ISO-8859-1" indent="no"/><xsl:template match="/"><html><head/></html></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(latin1_meta, "<source/>"),

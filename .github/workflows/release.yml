@@ -14,7 +14,13 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
+      - name: Check support-crate versions against the prior release
+        run: |
+          previous="$(git describe --tags --match 'v*' --abbrev=0 HEAD^)"
+          bash .github/scripts/check-support-crate-versions.sh "$previous"
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth
       # Workspace path dependencies must exist in the registry before their consumers.

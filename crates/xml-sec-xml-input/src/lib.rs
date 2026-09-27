@@ -374,6 +374,11 @@ pub fn decode_text_bounded<'a>(
             }
             bytes.strip_prefix(&[0xFE, 0xFF]).unwrap_or(bytes)
         }
+        // XInclude 1.0 section 4.3 uses this signature to identify UTF-8, not as included text.
+        // https://www.w3.org/TR/2006/REC-xinclude-20061115/#text
+        SelectedEncoding::Standard(value) if value == encoding_rs::UTF_8 => {
+            bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes)
+        }
         _ => bytes,
     };
     decode_selected(bytes, selected, maximum_decoded_bytes)
@@ -1015,6 +1020,19 @@ mod tests {
             decode_text(&little[2..], "UTF-16"),
             Err(Error::MissingUtf16ByteOrder)
         ));
+    }
+
+    #[test]
+    fn utf8_text_consumes_its_signature_without_removing_content_fe_ff() {
+        // XInclude 1.0 section 4.3 treats the BOM as an encoding signature, not included text.
+        // https://www.w3.org/TR/2006/REC-xinclude-20061115/#text
+        assert_eq!(decode_text(b"\xef\xbb\xbfbody", "UTF-8").unwrap(), "body");
+        assert_eq!(decode_text(b"\xef\xbb\xbfbody", "utf8").unwrap(), "body");
+        assert_eq!(
+            decode_text(b"body\xef\xbb\xbftail", "UTF-8").unwrap(),
+            "body\u{feff}tail"
+        );
+        assert_eq!(decode_text(b"body", "UTF-8").unwrap(), "body");
     }
 
     #[test]
