@@ -1158,28 +1158,7 @@ fn assert_case(case: &Case) {
         .map(|path| std::fs::read(root.join(path)).expect("oracle output exists"));
     match (execute(case), expected) {
         (Ok(result), Some(expected)) => {
-            let actual = result.serialized;
-            let actual_is_html = actual.media_type.as_deref() == Some("text/html");
-            let actual_is_xml = actual.media_type.as_deref().is_some_and(|media_type| {
-                media_type == "text/xml"
-                    || media_type.ends_with("/xml")
-                    || media_type.ends_with("+xml")
-            });
-            let (actual, expected) = if actual_is_html {
-                normalize_html_oracle_pair(&actual.bytes, &expected)
-            } else if actual_is_xml {
-                (
-                    normalize_xml_lexical_forms(&actual.bytes),
-                    normalize_xml_lexical_forms(&expected),
-                )
-            } else {
-                (actual.bytes, expected)
-            };
-            let actual = normalize_case_specific_oracle_output(case, actual);
-            let expected = normalize_case_specific_oracle_output(case, expected);
-            let (actual, expected) = normalize_generated_id_pairs(&actual, &expected);
-            let actual = normalize_text_quote_references(&actual);
-            let expected = normalize_text_quote_references(&expected);
+            let (actual, expected) = normalized_oracle_pair(case, result.serialized, expected);
             if assert_strict_xslt_output_deviation(case, &actual, &expected) {
                 return;
             }
@@ -1243,6 +1222,34 @@ fn assert_case(case: &Case) {
         (Err(error), Some(_)) if is_expected_strict_xslt_error(case, &error) => {}
         (Err(error), _) => panic!("{}: {error}", case_name(case)),
     }
+}
+
+fn normalized_oracle_pair(
+    case: &Case,
+    actual: xml_sec_xslt::SerializedOutput,
+    expected: Vec<u8>,
+) -> (Vec<u8>, Vec<u8>) {
+    let actual_is_html = actual.media_type.as_deref() == Some("text/html");
+    let actual_is_xml = actual.media_type.as_deref().is_some_and(|media_type| {
+        media_type == "text/xml" || media_type.ends_with("/xml") || media_type.ends_with("+xml")
+    });
+    let (actual, expected) = if actual_is_html {
+        normalize_html_oracle_pair(&actual.bytes, &expected)
+    } else if actual_is_xml {
+        (
+            normalize_xml_lexical_forms(&actual.bytes),
+            normalize_xml_lexical_forms(&expected),
+        )
+    } else {
+        (actual.bytes, expected)
+    };
+    let actual = normalize_case_specific_oracle_output(case, actual);
+    let expected = normalize_case_specific_oracle_output(case, expected);
+    let (actual, expected) = normalize_generated_id_pairs(&actual, &expected);
+    (
+        normalize_text_quote_references(&actual),
+        normalize_text_quote_references(&expected),
+    )
 }
 
 fn is_standard_conformant_libxslt_divergence(case: &Case) -> bool {
@@ -1339,10 +1346,18 @@ fn assert_strict_xslt_output_deviation(case: &Case, actual: &[u8], expected: &[u
         // libxslt forwards parameters through built-in template rules. XSLT 1.0 defines the
         // built-in rule as an apply-templates without with-param, so the strict result must not
         // retain the forms carried by the original parameter.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#built-in-rule
         "exslt/common/node-set.5.xsl" => {
-            assert!(actual.contains("<horizontal>"));
-            assert!(actual.contains("<vertical>"));
-            assert!(!actual.contains("<forms><form>"));
+            let expected = String::from_utf8_lossy(expected);
+            let (metadata, _) = expected
+                .split_once("</metaproperties>")
+                .expect("donor output contains the unchanged metadata");
+            assert_eq!(
+                actual.as_ref(),
+                format!(
+                    "{metadata}</metaproperties><horizontal><node heading=\"caste\"><node heading=\"Brahmin\">\n\t \n  </node><node heading=\"non-Brahmin\">\n\t \n  </node></node></horizontal><vertical>\n\t \n  </vertical><cells/></document>\n"
+                )
+            );
             true
         }
         "exslt/common/node-set.6.xsl" => {
@@ -1450,9 +1465,12 @@ fn assert_strict_xslt_output_deviation(case: &Case, actual: &[u8], expected: &[u
         // XSLT 1.0 section 7.1.1 assigns the namespace node designated by result-prefix,
         // including its prefix. libxslt retains the stylesheet prefix while changing only URI.
         "REC/test-7.1.1.xsl" => {
-            assert!(actual.contains("<xsl:stylesheet"));
-            assert!(actual.contains("<xsl:template"));
-            assert!(!actual.contains("<axsl:"));
+            let expected = String::from_utf8_lossy(expected);
+            let expected = expected.replace("axsl:", "xsl:").replace("xmlns:axsl=", "xmlns:xsl=").replace(
+                "xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\" xmlns:fo=\"http://www.w3.org/1999/XSL/Format\"",
+                "xmlns:fo=\"http://www.w3.org/1999/XSL/Format\" xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\"",
+            );
+            assert_eq!(actual.as_ref(), expected);
             true
         }
         // XSLT 1.0 section 7.1.1 maps #default to the default namespace bound at the
@@ -1493,14 +1511,63 @@ fn assert_strict_xslt_output_deviation(case: &Case, actual: &[u8], expected: &[u
             true
         }
         "general/bug-81.xsl" => {
-            assert_eq!(actual.matches("0.6400000000000001").count(), 2);
+            let expected = String::from_utf8_lossy(expected);
+            assert_eq!(expected.matches("0.64").count(), 2);
+            assert_eq!(
+                actual.as_ref(),
+                expected.replace("0.64", "0.6400000000000001")
+            );
             true
         }
+        // XPath 1.0 section 4.2 retains enough decimal digits to distinguish these two
+        // arithmetic results; the donor prints shorter decimal forms.
+        // https://www.w3.org/TR/1999/REC-xpath-19991116#function-string
         "XSLTMark/metric.xsl" => {
-            assert!(actual.contains("<measurement unit=\"yd\">95012.38841989999</measurement>"));
+            let expected = String::from_utf8_lossy(expected);
+            assert_eq!(expected.matches("95012.3884199").count(), 1);
+            assert_eq!(expected.matches("0.04702523").count(), 1);
+            assert_eq!(
+                actual.as_ref(),
+                expected
+                    .replacen("95012.3884199", "95012.38841989999", 1)
+                    .replacen("0.04702523", "0.047025229999999994", 1)
+            );
             true
         }
         _ => false,
+    }
+}
+
+#[test]
+fn strict_oracle_exceptions_reject_truncated_results() {
+    for stylesheet in [
+        "exslt/common/node-set.5.xsl",
+        "REC/test-7.1.1.xsl",
+        "general/bug-81.xsl",
+        "XSLTMark/metric.xsl",
+    ] {
+        let case = cases()
+            .into_iter()
+            .find(|case| case.stylesheet == Path::new(stylesheet))
+            .expect("strict oracle exception is registered");
+        let expected = std::fs::read(upstream_tests().join(case.output.as_ref().unwrap()))
+            .expect("oracle output exists");
+        let actual = execute(&case)
+            .expect("strict oracle case executes")
+            .serialized;
+        let (actual, expected) = normalized_oracle_pair(&case, actual, expected);
+        assert!(assert_strict_xslt_output_deviation(
+            &case, &actual, &expected
+        ));
+        assert!(
+            std::panic::catch_unwind(|| assert_strict_xslt_output_deviation(
+                &case,
+                &actual[..actual.len() - 1],
+                &expected
+            ))
+            .is_err(),
+            "{stylesheet}: truncated output must not pass the strict exception"
+        );
     }
 }
 

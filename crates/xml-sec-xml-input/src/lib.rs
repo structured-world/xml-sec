@@ -222,6 +222,27 @@ pub fn decode_xml_bounded<'a>(
     explicit_encoding: Option<&str>,
     maximum_decoded_bytes: usize,
 ) -> Result<Cow<'a, str>, Error> {
+    decode_xml_bounded_inner(bytes, explicit_encoding, maximum_decoded_bytes, true)
+}
+
+/// Detect XML-media-type text encoding without changing the included text's declaration.
+///
+/// XInclude `parse="text"` uses XML encoding detection for XML media types, but includes the
+/// decoded characters as text rather than reparsing or rewriting an XML declaration.
+pub fn decode_xml_text_bounded<'a>(
+    bytes: &'a [u8],
+    explicit_encoding: Option<&str>,
+    maximum_decoded_bytes: usize,
+) -> Result<Cow<'a, str>, Error> {
+    decode_xml_bounded_inner(bytes, explicit_encoding, maximum_decoded_bytes, false)
+}
+
+fn decode_xml_bounded_inner<'a>(
+    bytes: &'a [u8],
+    explicit_encoding: Option<&str>,
+    maximum_decoded_bytes: usize,
+    normalize_declaration: bool,
+) -> Result<Cow<'a, str>, Error> {
     let physical = physical_encoding(bytes)?;
     let ascii_declaration = if physical.is_none() {
         declaration_from_ascii_bytes(bytes)?
@@ -308,7 +329,8 @@ pub fn decode_xml_bounded<'a>(
         }
     }
 
-    if !selected.is_utf8()
+    if normalize_declaration
+        && !selected.is_utf8()
         && let Some(range) = declaration
     {
         let normalized_len = decoded

@@ -3472,6 +3472,39 @@ fn terminating_messages_and_attribute_set_cycles_are_typed_failures() {
 }
 
 #[test]
+fn terminating_message_reserves_peak_owned_bytes_before_prefixing() {
+    // The public path must propagate budget exhaustion rather than terminating successfully.
+    // The exact simultaneous-buffer boundary is checked beside the prefixing helper.
+    let body = "x".repeat(4096);
+    let stylesheet = compile(&format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:message terminate="yes">{body}</xsl:message></xsl:template></xsl:stylesheet>"#
+    ));
+    let source = Document::parse("<root/>", None).expect("source parses");
+    let result = |owned_bytes| {
+        let mut budget = execution_budget(1024);
+        budget.owned_bytes = owned_bytes;
+        stylesheet.execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+    };
+    assert!(matches!(
+        result(4096),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+    assert!(matches!(result(1 << 20), Err(Error::Dynamic(_))));
+}
+
+#[test]
 fn result_tree_fragments_preserve_nodes_and_global_dependencies_are_order_independent() {
     // RTF content is a temporary tree, and global bindings form a dependency graph.
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:variable name="later" select="$base"/><xsl:variable name="base" select="'ok'"/><xsl:template match="/"><xsl:variable name="fragment"><b><xsl:value-of select="$later"/></b><xsl:comment>kept</xsl:comment><xsl:processing-instruction name="done">yes</xsl:processing-instruction></xsl:variable><out><xsl:copy-of select="$fragment"/></out></xsl:template></xsl:stylesheet>"#;
@@ -5942,6 +5975,108 @@ fn xinclude_fallback_never_swallows_security_budget_failures() {
         ),
         Err(Error::StaleResource { .. })
     ));
+}
+
+#[test]
+fn xinclude_text_uses_external_encoding_before_attribute() {
+    // XInclude 1.0 section 4.3 gives external encoding information precedence over the
+    // include element's encoding attribute; only absent metadata falls back to that attribute.
+    let resolver = Arc::new(ContextResolver::default());
+    for (href, media_type, encoding) in [
+        ("mime.txt", "text/plain; charset=ISO-8859-1", None),
+        (
+            "resolver.txt",
+            "text/plain; charset=UTF-8",
+            Some("ISO-8859-1"),
+        ),
+    ] {
+        resolver
+            .resources
+            .lock()
+            .expect("test resolver mutex is not poisoned")
+            .insert(
+                (href.into(), Some("memory:source.xml".into())),
+                ResolvedResource {
+                    canonical_uri: format!("memory:{href}"),
+                    identity: ResourceIdentity(href.into()),
+                    bytes: b"caf\xe9".to_vec(),
+                    media_type: Some(media_type.into()),
+                    encoding: encoding.map(str::to_owned),
+                },
+            );
+    }
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="root"/></xsl:template></xsl:stylesheet>"#,
+    );
+    for href in ["mime.txt", "resolver.txt"] {
+        let source = Document::parse(
+            &format!(
+                r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="{href}" parse="text" encoding="UTF-8"/></root>"#
+            ),
+            Some("memory:source.xml"),
+        )
+        .expect("source parses");
+        let result = stylesheet
+            .execute_with_source_processing(
+                &source,
+                &Parameters::new(),
+                resolver.clone(),
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+                SourceProcessing::XInclude,
+            )
+            .expect("external encoding takes precedence");
+        assert_eq!(result.serialized.bytes, "café".as_bytes());
+    }
+}
+
+#[test]
+fn xinclude_text_with_xml_media_type_uses_xml_encoding_detection() {
+    // XInclude 1.0 section 4.3 selects XML 1.0 encoding detection when the returned media type
+    // is XML, before considering the xi:include encoding attribute.
+    let resolver = Arc::new(ContextResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            ("xml-text.txt".into(), Some("memory:source.xml".into())),
+            ResolvedResource {
+                canonical_uri: "memory:xml-text.txt".into(),
+                identity: ResourceIdentity("xml-text.txt".into()),
+                bytes: b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>caf\xe9".to_vec(),
+                media_type: Some("application/xml".into()),
+                encoding: None,
+            },
+        );
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="root"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="xml-text.txt" parse="text" encoding="UTF-8"/></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("source parses");
+    let result = stylesheet
+        .execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+            SourceProcessing::XInclude,
+        )
+        .expect("XML media type selects the XML declaration's encoding");
+    assert_eq!(
+        result.serialized.bytes,
+        "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>café".as_bytes()
+    );
 }
 
 #[test]
@@ -13584,12 +13719,21 @@ fn xinclude_text_normalizes_all_line_endings() {
 fn xinclude_text_validates_after_non_utf8_decoding() {
     // Character validation applies to decoded Unicode, not raw octets; a valid Latin-1 resource
     // must remain usable while forbidden decoded scalar values fail in the companion test.
-    let resolver = Arc::new(ByteResolver::default());
+    let resolver = Arc::new(ContextResolver::default());
     resolver
         .resources
         .lock()
         .expect("test resolver mutex is not poisoned")
-        .insert("latin1.txt".into(), b"caf\xe9".to_vec());
+        .insert(
+            ("latin1.txt".into(), Some("memory:source.xml".into())),
+            ResolvedResource {
+                canonical_uri: "memory:latin1.txt".into(),
+                identity: ResourceIdentity("latin1.txt".into()),
+                bytes: b"caf\xe9".to_vec(),
+                media_type: Some("text/plain".into()),
+                encoding: None,
+            },
+        );
     let stylesheet = compile(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="."/></xsl:template></xsl:stylesheet>"#,
     );

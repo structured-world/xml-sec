@@ -2666,13 +2666,9 @@ impl<'a> Execution<'a> {
                     current_precedence,
                     None,
                 )?;
-                let mut content = self.consume_temporary_fragment(fragment, serialize_fragment)?;
+                let content = self.consume_temporary_fragment(fragment, serialize_fragment)?;
                 if *terminate {
-                    const PREFIX: &str = "xsl:message terminated transformation: ";
-                    self.meter
-                        .check_additional(BudgetKind::OwnedBytes, PREFIX.len())?;
-                    content.insert_str(0, PREFIX);
-                    return Err(Error::Dynamic(content));
+                    return Err(terminating_message_error(content, &mut self.meter)?);
                 }
                 reserve_retained_vec_slot(&mut self.messages, &mut self.meter)?;
                 self.messages.push(Message {
@@ -4900,6 +4896,13 @@ impl<'a> Execution<'a> {
     }
 }
 
+fn terminating_message_error(mut content: String, meter: &mut Meter) -> Result<Error> {
+    const PREFIX: &str = "xsl:message terminated transformation: ";
+    reserve_metered_string(&mut content, PREFIX.len(), meter)?;
+    content.insert_str(0, PREFIX);
+    Ok(Error::Dynamic(content))
+}
+
 fn effective_globals<'a>(
     stylesheet: &'a Stylesheet,
     meter: &mut Meter,
@@ -6672,6 +6675,36 @@ mod tests {
         BudgetKind, CompileBudget, Compiler, Document, Error, ExecutionBudget, ExpandedName,
         NoResolver, NodeId, NodeKind, NodeReference, Value,
     };
+
+    #[test]
+    fn terminating_message_prefix_accounts_for_peak_string_capacity() {
+        // The old check covered only prefix length; insert_str then allocated a second buffer
+        // while the original serialized message was still charged and live.
+        let mut content = String::with_capacity(4096);
+        content.extend(std::iter::repeat_n('x', 4096));
+        let mut constrained = meter(content.capacity() * 2 - 1);
+        constrained
+            .charge(BudgetKind::OwnedBytes, content.capacity())
+            .expect("serialized message fits");
+        assert!(matches!(
+            super::terminating_message_error(content, &mut constrained),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            })
+        ));
+
+        let mut content = String::with_capacity(4096);
+        content.extend(std::iter::repeat_n('x', 4096));
+        let mut sufficient = meter(content.capacity() * 3);
+        sufficient
+            .charge(BudgetKind::OwnedBytes, content.capacity())
+            .expect("serialized message fits");
+        assert!(matches!(
+            super::terminating_message_error(content, &mut sufficient),
+            Ok(Error::Dynamic(message)) if message.starts_with("xsl:message terminated transformation: ")
+        ));
+    }
 
     #[test]
     fn variable_scope_retains_its_hash_storage_charge() {

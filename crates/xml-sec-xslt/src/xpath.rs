@@ -5055,9 +5055,26 @@ fn resolve_xinclude(
         None => true,
     };
     if parse == "text" {
-        let encoding = encoding.or(resource.encoding.as_deref());
+        // XInclude 1.0 section 4.3 gives external encoding information priority over the
+        // xi:include encoding attribute. The resolver's explicit label and media-type charset
+        // are both external information; only then may the attribute select an encoding.
+        // https://www.w3.org/TR/2006/REC-xinclude-20061115/#text
+        let external_encoding = resource
+            .encoding
+            .as_deref()
+            .or_else(|| resource.media_type.as_deref().and_then(media_type_charset));
+        let xml_media_type = external_encoding.is_none()
+            && resource
+                .media_type
+                .as_deref()
+                .is_some_and(is_xml_media_type);
+        let mode = if xml_media_type {
+            XIncludeParseMode::TextXmlMediaType
+        } else {
+            XIncludeParseMode::Text
+        };
         let mut value =
-            decode_xinclude_resource(&resource, encoding, meter, XIncludeParseMode::Text)?;
+            decode_xinclude_resource(&resource, external_encoding.or(encoding), meter, mode)?;
         normalize_xinclude_text_line_endings(&mut value, meter).map_err(XIncludeFailure::Fatal)?;
         // XInclude 1.0 section 4.3 makes every character forbidden in XML documents a fatal
         // error, even after successful decoding: https://www.w3.org/TR/xinclude/#text_included
@@ -5351,6 +5368,14 @@ fn parse_external_document_metered(
 enum XIncludeParseMode {
     Xml,
     Text,
+    TextXmlMediaType,
+}
+
+#[derive(Clone, Copy)]
+enum ResourceDecodeMode {
+    Xml,
+    Text,
+    XmlText,
 }
 
 fn decode_xinclude_resource(
@@ -5361,14 +5386,15 @@ fn decode_xinclude_resource(
 ) -> std::result::Result<MeteredDecodedResource, XIncludeFailure> {
     let source_owned_bytes = resource.bytes.capacity();
     let bytes = resource.bytes.as_slice();
-    let (bytes, encoding, parsed_xml) = match mode {
+    let (bytes, encoding, decode_mode) = match mode {
         XIncludeParseMode::Text => {
             let (bytes, encoding) = xinclude_text_payload(bytes, encoding);
-            (bytes, Some(encoding), false)
+            (bytes, Some(encoding), ResourceDecodeMode::Text)
         }
-        XIncludeParseMode::Xml => (bytes, encoding, true),
+        XIncludeParseMode::TextXmlMediaType => (bytes, None, ResourceDecodeMode::XmlText),
+        XIncludeParseMode::Xml => (bytes, encoding, ResourceDecodeMode::Xml),
     };
-    decode_resource_metered_inner(bytes, source_owned_bytes, encoding, meter, parsed_xml).map_err(
+    decode_resource_metered_inner(bytes, source_owned_bytes, encoding, meter, decode_mode).map_err(
         |error| match error {
             MeteredDecodeError::Budget(error) => XIncludeFailure::Fatal(error),
             MeteredDecodeError::Decode(error) => classify_xinclude_decode_error(error, mode),
@@ -5392,10 +5418,14 @@ fn classify_xinclude_decode_error(
     );
     let error = Error::Xml(error.to_string());
     match (mode, unsupported_encoding) {
-        (XIncludeParseMode::Xml | XIncludeParseMode::Text, true) => {
-            XIncludeFailure::Resource(error)
-        }
-        (XIncludeParseMode::Xml | XIncludeParseMode::Text, false) => XIncludeFailure::Fatal(error),
+        (
+            XIncludeParseMode::Xml | XIncludeParseMode::Text | XIncludeParseMode::TextXmlMediaType,
+            true,
+        ) => XIncludeFailure::Resource(error),
+        (
+            XIncludeParseMode::Xml | XIncludeParseMode::Text | XIncludeParseMode::TextXmlMediaType,
+            false,
+        ) => XIncludeFailure::Fatal(error),
     }
 }
 
@@ -5454,6 +5484,32 @@ fn xinclude_text_payload<'a>(bytes: &'a [u8], encoding: Option<&'a str>) -> (&'a
         return (payload, encoding);
     }
     (bytes, encoding)
+}
+
+fn media_type_charset(media_type: &str) -> Option<&str> {
+    media_type.split(';').skip(1).find_map(|parameter| {
+        let (name, value) = parameter.trim().split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("charset") {
+            return None;
+        }
+        let value = value.trim().trim_matches('"');
+        (!value.is_empty()).then_some(value)
+    })
+}
+
+fn is_xml_media_type(media_type: &str) -> bool {
+    let kind = media_type.split(';').next().unwrap_or(media_type).trim();
+    kind.eq_ignore_ascii_case("text/xml")
+        || kind.eq_ignore_ascii_case("application/xml")
+        || ((kind
+            .get(..5)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("text/"))
+            || kind
+                .get(..12)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("application/")))
+            && kind
+                .get(kind.len().saturating_sub(4)..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case("+xml")))
 }
 
 fn decode_resource_for_xml_parse(
@@ -5516,7 +5572,12 @@ fn decode_resource_metered(
     meter: &mut Meter,
     parsed_xml: bool,
 ) -> Result<MeteredDecodedResource> {
-    decode_resource_metered_inner(bytes, source_owned_bytes, encoding, meter, parsed_xml).map_err(
+    let mode = if parsed_xml {
+        ResourceDecodeMode::Xml
+    } else {
+        ResourceDecodeMode::Text
+    };
+    decode_resource_metered_inner(bytes, source_owned_bytes, encoding, meter, mode).map_err(
         |error| match error {
             MeteredDecodeError::Budget(error) => error,
             MeteredDecodeError::Decode(error) => Error::Xml(error.to_string()),
@@ -5539,8 +5600,9 @@ fn decode_resource_metered_inner(
     source_owned_bytes: usize,
     encoding: Option<&str>,
     meter: &mut Meter,
-    parsed_xml: bool,
+    mode: ResourceDecodeMode,
 ) -> std::result::Result<MeteredDecodedResource, MeteredDecodeError> {
+    let parsed_xml = matches!(mode, ResourceDecodeMode::Xml);
     // XML parsing retains one decoded source copy while the decoder's output is still live.
     let decoded_copies = if parsed_xml { 2 } else { 1 };
     let (used, limit) = meter
@@ -5563,20 +5625,27 @@ fn decode_resource_metered_inner(
     }
     let available = limit - source_total;
     let maximum_decoded = available / decoded_copies;
-    let decoded = decode_resource(bytes, encoding, parsed_xml, maximum_decoded).map_err(
-        |error| match error {
-            xml_sec_xml_input::Error::DecodedLimit { actual, .. } => {
-                MeteredDecodeError::Budget(Error::Budget {
-                    kind: BudgetKind::OwnedBytes,
-                    limit,
-                    actual: used
-                        .saturating_add(source_owned_bytes)
-                        .saturating_add(actual.saturating_mul(decoded_copies)),
-                })
-            }
-            error => MeteredDecodeError::Decode(error),
-        },
-    )?;
+    let decoded = match mode {
+        ResourceDecodeMode::XmlText => {
+            xml_sec_xml_input::decode_xml_text_bounded(bytes, encoding, maximum_decoded)
+                .map(|value| value.into_owned())
+        }
+        ResourceDecodeMode::Xml | ResourceDecodeMode::Text => {
+            decode_resource(bytes, encoding, parsed_xml, maximum_decoded)
+        }
+    }
+    .map_err(|error| match error {
+        xml_sec_xml_input::Error::DecodedLimit { actual, .. } => {
+            MeteredDecodeError::Budget(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                limit,
+                actual: used
+                    .saturating_add(source_owned_bytes)
+                    .saturating_add(actual.saturating_mul(decoded_copies)),
+            })
+        }
+        error => MeteredDecodeError::Decode(error),
+    })?;
     let parser_owned_bytes = if parsed_xml { decoded.len() } else { 0 };
     let temporary_bytes = decoded.capacity().saturating_add(parser_owned_bytes);
     let retained = source_owned_bytes.saturating_add(temporary_bytes);
@@ -11792,7 +11861,11 @@ mod tests {
                 bytes.capacity(),
                 Some("UTF-16LE"),
                 &mut meter,
-                parsed_xml,
+                if parsed_xml {
+                    ResourceDecodeMode::Xml
+                } else {
+                    ResourceDecodeMode::Text
+                },
             ) else {
                 panic!("UTF-16 resource must decode");
             };
