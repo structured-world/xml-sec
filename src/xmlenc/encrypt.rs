@@ -4,11 +4,8 @@ use std::{fmt, sync::Arc};
 
 use crate::xml::dom::{Document, Node};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use quick_xml::{
-    Writer,
-    events::{BytesEnd, BytesStart, BytesText, Event},
-};
 use rsa::RsaPublicKey;
+use xml_sec_xml_input::lexical::Writer;
 
 use crate::document::{
     DocumentParseSettings, XmlDocument, XmlDocumentError, XmlParseWorkBudget,
@@ -279,7 +276,7 @@ impl EncryptedDataBuilder {
         validate_xml_plaintext(
             xml,
             &self.encrypted_type,
-            &self.policy,
+            operation.policy(),
             &operation.budgets().xml_parse,
             self.xml_backend,
         )?;
@@ -291,7 +288,7 @@ impl EncryptedDataBuilder {
         )?;
         validate_standalone_encrypted_data_nodes(
             generated.xml_nodes,
-            self.policy.resources.effective_xml_nodes() as usize,
+            operation.policy().resources.effective_xml_nodes() as usize,
         )?;
         Ok(generated.result)
     }
@@ -315,7 +312,7 @@ impl EncryptedDataBuilder {
             self.encrypt_payload_with_operation(data, encrypted_type, &mut operation, false)?;
         validate_standalone_encrypted_data_nodes(
             generated.xml_nodes,
-            self.policy.resources.effective_xml_nodes() as usize,
+            operation.policy().resources.effective_xml_nodes() as usize,
         )?;
         Ok(generated.result)
     }
@@ -409,14 +406,14 @@ impl EncryptedDataBuilder {
                     document.as_xml().len(),
                     source.len(),
                     result.encrypted_data_xml.len(),
-                    self.policy.resources.max_xml_document_bytes,
+                    operation.policy().resources.max_xml_document_bytes,
                 )?;
                 validate_replacement_node_counts(
                     document_nodes,
                     selected_nodes,
                     generated.xml_nodes,
                     ReplacementMode::ReplaceElement,
-                    self.policy.resources.effective_xml_nodes() as usize,
+                    operation.policy().resources.effective_xml_nodes() as usize,
                 )?;
                 let settings = self.document_parse_settings();
                 let mutation = require_encryption_mutation(generated.mutation)?;
@@ -466,14 +463,14 @@ impl EncryptedDataBuilder {
                     document.as_xml().len(),
                     removed,
                     inserted,
-                    self.policy.resources.max_xml_document_bytes,
+                    operation.policy().resources.max_xml_document_bytes,
                 )?;
                 validate_replacement_node_counts(
                     document_nodes,
                     selected_nodes,
                     generated.xml_nodes,
                     ReplacementMode::ReplaceContent,
-                    self.policy.resources.effective_xml_nodes() as usize,
+                    operation.policy().resources.effective_xml_nodes() as usize,
                 )?;
                 let settings = self.document_parse_settings();
                 let mutation = require_encryption_mutation(generated.mutation)?;
@@ -507,8 +504,11 @@ impl EncryptedDataBuilder {
     ) -> Result<GeneratedEncryption, XmlEncError> {
         // Bound caller-controlled inputs before hashing or allocating one plan
         // node per recipient. The compiled graph then gates all accepted work.
-        self.validate_plaintext_len(plaintext.len())?;
-        self.validate_configuration()?;
+        validate_plaintext_len(
+            plaintext.len(),
+            operation.policy().resources.max_encryption_plaintext_bytes,
+        )?;
+        self.validate_configuration_with_policy(operation.policy())?;
         let input_resource = OperationResourceIdentity::external("encryption-input", plaintext);
         let plan = compile_encryption_plan(
             operation,
@@ -551,10 +551,13 @@ impl EncryptedDataBuilder {
                 &encrypted_keys,
                 &ciphertext,
             )?;
-            self.validate_document_len(encrypted_data_xml.len())?;
+            validate_document_len(
+                encrypted_data_xml.len(),
+                operation.policy().resources.max_xml_document_bytes,
+            )?;
             let xml_nodes = count_generated_encrypted_data_nodes(
                 &encrypted_data_xml,
-                &self.policy,
+                operation.policy(),
                 &operation.budgets().xml_parse,
                 self.xml_backend,
             )?;
@@ -576,13 +579,16 @@ impl EncryptedDataBuilder {
         })
     }
 
-    fn validate_configuration(&self) -> Result<(), XmlEncError> {
-        self.policy.validate()?;
+    fn validate_configuration_with_policy(
+        &self,
+        policy: &crate::policy::EncryptionPolicy,
+    ) -> Result<(), XmlEncError> {
+        policy.validate()?;
+        let metadata_limit = policy.resources.max_encryption_metadata_bytes;
         if let EncryptedDataType::Other(uri) = &self.encrypted_type {
-            self.validate_metadata("EncryptedData Type", Some(uri))?;
+            validate_metadata("EncryptedData Type", Some(uri), metadata_limit)?;
         }
-        if self
-            .policy
+        if policy
             .data_algorithms
             .as_ref()
             .is_some_and(|allowed| !allowed.contains(&self.algorithm))
@@ -593,25 +599,27 @@ impl EncryptedDataBuilder {
             }
             .into());
         }
-        if self.recipients.len() > self.policy.resources.max_encryption_recipients {
+        if self.recipients.len() > policy.resources.max_encryption_recipients {
             return Err(crate::policy::PolicyViolation::ResourceLimit {
                 resource: crate::policy::resource_name::ENCRYPTION_RECIPIENTS,
-                maximum: self.policy.resources.max_encryption_recipients,
+                maximum: policy.resources.max_encryption_recipients,
                 actual: self.recipients.len(),
             }
             .into());
         }
         let key_candidates = self.recipients.len() + usize::from(self.direct_key.is_some());
-        self.policy
-            .resources
-            .validate_key_candidates(key_candidates)?;
-        self.validate_metadata("EncryptedData Id", self.id.as_deref())?;
+        policy.resources.validate_key_candidates(key_candidates)?;
+        validate_metadata("EncryptedData Id", self.id.as_deref(), metadata_limit)?;
         if self.id.as_deref().is_some_and(|id| !is_xml_ncname(id)) {
             return Err(XmlEncError::InvalidEncryptionConfig(
                 "EncryptedData Id must be an XML NCName".into(),
             ));
         }
-        self.validate_key_name("direct KeyName", self.direct_key_name.as_deref())?;
+        validate_key_name(
+            "direct KeyName",
+            self.direct_key_name.as_deref(),
+            metadata_limit,
+        )?;
         for recipient in &self.recipients {
             match recipient {
                 EncryptionRecipient::RsaOaep {
@@ -620,9 +628,8 @@ impl EncryptedDataBuilder {
                     recipient,
                     key_name,
                 } => {
-                    validate_key_transport_recipient(public_key.as_ref(), &self.policy)?;
-                    if self
-                        .policy
+                    validate_key_transport_recipient(public_key.as_ref(), policy)?;
+                    if policy
                         .key_transport_algorithms
                         .as_ref()
                         .is_some_and(|allowed| !allowed.contains(&parameters.algorithm))
@@ -633,7 +640,7 @@ impl EncryptedDataBuilder {
                         }
                         .into());
                     }
-                    if let Some(allowed) = &self.policy.oaep_digests {
+                    if let Some(allowed) = &policy.oaep_digests {
                         let rejected_uri = if !allowed.contains(&parameters.digest) {
                             Some(parameters.digest.uri())
                         } else if !allowed.contains(&parameters.mgf_digest) {
@@ -649,9 +656,13 @@ impl EncryptedDataBuilder {
                             .into());
                         }
                     }
-                    self.validate_metadata("EncryptedKey Recipient", recipient.as_deref())?;
-                    self.validate_key_name("EncryptedKey KeyName", key_name.as_deref())?;
-                    self.validate_metadata_len(parameters.label.len())?;
+                    validate_metadata(
+                        "EncryptedKey Recipient",
+                        recipient.as_deref(),
+                        metadata_limit,
+                    )?;
+                    validate_key_name("EncryptedKey KeyName", key_name.as_deref(), metadata_limit)?;
+                    validate_metadata_len(parameters.label.len(), metadata_limit)?;
                 }
                 EncryptionRecipient::AesKeyWrap {
                     kek,
@@ -659,8 +670,7 @@ impl EncryptedDataBuilder {
                     recipient,
                     key_name,
                 } => {
-                    if self
-                        .policy
+                    if policy
                         .key_wrap_algorithms
                         .as_ref()
                         .is_some_and(|allowed| !allowed.contains(algorithm))
@@ -679,8 +689,12 @@ impl EncryptedDataBuilder {
                             kek.len()
                         )));
                     }
-                    self.validate_metadata("EncryptedKey Recipient", recipient.as_deref())?;
-                    self.validate_key_name("EncryptedKey KeyName", key_name.as_deref())?;
+                    validate_metadata(
+                        "EncryptedKey Recipient",
+                        recipient.as_deref(),
+                        metadata_limit,
+                    )?;
+                    validate_key_name("EncryptedKey KeyName", key_name.as_deref(), metadata_limit)?;
                 }
             }
         }
@@ -698,34 +712,6 @@ impl EncryptedDataBuilder {
             }
             _ => Ok(()),
         }
-    }
-
-    fn validate_metadata(
-        &self,
-        field: &'static str,
-        value: Option<&str>,
-    ) -> Result<(), XmlEncError> {
-        validate_metadata(
-            field,
-            value,
-            self.policy.resources.max_encryption_metadata_bytes,
-        )
-    }
-
-    fn validate_key_name(
-        &self,
-        field: &'static str,
-        value: Option<&str>,
-    ) -> Result<(), XmlEncError> {
-        validate_key_name(
-            field,
-            value,
-            self.policy.resources.max_encryption_metadata_bytes,
-        )
-    }
-
-    fn validate_metadata_len(&self, actual: usize) -> Result<(), XmlEncError> {
-        validate_metadata_len(actual, self.policy.resources.max_encryption_metadata_bytes)
     }
 
     fn validate_plaintext_len(&self, actual: usize) -> Result<(), XmlEncError> {
@@ -1031,37 +1017,39 @@ fn render_encrypted_data(
     ciphertext: &[u8],
 ) -> Result<String, XmlEncError> {
     let mut writer = Writer::new(Vec::new());
-    let mut root = BytesStart::new("xenc:EncryptedData");
-    root.push_attribute(("xmlns:xenc", XMLENC_NS));
-    root.push_attribute(("xmlns:xenc11", XMLENC11_NS));
-    root.push_attribute(("xmlns:ds", XMLDSIG_NS));
+    let mut root_attributes = vec![
+        ("xmlns:xenc", XMLENC_NS),
+        ("xmlns:xenc11", XMLENC11_NS),
+        ("xmlns:ds", XMLDSIG_NS),
+    ];
     if let Some(id) = id {
-        root.push_attribute(("Id", id));
+        root_attributes.push(("Id", id));
     }
+    let encrypted_type_uri;
     if let Some(encrypted_type) = encrypted_type {
-        let uri = match encrypted_type {
+        encrypted_type_uri = match encrypted_type {
             EncryptedDataType::Element => format!("{XMLENC_NS}Element"),
             EncryptedDataType::Content => format!("{XMLENC_NS}Content"),
             EncryptedDataType::Other(uri) => uri.clone(),
         };
-        root.push_attribute(("Type", uri.as_str()));
+        root_attributes.push(("Type", encrypted_type_uri.as_str()));
     }
-    write_event(&mut writer, Event::Start(root))?;
+    write_start(&mut writer, "xenc:EncryptedData", root_attributes)?;
     write_empty_with_algorithm(&mut writer, "xenc:EncryptionMethod", algorithm.uri())?;
 
     if direct_key_name.is_some() || !encrypted_keys.is_empty() {
-        write_event(&mut writer, Event::Start(BytesStart::new("ds:KeyInfo")))?;
+        write_start(&mut writer, "ds:KeyInfo", [])?;
         if let Some(key_name) = direct_key_name {
             write_text_element(&mut writer, "ds:KeyName", key_name)?;
         }
         for encrypted_key in encrypted_keys {
             write_encrypted_key(&mut writer, encrypted_key)?;
         }
-        write_event(&mut writer, Event::End(BytesEnd::new("ds:KeyInfo")))?;
+        write_end(&mut writer, "ds:KeyInfo")?;
     }
 
     write_cipher_data(&mut writer, ciphertext)?;
-    write_event(&mut writer, Event::End(BytesEnd::new("xenc:EncryptedData")))?;
+    write_end(&mut writer, "xenc:EncryptedData")?;
     String::from_utf8(writer.into_inner())
         .map_err(|error| XmlEncError::XmlSerialize(error.to_string()))
 }
@@ -1070,16 +1058,22 @@ fn write_encrypted_key(
     writer: &mut Writer<Vec<u8>>,
     encrypted_key: &WrappedKey,
 ) -> Result<(), XmlEncError> {
-    let mut start = BytesStart::new("xenc:EncryptedKey");
-    if let Some(recipient) = encrypted_key.recipient.as_deref() {
-        start.push_attribute(("Recipient", recipient));
-    }
-    write_event(writer, Event::Start(start))?;
+    write_start(
+        writer,
+        "xenc:EncryptedKey",
+        encrypted_key
+            .recipient
+            .as_deref()
+            .map(|recipient| vec![("Recipient", recipient)])
+            .unwrap_or_default(),
+    )?;
 
     if let Some(parameters) = encrypted_key.oaep.as_ref() {
-        let mut method = BytesStart::new("xenc:EncryptionMethod");
-        method.push_attribute(("Algorithm", encrypted_key.algorithm_uri));
-        write_event(writer, Event::Start(method))?;
+        write_start(
+            writer,
+            "xenc:EncryptionMethod",
+            [("Algorithm", encrypted_key.algorithm_uri)],
+        )?;
         if !parameters.label.is_empty() {
             write_text_element(
                 writer,
@@ -1093,24 +1087,24 @@ fn write_encrypted_key(
         {
             write_empty_with_algorithm(writer, "xenc11:MGF", parameters.mgf_digest.mgf_uri())?;
         }
-        write_event(writer, Event::End(BytesEnd::new("xenc:EncryptionMethod")))?;
+        write_end(writer, "xenc:EncryptionMethod")?;
     } else {
         write_empty_with_algorithm(writer, "xenc:EncryptionMethod", encrypted_key.algorithm_uri)?;
     }
 
     if let Some(key_name) = encrypted_key.key_name.as_deref() {
-        write_event(writer, Event::Start(BytesStart::new("ds:KeyInfo")))?;
+        write_start(writer, "ds:KeyInfo", [])?;
         write_text_element(writer, "ds:KeyName", key_name)?;
-        write_event(writer, Event::End(BytesEnd::new("ds:KeyInfo")))?;
+        write_end(writer, "ds:KeyInfo")?;
     }
     write_cipher_data(writer, &encrypted_key.ciphertext)?;
-    write_event(writer, Event::End(BytesEnd::new("xenc:EncryptedKey")))
+    write_end(writer, "xenc:EncryptedKey")
 }
 
 fn write_cipher_data(writer: &mut Writer<Vec<u8>>, value: &[u8]) -> Result<(), XmlEncError> {
-    write_event(writer, Event::Start(BytesStart::new("xenc:CipherData")))?;
+    write_start(writer, "xenc:CipherData", [])?;
     write_text_element(writer, "xenc:CipherValue", &STANDARD.encode(value))?;
-    write_event(writer, Event::End(BytesEnd::new("xenc:CipherData")))
+    write_end(writer, "xenc:CipherData")
 }
 
 fn write_empty_with_algorithm(
@@ -1118,9 +1112,9 @@ fn write_empty_with_algorithm(
     name: &str,
     algorithm: &str,
 ) -> Result<(), XmlEncError> {
-    let mut element = BytesStart::new(name);
-    element.push_attribute(("Algorithm", algorithm));
-    write_event(writer, Event::Empty(element))
+    writer
+        .empty(name, [("Algorithm", algorithm)])
+        .map_err(|error| XmlEncError::XmlSerialize(error.to_string()))
 }
 
 fn write_text_element(
@@ -1128,14 +1122,26 @@ fn write_text_element(
     name: &str,
     text: &str,
 ) -> Result<(), XmlEncError> {
-    write_event(writer, Event::Start(BytesStart::new(name)))?;
-    write_event(writer, Event::Text(BytesText::new(text)))?;
-    write_event(writer, Event::End(BytesEnd::new(name)))
+    write_start(writer, name, [])?;
+    writer
+        .text(text)
+        .map_err(|error| XmlEncError::XmlSerialize(error.to_string()))?;
+    write_end(writer, name)
 }
 
-fn write_event(writer: &mut Writer<Vec<u8>>, event: Event<'_>) -> Result<(), XmlEncError> {
+fn write_start<'a>(
+    writer: &mut Writer<Vec<u8>>,
+    name: &str,
+    attributes: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<(), XmlEncError> {
     writer
-        .write_event(event)
+        .start(name, attributes)
+        .map_err(|error| XmlEncError::XmlSerialize(error.to_string()))
+}
+
+fn write_end(writer: &mut Writer<Vec<u8>>, name: &str) -> Result<(), XmlEncError> {
+    writer
+        .end(name)
         .map_err(|error| XmlEncError::XmlSerialize(error.to_string()))
 }
 
@@ -1571,7 +1577,7 @@ mod tests {
             .recipient_aes_kw([0x44; 32], KeyWrapAlgorithm::AesKw128);
 
         assert!(matches!(
-            builder.validate_configuration(),
+            builder.validate_configuration_with_policy(&builder.policy),
             Err(XmlEncError::InvalidEncryptionConfig(_))
         ));
     }
@@ -1647,7 +1653,7 @@ mod tests {
             .add_recipient(EncryptionRecipient::rsa_oaep(public).oaep_parameters(parameters));
 
         assert!(matches!(
-            builder.validate_configuration(),
+            builder.validate_configuration_with_policy(&builder.policy),
             Err(XmlEncError::Policy(
                 crate::policy::PolicyViolation::Algorithm { algorithm, .. }
             )) if algorithm == OaepDigestAlgorithm::Sha384.mgf_uri()

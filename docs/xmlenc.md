@@ -180,7 +180,9 @@ recursive internal-entity replacement traversal to cumulative XML parse work.
 namespace context, and invalidate prior node identities after a successful mutation. String APIs
 remain adapters over this boundary. `ResourcePolicy::max_xml_parse_work_bytes` is cumulative across
 the initial document, generated or decrypted fragment validation, committed generations, and all
-key-candidate retries, so nested helpers cannot reset parser work. Use
+key-candidate retries, so nested helpers cannot reset parser work. Policy-aware
+`XmlDocument` byte parsing also charges the source-byte decoding pass before encoding
+validation or transcoding. Use
 `XmlDocument::parse_with_policy(xml, &encryption_or_decryption_policy)` when constructing a retained
 document with non-default XML rules; this derives parsing directly from the operation's immutable
 policy snapshot. The projected output byte length is checked before constructing

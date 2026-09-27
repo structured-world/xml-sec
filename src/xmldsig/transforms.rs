@@ -392,12 +392,7 @@ impl TransformExecutionBudget {
                 resources.effective_xml_base_resolution_bytes(),
             ),
             xml_parse_work: XmlParseWorkBudget::from_resources(resources),
-            xml_parse_settings: DocumentParseSettings::new_with_depth(
-                false,
-                resources.effective_xml_nodes(),
-                resources.max_xml_depth,
-                resources.max_xml_document_bytes,
-            ),
+            xml_parse_settings: DocumentParseSettings::for_transform_output(resources),
             state: TransformChainState::default(),
         }
     }
@@ -1146,8 +1141,12 @@ fn execute_transform_chain<'s, 'e, 'd>(
         // returns only owned digest bytes. Every C14N output is charged before
         // recursion, so these retained buffers remain a bounded subset of the
         // signature-wide canonicalization work budget.
-        let xml = crate::encoding::decode_xml_octets(&bytes)
-            .map_err(|error| TransformError::XmlParse(error.to_string()))?;
+        // Decoding is a separate input pass, including malformed-input failures. Reserve it
+        // before any transcoding; the subsequent parser charges its own decoded-byte passes.
+        context.budget.xml_parse_work.charge_policy(bytes.len())?;
+        let xml =
+            crate::encoding::decode_xml_octets(&bytes, context.budget.xml_parse_settings.max_bytes)
+                .map_err(map_transform_xml_decode_error)?;
         let settings = DocumentParseSettings {
             allow_dtd: context.options.internal_dtd_allowed(),
             ..context.budget.xml_parse_settings
@@ -1417,6 +1416,19 @@ fn map_transform_xml_parse_error(
     match error.into_policy_violation(settings) {
         Ok(error) => TransformError::Policy(error),
         Err(error) => TransformError::XmlParse(error.to_string()),
+    }
+}
+
+fn map_transform_xml_decode_error(error: crate::encoding::XmlEncodingError) -> TransformError {
+    match error {
+        crate::encoding::XmlEncodingError::DecodedLimit { maximum, actual } => {
+            TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_DOCUMENT,
+                maximum,
+                actual,
+            })
+        }
+        error => TransformError::XmlParse(error.to_string()),
     }
 }
 
@@ -2657,6 +2669,65 @@ mod tests {
     }
 
     #[test]
+    fn binary_to_node_set_adapter_preserves_decoded_document_limit() {
+        // A compact single-byte XML resource can expand when decoded to UTF-8. That expansion
+        // remains a document resource-limit failure rather than becoming a parser diagnostic.
+        let signature_document = Document::parse("<Signature/>").unwrap();
+        let xml = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><root>\xe9\xe9</root>";
+        let resources = crate::policy::ResourcePolicy {
+            max_xml_document_bytes: xml.len(),
+            ..crate::policy::ResourcePolicy::default()
+        };
+        let budget = TransformExecutionBudget::from_resources(&resources);
+        let transforms = [Transform::XPath(XPathExpression::new("true()"))];
+
+        let error = execute_transforms_with_options_and_budget(
+            signature_document.root_element(),
+            TransformData::Binary(xml.to_vec()),
+            &transforms,
+            TransformOptions::default(),
+            &budget,
+        )
+        .expect_err("decoded XML expansion must retain resource-limit classification");
+
+        assert!(matches!(
+            error,
+            TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_DOCUMENT,
+                maximum,
+                actual,
+            }) if maximum == xml.len() && actual > maximum
+        ));
+    }
+
+    #[test]
+    fn binary_adapter_gates_decode_even_when_input_is_malformed() {
+        // Failed decoding is operation work too; denial must precede UTF-16 traversal/allocation.
+        let signature_document = Document::parse("<Signature/>").unwrap();
+        let resources = crate::policy::ResourcePolicy {
+            max_xml_parse_work_bytes: 0,
+            ..crate::policy::ResourcePolicy::default()
+        };
+        let budget = TransformExecutionBudget::from_resources(&resources);
+        let error = execute_transforms_with_options_and_budget(
+            signature_document.root_element(),
+            TransformData::Binary(vec![0xff, 0xfe, 0x00, 0xd8]),
+            &[Transform::XPath(XPathExpression::new("true()"))],
+            TransformOptions::default(),
+            &budget,
+        )
+        .expect_err("zero work must reject before malformed decoding");
+        assert!(matches!(
+            error,
+            TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
+                maximum: 0,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn recursive_binary_adapters_share_xml_parse_work() {
         // Binary-to-node-set adaptation can recur across references and nested
         // transform execution. Each decoded document must consume the same
@@ -2664,8 +2735,10 @@ mod tests {
         let signature_document = Document::parse("<Signature/>").unwrap();
         let xml = b"<root/>";
         let parser_passes = crate::document::selected_parser_passes();
+        // Encoded-byte decoding precedes all decoded-text parser passes, even for UTF-8.
+        let adapter_work = xml.len() * (1 + parser_passes);
         let resources = crate::policy::ResourcePolicy {
-            max_xml_parse_work_bytes: xml.len() * parser_passes,
+            max_xml_parse_work_bytes: adapter_work,
             ..crate::policy::ResourcePolicy::default()
         };
         let budget = TransformExecutionBudget::from_resources(&resources);
@@ -2694,8 +2767,8 @@ mod tests {
                 resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
                 maximum,
                 actual,
-            }) if maximum == xml.len() * parser_passes
-                && actual == xml.len() * (parser_passes + 1)
+            }) if maximum == adapter_work
+                && actual == adapter_work + xml.len()
         ));
     }
 
@@ -2760,6 +2833,37 @@ mod tests {
                 resource: crate::policy::resource_name::XML_DEPTH,
                 maximum: 2,
                 actual: 3,
+            })
+        ));
+    }
+
+    #[test]
+    fn binary_to_node_set_adapter_enforces_operation_namespace_limit() {
+        // Transform-produced XML is reparsed under the same compiled namespace-binding policy as
+        // the operation's initial document; the hard parser ceiling must not replace that limit.
+        let signature_document = Document::parse("<Signature/>").unwrap();
+        let resources = crate::policy::ResourcePolicy {
+            max_xml_namespace_bindings: 1,
+            ..crate::policy::ResourcePolicy::default()
+        };
+        let budget = TransformExecutionBudget::from_resources(&resources);
+        let transforms = [Transform::XPath(XPathExpression::new("true()"))];
+
+        let error = execute_transforms_with_options_and_budget(
+            signature_document.root_element(),
+            TransformData::Binary(b"<root xmlns:a=\"urn:a\" xmlns:b=\"urn:b\"/>".to_vec()),
+            &transforms,
+            TransformOptions::default(),
+            &budget,
+        )
+        .expect_err("detached XML must inherit the operation namespace-binding limit");
+
+        assert!(matches!(
+            error,
+            TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_NAMESPACE_BINDINGS,
+                maximum: 1,
+                actual: 2,
             })
         ));
     }

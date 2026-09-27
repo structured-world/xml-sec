@@ -285,21 +285,21 @@ impl<'a> DecryptContext<'a> {
         budgets: DecryptionOperationBudgets,
         mut accept: impl FnMut(DecryptedContent, &XmlParseWorkBudget) -> Result<T, XmlEncError>,
     ) -> Result<ProcessedDecryption<T>, XmlEncError> {
-        self.policy.resources.validate()?;
-        validate_encrypted_data_metadata(encrypted, &self.policy)?;
         let mut operation =
             OperationExecutionContext::new(self.policy.clone(), budgets, document_binding);
+        operation.policy().resources.validate()?;
+        validate_encrypted_data_metadata(encrypted, operation.policy())?;
         let plan_nodes = compile_decryption_plan(&mut operation, mutates_document)?;
         let (algorithm, ciphertext) = operation.run(plan_nodes.document, || {
             encrypted.encryption_method.validate_structure()?;
             validate_recipient_count(
                 encrypted.encrypted_keys.len(),
-                self.policy.resources.max_encryption_recipients,
+                operation.policy().resources.max_encryption_recipients,
             )?;
             let algorithm =
                 DataEncryptionAlgorithm::from_uri(&encrypted.encryption_method.algorithm)?;
-            if self
-                .policy
+            if operation
+                .policy()
                 .data_algorithms
                 .as_ref()
                 .is_some_and(|allowed| !allowed.contains(&algorithm))
@@ -315,8 +315,8 @@ impl<'a> DecryptContext<'a> {
             validate_typed_cipher_values(
                 encrypted,
                 algorithm,
-                self.policy.resources.max_encryption_plaintext_bytes,
-                self.policy.resources.max_xml_document_bytes,
+                operation.policy().resources.max_encryption_plaintext_bytes,
+                operation.policy().resources.max_xml_document_bytes,
             )?;
             let ciphertext = STANDARD
                 .decode(&encrypted.cipher_data.value)
@@ -325,12 +325,12 @@ impl<'a> DecryptContext<'a> {
                 algorithm,
                 ciphertext.len(),
                 &encrypted.encrypted_keys,
-                &self.policy,
+                operation.policy(),
             )?;
             validate_possible_plaintext_len(
                 algorithm,
                 ciphertext.len(),
-                self.policy.resources.max_encryption_plaintext_bytes,
+                operation.policy().resources.max_encryption_plaintext_bytes,
             )?;
             Ok::<_, XmlEncError>((algorithm, ciphertext))
         })?;
@@ -340,7 +340,7 @@ impl<'a> DecryptContext<'a> {
                 algorithm,
                 encrypted,
                 self.resolver,
-                &self.policy,
+                operation.policy(),
                 &mut operation.budgets().key_candidates.borrow_mut(),
             )
         })?;
@@ -360,7 +360,7 @@ impl<'a> DecryptContext<'a> {
                     validate_provider_plaintext_len(algorithm, ciphertext.len(), plaintext.len())?;
                     validate_plaintext_len(
                         plaintext.len(),
-                        self.policy.resources.max_encryption_plaintext_bytes,
+                        operation.policy().resources.max_encryption_plaintext_bytes,
                     )?;
                     let content = match encrypted.encrypted_type.as_ref() {
                         Some(EncryptedDataType::Element | EncryptedDataType::Content) => {

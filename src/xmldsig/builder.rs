@@ -3,8 +3,7 @@
 use std::{collections::HashSet, io::Write};
 
 use base64::Engine;
-use quick_xml::Writer;
-use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
+use xml_sec_xml_input::lexical::Writer;
 
 use crate::c14n::{C14nAlgorithm, C14nMode, canonicalize_bounded_with_xml_base_budget};
 use crate::policy::{PolicyViolation, SigningPolicy};
@@ -242,13 +241,12 @@ impl SignatureBuilder {
         let prefix = self.ns_prefix.as_deref();
         let mut writer = Writer::new(Vec::new());
         let signature_name = qualified_name(prefix, "Signature");
-        let mut signature = BytesStart::new(&signature_name);
         let namespace_attr = prefix.map_or_else(|| "xmlns".to_owned(), |p| format!("xmlns:{p}"));
-        signature.push_attribute((namespace_attr.as_str(), XMLDSIG_NS));
+        let mut attributes = vec![(namespace_attr.as_str(), XMLDSIG_NS)];
         if let Some(id) = &self.signature_id {
-            signature.push_attribute(("Id", id.as_str()));
+            attributes.push(("Id", id.as_str()));
         }
-        writer.write_event(Event::Start(signature))?;
+        writer.start(&signature_name, attributes)?;
 
         write_start(&mut writer, prefix, "SignedInfo")?;
         write_algorithm(
@@ -271,7 +269,7 @@ impl SignatureBuilder {
         if self.include_key_info {
             write_empty(&mut writer, prefix, "KeyInfo")?;
         }
-        writer.write_event(Event::End(BytesEnd::new(signature_name)))?;
+        writer.end(&signature_name)?;
 
         let template = String::from_utf8(writer.into_inner())?;
         // Field-level checks bound each input class; these checks cover the
@@ -578,15 +576,15 @@ fn write_reference<W: Write>(
     reference: &ReferenceBuilder,
 ) -> Result<(), std::io::Error> {
     let name = qualified_name(prefix, "Reference");
-    let mut element = BytesStart::new(&name);
+    let mut attributes = Vec::new();
     if let Some(id) = &reference.id {
-        element.push_attribute(("Id", id.as_str()));
+        attributes.push(("Id", id.as_str()));
     }
     if let Some(ref_type) = &reference.ref_type {
-        element.push_attribute(("Type", ref_type.as_str()));
+        attributes.push(("Type", ref_type.as_str()));
     }
-    element.push_attribute(("URI", reference.uri.as_str()));
-    writer.write_event(Event::Start(element))?;
+    attributes.push(("URI", reference.uri.as_str()));
+    writer.start(&name, attributes)?;
 
     let generated_transforms = reference_transforms_for_generation(reference);
     if !generated_transforms.is_empty() {
@@ -603,7 +601,7 @@ fn write_reference<W: Write>(
         reference.digest_method.uri(),
     )?;
     write_empty(writer, prefix, "DigestValue")?;
-    writer.write_event(Event::End(BytesEnd::new(name)))?;
+    writer.end(&name)?;
     Ok(())
 }
 
@@ -630,33 +628,28 @@ fn write_transform<W: Write>(
         }
         Transform::XpathExcludeAllSignatures => {
             let name = qualified_name(prefix, "Transform");
-            let mut element = BytesStart::new(&name);
-            element.push_attribute(("Algorithm", XPATH_TRANSFORM_URI));
-            writer.write_event(Event::Start(element))?;
+            writer.start(&name, [("Algorithm", XPATH_TRANSFORM_URI)])?;
             let xpath_name = qualified_name(prefix, "XPath");
-            let mut xpath = BytesStart::new(&xpath_name);
             let namespace = format!("xmlns:{ENVELOPED_SIGNATURE_XPATH_PREFIX}");
-            xpath.push_attribute((namespace.as_str(), XMLDSIG_NS));
-            writer.write_event(Event::Start(xpath))?;
-            writer.write_event(Event::Text(BytesText::new(ENVELOPED_SIGNATURE_XPATH_EXPR)))?;
-            writer.write_event(Event::End(BytesEnd::new(xpath_name)))?;
-            writer.write_event(Event::End(BytesEnd::new(name)))?;
+            writer.start(&xpath_name, [(namespace.as_str(), XMLDSIG_NS)])?;
+            writer.text(ENVELOPED_SIGNATURE_XPATH_EXPR)?;
+            writer.end(&xpath_name)?;
+            writer.end(&name)?;
             Ok(())
         }
         Transform::XPath(xpath) => {
             let transform_name = qualified_name(prefix, "Transform");
-            let mut transform_element = BytesStart::new(&transform_name);
-            transform_element.push_attribute(("Algorithm", XPATH_TRANSFORM_URI));
-            writer.write_event(Event::Start(transform_element))?;
+            writer.start(&transform_name, [("Algorithm", XPATH_TRANSFORM_URI)])?;
             write_xpath_expression(writer, prefix, "XPath", None, xpath)?;
-            writer.write_event(Event::End(BytesEnd::new(transform_name)))?;
+            writer.end(&transform_name)?;
             Ok(())
         }
         Transform::XPathFilter2(filters) => {
             let transform_name = qualified_name(prefix, "Transform");
-            let mut transform_element = BytesStart::new(&transform_name);
-            transform_element.push_attribute(("Algorithm", XPATH_FILTER2_TRANSFORM_URI));
-            writer.write_event(Event::Start(transform_element))?;
+            writer.start(
+                &transform_name,
+                [("Algorithm", XPATH_FILTER2_TRANSFORM_URI)],
+            )?;
             for filter in filters {
                 write_xpath_expression(
                     writer,
@@ -666,7 +659,7 @@ fn write_transform<W: Write>(
                     filter.xpath(),
                 )?;
             }
-            writer.write_event(Event::End(BytesEnd::new(transform_name)))?;
+            writer.end(&transform_name)?;
             Ok(())
         }
         Transform::Base64Decode => {
@@ -677,9 +670,7 @@ fn write_transform<W: Write>(
         }
         Transform::C14n(algorithm) => {
             let name = qualified_name(prefix, "Transform");
-            let mut element = BytesStart::new(&name);
-            element.push_attribute(("Algorithm", algorithm.uri()));
-            writer.write_event(Event::Start(element))?;
+            writer.start(&name, [("Algorithm", algorithm.uri())])?;
 
             if algorithm.mode() == C14nMode::Exclusive1_0 {
                 let mut prefixes: Vec<&str> = algorithm
@@ -693,12 +684,15 @@ fn write_transform<W: Write>(
                     .map(|p| if p.is_empty() { "#default" } else { p })
                     .collect::<Vec<_>>()
                     .join(" ");
-                let mut inclusive = BytesStart::new("ec:InclusiveNamespaces");
-                inclusive.push_attribute(("xmlns:ec", EXCLUSIVE_C14N_NS));
-                inclusive.push_attribute(("PrefixList", prefix_list.as_str()));
-                writer.write_event(Event::Empty(inclusive))?;
+                writer.empty(
+                    "ec:InclusiveNamespaces",
+                    [
+                        ("xmlns:ec", EXCLUSIVE_C14N_NS),
+                        ("PrefixList", prefix_list.as_str()),
+                    ],
+                )?;
             }
-            writer.write_event(Event::End(BytesEnd::new(name)))?;
+            writer.end(&name)?;
             Ok(())
         }
     }
@@ -712,25 +706,25 @@ fn write_xpath_expression<W: Write>(
     xpath: &XPathExpression,
 ) -> Result<(), std::io::Error> {
     let name = qualified_name(prefix, local_name);
-    let mut element = BytesStart::new(&name);
     let namespace_attributes = xpath
         .namespaces()
         .iter()
         .filter(|(namespace_prefix, _)| namespace_prefix.as_str() != "xml")
         .map(|(namespace_prefix, uri)| (format!("xmlns:{namespace_prefix}"), uri))
         .collect::<Vec<_>>();
+    let mut attributes = Vec::new();
     if prefix.is_none() && filter.is_some() {
-        element.push_attribute(("xmlns", XPATH_FILTER2_TRANSFORM_URI));
+        attributes.push(("xmlns", XPATH_FILTER2_TRANSFORM_URI));
     }
     if let Some(filter) = filter {
-        element.push_attribute(("Filter", filter));
+        attributes.push(("Filter", filter));
     }
     for (attribute, uri) in &namespace_attributes {
-        element.push_attribute((attribute.as_str(), uri.as_str()));
+        attributes.push((attribute.as_str(), uri.as_str()));
     }
-    writer.write_event(Event::Start(element))?;
-    writer.write_event(Event::Text(BytesText::new(xpath.expression())))?;
-    writer.write_event(Event::End(BytesEnd::new(name)))?;
+    writer.start(&name, attributes)?;
+    writer.text(xpath.expression())?;
+    writer.end(&name)?;
     Ok(())
 }
 
@@ -741,9 +735,7 @@ fn write_algorithm<W: Write>(
     algorithm: &str,
 ) -> Result<(), std::io::Error> {
     let name = qualified_name(prefix, local_name);
-    let mut element = BytesStart::new(name);
-    element.push_attribute(("Algorithm", algorithm));
-    writer.write_event(Event::Empty(element))?;
+    writer.empty(&name, [("Algorithm", algorithm)])?;
     Ok(())
 }
 
@@ -752,9 +744,7 @@ fn write_start<W: Write>(
     prefix: Option<&str>,
     local_name: &str,
 ) -> Result<(), std::io::Error> {
-    writer.write_event(Event::Start(BytesStart::new(qualified_name(
-        prefix, local_name,
-    ))))?;
+    writer.start(&qualified_name(prefix, local_name), [])?;
     Ok(())
 }
 
@@ -763,9 +753,7 @@ fn write_end<W: Write>(
     prefix: Option<&str>,
     local_name: &str,
 ) -> Result<(), std::io::Error> {
-    writer.write_event(Event::End(BytesEnd::new(qualified_name(
-        prefix, local_name,
-    ))))?;
+    writer.end(&qualified_name(prefix, local_name))?;
     Ok(())
 }
 
@@ -774,9 +762,7 @@ fn write_empty<W: Write>(
     prefix: Option<&str>,
     local_name: &str,
 ) -> Result<(), std::io::Error> {
-    writer.write_event(Event::Empty(BytesStart::new(qualified_name(
-        prefix, local_name,
-    ))))?;
+    writer.empty(&qualified_name(prefix, local_name), [])?;
     Ok(())
 }
 
