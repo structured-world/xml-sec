@@ -2574,8 +2574,9 @@ impl<'a> Execution<'a> {
                     })
                     .transpose()?
                     .flatten();
-                // XSLT 1.0 sections 7.7 and 7.7.1 define `grouping-size` as a numeric AVT;
-                // libxslt converts its positive Number to an integral width by truncation.
+                // XSLT 1.0 sections 7.7 and 7.7.1 type `grouping-size` as a numeric AVT but
+                // prescribe no error for a fractional or non-positive value. libxslt converts
+                // positive fractions to an integral width and leaves invalid widths ungrouped.
                 // https://www.w3.org/TR/1999/REC-xslt-19991116#number
                 let grouping_size_value = number
                     .grouping_size

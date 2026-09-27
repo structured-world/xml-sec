@@ -1433,7 +1433,9 @@ fn serialize_node_tasks<'document>(
 }
 
 fn is_html_output_namespace(namespace: Option<&str>) -> bool {
-    matches!(namespace, None | Some("http://www.w3.org/TR/REC-html40"))
+    // XSLT 1.0 section 16.2 reserves HTML output behavior for null-namespace elements.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
+    namespace.is_none()
 }
 
 fn push_cdata(value: &str, version: &str, encoding: &OutputEncoding, output: &mut RenderBuffer) {
@@ -1649,6 +1651,8 @@ enum HtmlUriEscaping {
 }
 
 fn html_uri_escaping(element: &str, attribute: &str) -> Option<HtmlUriEscaping> {
+    // HTML 4.01 section 12.2 defines A/href as a URI but A/name as an anchor identifier.
+    // https://www.w3.org/TR/html401/struct/links.html#h-12.2
     let libxslt_pair = (attribute.eq_ignore_ascii_case("action")
         && element.eq_ignore_ascii_case("form"))
         || (attribute.eq_ignore_ascii_case("cite")
@@ -1657,7 +1661,6 @@ fn html_uri_escaping(element: &str, attribute: &str) -> Option<HtmlUriEscaping> 
             && ascii_eq_any(element, &["a", "area", "link", "base"]))
         || (attribute.eq_ignore_ascii_case("longdesc")
             && ascii_eq_any(element, &["img", "frame", "iframe"]))
-        || (attribute.eq_ignore_ascii_case("name") && element.eq_ignore_ascii_case("a"))
         || (attribute.eq_ignore_ascii_case("src")
             && ascii_eq_any(element, &["img", "input", "frame", "iframe", "script"]))
         || (attribute.eq_ignore_ascii_case("usemap")

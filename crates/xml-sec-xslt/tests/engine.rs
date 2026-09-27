@@ -2329,7 +2329,7 @@ fn serializer_honors_doctype_cdata_html_and_text_contracts() {
     let legacy_html_namespace = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="html" indent="no"/><xsl:template match="/"><head xmlns="http://www.w3.org/TR/REC-html40"/></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(legacy_html_namespace, "<source/>"),
-        r#"<head xmlns="http://www.w3.org/TR/REC-html40"><meta http-equiv="Content-Type" content="text/html; charset=UTF-8"></head>"#
+        r#"<head xmlns="http://www.w3.org/TR/REC-html40"></head>"#
     );
 
     let xhtml = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns="http://www.w3.org/1999/xhtml"><xsl:output method="xml" omit-xml-declaration="yes" indent="no"/><xsl:template match="/"><html><link/></html></xsl:template></xsl:stylesheet>"#;
@@ -9122,12 +9122,13 @@ fn built_in_template_rules_consume_supplied_parameters_in_fragments() {
 
 #[test]
 fn html_uri_escaping_uses_element_attribute_pairs_and_expanded_names() {
-    // URI escaping applies only to the pairs listed by the XSLT HTML output contract.
-    // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
-    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:x="urn:foreign"><xsl:output method="html" indent="no"/><xsl:template match="/"><html><head profile="é path"/><body background="é path"><div href="é"/><foo src="é"/><a href="é path" x:href="é"/><object archive="é" classid="é" codebase="é" data="é"/><applet archive="é" codebase="é"/></body></html></xsl:template></xsl:stylesheet>"#;
+    // XSLT HTML output escapes URI-typed attributes; HTML 4.01 types A/href as URI and
+    // A/name as a plain anchor identifier.
+    // https://www.w3.org/TR/html401/struct/links.html#h-12.2
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:x="urn:foreign"><xsl:output method="html" indent="no"/><xsl:template match="/"><html><head profile="é path"/><body background="é path"><div href="é"/><foo src="é"/><a href="é path" name="café" x:href="é"/><object archive="é" classid="é" codebase="é" data="é"/><applet archive="é" codebase="é"/></body></html></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(stylesheet, "<source/>"),
-        "<html xmlns:x=\"urn:foreign\"><head profile=\"%C3%A9 path\"><meta http-equiv=\"Content-Type\" content=\"text/html; charset=UTF-8\"></head><body background=\"%C3%A9 path\"><div href=\"é\"></div><foo src=\"é\"></foo><a href=\"%C3%A9%20path\" x:href=\"é\"></a><object archive=\"%C3%A9\" classid=\"%C3%A9\" codebase=\"%C3%A9\" data=\"%C3%A9\"></object><applet archive=\"%C3%A9\" codebase=\"%C3%A9\"></applet></body></html>"
+        "<html xmlns:x=\"urn:foreign\"><head profile=\"%C3%A9 path\"><meta http-equiv=\"Content-Type\" content=\"text/html; charset=UTF-8\"></head><body background=\"%C3%A9 path\"><div href=\"é\"></div><foo src=\"é\"></foo><a href=\"%C3%A9%20path\" name=\"café\" x:href=\"é\"></a><object archive=\"%C3%A9\" classid=\"%C3%A9\" codebase=\"%C3%A9\" data=\"%C3%A9\"></object><applet archive=\"%C3%A9\" codebase=\"%C3%A9\"></applet></body></html>"
     );
 }
 

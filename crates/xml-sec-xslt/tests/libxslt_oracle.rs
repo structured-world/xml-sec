@@ -1416,10 +1416,31 @@ fn assert_strict_xslt_output_deviation(case: &Case, actual: &[u8], expected: &[u
             assert!(!actual.contains("http-equiv=\"Content-Type\""));
             true
         }
+        // XSLT 1.0 section 16.2 reserves HTML serialization for null-namespace elements.
+        // libxslt inserts an HTML META into this namespaced HEAD instead.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
+        "general/bug-130.xsl" => {
+            let expected = String::from_utf8_lossy(expected);
+            assert_eq!(actual, expected.replacen("<meta charset=\"UTF-8\">", "", 1));
+            true
+        }
+        // HTML 4.01 section 12.2.1 defines A/name as an anchor identifier, not a URI.
+        // libxslt percent-encodes that attribute in its HTML output.
+        // https://www.w3.org/TR/html401/struct/links.html#h-12.2.1
+        "general/bug-159.xsl" => {
+            let expected = String::from_utf8_lossy(expected);
+            assert_eq!(
+                actual,
+                expected.replacen("name=\"%D1%91\"", "name=\"&#1105;\"", 1)
+            );
+            true
+        }
         // XPath 1.0 section 4.2 requires enough decimal digits to distinguish the IEEE-754 value.
         // libxslt rounds these arithmetic results to a shorter, non-distinguishing representation.
         "general/bug-5-.xsl" => {
-            assert!(numeric_lexical_forms_are_ieee_equivalent(&actual, expected));
+            assert!(numeric_lexical_forms_match_known_libxslt_rounding(
+                &actual, expected
+            ));
             true
         }
         "general/bug-81.xsl" => {
@@ -1434,7 +1455,7 @@ fn assert_strict_xslt_output_deviation(case: &Case, actual: &[u8], expected: &[u
     }
 }
 
-fn numeric_lexical_forms_are_ieee_equivalent(actual: &str, expected: &[u8]) -> bool {
+fn numeric_lexical_forms_match_known_libxslt_rounding(actual: &str, expected: &[u8]) -> bool {
     let Ok(expected) = std::str::from_utf8(expected) else {
         return false;
     };
@@ -1455,16 +1476,13 @@ fn numeric_lexical_forms_are_ieee_equivalent(actual: &str, expected: &[u8]) -> b
         }
         let actual_number = &actual[actual_start..actual_end];
         let expected_number = &expected[expected_start..expected_end];
-        if actual_number != expected_number {
-            let (Ok(actual_number), Ok(expected_number)) =
-                (actual_number.parse::<f64>(), expected_number.parse::<f64>())
-            else {
-                return false;
-            };
-            let scale = actual_number.abs().max(expected_number.abs()).max(1.0);
-            if (actual_number - expected_number).abs() > f64::EPSILON * scale * 16.0 {
-                return false;
-            }
+        if actual_number != expected_number
+            && !matches!(
+                (actual_number, expected_number),
+                ("1664.4799999999998", "1664.48") | ("730.7499999999999", "730.75")
+            )
+        {
+            return false;
         }
         actual_cursor = actual_end;
         expected_cursor = expected_end;
@@ -2551,16 +2569,20 @@ fn stale_gdp_uri_normalization_removes_only_the_known_leading_prefix() {
 
 #[test]
 fn strict_numeric_oracle_comparison_preserves_structure_and_rejects_large_deltas() {
-    assert!(numeric_lexical_forms_are_ieee_equivalent(
+    assert!(numeric_lexical_forms_match_known_libxslt_rounding(
         "<v>1664.4799999999998</v>",
         b"<v>1664.48</v>"
     ));
-    assert!(!numeric_lexical_forms_are_ieee_equivalent(
+    assert!(!numeric_lexical_forms_match_known_libxslt_rounding(
         "<other>1664.4799999999998</other>",
         b"<v>1664.48</v>"
     ));
-    assert!(!numeric_lexical_forms_are_ieee_equivalent(
+    assert!(!numeric_lexical_forms_match_known_libxslt_rounding(
         "<v>1664.49</v>",
+        b"<v>1664.48</v>"
+    ));
+    assert!(!numeric_lexical_forms_match_known_libxslt_rounding(
+        "<v>1664.4800000000002</v>",
         b"<v>1664.48</v>"
     ));
 }
