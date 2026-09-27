@@ -383,6 +383,7 @@ pub struct ResourcePolicy {
     /// Maximum element nesting depth in one parsed document.
     pub max_xml_depth: usize,
     /// Maximum namespace prefixes simultaneously bound while parsing XML.
+    /// Node and depth limits alone do not bound declarations on one element.
     pub max_xml_namespace_bindings: usize,
     /// Maximum references in one signature or manifest.
     pub max_references: usize,

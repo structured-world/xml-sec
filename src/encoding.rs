@@ -2,12 +2,17 @@
 
 use std::borrow::Cow;
 
+/// Shared decoder errors, including unsupported encodings and decoded-size limits.
+/// This replaces the former XML-only error variants rather than collapsing new
+/// failure classes into misleading legacy variants.
 pub use xml_sec_xml_input::Error as XmlEncodingError;
 
 /// Decode XML 1.0 octets into the backend-neutral Unicode parser contract.
 ///
 /// UTF-8 input remains borrowed. Other declared XML encodings are decoded
 /// strictly and their declaration is normalized to UTF-8 before parsing.
+/// Callers must supply a size ceiling; an implicit unbounded compatibility path
+/// would permit untrusted input to allocate without the operation's budget.
 pub fn decode_xml_octets(
     bytes: &[u8],
     maximum_decoded_bytes: usize,

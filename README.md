@@ -140,6 +140,14 @@ metadata. UTF-8 remains borrowed when possible; other supported encodings are st
 under the same materialization ceiling. Conflicting declarations, malformed byte sequences,
 ambiguous BOM-less UTF-16/UTF-32, and unsupported EBCDIC variants fail explicitly.
 
+**API migration for this pre-release change:** `encoding::decode_xml_octets` now requires a
+maximum decoded-byte count as its second argument. `encoding::XmlEncodingError` is now the
+shared, non-exhaustive `xml-sec-xml-input::Error`; update matches to handle the new error
+variants and include a fallback arm. Code constructing `ResourcePolicy` with every field must
+also set `max_xml_namespace_bindings` (or start from `ResourcePolicy::default()` and override
+selected fields). These changes keep decoding and namespace-scope allocation under explicit
+resource limits.
+
 ## Native xmlsec1 CLI
 
 ```sh
