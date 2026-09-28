@@ -486,7 +486,7 @@ impl Default for ResourcePolicy {
             max_xpath_namespace_bytes: crate::hard_limits::XPATH_NAMESPACE_BYTE_CEILING,
             max_xpath_filters: crate::hard_limits::XPATH_FILTER_COUNT_CEILING,
             max_node_set_filter_work: crate::hard_limits::NODE_SET_FILTER_WORK_CEILING,
-            max_node_set_entries: crate::hard_limits::NODE_SET_ENTRY_DEFAULT,
+            max_node_set_entries: 262_144,
             max_node_set_owned_string_bytes: crate::hard_limits::NODE_SET_OWNED_STRING_BYTE_CEILING,
             max_node_set_cumulative_owned_string_bytes:
                 crate::hard_limits::NODE_SET_CUMULATIVE_OWNED_STRING_BYTE_CEILING,
