@@ -5010,7 +5010,7 @@ fn append_avt_expression_value(
     evaluator: &Evaluator,
     meter: &mut Meter,
 ) -> Result<()> {
-    let (value, temporary_bytes) = value.into_temporary_string(evaluator, meter)?;
+    let (value, temporary_bytes) = value.into_fully_metered_temporary_string(evaluator, meter)?;
     let appended = output.push_str(&value, meter);
     meter.release_owned_bytes(temporary_bytes);
     appended
@@ -7499,6 +7499,78 @@ mod tests {
             )]))
             .is_none()
         );
+    }
+
+    #[test]
+    fn avt_string_and_output_share_peak_owned_byte_budget() {
+        // The evaluated string remains live while the AVT output grows.
+        let stylesheet = Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(1 << 20, 4, 16, 1 << 20),
+        )
+        .compile(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"/>"#,
+            None,
+        )
+        .expect("stylesheet compiles");
+        let source = Document::parse("<root/>", None).expect("source parses");
+        let mut setup_meter = meter(usize::MAX);
+        let source_options = super::EvaluatorSourceOptions {
+            process_xinclude: false,
+            whitespace: Arc::from([]),
+            clock: Some(Arc::new(crate::SystemClock)),
+        };
+        let prepared = super::prepare_evaluator_source(
+            &source,
+            &NoResolver,
+            &mut setup_meter,
+            &source_options,
+        )
+        .expect("source prepares");
+        let execution = super::Execution::new(
+            &stylesheet,
+            prepared,
+            &super::Parameters::new(),
+            super::PreparedParameters {
+                effective_globals: std::collections::HashMap::new(),
+                source_remap: super::SourceParameterRemap {
+                    mapping: None,
+                    owned_bytes: 0,
+                },
+            },
+            crate::ExecutionEnvironment::new(Arc::new(NoResolver)),
+            setup_meter,
+            source_options,
+        )
+        .expect("execution initializes");
+        let value = "x".repeat(4096);
+        let mut output = super::MeteredString::new();
+        let mut constrained = meter(value.capacity());
+
+        assert!(matches!(
+            super::append_avt_expression_value(
+                &mut output,
+                super::XPathValue::String(value),
+                &execution.evaluator,
+                &mut constrained,
+            ),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            })
+        ));
+        assert!(output.is_empty());
+
+        let value = "x".repeat(4096);
+        let mut sufficient = meter(value.capacity() * 2);
+        super::append_avt_expression_value(
+            &mut output,
+            super::XPathValue::String(value),
+            &execution.evaluator,
+            &mut sufficient,
+        )
+        .expect("budget for both live strings succeeds");
+        assert_eq!(output.len(), 4096);
     }
 
     #[test]
