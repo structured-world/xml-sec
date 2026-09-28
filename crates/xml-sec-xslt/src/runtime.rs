@@ -360,6 +360,7 @@ struct Execution<'a> {
     evaluator: Evaluator,
     result: Document,
     output_stack: Vec<NodeId>,
+    output_stack_reserved_owned_bytes: usize,
     scopes: Vec<VariableScope>,
     scopes_reserved_owned_bytes: usize,
     // A global leaves this map before evaluation, so recursive access is detected without
@@ -372,7 +373,8 @@ struct Execution<'a> {
     secondary_outputs: Vec<SecondaryOutput>,
     secondary_output_uris: HashSet<Arc<String>>,
     secondary_output_uri_index_bytes: usize,
-    modes: Vec<Option<ExpandedName>>,
+    modes: Vec<MeteredMode>,
+    modes_reserved_owned_bytes: usize,
     exslt_calls: ExsltCallStack,
     function_depth: usize,
     native_sequence_depth: usize,
@@ -682,9 +684,15 @@ impl EvaluatedParameters {
 struct ResultTreeState {
     document: Document,
     output_stack: Vec<NodeId>,
+    output_stack_reserved_owned_bytes: usize,
     attribute_insert_position: Option<usize>,
     attribute_protected_names: Option<ProtectedAttributeNames>,
     was_temporary: bool,
+}
+
+struct MeteredMode {
+    name: Option<ExpandedName>,
+    reserved_owned_bytes: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -711,6 +719,7 @@ enum TemplateTask {
     ApplyOne {
         node: SourceNode,
         mode: Option<ExpandedName>,
+        mode_reserved_owned_bytes: usize,
         params: Arc<EvaluatedParameters>,
         frame: ApplyFrame,
     },
@@ -857,11 +866,27 @@ impl<'a> Execution<'a> {
         let mut scopes_reserved_owned_bytes = 0;
         reserve_temporary_vec_slot(&mut scopes, &mut meter, &mut scopes_reserved_owned_bytes)?;
         scopes.push(VariableScope::default());
+        let mut modes = Vec::new();
+        let mut modes_reserved_owned_bytes = 0;
+        reserve_temporary_vec_slot(&mut modes, &mut meter, &mut modes_reserved_owned_bytes)?;
+        modes.push(MeteredMode {
+            name: None,
+            reserved_owned_bytes: 0,
+        });
+        let mut output_stack = Vec::new();
+        let mut output_stack_reserved_owned_bytes = 0;
+        reserve_temporary_vec_slot(
+            &mut output_stack,
+            &mut meter,
+            &mut output_stack_reserved_owned_bytes,
+        )?;
+        output_stack.push(result_root);
         let mut state = Self {
             stylesheet,
             evaluator,
             result,
-            output_stack: vec![result_root],
+            output_stack,
+            output_stack_reserved_owned_bytes,
             scopes,
             scopes_reserved_owned_bytes,
             pending_globals: HashMap::new(),
@@ -872,7 +897,8 @@ impl<'a> Execution<'a> {
             secondary_outputs: vec![],
             secondary_output_uris: HashSet::new(),
             secondary_output_uri_index_bytes: 0,
-            modes: vec![None],
+            modes,
+            modes_reserved_owned_bytes,
             exslt_calls: ExsltCallStack::default(),
             function_depth: 0,
             native_sequence_depth: 0,
@@ -1281,6 +1307,12 @@ impl<'a> Execution<'a> {
         }
     }
 
+    fn pop_mode(&mut self) {
+        if let Some(mode) = self.modes.pop() {
+            self.meter.release_owned_bytes(mode.reserved_owned_bytes);
+        }
+    }
+
     fn apply_one(
         &mut self,
         node: SourceNode,
@@ -1288,9 +1320,13 @@ impl<'a> Execution<'a> {
         params: Arc<EvaluatedParameters>,
         frame: ApplyFrame,
     ) -> Result<()> {
+        let mode_reserved_owned_bytes = mode.map_or(0, expanded_name_owned_bytes);
+        self.meter
+            .charge(BudgetKind::OwnedBytes, mode_reserved_owned_bytes)?;
         self.run_template_tasks(TemplateTask::ApplyOne {
             node,
             mode: mode.cloned(),
+            mode_reserved_owned_bytes,
             params,
             frame,
         })
@@ -1318,9 +1354,23 @@ impl<'a> Execution<'a> {
         let mode_depth = self.modes.len();
         let output_depth = self.output_stack.len();
         let mut tasks = TemplateTaskStack::default();
-        let result = tasks
-            .push(initial, &mut self.meter)
-            .and_then(|()| self.run_template_task_stack(&mut tasks));
+        let result = if let Err(error) = reserve_temporary_vec_slot(
+            &mut tasks.items,
+            &mut self.meter,
+            &mut tasks.reserved_owned_bytes,
+        ) {
+            if let TemplateTask::ApplyOne {
+                mode_reserved_owned_bytes,
+                ..
+            } = initial
+            {
+                self.meter.release_owned_bytes(mode_reserved_owned_bytes);
+            }
+            Err(error)
+        } else {
+            tasks.items.push(initial);
+            self.run_template_task_stack(&mut tasks)
+        };
         if result.is_err() {
             // Pending instructions must not run during unwinding. Restore only
             // frames that were actually entered; a queued PushScope may never
@@ -1344,13 +1394,19 @@ impl<'a> Execution<'a> {
                     } => {
                         self.meter.release_owned_bytes(reserved_owned_bytes);
                     }
+                    TemplateTask::ApplyOne {
+                        mode_reserved_owned_bytes,
+                        ..
+                    } => self.meter.release_owned_bytes(mode_reserved_owned_bytes),
                     _ => {}
                 }
             }
             while self.scopes.len() > scope_depth {
                 self.pop_scope();
             }
-            self.modes.truncate(mode_depth);
+            while self.modes.len() > mode_depth {
+                self.pop_mode();
+            }
             self.output_stack.truncate(output_depth);
         }
         tasks.release(&mut self.meter);
@@ -1377,9 +1433,17 @@ impl<'a> Execution<'a> {
                 TemplateTask::ApplyOne {
                     node,
                     mode,
+                    mode_reserved_owned_bytes,
                     params,
                     frame,
-                } => self.push_apply_one_tasks(tasks, node, mode, params, frame)?,
+                } => self.push_apply_one_tasks(
+                    tasks,
+                    node,
+                    mode,
+                    mode_reserved_owned_bytes,
+                    params,
+                    frame,
+                )?,
                 TemplateTask::ApplyBatch {
                     nodes,
                     next,
@@ -1395,7 +1459,7 @@ impl<'a> Execution<'a> {
                     };
                     let total = nodes.len();
                     let selected_mode = mode.clone();
-                    tasks.push(
+                    if let Err(error) = tasks.push(
                         TemplateTask::ApplyBatch {
                             nodes,
                             next: next + 1,
@@ -1405,11 +1469,16 @@ impl<'a> Execution<'a> {
                             reserved_owned_bytes,
                         },
                         &mut self.meter,
-                    )?;
+                    ) {
+                        self.meter.release_owned_bytes(reserved_owned_bytes);
+                        self.release_parameters_if_last(&params);
+                        return Err(error);
+                    }
                     tasks.push(
                         TemplateTask::ApplyOne {
                             node: selected,
                             mode: selected_mode,
+                            mode_reserved_owned_bytes: 0,
                             params,
                             frame: ApplyFrame::new(next + 1, total, depth),
                         },
@@ -1451,7 +1520,7 @@ impl<'a> Execution<'a> {
                     self.restore_caller_scopes(caller_scopes);
                 }
                 TemplateTask::RestoreMode => {
-                    self.modes.pop();
+                    self.pop_mode();
                 }
                 TemplateTask::PopOutput => {
                     self.output_stack.pop();
@@ -1537,11 +1606,22 @@ impl<'a> Execution<'a> {
                                     return Err(error);
                                 }
                             };
+                            let mode_reservation =
+                                mode.as_ref().map_or(0, expanded_name_owned_bytes);
+                            if let Err(error) =
+                                self.meter.charge(BudgetKind::OwnedBytes, mode_reservation)
+                            {
+                                self.meter.release_owned_bytes(node_reservation);
+                                return Err(error);
+                            }
                             self.push_apply_batch(
                                 tasks,
                                 nodes,
                                 node_reservation,
-                                mode.clone(),
+                                MeteredMode {
+                                    name: mode.clone(),
+                                    reserved_owned_bytes: mode_reservation,
+                                },
                                 supplied,
                                 depth + 1,
                             )?;
@@ -1552,10 +1632,16 @@ impl<'a> Execution<'a> {
                                     "xsl:apply-imports requires a current template rule".into(),
                                 )
                             })?;
-                            tasks.push(
+                            let mode = self.modes.last().and_then(|mode| mode.name.as_ref());
+                            let mode_reserved_owned_bytes =
+                                mode.map_or(0, expanded_name_owned_bytes);
+                            self.meter
+                                .charge(BudgetKind::OwnedBytes, mode_reserved_owned_bytes)?;
+                            if let Err(error) = tasks.push(
                                 TemplateTask::ApplyOne {
                                     node,
-                                    mode: self.modes.last().cloned().flatten(),
+                                    mode: mode.cloned(),
+                                    mode_reserved_owned_bytes,
                                     params: Arc::new(EvaluatedParameters::default()),
                                     frame: ApplyFrame {
                                         max_precedence: Some(current_rule_precedence),
@@ -1565,7 +1651,10 @@ impl<'a> Execution<'a> {
                                     },
                                 },
                                 &mut self.meter,
-                            )?;
+                            ) {
+                                self.meter.release_owned_bytes(mode_reserved_owned_bytes);
+                                return Err(error);
+                            }
                         }
                         Instruction::LiteralElement {
                             base_uri,
@@ -1601,7 +1690,7 @@ impl<'a> Execution<'a> {
                                 },
                                 base_uri.clone(),
                             )?;
-                            self.output_stack.push(id);
+                            self.push_output_node(id)?;
                             self.apply_attribute_sets(
                                 attribute_sets,
                                 &node,
@@ -1673,7 +1762,7 @@ impl<'a> Execution<'a> {
                                             namespaces,
                                             base_uri.as_deref(),
                                         )?;
-                                        self.output_stack.push(target);
+                                        self.push_output_node(target)?;
                                         self.apply_attribute_sets(
                                             attribute_sets,
                                             &node,
@@ -1811,6 +1900,29 @@ impl<'a> Execution<'a> {
         tasks: &mut TemplateTaskStack,
         node: SourceNode,
         mode: Option<ExpandedName>,
+        mode_reserved_owned_bytes: usize,
+        params: Arc<EvaluatedParameters>,
+        frame: ApplyFrame,
+    ) -> Result<()> {
+        let mut mode_reserved_owned_bytes = mode_reserved_owned_bytes;
+        let result = self.push_apply_one_tasks_inner(
+            tasks,
+            node,
+            mode,
+            &mut mode_reserved_owned_bytes,
+            params,
+            frame,
+        );
+        self.meter.release_owned_bytes(mode_reserved_owned_bytes);
+        result
+    }
+
+    fn push_apply_one_tasks_inner(
+        &mut self,
+        tasks: &mut TemplateTaskStack,
+        node: SourceNode,
+        mode: Option<ExpandedName>,
+        mode_reserved_owned_bytes: &mut usize,
         params: Arc<EvaluatedParameters>,
         frame: ApplyFrame,
     ) -> Result<()> {
@@ -1844,7 +1956,16 @@ impl<'a> Execution<'a> {
             }
         }
         if let Some(template) = selected {
-            self.modes.push(mode);
+            reserve_temporary_vec_slot(
+                &mut self.modes,
+                &mut self.meter,
+                &mut self.modes_reserved_owned_bytes,
+            )?;
+            self.modes.push(MeteredMode {
+                name: mode,
+                reserved_owned_bytes: *mode_reserved_owned_bytes,
+            });
+            *mode_reserved_owned_bytes = 0;
             tasks.push(TemplateTask::RestoreMode, &mut self.meter)?;
             let current_rule_precedence = Some(template.precedence);
             tasks.push(
@@ -1872,11 +1993,15 @@ impl<'a> Execution<'a> {
                         self.meter
                             .charge(BudgetKind::OwnedBytes, child_reservation)?;
                         let built_in_params = Arc::new(EvaluatedParameters::default());
+                        let reservation = std::mem::take(mode_reserved_owned_bytes);
                         self.push_apply_batch(
                             tasks,
                             children,
                             child_reservation,
-                            mode,
+                            MeteredMode {
+                                name: mode,
+                                reserved_owned_bytes: reservation,
+                            },
                             built_in_params,
                             frame.depth + 1,
                         )
@@ -1895,12 +2020,13 @@ impl<'a> Execution<'a> {
         tasks: &mut TemplateTaskStack,
         nodes: Vec<SourceNode>,
         node_reservation: usize,
-        mode: Option<ExpandedName>,
+        mode: MeteredMode,
         params: Arc<EvaluatedParameters>,
         depth: usize,
     ) -> Result<()> {
         if nodes.is_empty() {
             self.meter.release_owned_bytes(node_reservation);
+            self.meter.release_owned_bytes(mode.reserved_owned_bytes);
             self.release_parameters_if_last(&params);
             return Ok(());
         }
@@ -1912,11 +2038,17 @@ impl<'a> Execution<'a> {
         );
         // The batch retains one mode while one serial application can hold a second clone.
         let mode_bytes = mode
+            .name
             .as_ref()
             .map_or(0, expanded_name_owned_bytes)
             .saturating_mul(2);
-        if let Err(error) = self.meter.charge(BudgetKind::OwnedBytes, mode_bytes) {
+        let additional_mode_reservation = mode_bytes.saturating_sub(mode.reserved_owned_bytes);
+        if let Err(error) = self
+            .meter
+            .charge(BudgetKind::OwnedBytes, additional_mode_reservation)
+        {
             self.meter.release_owned_bytes(node_reservation);
+            self.meter.release_owned_bytes(mode.reserved_owned_bytes);
             return Err(error);
         }
         let reserved_owned_bytes = node_reservation.saturating_add(mode_bytes);
@@ -1924,7 +2056,7 @@ impl<'a> Execution<'a> {
             TemplateTask::ApplyBatch {
                 nodes,
                 next: 0,
-                mode,
+                mode: mode.name,
                 params,
                 depth,
                 reserved_owned_bytes,
@@ -2110,7 +2242,7 @@ impl<'a> Execution<'a> {
         self.meter
             .release_owned_bytes(namespace_reservation.saturating_add(namespace_clone_reservation));
         let id = pushed?;
-        self.output_stack.push(id);
+        self.push_output_node(id)?;
         self.apply_attribute_sets(attribute_sets, node, frame, precedence)
     }
 
@@ -2202,7 +2334,7 @@ impl<'a> Execution<'a> {
                     },
                     base_uri.clone(),
                 )?;
-                self.output_stack.push(id);
+                self.push_output_node(id)?;
                 self.apply_attribute_sets(
                     attribute_sets,
                     node,
@@ -2271,18 +2403,22 @@ impl<'a> Execution<'a> {
                 let current_rule_precedence = current_precedence.ok_or_else(|| {
                     Error::Dynamic("xsl:apply-imports requires a current template rule".into())
                 })?;
-                let mode = self.modes.last().cloned().flatten();
-                self.apply_one(
-                    node.clone(),
-                    mode.as_ref(),
-                    Arc::new(EvaluatedParameters::default()),
-                    ApplyFrame {
+                let mode = self.modes.last().and_then(|mode| mode.name.as_ref());
+                let mode_reserved_owned_bytes = mode.map_or(0, expanded_name_owned_bytes);
+                self.meter
+                    .charge(BudgetKind::OwnedBytes, mode_reserved_owned_bytes)?;
+                self.run_template_tasks(TemplateTask::ApplyOne {
+                    node: node.clone(),
+                    mode: mode.cloned(),
+                    mode_reserved_owned_bytes,
+                    params: Arc::new(EvaluatedParameters::default()),
+                    frame: ApplyFrame {
                         max_precedence: Some(current_rule_precedence),
                         position,
                         size,
                         depth: depth + 1,
                     },
-                )
+                })
             }
             Instruction::CallTemplate { name, parameters } => {
                 let supplied = Arc::new(self.evaluate_with_params(
@@ -2421,7 +2557,7 @@ impl<'a> Execution<'a> {
                                         namespaces,
                                         base_uri.as_deref(),
                                     )?;
-                                    self.output_stack.push(target);
+                                    self.push_output_node(target)?;
                                     self.apply_attribute_sets(
                                         attribute_sets,
                                         node,
@@ -3978,9 +4114,25 @@ impl<'a> Execution<'a> {
     ) -> Result<ResultTreeState> {
         let temporary = self.empty_metered_result(base_uri)?;
         let temporary_root = temporary.root();
+        let mut output_stack = Vec::new();
+        let mut output_stack_reserved_owned_bytes = 0;
+        if let Err(error) = reserve_temporary_vec_slot(
+            &mut output_stack,
+            &mut self.meter,
+            &mut output_stack_reserved_owned_bytes,
+        ) {
+            self.meter
+                .release_owned_bytes(metered_document_owned_bytes(&temporary));
+            return Err(error);
+        }
+        output_stack.push(temporary_root);
         Ok(ResultTreeState {
             document: std::mem::replace(&mut self.result, temporary),
-            output_stack: std::mem::replace(&mut self.output_stack, vec![temporary_root]),
+            output_stack: std::mem::replace(&mut self.output_stack, output_stack),
+            output_stack_reserved_owned_bytes: std::mem::replace(
+                &mut self.output_stack_reserved_owned_bytes,
+                output_stack_reserved_owned_bytes,
+            ),
             attribute_insert_position: self.attribute_insert_position.take(),
             attribute_protected_names: self.attribute_protected_names.take(),
             was_temporary: std::mem::replace(&mut self.result_is_temporary, is_temporary),
@@ -3989,11 +4141,24 @@ impl<'a> Execution<'a> {
 
     fn restore_result_tree(&mut self, previous: ResultTreeState) -> Document {
         let captured = std::mem::replace(&mut self.result, previous.document);
+        self.meter
+            .release_owned_bytes(self.output_stack_reserved_owned_bytes);
         self.output_stack = previous.output_stack;
+        self.output_stack_reserved_owned_bytes = previous.output_stack_reserved_owned_bytes;
         self.attribute_insert_position = previous.attribute_insert_position;
         self.attribute_protected_names = previous.attribute_protected_names;
         self.result_is_temporary = previous.was_temporary;
         captured
+    }
+
+    fn push_output_node(&mut self, node: NodeId) -> Result<()> {
+        reserve_temporary_vec_slot(
+            &mut self.output_stack,
+            &mut self.meter,
+            &mut self.output_stack_reserved_owned_bytes,
+        )?;
+        self.output_stack.push(node);
+        Ok(())
     }
     fn copy_document(
         &mut self,
@@ -7571,6 +7736,156 @@ mod tests {
         )
         .expect("budget for both live strings succeeds");
         assert_eq!(output.len(), 4096);
+    }
+
+    #[test]
+    fn apply_one_mode_clone_consumes_owned_byte_budget() {
+        // A long mode survives in the task while its template is selected.
+        let stylesheet = Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(1 << 20, 4, 16, 1 << 20),
+        )
+        .compile(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"/>"#,
+            None,
+        )
+        .expect("stylesheet compiles");
+        let source = Document::parse("<root/>", None).expect("source parses");
+        let mut setup_meter = meter(usize::MAX);
+        let source_options = super::EvaluatorSourceOptions {
+            process_xinclude: false,
+            whitespace: Arc::from([]),
+            clock: Some(Arc::new(crate::SystemClock)),
+        };
+        let prepared = super::prepare_evaluator_source(
+            &source,
+            &NoResolver,
+            &mut setup_meter,
+            &source_options,
+        )
+        .expect("source prepares");
+        let mut execution = super::Execution::new(
+            &stylesheet,
+            prepared,
+            &super::Parameters::new(),
+            super::PreparedParameters {
+                effective_globals: std::collections::HashMap::new(),
+                source_remap: super::SourceParameterRemap {
+                    mapping: None,
+                    owned_bytes: 0,
+                },
+            },
+            crate::ExecutionEnvironment::new(Arc::new(NoResolver)),
+            setup_meter,
+            source_options,
+        )
+        .expect("execution initializes");
+        let mode = ExpandedName::new(Some("urn:mode"), "m".repeat(4096));
+        let task_capacity = 4 * std::mem::size_of::<super::TemplateTask>();
+        execution.meter = meter(task_capacity + 128);
+        let owner = execution.evaluator.source.logical_roots()[0];
+
+        assert!(matches!(
+            execution.apply_one(
+                NodeReference::Namespace { owner, index: 0 },
+                Some(&mode),
+                Arc::new(super::EvaluatedParameters::default()),
+                ApplyFrame::new(1, 1, 0),
+            ),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn output_parent_stack_charges_capacity_growth() {
+        let stylesheet = Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(1 << 20, 4, 16, 1 << 20),
+        )
+        .compile(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"/>"#,
+            None,
+        )
+        .expect("stylesheet compiles");
+        let source = Document::parse("<root/>", None).expect("source parses");
+        let source_options = super::EvaluatorSourceOptions {
+            process_xinclude: false,
+            whitespace: Arc::from([]),
+            clock: Some(Arc::new(crate::SystemClock)),
+        };
+        let prepared = super::prepare_evaluator_source(
+            &source,
+            &NoResolver,
+            &mut meter(usize::MAX),
+            &source_options,
+        )
+        .expect("source prepares");
+        let mut execution = super::Execution::new(
+            &stylesheet,
+            prepared,
+            &super::Parameters::new(),
+            super::PreparedParameters {
+                effective_globals: std::collections::HashMap::new(),
+                source_remap: super::SourceParameterRemap {
+                    mapping: None,
+                    owned_bytes: 0,
+                },
+            },
+            crate::ExecutionEnvironment::new(Arc::new(NoResolver)),
+            meter(usize::MAX),
+            source_options,
+        )
+        .expect("execution initializes");
+        let old_capacity = execution.output_stack.capacity();
+        let before = execution
+            .meter
+            .usage(BudgetKind::OwnedBytes)
+            .expect("owned-byte usage is available")
+            .0;
+        let root = execution.result.root();
+        while execution.output_stack.capacity() == old_capacity {
+            execution.push_output_node(root).expect("stack fits");
+        }
+        let new_capacity = execution.output_stack.capacity();
+        let after = execution
+            .meter
+            .usage(BudgetKind::OwnedBytes)
+            .expect("owned-byte usage is available")
+            .0;
+        assert_eq!(
+            after - before,
+            (new_capacity - old_capacity) * std::mem::size_of::<NodeId>()
+        );
+
+        let previous = execution
+            .enter_result_tree(None, true)
+            .expect("temporary tree fits");
+        let temporary_charge = super::metered_document_owned_bytes(&execution.result)
+            + execution.output_stack_reserved_owned_bytes;
+        assert_eq!(
+            execution
+                .meter
+                .usage(BudgetKind::OwnedBytes)
+                .expect("owned-byte usage is available")
+                .0
+                - after,
+            temporary_charge
+        );
+        let temporary = execution.restore_result_tree(previous);
+        execution
+            .meter
+            .release_owned_bytes(super::metered_document_owned_bytes(&temporary));
+        assert_eq!(
+            execution
+                .meter
+                .usage(BudgetKind::OwnedBytes)
+                .expect("owned-byte usage is available")
+                .0,
+            after
+        );
     }
 
     #[test]

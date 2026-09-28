@@ -155,7 +155,7 @@ pub(super) fn append_signature_to_root_with_options(
     let output = if xml[root_range.clone()].trim_end().ends_with("/>") {
         replace_element_content(xml, root_range, signature_template, "", policy)?
     } else {
-        append_element_content(xml, root_range, signature_template, "", policy)?
+        append_element_content(xml, root_range, signature_template, "", &[], policy)?
     };
     parse_mutation_xml_with_options(&output, policy)?;
     Ok(output)
@@ -703,11 +703,20 @@ fn merge_one_key_info_source_at_index_with_options(
                 policy,
             )?
         } else {
+            let retained_bindings = source
+                .namespaces()
+                .any(|binding| {
+                    placeholder.lookup_namespace_uri(binding.name()) != Some(binding.uri())
+                })
+                .then(|| preserve_retained_child_namespaces(xml, placeholder, source))
+                .transpose()?
+                .unwrap_or_default();
             append_element_content(
                 xml,
                 placeholder.range(),
                 source_content,
                 &generated_attributes,
+                &retained_bindings,
                 policy,
             )?
         };
@@ -1048,6 +1057,7 @@ fn append_element_content(
     range: Range<usize>,
     content: &str,
     namespace_attributes: &str,
+    retained_bindings: &[(usize, String)],
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<String, XmlMutationError> {
     let element = &xml[range.clone()];
@@ -1056,25 +1066,99 @@ fn append_element_content(
     let content_end = element
         .rfind("</")
         .ok_or(XmlMutationError::InvalidAppendTarget)?;
+    let added_binding_bytes =
+        retained_bindings
+            .iter()
+            .try_fold(0usize, |total, (_, binding)| {
+                total
+                    .checked_add(binding.len())
+                    .ok_or_else(|| projected_xml_length_overflow(policy))
+            })?;
     let replacement_len = (content_start - 1)
         .checked_add(namespace_attributes.len())
         .and_then(|length| length.checked_add(1))
         .and_then(|length| length.checked_add(content_end - content_start))
+        .and_then(|length| length.checked_add(added_binding_bytes))
         .and_then(|length| length.checked_add(content.len()))
         .and_then(|length| length.checked_add(element.len() - content_end))
         .ok_or_else(|| projected_xml_length_overflow(policy))?;
-    validate_projected_replacement_len(xml, range.len(), replacement_len, policy)?;
-    let replacement = format!(
-        "{}{}>{}{}{}",
-        &element[..content_start - 1],
-        namespace_attributes,
-        &element[content_start..content_end],
-        content,
-        &element[content_end..]
+    let projected_len =
+        validate_projected_replacement_len(xml, range.len(), replacement_len, policy)?;
+    let mut output = String::with_capacity(projected_len);
+    output.push_str(&xml[..range.start]);
+    output.push_str(&element[..content_start - 1]);
+    output.push_str(namespace_attributes);
+    output.push('>');
+    let retained_start = range.start + content_start;
+    let retained_end = range.start + content_end;
+    let mut cursor = retained_start;
+    for (insertion, binding) in retained_bindings {
+        let segment = xml
+            .get(cursor..*insertion)
+            .ok_or(XmlMutationError::InvalidAppendTarget)?;
+        output.push_str(segment);
+        output.push_str(binding);
+        cursor = *insertion;
+    }
+    output.push_str(
+        xml.get(cursor..retained_end)
+            .ok_or(XmlMutationError::InvalidAppendTarget)?,
     );
-    let mut output = xml.to_owned();
-    output.replace_range(range, &replacement);
+    output.push_str(content);
+    output.push_str(&element[content_end..]);
+    output.push_str(&xml[range.end..]);
     Ok(output)
+}
+
+fn preserve_retained_child_namespaces(
+    xml: &str,
+    placeholder: crate::xml::dom::Node<'_, '_>,
+    source: crate::xml::dom::Node<'_, '_>,
+) -> Result<Vec<(usize, String)>, XmlMutationError> {
+    let mut insertions = Vec::new();
+    for child in placeholder.children().filter(|child| child.is_element()) {
+        let child_range = child.range();
+        let child_opening_end = child_range.start
+            + element_opening_end(&xml[child_range.clone()])
+                .ok_or(XmlMutationError::InvalidAppendTarget)?;
+        let insertion = if xml[child_range.start..child_opening_end].ends_with("/>") {
+            child_opening_end - 2
+        } else {
+            child_opening_end - 1
+        };
+        let owned = owned_namespace_declarations(&xml[child_range.start..insertion])?;
+        let mut declarations = String::new();
+        for binding in source.namespaces() {
+            let name = binding.name();
+            if placeholder.lookup_namespace_uri(name) == Some(binding.uri())
+                || owned.contains(name.unwrap_or_default())
+            {
+                continue;
+            }
+            let original = child.lookup_namespace_uri(name);
+            if original == Some(binding.uri()) {
+                continue;
+            }
+            if let Some(prefix) = name {
+                if let Some(uri) = original {
+                    declarations
+                        .push_str(&format!(" xmlns:{prefix}=\"{}\"", escape_attribute(uri)));
+                }
+            } else {
+                declarations.push_str(&format!(
+                    " xmlns=\"{}\"",
+                    escape_attribute(original.unwrap_or_default())
+                ));
+            }
+        }
+        if !declarations.is_empty() {
+            insertions.push((insertion, declarations));
+        }
+    }
+    // Namespaces in XML 1.0 (Third Edition) §§6.1-6.2:
+    // https://www.w3.org/TR/REC-xml-names/#scoping-defaulting
+    // Rebinding X509Data must not change expanded names of retained descendants.
+    Ok(insertions)
 }
 
 fn validate_projected_replacement_len(
@@ -1945,6 +2029,32 @@ mod tests {
                 .find(|node| node.has_tag_name(("urn:example:x509", "Policy")))
                 .and_then(|node| node.text()),
             Some("keep")
+        );
+    }
+
+    #[test]
+    fn key_info_source_merge_preserves_retained_child_namespaces() {
+        // Generated bindings must not re-interpret caller-owned extension metadata.
+        let source = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns="urn:caller" xmlns:ext="urn:caller-ext"><ds:KeyInfo><ds:X509Data><Metadata><ext:Child/></Metadata></ds:X509Data></ds:KeyInfo></ds:Signature>"#;
+        let generated = r#"<X509Data xmlns="http://www.w3.org/2000/09/xmldsig#" xmlns:ext="urn:generated-ext"><X509Certificate>Y2VydA==</X509Certificate></X509Data>"#;
+
+        let merged = merge_key_info_source_at_index_with_options(source, generated, 0, None)
+            .expect("generated identity must preserve caller namespace semantics");
+        let document = dom::Document::parse(&merged).expect("merged XML must parse");
+        assert!(
+            document
+                .descendants()
+                .any(|node| node.has_tag_name(("urn:caller", "Metadata")))
+        );
+        assert!(
+            document
+                .descendants()
+                .any(|node| node.has_tag_name(("urn:caller-ext", "Child")))
+        );
+        assert!(
+            document
+                .descendants()
+                .any(|node| node.has_tag_name((XMLDSIG_NS, "X509Certificate")))
         );
     }
 
