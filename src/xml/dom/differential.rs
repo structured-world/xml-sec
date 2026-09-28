@@ -53,6 +53,10 @@ fn equivalent_rejection(left: &ParseError, right: &ParseError) -> bool {
                 ParseError::DepthLimitReached { .. },
                 ParseError::DepthLimitReached { .. }
             )
+            | (
+                ParseError::NamespaceBindingLimitReached { .. },
+                ParseError::NamespaceBindingLimitReached { .. }
+            )
             | (ParseError::Backend { .. }, ParseError::Backend { .. })
     )
 }
@@ -72,6 +76,9 @@ fn acceptance_summary(
         }
         Err(ParseError::SourcePositionLimitReached { .. }) => "rejected by source-position limit",
         Err(ParseError::DepthLimitReached { .. }) => "rejected by depth limit",
+        Err(ParseError::NamespaceBindingLimitReached { .. }) => {
+            "rejected by namespace binding limit"
+        }
         Err(ParseError::BackendUnavailable { .. }) => "rejected as unavailable",
         Err(ParseError::Backend { .. }) => "rejected as malformed",
         Err(ParseError::BackendDivergence { .. }) => "reported nested divergence",

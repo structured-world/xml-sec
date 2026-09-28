@@ -241,8 +241,9 @@ pub fn verify_rsa_signature_pem(
 /// Verify an ECDSA XMLDSig signature using a PEM-encoded SPKI public key.
 ///
 /// The PEM must contain a `PUBLIC KEY` block. The signature value is expected
-/// to use the XMLDSig fixed-width `r || s` format required by RFC 6931 /
-/// XMLDSig 1.1. Use [`verify_ecdsa_signature_pem_with_encoding`] to opt into
+/// to use the XMLDSig fixed-width `r || s` format required by
+/// [RFC 9231 section 2.3.6](https://www.rfc-editor.org/rfc/rfc9231.html#section-2.3.6)
+/// (which replaces RFC 6931) and XMLDSig 1.1. Use [`verify_ecdsa_signature_pem_with_encoding`] to opt into
 /// libxmlsec1's ASN.1 compatibility representation. Returns `Ok(false)` for a
 /// signature mismatch and `Err` for key or signature-format errors.
 #[must_use = "discarding the verification result skips signature validation"]

@@ -11,6 +11,10 @@ use p256::SecretKey as P256SecretKey;
 use p384::SecretKey as P384SecretKey;
 use p521::SecretKey as P521SecretKey;
 use rand_chacha::{ChaCha8Rng, rand_core::SeedableRng as _};
+use rcgen::{
+    BasicConstraints, CertificateParams, CertificateRevocationListParams, IsCa, Issuer,
+    KeyIdMethod, KeyPair, KeyUsagePurpose, RevokedCertParams, SerialNumber,
+};
 use rsa::{
     RsaPrivateKey, RsaPublicKey,
     pkcs8::{
@@ -18,6 +22,7 @@ use rsa::{
     },
     traits::PublicKeyParts as _,
 };
+use time::{Duration, OffsetDateTime};
 use x509_parser::{extensions::ParsedExtension, prelude::FromDer as _};
 use xml_sec::{
     c14n::{C14nAlgorithm, C14nMode},
@@ -73,6 +78,10 @@ fn traditional_dsa_private_key_der(key: &dsa::SigningKey) -> Vec<u8> {
 }
 
 fn traditional_dsa_private_key_pem(der: &[u8]) -> String {
+    pem_text("DSA PRIVATE KEY", der)
+}
+
+fn pem_text(label: &str, der: &[u8]) -> String {
     let encoded = base64::engine::general_purpose::STANDARD.encode(der);
     let body = encoded
         .as_bytes()
@@ -80,7 +89,7 @@ fn traditional_dsa_private_key_pem(der: &[u8]) -> String {
         .map(|chunk| std::str::from_utf8(chunk).unwrap())
         .collect::<Vec<_>>()
         .join("\n");
-    format!("-----BEGIN DSA PRIVATE KEY-----\n{body}\n-----END DSA PRIVATE KEY-----\n")
+    format!("-----BEGIN {label}-----\n{body}\n-----END {label}-----\n")
 }
 
 fn signature_template_without_key_info() -> &'static str {
@@ -7072,7 +7081,124 @@ fn explicit_certificate_verification_honors_embedded_crls() {
         .unwrap();
     assert!(!checked.status.success());
     assert!(
-        String::from_utf8_lossy(&checked.stderr).contains("CRL"),
+        // RFC 10007 section 4 rejects this legacy v3 issuer's absent KeyUsage
+        // before consulting the authenticated CRL's revoked serials.
+        String::from_utf8_lossy(&checked.stderr)
+            .contains("certificate at chain position 1 does not permit cRLSign"),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+}
+
+#[test]
+fn explicit_certificate_verification_reports_revoked_leaf() {
+    // Exercise the CLI's revoked-serial path with an issuer that is authorized to sign CRLs;
+    // this remains independent from the legacy fixture's cRLSign rejection above.
+    let temp = tempfile::tempdir().unwrap();
+    let mut root_params = CertificateParams::new(Vec::new()).unwrap();
+    root_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "CLI revocation root");
+    root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    root_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let root = rcgen::CertifiedIssuer::self_signed(root_params, KeyPair::generate().unwrap())
+        .expect("root should be self-signable");
+
+    let issuer_key = KeyPair::generate().expect("issuer key generation should succeed");
+    let mut issuer_params = CertificateParams::new(Vec::new()).unwrap();
+    issuer_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "CLI revocation issuer");
+    issuer_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    issuer_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let issuer_certificate = issuer_params
+        .signed_by(&issuer_key, &root)
+        .expect("root should sign issuer certificate");
+    let issuer = Issuer::new(issuer_params, issuer_key);
+
+    let mut leaf_params = CertificateParams::new(Vec::new()).unwrap();
+    leaf_params.serial_number = Some(SerialNumber::from(42_u64));
+    leaf_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "CLI revoked signer");
+    leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    let leaf_key = KeyPair::generate().expect("leaf key generation should succeed");
+    let leaf = leaf_params
+        .signed_by(&leaf_key, &issuer)
+        .expect("issuer should sign leaf certificate");
+    let verification_window = OffsetDateTime::now_utc();
+    let crl = CertificateRevocationListParams {
+        this_update: verification_window - Duration::days(1),
+        next_update: verification_window + Duration::days(1),
+        crl_number: SerialNumber::from(1_u64),
+        issuing_distribution_point: None,
+        revoked_certs: vec![RevokedCertParams {
+            serial_number: SerialNumber::from(42_u64),
+            revocation_time: verification_window - Duration::hours(1),
+            reason_code: None,
+            invalidity_date: None,
+        }],
+        key_identifier_method: KeyIdMethod::Sha256,
+    }
+    .signed_by(&issuer)
+    .expect("issuer should sign CRL");
+
+    let root_path = temp.path().join("root.pem");
+    let issuer_path = temp.path().join("issuer.pem");
+    let leaf_path = temp.path().join("leaf.pem");
+    let leaf_key_path = temp.path().join("leaf-key.pem");
+    fs::write(&root_path, pem_text("CERTIFICATE", root.der())).unwrap();
+    fs::write(
+        &issuer_path,
+        pem_text("CERTIFICATE", issuer_certificate.der()),
+    )
+    .unwrap();
+    fs::write(&leaf_path, pem_text("CERTIFICATE", leaf.der())).unwrap();
+    fs::write(&leaf_key_path, leaf_key.serialize_pem()).unwrap();
+
+    let signed = temp.path().join("signed.xml");
+    let with_crl = temp.path().join("signed-with-crl.xml");
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-ecdsa-sha256.tmpl");
+    let compound = format!("{},{}", leaf_key_path.display(), leaf_path.display());
+    let sign = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(compound)
+        .arg("--output")
+        .arg(&signed)
+        .arg(template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+    let signed_xml = fs::read_to_string(&signed).unwrap();
+    let signed_xml = signed_xml.replacen(
+        "</X509Data>",
+        &format!(
+            "<X509CRL>{}</X509CRL></X509Data>",
+            base64::engine::general_purpose::STANDARD.encode(crl.der())
+        ),
+        1,
+    );
+    fs::write(&with_crl, signed_xml).unwrap();
+
+    let checked = Command::new(binary())
+        .args(["verify", "--verify-crls", "--pubkey-cert-pem"])
+        .arg(&leaf_path)
+        .arg("--trusted-pem")
+        .arg(&root_path)
+        .arg("--untrusted-pem")
+        .arg(&issuer_path)
+        .arg(&with_crl)
+        .output()
+        .unwrap();
+    assert!(!checked.status.success());
+    assert!(
+        String::from_utf8_lossy(&checked.stderr)
+            .contains("certificate at chain position 0 is revoked"),
         "{}",
         String::from_utf8_lossy(&checked.stderr)
     );

@@ -507,14 +507,19 @@ fn rejects_certificate_with_tampered_signature() {
 }
 
 #[test]
-fn rejects_certificate_revoked_by_authenticated_crl() {
+fn rejects_legacy_crl_issuer_without_key_usage() {
+    // RFC 10007 section 4 requires KeyUsage on the donor's v3 issuer even
+    // though the CRL signature is valid and the leaf serial is listed as revoked.
     let crl = fixture("rsa/rsa-2048-cert-revoked-crl.pem");
     let info = parsed_chain("rsa/rsa-2048-cert.pem", Some(crl));
     let anchors = [fixture("cacert.pem")];
 
     assert_eq!(
         verify_x509_certificate_chain(&info, &options(&anchors, true)),
-        Err(X509ChainError::Revoked(0))
+        Err(X509ChainError::InvalidKeyUsage {
+            position: 1,
+            required: "cRLSign"
+        })
     );
 }
 
@@ -585,6 +590,79 @@ fn rejects_crl_without_next_update() {
         verify_x509_certificate_chain(&info, &options(&anchors, true)),
         Err(X509ChainError::InvalidCrl(0))
     );
+}
+
+#[test]
+fn crl_issuer_v3_requires_key_usage_and_crl_sign() {
+    // RFC 10007 section 4 updates RFC 5280 6.3.3(f): v3 requires KeyUsage/cRLSign;
+    // Exercise the public chain verifier with signed DER,
+    // not a mocked certificate accessor, and keep signature/key identity unchanged.
+    let mut params = CertificateParams::new(Vec::new()).unwrap();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "CRL usage authority");
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let root = rcgen::CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap();
+    let leaf = CertificateParams::new(Vec::new())
+        .unwrap()
+        .signed_by(&KeyPair::generate().unwrap(), &root)
+        .unwrap();
+    let crl = CertificateRevocationListParams {
+        this_update: date_time_ymd(2026, 3, 15),
+        next_update: date_time_ymd(2026, 4, 15),
+        crl_number: SerialNumber::from(1_u64),
+        issuing_distribution_point: None,
+        revoked_certs: Vec::new(),
+        key_identifier_method: KeyIdMethod::Sha256,
+    }
+    .signed_by(&root)
+    .unwrap();
+    for (usage, accepted) in [(None, false), (Some(false), false), (Some(true), true)] {
+        use der::{Tagged as _, asn1::Any};
+        let mut certificate = Vec::<Any>::from_der(root.der()).unwrap();
+        let mut tbs = Vec::<Any>::from_der(&certificate[0].to_der().unwrap()).unwrap();
+        {
+            let field = tbs.last_mut().unwrap();
+            let mut extensions = x509_cert::ext::Extensions::from_der(field.value()).unwrap();
+            if usage.is_none() {
+                extensions.retain(|extension| extension.extn_id.to_string() != "2.5.29.15");
+            } else if usage == Some(false) {
+                let extension = extensions
+                    .iter_mut()
+                    .find(|extension| extension.extn_id.to_string() == "2.5.29.15")
+                    .unwrap();
+                // DER BIT STRING containing keyCertSign only (bit 5), not cRLSign (bit 6).
+                extension.extn_value =
+                    der::asn1::OctetString::new([0x03, 0x02, 0x02, 0x04]).unwrap();
+            }
+            *field = Any::new(field.tag(), extensions.to_der().unwrap()).unwrap();
+        }
+        let tbs_der = tbs.to_der().unwrap();
+        certificate[0] = Any::from_der(&tbs_der).unwrap();
+        certificate[2] =
+            Any::encode_from(&BitString::from_bytes(&root.key().sign(&tbs_der).unwrap()).unwrap())
+                .unwrap();
+        let issuer = certificate.to_der().unwrap();
+        let anchors = [issuer.clone()];
+        let mut info = generated_info(vec![leaf.der().to_vec(), issuer]);
+        info.crls.push(crl.der().to_vec());
+        let result = verify_x509_certificate_chain(&info, &options(&anchors, true));
+        let expected = if accepted {
+            Ok(())
+        } else {
+            Err(X509ChainError::InvalidKeyUsage {
+                position: 1,
+                required: "cRLSign",
+            })
+        };
+        assert_eq!(result, expected, "v3 cRLSign={usage:?}");
+        // The new rule must not affect operations where CRL checking is disabled.
+        assert_eq!(
+            verify_x509_certificate_chain(&info, &options(&anchors, false)),
+            Ok(())
+        );
+    }
 }
 
 #[test]

@@ -349,7 +349,7 @@ pub(super) fn xpath_string_scan_count(source: &str) -> usize {
         if !(byte.is_ascii_alphabetic() || byte == b'_') {
             match byte {
                 b',' | b'=' | b'<' | b'>' => {
-                    // This charge matches sxd-xpath-no-unsafe 0.5.1 rather than
+                    // This charge matches xml-sec-sxd-xpath 0.1.0 rather than
                     // XPath's abstract pairwise wording: node-set equality
                     // builds one HashSet<String> per operand and tests set
                     // intersection, while relational comparison coerces each
@@ -1415,24 +1415,27 @@ impl function::Function for LangFunction {
     ) -> Result<Value<'d>, function::Error> {
         let mut args = function::Args(args);
         args.exactly(1)?;
-        let requested = args.pop_string()?.to_ascii_lowercase();
+        let requested = args.pop_string(context)?;
         let mut node = Some(context.node.clone());
         while let Some(current) = node {
             self.work_budget.charge_function(1)?;
             if let Some(element) = current.element()
-                && let Some(language) = element.attributes().into_iter().find_map(|attribute| {
+                && let Some(matches) = element.attributes().into_iter().find_map(|attribute| {
                     let stored_name = attribute.name();
                     let name = sxd_document_no_unsafe::as_qname!(stored_name);
                     (name.local_part() == "lang"
                         && name.namespace_uri() == Some("http://www.w3.org/XML/1998/namespace"))
-                    .then(|| sxd_document_no_unsafe::as_str!(attribute.value()).to_owned())
+                    .then(|| {
+                        let stored_value = attribute.value();
+                        let language = sxd_document_no_unsafe::as_str!(stored_value);
+                        language.eq_ignore_ascii_case(&requested)
+                            || (language.as_bytes().get(requested.len()) == Some(&b'-')
+                                && language
+                                    .get(..requested.len())
+                                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&requested)))
+                    })
                 })
             {
-                let language = language.to_ascii_lowercase();
-                let matches = language == requested
-                    || language
-                        .strip_prefix(&requested)
-                        .is_some_and(|suffix| suffix.starts_with('-'));
                 return Ok(Value::Boolean(matches));
             }
             node = current.parent();
@@ -2535,7 +2538,7 @@ mod tests {
 
     #[test]
     fn xpath_string_profile_matches_pinned_nodeset_comparison_contract() {
-        // sxd-xpath-no-unsafe 0.5.1 hashes each node-set's string values before
+        // xml-sec-sxd-xpath 0.1.0 hashes each node-set's string values before
         // testing equality, so one comparison is two linear operand scans, not
         // a Cartesian product. The conservative full-source charge is one pass.
         assert_eq!(
