@@ -1895,10 +1895,10 @@ mod tests {
     #[test]
     fn xpath_rejects_oversized_source_before_building_mirror() {
         // A small same-document reference must not permit XPath to duplicate an
-        // unrelated source document that exceeds the node-set materialization cap.
+        // unrelated source document that exceeds the selected node-set budget.
         let xml = format!(
             "<root><target Id=\"selected\"><child/></target>{}</root>",
-            "<outside/>".repeat(65_537)
+            "<outside/>".repeat(129)
         );
         let document = Document::parse(&xml).expect("fixed oversized fixture must parse");
         let target = document
@@ -1906,9 +1906,15 @@ mod tests {
             .find(|node| node.attribute("Id") == Some("selected"))
             .expect("fixed fixture contains selected subtree");
 
-        let error = apply_xpath_filter(
+        let materialization_budget = NodeSetMaterializationBudget::with_limits(128, 1_024, 1_024);
+        let error = apply_xpath_filter_with_semantics_and_budget(
             NodeSet::subtree(target).expect("selected subtree fits the node-set budget"),
             &XPathExpression::new("true()"),
+            XPathHereSemantics::default(),
+            XPathDocumentRelation::SameDocument,
+            &XPathWorkBudget::default(),
+            &NodeFilterWorkBudget::default(),
+            &materialization_budget,
         )
         .err()
         .expect("XPath must reject the source before allocating an oversized mirror");

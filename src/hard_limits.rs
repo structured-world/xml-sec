@@ -105,7 +105,9 @@ pub(crate) const XPATH_FILTER_COUNT_CEILING: usize = 64;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const NODE_SET_FILTER_WORK_CEILING: usize = 6_000_000;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
-pub(crate) const NODE_SET_ENTRY_CEILING: usize = 65_536;
+pub(crate) const NODE_SET_ENTRY_DEFAULT: usize = 262_144;
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const NODE_SET_ENTRY_CEILING: usize = 524_288;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const NODE_SET_OWNED_STRING_BYTE_CEILING: usize = 8 * 1024 * 1024;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]

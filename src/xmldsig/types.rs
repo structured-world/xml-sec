@@ -1151,7 +1151,7 @@ mod tests {
         // without attempting to materialize the irrelevant Signature content.
         let xml = format!(
             "<root><target Id=\"selected\"><child/></target><Signature>{}</Signature></root>",
-            "<Object/>".repeat(MAX_NODE_SET_ENTRIES + 1)
+            "<Object/>".repeat(129)
         );
         let document = Document::parse(&xml).expect("fixed oversized fixture must parse");
         let target = document
@@ -1162,7 +1162,8 @@ mod tests {
             .descendants()
             .find(|node| node.has_tag_name("Signature"))
             .expect("fixed fixture contains the excluded Signature subtree");
-        let mut nodes = NodeSet::subtree(target)
+        let budget = NodeSetMaterializationBudget::with_limits(3, 8, 8);
+        let mut nodes = NodeSet::subtree_with_budget(target, &budget)
             .expect("small selected subtree must fit the materialization budget");
         let entries_before = nodes.nodes.len();
 
