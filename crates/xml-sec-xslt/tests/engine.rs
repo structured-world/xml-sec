@@ -5260,6 +5260,20 @@ fn xpath_document_root_and_inherited_language_use_xslt_context() {
 }
 
 #[test]
+fn empty_xml_lang_cancels_inheritance_and_matches_no_language() {
+    // XML 1.0 section 2.12 treats an empty xml:lang as no language, and XPath
+    // 1.0 section 4.3 must not match it even when lang() requests an empty string.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="lang('')"/><xsl:text>|</xsl:text><xsl:apply-templates select="root/child/leaf"/></xsl:template><xsl:template match="leaf"><xsl:value-of select="lang('')"/><xsl:text>|</xsl:text><xsl:value-of select="lang('en')"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(
+            stylesheet,
+            r#"<root xml:lang="en"><child xml:lang=""><leaf/></child></root>"#
+        ),
+        "false|false|false"
+    );
+}
+
+#[test]
 fn stylesheet_defined_exslt_functions_preserve_xpath_values() {
     // Function calls must retain numeric and result-tree-fragment types across
     // recursion instead of degrading every extension result to a string.

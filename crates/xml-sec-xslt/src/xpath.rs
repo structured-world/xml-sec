@@ -6901,13 +6901,16 @@ impl function::Function for LangFunction {
 
 fn language_tag_matches(language: &str, requested: &str) -> bool {
     // XPath 1.0 section 4.3 requires ASCII case-insensitive matching of the language token and
-    // permits a sublanguage suffix separated by '-'. Avoid allocating folded copies.
+    // permits a sublanguage suffix separated by '-'. XML 1.0 section 2.12 defines an empty
+    // xml:lang as no language, not a tag that lang('') can match. Avoid allocating folded copies.
     // https://www.w3.org/TR/1999/REC-xpath-19991116#function-lang
-    language.eq_ignore_ascii_case(requested)
-        || language
-            .get(..requested.len())
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(requested))
-            && language.as_bytes().get(requested.len()) == Some(&b'-')
+    // https://www.w3.org/TR/2008/REC-xml-20081126/#sec-lang-tag
+    !language.is_empty()
+        && (language.eq_ignore_ascii_case(requested)
+            || language
+                .get(..requested.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(requested))
+                && language.as_bytes().get(requested.len()) == Some(&b'-'))
 }
 
 type IdIndex = Vec<HashMap<String, NodePath>>;

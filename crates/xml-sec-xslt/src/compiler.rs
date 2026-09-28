@@ -57,7 +57,14 @@ impl<R: Resolver> Compiler<R> {
         let mut state = CompileState::new(self.budget, xml.len());
         state.charge_owned(decoded_workspace)?;
         self.compile_module(xml, base_uri, None, None, &mut state, 1)?;
-        let principal_document = parse_semantic_document_metered(xml, base_uri, &mut state)?;
+        let principal_document = if let Some(module) = state
+            .module_documents
+            .remove(&StylesheetDocumentId::PRINCIPAL)
+        {
+            module.document
+        } else {
+            parse_semantic_document_metered(xml, base_uri, &mut state)?
+        };
         let principal_base_uri = clone_compile_string(base_uri, &mut state)?;
         let mut stylesheet = state.finish()?;
         stylesheet.principal_document = principal_document;
@@ -113,31 +120,51 @@ impl<R: Resolver> Compiler<R> {
         )?;
         with_compiler_document(xml, base_uri, state, |document, state| {
             let root = stylesheet_module_root(document, fragment, state.current_module_document())?;
-            let StylesheetModuleKind::Standard { forward } = stylesheet_module_kind(root)? else {
-                let precedence = inherited_precedence.unwrap_or_else(|| state.next_precedence());
-                return self
-                    .compile_literal_result_stylesheet(root, base_uri, precedence, state, depth);
-            };
-            validate_standard_stylesheet_content(root)?;
-            validate_top_level_declaration_attributes(root, forward)?;
-            validate_namespace_prefix_attributes(root, forward)?;
-            let mut saw_non_import = false;
-            self.compile_effective_imports(root, base_uri, state, depth, &mut saw_non_import)?;
-            let local_precedence = inherited_precedence.unwrap_or_else(|| state.next_precedence());
-            self.compile_effective_declarations(
-                root,
-                base_uri,
-                local_precedence,
-                forward,
-                state,
-                depth,
-            )
+            self.compile_module_root(root, xml, base_uri, inherited_precedence, state, depth)
         })
+    }
+
+    fn compile_module_root(
+        &self,
+        root: roxmltree::Node<'_, '_>,
+        source_xml: &str,
+        base_uri: Option<&str>,
+        inherited_precedence: Option<usize>,
+        state: &mut CompileState,
+        depth: usize,
+    ) -> Result<()> {
+        let StylesheetModuleKind::Standard { forward } = stylesheet_module_kind(root)? else {
+            let precedence = inherited_precedence.unwrap_or_else(|| state.next_precedence());
+            return self
+                .compile_literal_result_stylesheet(root, base_uri, precedence, state, depth);
+        };
+        validate_standard_stylesheet_content(root)?;
+        validate_top_level_declaration_attributes(root, forward)?;
+        validate_namespace_prefix_attributes(root, forward)?;
+        let mut saw_non_import = false;
+        self.compile_effective_imports(
+            root,
+            source_xml,
+            base_uri,
+            state,
+            depth,
+            &mut saw_non_import,
+        )?;
+        let local_precedence = inherited_precedence.unwrap_or_else(|| state.next_precedence());
+        self.compile_effective_declarations(
+            root,
+            source_xml,
+            base_uri,
+            local_precedence,
+            state,
+            depth,
+        )
     }
 
     fn compile_effective_imports(
         &self,
         root: roxmltree::Node<'_, '_>,
+        source_xml: &str,
         base_uri: Option<&str>,
         state: &mut CompileState,
         depth: usize,
@@ -156,18 +183,48 @@ impl<R: Resolver> Compiler<R> {
                     state.budget.recursion_depth,
                     depth + 1,
                 )?;
-                let module = self.resolve_module(child, base_uri, ResolvePurpose::Import, state)?;
-                self.enter_resource(&module.resource, module.fragment, state, |state| {
-                    let source = resource_source(&module.resource, state)?;
-                    self.compile_module(
-                        source.as_str(),
-                        Some(&module.resource.canonical_uri),
-                        module.fragment,
-                        None,
-                        state,
-                        depth + 1,
-                    )
-                })?;
+                let module =
+                    self.resolve_module(child, base_uri, ResolvePurpose::Import, true, state)?;
+                match module {
+                    ResolvedModule::Local { fragment } => {
+                        let target =
+                            self.local_module_root(child, fragment, source_xml, base_uri, state)?;
+                        let document_id = state.current_stylesheet_document();
+                        self.enter_module(
+                            document_id,
+                            base_uri.unwrap_or(""),
+                            Some(fragment),
+                            state,
+                            |state| {
+                                state.charge_owned(estimate_compiled_owned_bytes_for_nodes(
+                                    target.descendants(),
+                                    base_uri,
+                                ))?;
+                                self.compile_module_root(
+                                    target,
+                                    source_xml,
+                                    base_uri,
+                                    None,
+                                    state,
+                                    depth + 1,
+                                )
+                            },
+                        )?;
+                    }
+                    ResolvedModule::External { resource, fragment } => {
+                        self.enter_resource(&resource, fragment, state, |state| {
+                            let source = resource_source(&resource, state)?;
+                            self.compile_module(
+                                source.as_str(),
+                                Some(&resource.canonical_uri),
+                                fragment,
+                                None,
+                                state,
+                                depth + 1,
+                            )
+                        })?;
+                    }
+                }
             } else if child.has_tag_name((XSLT_NS, "include")) {
                 ensure(
                     BudgetKind::RecursionDepth,
@@ -175,32 +232,72 @@ impl<R: Resolver> Compiler<R> {
                     depth + 1,
                 )?;
                 let module =
-                    self.resolve_module(child, base_uri, ResolvePurpose::Include, state)?;
-                self.enter_resource(&module.resource, module.fragment, state, |state| {
-                    let source = resource_source(&module.resource, state)?;
-                    with_frontend_document(source.as_str(), state, |document, state| {
-                        let included_root = stylesheet_module_root(
-                            document,
-                            module.fragment,
-                            state.current_module_document(),
+                    self.resolve_module(child, base_uri, ResolvePurpose::Include, true, state)?;
+                match module {
+                    ResolvedModule::Local { fragment } => {
+                        let target =
+                            self.local_module_root(child, fragment, source_xml, base_uri, state)?;
+                        let document_id = state.current_stylesheet_document();
+                        self.enter_module(
+                            document_id,
+                            base_uri.unwrap_or(""),
+                            Some(fragment),
+                            state,
+                            |state| {
+                                if let StylesheetModuleKind::Standard { forward } =
+                                    stylesheet_module_kind(target)?
+                                {
+                                    validate_standard_stylesheet_content(target)?;
+                                    validate_top_level_declaration_attributes(target, forward)?;
+                                    validate_namespace_prefix_attributes(target, forward)?;
+                                    self.compile_effective_imports(
+                                        target,
+                                        source_xml,
+                                        base_uri,
+                                        state,
+                                        depth + 1,
+                                        saw_non_import,
+                                    )?;
+                                }
+                                Ok(())
+                            },
                         )?;
-                        match stylesheet_module_kind(included_root)? {
-                            StylesheetModuleKind::Standard { forward } => {
-                                validate_standard_stylesheet_content(included_root)?;
-                                validate_top_level_declaration_attributes(included_root, forward)?;
-                                validate_namespace_prefix_attributes(included_root, forward)?;
-                                self.compile_effective_imports(
-                                    included_root,
-                                    Some(&module.resource.canonical_uri),
-                                    state,
-                                    depth + 1,
-                                    saw_non_import,
-                                )
-                            }
-                            StylesheetModuleKind::Simplified => Ok(()),
-                        }
-                    })
-                })?;
+                    }
+                    ResolvedModule::External { resource, fragment } => {
+                        self.enter_resource(&resource, fragment, state, |state| {
+                            let source = resource_source(&resource, state)?;
+                            with_frontend_document(source.as_str(), state, |document, state| {
+                                let included_root = stylesheet_module_root(
+                                    document,
+                                    fragment,
+                                    state.current_module_document(),
+                                )?;
+                                match stylesheet_module_kind(included_root)? {
+                                    StylesheetModuleKind::Standard { forward } => {
+                                        validate_standard_stylesheet_content(included_root)?;
+                                        validate_top_level_declaration_attributes(
+                                            included_root,
+                                            forward,
+                                        )?;
+                                        validate_namespace_prefix_attributes(
+                                            included_root,
+                                            forward,
+                                        )?;
+                                        self.compile_effective_imports(
+                                            included_root,
+                                            source.as_str(),
+                                            Some(&resource.canonical_uri),
+                                            state,
+                                            depth + 1,
+                                            saw_non_import,
+                                        )
+                                    }
+                                    StylesheetModuleKind::Simplified => Ok(()),
+                                }
+                            })
+                        })?;
+                    }
+                }
                 // XSLT 1.0 section 2.6.2 requires imports to precede every other top-level
                 // element, explicitly including xsl:include after its imports are expanded.
                 // https://www.w3.org/TR/1999/REC-xslt-19991116#import
@@ -215,12 +312,13 @@ impl<R: Resolver> Compiler<R> {
     fn compile_effective_declarations(
         &self,
         root: roxmltree::Node<'_, '_>,
+        source_xml: &str,
         base_uri: Option<&str>,
         precedence: usize,
-        forward: bool,
         state: &mut CompileState,
         depth: usize,
     ) -> Result<()> {
+        let forward = module_forward_compatible(root)?;
         for child in root.children().filter(roxmltree::Node::is_element) {
             if child.has_tag_name((XSLT_NS, "import")) {
                 continue;
@@ -232,42 +330,81 @@ impl<R: Resolver> Compiler<R> {
                     depth + 1,
                 )?;
                 let module =
-                    self.resolve_module(child, base_uri, ResolvePurpose::Include, state)?;
-                self.enter_resource(&module.resource, module.fragment, state, |state| {
-                    let source = resource_source(&module.resource, state)?;
-                    with_compiler_document(
-                        source.as_str(),
-                        Some(&module.resource.canonical_uri),
-                        state,
-                        |document, state| {
-                            let included_root = stylesheet_module_root(
-                                document,
-                                module.fragment,
-                                state.current_module_document(),
-                            )?;
-                            match stylesheet_module_kind(included_root)? {
-                                StylesheetModuleKind::Standard {
-                                    forward: included_forward,
-                                } => self.compile_effective_declarations(
-                                    included_root,
-                                    Some(&module.resource.canonical_uri),
-                                    precedence,
-                                    included_forward,
-                                    state,
-                                    depth + 1,
-                                ),
-                                StylesheetModuleKind::Simplified => self
-                                    .compile_literal_result_stylesheet(
-                                        included_root,
-                                        Some(&module.resource.canonical_uri),
-                                        precedence,
-                                        state,
-                                        depth + 1,
-                                    ),
-                            }
-                        },
-                    )
-                })?;
+                    self.resolve_module(child, base_uri, ResolvePurpose::Include, false, state)?;
+                match module {
+                    ResolvedModule::Local { fragment } => {
+                        let target =
+                            self.local_module_root(child, fragment, source_xml, base_uri, state)?;
+                        let document_id = state.current_stylesheet_document();
+                        self.enter_module(
+                            document_id,
+                            base_uri.unwrap_or(""),
+                            Some(fragment),
+                            state,
+                            |state| {
+                                state.charge_owned(estimate_compiled_owned_bytes_for_nodes(
+                                    target.descendants(),
+                                    base_uri,
+                                ))?;
+                                match stylesheet_module_kind(target)? {
+                                    StylesheetModuleKind::Standard { .. } => self
+                                        .compile_effective_declarations(
+                                            target,
+                                            source_xml,
+                                            base_uri,
+                                            precedence,
+                                            state,
+                                            depth + 1,
+                                        ),
+                                    StylesheetModuleKind::Simplified => self
+                                        .compile_literal_result_stylesheet(
+                                            target,
+                                            base_uri,
+                                            precedence,
+                                            state,
+                                            depth + 1,
+                                        ),
+                                }
+                            },
+                        )?;
+                    }
+                    ResolvedModule::External { resource, fragment } => {
+                        self.enter_resource(&resource, fragment, state, |state| {
+                            let source = resource_source(&resource, state)?;
+                            with_compiler_document(
+                                source.as_str(),
+                                Some(&resource.canonical_uri),
+                                state,
+                                |document, state| {
+                                    let included_root = stylesheet_module_root(
+                                        document,
+                                        fragment,
+                                        state.current_module_document(),
+                                    )?;
+                                    match stylesheet_module_kind(included_root)? {
+                                        StylesheetModuleKind::Standard { .. } => self
+                                            .compile_effective_declarations(
+                                                included_root,
+                                                source.as_str(),
+                                                Some(&resource.canonical_uri),
+                                                precedence,
+                                                state,
+                                                depth + 1,
+                                            ),
+                                        StylesheetModuleKind::Simplified => self
+                                            .compile_literal_result_stylesheet(
+                                                included_root,
+                                                Some(&resource.canonical_uri),
+                                                precedence,
+                                                state,
+                                                depth + 1,
+                                            ),
+                                    }
+                                },
+                            )
+                        })?;
+                    }
+                }
                 continue;
             }
             self.compile_top_level(child, base_uri, precedence, forward, state, depth)?;
@@ -280,6 +417,7 @@ impl<R: Resolver> Compiler<R> {
         node: roxmltree::Node<'input, 'input>,
         base_uri: Option<&str>,
         purpose: ResolvePurpose,
+        count_local_module: bool,
         state: &mut CompileState,
     ) -> Result<ResolvedModule<'input>> {
         // XSLT 1.0 sections 2.6.1 and 2.6.2 define include/import as EMPTY. Validate the
@@ -298,6 +436,22 @@ impl<R: Resolver> Compiler<R> {
             ));
         }
         let effective_base = effective_base_uri(node, base_uri)?;
+        if let Some(fragment) = fragment
+            && resource_href.is_empty()
+            && effective_base.as_deref() == base_uri
+        {
+            // Includes are visited once for imports and again for declarations;
+            // account for them during the first pass, before nested expansion.
+            if count_local_module {
+                state.imported_modules = state.imported_modules.saturating_add(1);
+                ensure(
+                    BudgetKind::ImportedModules,
+                    state.budget.imported_modules,
+                    state.imported_modules,
+                )?;
+            }
+            return Ok(ResolvedModule::Local { fragment });
+        }
         let request_owned_bytes =
             resolve_request_retained_bytes(resource_href, effective_base.as_deref());
         state.charge_owned(request_owned_bytes)?;
@@ -309,7 +463,7 @@ impl<R: Resolver> Compiler<R> {
         if let Some(resource) = state.resolved_requests.get(&request) {
             let resource = Arc::clone(resource);
             state.release_owned(request_owned_bytes);
-            return Ok(ResolvedModule { resource, fragment });
+            return Ok(ResolvedModule::External { resource, fragment });
         }
         state.imported_modules = state.imported_modules.saturating_add(1);
         ensure(
@@ -370,7 +524,7 @@ impl<R: Resolver> Compiler<R> {
         state
             .resolved_requests
             .insert(request, Arc::clone(&resource));
-        Ok(ResolvedModule { resource, fragment })
+        Ok(ResolvedModule::External { resource, fragment })
     }
 
     fn enter_resource<T>(
@@ -380,12 +534,30 @@ impl<R: Resolver> Compiler<R> {
         state: &mut CompileState,
         compile: impl FnOnce(&mut CompileState) -> Result<T>,
     ) -> Result<T> {
+        let document_id = state.resolved_identities[&resource.identity].document_id;
+        self.enter_module(
+            document_id,
+            &resource.canonical_uri,
+            fragment,
+            state,
+            compile,
+        )
+    }
+
+    fn enter_module<T>(
+        &self,
+        document_id: StylesheetDocumentId,
+        uri: &str,
+        fragment: Option<&str>,
+        state: &mut CompileState,
+        compile: impl FnOnce(&mut CompileState) -> Result<T>,
+    ) -> Result<T> {
         if state.active_resources.iter().any(|active| {
-            active.resource.identity == resource.identity && active.fragment.as_deref() == fragment
+            active.document_id == document_id && active.fragment.as_deref() == fragment
         }) {
             return Err(Error::Static(format!(
                 "stylesheet include/import cycle at {}{}",
-                resource.canonical_uri,
+                uri,
                 fragment.map_or(String::new(), |fragment| format!("#{fragment}"))
             )));
         }
@@ -395,7 +567,7 @@ impl<R: Resolver> Compiler<R> {
         let fragment_bytes = fragment.map_or(0, str::len);
         state.charge_owned(fragment_bytes)?;
         if let Err(error) = state.push_active_resource(ActiveResource {
-            resource: Arc::clone(resource),
+            document_id,
             fragment: fragment.map(Into::into),
         }) {
             state.release_owned(fragment_bytes);
@@ -410,6 +582,42 @@ impl<R: Resolver> Compiler<R> {
         drop(active);
         state.release_owned(fragment_bytes);
         result
+    }
+
+    fn local_module_root<'nodes, 'input>(
+        &self,
+        include_or_import: roxmltree::Node<'nodes, 'input>,
+        fragment: &str,
+        source_xml: &str,
+        base_uri: Option<&str>,
+        state: &mut CompileState,
+    ) -> Result<roxmltree::Node<'nodes, 'input>> {
+        let document_id = state.current_stylesheet_document();
+        if !state.module_documents.contains_key(&document_id) {
+            let document = parse_semantic_document_metered(source_xml, base_uri, state)?;
+            state.charge_owned(module_document_cache_entry_bytes())?;
+            state.module_documents.insert(
+                document_id,
+                ModuleDocument {
+                    id: document_id,
+                    document,
+                },
+            );
+        }
+        let target = stylesheet_module_root(
+            include_or_import.document(),
+            Some(fragment),
+            state.current_module_document(),
+        )?;
+        if include_or_import
+            .ancestors()
+            .any(|ancestor| ancestor == target)
+        {
+            return Err(Error::Static(format!(
+                "stylesheet include/import cycle at #{fragment}"
+            )));
+        }
+        Ok(target)
     }
 
     fn compile_literal_result_stylesheet(
@@ -1875,7 +2083,7 @@ struct OutputPropertyPrecedence {
 }
 
 struct ActiveResource {
-    resource: Arc<ResolvedResource>,
+    document_id: StylesheetDocumentId,
     fragment: Option<Box<str>>,
 }
 
@@ -1954,9 +2162,7 @@ impl CompileState {
     fn current_stylesheet_document(&self) -> StylesheetDocumentId {
         self.active_resources
             .last()
-            .map_or(StylesheetDocumentId::PRINCIPAL, |active| {
-                self.resolved_identities[&active.resource.identity].document_id
-            })
+            .map_or(StylesheetDocumentId::PRINCIPAL, |active| active.document_id)
     }
 
     fn current_module_document(&self) -> Option<&Document> {
@@ -2390,7 +2596,14 @@ fn estimate_compiled_owned_bytes(
     document: &roxmltree::Document<'_>,
     module_base_uri: Option<&str>,
 ) -> usize {
-    document.descendants().fold(0usize, |total, node| {
+    estimate_compiled_owned_bytes_for_nodes(document.descendants(), module_base_uri)
+}
+
+fn estimate_compiled_owned_bytes_for_nodes<'nodes, 'input: 'nodes>(
+    nodes: impl Iterator<Item = roxmltree::Node<'nodes, 'input>>,
+    module_base_uri: Option<&str>,
+) -> usize {
+    nodes.fold(0usize, |total, node| {
         // Compilation retains both a normalized semantic node and, conservatively, one IR
         // instruction for each frontend node. Child IDs, attributes, and namespaces live in
         // separately allocated containers and therefore need explicit structural accounting.
@@ -2672,9 +2885,14 @@ struct ResolveRequest {
     purpose: ResolvePurpose,
 }
 
-struct ResolvedModule<'input> {
-    resource: Arc<ResolvedResource>,
-    fragment: Option<&'input str>,
+enum ResolvedModule<'input> {
+    Local {
+        fragment: &'input str,
+    },
+    External {
+        resource: Arc<ResolvedResource>,
+        fragment: Option<&'input str>,
+    },
 }
 
 struct ResolvedIdentity {
@@ -3120,28 +3338,24 @@ fn stylesheet_module_root<'nodes, 'input>(
         })
         .transpose()?
         .flatten();
-    let mut selected = semantic_ordinal
-        .map(|ordinal| {
-            document
-                .descendants()
-                .filter(roxmltree::Node::is_element)
-                .nth(ordinal)
-                .ok_or_else(|| {
-                    Error::Xml("semantic and frontend XML element order diverged".into())
-                })
-        })
-        .transpose()?;
-
     // XML 1.0 section 3.3.1 assigns ID semantics from the declared type, not from an
     // attribute name. XPointer Framework section 3.2 resolves shorthand pointers through that
     // typed ID index. The unqualified `id` scan below is retained only as a compatibility
     // extension for historical stylesheets. https://www.w3.org/TR/xml/#id
     // https://www.w3.org/TR/2003/REC-xptr-framework-20030325/#shorthand
-    for node in document.descendants().filter(roxmltree::Node::is_element) {
+    let mut selected = None;
+    let mut semantic_match_found = semantic_ordinal.is_none();
+    for (ordinal, node) in document
+        .descendants()
+        .filter(roxmltree::Node::is_element)
+        .enumerate()
+    {
+        let typed_match = semantic_ordinal == Some(ordinal);
+        semantic_match_found |= typed_match;
         let unqualified_match = node
             .attribute("id")
             .is_some_and(|candidate| fragment.equals(candidate));
-        if !unqualified_match || selected == Some(node) {
+        if !typed_match && !unqualified_match {
             continue;
         }
         if selected.replace(node).is_some() {
@@ -3149,6 +3363,11 @@ fn stylesheet_module_root<'nodes, 'input>(
                 "stylesheet module fragment #{raw_fragment} is not unique"
             )));
         }
+    }
+    if !semantic_match_found {
+        return Err(Error::Xml(
+            "semantic and frontend XML element order diverged".into(),
+        ));
     }
     let selected = selected.ok_or_else(|| {
         Error::Static(format!(
@@ -4749,21 +4968,20 @@ mod tests {
         let slot_bytes = std::mem::size_of::<ActiveResource>();
         let budget = CompileBudget::new(4096, 0, 32, slot_bytes * 4 - 1);
         let compiler = Compiler::new(Arc::new(crate::NoResolver), budget);
-        let resource = Arc::new(ResolvedResource {
-            canonical_uri: "memory:module.xsl".into(),
-            identity: ResourceIdentity("module".into()),
-            bytes: Vec::new(),
-            media_type: None,
-            encoding: None,
-        });
         let mut state = CompileState::new(budget, 0);
         let entered = Cell::new(false);
 
         let error = compiler
-            .enter_resource(&resource, None, &mut state, |_| {
-                entered.set(true);
-                Ok(())
-            })
+            .enter_module(
+                StylesheetDocumentId(1),
+                "memory:module.xsl",
+                None,
+                &mut state,
+                |_| {
+                    entered.set(true);
+                    Ok(())
+                },
+            )
             .expect_err("active module storage must cross the compile-owned budget first");
 
         assert!(!entered.get());
@@ -5235,6 +5453,114 @@ mod tests {
                     .contains_key(&ExpandedName::new(None::<String>, "ignored"))
             );
         }
+    }
+
+    #[test]
+    fn fragment_only_include_and_import_use_the_current_document() {
+        // XSLT 1.0 sections 2.6 and 2.7 allow a fragment to select an embedded stylesheet
+        // in the current resource without another resolver request.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#embedded
+        for instruction in ["include", "import"] {
+            let principal = format!(
+                r##"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:ext="urn:ext"><xsl:{instruction} href="#target"/><ext:modules><xsl:stylesheet id="target" version="1.0"><xsl:template name="selected"/></xsl:stylesheet></ext:modules></xsl:stylesheet>"##
+            );
+            let stylesheet = Compiler::new(
+                Arc::new(crate::NoResolver),
+                CompileBudget::new(1 << 20, 4, 16, 1 << 20),
+            )
+            .compile(&principal, Some("memory:main.xsl"))
+            .expect("fragment-only module compiles without a resolver");
+            assert!(
+                stylesheet
+                    .named_template_index
+                    .contains_key(&ExpandedName::new(None::<String>, "selected"))
+            );
+        }
+    }
+
+    #[test]
+    fn fragment_only_reference_inside_external_module_uses_its_document() {
+        let principal = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:include href="module.xml#a"/></xsl:stylesheet>"#;
+        let module = br##"<bundle xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:stylesheet id="a" version="1.0"><xsl:include href="#b"/></xsl:stylesheet><xsl:stylesheet id="b" version="1.0"><xsl:template name="selected"/></xsl:stylesheet></bundle>"##;
+        let stylesheet = Compiler::new(
+            Arc::new(FragmentModuleResolver {
+                module: module.to_vec(),
+            }),
+            CompileBudget::new(1 << 20, 4, 16, 1 << 20),
+        )
+        .compile(principal, Some("memory:main.xsl"))
+        .expect("fragment-only reference stays within the external module document");
+        assert!(
+            stylesheet
+                .named_template_index
+                .contains_key(&ExpandedName::new(None::<String>, "selected"))
+        );
+    }
+
+    #[test]
+    fn fragment_only_module_uses_declared_id_in_principal_document() {
+        // XML 1.0 section 3.3.1 gives the declared attribute ID semantics; the
+        // frontend's attribute-name fallback must not be the only lookup path.
+        let principal = r##"<!DOCTYPE xsl:stylesheet [
+            <!ATTLIST xsl:stylesheet ext:module-key ID #IMPLIED>
+        ]>
+        <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:ext="urn:ext">
+          <xsl:include href="#target"/>
+          <ext:modules><xsl:stylesheet ext:module-key="target" version="1.0">
+            <xsl:template name="selected"/>
+          </xsl:stylesheet></ext:modules>
+        </xsl:stylesheet>"##;
+        let stylesheet = Compiler::new(
+            Arc::new(crate::NoResolver),
+            CompileBudget::new(1 << 20, 4, 16, 1 << 20),
+        )
+        .compile(principal, Some("memory:main.xsl"))
+        .expect("DTD-declared ID selects a local embedded module");
+        assert!(
+            stylesheet
+                .named_template_index
+                .contains_key(&ExpandedName::new(None::<String>, "selected"))
+        );
+    }
+
+    #[test]
+    fn fragment_only_modules_obey_cycle_and_import_limits() {
+        let principal = r##"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:ext="urn:ext"><xsl:include href="#a"/><ext:modules><xsl:stylesheet id="a" version="1.0"><xsl:include href="#b"/></xsl:stylesheet><xsl:stylesheet id="b" version="1.0"><xsl:include href="#a"/></xsl:stylesheet></ext:modules></xsl:stylesheet>"##;
+        let error = Compiler::new(
+            Arc::new(crate::NoResolver),
+            CompileBudget::new(1 << 20, 8, 16, 1 << 20),
+        )
+        .compile(principal, Some("memory:main.xsl"))
+        .expect_err("local fragment cycle is rejected");
+        assert!(error.to_string().contains("cycle"), "{error}");
+
+        let error = Compiler::new(
+            Arc::new(crate::NoResolver),
+            CompileBudget::new(1 << 20, 1, 8, 1 << 20),
+        )
+        .compile(principal, Some("memory:main.xsl"))
+        .expect_err("local fragment expansion obeys the module limit");
+        assert!(
+            matches!(
+                error,
+                Error::Budget {
+                    kind: BudgetKind::ImportedModules,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn fragment_only_include_counts_once_across_compilation_phases() {
+        let principal = r##"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:ext="urn:ext"><xsl:include href="#a"/><ext:modules><xsl:stylesheet id="a" version="1.0"><xsl:template name="selected"/></xsl:stylesheet></ext:modules></xsl:stylesheet>"##;
+        Compiler::new(
+            Arc::new(crate::NoResolver),
+            CompileBudget::new(1 << 20, 1, 8, 1 << 20),
+        )
+        .compile(principal, Some("memory:main.xsl"))
+        .expect("one local include counts as one module across both phases");
     }
 
     #[test]
