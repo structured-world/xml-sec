@@ -1252,7 +1252,7 @@ impl XmlDocument {
                     actual: actual.saturating_sub(1),
                 }
             }
-            (_, error) => error,
+            (_, error) => strip_validation_wrapper_namespace_binding(error, settings),
         })?;
         parsed.with_dependent(|_, document| validate_wrappers(document, &wrapper_ranges))
     }
@@ -1749,7 +1749,7 @@ impl XmlDocument {
                     actual: actual.saturating_sub(1),
                 }
             }
-            (_, error) => error,
+            (_, error) => strip_validation_wrapper_namespace_binding(error, settings),
         })?;
         parsed.with_dependent(|_, document| {
             validation_wrapper(document, wrapper_range.clone()).map(|_| ())
@@ -3363,6 +3363,22 @@ fn wrapped_fragment(replacement: &str) -> String {
     format!("{VALIDATION_WRAPPER_OPEN}{replacement}{VALIDATION_WRAPPER_CLOSE}")
 }
 
+fn strip_validation_wrapper_namespace_binding(
+    error: XmlDocumentError,
+    settings: DocumentParseSettings,
+) -> XmlDocumentError {
+    match error {
+        XmlDocumentError::Parse(ParseError::NamespaceBindingLimitReached { actual, .. }) => {
+            // The temporary wrapper contributes one binding that the committed document lacks.
+            XmlDocumentError::Parse(ParseError::NamespaceBindingLimitReached {
+                maximum: settings.namespace_bindings_limit,
+                actual: actual.saturating_sub(1),
+            })
+        }
+        error => error,
+    }
+}
+
 fn validation_wrapper<'a, 'input>(
     parsed: &'a ParsedDocument<'input>,
     expected_range: std::ops::Range<usize>,
@@ -4529,6 +4545,38 @@ mod tests {
                     .is_err()
             );
             assert_eq!(document.as_xml(), "<root>text</root>");
+        }
+    }
+
+    #[test]
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    fn validation_wrapper_namespace_error_reports_document_limit() {
+        // A rejected replacement must report only caller-visible bindings, not the wrapper's.
+        let settings = DocumentParseSettings {
+            namespace_bindings_limit: 1,
+            ..DocumentParseSettings::default()
+        };
+        for batch in [false, true] {
+            let mut document = XmlDocument::parse_with_settings("<root/>".into(), settings)
+                .expect("namespace-free input");
+            let root = document.with_view(|view| view.root_element());
+            let replacement = "<child xmlns:a='urn:a' xmlns:b='urn:b'/>";
+            let error = if batch {
+                document.replace_contents(&[(root, replacement.into())])
+            } else {
+                document.replace_content(root, replacement)
+            }
+            .expect_err("two bindings exceed the configured ceiling");
+            assert!(matches!(
+                error.into_policy_violation(settings),
+                Ok(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_NAMESPACE_BINDINGS,
+                    maximum: 1,
+                    actual: 2,
+                })
+            ));
+            assert_eq!(document.as_xml(), "<root/>");
+            assert_eq!(document.generation(), 0);
         }
     }
 
