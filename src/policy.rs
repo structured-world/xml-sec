@@ -440,7 +440,8 @@ pub struct ResourcePolicy {
     pub max_xpath_filters: usize,
     /// Maximum cumulative node-set entries visited by filtering transforms.
     pub max_node_set_filter_work: usize,
-    /// Maximum entries materialized in one exact node set.
+    /// Maximum entries materialized in one exact node set. Defaults to 262,144;
+    /// callers may raise it to the absolute ceiling of 524,288.
     pub max_node_set_entries: usize,
     /// Maximum owned string bytes in one materialized node set.
     pub max_node_set_owned_string_bytes: usize,
@@ -485,7 +486,7 @@ impl Default for ResourcePolicy {
             max_xpath_namespace_bytes: crate::hard_limits::XPATH_NAMESPACE_BYTE_CEILING,
             max_xpath_filters: crate::hard_limits::XPATH_FILTER_COUNT_CEILING,
             max_node_set_filter_work: crate::hard_limits::NODE_SET_FILTER_WORK_CEILING,
-            max_node_set_entries: crate::hard_limits::NODE_SET_ENTRY_CEILING,
+            max_node_set_entries: 262_144,
             max_node_set_owned_string_bytes: crate::hard_limits::NODE_SET_OWNED_STRING_BYTE_CEILING,
             max_node_set_cumulative_owned_string_bytes:
                 crate::hard_limits::NODE_SET_CUMULATIVE_OWNED_STRING_BYTE_CEILING,
@@ -1458,6 +1459,27 @@ mod tests {
         };
 
         assert_eq!(policy.validate(), Ok(()));
+    }
+
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    #[test]
+    fn node_set_policy_has_headroom_above_its_default() {
+        let mut policy = ResourcePolicy::default();
+        assert_eq!(policy.max_node_set_entries, 262_144);
+        assert_eq!(policy.validate(), Ok(()));
+
+        policy.max_node_set_entries = 524_288;
+        assert_eq!(policy.validate(), Ok(()));
+
+        policy.max_node_set_entries = 524_289;
+        assert_eq!(
+            policy.validate(),
+            Err(PolicyViolation::ResourceLimit {
+                resource: resource_name::NODE_SET_ENTRIES,
+                maximum: 524_288,
+                actual: 524_289,
+            })
+        );
     }
 
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]

@@ -30,6 +30,99 @@ fn exclusive_c14n() -> C14nAlgorithm {
     C14nAlgorithm::new(C14nMode::Exclusive1_0, false)
 }
 
+fn namespace_dense_document(items: usize) -> String {
+    let namespaces = (0..257)
+        .map(|index| format!(r#" xmlns:n{index}="urn:{index}""#))
+        .collect::<String>();
+    format!(
+        "<root{namespaces}><payload ID=\"payload\">{}</payload></root>",
+        "<item/>".repeat(items)
+    )
+}
+
+fn namespace_dense_signature_builder() -> SignatureBuilder {
+    SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .key_info(true)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        )
+}
+
+#[test]
+fn public_sign_and_verify_accept_node_set_above_old_default() {
+    // 257 inherited namespaces across 257 children exceed the former 65,536
+    // entries; both public operations must use the raised policy default.
+    let key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA key must parse");
+    let writer = X509CertificateKeyInfoWriter::from_pem(&read_fixture(
+        "tests/fixtures/keys/rsa/rsa-2048-cert.pem",
+    ))
+    .expect("certificate must parse");
+    let signed = SignContext::new(&key)
+        .key_info_writer(&writer)
+        .sign_with_builder(
+            &namespace_dense_document(257),
+            &namespace_dense_signature_builder(),
+        )
+        .expect("signing must accept a node set above the old default");
+    let result = VerifyContext::new()
+        .key_resolver(&DefaultKeyResolver::default())
+        .verify(&signed)
+        .expect("verification must accept a node set above the old default");
+    assert_eq!(result.status, DsigStatus::Valid);
+}
+
+#[test]
+fn public_sign_and_verify_enforce_configured_node_set_boundary() {
+    // 257 inherited namespaces across 1,024 children exceed the 262,144
+    // default but fit below the 524,288 absolute ceiling.
+    let key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA key must parse");
+    let writer = X509CertificateKeyInfoWriter::from_pem(&read_fixture(
+        "tests/fixtures/keys/rsa/rsa-2048-cert.pem",
+    ))
+    .expect("certificate must parse");
+    let xml = namespace_dense_document(1_024);
+    let builder = namespace_dense_signature_builder();
+    let default_error = SignContext::new(&key)
+        .key_info_writer(&writer)
+        .sign_with_builder(&xml, &builder)
+        .expect_err("default signing policy must bound node-set materialization");
+    assert!(default_error.to_string().contains("node-set entries"));
+
+    let resources = xml_sec::policy::ResourcePolicy {
+        max_node_set_entries: 524_288,
+        ..xml_sec::policy::ResourcePolicy::default()
+    };
+    let signed = SignContext::new(&key)
+        .key_info_writer(&writer)
+        .policy(SigningPolicy {
+            resources: resources.clone(),
+            ..SigningPolicy::default()
+        })
+        .sign_with_builder(&xml, &builder)
+        .expect("raised signing policy must accept the same document");
+    let resolver = DefaultKeyResolver::default();
+    let default_error = VerifyContext::new()
+        .key_resolver(&resolver)
+        .verify(&signed)
+        .expect_err("default verification policy must bound node-set materialization");
+    assert!(default_error.to_string().contains("node-set entries"));
+    let result = VerifyContext::new()
+        .key_resolver(&resolver)
+        .policy(VerificationPolicy {
+            resources,
+            ..VerificationPolicy::default()
+        })
+        .verify(&signed)
+        .expect("raised verification policy must accept the same document");
+    assert_eq!(result.status, DsigStatus::Valid);
+}
+
 #[test]
 fn owned_builder_signing_rejects_projected_node_limit_atomically() {
     // A document parsed under a broader creation ceiling must still obey the

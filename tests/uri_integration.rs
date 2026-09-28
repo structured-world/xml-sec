@@ -66,13 +66,27 @@ fn empty_uri_with_namespaces() {
 }
 
 #[test]
-fn empty_uri_rejects_quadratic_namespace_materialization() {
-    // In-scope namespace nodes are projected for every owner element. Bound the
-    // N-declarations-by-N-elements product before allocating the backing set.
+fn empty_uri_accepts_a_node_set_above_the_old_ceiling() {
+    // A dense namespace projection with more than 65,536 entries must fit the
+    // low-level hard ceiling; previously that ceiling rejected it.
     let namespaces = (0..257)
         .map(|index| format!(r#" xmlns:n{index}="urn:{index}""#))
         .collect::<String>();
     let xml = format!("<root{namespaces}>{}</root>", "<item/>".repeat(257));
+    let document = roxmltree::Document::parse(&xml).expect("generated XML must parse");
+    let set = NodeSet::entire_document_without_comments(&document)
+        .expect("a node set just above the former limit must fit");
+    assert!(set.contains(document.root_element()));
+}
+
+#[test]
+fn empty_uri_rejects_quadratic_namespace_materialization() {
+    // In-scope namespace nodes are projected for every owner element. Bound the
+    // declarations-by-elements product before allocating the backing set.
+    let namespaces = (0..257)
+        .map(|index| format!(r#" xmlns:n{index}="urn:{index}""#))
+        .collect::<String>();
+    let xml = format!("<root{namespaces}>{}</root>", "<item/>".repeat(2048));
     let document = roxmltree::Document::parse(&xml).expect("generated XML must parse");
     let error = match UriReferenceResolver::new(&document).dereference("") {
         Err(error) => error,
@@ -83,6 +97,7 @@ fn empty_uri_rejects_quadratic_namespace_materialization() {
         error,
         xml_sec::xmldsig::TransformError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
             resource: "node-set entries",
+            maximum: 524_288,
             ..
         })
     ));
@@ -95,6 +110,7 @@ fn empty_uri_rejects_quadratic_namespace_materialization() {
         direct_error,
         xml_sec::xmldsig::TransformError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
             resource: "node-set entries",
+            maximum: 524_288,
             ..
         })
     ));
