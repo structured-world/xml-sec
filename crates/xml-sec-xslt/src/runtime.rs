@@ -347,7 +347,14 @@ fn source_xml_space_preserves_whitespace(
                 if attribute.name.local != "space" {
                     continue;
                 }
-                return attribute.value == "preserve";
+                match attribute.value.as_str() {
+                    "preserve" => return true,
+                    "default" => return false,
+                    // XML 1.0 Fifth Edition section 2.10 permits recovery by ignoring an
+                    // erroneous xml:space, leaving the ancestor's intention in effect.
+                    // https://www.w3.org/TR/2008/REC-xml-20081126/#sec-white-space
+                    _ => continue,
+                }
             }
         }
         ancestor = current.parent;

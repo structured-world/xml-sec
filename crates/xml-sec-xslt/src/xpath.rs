@@ -5487,17 +5487,21 @@ fn media_type_charset(media_type: &str) -> Option<&str> {
 
 fn is_xml_media_type(media_type: &str) -> bool {
     let kind = media_type.split(';').next().unwrap_or(media_type).trim();
-    kind.eq_ignore_ascii_case("text/xml")
-        || kind.eq_ignore_ascii_case("application/xml")
-        || ((kind
-            .get(..5)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("text/"))
-            || kind
-                .get(..12)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("application/")))
-            && kind
-                .get(kind.len().saturating_sub(4)..)
-                .is_some_and(|suffix| suffix.eq_ignore_ascii_case("+xml")))
+    if kind.eq_ignore_ascii_case("text/xml") || kind.eq_ignore_ascii_case("application/xml") {
+        return true;
+    }
+    let Some((type_name, subtype)) = kind.split_once('/') else {
+        return false;
+    };
+    // RFC 3023 section 7 uses +xml across top-level types (including image/svg+xml), so
+    // XInclude 1.0 section 4.3 must apply XML encoding detection to all of them.
+    // https://www.rfc-editor.org/rfc/rfc3023.html#section-7
+    // https://www.w3.org/TR/2006/REC-xinclude-20061115/#text
+    !type_name.is_empty()
+        && subtype.len() > 4
+        && subtype
+            .get(subtype.len() - 4..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case("+xml"))
 }
 
 fn decode_resource_for_xml_parse(

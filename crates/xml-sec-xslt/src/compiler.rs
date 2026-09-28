@@ -3246,10 +3246,18 @@ fn compile_sequence<'a>(
 }
 
 fn stylesheet_space_is_preserved(node: roxmltree::Node<'_, '_>) -> bool {
+    // XML 1.0 Fifth Edition section 2.10 permits ignoring an erroneous xml:space;
+    // continue to the nearest ancestor with a meaningful value.
+    // https://www.w3.org/TR/2008/REC-xml-20081126/#sec-white-space
     node.ancestors()
         .filter(roxmltree::Node::is_element)
-        .find_map(|ancestor| ancestor.attribute((XML_NS, "space")))
-        == Some("preserve")
+        .filter_map(|ancestor| ancestor.attribute((XML_NS, "space")))
+        .find_map(|value| match value {
+            "preserve" => Some(true),
+            "default" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(false)
 }
 fn compile_instruction(
     node: roxmltree::Node<'_, '_>,

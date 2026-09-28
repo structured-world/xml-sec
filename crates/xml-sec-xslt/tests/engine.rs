@@ -3603,6 +3603,20 @@ fn source_strip_space_does_not_override_inherited_xml_space_preserve() {
 }
 
 #[test]
+fn invalid_source_xml_space_does_not_override_inherited_preserve() {
+    // XML 1.0 Fifth Edition section 2.10 permits recovery by ignoring an erroneous xml:space.
+    // https://www.w3.org/TR/2008/REC-xml-20081126/#sec-white-space
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:strip-space elements="*"/><xsl:template match="/"><xsl:value-of select="count(root/child/text())"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(
+            stylesheet,
+            r#"<root xml:space="preserve"><child xml:space="invalid"> </child></root>"#,
+        ),
+        "1"
+    );
+}
+
+#[test]
 fn whitespace_rules_reject_malformed_qname_name_tests() {
     // XSLT 1.0 section 3.4 permits QName, prefix:* and * only; malformed tokens must not install
     // inert rules that silently hide stylesheet errors.
@@ -3677,6 +3691,17 @@ fn stylesheet_xml_space_controls_literal_whitespace() {
     assert_eq!(
         execute(stylesheet, "<source/>"),
         "<out xml:space=\"preserve\"> <kept> </kept><reset xml:space=\"default\"/> </out>\n"
+    );
+}
+
+#[test]
+fn invalid_stylesheet_xml_space_does_not_override_inherited_preserve() {
+    // The chosen XML 1.0 section 2.10 recovery ignores invalid xml:space on a descendant.
+    // https://www.w3.org/TR/2008/REC-xml-20081126/#sec-white-space
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/" xml:space="preserve"><out xml:space="invalid"> </out></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<source/>"),
+        "<out xml:space=\"invalid\"> </out>\n"
     );
 }
 
@@ -6076,6 +6101,50 @@ fn xinclude_text_with_xml_media_type_uses_xml_encoding_detection() {
     assert_eq!(
         result.serialized.bytes,
         "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>café".as_bytes()
+    );
+}
+
+#[test]
+fn xinclude_text_with_image_xml_media_type_uses_xml_encoding_detection() {
+    // RFC 3023 also identifies image/svg+xml as XML; XInclude 1.0 section 4.3 uses XML
+    // encoding detection for XML media types before the xi:include encoding attribute.
+    // https://www.w3.org/TR/2006/REC-xinclude-20061115/#text
+    let resolver = Arc::new(ContextResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            ("svg-text.txt".into(), Some("memory:source.xml".into())),
+            ResolvedResource {
+                canonical_uri: "memory:svg-text.txt".into(),
+                identity: ResourceIdentity("svg-text.txt".into()),
+                bytes: b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>caf\xe9".to_vec(),
+                media_type: Some("image/svg+xml".into()),
+                encoding: None,
+            },
+        );
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="root"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="svg-text.txt" parse="text" encoding="UTF-8"/></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("source parses");
+    let result = stylesheet.execute_with_source_processing(
+        &source,
+        &Parameters::new(),
+        resolver,
+        ExecutionOptions {
+            budget: execution_budget(1024),
+            initial_mode: None,
+            initial_template: None,
+        },
+        SourceProcessing::XInclude,
+    );
+    assert!(
+        matches!(result, Ok(result) if result.serialized.bytes == "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>café".as_bytes())
     );
 }
 
