@@ -849,15 +849,14 @@ impl Evaluator {
             &source_options.whitespace,
             meter,
         )?;
-        let mut module_roots = Vec::with_capacity(module_documents.len());
+        let module_roots_start = source.logical_roots().len();
         for module in module_documents {
-            let root = import_stylesheet_document(
+            import_stylesheet_document(
                 &mut source,
                 &module.document,
                 &source_options.whitespace,
                 meter,
             )?;
-            module_roots.push((module.id, root));
         }
         let package = project_semantic_document(&source, meter)?;
         let maps = NodeMaps::new(&source, meter)?;
@@ -910,11 +909,16 @@ impl Evaluator {
             &mut document_cache_index_bytes,
             meter,
         )?;
-        for (id, root) in module_roots {
+        // Each import appends one logical root in module order; reuse that metered
+        // document storage instead of allocating a second per-module scratch vector.
+        for (module, &root) in module_documents
+            .iter()
+            .zip(&source.logical_roots()[module_roots_start..])
+        {
             let request = DocumentRequest {
                 href: String::new(),
                 base_uri: None,
-                empty_document: Some(EmptyDocumentId::Stylesheet(id)),
+                empty_document: Some(EmptyDocumentId::Stylesheet(module.id)),
             };
             seed_document_cache(
                 request,

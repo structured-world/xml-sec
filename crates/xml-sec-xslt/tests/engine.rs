@@ -14173,3 +14173,43 @@ fn empty_document_uris_preserve_their_logical_document_origin() {
         .expect("empty document URIs resolve without external access");
     assert_eq!(result.serialized.bytes, b"source|source|stylesheet");
 }
+
+#[test]
+fn imported_stylesheet_document_roots_preserve_module_order() {
+    // document('') in each imported template must resolve to that module, not the principal
+    // stylesheet or a neighboring import after roots are projected into the XPath cache.
+    let resolver = Arc::new(MemoryResolver::default());
+    {
+        let mut resources = resolver.resources.lock().expect("resolver mutex");
+        for (name, marker) in [("first.xsl", "first"), ("second.xsl", "second")] {
+            resources.insert(
+                name.into(),
+                format!(
+                    r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:meta="urn:metadata"><meta:marker>{marker}</meta:marker><xsl:template name="{marker}"><xsl:value-of select="document('')/*/meta:marker"/></xsl:template></xsl:stylesheet>"#
+                ),
+            );
+        }
+    }
+    let stylesheet = Compiler::new(
+        Arc::clone(&resolver),
+        CompileBudget::new(1 << 20, 8, 256, 4 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:import href="first.xsl"/><xsl:import href="second.xsl"/><xsl:output method="text"/><xsl:template match="/"><xsl:call-template name="first"/><xsl:text>|</xsl:text><xsl:call-template name="second"/></xsl:template></xsl:stylesheet>"#,
+        Some("memory:main.xsl"),
+    )
+    .expect("both stylesheet modules compile");
+    let result = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1 << 20),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("each module resolves its own document root");
+    assert_eq!(result.serialized.bytes, b"first|second");
+}
