@@ -59,9 +59,22 @@ mod sxd_document;
 #[cfg_attr(test, allow(clippy::unwrap_used))]
 #[path = "sxd_xpath/lib.rs"]
 mod sxd_xpath;
-/// Shared XML byte-decoding and lexical processing primitives.
 #[path = "xml_input/shared.rs"]
-pub mod xml_input;
+// The internal xml-input crate also compiles this source for XSLT's wider API.
+#[allow(dead_code)]
+mod xml_input_shared;
+/// XML lexical helpers used by the packaged CLI.
+///
+/// Decoding untrusted XML requires a caller-supplied limit through
+/// [`encoding::decode_xml_octets`]; the unbounded internal helpers are not public.
+///
+/// ```compile_fail
+/// use xml_sec::xml_input::decode_xml;
+/// ```
+pub mod xml_input {
+    pub use crate::xml_input_shared::lexical;
+    pub(crate) use crate::xml_input_shared::{Error, decode_xml_bounded};
+}
 #[cfg(all(test, feature = "xmldsig"))]
 pub(crate) use sxd_document::{Package, QName, dom};
 #[cfg(feature = "xmldsig")]

@@ -3,7 +3,7 @@ name = "xml-sec"
 version = "0.1.16"
 edition = "2024"
 rust-version = "1.92"
-license = "Apache-2.0"
+license = "Apache-2.0 AND MIT"
 description = "Pure Rust XML Security: XMLDSig, XMLEnc, C14N. Drop-in replacement for libxmlsec1."
 repository = "https://github.com/structured-world/xml-sec"
 homepage = "https://github.com/structured-world/xml-sec"
@@ -15,6 +15,7 @@ include = [
     "/Cargo.toml",
     "/Cargo.lock",
     "/LICENSE",
+    "/LICENSE-THIRD-PARTY",
     "/README.md",
     "/docs/**",
     "/src/**",
