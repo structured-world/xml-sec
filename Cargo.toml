@@ -17,6 +17,7 @@ include = [
     "/LICENSE",
     "/LICENSE-THIRD-PARTY",
     "/README.md",
+    "/assets/usdt-qr.svg",
     "/docs/**",
     "/src/**",
     "/examples/**",
