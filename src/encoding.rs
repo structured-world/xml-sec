@@ -1,11 +1,12 @@
 //! XML byte-encoding detection shared by process and transform boundaries.
 
+use crate::xml_input as xml_sec_xml_input;
 use std::borrow::Cow;
 
 /// Shared decoder errors, including unsupported encodings and decoded-size limits.
 /// This replaces the former XML-only error variants rather than collapsing new
 /// failure classes into misleading legacy variants.
-pub use xml_sec_xml_input::Error as XmlEncodingError;
+pub use crate::xml_input_shared::Error as XmlEncodingError;
 
 /// Decode XML 1.0 octets into the backend-neutral Unicode parser contract.
 ///

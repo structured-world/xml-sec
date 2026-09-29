@@ -9,6 +9,8 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::rc::Rc;
 
+use crate::sxd_document as sxd_document_no_unsafe;
+use crate::sxd_xpath as sxd_xpath_no_unsafe;
 use crate::xml::dom::{Document, NodeId};
 use sxd_document_no_unsafe::{Package, QName, dom};
 use sxd_xpath_no_unsafe::{Context, Factory, Value, function, nodeset};

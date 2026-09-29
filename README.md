@@ -142,11 +142,13 @@ ambiguous BOM-less UTF-16/UTF-32, and unsupported EBCDIC variants fail explicitl
 
 **API migration for this pre-release change:** `encoding::decode_xml_octets` now requires a
 maximum decoded-byte count as its second argument. `encoding::XmlEncodingError` is now the
-shared, non-exhaustive `xml-sec-xml-input::Error`; update matches to handle the new error
+shared, non-exhaustive `xml_sec::encoding::XmlEncodingError`; update matches to handle the new error
 variants and include a fallback arm. Code constructing `ResourcePolicy` with every field must
 also set `max_xml_namespace_bindings` (or start from `ResourcePolicy::default()` and override
 selected fields). These changes keep decoding and namespace-scope allocation under explicit
-resource limits.
+resource limits. For trusted resolver-provided encoding metadata, use
+`xml_input::decode_xml_bounded(bytes, Some(encoding), maximum_decoded_bytes)`; the unbounded
+decoder remains internal.
 
 ## Native xmlsec1 CLI
 
@@ -184,14 +186,11 @@ access, XInclude processing, and operation time explicit. The default grants no 
 clock access; callers may supply a fixed clock for reproducible EXSLT date functions or explicitly
 request host-clock compatibility.
 
-```sh
-cargo add xml-sec-xslt
-```
-
-The engine remains a separate architectural boundary. The main crate continues to reject XMLDSig
+The engine currently remains an in-repository workspace crate rather than a separately published
+package; `xml-sec` is the only crate published to crates.io. The main crate continues to reject XMLDSig
 XSLT transforms until the policy, resource identity, and node-set adapter contracts are connected.
-[`xml-sec-xml-input`](crates/xml-sec-xml-input) supplies the shared strict byte-decoding and lexical
-boundary used by core and XSLT paths.
+The shared strict byte-decoding and lexical source is compiled into `xml-sec` and reused by the
+internal XSLT workspace crate.
 
 ## Specifications
 

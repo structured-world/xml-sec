@@ -16,6 +16,8 @@
 //! to use [`evaluate_xpath`][evaluate_xpath].
 //!
 //! ```
+//! # #[cfg(not(feature = "embedded"))]
+//! # {
 //! use sxd_document_no_unsafe::parser;
 //! use sxd_xpath_no_unsafe::{evaluate_xpath, Value};
 //!
@@ -25,6 +27,7 @@
 //! let value = evaluate_xpath(&document, "/root").expect("XPath evaluation failed");
 //!
 //! assert_eq!("hello", value.string());
+//! # }
 //! ```
 //!
 //! Evaluating an XPath returns a [`Value`][], representing the
@@ -40,6 +43,8 @@
 //! accomplished:
 //!
 //! ```
+//! # #[cfg(not(feature = "embedded"))]
+//! # {
 //! use sxd_document_no_unsafe::parser;
 //! use sxd_xpath_no_unsafe::{Factory, Context, Value};
 //!
@@ -56,6 +61,7 @@
 //!     .expect("XPath evaluation failed");
 //!
 //! assert_eq!("hello", value.string());
+//! # }
 //! ```
 //!
 //! See [`Context`][] for details on how to customize the
@@ -109,6 +115,8 @@ compile_error!("select either `no-unsafe` or `raw-pointer-backend`");
 // Cargo's all-feature verification enables both selectors. Safe precedence keeps that profile
 // free of raw pointers; selecting the legacy backend requires disabling default features.
 
+#[cfg(feature = "embedded")]
+use crate::sxd_document as sxd_document_no_unsafe;
 use snafu::{ResultExt, Snafu};
 use std::borrow::ToOwned;
 use std::string;
@@ -123,15 +131,15 @@ pub use crate::context::Context;
 
 #[macro_use]
 pub mod macros;
-mod axis;
+pub(crate) mod axis;
 pub mod context;
-mod expression;
+pub(crate) mod expression;
 pub mod function;
-mod node_test;
+pub(crate) mod node_test;
 pub mod nodeset;
-mod parser;
-mod token;
-mod tokenizer;
+pub(crate) mod parser;
+pub(crate) mod token;
+pub(crate) mod tokenizer;
 
 // These belong in the the document
 
@@ -219,7 +227,7 @@ impl OwnedQName {
     }
 }
 
-type LiteralValue = Value<'static>;
+pub(crate) type LiteralValue = Value<'static>;
 
 struct FormattedLength(usize);
 
@@ -260,7 +268,7 @@ pub enum Value<'d> {
     Nodeset(nodeset::Nodeset<'d>),
 }
 
-fn str_to_num(s: &str) -> f64 {
+pub(crate) fn str_to_num(s: &str) -> f64 {
     let lexical = s.trim_matches(|character| matches!(character, ' ' | '\t' | '\r' | '\n'));
     let unsigned = lexical.strip_prefix('-').unwrap_or(lexical);
     let mut parts = unsigned.split('.');
@@ -476,6 +484,8 @@ impl XPath {
     /// The most common case is to pass in a reference to a [`Context`][]:
     ///
     /// ```rust,no_run
+    /// # #[cfg(not(feature = "embedded"))]
+    /// # mod example {
     /// use sxd_document_no_unsafe::dom::Document;
     /// use sxd_xpath_no_unsafe::{XPath, Context};
     ///
@@ -486,6 +496,7 @@ impl XPath {
     /// }
     ///
     /// # fn main() {}
+    /// # }
     /// ```
     ///
     /// [`Context`]: context/struct.Context.html
@@ -698,6 +709,8 @@ pub enum Error {
 /// # Examples
 ///
 /// ```
+/// # #[cfg(not(feature = "embedded"))]
+/// # {
 /// use sxd_document_no_unsafe::parser;
 /// use sxd_xpath_no_unsafe::{evaluate_xpath, Value};
 ///
@@ -705,6 +718,7 @@ pub enum Error {
 /// let document = package.as_document();
 ///
 /// assert_eq!(Ok(Value::Number(3.0)), evaluate_xpath(&document, "/*/a + /*/b"));
+/// # }
 /// ```
 pub fn evaluate_xpath<'d>(document: &'d Document<'d>, xpath: &str) -> Result<Value<'d>, Error> {
     let factory = Factory::new();

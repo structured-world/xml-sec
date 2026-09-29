@@ -1,5 +1,7 @@
 //! Support for registering and creating XPath functions.
 
+#[cfg(feature = "embedded")]
+use crate::sxd_document as sxd_document_no_unsafe;
 use snafu::Snafu;
 use std::borrow::ToOwned;
 use std::ops::Index;
@@ -803,6 +805,8 @@ mod test {
     use std::borrow::ToOwned;
     use std::{f64, fmt};
 
+    #[cfg(feature = "embedded")]
+    use super::sxd_document_no_unsafe;
     use sxd_document_no_unsafe::Package;
 
     use crate::context;

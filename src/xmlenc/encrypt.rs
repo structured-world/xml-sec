@@ -1,5 +1,6 @@
 //! XMLEnc content encryption, key wrapping, and XML generation.
 
+use crate::xml_input as xml_sec_xml_input;
 use std::{fmt, sync::Arc};
 
 use crate::xml::dom::{Document, Node};

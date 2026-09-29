@@ -1,5 +1,6 @@
 //! Builders for deterministic XMLDSig signature templates.
 
+use crate::xml_input as xml_sec_xml_input;
 use std::{collections::HashSet, io::Write};
 
 use base64::Engine;

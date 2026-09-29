@@ -1,12 +1,15 @@
 /// Convenience constructor for a nodeset.
 ///
 /// ```
+/// # #[cfg(not(feature = "embedded"))]
+/// # {
 /// use sxd_document_no_unsafe::Package;
 ///
 /// let package = Package::new();
 /// let root = package.as_document().root();
 /// let nodes = sxd_xpath_no_unsafe::nodeset![root,];
 /// assert_eq!(nodes.size(), 1);
+/// # }
 /// ```
 #[macro_export]
 macro_rules! nodeset(

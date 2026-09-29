@@ -1,5 +1,6 @@
 //! Shared lexical preflight and source-position sidecar for every DOM backend.
 
+use crate::xml_input as xml_sec_xml_input;
 use std::ops::Range;
 
 use xml_sec_xml_input::lexical::{Event, Scanner};

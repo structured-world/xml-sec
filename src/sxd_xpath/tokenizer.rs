@@ -1,3 +1,5 @@
+#[cfg(feature = "embedded")]
+use crate::sxd_document as sxd_document_no_unsafe;
 use peresil::{self, Identifier, Recoverable, StringPoint, try_parse};
 use snafu::Snafu;
 use std::borrow::ToOwned;

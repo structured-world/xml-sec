@@ -13,6 +13,7 @@ use rsa::{
     traits::PublicKeyParts as _,
 };
 use x509_parser::prelude::FromDer as _;
+use xml_sec::xml_input as xml_sec_xml_input;
 use xml_sec::{
     IdAttributeRegistration, XmlBackend,
     policy::{
