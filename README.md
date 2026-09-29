@@ -146,7 +146,9 @@ shared, non-exhaustive `xml_sec::encoding::XmlEncodingError`; update matches to 
 variants and include a fallback arm. Code constructing `ResourcePolicy` with every field must
 also set `max_xml_namespace_bindings` (or start from `ResourcePolicy::default()` and override
 selected fields). These changes keep decoding and namespace-scope allocation under explicit
-resource limits.
+resource limits. For trusted resolver-provided encoding metadata, use
+`xml_input::decode_xml_bounded(bytes, Some(encoding), maximum_decoded_bytes)`; the unbounded
+decoder remains internal.
 
 ## Native xmlsec1 CLI
 

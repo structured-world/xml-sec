@@ -63,17 +63,16 @@ mod sxd_xpath;
 // The internal xml-input crate also compiles this source for XSLT's wider API.
 #[allow(dead_code)]
 mod xml_input_shared;
-/// XML lexical helpers used by the packaged CLI.
+/// Bounded XML input decoding and lexical helpers.
 ///
-/// Decoding untrusted XML requires a caller-supplied limit through
-/// [`encoding::decode_xml_octets`]; the unbounded internal helpers are not public.
+/// [`decode_xml_bounded`] accepts trusted encoding metadata and a caller-supplied
+/// decoded-byte limit. The unbounded internal helpers are not public.
 ///
 /// ```compile_fail
 /// use xml_sec::xml_input::decode_xml;
 /// ```
 pub mod xml_input {
-    pub use crate::xml_input_shared::lexical;
-    pub(crate) use crate::xml_input_shared::{Error, decode_xml_bounded};
+    pub use crate::xml_input_shared::{Error, decode_xml_bounded, lexical};
 }
 #[cfg(all(test, feature = "xmldsig"))]
 pub(crate) use sxd_document::{Package, QName, dom};
