@@ -1,5 +1,8 @@
 [workspace]
+release = false
 semver_check = false
+# Unlike the single-crate coordinode workspace, older tags lack current internal members.
+# git_only reconstructs those tags and fails before it can select the release package.
 git_release_enable = false
 git_tag_enable = false
 changelog_update = true
@@ -10,6 +13,7 @@ release_commits = "^(feat|fix|perf|refactor|docs)(\\([^)]+\\))?!?:"
 
 [[package]]
 name = "xml-sec"
+release = true
 git_release_enable = true
 git_tag_enable = true
 git_tag_name = "v{{ version }}"

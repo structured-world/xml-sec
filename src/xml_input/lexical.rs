@@ -958,6 +958,7 @@ fn validate_writer_characters(value: &str) -> std::io::Result<()> {
 }
 
 #[cfg(all(test, feature = "std"))]
+#[allow(clippy::unwrap_used)]
 mod tests {
     #[test]
     fn xml_version_requires_digits_after_the_period() {

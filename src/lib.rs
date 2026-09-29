@@ -30,6 +30,11 @@
 #![deny(clippy::unwrap_used)]
 #![warn(missing_docs)]
 
+extern crate alloc;
+#[cfg(feature = "xmldsig")]
+#[macro_use]
+extern crate peresil;
+
 #[cfg(not(any(feature = "xml-backend-xmloxide", feature = "xml-backend-roxmltree")))]
 compile_error!(
     "compile at least one XML backend: `xml-backend-xmloxide` or `xml-backend-roxmltree`"
@@ -40,6 +45,34 @@ pub mod document;
 pub mod encoding;
 pub mod error;
 mod hard_limits;
+#[cfg(feature = "xmldsig")]
+// The same sources also build as standalone crates for the XSLT workspace member.
+// Only their XPath-facing surface is used by this package.
+#[doc(hidden)]
+#[allow(dead_code, unused_imports, missing_docs)]
+#[cfg_attr(test, allow(clippy::unwrap_used))]
+#[path = "sxd_document/lib.rs"]
+mod sxd_document;
+#[cfg(feature = "xmldsig")]
+#[doc(hidden)]
+#[allow(dead_code, unused_imports, missing_docs)]
+#[cfg_attr(test, allow(clippy::unwrap_used))]
+#[path = "sxd_xpath/lib.rs"]
+mod sxd_xpath;
+/// Shared XML byte-decoding and lexical processing primitives.
+#[path = "xml_input/shared.rs"]
+pub mod xml_input;
+#[cfg(all(test, feature = "xmldsig"))]
+pub(crate) use sxd_document::{Package, QName, dom};
+#[cfg(feature = "xmldsig")]
+pub(crate) use sxd_document::{StorageRequirements, XML_NS_PREFIX, XML_NS_URI, str, string_pool};
+#[cfg(all(test, feature = "xmldsig"))]
+pub(crate) use sxd_xpath::{Context, Factory};
+#[cfg(feature = "xmldsig")]
+pub(crate) use sxd_xpath::{
+    LiteralValue, OwnedPrefixedName, OwnedQName, ParseBudget, Value, axis, context, expression,
+    function, node_test, node_to_num_with_context, nodeset, parser, str_to_num, token, tokenizer,
+};
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 mod operation;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]

@@ -1,6 +1,8 @@
 //! Support for the various types of contexts before and during XPath
 //! evaluation.
 
+#[cfg(feature = "embedded")]
+use crate::sxd_document as sxd_document_no_unsafe;
 use sxd_document_no_unsafe::QName;
 
 use std::cell::Cell;
@@ -76,6 +78,8 @@ impl<V> QNameMap<V> {
 /// A complete example showing all optional settings.
 ///
 /// ```
+/// # #[cfg(not(feature = "embedded"))]
+/// # {
 /// use std::collections::HashMap;
 /// use sxd_document_no_unsafe::parser;
 /// use sxd_xpath_no_unsafe::{Factory, Context, Value};
@@ -118,6 +122,7 @@ impl<V> QNameMap<V> {
 ///
 /// let number = value.number(&evaluation).expect("numeric conversion failed");
 /// assert_eq!(0.952, (number * 1000.0).trunc() / 1000.0);
+/// # }
 /// ```
 ///
 /// Note that we are using a custom function (`sigmoid`), a variable
@@ -491,6 +496,8 @@ impl<'c, 'd> Iterator for EvaluationNodesetIter<'c, 'd> {
 #[cfg(test)]
 mod tests {
     use super::Context;
+    #[cfg(feature = "embedded")]
+    use super::sxd_document_no_unsafe;
 
     #[test]
     fn qname_lookup_does_not_allocate() {

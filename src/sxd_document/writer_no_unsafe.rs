@@ -123,16 +123,26 @@ impl PrefixMapping {
     }
 
     fn default_namespace_uri_in_current_scope(&self) -> Option<&str> {
-        self.scopes.last().unwrap().default_namespace_uri.as_deref()
+        self.scopes
+            .last()
+            .expect("prefix mapping always has a current scope")
+            .default_namespace_uri
+            .as_deref()
     }
 
     fn prefixes_in_current_scope(&self) -> std::slice::Iter<'_, (String, String)> {
-        self.scopes.last().unwrap().defined_prefixes.iter()
+        self.scopes
+            .last()
+            .expect("prefix mapping always has a current scope")
+            .defined_prefixes
+            .iter()
     }
 
     fn populate_scope(&mut self, element: &dom::Element<'_>, attributes: &[dom::Attribute<'_>]) {
-        self.scopes.last_mut().unwrap().default_namespace_uri =
-            element.default_namespace_uri().map(|s| s.to_string());
+        self.scopes
+            .last_mut()
+            .expect("prefix mapping always has a current scope")
+            .default_namespace_uri = element.default_namespace_uri().map(|s| s.to_string());
 
         if let Some(prefix) = element.preferred_prefix() {
             let name = element.name();
@@ -511,8 +521,8 @@ impl Writer {
         let mut todo = vec![Element(element)];
         let mut mapping = PrefixMapping::new();
 
-        while !todo.is_empty() {
-            self.format_one(todo.pop().unwrap(), &mut todo, &mut mapping, writer)?;
+        while let Some(next) = todo.pop() {
+            self.format_one(next, &mut todo, &mut mapping, writer)?;
         }
 
         Ok(())

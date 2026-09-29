@@ -13,6 +13,7 @@
 edition = "2024"
 name = "xml-sec-sxd-xpath"
 version = "0.1.1"
+publish = false
 authors = [
     "Jake Goulding <jake.goulding@gmail.com>",
     "Neil Soiffer <soiffer@alum.mit.edu>",
@@ -42,7 +43,10 @@ unstable = []
 
 [lib]
 name = "sxd_xpath_no_unsafe"
-path = "src/lib.rs"
+path = "../../src/sxd_xpath/lib.rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("embedded"))'] }
 
 [[test]]
 name = "integration"

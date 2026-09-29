@@ -3,6 +3,8 @@
 //! ### Example
 //!
 //! ```
+//! # #[cfg(not(feature = "embedded"))]
+//! # {
 //! use sxd_document_no_unsafe::parser;
 //! let xml = r#"<?xml version="1.0"?>
 //! <!-- Awesome data incoming -->
@@ -12,6 +14,7 @@
 //!   <datum>Math &gt; others</datum>
 //! </data>"#;
 //! let doc = parser::parse(xml).expect("Failed to parse");
+//! # }
 //! ```
 
 use std::{
@@ -1364,7 +1367,10 @@ impl<'a> DeferredAttributes<'a> {
                 Ok(Some(value))
             }
             _ => {
-                let last_namespace = self.default_namespaces.last().unwrap();
+                let last_namespace = self
+                    .default_namespaces
+                    .last()
+                    .expect("this branch contains multiple default namespaces");
                 Err(last_namespace
                     .name
                     .map(|_| SpecificError::RedefinedDefaultNamespace))

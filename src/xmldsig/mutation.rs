@@ -3,6 +3,7 @@
 //! The selected semantic DOM is immutable. These helpers validate structure
 //! through the backend-neutral DOM contract, then splice validated source ranges.
 
+use crate::xml_input as xml_sec_xml_input;
 use std::ops::Range;
 
 use xml_sec_xml_input::lexical::{escape_attribute, escape_text};

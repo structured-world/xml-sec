@@ -1,5 +1,6 @@
 //! XML byte-encoding detection shared by process and transform boundaries.
 
+use crate::xml_input as xml_sec_xml_input;
 use std::borrow::Cow;
 
 /// Shared decoder errors, including unsupported encodings and decoded-size limits.

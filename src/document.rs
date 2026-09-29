@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::xml::dom::{Document, Node, NodeId, ParseError, ParsingOptions, XmlBackend};
+use crate::xml_input as xml_sec_xml_input;
 use self_cell::self_cell;
 
 use crate::IdAttributeRegistration;

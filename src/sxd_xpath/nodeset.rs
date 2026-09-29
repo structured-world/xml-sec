@@ -1,5 +1,7 @@
 //! Support for collections of nodes.
 
+#[cfg(feature = "embedded")]
+use crate::sxd_document as sxd_document_no_unsafe;
 use std::borrow::ToOwned;
 use std::collections::HashSet;
 use std::collections::hash_set;
@@ -1259,6 +1261,8 @@ impl<'d> FromIterator<Node<'d>> for OrderedNodes<'d> {
 mod test {
     use std::borrow::ToOwned;
 
+    #[cfg(feature = "embedded")]
+    use super::sxd_document_no_unsafe;
     use sxd_document_no_unsafe::Package;
 
     use super::Node::*;

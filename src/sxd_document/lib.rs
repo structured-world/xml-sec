@@ -1,5 +1,7 @@
 //!
 //! ```
+//! # #[cfg(not(feature = "embedded"))]
+//! # {
 //! use sxd_document_no_unsafe::Package;
 //! let package = Package::new();
 //! let doc = package.as_document();
@@ -12,6 +14,7 @@
 //! hello.append_child(comment);
 //! hello.append_child(text);
 //! doc.root().append_child(hello);
+//! # }
 //! ```
 //!
 //! ### Memory and ownership
@@ -56,6 +59,7 @@ compile_error!("select either `no-unsafe` or `raw-pointer-backend`");
 // Cargo's all-feature verification enables both selectors. Safe precedence keeps that profile
 // free of raw pointers; selecting the legacy backend requires disabling default features.
 
+#[cfg(not(feature = "embedded"))]
 #[macro_use]
 extern crate peresil;
 
@@ -141,7 +145,7 @@ pub fn estimated_storage_bytes(requirements: StorageRequirements) -> usize {
 }
 
 mod lazy_hash_map;
-mod str;
+pub(crate) mod str;
 mod str_ext;
 
 #[cfg(not(feature = "no-unsafe"))]
@@ -149,7 +153,7 @@ pub mod dom;
 #[cfg(not(feature = "no-unsafe"))]
 mod raw;
 #[cfg(not(feature = "no-unsafe"))]
-mod string_pool;
+pub(crate) mod string_pool;
 #[cfg(not(feature = "no-unsafe"))]
 #[doc(hidden)]
 pub mod thindom;
@@ -161,7 +165,7 @@ pub mod writer;
 mod raw;
 #[cfg(feature = "no-unsafe")]
 #[path = "string_pool_no_unsafe.rs"]
-mod string_pool;
+pub(crate) mod string_pool;
 #[cfg(feature = "no-unsafe")]
 pub use string_pool::InternedString;
 #[cfg(feature = "no-unsafe")]
@@ -190,6 +194,8 @@ pub mod __internal {
 }
 
 pub use crate::str::XmlChar;
+#[cfg(feature = "embedded")]
+pub use crate::{as_opt_str, as_qname, as_str, to_ns_str};
 
 #[cfg(not(feature = "no-unsafe"))]
 #[macro_export]
@@ -267,8 +273,8 @@ pub type NsStr<'d> = &'d str;
 /// signature; owned storage does not borrow from `'d` in this mode.
 pub type NsStr<'d> = String;
 
-static XML_NS_PREFIX: &str = "xml";
-static XML_NS_URI: &str = "http://www.w3.org/XML/1998/namespace";
+pub(crate) static XML_NS_PREFIX: &str = "xml";
+pub(crate) static XML_NS_URI: &str = "http://www.w3.org/XML/1998/namespace";
 
 /// A prefixed name. This represents what is found in the string form
 /// of an XML document, and does not apply any namespace mapping.

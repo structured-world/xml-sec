@@ -17,29 +17,8 @@ jobs:
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
-      - name: Check support-crate versions against the prior release
-        run: |
-          previous="$(git describe --tags --match 'v*' --abbrev=0 HEAD^)"
-          bash .github/scripts/check-support-crate-versions.sh "$previous"
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth
-      # Workspace path dependencies must exist in the registry before their consumers.
-      - name: Publish document support crate to crates.io
-        run: bash .github/scripts/publish-crate.sh xml-sec-sxd-document
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-      - name: Publish XPath support crate to crates.io
-        run: bash .github/scripts/publish-crate.sh xml-sec-sxd-xpath
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-      - name: Publish XML input crate to crates.io
-        run: bash .github/scripts/publish-crate.sh xml-sec-xml-input
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-      - name: Publish XSLT crate to crates.io
-        run: bash .github/scripts/publish-crate.sh xml-sec-xslt
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
       - name: Publish xml-sec to crates.io
         run: bash .github/scripts/publish-crate.sh xml-sec
         env:

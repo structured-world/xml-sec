@@ -16,20 +16,6 @@ env:
   LD_LIBRARY_PATH: ${{ github.workspace }}/.tools/xmlsec1-1.3.13/lib
 
 jobs:
-  support-crate-versions:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Verify support-crate version gate
-        run: bash .github/scripts/test-check-support-crate-versions.sh
-      - name: Require version bumps for changed support crates
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: bash .github/scripts/check-support-crate-versions.sh "$BASE_SHA"
-
   capability-ledger:
     runs-on: ubuntu-latest
     steps:
