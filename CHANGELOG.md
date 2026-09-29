@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.17](https://github.com/structured-world/xml-sec/compare/v0.1.16...v0.1.17) - 2026-09-29
+
+### Added
+
+- *(xslt)* implement standalone XSLT engine
+
+### Fixed
+
+- *(xml)* expose bounded trusted decoding
+- *(xmldsig)* raise node-set capacity
+
 ## [0.1.16](https://github.com/structured-world/xml-sec/compare/v0.1.15...v0.1.16) - 2026-08-29
 
 ### Added
