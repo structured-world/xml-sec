@@ -3793,6 +3793,112 @@ fn lax_store_encryption_replaces_stale_content_key_name() {
 }
 
 #[test]
+fn lax_store_rsa_recipients_consume_distinct_candidates() {
+    // Lax selection consumes each entry once, including exact and singleton
+    // matches; every recipient must decrypt and exhaustion must emit no output.
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("keys.xml");
+    let template = temp.path().join("template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let encrypted = temp.path().join("encrypted.xml");
+    let base64 = base64::engine::general_purpose::STANDARD;
+    let mut entries = Vec::new();
+    for (name, bits) in [("a", 2048), ("b", 4096)] {
+        let pem = fs::read_to_string(
+            project_root().join(format!("tests/fixtures/keys/rsa/rsa-{bits}-pubkey.pem")),
+        )
+        .unwrap();
+        let public = RsaPublicKey::from_public_key_pem(&pem).unwrap();
+        entries.push(format!(
+            "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>{name}</KeyName><KeyValue><RSAKeyValue><Modulus>{}</Modulus><Exponent>{}</Exponent></RSAKeyValue></KeyValue></KeyInfo>",
+            base64.encode(public.n().to_be_bytes_trimmed_vartime()),
+            base64.encode(public.e().to_be_bytes_trimmed_vartime()),
+        ));
+    }
+    fs::write(
+        &store,
+        format!(
+            "<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\">{}</Keys>",
+            entries.join("")
+        ),
+    )
+    .unwrap();
+    fs::write(&plaintext, b"distinct store recipients").unwrap();
+    let write_template = |names: &[Option<&str>]| {
+        let recipients = names.iter().map(|name| {
+            let key_info = name.map_or_else(String::new, |name| format!("<ds:KeyInfo><ds:KeyName>{name}</ds:KeyName></ds:KeyInfo>"));
+            format!("<EncryptedKey><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#rsa-oaep\"/>{key_info}<CipherData><CipherValue/></CipherData></EncryptedKey>")
+        }).collect::<String>();
+        fs::write(&template, format!("<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><ds:KeyInfo>{recipients}</ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>")).unwrap();
+    };
+    let encrypt = |output: &Path| {
+        Command::new(binary())
+            .args(["encrypt", "--lax-key-search", "--keys-file"])
+            .arg(&store)
+            .arg("--binary-data")
+            .arg(&plaintext)
+            .arg("--output")
+            .arg(output)
+            .arg(&template)
+            .output()
+            .unwrap()
+    };
+    for names in [
+        [None, None],
+        [Some("unknown-a"), Some("unknown-b")],
+        [Some("a"), None],
+    ] {
+        write_template(&names);
+        let result = encrypt(&encrypted);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        for bits in [2048, 4096] {
+            let result = Command::new(binary())
+                .args(["decrypt", "--lax-key-search", "--privkey-pem"])
+                .arg(project_root().join(format!("tests/fixtures/keys/rsa/rsa-{bits}-key.pem")))
+                .arg(&encrypted)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "recipient {bits}, names {names:?}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(result.stdout, b"distinct store recipients");
+        }
+    }
+    for (names, single_key) in [(vec![None, None, None], false), (vec![None, None], true)] {
+        if single_key {
+            fs::write(
+                &store,
+                format!(
+                    "<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\">{}</Keys>",
+                    entries[0]
+                ),
+            )
+            .unwrap();
+        }
+        write_template(&names);
+        let output = temp.path().join(if single_key {
+            "singleton.xml"
+        } else {
+            "exhausted.xml"
+        });
+        let result = encrypt(&output);
+        assert!(!result.status.success());
+        assert!(
+            String::from_utf8_lossy(&result.stderr)
+                .contains("no compatible RSA key in --keys-file")
+        );
+        assert!(!output.exists());
+        assert!(result.stdout.is_empty());
+    }
+}
+
+#[test]
 fn lax_rsa_recipients_charge_only_attempted_store_keys() {
     // Two exact recipients must not each consume the 33 unused lax fallbacks.
     let temp = tempfile::tempdir().unwrap();

@@ -2211,7 +2211,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         )?;
         let mut store_candidate_budget =
             KeyCandidateBudget::with_limit(policy.resources.max_key_candidates);
-        let mut public_keys_by_name = HashMap::new();
+        let mut available_public_keys_by_name = HashMap::new();
         let mut only_public_key = None;
         let mut public_key_count = 0;
         for entry in store
@@ -2221,13 +2221,17 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         {
             public_key_count += 1;
             only_public_key = Some(entry);
-            public_keys_by_name.insert(entry.name.as_str(), entry);
+            available_public_keys_by_name.insert(entry.name.as_str(), entry);
         }
         for (recipient, metadata) in template_recipients.into_iter().zip(recipient_metadata) {
             let lax = invocation.flag("lax-key-search");
             let exact = match recipient.key_name.as_deref() {
-                Some(name) => public_keys_by_name.get(name).copied(),
-                None if public_key_count == 1 => only_public_key,
+                Some(name) => available_public_keys_by_name.get(name).copied(),
+                None if public_key_count == 1 => only_public_key.and_then(|entry| {
+                    available_public_keys_by_name
+                        .get(entry.name.as_str())
+                        .copied()
+                }),
                 None if !lax && public_key_count > 1 => {
                     return Err(CommandError::Usage(
                         "multiple matching keys in --keys-file".into(),
@@ -2240,6 +2244,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             }
             let fallbacks = store.public_keys().iter().filter(|entry| {
                 lax && entry.usages.allows(key_manager::KeyUsage::Encrypt)
+                    && available_public_keys_by_name.contains_key(entry.name.as_str())
                     && !exact.is_some_and(|selected| std::ptr::eq(selected, *entry))
             });
             let mut selected = None;
@@ -2274,6 +2279,11 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                     CommandError::Usage("no compatible RSA key in --keys-file".into())
                 })
             })?;
+            // Lax recipient search assigns each available entry once, as the
+            // explicit-key path does. Keep store order for subsequent fallbacks.
+            if lax {
+                available_public_keys_by_name.remove(entry.name.as_str());
+            }
             let mut configured =
                 EncryptionRecipient::rsa_oaep(candidate.public_key).key_name(&entry.name);
             if let Some(parameters) = recipient.oaep_parameters {

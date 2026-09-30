@@ -102,6 +102,10 @@ compatibility search mode. The CLI uses the same signing, verification,
 encryption, and decryption policy checks as direct key options. During
 decryption, a named direct AES key from `--keys-file` can be selected even
 when `EncryptedData` also contains an `EncryptedKey` recipient.
+For multiple RSA encryption recipients, `--lax-key-search` prefers an exact
+name and then tries remaining compatible entries in store order. Each selected
+entry is consumed once for that operation; insufficient entries fail before
+any encrypted output is written.
 
 For production applications, do not put passwords on a process command line:
 load them through the application's secret channel and call the byte-oriented
