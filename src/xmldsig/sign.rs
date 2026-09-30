@@ -404,16 +404,8 @@ fn expected_signature_output_len(
                 .dsa_component_len()
                 .expect("DSA algorithm matched above");
             if component_len != required_component_len {
-                return Err(crate::policy::PolicyViolation::InvalidKeyMaterial {
-                    operation: "signing",
-                    key_type: "DSA",
-                    reason: match algorithm {
-                        SignatureAlgorithm::DsaSha1 => "DSA-SHA1 requires a 160-bit q parameter",
-                        SignatureAlgorithm::DsaSha256 => {
-                            "DSA-SHA256 requires a 256-bit q parameter"
-                        }
-                        _ => unreachable!("DSA algorithm matched above"),
-                    },
+                return Err(SigningKeyError::UnsupportedAlgorithm {
+                    uri: algorithm.uri().to_owned(),
                 }
                 .into());
             }
@@ -3551,6 +3543,45 @@ mod error_conversion_tests {
     }
 
     struct FixedRsaSigningKey;
+
+    struct WrongWidthDsaSigningKey;
+
+    impl SigningKey for WrongWidthDsaSigningKey {
+        fn sign(
+            &self,
+            _algorithm: SignatureAlgorithm,
+            _canonical_signed_info: &[u8],
+        ) -> Result<Vec<u8>, SigningKeyError> {
+            unreachable!("preflight must reject this candidate")
+        }
+
+        fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
+            Ok(SigningPublicKeyInfo::Dsa {
+                spki_der: Vec::new(),
+                p: Vec::new(),
+                q: Vec::new(),
+                g: Vec::new(),
+                y: Vec::new(),
+                modulus_bits: 2048,
+                component_len: 20,
+            })
+        }
+    }
+
+    #[test]
+    fn dsa_q_width_mismatch_is_candidate_incompatibility() {
+        // Lax search may skip an incompatible key but must not skip policy failures.
+        let error = validate_signing_key(
+            &WrongWidthDsaSigningKey,
+            SignatureAlgorithm::DsaSha256,
+            &crate::policy::SigningPolicy::default(),
+        )
+        .expect_err("SHA-256 requires a 256-bit q");
+        assert!(matches!(
+            error,
+            SigningError::Key(SigningKeyError::UnsupportedAlgorithm { .. })
+        ));
+    }
 
     impl SigningKey for FixedRsaSigningKey {
         fn sign(

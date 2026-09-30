@@ -71,7 +71,7 @@ jobs:
             xml-backend: fat-runtime
             cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backends-all
           - rust: stable
-            xml-backend: xmlenc-only
+            xml-backend: xmlenc-inventory
             cargo-args: --no-default-features --features xmlenc,xml-backend-xmloxide
           - rust: "1.92.0"
             xml-backend: xmloxide

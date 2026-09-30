@@ -1060,12 +1060,8 @@ fn dsa_sha1_rejects_a_key_with_a_256_bit_q() {
 
     assert!(matches!(
         validate_signing_key(&key, SignatureAlgorithm::DsaSha1, &policy),
-        Err(xml_sec::xmldsig::SigningError::Policy(
-            PolicyViolation::InvalidKeyMaterial {
-                operation: "signing",
-                key_type: "DSA",
-                reason: "DSA-SHA1 requires a 160-bit q parameter",
-            }
+        Err(xml_sec::xmldsig::SigningError::Key(
+            xml_sec::xmldsig::SigningKeyError::UnsupportedAlgorithm { .. }
         ))
     ));
     assert!(matches!(

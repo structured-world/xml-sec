@@ -210,6 +210,7 @@ pub(crate) const OPTION_SPECS: &[OptionSpec] = &[
     option_spec!("privkey-der", [], VALUE, true, MULTIPLE),
     option_spec!("pkcs8-pem", ["privkey-p8-pem"], VALUE, true, MULTIPLE),
     option_spec!("pkcs8-der", ["privkey-p8-der"], VALUE, true, MULTIPLE),
+    option_spec!("pkcs12", [], VALUE, true, MULTIPLE),
     option_spec!("pubkey-pem", ["pubkey"], VALUE, true, MULTIPLE),
     option_spec!("pubkey-der", [], VALUE, true, MULTIPLE),
     option_spec!("pubkey-cert-pem", ["pubkey-cert"], VALUE, true, MULTIPLE),

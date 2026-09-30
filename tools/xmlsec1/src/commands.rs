@@ -16,6 +16,7 @@ use x509_parser::prelude::FromDer as _;
 use xml_sec::xml_input as xml_sec_xml_input;
 use xml_sec::{
     IdAttributeRegistration, XmlBackend,
+    key_manager::{self, KeyInventory, SymmetricKeyKind},
     policy::{
         DecryptionPolicy, EcdsaSignatureValueEncoding, EncryptionPolicy, HmacPolicy,
         ManifestProcessing, ResourcePolicy, SameDocumentIdSemantics, SigningPolicy,
@@ -69,7 +70,9 @@ const SIGN_OPTIONS: &[&str] = &[
     "privkey-der",
     "pkcs8-pem",
     "pkcs8-der",
+    "pkcs12",
     "hmac-key",
+    "keys-file",
     "pwd",
     "lax-key-search",
     "node-id",
@@ -89,6 +92,7 @@ const VERIFY_OPTIONS: &[&str] = &[
     "pubkey-cert-pem",
     "pubkey-cert-der",
     "hmac-key",
+    "keys-file",
     "trusted-pem",
     "trusted-der",
     "untrusted-pem",
@@ -120,6 +124,7 @@ const ENCRYPT_OPTIONS: &[&str] = &[
     "binary-data",
     "xml-data",
     "aes-key",
+    "keys-file",
     "pubkey-pem",
     "pubkey-der",
     "pubkey-cert-pem",
@@ -137,10 +142,12 @@ const DECRYPT_OPTIONS: &[&str] = &[
     "print-xml-debug",
     "output",
     "aes-key",
+    "keys-file",
     "privkey-pem",
     "privkey-der",
     "pkcs8-pem",
     "pkcs8-der",
+    "pkcs12",
     "pwd",
     "lax-key-search",
     "node-id",
@@ -194,6 +201,8 @@ pub enum CommandError {
     ExternalMaterialTooLarge { maximum: usize },
     #[error(transparent)]
     Key(#[from] key_material::KeyMaterialError),
+    #[error(transparent)]
+    KeyStore(#[from] key_manager::KeyStoreError),
     #[error("XML signature operation failed: {0}")]
     Signature(String),
     #[error("signature is invalid")]
@@ -695,6 +704,68 @@ fn named_candidate_search<'a, T: Copy>(
     )
 }
 
+fn load_xml_key_stores<P: xml_sec::document::XmlDocumentPolicy>(
+    invocation: &Invocation,
+    policy: &P,
+    backend: XmlBackend,
+    budget: &mut ExternalMaterialBudget,
+) -> Result<KeyInventory, CommandError> {
+    let resources = policy.resource_policy();
+    let mut all = KeyInventory::default();
+    for option in invocation.values("keys-file") {
+        let path = Path::new(option.value.as_deref().unwrap_or_default());
+        let bytes = read_key_material_with_budget(path, budget)?;
+        let store = KeyInventory::from_xml_bytes(&bytes, policy, backend)?;
+        all.extend(store, resources)?;
+    }
+    Ok(all)
+}
+
+fn select_store_candidates<'a, T>(
+    entries: impl Iterator<Item = &'a T>,
+    requested_names: &[String],
+    lax: bool,
+    max_candidates: usize,
+    name: impl Fn(&T) -> &str,
+) -> Result<Vec<&'a T>, CommandError> {
+    // Policy caps candidates per stage, not the sum of selection and crypto
+    // attempts. Bound this scan independently before materializing matches.
+    let mut named = Vec::new();
+    let mut fallback = Vec::new();
+    for (inspected, entry) in entries.enumerate() {
+        if inspected == max_candidates {
+            return Err(CommandError::KeyStore(key_manager::KeyStoreError::Policy(
+                xml_sec::policy::PolicyViolation::ResourceLimit {
+                    resource: "key candidates",
+                    maximum: max_candidates,
+                    actual: inspected.saturating_add(1),
+                },
+            )));
+        }
+        if requested_names.is_empty()
+            || requested_names
+                .iter()
+                .any(|requested| requested == name(entry))
+        {
+            named.push(entry);
+        } else if lax {
+            fallback.push(entry);
+        }
+    }
+    if !lax && named.len() > 1 {
+        return Err(CommandError::Usage(
+            "multiple matching keys in --keys-file".into(),
+        ));
+    }
+    if lax {
+        named.extend(fallback);
+    }
+    if named.is_empty() {
+        return Err(CommandError::Usage("no matching key in --keys-file".into()));
+    }
+    Ok(named)
+}
+
 fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
     validate_options(invocation, SIGN_OPTIONS)?;
     let xml_backend = selected_xml_backend(invocation)?;
@@ -713,14 +784,82 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
         &policy,
         xml_backend,
     )?;
-    let selected = select_signing_key(
-        invocation,
-        &signature.key_names,
-        signature.algorithm,
-        signature.key_info.as_ref(),
-        &policy,
-        password,
-    )?;
+    let has_key_store = invocation.values("keys-file").next().is_some();
+    if has_key_store
+        && invocation
+            .ordered_values(&[
+                "hmac-key",
+                "privkey-pem",
+                "privkey-der",
+                "pkcs8-pem",
+                "pkcs8-der",
+                "pkcs12",
+            ])
+            .next()
+            .is_some()
+    {
+        return Err(CommandError::Usage(
+            "sign cannot combine --keys-file with explicit key options".into(),
+        ));
+    }
+    let selected = if has_key_store {
+        if signature.key_names.is_empty() && !invocation.flag("lax-key-search") {
+            return Err(CommandError::Usage(
+                "sign with --keys-file requires a template KeyName unless --lax-key-search is set"
+                    .into(),
+            ));
+        }
+        let mut budget =
+            ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
+        let store = load_xml_key_stores(invocation, &policy, xml_backend, &mut budget)?;
+        let lax_candidates = invocation.flag("lax-key-search");
+        let candidates = if signature.algorithm.hmac_output_bits().is_some() {
+            select_store_candidates(
+                store.symmetric_keys().iter().filter(|entry| {
+                    entry.kind == SymmetricKeyKind::Hmac
+                        && entry.usages.allows(key_manager::KeyUsage::Sign)
+                }),
+                &signature.key_names,
+                lax_candidates,
+                policy.resources.max_key_candidates,
+                |entry| &entry.name,
+            )?
+            .into_iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>()
+        } else {
+            select_store_candidates(
+                store
+                    .private_keys()
+                    .iter()
+                    .filter(|entry| entry.usages.allows(key_manager::KeyUsage::Sign)),
+                &signature.key_names,
+                lax_candidates,
+                policy.resources.max_key_candidates,
+                |entry| &entry.name,
+            )?
+            .into_iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>()
+        };
+        select_store_signing_key(
+            &store,
+            candidates,
+            signature.algorithm,
+            signature.key_info.as_ref(),
+            &policy,
+            lax_candidates,
+        )?
+    } else {
+        select_signing_key(
+            invocation,
+            &signature.key_names,
+            signature.algorithm,
+            signature.key_info.as_ref(),
+            &policy,
+            password,
+        )?
+    };
     let mut context = SignContext::new(selected.key.as_ref())
         .policy(policy)
         .xml_backend(xml_backend)
@@ -801,6 +940,40 @@ struct SigningKeyCandidate {
     leaf_certificate_der: Option<Vec<u8>>,
 }
 
+fn select_store_signing_key<'a>(
+    store: &KeyInventory,
+    candidates: impl IntoIterator<Item = &'a str>,
+    algorithm: SignatureAlgorithm,
+    key_info: Option<&KeyInfo>,
+    policy: &SigningPolicy,
+    lax: bool,
+) -> Result<SigningKeyCandidate, CommandError> {
+    let mut last_error = None;
+    let mut lookup_budget = key_manager::SigningLookupBudget::default();
+    for name in candidates {
+        let attempt = store
+            .signing_key_with_budget(name, algorithm, policy, &mut lookup_budget)
+            .map_err(CommandError::from)
+            .and_then(|key| {
+                let candidate = SigningKeyCandidate {
+                    key,
+                    certificate_writer: None,
+                    leaf_certificate_der: None,
+                };
+                validate_signing_key_info(key_info, &candidate)?;
+                Ok(candidate)
+            });
+        match attempt {
+            Ok(candidate) => return Ok(candidate),
+            Err(error) if lax && lax_candidate_error_is_recoverable(&error) => {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| CommandError::Usage("no compatible signing key".into())))
+}
+
 fn select_signing_key(
     invocation: &Invocation,
     requested_names: &[String],
@@ -813,7 +986,13 @@ fn select_signing_key(
     let key_options: &[&str] = if hmac {
         &["hmac-key"]
     } else {
-        &["privkey-pem", "privkey-der", "pkcs8-pem", "pkcs8-der"]
+        &[
+            "privkey-pem",
+            "privkey-der",
+            "pkcs8-pem",
+            "pkcs8-der",
+            "pkcs12",
+        ]
     };
     let key_kind = if hmac { "HMAC key" } else { "private key" };
     let keys = invocation
@@ -824,7 +1003,7 @@ fn select_signing_key(
         return Err(CommandError::Usage(if hmac {
             "HMAC signing requires --hmac-key".into()
         } else {
-            "sign requires --privkey-pem or --pkcs8-pem/der".into()
+            "sign requires --privkey-pem, --pkcs8-pem/der, or --pkcs12".into()
         }));
     }
     let candidates = named_candidate_search(
@@ -889,6 +1068,39 @@ fn prepare_signing_key_candidate(
             key: Box::new(key),
             certificate_writer: None,
             leaf_certificate_der: None,
+        });
+    }
+    if option.name == "pkcs12" {
+        let path = Path::new(option.value.as_deref().unwrap_or_default());
+        let bytes = read_key_material_with_budget(path, material_budget)?;
+        let password = password
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .ok_or(key_manager::KeyStoreError::ProtectedContainer)?;
+        let mut inventory = KeyInventory::default();
+        let name = option.parameter.clone().unwrap_or_else(|| "pkcs12".into());
+        inventory.add_pkcs12(name.clone(), &bytes, password, &policy.resources)?;
+        let key = inventory.signing_key(&name, algorithm, policy)?;
+        let imported = inventory
+            .private_keys()
+            .first()
+            .ok_or_else(|| CommandError::Usage("PKCS#12 contains no usable private key".into()))?;
+        let certificate_writer = imported
+            .matching_certificate_chain()
+            .map(X509CertificateKeyInfoWriter::from_der_chain)
+            .transpose()
+            .map_err(|error| CommandError::Signature(error.to_string()))?;
+        if let Some(writer) = &certificate_writer {
+            writer
+                .write_key_info(key.as_ref())
+                .map_err(|error| CommandError::Signature(error.to_string()))?;
+        }
+        return Ok(SigningKeyCandidate {
+            key,
+            certificate_writer,
+            leaf_certificate_der: imported
+                .matching_certificate_chain()
+                .and_then(|chain| chain.first())
+                .cloned(),
         });
     }
     let (path, certificate_paths) =
@@ -1174,7 +1386,13 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
     // With an explicit public key there is no key-manager search to relax.
     // Reject the flag on resolver-backed paths until its semantics exist.
     let lax_key_search = invocation.flag("lax-key-search");
-    if lax_key_search && explicit_keys.is_empty() {
+    let has_key_store = invocation.values("keys-file").next().is_some();
+    if has_key_store && !explicit_keys.is_empty() {
+        return Err(CommandError::Usage(
+            "verify cannot combine --keys-file with explicit key options".into(),
+        ));
+    }
+    if lax_key_search && explicit_keys.is_empty() && !has_key_store {
         return Err(CommandError::UnsupportedOption("lax-key-search".into()));
     }
     let policy = xmlsec_compatibility_verification_policy(invocation);
@@ -1182,7 +1400,7 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
     let start_node_id = option_text(invocation, "node-id")?;
     let id_attributes = id_attribute_registrations(invocation)?;
     let key_name_resolution = if lax_key_search
-        || explicit_keys.is_empty()
+        || (explicit_keys.is_empty() && !has_key_store)
         || matches!(explicit_keys.as_slice(), [(key, _)] if key.parameter.is_none())
     {
         key_material::VerificationKeyNameResolution::IgnoreDocumentKeyInfo
@@ -1218,6 +1436,8 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
         selected_keys.is_empty(),
         &mut certificate_budget,
     )?;
+    let stored_keys =
+        load_xml_key_stores(invocation, &policy, xml_backend, &mut certificate_budget)?;
     let result = if !selected_keys.is_empty() {
         let mut candidates = Vec::with_capacity(selected_keys.len());
         let mut last_load_error = None;
@@ -1262,6 +1482,65 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
         }
         let resolver = CandidateVerificationResolver::new(
             candidates,
+            configured_certificates,
+            lax_key_search,
+            policy.key_trust.check_crls,
+        );
+        verification_context(policy, start_node_id, &id_attributes, xml_backend)
+            .key_resolver(&resolver)
+            .verify(&xml)
+            .map_err(|error| CommandError::Signature(error.to_string()))?
+    } else if has_key_store && algorithm.hmac_output_bits().is_some() {
+        let selected = select_store_candidates(
+            stored_keys.symmetric_keys().iter().filter(|entry| {
+                entry.kind == SymmetricKeyKind::Hmac
+                    && entry.usages.allows(key_manager::KeyUsage::Verify)
+            }),
+            &signature.key_names,
+            lax_key_search,
+            policy.resources.max_key_candidates,
+            |entry| &entry.name,
+        )?;
+        KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
+            .consume(selected.len())
+            .map_err(|error| CommandError::Signature(error.to_string()))?;
+        let candidates = selected
+            .into_iter()
+            .map(|entry| {
+                HmacVerificationKey::new(entry.bytes.to_vec())
+                    .map(ExplicitVerificationCandidate::Hmac)
+                    .map_err(|error| CommandError::Signature(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let resolver = CandidateVerificationResolver::new(
+            candidates,
+            configured_certificates,
+            lax_key_search,
+            policy.key_trust.check_crls,
+        );
+        verification_context(policy, start_node_id, &id_attributes, xml_backend)
+            .key_resolver(&resolver)
+            .verify(&xml)
+            .map_err(|error| CommandError::Signature(error.to_string()))?
+    } else if has_key_store {
+        let selected = select_store_candidates(
+            stored_keys
+                .public_keys()
+                .iter()
+                .filter(|entry| entry.usages.allows(key_manager::KeyUsage::Verify)),
+            &signature.key_names,
+            lax_key_search,
+            policy.resources.max_key_candidates,
+            |entry| &entry.name,
+        )?;
+        KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
+            .consume(selected.len())
+            .map_err(|error| CommandError::Signature(error.to_string()))?;
+        let resolver = CandidateVerificationResolver::new(
+            selected
+                .into_iter()
+                .map(|entry| ExplicitVerificationCandidate::Certificate(entry.key_info.clone()))
+                .collect(),
             configured_certificates,
             lax_key_search,
             policy.key_trust.check_crls,
@@ -1363,12 +1642,46 @@ impl ExternalMaterialBudget {
             })?;
         Ok(())
     }
+
+    fn remaining(&self) -> usize {
+        self.maximum_bytes - self.total_bytes
+    }
+}
+
+fn read_key_material_with_budget(
+    path: &Path,
+    budget: &mut ExternalMaterialBudget,
+) -> Result<Vec<u8>, CommandError> {
+    let remaining = budget.remaining();
+    let bytes = key_material::read_with_limit(path, remaining).map_err(|error| {
+        if remaining < key_material::KEY_MATERIAL_BYTE_CEILING
+            && matches!(
+                error,
+                key_material::KeyMaterialError::KeyMaterialTooLarge { .. }
+            )
+        {
+            CommandError::ExternalMaterialTooLarge {
+                maximum: budget.maximum_bytes,
+            }
+        } else {
+            error.into()
+        }
+    })?;
+    budget.charge(bytes.len())?;
+    Ok(bytes)
 }
 
 fn lax_candidate_error_is_recoverable(error: &CommandError) -> bool {
-    // Lax lookup may skip an unusable candidate, but an invocation-wide
-    // resource ceiling is terminal rather than a property of that candidate.
-    !matches!(error, CommandError::ExternalMaterialTooLarge { .. })
+    // Lax lookup may skip an unusable candidate, not an invocation-wide
+    // resource failure or a failed protected-container authentication.
+    !matches!(
+        error,
+        CommandError::ExternalMaterialTooLarge { .. }
+            | CommandError::KeyStore(key_manager::KeyStoreError::ProtectedContainer)
+            | CommandError::KeyStore(key_manager::KeyStoreError::Policy(_))
+            | CommandError::Key(key_material::KeyMaterialError::ProtectedContainer)
+            | CommandError::Key(key_material::KeyMaterialError::Policy(_))
+    )
 }
 
 fn push_configured_certificate(certificates: &mut Vec<Vec<u8>>, certificate: Vec<u8>) {
@@ -1783,6 +2096,12 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             (option, certificate)
         })
         .collect::<Vec<_>>();
+    let has_key_store = invocation.values("keys-file").next().is_some();
+    if has_key_store && (!aes_keys.is_empty() || !public_keys.is_empty()) {
+        return Err(CommandError::Usage(
+            "encrypt cannot combine --keys-file with explicit key options".into(),
+        ));
+    }
     if !aes_keys.is_empty() && !public_keys.is_empty() {
         return Err(CommandError::Usage(
             "encrypt cannot combine explicit AES and RSA recipient keys".into(),
@@ -1837,6 +2156,130 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         builder = builder.direct_key(key);
         if let Some(name) = option.parameter.as_deref() {
             builder = builder.direct_key_name(name);
+        }
+    } else if has_key_store && !metadata.has_encrypted_key_recipient {
+        let mut budget =
+            ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
+        let store = load_xml_key_stores(invocation, &policy, xml_backend, &mut budget)?;
+        let requested_names = metadata
+            .content_key_name
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let candidates = select_store_candidates(
+            store.symmetric_keys().iter().filter(|entry| {
+                entry.kind == SymmetricKeyKind::Aes
+                    && entry.usages.allows(key_manager::KeyUsage::Encrypt)
+            }),
+            &requested_names,
+            invocation.flag("lax-key-search"),
+            policy.resources.max_key_candidates,
+            |entry| &entry.name,
+        )?;
+        KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
+            .consume(candidates.len())
+            .map_err(|error| CommandError::Encryption(error.to_string()))?;
+        let selected = candidates
+            .into_iter()
+            .find(|entry| entry.bytes.len() == algorithm.key_len())
+            .ok_or_else(|| CommandError::Usage("no compatible AES key in --keys-file".into()))?;
+        let key =
+            key_material::decode_symmetric(selected.bytes.to_vec(), Some(algorithm.key_len()))?;
+        builder = builder.direct_key(key).direct_key_name(&selected.name);
+    } else if has_key_store {
+        let mut budget =
+            ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
+        let store = load_xml_key_stores(invocation, &policy, xml_backend, &mut budget)?;
+        let template_recipients = if metadata.recipients.is_empty() {
+            vec![EncryptionTemplateRecipient {
+                key_name: None,
+                oaep_parameters: None,
+            }]
+        } else {
+            metadata.recipients
+        };
+        KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
+            .consume(template_recipients.len())
+            .map_err(|error| CommandError::Encryption(error.to_string()))?;
+        let recipient_metadata = recipient_key_metadata(
+            &template,
+            start_node_id,
+            &id_attributes,
+            &policy,
+            template_recipients.len(),
+            xml_backend,
+        )?;
+        let mut store_candidate_budget =
+            KeyCandidateBudget::with_limit(policy.resources.max_key_candidates);
+        let mut public_keys_by_name = HashMap::new();
+        let mut only_public_key = None;
+        let mut public_key_count = 0;
+        for entry in store
+            .public_keys()
+            .iter()
+            .filter(|entry| entry.usages.allows(key_manager::KeyUsage::Encrypt))
+        {
+            public_key_count += 1;
+            only_public_key = Some(entry);
+            public_keys_by_name.insert(entry.name.as_str(), entry);
+        }
+        for (recipient, metadata) in template_recipients.into_iter().zip(recipient_metadata) {
+            let lax = invocation.flag("lax-key-search");
+            let exact = match recipient.key_name.as_deref() {
+                Some(name) => public_keys_by_name.get(name).copied(),
+                None if public_key_count == 1 => only_public_key,
+                None if !lax && public_key_count > 1 => {
+                    return Err(CommandError::Usage(
+                        "multiple matching keys in --keys-file".into(),
+                    ));
+                }
+                None => None,
+            };
+            if exact.is_none() && !lax {
+                return Err(CommandError::Usage("no matching key in --keys-file".into()));
+            }
+            let fallbacks = store.public_keys().iter().filter(|entry| {
+                lax && entry.usages.allows(key_manager::KeyUsage::Encrypt)
+                    && !exact.is_some_and(|selected| std::ptr::eq(selected, *entry))
+            });
+            let mut selected = None;
+            let mut last_error = None;
+            for entry in exact.into_iter().chain(fallbacks) {
+                store_candidate_budget
+                    .consume(1)
+                    .map_err(|error| CommandError::Encryption(error.to_string()))?;
+                let candidate = entry
+                    .rsa_encryption_key(&policy)
+                    .map_err(CommandError::from)
+                    .and_then(|public_key| {
+                        validate_rsa_recipient_key(&public_key, &policy)
+                            .map_err(|error| CommandError::Encryption(error.to_string()))?;
+                        let candidate = RecipientPublicKeyCandidate {
+                            public_key,
+                            certificate_der: None,
+                        };
+                        validate_recipient_key_metadata(metadata.as_ref(), &candidate)?;
+                        Ok(candidate)
+                    });
+                match candidate {
+                    Ok(candidate) => {
+                        selected = Some((entry, candidate));
+                        break;
+                    }
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            let (entry, candidate) = selected.ok_or_else(|| {
+                last_error.unwrap_or_else(|| {
+                    CommandError::Usage("no compatible RSA key in --keys-file".into())
+                })
+            })?;
+            let mut configured =
+                EncryptionRecipient::rsa_oaep(candidate.public_key).key_name(&entry.name);
+            if let Some(parameters) = recipient.oaep_parameters {
+                configured = configured.oaep_parameters(parameters);
+            }
+            builder = builder.add_recipient(configured);
         }
     } else if !public_keys.is_empty() {
         let template_recipients = if metadata.recipients.is_empty() {
@@ -2393,6 +2836,31 @@ fn direct_simple_text(node: Node<'_, '_>, field: &str) -> Result<String, Command
         .collect())
 }
 
+fn same_direct_simple_text(
+    left: Node<'_, '_>,
+    right: Node<'_, '_>,
+    field: &str,
+) -> Result<bool, CommandError> {
+    if left.children().any(|child| child.is_element())
+        || right.children().any(|child| child.is_element())
+    {
+        return Err(CommandError::Encryption(format!(
+            "{field} must not contain element children"
+        )));
+    }
+    let left_bytes = left
+        .children()
+        .filter(Node::is_text)
+        .filter_map(|child| child.text())
+        .flat_map(str::bytes);
+    let right_bytes = right
+        .children()
+        .filter(Node::is_text)
+        .filter_map(|child| child.text())
+        .flat_map(str::bytes);
+    Ok(left_bytes.eq(right_bytes))
+}
+
 fn oaep_digest_from_uri(uri: &str) -> Result<OaepDigestAlgorithm, CommandError> {
     OaepDigestAlgorithm::from_uri(uri)
         .ok_or_else(|| CommandError::Encryption(format!("unsupported OAEP digest: {uri}")))
@@ -2449,6 +2917,17 @@ fn apply_encryption_template(
     let generated_key_info = direct_child_element(generated_data, XMLDSIG_NS, "KeyInfo");
     match (template_key_info, generated_key_info) {
         (Some(template_key_info), Some(generated_key_info)) => {
+            if let (Some(template_name), Some(generated_name)) = (
+                direct_child_element(template_key_info, XMLDSIG_NS, "KeyName"),
+                direct_child_element(generated_key_info, XMLDSIG_NS, "KeyName"),
+            ) && template_name.text() != generated_name.text()
+            {
+                replacements.push(replace_element_text(
+                    template,
+                    template_name,
+                    &escape_text(generated_name.text().unwrap_or_default()),
+                )?);
+            }
             let template_keys = direct_encrypted_keys(template_key_info);
             let generated_keys = direct_encrypted_keys(generated_key_info);
             let template_values = encrypted_key_cipher_values(template_key_info, "template")?;
@@ -2600,8 +3079,13 @@ fn merge_generated_recipient_key_name(
     let key_name = standalone_element(generated, generated_key_name)?;
 
     if let Some(template_key_info) = direct_child_element(template_key, XMLDSIG_NS, "KeyInfo") {
-        if direct_child_element(template_key_info, XMLDSIG_NS, "KeyName").is_some() {
-            return Ok(None);
+        if let Some(template_key_name) =
+            direct_child_element(template_key_info, XMLDSIG_NS, "KeyName")
+        {
+            if same_direct_simple_text(template_key_name, generated_key_name, "KeyName")? {
+                return Ok(None);
+            }
+            return Ok(Some((template_key_name.range(), key_name)));
         }
         return append_element_children_replacement(template, template_key_info, &key_name)
             .map(Some);
@@ -2796,9 +3280,7 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     validate_options(invocation, DECRYPT_OPTIONS)?;
     let xml_backend = selected_xml_backend(invocation)?;
     validate_supported_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
-    if invocation.flag("pwd") {
-        return Err(CommandError::UnsupportedOption("pwd".into()));
-    }
+    let password = invocation.password_bytes();
     let policy = DecryptionPolicy::default();
     let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
     let encrypted_data_id = option_text(invocation, "node-id")?;
@@ -2810,8 +3292,20 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     let recipient_key_names = encrypted_key_recipient_names(encrypted_data)?;
     let aes_keys = invocation.values("aes-key").collect::<Vec<_>>();
     let private_keys = invocation
-        .ordered_values(&["privkey-pem", "privkey-der", "pkcs8-pem", "pkcs8-der"])
+        .ordered_values(&[
+            "privkey-pem",
+            "privkey-der",
+            "pkcs8-pem",
+            "pkcs8-der",
+            "pkcs12",
+        ])
         .collect::<Vec<_>>();
+    let has_key_store = invocation.values("keys-file").next().is_some();
+    if has_key_store && (!aes_keys.is_empty() || !private_keys.is_empty()) {
+        return Err(CommandError::Usage(
+            "decrypt cannot combine --keys-file with explicit key options".into(),
+        ));
+    }
     if !aes_keys.is_empty() && !private_keys.is_empty() {
         return Err(CommandError::Usage(
             "decrypt cannot combine explicit AES and RSA private keys".into(),
@@ -2839,7 +3333,7 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         let mut last_error = None;
         for (option, ()) in candidates {
             match key_material::load_symmetric(option.value.as_deref().unwrap_or_default(), None) {
-                Ok(key) => keys.push(key),
+                Ok(key) => keys.push(std::borrow::Cow::Owned(key)),
                 Err(error) if lax_key_search => last_error = Some(CommandError::from(error)),
                 Err(error) => return Err(error.into()),
             }
@@ -2850,6 +3344,49 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         }
         decrypt_input(
             &CandidateSymmetricKeyDecryptor { keys },
+            &xml,
+            encrypted_data_id,
+            standalone,
+            policy,
+            &id_attributes,
+            xml_backend,
+        )?
+    } else if has_key_store {
+        let mut budget =
+            ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
+        let store = load_xml_key_stores(invocation, &policy, xml_backend, &mut budget)?;
+        if !recipient_key_names.is_empty()
+            && !store.symmetric_keys().iter().any(|entry| {
+                entry.kind == SymmetricKeyKind::Aes
+                    && entry.usages.allows(key_manager::KeyUsage::Decrypt)
+            })
+        {
+            return Err(CommandError::Usage(
+                "--keys-file does not supply RSA recipient private keys for decrypt".into(),
+            ));
+        }
+        let requested_names = content_key_name.iter().cloned().collect::<Vec<_>>();
+        let selected = select_store_candidates(
+            store.symmetric_keys().iter().filter(|entry| {
+                entry.kind == SymmetricKeyKind::Aes
+                    && entry.usages.allows(key_manager::KeyUsage::Decrypt)
+            }),
+            &requested_names,
+            invocation.flag("lax-key-search"),
+            policy.resources.max_key_candidates,
+            |entry| &entry.name,
+        )?;
+        KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
+            .consume(selected.len())
+            .map_err(|error| CommandError::Encryption(error.to_string()))?;
+        let resolver = CandidateSymmetricKeyDecryptor {
+            keys: selected
+                .into_iter()
+                .map(|entry| std::borrow::Cow::Borrowed(entry.bytes.as_slice()))
+                .collect(),
+        };
+        decrypt_input(
+            &resolver,
             &xml,
             encrypted_data_id,
             standalone,
@@ -2873,14 +3410,40 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
         for option in selected {
             let loaded = (|| {
+                if option.name == "pkcs12" {
+                    let path = Path::new(option.value.as_deref().unwrap_or_default());
+                    let bytes = read_key_material_with_budget(path, &mut certificate_budget)?;
+                    let password = password
+                        .and_then(|value| std::str::from_utf8(value).ok())
+                        .ok_or(key_manager::KeyStoreError::ProtectedContainer)?;
+                    let mut inventory = KeyInventory::default();
+                    let name = option.parameter.clone().unwrap_or_else(|| "pkcs12".into());
+                    inventory.add_pkcs12(name.clone(), &bytes, password, &policy.resources)?;
+                    let imported = inventory.private_keys().first().ok_or_else(|| {
+                        CommandError::Usage("PKCS#12 contains no usable private key".into())
+                    })?;
+                    let private_key = key_material::decode_rsa_private_with_password(
+                        path,
+                        &imported.pkcs8_der,
+                        key_material::PrivateKeyFormat::Pkcs8Der,
+                        None,
+                        &policy.resources,
+                    )?;
+                    return Ok(RecipientPrivateKey {
+                        inner: PrivateKeyDecryptor::new(private_key),
+                        key_name: option.parameter.clone(),
+                    });
+                }
                 let (path, certificate_paths) =
                     split_key_and_certificates(option.value.as_deref().unwrap_or_default())?;
-                let bytes = key_material::read(path)?;
-                certificate_budget.charge(bytes.len())?;
-                let private_key = key_material::decode_rsa_private(
+                let bytes =
+                    read_key_material_with_budget(Path::new(path), &mut certificate_budget)?;
+                let private_key = key_material::decode_rsa_private_with_password(
                     Path::new(path),
                     &bytes,
                     private_key_format(option),
+                    password,
+                    &policy.resources,
                 )?;
                 if !certificate_paths.is_empty() {
                     let encoding = if matches!(
@@ -2934,7 +3497,7 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         )?
     } else {
         return Err(CommandError::Usage(
-            "decrypt requires --aes-key or an RSA private key".into(),
+            "decrypt requires --aes-key, an RSA private key, or --pkcs12".into(),
         ));
     };
     write_result_then_stdout_diagnostics(invocation, &bytes, stdout, |stdout| {
@@ -3007,18 +3570,21 @@ struct RecipientPrivateKey {
     key_name: Option<String>,
 }
 
-struct CandidateSymmetricKeyDecryptor {
-    keys: Vec<Vec<u8>>,
+struct CandidateSymmetricKeyDecryptor<'a> {
+    keys: Vec<std::borrow::Cow<'a, [u8]>>,
 }
 
-impl DecryptionKeyResolver for CandidateSymmetricKeyDecryptor {
+impl DecryptionKeyResolver for CandidateSymmetricKeyDecryptor<'_> {
     fn resolve_key(
         &self,
         _provider: &dyn CryptoProvider,
         _algorithm: DataEncryptionAlgorithm,
         _encrypted_key: Option<&EncryptedKey>,
     ) -> Result<Vec<u8>, XmlEncError> {
-        self.keys.first().cloned().ok_or(XmlEncError::KeyNotFound)
+        self.keys
+            .first()
+            .map(|key| key.as_ref().to_vec())
+            .ok_or(XmlEncError::KeyNotFound)
     }
 
     fn resolve_key_candidates(
@@ -3030,7 +3596,7 @@ impl DecryptionKeyResolver for CandidateSymmetricKeyDecryptor {
     ) -> Result<Vec<Vec<u8>>, XmlEncError> {
         if encrypted_key.is_none() {
             budget.consume(self.keys.len())?;
-            Ok(self.keys.clone())
+            Ok(self.keys.iter().map(|key| key.as_ref().to_vec()).collect())
         } else {
             Err(XmlEncError::KeyNotFound)
         }
@@ -3517,10 +4083,39 @@ fn stdout_error(source: std::io::Error) -> CommandError {
 mod tests {
     use std::{cell::Cell, ffi::OsString, rc::Rc};
 
+    use base64::Engine as _;
+
     use super::*;
 
     fn invocation(arguments: &[&str]) -> Invocation {
         Invocation::parse(arguments.iter().map(OsString::from)).unwrap()
+    }
+
+    #[test]
+    fn lax_key_search_stops_on_password_and_policy_failures() {
+        // Candidate search may skip incompatible keys, never terminal
+        // authentication or operation-wide policy failures.
+        assert!(!lax_candidate_error_is_recoverable(&CommandError::Key(
+            key_material::KeyMaterialError::ProtectedContainer,
+        )));
+        assert!(!lax_candidate_error_is_recoverable(
+            &CommandError::KeyStore(key_manager::KeyStoreError::Policy(
+                xml_sec::policy::PolicyViolation::ResourceLimit {
+                    resource: "external resource bytes",
+                    maximum: 1,
+                    actual: 2,
+                },
+            ),)
+        ));
+        assert!(!lax_candidate_error_is_recoverable(&CommandError::Key(
+            key_material::KeyMaterialError::Policy(
+                xml_sec::policy::PolicyViolation::ResourceLimit {
+                    resource: "external resource bytes",
+                    maximum: 1,
+                    actual: 2,
+                },
+            ),
+        )));
     }
 
     #[test]
@@ -3567,6 +4162,364 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tools/xmlsec1/testdata")
             .join(name)
+    }
+
+    #[test]
+    fn named_store_encryption_falls_back_only_when_lax() {
+        // An absent named key may fall back in lax mode, but an exact match wins.
+        let names = ["fallback", "exact"];
+        let requested = vec!["exact".to_string()];
+        assert_eq!(
+            select_store_candidates(names.iter(), &requested, true, 2, |name| name).unwrap()[0],
+            &"exact"
+        );
+        let absent = vec!["absent".to_string()];
+        assert!(select_store_candidates(names.iter(), &absent, false, 2, |name| name).is_err());
+        assert_eq!(
+            select_store_candidates(names.iter(), &absent, true, 2, |name| name).unwrap()[0],
+            &"fallback"
+        );
+    }
+
+    #[test]
+    fn store_selection_bounds_inspected_candidates() {
+        // A name filter cannot make scanning an oversized candidate pool free.
+        let names = ["first", "second"];
+        let requested = vec!["second".to_owned()];
+        assert!(matches!(
+            select_store_candidates(names.iter(), &requested, false, 1, |name| name),
+            Err(CommandError::KeyStore(key_manager::KeyStoreError::Policy(
+                xml_sec::policy::PolicyViolation::ResourceLimit {
+                    resource: "key candidates",
+                    maximum: 1,
+                    actual: 2,
+                }
+            )))
+        ));
+        assert_eq!(
+            select_store_candidates(names.iter(), &requested, false, 2, |name| name).unwrap(),
+            vec![&"second"]
+        );
+    }
+
+    #[test]
+    fn cli_lax_store_encryption_accepts_missing_template_key_name() {
+        // Exercise the command boundary: a present but unknown KeyName must
+        // fall back only when --lax-key-search was explicitly requested.
+        let temp = tempfile::tempdir().expect("temporary test directory");
+        let template_path = temp.path().join("template.xml");
+        let input_path = temp.path().join("input.bin");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/xmlenc/aleksey-xmlenc-01/enc-aes128gcm-keyname.tmpl");
+        let template = fs::read_to_string(fixture)
+            .expect("encryption template fixture")
+            .replace("test-aes128", "absent");
+        fs::write(&template_path, template).expect("write encryption template");
+        fs::write(&input_path, b"lax fallback payload").expect("write plaintext");
+        let store =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keys/xmlsec/mixed-keys.xml");
+        let args = [
+            "xmlsec1",
+            "encrypt",
+            "--keys-file",
+            store.to_str().expect("fixture path is UTF-8"),
+            "--binary-data",
+            input_path.to_str().expect("input path is UTF-8"),
+            template_path.to_str().expect("template path is UTF-8"),
+        ];
+        assert!(execute(invocation(&args), &mut Vec::new(), &mut Vec::new()).is_err());
+        let mut lax_args = vec!["xmlsec1", "encrypt", "--lax-key-search"];
+        lax_args.extend_from_slice(&args[2..]);
+        let mut output = Vec::new();
+        execute(invocation(&lax_args), &mut output, &mut Vec::new())
+            .expect("lax store encryption finds alternate AES key");
+        assert!(String::from_utf8_lossy(&output).contains("CipherValue"));
+    }
+
+    #[test]
+    fn cli_lax_store_encryption_skips_ineligible_aes_key() {
+        // A fallback candidate with the wrong AES length must not hide a later usable key.
+        let temp = tempfile::tempdir().expect("temporary test directory");
+        let template_path = temp.path().join("template.xml");
+        let input_path = temp.path().join("input.bin");
+        let store_path = temp.path().join("keys.xml");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/xmlenc/aleksey-xmlenc-01/enc-aes128gcm-keyname.tmpl");
+        let template = fs::read_to_string(fixture)
+            .expect("encryption template fixture")
+            .replace("test-aes128", "absent");
+        fs::write(&template_path, template).expect("write encryption template");
+        fs::write(&input_path, b"lax fallback payload").expect("write plaintext");
+        let source = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keys/xmlsec/mixed-keys.xml"),
+        )
+        .expect("key store fixture");
+        let extra = "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>wrong-aes192</KeyName><KeyValue><AESKeyValue xmlns=\"http://www.aleksey.com/xmlsec/2002\">AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA</AESKeyValue></KeyValue></KeyInfo>";
+        fs::write(
+            &store_path,
+            source.replacen("<KeyInfo", &format!("{extra}<KeyInfo"), 1),
+        )
+        .expect("write key store");
+        let args = [
+            "xmlsec1",
+            "encrypt",
+            "--lax-key-search",
+            "--keys-file",
+            store_path.to_str().expect("store path is UTF-8"),
+            "--binary-data",
+            input_path.to_str().expect("input path is UTF-8"),
+            template_path.to_str().expect("template path is UTF-8"),
+        ];
+        let mut output = Vec::new();
+        execute(invocation(&args), &mut output, &mut Vec::new())
+            .expect("lax search skips AES-192 before AES-128");
+        assert!(String::from_utf8_lossy(&output).contains("CipherValue"));
+    }
+
+    #[test]
+    fn cli_lax_store_encryption_skips_ineligible_rsa_key() {
+        // A 1024-bit donor key precedes a policy-eligible 2048-bit key.
+        let temp = tempfile::tempdir().expect("temporary test directory");
+        let template_path = temp.path().join("template.xml");
+        let input_path = temp.path().join("input.bin");
+        let store_path = temp.path().join("keys.xml");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "tests/fixtures/xmlenc/aleksey-xmlenc-01/enc-aes256-kt-rsa_oaep_sha1_mgf1_sha512.tmpl",
+        );
+        let template = fs::read_to_string(fixture)
+            .expect("encryption template fixture")
+            .replace("TestKeyName-rsa-4096", "absent");
+        fs::write(&template_path, template).expect("write encryption template");
+        fs::write(&input_path, b"<root>lax RSA fallback payload</root>").expect("write plaintext");
+        let pem = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"),
+        )
+        .expect("public key fixture");
+        let public_key = RsaPublicKey::from_public_key_pem(&pem).expect("RSA public key");
+        let encode = |bytes: Vec<u8>| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let extra = format!(
+            "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>valid-rsa</KeyName><KeyValue><RSAKeyValue><Modulus>{}</Modulus><Exponent>{}</Exponent></RSAKeyValue></KeyValue></KeyInfo>",
+            encode(public_key.n().to_be_bytes_trimmed_vartime().into_vec()),
+            encode(public_key.e().to_be_bytes_trimmed_vartime().into_vec())
+        );
+        let source = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keys/xmlsec/mixed-keys.xml"),
+        )
+        .expect("key store fixture");
+        fs::write(
+            &store_path,
+            source.replacen("</Keys>", &format!("{extra}</Keys>"), 1),
+        )
+        .expect("write key store");
+        let args = [
+            "xmlsec1",
+            "encrypt",
+            "--lax-key-search",
+            "--keys-file",
+            store_path.to_str().expect("store path is UTF-8"),
+            "--xml-data",
+            input_path.to_str().expect("input path is UTF-8"),
+            template_path.to_str().expect("template path is UTF-8"),
+        ];
+        let mut output = Vec::new();
+        execute(invocation(&args), &mut output, &mut Vec::new())
+            .expect("lax search skips RSA-1024 before RSA-2048");
+        assert!(String::from_utf8_lossy(&output).contains("CipherValue"));
+        let encrypted = temp.path().join("encrypted.xml");
+        fs::write(&encrypted, &output).expect("write encrypted output");
+        let private =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keys/rsa/rsa-2048-key.pem");
+        let decrypt_args = [
+            "xmlsec1",
+            "decrypt",
+            "--privkey-pem:valid-rsa",
+            private.to_str().expect("key path is UTF-8"),
+            encrypted.to_str().expect("encrypted path is UTF-8"),
+        ];
+        let mut decrypted = Vec::new();
+        execute(invocation(&decrypt_args), &mut decrypted, &mut Vec::new())
+            .expect("strict decryption uses the fallback recipient name");
+        assert_eq!(decrypted, b"lax RSA fallback payload");
+    }
+
+    #[test]
+    fn store_signing_retries_key_info_mismatch_in_lax_mode() {
+        // An algorithm-compatible key is not a valid match for embedded KeyInfo.
+        let mut inventory = KeyInventory::default();
+        let policy = SigningPolicy::default();
+        let wrong = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keys/rsa/rsa-2048-key.pem"),
+        )
+        .unwrap();
+        let right = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keys/rsa/rsa-4096-key.pem"),
+        )
+        .unwrap();
+        for (name, pem) in [("wrong", wrong), ("right", right)] {
+            inventory
+                .add_private_pem(
+                    name.into(),
+                    &pem,
+                    None,
+                    key_manager::KeyUsages::SIGN,
+                    &policy.resources,
+                )
+                .unwrap();
+        }
+        let right_spki = inventory
+            .signing_key("right", SignatureAlgorithm::RsaSha256, &policy)
+            .unwrap()
+            .public_key_info()
+            .unwrap()
+            .spki_der()
+            .unwrap()
+            .to_vec();
+        let mut info = KeyInfo::default();
+        info.sources
+            .push(KeyInfoSource::DerEncodedKeyValue(right_spki));
+        assert!(
+            select_store_signing_key(
+                &inventory,
+                ["wrong"],
+                SignatureAlgorithm::RsaSha256,
+                Some(&info),
+                &policy,
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            select_store_signing_key(
+                &inventory,
+                ["wrong", "right"],
+                SignatureAlgorithm::RsaSha256,
+                Some(&info),
+                &policy,
+                true,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn lax_store_signing_shares_lookup_budget_across_retries() {
+        // Three independent scans cost 1 + 2 + 3 inspections, not three.
+        let mut inventory = KeyInventory::default();
+        let mut policy = SigningPolicy::default();
+        let wrong = fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keys/rsa/rsa-2048-key.pem"),
+        )
+        .unwrap();
+        let right = fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keys/rsa/rsa-4096-key.pem"),
+        )
+        .unwrap();
+        for (name, pem) in [("wrong-a", &wrong), ("wrong-b", &wrong), ("right", &right)] {
+            inventory
+                .add_private_pem(
+                    name.into(),
+                    pem,
+                    None,
+                    key_manager::KeyUsages::SIGN,
+                    &policy.resources,
+                )
+                .unwrap();
+        }
+        let right_spki = inventory
+            .signing_key("right", SignatureAlgorithm::RsaSha256, &policy)
+            .unwrap()
+            .public_key_info()
+            .unwrap()
+            .spki_der()
+            .unwrap()
+            .to_vec();
+        let mut info = KeyInfo::default();
+        info.sources
+            .push(KeyInfoSource::DerEncodedKeyValue(right_spki));
+        policy.resources.max_key_candidates = 3;
+        assert!(
+            select_store_signing_key(
+                &inventory,
+                ["wrong-a", "wrong-b", "right"],
+                SignatureAlgorithm::RsaSha256,
+                Some(&info),
+                &policy,
+                true,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn strict_store_signing_requires_template_key_name() {
+        // A singleton store must not silently authorize an unnamed template.
+        let temp = tempfile::tempdir().expect("temporary signing template");
+        let template = temp.path().join("unsigned.xml");
+        fs::write(
+            &template,
+            br#"<Signature xmlns="http://www.w3.org/2000/09/xmldsig#"><SignedInfo><CanonicalizationMethod Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/><SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"/><Reference URI=""><Transforms><Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/></Transforms><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue/></Reference></SignedInfo><SignatureValue/></Signature>"#,
+        )
+        .expect("write template");
+        let template = template.to_str().expect("UTF-8 path");
+        let store = temp.path().join("keys.xml");
+        fs::write(
+            &store,
+            br#"<Keys xmlns="http://www.aleksey.com/xmlsec/2002"><KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><KeyName>only-key</KeyName><KeyValue><HMACKeyValue xmlns="http://www.aleksey.com/xmlsec/2002">c2VjcmV0</HMACKeyValue></KeyValue></KeyInfo></Keys>"#,
+        )
+        .expect("write singleton store");
+        let store = store.to_str().expect("UTF-8 path");
+        let strict = invocation(&["xmlsec1", "sign", "--keys-file", store, template]);
+        let error = sign(&strict, &mut Vec::new()).expect_err("strict mode requires KeyName");
+        assert!(
+            error.to_string().contains("requires a template KeyName"),
+            "{error}"
+        );
+        let lax = invocation(&[
+            "xmlsec1",
+            "sign",
+            "--lax-key-search",
+            "--keys-file",
+            store,
+            template,
+        ]);
+        let mut signed = Vec::new();
+        sign(&lax, &mut signed).expect("lax mode may select the unnamed singleton");
+        assert!(String::from_utf8_lossy(&signed).contains("DigestValue"));
+    }
+
+    #[test]
+    fn pkcs12_signing_ignores_unrelated_ca_certificate() {
+        // A CA-only bundle still provides its private signing key, without a leaf writer.
+        let bundle = base64::engine::general_purpose::STANDARD
+            .decode(
+                include_str!("../../../tests/fixtures/keys/pkcs12/rsa-key-unrelated-ca.p12.b64")
+                    .trim(),
+            )
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("key.p12");
+        fs::write(&path, bundle).unwrap();
+        let parsed = Invocation::parse([
+            OsString::from("xmlsec1"),
+            OsString::from("sign"),
+            OsString::from("--pkcs12"),
+            path.into_os_string(),
+            OsString::from("template.xml"),
+        ])
+        .unwrap();
+        let option = parsed.values("pkcs12").next().unwrap();
+        let mut budget = ExternalMaterialBudget::new(usize::MAX);
+        let candidate = prepare_signing_key_candidate(
+            option,
+            SignatureAlgorithm::RsaSha256,
+            &SigningPolicy::default(),
+            Some(b"secret"),
+            &mut budget,
+        )
+        .unwrap();
+        assert!(candidate.certificate_writer.is_none());
+        assert!(candidate.leaf_certificate_der.is_none());
     }
 
     struct CountingVerificationKey {
@@ -3982,6 +4935,40 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn generated_recipient_replaces_a_split_stale_key_name() {
+        // A comment may split direct KeyName text without changing its value.
+        // Comparing only the first text child would retain the stale name.
+        let template = format!(
+            "<e:EncryptedKey xmlns:e=\"{XMLENC_NS}\" xmlns:s=\"{XMLDSIG_NS}\"><s:KeyInfo><s:KeyName>valid<!-- split -->-old</s:KeyName></s:KeyInfo><e:CipherData><e:CipherValue/></e:CipherData></e:EncryptedKey>"
+        );
+        let generated = format!(
+            "<e:EncryptedKey xmlns:e=\"{XMLENC_NS}\" xmlns:s=\"{XMLDSIG_NS}\"><s:KeyInfo><s:KeyName>valid</s:KeyName></s:KeyInfo><e:CipherData><e:CipherValue>a2V5</e:CipherValue></e:CipherData></e:EncryptedKey>"
+        );
+        let template_doc = Document::parse(&template).expect("template parses");
+        let generated_doc = Document::parse(&generated).expect("generated key parses");
+        let replacement = merge_generated_recipient_key_name(
+            &template,
+            template_doc.root_element(),
+            &generated,
+            generated_doc.root_element(),
+        )
+        .expect("recipient name merge succeeds")
+        .expect("the stale full name must be replaced");
+        let rendered = format!(
+            "{}{}{}",
+            &template[..replacement.0.start],
+            replacement.1,
+            &template[replacement.0.end..]
+        );
+        let document = Document::parse(&rendered).expect("replacement parses");
+        let key_name = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyName")))
+            .expect("recipient name remains present");
+        assert_eq!(direct_simple_text(key_name, "KeyName").unwrap(), "valid");
     }
 
     #[test]
