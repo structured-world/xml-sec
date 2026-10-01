@@ -3,8 +3,9 @@
 use std::{collections::HashMap, fmt, time::SystemTime};
 
 use crypto_bigint::BoxedUint;
-use dsa::pkcs8::{DecodePublicKey as DsaDecodePublicKey, EncodePublicKey as DsaEncodePublicKey};
+use dsa::pkcs8::EncodePublicKey as DsaEncodePublicKey;
 use hmac::{KeyInit, Mac};
+use rsa::pkcs8::DecodePublicKey as _;
 use x509_parser::{
     prelude::{FromDer, X509Certificate},
     public_key::PublicKey,
@@ -13,8 +14,9 @@ use x509_parser::{
 use zeroize::Zeroizing;
 
 use super::signature::{
-    signature_value_matches_spki, signature_value_matches_spki_with_encoding,
-    validate_dsa_signature_spki_with_minimum, validate_rsa_signature_spki_with_minimum,
+    decode_dsa_verifying_key, signature_value_matches_spki,
+    signature_value_matches_spki_with_encoding, validate_dsa_signature_spki_with_minimum,
+    validate_ec_public_key_encoding, validate_rsa_signature_spki_with_minimum,
     verify_dsa_signature_spki_primitive, verify_dsa_signature_spki_with_minimum,
     verify_rsa_signature_spki_primitive, verify_rsa_signature_spki_with_minimum,
 };
@@ -29,7 +31,7 @@ use super::{
         x509_data_has_lookup_identifiers, x509_selector_categories_match_chain,
     },
     verify_ecdsa_signature_spki, verify_ecdsa_signature_spki_with_encoding,
-    x509::verify_x509_certificate_chain_with_provider,
+    x509::verify_x509_certificate_chain_with_provider_and_crls,
 };
 
 /// Caller-owned HMAC verification key.
@@ -444,6 +446,8 @@ pub struct KeyResolverConfig {
     pub lookup_certs: Vec<Vec<u8>>,
     /// DER-encoded certificates accepted as trust anchors.
     pub trusted_certs: Vec<Vec<u8>>,
+    /// Caller-owned revocation evidence applied without copying it into each XML source.
+    pub crls: Vec<Vec<u8>>,
     /// Verification keys addressable by `<KeyName>` content.
     pub named_keys: HashMap<String, VerificationKey>,
 }
@@ -454,43 +458,53 @@ pub struct DefaultKeyResolver {
     config: KeyResolverConfig,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum ResolutionScope {
+    Document,
+    Trusted,
+    DocumentPrefix(usize),
+    TrustedPrefix(usize),
+}
+
 /// Counts candidates actually inspected by one resolver invocation.
 ///
 /// Parser cardinality preflights prevent expensive materialization, but do not
 /// replace this runtime accounting: embedded and indirect candidates both
 /// consume resolver work when inspected.
-struct InspectedKeyCandidateBudget {
+#[derive(Clone, Copy)]
+pub(crate) struct InspectedKeyCandidateBudget {
     maximum: usize,
     attempted: usize,
 }
 
 impl InspectedKeyCandidateBudget {
-    fn new(maximum: usize) -> Self {
+    pub(crate) fn new(maximum: usize) -> Self {
         Self {
             maximum,
             attempted: 0,
         }
     }
 
-    fn charge(&mut self) -> Result<(), DsigError> {
+    pub(crate) fn charge(&mut self) -> Result<(), DsigError> {
         self.charge_many(1)
     }
 
-    fn charge_many(&mut self, count: usize) -> Result<(), DsigError> {
-        self.attempted = self.attempted.saturating_add(count);
-        if self.attempted > self.maximum {
+    pub(crate) fn charge_many(&mut self, count: usize) -> Result<(), DsigError> {
+        debug_assert!(self.attempted <= self.maximum);
+        if count > self.maximum - self.attempted {
             return Err(crate::policy::PolicyViolation::ResourceLimit {
                 resource: crate::policy::resource_name::KEY_CANDIDATES,
                 maximum: self.maximum,
-                actual: self.attempted,
+                actual: self.attempted.saturating_add(count),
             }
             .into());
         }
+        self.attempted += count;
         Ok(())
     }
 }
 
-fn validate_key_info_source_permissions(
+pub(crate) fn validate_key_info_source_permissions(
     key_info: &KeyInfo,
     allowed: crate::policy::KeySourcePolicy,
 ) -> Result<(), crate::policy::PolicyViolation> {
@@ -526,6 +540,60 @@ fn validate_key_info_source_permissions(
 }
 
 impl DefaultKeyResolver {
+    pub(crate) fn resolve_with_candidate_budget(
+        &self,
+        key_info: Option<&KeyInfo>,
+        algorithm: SignatureAlgorithm,
+        policy: &crate::policy::VerificationPolicy,
+        provider: &dyn crate::provider::CryptoProvider,
+        candidate_budget: &mut InspectedKeyCandidateBudget,
+    ) -> Result<Option<Box<dyn VerifyingKey>>, DsigError> {
+        self.resolve_with_trust(
+            key_info,
+            algorithm,
+            policy,
+            provider,
+            candidate_budget,
+            ResolutionScope::Document,
+        )
+    }
+
+    pub(crate) fn resolve_trusted_material_with_candidate_budget(
+        &self,
+        key_info: &KeyInfo,
+        algorithm: SignatureAlgorithm,
+        policy: &crate::policy::VerificationPolicy,
+        provider: &dyn crate::provider::CryptoProvider,
+        candidate_budget: &mut InspectedKeyCandidateBudget,
+    ) -> Result<Option<Box<dyn VerifyingKey>>, DsigError> {
+        self.resolve_with_trust(
+            Some(key_info),
+            algorithm,
+            policy,
+            provider,
+            candidate_budget,
+            ResolutionScope::Trusted,
+        )
+    }
+
+    pub(crate) fn resolve_prefix_with_candidate_budget(
+        &self,
+        key_info: &KeyInfo,
+        algorithm: SignatureAlgorithm,
+        policy: &crate::policy::VerificationPolicy,
+        provider: &dyn crate::provider::CryptoProvider,
+        candidate_budget: &mut InspectedKeyCandidateBudget,
+        scope: ResolutionScope,
+    ) -> Result<Option<Box<dyn VerifyingKey>>, DsigError> {
+        self.resolve_with_trust(
+            Some(key_info),
+            algorithm,
+            policy,
+            provider,
+            candidate_budget,
+            scope,
+        )
+    }
     /// Construct a resolver from explicit caller-owned key and certificate stores.
     #[must_use]
     pub fn new(config: KeyResolverConfig) -> Self {
@@ -536,6 +604,49 @@ impl DefaultKeyResolver {
     #[must_use]
     pub fn config(&self) -> &KeyResolverConfig {
         &self.config
+    }
+
+    fn check_configured_x509_material(
+        &self,
+        resources: &crate::policy::ResourcePolicy,
+        trust: &crate::policy::KeyTrustPolicy,
+        budget: &mut InspectedKeyCandidateBudget,
+    ) -> Result<(), DsigError> {
+        if trust.check_crls && trust.verify_x509_chains {
+            budget.charge_many(self.config.crls.len())?;
+        }
+        let certificates = self
+            .config
+            .trusted_certs
+            .iter()
+            .chain(&self.config.lookup_certs);
+        let crls = self
+            .config
+            .crls
+            .iter()
+            .filter(|_| trust.check_crls && trust.verify_x509_chains);
+        let mut total = 0_usize;
+        for material in certificates.chain(crls) {
+            if material.len() > resources.max_external_resource_bytes {
+                return Err(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
+                    maximum: resources.max_external_resource_bytes,
+                    actual: material.len(),
+                }
+                .into());
+            }
+            debug_assert!(total <= resources.max_external_resource_total_bytes);
+            if material.len() > resources.max_external_resource_total_bytes - total {
+                return Err(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                    maximum: resources.max_external_resource_total_bytes,
+                    actual: total.saturating_add(material.len()),
+                }
+                .into());
+            }
+            total += material.len();
+        }
+        Ok(())
     }
 
     fn resolve_x509(
@@ -599,7 +710,12 @@ impl DefaultKeyResolver {
             rsa_keys: trust.rsa_keys,
             dsa_keys: trust.dsa_keys,
         };
-        verify_x509_certificate_chain_with_provider(info, &options, provider)?;
+        verify_x509_certificate_chain_with_provider_and_crls(
+            info,
+            &options,
+            provider,
+            &self.config.crls,
+        )?;
         Ok(())
     }
 
@@ -970,27 +1086,52 @@ impl DefaultKeyResolver {
         }))
     }
 
-    fn resolve_with_trust<'a>(
-        &'a self,
+    fn resolve_with_trust(
+        &self,
         key_info: Option<&KeyInfo>,
         algorithm: SignatureAlgorithm,
-        sources: crate::policy::KeySourcePolicy,
-        trust: &crate::policy::KeyTrustPolicy,
-        resources: &crate::policy::ResourcePolicy,
+        policy: &crate::policy::VerificationPolicy,
         provider: &dyn crate::provider::CryptoProvider,
-    ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
+        candidate_budget: &mut InspectedKeyCandidateBudget,
+        scope: ResolutionScope,
+    ) -> Result<Option<Box<dyn VerifyingKey>>, DsigError> {
+        let trust = &policy.key_trust;
+        let resources = &policy.resources;
         trust.validate()?;
         resources.validate()?;
         let Some(key_info) = key_info else {
             return Ok(None);
         };
-        validate_key_info_source_permissions(key_info, sources)?;
-        let mut candidate_budget = InspectedKeyCandidateBudget::new(resources.max_key_candidates);
+        let document_sources = matches!(
+            scope,
+            ResolutionScope::Document | ResolutionScope::DocumentPrefix(_)
+        );
+        if document_sources {
+            validate_key_info_source_permissions(key_info, policy.key_sources)?;
+        }
+        let source_end = match scope {
+            ResolutionScope::DocumentPrefix(end) | ResolutionScope::TrustedPrefix(end) => end,
+            _ => key_info.sources.len(),
+        };
         let mut deferred_key_value_error = None;
-        for source in &key_info.sources {
+        let mut configured_material_checked = false;
+        for source in &key_info.sources[..source_end] {
+            if !document_sources && matches!(source, KeyInfoSource::KeyName(_)) {
+                continue;
+            }
             let resolved = match source {
                 KeyInfoSource::X509Data(info) => {
-                    self.resolve_x509(info, algorithm, trust, provider, &mut candidate_budget)?
+                    if !configured_material_checked
+                        && (if info.certificate_chain.is_empty() {
+                            x509_data_has_lookup_identifiers(info)
+                        } else {
+                            trust.verify_x509_chains
+                        })
+                    {
+                        self.check_configured_x509_material(resources, trust, candidate_budget)?;
+                        configured_material_checked = true;
+                    }
+                    self.resolve_x509(info, algorithm, trust, provider, candidate_budget)?
                 }
                 KeyInfoSource::DerEncodedKeyValue(public_key_bytes) => {
                     candidate_budget.charge()?;
@@ -1058,13 +1199,15 @@ impl KeyResolver for DefaultKeyResolver {
         algorithm: SignatureAlgorithm,
     ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
         let policy = crate::policy::VerificationPolicy::default();
+        let mut candidate_budget =
+            InspectedKeyCandidateBudget::new(policy.resources.max_key_candidates);
         self.resolve_with_trust(
             key_info,
             algorithm,
-            policy.key_sources,
-            &policy.key_trust,
-            &policy.resources,
+            &policy,
             crate::provider::default_provider(),
+            &mut candidate_budget,
+            ResolutionScope::Document,
         )
     }
 
@@ -1089,13 +1232,14 @@ impl KeyResolver for DefaultKeyResolver {
         policy: &crate::policy::VerificationPolicy,
         provider: &dyn crate::provider::CryptoProvider,
     ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
-        self.resolve_with_trust(
+        let mut candidate_budget =
+            InspectedKeyCandidateBudget::new(policy.resources.max_key_candidates);
+        self.resolve_with_candidate_budget(
             key_info,
             algorithm,
-            policy.key_sources,
-            &policy.key_trust,
-            &policy.resources,
+            policy,
             provider,
+            &mut candidate_budget,
         )
     }
 
@@ -1151,6 +1295,7 @@ fn rsa_key_value_to_spki_der(
     modulus: &[u8],
     exponent: &[u8],
 ) -> Result<Vec<u8>, KeyResolutionError> {
+    let (modulus, exponent) = bounded_rsa_public_components(modulus, exponent)?;
     let key = rsa::RsaPublicKey::new(
         BoxedUint::from_be_slice_vartime(modulus),
         BoxedUint::from_be_slice_vartime(exponent),
@@ -1159,6 +1304,30 @@ fn rsa_key_value_to_spki_der(
     key.to_public_key_der()
         .map_err(|_| KeyResolutionError::InvalidPublicKey)
         .map(|der| der.as_bytes().to_vec())
+}
+
+pub(crate) fn bounded_rsa_public_components<'a>(
+    modulus: &'a [u8],
+    exponent: &'a [u8],
+) -> Result<(&'a [u8], &'a [u8]), KeyResolutionError> {
+    let modulus = &modulus[modulus
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(modulus.len())..];
+    let exponent = &exponent[exponent
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(exponent.len())..];
+    let maximum = crate::hard_limits::RSA_MODULUS_BIT_CEILING;
+    if modulus.is_empty()
+        || exponent.is_empty()
+        || modulus.len() > maximum.div_ceil(8)
+        || exponent.len() > maximum.div_ceil(8)
+        || (modulus.len() * 8 - modulus[0].leading_zeros() as usize) > maximum
+    {
+        return Err(KeyResolutionError::InvalidPublicKey);
+    }
+    Ok((modulus, exponent))
 }
 
 fn dsa_key_value_to_spki_der(
@@ -1234,8 +1403,8 @@ fn validate_spki_algorithm(
         .map(|oid| oid.to_id_string());
     match (algorithm, parsed) {
         (SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256, PublicKey::DSA(_)) => {
-            let _ = dsa::VerifyingKey::from_public_key_der(public_key_bytes)
-                .map_err(|_| KeyResolutionError::AlgorithmMismatch)?;
+            let _ = decode_dsa_verifying_key(public_key_bytes)
+                .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
             Ok(())
         }
         (
@@ -1252,16 +1421,92 @@ fn validate_spki_algorithm(
             | SignatureAlgorithm::EcdsaSha256
             | SignatureAlgorithm::EcdsaSha384
             | SignatureAlgorithm::EcdsaSha512,
-            PublicKey::EC(_),
+            PublicKey::EC(ec),
         ) if matches!(
             curve_oid.as_deref(),
             Some(EC_P256_OID | EC_P384_OID | EC_P521_OID)
         ) =>
         {
+            validate_ec_public_key_encoding(&ec, spki.subject_public_key.data.as_ref())
+                .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
+            validate_ec_point(curve_oid.as_deref(), spki.subject_public_key.data.as_ref())?;
             Ok(())
         }
         _ => Err(KeyResolutionError::AlgorithmMismatch),
     }
+}
+
+pub(crate) fn supported_parsed_spki_is_rsa(
+    spki: &SubjectPublicKeyInfo<'_>,
+    public_key_bytes: &[u8],
+) -> Result<bool, KeyResolutionError> {
+    let parsed = spki
+        .parsed()
+        .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
+    match parsed {
+        PublicKey::RSA(key) => {
+            bounded_rsa_public_components(key.modulus, key.exponent)?;
+            rsa::RsaPublicKey::from_public_key_der(public_key_bytes)
+                .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
+            Ok(true)
+        }
+        PublicKey::DSA(_) => {
+            let _ = decode_dsa_verifying_key(public_key_bytes)
+                .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
+            Ok(false)
+        }
+        PublicKey::EC(ec) => {
+            validate_ec_public_key_encoding(&ec, spki.subject_public_key.data.as_ref())
+                .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
+            let curve_oid = spki
+                .algorithm
+                .parameters
+                .as_ref()
+                .and_then(|value| value.as_oid().ok())
+                .map(|oid| oid.to_id_string());
+            validate_ec_point(curve_oid.as_deref(), spki.subject_public_key.data.as_ref())?;
+            Ok(false)
+        }
+        _ => Err(KeyResolutionError::AlgorithmMismatch),
+    }
+}
+
+fn validate_ec_point(curve_oid: Option<&str>, point: &[u8]) -> Result<(), KeyResolutionError> {
+    match curve_oid {
+        Some(EC_P256_OID) => p256::PublicKey::from_sec1_bytes(point).map(|_| ()),
+        Some(EC_P384_OID) => p384::PublicKey::from_sec1_bytes(point).map(|_| ()),
+        Some(EC_P521_OID) => p521::PublicKey::from_sec1_bytes(point).map(|_| ()),
+        _ => return Err(KeyResolutionError::AlgorithmMismatch),
+    }
+    .map_err(|_| KeyResolutionError::InvalidPublicKey)
+}
+
+pub(crate) fn supported_key_value_is_rsa(value: &KeyValueInfo) -> Result<bool, KeyResolutionError> {
+    let (spki, is_rsa) = match value {
+        KeyValueInfo::Rsa { modulus, exponent } => {
+            (rsa_key_value_to_spki_der(modulus, exponent)?, true)
+        }
+        KeyValueInfo::Dsa {
+            p: Some(p),
+            q: Some(q),
+            g: Some(g),
+            y,
+        } => (dsa_key_value_to_spki_der(p, q, g, y)?, false),
+        KeyValueInfo::Ec {
+            curve_oid,
+            public_key,
+        } => (ec_key_value_to_spki_der(curve_oid, public_key)?, false),
+        _ => return Err(KeyResolutionError::InvalidPublicKey),
+    };
+    let algorithm = if is_rsa {
+        SignatureAlgorithm::RsaSha256
+    } else if matches!(value, KeyValueInfo::Dsa { .. }) {
+        SignatureAlgorithm::DsaSha256
+    } else {
+        SignatureAlgorithm::EcdsaSha256
+    };
+    validate_spki_algorithm(&spki, algorithm)?;
+    Ok(is_rsa)
 }
 
 #[cfg(test)]
@@ -1270,6 +1515,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use base64::{Engine, engine::general_purpose::STANDARD};
+    use der::Decode as _;
     use rcgen::{
         CertificateRevocationListParams, Issuer, KeyIdMethod, KeyPair, KeyUsagePurpose,
         RevokedCertParams, SerialNumber, date_time_ymd,
@@ -1277,6 +1523,50 @@ mod tests {
     use rsa::{pkcs8::DecodePublicKey, traits::PublicKeyParts};
 
     use super::*;
+
+    #[test]
+    fn xml_rsa_components_are_bounded_before_bigint_decode() {
+        // KeyValue import must reject oversized decoded modulus before conversion.
+        let oversized = vec![1_u8; crate::hard_limits::RSA_MODULUS_BIT_CEILING.div_ceil(8) + 1];
+        assert!(matches!(
+            rsa_key_value_to_spki_der(&oversized, &[1, 0, 1]),
+            Err(KeyResolutionError::InvalidPublicKey)
+        ));
+    }
+
+    #[test]
+    fn oversized_dsa_spki_parameter_is_rejected_before_bigint_decode() {
+        // A bounded SPKI may still contain a parameter much larger than the
+        // non-configurable DSA component ceiling.
+        let oversized = vec![1_u8; crate::hard_limits::DSA_KEY_COMPONENT_BYTE_CEILING + 1];
+        let one = [1_u8];
+        let params = der::Encode::to_der(&super::super::signature::BorrowedDsaPublicParameters {
+            p: der::asn1::UintRef::new(&oversized).expect("positive P"),
+            q: der::asn1::UintRef::new(&one).expect("positive Q"),
+            g: der::asn1::UintRef::new(&one).expect("positive G"),
+        })
+        .expect("parameters encode");
+        let y = der::Encode::to_der(&der::asn1::UintRef::new(&one).expect("positive Y"))
+            .expect("public value encodes");
+        let spki = rsa::pkcs8::SubjectPublicKeyInfoRef {
+            algorithm: rsa::pkcs8::AlgorithmIdentifierRef {
+                oid: dsa::OID,
+                parameters: Some(der::asn1::AnyRef::from_der(&params).expect("parameters")),
+            },
+            subject_public_key: der::asn1::BitStringRef::new(0, &y).expect("bit string"),
+        };
+        let encoded = der::Encode::to_der(&spki).expect("SPKI encodes");
+        assert!(matches!(
+            decode_dsa_verifying_key(&encoded),
+            Err(super::super::signature::SignatureVerificationError::InvalidKeyDer)
+        ));
+        // Ordinary verification must use the same borrowed preflight, not
+        // reject only after an allocating crypto decoder reports mismatch.
+        assert!(matches!(
+            validate_spki_algorithm(&encoded, SignatureAlgorithm::DsaSha256),
+            Err(KeyResolutionError::InvalidPublicKey)
+        ));
+    }
 
     struct RejectSecondSha512Provider {
         sha512_calls: AtomicUsize,
@@ -3327,6 +3617,134 @@ mod tests {
                 actual: 2,
             })
         ));
+    }
+
+    #[test]
+    fn configured_crls_are_bounded_before_der_parsing() {
+        // Invalid DER must not be parsed when its size or count already violates policy.
+        let key_info = KeyInfo {
+            sources: vec![KeyInfoSource::X509Data(X509DataInfo {
+                subject_names: vec!["CN=selected".into()],
+                ..X509DataInfo::default()
+            })],
+        };
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.key_trust.check_crls = true;
+        policy.key_trust.verify_x509_chains = true;
+        policy.resources.max_external_resource_bytes = 4;
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            crls: vec![vec![0; 5]],
+            ..KeyResolverConfig::default()
+        });
+        let error = resolver
+            .resolve_with_policy(Some(&key_info), SignatureAlgorithm::RsaSha256, &policy)
+            .err()
+            .expect("oversized CRL must fail before DER parsing");
+        assert!(
+            matches!(
+                error,
+                DsigError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
+                    ..
+                })
+            ),
+            "{error:?}"
+        );
+
+        policy.resources.max_external_resource_bytes = 4;
+        policy.resources.max_external_resource_total_bytes = 7;
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            crls: vec![vec![0; 4], vec![0; 4]],
+            ..KeyResolverConfig::default()
+        });
+        let error = resolver
+            .resolve_with_policy(Some(&key_info), SignatureAlgorithm::RsaSha256, &policy)
+            .err()
+            .expect("aggregate CRL bytes must fail before DER parsing");
+        assert!(matches!(
+            error,
+            DsigError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                ..
+            })
+        ));
+
+        policy.resources.max_external_resource_total_bytes = 8;
+        policy.resources.max_key_candidates = 1;
+        let error = resolver
+            .resolve_with_policy(Some(&key_info), SignatureAlgorithm::RsaSha256, &policy)
+            .err()
+            .expect("CRL candidate count must fail before DER parsing");
+        assert!(matches!(
+            error,
+            DsigError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::KEY_CANDIDATES,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn configured_certificates_and_crls_share_external_byte_budget() {
+        // A stricter operation policy must account for all resolver-owned
+        // material on a selector path, even when the resolver was built under
+        // a broader policy.
+        let key_info = KeyInfo {
+            sources: vec![KeyInfoSource::X509Data(X509DataInfo {
+                subject_names: vec!["CN=selected".into()],
+                ..X509DataInfo::default()
+            })],
+        };
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.key_trust.check_crls = true;
+        policy.key_trust.verify_x509_chains = true;
+        policy.resources.max_external_resource_bytes = 8;
+        policy.resources.max_external_resource_total_bytes = 12;
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            trusted_certs: vec![vec![0; 8]],
+            crls: vec![vec![0; 8]],
+            ..KeyResolverConfig::default()
+        });
+        let error = resolver
+            .resolve_with_policy(Some(&key_info), SignatureAlgorithm::RsaSha256, &policy)
+            .err()
+            .expect("combined external material exceeds the operation limit");
+        assert!(matches!(
+            error,
+            DsigError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn direct_certificate_does_not_charge_unused_configured_store() {
+        // A direct embedded certificate bypasses configured lookup material
+        // when chain verification is disabled.
+        let certificate = certificate_der(RSA_4096_CERTIFICATE);
+        let key_info = KeyInfo {
+            sources: vec![KeyInfoSource::X509Data(X509DataInfo {
+                certificates: vec![certificate],
+                certificate_chain: vec![0],
+                subject_names: vec!["CN=unused-selector".into()],
+                ..X509DataInfo::default()
+            })],
+        };
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            lookup_certs: vec![vec![0; 4096]],
+            trusted_certs: vec![vec![0; 4096]],
+            ..KeyResolverConfig::default()
+        });
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_external_resource_bytes = 1024;
+        policy.resources.max_external_resource_total_bytes = 1024;
+        assert!(
+            resolver
+                .resolve_with_policy(Some(&key_info), SignatureAlgorithm::RsaSha256, &policy)
+                .expect("unused configured certificates are not charged")
+                .is_some()
+        );
     }
 
     #[test]

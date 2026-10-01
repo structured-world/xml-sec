@@ -5,6 +5,7 @@
 //! generation atomically, so identities from an older generation cannot be
 //! confused with nodes in the new tree.
 
+use std::borrow::Cow;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
@@ -3303,6 +3304,14 @@ fn decode_owned_xml(
     maximum: usize,
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<String, XmlDocumentError> {
+    decode_xml_with_budget(bytes, maximum, budget).map(Cow::into_owned)
+}
+
+pub(crate) fn decode_xml_with_budget<'a>(
+    bytes: &'a [u8],
+    maximum: usize,
+    budget: Option<&XmlParseWorkBudget>,
+) -> Result<Cow<'a, str>, XmlDocumentError> {
     if bytes.len() > maximum {
         return Err(XmlDocumentError::DocumentTooLarge {
             maximum,
@@ -3313,14 +3322,12 @@ fn decode_owned_xml(
     // Charge it before encoding detection/transcoding and retain that charge
     // in the same sticky budget used by preflight and semantic construction.
     charge_parse_work(budget, bytes.len())?;
-    xml_sec_xml_input::decode_xml_bounded(bytes, None, maximum)
-        .map(|xml| xml.into_owned())
-        .map_err(|error| match error {
-            xml_sec_xml_input::Error::DecodedLimit { actual, .. } => {
-                XmlDocumentError::DocumentTooLarge { maximum, actual }
-            }
-            error => XmlDocumentError::Encoding(error),
-        })
+    xml_sec_xml_input::decode_xml_bounded(bytes, None, maximum).map_err(|error| match error {
+        xml_sec_xml_input::Error::DecodedLimit { actual, .. } => {
+            XmlDocumentError::DocumentTooLarge { maximum, actual }
+        }
+        error => XmlDocumentError::Encoding(error),
+    })
 }
 
 fn allocate_document_identity(counter: &AtomicU64) -> Result<DocumentIdentity, XmlDocumentError> {

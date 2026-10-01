@@ -15,6 +15,7 @@
 use crate::xml::dom::Node;
 
 mod decrypt;
+pub(crate) use decrypt::validate_key_len;
 mod encrypt;
 mod parse;
 mod types;

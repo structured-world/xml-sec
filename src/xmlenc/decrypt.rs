@@ -1193,7 +1193,10 @@ fn projected_decoded_len_for_encoded_len(encoded_len: usize) -> usize {
         .unwrap_or(usize::MAX)
 }
 
-fn validate_key_len(algorithm: DataEncryptionAlgorithm, key: &[u8]) -> Result<(), XmlEncError> {
+pub(crate) fn validate_key_len(
+    algorithm: DataEncryptionAlgorithm,
+    key: &[u8],
+) -> Result<(), XmlEncError> {
     if key.len() == algorithm.key_len() {
         Ok(())
     } else {

@@ -56,6 +56,17 @@ pub(crate) const ENCRYPTION_RECIPIENT_CEILING: usize = 64;
 /// Maximum symmetric keys attempted by one prepared decryption operation.
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const KEY_CANDIDATE_CEILING: usize = 64;
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const KEY_IMPORT_KDF_WORK_CEILING: u64 = 10_000_000;
+/// Maximum workspace reserved by one imported password key derivation.
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const KEY_IMPORT_KDF_MEMORY_CEILING: usize = 32 * 1024 * 1024;
+/// Stack-safety ceiling for BER construction and nested PKCS#12 safe bags.
+#[cfg(feature = "xmldsig")]
+pub(crate) const PKCS12_NESTING_CEILING: usize = 32;
+/// Maximum byte length of one imported DSA integer before big-integer work.
+#[cfg(feature = "xmldsig")]
+pub(crate) const DSA_KEY_COMPONENT_BYTE_CEILING: usize = 512;
 /// Maximum nested `KeyInfoReference` dereference depth.
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const KEY_INFO_REFERENCE_DEPTH_CEILING: usize = 8;

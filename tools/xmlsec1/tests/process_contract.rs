@@ -17,6 +17,7 @@ use rcgen::{
 };
 use rsa::{
     RsaPrivateKey, RsaPublicKey,
+    pkcs1::DecodeRsaPrivateKey as _,
     pkcs8::{
         DecodePrivateKey as _, DecodePublicKey as _, EncodePrivateKey as _, EncodePublicKey as _,
     },
@@ -44,6 +45,230 @@ fn binary() -> &'static str {
 
 fn project_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
+}
+
+#[test]
+fn donor_pkcs12_decrypts_and_wrong_password_fails_closed() {
+    // The PHAOS bundle and ciphertext are independent xmlsec1 oracle inputs.
+    let fixture = project_root().join("tests/fixtures/xmlenc/01-phaos-xmlenc-3");
+    let encrypted = fixture.join("enc-element-aes128-kt-rsa_oaep_sha1.xml");
+    let key = fixture.join("rsa-priv-key.p12");
+    let run = |password: &str| {
+        Command::new(binary())
+            .arg("decrypt")
+            .arg("--pkcs12:my-rsa-key")
+            .arg(&key)
+            .arg("--pwd")
+            .arg(password)
+            .arg(&encrypted)
+            .output()
+            .unwrap()
+    };
+    let success = run("secret");
+    assert!(
+        success.status.success(),
+        "{}",
+        String::from_utf8_lossy(&success.stderr)
+    );
+    assert!(String::from_utf8_lossy(&success.stdout).contains("CreditCard"));
+
+    let failure = run("wrong-password");
+    assert!(!failure.status.success());
+    assert!(!String::from_utf8_lossy(&failure.stderr).contains("wrong-password"));
+}
+
+#[test]
+fn donor_pkcs12_signs_without_exposing_password() {
+    // The PKCS#12 importer must feed the normal signing pipeline, not just RSA
+    // transport decryption, and a wrong password must not retry plaintext DER.
+    let fixture = project_root().join("tests/fixtures/xmlenc/01-phaos-xmlenc-3");
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("template.xml");
+    let signed = temp.path().join("signed.xml");
+    let public = temp.path().join("public.der");
+    fs::write(&template, signature_template_without_key_info()).unwrap();
+    let private =
+        RsaPrivateKey::from_pkcs1_der(&fs::read(fixture.join("rsa-priv-key.der")).unwrap())
+            .unwrap();
+    fs::write(
+        &public,
+        private
+            .to_public_key()
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    let key = fixture.join("rsa-priv-key.p12");
+    let sign = |password: &str| {
+        Command::new(binary())
+            .arg("sign")
+            .arg("--pkcs12")
+            .arg(&key)
+            .arg("--pwd")
+            .arg(password)
+            .arg("--output")
+            .arg(&signed)
+            .arg(&template)
+            .output()
+            .unwrap()
+    };
+    let success = sign("secret");
+    assert!(
+        success.status.success(),
+        "{}",
+        String::from_utf8_lossy(&success.stderr)
+    );
+    let verified = Command::new(binary())
+        .arg("verify")
+        .arg("--pubkey-der")
+        .arg(&public)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(
+        verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+
+    let failed = sign("wrong-password");
+    assert!(!failed.status.success());
+    assert!(!String::from_utf8_lossy(&failed.stderr).contains("wrong-password"));
+}
+
+#[test]
+fn lax_signing_stops_on_protected_pkcs12_failure() {
+    // A wrong container password is an invocation failure, not permission to
+    // use a later unprotected signing key from the lax candidate list.
+    let fixture = project_root().join("tests/fixtures/xmlenc/01-phaos-xmlenc-3");
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("template.xml");
+    fs::write(&template, signature_template_without_key_info()).unwrap();
+    let result = Command::new(binary())
+        .args(["sign", "--lax-key-search", "--pkcs12:first"])
+        .arg(fixture.join("rsa-priv-key.p12"))
+        .args(["--privkey-pem:second"])
+        .arg(project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem"))
+        .args(["--pwd", "wrong-password"])
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        !result.status.success(),
+        "wrong PKCS#12 password was skipped"
+    );
+    assert!(!String::from_utf8_lossy(&result.stderr).contains("wrong-password"));
+}
+
+#[test]
+fn lax_decryption_stops_on_protected_pkcs12_failure() {
+    // A protected-container authentication failure must not be bypassed by
+    // decrypting with a later plaintext private-key candidate.
+    let fixture = project_root().join("tests/fixtures/xmlenc/01-phaos-xmlenc-3");
+    let result = Command::new(binary())
+        .args(["decrypt", "--lax-key-search", "--pkcs12:my-rsa-key"])
+        .arg(fixture.join("rsa-priv-key.p12"))
+        .args(["--privkey-der:second"])
+        .arg(fixture.join("rsa-priv-key.der"))
+        .args(["--pwd", "wrong-password"])
+        .arg(fixture.join("enc-element-aes128-kt-rsa_oaep_sha1.xml"))
+        .output()
+        .unwrap();
+    assert!(
+        !result.status.success(),
+        "wrong PKCS#12 password was skipped"
+    );
+    assert!(!String::from_utf8_lossy(&result.stderr).contains("wrong-password"));
+}
+
+#[test]
+fn lax_decryption_stops_on_traditional_encrypted_rsa_pem_failure() {
+    // A wrong password for the first protected RSA candidate cannot authorize
+    // fallback to a later unprotected key for the same recipient.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let encrypted = temp.path().join("encrypted.xml");
+    let keys = project_root().join("tests/fixtures/keys/rsa");
+    fs::write(&template, r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep"/><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#).unwrap();
+    fs::write(&plaintext, b"protected RSA recipient").unwrap();
+    let encrypt = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem"])
+        .arg(keys.join("rsa-2048-pubkey.pem"))
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        encrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&encrypt.stderr)
+    );
+    let decrypt = Command::new(binary())
+        .args(["decrypt", "--lax-key-search", "--privkey-pem:first"])
+        .arg(keys.join("rsa-2048-key-traditional-encrypted.pem"))
+        .arg("--privkey-pem:second")
+        .arg(keys.join("rsa-2048-key.pem"))
+        .args(["--pwd", "wrong-legacy-password-sentinel"])
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(!decrypt.status.success());
+    assert!(!String::from_utf8_lossy(&decrypt.stderr).contains("wrong-legacy-password-sentinel"));
+}
+
+#[test]
+fn donor_xml_store_private_dsa_signs_and_public_dsa_verifies() {
+    // The upstream xmlsec extension carries DSA X only in the store. The
+    // signature document names the key but does not contain secret material.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("dsa-template.xml");
+    let signed = temp.path().join("dsa-signed.xml");
+    let source = signature_template_without_key_info()
+        .replace(
+            "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+            "http://www.w3.org/2000/09/xmldsig#dsa-sha1",
+        )
+        .replace(
+            "http://www.w3.org/2001/04/xmlenc#sha256",
+            "http://www.w3.org/2000/09/xmldsig#sha1",
+        )
+        .replace(
+            "<SignatureValue/>",
+            "<SignatureValue/><KeyInfo><KeyName>test-dsa</KeyName></KeyInfo>",
+        );
+    fs::write(&template, source).unwrap();
+    let store = project_root().join("tests/fixtures/keys/xmlsec/mixed-keys.xml");
+    let sign = Command::new(binary())
+        .arg("sign")
+        .arg("--keys-file")
+        .arg(&store)
+        .arg("--output")
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+    let verify = Command::new(binary())
+        .arg("verify")
+        .arg("--keys-file")
+        .arg(&store)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
 }
 
 #[derive(der::Sequence)]
@@ -445,6 +670,154 @@ fn compatibility_cli_signs_hmac_templates_with_named_raw_keys() {
 }
 
 #[test]
+fn key_store_supplies_named_hmac_key_for_sign_and_verify() {
+    // A libxmlsec1 key store is an input key source, not merely output of the
+    // `keys` command. A missing or malformed store must not fall back to an
+    // unrelated key.
+    let temp = tempfile::tempdir().unwrap();
+    let template = project_root().join(
+        "tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-enveloping-hmac-sha1.tmpl",
+    );
+    let key_store = temp.path().join("keys.xml");
+    let signed = temp.path().join("signed.xml");
+    let secret = fs::read(project_root().join("tests/fixtures/keys/hmackey.bin")).unwrap();
+    let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, secret);
+    fs::write(
+        &key_store,
+        format!(
+            "<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\"><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>TeskKeyName-Hmac</KeyName><KeyValue><HMACKeyValue xmlns=\"http://www.aleksey.com/xmlsec/2002\">{encoded}</HMACKeyValue></KeyValue></KeyInfo></Keys>"
+        ),
+    )
+    .unwrap();
+
+    let sign = Command::new(binary())
+        .args(["sign", "--keys-file"])
+        .arg(&key_store)
+        .arg("--output")
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let verify = Command::new(binary())
+        .args(["verify", "--keys-file"])
+        .arg(&key_store)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+
+    let duplicate = Command::new(binary())
+        .args(["verify", "--keys-file"])
+        .arg(&key_store)
+        .arg("--keys-file")
+        .arg(&key_store)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(!duplicate.status.success());
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("duplicate key name"));
+
+    let malformed = temp.path().join("malformed.xml");
+    fs::write(&malformed, "<Keys><KeyInfo/></Keys>").unwrap();
+    let rejected = Command::new(binary())
+        .args(["verify", "--keys-file"])
+        .arg(&malformed)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+}
+
+#[test]
+fn key_store_accepts_mixed_upstream_key_types() {
+    // The upstream keys.xml intentionally mixes symmetric, RSA, DSA, and
+    // additional key families. An unsupported entry cannot invalidate a
+    // separately usable HMAC entry in the same store.
+    let template = project_root().join(
+        "tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-enveloping-hmac-sha1.tmpl",
+    );
+    let store = project_root().join("tests/fixtures/keys/xmlsec/mixed-keys.xml");
+    let output = Command::new(binary())
+        .args(["sign", "--lax-key-search", "--keys-file"])
+        .arg(&store)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn lax_key_store_verification_skips_incompatible_family() {
+    // The first named store entry is DSA; the RSA signature must be checked
+    // against the later compatible entry instead of failing at the first key.
+    let temp = tempfile::tempdir().unwrap();
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let signed = temp.path().join("signed.xml");
+    let sign = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem"))
+        .arg("--output")
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let donor =
+        fs::read_to_string(project_root().join("tests/fixtures/keys/xmlsec/mixed-keys.xml"))
+            .unwrap();
+    let dsa_name = donor.find("<KeyName>test-dsa</KeyName>").unwrap();
+    let dsa_start = donor[..dsa_name].rfind("<KeyInfo").unwrap();
+    let dsa_end = donor[dsa_name..].find("</KeyInfo>").unwrap() + dsa_name + "</KeyInfo>".len();
+    let public_pem =
+        fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem"))
+            .unwrap();
+    let public = RsaPublicKey::from_public_key_pem(&public_pem).unwrap();
+    let base64 = base64::engine::general_purpose::STANDARD;
+    let store = temp.path().join("keys.xml");
+    fs::write(
+        &store,
+        format!(
+            "<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\">{}<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>rsa</KeyName><KeyValue><RSAKeyValue><Modulus>{}</Modulus><Exponent>{}</Exponent></RSAKeyValue></KeyValue></KeyInfo></Keys>",
+            &donor[dsa_start..dsa_end],
+            base64.encode(public.n().to_be_bytes_trimmed_vartime()),
+            base64.encode(public.e().to_be_bytes_trimmed_vartime()),
+        ),
+    )
+    .unwrap();
+    let verify = Command::new(binary())
+        .args(["verify", "--lax-key-search", "--keys-file"])
+        .arg(&store)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+}
+
+#[test]
 #[expect(
     deprecated,
     reason = "the compatibility CLI must retain coverage for legacy DSA 1024/160 keys"
@@ -577,6 +950,28 @@ fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
             .as_bytes(),
     )
     .unwrap();
+    let compatible_private = temp.path().join("dsa-2048-private.der");
+    fs::write(
+        &compatible_private,
+        dsa_key.to_pkcs8_der().unwrap().as_bytes(),
+    )
+    .unwrap();
+    let lax_signed = temp.path().join("dsa-lax-signed.xml");
+    let lax_sign = Command::new(binary())
+        .args(["sign", "--lax-key-search", "--pkcs8-der:wrong"])
+        .arg(&legacy_private)
+        .arg("--pkcs8-der:TestKeyName-dsa-2048")
+        .arg(&compatible_private)
+        .arg("--output")
+        .arg(&lax_signed)
+        .arg(&dsa_template)
+        .output()
+        .unwrap();
+    assert!(
+        lax_sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lax_sign.stderr)
+    );
     let donor_legacy_template = project_root()
         .join("tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-enveloping-dsa.tmpl");
     let legacy_template = temp.path().join("dsa-1024-template.xml");
@@ -3070,6 +3465,628 @@ fn encrypts_decrypts_and_rejects_wrong_symmetric_key() {
         .output()
         .unwrap();
     assert!(!rejected.status.success());
+}
+
+#[test]
+fn key_store_supplies_aes_key_for_encryption_and_decryption() {
+    // The same named key store must serve both sides of a binary encryption
+    // round trip; a second store with different material must not decrypt it.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let store = temp.path().join("keys.xml");
+    let wrong_store = temp.path().join("wrong.xml");
+    let encrypted = temp.path().join("encrypted.xml");
+    let decrypted = temp.path().join("decrypted.bin");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><KeyName>content</KeyName></KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"key-store round trip\0\xff").unwrap();
+    for (path, key) in [
+        (&store, b"0123456789abcdef"),
+        (&wrong_store, b"fedcba9876543210"),
+    ] {
+        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key);
+        fs::write(path, format!("<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\"><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>content</KeyName><KeyValue><AESKeyValue xmlns=\"http://www.aleksey.com/xmlsec/2002\">{encoded}</AESKeyValue></KeyValue></KeyInfo></Keys>")).unwrap();
+    }
+    let encrypt = Command::new(binary())
+        .args(["encrypt", "--keys-file"])
+        .arg(&store)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        encrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&encrypt.stderr)
+    );
+    let decrypt = Command::new(binary())
+        .args(["decrypt", "--keys-file"])
+        .arg(&store)
+        .arg("--output")
+        .arg(&decrypted)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        decrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decrypt.stderr)
+    );
+    assert_eq!(fs::read(&decrypted).unwrap(), fs::read(&plaintext).unwrap());
+    // An embedded recipient does not invalidate a separate direct content key.
+    // Both explicit and stored direct keys must take the same selection path.
+    let with_recipient = temp.path().join("encrypted-with-recipient.xml");
+    let direct_key = temp.path().join("content.key");
+    fs::write(&direct_key, b"0123456789abcdef").unwrap();
+    let encrypted_xml = fs::read_to_string(&encrypted).unwrap();
+    assert!(encrypted_xml.contains("</KeyInfo>"));
+    let encrypted_xml = encrypted_xml.replacen(
+        "</KeyInfo>",
+        "<EncryptedKey xmlns=\"http://www.w3.org/2001/04/xmlenc#\"><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#rsa-oaep\"/><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>recipient</KeyName></KeyInfo><CipherData><CipherValue>AA==</CipherValue></CipherData></EncryptedKey></KeyInfo>",
+        1,
+    );
+    fs::write(&with_recipient, encrypted_xml).unwrap();
+    let explicit = Command::new(binary())
+        .args(["decrypt", "--aes-key:content"])
+        .arg(&direct_key)
+        .arg(&with_recipient)
+        .output()
+        .unwrap();
+    assert!(
+        explicit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&explicit.stderr)
+    );
+    assert_eq!(explicit.stdout, fs::read(&plaintext).unwrap());
+    let stored = Command::new(binary())
+        .args(["decrypt", "--keys-file"])
+        .arg(&store)
+        .arg(&with_recipient)
+        .output()
+        .unwrap();
+    assert!(
+        stored.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stored.stderr)
+    );
+    assert_eq!(stored.stdout, fs::read(&plaintext).unwrap());
+    let wrong = Command::new(binary())
+        .args(["decrypt", "--keys-file"])
+        .arg(&wrong_store)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(!wrong.status.success());
+
+    let mixed_store = temp.path().join("mixed.xml");
+    let wrong_encoded = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        b"fedcba9876543210",
+    );
+    let right_encoded = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        b"0123456789abcdef",
+    );
+    fs::write(
+        &mixed_store,
+        format!("<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\"><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>wrong</KeyName><KeyValue><AESKeyValue xmlns=\"http://www.aleksey.com/xmlsec/2002\">{wrong_encoded}</AESKeyValue></KeyValue></KeyInfo><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>content</KeyName><KeyValue><AESKeyValue xmlns=\"http://www.aleksey.com/xmlsec/2002\">{right_encoded}</AESKeyValue></KeyValue></KeyInfo></Keys>"),
+    )
+    .unwrap();
+    let lax = Command::new(binary())
+        .args(["decrypt", "--lax-key-search", "--keys-file"])
+        .arg(&mixed_store)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        lax.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lax.stderr)
+    );
+    assert_eq!(lax.stdout, fs::read(&plaintext).unwrap());
+}
+
+#[test]
+fn key_store_rsa_recipient_round_trips_with_explicit_private_key() {
+    // A named RSAKeyValue in the imported store must serve an EncryptedKey
+    // recipient without an additional public-key file option.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("template.xml");
+    let store = temp.path().join("keys.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let encrypted = temp.path().join("encrypted.xml");
+    let public_pem =
+        fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem"))
+            .unwrap();
+    let public = RsaPublicKey::from_public_key_pem(&public_pem).unwrap();
+    let base64 = base64::engine::general_purpose::STANDARD;
+    fs::write(
+        &store,
+        format!(
+            "<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\"><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>recipient</KeyName><KeyValue><RSAKeyValue><Modulus>{}</Modulus><Exponent>{}</Exponent></RSAKeyValue></KeyValue></KeyInfo></Keys>",
+            base64.encode(public.n().to_be_bytes_trimmed_vartime()),
+            base64.encode(public.e().to_be_bytes_trimmed_vartime()),
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep"/><ds:KeyInfo><ds:KeyName>recipient</ds:KeyName></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"named RSA recipient payload").unwrap();
+    let encrypt = Command::new(binary())
+        .args(["encrypt", "--keys-file"])
+        .arg(&store)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        encrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&encrypt.stderr)
+    );
+    let decrypt = Command::new(binary())
+        .args(["decrypt", "--privkey-pem"])
+        .arg(project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem"))
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        decrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decrypt.stderr)
+    );
+    assert_eq!(decrypt.stdout, fs::read(&plaintext).unwrap());
+
+    // Lax lookup must still prefer the recipient's exact name over an earlier
+    // usable-but-wrong RSA key in the same store.
+    let wrong_public_pem =
+        fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"))
+            .unwrap();
+    let wrong_public = RsaPublicKey::from_public_key_pem(&wrong_public_pem).unwrap();
+    fs::write(
+        &store,
+        format!(
+            "<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\"><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>wrong</KeyName><KeyValue><RSAKeyValue><Modulus>{}</Modulus><Exponent>{}</Exponent></RSAKeyValue></KeyValue></KeyInfo><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>recipient</KeyName><KeyValue><RSAKeyValue><Modulus>{}</Modulus><Exponent>{}</Exponent></RSAKeyValue></KeyValue></KeyInfo></Keys>",
+            base64.encode(wrong_public.n().to_be_bytes_trimmed_vartime()),
+            base64.encode(wrong_public.e().to_be_bytes_trimmed_vartime()),
+            base64.encode(public.n().to_be_bytes_trimmed_vartime()),
+            base64.encode(public.e().to_be_bytes_trimmed_vartime()),
+        ),
+    )
+    .unwrap();
+    let lax_encrypted = temp.path().join("lax-encrypted.xml");
+    let lax_encrypt = Command::new(binary())
+        .args(["encrypt", "--lax-key-search", "--keys-file"])
+        .arg(&store)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&lax_encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        lax_encrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lax_encrypt.stderr)
+    );
+    let lax_decrypt = Command::new(binary())
+        .args(["decrypt", "--privkey-pem"])
+        .arg(project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem"))
+        .arg(&lax_encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        lax_decrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lax_decrypt.stderr)
+    );
+    assert_eq!(lax_decrypt.stdout, fs::read(&plaintext).unwrap());
+
+    let unsupported_store_decrypt = Command::new(binary())
+        .args(["decrypt", "--keys-file"])
+        .arg(&store)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(!unsupported_store_decrypt.status.success());
+    assert!(
+        String::from_utf8_lossy(&unsupported_store_decrypt.stderr)
+            .contains("--keys-file does not supply RSA recipient private keys")
+    );
+
+    let wrong_public_pem =
+        fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"))
+            .unwrap();
+    let wrong_public = RsaPublicKey::from_public_key_pem(&wrong_public_pem).unwrap();
+    let conflicting = format!(
+        "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#rsa-oaep\"/><ds:KeyInfo><ds:KeyName>recipient</ds:KeyName><ds:KeyValue><ds:RSAKeyValue><ds:Modulus>{}</ds:Modulus><ds:Exponent>{}</ds:Exponent></ds:RSAKeyValue></ds:KeyValue></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>",
+        base64.encode(wrong_public.n().to_be_bytes_trimmed_vartime()),
+        base64.encode(wrong_public.e().to_be_bytes_trimmed_vartime()),
+    );
+    fs::write(&template, conflicting).unwrap();
+    let rejected = Command::new(binary())
+        .args(["encrypt", "--keys-file"])
+        .arg(&store)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+}
+
+#[test]
+fn lax_store_encryption_replaces_stale_content_key_name() {
+    // Lax fallback must publish the selected content-key identity so a strict
+    // decryptor can select that same key from the resulting document.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("template.xml");
+    let store = temp.path().join("keys.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let encrypted = temp.path().join("encrypted.xml");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><ds:KeyName>selected<!--split text-->-old</ds:KeyName></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(b"0123456789abcdef");
+    fs::write(
+        &store,
+        format!("<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\"><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>selected</KeyName><KeyValue><AESKeyValue xmlns=\"http://www.aleksey.com/xmlsec/2002\">{encoded}</AESKeyValue></KeyValue></KeyInfo></Keys>"),
+    )
+    .unwrap();
+    fs::write(&plaintext, b"lax content key fallback").unwrap();
+    let encrypt = Command::new(binary())
+        .args(["encrypt", "--lax-key-search", "--keys-file"])
+        .arg(&store)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        encrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&encrypt.stderr)
+    );
+    let xml = fs::read_to_string(&encrypted).unwrap();
+    let document = roxmltree::Document::parse(&xml).unwrap();
+    let content_key_name = document
+        .root_element()
+        .children()
+        .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyInfo")))
+        .and_then(|key_info| {
+            key_info
+                .children()
+                .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyName")))
+        })
+        .and_then(|node| node.text());
+    assert_eq!(content_key_name, Some("selected"));
+    let decrypt = Command::new(binary())
+        .args(["decrypt", "--keys-file"])
+        .arg(&store)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        decrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decrypt.stderr)
+    );
+    assert_eq!(decrypt.stdout, b"lax content key fallback");
+}
+
+#[test]
+fn lax_store_rsa_recipients_consume_distinct_candidates() {
+    // Lax selection consumes each entry once, including exact and singleton
+    // matches; every recipient must decrypt and exhaustion must emit no output.
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("keys.xml");
+    let template = temp.path().join("template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let encrypted = temp.path().join("encrypted.xml");
+    let base64 = base64::engine::general_purpose::STANDARD;
+    let mut entries = Vec::new();
+    for (name, bits) in [("a", 2048), ("b", 4096)] {
+        let pem = fs::read_to_string(
+            project_root().join(format!("tests/fixtures/keys/rsa/rsa-{bits}-pubkey.pem")),
+        )
+        .unwrap();
+        let public = RsaPublicKey::from_public_key_pem(&pem).unwrap();
+        entries.push(format!(
+            "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>{name}</KeyName><KeyValue><RSAKeyValue><Modulus>{}</Modulus><Exponent>{}</Exponent></RSAKeyValue></KeyValue></KeyInfo>",
+            base64.encode(public.n().to_be_bytes_trimmed_vartime()),
+            base64.encode(public.e().to_be_bytes_trimmed_vartime()),
+        ));
+    }
+    fs::write(
+        &store,
+        format!(
+            "<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\">{}</Keys>",
+            entries.join("")
+        ),
+    )
+    .unwrap();
+    fs::write(&plaintext, b"distinct store recipients").unwrap();
+    let write_template = |names: &[Option<&str>]| {
+        let recipients = names.iter().map(|name| {
+            let key_info = name.map_or_else(String::new, |name| format!("<ds:KeyInfo><ds:KeyName>{name}</ds:KeyName></ds:KeyInfo>"));
+            format!("<EncryptedKey><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#rsa-oaep\"/>{key_info}<CipherData><CipherValue/></CipherData></EncryptedKey>")
+        }).collect::<String>();
+        fs::write(&template, format!("<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><ds:KeyInfo>{recipients}</ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>")).unwrap();
+    };
+    let encrypt = |output: &Path| {
+        Command::new(binary())
+            .args(["encrypt", "--lax-key-search", "--keys-file"])
+            .arg(&store)
+            .arg("--binary-data")
+            .arg(&plaintext)
+            .arg("--output")
+            .arg(output)
+            .arg(&template)
+            .output()
+            .unwrap()
+    };
+    for names in [
+        [None, None],
+        [Some("unknown-a"), Some("unknown-b")],
+        [Some("a"), None],
+        [None, Some("a")],
+    ] {
+        write_template(&names);
+        let result = encrypt(&encrypted);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        // A fallback cannot steal the key requested by a later named slot.
+        if names == [None, Some("a")] {
+            let xml = fs::read_to_string(&encrypted).unwrap();
+            let document = roxmltree::Document::parse(&xml).unwrap();
+            let assigned = document
+                .descendants()
+                .filter(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyName")))
+                .map(|node| node.text().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(assigned, ["b", "a"]);
+        }
+        for bits in [2048, 4096] {
+            let result = Command::new(binary())
+                .args(["decrypt", "--lax-key-search", "--privkey-pem"])
+                .arg(project_root().join(format!("tests/fixtures/keys/rsa/rsa-{bits}-key.pem")))
+                .arg(&encrypted)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "recipient {bits}, names {names:?}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(result.stdout, b"distinct store recipients");
+        }
+    }
+    // A stale later name must not reserve a key contradicted by its RSA
+    // metadata: the unnamed first slot needs a, and the later slot needs b.
+    let first_info = entries[0].replace("<KeyName>a</KeyName>", "");
+    let second_info = entries[1].replace("<KeyName>b</KeyName>", "<KeyName>a</KeyName>");
+    let recipients = [first_info, second_info].into_iter().map(|info| format!(
+        "<EncryptedKey><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#rsa-oaep\"/>{info}<CipherData><CipherValue/></CipherData></EncryptedKey>"
+    )).collect::<String>();
+    fs::write(&template, format!("<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><ds:KeyInfo>{recipients}</ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>")).unwrap();
+    let result = encrypt(&encrypted);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let xml = fs::read_to_string(&encrypted).unwrap();
+    let document = roxmltree::Document::parse(&xml).unwrap();
+    assert_eq!(
+        document
+            .descendants()
+            .filter(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyName")))
+            .map(|node| node.text().unwrap())
+            .collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    for bits in [2048, 4096] {
+        let decrypted = Command::new(binary())
+            .args(["decrypt", "--lax-key-search", "--privkey-pem"])
+            .arg(project_root().join(format!("tests/fixtures/keys/rsa/rsa-{bits}-key.pem")))
+            .arg(&encrypted)
+            .output()
+            .unwrap();
+        assert!(
+            decrypted.status.success(),
+            "{}",
+            String::from_utf8_lossy(&decrypted.stderr)
+        );
+        assert_eq!(decrypted.stdout, b"distinct store recipients");
+    }
+    for (names, single_key) in [(vec![None, None, None], false), (vec![None, None], true)] {
+        if single_key {
+            fs::write(
+                &store,
+                format!(
+                    "<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\">{}</Keys>",
+                    entries[0]
+                ),
+            )
+            .unwrap();
+        }
+        write_template(&names);
+        let output = temp.path().join(if single_key {
+            "singleton.xml"
+        } else {
+            "exhausted.xml"
+        });
+        let result = encrypt(&output);
+        assert!(!result.status.success());
+        assert!(
+            String::from_utf8_lossy(&result.stderr)
+                .contains("no compatible RSA key in --keys-file")
+        );
+        assert!(!output.exists());
+        assert!(result.stdout.is_empty());
+    }
+}
+
+#[test]
+fn lax_rsa_recipients_charge_only_attempted_store_keys() {
+    // Two exact recipients must not each consume the 33 unused lax fallbacks.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("template.xml");
+    let store = temp.path().join("keys.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let encrypted = temp.path().join("encrypted.xml");
+    let public_pem =
+        fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem"))
+            .unwrap();
+    let public = RsaPublicKey::from_public_key_pem(&public_pem).unwrap();
+    let base64 = base64::engine::general_purpose::STANDARD;
+    let modulus = base64.encode(public.n().to_be_bytes_trimmed_vartime());
+    let exponent = base64.encode(public.e().to_be_bytes_trimmed_vartime());
+    let mut key_store = String::from("<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\">");
+    for index in 0..33 {
+        key_store.push_str(&format!(
+            "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>recipient-{index}</KeyName><KeyValue><RSAKeyValue><Modulus>{modulus}</Modulus><Exponent>{exponent}</Exponent></RSAKeyValue></KeyValue></KeyInfo>"
+        ));
+    }
+    key_store.push_str("</Keys>");
+    fs::write(&store, key_store).unwrap();
+    let mut recipient_nodes = String::new();
+    for index in 0..2 {
+        recipient_nodes.push_str(&format!(
+            "<EncryptedKey><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#rsa-oaep\"/><ds:KeyInfo><ds:KeyName>recipient-{index}</ds:KeyName></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedKey>"
+        ));
+    }
+    fs::write(
+        &template,
+        format!(
+            "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><ds:KeyInfo>{recipient_nodes}</ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"
+        ),
+    )
+    .unwrap();
+    fs::write(&plaintext, b"two named recipients").unwrap();
+    let encrypt = Command::new(binary())
+        .args(["encrypt", "--lax-key-search", "--keys-file"])
+        .arg(&store)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        encrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&encrypt.stderr)
+    );
+    let decrypt = Command::new(binary())
+        .args(["decrypt", "--privkey-pem"])
+        .arg(project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem"))
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(decrypt.status.success());
+    assert_eq!(decrypt.stdout, b"two named recipients");
+}
+
+#[test]
+fn lax_cached_recipients_charge_decoding_once() {
+    // Reservation validates immutable metadata and retains the decoded key.
+    // Reusing it must not consume another candidate, including at the full cap.
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("keys.xml");
+    let template = temp.path().join("template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let encrypted = temp.path().join("encrypted.xml");
+    let public_pem =
+        fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"))
+            .unwrap();
+    let public = RsaPublicKey::from_public_key_pem(&public_pem).unwrap();
+    let base64 = base64::engine::general_purpose::STANDARD;
+    let modulus = base64.encode(public.n().to_be_bytes_trimmed_vartime());
+    let exponent = base64.encode(public.e().to_be_bytes_trimmed_vartime());
+    let key_value = format!(
+        "<ds:KeyValue><ds:RSAKeyValue><ds:Modulus>{modulus}</ds:Modulus><ds:Exponent>{exponent}</ds:Exponent></ds:RSAKeyValue></ds:KeyValue>"
+    );
+    fs::write(&plaintext, b"cached recipient boundary").unwrap();
+    for count in [33, 64] {
+        let mut key_store = String::from(
+            "<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">",
+        );
+        let mut recipients = String::new();
+        for index in 0..count {
+            key_store.push_str(&format!(
+                "<ds:KeyInfo><ds:KeyName>recipient-{index}</ds:KeyName>{key_value}</ds:KeyInfo>"
+            ));
+            recipients.push_str(&format!(
+                "<EncryptedKey><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#rsa-oaep\"/><ds:KeyInfo><ds:KeyName>recipient-{index}</ds:KeyName>{key_value}</ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedKey>"
+            ));
+        }
+        key_store.push_str("</Keys>");
+        fs::write(&store, key_store).unwrap();
+        fs::write(&template, format!(
+            "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><ds:KeyInfo>{recipients}</ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"
+        )).unwrap();
+        let encrypt = Command::new(binary())
+            .args(["encrypt", "--lax-key-search", "--keys-file"])
+            .arg(&store)
+            .arg("--binary-data")
+            .arg(&plaintext)
+            .arg("--output")
+            .arg(&encrypted)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(
+            encrypt.status.success(),
+            "{count} recipients: {}",
+            String::from_utf8_lossy(&encrypt.stderr)
+        );
+        let xml = fs::read_to_string(&encrypted).unwrap();
+        let document = roxmltree::Document::parse(&xml).unwrap();
+        let actual_names: Vec<_> = document
+            .descendants()
+            .filter(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyName")))
+            .map(|node| node.text().unwrap())
+            .collect();
+        let expected_names: Vec<_> = (0..count)
+            .map(|index| format!("recipient-{index}"))
+            .collect();
+        assert_eq!(actual_names, expected_names);
+        let decrypt = Command::new(binary())
+            .args(["decrypt", "--privkey-pem:recipient-0"])
+            .arg(project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .arg(&encrypted)
+            .output()
+            .unwrap();
+        assert!(
+            decrypt.status.success(),
+            "{}",
+            String::from_utf8_lossy(&decrypt.stderr)
+        );
+        assert_eq!(decrypt.stdout, b"cached recipient boundary");
+    }
 }
 
 #[test]

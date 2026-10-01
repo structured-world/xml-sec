@@ -908,7 +908,8 @@ mod rustcrypto_x509 {
                 // Certificate signatures are ASN.1 DER integers sized by the
                 // issuer's q parameter. XMLDSig's fixed 20-byte r||s framing
                 // applies only to SignatureValue, never to X.509 signatures.
-                let Ok(key) = dsa::VerifyingKey::from_public_key_der(issuer_spki_der) else {
+                let Ok(key) = crate::xmldsig::signature::decode_dsa_verifying_key(issuer_spki_der)
+                else {
                     return Ok(false);
                 };
                 let Ok(signature) = dsa::Signature::from_der(signature) else {
