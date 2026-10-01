@@ -88,6 +88,10 @@ resource-policy error without invoking the callback.
 are capped by implementation safety ceilings and checked before decryption.
 Exceeding a recognized KDF's work or memory limit returns a policy error;
 missing or incorrect passwords remain protected-container errors.
+PBKDF2 work includes every output block required by the cipher's key width
+(RFC 8018 section 5.2). Scrypt workspaces must fit both the KDF-specific ceiling
+and the remaining aggregate allowance alongside retained inventory, key name,
+and imported container; these checks precede password callbacks.
 The CLI applies the same pre-decryption KDF limits to explicit protected PKCS#8
 PEM/DER keys, including the generic private-key options, as to inventory imports.
 When the PKCS#12 parser rejects an oversized salt, that distinct resource
@@ -108,6 +112,9 @@ BER PrivateKeyInfo framing and constructed private-key OCTET STRINGs are
 normalized to bounded PKCS#8 DER before storage. CMS EncryptedData accepts
 unprotected attributes with version 2, while requiring version 0 without them
 (RFC 5652 section 8); metadata framing is validated before password processing.
+The outer CMS attribute collection must be nonempty, but an unknown attribute's
+generic `attrValues SET OF` has no minimum cardinality (RFC 5652 sections 5.3
+and 6.1). Attribute-specific requirements are not inferred for unknown OIDs.
 Temporary import allocations share the aggregate allowance with material already
 retained by the inventory, and KDF workspaces are checked before derivation.
 Named direct AES keys participate only in direct content-key resolution, not

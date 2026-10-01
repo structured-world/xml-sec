@@ -464,6 +464,24 @@ pub(crate) enum ResolutionScope {
     Trusted,
     DocumentPrefix(usize),
     TrustedPrefix(usize),
+    DocumentSuffix(usize),
+    TrustedSuffix(usize),
+}
+
+/// A partial source scan separates a deferred mismatch from terminal errors.
+/// Continuations may retain the former, but cannot retry the latter.
+pub(crate) struct SourceResolution {
+    pub(crate) key: Option<Box<dyn VerifyingKey>>,
+    pub(crate) deferred_error: Option<KeyResolutionError>,
+}
+
+impl SourceResolution {
+    pub(crate) fn finish(self) -> Result<Option<Box<dyn VerifyingKey>>, DsigError> {
+        if let Some(error) = self.deferred_error {
+            return Err(error.into());
+        }
+        Ok(self.key)
+    }
 }
 
 /// Counts candidates actually inspected by one resolver invocation.
@@ -588,7 +606,7 @@ impl DefaultKeyResolver {
         )
     }
 
-    pub(crate) fn resolve_prefix_with_candidate_budget(
+    pub(crate) fn resolve_sources_with_candidate_budget(
         &self,
         key_info: &KeyInfo,
         algorithm: SignatureAlgorithm,
@@ -596,8 +614,8 @@ impl DefaultKeyResolver {
         provider: &dyn crate::provider::CryptoProvider,
         candidate_budget: &mut InspectedKeyCandidateBudget,
         scope: ResolutionScope,
-    ) -> Result<Option<Box<dyn VerifyingKey>>, DsigError> {
-        self.resolve_with_trust(
+    ) -> Result<SourceResolution, DsigError> {
+        self.resolve_source_range(
             Some(key_info),
             algorithm,
             policy,
@@ -1107,16 +1125,41 @@ impl DefaultKeyResolver {
         candidate_budget: &mut InspectedKeyCandidateBudget,
         scope: ResolutionScope,
     ) -> Result<Option<Box<dyn VerifyingKey>>, DsigError> {
+        self.resolve_source_range(
+            key_info,
+            algorithm,
+            policy,
+            provider,
+            candidate_budget,
+            scope,
+        )?
+        .finish()
+    }
+
+    fn resolve_source_range(
+        &self,
+        key_info: Option<&KeyInfo>,
+        algorithm: SignatureAlgorithm,
+        policy: &crate::policy::VerificationPolicy,
+        provider: &dyn crate::provider::CryptoProvider,
+        candidate_budget: &mut InspectedKeyCandidateBudget,
+        scope: ResolutionScope,
+    ) -> Result<SourceResolution, DsigError> {
         let trust = &policy.key_trust;
         let resources = &policy.resources;
         trust.validate()?;
         resources.validate()?;
         let Some(key_info) = key_info else {
-            return Ok(None);
+            return Ok(SourceResolution {
+                key: None,
+                deferred_error: None,
+            });
         };
         let document_sources = matches!(
             scope,
-            ResolutionScope::Document | ResolutionScope::DocumentPrefix(_)
+            ResolutionScope::Document
+                | ResolutionScope::DocumentPrefix(_)
+                | ResolutionScope::DocumentSuffix(_)
         );
         if document_sources {
             validate_key_info_source_permissions(key_info, policy.key_sources)?;
@@ -1125,9 +1168,13 @@ impl DefaultKeyResolver {
             ResolutionScope::DocumentPrefix(end) | ResolutionScope::TrustedPrefix(end) => end,
             _ => key_info.sources.len(),
         };
+        let source_start = match scope {
+            ResolutionScope::DocumentSuffix(start) | ResolutionScope::TrustedSuffix(start) => start,
+            _ => 0,
+        };
         let mut deferred_key_value_error = None;
         let mut configured_material_checked = false;
-        for source in &key_info.sources[..source_end] {
+        for source in &key_info.sources[source_start..source_end] {
             if !document_sources && matches!(source, KeyInfoSource::KeyName(_)) {
                 continue;
             }
@@ -1190,17 +1237,20 @@ impl DefaultKeyResolver {
                 }
             };
             if let Some(key) = resolved {
-                return Ok(Some(Box::new(PolicyBoundVerificationKey {
-                    key,
-                    rsa_minimum_bits: trust.rsa_keys.minimum_modulus_bits,
-                    dsa_minimum_bits: trust.dsa_keys.minimum_modulus_bits,
-                })));
+                return Ok(SourceResolution {
+                    key: Some(Box::new(PolicyBoundVerificationKey {
+                        key,
+                        rsa_minimum_bits: trust.rsa_keys.minimum_modulus_bits,
+                        dsa_minimum_bits: trust.dsa_keys.minimum_modulus_bits,
+                    })),
+                    deferred_error: None,
+                });
             }
         }
-        if let Some(error) = deferred_key_value_error {
-            return Err(error.into());
-        }
-        Ok(None)
+        Ok(SourceResolution {
+            key: None,
+            deferred_error: deferred_key_value_error,
+        })
     }
 }
 

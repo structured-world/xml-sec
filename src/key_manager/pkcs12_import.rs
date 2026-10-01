@@ -776,11 +776,13 @@ fn validate_attribute_values(mut bytes: &[u8], depth: usize) -> Result<()> {
 }
 
 fn validate_attributes(mut attributes: Reader<'_>) -> Result<()> {
-    // RFC 7292 4.2 and RFC 5652 10.2.1 define attributes as an OID and
-    // a SET OF values. Ignoring an attribute's meaning does not waive its
-    // framing; validate without retaining or decoding the metadata.
+    // RFC 7292 4.2 and RFC 5652 5.3 define attributes as an OID and
+    // a SET OF values, with no generic minimum number of values. The
+    // SIZE (1..MAX) constraint in CMS 6.1 is on UnprotectedAttributes,
+    // not attrValues: do not reject an empty SET for an unknown attribute.
+    // Ignoring its meaning does not waive framing; validate borrowed bytes.
     // https://www.rfc-editor.org/rfc/rfc7292#section-4.2
-    // https://www.rfc-editor.org/rfc/rfc5652#section-10.2.1
+    // https://www.rfc-editor.org/rfc/rfc5652#section-5.3
     while !attributes.0.is_empty() {
         let mut attribute = Reader(attributes.take(0x30)?.value);
         attribute.oid()?;
@@ -1253,9 +1255,13 @@ mod tests {
             oid(Oid::new_unwrap("1.2.3.4")),
             encoded(0x31, &encoded(4, b"value")),
         ]);
+        // RFC 5652 5.3 constrains the outer attribute collection, not the
+        // generic Attribute.attrValues SET OF. Empty unknown values are valid.
+        let empty_values = sequence(&[oid(Oid::new_unwrap("1.2.3.4")), encoded(0x31, &[])]);
         for (version, attrs, accepted) in [
             (0, None, true),
             (2, Some(attribute.clone()), true),
+            (2, Some(empty_values), true),
             (0, Some(attribute), false),
             (2, None, false),
             (2, Some(Vec::new()), false),

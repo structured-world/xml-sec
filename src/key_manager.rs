@@ -462,12 +462,13 @@ impl<'a> KeyResolver for InventoryVerificationResolver<'a> {
         });
         // Try only sources preceding the first configured-X.509 use without
         // inspecting or copying inventory certificates that may never be used.
+        let mut prefix_error = None;
         if let Some(info) = selected_info
             && let Some(first_x509) = configured_x509_index
             && first_x509 != 0
         {
             let prefix_resolver = DefaultKeyResolver::new(KeyResolverConfig::default());
-            let result = prefix_resolver.resolve_prefix_with_candidate_budget(
+            let outcome = prefix_resolver.resolve_sources_with_candidate_budget(
                 info,
                 algorithm,
                 policy,
@@ -478,12 +479,11 @@ impl<'a> KeyResolver for InventoryVerificationResolver<'a> {
                 } else {
                     crate::xmldsig::keys::ResolutionScope::DocumentPrefix(first_x509)
                 },
-            );
-            match result {
-                Ok(Some(key)) => return Ok(Some(key)),
-                Err(DsigError::Policy(violation)) => return Err(violation.into()),
-                _ => {}
+            )?;
+            if let Some(key) = outcome.key {
+                return Ok(Some(key));
             }
+            prefix_error = outcome.deferred_error.map(DsigError::from);
         }
         let fallback = if configured_x509_index.is_some() {
             let certificates = self
@@ -543,6 +543,30 @@ impl<'a> KeyResolver for InventoryVerificationResolver<'a> {
         } else {
             DefaultKeyResolver::new(KeyResolverConfig::default())
         };
+        if let Some(first_x509) = configured_x509_index
+            && let Some(info) = selected_info
+        {
+            // Resume after the inspected prefix: one budget counts actual
+            // work, not a replay caused by attaching configured certificates.
+            let result = fallback
+                .resolve_sources_with_candidate_budget(
+                    info,
+                    algorithm,
+                    policy,
+                    provider,
+                    &mut inspected_candidates,
+                    if candidate.is_some() {
+                        crate::xmldsig::keys::ResolutionScope::TrustedSuffix(first_x509)
+                    } else {
+                        crate::xmldsig::keys::ResolutionScope::DocumentSuffix(first_x509)
+                    },
+                )
+                .and_then(crate::xmldsig::keys::SourceResolution::finish);
+            return match (result, prefix_error) {
+                (Ok(None), Some(error)) => Err(error),
+                (result, _) => result,
+            };
+        }
         if let Some(candidate) = candidate {
             return fallback.resolve_trusted_material_with_candidate_budget(
                 &candidate.key_info,
@@ -1150,7 +1174,8 @@ impl KeyInventory {
                 resources.max_external_resource_bytes,
             ));
         }
-        self.check_material_capacity(named_material_length(&name, bytes.len(), 1)?, resources)?;
+        let retained_with_input =
+            self.check_material_capacity(named_material_length(&name, bytes.len(), 1)?, resources)?;
         let permitted = KeyUsages::SIGN.union(KeyUsages::DECRYPT);
         if usages.0 == 0 || usages.0 & !permitted.0 != 0 {
             return Err(KeyStoreError::Selection(
@@ -1160,7 +1185,7 @@ impl KeyInventory {
         let der = if PrivateKeyInfoRef::try_from(bytes).is_ok() {
             Zeroizing::new(bytes.to_vec())
         } else if let Ok(encrypted) = EncryptedPrivateKeyInfoRef::try_from(bytes) {
-            enforce_pkcs8_kdf_policy(&encrypted, resources)?;
+            enforce_pkcs8_kdf_policy(&encrypted, resources, retained_with_input)?;
             let password = password.ok_or(KeyStoreError::ProtectedContainer)?;
             let plain = encrypted
                 .decrypt(password)
@@ -1222,9 +1247,10 @@ impl KeyInventory {
                 resources.max_external_resource_bytes,
             ));
         }
-        self.check_material_capacity(named_material_length(&name, bytes.len(), 1)?, resources)?;
+        let retained_with_input =
+            self.check_material_capacity(named_material_length(&name, bytes.len(), 1)?, resources)?;
         let secret = if let Ok(encrypted) = EncryptedPrivateKeyInfoRef::try_from(bytes) {
-            enforce_pkcs8_kdf_policy(&encrypted, resources)?;
+            enforce_pkcs8_kdf_policy(&encrypted, resources, retained_with_input)?;
             Some(password().ok_or(KeyStoreError::ProtectedContainer)?)
         } else {
             None
@@ -2059,6 +2085,7 @@ fn single_pem_block(bytes: &[u8], maximum: usize) -> Result<pem::Pem, KeyStoreEr
 fn enforce_pkcs8_kdf_policy(
     encrypted: &EncryptedPrivateKeyInfoRef<'_>,
     resources: &ResourcePolicy,
+    retained_with_input: usize,
 ) -> Result<(), KeyStoreError> {
     use pkcs8::pkcs5::{EncryptionScheme, pbes2::Kdf};
     // RFC 8018 §6.2 leaves KDF iteration policy to the application. Reject
@@ -2072,11 +2099,25 @@ fn enforce_pkcs8_kdf_policy(
             if kdf.iteration_count == 0 {
                 return Err(KeyStoreError::ProtectedContainer);
             }
-            if u64::from(kdf.iteration_count) > resources.max_key_import_kdf_work as u64 {
+            use pkcs8::pkcs5::pbes2::Pbkdf2Prf;
+            let hash_len = match kdf.prf {
+                Pbkdf2Prf::HmacWithSha1 => 20,
+                Pbkdf2Prf::HmacWithSha224 => 28,
+                Pbkdf2Prf::HmacWithSha256 => 32,
+                Pbkdf2Prf::HmacWithSha384 => 48,
+                Pbkdf2Prf::HmacWithSha512 => 64,
+                _ => return Err(KeyStoreError::ProtectedContainer),
+            };
+            // RFC 8018 5.2 steps 2-3: every ceil(dkLen/hLen) block runs c
+            // PRFs. The cipher determines dkLen, not a caller's KDF hint.
+            // https://www.rfc-editor.org/rfc/rfc8018#section-5.2
+            let blocks = params.encryption.key_size().div_ceil(hash_len) as u64;
+            let work = u64::from(kdf.iteration_count).checked_mul(blocks);
+            if work.is_none_or(|work| work > resources.max_key_import_kdf_work as u64) {
                 return Err(kdf_policy_violation(
                     crate::policy::resource_name::KEY_IMPORT_KDF_WORK,
                     resources.max_key_import_kdf_work,
-                    Some(u64::from(kdf.iteration_count)),
+                    work,
                 ));
             }
         }
@@ -2086,6 +2127,7 @@ fn enforce_pkcs8_kdf_policy(
                 u64::from(kdf.block_size),
                 u64::from(kdf.parallelization),
                 resources,
+                retained_with_input,
             )?;
         }
         _ => return Err(KeyStoreError::ProtectedContainer),
@@ -2098,6 +2140,7 @@ fn enforce_scrypt_kdf_limits(
     r: u64,
     p: u64,
     resources: &ResourcePolicy,
+    retained_with_input: usize,
 ) -> Result<(), KeyStoreError> {
     if n == 0 || r == 0 || p == 0 {
         return Err(KeyStoreError::ProtectedContainer);
@@ -2122,6 +2165,16 @@ fn enforce_scrypt_kdf_limits(
             crate::policy::resource_name::KEY_IMPORT_KDF_MEMORY,
             resources.max_key_import_kdf_memory_bytes,
             memory,
+        ));
+    }
+    // The workspace is live alongside the existing inventory, name and
+    // imported container. An independent KDF ceiling cannot waive that peak.
+    let total = memory.and_then(|memory| memory.checked_add(retained_with_input as u64));
+    if total.is_none_or(|total| total > resources.max_external_resource_total_bytes as u64) {
+        return Err(kdf_policy_violation(
+            crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+            resources.max_external_resource_total_bytes,
+            total,
         ));
     }
     Ok(())
@@ -3601,6 +3654,292 @@ mod tests {
     }
 
     #[test]
+    fn pkcs8_pbkdf2_output_blocks_are_checked_before_password() {
+        use der::Encode as _;
+        // AES-256/SHA-1 needs two PBKDF2 blocks; three rounds cost six PRFs,
+        // not three. Denial must precede the public password callback.
+        use pkcs8::pkcs5::{EncryptionScheme, pbes2};
+        let encrypted = EncryptedPrivateKeyInfoRef {
+            encryption_algorithm: EncryptionScheme::Pbes2(pbes2::Parameters {
+                kdf: pbes2::Kdf::Pbkdf2(pbes2::Pbkdf2Params {
+                    salt: pbes2::Salt::new(b"12345678").expect("salt"),
+                    iteration_count: 3,
+                    key_length: None,
+                    prf: pbes2::Pbkdf2Prf::HmacWithSha1,
+                }),
+                encryption: pbes2::EncryptionScheme::Aes256Cbc { iv: [0; 16] },
+            }),
+            encrypted_data: der::asn1::OctetStringRef::new(&[0; 16]).expect("ciphertext"),
+        };
+        let bytes = encrypted.to_der().expect("encrypted envelope");
+        let resources = ResourcePolicy {
+            max_key_import_kdf_work: 5,
+            ..ResourcePolicy::default()
+        };
+        let calls = std::cell::Cell::new(0);
+        let result = KeyInventory::default().add_private_der_with_password_callback(
+            "key".into(),
+            &bytes,
+            || {
+                calls.set(calls.get() + 1);
+                None
+            },
+            KeyUsages::SIGN,
+            &resources,
+        );
+        assert_eq!(calls.get(), 0);
+        assert!(matches!(
+            result,
+            Err(KeyStoreError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::KEY_IMPORT_KDF_WORK,
+                    maximum: 5,
+                    actual: 6,
+                }
+            ))
+        ));
+        let exact = ResourcePolicy {
+            max_key_import_kdf_work: 6,
+            ..resources
+        };
+        assert!(enforce_pkcs8_kdf_policy(&encrypted, &exact, 0).is_ok());
+        // Cover each PRF width and CBC key width, including single-block
+        // cases so the fix cannot unconditionally double iteration charges.
+        for (prf, hash_len) in [
+            (pbes2::Pbkdf2Prf::HmacWithSha1, 20),
+            (pbes2::Pbkdf2Prf::HmacWithSha224, 28),
+            (pbes2::Pbkdf2Prf::HmacWithSha256, 32),
+            (pbes2::Pbkdf2Prf::HmacWithSha384, 48),
+            (pbes2::Pbkdf2Prf::HmacWithSha512, 64),
+        ] {
+            for cipher in [
+                pbes2::EncryptionScheme::Aes128Cbc { iv: [0; 16] },
+                pbes2::EncryptionScheme::Aes192Cbc { iv: [0; 16] },
+                pbes2::EncryptionScheme::Aes256Cbc { iv: [0; 16] },
+            ] {
+                let mut envelope = encrypted.clone();
+                let EncryptionScheme::Pbes2(params) = &mut envelope.encryption_algorithm else {
+                    panic!("PBES2 fixture");
+                };
+                let pbes2::Kdf::Pbkdf2(kdf) = &mut params.kdf else {
+                    panic!("PBKDF2 fixture");
+                };
+                kdf.prf = prf;
+                params.encryption = cipher;
+                let work = 3 * cipher.key_size().div_ceil(hash_len);
+                let exact = ResourcePolicy {
+                    max_key_import_kdf_work: work,
+                    ..ResourcePolicy::default()
+                };
+                assert!(enforce_pkcs8_kdf_policy(&envelope, &exact, 0).is_ok());
+                let tight = ResourcePolicy {
+                    max_key_import_kdf_work: work - 1,
+                    ..exact
+                };
+                assert!(matches!(enforce_pkcs8_kdf_policy(&envelope, &tight, 0),
+                    Err(KeyStoreError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                        resource: crate::policy::resource_name::KEY_IMPORT_KDF_WORK,
+                        actual, ..
+                    })) if actual == work));
+            }
+        }
+    }
+
+    #[test]
+    fn pkcs8_scrypt_workspace_shares_retained_inventory_budget() {
+        use der::Encode as _;
+        // A workspace below its own ceiling must still fit alongside existing
+        // inventory material; rejection must precede password delivery.
+        use pkcs8::pkcs5::{EncryptionScheme, pbes2};
+        let encrypted = EncryptedPrivateKeyInfoRef {
+            encryption_algorithm: EncryptionScheme::Pbes2(pbes2::Parameters {
+                kdf: pbes2::Kdf::Scrypt(pbes2::ScryptParams {
+                    salt: pbes2::Salt::new(b"12345678").expect("salt"),
+                    cost_parameter: 16,
+                    block_size: 1,
+                    parallelization: 1,
+                    key_length: None,
+                }),
+                encryption: pbes2::EncryptionScheme::Aes256Cbc { iv: [0; 16] },
+            }),
+            encrypted_data: der::asn1::OctetStringRef::new(&[0; 16]).expect("ciphertext"),
+        };
+        let bytes = encrypted.to_der().expect("envelope");
+        let mut inventory = KeyInventory::default();
+        inventory
+            .add_symmetric(
+                "old".into(),
+                SymmetricKeyKind::Hmac,
+                vec![7; 1024],
+                KeyUsages::SIGN,
+                &ResourcePolicy::default(),
+            )
+            .expect("retained key");
+        let resources = ResourcePolicy {
+            max_external_resource_total_bytes: inventory.material_bytes + 2304,
+            max_key_import_kdf_memory_bytes: 4096,
+            ..ResourcePolicy::default()
+        };
+        let calls = std::cell::Cell::new(0);
+        let result = inventory.add_private_der_with_password_callback(
+            "new".into(),
+            &bytes,
+            || {
+                calls.set(calls.get() + 1);
+                None
+            },
+            KeyUsages::SIGN,
+            &resources,
+        );
+        assert_eq!(calls.get(), 0);
+        assert!(matches!(
+            result,
+            Err(KeyStoreError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                    ..
+                }
+            ))
+        ));
+        assert!(inventory.private_keys().is_empty());
+        assert_eq!(inventory.symmetric_keys().len(), 1);
+        let exact = ResourcePolicy {
+            max_external_resource_total_bytes: inventory.material_bytes + bytes.len() + 3 + 2304,
+            ..resources
+        };
+        assert!(matches!(
+            inventory.add_private_der_with_password_callback(
+                "new".into(),
+                &bytes,
+                || {
+                    calls.set(calls.get() + 1);
+                    None
+                },
+                KeyUsages::SIGN,
+                &exact,
+            ),
+            Err(KeyStoreError::ProtectedContainer)
+        ));
+        assert_eq!(
+            calls.get(),
+            1,
+            "an exactly fitting workspace reaches password delivery"
+        );
+    }
+
+    #[test]
+    fn configured_x509_fallback_preserves_terminal_prefix_errors() {
+        // Attaching configured certificates must not turn malformed earlier
+        // DER key material into a successful certificate fallback.
+        let resources = ResourcePolicy::default();
+        let mut inventory = KeyInventory::default();
+        let certificate = single_pem_block(
+            include_bytes!("../tests/fixtures/keys/rsa/rsa-2048-cert.pem"),
+            resources.max_external_resource_bytes,
+        )
+        .expect("certificate")
+        .into_contents();
+        let subject = crate::xmldsig::parse::parse_x509_certificate(&certificate)
+            .expect("leaf")
+            .subject_dn;
+        inventory
+            .add_certificate_der(certificate, false, &resources)
+            .expect("lookup");
+        let mut info = KeyInfo {
+            sources: vec![
+                KeyInfoSource::DerEncodedKeyValue(vec![0]),
+                KeyInfoSource::X509Data(X509DataInfo {
+                    subject_names: vec![subject],
+                    ..X509DataInfo::default()
+                }),
+            ],
+        };
+        assert!(
+            inventory
+                .verification_resolver()
+                .resolve(Some(&info), SignatureAlgorithm::RsaSha256,)
+                .is_err(),
+            "a terminal prefix error must stop resolution"
+        );
+        // Unsupported EC material for an RSA method is explicitly deferrable;
+        // a certificate can satisfy it, but a complete miss retains the error.
+        info.sources[0] = KeyInfoSource::KeyValue(KeyValueInfo::InvalidEcKeyValue);
+        assert!(
+            inventory
+                .verification_resolver()
+                .resolve(Some(&info), SignatureAlgorithm::RsaSha256,)
+                .expect("deferred prefix permits certificate fallback")
+                .is_some()
+        );
+        let KeyInfoSource::X509Data(data) = &mut info.sources[1] else {
+            panic!("X509 selector");
+        };
+        data.subject_names = vec!["CN=absent".into()];
+        assert!(
+            inventory
+                .verification_resolver()
+                .resolve(Some(&info), SignatureAlgorithm::RsaSha256,)
+                .is_err(),
+            "a complete miss retains its deferred error"
+        );
+    }
+
+    #[test]
+    fn configured_x509_fallback_does_not_reinspect_prefix() {
+        // One absent name, its document source, and the certificate inspection
+        // fit exactly. Replaying the source prefix incorrectly exhausts it.
+        let resources = ResourcePolicy::default();
+        let mut inventory = KeyInventory::default();
+        let certificate = single_pem_block(
+            include_bytes!("../tests/fixtures/keys/rsa/rsa-2048-cert.pem"),
+            resources.max_external_resource_bytes,
+        )
+        .expect("certificate")
+        .into_contents();
+        let subject = crate::xmldsig::parse::parse_x509_certificate(&certificate)
+            .expect("leaf")
+            .subject_dn;
+        inventory
+            .add_certificate_der(certificate, false, &resources)
+            .expect("lookup");
+        let info = KeyInfo {
+            sources: vec![
+                KeyInfoSource::KeyName("absent".into()),
+                KeyInfoSource::X509Data(X509DataInfo {
+                    subject_names: vec![subject],
+                    ..X509DataInfo::default()
+                }),
+            ],
+        };
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_key_candidates = 3;
+        assert!(
+            inventory
+                .verification_resolver()
+                .resolve_with_policy_and_provider(
+                    Some(&info),
+                    SignatureAlgorithm::RsaSha256,
+                    &policy,
+                    crate::provider::default_provider(),
+                )
+                .expect("each source inspected once")
+                .is_some()
+        );
+        policy.resources.max_key_candidates = 2;
+        assert!(matches!(
+            inventory
+                .verification_resolver()
+                .resolve_with_policy_and_provider(
+                    Some(&info),
+                    SignatureAlgorithm::RsaSha256,
+                    &policy,
+                    crate::provider::default_provider(),
+                ),
+            Err(DsigError::Policy(_))
+        ));
+    }
+
+    #[test]
     fn scrypt_parallel_buffers_are_checked_before_derivation() {
         // N*r fits a tiny limit, but p independent B/V/T workspaces do not.
         let mut resources = ResourcePolicy {
@@ -3609,7 +3948,7 @@ mod tests {
             ..ResourcePolicy::default()
         };
         assert!(matches!(
-            enforce_scrypt_kdf_limits(2, 1, 1_000, &resources),
+            enforce_scrypt_kdf_limits(2, 1, 1_000, &resources, 0),
             Err(KeyStoreError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
                     resource: crate::policy::resource_name::KEY_IMPORT_KDF_MEMORY,
@@ -3619,7 +3958,7 @@ mod tests {
             ))
         ));
         resources.max_key_import_kdf_memory_bytes = 512_000;
-        assert!(enforce_scrypt_kdf_limits(2, 1, 1_000, &resources).is_ok());
+        assert!(enforce_scrypt_kdf_limits(2, 1, 1_000, &resources, 0).is_ok());
     }
 
     #[test]
