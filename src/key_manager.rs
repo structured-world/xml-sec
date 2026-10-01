@@ -1211,10 +1211,18 @@ impl KeyInventory {
                 })?;
             enforce_pkcs8_kdf_policy(&encrypted, resources, kdf_live_bytes)?;
             let password = password.ok_or(KeyStoreError::ProtectedContainer)?;
-            let plain = encrypted
-                .decrypt(password)
+            // Decrypt in the one preflighted, zeroizing output allocation;
+            // SecretDocument followed by to_vec would retain two plaintext copies.
+            let mut plain = Zeroizing::new(encrypted.encrypted_data.as_bytes().to_vec());
+            let plaintext_len = encrypted
+                .encryption_algorithm
+                .decrypt_in_place(password, &mut plain)
                 .map_err(|_| KeyStoreError::ProtectedContainer)?;
-            Zeroizing::new(plain.as_bytes().to_vec())
+            let plaintext_len = plaintext_len.len();
+            plain.truncate(plaintext_len);
+            PrivateKeyInfoRef::try_from(plain.as_slice())
+                .map_err(|_| KeyStoreError::ProtectedContainer)?;
+            plain
         } else {
             preflight_rsa_pkcs1_components(bytes)?;
             let rsa = RsaPrivateKey::from_pkcs1_der(bytes)
@@ -1528,14 +1536,14 @@ impl KeyInventory {
                 },
             ));
         }
-        self.check_material_capacity(named_material_length(name, bytes.len(), 1)?, resources)?;
+        let retained_with_input =
+            self.check_material_capacity(named_material_length(name, bytes.len(), 1)?, resources)?;
         let remaining_candidates = resources.max_key_candidates - self.entry_count;
         Ok(Pkcs12Limits {
             resources: resources.clone(),
             candidates: remaining_candidates,
-            memory_available: resources.max_external_resource_total_bytes
-                - self.material_bytes
-                - name.len(),
+            // Borrowing the PFX does not end its lifetime during decryption.
+            memory_available: resources.max_external_resource_total_bytes - retained_with_input,
         })
     }
 
@@ -2118,6 +2126,19 @@ fn enforce_pkcs8_kdf_policy(
     let EncryptionScheme::Pbes2(params) = &encrypted.encryption_algorithm else {
         return Err(KeyStoreError::ProtectedContainer);
     };
+    // PBES2 decryption mutates a ciphertext-sized output buffer while the
+    // encoded input remains live. Include that capacity before any password
+    // callback or KDF, including failed padding/DER decoding.
+    let live_with_output =
+        retained_with_input.checked_add(encrypted.encrypted_data.as_bytes().len());
+    if live_with_output.is_none_or(|total| total > resources.max_external_resource_total_bytes) {
+        return Err(kdf_policy_violation(
+            crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+            resources.max_external_resource_total_bytes,
+            live_with_output.map(|total| total as u64),
+        ));
+    }
+    let live_with_output = live_with_output.ok_or(KeyStoreError::ProtectedContainer)?;
     match &params.kdf {
         Kdf::Pbkdf2(kdf) => {
             if kdf.iteration_count == 0 {
@@ -2151,7 +2172,7 @@ fn enforce_pkcs8_kdf_policy(
                 u64::from(kdf.block_size),
                 u64::from(kdf.parallelization),
                 resources,
-                retained_with_input,
+                live_with_output,
             )?;
         }
         _ => return Err(KeyStoreError::ProtectedContainer),
@@ -2757,6 +2778,34 @@ mod tests {
             inventory
                 .add_pkcs12("second".into(), bundle, "secret", &resources)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn pkcs12_temporary_budget_excludes_live_input() {
+        // The borrowed PFX remains live during both prepare and decrypt;
+        // plaintext and KDF allocations must not reuse its allowance.
+        let resources = ResourcePolicy::default();
+        let mut inventory = KeyInventory::default();
+        inventory
+            .add_symmetric(
+                "old".into(),
+                SymmetricKeyKind::Hmac,
+                vec![7; 32],
+                KeyUsages::SIGN,
+                &resources,
+            )
+            .expect("retained key");
+        let input = [0; 128];
+        let limits = inventory
+            .pkcs12_import_limits("new", &input, KeyUsages::SIGN, &resources)
+            .expect("import allowance");
+        assert_eq!(
+            limits.memory_available,
+            resources.max_external_resource_total_bytes
+                - inventory.material_bytes
+                - 3
+                - input.len()
         );
     }
 
@@ -3770,6 +3819,80 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_pkcs8_plaintext_is_reserved_before_password() {
+        use der::Encode as _;
+        use pkcs8::pkcs5::{EncryptionScheme, pbes2};
+        // PBKDF2 has no large workspace, but decrypt still allocates a full
+        // ciphertext-sized buffer, even for a wrong password/malformed key.
+        let encrypted = EncryptedPrivateKeyInfoRef {
+            encryption_algorithm: EncryptionScheme::Pbes2(pbes2::Parameters {
+                kdf: pbes2::Kdf::Pbkdf2(pbes2::Pbkdf2Params {
+                    salt: pbes2::Salt::new(b"12345678").expect("salt"),
+                    iteration_count: 2,
+                    key_length: None,
+                    prf: pbes2::Pbkdf2Prf::HmacWithSha256,
+                }),
+                encryption: pbes2::EncryptionScheme::Aes256Cbc { iv: [0; 16] },
+            }),
+            encrypted_data: der::asn1::OctetStringRef::new(&[0; 64]).expect("ciphertext"),
+        };
+        let bytes = encrypted.to_der().expect("envelope");
+        let peak = 3 + bytes.len() + 64;
+        let tight = ResourcePolicy {
+            max_external_resource_total_bytes: peak - 1,
+            ..ResourcePolicy::default()
+        };
+        let calls = std::cell::Cell::new(0);
+        let mut inventory = KeyInventory::default();
+        let result = inventory.add_private_der_with_password_callback(
+            "new".into(),
+            &bytes,
+            || {
+                calls.set(calls.get() + 1);
+                None
+            },
+            KeyUsages::SIGN,
+            &tight,
+        );
+        assert_eq!(calls.get(), 0);
+        assert!(
+            matches!(result, Err(KeyStoreError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+            resource: crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES, actual, ..
+        })) if actual == peak)
+        );
+        assert!(matches!(
+            inventory.add_private_der(
+                "new".into(),
+                &bytes,
+                Some(b"wrong"),
+                KeyUsages::SIGN,
+                &tight
+            ),
+            Err(KeyStoreError::Policy(_))
+        ));
+        let exact = ResourcePolicy {
+            max_external_resource_total_bytes: peak,
+            ..tight
+        };
+        assert!(matches!(
+            inventory.add_private_der_with_password_callback(
+                "new".into(),
+                &bytes,
+                || {
+                    calls.set(calls.get() + 1);
+                    None
+                },
+                KeyUsages::SIGN,
+                &exact
+            ),
+            Err(KeyStoreError::ProtectedContainer)
+        ));
+        assert_eq!(calls.get(), 1);
+        assert!(inventory.private_keys().is_empty());
+        assert_eq!(inventory.material_bytes, 0);
+    }
+
+    #[test]
     fn encrypted_pem_workspace_accounts_for_live_encoded_input() {
         use der::Encode as _;
         use pkcs8::pkcs5::{EncryptionScheme, pbes2};
@@ -3790,7 +3913,7 @@ mod tests {
         };
         let der = encrypted.to_der().expect("envelope");
         let pem = pem::encode(&pem::Pem::new("ENCRYPTED PRIVATE KEY", der.clone()));
-        let peak = 3 + pem.len() + der.len() + 2304;
+        let peak = 3 + pem.len() + der.len() + 16 + 2304;
         let mut inventory = KeyInventory::default();
         let tight = ResourcePolicy {
             max_external_resource_total_bytes: peak - 1,
@@ -3836,7 +3959,7 @@ mod tests {
         .expect("envelope");
         let pem = pem::encode(&pem::Pem::new("ENCRYPTED PRIVATE KEY", real.clone()));
         let resources = ResourcePolicy {
-            max_external_resource_total_bytes: 3 + pem.len() + real.len() + 2304,
+            max_external_resource_total_bytes: 3 + pem.len() + real.len() + ciphertext.len() + 2304,
             ..ResourcePolicy::default()
         };
         inventory
@@ -3910,7 +4033,11 @@ mod tests {
         assert!(inventory.private_keys().is_empty());
         assert_eq!(inventory.symmetric_keys().len(), 1);
         let exact = ResourcePolicy {
-            max_external_resource_total_bytes: inventory.material_bytes + bytes.len() + 3 + 2304,
+            max_external_resource_total_bytes: inventory.material_bytes
+                + bytes.len()
+                + 3
+                + 16
+                + 2304,
             ..resources
         };
         assert!(matches!(

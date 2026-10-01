@@ -249,7 +249,7 @@ impl<'a> Reader<'a> {
     fn oid(&mut self) -> Result<Oid> {
         Oid::from_bytes(self.take(6)?.value).map_err(|_| KeyStoreError::ProtectedContainer)
     }
-    fn integer(&mut self) -> Result<u32> {
+    fn nonnegative_integer(&mut self) -> Result<&'a [u8]> {
         let bytes = self.take(2)?.value;
         // X.690 8.3.2 forbids redundant sign octets in BER INTEGER too,
         // not only DER; all these fields require nonnegative values.
@@ -260,6 +260,10 @@ impl<'a> Reader<'a> {
         {
             return malformed();
         }
+        Ok(bytes)
+    }
+    fn integer(&mut self) -> Result<u32> {
+        let bytes = self.nonnegative_integer()?;
         bytes
             .iter()
             .try_fold(0_u32, |n, b| {
@@ -267,6 +271,26 @@ impl<'a> Reader<'a> {
                     .and_then(|n| n.checked_add(u32::from(*b)))
             })
             .ok_or(KeyStoreError::ProtectedContainer)
+    }
+    fn kdf_iterations(&mut self, budget: &Budget<'_>) -> Result<u32> {
+        let bytes = self.nonnegative_integer()?;
+        let significant = if bytes[0] == 0 { &bytes[1..] } else { bytes };
+        let maximum = budget.limits.resources.max_key_import_kdf_work;
+        // RFC 7292 section 4 uses BER INTEGERs, not machine-width counters.
+        // A canonical positive value beyond the application's work ceiling
+        // is a policy denial; malformed sign encoding remains a format error.
+        // https://www.rfc-editor.org/rfc/rfc7292#section-4
+        if significant.len() > 4 {
+            return Err(PolicyViolation::KdfIterationsOutsideLimit { maximum }.into());
+        }
+        let mut rounds = 0_u32;
+        for byte in significant {
+            rounds = rounds * 256 + u32::from(*byte);
+        }
+        if rounds == 0 || u64::from(rounds) > maximum as u64 || rounds > i32::MAX as u32 {
+            return Err(PolicyViolation::KdfIterationsOutsideLimit { maximum }.into());
+        }
+        Ok(rounds)
     }
     fn null_or_absent(&mut self) -> Result<()> {
         if !self.0.is_empty() && !self.take(5)?.value.is_empty() {
@@ -457,7 +481,11 @@ impl<'a> Mac<'a> {
         let (salt_tlv, rest) = tlv(mac.0, 0)?;
         let salt = octets(salt_tlv, 4, budget)?;
         mac.0 = rest;
-        let rounds = if mac.0.is_empty() { 1 } else { mac.integer()? };
+        let rounds = if mac.0.is_empty() {
+            1
+        } else {
+            mac.kdf_iterations(budget)?
+        };
         mac.finish()?;
         budget.kdf(rounds, 1, &salt)?;
         Ok(Self {
@@ -519,7 +547,7 @@ struct Encryption<'a> {
     salt: Bytes<'a>,
     rounds: u32,
     hash: Option<Hash>,
-    iv: &'a [u8],
+    iv: [u8; 16],
 }
 impl<'a> Encryption<'a> {
     fn parse(encoded: Tlv<'a>, budget: &mut Budget<'_>) -> Result<Self> {
@@ -540,7 +568,7 @@ impl<'a> Encryption<'a> {
             let (value, rest) = tlv(derivation.0, 0)?;
             salt = octets(value, 4, budget)?;
             derivation.0 = rest;
-            rounds = derivation.integer()?;
+            rounds = derivation.kdf_iterations(budget)?;
             let length = if derivation.0.first() == Some(&2) {
                 Some(derivation.integer()?)
             } else {
@@ -566,11 +594,29 @@ impl<'a> Encryption<'a> {
                     "unsupported PKCS#12 PBES2 encryption scheme",
                 ));
             };
-            iv = scheme.take(4)?.value;
+            let (value, rest) = tlv(scheme.0, 0)?;
+            // RFC 7292 section 4 requires BER, whose OCTET STRINGs may be
+            // constructed (X.690 8.7.1, 8.7.3). AES IVs are exactly 16 bytes;
+            // stream segments into fixed cipher state rather than flattening
+            // attacker-controlled segmentation into a temporary heap buffer.
+            // https://www.itu.int/rec/T-REC-X.690-202102-I/en
+            let mut decoded_iv = [0; 16];
+            let mut length_so_far = 0;
+            octet_visit(value, 4, 0, &mut |segment| {
+                if segment.len() > decoded_iv.len() - length_so_far {
+                    return malformed();
+                }
+                decoded_iv[length_so_far..length_so_far + segment.len()].copy_from_slice(segment);
+                length_so_far += segment.len();
+                Ok(())
+            })?;
+            if length_so_far != decoded_iv.len() {
+                return malformed();
+            }
+            iv = decoded_iv;
+            scheme.0 = rest;
             scheme.finish()?;
-            if iv.len() != cipher.block()
-                || length.is_some_and(|length| length as usize != cipher.key_len())
-            {
+            if length.is_some_and(|length| length as usize != cipher.key_len()) {
                 return malformed();
             }
             hash = Some(prf);
@@ -588,9 +634,9 @@ impl<'a> Encryption<'a> {
             let (value, rest) = tlv(params.0, 0)?;
             salt = octets(value, 4, budget)?;
             params.0 = rest;
-            rounds = params.integer()?;
+            rounds = params.kdf_iterations(budget)?;
             hash = None;
-            iv = &[];
+            iv = [0; 16];
             // Appendix B.2 derives key and IV separately; 24-byte SHA-1
             // keys need two digest blocks, not one iteration charge.
             budget.kdf(rounds, cipher.key_len().div_ceil(20) + 1, &salt)?;
@@ -627,7 +673,7 @@ impl<'a> Encryption<'a> {
                     &mut key[..self.cipher.key_len()]
                 )
             );
-            iv[..self.iv.len()].copy_from_slice(self.iv);
+            iv.copy_from_slice(&self.iv);
         } else {
             let bmp = password.bmp(budget)?;
             budget.legacy_workspace(&self.salt, bmp, 64, self.cipher.key_len())?;
@@ -1513,6 +1559,190 @@ mod tests {
                 }
             ))
         ));
+    }
+
+    #[test]
+    fn pbes2_ber_iv_forms_preserve_decryption() {
+        // RFC 7292 section 4 accepts BER; X.690 8.7 permits nested,
+        // definite or indefinite OCTET STRING segmentation for the IV.
+        let private = pem::parse(include_bytes!(
+            "../../tests/fixtures/keys/rsa/rsa-2048-key.pem"
+        ))
+        .expect("key")
+        .into_contents();
+        let iv = [7; 16];
+        let mut key = [0; 16];
+        pbkdf2::pbkdf2_hmac::<sha1::Sha1>(b"secret", b"12345678", 2, &mut key);
+        let mut output = vec![0; private.len() + 16];
+        let ciphertext = cbc::Encryptor::<aes::Aes128Enc>::new_from_slices(&key, &iv)
+            .expect("cipher")
+            .encrypt_padded_b2b::<Pkcs7>(&private, &mut output)
+            .expect("padding")
+            .to_vec();
+        let segments = [encoded(4, &iv[..5]), encoded(4, &iv[5..])].concat();
+        for encoded_iv in [
+            encoded(4, &iv),
+            encoded(0x24, &segments),
+            [vec![0x24, 0x80], segments.clone(), vec![0, 0]].concat(),
+            encoded(0x24, &encoded(0x24, &segments)),
+        ] {
+            let algorithm = sequence(&[
+                oid(PBES2),
+                sequence(&[
+                    sequence(&[
+                        oid(PBKDF2),
+                        sequence(&[encoded(4, b"12345678"), integer(2)]),
+                    ]),
+                    sequence(&[oid(pkcs8::pkcs5::pbes2::AES_128_CBC_OID), encoded_iv]),
+                ]),
+            ]);
+            let bytes = pfx(&[data(&sequence(&[bag(
+                pkcs12::PKCS_12_PKCS8_KEY_BAG_OID,
+                &sequence(&[algorithm, encoded(4, &ciphertext)]),
+            )]))]);
+            let mut inventory = super::super::KeyInventory::default();
+            inventory
+                .add_pkcs12("key".into(), &bytes, "secret", &ResourcePolicy::default())
+                .expect("all BER IV forms import");
+            assert_eq!(inventory.private_keys()[0].pkcs8_der.as_slice(), private);
+        }
+    }
+
+    #[test]
+    fn pbes2_ber_iv_rejects_invalid_segments_and_lengths() {
+        // Segmentation changes framing, never AES's required IV length or
+        // the universal OCTET STRING type of each component.
+        for iv in [
+            encoded(4, &[0; 15]),
+            encoded(4, &[0; 17]),
+            encoded(0x24, &encoded(4, &[0; 17])),
+            encoded(0x24, &encoded(2, &[0; 16])),
+            [vec![0x24, 0x80], encoded(4, &[0; 16])].concat(),
+        ] {
+            let algorithm = sequence(&[
+                oid(PBES2),
+                sequence(&[
+                    sequence(&[oid(PBKDF2), sequence(&[encoded(4, b"salt"), integer(2)])]),
+                    sequence(&[oid(pkcs8::pkcs5::pbes2::AES_128_CBC_OID), iv]),
+                ]),
+            ]);
+            let limits = limits(64);
+            let mut budget = Budget::new(&limits);
+            let result =
+                tlv(&algorithm, 0).and_then(|(value, _)| Encryption::parse(value, &mut budget));
+            assert!(matches!(result, Err(KeyStoreError::ProtectedContainer)));
+            assert_eq!(budget.memory, 0, "IV framing requires no heap allocation");
+        }
+    }
+
+    #[test]
+    fn kdf_integer_classification_preserves_ber_errors() {
+        // Machine-width-independent policy denial must not hide malformed
+        // negative/redundant/empty INTEGER encodings (X.690 8.3.2).
+        let limits = Limits {
+            resources: ResourcePolicy {
+                max_key_import_kdf_work: 128,
+                ..ResourcePolicy::default()
+            },
+            ..limits(64)
+        };
+        let budget = Budget::new(&limits);
+        for value in [&[][..], &[0x80][..], &[0, 1][..]] {
+            let encoded = encoded(2, value);
+            assert!(matches!(
+                Reader(&encoded).kdf_iterations(&budget),
+                Err(KeyStoreError::ProtectedContainer)
+            ));
+        }
+        let exact = encoded(2, &[0, 128]);
+        assert_eq!(
+            Reader(&exact).kdf_iterations(&budget).expect("exact limit"),
+            128
+        );
+        let exceeded = encoded(2, &[0, 129]);
+        assert!(matches!(
+            Reader(&exceeded).kdf_iterations(&budget),
+            Err(KeyStoreError::Policy(
+                PolicyViolation::KdfIterationsOutsideLimit { maximum: 128 }
+            ))
+        ));
+    }
+
+    #[test]
+    fn oversized_kdf_integers_are_policy_failures() {
+        // Positive BER INTEGERs do not become malformed merely because
+        // they exceed a machine integer; reject work before any password.
+        for value in [&[1, 0, 0, 0, 0][..], &[1, 0, 0, 0, 0, 0, 0, 0, 0][..]] {
+            let rounds = encoded(2, value);
+            let pbes2 = sequence(&[
+                oid(PBES2),
+                sequence(&[
+                    sequence(&[
+                        oid(PBKDF2),
+                        sequence(&[encoded(4, b"salt"), rounds.clone()]),
+                    ]),
+                    sequence(&[
+                        oid(pkcs8::pkcs5::pbes2::AES_128_CBC_OID),
+                        encoded(4, &[0; 16]),
+                    ]),
+                ]),
+            ]);
+            let legacy = sequence(&[
+                oid(pkcs12::PKCS_12_PBE_WITH_SHAAND3_KEY_TRIPLE_DES_CBC),
+                sequence(&[encoded(4, b"salt"), rounds.clone()]),
+            ]);
+            for algorithm in [pbes2, legacy] {
+                let bytes = pfx(&[data(&sequence(&[bag(
+                    pkcs12::PKCS_12_PKCS8_KEY_BAG_OID,
+                    &sequence(&[algorithm, encoded(4, &[0; 16])]),
+                )]))]);
+                let limits = limits(64);
+                assert!(matches!(
+                    prepare(&bytes, &limits),
+                    Err(KeyStoreError::Policy(
+                        PolicyViolation::KdfIterationsOutsideLimit { .. }
+                    ))
+                ));
+                let calls = std::cell::Cell::new(0);
+                let result = super::super::KeyInventory::default()
+                    .add_pkcs12_with_password_callback(
+                        "key".into(),
+                        &bytes,
+                        || {
+                            calls.set(calls.get() + 1);
+                            None
+                        },
+                        super::super::KeyUsages::SIGN,
+                        &limits.resources,
+                    );
+                assert!(matches!(
+                    result,
+                    Err(KeyStoreError::Policy(
+                        PolicyViolation::KdfIterationsOutsideLimit { .. }
+                    ))
+                ));
+                assert_eq!(
+                    calls.get(),
+                    0,
+                    "oversized work is rejected before password delivery"
+                );
+            }
+            let mac = sequence(&[
+                sequence(&[
+                    sequence(&[oid(Oid::new_unwrap("1.3.14.3.2.26")), encoded(5, &[])]),
+                    encoded(4, &[0; 20]),
+                ]),
+                encoded(4, b"salt"),
+                rounds,
+            ]);
+            let bytes = sequence(&[integer(3), data(&sequence(&[])), mac]);
+            assert!(matches!(
+                prepare(&bytes, &limits(64)),
+                Err(KeyStoreError::Policy(
+                    PolicyViolation::KdfIterationsOutsideLimit { .. }
+                ))
+            ));
+        }
     }
 
     #[test]

@@ -94,7 +94,9 @@ missing or incorrect passwords remain protected-container errors.
 PBKDF2 work includes every output block required by the cipher's key width
 (RFC 8018 section 5.2). Scrypt workspaces must fit both the KDF-specific ceiling
 and the remaining aggregate allowance alongside retained inventory, key name,
-and imported container; these checks precede password callbacks. For PEM imports,
+and imported container; these checks precede password callbacks. The ciphertext-sized
+PKCS#8 decryption buffer also counts toward the peak, even when decryption fails.
+It is decrypted in place and retained without a second plaintext copy. For PEM imports,
 the encoded input and decoded DER coexist and both count toward that peak.
 The CLI applies the same pre-decryption KDF limits to explicit protected PKCS#8
 PEM/DER keys, including the generic private-key options, as to inventory imports.
@@ -120,7 +122,13 @@ The outer CMS attribute collection must be nonempty, but an unknown attribute's
 generic `attrValues SET OF` has no minimum cardinality (RFC 5652 sections 5.3
 and 6.1). Attribute-specific requirements are not inferred for unknown OIDs.
 Temporary import allocations share the aggregate allowance with material already
-retained by the inventory, and KDF workspaces are checked before derivation.
+retained by the inventory and the still-live caller-owned PFX input; KDF workspaces
+are checked before derivation. AES-CBC IVs accept primitive and constructed BER
+OCTET STRINGs, including nested and indefinite segmentation, without heap
+flattening; their decoded length must still be exactly 16 bytes (X.690 section 8.7).
+Canonical positive KDF iteration INTEGERs exceeding the work limit return typed
+policy denials even when larger than a machine integer. Malformed INTEGER sign
+encodings remain protected-container errors, not policy errors.
 Named direct AES keys participate only in direct content-key resolution, not
 in recipient-key unwrapping, so recipient hints cannot duplicate their candidate.
 
