@@ -91,7 +91,10 @@ triggers an unprotected fallback. PEM private-key labels must match their
 payload: `ENCRYPTED PRIVATE KEY` cannot contain plaintext PKCS#8, and
 `PRIVATE KEY` cannot contain an encrypted container. RFC 7468 section 2
 permits reinterpretation, but this API deliberately forbids it to preserve
-the protected-key contract. Oversized encoded bundles return a typed
+the protected-key contract. Similarly, `PUBLIC KEY` requires SubjectPublicKeyInfo
+(RFC 7468 section 13); certificates are accepted through the certificate APIs
+or generic DER import, not by reinterpreting a public-key PEM label.
+Oversized encoded bundles return a typed
 resource-policy error without invoking the callback.
 `ResourcePolicy::max_key_import_kdf_work` and
 `max_key_import_kdf_memory_bytes` can tighten protected-key derivation; both
@@ -105,11 +108,14 @@ and imported container; these checks precede password callbacks. The ciphertext-
 PKCS#8 decryption buffer also counts toward the peak, even when decryption fails.
 It is decrypted in place and retained without a second plaintext copy. For PEM imports,
 the encoded input and decoded DER coexist and both count toward that peak.
-PKCS#8 passwords count toward per-resource and aggregate live-byte limits before
+PKCS#8 and PKCS#12 passwords count toward per-resource and aggregate live-byte limits before
 derivation; callback buffers are charged by capacity, not just length. Work includes
 one unit per 64 password bytes per HMAC initialization (two passes for scrypt)
-in addition to the KDF's derivation work. Plaintext
-imports still ignore unused passwords. These limits are product policy, not format syntax.
+in addition to the KDF's derivation work. Each PKCS#12 PBES2 derivation charges
+password preprocessing to the shared budget, including encrypted nested bags;
+legacy BMP password conversion consumes separate live memory when needed.
+Plaintext PKCS#8 imports still ignore unused passwords.
+These limits are product policy, not format syntax.
 The CLI applies the same pre-decryption KDF limits to explicit protected PKCS#8
 PEM/DER keys, including the generic private-key options, as to inventory imports.
 When the PKCS#12 parser rejects an oversized salt, that distinct resource

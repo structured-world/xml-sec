@@ -47,6 +47,11 @@ use crate::{
 const XMLSEC_NS: &str = "http://www.aleksey.com/xmlsec/2002";
 const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 
+enum PublicDerFormat {
+    KeyOrCertificate,
+    SubjectPublicKeyInfo,
+}
+
 fn check_selected_public_material(
     info: &KeyInfo,
     resources: &ResourcePolicy,
@@ -1044,6 +1049,23 @@ impl KeyInventory {
         usages: Option<KeyUsages>,
         resources: &ResourcePolicy,
     ) -> Result<(), KeyStoreError> {
+        self.add_public_der_payload(
+            name,
+            der,
+            usages,
+            resources,
+            PublicDerFormat::KeyOrCertificate,
+        )
+    }
+
+    fn add_public_der_payload(
+        &mut self,
+        name: String,
+        der: Vec<u8>,
+        usages: Option<KeyUsages>,
+        resources: &ResourcePolicy,
+        format: PublicDerFormat,
+    ) -> Result<(), KeyStoreError> {
         self.check_new_name(&name, resources)?;
         let permitted = KeyUsages::VERIFY.union(KeyUsages::ENCRYPT);
         if usages.is_some_and(|usages| usages.0 == 0 || usages.0 & !permitted.0 != 0) {
@@ -1071,6 +1093,14 @@ impl KeyInventory {
                 .push(KeyInfoSource::DerEncodedKeyValue(der));
             is_rsa
         } else {
+            if matches!(format, PublicDerFormat::SubjectPublicKeyInfo) {
+                // RFC 7468 section 13 identifies PUBLIC KEY as SPKI. Section 2
+                // permits reinterpretation, but this label-dispatched API does
+                // not: certificate fallback belongs only to generic DER import.
+                // https://www.rfc-editor.org/rfc/rfc7468#section-13
+                // https://www.rfc-editor.org/rfc/rfc7468#section-2
+                return Err(KeyStoreError::Selection("invalid PUBLIC KEY payload"));
+            }
             let (rest, certificate) = X509Certificate::from_der(&der)
                 .map_err(|_| KeyStoreError::Selection("invalid public key or X.509 certificate"))?;
             if !rest.is_empty() {
@@ -1163,7 +1193,13 @@ impl KeyInventory {
             named_material_length(&name, bytes.len().max(der.len()), 2)?,
             resources,
         )?;
-        self.add_public_der_inner(name, der, usages, resources)?;
+        self.add_public_der_payload(
+            name,
+            der,
+            usages,
+            resources,
+            PublicDerFormat::SubjectPublicKeyInfo,
+        )?;
         debug_assert!(self.material_bytes >= previous_total);
         self.material_bytes = charged_total;
         Ok(())
@@ -1422,7 +1458,7 @@ impl KeyInventory {
         let limits = self.pkcs12_import_limits(&name, bytes, usages, resources)?;
         let prepared = pkcs12_import::prepare(bytes, &limits)?;
         let secret = password().ok_or(KeyStoreError::ProtectedContainer)?;
-        let contents = prepared.decrypt(&secret)?;
+        let contents = prepared.decrypt_with_password_capacity(&secret, secret.capacity())?;
         self.add_pkcs12_contents(name, bytes.len(), contents, usages, resources, false)
     }
 
@@ -3604,6 +3640,41 @@ mod tests {
                 .add_public_pem("other".into(), &trailing, &resources)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn public_pem_label_rejects_certificate_payload() {
+        // Strict label dispatch must not inherit generic DER's certificate fallback.
+        let certificate = pem::parse(include_bytes!(
+            "../tests/fixtures/keys/rsa/rsa-2048-cert.pem"
+        ))
+        .expect("certificate")
+        .into_contents();
+        let mislabeled = pem::encode(&pem::Pem::new("PUBLIC KEY", certificate.clone()));
+        let resources = ResourcePolicy::default();
+        for usages in [None, Some(KeyUsages::VERIFY)] {
+            let mut inventory = KeyInventory::default();
+            assert!(matches!(
+                inventory.add_public_pem_inner(
+                    "key".into(),
+                    mislabeled.as_bytes(),
+                    usages,
+                    &resources
+                ),
+                Err(KeyStoreError::Selection("invalid PUBLIC KEY payload"))
+            ));
+            assert!(inventory.public_keys().is_empty());
+        }
+        KeyInventory::default()
+            .add_public_der("cert".into(), certificate, &resources)
+            .expect("generic DER intentionally accepts certificates");
+        KeyInventory::default()
+            .add_public_pem(
+                "spki".into(),
+                include_bytes!("../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"),
+                &resources,
+            )
+            .expect("correct SPKI label");
     }
 
     #[test]

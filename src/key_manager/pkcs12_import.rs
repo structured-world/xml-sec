@@ -663,6 +663,14 @@ impl<'a> Encryption<'a> {
         let mut key = Zeroizing::new([0_u8; 32]);
         let mut iv = Zeroizing::new([0_u8; 16]);
         if let Some(hash) = self.hash {
+            // Product work accounting matches PKCS#8: charge password-keyed
+            // HMAC preprocessing for each derivation, including hidden bags.
+            let work = password.utf8.len().div_ceil(64);
+            let maximum = budget.limits.resources.max_key_import_kdf_work;
+            if work > maximum - budget.work {
+                return Err(denial(resource_name::KEY_IMPORT_KDF_WORK, maximum));
+            }
+            budget.work += work;
             with_hash!(
                 hash,
                 D,
@@ -1151,8 +1159,26 @@ pub(super) fn prepare<'a, 'l>(bytes: &'a [u8], limits: &'l Limits) -> Result<Pre
 
 impl Prepared<'_, '_> {
     pub(super) fn decrypt(self, password: &str) -> Result<Contents> {
+        self.decrypt_with_password_capacity(password, password.len())
+    }
+
+    pub(super) fn decrypt_with_password_capacity(
+        self,
+        password: &str,
+        capacity: usize,
+    ) -> Result<Contents> {
         let Self { pfx, limits } = self;
         let mut budget = Budget::new(limits);
+        // The original UTF-8 buffer remains live alongside BER views, BMP
+        // conversion, and decrypted contents; a callback can retain spare capacity.
+        if password.len() > limits.resources.max_external_resource_bytes {
+            return Err(denial(
+                resource_name::EXTERNAL_RESOURCE_BYTES,
+                limits.resources.max_external_resource_bytes,
+            ));
+        }
+        debug_assert!(capacity >= password.len());
+        budget.allocate(capacity)?;
         budget.allocate(pfx.safe.owned_capacity())?;
         if let Some(mac) = &pfx.mac {
             budget.allocate(mac.salt.owned_capacity() + mac.digest.owned_capacity())?;
@@ -1743,6 +1769,80 @@ mod tests {
                 ))
             ));
         }
+    }
+
+    #[test]
+    fn pbes2_password_shares_work_and_live_memory_budget() {
+        // A no-MAC PFX still hashes its UTF-8 password before PBKDF2. Policy
+        // denial must precede derivation, and callback spare capacity is live.
+        let password = "p".repeat(256);
+        let private = pem::parse(include_bytes!(
+            "../../tests/fixtures/keys/rsa/rsa-2048-key.pem"
+        ))
+        .expect("key")
+        .into_contents();
+        let mut key = [0; 16];
+        let iv = [7; 16];
+        pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password.as_bytes(), b"salt", 2, &mut key);
+        let mut output = vec![0; private.len() + 16];
+        let ciphertext = cbc::Encryptor::<aes::Aes128Enc>::new_from_slices(&key, &iv)
+            .expect("cipher")
+            .encrypt_padded_b2b::<Pkcs7>(&private, &mut output)
+            .expect("padding")
+            .to_vec();
+        let algorithm = sequence(&[
+            oid(PBES2),
+            sequence(&[
+                sequence(&[oid(PBKDF2), sequence(&[encoded(4, b"salt"), integer(2)])]),
+                sequence(&[oid(pkcs8::pkcs5::pbes2::AES_128_CBC_OID), encoded(4, &iv)]),
+            ]),
+        ]);
+        let bytes = pfx(&[data(&sequence(&[bag(
+            pkcs12::PKCS_12_PKCS8_KEY_BAG_OID,
+            &sequence(&[algorithm, encoded(4, &ciphertext)]),
+        )]))]);
+        let peak = password.len() + ciphertext.len() + core::mem::size_of::<Zeroizing<Vec<u8>>>();
+        for (work, memory, per_resource) in [(5, peak, 256), (6, peak - 1, 256), (6, peak, 255)] {
+            let mut limits = limits(64);
+            limits.resources.max_key_import_kdf_work = work;
+            limits.resources.max_external_resource_bytes = per_resource;
+            limits.memory_available = memory;
+            assert!(matches!(
+                prepare(&bytes, &limits)
+                    .expect("visible KDF fits")
+                    .decrypt(&password),
+                Err(KeyStoreError::Policy(_))
+            ));
+        }
+        let mut exact = limits(64);
+        exact.resources.max_key_import_kdf_work = 6;
+        exact.memory_available = peak;
+        assert_eq!(
+            &*prepare(&bytes, &exact)
+                .expect("preflight")
+                .decrypt(&password)
+                .expect("exact password allowances")
+                .private_keys[0],
+            &private
+        );
+        let mut secret = String::with_capacity(4096);
+        secret.push_str(&password);
+        let resources = ResourcePolicy {
+            max_external_resource_total_bytes: bytes.len() + peak + 3,
+            ..ResourcePolicy::default()
+        };
+        let mut inventory = super::super::KeyInventory::default();
+        assert!(matches!(
+            inventory.add_pkcs12_with_password_callback(
+                "new".into(),
+                &bytes,
+                || Some(Zeroizing::new(secret)),
+                super::super::KeyUsages::SIGN,
+                &resources
+            ),
+            Err(KeyStoreError::Policy(_))
+        ));
+        assert!(inventory.private_keys().is_empty());
     }
 
     #[test]
