@@ -2244,33 +2244,82 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         {
             public_key_count += 1;
             only_public_key = Some(entry);
-            available_public_keys_by_name.insert(entry.name.as_str(), (entry, 0_usize));
+            available_public_keys_by_name.insert(
+                entry.name.as_str(),
+                AvailableStoreRecipient {
+                    entry,
+                    reservations: 0,
+                    loaded: None,
+                },
+            );
         }
-        // Reserve exact names before fallback assignment. Reuse the availability
-        // index so reservations require neither key copies nor a second map.
-        for recipient in &template_recipients {
-            if let Some(name) = recipient.key_name.as_deref()
-                && let Some((_, remaining)) = available_public_keys_by_name.get_mut(name)
-            {
-                *remaining += 1;
+        let lax = invocation.flag("lax-key-search");
+        let mut reserved_slots = Vec::new();
+        if lax {
+            reserved_slots.reserve(template_recipients.len());
+            // A stale name contradicted by recipient metadata is not an exact
+            // match. Cache decoded candidates so reservation checks do not
+            // repeat RSA decoding during assignment; names remain borrowed.
+            for (recipient, metadata) in template_recipients.iter().zip(&recipient_metadata) {
+                let mut reserved = false;
+                if let Some(name) = recipient.key_name.as_deref()
+                    && let Some(available) = available_public_keys_by_name.get_mut(name)
+                {
+                    if metadata.as_ref().is_some_and(|metadata| {
+                        metadata
+                            .0
+                            .sources
+                            .iter()
+                            .any(|source| !matches!(source, KeyInfoSource::KeyName(_)))
+                    }) {
+                        if available.loaded.is_none() {
+                            store_candidate_budget
+                                .consume(1)
+                                .map_err(|error| CommandError::Encryption(error.to_string()))?;
+                            match load_stored_recipient_candidate(available.entry, &policy) {
+                                Ok(candidate) => available.loaded = Some(candidate),
+                                Err(
+                                    error @ CommandError::KeyStore(
+                                        key_manager::KeyStoreError::Policy(_),
+                                    ),
+                                ) => return Err(error),
+                                Err(_) => {}
+                            }
+                        }
+                        reserved = available.loaded.as_ref().is_some_and(|candidate| {
+                            validate_recipient_key_metadata(metadata.as_ref(), candidate).is_ok()
+                        });
+                    } else {
+                        reserved = true;
+                    }
+                    if reserved {
+                        available.reservations += 1;
+                    }
+                }
+                reserved_slots.push(reserved);
             }
         }
-        for (recipient, metadata) in template_recipients.into_iter().zip(recipient_metadata) {
-            let lax = invocation.flag("lax-key-search");
-            if let Some(name) = recipient.key_name.as_deref()
-                && let Some((_, remaining)) = available_public_keys_by_name.get_mut(name)
+        for (slot, (recipient, metadata)) in template_recipients
+            .into_iter()
+            .zip(recipient_metadata)
+            .enumerate()
+        {
+            if lax
+                && reserved_slots[slot]
+                && let Some(name) = recipient.key_name.as_deref()
+                && let Some(available) = available_public_keys_by_name.get_mut(name)
             {
-                *remaining -= 1;
+                available.reservations -= 1;
             }
             let exact = match recipient.key_name.as_deref() {
                 Some(name) => available_public_keys_by_name
                     .get(name)
-                    .map(|(entry, _)| *entry),
+                    .map(|available| available.entry),
                 None if public_key_count == 1 => only_public_key.and_then(|entry| {
                     available_public_keys_by_name
                         .get(entry.name.as_str())
-                        .filter(|(_, remaining)| !lax || *remaining == 0)
-                        .map(|(entry, _)| *entry)
+                        .filter(|available| !lax || available.reservations == 0)
+                        .map(|available| available.entry)
                 }),
                 None if !lax && public_key_count > 1 => {
                     return Err(CommandError::Usage(
@@ -2284,28 +2333,35 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             }
             let fallbacks = store.public_keys().iter().filter(|entry| {
                 lax && entry.usages.allows(key_manager::KeyUsage::Encrypt)
-                    && available_public_keys_by_name
-                        .get(entry.name.as_str())
-                        .is_some_and(|(_, remaining)| *remaining == 0)
                     && !exact.is_some_and(|selected| std::ptr::eq(selected, *entry))
             });
             let mut selected = None;
             let mut last_error = None;
             for entry in exact.into_iter().chain(fallbacks) {
+                if !exact.is_some_and(|selected| std::ptr::eq(selected, entry))
+                    && !available_public_keys_by_name
+                        .get(entry.name.as_str())
+                        .is_some_and(|available| available.reservations == 0)
+                {
+                    continue;
+                }
                 store_candidate_budget
                     .consume(1)
                     .map_err(|error| CommandError::Encryption(error.to_string()))?;
-                let candidate = entry
-                    .rsa_encryption_key(&policy)
-                    .map_err(CommandError::from)
-                    .and_then(|public_key| {
-                        validate_rsa_recipient_key(&public_key, &policy)
-                            .map_err(|error| CommandError::Encryption(error.to_string()))?;
-                        let candidate = RecipientPublicKeyCandidate {
-                            public_key,
-                            certificate_der: None,
-                        };
-                        validate_recipient_key_metadata(metadata.as_ref(), &candidate)?;
+                let cached = available_public_keys_by_name
+                    .get_mut(entry.name.as_str())
+                    .and_then(|available| available.loaded.take());
+                let candidate = cached
+                    .map_or_else(|| load_stored_recipient_candidate(entry, &policy), Ok)
+                    .and_then(|candidate| {
+                        // This exact slot was checked against immutable metadata
+                        // before reservation. Do not repeat its conversions.
+                        if !(lax
+                            && reserved_slots[slot]
+                            && exact.is_some_and(|selected| std::ptr::eq(selected, entry)))
+                        {
+                            validate_recipient_key_metadata(metadata.as_ref(), &candidate)?;
+                        }
                         Ok(candidate)
                     });
                 match candidate {
@@ -2611,6 +2667,25 @@ fn write_debug_transform(
 struct RecipientPublicKeyCandidate {
     public_key: RsaPublicKey,
     certificate_der: Option<Vec<u8>>,
+}
+
+struct AvailableStoreRecipient<'a> {
+    entry: &'a key_manager::StoredPublicKey,
+    reservations: usize,
+    loaded: Option<RecipientPublicKeyCandidate>,
+}
+
+fn load_stored_recipient_candidate(
+    entry: &key_manager::StoredPublicKey,
+    policy: &EncryptionPolicy,
+) -> Result<RecipientPublicKeyCandidate, CommandError> {
+    let public_key = entry.rsa_encryption_key(policy)?;
+    validate_rsa_recipient_key(&public_key, policy)
+        .map_err(|error| CommandError::Encryption(error.to_string()))?;
+    Ok(RecipientPublicKeyCandidate {
+        public_key,
+        certificate_der: None,
+    })
 }
 
 #[derive(Clone, Copy)]

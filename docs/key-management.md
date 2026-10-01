@@ -62,6 +62,11 @@ at import rather than acquiring verification permission.
 Public DSA entries must contain independently usable parameters; the inventory
 does not infer missing parameters from another entry. Verification validates the
 complete policy snapshot before selecting or copying any key, including HMAC.
+EC SPKI and certificate imports use the verifier's uncompressed SEC1 profile;
+compressed points are rejected before granting verification usage. Each complete
+KeyValue is one resource for selection limits, not one resource per component.
+When a named certificate is selected, enabled CRL checking retains both inventory
+and document CRLs, with their combined resource budget checked before copying.
 
 `add_private_der_with_password_callback` asks the caller for a zeroizing byte
 password only for encrypted PKCS#8; plaintext input does not invoke it.
@@ -112,7 +117,9 @@ name and then tries remaining compatible entries in store order. Each selected
 entry is consumed once for that operation; insufficient entries fail before
 any encrypted output is written.
 Entries explicitly named by later recipient slots are reserved before assigning
-fallbacks, so an unnamed slot cannot consume a later recipient's requested key.
+fallbacks only when they match that slot's key metadata. An unnamed slot cannot
+consume a later compatible exact match, but a stale name contradicted by metadata
+does not reserve an incompatible key.
 
 For production applications, do not put passwords on a process command line:
 load them through the application's secret channel and call the byte-oriented

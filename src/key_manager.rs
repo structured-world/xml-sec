@@ -79,26 +79,35 @@ fn check_selected_public_material(
             Ok(())
         };
         match source {
-            KeyInfoSource::KeyValue(KeyValueInfo::Rsa { modulus, exponent }) => {
-                charge(modulus.len())?;
-                charge(exponent.len())?;
-            }
-            KeyInfoSource::KeyValue(KeyValueInfo::Dsa { p, q, g, y }) => {
-                for length in [
-                    p.as_ref().map_or(0, Vec::len),
-                    q.as_ref().map_or(0, Vec::len),
-                    g.as_ref().map_or(0, Vec::len),
-                    y.len(),
-                ] {
-                    charge(length)?;
-                }
-            }
-            KeyInfoSource::KeyValue(KeyValueInfo::Ec {
-                curve_oid,
-                public_key,
-            }) => {
-                charge(curve_oid.len())?;
-                charge(public_key.len())?;
+            KeyInfoSource::KeyValue(value) => {
+                // One selected key is one resource, irrespective of how many
+                // XML fields encode it. Bound the complete borrowed payload
+                // before resolution materializes its SPKI.
+                let lengths = match value {
+                    KeyValueInfo::Rsa { modulus, exponent } => {
+                        [modulus.len(), exponent.len(), 0, 0]
+                    }
+                    KeyValueInfo::Dsa { p, q, g, y } => [
+                        p.as_ref().map_or(0, Vec::len),
+                        q.as_ref().map_or(0, Vec::len),
+                        g.as_ref().map_or(0, Vec::len),
+                        y.len(),
+                    ],
+                    KeyValueInfo::Ec {
+                        curve_oid,
+                        public_key,
+                    } => [curve_oid.len(), public_key.len(), 0, 0],
+                    KeyValueInfo::InvalidEcKeyValue | KeyValueInfo::Unsupported { .. } => continue,
+                };
+                let length = lengths.into_iter().try_fold(0_usize, |sum, length| {
+                    sum.checked_add(length)
+                        .ok_or(crate::policy::PolicyViolation::ResourceLimit {
+                            resource: crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
+                            maximum: resources.max_external_resource_bytes,
+                            actual: usize::MAX,
+                        })
+                })?;
+                charge(length)?;
             }
             KeyInfoSource::DerEncodedKeyValue(bytes) => charge(bytes.len())?,
             KeyInfoSource::X509Data(data) => {
@@ -482,13 +491,30 @@ impl<'a> KeyResolver for InventoryVerificationResolver<'a> {
                 .lookup_certificates
                 .iter()
                 .chain(&self.inventory.trusted_certificates);
+            // Selecting a trusted named key substitutes key material, not
+            // document revocation evidence. Retain CRLs without importing any
+            // document certificate into the trusted candidate's chain.
+            let document_crls = key_info
+                .filter(|_| {
+                    candidate.is_some()
+                        && policy.key_trust.check_crls
+                        && policy.key_trust.verify_x509_chains
+                })
+                .into_iter()
+                .flat_map(|info| &info.sources)
+                .filter_map(|source| match source {
+                    KeyInfoSource::X509Data(data) => Some(data.crls.as_slice()),
+                    _ => None,
+                })
+                .flatten();
             let crls = self
                 .inventory
                 .crls
                 .iter()
+                .chain(document_crls)
                 .filter(|_| policy.key_trust.check_crls && policy.key_trust.verify_x509_chains);
             let mut total = selected_material_bytes;
-            for material in certificates.chain(crls) {
+            for material in certificates.chain(crls.clone()) {
                 if material.len() > policy.resources.max_external_resource_bytes {
                     return Err(crate::policy::PolicyViolation::ResourceLimit {
                         resource: crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
@@ -511,11 +537,7 @@ impl<'a> KeyResolver for InventoryVerificationResolver<'a> {
             DefaultKeyResolver::new(KeyResolverConfig {
                 lookup_certs: self.inventory.lookup_certificates.clone(),
                 trusted_certs: self.inventory.trusted_certificates.clone(),
-                crls: if policy.key_trust.check_crls && policy.key_trust.verify_x509_chains {
-                    self.inventory.crls.clone()
-                } else {
-                    Vec::new()
-                },
+                crls: crls.cloned().collect(),
                 ..KeyResolverConfig::default()
             })
         } else {
@@ -3824,6 +3846,123 @@ mod tests {
     }
 
     #[test]
+    fn named_certificate_resolution_preserves_document_crl() {
+        // Named inventory selection must preserve document revocation evidence;
+        // without it the same chain is valid and resolves successfully.
+        use rcgen::{CertificateParams, KeyPair, KeyUsagePurpose, SerialNumber};
+        let mut root_params = CertificateParams::new(Vec::new()).expect("root params");
+        root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        root_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let root = rcgen::CertifiedIssuer::self_signed(
+            root_params,
+            KeyPair::generate().expect("root key"),
+        )
+        .expect("root certificate");
+        let mut leaf_params = CertificateParams::new(Vec::new()).expect("leaf params");
+        leaf_params.serial_number = Some(SerialNumber::from(42_u64));
+        leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        let leaf = leaf_params
+            .signed_by(&KeyPair::generate().expect("leaf key"), &root)
+            .expect("leaf certificate");
+        let now = time::OffsetDateTime::now_utc();
+        let crl = rcgen::CertificateRevocationListParams {
+            this_update: now - time::Duration::days(1),
+            next_update: now + time::Duration::days(1),
+            crl_number: SerialNumber::from(1_u64),
+            issuing_distribution_point: None,
+            revoked_certs: vec![rcgen::RevokedCertParams {
+                serial_number: SerialNumber::from(42_u64),
+                revocation_time: now - time::Duration::hours(1),
+                reason_code: None,
+                invalidity_date: None,
+            }],
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        }
+        .signed_by(&root)
+        .expect("signed CRL");
+        let resources = ResourcePolicy::default();
+        let mut inventory = KeyInventory::default();
+        inventory
+            .add_public_der("leaf".into(), leaf.der().to_vec(), &resources)
+            .expect("leaf imports");
+        inventory
+            .add_certificate_der(root.der().to_vec(), true, &resources)
+            .expect("root imports");
+        let policy = crate::policy::VerificationPolicy {
+            key_trust: crate::policy::KeyTrustPolicy {
+                verify_x509_chains: true,
+                check_crls: true,
+                verification_time: Some(std::time::SystemTime::now()),
+                ..crate::policy::KeyTrustPolicy::default()
+            },
+            ..crate::policy::VerificationPolicy::default()
+        };
+        let mut info = KeyInfo {
+            sources: vec![KeyInfoSource::KeyName("leaf".into())],
+        };
+        let resolver = inventory.verification_resolver();
+        assert!(
+            resolver
+                .resolve_with_policy_and_provider(
+                    Some(&info),
+                    SignatureAlgorithm::EcdsaSha256,
+                    &policy,
+                    crate::provider::default_provider()
+                )
+                .expect("unrevoked chain resolves")
+                .is_some()
+        );
+        info.sources.push(KeyInfoSource::X509Data(X509DataInfo {
+            crls: vec![crl.der().to_vec()],
+            ..X509DataInfo::default()
+        }));
+        let error = resolver
+            .resolve_with_policy_and_provider(
+                Some(&info),
+                SignatureAlgorithm::EcdsaSha256,
+                &policy,
+                crate::provider::default_provider(),
+            )
+            .err()
+            .expect("document CRL revokes leaf");
+        assert!(
+            error
+                .to_string()
+                .contains("certificate at chain position 0 is revoked"),
+            "{error}"
+        );
+        let mut bounded = policy.clone();
+        bounded.resources.max_external_resource_total_bytes =
+            leaf.der().len() + root.der().len() + crl.der().len() - 1;
+        assert!(matches!(
+            resolver.resolve_with_policy_and_provider(
+                Some(&info),
+                SignatureAlgorithm::EcdsaSha256,
+                &bounded,
+                crate::provider::default_provider()
+            ),
+            Err(DsigError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                    ..
+                }
+            ))
+        ));
+        bounded.key_trust.check_crls = false;
+        assert!(
+            resolver
+                .resolve_with_policy_and_provider(
+                    Some(&info),
+                    SignatureAlgorithm::EcdsaSha256,
+                    &bounded,
+                    crate::provider::default_provider()
+                )
+                .expect("disabled CRL checks do not load CRLs")
+                .is_some()
+        );
+    }
+
+    #[test]
     fn named_certificate_resolution_enforces_inventory_crl() {
         // A KeyName must not drop caller-supplied revocation evidence.
         fn cert(pem: &[u8]) -> Vec<u8> {
@@ -4051,6 +4190,101 @@ mod tests {
                 actual: 6,
             })
         ));
+    }
+
+    #[test]
+    fn selected_key_value_is_one_resource() {
+        // Representation must not split one key into separately bounded
+        // components; exact boundaries remain accepted for all KeyValue kinds.
+        for value in [
+            KeyValueInfo::Rsa {
+                modulus: vec![1; 256],
+                exponent: vec![1; 3],
+            },
+            KeyValueInfo::Dsa {
+                p: Some(vec![1; 64]),
+                q: Some(vec![1; 16]),
+                g: Some(vec![1; 64]),
+                y: vec![1; 64],
+            },
+            KeyValueInfo::Ec {
+                curve_oid: "1.2.840.10045.3.1.7".into(),
+                public_key: vec![1; 65],
+            },
+        ] {
+            let info = KeyInfo {
+                sources: vec![KeyInfoSource::KeyValue(value)],
+            };
+            let size =
+                check_selected_public_material(&info, &ResourcePolicy::default()).expect("size");
+            let resources = ResourcePolicy {
+                max_external_resource_bytes: size,
+                ..ResourcePolicy::default()
+            };
+            assert_eq!(
+                check_selected_public_material(&info, &resources).expect("exact limit"),
+                size
+            );
+            let resources = ResourcePolicy {
+                max_external_resource_bytes: size - 1,
+                ..resources
+            };
+            assert!(matches!(check_selected_public_material(&info, &resources),
+                Err(DsigError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES, actual, ..
+                })) if actual == size));
+        }
+    }
+
+    #[test]
+    fn named_verification_bounds_complete_key_value() {
+        // A broadly imported XML key must obey the tighter operation snapshot
+        // before the resolver constructs an SPKI from its components.
+        use rsa::{pkcs8::DecodePublicKey as _, traits::PublicKeyParts as _};
+        let public = RsaPublicKey::from_public_key_pem(include_str!(
+            "../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"
+        ))
+        .expect("RSA fixture");
+        let modulus = public.n().to_be_bytes_trimmed_vartime();
+        let exponent = public.e().to_be_bytes_trimmed_vartime();
+        let size = modulus.len() + exponent.len();
+        let base64 = base64::engine::general_purpose::STANDARD;
+        let xml = format!(
+            "<Keys xmlns=\"{XMLSEC_NS}\"><KeyInfo xmlns=\"{XMLDSIG_NS}\"><KeyName>named</KeyName><KeyValue><RSAKeyValue><Modulus>{}</Modulus><Exponent>{}</Exponent></RSAKeyValue></KeyValue></KeyInfo></Keys>",
+            base64.encode(modulus),
+            base64.encode(exponent)
+        );
+        let inventory = KeyInventory::from_xml_bytes(
+            xml.as_bytes(),
+            &xml_policy(ResourcePolicy::default()),
+            XmlBackend::default(),
+        )
+        .expect("broad import");
+        let info = KeyInfo {
+            sources: vec![KeyInfoSource::KeyName("named".into())],
+        };
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_external_resource_bytes = size;
+        assert!(
+            inventory
+                .verification_resolver()
+                .resolve_with_policy_and_provider(
+                    Some(&info),
+                    SignatureAlgorithm::RsaSha256,
+                    &policy,
+                    crate::provider::default_provider()
+                )
+                .expect("exact complete-key limit")
+                .is_some()
+        );
+        policy.resources.max_external_resource_bytes = size - 1;
+        assert!(
+            matches!(inventory.verification_resolver().resolve_with_policy_and_provider(Some(&info), SignatureAlgorithm::RsaSha256,
+            &policy, crate::provider::default_provider()),
+            Err(DsigError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES, actual, ..
+            })) if actual == size)
+        );
     }
 
     #[test]
@@ -4491,6 +4725,106 @@ mod tests {
             )
             .expect_err("oversized DSA parameter must fail preflight");
         assert!(error.to_string().contains("safety limit"), "{error}");
+    }
+
+    #[test]
+    fn compressed_ec_spki_cannot_acquire_verify_usage() {
+        // Import must enforce the same SEC1 profile as signature verification,
+        // for every supported curve, rather than grant unusable VERIFY usage.
+        for pem in [
+            include_bytes!("../tests/fixtures/keys/ec/ec-prime256v1-pubkey.pem").as_slice(),
+            include_bytes!("../tests/fixtures/keys/ec/ec-prime384v1-pubkey.pem").as_slice(),
+            include_bytes!("../tests/fixtures/keys/ec/ec-prime521v1-pubkey.pem").as_slice(),
+        ] {
+            let original =
+                single_pem_block(pem, ResourcePolicy::default().max_external_resource_bytes)
+                    .expect("EC fixture")
+                    .into_contents();
+            let spki = rsa::pkcs8::SubjectPublicKeyInfoRef::from_der(&original).expect("SPKI");
+            let point = spki
+                .subject_public_key
+                .as_bytes()
+                .expect("octet-aligned point");
+            let coordinate_len = (point.len() - 1) / 2;
+            let mut compressed = vec![2 | (point.last().expect("Y coordinate") & 1)];
+            compressed.extend_from_slice(&point[1..=coordinate_len]);
+            let encoded = der::Encode::to_der(&rsa::pkcs8::SubjectPublicKeyInfoRef {
+                algorithm: spki.algorithm,
+                subject_public_key: der::asn1::BitStringRef::from_bytes(&compressed)
+                    .expect("point"),
+            })
+            .expect("compressed SPKI");
+            let mut inventory = KeyInventory::default();
+            assert!(
+                inventory
+                    .add_public_der("compressed".into(), encoded, &ResourcePolicy::default())
+                    .is_err()
+            );
+            assert!(inventory.public_keys().is_empty());
+            inventory
+                .add_public_der("uncompressed".into(), original, &ResourcePolicy::default())
+                .expect("supported uncompressed encoding remains usable");
+        }
+        // A genuinely signed certificate wrapper must not bypass this profile.
+        struct CompressedPoint<'a>(&'a [u8], &'static rcgen::SignatureAlgorithm);
+        impl rcgen::PublicKeyData for CompressedPoint<'_> {
+            fn der_bytes(&self) -> &[u8] {
+                self.0
+            }
+            fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
+                self.1
+            }
+        }
+        let mut root_params = rcgen::CertificateParams::new(Vec::new()).expect("root params");
+        root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let root = rcgen::CertifiedIssuer::self_signed(
+            root_params,
+            rcgen::KeyPair::generate().expect("root key"),
+        )
+        .expect("root certificate");
+        for (pem, algorithm) in [
+            (
+                include_bytes!("../tests/fixtures/keys/ec/ec-prime256v1-cert.pem").as_slice(),
+                &rcgen::PKCS_ECDSA_P256_SHA256,
+            ),
+            (
+                include_bytes!("../tests/fixtures/keys/ec/ec-prime384v1-cert.pem").as_slice(),
+                &rcgen::PKCS_ECDSA_P384_SHA384,
+            ),
+        ] {
+            let original =
+                single_pem_block(pem, ResourcePolicy::default().max_external_resource_bytes)
+                    .expect("certificate fixture")
+                    .into_contents();
+            let (_, certificate) = X509Certificate::from_der(&original).expect("certificate");
+            let point = certificate.public_key().subject_public_key.data.as_ref();
+            let coordinate_len = (point.len() - 1) / 2;
+            let mut compressed = vec![2 | (point.last().expect("Y coordinate") & 1)];
+            compressed.extend_from_slice(&point[1..=coordinate_len]);
+            let leaf = rcgen::CertificateParams::new(Vec::new())
+                .expect("leaf params")
+                .signed_by(&CompressedPoint(&compressed, algorithm), &root)
+                .expect("signed compressed certificate");
+            let encoded = leaf.der().to_vec();
+            let mut inventory = KeyInventory::default();
+            assert!(
+                inventory
+                    .add_public_der(
+                        "compressed-cert".into(),
+                        encoded,
+                        &ResourcePolicy::default()
+                    )
+                    .is_err()
+            );
+            assert!(inventory.public_keys().is_empty());
+            inventory
+                .add_public_der(
+                    "uncompressed-cert".into(),
+                    original,
+                    &ResourcePolicy::default(),
+                )
+                .expect("uncompressed certificate imports");
+        }
     }
 
     #[test]

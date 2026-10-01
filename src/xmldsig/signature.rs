@@ -985,7 +985,7 @@ fn parse_der_length(input: &[u8]) -> Option<Result<(usize, &[u8]), ()>> {
     Some(Ok((declared_len, remainder)))
 }
 
-fn validate_ec_public_key_encoding(
+pub(crate) fn validate_ec_public_key_encoding(
     ec: &ECPoint<'_>,
     public_key_bytes: &[u8],
 ) -> Result<(), SignatureVerificationError> {
@@ -995,6 +995,9 @@ fn validate_ec_public_key_encoding(
         .and_then(|len| len.checked_add(1))
         .ok_or(SignatureVerificationError::InvalidKeyDer)?;
 
+    // RFC 5480 §2.2 permits, but does not require, compressed points:
+    // https://www.rfc-editor.org/rfc/rfc5480.html#section-2.2 . This implementation
+    // uses the uncompressed profile consistently for import and verification.
     let is_uncompressed_sec1 =
         public_key_bytes.len() == expected_len && public_key_bytes.first() == Some(&0x04);
     if !is_uncompressed_sec1 {

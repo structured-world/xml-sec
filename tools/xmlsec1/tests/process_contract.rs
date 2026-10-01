@@ -3882,6 +3882,44 @@ fn lax_store_rsa_recipients_consume_distinct_candidates() {
             assert_eq!(result.stdout, b"distinct store recipients");
         }
     }
+    // A stale later name must not reserve a key contradicted by its RSA
+    // metadata: the unnamed first slot needs a, and the later slot needs b.
+    let first_info = entries[0].replace("<KeyName>a</KeyName>", "");
+    let second_info = entries[1].replace("<KeyName>b</KeyName>", "<KeyName>a</KeyName>");
+    let recipients = [first_info, second_info].into_iter().map(|info| format!(
+        "<EncryptedKey><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#rsa-oaep\"/>{info}<CipherData><CipherValue/></CipherData></EncryptedKey>"
+    )).collect::<String>();
+    fs::write(&template, format!("<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><ds:KeyInfo>{recipients}</ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>")).unwrap();
+    let result = encrypt(&encrypted);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let xml = fs::read_to_string(&encrypted).unwrap();
+    let document = roxmltree::Document::parse(&xml).unwrap();
+    assert_eq!(
+        document
+            .descendants()
+            .filter(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyName")))
+            .map(|node| node.text().unwrap())
+            .collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    for bits in [2048, 4096] {
+        let decrypted = Command::new(binary())
+            .args(["decrypt", "--lax-key-search", "--privkey-pem"])
+            .arg(project_root().join(format!("tests/fixtures/keys/rsa/rsa-{bits}-key.pem")))
+            .arg(&encrypted)
+            .output()
+            .unwrap();
+        assert!(
+            decrypted.status.success(),
+            "{}",
+            String::from_utf8_lossy(&decrypted.stderr)
+        );
+        assert_eq!(decrypted.stdout, b"distinct store recipients");
+    }
     for (names, single_key) in [(vec![None, None, None], false), (vec![None, None], true)] {
         if single_key {
             fs::write(

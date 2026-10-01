@@ -16,9 +16,9 @@ use zeroize::Zeroizing;
 use super::signature::{
     decode_dsa_verifying_key, signature_value_matches_spki,
     signature_value_matches_spki_with_encoding, validate_dsa_signature_spki_with_minimum,
-    validate_rsa_signature_spki_with_minimum, verify_dsa_signature_spki_primitive,
-    verify_dsa_signature_spki_with_minimum, verify_rsa_signature_spki_primitive,
-    verify_rsa_signature_spki_with_minimum,
+    validate_ec_public_key_encoding, validate_rsa_signature_spki_with_minimum,
+    verify_dsa_signature_spki_primitive, verify_dsa_signature_spki_with_minimum,
+    verify_rsa_signature_spki_primitive, verify_rsa_signature_spki_with_minimum,
 };
 use super::{
     DsigError, KeyInfo, KeyInfoSource, KeyResolver, KeyValueInfo, SignatureAlgorithm, VerifyingKey,
@@ -1421,12 +1421,14 @@ fn validate_spki_algorithm(
             | SignatureAlgorithm::EcdsaSha256
             | SignatureAlgorithm::EcdsaSha384
             | SignatureAlgorithm::EcdsaSha512,
-            PublicKey::EC(_),
+            PublicKey::EC(ec),
         ) if matches!(
             curve_oid.as_deref(),
             Some(EC_P256_OID | EC_P384_OID | EC_P521_OID)
         ) =>
         {
+            validate_ec_public_key_encoding(&ec, spki.subject_public_key.data.as_ref())
+                .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
             validate_ec_point(curve_oid.as_deref(), spki.subject_public_key.data.as_ref())?;
             Ok(())
         }
@@ -1453,7 +1455,9 @@ pub(crate) fn supported_parsed_spki_is_rsa(
                 .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
             Ok(false)
         }
-        PublicKey::EC(_) => {
+        PublicKey::EC(ec) => {
+            validate_ec_public_key_encoding(&ec, spki.subject_public_key.data.as_ref())
+                .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
             let curve_oid = spki
                 .algorithm
                 .parameters
