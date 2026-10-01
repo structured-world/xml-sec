@@ -693,11 +693,25 @@ fn encrypted_content<'a>(
         return malformed();
     }
     let mut data = Reader(encoded.value);
-    if data.integer()? != 0 {
+    let version = data.integer()?;
+    let mut info = Reader(data.take(0x30)?.value);
+    let attributes_present = !data.0.is_empty();
+    if attributes_present {
+        let attributes = data.take(0xa1)?;
+        // UnprotectedAttributes is SET SIZE (1..MAX) OF Attribute (6.1).
+        // https://www.rfc-editor.org/rfc/rfc5652#section-6.1
+        if attributes.value.is_empty() {
+            return malformed();
+        }
+        validate_attributes(Reader(attributes.value))?;
+    }
+    data.finish()?;
+    // RFC 5652 8: version is 2 with unprotectedAttrs, otherwise 0.
+    // Unknown metadata does not affect key selection, but must be well framed.
+    // https://www.rfc-editor.org/rfc/rfc5652#section-8
+    if version != if attributes_present { 2 } else { 0 } {
         return malformed();
     }
-    let mut info = Reader(data.take(0x30)?.value);
-    data.finish()?;
     if info.oid()? != DATA {
         return malformed();
     }
@@ -762,10 +776,11 @@ fn validate_attribute_values(mut bytes: &[u8], depth: usize) -> Result<()> {
 }
 
 fn validate_attributes(mut attributes: Reader<'_>) -> Result<()> {
-    // RFC 7292 4.2 defines each optional PKCS12Attribute as an OID and
+    // RFC 7292 4.2 and RFC 5652 10.2.1 define attributes as an OID and
     // a SET OF values. Ignoring an attribute's meaning does not waive its
     // framing; validate without retaining or decoding the metadata.
     // https://www.rfc-editor.org/rfc/rfc7292#section-4.2
+    // https://www.rfc-editor.org/rfc/rfc5652#section-10.2.1
     while !attributes.0.is_empty() {
         let mut attribute = Reader(attributes.take(0x30)?.value);
         attribute.oid()?;
@@ -773,6 +788,142 @@ fn validate_attributes(mut attributes: Reader<'_>) -> Result<()> {
         attribute.finish()?;
     }
     Ok(())
+}
+
+fn der_header_length(length: usize) -> usize {
+    if length < 128 {
+        2
+    } else {
+        2 + (usize::BITS - length.leading_zeros()).div_ceil(8) as usize
+    }
+}
+
+fn append_der_header(output: &mut Vec<u8>, tag: u8, length: usize) {
+    output.push(tag);
+    if length < 128 {
+        output.push(length as u8);
+    } else {
+        let bytes = length.to_be_bytes();
+        let first = bytes
+            .iter()
+            .position(|byte| *byte != 0)
+            .unwrap_or(bytes.len());
+        output.push(0x80 | (bytes.len() - first) as u8);
+        output.extend_from_slice(&bytes[first..]);
+    }
+}
+
+// AlgorithmIdentifier parameters used by supported keys are primitive values
+// or a SEQUENCE of integers (DSA). Normalize framing without a heap object tree.
+fn parameter_length(value: Tlv<'_>, depth: usize) -> Result<usize> {
+    let length = parameter_body_length(value, depth)?;
+    length
+        .checked_add(der_header_length(length))
+        .ok_or(KeyStoreError::ProtectedContainer)
+}
+
+fn parameter_body_length(value: Tlv<'_>, depth: usize) -> Result<usize> {
+    if depth >= crate::hard_limits::PKCS12_NESTING_CEILING || value.tag & 0x1f == 0x1f {
+        return malformed();
+    }
+    let mut length = value.value.len();
+    if value.tag & 0x20 != 0 {
+        if value.tag != 0x30 {
+            return malformed();
+        }
+        length = 0;
+        let mut children = value.value;
+        while !children.is_empty() {
+            let (child, rest) = tlv(children, depth + 1)?;
+            length = length
+                .checked_add(parameter_length(child, depth + 1)?)
+                .ok_or(KeyStoreError::ProtectedContainer)?;
+            children = rest;
+        }
+    }
+    Ok(length)
+}
+
+fn append_parameter(output: &mut Vec<u8>, value: Tlv<'_>, depth: usize) -> Result<()> {
+    let body = parameter_body_length(value, depth)?;
+    append_der_header(output, value.tag, body);
+    if value.tag == 0x30 {
+        let mut children = value.value;
+        while !children.is_empty() {
+            let (child, rest) = tlv(children, depth + 1)?;
+            append_parameter(output, child, depth + 1)?;
+            children = rest;
+        }
+    } else {
+        output.extend_from_slice(value.value);
+    }
+    Ok(())
+}
+
+fn normalize_private_key(bytes: &[u8], budget: &mut Budget<'_>) -> Result<Zeroizing<Vec<u8>>> {
+    use der::Decode as _;
+    if pkcs8::PrivateKeyInfoRef::from_der(bytes).is_ok() {
+        return budget.copy(bytes);
+    }
+    // RFC 7292 4/4.2.1 permits BER KeyBag PrivateKeyInfo. Rebuild its
+    // framing and flatten OCTET STRING fragments before DER-only decoding.
+    // Attributes are ignored by the key decoder, but validated before discard.
+    // https://www.rfc-editor.org/rfc/rfc7292#section-4.2.1
+    let mut key = Reader::sequence(bytes)?;
+    let version = key.integer()?;
+    if version > 1 {
+        return malformed();
+    }
+    let algorithm = key.take(0x30)?;
+    let (secret, rest) = tlv(key.0, 0)?;
+    key.0 = rest;
+    let mut secret_length = 0usize;
+    octet_visit(secret, 4, 0, &mut |part| {
+        secret_length = secret_length
+            .checked_add(part.len())
+            .ok_or(KeyStoreError::ProtectedContainer)?;
+        Ok(())
+    })?;
+    if key.0.first() == Some(&0xa0) {
+        validate_attributes(Reader(key.take(0xa0)?.value))?;
+    }
+    let public = if !key.0.is_empty() {
+        Some(key.take(0x81)?)
+    } else {
+        None
+    };
+    key.finish()?;
+    if (version == 1) != public.is_some() {
+        return malformed();
+    }
+    let public_length = public.map_or(0, |value| {
+        value.value.len() + der_header_length(value.value.len())
+    });
+    let body_length = 3usize
+        .checked_add(parameter_length(algorithm, 0)?)
+        .and_then(|length| length.checked_add(secret_length))
+        .and_then(|length| length.checked_add(der_header_length(secret_length)))
+        .and_then(|length| length.checked_add(public_length))
+        .ok_or(KeyStoreError::ProtectedContainer)?;
+    let length = body_length
+        .checked_add(der_header_length(body_length))
+        .ok_or(KeyStoreError::ProtectedContainer)?;
+    budget.allocate(length)?;
+    let mut output = Zeroizing::new(Vec::with_capacity(length));
+    append_der_header(&mut output, 0x30, body_length);
+    output.extend_from_slice(&[2, 1, version as u8]);
+    append_parameter(&mut output, algorithm, 0)?;
+    append_der_header(&mut output, 4, secret_length);
+    octet_visit(secret, 4, 0, &mut |part| {
+        output.extend_from_slice(part);
+        Ok(())
+    })?;
+    if let Some(public) = public {
+        append_der_header(&mut output, 0x81, public.value.len());
+        output.extend_from_slice(public.value);
+    }
+    pkcs8::PrivateKeyInfoRef::from_der(&output).map_err(|_| KeyStoreError::ProtectedContainer)?;
+    Ok(output)
 }
 
 fn safe_contents(
@@ -811,9 +962,16 @@ fn safe_contents(
                 }
                 budget.allocate(core::mem::size_of::<Zeroizing<Vec<u8>>>())?;
                 contents.private_keys.reserve_exact(1);
-                contents
-                    .private_keys
-                    .push(encryption.decrypt(&encrypted, password, budget)?);
+                let plaintext = encryption.decrypt(&encrypted, password, budget)?;
+                use der::Decode as _;
+                let private_key = if pkcs8::PrivateKeyInfoRef::from_der(&plaintext).is_ok() {
+                    plaintext
+                } else {
+                    let normalized = normalize_private_key(&plaintext, budget)?;
+                    budget.memory -= plaintext.capacity();
+                    normalized
+                };
+                contents.private_keys.push(private_key);
             }
             encrypted.release(budget);
             encryption.salt.release(budget);
@@ -826,7 +984,9 @@ fn safe_contents(
                 }
                 budget.allocate(core::mem::size_of::<Zeroizing<Vec<u8>>>())?;
                 contents.private_keys.reserve_exact(1);
-                contents.private_keys.push(budget.copy(value)?);
+                contents
+                    .private_keys
+                    .push(normalize_private_key(value, budget)?);
             }
         } else if oid == pkcs12::PKCS_12_CERT_BAG_OID {
             let mut cert = Reader::sequence(value)?;
@@ -1011,6 +1171,112 @@ mod tests {
             resources: ResourcePolicy::default(),
             candidates,
             memory_available: ResourcePolicy::default().max_external_resource_total_bytes,
+        }
+    }
+
+    #[test]
+    fn ber_private_key_info_is_normalized_before_storage() {
+        // KeyBag inherits the PFX BER contract; an indefinite SEQUENCE and
+        // constructed OCTET STRING must reach the DER-only key decoder intact.
+        let der = sequence(&[
+            integer(0),
+            sequence(&[
+                oid(rsa::pkcs8::spki::ObjectIdentifier::new_unwrap(
+                    "1.2.840.113549.1.1.1",
+                )),
+                encoded(5, &[]),
+            ]),
+            encoded(4, b"private"),
+        ]);
+        let mut ber = vec![0x30, 0x80];
+        ber.extend(integer(0));
+        ber.extend(sequence(&[
+            oid(Oid::new_unwrap("1.2.840.113549.1.1.1")),
+            encoded(5, &[]),
+        ]));
+        ber.extend([
+            0x24, 0x80, 4, 3, b'p', b'r', b'i', 4, 4, b'v', b'a', b't', b'e', 0, 0, 0, 0,
+        ]);
+        let bytes = pfx(&[data(&sequence(&[bag(pkcs12::PKCS_12_KEY_BAG_OID, &ber)]))]);
+        let limits = limits(64);
+        let imported = prepare(&bytes, &limits)
+            .expect("BER preflight")
+            .decrypt("secret")
+            .expect("BER key import");
+        assert_eq!(&*imported.private_keys[0], &der);
+        let mut tight = limits;
+        tight.memory_available = der.len() - 1;
+        let mut budget = Budget::new(&tight);
+        assert!(matches!(
+            normalize_private_key(&ber, &mut budget),
+            Err(KeyStoreError::Policy(_))
+        ));
+        assert_eq!(budget.memory, 0, "denial precedes output allocation");
+    }
+
+    #[test]
+    fn ber_key_bag_reaches_public_inventory() {
+        // Public import must normalize the actual key, not merely accept BER
+        // framing in preflight and fail in the later PKCS#8 decoder.
+        let private = pem::parse(include_bytes!(
+            "../../tests/fixtures/keys/rsa/rsa-2048-key.pem"
+        ))
+        .expect("PKCS#8 fixture")
+        .into_contents();
+        let sequence_value = tlv(&private, 0).expect("PrivateKeyInfo sequence").0;
+        let mut ber = vec![0x30, 0x80];
+        ber.extend_from_slice(sequence_value.value);
+        ber.extend_from_slice(&[0, 0]);
+        let bytes = pfx(&[data(&sequence(&[bag(pkcs12::PKCS_12_KEY_BAG_OID, &ber)]))]);
+        let mut inventory = crate::key_manager::KeyInventory::default();
+        inventory
+            .add_pkcs12(
+                "signer".into(),
+                &bytes,
+                "secret",
+                &ResourcePolicy::default(),
+            )
+            .expect("public BER import");
+        assert_eq!(inventory.private_keys().len(), 1);
+    }
+
+    #[test]
+    fn encrypted_data_version_tracks_unprotected_attributes() {
+        // CMS version 2 is required exactly when [1] attributes are present.
+        // Validate them before password processing, including malformed tails.
+        let algorithm = sequence(&[
+            oid(pkcs12::PKCS_12_PBE_WITH_SHAAND3_KEY_TRIPLE_DES_CBC),
+            sequence(&[encoded(4, b"12345678"), integer(2)]),
+        ]);
+        let info = sequence(&[oid(DATA), algorithm, encoded(0x80, &[0; 8])]);
+        let attribute = sequence(&[
+            oid(Oid::new_unwrap("1.2.3.4")),
+            encoded(0x31, &encoded(4, b"value")),
+        ]);
+        for (version, attrs, accepted) in [
+            (0, None, true),
+            (2, Some(attribute.clone()), true),
+            (0, Some(attribute), false),
+            (2, None, false),
+            (2, Some(Vec::new()), false),
+            (2, Some(vec![0xff]), false),
+        ] {
+            let mut parts = vec![integer(version), info.clone()];
+            if let Some(attrs) = attrs {
+                parts.push(encoded(0xa1, &attrs));
+            }
+            let limits = limits(64);
+            let mut budget = Budget::new(&limits);
+            let bytes = sequence(&parts);
+            assert_eq!(
+                encrypted_content(
+                    tlv(&bytes, 0).expect("EncryptedData sequence").0,
+                    &mut budget
+                )
+                .is_ok(),
+                accepted,
+                "version {version}"
+            );
         }
     }
 

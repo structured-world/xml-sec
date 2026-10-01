@@ -6333,6 +6333,51 @@ fn lax_rsa_search_skips_candidates_that_conflict_with_recipient_metadata() {
 }
 
 #[test]
+fn lax_stored_rsa_encryption_stops_on_policy_denial() {
+    // A stored weak recipient is a typed policy failure, not a candidate miss;
+    // a later strong key must not suppress it or produce encrypted output.
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("keys.xml");
+    let template = temp.path().join("template.xml");
+    let plaintext = temp.path().join("plain.bin");
+    let output = temp.path().join("encrypted.xml");
+    let weak = RsaPrivateKey::new(&mut ChaCha8Rng::from_seed([0x72; 32]), 1024)
+        .unwrap()
+        .to_public_key();
+    let strong = RsaPublicKey::from_public_key_pem(
+        &fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"))
+            .unwrap(),
+    )
+    .unwrap();
+    let mut xml = String::from("<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\">");
+    for (name, key) in [("weak", weak), ("strong", strong)] {
+        xml.push_str(&format!("<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>{name}</KeyName><KeyValue><RSAKeyValue><Modulus>{}</Modulus><Exponent>{}</Exponent></RSAKeyValue></KeyValue></KeyInfo>", base64::engine::general_purpose::STANDARD.encode(key.n().to_be_bytes_trimmed_vartime()), base64::engine::general_purpose::STANDARD.encode(key.e().to_be_bytes_trimmed_vartime())));
+    }
+    xml.push_str("</Keys>");
+    fs::write(&store, xml).unwrap();
+    fs::write(&template, r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep"/><ds:KeyInfo><ds:KeyName>missing</ds:KeyName></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#).unwrap();
+    fs::write(&plaintext, b"policy denial is terminal").unwrap();
+    let result = Command::new(binary())
+        .args(["encrypt", "--lax-key-search", "--keys-file"])
+        .arg(&store)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&output)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr)
+            .contains("requires RSA keys between 2048 and 8192 bits: got 1024"),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!output.exists());
+}
+
+#[test]
 fn lax_rsa_encryption_skips_keys_rejected_by_policy() {
     // Lax lookup searches for a usable RSA recipient. A parseable weak key must
     // not prevent a later policy-compliant key from reaching encryption.

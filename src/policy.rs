@@ -1348,6 +1348,16 @@ mod tests {
                 |p| &mut p.max_key_candidates,
             ),
             (
+                resource_name::KEY_IMPORT_KDF_WORK,
+                crate::hard_limits::KEY_IMPORT_KDF_WORK_CEILING as usize,
+                |p| &mut p.max_key_import_kdf_work,
+            ),
+            (
+                resource_name::KEY_IMPORT_KDF_MEMORY,
+                crate::hard_limits::KEY_IMPORT_KDF_MEMORY_CEILING,
+                |p| &mut p.max_key_import_kdf_memory_bytes,
+            ),
+            (
                 resource_name::KEY_INFO_REFERENCE_DEPTH,
                 crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING,
                 |p| &mut p.max_key_info_reference_depth,

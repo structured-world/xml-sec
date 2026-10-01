@@ -1897,8 +1897,7 @@ impl KeyResolver for CandidateVerificationResolver {
     ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
         validate_verification_candidate_count(self.candidates.len(), policy)?;
         policy.validate()?;
-        let mut candidate_budget =
-            InspectedKeyCandidateBudget::new(policy.resources.max_key_candidates);
+        let mut candidate_budget = InspectedKeyCandidateBudget::new(policy);
         let document_crls = key_info
             .into_iter()
             .flat_map(|info| &info.sources)
@@ -2386,6 +2385,9 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                     Ok(candidate) => {
                         selected = Some((entry, candidate));
                         break;
+                    }
+                    Err(error @ CommandError::KeyStore(key_manager::KeyStoreError::Policy(_))) => {
+                        return Err(error);
                     }
                     Err(error) => last_error = Some(error),
                 }
@@ -4489,8 +4491,9 @@ mod tests {
     }
 
     #[test]
-    fn cli_lax_store_encryption_skips_ineligible_rsa_key() {
-        // A 1024-bit donor key precedes a policy-eligible 2048-bit key.
+    fn cli_lax_store_encryption_preserves_policy_denial() {
+        // Policy denials are terminal even when a later key is eligible.
+        // A compliant-only inventory must still complete the round-trip.
         let temp = tempfile::tempdir().expect("temporary test directory");
         let template_path = temp.path().join("template.xml");
         let input_path = temp.path().join("input.bin");
@@ -4535,8 +4538,26 @@ mod tests {
             template_path.to_str().expect("template path is UTF-8"),
         ];
         let mut output = Vec::new();
+        assert!(matches!(
+            execute(invocation(&args), &mut output, &mut Vec::new()),
+            Err(CommandError::KeyStore(key_manager::KeyStoreError::Policy(
+                xml_sec::policy::PolicyViolation::KeySize {
+                    operation: "encryption",
+                    key_type: "RSA",
+                    minimum_bits: 2048,
+                    maximum_bits: 8192,
+                    actual_bits: 1024,
+                }
+            )))
+        ));
+        assert!(output.is_empty());
+        fs::write(
+            &store_path,
+            format!("<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\">{extra}</Keys>"),
+        )
+        .expect("compliant-only store");
         execute(invocation(&args), &mut output, &mut Vec::new())
-            .expect("lax search skips RSA-1024 before RSA-2048");
+            .expect("lax search selects the compliant RSA key");
         assert!(String::from_utf8_lossy(&output).contains("CipherValue"));
         let encrypted = temp.path().join("encrypted.xml");
         fs::write(&encrypted, &output).expect("write encrypted output");

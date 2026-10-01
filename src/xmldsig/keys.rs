@@ -480,11 +480,11 @@ pub struct InspectedKeyCandidateBudget {
 }
 
 impl InspectedKeyCandidateBudget {
-    /// Start an empty budget; resolution also enforces the active policy ceiling.
+    /// Start shared accounting derived solely from the operation policy.
     #[must_use]
-    pub fn new(maximum: usize) -> Self {
+    pub fn new(policy: &crate::policy::VerificationPolicy) -> Self {
         Self {
-            maximum,
+            maximum: policy.resources.max_key_candidates,
             attempted: 0,
         }
     }
@@ -1211,8 +1211,7 @@ impl KeyResolver for DefaultKeyResolver {
         algorithm: SignatureAlgorithm,
     ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
         let policy = crate::policy::VerificationPolicy::default();
-        let mut candidate_budget =
-            InspectedKeyCandidateBudget::new(policy.resources.max_key_candidates);
+        let mut candidate_budget = InspectedKeyCandidateBudget::new(&policy);
         self.resolve_with_trust(
             key_info,
             algorithm,
@@ -1244,8 +1243,7 @@ impl KeyResolver for DefaultKeyResolver {
         policy: &crate::policy::VerificationPolicy,
         provider: &dyn crate::provider::CryptoProvider,
     ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
-        let mut candidate_budget =
-            InspectedKeyCandidateBudget::new(policy.resources.max_key_candidates);
+        let mut candidate_budget = InspectedKeyCandidateBudget::new(policy);
         self.resolve_with_candidate_budget(
             key_info,
             algorithm,
@@ -1348,6 +1346,18 @@ fn dsa_key_value_to_spki_der(
     g: &[u8],
     y: &[u8],
 ) -> Result<Vec<u8>, KeyResolutionError> {
+    // Bound borrowed unsigned components before any bigint allocation or
+    // subgroup exponentiation, not only after the SPKI has been produced.
+    let trim = |bytes: &[u8]| bytes.iter().take_while(|byte| **byte == 0).count();
+    let p = &p[trim(p)..];
+    let q = &q[trim(q)..];
+    let g = &g[trim(g)..];
+    let y = &y[trim(y)..];
+    for value in [p, q, g, y] {
+        if value.is_empty() || value.len() > crate::hard_limits::DSA_KEY_COMPONENT_BYTE_CEILING {
+            return Err(KeyResolutionError::InvalidPublicKey);
+        }
+    }
     let components = dsa::Components::from_components(
         BoxedUint::from_be_slice_vartime(p),
         BoxedUint::from_be_slice_vartime(q),
@@ -1538,7 +1548,7 @@ mod tests {
 
     #[test]
     fn shared_candidate_budget_cannot_relax_active_policy() {
-        // A caller-created large budget cannot override policy, nor can a
+        // A policy-derived budget cannot override policy, nor can a
         // later tighter snapshot forget work already performed.
         let resolver = DefaultKeyResolver::new(KeyResolverConfig::default());
         let info = KeyInfo {
@@ -1546,7 +1556,7 @@ mod tests {
         };
         let mut policy = crate::policy::VerificationPolicy::default();
         policy.resources.max_key_candidates = 1;
-        let mut budget = InspectedKeyCandidateBudget::new(64);
+        let mut budget = InspectedKeyCandidateBudget::new(&policy);
         assert!(
             resolver
                 .resolve_with_candidate_budget(
@@ -1575,7 +1585,8 @@ mod tests {
                 }
             ))
         ));
-        let mut spent = InspectedKeyCandidateBudget::new(64);
+        let mut spent =
+            InspectedKeyCandidateBudget::new(&crate::policy::VerificationPolicy::default());
         spent
             .charge_many(2)
             .expect("initial budget admits two candidates");
@@ -1595,6 +1606,48 @@ mod tests {
                 }
             ))
         ));
+    }
+
+    #[test]
+    fn dsa_key_value_components_are_bounded_before_bigint_decode() {
+        // Every unsigned XML component uses the same pre-conversion ceiling;
+        // redundant zero padding must not inflate bigint precision or change it.
+        let public = dsa::VerifyingKey::from_public_key_pem(include_str!(
+            "../../tests/fixtures/keys/dsa/dsa-2048-public.pem"
+        ))
+        .expect("DSA fixture");
+        let components = public.components();
+        let values = [
+            components.p().to_be_bytes_trimmed_vartime().to_vec(),
+            components.q().to_be_bytes_trimmed_vartime().to_vec(),
+            components.g().to_be_bytes_trimmed_vartime().to_vec(),
+            public.y().to_be_bytes_trimmed_vartime().to_vec(),
+        ];
+        let expected = dsa_key_value_to_spki_der(&values[0], &values[1], &values[2], &values[3])
+            .expect("valid DSA");
+        for index in 0..4 {
+            let mut oversized = values.clone();
+            oversized[index] = vec![1; crate::hard_limits::DSA_KEY_COMPONENT_BYTE_CEILING + 1];
+            assert!(
+                dsa_key_value_to_spki_der(
+                    &oversized[0],
+                    &oversized[1],
+                    &oversized[2],
+                    &oversized[3]
+                )
+                .is_err()
+            );
+        }
+        let padded = values.map(|value| {
+            let mut padded = vec![0; 1024];
+            padded.extend(value);
+            padded
+        });
+        assert_eq!(
+            dsa_key_value_to_spki_der(&padded[0], &padded[1], &padded[2], &padded[3])
+                .expect("zero padding preserves unsigned DSA value"),
+            expected
+        );
     }
 
     #[test]

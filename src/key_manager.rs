@@ -354,8 +354,7 @@ impl<'a> KeyResolver for InventoryVerificationResolver<'a> {
         }
         let mut candidate: Option<&StoredPublicKey> = None;
         let mut secret_candidate: Option<&StoredSymmetricKey> = None;
-        let mut inspected_candidates =
-            InspectedKeyCandidateBudget::new(policy.resources.max_key_candidates);
+        let mut inspected_candidates = InspectedKeyCandidateBudget::new(policy);
         for name in key_info
             .into_iter()
             .flat_map(|info| &info.sources)

@@ -102,6 +102,12 @@ denial is not a password error. Lax CLI verification also shares one inspection
 budget across all stored candidates and stops on a policy denial even after
 another candidate resolved. Custom bag attributes accept BER high-tag-number
 identifiers (X.690 section 8.1.2.4) without retaining their values.
+Shared XMLDSig candidate accounting is constructed from the operation's
+`VerificationPolicy`, not a separate caller-supplied numeric limit.
+BER PrivateKeyInfo framing and constructed private-key OCTET STRINGs are
+normalized to bounded PKCS#8 DER before storage. CMS EncryptedData accepts
+unprotected attributes with version 2, while requiring version 0 without them
+(RFC 5652 section 8); metadata framing is validated before password processing.
 Temporary import allocations share the aggregate allowance with material already
 retained by the inventory, and KDF workspaces are checked before derivation.
 Named direct AES keys participate only in direct content-key resolution, not
@@ -137,6 +143,12 @@ For multiple RSA encryption recipients, `--lax-key-search` prefers an exact
 name and then tries remaining compatible entries in store order. Each selected
 entry is consumed once for that operation; insufficient entries fail before
 any encrypted output is written.
+Stored RSA recipient policy denials are terminal even with `--lax-key-search`;
+they are never downgraded to a candidate mismatch. Traditional encrypted RSA,
+DSA, and EC PEM also fail terminally when CBC padding succeeds but the decoded
+key is invalid, because padding does not authenticate the decrypted bytes.
+Traditional EC PEM is decoded once before selecting a curve; all supported
+curve decoders borrow the same zeroizing plaintext buffer.
 Entries explicitly named by later recipient slots are reserved before assigning
 fallbacks only when they match that slot's key metadata. An unnamed slot cannot
 consume a later compatible exact match, but a stale name contradicted by metadata
