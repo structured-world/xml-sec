@@ -71,8 +71,11 @@ and document CRLs, with their combined resource budget checked before copying.
 `add_private_der_with_password_callback` asks the caller for a zeroizing byte
 password only for encrypted PKCS#8; plaintext input does not invoke it.
 `add_pkcs12_with_password_callback` obtains a zeroizing string password before
-decoding the bundle, after checking the encoded size and outer MAC KDF
-parameters. Other KDF parameters are checked during full decoding. A missing
+decoding the bundle, after checking encoded size, visible bag/container counts,
+and all visible MAC/encryption KDF parameters against one aggregate work budget.
+KDF parameters inside encrypted SafeContents cannot be inspected without the
+password: they are checked immediately after outer decryption, before running
+the inner derivation (RFC 7292 sections 4.1 and 4.2.2). A missing
 or wrong password returns a redacted error and never
 triggers an unprotected fallback. Oversized encoded bundles return a typed
 resource-policy error without invoking the callback.
@@ -85,6 +88,14 @@ The CLI applies the same pre-decryption KDF limits to explicit protected PKCS#8
 PEM/DER keys, including the generic private-key options, as to inventory imports.
 When the PKCS#12 parser rejects an oversized salt, that distinct resource
 rejection also returns a typed policy error.
+The importer uses RustCrypto primitives with borrowed BER views; it supports
+PBES2/PBKDF2 with AES-CBC and legacy SHA-1/3DES containers, plus SHA-1/SHA-2 MACs.
+Private keys and decrypted temporary buffers are zeroized. Nested safe bags
+share the same candidate and KDF budgets; a count denial is not a password error.
+Temporary import allocations share the aggregate allowance with material already
+retained by the inventory, and KDF workspaces are checked before derivation.
+Named direct AES keys participate only in direct content-key resolution, not
+in recipient-key unwrapping, so recipient hints cannot duplicate their candidate.
 
 ```rust
 use xml_sec::key_manager::{KeyInventory, KeyUsages, SymmetricKeyKind};

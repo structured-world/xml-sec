@@ -12,7 +12,8 @@ use dsa::{
     Components as DsaComponents, SigningKey as NativeDsaSigningKey,
     VerifyingKey as DsaVerifyingKey, pkcs8::EncodePrivateKey as _,
 };
-use ribergshamra_pkcs12::{Pkcs12Limits, parse_pkcs12_with_limits};
+mod pkcs12_import;
+use pkcs12_import::Limits as Pkcs12Limits;
 #[cfg(feature = "xmlenc")]
 use rsa::pkcs8::DecodePublicKey as _;
 use rsa::{
@@ -575,6 +576,42 @@ enum ParsedMaterial {
 
 type ParsedDsaKey = (KeyValueInfo, Option<Zeroizing<Vec<u8>>>);
 
+#[cfg(feature = "xmlenc")]
+struct InventoryDirectAes(Zeroizing<Vec<u8>>);
+
+#[cfg(feature = "xmlenc")]
+impl crate::xmlenc::DecryptionKeyResolver for InventoryDirectAes {
+    fn resolve_key(
+        &self,
+        _provider: &dyn crate::provider::CryptoProvider,
+        algorithm: crate::xmlenc::DataEncryptionAlgorithm,
+        encrypted_key: Option<&crate::xmlenc::EncryptedKey>,
+    ) -> Result<Vec<u8>, crate::xmlenc::XmlEncError> {
+        if encrypted_key.is_some() {
+            return Err(crate::xmlenc::XmlEncError::KeyNotFound);
+        }
+        crate::xmlenc::validate_key_len(algorithm, &self.0)?;
+        Ok(self.0.to_vec())
+    }
+
+    fn resolve_key_candidates(
+        &self,
+        provider: &dyn crate::provider::CryptoProvider,
+        algorithm: crate::xmlenc::DataEncryptionAlgorithm,
+        encrypted_key: Option<&crate::xmlenc::EncryptedKey>,
+        budget: &mut crate::xmlenc::KeyCandidateBudget,
+    ) -> Result<Vec<Vec<u8>>, crate::xmlenc::XmlEncError> {
+        // This inventory entry is a content key, not a transport key.
+        // Ineligible recipient paths neither copy it nor consume candidates.
+        if encrypted_key.is_some() {
+            return Err(crate::xmlenc::XmlEncError::KeyNotFound);
+        }
+        budget.consume(1)?;
+        self.resolve_key(provider, algorithm, None)
+            .map(|key| vec![key])
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 /// Key-store import errors that never include secret material.
 pub enum KeyStoreError {
@@ -866,9 +903,9 @@ impl KeyInventory {
                 ));
             }
             check_selected_material_size(entry.bytes.len(), &policy.resources)?;
-            return Ok(Box::new(crate::xmlenc::SymmetricKeyDecryptor::new(
+            return Ok(Box::new(InventoryDirectAes(Zeroizing::new(
                 entry.bytes.to_vec(),
-            )));
+            ))));
         }
         let entry = find_named_entry(
             &self.private_keys,
@@ -1252,9 +1289,10 @@ impl KeyInventory {
         F: FnOnce() -> Option<Zeroizing<String>>,
     {
         let limits = self.pkcs12_import_limits(&name, bytes, usages, resources)?;
-        preflight_pkcs12_outer_mac_kdf(bytes, &limits)?;
+        let prepared = pkcs12_import::prepare(bytes, &limits)?;
         let secret = password().ok_or(KeyStoreError::ProtectedContainer)?;
-        self.add_pkcs12_with_usages(name, bytes, &secret, usages, resources)
+        let contents = prepared.decrypt(&secret)?;
+        self.add_pkcs12_contents(name, bytes.len(), contents, usages, resources, false)
     }
 
     /// Import a PKCS#12 bundle with explicit signing/decryption permissions.
@@ -1274,13 +1312,24 @@ impl KeyInventory {
         name: String,
         bytes: &[u8],
         password: &str,
-        mut usages: KeyUsages,
+        usages: KeyUsages,
         resources: &ResourcePolicy,
         auto_decrypt: bool,
     ) -> Result<(), KeyStoreError> {
         let limits = self.pkcs12_import_limits(&name, bytes, usages, resources)?;
-        let mut contents = parse_pkcs12_with_limits(bytes, password, &limits)
-            .map_err(|error| classify_pkcs12_error(error, &limits))?;
+        let contents = pkcs12_import::prepare(bytes, &limits)?.decrypt(password)?;
+        self.add_pkcs12_contents(name, bytes.len(), contents, usages, resources, auto_decrypt)
+    }
+
+    fn add_pkcs12_contents(
+        &mut self,
+        name: String,
+        encoded_len: usize,
+        mut contents: pkcs12_import::Contents,
+        mut usages: KeyUsages,
+        resources: &ResourcePolicy,
+        auto_decrypt: bool,
+    ) -> Result<(), KeyStoreError> {
         if contents.private_keys.len() != 1 {
             return Err(KeyStoreError::Selection(
                 "PKCS#12 bundle must contain exactly one private key",
@@ -1351,15 +1400,19 @@ impl KeyInventory {
             .ok_or(KeyStoreError::Selection("key candidate count overflow"))?;
         let remaining_candidates = resources.max_key_candidates - self.entry_count;
         if retained_candidates > remaining_candidates {
-            return Err(KeyStoreError::Selection("key candidate limit exceeded"));
+            return Err(crate::policy::PolicyViolation::ResourceLimitExceeded {
+                resource: crate::policy::resource_name::KEY_CANDIDATES,
+                maximum: remaining_candidates,
+            }
+            .into());
         }
         self.reserve_material(
-            named_material_length(&name, decoded_bytes.max(bytes.len()), 1)?,
+            named_material_length(&name, decoded_bytes.max(encoded_len), 1)?,
             resources,
         )?;
         self.private_keys.push(StoredPrivateKey {
             name,
-            pkcs8_der: Zeroizing::new(private_key.as_ref().to_vec()),
+            pkcs8_der: private_key,
             usages,
             certificate_chain: certificates,
             has_matching_leaf,
@@ -1392,27 +1445,13 @@ impl KeyInventory {
         }
         self.check_material_capacity(named_material_length(name, bytes.len(), 1)?, resources)?;
         let remaining_candidates = resources.max_key_candidates - self.entry_count;
-        let mut limits = Pkcs12Limits::default();
-        limits.max_kdf_work = limits
-            .max_kdf_work
-            .min(resources.max_key_import_kdf_work as u64);
-        limits.max_iterations = limits
-            .max_iterations
-            .min(u32::try_from(resources.max_key_import_kdf_work).unwrap_or(u32::MAX));
-        limits.max_input_len = limits
-            .max_input_len
-            .min(resources.max_external_resource_bytes);
-        limits.max_bags = limits.max_bags.min(remaining_candidates);
-        limits.max_content_infos = limits.max_content_infos.min(remaining_candidates);
-        if bytes.len() > limits.max_input_len {
-            return Err(KeyStoreError::Policy(
-                crate::policy::PolicyViolation::ResourceLimitExceeded {
-                    resource: crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
-                    maximum: limits.max_input_len,
-                },
-            ));
-        }
-        Ok(limits)
+        Ok(Pkcs12Limits {
+            resources: resources.clone(),
+            candidates: remaining_candidates,
+            memory_available: resources.max_external_resource_total_bytes
+                - self.material_bytes
+                - name.len(),
+        })
     }
 
     fn check_new_name(&self, name: &str, resources: &ResourcePolicy) -> Result<(), KeyStoreError> {
@@ -1942,89 +1981,6 @@ fn single_pem_block(bytes: &[u8], maximum: usize) -> Result<pem::Pem, KeyStoreEr
     Ok(block)
 }
 
-fn classify_pkcs12_error(error: ribergshamra_core::Error, limits: &Pkcs12Limits) -> KeyStoreError {
-    // The donor reports KDF and salt ceilings as untyped Key errors. Match
-    // only their exact diagnostics so wrong passwords and malformed bundles
-    // stay distinct; it does not expose the observed sizes.
-    match error {
-        ribergshamra_core::Error::Key(message)
-            if message == "PKCS#12 iterations outside configured limit" =>
-        {
-            KeyStoreError::Policy(crate::policy::PolicyViolation::KdfIterationsOutsideLimit {
-                maximum: limits.max_iterations as usize,
-            })
-        }
-        ribergshamra_core::Error::Key(message) => {
-            let (resource, maximum) = match message.as_str() {
-                "PKCS#12 salt exceeds configured size limit" => {
-                    ("PKCS#12 salt bytes", limits.max_salt_len)
-                }
-                "PKCS#12 aggregate KDF work exceeds configured limit" => (
-                    crate::policy::resource_name::KEY_IMPORT_KDF_WORK,
-                    usize::try_from(limits.max_kdf_work).unwrap_or(usize::MAX),
-                ),
-                _ => return KeyStoreError::ProtectedContainer,
-            };
-            KeyStoreError::Policy(crate::policy::PolicyViolation::ResourceLimitExceeded {
-                resource,
-                maximum,
-            })
-        }
-        _ => KeyStoreError::ProtectedContainer,
-    }
-}
-
-fn preflight_pkcs12_outer_mac_kdf(
-    bytes: &[u8],
-    limits: &Pkcs12Limits,
-) -> Result<(), KeyStoreError> {
-    use x509_parser::der_parser::ber::{Tag, parse_ber_slice, parse_ber_u32};
-
-    // Preflight the outer MacData without copying or decrypting the authenticated
-    // safe. The full parser still enforces limits on its other KDF parameters.
-    let Some(iterations) = (|| {
-        let (trailing, pfx) = parse_ber_slice(bytes, Tag::Sequence).ok()?;
-        if !trailing.is_empty() {
-            return None;
-        }
-        let (pfx, version) = parse_ber_u32(pfx).ok()?;
-        if version != 3 {
-            return None;
-        }
-        let (pfx, _) = parse_ber_slice(pfx, Tag::Sequence).ok()?;
-        let (trailing, mac) = parse_ber_slice(pfx, Tag::Sequence).ok()?;
-        if !trailing.is_empty() {
-            return None;
-        }
-        let (mac, _) = parse_ber_slice(mac, Tag::Sequence).ok()?;
-        let (mac, _) = parse_ber_slice(mac, Tag::OctetString).ok()?;
-        if mac.is_empty() {
-            Some(1)
-        } else {
-            let (trailing, iterations) = parse_ber_u32(mac).ok()?;
-            trailing.is_empty().then_some(iterations)
-        }
-    })() else {
-        return Ok(());
-    };
-    if iterations == 0 || iterations > limits.max_iterations {
-        return Err(KeyStoreError::Policy(
-            crate::policy::PolicyViolation::KdfIterationsOutsideLimit {
-                maximum: limits.max_iterations as usize,
-            },
-        ));
-    }
-    if u64::from(iterations) > limits.max_kdf_work {
-        return Err(KeyStoreError::Policy(
-            crate::policy::PolicyViolation::ResourceLimitExceeded {
-                resource: crate::policy::resource_name::KEY_IMPORT_KDF_WORK,
-                maximum: usize::try_from(limits.max_kdf_work).unwrap_or(usize::MAX),
-            },
-        ));
-    }
-    Ok(())
-}
-
 fn enforce_pkcs8_kdf_policy(
     encrypted: &EncryptedPrivateKeyInfoRef<'_>,
     resources: &ResourcePolicy,
@@ -2325,44 +2281,126 @@ mod tests {
     }
 
     #[test]
-    fn pkcs12_aggregate_kdf_work_preserves_policy_error() {
-        // The donor exposes a distinct aggregate-work diagnostic but no count.
-        let limits = Pkcs12Limits {
-            max_kdf_work: 2,
-            ..Pkcs12Limits::default()
+    fn pkcs12_visible_encryption_kdf_is_checked_before_password() {
+        // Raising an unencrypted PBES2 iteration count must deny the import
+        // before asking for a secret, even when MacData is within the limit.
+        let mut bytes =
+            include_bytes!("../tests/fixtures/xmlenc/01-phaos-xmlenc-3/rsa-priv-key.p12").to_vec();
+        let offset = bytes
+            .windows(4)
+            .position(|v| v == [2, 2, 8, 0])
+            .expect("PBKDF2 iterations");
+        bytes[offset + 3] = 1;
+        let resources = ResourcePolicy {
+            max_key_import_kdf_work: 2048,
+            ..ResourcePolicy::default()
         };
+        let result = KeyInventory::default().add_pkcs12_with_password_callback(
+            "limited".into(),
+            &bytes,
+            || panic!("visible KDF must be checked first"),
+            KeyUsages::SIGN,
+            &resources,
+        );
+        assert!(matches!(result, Err(KeyStoreError::Policy(_))));
+    }
+
+    #[test]
+    fn pkcs12_content_count_denial_is_not_a_password_error() {
+        // AuthenticatedSafe has two content infos; its count is public and
+        // must report the candidate policy rather than request a password.
+        let bytes = include_bytes!("../tests/fixtures/xmlenc/01-phaos-xmlenc-3/rsa-priv-key.p12");
+        let resources = ResourcePolicy {
+            max_key_candidates: 1,
+            ..ResourcePolicy::default()
+        };
+        let result = KeyInventory::default().add_pkcs12_with_password_callback(
+            "limited".into(),
+            bytes,
+            || panic!("container limit must be checked first"),
+            KeyUsages::SIGN,
+            &resources,
+        );
         assert!(matches!(
-            classify_pkcs12_error(
-                ribergshamra_core::Error::Key(
-                    "PKCS#12 aggregate KDF work exceeds configured limit".into()
-                ),
-                &limits,
-            ),
-            KeyStoreError::Policy(crate::policy::PolicyViolation::ResourceLimitExceeded {
-                resource: crate::policy::resource_name::KEY_IMPORT_KDF_WORK,
-                maximum: 2,
-            })
-        ));
-        assert!(matches!(
-            classify_pkcs12_error(ribergshamra_core::Error::Key("other".into()), &limits),
-            KeyStoreError::ProtectedContainer
+            result,
+            Err(KeyStoreError::Policy(
+                crate::policy::PolicyViolation::ResourceLimitExceeded {
+                    resource: crate::policy::resource_name::KEY_CANDIDATES,
+                    maximum: 1,
+                }
+            ))
         ));
     }
 
     #[test]
-    fn pkcs12_oversized_salt_preserves_policy_error() {
-        // The parser's own salt ceiling must not look like a wrong password.
-        let limits = Pkcs12Limits::default();
+    fn pkcs12_aggregate_kdf_work_preserves_policy_error() {
+        // Individual counts fit, but MAC plus PBES2 exceeds one shared budget.
+        let resources = ResourcePolicy {
+            max_key_import_kdf_work: 3000,
+            ..ResourcePolicy::default()
+        };
+        let bytes = include_bytes!("../tests/fixtures/xmlenc/01-phaos-xmlenc-3/rsa-priv-key.p12");
         assert!(matches!(
-            classify_pkcs12_error(
-                ribergshamra_core::Error::Key("PKCS#12 salt exceeds configured size limit".into()),
-                &limits,
-            ),
-            KeyStoreError::Policy(crate::policy::PolicyViolation::ResourceLimitExceeded {
-                resource: "PKCS#12 salt bytes",
-                maximum: 65_536,
-            })
+            KeyInventory::default().add_pkcs12("limited".into(), bytes, "secret", &resources),
+            Err(KeyStoreError::Policy(
+                crate::policy::PolicyViolation::ResourceLimitExceeded {
+                    resource: crate::policy::resource_name::KEY_IMPORT_KDF_WORK,
+                    maximum: 3000,
+                }
+            ))
         ));
+    }
+
+    #[test]
+    fn pkcs12_workspace_denial_preserves_policy_error() {
+        // KDF workspace denial must not look like a wrong password.
+        let resources = ResourcePolicy {
+            max_key_import_kdf_memory_bytes: 1,
+            ..ResourcePolicy::default()
+        };
+        let bytes = include_bytes!("../tests/fixtures/xmlenc/01-phaos-xmlenc-3/rsa-priv-key.p12");
+        assert!(matches!(
+            KeyInventory::default().add_pkcs12("limited".into(), bytes, "secret", &resources),
+            Err(KeyStoreError::Policy(
+                crate::policy::PolicyViolation::ResourceLimitExceeded {
+                    resource: crate::policy::resource_name::KEY_IMPORT_KDF_MEMORY,
+                    maximum: 1,
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn pkcs12_temporary_memory_shares_existing_inventory_budget() {
+        // Encoded input fits, but decrypted buffers and retained vector slots
+        // must not receive a fresh aggregate allowance beside existing keys.
+        let resources = ResourcePolicy {
+            max_external_resource_bytes: 3000,
+            max_external_resource_total_bytes: 5000,
+            ..ResourcePolicy::default()
+        };
+        let mut inventory = KeyInventory::default();
+        inventory
+            .add_symmetric(
+                "hmac".into(),
+                SymmetricKeyKind::Hmac,
+                vec![1; 2000],
+                KeyUsages::SIGN,
+                &resources,
+            )
+            .expect("existing key fits");
+        let bytes = include_bytes!("../tests/fixtures/xmlenc/01-phaos-xmlenc-3/rsa-priv-key.p12");
+        assert!(matches!(
+            inventory.add_pkcs12("bundle".into(), bytes, "secret", &resources),
+            Err(KeyStoreError::Policy(
+                crate::policy::PolicyViolation::ResourceLimitExceeded {
+                    resource: crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                    maximum: 5000
+                }
+            ))
+        ));
+        assert_eq!(inventory.symmetric_keys().len(), 1);
+        assert!(inventory.private_keys().is_empty());
     }
 
     #[test]
@@ -4908,6 +4946,72 @@ mod tests {
                 .decryption_resolver("encrypt-only", &crate::policy::DecryptionPolicy::default())
                 .is_err()
         );
+    }
+
+    #[cfg(feature = "xmlenc")]
+    #[test]
+    fn inventory_direct_aes_does_not_consume_recipient_candidates() {
+        // A direct AES key is not a wrapping key. Recipient traversal must
+        // leave its sole candidate available for the later direct-key path.
+        use crate::xmlenc::{
+            CipherData, DataEncryptionAlgorithm, EncryptedKey, EncryptionMethod,
+            KeyCandidateBudget, KeyTransportAlgorithm, XmlEncError,
+        };
+        let mut keys = KeyInventory::default();
+        keys.add_symmetric(
+            "direct".into(),
+            SymmetricKeyKind::Aes,
+            vec![1; 16],
+            KeyUsages::DECRYPT,
+            &ResourcePolicy::default(),
+        )
+        .expect("AES imports");
+        let resolver = keys
+            .decryption_resolver("direct", &crate::policy::DecryptionPolicy::default())
+            .expect("AES resolver");
+        let recipient = EncryptedKey {
+            id: None,
+            recipient: None,
+            key_name: None,
+            encryption_method: EncryptionMethod {
+                algorithm: KeyTransportAlgorithm::RsaOaep11.uri().into(),
+                key_size_bits: None,
+                oaep_digest: None,
+                mgf_algorithm: None,
+                oaep_params: None,
+            },
+            cipher_data: CipherData {
+                value: String::new(),
+            },
+            reference_list: None,
+            carried_key_name: None,
+        };
+        let mut budget = KeyCandidateBudget::with_limit(1);
+        let provider = crate::provider::RustCryptoProvider;
+        for _ in 0..64 {
+            assert!(matches!(
+                resolver.resolve_key_candidates(
+                    &provider,
+                    DataEncryptionAlgorithm::Aes128Gcm,
+                    Some(&recipient),
+                    &mut budget
+                ),
+                Err(XmlEncError::KeyNotFound)
+            ));
+            assert_eq!(budget.remaining(), 1);
+        }
+        assert_eq!(
+            resolver
+                .resolve_key_candidates(
+                    &provider,
+                    DataEncryptionAlgorithm::Aes128Gcm,
+                    None,
+                    &mut budget
+                )
+                .expect("one direct candidate"),
+            vec![vec![1; 16]]
+        );
+        assert_eq!(budget.remaining(), 0);
     }
 
     #[cfg(feature = "xmlenc")]

@@ -428,9 +428,9 @@ pub struct ResourcePolicy {
     /// Maximum key-source expansion work and concrete key or certificate
     /// candidates inspected by one operation stage.
     pub max_key_candidates: usize,
-    /// Maximum PBKDF2 iterations or conservative scrypt work during key import.
+    /// Maximum aggregate PBKDF2/PKCS#12 hash rounds or conservative scrypt work during key import.
     pub max_key_import_kdf_work: usize,
-    /// Maximum estimated scrypt memory bytes during key import.
+    /// Maximum estimated scrypt or PKCS#12 KDF workspace bytes during key import.
     pub max_key_import_kdf_memory_bytes: usize,
     /// Maximum nested `KeyInfoReference` dereference depth.
     pub max_key_info_reference_depth: usize,

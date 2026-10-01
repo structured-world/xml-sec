@@ -59,7 +59,7 @@ xml-sec = { version = "0.1", default-features = false, features = ["xmldsig", "c
 | XML signatures | XMLDSig signing and verification, RSA/DSA/ECDSA/HMAC, XPath transforms, `Manifest`, `KeyInfo`, and caller-provided references |
 | XML encryption | AES-CBC/GCM, RSA-OAEP, AES Key Wrap, multiple recipients, and Element/Content replacement |
 | X.509 | Certificate key extraction, chain validation, CRLs, and policy-controlled trust |
-| Key management | Caller-owned named inventory, usage-restricted keys, xmlsec `keys.xml`, encrypted PKCS#8, and PKCS#12 import |
+| Key management | Caller-owned named inventory, usage-restricted keys, xmlsec `keys.xml`, encrypted PKCS#8, and bounded RustCrypto-backed PKCS#12 import |
 | SAML 2.0 | Signed assertions and encrypted-assertion workflows covered by integration tests |
 | XML input | Strict bounded byte decoding, entity/depth/node limits, stable node identities, and generation-safe mutation |
 | Crypto | Provider-neutral contracts and opaque key handles with pure-Rust RustCrypto as the default implementation |
