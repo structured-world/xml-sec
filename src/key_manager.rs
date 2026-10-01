@@ -950,6 +950,17 @@ impl KeyInventory {
             ));
         }
         check_selected_material_size(entry.pkcs8_der.len(), &policy.resources)?;
+        // Borrow public PKCS#1 components before bigint decoding: import
+        // permission is not an exemption from the decryption snapshot.
+        let info = PrivateKeyInfoRef::try_from(entry.pkcs8_der.as_slice())
+            .map_err(|_| KeyStoreError::Selection("incompatible RSA decryption key"))?;
+        let components = rsa::pkcs1::RsaPrivateKey::from_der(info.private_key.as_bytes())
+            .map_err(|_| KeyStoreError::Selection("incompatible RSA decryption key"))?;
+        policy.rsa_keys.validate_components(
+            "decryption",
+            components.modulus.as_bytes(),
+            components.public_exponent.as_bytes(),
+        )?;
         let key = RsaPrivateKey::from_pkcs8_der(&entry.pkcs8_der)
             .map_err(|_| KeyStoreError::Selection("incompatible RSA decryption key"))?;
         Ok(Box::new(crate::xmlenc::PrivateKeyDecryptor::new(key)))
@@ -1211,6 +1222,7 @@ impl KeyInventory {
                 })?;
             enforce_pkcs8_kdf_policy(&encrypted, resources, kdf_live_bytes)?;
             let password = password.ok_or(KeyStoreError::ProtectedContainer)?;
+            enforce_pkcs8_password_policy(&encrypted, password, resources, kdf_live_bytes)?;
             // Decrypt in the one preflighted, zeroizing output allocation;
             // SecretDocument followed by to_vec would retain two plaintext copies.
             let mut plain = Zeroizing::new(encrypted.encrypted_data.as_bytes().to_vec());
@@ -1281,12 +1293,38 @@ impl KeyInventory {
         }
         let retained_with_input =
             self.check_material_capacity(named_material_length(&name, bytes.len(), 1)?, resources)?;
-        let secret = if let Ok(encrypted) = EncryptedPrivateKeyInfoRef::try_from(bytes) {
-            enforce_pkcs8_kdf_policy(&encrypted, resources, retained_with_input)?;
+        let encrypted = EncryptedPrivateKeyInfoRef::try_from(bytes).ok();
+        let secret = if let Some(encrypted) = &encrypted {
+            enforce_pkcs8_kdf_policy(encrypted, resources, retained_with_input)?;
             Some(password().ok_or(KeyStoreError::ProtectedContainer)?)
         } else {
             None
         };
+        if let Some(secret) = &secret {
+            // The callback owns capacity, not only initialized password bytes.
+            self.check_material_capacity(
+                named_material_length(
+                    &name,
+                    bytes.len().checked_add(secret.capacity()).ok_or_else(|| {
+                        import_resource_limit(
+                            crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                            resources.max_external_resource_total_bytes,
+                        )
+                    })?,
+                    1,
+                )?,
+                resources,
+            )?;
+            let encrypted = encrypted
+                .as_ref()
+                .ok_or(KeyStoreError::ProtectedContainer)?;
+            enforce_pkcs8_password_policy(
+                encrypted,
+                secret,
+                resources,
+                retained_with_input + secret.capacity() - secret.len(),
+            )?;
+        }
         self.add_private_der(
             name,
             bytes,
@@ -2178,6 +2216,60 @@ fn enforce_pkcs8_kdf_policy(
         _ => return Err(KeyStoreError::ProtectedContainer),
     }
     Ok(())
+}
+
+fn enforce_pkcs8_password_policy(
+    encrypted: &EncryptedPrivateKeyInfoRef<'_>,
+    password: &[u8],
+    resources: &ResourcePolicy,
+    live_bytes: usize,
+) -> Result<(), KeyStoreError> {
+    if password.len() > resources.max_external_resource_bytes {
+        return Err(kdf_policy_violation(
+            crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
+            resources.max_external_resource_bytes,
+            Some(password.len() as u64),
+        ));
+    }
+    let live = live_bytes.checked_add(password.len()).ok_or_else(|| {
+        import_resource_limit(
+            crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+            resources.max_external_resource_total_bytes,
+        )
+    })?;
+    // Product work accounting: one unit per 64 input bytes conservatively
+    // covers password hashing for the supported SHA PRFs, in addition to rounds.
+    let hashing_passes = match &encrypted.encryption_algorithm {
+        pkcs8::pkcs5::EncryptionScheme::Pbes2(params)
+            if matches!(&params.kdf, pkcs8::pkcs5::pbes2::Kdf::Scrypt(_)) =>
+        {
+            2
+        }
+        _ => 1,
+    };
+    // Scrypt initializes password-keyed HMAC both before and after ROMix.
+    let password_work = password.len().div_ceil(64) * hashing_passes;
+    if password_work > resources.max_key_import_kdf_work {
+        return Err(kdf_policy_violation(
+            crate::policy::resource_name::KEY_IMPORT_KDF_WORK,
+            resources.max_key_import_kdf_work,
+            Some(password_work as u64),
+        ));
+    }
+    let mut remaining = resources.clone();
+    remaining.max_key_import_kdf_work -= password_work;
+    enforce_pkcs8_kdf_policy(encrypted, &remaining, live).map_err(|error| match error {
+        KeyStoreError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+            resource: crate::policy::resource_name::KEY_IMPORT_KDF_WORK,
+            actual,
+            ..
+        }) => kdf_policy_violation(
+            crate::policy::resource_name::KEY_IMPORT_KDF_WORK,
+            resources.max_key_import_kdf_work,
+            Some(actual.saturating_add(password_work) as u64),
+        ),
+        error => error,
+    })
 }
 
 fn enforce_scrypt_kdf_limits(
@@ -3819,6 +3911,87 @@ mod tests {
     }
 
     #[test]
+    fn protected_password_consumes_live_byte_and_work_budgets() {
+        use der::Encode as _;
+        use pkcs8::pkcs5::{EncryptionScheme, pbes2};
+        // Password hashing and retained callback capacity must be denied before
+        // failed padding can hide the resource-policy failure.
+        let envelope = EncryptedPrivateKeyInfoRef {
+            encryption_algorithm: EncryptionScheme::Pbes2(pbes2::Parameters {
+                kdf: pbes2::Kdf::Pbkdf2(pbes2::Pbkdf2Params {
+                    salt: pbes2::Salt::new(b"12345678").expect("salt"),
+                    iteration_count: 2,
+                    key_length: None,
+                    prf: pbes2::Pbkdf2Prf::HmacWithSha256,
+                }),
+                encryption: pbes2::EncryptionScheme::Aes256Cbc { iv: [0; 16] },
+            }),
+            encrypted_data: der::asn1::OctetStringRef::new(&[0; 64]).expect("ciphertext"),
+        }
+        .to_der()
+        .expect("envelope");
+        let peak = 3 + envelope.len() + 64;
+        for resources in [
+            ResourcePolicy {
+                max_external_resource_bytes: 255,
+                ..ResourcePolicy::default()
+            },
+            ResourcePolicy {
+                max_external_resource_total_bytes: peak + 255,
+                ..ResourcePolicy::default()
+            },
+            ResourcePolicy {
+                max_key_import_kdf_work: 5,
+                ..ResourcePolicy::default()
+            },
+        ] {
+            let mut inventory = KeyInventory::default();
+            assert!(matches!(
+                inventory.add_private_der(
+                    "new".into(),
+                    &envelope,
+                    Some(&[0; 256]),
+                    KeyUsages::SIGN,
+                    &resources
+                ),
+                Err(KeyStoreError::Policy(_))
+            ));
+            assert!(inventory.private_keys().is_empty());
+        }
+        let resources = ResourcePolicy {
+            max_external_resource_total_bytes: peak + 255,
+            ..ResourcePolicy::default()
+        };
+        let mut secret = Vec::with_capacity(256);
+        secret.push(0);
+        assert!(matches!(
+            KeyInventory::default().add_private_der_with_password_callback(
+                "new".into(),
+                &envelope,
+                || Some(Zeroizing::new(secret)),
+                KeyUsages::SIGN,
+                &resources
+            ),
+            Err(KeyStoreError::Policy(_))
+        ));
+        let exact = ResourcePolicy {
+            max_external_resource_total_bytes: peak + 256,
+            max_key_import_kdf_work: 6,
+            ..ResourcePolicy::default()
+        };
+        assert!(matches!(
+            KeyInventory::default().add_private_der(
+                "new".into(),
+                &envelope,
+                Some(&[0; 256]),
+                KeyUsages::SIGN,
+                &exact
+            ),
+            Err(KeyStoreError::ProtectedContainer)
+        ));
+    }
+
+    #[test]
     fn encrypted_pkcs8_plaintext_is_reserved_before_password() {
         use der::Encode as _;
         use pkcs8::pkcs5::{EncryptionScheme, pbes2};
@@ -3959,7 +4132,12 @@ mod tests {
         .expect("envelope");
         let pem = pem::encode(&pem::Pem::new("ENCRYPTED PRIVATE KEY", real.clone()));
         let resources = ResourcePolicy {
-            max_external_resource_total_bytes: 3 + pem.len() + real.len() + ciphertext.len() + 2304,
+            max_external_resource_total_bytes: 3
+                + pem.len()
+                + real.len()
+                + ciphertext.len()
+                + 2304
+                + b"correct".len(),
             ..ResourcePolicy::default()
         };
         inventory
@@ -5432,6 +5610,74 @@ mod tests {
                 .decryption_resolver("decrypt", &crate::policy::DecryptionPolicy::default())
                 .is_ok()
         );
+    }
+
+    #[cfg(feature = "xmlenc")]
+    #[test]
+    fn selected_weak_rsa_decryptor_obeys_default_policy() {
+        // Importing a legacy key grants no exemption from operation minima.
+        let mut inventory = KeyInventory::default();
+        let weak = RsaPrivateKey::new(&mut ChaCha8Rng::seed_from_u64(0xA11C_E502), 1024)
+            .expect("legacy key generation")
+            .to_pkcs8_der()
+            .expect("legacy key encoding");
+        inventory
+            .add_private_der(
+                "weak".into(),
+                weak.as_bytes(),
+                None,
+                KeyUsages::DECRYPT,
+                &ResourcePolicy::default(),
+            )
+            .expect("legacy import");
+        let error = inventory
+            .decryption_resolver("weak", &crate::policy::DecryptionPolicy::default())
+            .err()
+            .expect("weak key is rejected");
+        assert!(
+            matches!(
+                error,
+                KeyStoreError::Policy(crate::policy::PolicyViolation::KeySize {
+                    operation: "decryption",
+                    ..
+                })
+            ),
+            "{error:?}"
+        );
+        // A caller can deliberately authorize legacy input, but the snapshot
+        // must survive inventory selection and the complete recovery pipeline.
+        let key = RsaPrivateKey::from_pkcs8_der(weak.as_bytes()).expect("legacy decode");
+        let mut encryption = crate::policy::EncryptionPolicy::default();
+        encryption.rsa_keys.minimum_modulus_bits = 1024;
+        let encrypted = crate::xmlenc::EncryptedDataBuilder::new(
+            crate::xmlenc::DataEncryptionAlgorithm::Aes128Gcm,
+        )
+        .policy(encryption)
+        .recipient_rsa_oaep(key.to_public_key())
+        .encrypt_binary(b"legacy consent")
+        .expect("explicit legacy encryption");
+        let mut decryption = crate::policy::DecryptionPolicy::default();
+        decryption.rsa_keys.minimum_modulus_bits = 1024;
+        let resolver = inventory
+            .decryption_resolver("weak", &decryption)
+            .expect("explicit legacy selection");
+        assert_eq!(
+            crate::xmlenc::DecryptContext::new(resolver.as_ref())
+                .policy(decryption)
+                .decrypt(&encrypted.encrypted_data_xml)
+                .expect("explicit legacy recovery"),
+            crate::xmlenc::DecryptedContent::Bytes(b"legacy consent".to_vec())
+        );
+        assert!(matches!(
+            crate::xmlenc::DecryptContext::new(resolver.as_ref())
+                .decrypt(&encrypted.encrypted_data_xml),
+            Err(crate::xmlenc::XmlEncError::Policy(
+                crate::policy::PolicyViolation::KeySize {
+                    actual_bits: 1024,
+                    ..
+                }
+            ))
+        ));
     }
 
     #[cfg(feature = "xmlenc")]

@@ -352,6 +352,14 @@ pub trait KeyTransportKey: Send + Sync {
 /// public metadata required to reject malformed RSA inputs before dispatch.
 #[cfg(feature = "xmlenc")]
 pub trait KeyRecoveryKey: Send + Sync {
+    /// Exact mathematical bit length of the recovery key's public modulus,
+    /// excluding leading zero padding. Not the rounded ciphertext width.
+    fn rsa_modulus_bits(&self) -> usize;
+
+    /// Public exponent of that same key, or `None` if wider than 64 bits.
+    /// Opaque providers expose public metadata without copying private material.
+    fn rsa_public_exponent(&self) -> Option<u64>;
+
     /// Exact RSA ciphertext width in bytes for the key used by
     /// [`Self::recover_with_provider`].
     fn ciphertext_len(&self) -> usize;
@@ -633,6 +641,12 @@ impl From<rsa::RsaPrivateKey> for RustCryptoRsaPrivateKey {
 
 #[cfg(feature = "xmlenc")]
 impl KeyRecoveryKey for RustCryptoRsaPrivateKey {
+    fn rsa_modulus_bits(&self) -> usize {
+        KeyRecoveryKey::rsa_modulus_bits(&self.key)
+    }
+    fn rsa_public_exponent(&self) -> Option<u64> {
+        KeyRecoveryKey::rsa_public_exponent(&self.key)
+    }
     fn ciphertext_len(&self) -> usize {
         self.ciphertext_len
     }
@@ -649,6 +663,26 @@ impl KeyRecoveryKey for RustCryptoRsaPrivateKey {
 
 #[cfg(feature = "xmlenc")]
 impl KeyRecoveryKey for rsa::RsaPrivateKey {
+    fn rsa_modulus_bits(&self) -> usize {
+        use rsa::traits::PublicKeyParts as _;
+        self.n().bits_vartime() as usize
+    }
+    fn rsa_public_exponent(&self) -> Option<u64> {
+        use rsa::traits::PublicKeyParts as _;
+        if self.e().bits_vartime() > 64 {
+            return None;
+        }
+        let mut exponent = 0_u64;
+        let word_bits = crypto_bigint::Word::BITS as usize;
+        for (index, word) in self.e().as_words().iter().take(64 / word_bits).enumerate() {
+            #[cfg(target_pointer_width = "64")]
+            let word = *word;
+            #[cfg(target_pointer_width = "32")]
+            let word = u64::from(*word);
+            exponent |= word << (index * word_bits);
+        }
+        Some(exponent)
+    }
     fn ciphertext_len(&self) -> usize {
         use rsa::traits::PublicKeyParts as _;
         self.size()

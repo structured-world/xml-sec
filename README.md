@@ -107,6 +107,9 @@ fn example() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+RSA encryption and decryption default to a 2048-bit minimum. Applications accepting legacy
+keys must explicitly select a lower operation-policy minimum; importing a key does not bypass it.
+
 See [XML Encryption](docs/xmlenc.md) for reciprocal decryption, key transport, recipient selection,
 document replacement, and parser policy.
 

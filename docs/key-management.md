@@ -70,6 +70,13 @@ and document CRLs, with their combined resource budget checked before copying.
 Configured X.509 fallback resumes after previously inspected sources. If no key
 resolves, it retains the first deferred key mismatch in source order; terminal
 errors stop resolution immediately rather than becoming fallback candidates.
+Embedded certificates and CRLs share one aggregate byte allowance with the
+configured certificates and enabled CRLs before chain parsing or assembly.
+RSA decryption selection checks borrowed public components before bigint
+decoding. `DecryptionPolicy::rsa_keys` defaults to a 2048-bit minimum; the same
+snapshot is enforced again before provider recovery, including opaque keys.
+Applications accepting legacy input must explicitly lower this minimum; import
+permission and a resolver selected under a weaker policy do not weaken a later operation.
 
 `add_private_der_with_password_callback` asks the caller for a zeroizing byte
 password only for encrypted PKCS#8; plaintext input does not invoke it.
@@ -98,6 +105,11 @@ and imported container; these checks precede password callbacks. The ciphertext-
 PKCS#8 decryption buffer also counts toward the peak, even when decryption fails.
 It is decrypted in place and retained without a second plaintext copy. For PEM imports,
 the encoded input and decoded DER coexist and both count toward that peak.
+PKCS#8 passwords count toward per-resource and aggregate live-byte limits before
+derivation; callback buffers are charged by capacity, not just length. Work includes
+one unit per 64 password bytes per HMAC initialization (two passes for scrypt)
+in addition to the KDF's derivation work. Plaintext
+imports still ignore unused passwords. These limits are product policy, not format syntax.
 The CLI applies the same pre-decryption KDF limits to explicit protected PKCS#8
 PEM/DER keys, including the generic private-key options, as to inventory imports.
 When the PKCS#12 parser rejects an oversized salt, that distinct resource

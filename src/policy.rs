@@ -239,11 +239,11 @@ impl HmacPolicy {
     }
 }
 
-/// RSA strength and structural requirements for outbound cryptographic operations.
+/// RSA strength and structural requirements for cryptographic operations.
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RsaKeyPolicy {
-    /// Minimum mathematical RSA modulus bit length accepted for new output.
+    /// Minimum mathematical RSA modulus bit length accepted by the operation.
     pub minimum_modulus_bits: usize,
 }
 
@@ -341,6 +341,30 @@ impl RsaKeyPolicy {
                 key_type: "RSA",
                 reason: "modulus width overflows",
             })?;
+        let exponent = if exponent.is_empty() || exponent.len() > 8 {
+            None
+        } else {
+            let mut bytes = [0_u8; 8];
+            bytes[8 - exponent.len()..].copy_from_slice(exponent);
+            Some(u64::from_be_bytes(bytes))
+        };
+        self.validate_public_metadata(operation, modulus_bits, exponent)
+    }
+
+    pub(crate) fn validate_public_metadata(
+        &self,
+        operation: &'static str,
+        modulus_bits: usize,
+        exponent: Option<u64>,
+    ) -> Result<usize, PolicyViolation> {
+        self.validate()?;
+        if modulus_bits == 0 {
+            return Err(PolicyViolation::InvalidKeyMaterial {
+                operation,
+                key_type: "RSA",
+                reason: "modulus is zero",
+            });
+        }
         if !(self.minimum_modulus_bits..=crate::hard_limits::RSA_MODULUS_BIT_CEILING)
             .contains(&modulus_bits)
         {
@@ -352,16 +376,11 @@ impl RsaKeyPolicy {
                 actual_bits: modulus_bits,
             });
         }
-        if exponent.is_empty() || exponent.len() > 8 {
-            return Err(PolicyViolation::InvalidKeyMaterial {
-                operation,
-                key_type: "RSA",
-                reason: "public exponent has invalid encoding",
-            });
-        }
-        let mut exponent_bytes = [0_u8; 8];
-        exponent_bytes[8 - exponent.len()..].copy_from_slice(exponent);
-        let exponent = u64::from_be_bytes(exponent_bytes);
+        let exponent = exponent.ok_or(PolicyViolation::InvalidKeyMaterial {
+            operation,
+            key_type: "RSA",
+            reason: "public exponent has invalid encoding",
+        })?;
         if !(3..=((1_u64 << 33) - 1)).contains(&exponent) || exponent % 2 == 0 {
             return Err(PolicyViolation::InvalidKeyMaterial {
                 operation,
@@ -369,7 +388,7 @@ impl RsaKeyPolicy {
                 reason: "public exponent is outside the supported odd range",
             });
         }
-        Ok(modulus.len())
+        Ok(modulus_bits.div_ceil(8))
     }
 }
 
@@ -428,7 +447,8 @@ pub struct ResourcePolicy {
     /// Maximum key-source expansion work and concrete key or certificate
     /// candidates inspected by one operation stage.
     pub max_key_candidates: usize,
-    /// Maximum aggregate PBKDF2/PKCS#12 hash rounds or conservative scrypt work during key import.
+    /// Maximum aggregate PBKDF2/PKCS#12 hash rounds or conservative scrypt work
+    /// during key import, including PKCS#8 password-hashing work units.
     pub max_key_import_kdf_work: usize,
     /// Maximum estimated scrypt or PKCS#12 KDF workspace bytes during key import.
     pub max_key_import_kdf_memory_bytes: usize,
@@ -1208,6 +1228,9 @@ pub struct DecryptionPolicy {
     pub key_wrap_algorithms: Option<HashSet<KeyWrapAlgorithm>>,
     /// Allowed OAEP digest algorithms accepted on input.
     pub oaep_digests: Option<HashSet<OaepDigestAlgorithm>>,
+    /// RSA requirements enforced before OAEP recovery; defaults to 2048 bits.
+    /// Legacy input requires an explicit caller-selected lower minimum.
+    pub rsa_keys: RsaKeyPolicy,
     /// XML parser rules.
     pub xml: XmlInputPolicy,
     /// Resource ceilings.
@@ -1218,7 +1241,8 @@ pub struct DecryptionPolicy {
 impl DecryptionPolicy {
     /// Validate the complete snapshot before inbound decryption work begins.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
-        self.resources.validate()
+        self.resources.validate()?;
+        self.rsa_keys.validate()
     }
 }
 

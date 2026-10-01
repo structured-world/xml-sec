@@ -638,11 +638,13 @@ impl DefaultKeyResolver {
 
     fn check_configured_x509_material(
         &self,
+        info: &X509DataInfo,
         resources: &crate::policy::ResourcePolicy,
         trust: &crate::policy::KeyTrustPolicy,
         budget: &mut InspectedKeyCandidateBudget,
+        charge_crls: bool,
     ) -> Result<(), DsigError> {
-        if trust.check_crls && trust.verify_x509_chains {
+        if charge_crls && trust.check_crls && trust.verify_x509_chains {
             budget.charge_many(self.config.crls.len())?;
         }
         let certificates = self
@@ -656,7 +658,15 @@ impl DefaultKeyResolver {
             .iter()
             .filter(|_| trust.check_crls && trust.verify_x509_chains);
         let mut total = 0_usize;
-        for material in certificates.chain(crls) {
+        // Embedded and configured bytes coexist during chain assembly; this
+        // combined preflight precedes certificate parsing and cloning.
+        for material in info
+            .certificates
+            .iter()
+            .chain(&info.crls)
+            .chain(certificates)
+            .chain(crls)
+        {
             if material.len() > resources.max_external_resource_bytes {
                 return Err(crate::policy::PolicyViolation::ResourceLimit {
                     resource: crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
@@ -1180,14 +1190,18 @@ impl DefaultKeyResolver {
             }
             let resolved = match source {
                 KeyInfoSource::X509Data(info) => {
-                    if !configured_material_checked
-                        && (if info.certificate_chain.is_empty() {
-                            x509_data_has_lookup_identifiers(info)
-                        } else {
-                            trust.verify_x509_chains
-                        })
-                    {
-                        self.check_configured_x509_material(resources, trust, candidate_budget)?;
+                    if if info.certificate_chain.is_empty() {
+                        x509_data_has_lookup_identifiers(info)
+                    } else {
+                        trust.verify_x509_chains
+                    } {
+                        self.check_configured_x509_material(
+                            info,
+                            resources,
+                            trust,
+                            candidate_budget,
+                            !configured_material_checked,
+                        )?;
                         configured_material_checked = true;
                     }
                     self.resolve_x509(info, algorithm, trust, provider, candidate_budget)?
@@ -3891,6 +3905,76 @@ mod tests {
                 resource: crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn embedded_and_configured_x509_share_one_byte_budget() {
+        // Both halves fit separately; their combined live material must fail
+        // before attempting to parse the deliberately invalid certificate DER.
+        let mut info = KeyInfo {
+            sources: vec![KeyInfoSource::X509Data(X509DataInfo {
+                certificates: vec![vec![0; 8]],
+                certificate_chain: vec![0],
+                crls: vec![vec![0; 2]],
+                ..X509DataInfo::default()
+            })],
+        };
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            crls: vec![vec![0; 8]],
+            ..KeyResolverConfig::default()
+        });
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.key_trust.check_crls = true;
+        policy.key_trust.verify_x509_chains = true;
+        policy.resources.max_external_resource_total_bytes = 17;
+        let error = resolver
+            .resolve_with_policy(Some(&info), SignatureAlgorithm::RsaSha256, &policy)
+            .err()
+            .expect("combined material must be rejected");
+        assert!(
+            matches!(
+                error,
+                DsigError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                    actual: 18,
+                    ..
+                })
+            ),
+            "{error:?}"
+        );
+        policy.resources.max_external_resource_total_bytes = 18;
+        let error = resolver
+            .resolve_with_policy(Some(&info), SignatureAlgorithm::RsaSha256, &policy)
+            .err()
+            .expect("exact byte allowance reaches DER parsing");
+        assert!(
+            matches!(
+                error,
+                DsigError::KeyResolution(KeyResolutionError::InvalidCertificate)
+            ),
+            "{error:?}"
+        );
+        // A prior lookup source may charge configured CRLs once, but cannot
+        // suppress the combined-byte preflight of a later embedded source.
+        info.sources.insert(
+            0,
+            KeyInfoSource::X509Data(X509DataInfo {
+                subject_names: vec!["CN=absent".into()],
+                ..X509DataInfo::default()
+            }),
+        );
+        policy.resources.max_external_resource_total_bytes = 17;
+        policy.resources.max_key_candidates = 2;
+        assert!(matches!(
+            resolver.resolve_with_policy(Some(&info), SignatureAlgorithm::RsaSha256, &policy),
+            Err(DsigError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                    actual: 18,
+                    ..
+                }
+            ))
         ));
     }
 

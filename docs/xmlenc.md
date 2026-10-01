@@ -68,7 +68,10 @@ the child for every non-default MGF.
 the RSA convenience constructor wraps a RustCrypto key into the same contract. The handle exposes
 only normalized public modulus/exponent metadata required by encryption policy and framing checks.
 On decryption, `PrivateKeyDecryptor::provider_key` accepts an opaque `KeyRecoveryKey`; private key
-material never enters XML orchestration. Capability checks receive complete OAEP digest, MGF, and
+material never enters XML orchestration. Exact modulus bit length and public exponent
+metadata enforce `DecryptionPolicy::rsa_keys` before recovery, including agreement
+between the mathematical modulus width and ciphertext width, without copying the modulus.
+Capability checks receive complete OAEP digest, MGF, and
 label parameters. Key transport and key recovery are independent capabilities, so a private-key
 provider can advertise recovery without public-key wrapping support. An unsupported provider fails
 without invoking the key or falling back.
@@ -77,6 +80,11 @@ the existing `validate_rsa_recipient_key` remains the RustCrypto convenience for
 `EncryptionPolicy::rsa_keys` validates every recipient modulus and exponent before provider
 dispatch. New output defaults to 2048-8192-bit RSA keys; callers can explicitly tighten or relax
 the minimum for a deployment profile, but cannot exceed the implementation ceiling.
+Decryption uses the same default range through `DecryptionPolicy::rsa_keys`.
+A caller can explicitly lower its minimum for legacy input; this is application
+security policy, not an XMLEnc validity constraint. RSA resolver wrappers must forward
+the operation snapshot through `resolve_key_candidates_with_policy`; the standalone
+`resolve_key` API uses the default policy.
 Encryption preflight also applies the operation-wide `ResourcePolicy::max_key_candidates` limit
 before inspecting or dispatching any configured key: a direct content key consumes one candidate,
 while recipient mode consumes one candidate per independently wrapped recipient. The separate

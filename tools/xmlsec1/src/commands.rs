@@ -3773,6 +3773,7 @@ impl DecryptionKeyResolver for NamedRecipientDecryptor {
                 .resolve_key(provider, algorithm, Some(encrypted_key))
             {
                 Ok(key) => return Ok(key),
+                Err(error @ XmlEncError::Policy(_)) => return Err(error),
                 Err(error) => last_error = Some(error),
             }
         }
@@ -3786,6 +3787,24 @@ impl DecryptionKeyResolver for NamedRecipientDecryptor {
         encrypted_key: Option<&EncryptedKey>,
         budget: &mut KeyCandidateBudget,
     ) -> Result<Vec<Vec<u8>>, XmlEncError> {
+        self.resolve_key_candidates_with_policy(
+            provider,
+            algorithm,
+            encrypted_key,
+            &DecryptionPolicy::default(),
+            budget,
+        )
+    }
+
+    fn resolve_key_candidates_with_policy(
+        &self,
+        provider: &dyn CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        encrypted_key: Option<&EncryptedKey>,
+        policy: &DecryptionPolicy,
+        budget: &mut KeyCandidateBudget,
+    ) -> Result<Vec<Vec<u8>>, XmlEncError> {
+        policy.validate()?;
         let Some(encrypted_key) = encrypted_key else {
             return Err(XmlEncError::KeyNotFound);
         };
@@ -3793,11 +3812,14 @@ impl DecryptionKeyResolver for NamedRecipientDecryptor {
         let mut last_error = None;
         for key in self.applicable_keys(encrypted_key) {
             budget.consume(1)?;
-            match key
-                .inner
-                .resolve_key(provider, algorithm, Some(encrypted_key))
-            {
+            match key.inner.resolve_key_with_policy(
+                provider,
+                algorithm,
+                Some(encrypted_key),
+                policy,
+            ) {
                 Ok(key) => resolved.push(key),
+                Err(error @ XmlEncError::Policy(_)) => return Err(error),
                 Err(error) => last_error = Some(error),
             }
         }
