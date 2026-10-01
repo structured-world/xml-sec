@@ -471,27 +471,31 @@ pub(crate) enum ResolutionScope {
 /// Parser cardinality preflights prevent expensive materialization, but do not
 /// replace this runtime accounting: embedded and indirect candidates both
 /// consume resolver work when inspected.
-#[derive(Clone, Copy)]
-pub(crate) struct InspectedKeyCandidateBudget {
+/// Cumulative source-inspection work shared across one key resolution operation.
+/// Reuse this budget when resolving multiple caller-owned candidate records.
+#[derive(Debug)]
+pub struct InspectedKeyCandidateBudget {
     maximum: usize,
     attempted: usize,
 }
 
 impl InspectedKeyCandidateBudget {
-    pub(crate) fn new(maximum: usize) -> Self {
+    /// Start an empty budget; resolution also enforces the active policy ceiling.
+    #[must_use]
+    pub fn new(maximum: usize) -> Self {
         Self {
             maximum,
             attempted: 0,
         }
     }
 
-    pub(crate) fn charge(&mut self) -> Result<(), DsigError> {
+    /// Reserve one direct-key inspection before copying or decoding it.
+    pub fn charge(&mut self) -> Result<(), DsigError> {
         self.charge_many(1)
     }
 
     pub(crate) fn charge_many(&mut self, count: usize) -> Result<(), DsigError> {
-        debug_assert!(self.attempted <= self.maximum);
-        if count > self.maximum - self.attempted {
+        if self.attempted > self.maximum || count > self.maximum - self.attempted {
             return Err(crate::policy::PolicyViolation::ResourceLimit {
                 resource: crate::policy::resource_name::KEY_CANDIDATES,
                 maximum: self.maximum,
@@ -499,6 +503,7 @@ impl InspectedKeyCandidateBudget {
             }
             .into());
         }
+        debug_assert!(self.attempted <= self.maximum);
         self.attempted += count;
         Ok(())
     }
@@ -540,7 +545,10 @@ pub(crate) fn validate_key_info_source_permissions(
 }
 
 impl DefaultKeyResolver {
-    pub(crate) fn resolve_with_candidate_budget(
+    /// Resolve another candidate without resetting aggregate inspection work.
+    /// The caller must keep the same budget throughout an operation, including
+    /// failed attempts; policy denials must not be treated as candidate misses.
+    pub fn resolve_with_candidate_budget(
         &self,
         key_info: Option<&KeyInfo>,
         algorithm: SignatureAlgorithm,
@@ -548,6 +556,10 @@ impl DefaultKeyResolver {
         provider: &dyn crate::provider::CryptoProvider,
         candidate_budget: &mut InspectedKeyCandidateBudget,
     ) -> Result<Option<Box<dyn VerifyingKey>>, DsigError> {
+        candidate_budget.maximum = candidate_budget
+            .maximum
+            .min(policy.resources.max_key_candidates);
+        candidate_budget.charge_many(0)?;
         self.resolve_with_trust(
             key_info,
             algorithm,
@@ -1523,6 +1535,67 @@ mod tests {
     use rsa::{pkcs8::DecodePublicKey, traits::PublicKeyParts};
 
     use super::*;
+
+    #[test]
+    fn shared_candidate_budget_cannot_relax_active_policy() {
+        // A caller-created large budget cannot override policy, nor can a
+        // later tighter snapshot forget work already performed.
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig::default());
+        let info = KeyInfo {
+            sources: vec![KeyInfoSource::KeyName("missing".into())],
+        };
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_key_candidates = 1;
+        let mut budget = InspectedKeyCandidateBudget::new(64);
+        assert!(
+            resolver
+                .resolve_with_candidate_budget(
+                    Some(&info),
+                    SignatureAlgorithm::RsaSha256,
+                    &policy,
+                    crate::provider::default_provider(),
+                    &mut budget
+                )
+                .expect("first candidate fits the active policy")
+                .is_none()
+        );
+        assert!(matches!(
+            resolver.resolve_with_candidate_budget(
+                Some(&info),
+                SignatureAlgorithm::RsaSha256,
+                &policy,
+                crate::provider::default_provider(),
+                &mut budget
+            ),
+            Err(DsigError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    maximum: 1,
+                    actual: 2,
+                    ..
+                }
+            ))
+        ));
+        let mut spent = InspectedKeyCandidateBudget::new(64);
+        spent
+            .charge_many(2)
+            .expect("initial budget admits two candidates");
+        assert!(matches!(
+            resolver.resolve_with_candidate_budget(
+                None,
+                SignatureAlgorithm::RsaSha256,
+                &policy,
+                crate::provider::default_provider(),
+                &mut spent
+            ),
+            Err(DsigError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    maximum: 1,
+                    actual: 2,
+                    ..
+                }
+            ))
+        ));
+    }
 
     #[test]
     fn xml_rsa_components_are_bounded_before_bigint_decode() {

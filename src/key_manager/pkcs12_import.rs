@@ -31,8 +31,7 @@ struct Budget<'a> {
     limits: &'a Limits,
     work: usize,
     memory: usize,
-    bags: usize,
-    infos: usize,
+    candidates: usize,
 }
 
 fn denial(resource: &'static str, maximum: usize) -> KeyStoreError {
@@ -49,8 +48,7 @@ impl<'a> Budget<'a> {
             limits,
             work: 0,
             memory: 0,
-            bags: 0,
-            infos: 0,
+            candidates: 0,
         }
     }
 
@@ -71,15 +69,14 @@ impl<'a> Budget<'a> {
         Ok(Zeroizing::new(bytes.to_vec()))
     }
 
-    fn count(&mut self, bag: bool) -> Result<()> {
-        let count = if bag { &mut self.bags } else { &mut self.infos };
-        if *count >= self.limits.candidates {
+    fn count(&mut self) -> Result<()> {
+        if self.candidates >= self.limits.candidates {
             return Err(denial(
                 resource_name::KEY_CANDIDATES,
                 self.limits.candidates,
             ));
         }
-        *count += 1;
+        self.candidates += 1;
         Ok(())
     }
 
@@ -153,13 +150,36 @@ fn tlv(bytes: &[u8], depth: usize) -> Result<(Tlv<'_>, &[u8])> {
         return malformed();
     }
     let tag = bytes[0];
-    if tag & 0x1f == 0x1f || tag == 0 {
+    if tag == 0 {
         return malformed();
     }
-    let mut start = 2;
+    let mut identifier_end = 1;
+    if tag & 0x1f == 0x1f {
+        // X.690 (2021) 8.1.2.4: high tags use nonzero base-128 groups.
+        // Unknown attribute tags need framing, not an integer materialization;
+        // scanning borrowed octets also accepts numbers wider than usize.
+        // https://www.itu.int/rec/T-REC-X.690-202102-I/en
+        let first = bytes[identifier_end];
+        if first & 0x7f == 0 || first < 31 {
+            return malformed();
+        }
+        loop {
+            let byte = *bytes
+                .get(identifier_end)
+                .ok_or(KeyStoreError::ProtectedContainer)?;
+            identifier_end += 1;
+            if byte & 0x80 == 0 {
+                break;
+            }
+        }
+    }
+    let length_octet = *bytes
+        .get(identifier_end)
+        .ok_or(KeyStoreError::ProtectedContainer)?;
+    let mut start = identifier_end + 1;
     let end;
     let consumed;
-    if bytes[1] == 0x80 {
+    if length_octet == 0x80 {
         if tag & 0x20 == 0 {
             return malformed();
         }
@@ -173,7 +193,7 @@ fn tlv(bytes: &[u8], depth: usize) -> Result<(Tlv<'_>, &[u8])> {
             remaining = tlv(remaining, depth + 1)?.1;
         }
     } else {
-        let mut length = usize::from(bytes[1]);
+        let mut length = usize::from(length_octet);
         if length & 0x80 != 0 {
             let count = length & 0x7f;
             if count == 0 || count > core::mem::size_of::<usize>() || count > bytes.len() - start {
@@ -767,7 +787,7 @@ fn safe_contents(
     }
     let mut safe = Reader::sequence(bytes)?;
     while !safe.0.is_empty() {
-        budget.count(true)?;
+        budget.count()?;
         let mut bag = Reader(safe.take(0x30)?.value);
         let oid = bag.oid()?;
         let value = bag.take(0xa0)?.value;
@@ -848,7 +868,7 @@ fn walk_safe(
 ) -> Result<()> {
     let mut safe = Reader::sequence(bytes)?;
     while !safe.0.is_empty() {
-        budget.count(false)?;
+        budget.count()?;
         let (oid, content) = content_info(safe.take(0x30)?)?;
         if oid == DATA {
             let data = octets(content, 4, budget)?;
@@ -1038,6 +1058,43 @@ mod tests {
     }
 
     #[test]
+    fn high_tag_attributes_are_valid_ber() {
+        // Unknown attributes are ignorable, but their high-number identifiers
+        // must remain well framed for primitive, constructed and indefinite BER.
+        for value in [
+            vec![0x9f, 31, 1, 7],
+            vec![0xbf, 0x81, 0, 2, 4, 0],
+            vec![0xbf, 31, 0x80, 4, 0, 0, 0],
+            vec![
+                0x9f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f, 0,
+            ],
+        ] {
+            let key = sequence(&[
+                oid(pkcs12::PKCS_12_KEY_BAG_OID),
+                encoded(0xa0, &[0x30, 0]),
+                encoded(
+                    0x31,
+                    &sequence(&[oid(Oid::new_unwrap("1.2.3.4")), encoded(0x31, &value)]),
+                ),
+            ]);
+            assert!(prepare(&pfx(&[data(&sequence(&[key]))]), &limits(64)).is_ok());
+        }
+        for value in [
+            &[0x9f, 0, 0][..],
+            &[0x9f, 0x80, 31, 0],
+            &[0x9f, 30, 0],
+            &[0x9f, 0x81],
+            &[0x9f, 31],
+            &[0x9f, 31, 0x80, 0, 0],
+        ] {
+            assert!(
+                tlv(value, 0).is_err(),
+                "malformed identifier/length {value:?}"
+            );
+        }
+    }
+
+    #[test]
     fn malformed_bag_attributes_are_rejected_before_password() {
         // Optional attributes are still ASN.1 Attribute records, not an
         // unchecked opaque tail that can hide malformed BER.
@@ -1053,6 +1110,23 @@ mod tests {
     fn redundant_integer_octets_are_not_ber() {
         // X.690 8.3.2 disallows a redundant leading zero even for BER.
         assert!(Reader(&[2, 2, 0, 3]).integer().is_err());
+    }
+
+    #[test]
+    fn content_infos_and_bags_share_candidate_count() {
+        // Empty ContentInfos still inspect a source; bags cannot start a new allowance.
+        let key = bag(pkcs12::PKCS_12_KEY_BAG_OID, &[0x30, 0]);
+        let bytes = pfx(&[data(&sequence(&[])), data(&sequence(&[key]))]);
+        assert!(matches!(
+            prepare(&bytes, &limits(2)),
+            Err(KeyStoreError::Policy(
+                PolicyViolation::ResourceLimitExceeded {
+                    resource: resource_name::KEY_CANDIDATES,
+                    maximum: 2
+                }
+            ))
+        ));
+        assert!(prepare(&bytes, &limits(3)).is_ok());
     }
 
     #[test]

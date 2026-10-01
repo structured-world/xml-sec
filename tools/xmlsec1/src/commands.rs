@@ -25,10 +25,11 @@ use xml_sec::{
     provider::{CryptoProvider, default_provider},
     xmldsig::{
         DefaultKeyResolver, DigestAlgorithm, DsigError, DsigStatus, FailureReason, HmacSigningKey,
-        HmacVerificationKey, KeyInfo, KeyInfoSource, KeyInfoWriter, KeyResolver, KeyResolverConfig,
-        KeyValueInfo, ReferenceResult, SignContext, SignatureAlgorithm, SignatureTemplateSelection,
-        SigningKey, SigningPublicKeyInfo, UriTypeSet, VerificationKey, VerifyContext, VerifyResult,
-        VerifyingKey, X509CertificateKeyInfoWriter, XPathHereSemantics, parse_key_info,
+        HmacVerificationKey, InspectedKeyCandidateBudget, KeyInfo, KeyInfoSource, KeyInfoWriter,
+        KeyResolver, KeyResolverConfig, KeyValueInfo, ReferenceResult, SignContext,
+        SignatureAlgorithm, SignatureTemplateSelection, SigningKey, SigningPublicKeyInfo,
+        UriTypeSet, VerificationKey, VerifyContext, VerifyResult, VerifyingKey,
+        X509CertificateKeyInfoWriter, XPathHereSemantics, parse_key_info,
         uri::UriReferenceResolver, validate_signing_key, x509_certificate_matches_selectors,
     },
     xmlenc::{
@@ -1895,6 +1896,9 @@ impl KeyResolver for CandidateVerificationResolver {
         provider: &dyn CryptoProvider,
     ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
         validate_verification_candidate_count(self.candidates.len(), policy)?;
+        policy.validate()?;
+        let mut candidate_budget =
+            InspectedKeyCandidateBudget::new(policy.resources.max_key_candidates);
         let document_crls = key_info
             .into_iter()
             .flat_map(|info| &info.sources)
@@ -1902,9 +1906,8 @@ impl KeyResolver for CandidateVerificationResolver {
                 KeyInfoSource::X509Data(info) => Some(info.crls.as_slice()),
                 _ => None,
             })
-            .flatten()
-            .cloned()
-            .collect::<Vec<_>>();
+            .flatten();
+        let has_document_crls = document_crls.clone().next().is_some();
         let mut certificate_policy = policy.clone();
         if !self.has_trusted_certificates {
             // A caller-pinned certificate without a separate trust anchor is
@@ -1918,32 +1921,39 @@ impl KeyResolver for CandidateVerificationResolver {
         for candidate in &self.candidates {
             let key = match candidate {
                 ExplicitVerificationCandidate::Direct(key) => {
+                    candidate_budget.charge()?;
                     Some(Box::new(key.clone()) as Box<dyn VerifyingKey>)
                 }
                 ExplicitVerificationCandidate::Hmac(key) => {
+                    candidate_budget.charge()?;
                     Some(Box::new(key.clone()) as Box<dyn VerifyingKey>)
                 }
                 ExplicitVerificationCandidate::Certificate(info) => {
-                    let mut candidate = info.clone();
-                    if !document_crls.is_empty()
-                        && let Some(KeyInfoSource::X509Data(x509)) = candidate
+                    let mut candidate = Cow::Borrowed(info);
+                    if has_document_crls
+                        && let Some(index) = info
                             .sources
-                            .iter_mut()
-                            .find(|source| matches!(source, KeyInfoSource::X509Data(_)))
+                            .iter()
+                            .position(|source| matches!(source, KeyInfoSource::X509Data(_)))
+                        && let KeyInfoSource::X509Data(x509) =
+                            &mut candidate.to_mut().sources[index]
                     {
                         // The explicit certificate remains the sole identity
                         // source. Only revocation evidence crosses from the
                         // untrusted document KeyInfo into its candidate path.
-                        x509.crls.extend(document_crls.iter().cloned());
+                        x509.crls.extend(document_crls.clone().cloned());
                     }
-                    match self.certificate_resolver.resolve_with_policy_and_provider(
-                        Some(&candidate),
+                    match self.certificate_resolver.resolve_with_candidate_budget(
+                        Some(candidate.as_ref()),
                         algorithm,
                         &certificate_policy,
                         provider,
+                        &mut candidate_budget,
                     ) {
                         Ok(key) => key,
-                        Err(error) if self.lax_key_search => {
+                        Err(error)
+                            if self.lax_key_search && !matches!(error, DsigError::Policy(_)) =>
+                        {
                             last_error = Some(error);
                             continue;
                         }
@@ -1954,7 +1964,9 @@ impl KeyResolver for CandidateVerificationResolver {
             if let Some(key) = key {
                 match key.validate_policy(policy) {
                     Ok(()) => resolved.push(key),
-                    Err(error) if self.lax_key_search => last_error = Some(error),
+                    Err(error) if self.lax_key_search && !matches!(error, DsigError::Policy(_)) => {
+                        last_error = Some(error)
+                    }
                     Err(error) => return Err(error),
                 }
             }
@@ -4814,6 +4826,58 @@ mod tests {
         assert_eq!(result.status, DsigStatus::Valid);
         assert_eq!(first_calls.get(), 1);
         assert_eq!(second_calls.get(), 1);
+    }
+
+    #[test]
+    fn stored_verification_sources_share_candidate_budget() {
+        // Lax search must not reset source-inspection work per imported entry,
+        // or swallow the denial because an earlier candidate resolved.
+        let mut info = KeyInfo::default();
+        info.sources = vec![
+            KeyInfoSource::KeyName("first".into()),
+            KeyInfoSource::KeyValue(KeyValueInfo::Unsupported {
+                namespace: None,
+                local_name: "unsupported".into(),
+            }),
+        ];
+        let mut inventory = KeyInventory::default();
+        inventory
+            .add_public_pem(
+                "valid".into(),
+                include_bytes!("../../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"),
+                &ResourcePolicy::default(),
+            )
+            .unwrap();
+        let valid = inventory.public_keys()[0].key_info.clone();
+        for info in [info, valid] {
+            let resolver = CandidateVerificationResolver::new(
+                vec![
+                    ExplicitVerificationCandidate::Certificate(info.clone()),
+                    ExplicitVerificationCandidate::Certificate(info),
+                ],
+                ConfiguredCertificates::default(),
+                true,
+                false,
+            );
+            let mut policy = VerificationPolicy::default();
+            policy.resources.max_key_candidates = 3;
+            assert!(matches!(resolver.resolve_with_policy_and_provider(None,
+            SignatureAlgorithm::RsaSha256, &policy, default_provider()),
+            Err(DsigError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
+                resource, maximum: 3, ..
+            })) if resource == "key candidates"));
+            policy.resources.max_key_candidates = 4;
+            assert!(
+                resolver
+                    .resolve_with_policy_and_provider(
+                        None,
+                        SignatureAlgorithm::RsaSha256,
+                        &policy,
+                        default_provider()
+                    )
+                    .is_ok()
+            );
+        }
     }
 
     #[test]

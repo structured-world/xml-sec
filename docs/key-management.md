@@ -50,7 +50,7 @@ decides algorithm acceptance, key minima, certificate validation, CRL checks,
 and resource limits. An imported key is never permission to bypass that policy.
 Caller-provided key names are bounded before import and charged to the retained
 material budget for every stored copy, including public-key `KeyName` metadata.
-Selection methods return `KeyStoreError::Policy` for operation-policy denials,
+Import and selection methods return `KeyStoreError::Policy` for operation-policy denials,
 distinct from candidate-local `KeyStoreError::Selection` failures. Callers
 must not retry another key after a policy rejection.
 An already-selected public entry can expose its RSA recipient key directly via
@@ -77,7 +77,11 @@ KDF parameters inside encrypted SafeContents cannot be inspected without the
 password: they are checked immediately after outer decryption, before running
 the inner derivation (RFC 7292 sections 4.1 and 4.2.2). A missing
 or wrong password returns a redacted error and never
-triggers an unprotected fallback. Oversized encoded bundles return a typed
+triggers an unprotected fallback. PEM private-key labels must match their
+payload: `ENCRYPTED PRIVATE KEY` cannot contain plaintext PKCS#8, and
+`PRIVATE KEY` cannot contain an encrypted container. RFC 7468 section 2
+permits reinterpretation, but this API deliberately forbids it to preserve
+the protected-key contract. Oversized encoded bundles return a typed
 resource-policy error without invoking the callback.
 `ResourcePolicy::max_key_import_kdf_work` and
 `max_key_import_kdf_memory_bytes` can tighten protected-key derivation; both
@@ -93,7 +97,11 @@ PBES2/PBKDF2 with AES-CBC and legacy SHA-1/3DES containers, plus SHA-1/SHA-2 MAC
 Unsupported digest, PRF, KDF, and cipher algorithms return a selection error,
 not a protected-container error; RC2 containers are not supported.
 Private keys and decrypted temporary buffers are zeroized. Nested safe bags
-share the same candidate and KDF budgets; a count denial is not a password error.
+share the same candidate and KDF budgets with ContentInfo records; a count
+denial is not a password error. Lax CLI verification also shares one inspection
+budget across all stored candidates and stops on a policy denial even after
+another candidate resolved. Custom bag attributes accept BER high-tag-number
+identifiers (X.690 section 8.1.2.4) without retaining their values.
 Temporary import allocations share the aggregate allowance with material already
 retained by the inventory, and KDF workspaces are checked before derivation.
 Named direct AES keys participate only in direct content-key resolution, not

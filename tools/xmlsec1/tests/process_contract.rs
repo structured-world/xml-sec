@@ -48,6 +48,45 @@ fn project_root() -> &'static Path {
 }
 
 #[test]
+fn mislabeled_encrypted_pem_cannot_sign() {
+    // Generic private-key loading must honor PEM protection labels, not retry
+    // plaintext DER; rejection must leave no signed output on disk.
+    let temp = tempfile::tempdir().unwrap();
+    let private = temp.path().join("private.pem");
+    let template = temp.path().join("template.xml");
+    let signed = temp.path().join("signed.xml");
+    let block = pem::parse(
+        fs::read(project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem")).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &private,
+        pem::encode(&pem::Pem::new(
+            "ENCRYPTED PRIVATE KEY",
+            block.into_contents(),
+        )),
+    )
+    .unwrap();
+    fs::write(&template, signature_template_without_key_info()).unwrap();
+    for password in [None, Some("unused-password")] {
+        let mut command = Command::new(binary());
+        command.args(["sign", "--privkey-pem"]).arg(&private);
+        if let Some(password) = password {
+            command.args(["--pwd", password]);
+        }
+        let result = command
+            .arg("--output")
+            .arg(&signed)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(!signed.exists());
+        assert!(!String::from_utf8_lossy(&result.stderr).contains("unused-password"));
+    }
+}
+
+#[test]
 fn donor_pkcs12_decrypts_and_wrong_password_fails_closed() {
     // The PHAOS bundle and ciphertext are independent xmlsec1 oracle inputs.
     let fixture = project_root().join("tests/fixtures/xmlenc/01-phaos-xmlenc-3");

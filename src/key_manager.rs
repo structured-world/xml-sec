@@ -726,15 +726,19 @@ impl KeyInventory {
             .checked_add(other.entry_count)
             .ok_or(KeyStoreError::Selection("key candidate count overflow"))?;
         if candidates > resources.max_key_candidates {
-            return Err(KeyStoreError::Selection("key candidate limit exceeded"));
+            return Err(import_resource_limit(
+                crate::policy::resource_name::KEY_CANDIDATES,
+                resources.max_key_candidates,
+            ));
         }
         let bytes = self
             .material_bytes
             .checked_add(other.material_bytes)
             .ok_or(KeyStoreError::Selection("key material size overflow"))?;
         if bytes > resources.max_external_resource_total_bytes {
-            return Err(KeyStoreError::Selection(
-                "key material total exceeds resource limit",
+            return Err(import_resource_limit(
+                crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                resources.max_external_resource_total_bytes,
             ));
         }
         let mut names = HashSet::new();
@@ -941,8 +945,13 @@ impl KeyInventory {
         resources: &ResourcePolicy,
     ) -> Result<(), KeyStoreError> {
         self.check_new_name(&name, resources)?;
+        if bytes.len() > resources.max_external_resource_bytes {
+            return Err(import_resource_limit(
+                crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
+                resources.max_external_resource_bytes,
+            ));
+        }
         if bytes.is_empty()
-            || bytes.len() > resources.max_external_resource_bytes
             || (kind == SymmetricKeyKind::Aes && !matches!(bytes.len(), 16 | 24 | 32))
         {
             return Err(KeyStoreError::Selection("invalid symmetric key length"));
@@ -1005,8 +1014,9 @@ impl KeyInventory {
             return Err(KeyStoreError::Selection("public key usage is incompatible"));
         }
         if der.len() > resources.max_external_resource_bytes {
-            return Err(KeyStoreError::Selection(
-                "public key exceeds resource limit",
+            return Err(import_resource_limit(
+                crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
+                resources.max_external_resource_bytes,
             ));
         }
         self.check_material_capacity(named_material_length(&name, der.len(), 2)?, resources)?;
@@ -1136,8 +1146,9 @@ impl KeyInventory {
     ) -> Result<(), KeyStoreError> {
         self.check_new_name(&name, resources)?;
         if bytes.len() > resources.max_external_resource_bytes {
-            return Err(KeyStoreError::Selection(
-                "private key exceeds resource limit",
+            return Err(import_resource_limit(
+                crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
+                resources.max_external_resource_bytes,
             ));
         }
         self.check_material_capacity(named_material_length(&name, bytes.len(), 1)?, resources)?;
@@ -1166,8 +1177,9 @@ impl KeyInventory {
             Zeroizing::new(normalized.as_bytes().to_vec())
         };
         if der.len() > resources.max_external_resource_bytes {
-            return Err(KeyStoreError::Selection(
-                "private key exceeds resource limit",
+            return Err(import_resource_limit(
+                crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
+                resources.max_external_resource_bytes,
             ));
         }
         private_key_spki(&der)?;
@@ -1206,8 +1218,9 @@ impl KeyInventory {
     {
         self.check_new_name(&name, resources)?;
         if bytes.len() > resources.max_external_resource_bytes {
-            return Err(KeyStoreError::Selection(
-                "private key exceeds resource limit",
+            return Err(import_resource_limit(
+                crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
+                resources.max_external_resource_bytes,
             ));
         }
         self.check_material_capacity(named_material_length(&name, bytes.len(), 1)?, resources)?;
@@ -1240,19 +1253,42 @@ impl KeyInventory {
         self.check_new_name(&name, resources)?;
         self.check_material_capacity(named_material_length(&name, bytes.len(), 1)?, resources)?;
         let block = single_pem_block(bytes, resources.max_external_resource_bytes)?;
-        match block.tag() {
-            "PRIVATE KEY" | "ENCRYPTED PRIVATE KEY" | "RSA PRIVATE KEY" => {
-                let der = Zeroizing::new(block.into_contents());
-                let previous_total = self.material_bytes;
-                let name_len = name.len();
-                self.add_private_der(name, &der, password, usages, resources)?;
-                let retained_len = self.material_bytes - previous_total;
-                self.material_bytes =
-                    previous_total + name_len + bytes.len().max(retained_len - name_len);
-                Ok(())
-            }
-            _ => Err(KeyStoreError::Selection("unsupported private PEM label")),
+        enum Payload {
+            Plain,
+            Encrypted,
+            Rsa,
+            Unsupported,
         }
+        let payload = match block.tag() {
+            "PRIVATE KEY" => Payload::Plain,
+            "ENCRYPTED PRIVATE KEY" => Payload::Encrypted,
+            "RSA PRIVATE KEY" => Payload::Rsa,
+            _ => Payload::Unsupported,
+        };
+        let der = Zeroizing::new(block.into_contents());
+        // RFC 7468 sections 10/11 define distinct PKCS#8 labels. Section 2
+        // permits reinterpretation, but our protected-key contract forbids it:
+        // https://www.rfc-editor.org/rfc/rfc7468#section-2
+        match payload {
+            Payload::Encrypted => {
+                EncryptedPrivateKeyInfoRef::try_from(der.as_slice())
+                    .map_err(|_| KeyStoreError::ProtectedContainer)?;
+            }
+            Payload::Plain => {
+                PrivateKeyInfoRef::try_from(der.as_slice())
+                    .map_err(|_| KeyStoreError::Selection("invalid PRIVATE KEY payload"))?;
+            }
+            Payload::Rsa => preflight_rsa_pkcs1_components(&der)?,
+            Payload::Unsupported => {
+                return Err(KeyStoreError::Selection("unsupported private PEM label"));
+            }
+        }
+        let previous_total = self.material_bytes;
+        let name_len = name.len();
+        self.add_private_der(name, &der, password, usages, resources)?;
+        let retained_len = self.material_bytes - previous_total;
+        self.material_bytes = previous_total + name_len + bytes.len().max(retained_len - name_len);
+        Ok(())
     }
 
     /// Import a bounded PKCS#12 bundle from caller-owned bytes. The key may
@@ -1456,13 +1492,20 @@ impl KeyInventory {
 
     fn check_new_name(&self, name: &str, resources: &ResourcePolicy) -> Result<(), KeyStoreError> {
         ensure_resource_policy(resources)?;
-        if name.is_empty() || self.entry_count >= resources.max_key_candidates {
-            return Err(KeyStoreError::Selection(
-                "name or key candidate limit is invalid",
+        if name.is_empty() {
+            return Err(KeyStoreError::Selection("empty key name"));
+        }
+        if self.entry_count >= resources.max_key_candidates {
+            return Err(import_resource_limit(
+                crate::policy::resource_name::KEY_CANDIDATES,
+                resources.max_key_candidates,
             ));
         }
         if name.len() > resources.max_external_resource_bytes {
-            return Err(KeyStoreError::Selection("key name exceeds resource limit"));
+            return Err(import_resource_limit(
+                crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
+                resources.max_external_resource_bytes,
+            ));
         }
         self.check_material_capacity(name.len(), resources)?;
         if self.symmetric_keys.iter().any(|key| key.name == name)
@@ -1479,13 +1522,16 @@ impl KeyInventory {
         length: usize,
         resources: &ResourcePolicy,
     ) -> Result<usize, KeyStoreError> {
-        let total = self
-            .material_bytes
-            .checked_add(length)
-            .ok_or(KeyStoreError::Selection("key material size overflow"))?;
+        let total = self.material_bytes.checked_add(length).ok_or_else(|| {
+            import_resource_limit(
+                crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                resources.max_external_resource_total_bytes,
+            )
+        })?;
         if total > resources.max_external_resource_total_bytes {
-            return Err(KeyStoreError::Selection(
-                "key material total exceeds resource limit",
+            return Err(import_resource_limit(
+                crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                resources.max_external_resource_total_bytes,
             ));
         }
         Ok(total)
@@ -1510,8 +1556,9 @@ impl KeyInventory {
     ) -> Result<(), KeyStoreError> {
         ensure_resource_policy(resources)?;
         if der.len() > resources.max_external_resource_bytes {
-            return Err(KeyStoreError::Selection(
-                "certificate exceeds resource limit",
+            return Err(import_resource_limit(
+                crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
+                resources.max_external_resource_bytes,
             ));
         }
         let (rest, _) = X509Certificate::from_der(&der)
@@ -1520,7 +1567,10 @@ impl KeyInventory {
             return Err(KeyStoreError::Selection("invalid X.509 certificate"));
         }
         if self.entry_count >= resources.max_key_candidates {
-            return Err(KeyStoreError::Selection("key candidate limit exceeded"));
+            return Err(import_resource_limit(
+                crate::policy::resource_name::KEY_CANDIDATES,
+                resources.max_key_candidates,
+            ));
         }
         self.reserve_material(der.len(), resources)?;
         if trusted_anchor {
@@ -1540,7 +1590,10 @@ impl KeyInventory {
     ) -> Result<(), KeyStoreError> {
         ensure_resource_policy(resources)?;
         if der.len() > resources.max_external_resource_bytes {
-            return Err(KeyStoreError::Selection("CRL exceeds resource limit"));
+            return Err(import_resource_limit(
+                crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
+                resources.max_external_resource_bytes,
+            ));
         }
         let (rest, _) = x509_parser::revocation_list::CertificateRevocationList::from_der(&der)
             .map_err(|_| KeyStoreError::Selection("invalid X.509 CRL"))?;
@@ -1548,7 +1601,10 @@ impl KeyInventory {
             return Err(KeyStoreError::Selection("invalid X.509 CRL"));
         }
         if self.entry_count >= resources.max_key_candidates {
-            return Err(KeyStoreError::Selection("key candidate limit exceeded"));
+            return Err(import_resource_limit(
+                crate::policy::resource_name::KEY_CANDIDATES,
+                resources.max_key_candidates,
+            ));
         }
         self.reserve_material(der.len(), resources)?;
         self.crls.push(der);
@@ -1563,11 +1619,16 @@ impl KeyInventory {
     ) -> Result<Self, KeyStoreError> {
         let resources = policy.resource_policy();
         ensure_resource_policy(resources)?;
-        if bytes.len() > resources.max_external_resource_bytes
-            || bytes.len() > resources.max_external_resource_total_bytes
-        {
-            return Err(KeyStoreError::Selection(
-                "XML key store exceeds resource limit",
+        if bytes.len() > resources.max_external_resource_bytes {
+            return Err(import_resource_limit(
+                crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
+                resources.max_external_resource_bytes,
+            ));
+        }
+        if bytes.len() > resources.max_external_resource_total_bytes {
+            return Err(import_resource_limit(
+                crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                resources.max_external_resource_total_bytes,
             ));
         }
         let settings = DocumentParseSettings::from_policy(policy.xml_input_policy(), resources)
@@ -1580,9 +1641,15 @@ impl KeyInventory {
                 .min(resources.max_external_resource_bytes),
             Some(&budget),
         )
-        .map_err(|error| KeyStoreError::Invalid(error.to_string()))?;
+        .map_err(|error| match error.into_policy_violation(settings) {
+            Ok(violation) => KeyStoreError::Policy(violation),
+            Err(error) => KeyStoreError::Invalid(error.to_string()),
+        })?;
         let document = parse_borrowed_with_settings_and_budget(&text, settings, Some(&budget))
-            .map_err(|error| KeyStoreError::Invalid(error.to_string()))?;
+            .map_err(|error| match error.into_policy_violation(settings) {
+                Ok(violation) => KeyStoreError::Policy(violation),
+                Err(error) => KeyStoreError::Invalid(error.to_string()),
+            })?;
         let root = document.root_element();
         if !root.has_tag_name((XMLSEC_NS, "Keys")) {
             return Err(KeyStoreError::Invalid("expected xmlsec Keys root".into()));
@@ -1595,8 +1662,9 @@ impl KeyInventory {
                 return Err(KeyStoreError::Invalid("unexpected child of Keys".into()));
             }
             if entry_count >= resources.max_key_candidates {
-                return Err(KeyStoreError::Invalid(
-                    "key candidate limit exceeded".into(),
+                return Err(import_resource_limit(
+                    crate::policy::resource_name::KEY_CANDIDATES,
+                    resources.max_key_candidates,
                 ));
             }
             entry_count += 1;
@@ -1740,12 +1808,17 @@ impl KeyInventory {
         // Keep the input charge too, so compact XML never lowers the import budget.
         store.material_bytes = bytes.len().max(store.retained_material_bytes()?);
         if store.material_bytes > resources.max_external_resource_total_bytes {
-            return Err(KeyStoreError::Selection(
-                "key material total exceeds resource limit",
+            return Err(import_resource_limit(
+                crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                resources.max_external_resource_total_bytes,
             ));
         }
         Ok(store)
     }
+}
+
+fn import_resource_limit(resource: &'static str, maximum: usize) -> KeyStoreError {
+    crate::policy::PolicyViolation::ResourceLimitExceeded { resource, maximum }.into()
 }
 
 fn check_operation_material_size(
@@ -1961,7 +2034,10 @@ fn preflight_dsa_pkcs8_components(info: &PrivateKeyInfoRef<'_>) -> Result<(), Ke
 
 fn single_pem_block(bytes: &[u8], maximum: usize) -> Result<pem::Pem, KeyStoreError> {
     if bytes.len() > maximum {
-        return Err(KeyStoreError::Selection("PEM key exceeds resource limit"));
+        return Err(import_resource_limit(
+            crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
+            maximum,
+        ));
     }
     let text = std::str::from_utf8(bytes)
         .map_err(|_| KeyStoreError::Selection("PEM key is not ASCII text"))?
@@ -2583,10 +2659,12 @@ mod tests {
 
     #[test]
     fn pkcs12_imports_share_candidate_budget() {
-        // A key plus its retained certificate consumes two inventory slots.
+        // Two ContentInfos and two SafeBags cost four inspections. The retained
+        // key/certificate use two inventory slots, leaving too little work for
+        // another bundle even though two more retained slots would fit.
         let bundle = include_bytes!("../tests/fixtures/xmlenc/01-phaos-xmlenc-3/rsa-priv-key.p12");
         let resources = ResourcePolicy {
-            max_key_candidates: 3,
+            max_key_candidates: 4,
             ..ResourcePolicy::default()
         };
         let mut inventory = KeyInventory::default();
@@ -2743,7 +2821,12 @@ mod tests {
                 KeyUsages::SIGN,
                 &limited,
             ),
-            Err(KeyStoreError::Selection(_))
+            Err(KeyStoreError::Policy(
+                crate::policy::PolicyViolation::ResourceLimitExceeded {
+                    resource: crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                    ..
+                }
+            ))
         ));
         let limited_kdf = ResourcePolicy {
             max_key_import_kdf_work: 1,
@@ -2839,7 +2922,8 @@ mod tests {
 
     #[test]
     fn xml_store_charges_retained_decoded_material() {
-        // DSA retains public components and a derived private PKCS#8 buffer.
+        // DSA retains public components, private PKCS#8 and three name copies.
+        // A long valid name makes retained bytes exceed the encoded source.
         let source = include_str!("../tests/fixtures/keys/xmlsec/mixed-keys.xml");
         let marker = source.find("<KeyName>test-dsa</KeyName>").expect("DSA key");
         let start = source[..marker].rfind("<KeyInfo").expect("DSA KeyInfo");
@@ -2847,7 +2931,9 @@ mod tests {
             marker + source[marker..].find("</KeyInfo>").expect("DSA end") + "</KeyInfo>".len();
         let xml = format!(
             "<Keys xmlns=\"{XMLSEC_NS}\">{}</Keys>",
-            source[start..end].replace('\n', "")
+            source[start..end]
+                .replace('\n', "")
+                .replace("test-dsa", &"name".repeat(512))
         );
         let inventory = KeyInventory::from_xml_bytes(
             xml.as_bytes(),
@@ -2858,6 +2944,27 @@ mod tests {
         let retained = inventory.retained_material_bytes().expect("bounded tally");
         assert_eq!(inventory.material_bytes, xml.len().max(retained));
         assert!(retained >= inventory.private_keys[0].pkcs8_der.len());
+        assert!(
+            retained > xml.len(),
+            "fixture must distinguish retained bytes from source bytes"
+        );
+        let resources = ResourcePolicy {
+            max_external_resource_total_bytes: retained - 1,
+            ..ResourcePolicy::default()
+        };
+        assert!(matches!(
+            KeyInventory::from_xml_bytes(
+                xml.as_bytes(),
+                &xml_policy(resources),
+                XmlBackend::default()
+            ),
+            Err(KeyStoreError::Policy(
+                crate::policy::PolicyViolation::ResourceLimitExceeded {
+                    resource: crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                    ..
+                }
+            ))
+        ));
     }
 
     #[test]
@@ -3006,6 +3113,74 @@ mod tests {
     }
 
     #[test]
+    fn xml_store_import_limits_preserve_policy_errors() {
+        // Limit denials must not look like malformed stores or candidate misses.
+        let xml = format!(
+            "<Keys xmlns=\"{XMLSEC_NS}\"><KeyInfo xmlns=\"{XMLDSIG_NS}\"><KeyName>key</KeyName><KeyValue><HMACKeyValue xmlns=\"{XMLSEC_NS}\">c2VjcmV0</HMACKeyValue></KeyValue></KeyInfo></Keys>"
+        );
+        let two = xml.replace(
+            "</Keys>",
+            &format!(
+                "{} </Keys>",
+                xml[xml.find("<KeyInfo").expect("fixture has KeyInfo")
+                    ..xml.find("</Keys>").expect("fixture has Keys end tag")]
+                    .replace(">key<", ">other<")
+            ),
+        );
+        for (bytes, resources, expected) in [
+            (
+                xml.as_bytes(),
+                ResourcePolicy {
+                    max_external_resource_bytes: xml.len() - 1,
+                    ..ResourcePolicy::default()
+                },
+                crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
+            ),
+            (
+                xml.as_bytes(),
+                ResourcePolicy {
+                    max_external_resource_total_bytes: xml.len() - 1,
+                    ..ResourcePolicy::default()
+                },
+                crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+            ),
+            (
+                two.as_bytes(),
+                ResourcePolicy {
+                    max_key_candidates: 1,
+                    ..ResourcePolicy::default()
+                },
+                crate::policy::resource_name::KEY_CANDIDATES,
+            ),
+        ] {
+            assert!(
+                matches!(KeyInventory::from_xml_bytes(bytes, &xml_policy(resources), XmlBackend::default()),
+                Err(KeyStoreError::Policy(crate::policy::PolicyViolation::ResourceLimitExceeded { resource, .. })) if resource == expected)
+            );
+        }
+        let mut inventory = KeyInventory::default();
+        let resources = ResourcePolicy {
+            max_external_resource_total_bytes: 3,
+            ..ResourcePolicy::default()
+        };
+        assert!(matches!(
+            inventory.add_symmetric(
+                "key".into(),
+                SymmetricKeyKind::Hmac,
+                vec![7; 32],
+                KeyUsages::SIGN,
+                &resources
+            ),
+            Err(KeyStoreError::Policy(
+                crate::policy::PolicyViolation::ResourceLimitExceeded {
+                    resource: crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                    ..
+                }
+            ))
+        ));
+    }
+
+    #[test]
     fn xml_store_enforces_all_parser_resource_limits() {
         // Import must not skip the depth, namespace or cumulative work limits.
         let xml = format!(
@@ -3031,8 +3206,8 @@ mod tests {
                     &xml_policy(resources),
                     XmlBackend::default()
                 )
-                .is_err(),
-                "parser limit must apply to key stores"
+                .is_err_and(|error| matches!(error, KeyStoreError::Policy(_))),
+                "parser policy denial must retain its type in key stores"
             );
         }
     }
@@ -3300,6 +3475,32 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn private_pem_label_cannot_enable_der_fallback() {
+        // A protected label must never import plaintext, even with a password.
+        let plain = pem::parse(include_bytes!(
+            "../tests/fixtures/keys/rsa/rsa-2048-key.pem"
+        ))
+        .expect("fixture")
+        .into_contents();
+        let mislabeled = pem::encode(&pem::Pem::new("ENCRYPTED PRIVATE KEY", plain));
+        for password in [None, Some(b"ignored".as_slice())] {
+            let mut inventory = KeyInventory::default();
+            assert!(matches!(
+                inventory.add_private_pem(
+                    "key".into(),
+                    mislabeled.as_bytes(),
+                    password,
+                    KeyUsages::SIGN,
+                    &ResourcePolicy::default()
+                ),
+                Err(KeyStoreError::ProtectedContainer)
+            ));
+            assert!(inventory.private_keys.is_empty());
+            assert_eq!(inventory.material_bytes, 0);
+        }
     }
 
     #[test]
@@ -3611,8 +3812,12 @@ mod tests {
             assert!(
                 matches!(
                     import(&mut inventory, "second"),
-                    Err(KeyStoreError::Selection(
-                        "key material total exceeds resource limit"
+                    Err(KeyStoreError::Policy(
+                        crate::policy::PolicyViolation::ResourceLimitExceeded {
+                            resource:
+                                crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                            ..
+                        }
                     ))
                 ),
                 "second PEM input must exceed aggregate budget"
@@ -4677,8 +4882,11 @@ mod tests {
         };
         assert!(matches!(
             first.extend(second, &constrained),
-            Err(KeyStoreError::Selection(
-                "key material total exceeds resource limit"
+            Err(KeyStoreError::Policy(
+                crate::policy::PolicyViolation::ResourceLimitExceeded {
+                    resource: crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                    ..
+                }
             ))
         ));
         assert_eq!(first.entry_count(), 1);
