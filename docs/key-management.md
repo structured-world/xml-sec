@@ -67,6 +67,9 @@ compressed points are rejected before granting verification usage. Each complete
 KeyValue is one resource for selection limits, not one resource per component.
 When a named certificate is selected, enabled CRL checking retains both inventory
 and document CRLs, with their combined resource budget checked before copying.
+Configured X.509 fallback resumes after previously inspected sources. If no key
+resolves, it retains the first deferred key mismatch in source order; terminal
+errors stop resolution immediately rather than becoming fallback candidates.
 
 `add_private_der_with_password_callback` asks the caller for a zeroizing byte
 password only for encrypted PKCS#8; plaintext input does not invoke it.
@@ -91,7 +94,8 @@ missing or incorrect passwords remain protected-container errors.
 PBKDF2 work includes every output block required by the cipher's key width
 (RFC 8018 section 5.2). Scrypt workspaces must fit both the KDF-specific ceiling
 and the remaining aggregate allowance alongside retained inventory, key name,
-and imported container; these checks precede password callbacks.
+and imported container; these checks precede password callbacks. For PEM imports,
+the encoded input and decoded DER coexist and both count toward that peak.
 The CLI applies the same pre-decryption KDF limits to explicit protected PKCS#8
 PEM/DER keys, including the generic private-key options, as to inventory imports.
 When the PKCS#12 parser rejects an oversized salt, that distinct resource

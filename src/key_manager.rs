@@ -483,7 +483,7 @@ impl<'a> KeyResolver for InventoryVerificationResolver<'a> {
             if let Some(key) = outcome.key {
                 return Ok(Some(key));
             }
-            prefix_error = outcome.deferred_error.map(DsigError::from);
+            prefix_error = outcome.deferred_error;
         }
         let fallback = if configured_x509_index.is_some() {
             let certificates = self
@@ -548,24 +548,26 @@ impl<'a> KeyResolver for InventoryVerificationResolver<'a> {
         {
             // Resume after the inspected prefix: one budget counts actual
             // work, not a replay caused by attaching configured certificates.
-            let result = fallback
-                .resolve_sources_with_candidate_budget(
-                    info,
-                    algorithm,
-                    policy,
-                    provider,
-                    &mut inspected_candidates,
-                    if candidate.is_some() {
-                        crate::xmldsig::keys::ResolutionScope::TrustedSuffix(first_x509)
-                    } else {
-                        crate::xmldsig::keys::ResolutionScope::DocumentSuffix(first_x509)
-                    },
-                )
-                .and_then(crate::xmldsig::keys::SourceResolution::finish);
-            return match (result, prefix_error) {
-                (Ok(None), Some(error)) => Err(error),
-                (result, _) => result,
-            };
+            let mut outcome = fallback.resolve_sources_with_candidate_budget(
+                info,
+                algorithm,
+                policy,
+                provider,
+                &mut inspected_candidates,
+                if candidate.is_some() {
+                    crate::xmldsig::keys::ResolutionScope::TrustedSuffix(first_x509)
+                } else {
+                    crate::xmldsig::keys::ResolutionScope::DocumentSuffix(first_x509)
+                },
+            )?;
+            // Terminal suffix failures have already propagated. On a complete
+            // miss, keep the first deferred error in original source order.
+            if outcome.key.is_none()
+                && let Some(error) = prefix_error
+            {
+                outcome.deferred_error = Some(error);
+            }
+            return outcome.finish();
         }
         if let Some(candidate) = candidate {
             return fallback.resolve_trusted_material_with_candidate_budget(
@@ -1167,6 +1169,18 @@ impl KeyInventory {
         usages: KeyUsages,
         resources: &ResourcePolicy,
     ) -> Result<(), KeyStoreError> {
+        self.add_private_der_inner(name, bytes, password, usages, resources, 0)
+    }
+
+    fn add_private_der_inner(
+        &mut self,
+        name: String,
+        bytes: &[u8],
+        password: Option<&[u8]>,
+        usages: KeyUsages,
+        resources: &ResourcePolicy,
+        live_encoded_bytes: usize,
+    ) -> Result<(), KeyStoreError> {
         self.check_new_name(&name, resources)?;
         if bytes.len() > resources.max_external_resource_bytes {
             return Err(import_resource_limit(
@@ -1185,7 +1199,17 @@ impl KeyInventory {
         let der = if PrivateKeyInfoRef::try_from(bytes).is_ok() {
             Zeroizing::new(bytes.to_vec())
         } else if let Ok(encrypted) = EncryptedPrivateKeyInfoRef::try_from(bytes) {
-            enforce_pkcs8_kdf_policy(&encrypted, resources, retained_with_input)?;
+            // PEM decoding does not end the caller's encoded buffer lifetime.
+            // Its bytes coexist with DER and the KDF workspace, not replace DER.
+            let kdf_live_bytes = retained_with_input
+                .checked_add(live_encoded_bytes)
+                .ok_or_else(|| {
+                    import_resource_limit(
+                        crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                        resources.max_external_resource_total_bytes,
+                    )
+                })?;
+            enforce_pkcs8_kdf_policy(&encrypted, resources, kdf_live_bytes)?;
             let password = password.ok_or(KeyStoreError::ProtectedContainer)?;
             let plain = encrypted
                 .decrypt(password)
@@ -1310,7 +1334,7 @@ impl KeyInventory {
         }
         let previous_total = self.material_bytes;
         let name_len = name.len();
-        self.add_private_der(name, &der, password, usages, resources)?;
+        self.add_private_der_inner(name, &der, password, usages, resources, bytes.len())?;
         let retained_len = self.material_bytes - previous_total;
         self.material_bytes = previous_total + name_len + bytes.len().max(retained_len - name_len);
         Ok(())
@@ -3746,6 +3770,88 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_pem_workspace_accounts_for_live_encoded_input() {
+        use der::Encode as _;
+        use pkcs8::pkcs5::{EncryptionScheme, pbes2};
+        // PEM and its decoded DER coexist during derivation. A DER-only
+        // allowance must not authorize that larger peak or mutate inventory.
+        let encrypted = EncryptedPrivateKeyInfoRef {
+            encryption_algorithm: EncryptionScheme::Pbes2(pbes2::Parameters {
+                kdf: pbes2::Kdf::Scrypt(pbes2::ScryptParams {
+                    salt: pbes2::Salt::new(b"12345678").expect("salt"),
+                    cost_parameter: 16,
+                    block_size: 1,
+                    parallelization: 1,
+                    key_length: None,
+                }),
+                encryption: pbes2::EncryptionScheme::Aes256Cbc { iv: [0; 16] },
+            }),
+            encrypted_data: der::asn1::OctetStringRef::new(&[0; 16]).expect("ciphertext"),
+        };
+        let der = encrypted.to_der().expect("envelope");
+        let pem = pem::encode(&pem::Pem::new("ENCRYPTED PRIVATE KEY", der.clone()));
+        let peak = 3 + pem.len() + der.len() + 2304;
+        let mut inventory = KeyInventory::default();
+        let tight = ResourcePolicy {
+            max_external_resource_total_bytes: peak - 1,
+            ..ResourcePolicy::default()
+        };
+        assert!(matches!(
+            inventory.add_private_pem("new".into(), pem.as_bytes(), None, KeyUsages::SIGN, &tight),
+            Err(KeyStoreError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                actual, ..
+            })) if actual == peak
+        ));
+        let exact = ResourcePolicy {
+            max_external_resource_total_bytes: peak,
+            ..tight
+        };
+        assert!(matches!(
+            inventory.add_private_pem("new".into(), pem.as_bytes(), None, KeyUsages::SIGN, &exact),
+            Err(KeyStoreError::ProtectedContainer)
+        ));
+        assert!(matches!(
+            inventory.add_private_der("new".into(), &der, None, KeyUsages::SIGN, &tight),
+            Err(KeyStoreError::ProtectedContainer)
+        ));
+        assert!(inventory.private_keys().is_empty());
+        assert_eq!(inventory.material_bytes, 0);
+        // Exercise actual derivation/import as well as preflight: an exactly
+        // fitting PEM peak succeeds with the correct password, not just framing.
+        let plain = pem::parse(include_bytes!(
+            "../tests/fixtures/keys/rsa/rsa-2048-key.pem"
+        ))
+        .expect("private key")
+        .into_contents();
+        let EncryptionScheme::Pbes2(params) = &encrypted.encryption_algorithm else {
+            panic!("PBES2 envelope");
+        };
+        let ciphertext = params.encrypt(b"correct", &plain).expect("encrypt");
+        let real = EncryptedPrivateKeyInfoRef {
+            encryption_algorithm: encrypted.encryption_algorithm.clone(),
+            encrypted_data: der::asn1::OctetStringRef::new(&ciphertext).expect("ciphertext"),
+        }
+        .to_der()
+        .expect("envelope");
+        let pem = pem::encode(&pem::Pem::new("ENCRYPTED PRIVATE KEY", real.clone()));
+        let resources = ResourcePolicy {
+            max_external_resource_total_bytes: 3 + pem.len() + real.len() + 2304,
+            ..ResourcePolicy::default()
+        };
+        inventory
+            .add_private_pem(
+                "new".into(),
+                pem.as_bytes(),
+                Some(b"correct"),
+                KeyUsages::SIGN,
+                &resources,
+            )
+            .expect("exact PEM peak imports");
+        assert_eq!(inventory.private_keys().len(), 1);
+    }
+
+    #[test]
     fn pkcs8_scrypt_workspace_shares_retained_inventory_budget() {
         use der::Encode as _;
         // A workspace below its own ceiling must still fit alongside existing
@@ -3825,6 +3931,61 @@ mod tests {
             1,
             "an exactly fitting workspace reaches password delivery"
         );
+    }
+
+    #[test]
+    fn configured_x509_continuation_retains_first_deferred_error() {
+        // Splitting at configured X509 must preserve the unsplit diagnostic
+        // order, while a later terminal failure still stops immediately.
+        let mut inventory = KeyInventory::default();
+        inventory
+            .add_certificate_der(
+                single_pem_block(
+                    include_bytes!("../tests/fixtures/keys/rsa/rsa-2048-cert.pem"),
+                    ResourcePolicy::default().max_external_resource_bytes,
+                )
+                .expect("certificate")
+                .into_contents(),
+                false,
+                &ResourcePolicy::default(),
+            )
+            .expect("lookup");
+        let mut info = KeyInfo {
+            sources: vec![
+                KeyInfoSource::KeyValue(KeyValueInfo::Dsa {
+                    p: None,
+                    q: None,
+                    g: None,
+                    y: vec![1],
+                }),
+                KeyInfoSource::X509Data(X509DataInfo {
+                    subject_names: vec!["CN=absent".into()],
+                    ..X509DataInfo::default()
+                }),
+                KeyInfoSource::KeyValue(KeyValueInfo::InvalidEcKeyValue),
+            ],
+        };
+        let unsplit = DefaultKeyResolver::new(KeyResolverConfig::default())
+            .resolve(Some(&info), SignatureAlgorithm::RsaSha256)
+            .err()
+            .expect("mismatch");
+        let split = inventory
+            .verification_resolver()
+            .resolve(Some(&info), SignatureAlgorithm::RsaSha256)
+            .err()
+            .expect("mismatch");
+        assert_eq!(format!("{split:?}"), format!("{unsplit:?}"));
+        info.sources[2] = KeyInfoSource::DerEncodedKeyValue(vec![0]);
+        let unsplit = DefaultKeyResolver::new(KeyResolverConfig::default())
+            .resolve(Some(&info), SignatureAlgorithm::RsaSha256)
+            .err()
+            .expect("terminal");
+        let split = inventory
+            .verification_resolver()
+            .resolve(Some(&info), SignatureAlgorithm::RsaSha256)
+            .err()
+            .expect("terminal");
+        assert_eq!(format!("{split:?}"), format!("{unsplit:?}"));
     }
 
     #[test]
