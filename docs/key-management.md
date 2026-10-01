@@ -120,6 +120,9 @@ Entries explicitly named by later recipient slots are reserved before assigning
 fallbacks only when they match that slot's key metadata. An unnamed slot cannot
 consume a later compatible exact match, but a stale name contradicted by metadata
 does not reserve an incompatible key.
+Reservation retains a decoded matching RSA candidate. Assignment moves that
+candidate from the cache without decoding or charging it again; the candidate
+work limit counts actual inspections, not reuse of an already inspected key.
 
 For production applications, do not put passwords on a process command line:
 load them through the application's secret channel and call the byte-oriented

@@ -4011,6 +4011,85 @@ fn lax_rsa_recipients_charge_only_attempted_store_keys() {
 }
 
 #[test]
+fn lax_cached_recipients_charge_decoding_once() {
+    // Reservation validates immutable metadata and retains the decoded key.
+    // Reusing it must not consume another candidate, including at the full cap.
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("keys.xml");
+    let template = temp.path().join("template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let encrypted = temp.path().join("encrypted.xml");
+    let public_pem =
+        fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"))
+            .unwrap();
+    let public = RsaPublicKey::from_public_key_pem(&public_pem).unwrap();
+    let base64 = base64::engine::general_purpose::STANDARD;
+    let modulus = base64.encode(public.n().to_be_bytes_trimmed_vartime());
+    let exponent = base64.encode(public.e().to_be_bytes_trimmed_vartime());
+    let key_value = format!(
+        "<ds:KeyValue><ds:RSAKeyValue><ds:Modulus>{modulus}</ds:Modulus><ds:Exponent>{exponent}</ds:Exponent></ds:RSAKeyValue></ds:KeyValue>"
+    );
+    fs::write(&plaintext, b"cached recipient boundary").unwrap();
+    for count in [33, 64] {
+        let mut key_store = String::from(
+            "<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">",
+        );
+        let mut recipients = String::new();
+        for index in 0..count {
+            key_store.push_str(&format!(
+                "<ds:KeyInfo><ds:KeyName>recipient-{index}</ds:KeyName>{key_value}</ds:KeyInfo>"
+            ));
+            recipients.push_str(&format!(
+                "<EncryptedKey><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#rsa-oaep\"/><ds:KeyInfo><ds:KeyName>recipient-{index}</ds:KeyName>{key_value}</ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedKey>"
+            ));
+        }
+        key_store.push_str("</Keys>");
+        fs::write(&store, key_store).unwrap();
+        fs::write(&template, format!(
+            "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><ds:KeyInfo>{recipients}</ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"
+        )).unwrap();
+        let encrypt = Command::new(binary())
+            .args(["encrypt", "--lax-key-search", "--keys-file"])
+            .arg(&store)
+            .arg("--binary-data")
+            .arg(&plaintext)
+            .arg("--output")
+            .arg(&encrypted)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(
+            encrypt.status.success(),
+            "{count} recipients: {}",
+            String::from_utf8_lossy(&encrypt.stderr)
+        );
+        let xml = fs::read_to_string(&encrypted).unwrap();
+        let document = roxmltree::Document::parse(&xml).unwrap();
+        let actual_names: Vec<_> = document
+            .descendants()
+            .filter(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyName")))
+            .map(|node| node.text().unwrap())
+            .collect();
+        let expected_names: Vec<_> = (0..count)
+            .map(|index| format!("recipient-{index}"))
+            .collect();
+        assert_eq!(actual_names, expected_names);
+        let decrypt = Command::new(binary())
+            .args(["decrypt", "--privkey-pem:recipient-0"])
+            .arg(project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .arg(&encrypted)
+            .output()
+            .unwrap();
+        assert!(
+            decrypt.status.success(),
+            "{}",
+            String::from_utf8_lossy(&decrypt.stderr)
+        );
+        assert_eq!(decrypt.stdout, b"cached recipient boundary");
+    }
+}
+
+#[test]
 fn encryption_writes_requested_diagnostics_and_rejects_duplicate_methods() {
     // Encryption diagnostics are a separate stdout contract, and malformed
     // templates must fail before either diagnostics or ciphertext is emitted.

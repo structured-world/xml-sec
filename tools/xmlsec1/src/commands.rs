@@ -2345,25 +2345,31 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                 {
                     continue;
                 }
-                store_candidate_budget
-                    .consume(1)
-                    .map_err(|error| CommandError::Encryption(error.to_string()))?;
                 let cached = available_public_keys_by_name
                     .get_mut(entry.name.as_str())
                     .and_then(|available| available.loaded.take());
-                let candidate = cached
-                    .map_or_else(|| load_stored_recipient_candidate(entry, &policy), Ok)
-                    .and_then(|candidate| {
-                        // This exact slot was checked against immutable metadata
-                        // before reservation. Do not repeat its conversions.
-                        if !(lax
-                            && reserved_slots[slot]
-                            && exact.is_some_and(|selected| std::ptr::eq(selected, entry)))
-                        {
-                            validate_recipient_key_metadata(metadata.as_ref(), &candidate)?;
-                        }
-                        Ok(candidate)
-                    });
+                // Reservation already charged decoding for a retained candidate.
+                // Charge new inspections before work, not movement out of the cache.
+                let candidate = match cached {
+                    Some(candidate) => Ok(candidate),
+                    None => {
+                        store_candidate_budget
+                            .consume(1)
+                            .map_err(|error| CommandError::Encryption(error.to_string()))?;
+                        load_stored_recipient_candidate(entry, &policy)
+                    }
+                }
+                .and_then(|candidate| {
+                    // This exact slot was checked against immutable metadata
+                    // before reservation. Do not repeat its conversions.
+                    if !(lax
+                        && reserved_slots[slot]
+                        && exact.is_some_and(|selected| std::ptr::eq(selected, entry)))
+                    {
+                        validate_recipient_key_metadata(metadata.as_ref(), &candidate)?;
+                    }
+                    Ok(candidate)
+                });
                 match candidate {
                     Ok(candidate) => {
                         selected = Some((entry, candidate));
