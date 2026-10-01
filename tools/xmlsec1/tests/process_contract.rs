@@ -3740,7 +3740,7 @@ fn lax_store_encryption_replaces_stale_content_key_name() {
     let encrypted = temp.path().join("encrypted.xml");
     fs::write(
         &template,
-        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><ds:KeyName>stale</ds:KeyName></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><ds:KeyName>selected<!--split text-->-old</ds:KeyName></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
     )
     .unwrap();
     let encoded = base64::engine::general_purpose::STANDARD.encode(b"0123456789abcdef");
@@ -3847,6 +3847,7 @@ fn lax_store_rsa_recipients_consume_distinct_candidates() {
         [None, None],
         [Some("unknown-a"), Some("unknown-b")],
         [Some("a"), None],
+        [None, Some("a")],
     ] {
         write_template(&names);
         let result = encrypt(&encrypted);
@@ -3855,6 +3856,17 @@ fn lax_store_rsa_recipients_consume_distinct_candidates() {
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
+        // A fallback cannot steal the key requested by a later named slot.
+        if names == [None, Some("a")] {
+            let xml = fs::read_to_string(&encrypted).unwrap();
+            let document = roxmltree::Document::parse(&xml).unwrap();
+            let assigned = document
+                .descendants()
+                .filter(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyName")))
+                .map(|node| node.text().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(assigned, ["b", "a"]);
+        }
         for bits in [2048, 4096] {
             let result = Command::new(binary())
                 .args(["decrypt", "--lax-key-search", "--privkey-pem"])

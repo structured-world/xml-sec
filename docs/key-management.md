@@ -59,6 +59,9 @@ inventory name lookup. The operation policy is required so source sizes are
 checked before RSA decoding. Direct and XML key-store imports accept only
 16-, 24-, or 32-byte AES keys; unsupported public-key algorithms are rejected
 at import rather than acquiring verification permission.
+Public DSA entries must contain independently usable parameters; the inventory
+does not infer missing parameters from another entry. Verification validates the
+complete policy snapshot before selecting or copying any key, including HMAC.
 
 `add_private_der_with_password_callback` asks the caller for a zeroizing byte
 password only for encrypted PKCS#8; plaintext input does not invoke it.
@@ -73,6 +76,8 @@ resource-policy error without invoking the callback.
 are capped by implementation safety ceilings and checked before decryption.
 Exceeding a recognized KDF's work or memory limit returns a policy error;
 missing or incorrect passwords remain protected-container errors.
+The CLI applies the same pre-decryption KDF limits to explicit protected PKCS#8
+PEM/DER keys, including the generic private-key options, as to inventory imports.
 When the PKCS#12 parser rejects an oversized salt, that distinct resource
 rejection also returns a typed policy error.
 
@@ -106,6 +111,8 @@ For multiple RSA encryption recipients, `--lax-key-search` prefers an exact
 name and then tries remaining compatible entries in store order. Each selected
 entry is consumed once for that operation; insufficient entries fail before
 any encrypted output is written.
+Entries explicitly named by later recipient slots are reserved before assigning
+fallbacks, so an unnamed slot cannot consume a later recipient's requested key.
 
 For production applications, do not put passwords on a process command line:
 load them through the application's secret channel and call the byte-oriented

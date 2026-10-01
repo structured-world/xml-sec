@@ -338,6 +338,7 @@ impl<'a> KeyResolver for InventoryVerificationResolver<'a> {
         policy: &crate::policy::VerificationPolicy,
         provider: &dyn crate::provider::CryptoProvider,
     ) -> Result<Option<Box<dyn VerifyingKey + 'k>>, DsigError> {
+        policy.validate()?;
         if let Some(info) = key_info {
             crate::xmldsig::keys::validate_key_info_source_permissions(info, policy.key_sources)?;
         }
@@ -1648,6 +1649,10 @@ impl KeyInventory {
                     });
                 }
                 ParsedMaterial::Dsa(public, private) => {
+                    // This inventory has no external DSA parameter inheritance;
+                    // its stored public tuple must be independently resolvable.
+                    crate::xmldsig::keys::supported_key_value_is_rsa(&public)
+                        .map_err(|_| KeyStoreError::Invalid("invalid public DSAKeyValue".into()))?;
                     let mut key_info = KeyInfo::default();
                     key_info.sources.push(KeyInfoSource::KeyName(name.clone()));
                     key_info.sources.push(KeyInfoSource::KeyValue(public));
@@ -3405,6 +3410,36 @@ mod tests {
     }
 
     #[test]
+    fn named_hmac_resolution_rejects_invalid_policy_snapshot() {
+        // Early HMAC resolution must validate the entire snapshot even when
+        // the selected key is small and otherwise permitted.
+        let mut inventory = KeyInventory::default();
+        inventory
+            .add_symmetric(
+                "verify".into(),
+                SymmetricKeyKind::Hmac,
+                b"sufficiently-long-hmac-secret".to_vec(),
+                KeyUsages::VERIFY,
+                &ResourcePolicy::default(),
+            )
+            .expect("verification HMAC imports");
+        let info = KeyInfo {
+            sources: vec![KeyInfoSource::KeyName("verify".into())],
+            ..KeyInfo::default()
+        };
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_external_resource_bytes = usize::MAX;
+        assert!(matches!(
+            inventory.verification_resolver().resolve_with_policy(
+                Some(&info),
+                SignatureAlgorithm::HmacSha256,
+                &policy
+            ),
+            Err(DsigError::Policy(_))
+        ));
+    }
+
+    #[test]
     fn named_hmac_resolution_uses_active_resource_limits() {
         // A store imported under a broad policy must not bypass a later,
         // stricter verification snapshot when resolving a named secret.
@@ -4375,6 +4410,30 @@ mod tests {
             ))
         ));
         assert_eq!(first.entry_count(), 1);
+    }
+
+    #[test]
+    fn public_dsa_store_entries_require_usable_parameters() {
+        // The inventory has no implicit parameter inheritance. Do not grant
+        // VERIFY to material that its own resolver cannot construct as a key.
+        for fields in [
+            "<Y>AQ==</Y>",
+            "<P/><Q/><G/><Y>AQ==</Y>",
+            "<P>AQ==</P><Q>AQ==</Q><G>AQ==</G><Y>AQ==</Y>",
+        ] {
+            let xml = format!(
+                "<Keys xmlns=\"{XMLSEC_NS}\"><KeyInfo xmlns=\"{XMLDSIG_NS}\"><KeyName>dsa</KeyName><KeyValue><DSAKeyValue>{fields}</DSAKeyValue></KeyValue></KeyInfo></Keys>"
+            );
+            assert!(
+                KeyInventory::from_xml_bytes(
+                    xml.as_bytes(),
+                    &xml_policy(ResourcePolicy::default()),
+                    XmlBackend::default()
+                )
+                .is_err(),
+                "accepted unusable DSA: {fields}"
+            );
+        }
     }
 
     #[test]

@@ -1107,13 +1107,36 @@ fn prepare_signing_key_candidate(
         split_key_and_certificates(option.value.as_deref().unwrap_or_default())?;
     let key_bytes = key_material::read(path)?;
     material_budget.charge(key_bytes.len())?;
-    let key = key_material::decode_signing_key(
-        Path::new(path),
-        &key_bytes,
-        private_key_format(option),
-        algorithm,
-        password,
-    )?;
+    let format = private_key_format(option);
+    let key = if key_material::is_encrypted_pkcs8_container(&key_bytes, format) {
+        // All protected PKCS#8 aliases share the inventory's pre-decryption KDF gate;
+        // selecting a CLI spelling must never change import policy enforcement.
+        let mut inventory = KeyInventory::default();
+        let name = option.parameter.as_deref().unwrap_or("explicit");
+        match format {
+            key_material::PrivateKeyFormat::Pem | key_material::PrivateKeyFormat::Pkcs8Pem => {
+                inventory.add_private_pem(
+                    name.into(),
+                    &key_bytes,
+                    password,
+                    key_manager::KeyUsages::SIGN,
+                    &policy.resources,
+                )?;
+            }
+            key_material::PrivateKeyFormat::Der | key_material::PrivateKeyFormat::Pkcs8Der => {
+                inventory.add_private_der(
+                    name.into(),
+                    &key_bytes,
+                    password,
+                    key_manager::KeyUsages::SIGN,
+                    &policy.resources,
+                )?;
+            }
+        }
+        inventory.signing_key(name, algorithm, policy)?
+    } else {
+        key_material::decode_signing_key(Path::new(path), &key_bytes, format, algorithm, password)?
+    };
     validate_signing_key(key.as_ref(), algorithm, policy)
         .map_err(|error| CommandError::Signature(error.to_string()))?;
     let (certificate_writer, leaf_certificate_der) = if certificate_paths.is_empty() {
@@ -2221,16 +2244,33 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         {
             public_key_count += 1;
             only_public_key = Some(entry);
-            available_public_keys_by_name.insert(entry.name.as_str(), entry);
+            available_public_keys_by_name.insert(entry.name.as_str(), (entry, 0_usize));
+        }
+        // Reserve exact names before fallback assignment. Reuse the availability
+        // index so reservations require neither key copies nor a second map.
+        for recipient in &template_recipients {
+            if let Some(name) = recipient.key_name.as_deref()
+                && let Some((_, remaining)) = available_public_keys_by_name.get_mut(name)
+            {
+                *remaining += 1;
+            }
         }
         for (recipient, metadata) in template_recipients.into_iter().zip(recipient_metadata) {
             let lax = invocation.flag("lax-key-search");
+            if let Some(name) = recipient.key_name.as_deref()
+                && let Some((_, remaining)) = available_public_keys_by_name.get_mut(name)
+            {
+                *remaining -= 1;
+            }
             let exact = match recipient.key_name.as_deref() {
-                Some(name) => available_public_keys_by_name.get(name).copied(),
+                Some(name) => available_public_keys_by_name
+                    .get(name)
+                    .map(|(entry, _)| *entry),
                 None if public_key_count == 1 => only_public_key.and_then(|entry| {
                     available_public_keys_by_name
                         .get(entry.name.as_str())
-                        .copied()
+                        .filter(|(_, remaining)| !lax || *remaining == 0)
+                        .map(|(entry, _)| *entry)
                 }),
                 None if !lax && public_key_count > 1 => {
                     return Err(CommandError::Usage(
@@ -2244,7 +2284,9 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             }
             let fallbacks = store.public_keys().iter().filter(|entry| {
                 lax && entry.usages.allows(key_manager::KeyUsage::Encrypt)
-                    && available_public_keys_by_name.contains_key(entry.name.as_str())
+                    && available_public_keys_by_name
+                        .get(entry.name.as_str())
+                        .is_some_and(|(_, remaining)| *remaining == 0)
                     && !exact.is_some_and(|selected| std::ptr::eq(selected, *entry))
             });
             let mut selected = None;
@@ -2930,7 +2972,7 @@ fn apply_encryption_template(
             if let (Some(template_name), Some(generated_name)) = (
                 direct_child_element(template_key_info, XMLDSIG_NS, "KeyName"),
                 direct_child_element(generated_key_info, XMLDSIG_NS, "KeyName"),
-            ) && template_name.text() != generated_name.text()
+            ) && !same_direct_simple_text(template_name, generated_name, "KeyName")?
             {
                 replacements.push(replace_element_text(
                     template,
@@ -4099,6 +4141,73 @@ mod tests {
 
     fn invocation(arguments: &[&str]) -> Invocation {
         Invocation::parse(arguments.iter().map(OsString::from)).unwrap()
+    }
+
+    #[test]
+    fn explicit_pkcs8_signing_enforces_import_kdf_limits() {
+        // Explicit PEM/DER options, including generic private-key aliases, must
+        // reject KDF policy violations before password-dependent decryption.
+        use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng as _};
+        use rsa::pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _};
+        let rsa = rsa::RsaPrivateKey::from_pkcs8_pem(include_str!(
+            "../../../tests/fixtures/keys/rsa/rsa-2048-key.pem"
+        ))
+        .unwrap();
+        let plain = rsa.to_pkcs8_der().unwrap();
+        let encrypted = rsa::pkcs8::PrivateKeyInfoRef::try_from(plain.as_bytes())
+            .unwrap()
+            .encrypt_with_rng(&mut ChaCha20Rng::seed_from_u64(42), b"correct")
+            .unwrap();
+        let pem = encrypted
+            .to_pem("ENCRYPTED PRIVATE KEY", der::pem::LineEnding::LF)
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        for option_name in ["pkcs8-pem", "pkcs8-der", "privkey-pem", "privkey-der"] {
+            let path = temp.path().join(option_name);
+            fs::write(
+                &path,
+                if option_name.ends_with("pem") {
+                    pem.as_bytes()
+                } else {
+                    encrypted.as_bytes()
+                },
+            )
+            .unwrap();
+            let parsed = Invocation::parse([
+                OsString::from("xmlsec1"),
+                OsString::from("sign"),
+                OsString::from(format!("--{option_name}")),
+                path.into_os_string(),
+                OsString::from("template.xml"),
+            ])
+            .unwrap();
+            for memory_limit in [false, true] {
+                let mut policy = SigningPolicy::default();
+                if memory_limit {
+                    policy.resources.max_key_import_kdf_memory_bytes = 1;
+                } else {
+                    policy.resources.max_key_import_kdf_work = 1;
+                }
+                let mut budget =
+                    ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
+                let result = prepare_signing_key_candidate(
+                    parsed.values(option_name).next().unwrap(),
+                    SignatureAlgorithm::RsaSha256,
+                    &policy,
+                    Some(b"wrong"),
+                    &mut budget,
+                );
+                assert!(
+                    matches!(
+                        result,
+                        Err(CommandError::KeyStore(key_manager::KeyStoreError::Policy(
+                            _
+                        )))
+                    ),
+                    "{option_name}, memory limit {memory_limit}"
+                );
+            }
+        }
     }
 
     #[test]

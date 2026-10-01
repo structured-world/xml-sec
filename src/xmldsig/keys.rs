@@ -3,9 +3,9 @@
 use std::{collections::HashMap, fmt, time::SystemTime};
 
 use crypto_bigint::BoxedUint;
-use der::Decode as _;
-use dsa::pkcs8::{DecodePublicKey as DsaDecodePublicKey, EncodePublicKey as DsaEncodePublicKey};
+use dsa::pkcs8::EncodePublicKey as DsaEncodePublicKey;
 use hmac::{KeyInit, Mac};
+use rsa::pkcs8::DecodePublicKey as _;
 use x509_parser::{
     prelude::{FromDer, X509Certificate},
     public_key::PublicKey,
@@ -14,10 +14,11 @@ use x509_parser::{
 use zeroize::Zeroizing;
 
 use super::signature::{
-    signature_value_matches_spki, signature_value_matches_spki_with_encoding,
-    validate_dsa_signature_spki_with_minimum, validate_rsa_signature_spki_with_minimum,
-    verify_dsa_signature_spki_primitive, verify_dsa_signature_spki_with_minimum,
-    verify_rsa_signature_spki_primitive, verify_rsa_signature_spki_with_minimum,
+    decode_dsa_verifying_key, signature_value_matches_spki,
+    signature_value_matches_spki_with_encoding, validate_dsa_signature_spki_with_minimum,
+    validate_rsa_signature_spki_with_minimum, verify_dsa_signature_spki_primitive,
+    verify_dsa_signature_spki_with_minimum, verify_rsa_signature_spki_primitive,
+    verify_rsa_signature_spki_with_minimum,
 };
 use super::{
     DsigError, KeyInfo, KeyInfoSource, KeyResolver, KeyValueInfo, SignatureAlgorithm, VerifyingKey,
@@ -1402,8 +1403,8 @@ fn validate_spki_algorithm(
         .map(|oid| oid.to_id_string());
     match (algorithm, parsed) {
         (SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256, PublicKey::DSA(_)) => {
-            let _ = dsa::VerifyingKey::from_public_key_der(public_key_bytes)
-                .map_err(|_| KeyResolutionError::AlgorithmMismatch)?;
+            let _ = decode_dsa_verifying_key(public_key_bytes)
+                .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
             Ok(())
         }
         (
@@ -1448,9 +1449,8 @@ pub(crate) fn supported_parsed_spki_is_rsa(
             Ok(true)
         }
         PublicKey::DSA(_) => {
-            preflight_dsa_spki(public_key_bytes)?;
-            let _ = dsa::VerifyingKey::from_public_key_der(public_key_bytes)
-                .map_err(|_| KeyResolutionError::AlgorithmMismatch)?;
+            let _ = decode_dsa_verifying_key(public_key_bytes)
+                .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
             Ok(false)
         }
         PublicKey::EC(_) => {
@@ -1465,36 +1465,6 @@ pub(crate) fn supported_parsed_spki_is_rsa(
         }
         _ => Err(KeyResolutionError::AlgorithmMismatch),
     }
-}
-
-#[derive(der::Sequence)]
-struct BorrowedDsaPublicParameters<'a> {
-    p: der::asn1::UintRef<'a>,
-    q: der::asn1::UintRef<'a>,
-    g: der::asn1::UintRef<'a>,
-}
-
-fn preflight_dsa_spki(der: &[u8]) -> Result<(), KeyResolutionError> {
-    let spki = rsa::pkcs8::SubjectPublicKeyInfoRef::from_der(der)
-        .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
-    let parameters = spki
-        .algorithm
-        .parameters
-        .as_ref()
-        .ok_or(KeyResolutionError::InvalidPublicKey)?
-        .decode_as::<BorrowedDsaPublicParameters<'_>>()
-        .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
-    let y = der::asn1::UintRef::from_der(spki.subject_public_key.raw_bytes())
-        .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
-    if [parameters.p, parameters.q, parameters.g, y]
-        .into_iter()
-        .any(|component| {
-            component.as_bytes().len() > crate::hard_limits::DSA_KEY_COMPONENT_BYTE_CEILING
-        })
-    {
-        return Err(KeyResolutionError::InvalidPublicKey);
-    }
-    Ok(())
 }
 
 fn validate_ec_point(curve_oid: Option<&str>, point: &[u8]) -> Result<(), KeyResolutionError> {
@@ -1541,6 +1511,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use base64::{Engine, engine::general_purpose::STANDARD};
+    use der::Decode as _;
     use rcgen::{
         CertificateRevocationListParams, Issuer, KeyIdMethod, KeyPair, KeyUsagePurpose,
         RevokedCertParams, SerialNumber, date_time_ymd,
@@ -1565,7 +1536,7 @@ mod tests {
         // non-configurable DSA component ceiling.
         let oversized = vec![1_u8; crate::hard_limits::DSA_KEY_COMPONENT_BYTE_CEILING + 1];
         let one = [1_u8];
-        let params = der::Encode::to_der(&BorrowedDsaPublicParameters {
+        let params = der::Encode::to_der(&super::super::signature::BorrowedDsaPublicParameters {
             p: der::asn1::UintRef::new(&oversized).expect("positive P"),
             q: der::asn1::UintRef::new(&one).expect("positive Q"),
             g: der::asn1::UintRef::new(&one).expect("positive G"),
@@ -1582,7 +1553,13 @@ mod tests {
         };
         let encoded = der::Encode::to_der(&spki).expect("SPKI encodes");
         assert!(matches!(
-            preflight_dsa_spki(&encoded),
+            decode_dsa_verifying_key(&encoded),
+            Err(super::super::signature::SignatureVerificationError::InvalidKeyDer)
+        ));
+        // Ordinary verification must use the same borrowed preflight, not
+        // reject only after an allocating crypto decoder reports mismatch.
+        assert!(matches!(
+            validate_spki_algorithm(&encoded, SignatureAlgorithm::DsaSha256),
             Err(KeyResolutionError::InvalidPublicKey)
         ));
     }

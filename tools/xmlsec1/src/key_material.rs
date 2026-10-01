@@ -396,6 +396,10 @@ struct TraditionalDsaPrivateKey<'a> {
     x: UintRef<'a>,
 }
 
+pub(crate) fn is_encrypted_pkcs8_container(bytes: &[u8], format: PrivateKeyFormat) -> bool {
+    pkcs8_container_kind(bytes, format) == Some(Pkcs8ContainerKind::Encrypted)
+}
+
 fn pkcs8_container_kind(bytes: &[u8], format: PrivateKeyFormat) -> Option<Pkcs8ContainerKind> {
     match format {
         PrivateKeyFormat::Pem | PrivateKeyFormat::Pkcs8Pem => {
