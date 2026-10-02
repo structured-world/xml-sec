@@ -133,10 +133,78 @@ boundaries that use donor document-order lookup can explicitly select
 `SignatureTemplateSelection::FirstDescendant`; `start_node_id` scopes that selection to one subtree.
 `VerifyContext` instead requires one unique document-level `Signature` by default and rejects
 documents containing multiple candidates. Callers that intentionally consume multi-signature
-documents must choose `first_document_signature()` or scope lookup with `start_node_id()`.
+documents can use `verify_all()` / `verify_request()` for complete bounded outcomes, or explicitly
+choose `first_document_signature()` / scope lookup with `start_node_id()` for single-signature work.
 `SigningPolicy::rsa_keys` validates normalized modulus width and public exponent before provider
 dispatch. The default accepts 2048-8192-bit RSA keys for new signatures; compatibility callers can
 raise or lower the minimum explicitly, while the 8192-bit implementation ceiling cannot be relaxed.
+
+## Verification Requests and Evidence
+
+`VerifyContext::verify_all(&document)` processes every `Signature` in document order and returns
+`VerifyEvidence`. `Ok` means that the operation produced a report, not that the document passed:
+inspect `accepted()` or `all_valid()`. Malformed signatures and pipeline failures remain individual
+`SignatureEvidence` results; an empty document never passes. `ResourcePolicy::max_signatures`
+bounds discovery, report allocation, and signature work (default and absolute ceiling: 64).
+
+For application authorization, pass `VerificationRequest` to `verify_request`. Request data is
+borrowed: expected element identities, explicitly authorized keys for selected signatures,
+caller-owned external bytes, signature cardinality, and an opaque correlation value. It cannot
+relax the compiled security policy. The default requires all signatures to pass; `AtLeast(n)`
+explicitly tolerates other failures, while `Exactly(n)` requires exactly `n` signatures, all valid.
+Zero cardinality, duplicate targets, ambiguous key mappings, and foreign/stale identities are
+rejected before key or digest work. External bytes cannot be supplied simultaneously in the
+context and the request.
+
+```rust
+use xml_sec::XmlDocument;
+use xml_sec::xmldsig::{
+    CallerTrustedSignatureKey, VerificationRequest, VerifyContext, VerifyingKey,
+};
+
+fn verify_expected(xml: &str, key: &dyn VerifyingKey) -> Result<bool, Box<dyn std::error::Error>> {
+    let document = XmlDocument::parse(xml.to_owned())?;
+    let context = VerifyContext::new();
+    let signatures = context.signature_identities(&document)?;
+    if signatures.len() != 1 {
+        return Ok(false);
+    }
+    let target = document.with_view(|view| view.node_for_id("payload", &[]))
+        .ok_or("missing or ambiguous payload ID")?;
+    let keys = [CallerTrustedSignatureKey { signature: signatures[0], key }];
+    let targets = [target];
+    let request = VerificationRequest {
+        expected_targets: &targets,
+        trusted_keys: &keys,
+        ..VerificationRequest::default()
+    };
+    Ok(context.verify_request(&document, &request)?.accepted())
+}
+```
+
+`signature_identities` is bounded discovery, not authentication; it does no cryptographic work.
+Reports bind the processed Signature and Reference elements to the retained document generation.
+Same-document references record the resolved target identity; external references record a SHA-256
+fingerprint of resolved bytes before transforms, including XML Base resolution. The lexical URI
+is diagnostic only. Reference digest status and typed key-trust evidence remain separate from
+signature validity.
+
+`covers_element` proves expanded element-content coverage only under a valid, authorized signature
+(`CallerTrusted` or `ValidatedX509`). A matching digest under an invalid signature or an untrusted
+embedded key is insufficient. Authenticated Manifest references contribute only when processing is
+enabled and their own digests pass. Coverage excludes comments and the owning enveloped Signature;
+it is not original-byte equality. Arbitrary XPath projections and binary transforms remain
+indeterminate rather than claiming complete original-subtree coverage, as required by
+[XMLDSig 1.1 §8.1.1](https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-Signed).
+Any document mutation invalidates earlier coverage proofs. Same-name siblings cannot satisfy an
+identity-based expected-target requirement.
+
+Batch verification retains one parsed document and shares transform, XPath, external-resource,
+key-materialization, and canonicalization accounting across signatures. Authentication graphs remain
+signature-local, so one signature cannot authorize another signature's Manifest. X.509 validation
+captures one operation time for every candidate path and signature.
+
+## Provider Dispatch
 
 `SignContext::provider` selects both digest primitives and operation randomness. Built-in ECDSA
 signing obtains its prehash from that provider, while built-in RSA signing routes its blinding

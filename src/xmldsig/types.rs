@@ -843,7 +843,7 @@ pub(super) fn charge_resource_bytes(
     Ok(total)
 }
 
-fn subtree_node_id_range(node: Node<'_, '_>) -> RangeInclusive<u32> {
+pub(crate) fn subtree_node_id_range(node: Node<'_, '_>) -> RangeInclusive<u32> {
     let last_id = node
         .descendants()
         .next_back()
