@@ -600,16 +600,22 @@ impl<'a> KeyResolver for InventoryVerificationResolver<'a> {
                     }
                     .into());
                 }
-                debug_assert!(total <= policy.resources.max_external_resource_total_bytes);
-                if material.len() > policy.resources.max_external_resource_total_bytes - total {
-                    return Err(crate::policy::PolicyViolation::ResourceLimit {
-                        resource: crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
-                        maximum: policy.resources.max_external_resource_total_bytes,
-                        actual: total.saturating_add(material.len()),
+                // The owned resolver config and its borrowed inventory/document
+                // input coexist. Reserve both payloads before any config clone;
+                // this is live-memory policy, not a certificate syntax rule.
+                for _ in 0..2 {
+                    debug_assert!(total <= policy.resources.max_external_resource_total_bytes);
+                    if material.len() > policy.resources.max_external_resource_total_bytes - total {
+                        return Err(crate::policy::PolicyViolation::ResourceLimit {
+                            resource:
+                                crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                            maximum: policy.resources.max_external_resource_total_bytes,
+                            actual: total.saturating_add(material.len()),
+                        }
+                        .into());
                     }
-                    .into());
+                    total += material.len();
                 }
-                total += material.len();
             }
             DefaultKeyResolver::new(KeyResolverConfig {
                 lookup_certs: self.inventory.lookup_certificates.clone(),
@@ -1430,16 +1436,9 @@ impl KeyInventory {
                         resources.max_external_resource_total_bytes,
                     )
                 })?;
-            enforce_pkcs8_kdf_policy(&encrypted, resources, kdf_live_bytes)?;
+            let remaining = self.remaining_kdf_resources(resources)?;
+            enforce_pkcs8_kdf_policy(&encrypted, &remaining, kdf_live_bytes)?;
             let password = password.ok_or(KeyStoreError::ProtectedContainer)?;
-            let mut remaining = resources.clone();
-            if self.kdf_work > remaining.max_key_import_kdf_work {
-                return Err(import_resource_limit(
-                    crate::policy::resource_name::KEY_IMPORT_KDF_WORK,
-                    resources.max_key_import_kdf_work,
-                ));
-            }
-            remaining.max_key_import_kdf_work -= self.kdf_work;
             let work =
                 enforce_pkcs8_password_policy(&encrypted, password, &remaining, kdf_live_bytes)?;
             self.kdf_work += work;
@@ -1531,7 +1530,10 @@ impl KeyInventory {
             self.check_material_capacity(named_material_length(&name, bytes.len(), 1)?, resources)?;
         let encrypted = EncryptedPrivateKeyInfoRef::try_from(bytes).ok();
         let secret = if let Some(encrypted) = &encrypted {
-            enforce_pkcs8_kdf_policy(encrypted, resources, retained_with_input)?;
+            let remaining = self.remaining_kdf_resources(resources)?;
+            // Secret acquisition is observable work: use the same remaining
+            // allowance as direct import before invoking the caller.
+            enforce_pkcs8_kdf_policy(encrypted, &remaining, retained_with_input)?;
             Some(password().ok_or(KeyStoreError::ProtectedContainer)?)
         } else {
             None
@@ -1557,7 +1559,7 @@ impl KeyInventory {
             enforce_pkcs8_password_policy(
                 encrypted,
                 secret,
-                resources,
+                &self.remaining_kdf_resources(resources)?,
                 retained_with_input + secret.capacity() - secret.len(),
             )?;
         }
@@ -1851,6 +1853,21 @@ impl KeyInventory {
             return Err(KeyStoreError::Selection("duplicate key name"));
         }
         Ok(())
+    }
+
+    fn remaining_kdf_resources(
+        &self,
+        resources: &ResourcePolicy,
+    ) -> Result<ResourcePolicy, KeyStoreError> {
+        if self.kdf_work > resources.max_key_import_kdf_work {
+            return Err(import_resource_limit(
+                crate::policy::resource_name::KEY_IMPORT_KDF_WORK,
+                resources.max_key_import_kdf_work,
+            ));
+        }
+        let mut remaining = resources.clone();
+        remaining.max_key_import_kdf_work -= self.kdf_work;
+        Ok(remaining)
     }
 
     fn check_material_capacity(
@@ -4502,6 +4519,78 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_pkcs8_callback_checks_remaining_work() {
+        use der::Encode as _;
+        use pkcs8::pkcs5::{EncryptionScheme, pbes2};
+        // Failed decryption consumes work. A later container must not request
+        // another secret when its visible derivation exceeds the remainder.
+        let envelope = EncryptedPrivateKeyInfoRef {
+            encryption_algorithm: EncryptionScheme::Pbes2(pbes2::Parameters {
+                kdf: pbes2::Kdf::Pbkdf2(pbes2::Pbkdf2Params {
+                    salt: pbes2::Salt::new(b"12345678").expect("salt"),
+                    iteration_count: 2,
+                    key_length: None,
+                    prf: pbes2::Pbkdf2Prf::HmacWithSha256,
+                }),
+                encryption: pbes2::EncryptionScheme::Aes256Cbc { iv: [0; 16] },
+            }),
+            encrypted_data: der::asn1::OctetStringRef::new(&[0; 64]).expect("ciphertext"),
+        }
+        .to_der()
+        .expect("envelope");
+        let resources = ResourcePolicy {
+            max_key_import_kdf_work: 4,
+            ..ResourcePolicy::default()
+        };
+        let mut inventory = KeyInventory::default();
+        assert!(matches!(
+            inventory.add_private_der(
+                "first".into(),
+                &envelope,
+                Some(b"wrong"),
+                KeyUsages::SIGN,
+                &resources,
+            ),
+            Err(KeyStoreError::ProtectedContainer)
+        ));
+        assert_eq!(inventory.key_import_kdf_work(), 3);
+        let calls = std::cell::Cell::new(0);
+        let result = inventory.add_private_der_with_password_callback(
+            "second".into(),
+            &envelope,
+            || {
+                calls.set(calls.get() + 1);
+                Some(Zeroizing::new(b"wrong".to_vec()))
+            },
+            KeyUsages::SIGN,
+            &resources,
+        );
+        assert_eq!(calls.get(), 0, "preflight precedes secret acquisition");
+        assert!(matches!(result, Err(KeyStoreError::Policy(_))));
+        assert_eq!(inventory.key_import_kdf_work(), 3);
+        // An exact remaining derivation is allowed to request the password.
+        let exact = ResourcePolicy {
+            max_key_import_kdf_work: 6,
+            ..resources
+        };
+        assert!(matches!(
+            inventory.add_private_der_with_password_callback(
+                "third".into(),
+                &envelope,
+                || {
+                    calls.set(calls.get() + 1);
+                    Some(Zeroizing::new(b"wrong".to_vec()))
+                },
+                KeyUsages::SIGN,
+                &exact,
+            ),
+            Err(KeyStoreError::ProtectedContainer)
+        ));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(inventory.key_import_kdf_work(), 6);
+    }
+
+    #[test]
     fn encrypted_pkcs8_requires_correct_password_without_plaintext_fallback() {
         // Wrong passwords must not retry another format or leave a partial
         // registration in the caller-owned inventory.
@@ -6175,8 +6264,10 @@ mod tests {
             "{error}"
         );
         let mut bounded = policy.clone();
+        // The owned fallback coexists with the root and enabled document CRL.
+        // Deny one byte below that peak; disabling CRLs releases both charges.
         bounded.resources.max_external_resource_total_bytes =
-            leaf.der().len() + root.der().len() + crl.der().len() - 1;
+            leaf.der().len() + 2 * (root.der().len() + crl.der().len()) - 1;
         assert!(matches!(
             resolver.resolve_with_policy_and_provider(
                 Some(&info),
@@ -6528,6 +6619,128 @@ mod tests {
                 resource: crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES, actual, ..
             })) if actual == size)
         );
+    }
+
+    #[test]
+    fn configured_x509_fallback_budgets_live_copies() {
+        // Inventory bytes remain live while the owned fallback is assembled.
+        // Deny before cloning even malformed CRLs; admit the exact live peak.
+        let resources = ResourcePolicy::default();
+        let certificate = single_pem_block(
+            include_bytes!("../tests/fixtures/keys/rsa/rsa-2048-cert.pem"),
+            resources.max_external_resource_bytes,
+        )
+        .expect("certificate")
+        .into_contents();
+        for trusted in [false, true] {
+            for with_crl in [false, true] {
+                let mut inventory = KeyInventory::default();
+                inventory
+                    .add_certificate_der(certificate.clone(), trusted, &resources)
+                    .expect("certificate imports");
+                let document_crl = vec![0; 16];
+                if with_crl {
+                    inventory.crls.push(vec![0; 32]);
+                }
+                let info = KeyInfo {
+                    sources: vec![KeyInfoSource::X509Data(X509DataInfo {
+                        subject_names: vec!["CN=absent".into()],
+                        crls: if with_crl {
+                            vec![document_crl]
+                        } else {
+                            Vec::new()
+                        },
+                        ..X509DataInfo::default()
+                    })],
+                };
+                let mut policy = crate::policy::VerificationPolicy::default();
+                policy.key_trust.verify_x509_chains = true;
+                policy.key_trust.check_crls = with_crl;
+                let configured = certificate.len() + if with_crl { 32 } else { 0 };
+                // Document evidence is not copied into fallback for an unnamed
+                // source; the default resolver checks it with configured bytes.
+                let peak = 2 * configured;
+                policy.resources.max_external_resource_total_bytes = peak - 1;
+                assert!(
+                    matches!(
+                        inventory
+                            .verification_resolver()
+                            .resolve_with_policy_and_provider(
+                                Some(&info),
+                                SignatureAlgorithm::RsaSha256,
+                                &policy,
+                                crate::provider::default_provider(),
+                            ),
+                        Err(DsigError::Policy(
+                            crate::policy::PolicyViolation::ResourceLimit {
+                                resource:
+                                    crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                                ..
+                            }
+                        ))
+                    ),
+                    "each owned fallback copy must fit before allocation"
+                );
+                policy.resources.max_external_resource_total_bytes = peak;
+                let resolver = inventory.verification_resolver();
+                let outcome = resolver.resolve_with_policy_and_provider(
+                    Some(&info),
+                    SignatureAlgorithm::RsaSha256,
+                    &policy,
+                    crate::provider::default_provider(),
+                );
+                assert!(
+                    !matches!(outcome, Err(DsigError::Policy(_))),
+                    "exact copy budget passes preflight"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn named_x509_fallback_budgets_document_crl_copies() {
+        // A named certificate substitutes document keys, not revocation
+        // evidence. Both retained document CRLs and fallback copies coexist.
+        let resources = ResourcePolicy::default();
+        let certificate = single_pem_block(
+            include_bytes!("../tests/fixtures/keys/rsa/rsa-2048-cert.pem"),
+            resources.max_external_resource_bytes,
+        )
+        .expect("certificate")
+        .into_contents();
+        let mut inventory = KeyInventory::default();
+        inventory
+            .add_public_der("leaf".into(), certificate.clone(), &resources)
+            .expect("named certificate");
+        let info = KeyInfo {
+            sources: vec![
+                KeyInfoSource::KeyName("leaf".into()),
+                KeyInfoSource::X509Data(X509DataInfo {
+                    crls: vec![vec![0; 32]],
+                    ..X509DataInfo::default()
+                }),
+            ],
+        };
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.key_trust.verify_x509_chains = true;
+        policy.key_trust.check_crls = true;
+        policy.resources.max_external_resource_total_bytes = certificate.len() + 64 - 1;
+        assert!(matches!(
+            inventory
+                .verification_resolver()
+                .resolve_with_policy_and_provider(
+                    Some(&info),
+                    SignatureAlgorithm::RsaSha256,
+                    &policy,
+                    crate::provider::default_provider(),
+                ),
+            Err(DsigError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                    ..
+                }
+            ))
+        ));
     }
 
     #[test]

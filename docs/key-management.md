@@ -79,6 +79,9 @@ and document CRLs, with their combined resource budget checked before copying.
 Configured X.509 fallback resumes after previously inspected sources. If no key
 resolves, it retains the first deferred key mismatch in source order; terminal
 errors stop resolution immediately rather than becoming fallback candidates.
+Before constructing its owned resolver configuration, fallback accounts for both
+the original configured certificates/enabled CRLs and their simultaneously live
+copies, including document CRLs attached to a selected named certificate.
 Embedded certificates and CRLs share one aggregate byte allowance with the
 configured certificates and enabled CRLs before chain parsing or assembly.
 RSA decryption selection checks borrowed public components before bigint
@@ -114,6 +117,8 @@ resource-policy error without invoking the callback.
 `max_key_import_kdf_memory_bytes` can tighten protected-key derivation; both
 are capped by implementation safety ceilings and checked before decryption.
 KDF work accumulates across imports in one inventory, including failed decrypts.
+Encrypted PKCS#8 preflight uses the remaining work allowance before invoking a
+password callback; an exhausted allowance cannot prompt for another secret.
 The CLI carries that usage across temporary signing and decryption candidates,
 so lax search cannot multiply the operation allowance. Temporary inventories
 are released after extracting the candidate; accounting does not retain extra keys.
