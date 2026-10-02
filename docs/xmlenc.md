@@ -85,6 +85,12 @@ A caller can explicitly lower its minimum for legacy input; this is application
 security policy, not an XMLEnc validity constraint. RSA resolver wrappers must forward
 the operation snapshot through `resolve_key_candidates_with_policy`; the standalone
 `resolve_key` API uses the default policy.
+The trait's default policy-aware method resolves only direct content keys. It
+returns `KeyNotFound` for recipient keys before invoking legacy resolution:
+already-recovered AES bytes cannot establish the RSA source's policy compliance.
+Custom recipient resolvers must override that method, enforce the supplied
+snapshot before recovery, and charge the shared candidate budget. The built-in
+RSA and AES-KW resolvers provide explicit policy-aware implementations.
 Encryption preflight also applies the operation-wide `ResourcePolicy::max_key_candidates` limit
 before inspecting or dispatching any configured key: a direct content key consumes one candidate,
 while recipient mode consumes one candidate per independently wrapped recipient. The separate
