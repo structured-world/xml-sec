@@ -18,7 +18,7 @@ use pkcs12_import::Limits as Pkcs12Limits;
 use rsa::pkcs8::DecodePublicKey as _;
 use rsa::{
     RsaPrivateKey, RsaPublicKey,
-    pkcs1::{DecodeRsaPrivateKey as _, DecodeRsaPublicKey as _},
+    pkcs1::DecodeRsaPublicKey as _,
     pkcs8::{
         DecodePrivateKey as _, EncodePublicKey as _, EncryptedPrivateKeyInfoRef, PrivateKeyInfoRef,
     },
@@ -1283,7 +1283,29 @@ impl KeyInventory {
         let retained_with_input =
             self.check_material_capacity(named_material_length(&name, bytes.len(), 1)?, resources)?;
         validate_private_key_usages(usages)?;
+        // Borrowed input and decoded PEM remain live while an owned output is
+        // created. Preflight that peak, not only the final inventory footprint.
+        let check_plain_output = |output: usize| {
+            if output > resources.max_external_resource_bytes {
+                return Err(import_resource_limit(
+                    crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
+                    resources.max_external_resource_bytes,
+                ));
+            }
+            let live = bytes
+                .len()
+                .checked_add(live_encoded_bytes)
+                .and_then(|live| live.checked_add(output))
+                .ok_or_else(|| {
+                    import_resource_limit(
+                        crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                        resources.max_external_resource_total_bytes,
+                    )
+                })?;
+            self.check_material_capacity(named_material_length(&name, live, 1)?, resources)
+        };
         let der = if PrivateKeyInfoRef::try_from(bytes).is_ok() {
+            check_plain_output(bytes.len())?;
             Zeroizing::new(bytes.to_vec())
         } else if let Ok(encrypted) = EncryptedPrivateKeyInfoRef::try_from(bytes) {
             // PEM decoding does not end the caller's encoded buffer lifetime.
@@ -1312,13 +1334,27 @@ impl KeyInventory {
                 .map_err(|_| KeyStoreError::ProtectedContainer)?;
             plain
         } else {
+            use der::Encode as _;
             preflight_rsa_pkcs1_components(bytes)?;
-            let rsa = RsaPrivateKey::from_pkcs1_der(bytes)
-                .map_err(|_| KeyStoreError::Selection("unsupported private key DER"))?;
-            let normalized = rsa
-                .to_pkcs8_der()
+            // RFC 8017 A.1.2 / RFC 5958 section 2: wrap the original PKCS#1
+            // octets directly, avoiding bigint re-encoding and two owned DERs.
+            // https://www.rfc-editor.org/rfc/rfc5958#section-2
+            let normalized = PrivateKeyInfoRef::new(
+                rsa::pkcs1::ALGORITHM_ID,
+                der::asn1::OctetStringRef::new(bytes)
+                    .map_err(|_| KeyStoreError::Selection("invalid RSA private key"))?,
+            );
+            let size = usize::try_from(
+                normalized
+                    .encoded_len()
+                    .map_err(|_| KeyStoreError::Selection("invalid RSA private key"))?,
+            )
+            .map_err(|_| KeyStoreError::Selection("key material size overflow"))?;
+            check_plain_output(size)?;
+            let normalized = normalized
+                .to_der()
                 .map_err(|_| KeyStoreError::Selection("invalid RSA private key"))?;
-            Zeroizing::new(normalized.as_bytes().to_vec())
+            Zeroizing::new(normalized)
         };
         if der.len() > resources.max_external_resource_bytes {
             return Err(import_resource_limit(
@@ -4261,6 +4297,63 @@ mod tests {
     }
 
     #[test]
+    fn plaintext_private_import_checks_all_live_copies() {
+        use rsa::pkcs1::EncodeRsaPrivateKey as _;
+        // Borrowed input, decoded PEM and retained DER coexist. Reject one
+        // byte below that peak without retaining a key, and accept exactly it.
+        let der = pem::parse(include_bytes!(
+            "../tests/fixtures/keys/rsa/rsa-2048-key.pem"
+        ))
+        .expect("private key")
+        .into_contents();
+        let pkcs1 = RsaPrivateKey::from_pkcs8_der(&der)
+            .expect("RSA")
+            .to_pkcs1_der()
+            .expect("PKCS1");
+        for (label, input) in [
+            ("PRIVATE KEY", der.as_slice()),
+            ("RSA PRIVATE KEY", pkcs1.as_bytes()),
+        ] {
+            let pem = pem::encode(&pem::Pem::new(label, input.to_vec()));
+            for encoded in [false, true] {
+                let peak = 3 + input.len() + der.len() + if encoded { pem.len() } else { 0 };
+                for exact in [false, true] {
+                    let resources = ResourcePolicy {
+                        max_external_resource_total_bytes: peak - usize::from(!exact),
+                        ..ResourcePolicy::default()
+                    };
+                    let mut inventory = KeyInventory::default();
+                    let result = if encoded {
+                        inventory.add_private_pem(
+                            "new".into(),
+                            pem.as_bytes(),
+                            None,
+                            KeyUsages::SIGN,
+                            &resources,
+                        )
+                    } else {
+                        inventory.add_private_der(
+                            "new".into(),
+                            input,
+                            None,
+                            KeyUsages::SIGN,
+                            &resources,
+                        )
+                    };
+                    if exact {
+                        result.expect("exact live-byte allowance");
+                        assert_eq!(inventory.entry_count(), 1);
+                    } else {
+                        assert!(matches!(result, Err(KeyStoreError::Policy(_))));
+                        assert_eq!(inventory.entry_count(), 0);
+                        assert_eq!(inventory.material_bytes, 0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn encrypted_pkcs8_plaintext_is_reserved_before_password() {
         use der::Encode as _;
         use pkcs8::pkcs5::{EncryptionScheme, pbes2};
@@ -4860,10 +4953,19 @@ mod tests {
         let private = include_str!("../tests/fixtures/keys/rsa/rsa-4096-key.pem");
         for (pem, is_private) in [(public, false), (private, true)] {
             let padded = format!("{pem}{}", " ".repeat(16 * 1024));
+            // The first private import needs two simultaneous decoded DERs,
+            // in addition to encoded input; retaining the first input charge
+            // still makes the second padded import exceed this exact peak.
+            let private_workspace = if is_private {
+                pem::parse(pem).expect("private PEM").contents().len() * 2
+            } else {
+                0
+            };
             let resources = ResourcePolicy {
                 max_external_resource_bytes: padded.len(),
                 max_external_resource_total_bytes: padded.len()
                     + if is_private { 5 } else { 10 }
+                    + private_workspace
                     + 1,
                 ..ResourcePolicy::default()
             };

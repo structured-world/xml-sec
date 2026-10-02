@@ -111,12 +111,20 @@ and imported container; these checks precede password callbacks. The ciphertext-
 PKCS#8 decryption buffer also counts toward the peak, even when decryption fails.
 It is decrypted in place and retained without a second plaintext copy. For PEM imports,
 the encoded input and decoded DER coexist and both count toward that peak.
+Plaintext imports also preflight the retained DER copy alongside the still-live
+input and decoded PEM. PKCS#1 normalization wraps borrowed octets directly in
+one PKCS#8 output rather than re-encoding big integers into intermediate buffers.
 PKCS#8 and PKCS#12 passwords count toward per-resource and aggregate live-byte limits before
 derivation; callback buffers are charged by capacity, not just length. Work includes
 one unit per 64 password bytes per HMAC initialization (two passes for scrypt)
 in addition to the KDF's derivation work. Each PKCS#12 PBES2 derivation charges
 password preprocessing to the shared budget, including encrypted nested bags;
 legacy BMP password conversion consumes separate live memory when needed.
+The legacy PKCS#12 MAC uses RFC 7292 B.1 BMPString password formatting even
+when encryption uses PBES2. Supplementary Unicode characters therefore work
+only when no legacy MAC or encryption KDF requires BMPString. UTF-16 surrogate
+pairs used by some implementations are not accepted as BMPString; RFC 9879
+section 6 separately specifies UTF-8 for PBMAC1, which is not implemented here.
 Ciphertext output capacity is checked before password derivation, including
 after lazy BMP conversion, without allocating the output until decryption needs it.
 Plaintext PKCS#8 imports still ignore unused passwords.

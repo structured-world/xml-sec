@@ -792,11 +792,13 @@ struct Password<'a> {
 impl Password<'_> {
     fn bmp(&mut self, budget: &mut Budget<'_>) -> Result<&[u8]> {
         if self.bmp.is_none() {
-            // RFC 7292 B.1's BMPString conversion applies to its legacy KDF,
-            // not PBES2 (RFC 8018 6.2). Convert lazily so UTF-8 PBES2-only
-            // containers neither allocate this buffer nor reject non-BMP text.
+            // RFC 7292 B.1 requires BMPString for both the legacy encryption
+            // KDF and the legacy MAC, even when encryption itself is PBES2.
+            // BMPString is not UTF-16: supplementary characters cannot be
+            // represented by surrogate pairs. PBES2-only (no legacy MAC/KDF)
+            // uses UTF-8 directly; RFC 9879 section 6 distinguishes PBMAC1.
             // https://www.rfc-editor.org/rfc/rfc7292#appendix-B.1
-            // https://www.rfc-editor.org/rfc/rfc8018#section-6.2
+            // https://www.rfc-editor.org/rfc/rfc9879#section-6
             let mut units = 1_usize;
             for ch in self.utf8.chars() {
                 if u32::from(ch) > u16::MAX as u32 {
@@ -1255,6 +1257,33 @@ mod tests {
             candidates,
             memory_available: ResourcePolicy::default().max_external_resource_total_bytes,
         }
+    }
+
+    #[test]
+    fn legacy_password_format_is_bmp_not_utf16() {
+        // RFC 7292 B.1 is shared by legacy MAC and encryption derivation;
+        // surrogate-pair interoperability must not silently replace BMPString.
+        let limits = limits(64);
+        let mut budget = Budget::new(&limits);
+        let mut password = Password {
+            utf8: "p\u{ffff}",
+            bmp: None,
+        };
+        assert_eq!(
+            password.bmp(&mut budget).expect("BMP password"),
+            &[0, b'p', 255, 255, 0, 0]
+        );
+        let mut password = Password {
+            utf8: "secret\u{1f512}",
+            bmp: None,
+        };
+        let before = budget.memory;
+        assert!(matches!(
+            password.bmp(&mut budget),
+            Err(KeyStoreError::ProtectedContainer)
+        ));
+        assert_eq!(budget.memory, before, "reject before allocating conversion");
+        assert!(password.bmp.is_none());
     }
 
     #[test]
