@@ -1046,4 +1046,5 @@ fn deprecated_surface_is_explicitly_unsupported() {
             .all(|item| classification(&ledger, item).outcome == "intentionally-unsupported")
     );
 }
+#[cfg(all(feature = "xmldsig", feature = "xmlenc"))]
 use xml_sec as roxmltree;

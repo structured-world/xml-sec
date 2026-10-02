@@ -14,15 +14,12 @@ use dsa::{
 };
 mod pkcs12_import;
 use pkcs12_import::Limits as Pkcs12Limits;
-#[cfg(feature = "xmlenc")]
-use rsa::pkcs8::DecodePublicKey as _;
 use rsa::{
-    RsaPrivateKey, RsaPublicKey,
-    pkcs1::DecodeRsaPublicKey as _,
-    pkcs8::{
-        DecodePrivateKey as _, EncodePublicKey as _, EncryptedPrivateKeyInfoRef, PrivateKeyInfoRef,
-    },
+    RsaPrivateKey,
+    pkcs8::{DecodePrivateKey as _, EncryptedPrivateKeyInfoRef, PrivateKeyInfoRef},
 };
+#[cfg(feature = "xmlenc")]
+use rsa::{RsaPublicKey, pkcs8::DecodePublicKey as _};
 use x509_parser::prelude::{FromDer as _, X509Certificate};
 use zeroize::Zeroizing;
 
@@ -1205,6 +1202,8 @@ impl KeyInventory {
 
     /// Import one PEM-encoded public key. RFC 7468 labels select SPKI or
     /// PKCS#1; extra text and multiple armor blocks are rejected.
+    /// Aggregate capacity includes retained inventory, the live encoded input,
+    /// decoded DER, and any SPKI normalization output before allocation.
     pub fn add_public_pem(
         &mut self,
         name: String,
@@ -1235,22 +1234,62 @@ impl KeyInventory {
         ensure_resource_policy(resources)?;
         self.check_new_name(&name, resources)?;
         self.check_material_capacity(named_material_length(&name, bytes.len(), 2)?, resources)?;
-        let block = single_pem_block(bytes, resources.max_external_resource_bytes)?;
-        let der = match block.tag() {
-            "PUBLIC KEY" => block.into_contents(),
+        let block = BorrowedPublicPem::parse(bytes, resources.max_external_resource_bytes)?;
+        self.check_material_capacity(
+            named_material_length(
+                &name,
+                bytes
+                    .len()
+                    .checked_add(block.decoded_len)
+                    .ok_or(KeyStoreError::Selection("key material size overflow"))?,
+                2,
+            )?,
+            resources,
+        )?;
+        let decoded = block.decode()?;
+        let der = match block.label {
+            "PUBLIC KEY" => decoded,
             "RSA PUBLIC KEY" => {
-                let components = rsa::pkcs1::RsaPublicKey::from_der(block.contents())
+                use der::Encode as _;
+                let components = rsa::pkcs1::RsaPublicKey::from_der(&decoded)
                     .map_err(|_| KeyStoreError::Selection("invalid RSA public key"))?;
                 crate::xmldsig::keys::bounded_rsa_public_components(
                     components.modulus.as_bytes(),
                     components.public_exponent.as_bytes(),
                 )
                 .map_err(|_| KeyStoreError::Selection("RSA public key exceeds safety limit"))?;
-                RsaPublicKey::from_pkcs1_der(block.contents())
-                    .ok()
-                    .and_then(|key| key.to_public_key_der().ok())
-                    .map(|der| der.as_bytes().to_vec())
-                    .ok_or(KeyStoreError::Selection("invalid RSA public key"))?
+                // Wrap borrowed PKCS#1 bytes directly; the final SPKI importer
+                // performs native RSA validation once, without an intermediate key.
+                let spki = rsa::pkcs8::SubjectPublicKeyInfoRef {
+                    algorithm: rsa::pkcs1::ALGORITHM_ID,
+                    subject_public_key: der::asn1::BitStringRef::new(0, &decoded)
+                        .map_err(|_| KeyStoreError::Selection("invalid RSA public key"))?,
+                };
+                let encoded_len = usize::try_from(
+                    spki.encoded_len()
+                        .map_err(|_| KeyStoreError::Selection("invalid RSA public key"))?,
+                )
+                .map_err(|_| KeyStoreError::Selection("invalid RSA public key"))?;
+                if encoded_len > resources.max_external_resource_bytes {
+                    return Err(import_resource_limit(
+                        crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
+                        resources.max_external_resource_bytes,
+                    ));
+                }
+                self.check_material_capacity(
+                    named_material_length(
+                        &name,
+                        bytes
+                            .len()
+                            .checked_add(decoded.capacity())
+                            .and_then(|total| total.checked_add(encoded_len))
+                            .ok_or(KeyStoreError::Selection("key material size overflow"))?,
+                        2,
+                    )?,
+                    resources,
+                )?;
+                spki.to_der()
+                    .map_err(|_| KeyStoreError::Selection("invalid RSA public key"))?
             }
             _ => return Err(KeyStoreError::Selection("unsupported public PEM label")),
         };
@@ -2354,6 +2393,135 @@ fn preflight_dsa_pkcs8_components(info: &PrivateKeyInfoRef<'_>) -> Result<(), Ke
     Ok(())
 }
 
+// Borrow the frame and stream whitespace-separated Base64 into one preflighted
+// DER buffer. No normalized Base64 string or owned label/header copies are needed.
+struct BorrowedPublicPem<'a> {
+    label: &'a str,
+    data: &'a str,
+    decoded_len: usize,
+}
+
+impl<'a> BorrowedPublicPem<'a> {
+    fn parse(bytes: &'a [u8], maximum: usize) -> Result<Self, KeyStoreError> {
+        if bytes.len() > maximum {
+            return Err(import_resource_limit(
+                crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
+                maximum,
+            ));
+        }
+        let invalid = || KeyStoreError::Selection("invalid PEM key");
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| invalid())?
+            .trim_matches(|character: char| character.is_ascii_whitespace());
+        let (label, rest) = text
+            .strip_prefix("-----BEGIN ")
+            .and_then(|rest| rest.split_once("-----"))
+            .ok_or_else(invalid)?;
+        if !matches!(label, "PUBLIC KEY" | "RSA PUBLIC KEY") {
+            return Err(KeyStoreError::Selection("unsupported public PEM label"));
+        }
+        let (payload, end) = rest
+            .trim_start_matches([' ', '\t', '\n', '\r'])
+            .split_once("-----END ")
+            .ok_or_else(invalid)?;
+        let begin = if label == "PUBLIC KEY" {
+            "-----BEGIN PUBLIC KEY-----"
+        } else {
+            "-----BEGIN RSA PUBLIC KEY-----"
+        };
+        if end.strip_prefix(label) != Some("-----") || payload.contains(begin) {
+            return Err(KeyStoreError::Selection(
+                "PEM must contain one complete block",
+            ));
+        }
+        // Preserve the existing importer's optional header and whitespace
+        // acceptance without allocating header strings or a stripped body.
+        let data = if let Some((headers, data)) = payload
+            .split_once("\n\n")
+            .or_else(|| payload.split_once("\r\n\r\n"))
+        {
+            if headers.lines().any(|line| !line.contains(':')) {
+                return Err(invalid());
+            }
+            data
+        } else {
+            payload
+        };
+        let mut characters = 0_usize;
+        let mut padding = 0_usize;
+        for part in data.split_whitespace() {
+            for byte in part.bytes() {
+                if byte == b'=' {
+                    padding += 1;
+                } else if padding != 0
+                    || !matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/')
+                {
+                    return Err(invalid());
+                }
+                characters += 1;
+            }
+        }
+        if !characters.is_multiple_of(4) || padding > 2 {
+            return Err(invalid());
+        }
+        let decoded_len = (characters / 4 * 3)
+            .checked_sub(padding)
+            .ok_or_else(invalid)?;
+        Ok(Self {
+            label,
+            data,
+            decoded_len,
+        })
+    }
+
+    fn decode(&self) -> Result<Vec<u8>, KeyStoreError> {
+        use std::io::Read as _;
+        let input = PemBase64Reader {
+            parts: self.data.split_whitespace(),
+            current: &[],
+        };
+        let mut decoder =
+            base64::read::DecoderReader::new(input, &base64::engine::general_purpose::STANDARD);
+        let mut decoded = vec![0; self.decoded_len];
+        decoder
+            .read_exact(&mut decoded)
+            .map_err(|_| KeyStoreError::Selection("invalid PEM key"))?;
+        let mut eof = [0];
+        if decoder
+            .read(&mut eof)
+            .map_err(|_| KeyStoreError::Selection("invalid PEM key"))?
+            != 0
+        {
+            return Err(KeyStoreError::Selection("invalid PEM key"));
+        }
+        Ok(decoded)
+    }
+}
+
+struct PemBase64Reader<'a> {
+    parts: std::str::SplitWhitespace<'a>,
+    current: &'a [u8],
+}
+
+impl std::io::Read for PemBase64Reader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let mut written = 0;
+        while written < buffer.len() {
+            if self.current.is_empty() {
+                let Some(part) = self.parts.next() else {
+                    break;
+                };
+                self.current = part.as_bytes();
+            }
+            let length = self.current.len().min(buffer.len() - written);
+            buffer[written..written + length].copy_from_slice(&self.current[..length]);
+            self.current = &self.current[length..];
+            written += length;
+        }
+        Ok(written)
+    }
+}
+
 fn single_pem_block(bytes: &[u8], maximum: usize) -> Result<pem::Pem, KeyStoreError> {
     if bytes.len() > maximum {
         return Err(import_resource_limit(
@@ -2700,7 +2868,9 @@ fn parse_xmlsec_dsa_key_value(node: Node<'_, '_>) -> Result<ParsedDsaKey, KeySto
 #[cfg(test)]
 mod tests {
     use rand_chacha::{ChaCha8Rng, rand_core::SeedableRng as _};
+    use rsa::RsaPublicKey;
     use rsa::pkcs1::EncodeRsaPrivateKey as _;
+    use rsa::pkcs8::EncodePublicKey as _;
 
     use super::*;
 
@@ -4461,6 +4631,109 @@ mod tests {
     }
 
     #[test]
+    fn public_pem_decoder_preserves_framing_and_whitespace_contract() {
+        // Decode borrowed input without tightening the existing whitespace/header
+        // contract; malformed framing, alphabet and padding remain rejected.
+        for data in [
+            "AQID",
+            "A Q\tI\r\nD",
+            "A\u{2003}QID",
+            "Header: value\n\nAQID",
+            "Header: value\r\n\r\nAQID",
+        ] {
+            let text = format!("-----BEGIN PUBLIC KEY-----\n{data}\n-----END PUBLIC KEY-----");
+            let expected = single_pem_block(text.as_bytes(), 4096).expect("existing PEM contract");
+            let frame = BorrowedPublicPem::parse(text.as_bytes(), 4096).expect("borrowed frame");
+            assert_eq!(
+                frame.decode().expect("borrowed decode"),
+                expected.contents()
+            );
+        }
+        for data in ["AQI=", "AQ==", "AQID"] {
+            let text =
+                format!("-----BEGIN RSA PUBLIC KEY-----\n{data}\n-----END RSA PUBLIC KEY-----");
+            let frame = BorrowedPublicPem::parse(text.as_bytes(), 4096).expect("borrowed frame");
+            assert_eq!(frame.decode().expect("decode").len(), frame.decoded_len);
+        }
+        // Exercise padding and the decoder's fixed-size staging boundaries;
+        // whitespace-separated input must not truncate a multi-read payload.
+        for length in [0, 1, 2, 3, 1023, 1024, 1025, 4096] {
+            let bytes = vec![0xa5; length];
+            let encoded = pem::encode(&pem::Pem::new("PUBLIC KEY", bytes.clone()));
+            let frame = BorrowedPublicPem::parse(encoded.as_bytes(), 8192).expect("frame");
+            assert_eq!(frame.decoded_len, length);
+            assert_eq!(frame.decode().expect("streamed decoding"), bytes);
+        }
+        for text in [
+            "-----BEGIN PUBLIC KEY-----\nAQID\n-----END RSA PUBLIC KEY-----",
+            "-----BEGIN PUBLIC KEY-----\nAQID\n-----END PUBLIC KEY-----junk",
+            "-----BEGIN PUBLIC KEY-----\nAQID\n-----END PUBLIC KEY-----\n-----BEGIN PUBLIC KEY-----\nAQID\n-----END PUBLIC KEY-----",
+            "-----BEGIN PUBLIC KEY-----\nAQI\n-----END PUBLIC KEY-----",
+            "-----BEGIN PUBLIC KEY-----\nAQ$=\n-----END PUBLIC KEY-----",
+            "-----BEGIN PUBLIC KEY-----\nAR==\n-----END PUBLIC KEY-----",
+            "-----BEGIN PUBLIC KEY-----\nA===\n-----END PUBLIC KEY-----",
+            "-----BEGIN PUBLIC KEY-----\nAQ=I\n-----END PUBLIC KEY-----",
+            "-----BEGIN PUBLIC KEY-----\nnot a header\n\nAQID\n-----END PUBLIC KEY-----",
+        ] {
+            assert!(
+                BorrowedPublicPem::parse(text.as_bytes(), 4096)
+                    .and_then(|frame| frame.decode())
+                    .is_err(),
+                "accepted {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_pem_import_accounts_for_simultaneous_buffers() {
+        use rsa::pkcs1::EncodeRsaPublicKey as _;
+        use rsa::pkcs8::DecodePublicKey as _;
+        // Caller PEM, decoded bytes and a normalized SPKI coexist; neither
+        // prior inventory material nor any intermediate may reuse that budget.
+        let pem = include_bytes!("../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+        let spki = pem::parse(pem).expect("public PEM fixture").into_contents();
+        let key = RsaPublicKey::from_public_key_der(&spki).expect("RSA key");
+        let pkcs1 = key.to_pkcs1_der().expect("PKCS1 encoding");
+        for (label, decoded, extra) in [
+            ("PUBLIC KEY", spki.as_slice(), 0),
+            ("RSA PUBLIC KEY", pkcs1.as_bytes(), spki.len()),
+        ] {
+            let encoded = pem::encode(&pem::Pem::new(label, decoded.to_vec()));
+            for exact in [false, true] {
+                let mut inventory = KeyInventory::default();
+                inventory
+                    .add_symmetric(
+                        "existing".into(),
+                        SymmetricKeyKind::Hmac,
+                        vec![1; 16],
+                        KeyUsages::SIGN,
+                        &ResourcePolicy::default(),
+                    )
+                    .expect("existing key");
+                let retained = inventory.material_bytes;
+                let resources = ResourcePolicy {
+                    max_external_resource_total_bytes: retained
+                        + 2 * "new".len()
+                        + encoded.len()
+                        + decoded.len()
+                        + extra
+                        - usize::from(!exact),
+                    ..ResourcePolicy::default()
+                };
+                let result = inventory.add_public_pem("new".into(), encoded.as_bytes(), &resources);
+                if exact {
+                    result.expect("exact peak allowance");
+                    assert_eq!(inventory.entry_count(), 2);
+                } else {
+                    assert!(matches!(result, Err(KeyStoreError::Policy(_))));
+                    assert_eq!(inventory.entry_count(), 1);
+                    assert_eq!(inventory.material_bytes, retained);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn plaintext_private_import_checks_all_live_copies() {
         use rsa::pkcs1::EncodeRsaPrivateKey as _;
         // Borrowed input, decoded PEM and retained DER coexist. Reject one
@@ -5117,19 +5390,16 @@ mod tests {
         let private = include_str!("../tests/fixtures/keys/rsa/rsa-4096-key.pem");
         for (pem, is_private) in [(public, false), (private, true)] {
             let padded = format!("{pem}{}", " ".repeat(16 * 1024));
-            // The first private import needs two simultaneous decoded DERs,
-            // in addition to encoded input; retaining the first input charge
+            // Public imports need one live DER; private imports need two,
+            // in addition to encoded input. Retaining the first input charge
             // still makes the second padded import exceed this exact peak.
-            let private_workspace = if is_private {
-                pem::parse(pem).expect("private PEM").contents().len() * 2
-            } else {
-                0
-            };
+            let workspace = pem::parse(pem).expect("PEM payload").contents().len()
+                * if is_private { 2 } else { 1 };
             let resources = ResourcePolicy {
                 max_external_resource_bytes: padded.len(),
                 max_external_resource_total_bytes: padded.len()
                     + if is_private { 5 } else { 10 }
-                    + private_workspace
+                    + workspace
                     + 1,
                 ..ResourcePolicy::default()
             };
@@ -5383,27 +5653,30 @@ mod tests {
                 &ResourcePolicy::default(),
             )
             .expect("named X.509 certificate imports");
-        assert!(
-            inventory
-                .rsa_encryption_key(
-                    "recipient-cert",
-                    &crate::policy::EncryptionPolicy::default()
-                )
-                .is_ok()
-        );
-        let restricted = crate::policy::EncryptionPolicy {
-            resources: ResourcePolicy {
-                max_external_resource_bytes: 64,
-                max_external_resource_total_bytes: 64,
-                ..ResourcePolicy::default()
-            },
-            ..crate::policy::EncryptionPolicy::default()
-        };
-        assert!(
-            inventory
-                .rsa_encryption_key("recipient-cert", &restricted)
-                .is_err()
-        );
+        #[cfg(feature = "xmlenc")]
+        {
+            assert!(
+                inventory
+                    .rsa_encryption_key(
+                        "recipient-cert",
+                        &crate::policy::EncryptionPolicy::default()
+                    )
+                    .is_ok()
+            );
+            let restricted = crate::policy::EncryptionPolicy {
+                resources: ResourcePolicy {
+                    max_external_resource_bytes: 64,
+                    max_external_resource_total_bytes: 64,
+                    ..ResourcePolicy::default()
+                },
+                ..crate::policy::EncryptionPolicy::default()
+            };
+            assert!(
+                inventory
+                    .rsa_encryption_key("recipient-cert", &restricted)
+                    .is_err()
+            );
+        }
         assert!(inventory.trusted_certificates.is_empty());
     }
 

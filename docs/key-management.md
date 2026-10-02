@@ -104,6 +104,9 @@ permits reinterpretation, but this API deliberately forbids it to preserve
 the protected-key contract. Similarly, `PUBLIC KEY` requires SubjectPublicKeyInfo
 (RFC 7468 section 13); certificates are accepted through the certificate APIs
 or generic DER import, not by reinterpreting a public-key PEM label.
+Public PEM imports preflight retained inventory plus simultaneously live encoded
+input and decoded DER. PKCS#1 RSA imports also preflight the final SPKI output
+before wrapping borrowed key octets; decoding needs no normalized Base64 string.
 Oversized encoded bundles return a typed
 resource-policy error without invoking the callback.
 `ResourcePolicy::max_key_import_kdf_work` and
