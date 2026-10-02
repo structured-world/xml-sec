@@ -711,7 +711,8 @@ fn load_xml_key_stores<P: xml_sec::document::XmlDocumentPolicy>(
     backend: XmlBackend,
     budget: &mut ExternalMaterialBudget,
 ) -> Result<KeyInventory, CommandError> {
-    let mut importer = key_manager::XmlKeyStoreImporter::new(policy, backend)?;
+    let mut importer =
+        key_manager::XmlKeyStoreImporter::with_live_material(policy, backend, budget.total_bytes)?;
     for option in invocation.values("keys-file") {
         let path = Path::new(option.value.as_deref().unwrap_or_default());
         let bytes = read_key_material_with_budget(path, budget)?;
@@ -1055,6 +1056,22 @@ fn prepare_signing_key_candidate(
     password: Option<&[u8]>,
     material_budget: &mut ExternalMaterialBudget,
 ) -> Result<SigningKeyCandidate, CommandError> {
+    material_budget.with_key_import(&policy.resources, |budget, inventory, resources| {
+        prepare_signing_key_candidate_inner(
+            option, algorithm, policy, password, budget, inventory, resources,
+        )
+    })
+}
+
+fn prepare_signing_key_candidate_inner(
+    option: &crate::OptionValue,
+    algorithm: SignatureAlgorithm,
+    policy: &SigningPolicy,
+    password: Option<&[u8]>,
+    material_budget: &mut ExternalMaterialBudget,
+    inventory: &mut KeyInventory,
+    resources: &xml_sec::policy::ResourcePolicy,
+) -> Result<SigningKeyCandidate, CommandError> {
     if algorithm.hmac_output_bits().is_some() {
         let path = option.value.as_deref().unwrap_or_default();
         let key_bytes = key_material::read(path)?;
@@ -1075,9 +1092,8 @@ fn prepare_signing_key_candidate(
         let password = password
             .and_then(|value| std::str::from_utf8(value).ok())
             .ok_or(key_manager::KeyStoreError::ProtectedContainer)?;
-        let mut inventory = KeyInventory::default();
         let name = option.parameter.clone().unwrap_or_else(|| "pkcs12".into());
-        inventory.add_pkcs12(name.clone(), &bytes, password, &policy.resources)?;
+        inventory.add_pkcs12(name.clone(), &bytes, password, resources)?;
         let key = inventory.signing_key(&name, algorithm, policy)?;
         let imported = inventory
             .private_keys()
@@ -1110,7 +1126,6 @@ fn prepare_signing_key_candidate(
     let key = if key_material::is_encrypted_pkcs8_container(&key_bytes, format) {
         // All protected PKCS#8 aliases share the inventory's pre-decryption KDF gate;
         // selecting a CLI spelling must never change import policy enforcement.
-        let mut inventory = KeyInventory::default();
         let name = option.parameter.as_deref().unwrap_or("explicit");
         match format {
             key_material::PrivateKeyFormat::Pem | key_material::PrivateKeyFormat::Pkcs8Pem => {
@@ -1119,7 +1134,7 @@ fn prepare_signing_key_candidate(
                     &key_bytes,
                     password,
                     key_manager::KeyUsages::SIGN,
-                    &policy.resources,
+                    resources,
                 )?;
             }
             key_material::PrivateKeyFormat::Der | key_material::PrivateKeyFormat::Pkcs8Der => {
@@ -1128,7 +1143,7 @@ fn prepare_signing_key_candidate(
                     &key_bytes,
                     password,
                     key_manager::KeyUsages::SIGN,
-                    &policy.resources,
+                    resources,
                 )?;
             }
         }
@@ -1589,6 +1604,7 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
 struct ExternalMaterialBudget {
     total_bytes: usize,
     maximum_bytes: usize,
+    kdf_work: usize,
 }
 
 #[derive(Clone, Default)]
@@ -1651,6 +1667,7 @@ impl ExternalMaterialBudget {
         Self {
             total_bytes: 0,
             maximum_bytes,
+            kdf_work: 0,
         }
     }
 
@@ -1667,6 +1684,34 @@ impl ExternalMaterialBudget {
 
     fn remaining(&self) -> usize {
         self.maximum_bytes - self.total_bytes
+    }
+
+    fn with_key_import<T>(
+        &mut self,
+        resources: &xml_sec::policy::ResourcePolicy,
+        import: impl FnOnce(
+            &mut Self,
+            &mut KeyInventory,
+            &xml_sec::policy::ResourcePolicy,
+        ) -> Result<T, CommandError>,
+    ) -> Result<T, CommandError> {
+        if self.kdf_work > resources.max_key_import_kdf_work {
+            return Err(key_manager::KeyStoreError::Policy(
+                xml_sec::policy::PolicyViolation::ResourceLimitExceeded {
+                    resource: "key import KDF work",
+                    maximum: resources.max_key_import_kdf_work,
+                },
+            )
+            .into());
+        }
+        let mut remaining = resources.clone();
+        remaining.max_key_import_kdf_work -= self.kdf_work;
+        let mut inventory = KeyInventory::default();
+        let result = import(self, &mut inventory, &remaining);
+        // Retain actual work on every result, but release the temporary encoded
+        // inventory when its native key has been extracted. No key copies linger.
+        self.kdf_work += inventory.key_import_kdf_work();
+        result
     }
 }
 
@@ -3560,64 +3605,66 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         let mut certificate_budget =
             ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
         for option in selected {
-            let loaded = (|| {
-                if option.name == "pkcs12" {
-                    let path = Path::new(option.value.as_deref().unwrap_or_default());
-                    let bytes = read_key_material_with_budget(path, &mut certificate_budget)?;
-                    let password = password
-                        .and_then(|value| std::str::from_utf8(value).ok())
-                        .ok_or(key_manager::KeyStoreError::ProtectedContainer)?;
-                    let mut inventory = KeyInventory::default();
-                    let name = option.parameter.clone().unwrap_or_else(|| "pkcs12".into());
-                    inventory.add_pkcs12(name.clone(), &bytes, password, &policy.resources)?;
-                    let imported = inventory.private_keys().first().ok_or_else(|| {
-                        CommandError::Usage("PKCS#12 contains no usable private key".into())
-                    })?;
-                    let private_key = key_material::decode_rsa_private_with_password(
-                        path,
-                        &imported.pkcs8_der,
-                        key_material::PrivateKeyFormat::Pkcs8Der,
-                        None,
-                        &policy.resources,
+            let loaded = certificate_budget.with_key_import(
+                &policy.resources,
+                |certificate_budget, inventory, resources| {
+                    if option.name == "pkcs12" {
+                        let path = Path::new(option.value.as_deref().unwrap_or_default());
+                        let bytes = read_key_material_with_budget(path, certificate_budget)?;
+                        let password = password
+                            .and_then(|value| std::str::from_utf8(value).ok())
+                            .ok_or(key_manager::KeyStoreError::ProtectedContainer)?;
+                        let name = option.parameter.clone().unwrap_or_else(|| "pkcs12".into());
+                        inventory.add_pkcs12(name.clone(), &bytes, password, resources)?;
+                        let imported = inventory.private_keys().first().ok_or_else(|| {
+                            CommandError::Usage("PKCS#12 contains no usable private key".into())
+                        })?;
+                        let private_key = key_material::decode_rsa_private_with_password(
+                            path,
+                            &imported.pkcs8_der,
+                            key_material::PrivateKeyFormat::Pkcs8Der,
+                            None,
+                            &policy.resources,
+                        )?;
+                        return Ok(RecipientPrivateKey {
+                            inner: PrivateKeyDecryptor::new(private_key),
+                            key_name: option.parameter.clone(),
+                        });
+                    }
+                    let (path, certificate_paths) =
+                        split_key_and_certificates(option.value.as_deref().unwrap_or_default())?;
+                    let bytes = read_key_material_with_budget(Path::new(path), certificate_budget)?;
+                    let private_key = key_material::decode_rsa_private_with_inventory(
+                        Path::new(path),
+                        &bytes,
+                        private_key_format(option),
+                        password,
+                        resources,
+                        inventory,
                     )?;
-                    return Ok(RecipientPrivateKey {
+                    if !certificate_paths.is_empty() {
+                        let encoding = if matches!(
+                            private_key_format(option),
+                            key_material::PrivateKeyFormat::Der
+                                | key_material::PrivateKeyFormat::Pkcs8Der
+                        ) {
+                            key_material::CertificateEncoding::Der
+                        } else {
+                            key_material::CertificateEncoding::Pem
+                        };
+                        let certificates = load_certificate_companions(
+                            &certificate_paths,
+                            encoding,
+                            certificate_budget,
+                        )?;
+                        ensure_leaf_certificate_matches_rsa_key(&certificates[0], &private_key)?;
+                    }
+                    Ok::<_, CommandError>(RecipientPrivateKey {
                         inner: PrivateKeyDecryptor::new(private_key),
                         key_name: option.parameter.clone(),
-                    });
-                }
-                let (path, certificate_paths) =
-                    split_key_and_certificates(option.value.as_deref().unwrap_or_default())?;
-                let bytes =
-                    read_key_material_with_budget(Path::new(path), &mut certificate_budget)?;
-                let private_key = key_material::decode_rsa_private_with_password(
-                    Path::new(path),
-                    &bytes,
-                    private_key_format(option),
-                    password,
-                    &policy.resources,
-                )?;
-                if !certificate_paths.is_empty() {
-                    let encoding = if matches!(
-                        private_key_format(option),
-                        key_material::PrivateKeyFormat::Der
-                            | key_material::PrivateKeyFormat::Pkcs8Der
-                    ) {
-                        key_material::CertificateEncoding::Der
-                    } else {
-                        key_material::CertificateEncoding::Pem
-                    };
-                    let certificates = load_certificate_companions(
-                        &certificate_paths,
-                        encoding,
-                        &mut certificate_budget,
-                    )?;
-                    ensure_leaf_certificate_matches_rsa_key(&certificates[0], &private_key)?;
-                }
-                Ok::<_, CommandError>(RecipientPrivateKey {
-                    inner: PrivateKeyDecryptor::new(private_key),
-                    key_name: option.parameter.clone(),
-                })
-            })();
+                    })
+                },
+            );
             match loaded {
                 Ok(key) => keys.push(key),
                 Err(error) if lax_key_search && lax_candidate_error_is_recoverable(&error) => {
@@ -4302,6 +4349,130 @@ mod tests {
                 XmlBackend::default(),
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn temporary_private_imports_keep_kdf_work_after_failure() {
+        use der::Encode as _;
+        use rsa::pkcs8::{
+            EncryptedPrivateKeyInfoRef,
+            pkcs5::{EncryptionScheme, pbes2},
+        };
+        // A failed decrypt spent work even though its temporary inventory held
+        // no key. A second PEM/DER candidate must see only the remainder.
+        let envelope = EncryptedPrivateKeyInfoRef {
+            encryption_algorithm: EncryptionScheme::Pbes2(pbes2::Parameters {
+                kdf: pbes2::Kdf::Pbkdf2(pbes2::Pbkdf2Params {
+                    salt: pbes2::Salt::new(b"12345678").unwrap(),
+                    iteration_count: 2,
+                    key_length: None,
+                    prf: pbes2::Pbkdf2Prf::HmacWithSha256,
+                }),
+                encryption: pbes2::EncryptionScheme::Aes256Cbc { iv: [0; 16] },
+            }),
+            encrypted_data: der::asn1::OctetStringRef::new(&[0; 64]).unwrap(),
+        };
+        let der = envelope.to_der().unwrap();
+        let pem = pem::encode(&pem::Pem::new("ENCRYPTED PRIVATE KEY", der.clone()));
+        let resources = xml_sec::policy::ResourcePolicy {
+            max_key_import_kdf_work: 5,
+            ..Default::default()
+        };
+        for (bytes, format) in [
+            (der.as_slice(), key_material::PrivateKeyFormat::Pkcs8Der),
+            (pem.as_bytes(), key_material::PrivateKeyFormat::Pkcs8Pem),
+        ] {
+            let mut budget =
+                ExternalMaterialBudget::new(resources.max_external_resource_total_bytes);
+            let import = |_: &mut ExternalMaterialBudget,
+                          inventory: &mut KeyInventory,
+                          remaining: &xml_sec::policy::ResourcePolicy| {
+                key_material::decode_rsa_private_with_inventory(
+                    Path::new("key"),
+                    bytes,
+                    format,
+                    Some(b"wrong"),
+                    remaining,
+                    inventory,
+                )
+                .map_err(CommandError::from)
+            };
+            assert!(matches!(
+                budget.with_key_import(&resources, import),
+                Err(CommandError::Key(
+                    key_material::KeyMaterialError::ProtectedContainer
+                ))
+            ));
+            assert_eq!(budget.kdf_work, 3);
+            assert!(matches!(
+                budget.with_key_import(&resources, import),
+                Err(CommandError::Key(key_material::KeyMaterialError::Policy(_)))
+            ));
+            assert_eq!(budget.kdf_work, 3, "denial must precede the second KDF");
+        }
+    }
+
+    #[test]
+    fn temporary_pkcs12_imports_keep_aggregate_work() {
+        // Lax candidates use temporary inventories without resetting operation work.
+        let bytes =
+            include_bytes!("../../../tests/fixtures/xmlenc/01-phaos-xmlenc-3/rsa-priv-key.p12");
+        let resources = xml_sec::policy::ResourcePolicy {
+            max_key_import_kdf_work: 10_000,
+            ..Default::default()
+        };
+        let mut budget = ExternalMaterialBudget::new(resources.max_external_resource_total_bytes);
+        let import = |_: &mut ExternalMaterialBudget,
+                      inventory: &mut KeyInventory,
+                      remaining: &xml_sec::policy::ResourcePolicy| {
+            inventory
+                .add_pkcs12("key".into(), bytes, "secret", remaining)
+                .map_err(CommandError::from)
+        };
+        budget.with_key_import(&resources, import).unwrap();
+        assert!(budget.kdf_work > 0);
+        assert!(matches!(
+            budget.with_key_import(&resources, import),
+            Err(CommandError::KeyStore(key_manager::KeyStoreError::Policy(
+                _
+            )))
+        ));
+    }
+
+    #[test]
+    fn key_store_import_includes_prior_external_material() {
+        // Certificate buffers stay live while keys.xml and its decoded key coexist.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("keys.xml");
+        let xml = "<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:KeyInfo><ds:KeyName>a</ds:KeyName><ds:KeyValue><HMACKeyValue>AA==</HMACKeyValue></ds:KeyValue></ds:KeyInfo></Keys>";
+        fs::write(&path, xml).unwrap();
+        let invocation = invocation(&[
+            "xmlsec1",
+            "verify",
+            "--keys-file",
+            path.to_str().unwrap(),
+            "input.xml",
+        ]);
+        let mut policy = xml_sec::policy::VerificationPolicy::default();
+        policy.resources.max_external_resource_total_bytes = xml.len() + 100;
+        let mut budget =
+            ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
+        budget.charge(99).unwrap();
+        assert!(matches!(
+            load_xml_key_stores(&invocation, &policy, XmlBackend::default(), &mut budget),
+            Err(CommandError::KeyStore(key_manager::KeyStoreError::Policy(
+                _
+            )))
+        ));
+        let mut exact =
+            ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
+        exact.charge(97).unwrap();
+        assert_eq!(
+            load_xml_key_stores(&invocation, &policy, XmlBackend::default(), &mut exact)
+                .unwrap()
+                .entry_count(),
+            1
         );
     }
 

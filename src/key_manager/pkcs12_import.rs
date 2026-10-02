@@ -1153,8 +1153,24 @@ pub(super) struct Prepared<'a, 'l> {
     limits: &'l Limits,
 }
 
+#[cfg(test)]
 pub(super) fn prepare<'a, 'l>(bytes: &'a [u8], limits: &'l Limits) -> Result<Prepared<'a, 'l>> {
+    prepare_with_work(bytes, limits, 0)
+}
+
+pub(super) fn prepare_with_work<'a, 'l>(
+    bytes: &'a [u8],
+    limits: &'l Limits,
+    work: usize,
+) -> Result<Prepared<'a, 'l>> {
     let mut budget = Budget::new(limits);
+    if work > limits.resources.max_key_import_kdf_work {
+        return Err(denial(
+            resource_name::KEY_IMPORT_KDF_WORK,
+            limits.resources.max_key_import_kdf_work,
+        ));
+    }
+    budget.work = work;
     let pfx = Pfx::parse(bytes, &mut budget)?;
     walk_safe(
         &pfx.safe,
@@ -1169,45 +1185,68 @@ pub(super) fn prepare<'a, 'l>(bytes: &'a [u8], limits: &'l Limits) -> Result<Pre
 }
 
 impl Prepared<'_, '_> {
+    #[cfg(test)]
     pub(super) fn decrypt(self, password: &str) -> Result<Contents> {
         self.decrypt_with_password_capacity(password, password.len())
     }
 
+    #[cfg(test)]
     pub(super) fn decrypt_with_password_capacity(
         self,
         password: &str,
         capacity: usize,
     ) -> Result<Contents> {
+        self.decrypt_with_work(password, capacity, &mut 0)
+    }
+
+    pub(super) fn decrypt_with_work(
+        self,
+        password: &str,
+        capacity: usize,
+        work: &mut usize,
+    ) -> Result<Contents> {
         let Self { pfx, limits } = self;
         let mut budget = Budget::new(limits);
-        // The original UTF-8 buffer remains live alongside BER views, BMP
-        // conversion, and decrypted contents; a callback can retain spare capacity.
-        if password.len() > limits.resources.max_external_resource_bytes {
+        if *work > limits.resources.max_key_import_kdf_work {
             return Err(denial(
-                resource_name::EXTERNAL_RESOURCE_BYTES,
-                limits.resources.max_external_resource_bytes,
+                resource_name::KEY_IMPORT_KDF_WORK,
+                limits.resources.max_key_import_kdf_work,
             ));
         }
-        debug_assert!(capacity >= password.len());
-        budget.allocate(capacity)?;
-        budget.allocate(pfx.safe.owned_capacity())?;
-        if let Some(mac) = &pfx.mac {
-            budget.allocate(mac.salt.owned_capacity() + mac.digest.owned_capacity())?;
-            budget.kdf(mac.rounds, 1, &mac.salt)?;
-        }
-        let mut password = Password {
-            utf8: password,
-            bmp: None,
-        };
-        if let Some(mac) = &pfx.mac {
-            mac.verify(&pfx.safe, password.bmp(&mut budget)?, &budget)?;
-        }
-        let mut contents = Contents {
-            private_keys: Vec::new(),
-            certificates: Vec::new(),
-        };
-        walk_safe(&pfx.safe, &mut budget, Some(&mut password), &mut contents)?;
-        Ok(contents)
+        budget.work = *work;
+        let result = (|| {
+            // The original UTF-8 buffer remains live alongside BER views, BMP
+            // conversion, and decrypted contents; a callback can retain spare capacity.
+            if password.len() > limits.resources.max_external_resource_bytes {
+                return Err(denial(
+                    resource_name::EXTERNAL_RESOURCE_BYTES,
+                    limits.resources.max_external_resource_bytes,
+                ));
+            }
+            debug_assert!(capacity >= password.len());
+            budget.allocate(capacity)?;
+            budget.allocate(pfx.safe.owned_capacity())?;
+            if let Some(mac) = &pfx.mac {
+                budget.allocate(mac.salt.owned_capacity() + mac.digest.owned_capacity())?;
+                budget.kdf(mac.rounds, 1, &mac.salt)?;
+            }
+            let mut password = Password {
+                utf8: password,
+                bmp: None,
+            };
+            if let Some(mac) = &pfx.mac {
+                mac.verify(&pfx.safe, password.bmp(&mut budget)?, &budget)?;
+            }
+            let mut contents = Contents {
+                private_keys: Vec::new(),
+                certificates: Vec::new(),
+            };
+            walk_safe(&pfx.safe, &mut budget, Some(&mut password), &mut contents)?;
+            Ok(contents)
+        })();
+        // Work is not refunded by password, DER, or later association failures.
+        *work = budget.work;
+        result
     }
 }
 

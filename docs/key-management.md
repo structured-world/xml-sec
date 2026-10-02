@@ -113,6 +113,10 @@ resource-policy error without invoking the callback.
 `ResourcePolicy::max_key_import_kdf_work` and
 `max_key_import_kdf_memory_bytes` can tighten protected-key derivation; both
 are capped by implementation safety ceilings and checked before decryption.
+KDF work accumulates across imports in one inventory, including failed decrypts.
+The CLI carries that usage across temporary signing and decryption candidates,
+so lax search cannot multiply the operation allowance. Temporary inventories
+are released after extracting the candidate; accounting does not retain extra keys.
 Exceeding a recognized KDF's work or memory limit returns a policy error;
 missing or incorrect passwords remain protected-container errors.
 PBKDF2 work includes every output block required by the cipher's key width
@@ -168,6 +172,9 @@ retained material. XML Base64 decoding borrows text nodes and uses one exact-siz
 output buffer without normalized text copies. Embedded X509Data binary values
 obey the active per-resource and aggregate byte limits before decoding; repeated
 KeyInfo parses in one session retain that charge, including failed candidates.
+XML import sessions can also account for material retained outside the inventory;
+the CLI seeds this usage from its shared certificate/file ledger before loading
+`--keys-file`, so live certificate buffers cannot reuse the key-import allowance.
 BER PrivateKeyInfo framing and constructed private-key OCTET STRINGs are
 normalized to bounded PKCS#8 DER before storage. CMS EncryptedData accepts
 unprotected attributes with version 2, while requiring version 0 without them

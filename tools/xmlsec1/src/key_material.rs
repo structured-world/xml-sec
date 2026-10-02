@@ -994,9 +994,28 @@ pub fn decode_rsa_private_with_password(
     password: Option<&[u8]>,
     resources: &ResourcePolicy,
 ) -> Result<RsaPrivateKey, KeyMaterialError> {
+    decode_rsa_private_with_inventory(
+        path,
+        bytes,
+        format,
+        password,
+        resources,
+        &mut KeyInventory::default(),
+    )
+}
+
+/// Use the operation's import session so protected-key work is observable even
+/// when password validation or native RSA decoding fails.
+pub fn decode_rsa_private_with_inventory(
+    path: &Path,
+    bytes: &[u8],
+    format: PrivateKeyFormat,
+    password: Option<&[u8]>,
+    resources: &ResourcePolicy,
+    inventory: &mut KeyInventory,
+) -> Result<RsaPrivateKey, KeyMaterialError> {
     if pkcs8_container_kind(bytes, format) == Some(Pkcs8ContainerKind::Encrypted) {
         let password = password.ok_or(KeyMaterialError::ProtectedContainer)?;
-        let mut inventory = KeyInventory::default();
         let imported = match format {
             PrivateKeyFormat::Pem | PrivateKeyFormat::Pkcs8Pem => inventory.add_private_pem(
                 "cli-rsa".into(),

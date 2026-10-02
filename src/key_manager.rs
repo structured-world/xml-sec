@@ -169,6 +169,7 @@ pub struct KeyInventory {
     /// Caller-supplied DER certificate revocation lists.
     crls: Vec<Vec<u8>>,
     material_bytes: usize,
+    kdf_work: usize,
 }
 
 /// Import session for multiple XML key stores under one operation snapshot.
@@ -180,18 +181,36 @@ pub struct XmlKeyStoreImporter<'a, P: crate::document::XmlDocumentPolicy> {
     parse_work: XmlParseWorkBudget,
     inspected: usize,
     inventory: KeyInventory,
+    live_material_bytes: usize,
 }
 
 impl<'a, P: crate::document::XmlDocumentPolicy> XmlKeyStoreImporter<'a, P> {
     /// Bind this session to the caller's immutable policy and XML backend.
     pub fn new(policy: &'a P, backend: XmlBackend) -> Result<Self, KeyStoreError> {
+        Self::with_live_material(policy, backend, 0)
+    }
+
+    /// Bind import accounting to material already retained by the operation.
+    /// This is usage, not a second policy limit; it remains live until finish.
+    pub fn with_live_material(
+        policy: &'a P,
+        backend: XmlBackend,
+        live_material_bytes: usize,
+    ) -> Result<Self, KeyStoreError> {
         ensure_resource_policy(policy.resource_policy())?;
+        if live_material_bytes > policy.resource_policy().max_external_resource_total_bytes {
+            return Err(import_resource_limit(
+                crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                policy.resource_policy().max_external_resource_total_bytes,
+            ));
+        }
         Ok(Self {
             policy,
             backend,
             parse_work: XmlParseWorkBudget::from_resources(policy.resource_policy()),
             inspected: 0,
             inventory: KeyInventory::default(),
+            live_material_bytes,
         })
     }
 
@@ -204,7 +223,17 @@ impl<'a, P: crate::document::XmlDocumentPolicy> XmlKeyStoreImporter<'a, P> {
             self.backend,
             &self.parse_work,
             &mut self.inspected,
-            self.inventory.material_bytes,
+            self.inventory
+                .material_bytes
+                .checked_add(self.live_material_bytes)
+                .ok_or_else(|| {
+                    import_resource_limit(
+                        crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                        self.policy
+                            .resource_policy()
+                            .max_external_resource_total_bytes,
+                    )
+                })?,
         )?;
         self.inventory.extend(store, self.policy.resource_policy())
     }
@@ -724,6 +753,14 @@ pub enum KeyStoreError {
 }
 
 impl KeyInventory {
+    /// Work reserved before password derivation, including unsuccessful imports.
+    /// An operation importing through temporary inventories must carry this
+    /// usage forward rather than resetting its remaining KDF allowance.
+    #[must_use]
+    pub fn key_import_kdf_work(&self) -> usize {
+        self.kdf_work
+    }
+
     fn retained_material_bytes(&self) -> Result<usize, KeyStoreError> {
         let mut total = 0_usize;
         let mut add = |length: usize| -> Result<(), KeyStoreError> {
@@ -808,13 +845,23 @@ impl KeyInventory {
     }
 
     /// Combine two caller-owned imports after checking aggregate bytes,
-    /// candidates, and cross-store name collisions before mutating either.
+    /// candidates, KDF work, and cross-store name collisions before mutation.
     pub fn extend(
         &mut self,
         mut other: Self,
         resources: &ResourcePolicy,
     ) -> Result<(), KeyStoreError> {
         ensure_resource_policy(resources)?;
+        let work = self
+            .kdf_work
+            .checked_add(other.kdf_work)
+            .filter(|work| *work <= resources.max_key_import_kdf_work)
+            .ok_or_else(|| {
+                import_resource_limit(
+                    crate::policy::resource_name::KEY_IMPORT_KDF_WORK,
+                    resources.max_key_import_kdf_work,
+                )
+            })?;
         let candidates = self
             .entry_count
             .checked_add(other.entry_count)
@@ -854,6 +901,7 @@ impl KeyInventory {
         }
         self.entry_count = candidates;
         self.material_bytes = bytes;
+        self.kdf_work = work;
         self.symmetric_keys.append(&mut other.symmetric_keys);
         self.public_keys.append(&mut other.public_keys);
         self.private_keys.append(&mut other.private_keys);
@@ -1384,7 +1432,17 @@ impl KeyInventory {
                 })?;
             enforce_pkcs8_kdf_policy(&encrypted, resources, kdf_live_bytes)?;
             let password = password.ok_or(KeyStoreError::ProtectedContainer)?;
-            enforce_pkcs8_password_policy(&encrypted, password, resources, kdf_live_bytes)?;
+            let mut remaining = resources.clone();
+            if self.kdf_work > remaining.max_key_import_kdf_work {
+                return Err(import_resource_limit(
+                    crate::policy::resource_name::KEY_IMPORT_KDF_WORK,
+                    resources.max_key_import_kdf_work,
+                ));
+            }
+            remaining.max_key_import_kdf_work -= self.kdf_work;
+            let work =
+                enforce_pkcs8_password_policy(&encrypted, password, &remaining, kdf_live_bytes)?;
+            self.kdf_work += work;
             // Decrypt in the one preflighted, zeroizing output allocation;
             // SecretDocument followed by to_vec would retain two plaintext copies.
             let mut plain = Zeroizing::new(encrypted.encrypted_data.as_bytes().to_vec());
@@ -1607,9 +1665,10 @@ impl KeyInventory {
         F: FnOnce() -> Option<Zeroizing<String>>,
     {
         let limits = self.pkcs12_import_limits(&name, bytes, usages, resources)?;
-        let prepared = pkcs12_import::prepare(bytes, &limits)?;
+        let prepared = pkcs12_import::prepare_with_work(bytes, &limits, self.kdf_work)?;
         let secret = password().ok_or(KeyStoreError::ProtectedContainer)?;
-        let contents = prepared.decrypt_with_password_capacity(&secret, secret.capacity())?;
+        let contents =
+            prepared.decrypt_with_work(&secret, secret.capacity(), &mut self.kdf_work)?;
         self.add_pkcs12_contents(name, bytes.len(), contents, usages, resources, false)
     }
 
@@ -1635,7 +1694,8 @@ impl KeyInventory {
         auto_decrypt: bool,
     ) -> Result<(), KeyStoreError> {
         let limits = self.pkcs12_import_limits(&name, bytes, usages, resources)?;
-        let contents = pkcs12_import::prepare(bytes, &limits)?.decrypt(password)?;
+        let contents = pkcs12_import::prepare_with_work(bytes, &limits, self.kdf_work)?
+            .decrypt_with_work(password, password.len(), &mut self.kdf_work)?;
         self.add_pkcs12_contents(name, bytes.len(), contents, usages, resources, auto_decrypt)
     }
 
@@ -2568,7 +2628,7 @@ fn enforce_pkcs8_kdf_policy(
     encrypted: &EncryptedPrivateKeyInfoRef<'_>,
     resources: &ResourcePolicy,
     retained_with_input: usize,
-) -> Result<(), KeyStoreError> {
+) -> Result<usize, KeyStoreError> {
     use pkcs8::pkcs5::{EncryptionScheme, pbes2::Kdf};
     // RFC 8018 §6.2 leaves KDF iteration policy to the application. Reject
     // excessive work before decrypting attacker-supplied containers.
@@ -2589,7 +2649,7 @@ fn enforce_pkcs8_kdf_policy(
         ));
     }
     let live_with_output = live_with_output.ok_or(KeyStoreError::ProtectedContainer)?;
-    match &params.kdf {
+    let work = match &params.kdf {
         Kdf::Pbkdf2(kdf) => {
             if kdf.iteration_count == 0 {
                 return Err(KeyStoreError::ProtectedContainer);
@@ -2615,19 +2675,18 @@ fn enforce_pkcs8_kdf_policy(
                     work,
                 ));
             }
+            work.ok_or(KeyStoreError::ProtectedContainer)? as usize
         }
-        Kdf::Scrypt(kdf) => {
-            enforce_scrypt_kdf_limits(
-                kdf.cost_parameter,
-                u64::from(kdf.block_size),
-                u64::from(kdf.parallelization),
-                resources,
-                live_with_output,
-            )?;
-        }
+        Kdf::Scrypt(kdf) => enforce_scrypt_kdf_limits(
+            kdf.cost_parameter,
+            u64::from(kdf.block_size),
+            u64::from(kdf.parallelization),
+            resources,
+            live_with_output,
+        )?,
         _ => return Err(KeyStoreError::ProtectedContainer),
-    }
-    Ok(())
+    };
+    Ok(work)
 }
 
 fn enforce_pkcs8_password_policy(
@@ -2635,7 +2694,7 @@ fn enforce_pkcs8_password_policy(
     password: &[u8],
     resources: &ResourcePolicy,
     live_bytes: usize,
-) -> Result<(), KeyStoreError> {
+) -> Result<usize, KeyStoreError> {
     if password.len() > resources.max_external_resource_bytes {
         return Err(kdf_policy_violation(
             crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
@@ -2670,18 +2729,20 @@ fn enforce_pkcs8_password_policy(
     }
     let mut remaining = resources.clone();
     remaining.max_key_import_kdf_work -= password_work;
-    enforce_pkcs8_kdf_policy(encrypted, &remaining, live).map_err(|error| match error {
-        KeyStoreError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-            resource: crate::policy::resource_name::KEY_IMPORT_KDF_WORK,
-            actual,
-            ..
-        }) => kdf_policy_violation(
-            crate::policy::resource_name::KEY_IMPORT_KDF_WORK,
-            resources.max_key_import_kdf_work,
-            Some(actual.saturating_add(password_work) as u64),
-        ),
-        error => error,
-    })
+    enforce_pkcs8_kdf_policy(encrypted, &remaining, live)
+        .map(|work| work + password_work)
+        .map_err(|error| match error {
+            KeyStoreError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::KEY_IMPORT_KDF_WORK,
+                actual,
+                ..
+            }) => kdf_policy_violation(
+                crate::policy::resource_name::KEY_IMPORT_KDF_WORK,
+                resources.max_key_import_kdf_work,
+                Some(actual.saturating_add(password_work) as u64),
+            ),
+            error => error,
+        })
 }
 
 fn enforce_scrypt_kdf_limits(
@@ -2690,7 +2751,7 @@ fn enforce_scrypt_kdf_limits(
     p: u64,
     resources: &ResourcePolicy,
     retained_with_input: usize,
-) -> Result<(), KeyStoreError> {
+) -> Result<usize, KeyStoreError> {
     if n == 0 || r == 0 || p == 0 {
         return Err(KeyStoreError::ProtectedContainer);
     }
@@ -2726,7 +2787,8 @@ fn enforce_scrypt_kdf_limits(
             total,
         ));
     }
-    Ok(())
+    // The work check above proves this value exists and fits the usize ceiling.
+    Ok(work.ok_or(KeyStoreError::ProtectedContainer)? as usize)
 }
 
 fn kdf_policy_violation(
@@ -3043,6 +3105,71 @@ mod tests {
             resources,
             ..crate::policy::VerificationPolicy::default()
         }
+    }
+
+    #[test]
+    fn inventory_merge_preserves_import_work() {
+        // Moving inventories must not discard work spent before the merge.
+        let resources = ResourcePolicy {
+            max_key_import_kdf_work: 5,
+            ..Default::default()
+        };
+        let mut inventory = KeyInventory {
+            kdf_work: 2,
+            ..Default::default()
+        };
+        inventory
+            .extend(
+                KeyInventory {
+                    kdf_work: 3,
+                    ..Default::default()
+                },
+                &resources,
+            )
+            .expect("exact work allowance");
+        assert_eq!(inventory.key_import_kdf_work(), 5);
+        assert!(matches!(
+            inventory.extend(
+                KeyInventory {
+                    kdf_work: 1,
+                    ..Default::default()
+                },
+                &resources
+            ),
+            Err(KeyStoreError::Policy(_))
+        ));
+        assert_eq!(inventory.key_import_kdf_work(), 5, "failed merge is atomic");
+    }
+
+    #[test]
+    fn repeated_pkcs12_imports_share_kdf_work() {
+        // Each bundle fits by itself, but a session may not reset password work.
+        let bytes = include_bytes!("../tests/fixtures/xmlenc/01-phaos-xmlenc-3/rsa-priv-key.p12");
+        let resources = ResourcePolicy {
+            max_key_import_kdf_work: 10_000,
+            ..ResourcePolicy::default()
+        };
+        let mut inventory = KeyInventory::default();
+        inventory
+            .add_pkcs12("first".into(), bytes, "secret", &resources)
+            .expect("first bundle fits");
+        assert!(matches!(
+            inventory.add_pkcs12("second".into(), bytes, "secret", &resources),
+            Err(KeyStoreError::Policy(_))
+        ));
+        let work = inventory.key_import_kdf_work();
+        let exact = ResourcePolicy {
+            max_key_import_kdf_work: work * 2,
+            ..resources
+        };
+        let mut inventory = KeyInventory::default();
+        inventory
+            .add_pkcs12("first".into(), bytes, "secret", &exact)
+            .expect("first exact-boundary bundle");
+        inventory
+            .add_pkcs12("second".into(), bytes, "secret", &exact)
+            .expect("second exact-boundary bundle");
+        assert_eq!(inventory.key_import_kdf_work(), work * 2);
     }
 
     #[test]
