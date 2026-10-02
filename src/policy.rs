@@ -225,9 +225,10 @@ impl HmacPolicy {
                 operation: "HMAC",
                 algorithm: algorithm.uri().to_owned(),
             })?;
-        // XMLDSig 1.1 section 6.3.1 makes this a protocol floor, not a
+        // XMLDSig 1.1 section 4.4.2 makes this a protocol floor, not a
         // deployment preference: truncation is at least 80 bits and at least
         // half the underlying digest width. Caller policy may only tighten it.
+        // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-SignatureMethod
         let minimum = self.minimum_output_bits.max(80).max(maximum / 2);
         if selected_bits < minimum || selected_bits > maximum {
             return Err(PolicyViolation::HmacOutputLength {
@@ -1747,7 +1748,7 @@ mod tests {
     #[cfg(feature = "xmldsig")]
     #[test]
     fn hmac_output_policy_cannot_weaken_the_xmldsig_floor() {
-        // Caller policy may tighten but cannot weaken XMLDSig section 6.3.1:
+        // Caller policy may tighten but cannot weaken XMLDSig section 4.4.2:
         // truncation is at least 80 bits and at least half the digest width.
         let compatibility = HmacPolicy {
             minimum_key_bits: 40,

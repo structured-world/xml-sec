@@ -538,13 +538,7 @@ pub(crate) fn parse_signed_info_with_xpath_budget(
     let sig_method_node = children.next().ok_or(ParseError::MissingElement {
         element: "SignatureMethod",
     })?;
-    verify_ds_element(sig_method_node, "SignatureMethod")?;
-    let sig_uri = required_algorithm_attr(sig_method_node, "SignatureMethod")?;
-    let signature_method =
-        SignatureAlgorithm::from_uri(sig_uri).ok_or_else(|| ParseError::UnsupportedAlgorithm {
-            uri: sig_uri.to_string(),
-        })?;
-    let hmac_output_length_bits = parse_hmac_output_length(sig_method_node, signature_method)?;
+    let (signature_method, hmac_output_length_bits) = parse_signature_method(sig_method_node)?;
 
     // 3. One or more Reference elements
     let mut references = Vec::new();
@@ -577,10 +571,25 @@ pub(crate) fn parse_signed_info_with_xpath_budget(
 #[derive(Clone, Copy)]
 struct ByteAlignedHmacOutputLength(usize);
 
+pub(crate) fn parse_signature_method(
+    node: Node<'_, '_>,
+) -> Result<(SignatureAlgorithm, Option<usize>), ParseError> {
+    verify_ds_element(node, "SignatureMethod")?;
+    let uri = required_algorithm_attr(node, "SignatureMethod")?;
+    let algorithm =
+        SignatureAlgorithm::from_uri(uri).ok_or_else(|| ParseError::UnsupportedAlgorithm {
+            uri: uri.to_string(),
+        })?;
+    Ok((algorithm, parse_hmac_output_length(node, algorithm)?))
+}
+
 impl ByteAlignedHmacOutputLength {
     fn parse(text: &str, maximum_bits: usize) -> Result<Self, ParseError> {
+        // xs:integer whitespace collapse covers only XML whitespace, not Unicode
+        // separators: XML Schema Datatypes 1.0 sections 3.3.13.1 and 4.3.6.
+        // https://www.w3.org/TR/2004/REC-xmlschema-2-20041028/#rf-whiteSpace
         let bits = text
-            .trim()
+            .trim_matches([' ', '\t', '\r', '\n'])
             .parse::<usize>()
             .map_err(|_| ParseError::InvalidStructure("invalid HMACOutputLength".into()))?;
         // XMLDSig 1.1 section 6.3.1 normatively REQUIRES truncation
@@ -4805,6 +4814,22 @@ BA== </Modulus>
             Err(ParseError::InvalidStructure(reason))
                 if reason == "HMACOutputLength must be a positive byte-aligned value no greater than 160"
         ));
+    }
+
+    #[test]
+    fn hmac_output_length_rejects_non_xml_whitespace() {
+        // xs:integer whitespace normalization must not turn Unicode separators
+        // into legal surrounding XML whitespace (XSD 1.0 section 3.3.13).
+        for separator in ['\u{a0}', '\u{2003}', '\u{85}'] {
+            let text = format!("{separator}128{separator}");
+            assert!(ByteAlignedHmacOutputLength::parse(&text, 256).is_err());
+        }
+        assert_eq!(
+            ByteAlignedHmacOutputLength::parse(" \t\r\n+00128 \t", 256)
+                .unwrap()
+                .bits(),
+            128
+        );
     }
 
     #[test]

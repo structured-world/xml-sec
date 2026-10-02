@@ -2084,6 +2084,18 @@ fn verify_signature_node<'a>(
     }
     ctx.policy
         .check_signature_algorithm(signed_info.signature_method)?;
+    // Refuse an inadmissible authenticator before reference resolution/transforms.
+    // XMLDSig 1.1 section 4.4.2 explicitly requires max(80, hash_bits/2),
+    // independently of data; section 6.3.1 separately requires octet alignment.
+    // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-SignatureMethod
+    if let Some(full_output_bits) = signed_info.signature_method.hmac_output_bits() {
+        ctx.policy.hmac.validate_output(
+            signed_info.signature_method,
+            signed_info
+                .hmac_output_length_bits
+                .unwrap_or(full_output_bits),
+        )?;
+    }
     for reference in &signed_info.references {
         if ctx
             .policy
@@ -2321,9 +2333,6 @@ fn verify_signature_node<'a>(
         let expected_bits = signed_info
             .hmac_output_length_bits
             .unwrap_or(full_output_bits);
-        ctx.policy
-            .hmac
-            .validate_output(signed_info.signature_method, expected_bits)?;
         if signature_value.len() != expected_bits / 8 {
             return Err(SignatureVerificationPipelineError::InvalidStructure {
                 reason: "SignatureValue length does not match HMACOutputLength",
