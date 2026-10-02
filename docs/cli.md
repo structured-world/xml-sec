@@ -276,6 +276,9 @@ a different recipient. Selector-only `X509Data` (`X509SubjectName`,
 supplied through `--pubkey-cert-pem` or `--pubkey-cert-der`; a bare public key
 cannot satisfy certificate identity metadata. `KeyName` remains a lookup hint
 and empty `X509Data` remains a non-binding placeholder.
+All nested recipient `KeyInfo` elements share the operation's embedded-key,
+X.509 binary-data, and XML Base parsing allowances; each recipient does not
+receive a fresh default limit. Candidate limits are checked before decoding.
 For `--xml-data`, a missing template `Type` is materialized as XML Element
 metadata so a later embedded-document decrypt can perform XML replacement. As
 in libxmlsec1, the input is parsed as an XML document: Element encryption

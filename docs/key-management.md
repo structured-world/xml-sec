@@ -61,6 +61,11 @@ inventory name lookup. The operation policy is required so source sizes are
 checked before RSA decoding. Direct and XML key-store imports accept only
 16-, 24-, or 32-byte AES keys; unsupported public-key algorithms are rejected
 at import rather than acquiring verification permission.
+RSA private-key ingestion checks borrowed PKCS#1 components before constructing
+big integers in every CLI container path, including plaintext PKCS#8 and
+traditional PEM after decryption. Component safety failures are terminal during
+lax key search. Adapters can reuse `preflight_rsa_pkcs1_components` without
+creating an inventory or decoding the native key twice.
 Public DSA entries must contain independently usable parameters; the inventory
 does not infer missing parameters from another entry. Verification validates the
 complete policy snapshot before selecting or copying any key, including HMAC.

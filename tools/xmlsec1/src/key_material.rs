@@ -55,6 +55,8 @@ pub enum KeyMaterialError {
     UnsupportedPrivateKey(PathBuf),
     #[error("protected key container could not be decoded")]
     ProtectedContainer,
+    #[error("private key component preflight failed: {0}")]
+    PrivateKeyComponents(xml_sec::key_manager::KeyStoreError),
     #[error("unsupported public key in {}", .0.display())]
     UnsupportedPublicKey(PathBuf),
     #[error("invalid X.509 certificate in {}", .0.display())]
@@ -666,8 +668,43 @@ fn decode_traditional_rsa_pem(
     path: &Path,
 ) -> Result<RsaPrivateKey, KeyMaterialError> {
     let der = decode_openssl_traditional_pem(text, "RSA PRIVATE KEY", password, path)?;
+    preflight_rsa_der(&der.der, false, path).map_err(|error| {
+        if der.encrypted && !matches!(error, KeyMaterialError::PrivateKeyComponents(_)) {
+            KeyMaterialError::ProtectedContainer
+        } else {
+            error
+        }
+    })?;
     RsaPrivateKey::from_pkcs1_der(&der.der)
         .map_err(|_| traditional_key_decode_error(Some(&der), path))
+}
+
+fn preflight_rsa_der(bytes: &[u8], pkcs8_only: bool, path: &Path) -> Result<(), KeyMaterialError> {
+    let components = match PrivateKeyInfoRef::try_from(bytes) {
+        Ok(info) if info.algorithm.oid == rsa::pkcs1::ALGORITHM_OID => info.private_key.as_bytes(),
+        Ok(_) => return Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned())),
+        Err(_) if !pkcs8_only => bytes,
+        Err(_) => return Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned())),
+    };
+    xml_sec::key_manager::preflight_rsa_pkcs1_components(components).map_err(|error| match error {
+        xml_sec::key_manager::KeyStoreError::Selection("invalid RSA private key") => {
+            KeyMaterialError::UnsupportedPrivateKey(path.to_owned())
+        }
+        error => KeyMaterialError::PrivateKeyComponents(error),
+    })
+}
+
+fn decode_plain_rsa_pkcs8_pem(
+    bytes: &[u8],
+    path: &Path,
+) -> Result<Zeroizing<Vec<u8>>, KeyMaterialError> {
+    let (label, der) =
+        der::pem::decode_vec(bytes).map_err(|_| KeyMaterialError::InvalidPem(path.to_owned()))?;
+    let der = Zeroizing::new(der);
+    if label != "PRIVATE KEY" {
+        return Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()));
+    }
+    Ok(der)
 }
 
 struct TraditionalPemKey {
@@ -989,23 +1026,30 @@ pub fn decode_rsa_private_with_password(
             .and_then(|entry| RsaPrivateKey::from_pkcs8_der(&entry.pkcs8_der).ok())
             .ok_or_else(|| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()));
     }
-    match format {
+    let pem_der;
+    let der = match format {
         PrivateKeyFormat::Pem => {
             let text = std::str::from_utf8(bytes)
                 .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
             if pkcs8_container_kind(bytes, format) == Some(Pkcs8ContainerKind::Plain) {
-                RsaPrivateKey::from_pkcs8_pem(text).ok()
+                pem_der = decode_plain_rsa_pkcs8_pem(text.as_bytes(), path)?;
+                pem_der.as_slice()
             } else {
                 return decode_traditional_rsa_pem(text, password, path);
             }
         }
-        PrivateKeyFormat::Der => RsaPrivateKey::from_pkcs8_der(bytes)
-            .or_else(|_| RsaPrivateKey::from_pkcs1_der(bytes))
-            .ok(),
-        PrivateKeyFormat::Pkcs8Pem => std::str::from_utf8(bytes)
-            .ok()
-            .and_then(|text| RsaPrivateKey::from_pkcs8_pem(text).ok()),
-        PrivateKeyFormat::Pkcs8Der => RsaPrivateKey::from_pkcs8_der(bytes).ok(),
+        PrivateKeyFormat::Pkcs8Pem => {
+            pem_der = decode_plain_rsa_pkcs8_pem(bytes, path)?;
+            pem_der.as_slice()
+        }
+        PrivateKeyFormat::Der | PrivateKeyFormat::Pkcs8Der => bytes,
+    };
+    let pkcs8_only = format != PrivateKeyFormat::Der;
+    preflight_rsa_der(der, pkcs8_only, path)?;
+    if PrivateKeyInfoRef::try_from(der).is_ok() {
+        RsaPrivateKey::from_pkcs8_der(der).ok()
+    } else {
+        RsaPrivateKey::from_pkcs1_der(der).ok()
     }
     .ok_or_else(|| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
 }
@@ -1114,6 +1158,90 @@ mod tests {
     use rsa::pkcs1::{EncodeRsaPrivateKey as _, EncodeRsaPublicKey as _};
 
     use super::*;
+
+    #[test]
+    fn rsa_containers_preflight_components_before_native_decode() {
+        // Every CLI container must reject excessive borrowed components before
+        // bigint allocation, including traditional PEM after decryption.
+        let pem = include_str!("../../../tests/fixtures/keys/rsa/rsa-2048-key.pem");
+        let (_, der) = der::pem::decode_vec(pem.as_bytes()).expect("fixture PEM");
+        let info = PrivateKeyInfoRef::try_from(der.as_slice()).expect("fixture PKCS#8");
+        let oversized = vec![1_u8; 1025];
+        for modulus in [true, false] {
+            let mut key = rsa::pkcs1::RsaPrivateKey::from_der(info.private_key.as_bytes()).unwrap();
+            if modulus {
+                key.modulus = UintRef::new(&oversized).unwrap();
+            } else {
+                key.private_exponent = UintRef::new(&oversized).unwrap();
+            }
+            let pkcs1 = key.to_der().unwrap();
+            let pkcs8 = PrivateKeyInfoRef::new(
+                rsa::pkcs1::ALGORITHM_ID,
+                der::asn1::OctetStringRef::new(&pkcs1).unwrap(),
+            )
+            .to_der()
+            .unwrap();
+            let plain_pem = pem::encode(&pem::Pem::new("PRIVATE KEY", pkcs8.clone()));
+            let traditional = pem::encode(&pem::Pem::new("RSA PRIVATE KEY", pkcs1.clone()));
+            let protected = encrypted_traditional_pem("RSA PRIVATE KEY", &pkcs1, b"secret");
+            for (bytes, format, password) in [
+                (pkcs1.as_slice(), PrivateKeyFormat::Der, None),
+                (pkcs8.as_slice(), PrivateKeyFormat::Der, None),
+                (pkcs8.as_slice(), PrivateKeyFormat::Pkcs8Der, None),
+                (plain_pem.as_bytes(), PrivateKeyFormat::Pem, None),
+                (plain_pem.as_bytes(), PrivateKeyFormat::Pkcs8Pem, None),
+                (traditional.as_bytes(), PrivateKeyFormat::Pem, None),
+                (
+                    protected.as_bytes(),
+                    PrivateKeyFormat::Pem,
+                    Some(b"secret".as_slice()),
+                ),
+            ] {
+                let error = decode_rsa_private_with_password(
+                    Path::new("key"),
+                    bytes,
+                    format,
+                    password,
+                    &ResourcePolicy::default(),
+                )
+                .expect_err("oversized components must fail preflight");
+                assert!(
+                    error.to_string().contains("safety limit"),
+                    "{format:?}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rsa_pkcs8_pem_keeps_label_and_protected_failure_contracts() {
+        // A borrowed preflight must not enable label fallback or downgrade
+        // unauthenticated CBC plaintext to an ordinary candidate mismatch.
+        let fixture = include_bytes!("../../../tests/fixtures/keys/rsa/rsa-2048-key.pem");
+        let (_, der) = der::pem::decode_vec(fixture).unwrap();
+        let mislabeled = pem::encode(&pem::Pem::new("CERTIFICATE", der));
+        assert!(
+            decode_rsa_private_with_password(
+                Path::new("key.pem"),
+                mislabeled.as_bytes(),
+                PrivateKeyFormat::Pkcs8Pem,
+                None,
+                &ResourcePolicy::default(),
+            )
+            .is_err()
+        );
+        let protected = encrypted_traditional_pem("RSA PRIVATE KEY", b"not ASN.1", b"secret");
+        assert!(matches!(
+            decode_rsa_private_with_password(
+                Path::new("key.pem"),
+                protected.as_bytes(),
+                PrivateKeyFormat::Pem,
+                Some(b"secret"),
+                &ResourcePolicy::default(),
+            ),
+            Err(KeyMaterialError::ProtectedContainer)
+        ));
+    }
 
     #[test]
     fn protected_rsa_container_failure_is_not_a_lax_candidate_miss() {

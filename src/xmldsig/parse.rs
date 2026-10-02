@@ -752,6 +752,47 @@ pub fn parse_key_info(key_info_node: Node) -> Result<KeyInfo, ParseError> {
     parse_key_info_with_provider(key_info_node, crate::provider::default_provider())
 }
 
+/// Shared ingestion accounting for KeyInfo elements in one operation.
+///
+/// Parsing charges embedded candidates and X.509 bytes before materialization;
+/// these charges are independent of later resolver inspection work and are not
+/// refunded when parsing fails. The immutable operation snapshot is borrowed.
+pub struct KeyInfoParsingSession<'a> {
+    resources: &'a crate::policy::ResourcePolicy,
+    xml_base: XmlBaseResolutionBudget,
+    embedded_candidates: usize,
+    x509_binary_bytes: usize,
+}
+
+impl<'a> KeyInfoParsingSession<'a> {
+    /// Start a session using the operation's resource policy.
+    pub fn new(resources: &'a crate::policy::ResourcePolicy) -> Result<Self, ParseError> {
+        resources.validate()?;
+        Ok(Self {
+            resources,
+            xml_base: XmlBaseResolutionBudget::with_limits(
+                resources.effective_xml_base_components(),
+                resources.effective_xml_base_resolution_bytes(),
+            ),
+            embedded_candidates: 0,
+            x509_binary_bytes: 0,
+        })
+    }
+
+    /// Parse another element without resetting this operation's allowance.
+    pub fn parse(&mut self, node: Node) -> Result<KeyInfo, ParseError> {
+        parse_key_info_in_session(
+            node,
+            crate::provider::default_provider(),
+            &self.xml_base,
+            self.resources,
+            None,
+            &mut self.embedded_candidates,
+            &mut self.x509_binary_bytes,
+        )
+    }
+}
+
 pub(crate) fn parse_key_info_with_provider(
     key_info_node: Node,
     provider: &dyn crate::provider::CryptoProvider,
@@ -787,15 +828,33 @@ pub(crate) fn parse_key_info_with_policy_budgets_and_document_base(
     resources: &crate::policy::ResourcePolicy,
     document_base: Option<&str>,
 ) -> Result<KeyInfo, ParseError> {
+    parse_key_info_in_session(
+        key_info_node,
+        provider,
+        xml_base_budget,
+        resources,
+        document_base,
+        &mut 0,
+        &mut 0,
+    )
+}
+
+fn parse_key_info_in_session(
+    key_info_node: Node,
+    provider: &dyn crate::provider::CryptoProvider,
+    xml_base_budget: &XmlBaseResolutionBudget,
+    resources: &crate::policy::ResourcePolicy,
+    document_base: Option<&str>,
+    embedded_candidate_preflight_count: &mut usize,
+    x509_total_binary_len: &mut usize,
+) -> Result<KeyInfo, ParseError> {
     verify_ds_element(key_info_node, "KeyInfo")?;
     ensure_no_non_whitespace_text(key_info_node, "KeyInfo")?;
 
     let mut sources = Vec::new();
-    let mut x509_total_binary_len = 0usize;
     // KeyInfo is parsed before source selection, so preflight the cardinality
     // of every embedded key before decoding or algorithm-specific parsing.
     // This does not consume the resolver's inspected-candidate work budget.
-    let mut embedded_candidate_preflight_count = 0usize;
     for (index, child) in element_children(key_info_node).enumerate() {
         if index >= MAX_KEY_INFO_CHILD_COUNT {
             return Err(ParseError::InvalidStructure(
@@ -810,15 +869,15 @@ pub(crate) fn parse_key_info_with_policy_budgets_and_document_base(
                 sources.push(KeyInfoSource::KeyName(key_name));
             }
             (Some(XMLDSIG_NS), "KeyValue") => {
-                charge_embedded_key_candidate(&mut embedded_candidate_preflight_count, resources)?;
+                charge_embedded_key_candidate(embedded_candidate_preflight_count, resources)?;
                 let key_value = parse_key_value_dispatch(child)?;
                 sources.push(KeyInfoSource::KeyValue(key_value));
             }
             (Some(XMLDSIG_NS), "X509Data") => {
                 let x509 = parse_x509_data_dispatch_with_budget_and_provider(
                     child,
-                    &mut x509_total_binary_len,
-                    &mut embedded_candidate_preflight_count,
+                    x509_total_binary_len,
+                    embedded_candidate_preflight_count,
                     provider,
                     resources,
                 )?;
@@ -870,7 +929,7 @@ pub(crate) fn parse_key_info_with_policy_budgets_and_document_base(
                 });
             }
             (Some(XMLDSIG11_NS), "DEREncodedKeyValue") => {
-                charge_embedded_key_candidate(&mut embedded_candidate_preflight_count, resources)?;
+                charge_embedded_key_candidate(embedded_candidate_preflight_count, resources)?;
                 ensure_no_element_children(child, "DEREncodedKeyValue")?;
                 let der = decode_der_encoded_key_value_base64(child)?;
                 sources.push(KeyInfoSource::DerEncodedKeyValue(der));
@@ -2648,6 +2707,37 @@ mod tests {
     }
 
     // ── parse_key_info: dispatch parsing ──────────────────────────────
+
+    #[test]
+    fn key_info_session_retains_failed_work_and_applies_active_policy() {
+        // A failed KeyValue has already consumed inspection work; a second
+        // parse cannot recover that allowance or use the standalone default.
+        let resources = crate::policy::ResourcePolicy {
+            max_key_candidates: 1,
+            ..Default::default()
+        };
+        let xml = "<KeyInfo xmlns='http://www.w3.org/2000/09/xmldsig#'><KeyValue/></KeyInfo>";
+        let document = Document::parse(xml).unwrap();
+        let mut session = KeyInfoParsingSession::new(&resources).unwrap();
+        assert!(matches!(
+            session.parse(document.root_element()),
+            Err(ParseError::InvalidStructure(_))
+        ));
+        assert!(matches!(
+            session.parse(document.root_element()),
+            Err(ParseError::Policy(_))
+        ));
+        let zero = crate::policy::ResourcePolicy {
+            max_key_candidates: 0,
+            ..resources
+        };
+        assert!(matches!(
+            KeyInfoParsingSession::new(&zero)
+                .unwrap()
+                .parse(document.root_element()),
+            Err(ParseError::Policy(_))
+        ));
+    }
 
     #[test]
     fn key_info_candidate_budget_precedes_key_value_parsing() {

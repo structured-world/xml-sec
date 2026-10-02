@@ -1702,6 +1702,7 @@ fn lax_candidate_error_is_recoverable(error: &CommandError) -> bool {
             | CommandError::KeyStore(key_manager::KeyStoreError::ProtectedContainer)
             | CommandError::KeyStore(key_manager::KeyStoreError::Policy(_))
             | CommandError::Key(key_material::KeyMaterialError::ProtectedContainer)
+            | CommandError::Key(key_material::KeyMaterialError::PrivateKeyComponents(_))
             | CommandError::Key(key_material::KeyMaterialError::Policy(_))
     )
 }
@@ -2804,11 +2805,13 @@ fn recipient_key_metadata(
         ));
     }
 
+    let mut parsing = xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&policy.resources)
+        .map_err(|error| CommandError::Encryption(error.to_string()))?;
     encrypted_keys
         .into_iter()
         .map(|encrypted_key| {
             direct_child_element(encrypted_key, XMLDSIG_NS, "KeyInfo")
-                .map(|node| parse_key_info(node).map(ParsedRecipientKeyMetadata))
+                .map(|node| parsing.parse(node).map(ParsedRecipientKeyMetadata))
                 .transpose()
                 .map_err(|error| CommandError::Encryption(error.to_string()))
         })
@@ -4259,6 +4262,47 @@ mod tests {
     }
 
     #[test]
+    fn recipient_metadata_shares_operation_candidate_preflight() {
+        // Nested recipients must not each receive a fresh policy allowance;
+        // the third candidate is denied before its malformed payload is decoded.
+        let recipient = |value: &str| {
+            format!(
+                "<EncryptedKey><ds:KeyInfo><ds:KeyValue>{value}</ds:KeyValue></ds:KeyInfo></EncryptedKey>"
+            )
+        };
+        let template = |last: &str| {
+            format!(
+                "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:KeyInfo>{}{}{}</ds:KeyInfo></EncryptedData>",
+                recipient("<Unknown/>"),
+                recipient("<Unknown/>"),
+                recipient(last),
+            )
+        };
+        let mut policy = EncryptionPolicy::default();
+        policy.resources.max_key_candidates = 2;
+        let error =
+            recipient_key_metadata(&template(""), None, &[], &policy, 3, XmlBackend::default())
+                .err()
+                .expect("aggregate candidate limit");
+        assert_eq!(
+            error.to_string(),
+            "XML encryption operation failed: XMLDSig policy violation: key candidates exceeds policy maximum 2: got 3"
+        );
+        policy.resources.max_key_candidates = 3;
+        assert!(
+            recipient_key_metadata(
+                &template("<Unknown/>"),
+                None,
+                &[],
+                &policy,
+                3,
+                XmlBackend::default(),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn repeated_key_files_share_candidate_and_parser_budgets() {
         // The third entry must fail the operation budget before its malformed
         // key is decoded; XML parser work must not reset between files either.
@@ -4397,6 +4441,11 @@ mod tests {
         // authentication or operation-wide policy failures.
         assert!(!lax_candidate_error_is_recoverable(&CommandError::Key(
             key_material::KeyMaterialError::ProtectedContainer,
+        )));
+        assert!(!lax_candidate_error_is_recoverable(&CommandError::Key(
+            key_material::KeyMaterialError::PrivateKeyComponents(
+                key_manager::KeyStoreError::Selection("RSA modulus exceeds safety limit"),
+            ),
         )));
         assert!(!lax_candidate_error_is_recoverable(
             &CommandError::KeyStore(key_manager::KeyStoreError::Policy(

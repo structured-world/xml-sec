@@ -2187,7 +2187,11 @@ fn private_key_spki(der: &[u8]) -> Result<Vec<u8>, KeyStoreError> {
     Err(KeyStoreError::Selection("unsupported PKCS#12 private key"))
 }
 
-fn preflight_rsa_pkcs1_components(der: &[u8]) -> Result<(), KeyStoreError> {
+/// Validate borrowed PKCS#1 private components against process-safety ceilings.
+///
+/// Container adapters must call this before constructing native big integers.
+/// This checks ingestion safety, not the operation's RSA algorithm/key policy.
+pub fn preflight_rsa_pkcs1_components(der: &[u8]) -> Result<(), KeyStoreError> {
     let key = rsa::pkcs1::RsaPrivateKey::from_der(der)
         .map_err(|_| KeyStoreError::Selection("invalid RSA private key"))?;
     let modulus = key.modulus.as_bytes();
