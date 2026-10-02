@@ -257,6 +257,49 @@ fn weak_hmac_output_does_not_query_the_signing_key() {
 }
 
 #[test]
+fn valid_hmac_template_queries_key_metadata_once() {
+    // Parameter validation must not add a redundant external/HSM metadata call.
+    struct CountedKey {
+        key: HmacSigningKey,
+        calls: std::cell::Cell<usize>,
+    }
+    impl SigningKey for CountedKey {
+        fn sign(
+            &self,
+            algorithm: SignatureAlgorithm,
+            bytes: &[u8],
+        ) -> Result<Vec<u8>, SigningKeyError> {
+            self.key.sign(algorithm, bytes)
+        }
+
+        fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
+            self.calls.set(self.calls.get() + 1);
+            self.key.public_key_info()
+        }
+    }
+    let key = CountedKey {
+        key: HmacSigningKey::new(vec![0x42; 32]).unwrap(),
+        calls: std::cell::Cell::new(0),
+    };
+    let verifier = HmacVerificationKey::new(vec![0x42; 32]).unwrap();
+    for output in [None, Some(128), Some(256)] {
+        key.calls.set(0);
+        let signed = SignContext::new(&key)
+            .sign_template(&template(SignatureAlgorithm::HmacSha256, output))
+            .unwrap();
+        assert_eq!(key.calls.get(), 1);
+        assert_eq!(
+            VerifyContext::new()
+                .key(&verifier)
+                .verify(&signed)
+                .unwrap()
+                .status,
+            DsigStatus::Valid
+        );
+    }
+}
+
+#[test]
 fn weak_hmac_output_is_rejected_before_signing_reference_work() {
     // Signing must refuse the selected output before resolving a missing target.
     let xml = r##"<Signature xmlns="http://www.w3.org/2000/09/xmldsig#"><SignedInfo>

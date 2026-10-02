@@ -1632,17 +1632,16 @@ impl<'a> SignContext<'a> {
             let (algorithm, output_bits) =
                 validate_signing_signed_info_methods(signature, &self.policy)?;
             self.policy.check_signature_algorithm(algorithm)?;
-            if algorithm.hmac_output_bits().is_some() {
+            if let Some(full_bits) = algorithm.hmac_output_bits() {
                 // Reject weak HMAC parameters before callbacks or reference work;
                 // XMLDSig 1.1 section 4.4.2 explicitly requires max(80, hash_bits/2);
                 // section 6.3.1 separately requires octet-aligned truncation.
                 // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-SignatureMethod
-                expected_signature_output_len(
-                    self.signing_key,
-                    algorithm,
-                    &self.policy,
-                    output_bits,
-                )?;
+                // This is parameter validation only: key metadata belongs to the
+                // later key preflight, not a second external/HSM callback here.
+                self.policy
+                    .hmac
+                    .validate_output(algorithm, output_bits.unwrap_or(full_bits))?;
             }
             Ok::<_, SigningError>(())
         })?;

@@ -444,6 +444,8 @@ HMAC output can be omitted for full width or explicitly truncated on an octet bo
 The selected length is checked before reference resolution or transforms in both signing and
 verification, and before signing-key callbacks. Unsupported signature methods retain a typed
 `SigningError::ParseSignedInfo(ParseError::UnsupportedAlgorithm)` error during signing preflight.
+This early parameter check does not query key metadata; template signing queries it once in
+the key preflight before producing the signature.
 `HMACOutputLength` uses XML Schema integer syntax (including XML whitespace and
 an optional leading plus), not Unicode whitespace. XMLDSig 1.1 requires at least 80 bits and
 half the hash width; the default policy tightens that floor to at least 128 bits. Arbitrary
