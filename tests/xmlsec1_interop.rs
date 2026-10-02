@@ -8,6 +8,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[path = "common/xmlsec1.rs"]
 mod xmlsec1;
 
+#[path = "support/cryptographic.rs"]
+mod cryptographic;
+
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::policy::{
     EcdsaSignatureValueEncoding, SameDocumentIdSemantics, SigningPolicy, TransformPolicy,
@@ -699,7 +702,7 @@ fn xml_sec_verifies_xmlsec1_signatures_with_embedded_certificates() {
             Path::new(private_key),
             Path::new(certificate),
         );
-        let result = VerifyContext::new()
+        let result = cryptographic::context()
             .key_resolver(&resolver)
             .verify(&signed)
             .unwrap_or_else(|error| panic!("xml-sec failed to process xmlsec1 output: {error}"));

@@ -182,6 +182,25 @@ The native CLI selects the donor barename mode by default and the direct mode fo
 `--enable-visa3d-hack`. ID registrations remain request context and duplicate
 IDs fail in every mode.
 
+Verification separates signature correctness from key authorization.
+`VerificationPolicy::key_trust.mode` defaults to `VerificationTrustMode::RequireTrustedKey`:
+a `.key(...)` supplied by the caller, an explicitly authorized named inventory key,
+an exact configured certificate pin, or a validated X.509 path is required before
+signature-provider dispatch. Embedded keys and lookup certificates alone are candidates,
+not authorization. Custom resolvers declare authorization through
+`KeyResolver::resolve_for_verification`; the older discovery methods return candidates.
+
+For mathematical interoperability checks only, explicitly select
+`VerificationTrustMode::CryptographicOnly` in the immutable policy. A valid result in
+that mode does **not** establish signer trust. `VerifyResult::key_trust` reports
+`NotEstablished`, `CallerTrusted`, or `ValidatedX509` separately from signature status;
+authorization evidence does not turn an invalid signature into a valid one.
+Validated path evidence contains bounded SHA-256 certificate identities, the exact anchor,
+the operation's single validation time, and whether CRL processing was enforced.
+`TrustedPublicKey` cannot be constructed by merely parsing a certificate and is bound
+to the trust policy that validated it. Resolvers re-evaluate trust for each operation;
+updating an inventory does not reuse a previous operation's authorization.
+
 For production verification, configure `KeyResolverConfig::lookup_certs` with untrusted
 certificates that selector-only `X509Data` may address or use as path intermediates, and configure
 `KeyResolverConfig::trusted_certs` only with explicit trust anchors. With chain validation

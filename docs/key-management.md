@@ -50,6 +50,12 @@ are lookup candidates, **not trust anchors**, unless the caller
 explicitly registers them as trusted. The operation's immutable policy still
 decides algorithm acceptance, key minima, certificate validation, CRL checks,
 and resource limits. An imported key is never permission to bypass that policy.
+Named entries explicitly authorized for verification are caller-trusted keys;
+lookup certificates remain candidates until an exact caller pin or certificate
+path establishes authorization. The default `RequireTrustedKey` mode enforces
+this distinction before signature verification. `CryptographicOnly` is an explicit
+policy choice for mathematical checks and reports no signer trust. See
+[XMLDSig key authorization](xmldsig.md) for result evidence and custom resolver integration.
 Caller-provided key names are bounded before import and charged to the retained
 material budget for every stored copy, including public-key `KeyName` metadata.
 Import and selection methods return `KeyStoreError::Policy` for operation-policy denials,

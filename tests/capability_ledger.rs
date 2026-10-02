@@ -570,6 +570,7 @@ fn legacy_algorithm_claims_are_policy_gated() {
     )
     .expect("SHA-1 interoperability fixture must be readable");
     let mut verification_policy = xml_sec::policy::VerificationPolicy::default();
+    verification_policy.key_trust.mode = xml_sec::policy::VerificationTrustMode::CryptographicOnly;
     verification_policy
         .key_trust
         .allowed_legacy_signature_algorithms

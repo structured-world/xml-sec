@@ -2,6 +2,9 @@
 
 use std::fs;
 
+#[path = "support/cryptographic.rs"]
+mod cryptographic;
+
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::policy::SigningPolicy;
 use xml_sec::xmldsig::{
@@ -66,7 +69,7 @@ fn sign_document() -> String {
 
 fn verify(signed: &str) -> Result<xml_sec::xmldsig::VerifyResult, DsigError> {
     let resolver = DefaultKeyResolver::default();
-    VerifyContext::new()
+    cryptographic::context()
         .key_resolver(&resolver)
         .allowed_transforms([
             XPATH_FILTER2_TRANSFORM_URI,
@@ -214,7 +217,7 @@ fn here_semantics_are_explicit_across_signing_and_verification() {
         .key_info_writer(&key_info)
         .sign_with_builder(DOCUMENT, &builder)
         .expect("standards-mode XPath document must sign");
-    let standard_result = VerifyContext::new()
+    let standard_result = cryptographic::context()
         .key_resolver(&resolver)
         .allowed_transforms([
             XPATH_TRANSFORM_URI,
@@ -224,7 +227,7 @@ fn here_semantics_are_explicit_across_signing_and_verification() {
         .verify(&standard)
         .expect("standards-mode signature must be processable");
     assert_eq!(standard_result.status, DsigStatus::Valid);
-    let wrong_legacy_result = VerifyContext::new()
+    let wrong_legacy_result = cryptographic::context()
         .key_resolver(&resolver)
         .xpath_here_semantics(XPathHereSemantics::XmlSecLegacy)
         .verify(&standard)
@@ -239,13 +242,13 @@ fn here_semantics_are_explicit_across_signing_and_verification() {
         .xpath_here_semantics(XPathHereSemantics::XmlSecLegacy)
         .sign_with_builder(DOCUMENT, &builder)
         .expect("xmlsec-legacy XPath document must sign");
-    let legacy_result = VerifyContext::new()
+    let legacy_result = cryptographic::context()
         .key_resolver(&resolver)
         .xpath_here_semantics(XPathHereSemantics::XmlSecLegacy)
         .verify(&legacy)
         .expect("xmlsec-legacy signature must be processable");
     assert_eq!(legacy_result.status, DsigStatus::Valid);
-    let wrong_standard_result = VerifyContext::new()
+    let wrong_standard_result = cryptographic::context()
         .key_resolver(&resolver)
         .verify(&legacy)
         .expect("standards-mode verification must reach digest comparison");

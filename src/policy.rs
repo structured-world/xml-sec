@@ -939,10 +939,23 @@ pub enum ExtendedKeyPurpose {
     Other(Vec<u64>),
 }
 
+/// Whether verification must establish signer authorization in addition to mathematics.
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VerificationTrustMode {
+    /// Require path validation or an explicit caller trust declaration.
+    #[default]
+    RequireTrustedKey,
+    /// Check mathematical validity without authenticating the signer.
+    CryptographicOnly,
+}
+
 /// X.509 and key-resolution decisions for verification.
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyTrustPolicy {
+    /// Whether mathematical validity alone is sufficient for the operation.
+    pub mode: VerificationTrustMode,
     /// Require embedded or selected certificates to chain to a configured anchor.
     pub verify_x509_chains: bool,
     /// Maximum validated path depth.
@@ -972,6 +985,7 @@ pub struct KeyTrustPolicy {
 impl Default for KeyTrustPolicy {
     fn default() -> Self {
         Self {
+            mode: VerificationTrustMode::RequireTrustedKey,
             verify_x509_chains: false,
             max_x509_chain_depth: crate::hard_limits::X509_CHAIN_DEPTH_CEILING,
             max_x509_candidate_paths: crate::hard_limits::X509_CANDIDATE_PATH_CEILING,

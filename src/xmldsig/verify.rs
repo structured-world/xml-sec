@@ -138,6 +138,20 @@ pub trait VerifyingKey {
 /// This trait intentionally has no `Send + Sync` supertraits; callers that need
 /// cross-thread sharing can wrap resolvers/keys in their own thread-safe types.
 pub trait KeyResolver {
+    /// Discover and explicitly authorize a key for an end-to-end operation.
+    /// The default preserves discovery only: applications that authorize keys
+    /// themselves return `ResolvedVerificationKey::CallerTrusted` explicitly.
+    fn resolve_for_verification<'a>(
+        &'a self,
+        key_info: Option<&KeyInfo>,
+        algorithm: SignatureAlgorithm,
+        policy: &crate::policy::VerificationPolicy,
+        provider: &dyn crate::provider::CryptoProvider,
+    ) -> Result<Option<super::ResolvedVerificationKey<'a>>, DsigError> {
+        Ok(self
+            .resolve_with_policy_and_provider(key_info, algorithm, policy, provider)?
+            .map(super::ResolvedVerificationKey::Candidate))
+    }
     /// Resolve a verification key from parsed `<KeyInfo>` sources.
     ///
     /// Return `Ok(None)` when no suitable key could be resolved from available
@@ -279,6 +293,7 @@ pub enum SignatureSelection<'a> {
 
 /// Verification builder/configuration.
 #[must_use = "configure the context and call verify(), or store it for reuse"]
+#[derive(Clone)]
 pub struct VerifyContext<'a> {
     key: Option<&'a dyn VerifyingKey>,
     key_resolver: Option<&'a dyn KeyResolver>,
@@ -1100,6 +1115,8 @@ impl ReferenceProcessingError {
 #[non_exhaustive]
 #[must_use = "inspect status before accepting the document"]
 pub struct VerifyResult {
+    /// Key authorization, independent of `status`; neither alone authorizes data.
+    pub key_trust: super::KeyTrustEvidence,
     /// Core XMLDSig status for the `<SignedInfo>` references and signature value.
     ///
     /// Manifest reference failures do not alter this field; inspect
@@ -1378,6 +1395,22 @@ fn verify_signature_document_with_context_and_transforms(
     ctx: &VerifyContext<'_>,
     transforms: TransformExecutionBudget,
 ) -> Result<VerifyResult, SignatureVerificationPipelineError> {
+    // RFC 5280 §6.1.1 makes the validation time an input to path validation.
+    // Capture it once, not separately for each source or alternate path:
+    // https://www.rfc-editor.org/rfc/rfc5280#section-6.1.1
+    let captured_context;
+    let ctx = if ctx.policy.key_trust.verify_x509_chains
+        && ctx.policy.key_trust.verification_time.is_none()
+    {
+        captured_context = {
+            let mut context = ctx.clone();
+            context.policy.key_trust.verification_time = Some(std::time::SystemTime::now());
+            context
+        };
+        &captured_context
+    } else {
+        ctx
+    };
     let budgets = VerificationOperationBudgets::with_transforms(&ctx.policy, transforms);
     let mut operation = OperationExecutionContext::new(
         ctx.policy.clone(),
@@ -1666,6 +1699,7 @@ fn verify_signature_view<'a>(
         debug_assert!(operation.first_failure().is_some());
         let status = references.results[first_failure].status;
         return Ok(VerifyResult {
+            key_trust: super::KeyTrustEvidence::NotEvaluated,
             status,
             signed_info_references: references.results,
             manifest_references: Vec::new(),
@@ -1742,6 +1776,7 @@ fn verify_signature_view<'a>(
             return Err(error);
         }
         return Ok(VerifyResult {
+            key_trust: super::KeyTrustEvidence::NotEvaluated,
             status: DsigStatus::Invalid(FailureReason::KeyNotFound),
             signed_info_references: references.results,
             manifest_references: Vec::new(),
@@ -1786,6 +1821,7 @@ fn verify_signature_view<'a>(
             OperationDecisionReason::SignatureRejected,
         );
         return Ok(VerifyResult {
+            key_trust: resolved_key.evidence(&ctx.policy)?,
             status: DsigStatus::Invalid(FailureReason::SignatureMismatch),
             signed_info_references: references.results,
             manifest_references: Vec::new(),
@@ -1831,6 +1867,7 @@ fn verify_signature_view<'a>(
     operation.compile().map_err(map_verification_plan_error)?;
     operation.run(evidence, || {
         Ok::<_, SignatureVerificationPipelineError>(VerifyResult {
+            key_trust: resolved_key.evidence(&ctx.policy)?,
             status: DsigStatus::Valid,
             signed_info_references: references.results,
             manifest_references,
@@ -2987,12 +3024,31 @@ fn transform_preserves_manifest_structure(transform: &Transform) -> bool {
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "single bounded authorization result avoids heap allocation"
+)]
 enum ResolvedVerifyingKey<'a> {
     Borrowed(&'a dyn VerifyingKey),
-    Owned(Box<dyn VerifyingKey + 'a>),
+    Owned(super::ResolvedVerificationKey<'a>),
 }
 
 impl ResolvedVerifyingKey<'_> {
+    fn evidence(
+        &self,
+        policy: &crate::policy::VerificationPolicy,
+    ) -> Result<super::KeyTrustEvidence, DsigError> {
+        match self {
+            Self::Borrowed(_)
+                if policy.key_trust.mode
+                    == crate::policy::VerificationTrustMode::CryptographicOnly =>
+            {
+                Ok(super::KeyTrustEvidence::NotEstablished)
+            }
+            Self::Borrowed(_) => Ok(super::KeyTrustEvidence::CallerTrusted),
+            Self::Owned(key) => key.authorize(policy),
+        }
+    }
     fn as_ref(&self) -> &dyn VerifyingKey {
         match self {
             Self::Borrowed(key) => *key,
@@ -3018,12 +3074,11 @@ fn resolve_verifying_key<'k>(
     }
     if let Some(resolver) = ctx.key_resolver {
         require_verifying_key_candidate_capacity(&ctx.policy)?;
-        let resolved = resolver.resolve_with_policy_and_provider(
-            key_info,
-            algorithm,
-            &ctx.policy,
-            ctx.provider,
-        )?;
+        let resolved =
+            resolver.resolve_for_verification(key_info, algorithm, &ctx.policy, ctx.provider)?;
+        if let Some(key) = &resolved {
+            key.authorize(&ctx.policy)?;
+        }
         return Ok(resolved.map(ResolvedVerifyingKey::Owned));
     }
     Ok(None)
@@ -4040,6 +4095,66 @@ mod tests {
 
     struct PanicResolver;
 
+    struct UntrustedTestResolver;
+
+    impl KeyResolver for UntrustedTestResolver {
+        fn resolve<'a>(
+            &'a self,
+            _key_info: Option<&KeyInfo>,
+            _algorithm: SignatureAlgorithm,
+        ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
+            Ok(Some(Box::new(AcceptingKey)))
+        }
+    }
+
+    #[test]
+    fn verification_requires_explicit_key_authorization() {
+        // A resolver finding a working key must not authorize its signer.
+        let xml = signature_with_target_reference("AQ==");
+        let error = VerifyContext::new()
+            .key_resolver(&UntrustedTestResolver)
+            .verify(&xml)
+            .expect_err("default verification must reject an untrusted resolver candidate");
+        assert!(matches!(
+            error,
+            DsigError::Policy(crate::policy::PolicyViolation::KeyTrust { .. })
+        ));
+    }
+
+    #[test]
+    fn cryptographic_only_is_explicit_and_never_reports_trust() {
+        // Opting out of signer authorization must remain visible in the result.
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.key_trust.mode = crate::policy::VerificationTrustMode::CryptographicOnly;
+        let result = VerifyContext::new()
+            .policy(policy)
+            .key_resolver(&UntrustedTestResolver)
+            .verify(&signature_with_target_reference("AQ=="))
+            .expect("explicit mathematical mode permits an untrusted candidate");
+        assert_eq!(result.status, DsigStatus::Valid);
+        assert_eq!(
+            result.key_trust,
+            super::super::KeyTrustEvidence::NotEstablished
+        );
+    }
+
+    #[test]
+    fn caller_key_authorization_does_not_authenticate_an_invalid_signature() {
+        // A trusted key is not evidence that the signature itself verified.
+        let result = VerifyContext::new()
+            .key(&RejectingKey)
+            .verify(&signature_with_target_reference("AQ=="))
+            .expect("an invalid mathematical signature is a completed result");
+        assert_eq!(
+            result.status,
+            DsigStatus::Invalid(FailureReason::SignatureMismatch)
+        );
+        assert_eq!(
+            result.key_trust,
+            super::super::KeyTrustEvidence::CallerTrusted
+        );
+    }
+
     impl KeyResolver for PanicResolver {
         fn resolve<'a>(
             &'a self,
@@ -4084,6 +4199,18 @@ mod tests {
     struct FallbackKeyInfoResolver;
 
     impl KeyResolver for FallbackKeyInfoResolver {
+        fn resolve_for_verification<'a>(
+            &'a self,
+            key_info: Option<&KeyInfo>,
+            algorithm: SignatureAlgorithm,
+            _policy: &crate::policy::VerificationPolicy,
+            _provider: &dyn crate::provider::CryptoProvider,
+        ) -> Result<Option<super::super::ResolvedVerificationKey<'a>>, DsigError> {
+            // This test resolver explicitly authorizes its application-owned key.
+            self.resolve(key_info, algorithm)
+                .map(|key| key.map(super::super::ResolvedVerificationKey::CallerTrusted))
+        }
+
         fn resolve<'a>(
             &'a self,
             key_info: Option<&KeyInfo>,
@@ -4109,6 +4236,18 @@ mod tests {
     struct EarlyKeyInfoResolver;
 
     impl KeyResolver for EarlyKeyInfoResolver {
+        fn resolve_for_verification<'a>(
+            &'a self,
+            key_info: Option<&KeyInfo>,
+            algorithm: SignatureAlgorithm,
+            _policy: &crate::policy::VerificationPolicy,
+            _provider: &dyn crate::provider::CryptoProvider,
+        ) -> Result<Option<super::super::ResolvedVerificationKey<'a>>, DsigError> {
+            // Only the selected primary application key is authorized here.
+            self.resolve(key_info, algorithm)
+                .map(|key| key.map(super::super::ResolvedVerificationKey::CallerTrusted))
+        }
+
         fn resolve<'a>(
             &'a self,
             key_info: Option<&KeyInfo>,

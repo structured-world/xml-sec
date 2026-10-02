@@ -1375,6 +1375,11 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
     // path validation and cannot remain enabled after trust checks are bypassed.
     let insecure = invocation.flag("insecure");
     policy.key_trust.verify_x509_chains = !insecure;
+    policy.key_trust.mode = if insecure {
+        xml_sec::policy::VerificationTrustMode::CryptographicOnly
+    } else {
+        xml_sec::policy::VerificationTrustMode::RequireTrustedKey
+    };
     policy.key_trust.check_crls = invocation.flag("verify-crls") && !insecure;
     // libxmlsec1's OpenSSL backend does not consume
     // XMLSEC_KEYINFO_FLAGS_X509DATA_SKIP_STRICT_CHECKS; only its GnuTLS/NSS
@@ -1993,7 +1998,7 @@ impl KeyResolver for CandidateVerificationResolver {
                         provider,
                         &mut candidate_budget,
                     ) {
-                        Ok(key) => key,
+                        Ok(key) => key.map(xml_sec::xmldsig::ResolvedVerificationKey::into_key),
                         Err(error)
                             if self.lax_key_search && !matches!(error, DsigError::Policy(_)) =>
                         {
@@ -2033,6 +2038,19 @@ impl KeyResolver for CandidateVerificationResolver {
                 .candidates
                 .iter()
                 .any(|candidate| matches!(candidate, ExplicitVerificationCandidate::Certificate(_)))
+    }
+
+    fn resolve_for_verification<'a>(
+        &'a self,
+        key_info: Option<&KeyInfo>,
+        algorithm: SignatureAlgorithm,
+        policy: &VerificationPolicy,
+        provider: &dyn CryptoProvider,
+    ) -> Result<Option<xml_sec::xmldsig::ResolvedVerificationKey<'a>>, DsigError> {
+        // These candidates are explicitly supplied by the caller, never selected
+        // from document-controlled identity hints. PKI checks above still apply.
+        self.resolve_with_policy_and_provider(key_info, algorithm, policy, provider)
+            .map(|key| key.map(xml_sec::xmldsig::ResolvedVerificationKey::CallerTrusted))
     }
 }
 
