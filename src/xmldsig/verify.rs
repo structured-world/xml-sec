@@ -542,8 +542,10 @@ impl<'a> VerifyContext<'a> {
     ///
     /// All signatures share the operation's work and retention budgets. A
     /// malformed or invalid signature is retained as an individual outcome,
-    /// never silently skipped. Inspect [`VerifyEvidence::all_valid`] before
-    /// accepting the request; a successful return alone is not validation.
+    /// never silently skipped. Call [`VerifyEvidence::accepted`] with the
+    /// current document before accepting the request; a successful return
+    /// alone is not validation. [`VerifyEvidence::all_valid`] is historical
+    /// mathematical diagnostics only and does not revalidate document generation.
     pub fn verify_all(&self, document: &XmlDocument) -> Result<VerifyEvidence, DsigError> {
         verify_all_document(document, self, &VerificationRequest::default())
     }
@@ -1068,9 +1070,11 @@ impl VerificationOperationBudgets {
             return OperationResourceIdentity::Generated("omitted-reference", index);
         };
         if uri.is_empty() || uri == "#xpointer(/)" {
-            // XMLDSig 1.1 §4.4.3.3: URI="" selects the containing document
-            // node-set (without comments); #xpointer(/) retains comments.
-            // Both bind the document root, not an ID-resolved element.
+            // XMLDSig 1.1, Recommendation 11 April 2013, §4.4.3.3
+            // "Same-Document URI-References" (numbering differs in older editions):
+            // URI="" selects the containing document node-set without comments;
+            // #xpointer(/) retains comments. Both bind the document root, not
+            // an ID-resolved element (root XPointer meaning: §4.4.3.2).
             // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-Same-Document
             return OperationResourceIdentity::DocumentNode(view.root());
         }
