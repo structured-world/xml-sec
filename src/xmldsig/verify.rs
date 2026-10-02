@@ -16,7 +16,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 use crate::c14n::canonicalize_bounded_with_xml_base_budget;
-use crate::document::{DocumentParseSettings, DocumentView, XmlDocument, XmlDocumentError};
+use crate::document::{
+    DocumentParseSettings, DocumentView, NodeIdentity, XmlDocument, XmlDocumentError,
+};
 use crate::hard_limits::CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING;
 use crate::operation::{
     OperationDecisionReason, OperationExecutionContext, OperationNodeId, OperationNodeKind,
@@ -51,7 +53,7 @@ use super::transforms::{
     execute_transforms_with_options_and_budget, map_c14n_resource_policy_violation,
     transform_chain_produces_binary,
 };
-use super::types::{NodeSet, TransformError};
+use super::types::{NodeSet, TransformError, subtree_node_id_range};
 use super::uri::{ExternalResourceMapError, UriReferenceResolver, validate_external_resource_map};
 use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_bytes};
 
@@ -535,6 +537,227 @@ impl<'a> VerifyContext<'a> {
     pub fn verify_document(&self, document: &XmlDocument) -> Result<VerifyResult, DsigError> {
         verify_signature_document_with_context(document, self)
     }
+
+    /// Verify every Signature in one retained document generation.
+    ///
+    /// All signatures share the operation's work and retention budgets. A
+    /// malformed or invalid signature is retained as an individual outcome,
+    /// never silently skipped. Call [`VerifyEvidence::accepted`] with the
+    /// current document before accepting the request; a successful return
+    /// alone is not validation. [`VerifyEvidence::all_valid`] is historical
+    /// mathematical diagnostics only and does not revalidate document generation.
+    pub fn verify_all(&self, document: &XmlDocument) -> Result<VerifyEvidence, DsigError> {
+        verify_all_document(document, self, &VerificationRequest::default())
+    }
+
+    /// Discover bounded Signature identities without key or digest work.
+    ///
+    /// These are untrusted selection handles, not verification evidence. Use
+    /// them to authorize request keys even when Signatures have no XML ID.
+    pub fn signature_identities(
+        &self,
+        document: &XmlDocument,
+    ) -> Result<Vec<NodeIdentity>, DsigError> {
+        self.policy.validate()?;
+        document.validate_operation_policy(&self.policy.xml, &self.policy.resources)?;
+        document.with_view(|view| {
+            let count = count_signature_nodes(view, self.policy.resources.max_signatures)?;
+            let mut identities = Vec::with_capacity(count);
+            for node in view.document().descendants() {
+                if node.has_tag_name((XMLDSIG_NS, "Signature")) {
+                    identities.push(view.node_identity(node));
+                }
+            }
+            Ok(identities)
+        })
+    }
+
+    /// Verify all signatures against explicit caller-selected targets and keys.
+    ///
+    /// Requests are not policy: they cannot permit algorithms, URI classes or
+    /// XML features forbidden by the immutable policy snapshot.
+    pub fn verify_request(
+        &self,
+        document: &XmlDocument,
+        request: &VerificationRequest<'_>,
+    ) -> Result<VerifyEvidence, DsigError> {
+        verify_all_document(document, self, request)
+    }
+}
+
+/// Application requirement for the independently verified signatures.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SignatureRequirement {
+    /// Every discovered signature must pass, and at least one must exist.
+    #[default]
+    All,
+    /// Explicitly tolerate other invalid signatures if this many pass.
+    AtLeast(usize),
+    /// Require exactly this many discovered signatures, all passing.
+    Exactly(usize),
+}
+
+/// Explicit key authorization for one stable, caller-selected Signature.
+pub struct CallerTrustedSignatureKey<'a> {
+    /// Signature that this key is authorized to verify.
+    pub signature: NodeIdentity,
+    /// Application-owned key; embedded KeyInfo cannot override it.
+    pub key: &'a dyn VerifyingKey,
+}
+
+/// Request data, immutably borrowed for one verification operation.
+#[derive(Default)]
+pub struct VerificationRequest<'a> {
+    /// Elements whose complete expanded content must be authenticated.
+    /// Comments and an enveloped Signature are not part of this assertion.
+    pub expected_targets: &'a [NodeIdentity],
+    /// Per-signature trusted keys. Duplicate/foreign/stale mappings fail closed.
+    pub trusted_keys: &'a [CallerTrustedSignatureKey<'a>],
+    /// Explicit external bytes; no implicit I/O or configuration discovery.
+    pub external_resources: Option<&'a HashMap<String, Vec<u8>>>,
+    /// Required multi-signature outcome; zero counts are invalid requests.
+    pub signatures: SignatureRequirement,
+    /// Opaque caller correlation value, never read from XML or used as trust.
+    pub correlation: Option<[u8; 16]>,
+}
+
+/// Outcome for one exact Signature, including pipeline failures.
+#[derive(Debug)]
+pub struct SignatureEvidence {
+    identity: NodeIdentity,
+    result: Result<VerifyResult, DsigError>,
+}
+
+impl SignatureEvidence {
+    /// Stable identity of the Signature actually processed.
+    #[must_use]
+    pub const fn identity(&self) -> NodeIdentity {
+        self.identity
+    }
+
+    /// Individual outcome. Digest matches do not imply signature validity.
+    pub const fn result(&self) -> &Result<VerifyResult, DsigError> {
+        &self.result
+    }
+}
+
+/// Bounded outcomes for all signatures in one document generation.
+#[derive(Debug)]
+#[must_use = "inspect the individual outcomes before accepting the document"]
+pub struct VerifyEvidence {
+    document: NodeIdentity,
+    signatures: Vec<SignatureEvidence>,
+    accepted: bool,
+    correlation: Option<[u8; 16]>,
+}
+
+impl VerifyEvidence {
+    /// Whether the explicit request requirements hold for this document.
+    /// Foreign documents or any mutation after verification invalidate acceptance.
+    pub fn accepted(&self, document: &XmlDocument) -> Result<bool, DsigError> {
+        document.with_view(|view| {
+            view.resolve_node(self.document)?;
+            Ok(self.accepted)
+        })
+    }
+
+    /// Uninterpreted correlation value supplied by the caller.
+    #[must_use]
+    pub const fn correlation(&self) -> Option<[u8; 16]> {
+        self.correlation
+    }
+
+    /// Prove complete expanded element content under an authorized signature.
+    ///
+    /// This does not claim source-byte equality, comment coverage or protection
+    /// of the owning enveloped Signature. Arbitrary XPath/binary transforms
+    /// remain indeterminate rather than falsely covering their original input.
+    /// The exact document generation must still exist; wrapping an unsigned
+    /// sibling with a matching name cannot satisfy an identity-based assertion.
+    pub fn covers_element(
+        &self,
+        document: &XmlDocument,
+        target: NodeIdentity,
+    ) -> Result<bool, DsigError> {
+        document.with_view(|view| {
+            view.resolve_node(self.document)?;
+            let target_node = view.resolve_node(target)?;
+            if !target_node.is_element() {
+                return Err(DsigError::InvalidRequest {
+                    reason: "coverage target must be an element",
+                });
+            }
+            let target_id = target_node.id().get();
+            for signature in &self.signatures {
+                let Ok(result) = &signature.result else {
+                    continue;
+                };
+                if result.status != DsigStatus::Valid
+                    || !matches!(
+                        result.key_trust,
+                        super::KeyTrustEvidence::CallerTrusted
+                            | super::KeyTrustEvidence::ValidatedX509(_)
+                    )
+                {
+                    continue;
+                }
+                let signature_node = view.resolve_node(signature.identity)?;
+                for reference in result
+                    .signed_info_references
+                    .iter()
+                    .chain(&result.manifest_references)
+                {
+                    if reference.status != DsigStatus::Valid {
+                        continue;
+                    }
+                    let Some(root) = reference.target_identity else {
+                        continue;
+                    };
+                    if reference.coverage == ReferenceCoverage::TransformedData {
+                        continue;
+                    }
+                    let root = view.resolve_node(root)?;
+                    // The normalized arena assigns contiguous preorder IDs;
+                    // reuse the same subtree contract as node-set subtraction,
+                    // rather than walking depth for every report/target pair.
+                    if !subtree_node_id_range(root).contains(&target_id) {
+                        continue;
+                    }
+                    if reference.coverage == ReferenceCoverage::EnvelopedElementContent
+                        && subtree_node_id_range(signature_node).contains(&target_id)
+                    {
+                        continue;
+                    }
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+    }
+
+    /// Outcomes in document order, including malformed signatures.
+    #[must_use]
+    pub fn signatures(&self) -> &[SignatureEvidence] {
+        &self.signatures
+    }
+
+    /// Whether a nonempty set of signatures and their processed Manifests passed.
+    ///
+    /// This is a historical mathematical outcome, not current-document
+    /// authorization. Use `accepted(document)` for generation-bound acceptance.
+    #[must_use]
+    pub fn all_valid(&self) -> bool {
+        !self.signatures.is_empty()
+            && self.signatures.iter().all(|entry| {
+                entry.result.as_ref().is_ok_and(|result| {
+                    result.status == DsigStatus::Valid
+                        && result
+                            .manifest_references
+                            .iter()
+                            .all(|reference| reference.status == DsigStatus::Valid)
+                })
+            })
+    }
 }
 
 impl Default for VerifyContext<'_> {
@@ -548,6 +771,15 @@ impl Default for VerifyContext<'_> {
 #[non_exhaustive]
 #[must_use = "inspect status before accepting the reference result"]
 pub struct ReferenceResult {
+    /// Exact Reference node when processing a retained document.
+    pub reference_identity: Option<NodeIdentity>,
+    /// Resolved same-document target, not an untrusted URI claim.
+    pub target_identity: Option<NodeIdentity>,
+    /// SHA-256 identity of resolved external bytes before transforms. This is
+    /// provenance, not signer authorization or an original-element proof.
+    pub external_resource_fingerprint: Option<[u8; 32]>,
+    /// What can be proven about original element-content coverage.
+    pub coverage: ReferenceCoverage,
     /// Whether this reference came from `<SignedInfo>` or `<Manifest>`.
     pub reference_set: ReferenceSet,
     /// Zero-based index within `reference_set`.
@@ -560,6 +792,22 @@ pub struct ReferenceResult {
     pub status: DsigStatus,
     /// Pre-digest bytes (populated when `store_pre_digest` is enabled).
     pub pre_digest_data: Option<Vec<u8>>,
+}
+
+/// Conservative coverage classification for the original semantic document.
+///
+/// XMLDSig 1.1 §8.1.1 protects only transformed data. Unknown projection is
+/// deliberately not promoted to complete original-element coverage.
+/// https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-Signed
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReferenceCoverage {
+    /// No complete original-element coverage proof (binary or arbitrary filter).
+    TransformedData,
+    /// Expanded element names, attributes and content, excluding comments.
+    ElementContent,
+    /// Element content except the owning Signature subtree and comments.
+    EnvelopedElementContent,
 }
 
 /// Origin of a processed `<Reference>`.
@@ -723,6 +971,40 @@ fn reference_origin_node<'a, 'input>(
     }
 }
 
+fn bind_reference_evidence(
+    result: &mut ReferenceResult,
+    reference: &Reference,
+    view: DocumentView<'_>,
+    origin: Option<Node<'_, '_>>,
+    observed: &OperationResourceIdentity,
+) {
+    result.reference_identity = origin.map(|node| view.node_identity(node));
+    if let OperationResourceIdentity::External { fingerprint, .. } = observed {
+        result.external_resource_fingerprint = Some(*fingerprint);
+    }
+    if let OperationResourceIdentity::DocumentNode(target) = observed {
+        result.target_identity = Some(*target);
+        // A later node-set transform can reparse C14N output, so arbitrary
+        // chains cannot retain an original subtree claim. This classification
+        // describes proven element content, never discarded comments or the
+        // namespace-declaration spelling normalized by canonicalization.
+        let mut enveloped = false;
+        let mut canonicalized = false;
+        for transform in &reference.transforms {
+            match transform {
+                Transform::C14n(_) if !canonicalized => canonicalized = true,
+                Transform::Enveloped if !canonicalized => enveloped = true,
+                _ => return,
+            }
+        }
+        result.coverage = if enveloped {
+            ReferenceCoverage::EnvelopedElementContent
+        } else {
+            ReferenceCoverage::ElementContent
+        };
+    }
+}
+
 struct ReferenceExecutionContext<'a> {
     store_pre_digest: bool,
     transform_options: TransformOptions,
@@ -742,6 +1024,8 @@ struct VerificationOperationBudgets {
     xpath_parse: RefCell<XPathSignatureParseBudget>,
     key_info_materialization: RefCell<KeyInfoMaterializationState>,
     external_resource_identities: RefCell<HashMap<String, OperationResourceIdentity>>,
+    resolved_reference_resources: RefCell<HashMap<NodeId, OperationResourceIdentity>>,
+    external_resource_set_identity: RefCell<Option<OperationResourceIdentity>>,
 }
 
 impl VerificationOperationBudgets {
@@ -757,7 +1041,21 @@ impl VerificationOperationBudgets {
             xpath_parse: RefCell::new(XPathSignatureParseBudget::from_resources(&policy.resources)),
             key_info_materialization: RefCell::new(KeyInfoMaterializationState::default()),
             external_resource_identities: RefCell::new(HashMap::new()),
+            resolved_reference_resources: RefCell::new(HashMap::new()),
+            external_resource_set_identity: RefCell::new(None),
         }
+    }
+
+    fn external_resource_set_identity(
+        &self,
+        resolver: &UriReferenceResolver<'_>,
+    ) -> OperationResourceIdentity {
+        // One resolver borrows the same immutable map for the entire request.
+        // Hash/sort it once, not once per graph node or Signature.
+        let mut cached = self.external_resource_set_identity.borrow_mut();
+        cached
+            .get_or_insert_with(|| resolver.external_resource_set_identity())
+            .clone()
     }
 
     fn resource_identity_for_reference(
@@ -766,11 +1064,21 @@ impl VerificationOperationBudgets {
         index: usize,
         resolver: &UriReferenceResolver<'_>,
         view: DocumentView<'_>,
+        origin: Option<Node<'_, '_>>,
     ) -> OperationResourceIdentity {
         let Some(uri) = reference.uri.as_deref() else {
             return OperationResourceIdentity::Generated("omitted-reference", index);
         };
-        if uri.is_empty() || uri.starts_with('#') {
+        if uri.is_empty() || uri == "#xpointer(/)" {
+            // XMLDSig 1.1, Recommendation 11 April 2013, §4.4.3.3
+            // "Same-Document URI-References" (numbering differs in older editions):
+            // URI="" selects the containing document node-set without comments;
+            // #xpointer(/) retains comments. Both bind the document root, not
+            // an ID-resolved element (root XPointer meaning: §4.4.3.2).
+            // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-Same-Document
+            return OperationResourceIdentity::DocumentNode(view.root());
+        }
+        if uri.starts_with('#') {
             return resolver
                 .node_id_for_same_document_reference(uri)
                 .ok()
@@ -782,7 +1090,35 @@ impl VerificationOperationBudgets {
                 ));
         }
 
+        let resolved_uri;
+        let uri = if let Some(origin) = origin {
+            if let Some(identity) = self.resolved_reference_resources.borrow().get(&origin.id()) {
+                return identity.clone();
+            }
+            // XML Base Second Edition §4.2 resolves the external reference in
+            // its owning element's context. Identity and execution must agree.
+            // https://www.w3.org/TR/2009/REC-xmlbase-20090128/#resolving
+            let Ok(resolved) = crate::c14n::xml_base::resolve_uri_from_node_with_budget(
+                origin,
+                uri,
+                self.transforms.xml_base_resolution(),
+            ) else {
+                return OperationResourceIdentity::Generated(
+                    "unresolved-external-reference",
+                    index,
+                );
+            };
+            resolved_uri = resolved;
+            resolved_uri.as_str()
+        } else {
+            uri
+        };
         if let Some(identity) = self.external_resource_identities.borrow().get(uri).cloned() {
+            if let Some(origin) = origin {
+                self.resolved_reference_resources
+                    .borrow_mut()
+                    .insert(origin.id(), identity.clone());
+            }
             return identity;
         }
         let identity = resolver.external_resource_identity(uri).unwrap_or(
@@ -792,6 +1128,11 @@ impl VerificationOperationBudgets {
             self.external_resource_identities
                 .borrow_mut()
                 .insert(uri.to_owned(), identity.clone());
+            if let Some(origin) = origin {
+                self.resolved_reference_resources
+                    .borrow_mut()
+                    .insert(origin.id(), identity.clone());
+            }
         }
         identity
     }
@@ -808,8 +1149,8 @@ struct VerificationPlanNodes {
 
 fn compile_verification_operation_plan(
     operation: &mut OperationExecutionContext<
-        crate::policy::VerificationPolicy,
-        VerificationOperationBudgets,
+        &crate::policy::VerificationPolicy,
+        &VerificationOperationBudgets,
     >,
     view: DocumentView<'_>,
     signature_node: Node<'_, '_>,
@@ -826,7 +1167,7 @@ fn compile_verification_operation_plan(
             view.node_identity(signature_node),
         )),
     );
-    let key_materialization_resource = resolver.external_resource_set_identity();
+    let key_materialization_resource = operation.budgets().external_resource_set_identity(resolver);
     let key_materialization = operation.add_node(
         OperationNodeKind::Key { index: 0 },
         OperationStage::Resolve,
@@ -845,9 +1186,13 @@ fn compile_verification_operation_plan(
         .map_err(map_verification_plan_error)?;
     let mut digests = Vec::with_capacity(references.len());
     for (index, reference) in references.iter().enumerate() {
-        let resource = operation
-            .budgets()
-            .resource_identity_for_reference(reference, index, resolver, view);
+        let resource = operation.budgets().resource_identity_for_reference(
+            reference,
+            index,
+            resolver,
+            view,
+            reference_origin_node(signature_node, ReferenceSet::SignedInfo, index),
+        );
         let digest_node = operation.add_node(
             OperationNodeKind::Digest { index },
             OperationStage::Digest,
@@ -999,6 +1344,10 @@ fn process_reference_with_options(
     };
 
     Ok(ReferenceResult {
+        reference_identity: None,
+        target_identity: None,
+        external_resource_fingerprint: None,
+        coverage: ReferenceCoverage::TransformedData,
         reference_set,
         reference_index,
         uri: uri.to_owned(),
@@ -1145,6 +1494,12 @@ pub struct VerifyResult {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum DsigError {
+    /// Caller-supplied request identities or requirements are inconsistent.
+    #[error("invalid verification request: {reason}")]
+    InvalidRequest {
+        /// Concrete invariant violated before signature execution.
+        reason: &'static str,
+    },
     /// The compiled verification policy rejected an operation input.
     #[error("verification policy violation: {0}")]
     Policy(#[from] crate::policy::PolicyViolation),
@@ -1390,6 +1745,184 @@ fn verify_signature_document_with_context(
     )
 }
 
+fn count_signature_nodes(view: DocumentView<'_>, maximum: usize) -> Result<usize, DsigError> {
+    let mut count = 0;
+    for node in view.document().descendants() {
+        if !node.has_tag_name((XMLDSIG_NS, "Signature")) {
+            continue;
+        }
+        if count == maximum {
+            return Err(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::VERIFICATION_SIGNATURES,
+                maximum,
+                actual: count + 1,
+            }
+            .into());
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn verify_all_document(
+    document: &XmlDocument,
+    ctx: &VerifyContext<'_>,
+    request: &VerificationRequest<'_>,
+) -> Result<VerifyEvidence, DsigError> {
+    ctx.policy.validate()?;
+    document.validate_operation_policy(&ctx.policy.xml, &ctx.policy.resources)?;
+    if request.external_resources.is_some() && ctx.external_resources.is_some() {
+        return Err(DsigError::InvalidRequest {
+            reason: "external resources configured in both context and request",
+        });
+    }
+    // RFC 5280 §6.1.1: validation time is one operation input, including
+    // alternate certification paths and all Signatures in a batch.
+    // https://www.rfc-editor.org/rfc/rfc5280#section-6.1.1
+    let capture_time =
+        ctx.policy.key_trust.verify_x509_chains && ctx.policy.key_trust.verification_time.is_none();
+    let captured_context;
+    let ctx = if capture_time || request.external_resources.is_some() {
+        captured_context = {
+            let mut captured = ctx.clone();
+            if let Some(resources) = request.external_resources {
+                captured.external_resources = Some(resources);
+            }
+            if capture_time {
+                captured.policy.key_trust.verification_time = Some(std::time::SystemTime::now());
+            }
+            captured
+        };
+        &captured_context
+    } else {
+        ctx
+    };
+    let budgets = VerificationOperationBudgets::with_transforms(
+        &ctx.policy,
+        TransformExecutionBudget::from_resources(&ctx.policy.resources)
+            .with_xml_backend(ctx.xml_backend),
+    );
+    document.with_view(|view| {
+        match request.signatures {
+            SignatureRequirement::AtLeast(0) | SignatureRequirement::Exactly(0) => {
+                return Err(DsigError::InvalidRequest {
+                    reason: "signature requirement must be nonzero",
+                });
+            }
+            _ => {}
+        }
+        if request.expected_targets.len() > ctx.policy.resources.max_references {
+            return Err(DsigError::InvalidRequest {
+                reason: "too many expected coverage targets",
+            });
+        }
+        if request.trusted_keys.len() > ctx.policy.resources.max_signatures {
+            return Err(DsigError::InvalidRequest {
+                reason: "too many trusted signature keys",
+            });
+        }
+        for (index, target) in request.expected_targets.iter().copied().enumerate() {
+            if !view.resolve_node(target)?.is_element() {
+                return Err(DsigError::InvalidRequest {
+                    reason: "coverage target must be an element",
+                });
+            }
+            if request.expected_targets[..index].contains(&target) {
+                return Err(DsigError::InvalidRequest {
+                    reason: "duplicate expected coverage target",
+                });
+            }
+        }
+        for (index, entry) in request.trusted_keys.iter().enumerate() {
+            if !view
+                .resolve_node(entry.signature)?
+                .has_tag_name((XMLDSIG_NS, "Signature"))
+            {
+                return Err(DsigError::InvalidRequest {
+                    reason: "trusted key target must be a Signature",
+                });
+            }
+            if request.trusted_keys[..index]
+                .iter()
+                .any(|prior| prior.signature == entry.signature)
+            {
+                return Err(DsigError::InvalidRequest {
+                    reason: "ambiguous trusted keys for one Signature",
+                });
+            }
+        }
+        let is_signature = |node: &Node<'_, '_>| node.has_tag_name((XMLDSIG_NS, "Signature"));
+        let count = count_signature_nodes(view, ctx.policy.resources.max_signatures)?;
+        // Cardinality is checked before allocating the report or calling a
+        // resolver. No Vec of backend handles or cloned XML is needed.
+        let mut signatures = Vec::with_capacity(count);
+        let resolver = UriReferenceResolver::with_document_view(view, ctx.id_attributes)
+            .with_same_document_id_semantics(ctx.policy.transforms.same_document_id_semantics)
+            .with_external_resource_limits(
+                ctx.policy.resources.max_external_resource_bytes,
+                ctx.policy.resources.max_external_resource_total_bytes,
+            );
+        let resolver = match ctx.external_resources {
+            Some(resources) => resolver.with_external_resources(resources),
+            None => resolver,
+        };
+        for signature in view.document().descendants().filter(is_signature) {
+            // Authentication is signature-local; work accounting is request-
+            // wide. A valid first signature cannot authenticate a Manifest
+            // belonging to an invalid second signature.
+            let mut operation = OperationExecutionContext::new(
+                &ctx.policy,
+                &budgets,
+                Some((view.identity(), view.generation())),
+            );
+            let signature_identity = view.node_identity(signature);
+            let key = request
+                .trusted_keys
+                .iter()
+                .find(|entry| entry.signature == signature_identity)
+                .map(|entry| entry.key)
+                .or(ctx.key);
+            let result =
+                verify_signature_node(view, ctx, key, &mut operation, &resolver, signature);
+            signatures.push(SignatureEvidence {
+                identity: view.node_identity(signature),
+                result,
+            });
+        }
+        let mut evidence = VerifyEvidence {
+            document: view.root(),
+            signatures,
+            accepted: false,
+            correlation: request.correlation,
+        };
+        let valid = evidence
+            .signatures
+            .iter()
+            .filter(|entry| {
+                entry.result.as_ref().is_ok_and(|result| {
+                    result.status == DsigStatus::Valid
+                        && result
+                            .manifest_references
+                            .iter()
+                            .all(|reference| reference.status == DsigStatus::Valid)
+                })
+            })
+            .count();
+        evidence.accepted = match request.signatures {
+            SignatureRequirement::All => valid > 0 && valid == count,
+            SignatureRequirement::AtLeast(minimum) => valid >= minimum,
+            SignatureRequirement::Exactly(required) => valid == required && count == required,
+        };
+        for target in request.expected_targets {
+            if !evidence.covers_element(document, *target)? {
+                evidence.accepted = false;
+                break;
+            }
+        }
+        Ok(evidence)
+    })
+}
+
 fn verify_signature_document_with_context_and_transforms(
     document: &XmlDocument,
     ctx: &VerifyContext<'_>,
@@ -1413,8 +1946,8 @@ fn verify_signature_document_with_context_and_transforms(
     };
     let budgets = VerificationOperationBudgets::with_transforms(&ctx.policy, transforms);
     let mut operation = OperationExecutionContext::new(
-        ctx.policy.clone(),
-        budgets,
+        &ctx.policy,
+        &budgets,
         Some((document.identity(), document.generation())),
     );
     document.with_view(|view| verify_signature_view(view, ctx, &mut operation))
@@ -1424,8 +1957,8 @@ fn verify_signature_view<'a>(
     view: DocumentView<'a>,
     ctx: &VerifyContext<'_>,
     operation: &mut OperationExecutionContext<
-        crate::policy::VerificationPolicy,
-        VerificationOperationBudgets,
+        &crate::policy::VerificationPolicy,
+        &VerificationOperationBudgets,
     >,
 ) -> Result<VerifyResult, SignatureVerificationPipelineError> {
     ctx.policy.validate()?;
@@ -1480,9 +2013,32 @@ fn verify_signature_view<'a>(
         }
     };
 
+    verify_signature_node(view, ctx, ctx.key, operation, &resolver, signature_node)
+}
+
+fn verify_signature_node<'a>(
+    view: DocumentView<'a>,
+    ctx: &VerifyContext<'_>,
+    key: Option<&dyn VerifyingKey>,
+    operation: &mut OperationExecutionContext<
+        &crate::policy::VerificationPolicy,
+        &VerificationOperationBudgets,
+    >,
+    resolver: &UriReferenceResolver<'a>,
+    signature_node: Node<'a, 'a>,
+) -> Result<VerifyResult, DsigError> {
+    if ctx.policy.resources.max_signatures == 0 {
+        return Err(crate::policy::PolicyViolation::ResourceLimit {
+            resource: crate::policy::resource_name::VERIFICATION_SIGNATURES,
+            maximum: 0,
+            actual: 1,
+        }
+        .into());
+    }
+    let doc = view.document();
     let signature_children = parse_signature_children(signature_node)?;
     let signed_info_node = signature_children.signed_info_node;
-    let should_parse_key_info = match (ctx.key, ctx.key_resolver) {
+    let should_parse_key_info = match (key, ctx.key_resolver) {
         (Some(_), _) => false,
         (None, Some(resolver)) => resolver.consumes_document_key_info(),
         (None, None) => true,
@@ -1577,7 +2133,7 @@ fn verify_signature_view<'a>(
         view,
         signature_node,
         &signed_info.references,
-        &resolver,
+        resolver,
     )?;
     let signature_identity =
         OperationResourceIdentity::DocumentNode(view.node_identity(signature_node));
@@ -1586,7 +2142,7 @@ fn verify_signature_view<'a>(
             .validate_document_view(view)
             .map_err(map_verification_plan_error)
     })?;
-    let observed_key_resources = resolver.external_resource_set_identity();
+    let observed_key_resources = operation.budgets().external_resource_set_identity(resolver);
     let retrieval_materialization = operation.run_with_resource(
         plan_nodes.key_materialization,
         &observed_key_resources,
@@ -1603,7 +2159,7 @@ fn verify_signature_view<'a>(
                 let mut materialization = budgets.key_info_materialization.borrow_mut();
                 let mut outcome = materialize_key_info_references_with_budgets(
                     info,
-                    &resolver,
+                    resolver,
                     &ctx.policy,
                     ctx.provider,
                     &mut retrieval_budgets,
@@ -1611,7 +2167,7 @@ fn verify_signature_view<'a>(
                 )?;
                 outcome.merge(materialize_retrieval_methods_with_budgets(
                     info,
-                    &resolver,
+                    resolver,
                     ctx.policy.uris.retrieval_methods,
                     ctx.allowed_transform_uris(),
                     ctx.provider,
@@ -1633,10 +2189,14 @@ fn verify_signature_view<'a>(
         .zip(&signed_info.references)
         .enumerate()
     {
-        let observed = operation
-            .budgets()
-            .resource_identity_for_reference(reference, index, &resolver, view);
-        let result = operation.run_with_resource(node, &observed, || {
+        let observed = operation.budgets().resource_identity_for_reference(
+            reference,
+            index,
+            resolver,
+            view,
+            reference_origin_node(signature_node, ReferenceSet::SignedInfo, index),
+        );
+        let mut result = operation.run_with_resource(node, &observed, || {
             let budgets = operation.budgets();
             let execution = ReferenceExecutionContext {
                 store_pre_digest: ctx.store_pre_digest,
@@ -1647,7 +2207,7 @@ fn verify_signature_view<'a>(
             };
             process_reference_with_options(
                 reference,
-                &resolver,
+                resolver,
                 signature_node,
                 ReferenceSet::SignedInfo,
                 index,
@@ -1656,6 +2216,13 @@ fn verify_signature_view<'a>(
             )
             .map_err(SignatureVerificationPipelineError::from)
         })?;
+        bind_reference_evidence(
+            &mut result,
+            reference,
+            view,
+            reference_origin_node(signature_node, ReferenceSet::SignedInfo, index),
+            &observed,
+        );
         let accepted = result.status == DsigStatus::Valid;
         operation.set_outcome(
             node,
@@ -1764,7 +2331,7 @@ fn verify_signature_view<'a>(
         }
     }
     let resolved_key = operation.run(plan_nodes.key, || {
-        resolve_verifying_key(ctx, key_info.as_ref(), signed_info.signature_method)
+        resolve_verifying_key(ctx, key, key_info.as_ref(), signed_info.signature_method)
     })?;
     let Some(resolved_key) = resolved_key else {
         operation.set_outcome(
@@ -1846,7 +2413,7 @@ fn verify_signature_view<'a>(
                 operation,
                 view,
                 signature_node,
-                &resolver,
+                resolver,
                 ctx,
                 remaining_reference_capacity,
                 plan_nodes.crypto,
@@ -2654,8 +3221,8 @@ impl ScheduledManifestReference {
 
 fn process_authenticated_manifest_references(
     operation: &mut OperationExecutionContext<
-        crate::policy::VerificationPolicy,
-        VerificationOperationBudgets,
+        &crate::policy::VerificationPolicy,
+        &VerificationOperationBudgets,
     >,
     view: DocumentView<'_>,
     signature_node: Node<'_, '_>,
@@ -2716,6 +3283,7 @@ fn process_authenticated_manifest_references(
                 item.index,
                 resolver,
                 view,
+                resolver.node_for_node_id(item.reference_node_id),
             );
             let node = operation.add_node(
                 OperationNodeKind::Digest { index: item.index },
@@ -2766,6 +3334,7 @@ fn process_authenticated_manifest_references(
                         compiled.index,
                         resolver,
                         view,
+                        resolver.node_for_node_id(compiled.reference_node_id),
                     );
                     let result = operation.run_with_resource(node, &observed, || {
                         let reference = &compiled.reference;
@@ -2777,7 +3346,7 @@ fn process_authenticated_manifest_references(
                             canonicalized_data_budget: &budgets.canonicalized,
                             provider: ctx.provider,
                         };
-                        let result = if execution.transform_budget.remaining_c14n_output() == 0
+                        let mut result = if execution.transform_budget.remaining_c14n_output() == 0
                             || reference.transforms.len()
                                 > ctx.policy.resources.max_transforms_per_reference
                             || ctx
@@ -2833,6 +3402,13 @@ fn process_authenticated_manifest_references(
                                 ),
                             }
                         };
+                        bind_reference_evidence(
+                            &mut result,
+                            reference,
+                            view,
+                            resolver.node_for_node_id(compiled.reference_node_id),
+                            &observed,
+                        );
                         if result.status == DsigStatus::Valid
                             && reference
                                 .transforms
@@ -2874,6 +3450,10 @@ fn manifest_reference_invalid_result(
     reason: FailureReason,
 ) -> ReferenceResult {
     ReferenceResult {
+        reference_identity: None,
+        target_identity: None,
+        external_resource_fingerprint: None,
+        coverage: ReferenceCoverage::TransformedData,
         reference_set: ReferenceSet::Manifest,
         reference_index: index,
         uri: reference
@@ -2889,8 +3469,8 @@ fn manifest_reference_invalid_result(
 fn parse_manifest_references(
     signature_node: Node<'_, '_>,
     operation: &OperationExecutionContext<
-        crate::policy::VerificationPolicy,
-        VerificationOperationBudgets,
+        &crate::policy::VerificationPolicy,
+        &VerificationOperationBudgets,
     >,
     view: DocumentView<'_>,
     state: &mut ManifestDiscoveryState<'_>,
@@ -2977,6 +3557,10 @@ fn parse_manifest_references(
                             };
                         invalid.push(CompiledManifestInvalid {
                             result: ReferenceResult {
+                                reference_identity: Some(view.node_identity(child)),
+                                target_identity: None,
+                                external_resource_fingerprint: None,
+                                coverage: ReferenceCoverage::TransformedData,
                                 reference_set: ReferenceSet::Manifest,
                                 reference_index,
                                 uri: child.attribute("URI").unwrap_or("<omitted>").to_owned(),
@@ -3059,10 +3643,11 @@ impl ResolvedVerifyingKey<'_> {
 
 fn resolve_verifying_key<'k>(
     ctx: &VerifyContext<'k>,
+    key: Option<&'k dyn VerifyingKey>,
     key_info: Option<&KeyInfo>,
     algorithm: SignatureAlgorithm,
 ) -> Result<Option<ResolvedVerifyingKey<'k>>, SignatureVerificationPipelineError> {
-    if let Some(key) = ctx.key {
+    if let Some(key) = key {
         if !ctx.policy.key_sources.preset_key {
             return Err(crate::policy::PolicyViolation::KeyTrust {
                 reason: "pre-resolved verification keys are disabled",
@@ -3858,8 +4443,8 @@ mod tests {
                 let budgets =
                     VerificationOperationBudgets::with_transforms(&ctx.policy, transform_budget);
                 let mut operation = OperationExecutionContext::new(
-                    ctx.policy.clone(),
-                    budgets,
+                    &ctx.policy,
+                    &budgets,
                     Some((view.identity(), view.generation())),
                 );
                 let crypto =
@@ -4285,6 +4870,244 @@ mod tests {
   <ds:SignatureValue>AQ==</ds:SignatureValue>
 </ds:Signature>"#
         )
+    }
+
+    #[test]
+    fn verify_all_retains_each_signature_without_vacuous_success() {
+        // Malformed signatures remain individually visible; an empty document
+        // never satisfies a request merely because there were no failures.
+        let document = XmlDocument::parse(format!(
+            "<root xmlns:ds=\"{XMLDSIG_NS}\"><ds:Signature/><ds:Signature/></root>"
+        ))
+        .unwrap();
+        let evidence = VerifyContext::new().verify_all(&document).unwrap();
+        assert_eq!(evidence.signatures().len(), 2);
+        assert!(
+            evidence
+                .signatures()
+                .iter()
+                .all(|entry| entry.result().is_err())
+        );
+        assert!(!evidence.all_valid());
+        let empty = XmlDocument::parse("<root/>").unwrap();
+        assert!(!VerifyContext::new().verify_all(&empty).unwrap().all_valid());
+    }
+
+    #[test]
+    fn verify_all_checks_cardinality_before_running_keys() {
+        // The cardinality policy bounds report allocation and crypto work,
+        // including malformed signatures that never reach core validation.
+        let document = XmlDocument::parse(format!(
+            "<root xmlns:ds=\"{XMLDSIG_NS}\"><ds:Signature/><ds:Signature/></root>"
+        ))
+        .unwrap();
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_signatures = 1;
+        assert!(matches!(
+            VerifyContext::new().policy(policy).verify_all(&document),
+            Err(DsigError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "verification signatures",
+                    maximum: 1,
+                    actual: 2,
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn verification_signature_limit_also_gates_the_single_api() {
+        // The same compiled resource policy must apply to both public paths.
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_signatures = 0;
+        assert!(matches!(
+            VerifyContext::new()
+                .policy(policy)
+                .key(&AcceptingKey)
+                .verify(&signature_with_target_reference("AQ==")),
+            Err(DsigError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "verification signatures",
+                    maximum: 0,
+                    actual: 1,
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn verify_all_preserves_generation_and_rejects_wrapped_siblings() {
+        // A signature over one element never authenticates a lookalike sibling.
+        let xml = signature_with_target_reference("AQ==")
+            .replace("</root>", "<target ID=\"unsigned\">payload</target></root>");
+        let document = XmlDocument::parse(xml).unwrap();
+        let (signed, unsigned) = document.with_view(|view| {
+            (
+                view.node_for_id("target", &[]).unwrap(),
+                view.node_for_id("unsigned", &[]).unwrap(),
+            )
+        });
+        let evidence = VerifyContext::new()
+            .key(&AcceptingKey)
+            .verify_all(&document)
+            .unwrap();
+        assert!(evidence.all_valid());
+        assert!(evidence.covers_element(&document, signed).unwrap());
+        assert!(!evidence.covers_element(&document, unsigned).unwrap());
+        let foreign = XmlDocument::parse("<target/>").unwrap();
+        let target = foreign.with_view(|view| view.root_element());
+        assert!(matches!(
+            evidence.covers_element(&document, target),
+            Err(DsigError::Document(XmlDocumentError::ForeignIdentity))
+        ));
+    }
+
+    #[test]
+    fn verify_request_rejects_duplicate_targets_before_crypto() {
+        // Ambiguous request mapping is not a successful duplicate assertion.
+        let document = XmlDocument::parse(signature_with_target_reference("AQ==")).unwrap();
+        let target = document.with_view(|view| view.node_for_id("target", &[]).unwrap());
+        let targets = [target, target];
+        let request = VerificationRequest {
+            expected_targets: &targets,
+            ..VerificationRequest::default()
+        };
+        assert!(matches!(
+            VerifyContext::new().verify_request(&document, &request),
+            Err(DsigError::InvalidRequest {
+                reason: "duplicate expected coverage target"
+            })
+        ));
+    }
+
+    #[test]
+    fn verify_all_shares_canonicalization_retention_budget() {
+        // Repeating a Signature may not reset the retained-data allowance.
+        let xml = signature_with_target_reference("AQ==");
+        let single = VerifyContext::new()
+            .key(&AcceptingKey)
+            .store_pre_digest(true)
+            .verify(&xml)
+            .unwrap();
+        let bytes = single.canonicalized_signed_info.unwrap().len()
+            + single.signed_info_references[0]
+                .pre_digest_data
+                .as_ref()
+                .unwrap()
+                .len();
+        let parsed = Document::parse(&xml).unwrap();
+        let signature = parsed
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "Signature")))
+            .unwrap();
+        let xml = xml.replace("</root>", &format!("{}</root>", &xml[signature.range()]));
+        let document = XmlDocument::parse(xml).unwrap();
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_canonicalized_bytes = bytes * 2 - 1;
+        let evidence = VerifyContext::new()
+            .key(&AcceptingKey)
+            .store_pre_digest(true)
+            .policy(policy)
+            .verify_all(&document)
+            .unwrap();
+        assert_eq!(evidence.signatures.len(), 2);
+        assert_eq!(
+            evidence.signatures[0].result().as_ref().unwrap().status,
+            DsigStatus::Valid
+        );
+        assert!(matches!(
+            evidence.signatures[1].result(),
+            Err(DsigError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "canonicalized bytes",
+                    ..
+                }
+            ))
+        ));
+        assert!(!evidence.accepted(&document).unwrap());
+    }
+
+    #[test]
+    fn verify_all_manifest_coverage_requires_its_authenticated_digest() {
+        // A valid enclosing Signature authenticates the Manifest declaration,
+        // not a target whose separately checked Manifest digest mismatches.
+        for valid in [true, false] {
+            let document = XmlDocument::parse(signature_with_manifest_xml(valid)).unwrap();
+            let target = document.with_view(|view| view.node_for_id("target", &[]).unwrap());
+            let evidence = VerifyContext::new()
+                .key(&AcceptingKey)
+                .process_manifests(true)
+                .verify_all(&document)
+                .unwrap();
+            let result = evidence.signatures()[0].result().as_ref().unwrap();
+            assert_eq!(result.manifest_references.len(), 1);
+            assert!(result.manifest_references[0].reference_identity.is_some());
+            assert_eq!(evidence.covers_element(&document, target).unwrap(), valid);
+            assert_eq!(evidence.accepted(&document).unwrap(), valid);
+        }
+    }
+
+    #[test]
+    fn verify_all_filtered_digest_does_not_claim_original_subtree() {
+        // A projection may discard content even when its local digest matches.
+        // No arbitrary filter is promoted to complete original-node coverage.
+        let mut reference = make_reference(
+            "#target",
+            vec![Transform::XpathExcludeAllSignatures],
+            DigestAlgorithm::Sha256,
+            vec![],
+        );
+        let document = XmlDocument::parse(signature_with_target_reference("AQ==")).unwrap();
+        document.with_view(|view| {
+            let target = view.node_for_id("target", &[]).unwrap();
+            let mut result = manifest_reference_invalid_result(
+                &reference,
+                0,
+                FailureReason::ReferenceProcessingFailure { ref_index: 0 },
+            );
+            result.status = DsigStatus::Valid;
+            bind_reference_evidence(
+                &mut result,
+                &reference,
+                view,
+                None,
+                &OperationResourceIdentity::DocumentNode(target),
+            );
+            assert_eq!(result.target_identity, Some(target));
+            assert_eq!(result.coverage, ReferenceCoverage::TransformedData);
+            reference.transforms = vec![Transform::C14n(crate::c14n::C14nAlgorithm::new(
+                crate::c14n::C14nMode::Exclusive1_0,
+                false,
+            ))];
+            bind_reference_evidence(
+                &mut result,
+                &reference,
+                view,
+                None,
+                &OperationResourceIdentity::DocumentNode(target),
+            );
+            assert_eq!(result.coverage, ReferenceCoverage::ElementContent);
+        });
+    }
+
+    #[test]
+    fn verify_request_rejects_conflicting_resource_owners() {
+        // There is no implicit override between request bytes and old builder
+        // configuration: ownership must be explicit before resolver work.
+        let document = XmlDocument::parse("<root/>").unwrap();
+        let resources = HashMap::new();
+        let request = VerificationRequest {
+            external_resources: Some(&resources),
+            ..VerificationRequest::default()
+        };
+        assert!(matches!(
+            VerifyContext::new()
+                .external_resources(&resources)
+                .verify_request(&document, &request),
+            Err(DsigError::InvalidRequest {
+                reason: "external resources configured in both context and request"
+            })
+        ));
     }
 
     fn signature_with_target_reference(signature_value_b64: &str) -> String {
@@ -5382,8 +6205,8 @@ mod tests {
                 TransformExecutionBudget::from_resources(&policy.resources),
             );
             let operation = OperationExecutionContext::new(
-                policy,
-                budgets,
+                &policy,
+                &budgets,
                 Some((view.identity(), view.generation())),
             );
             operation.authenticate(view.node_identity(object));
@@ -5431,8 +6254,8 @@ mod tests {
                 TransformExecutionBudget::from_resources(&policy.resources),
             );
             let operation = OperationExecutionContext::new(
-                policy,
-                budgets,
+                &policy,
+                &budgets,
                 Some((view.identity(), view.generation())),
             );
             operation.authenticate(view.node_identity(outer));
@@ -7499,8 +8322,10 @@ mod tests {
         document.with_view(|view| {
             let resolver =
                 UriReferenceResolver::new(view.document()).with_external_resources(&resources);
-            let first = budgets.resource_identity_for_reference(&reference, 0, &resolver, view);
-            let second = budgets.resource_identity_for_reference(&reference, 1, &resolver, view);
+            let first =
+                budgets.resource_identity_for_reference(&reference, 0, &resolver, view, None);
+            let second =
+                budgets.resource_identity_for_reference(&reference, 1, &resolver, view, None);
 
             assert_eq!(first, second);
             assert_eq!(budgets.external_resource_identities.borrow().len(), 1);

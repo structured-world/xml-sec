@@ -3671,6 +3671,31 @@ mod tests {
             evidence.anchor_fingerprint(),
             &evidence.certificate_fingerprints()[0]
         );
+
+        // The batch entry point must retain the actual validated path rather
+        // than reducing trusted/lookup overlap to a boolean or XML claim.
+        let document = crate::XmlDocument::parse(x509_signature_with_leaf_subject())
+            .expect("signed certificate selector fixture must parse");
+        let report = super::super::VerifyContext::new()
+            .policy(verification_policy_with_trust(chain_policy_at(
+                fixture_certificate_time(),
+            )))
+            .key_resolver(&resolver)
+            .verify_all(&document)
+            .expect("batch verification must preserve the validated path");
+        assert!(
+            report
+                .accepted(&document)
+                .expect("current document acceptance")
+        );
+        assert_eq!(
+            report.signatures()[0]
+                .result()
+                .as_ref()
+                .expect("the individually processed Signature must verify")
+                .key_trust,
+            super::super::KeyTrustEvidence::ValidatedX509(evidence)
+        );
     }
 
     #[test]

@@ -24,6 +24,8 @@ Pure Rust XML Security for **XMLDSig**, **XML Encryption**, **C14N**, **SAML 2.0
   the libxml2/OpenSSL-style native dependency stack.
 - **Fail-closed security policy**: typed immutable policy controls algorithms, trust, XML parsing,
   transforms, external resources, and cumulative operation budgets.
+- **Identity-bound verification evidence**: bounded multi-signature reports, explicit trusted-key
+  requests, and expected-element coverage checks resist signature wrapping and stale-document reuse.
 - **xmlsec1 interoperability**: a native `xmlsec1` CLI surface plus deterministic offline
   compatibility corpora and generated parity ledgers.
 - **Encoding-aware XML input**: strict bounded decoding for UTF-8, UTF-16, UTF-32, and supported
