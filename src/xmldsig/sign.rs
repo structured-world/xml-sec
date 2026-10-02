@@ -1624,7 +1624,20 @@ impl<'a> SignContext<'a> {
             )?;
             parse_signature_children(signature)
                 .map_err(|error| SigningDigestError::InvalidStructure(error.to_string()))?;
-            validate_signing_signed_info_methods(signature, &self.policy)?;
+            let (algorithm, output_bits) =
+                validate_signing_signed_info_methods(signature, &self.policy)?;
+            self.policy.check_signature_algorithm(algorithm)?;
+            if algorithm.hmac_output_bits().is_some() {
+                // Reject weak HMAC parameters before callbacks or reference work;
+                // XMLDSig 1.1 section 4.4.2 defines the output minimum.
+                // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-SignatureMethod
+                expected_signature_output_len(
+                    self.signing_key,
+                    algorithm,
+                    &self.policy,
+                    output_bits,
+                )?;
+            }
             Ok::<_, SigningError>(())
         })?;
         let transform_options = TransformOptions::default()
@@ -2756,7 +2769,7 @@ fn validate_signing_references(
 fn validate_signing_signed_info_methods(
     signature: Node<'_, '_>,
     policy: &crate::policy::SigningPolicy,
-) -> Result<(), SigningDigestError> {
+) -> Result<(SignatureAlgorithm, Option<usize>), SigningDigestError> {
     let signed_info = find_required_child(signature, "SignedInfo")?;
     let canonicalization_method =
         element_children(signed_info)
@@ -2778,7 +2791,14 @@ fn validate_signing_signed_info_methods(
         }
         .into());
     }
-    Ok(())
+    let signature_method =
+        element_children(signed_info)
+            .nth(1)
+            .ok_or(SigningDigestError::MissingElement {
+                element: "SignatureMethod",
+            })?;
+    super::parse::parse_signature_method(signature_method)
+        .map_err(|error| SigningDigestError::InvalidStructure(error.to_string()))
 }
 
 struct SigningUriResolution<'a, 'resources> {
