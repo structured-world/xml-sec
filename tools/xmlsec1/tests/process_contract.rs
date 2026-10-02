@@ -3746,6 +3746,13 @@ fn key_store_rsa_recipient_round_trips_with_explicit_private_key() {
         String::from_utf8_lossy(&unsupported_store_decrypt.stderr)
             .contains("--keys-file does not supply RSA recipient private keys")
     );
+    // Public-key store rejection identifies the unavailable private material
+    // and the applicable input options, rather than implying failed recovery.
+    assert!(
+        String::from_utf8_lossy(&unsupported_store_decrypt.stderr).contains(
+            "RSAKeyValue imports are public-only; use --privkey-pem, --privkey-der, or --pkcs12"
+        )
+    );
 
     let wrong_public_pem =
         fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"))

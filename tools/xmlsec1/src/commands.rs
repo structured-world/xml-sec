@@ -3509,8 +3509,11 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                     && entry.usages.allows(key_manager::KeyUsage::Decrypt)
             })
         {
+            // XMLDSig 1.1 section 4.5.2.2 defines RSAKeyValue as Modulus and
+            // Exponent, not a private-key container:
+            // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-RSAKeyValue
             return Err(CommandError::Usage(
-                "--keys-file does not supply RSA recipient private keys for decrypt".into(),
+                "--keys-file does not supply RSA recipient private keys for decrypt: RSAKeyValue imports are public-only; use --privkey-pem, --privkey-der, or --pkcs12".into(),
             ));
         }
         let requested_names = content_key_name.iter().cloned().collect::<Vec<_>>();

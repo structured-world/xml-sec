@@ -187,9 +187,11 @@ for an encrypted key fails without a plaintext fallback, before output is
 committed, and is never included in diagnostics.
 `--keys-file FILE` imports a bounded xmlsec `keys.xml` store for sign, verify,
 encrypt, and decrypt. Named HMAC/DSA signers, named HMAC/RSA/EC public
-verification keys, direct AES content keys, and RSA-OAEP recipients are selected
+verification keys, direct AES content keys, and RSA-OAEP encryption recipients are selected
 from the same caller-owned inventory; an imported key never bypasses the
-operation policy. `--pkcs12[:NAME] FILE --pwd PASSWORD` supplies one private
+operation policy. XML `RSAKeyValue` entries are public-only and cannot recover
+an encrypted recipient key; use `--privkey-pem`, `--privkey-der`, or `--pkcs12`
+for RSA decryption. `--pkcs12[:NAME] FILE --pwd PASSWORD` supplies one private
 key and its certificate chain for sign or RSA decryption. Bundles with multiple
 private keys are rejected rather than selecting an arbitrary bag. Neither
 option triggers network lookup or implicit key discovery. See

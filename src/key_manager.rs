@@ -685,6 +685,27 @@ impl crate::xmlenc::DecryptionKeyResolver for InventoryDirectAes {
         self.resolve_key(provider, algorithm, None)
             .map(|key| vec![key])
     }
+
+    fn resolve_key_candidates_with_policy(
+        &self,
+        provider: &dyn crate::provider::CryptoProvider,
+        algorithm: crate::xmlenc::DataEncryptionAlgorithm,
+        encrypted_key: Option<&crate::xmlenc::EncryptedKey>,
+        policy: &crate::policy::DecryptionPolicy,
+        budget: &mut crate::xmlenc::KeyCandidateBudget,
+    ) -> Result<Vec<Vec<u8>>, crate::xmlenc::XmlEncError> {
+        policy.validate()?;
+        if encrypted_key.is_some() {
+            return Err(crate::xmlenc::XmlEncError::KeyNotFound);
+        }
+        check_selected_material_size(self.0.len(), &policy.resources).map_err(
+            |error| match error {
+                KeyStoreError::Policy(violation) => crate::xmlenc::XmlEncError::Policy(violation),
+                other => crate::xmlenc::XmlEncError::InvalidStructure(other.to_string()),
+            },
+        )?;
+        self.resolve_key_candidates(provider, algorithm, None, budget)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1362,12 +1383,13 @@ impl KeyInventory {
                 resources.max_external_resource_bytes,
             ));
         }
-        private_key_spki(&der)?;
-        if usages.allows(KeyUsage::Decrypt) && RsaPrivateKey::from_pkcs8_der(&der).is_err() {
+        let identity = PrivateKeyIdentity::decode(&der)?;
+        if usages.allows(KeyUsage::Decrypt) && !matches!(identity, PrivateKeyIdentity::Rsa(_)) {
             return Err(KeyStoreError::Selection(
                 "only RSA private keys can be used for decryption",
             ));
         }
+        drop(identity);
         self.reserve_material(
             named_material_length(&name, bytes.len().max(der.len()), 1)?,
             resources,
@@ -1584,10 +1606,8 @@ impl KeyInventory {
             .pop()
             .ok_or(KeyStoreError::ProtectedContainer)?;
         let mut certificates = contents.certificates;
-        let spki = private_key_spki(private_key.as_ref())?;
-        if usages.allows(KeyUsage::Decrypt)
-            && RsaPrivateKey::from_pkcs8_der(private_key.as_ref()).is_err()
-        {
+        let identity = PrivateKeyIdentity::decode(private_key.as_ref())?;
+        if usages.allows(KeyUsage::Decrypt) && !matches!(identity, PrivateKeyIdentity::Rsa(_)) {
             if auto_decrypt {
                 usages = KeyUsages::SIGN;
             } else {
@@ -1603,7 +1623,7 @@ impl KeyInventory {
             if !rest.is_empty() {
                 return Err(KeyStoreError::Selection("invalid certificate in PKCS#12"));
             }
-            if parsed.public_key().raw == spki.as_slice() {
+            if identity.matches_spki(parsed.public_key().raw) {
                 if matching_leaf.is_some_and(|leaf: &[u8]| leaf != certificate.as_slice()) {
                     return Err(KeyStoreError::Selection(
                         "ambiguous certificate for PKCS#12 private key",
@@ -1614,6 +1634,7 @@ impl KeyInventory {
                 matching_leaf = Some(certificate.as_slice());
             }
         }
+        drop(identity);
         // PKCS#12 may carry unrelated CA certificates. They remain lookup
         // material; only an actual SPKI match is promoted to the leaf slot.
         let has_matching_leaf = matching_leaf.is_some();
@@ -2160,31 +2181,105 @@ fn named_material_length(
         .ok_or(KeyStoreError::Selection("key material size overflow"))
 }
 
-fn private_key_spki(der: &[u8]) -> Result<Vec<u8>, KeyStoreError> {
-    let info = PrivateKeyInfoRef::try_from(der)
-        .map_err(|_| KeyStoreError::Selection("unsupported PKCS#12 private key"))?;
-    if info.algorithm.oid == rsa::pkcs1::ALGORITHM_OID {
-        preflight_rsa_pkcs1_components(info.private_key.as_bytes())?;
-    } else if info.algorithm.oid == dsa::OID {
-        preflight_dsa_pkcs8_components(&info)?;
+// Public identity stays borrowed (RSA), native (DSA), or stack-sized (EC).
+// Import validation must not serialize an unaccounted SPKI beside live input.
+enum PrivateKeyIdentity<'a> {
+    Rsa(rsa::pkcs1::RsaPrivateKey<'a>),
+    Dsa {
+        algorithm: rsa::pkcs8::AlgorithmIdentifierRef<'a>,
+        key: NativeDsaSigningKey,
+    },
+    Ec {
+        algorithm: rsa::pkcs8::AlgorithmIdentifierRef<'a>,
+        point: [u8; 133],
+        length: usize,
+    },
+}
+
+impl<'a> PrivateKeyIdentity<'a> {
+    fn decode(der: &'a [u8]) -> Result<Self, KeyStoreError> {
+        let info = PrivateKeyInfoRef::try_from(der)
+            .map_err(|_| KeyStoreError::Selection("unsupported PKCS#12 private key"))?;
+        if info.algorithm.oid == rsa::pkcs1::ALGORITHM_OID {
+            preflight_rsa_pkcs1_components(info.private_key.as_bytes())?;
+            RsaPrivateKey::from_pkcs8_der(der)
+                .map_err(|_| KeyStoreError::Selection("invalid RSA private key"))?;
+            return rsa::pkcs1::RsaPrivateKey::from_der(info.private_key.as_bytes())
+                .map(Self::Rsa)
+                .map_err(|_| KeyStoreError::Selection("invalid RSA private key"));
+        } else if info.algorithm.oid == dsa::OID {
+            preflight_dsa_pkcs8_components(&info)?;
+            return NativeDsaSigningKey::from_pkcs8_der(der)
+                .map(|key| Self::Dsa {
+                    algorithm: info.algorithm,
+                    key,
+                })
+                .map_err(|_| KeyStoreError::Selection("invalid DSA private key"));
+        }
+        macro_rules! try_ec {
+            ($key:ty) => {
+                if let Ok(key) = <$key>::from_pkcs8_der(der) {
+                    use p256::elliptic_curve::sec1::ToSec1Point as _;
+                    let encoded = key.public_key().to_sec1_point(false);
+                    let bytes = encoded.as_bytes();
+                    let mut point = [0; 133];
+                    point[..bytes.len()].copy_from_slice(bytes);
+                    return Ok(Self::Ec {
+                        algorithm: info.algorithm,
+                        point,
+                        length: bytes.len(),
+                    });
+                }
+            };
+        }
+        try_ec!(p256::SecretKey);
+        try_ec!(p384::SecretKey);
+        try_ec!(p521::SecretKey);
+        Err(KeyStoreError::Selection("unsupported PKCS#12 private key"))
     }
-    macro_rules! try_key {
-        ($key:ty) => {
-            if let Ok(key) = <$key>::from_pkcs8_der(der) {
-                return key
-                    .public_key_info()
-                    .ok()
-                    .and_then(|info| info.spki_der().map(ToOwned::to_owned))
-                    .ok_or(KeyStoreError::Selection("private key has no public key"));
-            }
+
+    fn matches_spki(&self, der: &[u8]) -> bool {
+        let Ok(spki) = rsa::pkcs8::SubjectPublicKeyInfoRef::from_der(der) else {
+            return false;
         };
+        let Some(bytes) = spki.subject_public_key.as_bytes() else {
+            return false;
+        };
+        match self {
+            Self::Rsa(key) => {
+                if spki.algorithm != rsa::pkcs1::ALGORITHM_ID {
+                    return false;
+                }
+                let Ok(public) = rsa::pkcs1::RsaPublicKey::from_der(bytes) else {
+                    return false;
+                };
+                key.modulus == public.modulus && key.public_exponent == public.public_exponent
+            }
+            Self::Dsa { algorithm, key } => {
+                if spki.algorithm != *algorithm {
+                    return false;
+                }
+                let Ok(y) = der::asn1::UintRef::from_der(bytes) else {
+                    return false;
+                };
+                // Compare native little-endian limbs as a byte iterator, without
+                // materializing a second big integer or owned public encoding.
+                key.verifying_key()
+                    .y()
+                    .as_words()
+                    .iter()
+                    .rev()
+                    .flat_map(|word| word.to_be_bytes())
+                    .skip_while(|byte| *byte == 0)
+                    .eq(y.as_bytes().iter().copied())
+            }
+            Self::Ec {
+                algorithm,
+                point,
+                length,
+            } => spki.algorithm == *algorithm && bytes == &point[..*length],
+        }
     }
-    try_key!(RsaSigningKey);
-    try_key!(DsaSigningKey);
-    try_key!(EcdsaP256SigningKey);
-    try_key!(EcdsaP384SigningKey);
-    try_key!(EcdsaP521SigningKey);
-    Err(KeyStoreError::Selection("unsupported PKCS#12 private key"))
 }
 
 /// Validate borrowed PKCS#1 private components against process-safety ceilings.
@@ -4301,6 +4396,71 @@ mod tests {
     }
 
     #[test]
+    fn private_identity_matches_without_owned_public_encoding() {
+        // Compare every supported family against its canonical encoder, and
+        // reject changed public material. Import itself retains no SPKI copy.
+        let rsa_der = pem::parse(include_bytes!(
+            "../tests/fixtures/keys/rsa/rsa-2048-key.pem"
+        ))
+        .expect("RSA PEM fixture")
+        .into_contents();
+        let rsa = RsaPrivateKey::from_pkcs8_der(&rsa_der).expect("RSA private key");
+        let public = rsa
+            .to_public_key()
+            .to_public_key_der()
+            .expect("RSA public encoding");
+        let identity = PrivateKeyIdentity::decode(&rsa_der).expect("RSA identity");
+        assert!(identity.matches_spki(public.as_bytes()));
+        let mut changed = public.as_bytes().to_vec();
+        *changed.last_mut().expect("nonempty RSA SPKI") ^= 2;
+        assert!(!identity.matches_spki(&changed));
+        assert!(!identity.matches_spki(b"invalid DER"));
+
+        macro_rules! check_ec {
+            ($key:ty, $length:expr) => {{
+                let mut scalar = [0; $length];
+                scalar[$length - 1] = 1;
+                let key = <$key>::from_slice(&scalar).expect("valid EC scalar");
+                let private = key.to_pkcs8_der().expect("EC private encoding");
+                let public = key
+                    .public_key()
+                    .to_public_key_der()
+                    .expect("EC public encoding");
+                let identity = PrivateKeyIdentity::decode(private.as_bytes()).expect("EC identity");
+                assert!(identity.matches_spki(public.as_bytes()));
+                let mut changed = public.as_bytes().to_vec();
+                *changed.last_mut().expect("nonempty EC SPKI") ^= 1;
+                assert!(!identity.matches_spki(&changed));
+            }};
+        }
+        check_ec!(p256::SecretKey, 32);
+        check_ec!(p384::SecretKey, 48);
+        check_ec!(p521::SecretKey, 66);
+
+        let inventory = KeyInventory::from_xml_bytes(
+            include_bytes!("../tests/fixtures/keys/xmlsec/mixed-keys.xml"),
+            &xml_policy(ResourcePolicy::default()),
+            XmlBackend::default(),
+        )
+        .expect("mixed store fixture");
+        let private = inventory
+            .private_keys()
+            .iter()
+            .find(|entry| entry.name == "test-dsa")
+            .expect("stored DSA private key");
+        let key = NativeDsaSigningKey::from_pkcs8_der(&private.pkcs8_der).expect("DSA private key");
+        let public = key
+            .verifying_key()
+            .to_public_key_der()
+            .expect("DSA public encoding");
+        let identity = PrivateKeyIdentity::decode(&private.pkcs8_der).expect("DSA identity");
+        assert!(identity.matches_spki(public.as_bytes()));
+        let mut changed = public.as_bytes().to_vec();
+        *changed.last_mut().expect("nonempty DSA SPKI") ^= 1;
+        assert!(!identity.matches_spki(&changed));
+    }
+
+    #[test]
     fn plaintext_private_import_checks_all_live_copies() {
         use rsa::pkcs1::EncodeRsaPrivateKey as _;
         // Borrowed input, decoded PEM and retained DER coexist. Reject one
@@ -6401,6 +6561,55 @@ mod tests {
                 .decryption_resolver("encrypt-only", &crate::policy::DecryptionPolicy::default())
                 .is_err()
         );
+    }
+
+    #[cfg(feature = "xmlenc")]
+    #[test]
+    fn inventory_direct_aes_rechecks_execution_policy() {
+        // Selection does not freeze resource permission: reject a tighter
+        // execution snapshot before copying bytes or consuming a candidate.
+        use crate::xmlenc::{DataEncryptionAlgorithm, KeyCandidateBudget, XmlEncError};
+        let mut inventory = KeyInventory::default();
+        inventory
+            .add_symmetric(
+                "aes".into(),
+                SymmetricKeyKind::Aes,
+                vec![1; 16],
+                KeyUsages::DECRYPT,
+                &ResourcePolicy::default(),
+            )
+            .expect("AES imports");
+        let resolver = inventory
+            .decryption_resolver("aes", &crate::policy::DecryptionPolicy::default())
+            .expect("AES resolver");
+        let mut policy = crate::policy::DecryptionPolicy::default();
+        policy.resources.max_external_resource_bytes = 15;
+        let mut budget = KeyCandidateBudget::with_limit(1);
+        assert!(matches!(
+            resolver.resolve_key_candidates_with_policy(
+                &crate::provider::RustCryptoProvider,
+                DataEncryptionAlgorithm::Aes128Gcm,
+                None,
+                &policy,
+                &mut budget
+            ),
+            Err(XmlEncError::Policy(_))
+        ));
+        assert_eq!(budget.remaining(), 1);
+        policy.resources.max_external_resource_bytes = 16;
+        assert_eq!(
+            resolver
+                .resolve_key_candidates_with_policy(
+                    &crate::provider::RustCryptoProvider,
+                    DataEncryptionAlgorithm::Aes128Gcm,
+                    None,
+                    &policy,
+                    &mut budget
+                )
+                .expect("exact execution allowance"),
+            vec![vec![1; 16]]
+        );
+        assert_eq!(budget.remaining(), 0);
     }
 
     #[cfg(feature = "xmlenc")]
