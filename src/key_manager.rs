@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 
+#[cfg(test)]
 use base64::Engine as _;
 use crypto_bigint::{
     BoxedUint,
@@ -37,7 +38,7 @@ use crate::{
         DefaultKeyResolver, DsaSigningKey, DsigError, EcdsaP256SigningKey, EcdsaP384SigningKey,
         EcdsaP521SigningKey, HmacSigningKey, HmacVerificationKey, KeyInfo, KeyInfoSource,
         KeyResolver, KeyResolverConfig, KeyValueInfo, RsaSigningKey, SignatureAlgorithm,
-        SigningKey, VerifyingKey, X509DataInfo, parse_key_info, validate_signing_key,
+        SigningKey, VerifyingKey, X509DataInfo, validate_signing_key,
     },
 };
 
@@ -641,7 +642,7 @@ impl<'a> KeyResolver for InventoryVerificationResolver<'a> {
 
 enum ParsedMaterial {
     Symmetric(SymmetricKeyKind, Zeroizing<Vec<u8>>),
-    Public(Option<KeyValueInfo>),
+    Public(KeyValueInfo),
     Dsa(KeyValueInfo, Option<Zeroizing<Vec<u8>>>),
     Unsupported,
 }
@@ -1234,7 +1235,10 @@ impl KeyInventory {
         ensure_resource_policy(resources)?;
         self.check_new_name(&name, resources)?;
         self.check_material_capacity(named_material_length(&name, bytes.len(), 2)?, resources)?;
-        let block = BorrowedPublicPem::parse(bytes, resources.max_external_resource_bytes)?;
+        let block = BorrowedPem::parse(bytes, resources.max_external_resource_bytes)?;
+        if !matches!(block.label, "PUBLIC KEY" | "RSA PUBLIC KEY") {
+            return Err(KeyStoreError::Selection("unsupported public PEM label"));
+        }
         self.check_material_capacity(
             named_material_length(
                 &name,
@@ -1521,20 +1525,32 @@ impl KeyInventory {
         ensure_resource_policy(resources)?;
         self.check_new_name(&name, resources)?;
         self.check_material_capacity(named_material_length(&name, bytes.len(), 1)?, resources)?;
-        let block = single_pem_block(bytes, resources.max_external_resource_bytes)?;
+        let block = BorrowedPem::parse(bytes, resources.max_external_resource_bytes)?;
+        validate_private_key_usages(usages)?;
+        self.check_material_capacity(
+            named_material_length(
+                &name,
+                bytes
+                    .len()
+                    .checked_add(block.decoded_len)
+                    .ok_or(KeyStoreError::Selection("key material size overflow"))?,
+                1,
+            )?,
+            resources,
+        )?;
         enum Payload {
             Plain,
             Encrypted,
             Rsa,
-            Unsupported,
         }
-        let payload = match block.tag() {
+        let payload = match block.label {
             "PRIVATE KEY" => Payload::Plain,
             "ENCRYPTED PRIVATE KEY" => Payload::Encrypted,
             "RSA PRIVATE KEY" => Payload::Rsa,
-            _ => Payload::Unsupported,
+            _ => return Err(KeyStoreError::Selection("unsupported private PEM label")),
         };
-        let der = Zeroizing::new(block.into_contents());
+        let mut der = Zeroizing::new(vec![0; block.decoded_len]);
+        block.decode_into(&mut der)?;
         // RFC 7468 sections 10/11 define distinct PKCS#8 labels. Section 2
         // permits reinterpretation, but our protected-key contract forbids it:
         // https://www.rfc-editor.org/rfc/rfc7468#section-2
@@ -1548,9 +1564,6 @@ impl KeyInventory {
                     .map_err(|_| KeyStoreError::Selection("invalid PRIVATE KEY payload"))?;
             }
             Payload::Rsa => preflight_rsa_pkcs1_components(&der)?,
-            Payload::Unsupported => {
-                return Err(KeyStoreError::Selection("unsupported private PEM label"));
-            }
         }
         let previous_total = self.material_bytes;
         let name_len = name.len();
@@ -1926,6 +1939,10 @@ impl KeyInventory {
         if !root.has_tag_name((XMLSEC_NS, "Keys")) {
             return Err(KeyStoreError::Invalid("expected xmlsec Keys root".into()));
         }
+        let mut material_budget = XmlImportMaterialBudget {
+            used: live_material + bytes.len(),
+            maximum: resources.max_external_resource_total_bytes,
+        };
         let mut names = HashSet::new();
         let mut store = Self::default();
         let mut entry_count = 0_usize;
@@ -1941,6 +1958,7 @@ impl KeyInventory {
             }
             *inspected += 1;
             entry_count += 1;
+            preflight_xml_material(info, &mut material_budget)?;
             let mut name = None;
             let mut value = None;
             for child in info.children().filter(|child| child.is_element()) {
@@ -1974,16 +1992,20 @@ impl KeyInventory {
                         None
                     };
                     value = Some(if let Some(kind) = material {
-                        ParsedMaterial::Symmetric(kind, Zeroizing::new(decode_xml_base64(key)?))
+                        ParsedMaterial::Symmetric(kind, decode_xml_base64_secret(key)?)
                     } else if key.has_tag_name((XMLDSIG_NS, "DSAKeyValue")) {
-                        let (public, private) = parse_xmlsec_dsa_key_value(key)?;
+                        let (public, private) =
+                            parse_xmlsec_dsa_key_value(key, &mut material_budget)?;
                         ParsedMaterial::Dsa(public, private)
                     } else if key.has_tag_name((XMLDSIG_NS, "RSAKeyValue"))
                         // XMLDSig 1.1 section 4.5.2.3 places ECKeyValue in dsig11:
                         // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-ECKeyValue
                         || key.has_tag_name((XMLDSIG11_NS, "ECKeyValue"))
                     {
-                        ParsedMaterial::Public(None)
+                        ParsedMaterial::Public(
+                            crate::xmldsig::parse::parse_key_value_dispatch(child)
+                                .map_err(|error| KeyStoreError::Invalid(error.to_string()))?,
+                        )
                     } else {
                         ParsedMaterial::Unsupported
                     });
@@ -2019,16 +2041,10 @@ impl KeyInventory {
                         usages,
                     });
                 }
-                ParsedMaterial::Public(manual_value) => {
-                    let key_info = if let Some(value) = manual_value {
-                        let mut key_info = KeyInfo::default();
-                        key_info.sources.push(KeyInfoSource::KeyName(name.clone()));
-                        key_info.sources.push(KeyInfoSource::KeyValue(value));
-                        key_info
-                    } else {
-                        parse_key_info(info)
-                            .map_err(|error| KeyStoreError::Invalid(error.to_string()))?
-                    };
+                ParsedMaterial::Public(value) => {
+                    let mut key_info = KeyInfo::default();
+                    key_info.sources.push(KeyInfoSource::KeyName(name.clone()));
+                    key_info.sources.push(KeyInfoSource::KeyValue(value));
                     let is_rsa = key_info
                         .sources
                         .iter()
@@ -2079,7 +2095,10 @@ impl KeyInventory {
         store.entry_count = entry_count;
         // Decoding can retain both public components and a derived private key.
         // Keep the input charge too, so compact XML never lowers the import budget.
-        store.material_bytes = bytes.len().max(store.retained_material_bytes()?);
+        store.material_bytes = bytes
+            .len()
+            .checked_add(store.retained_material_bytes()?)
+            .ok_or(KeyStoreError::Selection("key material size overflow"))?;
         if store.material_bytes > resources.max_external_resource_total_bytes - live_material {
             return Err(import_resource_limit(
                 crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
@@ -2395,13 +2414,13 @@ fn preflight_dsa_pkcs8_components(info: &PrivateKeyInfoRef<'_>) -> Result<(), Ke
 
 // Borrow the frame and stream whitespace-separated Base64 into one preflighted
 // DER buffer. No normalized Base64 string or owned label/header copies are needed.
-struct BorrowedPublicPem<'a> {
+struct BorrowedPem<'a> {
     label: &'a str,
     data: &'a str,
     decoded_len: usize,
 }
 
-impl<'a> BorrowedPublicPem<'a> {
+impl<'a> BorrowedPem<'a> {
     fn parse(bytes: &'a [u8], maximum: usize) -> Result<Self, KeyStoreError> {
         if bytes.len() > maximum {
             return Err(import_resource_limit(
@@ -2417,19 +2436,11 @@ impl<'a> BorrowedPublicPem<'a> {
             .strip_prefix("-----BEGIN ")
             .and_then(|rest| rest.split_once("-----"))
             .ok_or_else(invalid)?;
-        if !matches!(label, "PUBLIC KEY" | "RSA PUBLIC KEY") {
-            return Err(KeyStoreError::Selection("unsupported public PEM label"));
-        }
         let (payload, end) = rest
             .trim_start_matches([' ', '\t', '\n', '\r'])
             .split_once("-----END ")
             .ok_or_else(invalid)?;
-        let begin = if label == "PUBLIC KEY" {
-            "-----BEGIN PUBLIC KEY-----"
-        } else {
-            "-----BEGIN RSA PUBLIC KEY-----"
-        };
-        if end.strip_prefix(label) != Some("-----") || payload.contains(begin) {
+        if end.strip_prefix(label) != Some("-----") || payload.contains("-----BEGIN ") {
             return Err(KeyStoreError::Selection(
                 "PEM must contain one complete block",
             ));
@@ -2475,6 +2486,12 @@ impl<'a> BorrowedPublicPem<'a> {
     }
 
     fn decode(&self) -> Result<Vec<u8>, KeyStoreError> {
+        let mut decoded = vec![0; self.decoded_len];
+        self.decode_into(&mut decoded)?;
+        Ok(decoded)
+    }
+
+    fn decode_into(&self, decoded: &mut [u8]) -> Result<(), KeyStoreError> {
         use std::io::Read as _;
         let input = PemBase64Reader {
             parts: self.data.split_whitespace(),
@@ -2482,9 +2499,8 @@ impl<'a> BorrowedPublicPem<'a> {
         };
         let mut decoder =
             base64::read::DecoderReader::new(input, &base64::engine::general_purpose::STANDARD);
-        let mut decoded = vec![0; self.decoded_len];
         decoder
-            .read_exact(&mut decoded)
+            .read_exact(decoded)
             .map_err(|_| KeyStoreError::Selection("invalid PEM key"))?;
         let mut eof = [0];
         if decoder
@@ -2494,7 +2510,7 @@ impl<'a> BorrowedPublicPem<'a> {
         {
             return Err(KeyStoreError::Selection("invalid PEM key"));
         }
-        Ok(decoded)
+        Ok(())
     }
 }
 
@@ -2522,6 +2538,7 @@ impl std::io::Read for PemBase64Reader<'_> {
     }
 }
 
+#[cfg(test)]
 fn single_pem_block(bytes: &[u8], maximum: usize) -> Result<pem::Pem, KeyStoreError> {
     if bytes.len() > maximum {
         return Err(import_resource_limit(
@@ -2727,7 +2744,13 @@ fn kdf_policy_violation(
 }
 
 fn element_text(node: Node<'_, '_>) -> Result<String, KeyStoreError> {
-    let mut text = String::new();
+    let length = node
+        .children()
+        .filter(|child| child.is_text())
+        .filter_map(|child| child.text())
+        .map(str::len)
+        .sum();
+    let mut text = String::with_capacity(length);
     for child in node.children() {
         if child.is_element() {
             return Err(KeyStoreError::Invalid("unexpected nested element".into()));
@@ -2740,17 +2763,132 @@ fn element_text(node: Node<'_, '_>) -> Result<String, KeyStoreError> {
 }
 
 fn decode_xml_base64(node: Node<'_, '_>) -> Result<Vec<u8>, KeyStoreError> {
-    let encoded = element_text(node)?;
-    let normalized = encoded
-        .bytes()
-        .filter(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
-        .collect::<Vec<_>>();
-    base64::engine::general_purpose::STANDARD
-        .decode(normalized)
-        .map_err(|_| KeyStoreError::Invalid("invalid key base64".into()))
+    xml_base64_payload(node)?
+        .decode()
+        .map_err(|reason| KeyStoreError::Invalid(reason.into()))
 }
 
-fn parse_xmlsec_dsa_key_value(node: Node<'_, '_>) -> Result<ParsedDsaKey, KeyStoreError> {
+fn decode_xml_base64_secret(node: Node<'_, '_>) -> Result<Zeroizing<Vec<u8>>, KeyStoreError> {
+    let payload = xml_base64_payload(node)?;
+    // Own the zeroizing guard before decoding: malformed trailing bits can
+    // fail after part of the secret has already been written into the buffer.
+    let mut output = Zeroizing::new(vec![0; payload.decoded_len]);
+    payload
+        .decode_into(&mut output)
+        .map_err(|reason| KeyStoreError::Invalid(reason.into()))?;
+    Ok(output)
+}
+
+fn xml_base64_payload<'a, 'input>(
+    node: Node<'a, 'input>,
+) -> Result<crate::xmldsig::whitespace::XmlBase64Payload<'a, 'input>, KeyStoreError> {
+    crate::xmldsig::whitespace::XmlBase64Payload::new(node)
+        .map_err(|reason| KeyStoreError::Invalid(reason.into()))
+}
+
+struct XmlImportMaterialBudget {
+    used: usize,
+    maximum: usize,
+}
+
+impl XmlImportMaterialBudget {
+    fn reserve(&mut self, length: usize) -> Result<(), KeyStoreError> {
+        if self.used > self.maximum || length > self.maximum - self.used {
+            return Err(import_resource_limit(
+                crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                self.maximum,
+            ));
+        }
+        self.used += length;
+        Ok(())
+    }
+}
+
+fn preflight_xml_material(
+    info: Node<'_, '_>,
+    budget: &mut XmlImportMaterialBudget,
+) -> Result<(), KeyStoreError> {
+    // The source remains live while decoded entries and cloned names are
+    // retained. Charge them before importing any entry, including failed ones.
+    let key = info
+        .children()
+        .find(|child| child.has_tag_name((XMLDSIG_NS, "KeyValue")))
+        .and_then(|value| value.children().find(|child| child.is_element()));
+    let name_copies = match key {
+        Some(key) if key.has_tag_name((XMLDSIG_NS, "DSAKeyValue")) => {
+            if key
+                .children()
+                .any(|child| child.has_tag_name((XMLSEC_NS, "X")))
+            {
+                4
+            } else {
+                3
+            }
+        }
+        Some(key)
+            if key.has_tag_name((XMLDSIG_NS, "RSAKeyValue"))
+                || key.has_tag_name((XMLDSIG11_NS, "ECKeyValue")) =>
+        {
+            3
+        }
+        _ => 2,
+    };
+    let uses_shared_public_parser = key.is_some_and(|key| {
+        key.has_tag_name((XMLDSIG_NS, "RSAKeyValue"))
+            || key.has_tag_name((XMLDSIG11_NS, "ECKeyValue"))
+    });
+    if uses_shared_public_parser {
+        crate::xmldsig::parse::validate_key_info_container(info)
+            .map_err(|error| KeyStoreError::Invalid(error.to_string()))?;
+    }
+    for child in info.children().filter(|child| child.is_element()) {
+        if child.has_tag_name((XMLDSIG_NS, "KeyName")) {
+            let length = child
+                .children()
+                .filter(|node| node.is_text())
+                .filter_map(|node| node.text())
+                .try_fold(0_usize, |sum, text| {
+                    sum.checked_add(text.len())
+                        .ok_or(KeyStoreError::Selection("key material size overflow"))
+                })?;
+            // Inventory, duplicate-name set, KeyInfo and private DSA name.
+            if uses_shared_public_parser && length > crate::xmldsig::parse::MAX_KEY_NAME_TEXT_LEN {
+                return Err(KeyStoreError::Invalid(
+                    "KeyName exceeds maximum allowed text length".into(),
+                ));
+            }
+            for _ in 0..name_copies {
+                budget.reserve(length)?;
+            }
+        } else if child.has_tag_name((XMLDSIG_NS, "KeyValue")) {
+            for key in child.children().filter(|node| node.is_element()) {
+                if key.has_tag_name((XMLSEC_NS, "HMACKeyValue"))
+                    || key.has_tag_name((XMLSEC_NS, "AESKeyValue"))
+                    || key.has_tag_name((XMLSEC_NS, "DESKeyValue"))
+                {
+                    budget.reserve(xml_base64_payload(key)?.decoded_len)?;
+                } else if key.has_tag_name((XMLDSIG_NS, "RSAKeyValue"))
+                    || key.has_tag_name((XMLDSIG_NS, "DSAKeyValue"))
+                    || key.has_tag_name((XMLDSIG11_NS, "ECKeyValue"))
+                {
+                    for component in key.children().filter(|node| node.is_element()) {
+                        if component.has_tag_name((XMLDSIG11_NS, "NamedCurve")) {
+                            budget.reserve(component.attribute("URI").map_or(0, str::len))?;
+                        } else {
+                            budget.reserve(xml_base64_payload(component)?.decoded_len)?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_xmlsec_dsa_key_value(
+    node: Node<'_, '_>,
+    budget: &mut XmlImportMaterialBudget,
+) -> Result<ParsedDsaKey, KeyStoreError> {
     let mut p = None;
     let mut q = None;
     let mut g = None;
@@ -2775,7 +2913,7 @@ fn parse_xmlsec_dsa_key_value(node: Node<'_, '_>) -> Result<ParsedDsaKey, KeySto
             // XMLDSig 1.1 §4.5.2.1 has no private X field. libxmlsec's
             // keys.xml adds one before Y; only this store importer accepts it.
             // https://www.w3.org/TR/xmldsig-core1/#sec-DSAKeyValue
-            private_x = Some(Zeroizing::new(decode_xml_base64(child)?));
+            private_x = Some(decode_xml_base64_secret(child)?);
             (3, None)
         } else if child.has_tag_name((XMLDSIG_NS, "J")) {
             (5, None)
@@ -2826,42 +2964,68 @@ fn parse_xmlsec_dsa_key_value(node: Node<'_, '_>) -> Result<ParsedDsaKey, KeySto
         ));
     }
     let y = y.ok_or_else(|| KeyStoreError::Invalid("DSAKeyValue requires Y".into()))?;
-    let private = if let Some(x) = private_x {
-        let (Some(p), Some(q), Some(g)) = (&p, &q, &g) else {
-            return Err(KeyStoreError::Invalid(
-                "private DSA key requires P, Q, and G".into(),
-            ));
+    let private =
+        if let Some(x) = private_x {
+            let (Some(p), Some(q), Some(g)) = (&p, &q, &g) else {
+                return Err(KeyStoreError::Invalid(
+                    "private DSA key requires P, Q, and G".into(),
+                ));
+            };
+            let components = DsaComponents::from_components(
+                BoxedUint::from_be_slice_vartime(p),
+                BoxedUint::from_be_slice_vartime(q),
+                BoxedUint::from_be_slice_vartime(g),
+            )
+            .map_err(|_| KeyStoreError::Invalid("invalid DSA parameters".into()))?;
+            let x_value = BoxedUint::from_be_slice_vartime(&x);
+            let monty = BoxedMontyParams::new(components.p().clone());
+            let expected_y = BoxedMontyForm::new((**components.g()).clone(), &monty)
+                .pow(&x_value)
+                .retrieve();
+            if expected_y != BoxedUint::from_be_slice_vartime(&y) {
+                return Err(KeyStoreError::Invalid(
+                    "DSA private and public values differ".into(),
+                ));
+            }
+            let public = DsaVerifyingKey::from_components(components, expected_y)
+                .map_err(|_| KeyStoreError::Invalid("invalid DSA public key".into()))?;
+            let private = NativeDsaSigningKey::from_components(public, x_value)
+                .map_err(|_| KeyStoreError::Invalid("invalid DSA private key".into()))?;
+            use der::Encode as _;
+            // The native encoder owns parameter DER, padded X bytes, X DER and
+            // PKCS#8 DER concurrently; the retained copy also exists before return.
+            let parameters_len =
+                usize::try_from(private.verifying_key().components().encoded_len().map_err(
+                    |_| KeyStoreError::Invalid("DSA private key encoding failed".into()),
+                )?)
+                .map_err(|_| KeyStoreError::Selection("key material size overflow"))?;
+            let x_bytes_len = usize::try_from(private.x().bits_precision() / 8)
+                .map_err(|_| KeyStoreError::Selection("key material size overflow"))?;
+            // DER length headers and the PKCS#8 algorithm identifier fit this
+            // checked bound: each header is at most 1 tag + 1 count + sizeof(usize).
+            let header = 2 + std::mem::size_of::<usize>();
+            let x_der_len = x_bytes_len
+                .checked_add(header + 1)
+                .ok_or(KeyStoreError::Selection("key material size overflow"))?;
+            let pkcs8_len = parameters_len
+                .checked_add(x_der_len)
+                .and_then(|length| length.checked_add(4 * header + 16))
+                .ok_or(KeyStoreError::Selection("key material size overflow"))?;
+            budget.reserve(parameters_len)?;
+            budget.reserve(x_bytes_len)?;
+            budget.reserve(x_der_len)?;
+            budget.reserve(pkcs8_len)?;
+            budget.reserve(pkcs8_len)?;
+            Some(Zeroizing::new(
+                private
+                    .to_pkcs8_der()
+                    .map_err(|_| KeyStoreError::Invalid("DSA private key encoding failed".into()))?
+                    .as_bytes()
+                    .to_vec(),
+            ))
+        } else {
+            None
         };
-        let components = DsaComponents::from_components(
-            BoxedUint::from_be_slice_vartime(p),
-            BoxedUint::from_be_slice_vartime(q),
-            BoxedUint::from_be_slice_vartime(g),
-        )
-        .map_err(|_| KeyStoreError::Invalid("invalid DSA parameters".into()))?;
-        let x_value = BoxedUint::from_be_slice_vartime(&x);
-        let monty = BoxedMontyParams::new(components.p().clone());
-        let expected_y = BoxedMontyForm::new((**components.g()).clone(), &monty)
-            .pow(&x_value)
-            .retrieve();
-        if expected_y != BoxedUint::from_be_slice_vartime(&y) {
-            return Err(KeyStoreError::Invalid(
-                "DSA private and public values differ".into(),
-            ));
-        }
-        let public = DsaVerifyingKey::from_components(components, expected_y)
-            .map_err(|_| KeyStoreError::Invalid("invalid DSA public key".into()))?;
-        let private = NativeDsaSigningKey::from_components(public, x_value)
-            .map_err(|_| KeyStoreError::Invalid("invalid DSA private key".into()))?;
-        Some(Zeroizing::new(
-            private
-                .to_pkcs8_der()
-                .map_err(|_| KeyStoreError::Invalid("DSA private key encoding failed".into()))?
-                .as_bytes()
-                .to_vec(),
-        ))
-    } else {
-        None
-    };
     Ok((KeyValueInfo::Dsa { p, q, g, y }, private))
 }
 
@@ -3556,7 +3720,7 @@ mod tests {
         )
         .expect("compact DSA store imports");
         let retained = inventory.retained_material_bytes().expect("bounded tally");
-        assert_eq!(inventory.material_bytes, xml.len().max(retained));
+        assert_eq!(inventory.material_bytes, xml.len() + retained);
         assert!(retained >= inventory.private_keys[0].pkcs8_der.len());
         assert!(
             retained > xml.len(),
@@ -3612,7 +3776,8 @@ mod tests {
         assert_eq!(importer.finish().entry_count(), 0);
         let valid = xml("AA==");
         let policy = xml_policy(ResourcePolicy {
-            max_external_resource_total_bytes: valid.len(),
+            // Source, decoded byte, inventory name, and duplicate-name copy.
+            max_external_resource_total_bytes: valid.len() + 3,
             ..ResourcePolicy::default()
         });
         let mut importer =
@@ -3622,7 +3787,7 @@ mod tests {
             .expect("first source fits exactly");
         let consumed = importer.parse_work.consumed();
         assert!(matches!(
-            importer.import(b"!"),
+            importer.import(b"!!"),
             Err(KeyStoreError::Policy(
                 crate::policy::PolicyViolation::ResourceLimitExceeded {
                     resource: crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
@@ -4631,6 +4796,102 @@ mod tests {
     }
 
     #[test]
+    fn xml_import_counts_source_and_decoded_material_together() {
+        // The caller still owns the Base64 XML while the decoded HMAC is live.
+        let xml = format!(
+            "<Keys xmlns='{XMLSEC_NS}' xmlns:ds='{XMLDSIG_NS}'><ds:KeyInfo><ds:KeyName>hmac</ds:KeyName><ds:KeyValue><HMACKeyValue>{}</HMACKeyValue></ds:KeyValue></ds:KeyInfo></Keys>",
+            base64::engine::general_purpose::STANDARD.encode(vec![1; 1024])
+        );
+        let resources = ResourcePolicy {
+            max_external_resource_total_bytes: xml.len(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            KeyInventory::from_xml_bytes(
+                xml.as_bytes(),
+                &xml_policy(resources),
+                XmlBackend::default()
+            ),
+            Err(KeyStoreError::Policy(_))
+        ));
+        // Exact peak includes both live name copies, not just retained bytes.
+        let peak = xml.len() + 1024 + 2 * "hmac".len();
+        for maximum in [peak - 1, peak] {
+            let policy = xml_policy(ResourcePolicy {
+                max_external_resource_total_bytes: maximum,
+                ..Default::default()
+            });
+            let result =
+                KeyInventory::from_xml_bytes(xml.as_bytes(), &policy, XmlBackend::default());
+            if maximum == peak {
+                let store = result.expect("exact live peak fits");
+                assert_eq!(store.symmetric_keys[0].bytes.as_slice(), &[1; 1024]);
+                assert_eq!(store.material_bytes, xml.len() + 1024 + "hmac".len());
+            } else {
+                assert!(matches!(result, Err(KeyStoreError::Policy(_))));
+            }
+        }
+    }
+
+    #[test]
+    fn private_pem_preflight_precedes_payload_parsing() {
+        // Structurally invalid DER must never be reached when its allocation
+        // already exceeds the allowance, for plain and encrypted labels alike.
+        for label in ["PRIVATE KEY", "ENCRYPTED PRIVATE KEY", "RSA PRIVATE KEY"] {
+            let pem = pem::encode(&pem::Pem::new(label, vec![1, 2, 3]));
+            let resources = ResourcePolicy {
+                max_external_resource_total_bytes: pem.len() + "key".len() + 2,
+                ..Default::default()
+            };
+            let mut store = KeyInventory::default();
+            assert!(matches!(
+                store.add_private_pem(
+                    "key".into(),
+                    pem.as_bytes(),
+                    None,
+                    KeyUsages::SIGN,
+                    &resources
+                ),
+                Err(KeyStoreError::Policy(_))
+            ));
+            assert_eq!(store.entry_count(), 0);
+        }
+    }
+
+    #[test]
+    fn xml_public_key_import_preserves_key_info_metadata_validation() {
+        // Importing KeyValue directly must not bypass the original KeyInfo
+        // mixed-content and name-length validation performed by shared parsing.
+        let source = include_str!("../tests/fixtures/keys/xmlsec/mixed-keys.xml");
+        let marker = source.find("<RSAKeyValue").expect("RSA entry");
+        let start = source[..marker].rfind("<KeyInfo").expect("RSA KeyInfo");
+        let end =
+            marker + source[marker..].find("</KeyInfo>").expect("RSA end") + "</KeyInfo>".len();
+        let entry = &source[start..end];
+        let name_start = entry.find("<KeyName>").expect("name") + "<KeyName>".len();
+        let name_end = name_start + entry[name_start..].find("</KeyName>").expect("name end");
+        for changed in [
+            format!(
+                "{}{}{}",
+                &entry[..name_start],
+                "a".repeat(4097),
+                &entry[name_end..]
+            ),
+            entry.replacen("<KeyName>", "unexpected<KeyName>", 1),
+        ] {
+            let xml = format!("<Keys xmlns='{XMLSEC_NS}'>{changed}</Keys>");
+            assert!(
+                KeyInventory::from_xml_bytes(
+                    xml.as_bytes(),
+                    &xml_policy(ResourcePolicy::default()),
+                    XmlBackend::default()
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn public_pem_decoder_preserves_framing_and_whitespace_contract() {
         // Decode borrowed input without tightening the existing whitespace/header
         // contract; malformed framing, alphabet and padding remain rejected.
@@ -4643,7 +4904,7 @@ mod tests {
         ] {
             let text = format!("-----BEGIN PUBLIC KEY-----\n{data}\n-----END PUBLIC KEY-----");
             let expected = single_pem_block(text.as_bytes(), 4096).expect("existing PEM contract");
-            let frame = BorrowedPublicPem::parse(text.as_bytes(), 4096).expect("borrowed frame");
+            let frame = BorrowedPem::parse(text.as_bytes(), 4096).expect("borrowed frame");
             assert_eq!(
                 frame.decode().expect("borrowed decode"),
                 expected.contents()
@@ -4652,7 +4913,7 @@ mod tests {
         for data in ["AQI=", "AQ==", "AQID"] {
             let text =
                 format!("-----BEGIN RSA PUBLIC KEY-----\n{data}\n-----END RSA PUBLIC KEY-----");
-            let frame = BorrowedPublicPem::parse(text.as_bytes(), 4096).expect("borrowed frame");
+            let frame = BorrowedPem::parse(text.as_bytes(), 4096).expect("borrowed frame");
             assert_eq!(frame.decode().expect("decode").len(), frame.decoded_len);
         }
         // Exercise padding and the decoder's fixed-size staging boundaries;
@@ -4660,7 +4921,7 @@ mod tests {
         for length in [0, 1, 2, 3, 1023, 1024, 1025, 4096] {
             let bytes = vec![0xa5; length];
             let encoded = pem::encode(&pem::Pem::new("PUBLIC KEY", bytes.clone()));
-            let frame = BorrowedPublicPem::parse(encoded.as_bytes(), 8192).expect("frame");
+            let frame = BorrowedPem::parse(encoded.as_bytes(), 8192).expect("frame");
             assert_eq!(frame.decoded_len, length);
             assert_eq!(frame.decode().expect("streamed decoding"), bytes);
         }
@@ -4676,7 +4937,7 @@ mod tests {
             "-----BEGIN PUBLIC KEY-----\nnot a header\n\nAQID\n-----END PUBLIC KEY-----",
         ] {
             assert!(
-                BorrowedPublicPem::parse(text.as_bytes(), 4096)
+                BorrowedPem::parse(text.as_bytes(), 4096)
                     .and_then(|frame| frame.decode())
                     .is_err(),
                 "accepted {text}"

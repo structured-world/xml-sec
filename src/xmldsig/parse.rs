@@ -33,10 +33,7 @@ use x509_parser::x509::X509Name;
 use super::digest::compute_digest;
 use super::digest::{DigestAlgorithm, compute_digest_with_provider, constant_time_eq};
 use super::transforms::{self, Transform};
-use super::whitespace::{
-    XmlBase64NormalizeLimitedError, is_xml_whitespace_only, normalize_xml_base64_text,
-    normalize_xml_base64_text_with_limit,
-};
+use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_text};
 use super::x509::certificate_signature_matches_with_provider;
 use crate::c14n::C14nAlgorithm;
 use crate::c14n::xml_base::{
@@ -54,7 +51,7 @@ pub(crate) const XMLDSIG11_NS: &str = "http://www.w3.org/2009/xmldsig11#";
 const MAX_DER_ENCODED_KEY_VALUE_LEN: usize = 8192;
 const MAX_DER_ENCODED_KEY_VALUE_TEXT_LEN: usize = 65_536;
 const MAX_DER_ENCODED_KEY_VALUE_BASE64_LEN: usize = MAX_DER_ENCODED_KEY_VALUE_LEN.div_ceil(3) * 4;
-const MAX_KEY_NAME_TEXT_LEN: usize = 4096;
+pub(crate) const MAX_KEY_NAME_TEXT_LEN: usize = 4096;
 const MAX_KEY_INFO_CHILD_COUNT: usize = 64;
 const MAX_HMAC_OUTPUT_LENGTH_TEXT_LEN: usize = 32;
 const MAX_RETRIEVAL_XPATH_TEXT_LEN: usize = 256;
@@ -848,8 +845,7 @@ fn parse_key_info_in_session(
     embedded_candidate_preflight_count: &mut usize,
     x509_total_binary_len: &mut usize,
 ) -> Result<KeyInfo, ParseError> {
-    verify_ds_element(key_info_node, "KeyInfo")?;
-    ensure_no_non_whitespace_text(key_info_node, "KeyInfo")?;
+    validate_key_info_container(key_info_node)?;
 
     let mut sources = Vec::new();
     // KeyInfo is parsed before source selection, so preflight the cardinality
@@ -1119,7 +1115,7 @@ fn parse_inclusive_prefixes(node: Node) -> Result<Option<String>, ParseError> {
     Ok(None)
 }
 
-fn parse_key_value_dispatch(node: Node) -> Result<KeyValueInfo, ParseError> {
+pub(crate) fn parse_key_value_dispatch(node: Node) -> Result<KeyValueInfo, ParseError> {
     verify_ds_element(node, "KeyValue")?;
     ensure_no_non_whitespace_text(node, "KeyValue")?;
 
@@ -1147,6 +1143,11 @@ fn parse_key_value_dispatch(node: Node) -> Result<KeyValueInfo, ParseError> {
             local_name: child_name.to_string(),
         }),
     }
+}
+
+pub(crate) fn validate_key_info_container(node: Node) -> Result<(), ParseError> {
+    verify_ds_element(node, "KeyInfo")?;
+    ensure_no_non_whitespace_text(node, "KeyInfo")
 }
 
 fn parse_dsa_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
@@ -1335,45 +1336,27 @@ fn decode_crypto_binary(
     element_name: &'static str,
     max_decoded_len: usize,
 ) -> Result<Vec<u8>, ParseError> {
-    use base64::Engine;
-    use base64::engine::general_purpose::STANDARD;
-
     let max_base64_len = max_decoded_len.div_ceil(3) * 4;
-    let mut cleaned = String::with_capacity(max_base64_len);
-    for text in node
-        .children()
-        .filter(|child| child.is_text())
-        .filter_map(|child| child.text())
-    {
-        normalize_xml_base64_text_with_limit(text, &mut cleaned, max_base64_len).map_err(
-            |err| match err {
-                XmlBase64NormalizeLimitedError::InvalidWhitespace(err) => {
-                    ParseError::Base64(format!(
-                        "invalid XML whitespace U+{:04X} in {element_name}",
-                        err.invalid_byte
-                    ))
-                }
-                XmlBase64NormalizeLimitedError::TooLong(_) => ParseError::InvalidStructure(
-                    format!("{element_name} exceeds maximum allowed base64 length"),
-                ),
-            },
-        )?;
+    let payload = super::whitespace::XmlBase64Payload::bounded(node, usize::MAX, max_base64_len)
+        .map_err(|reason| xml_base64_payload_error(element_name, reason))?;
+    if payload.normalized_len > max_base64_len {
+        return Err(ParseError::InvalidStructure(format!(
+            "{element_name} exceeds maximum allowed base64 length"
+        )));
     }
-
-    let value = STANDARD
-        .decode(&cleaned)
-        .map_err(|err| ParseError::Base64(format!("{element_name}: {err}")))?;
-    if value.is_empty() {
+    if payload.decoded_len == 0 {
         return Err(ParseError::InvalidStructure(format!(
             "{element_name} must not be empty"
         )));
     }
-    if value.len() > max_decoded_len {
+    if payload.decoded_len > max_decoded_len {
         return Err(ParseError::InvalidStructure(format!(
             "{element_name} exceeds maximum allowed binary length"
         )));
     }
-    Ok(value)
+    payload
+        .decode()
+        .map_err(|reason| ParseError::Base64(format!("{element_name}: {reason}")))
 }
 
 pub(crate) fn parse_x509_data_dispatch_with_budget_and_provider(
@@ -1393,8 +1376,8 @@ pub(crate) fn parse_x509_data_dispatch_with_budget_and_provider(
                 charge_embedded_key_candidate(embedded_key_candidates, resources)?;
                 ensure_no_element_children(child, "X509Certificate")?;
                 ensure_x509_data_entry_budget(&info)?;
-                let cert = decode_x509_base64(child, "X509Certificate")?;
-                add_x509_data_usage(total_binary_len, cert.len())?;
+                let cert =
+                    decode_x509_base64(child, "X509Certificate", total_binary_len, resources)?;
                 let parsed_cert = parse_x509_certificate(cert.as_slice())?;
                 info.parsed_certificates.push(parsed_cert);
                 info.certificates.push(cert);
@@ -1417,23 +1400,20 @@ pub(crate) fn parse_x509_data_dispatch_with_budget_and_provider(
             (Some(XMLDSIG_NS), "X509SKI") => {
                 ensure_no_element_children(child, "X509SKI")?;
                 ensure_x509_data_entry_budget(&info)?;
-                let ski = decode_x509_base64(child, "X509SKI")?;
-                add_x509_data_usage(total_binary_len, ski.len())?;
+                let ski = decode_x509_base64(child, "X509SKI", total_binary_len, resources)?;
                 info.skis.push(ski);
             }
             (Some(XMLDSIG_NS), "X509CRL") => {
                 ensure_no_element_children(child, "X509CRL")?;
                 ensure_x509_data_entry_budget(&info)?;
-                let crl = decode_x509_base64(child, "X509CRL")?;
-                add_x509_data_usage(total_binary_len, crl.len())?;
+                let crl = decode_x509_base64(child, "X509CRL", total_binary_len, resources)?;
                 info.crls.push(crl);
             }
             (Some(XMLDSIG11_NS), "X509Digest") => {
                 ensure_no_element_children(child, "X509Digest")?;
                 ensure_x509_data_entry_budget(&info)?;
                 let algorithm = required_algorithm_attr(child, "X509Digest")?;
-                let digest = decode_x509_base64(child, "X509Digest")?;
-                add_x509_data_usage(total_binary_len, digest.len())?;
+                let digest = decode_x509_base64(child, "X509Digest", total_binary_len, resources)?;
                 info.digests.push((algorithm.to_string(), digest));
             }
             (Some(XMLDSIG_NS), child_name) | (Some(XMLDSIG11_NS), child_name) => {
@@ -2136,50 +2116,66 @@ fn add_x509_data_usage(total_binary_len: &mut usize, delta: usize) -> Result<(),
 fn decode_x509_base64(
     node: Node<'_, '_>,
     element_name: &'static str,
+    total_binary_len: &mut usize,
+    resources: &crate::policy::ResourcePolicy,
 ) -> Result<Vec<u8>, ParseError> {
-    use base64::Engine;
-    use base64::engine::general_purpose::STANDARD;
-
-    let mut cleaned = String::new();
-    let mut raw_text_len = 0usize;
-    for text in node
-        .children()
-        .filter(|child| child.is_text())
-        .filter_map(|child| child.text())
-    {
-        if raw_text_len.saturating_add(text.len()) > MAX_X509_BASE64_TEXT_LEN {
-            return Err(ParseError::InvalidStructure(format!(
-                "{element_name} exceeds maximum allowed text length"
-            )));
-        }
-        raw_text_len = raw_text_len.saturating_add(text.len());
-        normalize_xml_base64_text(text, &mut cleaned).map_err(|err| {
-            ParseError::Base64(format!(
-                "invalid XML whitespace U+{:04X} in {element_name}",
-                err.invalid_byte
-            ))
-        })?;
-        if cleaned.len() > MAX_X509_BASE64_NORMALIZED_LEN {
-            return Err(ParseError::InvalidStructure(format!(
-                "{element_name} exceeds maximum allowed base64 length"
-            )));
-        }
+    let payload = super::whitespace::XmlBase64Payload::bounded(
+        node,
+        MAX_X509_BASE64_TEXT_LEN,
+        MAX_X509_BASE64_NORMALIZED_LEN,
+    )
+    .map_err(|reason| xml_base64_payload_error(element_name, reason))?;
+    if payload.text_len > MAX_X509_BASE64_TEXT_LEN {
+        return Err(ParseError::InvalidStructure(format!(
+            "{element_name} exceeds maximum allowed text length"
+        )));
     }
-
-    let decoded = STANDARD
-        .decode(&cleaned)
-        .map_err(|e| ParseError::Base64(format!("{element_name}: {e}")))?;
-    if decoded.is_empty() {
+    if payload.normalized_len > MAX_X509_BASE64_NORMALIZED_LEN {
+        return Err(ParseError::InvalidStructure(format!(
+            "{element_name} exceeds maximum allowed base64 length"
+        )));
+    }
+    if payload.decoded_len == 0 {
         return Err(ParseError::InvalidStructure(format!(
             "{element_name} must not be empty"
         )));
     }
-    if decoded.len() > MAX_X509_DECODED_BINARY_LEN {
+    if payload.decoded_len > MAX_X509_DECODED_BINARY_LEN {
         return Err(ParseError::InvalidStructure(format!(
             "{element_name} exceeds maximum allowed binary length"
         )));
     }
-    Ok(decoded)
+    if payload.decoded_len > resources.max_external_resource_bytes {
+        return Err(crate::policy::PolicyViolation::ResourceLimitExceeded {
+            resource: crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
+            maximum: resources.max_external_resource_bytes,
+        }
+        .into());
+    }
+    if *total_binary_len > resources.max_external_resource_total_bytes
+        || payload.decoded_len > resources.max_external_resource_total_bytes - *total_binary_len
+    {
+        return Err(crate::policy::PolicyViolation::ResourceLimitExceeded {
+            resource: crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+            maximum: resources.max_external_resource_total_bytes,
+        }
+        .into());
+    }
+    // Reserve before allocation/DER parsing. Failed candidates consume the
+    // session budget too; retrying malformed data must not reset spent work.
+    add_x509_data_usage(total_binary_len, payload.decoded_len)?;
+    payload
+        .decode()
+        .map_err(|reason| ParseError::Base64(format!("{element_name}: {reason}")))
+}
+
+fn xml_base64_payload_error(element: &str, reason: &'static str) -> ParseError {
+    match reason {
+        "maximum allowed text length" | "maximum allowed base64 length" => {
+            ParseError::InvalidStructure(format!("{element} exceeds {reason}"))
+        }
+        _ => ParseError::Base64(format!("{element}: {reason}")),
+    }
 }
 
 pub(crate) fn parse_x509_certificate(cert_der: &[u8]) -> Result<ParsedX509Certificate, ParseError> {
@@ -2707,6 +2703,84 @@ mod tests {
     }
 
     // ── parse_key_info: dispatch parsing ──────────────────────────────
+
+    #[test]
+    fn key_info_session_applies_x509_byte_limits_before_decode() {
+        // SKI is binary X.509 metadata too; repeated parses share one allowance.
+        let document = Document::parse("<KeyInfo xmlns='http://www.w3.org/2000/09/xmldsig#'><X509Data><X509SKI>AQID</X509SKI></X509Data></KeyInfo>").unwrap();
+        for individual in [true, false] {
+            let resources = crate::policy::ResourcePolicy {
+                max_external_resource_bytes: if individual { 2 } else { 3 },
+                max_external_resource_total_bytes: if individual { 100 } else { 5 },
+                ..Default::default()
+            };
+            let mut session = KeyInfoParsingSession::new(&resources).unwrap();
+            if !individual {
+                session.parse(document.root_element()).unwrap();
+            }
+            assert!(matches!(
+                session.parse(document.root_element()),
+                Err(ParseError::Policy(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn all_x509_binary_fields_preflight_active_byte_policy() {
+        // Even invalid certificate DER must be rejected by the smaller active
+        // byte limit before certificate parsing, just like SKI/CRL/digest data.
+        for element in ["X509Certificate", "X509SKI", "X509CRL", "X509Digest"] {
+            let namespace = if element == "X509Digest" {
+                XMLDSIG11_NS
+            } else {
+                XMLDSIG_NS
+            };
+            let xml = format!(
+                "<KeyInfo xmlns='{XMLDSIG_NS}'><X509Data><v:{element} xmlns:v='{namespace}' Algorithm='test'>AQID</v:{element}></X509Data></KeyInfo>"
+            );
+            let document = Document::parse(&xml).unwrap();
+            let resources = crate::policy::ResourcePolicy {
+                max_external_resource_bytes: 2,
+                ..Default::default()
+            };
+            let mut session = KeyInfoParsingSession::new(&resources).unwrap();
+            assert!(
+                matches!(
+                    session.parse(document.root_element()),
+                    Err(ParseError::Policy(_))
+                ),
+                "{element}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_x509_der_parse_keeps_session_byte_charge() {
+        // A failed certificate attempt has already decoded three bytes. A
+        // subsequent valid SKI cannot reuse those bytes' aggregate allowance.
+        let invalid = Document::parse("<KeyInfo xmlns='http://www.w3.org/2000/09/xmldsig#'><X509Data><X509Certificate>AQID</X509Certificate></X509Data></KeyInfo>").unwrap();
+        let valid = Document::parse("<KeyInfo xmlns='http://www.w3.org/2000/09/xmldsig#'><X509Data><X509SKI>AQID</X509SKI></X509Data></KeyInfo>").unwrap();
+        let resources = crate::policy::ResourcePolicy {
+            max_external_resource_bytes: 3,
+            max_external_resource_total_bytes: 5,
+            ..Default::default()
+        };
+        let mut session = KeyInfoParsingSession::new(&resources).unwrap();
+        assert!(matches!(
+            session.parse(invalid.root_element()),
+            Err(ParseError::InvalidStructure(_))
+        ));
+        assert!(matches!(
+            session.parse(valid.root_element()),
+            Err(ParseError::Policy(_))
+        ));
+        assert!(
+            KeyInfoParsingSession::new(&resources)
+                .unwrap()
+                .parse(valid.root_element())
+                .is_ok()
+        );
+    }
 
     #[test]
     fn key_info_session_retains_failed_work_and_applies_active_policy() {

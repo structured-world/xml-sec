@@ -104,8 +104,9 @@ permits reinterpretation, but this API deliberately forbids it to preserve
 the protected-key contract. Similarly, `PUBLIC KEY` requires SubjectPublicKeyInfo
 (RFC 7468 section 13); certificates are accepted through the certificate APIs
 or generic DER import, not by reinterpreting a public-key PEM label.
-Public PEM imports preflight retained inventory plus simultaneously live encoded
-input and decoded DER. PKCS#1 RSA imports also preflight the final SPKI output
+Public and private PEM imports preflight retained inventory plus simultaneously
+live encoded input and decoded DER before allocating the decoded buffer.
+PKCS#1 RSA public imports also preflight the final SPKI output
 before wrapping borrowed key octets; decoding needs no normalized Base64 string.
 Oversized encoded bundles return a typed
 resource-policy error without invoking the callback.
@@ -161,6 +162,12 @@ uses this session for repeated `--keys-file`: candidate inspections and XML pars
 work share one operation allowance rather than resetting for each file. Failed
 imports preserve existing keys but retain their work charges; retained material
 from earlier files reduces capacity before decoding the next source.
+XML imports reserve the source together with decoded components, cloned names,
+and private-key encoding workspace, rather than using the larger of source and
+retained material. XML Base64 decoding borrows text nodes and uses one exact-size
+output buffer without normalized text copies. Embedded X509Data binary values
+obey the active per-resource and aggregate byte limits before decoding; repeated
+KeyInfo parses in one session retain that charge, including failed candidates.
 BER PrivateKeyInfo framing and constructed private-key OCTET STRINGs are
 normalized to bounded PKCS#8 DER before storage. CMS EncryptedData accepts
 unprotected attributes with version 2, while requiring version 0 without them
