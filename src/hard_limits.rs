@@ -81,6 +81,9 @@ pub(crate) const RSA_MODULUS_BIT_CEILING: usize = 8192;
 pub(crate) const DSA_MODULUS_BIT_CEILING: usize = 3072;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const SIGNATURE_REFERENCE_CEILING: usize = 64;
+/// Bounds retained per-signature reports and graph execution in one request.
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const VERIFICATION_SIGNATURE_CEILING: usize = 64;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const REFERENCE_TRANSFORM_CEILING: usize = 64;
 #[cfg(feature = "xmldsig")]

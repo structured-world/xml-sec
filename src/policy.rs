@@ -25,6 +25,7 @@ pub(crate) mod resource_name {
     pub const XML_DEPTH: &str = "XML element depth";
     pub const XML_NAMESPACE_BINDINGS: &str = "XML namespace bindings";
     pub const SIGNATURE_REFERENCES: &str = "signature references";
+    pub const VERIFICATION_SIGNATURES: &str = "verification signatures";
     pub const REFERENCE_TRANSFORMS: &str = "reference transforms";
     pub const XML_BASE_COMPONENTS: &str = "XML Base components";
     pub const XML_BASE_RESOLUTION_BYTES: &str = "XML Base resolution bytes";
@@ -422,6 +423,8 @@ pub struct ResourcePolicy {
     pub max_xml_namespace_bindings: usize,
     /// Maximum references in one signature or manifest.
     pub max_references: usize,
+    /// Maximum signatures examined and retained in one verification request.
+    pub max_signatures: usize,
     /// Maximum transforms in one reference.
     pub max_transforms_per_reference: usize,
     /// Maximum inherited `xml:base` components in one URI resolution.
@@ -496,6 +499,7 @@ impl Default for ResourcePolicy {
             max_xml_depth: crate::hard_limits::XML_DOCUMENT_DEPTH_CEILING,
             max_xml_namespace_bindings: crate::hard_limits::XML_NAMESPACE_BINDING_CEILING,
             max_references: crate::hard_limits::SIGNATURE_REFERENCE_CEILING,
+            max_signatures: crate::hard_limits::VERIFICATION_SIGNATURE_CEILING,
             max_transforms_per_reference: crate::hard_limits::REFERENCE_TRANSFORM_CEILING,
             max_xml_base_components: crate::hard_limits::XML_BASE_COMPONENT_CEILING,
             max_xml_base_resolution_bytes: crate::hard_limits::XML_BASE_RESOLUTION_BYTE_CEILING,
@@ -563,6 +567,11 @@ impl ResourcePolicy {
             resource_name::SIGNATURE_REFERENCES,
             self.max_references,
             crate::hard_limits::SIGNATURE_REFERENCE_CEILING,
+        )?;
+        Self::within(
+            resource_name::VERIFICATION_SIGNATURES,
+            self.max_signatures,
+            crate::hard_limits::VERIFICATION_SIGNATURE_CEILING,
         )?;
         Self::within(
             resource_name::REFERENCE_TRANSFORMS,
@@ -1326,6 +1335,11 @@ mod tests {
                 |p| &mut p.max_references,
             ),
             (
+                resource_name::VERIFICATION_SIGNATURES,
+                crate::hard_limits::VERIFICATION_SIGNATURE_CEILING,
+                |p| &mut p.max_signatures,
+            ),
+            (
                 resource_name::REFERENCE_TRANSFORMS,
                 crate::hard_limits::REFERENCE_TRANSFORM_CEILING,
                 |p| &mut p.max_transforms_per_reference,
@@ -1507,6 +1521,7 @@ mod tests {
             max_xml_depth: 0,
             max_xml_namespace_bindings: 0,
             max_references: 0,
+            max_signatures: 0,
             max_transforms_per_reference: 0,
             max_xml_base_components: 0,
             max_xml_base_resolution_bytes: 0,
