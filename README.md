@@ -59,6 +59,7 @@ xml-sec = { version = "0.1", default-features = false, features = ["xmldsig", "c
 | XML signatures | XMLDSig signing and verification, RSA/DSA/ECDSA/HMAC, XPath transforms, `Manifest`, `KeyInfo`, and caller-provided references |
 | XML encryption | AES-CBC/GCM, RSA-OAEP, AES Key Wrap, multiple recipients, and Element/Content replacement |
 | X.509 | Certificate key extraction, chain validation, CRLs, and policy-controlled trust |
+| Key management | Caller-owned named inventory, usage-restricted keys, xmlsec `keys.xml`, encrypted PKCS#8, and bounded RustCrypto-backed PKCS#12 import |
 | SAML 2.0 | Signed assertions and encrypted-assertion workflows covered by integration tests |
 | XML input | Strict bounded byte decoding, entity/depth/node limits, stable node identities, and generation-safe mutation |
 | Crypto | Provider-neutral contracts and opaque key handles with pure-Rust RustCrypto as the default implementation |
@@ -83,6 +84,8 @@ The signing and verification pipelines support same-document and caller-provided
 XPath 1.0 and XPath Filter 2 transforms, `Manifest`, structured `KeyInfo`, and policy-controlled
 X.509 validation. See [XML Digital Signatures](docs/xmldsig.md) for algorithms, transform semantics,
 key resolution, failure handling, and current interoperability boundaries.
+See [Key management](docs/key-management.md) for inventory ownership, format import,
+password handling, and CLI key-store behavior.
 
 ## XML Encryption
 
@@ -103,6 +106,9 @@ fn example() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+RSA encryption and decryption default to a 2048-bit minimum. Applications accepting legacy
+keys must explicitly select a lower operation-policy minimum; importing a key does not bypass it.
 
 See [XML Encryption](docs/xmlenc.md) for reciprocal decryption, key transport, recipient selection,
 document replacement, and parser policy.

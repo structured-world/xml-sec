@@ -106,6 +106,8 @@ cbc = { version = "0.2.1", optional = true }
 des = { version = "0.9", optional = true }
 md-5 = { version = "0.11", optional = true }
 pem = { version = "4", optional = true }
+pkcs12 = { version = "=0.2.0-pre.0", default-features = false, features = ["kdf"], optional = true }
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"], optional = true }
 
 # X.509 certificates
 x509-parser = { version = "0.18", features = ["verify"], optional = true }
@@ -152,6 +154,10 @@ xmldsig = [            # XML Digital Signatures (sign + verify)
     "dep:hmac",
     "dep:md-5",
     "dep:pem",
+    "dep:pkcs12",
+    "dep:pbkdf2",
+    "dep:aes",
+    "dep:cbc",
     "dep:peresil",
     "dep:p256",
     "dep:p384",
@@ -171,6 +177,8 @@ xmldsig = [            # XML Digital Signatures (sign + verify)
 ]
 xmlenc = [             # XML Encryption (encrypt + decrypt)
     "std",
+    # The shared key inventory stores XMLDSig KeyInfo for named RSA recipients.
+    "xmldsig",
     "dep:aes",
     "dep:aes-gcm",
     "dep:aes-kw",

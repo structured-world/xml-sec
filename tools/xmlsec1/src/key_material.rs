@@ -23,7 +23,8 @@ use rsa::{
     },
 };
 use x509_parser::prelude::FromDer as _;
-use xml_sec::policy::{PolicyViolation, SigningPolicy, VerificationPolicy};
+use xml_sec::key_manager::{KeyInventory, KeyUsages};
+use xml_sec::policy::{PolicyViolation, ResourcePolicy, SigningPolicy, VerificationPolicy};
 use xml_sec::xmldsig::{
     DsaSigningKey, DsigError, EcdsaP256SigningKey, EcdsaP384SigningKey, EcdsaP521SigningKey,
     KeyInfo, ReferenceProcessingError, RsaSigningKey, SignatureAlgorithm, SigningKey,
@@ -38,7 +39,7 @@ use zeroize::Zeroizing;
 
 // This is an absolute process-safety ceiling, not deployment policy. Parsed
 // key sizes remain governed by the operation policy after bounded ingestion.
-const KEY_MATERIAL_BYTE_CEILING: usize = 8 * 1024 * 1024;
+pub(crate) const KEY_MATERIAL_BYTE_CEILING: usize = 8 * 1024 * 1024;
 const MAX_AES_KEY_BYTES: usize = 32;
 
 #[derive(Debug, thiserror::Error)]
@@ -52,6 +53,8 @@ pub enum KeyMaterialError {
     InvalidPem(PathBuf),
     #[error("unsupported private key in {}", .0.display())]
     UnsupportedPrivateKey(PathBuf),
+    #[error("protected key container could not be decoded")]
+    ProtectedContainer,
     #[error("unsupported public key in {}", .0.display())]
     UnsupportedPublicKey(PathBuf),
     #[error("invalid X.509 certificate in {}", .0.display())]
@@ -115,23 +118,31 @@ pub enum CertificateEncoding {
 }
 
 pub fn read(path: impl AsRef<Path>) -> Result<Vec<u8>, KeyMaterialError> {
+    read_with_limit(path, KEY_MATERIAL_BYTE_CEILING)
+}
+
+pub fn read_with_limit(
+    path: impl AsRef<Path>,
+    maximum_bytes: usize,
+) -> Result<Vec<u8>, KeyMaterialError> {
     let path = path.as_ref();
-    let mut bytes = Vec::with_capacity(KEY_MATERIAL_BYTE_CEILING.min(64 * 1024));
+    let maximum = maximum_bytes.min(KEY_MATERIAL_BYTE_CEILING);
+    let mut bytes = Vec::with_capacity(maximum.min(64 * 1024));
     File::open(path)
         .map_err(|source| KeyMaterialError::Read {
             path: path.to_owned(),
             source,
         })?
-        .take(KEY_MATERIAL_BYTE_CEILING.saturating_add(1) as u64)
+        .take(maximum.saturating_add(1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|source| KeyMaterialError::Read {
             path: path.to_owned(),
             source,
         })?;
-    if bytes.len() > KEY_MATERIAL_BYTE_CEILING {
+    if bytes.len() > maximum {
         return Err(KeyMaterialError::KeyMaterialTooLarge {
             path: path.to_owned(),
-            maximum: KEY_MATERIAL_BYTE_CEILING,
+            maximum,
         });
     }
     Ok(bytes)
@@ -385,6 +396,10 @@ struct TraditionalDsaPrivateKey<'a> {
     x: UintRef<'a>,
 }
 
+pub(crate) fn is_encrypted_pkcs8_container(bytes: &[u8], format: PrivateKeyFormat) -> bool {
+    pkcs8_container_kind(bytes, format) == Some(Pkcs8ContainerKind::Encrypted)
+}
+
 fn pkcs8_container_kind(bytes: &[u8], format: PrivateKeyFormat) -> Option<Pkcs8ContainerKind> {
     match format {
         PrivateKeyFormat::Pem | PrivateKeyFormat::Pkcs8Pem => {
@@ -511,22 +526,26 @@ fn decode_ecdsa_signing_key(
     format: PrivateKeyFormat,
     password: Option<&[u8]>,
 ) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
-    decode_ecdsa_curve::<EcdsaP256SigningKey>(path, bytes, format, password)
-        .or_else(|_| decode_ecdsa_curve::<EcdsaP384SigningKey>(path, bytes, format, password))
-        .or_else(|_| decode_ecdsa_curve::<EcdsaP521SigningKey>(path, bytes, format, password))
+    if pkcs8_container_kind(bytes, format).is_some() {
+        return decode_pkcs8_signing_key::<EcdsaP256SigningKey>(path, bytes, format, password)
+            .or_else(|_| {
+                decode_pkcs8_signing_key::<EcdsaP384SigningKey>(path, bytes, format, password)
+            })
+            .or_else(|_| {
+                decode_pkcs8_signing_key::<EcdsaP521SigningKey>(path, bytes, format, password)
+            });
+    }
+    decode_ecdsa_sec1_key(path, bytes, format, password)
 }
 
-fn decode_ecdsa_curve<K: Pkcs8SigningKey + Sec1SigningKey>(
+fn decode_ecdsa_sec1_key(
     path: &Path,
     bytes: &[u8],
     format: PrivateKeyFormat,
     password: Option<&[u8]>,
 ) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
-    if pkcs8_container_kind(bytes, format).is_some() {
-        return decode_pkcs8_signing_key::<K>(path, bytes, format, password);
-    }
-
-    let pem_der = match format {
+    // Decode the envelope once; curve selection only borrows the same secret.
+    let decoded = match format {
         PrivateKeyFormat::Pem => {
             let text = std::str::from_utf8(bytes)
                 .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
@@ -542,10 +561,18 @@ fn decode_ecdsa_curve<K: Pkcs8SigningKey + Sec1SigningKey>(
             return Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()));
         }
     };
-    let der = pem_der.as_ref().map_or(bytes, |der| der.as_slice());
-    let key = K::decode_sec1_der(der).ok();
-    key.map(|key| Box::new(key) as Box<dyn SigningKey>)
-        .ok_or_else(|| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
+    let der = decoded.as_ref().map_or(bytes, |key| key.der.as_slice());
+    macro_rules! try_curve {
+        ($key:ty) => {
+            if let Ok(key) = <$key>::decode_sec1_der(der) {
+                return Ok(Box::new(key));
+            }
+        };
+    }
+    try_curve!(EcdsaP256SigningKey);
+    try_curve!(EcdsaP384SigningKey);
+    try_curve!(EcdsaP521SigningKey);
+    Err(traditional_key_decode_error(decoded.as_ref(), path))
 }
 
 fn decode_dsa_signing_key(
@@ -576,11 +603,11 @@ fn decode_dsa_signing_key(
             return Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()));
         }
     };
-    let der = pem_der.as_deref().map_or(bytes, Vec::as_slice);
-    let traditional = TraditionalDsaPrivateKey::from_der(der)
-        .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
+    let der = pem_der.as_ref().map_or(bytes, |key| key.der.as_slice());
+    let decode_error = || traditional_key_decode_error(pem_der.as_ref(), path);
+    let traditional = TraditionalDsaPrivateKey::from_der(der).map_err(|_| decode_error())?;
     if traditional.version != 0 {
-        return Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()));
+        return Err(decode_error());
     }
 
     let p = BoxedUint::from_be_slice_vartime(traditional.p.as_bytes());
@@ -588,27 +615,23 @@ fn decode_dsa_signing_key(
     let g = BoxedUint::from_be_slice_vartime(traditional.g.as_bytes());
     let y = BoxedUint::from_be_slice_vartime(traditional.y.as_bytes());
     let x = BoxedUint::from_be_slice_vartime(traditional.x.as_bytes());
-    let components = DsaComponents::from_components(p, q, g)
-        .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
+    let components = DsaComponents::from_components(p, q, g).map_err(|_| decode_error())?;
 
     let params = BoxedMontyParams::new(components.p().clone());
     let expected_y = BoxedMontyForm::new((**components.g()).clone(), &params)
         .pow(&x)
         .retrieve();
     if expected_y != y {
-        return Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()));
+        return Err(decode_error());
     }
 
-    let verifying_key = DsaVerifyingKey::from_components(components, y)
-        .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
-    let key = NativeDsaSigningKey::from_components(verifying_key, x)
-        .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
-    let normalized = key
-        .to_pkcs8_der()
-        .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
+    let verifying_key =
+        DsaVerifyingKey::from_components(components, y).map_err(|_| decode_error())?;
+    let key = NativeDsaSigningKey::from_components(verifying_key, x).map_err(|_| decode_error())?;
+    let normalized = key.to_pkcs8_der().map_err(|_| decode_error())?;
     DsaSigningKey::from_pkcs8_der(normalized.as_bytes())
         .map(|key| Box::new(key) as Box<dyn SigningKey>)
-        .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
+        .map_err(|_| decode_error())
 }
 
 fn decode_rsa_signing_key(
@@ -643,8 +666,23 @@ fn decode_traditional_rsa_pem(
     path: &Path,
 ) -> Result<RsaPrivateKey, KeyMaterialError> {
     let der = decode_openssl_traditional_pem(text, "RSA PRIVATE KEY", password, path)?;
-    RsaPrivateKey::from_pkcs1_der(&der)
-        .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
+    RsaPrivateKey::from_pkcs1_der(&der.der)
+        .map_err(|_| traditional_key_decode_error(Some(&der), path))
+}
+
+struct TraditionalPemKey {
+    der: Zeroizing<Vec<u8>>,
+    encrypted: bool,
+}
+
+fn traditional_key_decode_error(key: Option<&TraditionalPemKey>, path: &Path) -> KeyMaterialError {
+    // CBC padding is not authentication. Once an encrypted envelope has been
+    // recognized, invalid decoded key material must not enable lax fallback.
+    if key.is_some_and(|key| key.encrypted) {
+        KeyMaterialError::ProtectedContainer
+    } else {
+        KeyMaterialError::UnsupportedPrivateKey(path.to_owned())
+    }
 }
 
 fn decode_openssl_traditional_pem(
@@ -652,7 +690,7 @@ fn decode_openssl_traditional_pem(
     expected_tag: &str,
     password: Option<&[u8]>,
     path: &Path,
-) -> Result<Zeroizing<Vec<u8>>, KeyMaterialError> {
+) -> Result<TraditionalPemKey, KeyMaterialError> {
     // The header-aware parser accepts surrounding input, so enforce a single
     // complete block before trusting its OpenSSL encryption metadata.
     let text = text.trim_matches(|character: char| character.is_ascii_whitespace());
@@ -673,7 +711,10 @@ fn decode_openssl_traditional_pem(
 
     let headers = envelope.headers();
     if headers.iter().next().is_none() {
-        return Ok(Zeroizing::new(envelope.contents().to_vec()));
+        return Ok(TraditionalPemKey {
+            der: Zeroizing::new(envelope.contents().to_vec()),
+            encrypted: false,
+        });
     }
     if headers.iter().count() != 2 || headers.get("Proc-Type") != Some("4,ENCRYPTED") {
         return Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()));
@@ -684,9 +725,13 @@ fn decode_openssl_traditional_pem(
         .ok_or_else(|| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
     let iv = decode_hex(encoded_iv)
         .ok_or_else(|| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
-    let password =
-        password.ok_or_else(|| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
-    decrypt_openssl_legacy_pem(cipher, &iv, envelope.contents(), password, path)
+    let password = password.ok_or(KeyMaterialError::ProtectedContainer)?;
+    decrypt_openssl_legacy_pem(cipher, &iv, envelope.contents(), password, path).map(|der| {
+        TraditionalPemKey {
+            der,
+            encrypted: true,
+        }
+    })
 }
 
 fn decode_hex(value: &str) -> Option<Vec<u8>> {
@@ -735,7 +780,7 @@ fn decrypt_openssl_legacy_pem(
             let length = cbc::Decryptor::<$cipher>::new_from_slices(&key, iv)
                 .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?
                 .decrypt_padded::<Pkcs7>(&mut plaintext)
-                .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?
+                .map_err(|_| KeyMaterialError::ProtectedContainer)?
                 .len();
             plaintext.truncate(length);
         }};
@@ -894,17 +939,66 @@ pub fn load_rsa_private(
 
 /// Decode caller-owned RSA private-key bytes after the operation layer has
 /// charged their source length to its aggregate external-material budget.
+#[cfg(test)]
 pub fn decode_rsa_private(
     path: &Path,
     bytes: &[u8],
     format: PrivateKeyFormat,
 ) -> Result<RsaPrivateKey, KeyMaterialError> {
+    decode_rsa_private_with_password(path, bytes, format, None, &ResourcePolicy::default())
+}
+
+/// Decode an RSA transport key without retrying plaintext formats after a
+/// protected container fails password verification.
+pub fn decode_rsa_private_with_password(
+    path: &Path,
+    bytes: &[u8],
+    format: PrivateKeyFormat,
+    password: Option<&[u8]>,
+    resources: &ResourcePolicy,
+) -> Result<RsaPrivateKey, KeyMaterialError> {
+    if pkcs8_container_kind(bytes, format) == Some(Pkcs8ContainerKind::Encrypted) {
+        let password = password.ok_or(KeyMaterialError::ProtectedContainer)?;
+        let mut inventory = KeyInventory::default();
+        let imported = match format {
+            PrivateKeyFormat::Pem | PrivateKeyFormat::Pkcs8Pem => inventory.add_private_pem(
+                "cli-rsa".into(),
+                bytes,
+                Some(password),
+                KeyUsages::DECRYPT,
+                resources,
+            ),
+            PrivateKeyFormat::Der | PrivateKeyFormat::Pkcs8Der => inventory.add_private_der(
+                "cli-rsa".into(),
+                bytes,
+                Some(password),
+                KeyUsages::DECRYPT,
+                resources,
+            ),
+        };
+        imported.map_err(|error| match error {
+            xml_sec::key_manager::KeyStoreError::ProtectedContainer => {
+                KeyMaterialError::ProtectedContainer
+            }
+            xml_sec::key_manager::KeyStoreError::Policy(violation) => violation.into(),
+            _ => KeyMaterialError::UnsupportedPrivateKey(path.to_owned()),
+        })?;
+        return inventory
+            .private_keys()
+            .first()
+            .and_then(|entry| RsaPrivateKey::from_pkcs8_der(&entry.pkcs8_der).ok())
+            .ok_or_else(|| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()));
+    }
     match format {
-        PrivateKeyFormat::Pem => std::str::from_utf8(bytes).ok().and_then(|text| {
-            RsaPrivateKey::from_pkcs8_pem(text)
-                .or_else(|_| RsaPrivateKey::from_pkcs1_pem(text))
-                .ok()
-        }),
+        PrivateKeyFormat::Pem => {
+            let text = std::str::from_utf8(bytes)
+                .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
+            if pkcs8_container_kind(bytes, format) == Some(Pkcs8ContainerKind::Plain) {
+                RsaPrivateKey::from_pkcs8_pem(text).ok()
+            } else {
+                return decode_traditional_rsa_pem(text, password, path);
+            }
+        }
         PrivateKeyFormat::Der => RsaPrivateKey::from_pkcs8_der(bytes)
             .or_else(|_| RsaPrivateKey::from_pkcs1_der(bytes))
             .ok(),
@@ -1020,6 +1114,96 @@ mod tests {
     use rsa::pkcs1::{EncodeRsaPrivateKey as _, EncodeRsaPublicKey as _};
 
     use super::*;
+
+    #[test]
+    fn protected_rsa_container_failure_is_not_a_lax_candidate_miss() {
+        // A wrong or missing password must stop lax search before a later
+        // unprotected candidate can silently replace the requested key.
+        let rsa = RsaPrivateKey::from_pkcs8_pem(include_str!(
+            "../../../tests/fixtures/keys/rsa/rsa-2048-key.pem"
+        ))
+        .expect("RSA fixture");
+        let plain = rsa.to_pkcs8_der().expect("PKCS#8 fixture");
+        let mut rng = ChaCha20Rng::seed_from_u64(0xA11C_E501);
+        let encrypted = PrivateKeyInfoRef::try_from(plain.as_bytes())
+            .expect("PKCS#8 reference")
+            .encrypt_with_rng(&mut rng, b"correct")
+            .expect("encrypted fixture");
+        for password in [None, Some(b"wrong".as_slice())] {
+            assert!(matches!(
+                decode_rsa_private_with_password(
+                    Path::new("protected.der"),
+                    encrypted.as_bytes(),
+                    PrivateKeyFormat::Pkcs8Der,
+                    password,
+                    &ResourcePolicy::default(),
+                ),
+                Err(KeyMaterialError::ProtectedContainer)
+            ));
+        }
+        let invalid_policy = ResourcePolicy {
+            max_external_resource_bytes: usize::MAX,
+            ..ResourcePolicy::default()
+        };
+        assert!(matches!(
+            decode_rsa_private_with_password(
+                Path::new("protected.der"),
+                encrypted.as_bytes(),
+                PrivateKeyFormat::Pkcs8Der,
+                Some(b"correct"),
+                &invalid_policy,
+            ),
+            Err(KeyMaterialError::Policy(_))
+        ));
+    }
+
+    #[test]
+    fn encrypted_traditional_dsa_and_ec_reject_valid_padding_invalid_der() {
+        // CBC padding can succeed without authenticating the plaintext. A
+        // protected envelope containing invalid DER remains terminal for lax search.
+        for tag in ["DSA PRIVATE KEY", "EC PRIVATE KEY"] {
+            let text = encrypted_traditional_pem(tag, b"not ASN.1", b"secret");
+            let result = if tag == "DSA PRIVATE KEY" {
+                decode_dsa_signing_key(
+                    Path::new("key.pem"),
+                    text.as_bytes(),
+                    PrivateKeyFormat::Pem,
+                    Some(b"secret"),
+                )
+            } else {
+                decode_ecdsa_signing_key(
+                    Path::new("key.pem"),
+                    text.as_bytes(),
+                    PrivateKeyFormat::Pem,
+                    Some(b"secret"),
+                )
+            };
+            assert!(
+                matches!(result, Err(KeyMaterialError::ProtectedContainer)),
+                "{tag}"
+            );
+        }
+    }
+
+    #[test]
+    fn traditional_encrypted_rsa_pem_preserves_password_failure() {
+        // A protected traditional PEM must not look like a missing key to lax selection.
+        let pem = include_bytes!(
+            "../../../tests/fixtures/keys/rsa/rsa-2048-key-traditional-encrypted.pem"
+        );
+        for password in [None, Some(b"wrong".as_slice())] {
+            assert!(matches!(
+                decode_rsa_private_with_password(
+                    Path::new("protected.pem"),
+                    pem,
+                    PrivateKeyFormat::Pem,
+                    password,
+                    &ResourcePolicy::default(),
+                ),
+                Err(KeyMaterialError::ProtectedContainer)
+            ));
+        }
+    }
 
     fn load_signing_key(
         path: impl AsRef<Path>,

@@ -102,6 +102,8 @@ pub use xml::dom::{
 };
 
 #[cfg(feature = "xmldsig")]
+pub mod key_manager;
+#[cfg(feature = "xmldsig")]
 pub mod xmldsig;
 
 #[cfg(feature = "xmlenc")]

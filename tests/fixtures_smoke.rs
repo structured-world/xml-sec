@@ -193,7 +193,7 @@ fn c14n11_xml_base_input_present() {
 #[test]
 fn fixture_file_count_matches_expected() {
     let expected = [
-        ("keys", 28),
+        ("keys", 32),
         ("c14n", 41),
         ("xmldsig", 207),
         ("saml", 2),

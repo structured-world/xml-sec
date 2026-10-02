@@ -10,6 +10,7 @@
 //! - ECDSA keys are validated as uncompressed SEC1 points from the SPKI bit
 //!   string and verified with RustCrypto curve crates (`p256`/`p384`/`p521`).
 
+use der::Decode as _;
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
 use p384::ecdsa::{Signature as P384Signature, VerifyingKey as P384VerifyingKey};
 use p521::ecdsa::{Signature as P521Signature, VerifyingKey as P521VerifyingKey};
@@ -119,8 +120,7 @@ pub(crate) fn signature_value_matches_spki_with_encoding(
             algorithm @ (SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256),
             PublicKey::DSA(_),
         ) => {
-            let key = dsa::VerifyingKey::from_public_key_der(public_key_spki_der)
-                .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+            let key = decode_dsa_verifying_key(public_key_spki_der)?;
             let component_len = usize::try_from(key.components().q().bits_vartime())
                 .map_err(|_| SignatureVerificationError::InvalidKeyDer)?
                 .div_ceil(8);
@@ -425,8 +425,7 @@ pub(crate) fn validate_dsa_signature_spki_with_minimum(
     public_key_spki_der: &[u8],
     minimum_modulus_bits: usize,
 ) -> Result<(), SignatureVerificationError> {
-    let key = dsa::VerifyingKey::from_public_key_der(public_key_spki_der)
-        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+    let key = decode_dsa_verifying_key(public_key_spki_der)?;
     let modulus_bits = usize::try_from(key.components().p().bits_vartime())
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
     crate::policy::DsaKeyPolicy {
@@ -434,6 +433,39 @@ pub(crate) fn validate_dsa_signature_spki_with_minimum(
     }
     .validate_modulus_bits(modulus_bits)
     .map_err(SignatureVerificationError::KeyPolicy)
+}
+
+#[derive(der::Sequence)]
+pub(crate) struct BorrowedDsaPublicParameters<'a> {
+    pub(crate) p: der::asn1::UintRef<'a>,
+    pub(crate) q: der::asn1::UintRef<'a>,
+    pub(crate) g: der::asn1::UintRef<'a>,
+}
+
+pub(crate) fn decode_dsa_verifying_key(
+    bytes: &[u8],
+) -> Result<dsa::VerifyingKey, SignatureVerificationError> {
+    // Component size is a process-safety bound, not a DSA conformance rule.
+    // Inspect borrowed DER integers before any allocating bigint conversion,
+    // including certificate signatures and signature-framing checks.
+    let spki = rsa::pkcs8::SubjectPublicKeyInfoRef::from_der(bytes)
+        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+    let parameters = spki
+        .algorithm
+        .parameters
+        .as_ref()
+        .ok_or(SignatureVerificationError::InvalidKeyDer)?
+        .decode_as::<BorrowedDsaPublicParameters<'_>>()
+        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+    let y = der::asn1::UintRef::from_der(spki.subject_public_key.raw_bytes())
+        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+    for component in [parameters.p, parameters.q, parameters.g, y] {
+        if component.as_bytes().len() > crate::hard_limits::DSA_KEY_COMPONENT_BYTE_CEILING {
+            return Err(SignatureVerificationError::InvalidKeyDer);
+        }
+    }
+    dsa::VerifyingKey::from_public_key_der(bytes)
+        .map_err(|_| SignatureVerificationError::InvalidKeyDer)
 }
 
 pub(crate) fn verify_dsa_signature_spki_primitive(
@@ -450,8 +482,7 @@ pub(crate) fn verify_dsa_signature_spki_primitive(
             uri: algorithm.uri().to_string(),
         });
     }
-    let key = dsa::VerifyingKey::from_public_key_der(public_key_spki_der)
-        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+    let key = decode_dsa_verifying_key(public_key_spki_der)?;
     let component_len = usize::try_from(key.components().q().bits_vartime())
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?
         .div_ceil(8);
@@ -954,7 +985,7 @@ fn parse_der_length(input: &[u8]) -> Option<Result<(usize, &[u8]), ()>> {
     Some(Ok((declared_len, remainder)))
 }
 
-fn validate_ec_public_key_encoding(
+pub(crate) fn validate_ec_public_key_encoding(
     ec: &ECPoint<'_>,
     public_key_bytes: &[u8],
 ) -> Result<(), SignatureVerificationError> {
@@ -964,6 +995,9 @@ fn validate_ec_public_key_encoding(
         .and_then(|len| len.checked_add(1))
         .ok_or(SignatureVerificationError::InvalidKeyDer)?;
 
+    // RFC 5480 §2.2 permits, but does not require, compressed points:
+    // https://www.rfc-editor.org/rfc/rfc5480.html#section-2.2 . This implementation
+    // uses the uncompressed profile consistently for import and verification.
     let is_uncompressed_sec1 =
         public_key_bytes.len() == expected_len && public_key_bytes.first() == Some(&0x04);
     if !is_uncompressed_sec1 {
