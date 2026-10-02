@@ -47,6 +47,71 @@ fn signed_pair() -> (XmlDocument, HmacVerificationKey, HmacVerificationKey) {
 }
 
 #[test]
+fn empty_uri_authenticates_document_elements_but_not_its_signature() {
+    // Whole-document digest success must retain its original root identity,
+    // while the enveloped transform still excludes the owning Signature.
+    let secret = vec![0x45; 32];
+    let signer = HmacSigningKey::new(secret.clone()).unwrap();
+    let verifier = HmacVerificationKey::new(secret).unwrap();
+    for uri in ["", "#xpointer(/)"] {
+        let builder = SignatureBuilder::new(
+            C14nAlgorithm::new(C14nMode::Exclusive1_0, false),
+            SignatureAlgorithm::HmacSha256,
+        )
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri(uri)
+                .transform(Transform::Enveloped),
+        );
+        let xml = SignContext::new(&signer)
+            .sign_with_builder(
+                "<root><payload ID=\"target\">signed</payload></root>",
+                &builder,
+            )
+            .unwrap();
+        let document = XmlDocument::parse(xml).unwrap();
+        let (root, targets) = document.with_view(|view| {
+            (
+                view.root(),
+                [
+                    view.root_element(),
+                    view.node_for_id("target", &[]).unwrap(),
+                ],
+            )
+        });
+        let evidence = VerifyContext::new()
+            .key(&verifier)
+            .verify_request(
+                &document,
+                &VerificationRequest {
+                    expected_targets: &targets,
+                    ..VerificationRequest::default()
+                },
+            )
+            .unwrap();
+        assert!(evidence.all_valid());
+        assert_eq!(
+            evidence.signatures()[0]
+                .result()
+                .as_ref()
+                .unwrap()
+                .signed_info_references[0]
+                .target_identity,
+            Some(root)
+        );
+        for target in targets {
+            assert!(evidence.covers_element(&document, target).unwrap());
+        }
+        assert!(
+            !evidence
+                .covers_element(&document, evidence.signatures()[0].identity())
+                .unwrap()
+        );
+        assert!(evidence.accepted(&document).unwrap());
+    }
+}
+
+#[test]
 fn distinct_authorized_keys_bind_each_signature_and_expected_element() {
     // Independent keys authenticate independent elements, without a resolver
     // silently substituting embedded material or conflating lookalike names.
@@ -80,7 +145,7 @@ fn distinct_authorized_keys_bind_each_signature_and_expected_element() {
     let evidence = VerifyContext::new()
         .verify_request(&document, &request)
         .unwrap();
-    assert!(evidence.accepted());
+    assert!(evidence.accepted(&document).unwrap());
     assert!(evidence.all_valid());
     assert_eq!(evidence.correlation(), request.correlation);
     for (signature, target) in evidence.signatures().iter().zip(targets) {
@@ -111,7 +176,7 @@ fn partial_success_requires_explicit_request_and_cannot_cover_failed_target() {
     });
     let context = VerifyContext::new().key(&first);
     let evidence = context.verify_all(&document).unwrap();
-    assert!(!evidence.accepted());
+    assert!(!evidence.accepted(&document).unwrap());
     assert!(!evidence.all_valid());
     assert!(evidence.covers_element(&document, targets[0]).unwrap());
     assert!(!evidence.covers_element(&document, targets[1]).unwrap());
@@ -124,7 +189,8 @@ fn partial_success_requires_explicit_request_and_cannot_cover_failed_target() {
         context
             .verify_request(&document, &request)
             .unwrap()
-            .accepted()
+            .accepted(&document)
+            .unwrap()
     );
     let request = VerificationRequest {
         expected_targets: &targets,
@@ -134,7 +200,8 @@ fn partial_success_requires_explicit_request_and_cannot_cover_failed_target() {
         !context
             .verify_request(&document, &request)
             .unwrap()
-            .accepted()
+            .accepted(&document)
+            .unwrap()
     );
 }
 
@@ -163,6 +230,37 @@ fn mutations_invalidate_report_and_request_identities() {
         VerifyContext::new()
             .key(&first)
             .verify_request(&document, &request),
+        Err(DsigError::Document(XmlDocumentError::StaleIdentity { .. }))
+    ));
+}
+
+#[test]
+fn request_acceptance_cannot_authorize_a_mutated_document() {
+    // Acceptance is an authorization decision about one generation, not a
+    // cached boolean that may approve replacement content after verification.
+    let (mut document, first, _) = signed_pair();
+    let target = document.with_view(|view| view.node_for_id("first", &[]).unwrap());
+    let targets = [target];
+    let request = VerificationRequest {
+        expected_targets: &targets,
+        signatures: SignatureRequirement::AtLeast(1),
+        ..VerificationRequest::default()
+    };
+    let evidence = VerifyContext::new()
+        .key(&first)
+        .verify_request(&document, &request)
+        .unwrap();
+    assert!(evidence.accepted(&document).unwrap());
+    let foreign = XmlDocument::parse(document.as_xml().to_owned()).unwrap();
+    assert!(matches!(
+        evidence.accepted(&foreign),
+        Err(DsigError::Document(XmlDocumentError::ForeignIdentity))
+    ));
+    document
+        .replace_content(target, "unsigned replacement")
+        .unwrap();
+    assert!(matches!(
+        evidence.accepted(&document),
         Err(DsigError::Document(XmlDocumentError::StaleIdentity { .. }))
     ));
 }
@@ -265,7 +363,7 @@ fn request_key_authorization_cannot_relax_compiled_policy() {
         .policy(policy)
         .verify_request(&document, &request)
         .unwrap();
-    assert!(!report.accepted());
+    assert!(!report.accepted(&document).unwrap());
     assert!(report.signatures().iter().all(|entry| matches!(
         entry.result(),
         Err(DsigError::Policy(
@@ -315,7 +413,7 @@ fn external_evidence_identifies_resolved_bytes_not_the_lexical_uri() {
         .key(&key)
         .verify_request(&document, &request)
         .unwrap();
-    assert!(evidence.accepted());
+    assert!(evidence.accepted(&document).unwrap());
     let reference = &evidence.signatures()[0]
         .result()
         .as_ref()
@@ -369,7 +467,7 @@ fn duplicate_document_ids_never_become_ambiguous_coverage_proofs() {
                 .key(&first)
                 .verify_all(&document)
                 .unwrap();
-            assert!(!evidence.accepted());
+            assert!(!evidence.accepted(&document).unwrap());
             assert!(!evidence.all_valid());
         }
     }

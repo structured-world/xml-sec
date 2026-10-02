@@ -650,10 +650,13 @@ pub struct VerifyEvidence {
 }
 
 impl VerifyEvidence {
-    /// Whether the explicit request requirements were satisfied.
-    #[must_use]
-    pub const fn accepted(&self) -> bool {
-        self.accepted
+    /// Whether the explicit request requirements hold for this document.
+    /// Foreign documents or any mutation after verification invalidate acceptance.
+    pub fn accepted(&self, document: &XmlDocument) -> Result<bool, DsigError> {
+        document.with_view(|view| {
+            view.resolve_node(self.document)?;
+            Ok(self.accepted)
+        })
     }
 
     /// Uninterpreted correlation value supplied by the caller.
@@ -738,7 +741,8 @@ impl VerifyEvidence {
 
     /// Whether a nonempty set of signatures and their processed Manifests passed.
     ///
-    /// This is mathematical validity, not a signer-trust or coverage assertion.
+    /// This is a historical mathematical outcome, not current-document
+    /// authorization. Use `accepted(document)` for generation-bound acceptance.
     #[must_use]
     pub fn all_valid(&self) -> bool {
         !self.signatures.is_empty()
@@ -1063,7 +1067,14 @@ impl VerificationOperationBudgets {
         let Some(uri) = reference.uri.as_deref() else {
             return OperationResourceIdentity::Generated("omitted-reference", index);
         };
-        if uri.is_empty() || uri.starts_with('#') {
+        if uri.is_empty() || uri == "#xpointer(/)" {
+            // XMLDSig 1.1 §4.4.3.3: URI="" selects the containing document
+            // node-set (without comments); #xpointer(/) retains comments.
+            // Both bind the document root, not an ID-resolved element.
+            // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-Same-Document
+            return OperationResourceIdentity::DocumentNode(view.root());
+        }
+        if uri.starts_with('#') {
             return resolver
                 .node_id_for_same_document_reference(uri)
                 .ok()
@@ -5009,7 +5020,7 @@ mod tests {
                 }
             ))
         ));
-        assert!(!evidence.accepted());
+        assert!(!evidence.accepted(&document).unwrap());
     }
 
     #[test]
@@ -5028,7 +5039,7 @@ mod tests {
             assert_eq!(result.manifest_references.len(), 1);
             assert!(result.manifest_references[0].reference_identity.is_some());
             assert_eq!(evidence.covers_element(&document, target).unwrap(), valid);
-            assert_eq!(evidence.accepted(), valid);
+            assert_eq!(evidence.accepted(&document).unwrap(), valid);
         }
     }
 

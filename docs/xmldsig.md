@@ -143,7 +143,9 @@ raise or lower the minimum explicitly, while the 8192-bit implementation ceiling
 
 `VerifyContext::verify_all(&document)` processes every `Signature` in document order and returns
 `VerifyEvidence`. `Ok` means that the operation produced a report, not that the document passed:
-inspect `accepted()` or `all_valid()`. Malformed signatures and pipeline failures remain individual
+inspect `accepted(&document)?` for generation-bound request acceptance. `all_valid()` reports only
+the historical mathematical outcome, not authorization of the current document.
+Malformed signatures and pipeline failures remain individual
 `SignatureEvidence` results; an empty document never passes. `ResourcePolicy::max_signatures`
 bounds discovery, report allocation, and signature work (default and absolute ceiling: 64).
 
@@ -178,12 +180,13 @@ fn verify_expected(xml: &str, key: &dyn VerifyingKey) -> Result<bool, Box<dyn st
         trusted_keys: &keys,
         ..VerificationRequest::default()
     };
-    Ok(context.verify_request(&document, &request)?.accepted())
+    Ok(context.verify_request(&document, &request)?.accepted(&document)?)
 }
 ```
 
 `signature_identities` is bounded discovery, not authentication; it does no cryptographic work.
 Reports bind the processed Signature and Reference elements to the retained document generation.
+`accepted` and `covers_element` reject foreign documents and every later document mutation.
 Same-document references record the resolved target identity; external references record a SHA-256
 fingerprint of resolved bytes before transforms, including XML Base resolution. The lexical URI
 is diagnostic only. Reference digest status and typed key-trust evidence remain separate from

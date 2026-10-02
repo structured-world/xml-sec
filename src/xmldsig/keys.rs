@@ -3683,7 +3683,11 @@ mod tests {
             .key_resolver(&resolver)
             .verify_all(&document)
             .expect("batch verification must preserve the validated path");
-        assert!(report.accepted());
+        assert!(
+            report
+                .accepted(&document)
+                .expect("current document acceptance")
+        );
         assert_eq!(
             report.signatures()[0]
                 .result()
