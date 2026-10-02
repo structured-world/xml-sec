@@ -442,7 +442,9 @@ of the hash identifier. Digest methods include SHA-1/SHA224/SHA256/SHA384/SHA512
 HMAC output can be omitted for full width or explicitly truncated on an octet boundary, subject to
 `HmacPolicy` key and output minima.
 The selected length is checked before reference resolution or transforms in both signing and
-verification. `HMACOutputLength` uses XML Schema integer syntax (including XML whitespace and
+verification, and before signing-key callbacks. Unsupported signature methods retain a typed
+`SigningError::ParseSignedInfo(ParseError::UnsupportedAlgorithm)` error during signing preflight.
+`HMACOutputLength` uses XML Schema integer syntax (including XML whitespace and
 an optional leading plus), not Unicode whitespace. XMLDSig 1.1 requires at least 80 bits and
 half the hash width; the default policy tightens that floor to at least 128 bits. Arbitrary
 non-octet truncation accepted by some legacy implementations is not XMLDSig 1.1 conformance.

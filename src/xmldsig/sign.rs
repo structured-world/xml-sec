@@ -154,8 +154,8 @@ pub enum SigningError {
     #[error("signing digest pass failed: {0}")]
     Digest(SigningDigestError),
 
-    /// Parsing the digest-filled `<SignedInfo>` failed.
-    #[error("failed to parse SignedInfo after digest fill: {0}")]
+    /// Parsing `<SignedInfo>` or its methods failed during template validation.
+    #[error("failed to parse SignedInfo: {0}")]
     ParseSignedInfo(super::parse::ParseError),
 
     /// SignedInfo canonicalization failed.
@@ -362,6 +362,12 @@ fn expected_signature_output_len(
     policy: &crate::policy::SigningPolicy,
     hmac_output_length_bits: Option<usize>,
 ) -> Result<usize, SigningError> {
+    // Method parameters are untrusted; reject them before external key callbacks.
+    if let Some(full_bits) = algorithm.hmac_output_bits() {
+        policy
+            .hmac
+            .validate_output(algorithm, hmac_output_length_bits.unwrap_or(full_bits))?;
+    }
     let public_key = key.public_key_info()?;
     let expected = match (algorithm, public_key) {
         (
@@ -425,7 +431,6 @@ fn expected_signature_output_len(
                     .hmac_output_bits()
                     .ok_or(SigningKeyError::InvalidPublicKeyInfo)?,
             );
-            policy.hmac.validate_output(algorithm, output_bits)?;
             output_bits / 8
         }
         (
@@ -1629,7 +1634,8 @@ impl<'a> SignContext<'a> {
             self.policy.check_signature_algorithm(algorithm)?;
             if algorithm.hmac_output_bits().is_some() {
                 // Reject weak HMAC parameters before callbacks or reference work;
-                // XMLDSig 1.1 section 4.4.2 defines the output minimum.
+                // XMLDSig 1.1 section 4.4.2 explicitly requires max(80, hash_bits/2);
+                // section 6.3.1 separately requires octet-aligned truncation.
                 // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-SignatureMethod
                 expected_signature_output_len(
                     self.signing_key,
@@ -2769,7 +2775,7 @@ fn validate_signing_references(
 fn validate_signing_signed_info_methods(
     signature: Node<'_, '_>,
     policy: &crate::policy::SigningPolicy,
-) -> Result<(SignatureAlgorithm, Option<usize>), SigningDigestError> {
+) -> Result<(SignatureAlgorithm, Option<usize>), SigningError> {
     let signed_info = find_required_child(signature, "SignedInfo")?;
     let canonicalization_method =
         element_children(signed_info)
@@ -2797,8 +2803,7 @@ fn validate_signing_signed_info_methods(
             .ok_or(SigningDigestError::MissingElement {
                 element: "SignatureMethod",
             })?;
-    super::parse::parse_signature_method(signature_method)
-        .map_err(|error| SigningDigestError::InvalidStructure(error.to_string()))
+    super::parse::parse_signature_method(signature_method).map_err(SigningError::from)
 }
 
 struct SigningUriResolution<'a, 'resources> {

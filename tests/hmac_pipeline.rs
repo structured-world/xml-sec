@@ -6,8 +6,9 @@ mod xmlsec1;
 
 use xml_sec::policy::{PolicyViolation, SigningPolicy, VerificationPolicy};
 use xml_sec::xmldsig::{
-    DsigError, DsigStatus, HmacSigningKey, HmacVerificationKey, SignContext, SignatureAlgorithm,
-    SigningError, VerifyContext,
+    DsigError, DsigStatus, HmacSigningKey, HmacVerificationKey, ParseError, SignContext,
+    SignatureAlgorithm, SigningError, SigningKey, SigningKeyError, SigningPublicKeyInfo,
+    VerifyContext,
 };
 
 fn template(algorithm: SignatureAlgorithm, output: Option<usize>) -> String {
@@ -212,6 +213,47 @@ fn all_hmac_methods_interoperate_bidirectionally_with_xmlsec1() {
             assert_eq!(result.status, DsigStatus::Valid, "{algorithm:?}/{output:?}");
         }
     }
+}
+
+#[test]
+fn unknown_signing_method_preserves_typed_parse_error() {
+    // Early method validation must retain the public unsupported-algorithm error.
+    let key = HmacSigningKey::new(vec![0x42; 32]).unwrap();
+    let xml = template(SignatureAlgorithm::HmacSha256, None).replace(
+        SignatureAlgorithm::HmacSha256.uri(),
+        "urn:unsupported:signature",
+    );
+    assert!(matches!(
+        SignContext::new(&key).sign_template(&xml),
+        Err(SigningError::ParseSignedInfo(ParseError::UnsupportedAlgorithm { uri }))
+            if uri == "urn:unsupported:signature"
+    ));
+}
+
+#[test]
+fn weak_hmac_output_does_not_query_the_signing_key() {
+    // Policy refusal must precede even failed external/HSM key callbacks.
+    struct UnavailableKey(std::cell::Cell<usize>);
+    impl SigningKey for UnavailableKey {
+        fn sign(&self, _: SignatureAlgorithm, _: &[u8]) -> Result<Vec<u8>, SigningKeyError> {
+            panic!("policy-rejected input must not be signed")
+        }
+
+        fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
+            self.0.set(self.0.get() + 1);
+            Err(SigningKeyError::InvalidPublicKeyInfo)
+        }
+    }
+    let key = UnavailableKey(std::cell::Cell::new(0));
+    let xml = template(SignatureAlgorithm::HmacSha256, Some(120));
+    assert!(matches!(
+        SignContext::new(&key).sign_template(&xml),
+        Err(SigningError::Policy(PolicyViolation::HmacOutputLength {
+            actual: 120,
+            ..
+        }))
+    ));
+    assert_eq!(key.0.get(), 0);
 }
 
 #[test]
