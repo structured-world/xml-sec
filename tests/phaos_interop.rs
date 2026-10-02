@@ -250,6 +250,11 @@ fn verification_key() -> VerificationKey {
 
 fn policy(algorithm: SignatureAlgorithm, verify_x509_chains: bool) -> VerificationPolicy {
     let mut policy = VerificationPolicy::default();
+    policy.key_trust.mode = if verify_x509_chains {
+        xml_sec::policy::VerificationTrustMode::RequireTrustedKey
+    } else {
+        xml_sec::policy::VerificationTrustMode::CryptographicOnly
+    };
     policy
         .key_trust
         .allowed_legacy_signature_algorithms
@@ -310,13 +315,17 @@ fn execute(case: Case) -> Result<xml_sec::xmldsig::VerifyResult, DsigError> {
                 .verify(&xml)
         }
         Setup::Dsa => {
+            // These DSA cases may select KeyValue before X509Data: the corpus
+            // tests cryptographic interoperability, not authorization of that key.
+            let mut dsa_policy = policy(SignatureAlgorithm::DsaSha1, true);
+            dsa_policy.key_trust.mode = xml_sec::policy::VerificationTrustMode::CryptographicOnly;
             let resolver = DefaultKeyResolver::new(KeyResolverConfig {
                 lookup_certs: vec![certificate("dsa-cert.der")],
                 trusted_certs: vec![certificate("dsa-ca-cert.der")],
                 ..KeyResolverConfig::default()
             });
             VerifyContext::new()
-                .policy(policy(SignatureAlgorithm::DsaSha1, true))
+                .policy(dsa_policy)
                 .key_resolver(&resolver)
                 .process_manifests(true)
                 .allowed_uri_types(UriTypeSet::ALL)

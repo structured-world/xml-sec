@@ -181,6 +181,8 @@ fn fuzz_seed_reaches_valid_signature_verification() {
         ..KeyResolverConfig::default()
     });
 
+    policy.key_trust.mode = xml_sec::policy::VerificationTrustMode::CryptographicOnly;
+
     let result = VerifyContext::new()
         .policy(policy)
         .key_resolver(&resolver)

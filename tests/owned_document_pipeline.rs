@@ -2,12 +2,14 @@
 
 #![cfg(all(feature = "xmldsig", feature = "xmlenc"))]
 
+#[path = "support/cryptographic.rs"]
+mod cryptographic;
+
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize_document};
 use xml_sec::policy::{ResourcePolicy, SigningPolicy};
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DigestAlgorithm, DsigStatus, ReferenceBuilder, RsaSigningKey, SignContext,
-    SignatureAlgorithm, SignatureBuilder, Transform, VerifyContext, X509CertificateKeyInfoWriter,
-    XPathExpression,
+    SignatureAlgorithm, SignatureBuilder, Transform, X509CertificateKeyInfoWriter, XPathExpression,
 };
 use xml_sec::xmlenc::{
     DataEncryptionAlgorithm, DecryptContext, DocumentEncryptionOptions, EncryptedDataBuilder,
@@ -151,7 +153,7 @@ fn one_document_generation_flows_through_sign_verify_encrypt_and_decrypt() {
     let signed_generation = document.generation();
 
     let resolver = DefaultKeyResolver::default();
-    let verified = VerifyContext::new()
+    let verified = cryptographic::context()
         .key_resolver(&resolver)
         .verify_document(&document)
         .expect("owned document signature must verify");
@@ -174,7 +176,7 @@ fn one_document_generation_flows_through_sign_verify_encrypt_and_decrypt() {
         .decrypt_owned_document(&mut document, None)
         .expect("encrypted element must decrypt in place");
     assert_eq!(document.generation(), signed_generation + 2);
-    let verified = VerifyContext::new()
+    let verified = cryptographic::context()
         .key_resolver(&resolver)
         .verify_document(&document)
         .expect("restored signed document must verify");
@@ -234,7 +236,7 @@ fn here_resolves_inside_the_exact_owned_generation() {
         .expect("XPath document must sign");
 
     let resolver = DefaultKeyResolver::default();
-    let result = VerifyContext::new()
+    let result = cryptographic::context()
         .key_resolver(&resolver)
         .verify_document(&document)
         .expect("retained XPath document must verify");

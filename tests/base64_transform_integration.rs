@@ -2,6 +2,9 @@
 
 use std::fs;
 
+#[path = "support/cryptographic.rs"]
+mod cryptographic;
+
 use base64::Engine;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::xmldsig::{
@@ -63,7 +66,7 @@ fn base64_reference_round_trips_through_signing_and_verification() {
     assert!(signed.contains(&format!("Algorithm=\"{BASE64_TRANSFORM_URI}\"")));
 
     let resolver = DefaultKeyResolver::default();
-    let verified = VerifyContext::new()
+    let verified = cryptographic::context()
         .key_resolver(&resolver)
         .allowed_transforms([BASE64_TRANSFORM_URI, exclusive_c14n().uri()])
         .store_pre_digest(true)
@@ -146,14 +149,14 @@ fn decoded_xml_is_adapted_to_a_node_set_for_xpath() {
         .expect("Base64-to-XPath transform chain must sign");
     let resolver = DefaultKeyResolver::default();
 
-    let verified = VerifyContext::new()
+    let verified = cryptographic::context()
         .key_resolver(&resolver)
         .verify(&signed)
         .expect("Base64-to-XPath signature must verify");
     assert_eq!(verified.status, DsigStatus::Valid);
 
     let excluded = signed.replacen(DECODED_XML_BASE64, DECODED_EXCLUDED_TAMPER_BASE64, 1);
-    let excluded_result = VerifyContext::new()
+    let excluded_result = cryptographic::context()
         .key_resolver(&resolver)
         .verify(&excluded)
         .expect("excluded decoded XML tampering remains processable");
@@ -192,7 +195,7 @@ fn decoded_xml_is_adapted_for_xpath_filter2() {
         .sign_with_builder(&document, &builder)
         .expect("Base64-to-Filter2 transform chain must sign");
     let resolver = DefaultKeyResolver::default();
-    let result = VerifyContext::new()
+    let result = cryptographic::context()
         .key_resolver(&resolver)
         .verify(&signed)
         .expect("Base64-to-Filter2 signature must verify");
@@ -234,7 +237,7 @@ fn decoded_utf16_xml_is_adapted_to_a_node_set() {
             .key_info_writer(&key_info)
             .sign_with_builder(&document, &builder)
             .expect("BOM-marked UTF-16 XML must enter the XPath node-set pipeline");
-        let verified = VerifyContext::new()
+        let verified = cryptographic::context()
             .key_resolver(&resolver)
             .verify(&signed)
             .expect("UTF-16 transform chain must verify");

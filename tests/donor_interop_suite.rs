@@ -41,6 +41,8 @@ fn compatibility_verification_policy() -> VerificationPolicy {
         },
         ..VerificationPolicy::default()
     };
+    // This corpus establishes algorithm interoperability, not signer trust.
+    policy.key_trust.mode = xml_sec::policy::VerificationTrustMode::CryptographicOnly;
     policy.key_trust.allowed_legacy_signature_algorithms = HashSet::from([
         SignatureAlgorithm::DsaSha1,
         SignatureAlgorithm::EcdsaSha1,

@@ -60,6 +60,7 @@ pub mod parse;
 pub mod sign;
 pub mod signature;
 pub mod transforms;
+pub mod trust;
 pub mod types;
 pub mod uri;
 pub mod verify;
@@ -96,6 +97,7 @@ pub use transforms::{
     XPATH_FILTER2_TRANSFORM_URI, XPATH_TRANSFORM_URI, XPathExpression, XPathFilter,
     XPathFilterOperation, XPathHereSemantics, execute_transforms, parse_transforms,
 };
+pub use trust::{KeyTrustEvidence, ResolvedVerificationKey, TrustedPublicKey, X509TrustEvidence};
 pub use types::{NodeSet, TransformData, TransformError};
 pub use verify::{
     DsigError, DsigStatus, FailureReason, KeyResolver, ReferenceProcessingError, ReferenceResult,

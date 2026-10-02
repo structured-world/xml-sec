@@ -9,11 +9,14 @@
 
 use std::fs;
 
+#[path = "support/cryptographic.rs"]
+mod cryptographic;
+
 use xml_sec::XmlBackend;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize_xml_with_backend};
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DigestAlgorithm, DsigStatus, ReferenceBuilder, RsaSigningKey, SignContext,
-    SignatureAlgorithm, SignatureBuilder, Transform, VerifyContext, X509CertificateKeyInfoWriter,
+    SignatureAlgorithm, SignatureBuilder, Transform, X509CertificateKeyInfoWriter,
 };
 use xml_sec::xmlenc::{
     DataEncryptionAlgorithm, DecryptContext, DocumentEncryptionOptions, EncryptedDataBuilder,
@@ -67,7 +70,7 @@ fn every_compiled_runtime_backend_runs_complete_security_pipelines() {
             .key_info_writer(&key_info)
             .sign_with_builder("<root><value>payload</value></root>", &signature)
             .unwrap_or_else(|error| panic!("{backend:?} signing failed: {error}"));
-        let verified = VerifyContext::new()
+        let verified = cryptographic::context()
             .xml_backend(backend)
             .key_resolver(&DefaultKeyResolver::default())
             .verify(&signed)

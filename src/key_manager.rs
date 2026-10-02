@@ -425,6 +425,17 @@ impl<'a> KeyResolver for InventoryVerificationResolver<'a> {
         policy: &crate::policy::VerificationPolicy,
         provider: &dyn crate::provider::CryptoProvider,
     ) -> Result<Option<Box<dyn VerifyingKey + 'k>>, DsigError> {
+        self.resolve_for_verification(key_info, algorithm, policy, provider)
+            .map(|key| key.map(crate::xmldsig::ResolvedVerificationKey::into_key))
+    }
+
+    fn resolve_for_verification<'k>(
+        &'k self,
+        key_info: Option<&KeyInfo>,
+        algorithm: SignatureAlgorithm,
+        policy: &crate::policy::VerificationPolicy,
+        provider: &dyn crate::provider::CryptoProvider,
+    ) -> Result<Option<crate::xmldsig::ResolvedVerificationKey<'k>>, DsigError> {
         policy.validate()?;
         if let Some(info) = key_info {
             crate::xmldsig::keys::validate_key_info_source_permissions(info, policy.key_sources)?;
@@ -521,7 +532,9 @@ impl<'a> KeyResolver for InventoryVerificationResolver<'a> {
                     reason: "invalid named HMAC key",
                 }
             })?;
-            return Ok(Some(Box::new(key)));
+            return Ok(Some(
+                crate::xmldsig::ResolvedVerificationKey::CallerTrusted(Box::new(key)),
+            ));
         }
         let selected_material_bytes = candidate
             .map(|candidate| check_selected_public_material(&candidate.key_info, &policy.resources))
@@ -533,7 +546,10 @@ impl<'a> KeyResolver for InventoryVerificationResolver<'a> {
                 KeyInfoSource::X509Data(data) if data.certificate_chain.is_empty() => {
                     crate::xmldsig::parse::x509_data_has_lookup_identifiers(data)
                 }
-                KeyInfoSource::X509Data(_) => policy.key_trust.verify_x509_chains,
+                KeyInfoSource::X509Data(_) => {
+                    policy.key_trust.verify_x509_chains
+                        || !self.inventory.trusted_certificates.is_empty()
+                }
                 _ => false,
             })
         });

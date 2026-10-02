@@ -1,4 +1,7 @@
 use std::collections::HashSet;
+
+#[path = "support/cryptographic.rs"]
+mod cryptographic;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -68,7 +71,7 @@ fn public_sign_and_verify_accept_node_set_above_old_default() {
             &namespace_dense_signature_builder(),
         )
         .expect("signing must accept a node set above the old default");
-    let result = VerifyContext::new()
+    let result = cryptographic::context()
         .key_resolver(&DefaultKeyResolver::default())
         .verify(&signed)
         .expect("verification must accept a node set above the old default");
@@ -116,6 +119,10 @@ fn public_sign_and_verify_enforce_configured_node_set_boundary() {
         .key_resolver(&resolver)
         .policy(VerificationPolicy {
             resources,
+            key_trust: xml_sec::policy::KeyTrustPolicy {
+                mode: xml_sec::policy::VerificationTrustMode::CryptographicOnly,
+                ..xml_sec::policy::KeyTrustPolicy::default()
+            },
             ..VerificationPolicy::default()
         })
         .verify(&signed)
@@ -2326,7 +2333,7 @@ fn signs_rsa_template_with_embedded_x509_key_info() {
         )
         .expect("RSA signing with KeyInfo must succeed");
     let resolver = DefaultKeyResolver::default();
-    let verify_result = xml_sec::xmldsig::VerifyContext::new()
+    let verify_result = cryptographic::context()
         .key_resolver(&resolver)
         .verify(&signed)
         .expect("embedded certificate KeyInfo must resolve");
@@ -2375,7 +2382,7 @@ fn key_info_writer_populates_signed_key_info_before_reference_digests() {
         .key_info_writer(&key_info_writer)
         .sign_template(&xml)
         .expect("signed KeyInfo template must succeed");
-    let result = xml_sec::xmldsig::VerifyContext::new()
+    let result = cryptographic::context()
         .key_resolver(&DefaultKeyResolver::default())
         .verify(&signed)
         .expect("signed KeyInfo reference must verify without pipeline errors");
@@ -2433,7 +2440,7 @@ fn key_info_writer_accepts_multiple_direct_child_fragments() {
             &builder,
         )
         .expect("multiple KeyInfo child fragments must be accepted");
-    let result = xml_sec::xmldsig::VerifyContext::new()
+    let result = cryptographic::context()
         .key_resolver(&DefaultKeyResolver::default())
         .verify(&signed)
         .expect("writer certificate must resolve");
@@ -2486,7 +2493,7 @@ fn key_info_writer_replaces_stale_cryptographic_sources() {
         .key_info_writer(&writer)
         .sign_template(&xml)
         .expect("authoritative KeyInfo source must replace stale material");
-    let result = xml_sec::xmldsig::VerifyContext::new()
+    let result = cryptographic::context()
         .key_resolver(&DefaultKeyResolver::default())
         .verify(&signed)
         .expect("replacement certificate must resolve");
@@ -2549,7 +2556,7 @@ fn key_info_writer_generated_id_can_be_signed() {
         .key_info_writer(&writer)
         .sign_template(&xml)
         .expect("writer-generated ID must resolve during digesting");
-    let result = xml_sec::xmldsig::VerifyContext::new()
+    let result = cryptographic::context()
         .key_resolver(&DefaultKeyResolver::default())
         .verify(&signed)
         .expect("signed generated KeyInfo source must verify");
@@ -3118,6 +3125,7 @@ fn explicit_legacy_sha1_policy_builds_signs_and_verifies() {
         .expect("explicit compatibility policy must enable RSA-SHA1 signing");
 
     let mut verification_policy = VerificationPolicy::default();
+    verification_policy.key_trust.mode = xml_sec::policy::VerificationTrustMode::CryptographicOnly;
     verification_policy
         .key_trust
         .allowed_legacy_signature_algorithms

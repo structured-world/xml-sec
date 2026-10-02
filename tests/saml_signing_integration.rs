@@ -5,6 +5,9 @@
 //! fill a SAML-shaped template without moving that schema-significant element.
 
 use roxmltree::Document;
+
+#[path = "support/cryptographic.rs"]
+mod cryptographic;
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DsigStatus, FailureReason, RsaSigningKey, SignContext, VerifyContext,
     X509CertificateKeyInfoWriter,
@@ -82,7 +85,7 @@ fn signs_saml_response_with_schema_order_and_embedded_certificate() {
     }
 
     let key_resolver = DefaultKeyResolver::default();
-    let result = VerifyContext::new()
+    let result = cryptographic::context()
         .key_resolver(&key_resolver)
         .verify(&signed)
         .expect("embedded X.509 key resolution must complete");

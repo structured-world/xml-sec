@@ -29,6 +29,9 @@ fn chain_policy(check_crls: bool) -> KeyTrustPolicy {
 
 fn legacy_policy(algorithm: SignatureAlgorithm) -> xml_sec::policy::VerificationPolicy {
     let mut policy = xml_sec::policy::VerificationPolicy::default();
+    // Mathematical corpus validation; legacy_chain_policy replaces this trust
+    // domain when the test actually establishes certificate-path authorization.
+    policy.key_trust.mode = xml_sec::policy::VerificationTrustMode::CryptographicOnly;
     policy
         .key_trust
         .allowed_legacy_signature_algorithms
@@ -145,6 +148,7 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
     }
     let legacy_rsa = DefaultKeyResolver::default();
     let mut rsa_policy = xml_sec::policy::VerificationPolicy::default();
+    rsa_policy.key_trust.mode = xml_sec::policy::VerificationTrustMode::CryptographicOnly;
     rsa_policy
         .key_trust
         .allowed_legacy_signature_algorithms

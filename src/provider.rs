@@ -2028,6 +2028,7 @@ mod tests {
             .allowed_legacy_signature_algorithms
             .insert(SignatureAlgorithm::DsaSha1);
         policy.key_trust.dsa_keys.minimum_modulus_bits = 1024;
+        policy.key_trust.mode = crate::policy::VerificationTrustMode::CryptographicOnly;
         let result = VerifyContext::new()
             .policy(policy)
             .provider(&provider)

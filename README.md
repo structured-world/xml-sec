@@ -58,7 +58,7 @@ xml-sec = { version = "0.1", default-features = false, features = ["xmldsig", "c
 | Canonicalization | Canonical XML 1.0/1.1, Exclusive C14N, comments, and document subsets |
 | XML signatures | XMLDSig signing and verification, RSA/DSA/ECDSA/HMAC, XPath transforms, `Manifest`, `KeyInfo`, and caller-provided references |
 | XML encryption | AES-CBC/GCM, RSA-OAEP, AES Key Wrap, multiple recipients, and Element/Content replacement |
-| X.509 | Certificate key extraction, chain validation, CRLs, and policy-controlled trust |
+| X.509 | Certificate key extraction, chain validation, CRLs, required key authorization by default, and typed trust evidence |
 | Key management | Caller-owned named inventory, usage-restricted keys, xmlsec `keys.xml`, encrypted PKCS#8, and bounded RustCrypto-backed PKCS#12 import |
 | SAML 2.0 | Signed assertions and encrypted-assertion workflows covered by integration tests |
 | XML input | Strict bounded byte decoding, entity/depth/node limits, stable node identities, and generation-safe mutation |

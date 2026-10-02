@@ -128,6 +128,7 @@ fn donor_full_verification_suite_accepts_every_supported_case() {
     let mut passed = 0usize;
     let mut failed = Vec::<String>::new();
     let mut compatibility_policy = VerificationPolicy::default();
+    compatibility_policy.key_trust.mode = xml_sec::policy::VerificationTrustMode::CryptographicOnly;
     compatibility_policy
         .key_trust
         .allowed_legacy_signature_algorithms
@@ -164,6 +165,8 @@ fn donor_full_verification_suite_accepts_every_supported_case() {
                 })
             }
             Expectation::Chain { trust_anchor_path } => {
+                operation_policy.key_trust.mode =
+                    xml_sec::policy::VerificationTrustMode::RequireTrustedKey;
                 operation_policy.key_trust.verify_x509_chains = true;
                 // 2027-01-15 UTC, inside the donor chain's 2026-2126 validity window.
                 operation_policy.key_trust.verification_time =
