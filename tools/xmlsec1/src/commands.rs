@@ -711,15 +711,13 @@ fn load_xml_key_stores<P: xml_sec::document::XmlDocumentPolicy>(
     backend: XmlBackend,
     budget: &mut ExternalMaterialBudget,
 ) -> Result<KeyInventory, CommandError> {
-    let resources = policy.resource_policy();
-    let mut all = KeyInventory::default();
+    let mut importer = key_manager::XmlKeyStoreImporter::new(policy, backend)?;
     for option in invocation.values("keys-file") {
         let path = Path::new(option.value.as_deref().unwrap_or_default());
         let bytes = read_key_material_with_budget(path, budget)?;
-        let store = KeyInventory::from_xml_bytes(&bytes, policy, backend)?;
-        all.extend(store, resources)?;
+        importer.import(&bytes)?;
     }
-    Ok(all)
+    Ok(importer.finish())
 }
 
 fn select_store_candidates<'a, T>(
@@ -4258,6 +4256,72 @@ mod tests {
 
     fn invocation(arguments: &[&str]) -> Invocation {
         Invocation::parse(arguments.iter().map(OsString::from)).unwrap()
+    }
+
+    #[test]
+    fn repeated_key_files_share_candidate_and_parser_budgets() {
+        // The third entry must fail the operation budget before its malformed
+        // key is decoded; XML parser work must not reset between files either.
+        let temp = tempfile::tempdir().expect("test directory");
+        let first = temp.path().join("first.xml");
+        let second = temp.path().join("second.xml");
+        let entry = |name: &str, value: &str| {
+            format!(
+                "<ds:KeyInfo><ds:KeyName>{name}</ds:KeyName><ds:KeyValue><HMACKeyValue>{value}</HMACKeyValue></ds:KeyValue></ds:KeyInfo>"
+            )
+        };
+        let store = |entries: String| {
+            format!(
+                "<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">{entries}</Keys>"
+            )
+        };
+        let a = store(entry("a", "AA=="));
+        fs::write(&first, &a).expect("first store");
+        fs::write(&second, store(entry("b", "AA==") + &entry("c", "!"))).expect("second store");
+        let invocation = invocation(&[
+            "xmlsec1",
+            "sign",
+            "--keys-file",
+            first.to_str().unwrap(),
+            "--keys-file",
+            second.to_str().unwrap(),
+            "template.xml",
+        ]);
+        let mut policy = xml_sec::policy::VerificationPolicy::default();
+        policy.resources.max_key_candidates = 2;
+        let mut budget =
+            ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
+        assert!(matches!(
+            load_xml_key_stores(&invocation, &policy, XmlBackend::default(), &mut budget),
+            Err(CommandError::KeyStore(key_manager::KeyStoreError::Policy(
+                xml_sec::policy::PolicyViolation::ResourceLimitExceeded {
+                    resource: "key candidates",
+                    maximum: 2
+                }
+            )))
+        ));
+        fs::write(&second, store(entry("b", "AA=="))).expect("valid second store");
+        let mut budget =
+            ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
+        assert_eq!(
+            load_xml_key_stores(&invocation, &policy, XmlBackend::default(), &mut budget)
+                .expect("exact candidate boundary")
+                .entry_count(),
+            2
+        );
+        // Enough for either document individually, not both decoding/parsing passes.
+        policy.resources.max_xml_parse_work_bytes = a.len() * 3;
+        let mut budget =
+            ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
+        assert!(matches!(
+            load_xml_key_stores(&invocation, &policy, XmlBackend::default(), &mut budget),
+            Err(CommandError::KeyStore(key_manager::KeyStoreError::Policy(
+                xml_sec::policy::PolicyViolation::ResourceLimit {
+                    resource: "cumulative XML parse-work bytes",
+                    ..
+                }
+            )))
+        ));
     }
 
     #[test]

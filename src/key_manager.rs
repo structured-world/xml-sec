@@ -173,6 +173,51 @@ pub struct KeyInventory {
     material_bytes: usize,
 }
 
+/// Import session for multiple XML key stores under one operation snapshot.
+/// Failed attempts retain their inspection and parser-work charges. Successful
+/// stores are moved into the inventory, never cloned.
+pub struct XmlKeyStoreImporter<'a, P: crate::document::XmlDocumentPolicy> {
+    policy: &'a P,
+    backend: XmlBackend,
+    parse_work: XmlParseWorkBudget,
+    inspected: usize,
+    inventory: KeyInventory,
+}
+
+impl<'a, P: crate::document::XmlDocumentPolicy> XmlKeyStoreImporter<'a, P> {
+    /// Bind this session to the caller's immutable policy and XML backend.
+    pub fn new(policy: &'a P, backend: XmlBackend) -> Result<Self, KeyStoreError> {
+        ensure_resource_policy(policy.resource_policy())?;
+        Ok(Self {
+            policy,
+            backend,
+            parse_work: XmlParseWorkBudget::from_resources(policy.resource_policy()),
+            inspected: 0,
+            inventory: KeyInventory::default(),
+        })
+    }
+
+    /// Import a file without resetting work budgets. Failure leaves stored keys
+    /// unchanged, but does not refund work already performed.
+    pub fn import(&mut self, bytes: &[u8]) -> Result<(), KeyStoreError> {
+        let store = KeyInventory::from_xml_bytes_with_budget(
+            bytes,
+            self.policy,
+            self.backend,
+            &self.parse_work,
+            &mut self.inspected,
+            self.inventory.material_bytes,
+        )?;
+        self.inventory.extend(store, self.policy.resource_policy())
+    }
+
+    /// Finish the import session and transfer ownership of the complete inventory.
+    #[must_use]
+    pub fn finish(self) -> KeyInventory {
+        self.inventory
+    }
+}
+
 /// Candidate inspections shared by named signing lookups in one operation.
 #[derive(Default)]
 pub struct SigningLookupBudget {
@@ -1237,12 +1282,7 @@ impl KeyInventory {
         }
         let retained_with_input =
             self.check_material_capacity(named_material_length(&name, bytes.len(), 1)?, resources)?;
-        let permitted = KeyUsages::SIGN.union(KeyUsages::DECRYPT);
-        if usages.0 == 0 || usages.0 & !permitted.0 != 0 {
-            return Err(KeyStoreError::Selection(
-                "private key usage is incompatible",
-            ));
-        }
+        validate_private_key_usages(usages)?;
         let der = if PrivateKeyInfoRef::try_from(bytes).is_ok() {
             Zeroizing::new(bytes.to_vec())
         } else if let Ok(encrypted) = EncryptedPrivateKeyInfoRef::try_from(bytes) {
@@ -1321,6 +1361,7 @@ impl KeyInventory {
         F: FnOnce() -> Option<Zeroizing<Vec<u8>>>,
     {
         self.check_new_name(&name, resources)?;
+        validate_private_key_usages(usages)?;
         if bytes.len() > resources.max_external_resource_bytes {
             return Err(import_resource_limit(
                 crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
@@ -1596,12 +1637,7 @@ impl KeyInventory {
         resources: &ResourcePolicy,
     ) -> Result<Pkcs12Limits, KeyStoreError> {
         self.check_new_name(name, resources)?;
-        let permitted = KeyUsages::SIGN.union(KeyUsages::DECRYPT);
-        if usages.0 == 0 || usages.0 & !permitted.0 != 0 {
-            return Err(KeyStoreError::Selection(
-                "private key usage is incompatible",
-            ));
-        }
+        validate_private_key_usages(usages)?;
         if bytes.len() > resources.max_external_resource_bytes {
             return Err(KeyStoreError::Policy(
                 crate::policy::PolicyViolation::ResourceLimitExceeded {
@@ -1685,25 +1721,13 @@ impl KeyInventory {
         trusted_anchor: bool,
         resources: &ResourcePolicy,
     ) -> Result<(), KeyStoreError> {
-        ensure_resource_policy(resources)?;
-        if der.len() > resources.max_external_resource_bytes {
-            return Err(import_resource_limit(
-                crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
-                resources.max_external_resource_bytes,
-            ));
-        }
+        let material_bytes = self.preflight_x509_import(&der, resources)?;
         let (rest, _) = X509Certificate::from_der(&der)
             .map_err(|_| KeyStoreError::Selection("invalid X.509 certificate"))?;
         if !rest.is_empty() {
             return Err(KeyStoreError::Selection("invalid X.509 certificate"));
         }
-        if self.entry_count >= resources.max_key_candidates {
-            return Err(import_resource_limit(
-                crate::policy::resource_name::KEY_CANDIDATES,
-                resources.max_key_candidates,
-            ));
-        }
-        self.reserve_material(der.len(), resources)?;
+        self.material_bytes = material_bytes;
         if trusted_anchor {
             self.trusted_certificates.push(der);
         } else {
@@ -1719,6 +1743,24 @@ impl KeyInventory {
         der: Vec<u8>,
         resources: &ResourcePolicy,
     ) -> Result<(), KeyStoreError> {
+        let material_bytes = self.preflight_x509_import(&der, resources)?;
+        let (rest, _) = x509_parser::revocation_list::CertificateRevocationList::from_der(&der)
+            .map_err(|_| KeyStoreError::Selection("invalid X.509 CRL"))?;
+        if !rest.is_empty() {
+            return Err(KeyStoreError::Selection("invalid X.509 CRL"));
+        }
+        self.material_bytes = material_bytes;
+        self.crls.push(der);
+        self.entry_count += 1;
+        Ok(())
+    }
+
+    fn preflight_x509_import(
+        &self,
+        der: &[u8],
+        resources: &ResourcePolicy,
+    ) -> Result<usize, KeyStoreError> {
+        // Policy exhaustion is terminal before any candidate-local DER work.
         ensure_resource_policy(resources)?;
         if der.len() > resources.max_external_resource_bytes {
             return Err(import_resource_limit(
@@ -1726,27 +1768,31 @@ impl KeyInventory {
                 resources.max_external_resource_bytes,
             ));
         }
-        let (rest, _) = x509_parser::revocation_list::CertificateRevocationList::from_der(&der)
-            .map_err(|_| KeyStoreError::Selection("invalid X.509 CRL"))?;
-        if !rest.is_empty() {
-            return Err(KeyStoreError::Selection("invalid X.509 CRL"));
-        }
         if self.entry_count >= resources.max_key_candidates {
             return Err(import_resource_limit(
                 crate::policy::resource_name::KEY_CANDIDATES,
                 resources.max_key_candidates,
             ));
         }
-        self.reserve_material(der.len(), resources)?;
-        self.crls.push(der);
-        self.entry_count += 1;
-        Ok(())
+        self.check_material_capacity(der.len(), resources)
     }
     /// Import caller-owned XML bytes under the operation's XML and resource snapshot.
     pub fn from_xml_bytes<P: crate::document::XmlDocumentPolicy>(
         bytes: &[u8],
         policy: &P,
         backend: XmlBackend,
+    ) -> Result<Self, KeyStoreError> {
+        let budget = XmlParseWorkBudget::from_resources(policy.resource_policy());
+        Self::from_xml_bytes_with_budget(bytes, policy, backend, &budget, &mut 0, 0)
+    }
+
+    fn from_xml_bytes_with_budget<P: crate::document::XmlDocumentPolicy>(
+        bytes: &[u8],
+        policy: &P,
+        backend: XmlBackend,
+        budget: &XmlParseWorkBudget,
+        inspected: &mut usize,
+        live_material: usize,
     ) -> Result<Self, KeyStoreError> {
         let resources = policy.resource_policy();
         ensure_resource_policy(resources)?;
@@ -1756,7 +1802,7 @@ impl KeyInventory {
                 resources.max_external_resource_bytes,
             ));
         }
-        if bytes.len() > resources.max_external_resource_total_bytes {
+        if bytes.len() > resources.max_external_resource_total_bytes - live_material {
             return Err(import_resource_limit(
                 crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
                 resources.max_external_resource_total_bytes,
@@ -1764,19 +1810,18 @@ impl KeyInventory {
         }
         let settings = DocumentParseSettings::from_policy(policy.xml_input_policy(), resources)
             .with_backend(backend);
-        let budget = XmlParseWorkBudget::from_resources(resources);
         let text = crate::document::decode_xml_with_budget(
             bytes,
             resources
                 .max_xml_document_bytes
                 .min(resources.max_external_resource_bytes),
-            Some(&budget),
+            Some(budget),
         )
         .map_err(|error| match error.into_policy_violation(settings) {
             Ok(violation) => KeyStoreError::Policy(violation),
             Err(error) => KeyStoreError::Invalid(error.to_string()),
         })?;
-        let document = parse_borrowed_with_settings_and_budget(&text, settings, Some(&budget))
+        let document = parse_borrowed_with_settings_and_budget(&text, settings, Some(budget))
             .map_err(|error| match error.into_policy_violation(settings) {
                 Ok(violation) => KeyStoreError::Policy(violation),
                 Err(error) => KeyStoreError::Invalid(error.to_string()),
@@ -1792,12 +1837,13 @@ impl KeyInventory {
             if !info.has_tag_name((XMLDSIG_NS, "KeyInfo")) {
                 return Err(KeyStoreError::Invalid("unexpected child of Keys".into()));
             }
-            if entry_count >= resources.max_key_candidates {
+            if *inspected >= resources.max_key_candidates {
                 return Err(import_resource_limit(
                     crate::policy::resource_name::KEY_CANDIDATES,
                     resources.max_key_candidates,
                 ));
             }
+            *inspected += 1;
             entry_count += 1;
             let mut name = None;
             let mut value = None;
@@ -1938,7 +1984,7 @@ impl KeyInventory {
         // Decoding can retain both public components and a derived private key.
         // Keep the input charge too, so compact XML never lowers the import budget.
         store.material_bytes = bytes.len().max(store.retained_material_bytes()?);
-        if store.material_bytes > resources.max_external_resource_total_bytes {
+        if store.material_bytes > resources.max_external_resource_total_bytes - live_material {
             return Err(import_resource_limit(
                 crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
                 resources.max_external_resource_total_bytes,
@@ -1946,6 +1992,16 @@ impl KeyInventory {
         }
         Ok(store)
     }
+}
+
+fn validate_private_key_usages(usages: KeyUsages) -> Result<(), KeyStoreError> {
+    let permitted = KeyUsages::SIGN.union(KeyUsages::DECRYPT);
+    if usages.0 == 0 || usages.0 & !permitted.0 != 0 {
+        return Err(KeyStoreError::Selection(
+            "private key usage is incompatible",
+        ));
+    }
+    Ok(())
 }
 
 fn import_resource_limit(resource: &'static str, maximum: usize) -> KeyStoreError {
@@ -3221,6 +3277,63 @@ mod tests {
     }
 
     #[test]
+    fn xml_import_session_keeps_failed_work_and_preflights_live_material() {
+        // Retrying malformed input cannot refund candidate inspections; a
+        // full live inventory rejects the next source before XML parsing.
+        let xml = |value: &str| {
+            format!(
+                "<Keys xmlns=\"{XMLSEC_NS}\" xmlns:ds=\"{XMLDSIG_NS}\"><ds:KeyInfo><ds:KeyName>a</ds:KeyName><ds:KeyValue><HMACKeyValue>{value}</HMACKeyValue></ds:KeyValue></ds:KeyInfo></Keys>"
+            )
+        };
+        let policy = xml_policy(ResourcePolicy {
+            max_key_candidates: 1,
+            ..ResourcePolicy::default()
+        });
+        let mut importer =
+            XmlKeyStoreImporter::new(&policy, XmlBackend::default()).expect("session");
+        assert!(matches!(
+            importer.import(xml("!").as_bytes()),
+            Err(KeyStoreError::Invalid(_))
+        ));
+        assert!(matches!(
+            importer.import(xml("AA==").as_bytes()),
+            Err(KeyStoreError::Policy(
+                crate::policy::PolicyViolation::ResourceLimitExceeded {
+                    resource: crate::policy::resource_name::KEY_CANDIDATES,
+                    maximum: 1
+                }
+            ))
+        ));
+        assert_eq!(importer.finish().entry_count(), 0);
+        let valid = xml("AA==");
+        let policy = xml_policy(ResourcePolicy {
+            max_external_resource_total_bytes: valid.len(),
+            ..ResourcePolicy::default()
+        });
+        let mut importer =
+            XmlKeyStoreImporter::new(&policy, XmlBackend::default()).expect("session");
+        importer
+            .import(valid.as_bytes())
+            .expect("first source fits exactly");
+        let consumed = importer.parse_work.consumed();
+        assert!(matches!(
+            importer.import(b"!"),
+            Err(KeyStoreError::Policy(
+                crate::policy::PolicyViolation::ResourceLimitExceeded {
+                    resource: crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                    ..
+                }
+            ))
+        ));
+        assert_eq!(
+            importer.parse_work.consumed(),
+            consumed,
+            "no parser work after byte denial"
+        );
+        assert_eq!(importer.finish().entry_count(), 1);
+    }
+
+    #[test]
     fn xml_store_rejects_empty_symmetric_material() {
         // Empty decoded secrets are invalid at the same boundary as direct imports.
         for kind in ["HMACKeyValue", "AESKeyValue", "DESKeyValue"] {
@@ -3887,6 +4000,91 @@ mod tests {
                 &resources,
             )
             .expect("plaintext import ignores password callback");
+    }
+
+    #[test]
+    fn invalid_private_usages_do_not_request_password() {
+        // Caller-visible rejection must precede prompting or retrieving secrets.
+        let private = pem::parse(include_bytes!(
+            "../tests/fixtures/keys/rsa/rsa-2048-key.pem"
+        ))
+        .expect("key")
+        .into_contents();
+        let encrypted = PrivateKeyInfoRef::try_from(private.as_slice())
+            .expect("PKCS8")
+            .encrypt_with_rng(&mut ChaCha8Rng::seed_from_u64(42), b"correct")
+            .expect("encrypted PKCS8");
+        for usages in [
+            KeyUsages::VERIFY,
+            KeyUsages(0),
+            KeyUsages::SIGN.union(KeyUsages::VERIFY),
+        ] {
+            let calls = std::cell::Cell::new(0);
+            let mut inventory = KeyInventory::default();
+            assert!(matches!(
+                inventory.add_private_der_with_password_callback(
+                    "invalid".into(),
+                    encrypted.as_bytes(),
+                    || {
+                        calls.set(calls.get() + 1);
+                        Some(Zeroizing::new(b"correct".to_vec()))
+                    },
+                    usages,
+                    &ResourcePolicy::default()
+                ),
+                Err(KeyStoreError::Selection(
+                    "private key usage is incompatible"
+                ))
+            ));
+            assert_eq!(calls.get(), 0);
+            assert_eq!(inventory.entry_count(), 0);
+        }
+    }
+
+    #[test]
+    fn certificate_and_crl_capacity_precedes_der_parsing() {
+        // Exhausted inventory limits are terminal policy errors even for
+        // malformed DER. Failed imports must not change retained accounting.
+        for candidates in [true, false] {
+            for certificate in [true, false] {
+                let mut inventory = KeyInventory::default();
+                let resources = ResourcePolicy {
+                    max_key_candidates: if candidates { 1 } else { 64 },
+                    max_external_resource_total_bytes: 2,
+                    ..ResourcePolicy::default()
+                };
+                inventory
+                    .add_symmetric(
+                        "a".into(),
+                        SymmetricKeyKind::Hmac,
+                        vec![0],
+                        KeyUsages::SIGN,
+                        &resources,
+                    )
+                    .expect("fill inventory");
+                let result = if certificate {
+                    inventory.add_certificate_der(vec![0], false, &resources)
+                } else {
+                    inventory.add_crl_der(vec![0], &resources)
+                };
+                let resource = if candidates {
+                    crate::policy::resource_name::KEY_CANDIDATES
+                } else {
+                    crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES
+                };
+                assert!(matches!(result, Err(KeyStoreError::Policy(
+                    crate::policy::PolicyViolation::ResourceLimitExceeded { resource: actual, .. }
+                )) if actual == resource));
+                assert_eq!(inventory.entry_count(), 1);
+                assert_eq!(inventory.material_bytes, 2);
+                assert!(inventory.lookup_certificates.is_empty());
+                assert!(inventory.crls.is_empty());
+            }
+        }
+        assert!(matches!(
+            KeyInventory::default().add_crl_der(vec![0], &ResourcePolicy::default()),
+            Err(KeyStoreError::Selection("invalid X.509 CRL"))
+        ));
     }
 
     #[test]

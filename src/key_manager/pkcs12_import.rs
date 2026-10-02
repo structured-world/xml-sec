@@ -52,7 +52,7 @@ impl<'a> Budget<'a> {
         }
     }
 
-    fn allocate(&mut self, size: usize) -> Result<()> {
+    fn check_allocation(&self, size: usize) -> Result<()> {
         let maximum = self.limits.resources.max_external_resource_total_bytes;
         if size > self.limits.memory_available - self.memory {
             return Err(denial(
@@ -60,6 +60,11 @@ impl<'a> Budget<'a> {
                 maximum,
             ));
         }
+        Ok(())
+    }
+
+    fn allocate(&mut self, size: usize) -> Result<()> {
+        self.check_allocation(size)?;
         self.memory += size;
         Ok(())
     }
@@ -660,6 +665,9 @@ impl<'a> Encryption<'a> {
         if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(self.cipher.block()) {
             return malformed();
         }
+        // Preflight output before KDF work; allocate/charge it only when live,
+        // rather than invent overlap with the legacy KDF's temporary workspace.
+        budget.check_allocation(ciphertext.len())?;
         let mut key = Zeroizing::new([0_u8; 32]);
         let mut iv = Zeroizing::new([0_u8; 16]);
         if let Some(hash) = self.hash {
@@ -684,6 +692,7 @@ impl<'a> Encryption<'a> {
             iv.copy_from_slice(&self.iv);
         } else {
             let bmp = password.bmp(budget)?;
+            budget.check_allocation(ciphertext.len())?;
             budget.legacy_workspace(&self.salt, bmp, 64, self.cipher.key_len())?;
             let derived = Zeroizing::new(derive_key::<sha1::Sha1>(
                 bmp,
@@ -1245,6 +1254,42 @@ mod tests {
             resources: ResourcePolicy::default(),
             candidates,
             memory_available: ResourcePolicy::default().max_external_resource_total_bytes,
+        }
+    }
+
+    #[test]
+    fn ciphertext_capacity_is_checked_before_password_derivation() {
+        // An already-live callback buffer must stop both PBES2 and legacy KDF
+        // paths before any password preprocessing or BMP conversion.
+        for hash in [Some(Hash::Sha1), None] {
+            let mut limits = limits(64);
+            limits.memory_available = 31;
+            let mut budget = Budget::new(&limits);
+            budget.allocate(16).expect("live password capacity");
+            let mut password = Password {
+                utf8: "password",
+                bmp: None,
+            };
+            let encryption = Encryption {
+                cipher: if hash.is_some() {
+                    Cipher::Aes128
+                } else {
+                    Cipher::TripleDes
+                },
+                salt: Bytes::Borrowed(b"salt"),
+                rounds: 2,
+                hash,
+                iv: [0; 16],
+            };
+            assert!(matches!(
+                encryption.decrypt(&[0; 16], &mut password, &mut budget),
+                Err(KeyStoreError::Policy(_))
+            ));
+            assert_eq!(budget.work, 0, "no password hashing before memory denial");
+            assert!(
+                password.bmp.is_none(),
+                "no lazy BMP allocation before denial"
+            );
         }
     }
 

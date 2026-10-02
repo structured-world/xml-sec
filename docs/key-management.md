@@ -53,6 +53,8 @@ material budget for every stored copy, including public-key `KeyName` metadata.
 Import and selection methods return `KeyStoreError::Policy` for operation-policy denials,
 distinct from candidate-local `KeyStoreError::Selection` failures. Callers
 must not retry another key after a policy rejection.
+Certificate and CRL imports check candidate and aggregate capacity before DER
+parsing, so an exhausted inventory returns a policy error even for malformed input.
 An already-selected public entry can expose its RSA recipient key directly via
 `StoredPublicKey::rsa_encryption_key(&encryption_policy)` without a second
 inventory name lookup. The operation policy is required so source sizes are
@@ -80,6 +82,7 @@ permission and a resolver selected under a weaker policy do not weaken a later o
 
 `add_private_der_with_password_callback` asks the caller for a zeroizing byte
 password only for encrypted PKCS#8; plaintext input does not invoke it.
+Incompatible or empty private-key usages are rejected before requesting a password.
 `add_pkcs12_with_password_callback` obtains a zeroizing string password before
 decoding the bundle, after checking encoded size, visible bag/container counts,
 and all visible MAC/encryption KDF parameters against one aggregate work budget.
@@ -114,6 +117,8 @@ one unit per 64 password bytes per HMAC initialization (two passes for scrypt)
 in addition to the KDF's derivation work. Each PKCS#12 PBES2 derivation charges
 password preprocessing to the shared budget, including encrypted nested bags;
 legacy BMP password conversion consumes separate live memory when needed.
+Ciphertext output capacity is checked before password derivation, including
+after lazy BMP conversion, without allocating the output until decryption needs it.
 Plaintext PKCS#8 imports still ignore unused passwords.
 These limits are product policy, not format syntax.
 The CLI applies the same pre-decryption KDF limits to explicit protected PKCS#8
@@ -132,6 +137,12 @@ another candidate resolved. Custom bag attributes accept BER high-tag-number
 identifiers (X.690 section 8.1.2.4) without retaining their values.
 Shared XMLDSig candidate accounting is constructed from the operation's
 `VerificationPolicy`, not a separate caller-supplied numeric limit.
+For multiple XML stores, use `XmlKeyStoreImporter::new(&policy, backend)`, call
+`import(bytes)` for each source, then `finish()` to obtain the inventory. The CLI
+uses this session for repeated `--keys-file`: candidate inspections and XML parsing
+work share one operation allowance rather than resetting for each file. Failed
+imports preserve existing keys but retain their work charges; retained material
+from earlier files reduces capacity before decoding the next source.
 BER PrivateKeyInfo framing and constructed private-key OCTET STRINGs are
 normalized to bounded PKCS#8 DER before storage. CMS EncryptedData accepts
 unprotected attributes with version 2, while requiring version 0 without them
