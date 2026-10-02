@@ -803,7 +803,7 @@ pub fn register_core_functions(context: &mut context::Context<'_>) {
 #[cfg(test)]
 mod test {
     use std::borrow::ToOwned;
-    use std::{f64, fmt};
+    use std::fmt;
 
     #[cfg(feature = "embedded")]
     use super::sxd_document_no_unsafe;

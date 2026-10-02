@@ -40,6 +40,8 @@ pub(crate) mod resource_name {
     pub const ENCRYPTION_RECIPIENTS: &str = "encryption recipients";
     pub const ENCRYPTION_METADATA_BYTES: &str = "encryption metadata bytes";
     pub const KEY_CANDIDATES: &str = "key candidates";
+    pub const KEY_IMPORT_KDF_WORK: &str = "key import KDF work";
+    pub const KEY_IMPORT_KDF_MEMORY: &str = "key import KDF memory bytes";
     pub const KEY_INFO_REFERENCE_DEPTH: &str = "KeyInfoReference depth";
     pub const BASE64_TRANSFORM_INPUT_BYTES: &str = "Base64 transform input bytes";
     pub const BASE64_TRANSFORM_OUTPUT_BYTES: &str = "Base64 transform output bytes";
@@ -92,6 +94,20 @@ pub enum PolicyViolation {
         maximum: usize,
         /// Observed consumption.
         actual: usize,
+    },
+    /// An import exceeded a resource ceiling, but its parser did not expose the measured value.
+    #[error("{resource} exceeds policy maximum {maximum}")]
+    ResourceLimitExceeded {
+        /// Resource whose consumption was rejected.
+        resource: &'static str,
+        /// Effective policy ceiling.
+        maximum: usize,
+    },
+    /// A protected import supplied zero or too many KDF iterations; the parser did not expose the count.
+    #[error("key import KDF iterations must be between 1 and {maximum}")]
+    KdfIterationsOutsideLimit {
+        /// Effective iteration ceiling.
+        maximum: usize,
     },
     /// A configured resource limit violates a structural policy requirement.
     #[error("{resource} has invalid policy limit {actual}: {requirement}")]
@@ -223,11 +239,11 @@ impl HmacPolicy {
     }
 }
 
-/// RSA strength and structural requirements for outbound cryptographic operations.
+/// RSA strength and structural requirements for cryptographic operations.
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RsaKeyPolicy {
-    /// Minimum mathematical RSA modulus bit length accepted for new output.
+    /// Minimum mathematical RSA modulus bit length accepted by the operation.
     pub minimum_modulus_bits: usize,
 }
 
@@ -325,6 +341,30 @@ impl RsaKeyPolicy {
                 key_type: "RSA",
                 reason: "modulus width overflows",
             })?;
+        let exponent = if exponent.is_empty() || exponent.len() > 8 {
+            None
+        } else {
+            let mut bytes = [0_u8; 8];
+            bytes[8 - exponent.len()..].copy_from_slice(exponent);
+            Some(u64::from_be_bytes(bytes))
+        };
+        self.validate_public_metadata(operation, modulus_bits, exponent)
+    }
+
+    pub(crate) fn validate_public_metadata(
+        &self,
+        operation: &'static str,
+        modulus_bits: usize,
+        exponent: Option<u64>,
+    ) -> Result<usize, PolicyViolation> {
+        self.validate()?;
+        if modulus_bits == 0 {
+            return Err(PolicyViolation::InvalidKeyMaterial {
+                operation,
+                key_type: "RSA",
+                reason: "modulus is zero",
+            });
+        }
         if !(self.minimum_modulus_bits..=crate::hard_limits::RSA_MODULUS_BIT_CEILING)
             .contains(&modulus_bits)
         {
@@ -336,16 +376,11 @@ impl RsaKeyPolicy {
                 actual_bits: modulus_bits,
             });
         }
-        if exponent.is_empty() || exponent.len() > 8 {
-            return Err(PolicyViolation::InvalidKeyMaterial {
-                operation,
-                key_type: "RSA",
-                reason: "public exponent has invalid encoding",
-            });
-        }
-        let mut exponent_bytes = [0_u8; 8];
-        exponent_bytes[8 - exponent.len()..].copy_from_slice(exponent);
-        let exponent = u64::from_be_bytes(exponent_bytes);
+        let exponent = exponent.ok_or(PolicyViolation::InvalidKeyMaterial {
+            operation,
+            key_type: "RSA",
+            reason: "public exponent has invalid encoding",
+        })?;
         if !(3..=((1_u64 << 33) - 1)).contains(&exponent) || exponent % 2 == 0 {
             return Err(PolicyViolation::InvalidKeyMaterial {
                 operation,
@@ -353,7 +388,7 @@ impl RsaKeyPolicy {
                 reason: "public exponent is outside the supported odd range",
             });
         }
-        Ok(modulus.len())
+        Ok(modulus_bits.div_ceil(8))
     }
 }
 
@@ -412,6 +447,11 @@ pub struct ResourcePolicy {
     /// Maximum key-source expansion work and concrete key or certificate
     /// candidates inspected by one operation stage.
     pub max_key_candidates: usize,
+    /// Maximum aggregate PBKDF2/PKCS#12 hash rounds or conservative scrypt work
+    /// during key import, including PKCS#8 password-hashing work units.
+    pub max_key_import_kdf_work: usize,
+    /// Maximum estimated scrypt or PKCS#12 KDF workspace bytes during key import.
+    pub max_key_import_kdf_memory_bytes: usize,
     /// Maximum nested `KeyInfoReference` dereference depth.
     pub max_key_info_reference_depth: usize,
     /// Maximum bytes accepted by Base64 transforms before decoding.
@@ -469,6 +509,8 @@ impl Default for ResourcePolicy {
             max_encryption_recipients: crate::hard_limits::ENCRYPTION_RECIPIENT_CEILING,
             max_encryption_metadata_bytes: crate::hard_limits::ENCRYPTION_METADATA_BYTE_CEILING,
             max_key_candidates: crate::hard_limits::KEY_CANDIDATE_CEILING,
+            max_key_import_kdf_work: crate::hard_limits::KEY_IMPORT_KDF_WORK_CEILING as usize,
+            max_key_import_kdf_memory_bytes: crate::hard_limits::KEY_IMPORT_KDF_MEMORY_CEILING,
             max_key_info_reference_depth: crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING,
             max_base64_transform_input_bytes:
                 crate::hard_limits::BASE64_TRANSFORM_INPUT_BYTE_CEILING,
@@ -577,6 +619,16 @@ impl ResourcePolicy {
                 resource_name::KEY_CANDIDATES,
                 self.max_key_candidates,
                 crate::hard_limits::KEY_CANDIDATE_CEILING,
+            ),
+            (
+                resource_name::KEY_IMPORT_KDF_WORK,
+                self.max_key_import_kdf_work,
+                crate::hard_limits::KEY_IMPORT_KDF_WORK_CEILING as usize,
+            ),
+            (
+                resource_name::KEY_IMPORT_KDF_MEMORY,
+                self.max_key_import_kdf_memory_bytes,
+                crate::hard_limits::KEY_IMPORT_KDF_MEMORY_CEILING,
             ),
             (
                 resource_name::KEY_INFO_REFERENCE_DEPTH,
@@ -1176,6 +1228,9 @@ pub struct DecryptionPolicy {
     pub key_wrap_algorithms: Option<HashSet<KeyWrapAlgorithm>>,
     /// Allowed OAEP digest algorithms accepted on input.
     pub oaep_digests: Option<HashSet<OaepDigestAlgorithm>>,
+    /// RSA requirements enforced before OAEP recovery; defaults to 2048 bits.
+    /// Legacy input requires an explicit caller-selected lower minimum.
+    pub rsa_keys: RsaKeyPolicy,
     /// XML parser rules.
     pub xml: XmlInputPolicy,
     /// Resource ceilings.
@@ -1186,7 +1241,8 @@ pub struct DecryptionPolicy {
 impl DecryptionPolicy {
     /// Validate the complete snapshot before inbound decryption work begins.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
-        self.resources.validate()
+        self.resources.validate()?;
+        self.rsa_keys.validate()
     }
 }
 
@@ -1316,6 +1372,16 @@ mod tests {
                 |p| &mut p.max_key_candidates,
             ),
             (
+                resource_name::KEY_IMPORT_KDF_WORK,
+                crate::hard_limits::KEY_IMPORT_KDF_WORK_CEILING as usize,
+                |p| &mut p.max_key_import_kdf_work,
+            ),
+            (
+                resource_name::KEY_IMPORT_KDF_MEMORY,
+                crate::hard_limits::KEY_IMPORT_KDF_MEMORY_CEILING,
+                |p| &mut p.max_key_import_kdf_memory_bytes,
+            ),
+            (
                 resource_name::KEY_INFO_REFERENCE_DEPTH,
                 crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING,
                 |p| &mut p.max_key_info_reference_depth,
@@ -1439,6 +1505,8 @@ mod tests {
             max_encryption_recipients: 0,
             max_encryption_metadata_bytes: 0,
             max_key_candidates: 0,
+            max_key_import_kdf_work: 0,
+            max_key_import_kdf_memory_bytes: 0,
             max_key_info_reference_depth: 0,
             max_base64_transform_input_bytes: 0,
             max_base64_transform_output_bytes: 0,

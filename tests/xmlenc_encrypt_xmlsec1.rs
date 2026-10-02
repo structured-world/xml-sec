@@ -17,6 +17,7 @@ use xml_sec::xmlenc::{
     DataEncryptionAlgorithm, EncryptedDataBuilder, EncryptionRecipient, OaepDigestAlgorithm,
     RsaOaepParameters,
 };
+use xml_sec::{key_manager::KeyInventory, policy::ResourcePolicy};
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -148,6 +149,45 @@ fn xmlsec1_decrypts_rsa_oaep_wrapped_aes_cbc_from_xml_sec() {
             &encrypted.encrypted_data_xml,
             "--privkey-pem:interop-rsa",
             private_key_path
+        ),
+        plaintext
+    );
+}
+
+#[test]
+fn xmlsec1_decrypts_rsa_recipient_imported_by_key_inventory() {
+    // A caller-owned inventory, rather than a directly decoded RSA fixture,
+    // must preserve the independent libxmlsec1 transport wire contract.
+    if !xmlsec1::is_available() {
+        eprintln!("{}", xmlsec1::skip_reason());
+        return;
+    }
+    let public_path = Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    let private_path = Path::new("tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    let public_pem = fs::read(public_path).expect("public-key fixture must load");
+    let mut keys = KeyInventory::default();
+    keys.add_public_pem(
+        "inventory-rsa".into(),
+        &public_pem,
+        &ResourcePolicy::default(),
+    )
+    .expect("named public key must import");
+    let public = keys
+        .rsa_encryption_key(
+            "inventory-rsa",
+            &xml_sec::policy::EncryptionPolicy::default(),
+        )
+        .expect("imported RSA key must be usable for encryption");
+    let plaintext = b"inventory-backed xmlsec1 interoperability";
+    let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .add_recipient(EncryptionRecipient::rsa_oaep(public).key_name("inventory-rsa"))
+        .encrypt_binary(plaintext)
+        .expect("inventory-backed encryption must succeed");
+    assert_eq!(
+        decrypt_with_xmlsec1(
+            &encrypted.encrypted_data_xml,
+            "--privkey-pem:inventory-rsa",
+            private_path
         ),
         plaintext
     );

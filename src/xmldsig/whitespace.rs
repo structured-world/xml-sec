@@ -1,5 +1,127 @@
 //! Internal XML whitespace helpers shared across XMLDSig parsing and verification.
 
+/// Borrow XML text and validate its exact decoded size without normalizing it
+/// into a second heap buffer. Callers reserve this size before calling decode.
+pub(crate) struct XmlBase64Payload<'a, 'input> {
+    node: crate::xml::dom::Node<'a, 'input>,
+    pub(crate) decoded_len: usize,
+    pub(crate) normalized_len: usize,
+    pub(crate) text_len: usize,
+}
+
+impl<'a, 'input> XmlBase64Payload<'a, 'input> {
+    pub(crate) fn new(node: crate::xml::dom::Node<'a, 'input>) -> Result<Self, &'static str> {
+        Self::bounded(node, usize::MAX, usize::MAX)
+    }
+
+    pub(crate) fn bounded(
+        node: crate::xml::dom::Node<'a, 'input>,
+        max_text: usize,
+        max_normalized: usize,
+    ) -> Result<Self, &'static str> {
+        let mut normalized_len = 0_usize;
+        let mut padding = 0_usize;
+        let mut text_len = 0_usize;
+        for child in node.children() {
+            if child.is_element() {
+                return Err("unexpected nested element");
+            }
+            if !child.is_text() {
+                continue;
+            }
+            let text = child.text().unwrap_or_default();
+            if text.len() > max_text - text_len {
+                return Err("maximum allowed text length");
+            }
+            text_len = text_len
+                .checked_add(text.len())
+                .ok_or("base64 size overflow")?;
+            for byte in text.bytes() {
+                if matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
+                    continue;
+                }
+                if normalized_len >= max_normalized {
+                    return Err("maximum allowed base64 length");
+                }
+                if byte == b'=' {
+                    padding += 1;
+                    if padding > 2 {
+                        return Err("invalid base64 padding");
+                    }
+                } else if padding != 0
+                    || !matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/')
+                {
+                    return Err("invalid base64 character or XML whitespace");
+                }
+                normalized_len = normalized_len
+                    .checked_add(1)
+                    .ok_or("base64 size overflow")?;
+            }
+        }
+        if !normalized_len.is_multiple_of(4) {
+            return Err("invalid base64 length");
+        }
+        let decoded_len = (normalized_len / 4 * 3)
+            .checked_sub(padding)
+            .ok_or("invalid base64 padding")?;
+        Ok(Self {
+            node,
+            decoded_len,
+            normalized_len,
+            text_len,
+        })
+    }
+
+    pub(crate) fn decode(&self) -> Result<Vec<u8>, &'static str> {
+        let mut output = vec![0; self.decoded_len];
+        self.decode_into(&mut output)?;
+        Ok(output)
+    }
+
+    pub(crate) fn decode_into(&self, output: &mut [u8]) -> Result<(), &'static str> {
+        use std::io::Read as _;
+        let input = self
+            .node
+            .children()
+            .filter(|child| child.is_text())
+            .filter_map(|child| child.text())
+            .flat_map(str::bytes)
+            .filter(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n'));
+        let mut decoder = base64::read::DecoderReader::new(
+            Base64ByteReader(input),
+            &base64::engine::general_purpose::STANDARD,
+        );
+        decoder
+            .read_exact(output)
+            .map_err(|_| "invalid base64 padding or trailing bits")?;
+        let mut eof = [0];
+        if decoder
+            .read(&mut eof)
+            .map_err(|_| "invalid base64 padding or trailing bits")?
+            != 0
+        {
+            return Err("invalid base64 length");
+        }
+        Ok(())
+    }
+}
+
+struct Base64ByteReader<I>(I);
+
+impl<I: Iterator<Item = u8>> std::io::Read for Base64ByteReader<I> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let mut written = 0;
+        for slot in buffer {
+            let Some(byte) = self.0.next() else {
+                break;
+            };
+            *slot = byte;
+            written += 1;
+        }
+        Ok(written)
+    }
+}
+
 /// Return `true` when the text contains only XML 1.0 whitespace chars.
 #[inline]
 pub(crate) fn is_xml_whitespace_only(text: &str) -> bool {
@@ -124,6 +246,41 @@ mod tests {
         XmlBase64NormalizeLimitedError, normalize_xml_base64_bytes, normalize_xml_base64_text,
         normalize_xml_base64_text_with_limit,
     };
+
+    #[test]
+    fn borrowed_base64_stream_crosses_text_and_decoder_buffer_boundaries() {
+        // Text/comment boundaries and the decoder's internal chunk size must
+        // not become Base64 framing boundaries or require a normalized copy.
+        use base64::Engine as _;
+        let bytes = vec![7; 4097];
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let xml = format!(
+            "<value> {}<!--boundary-->{}\n</value>",
+            &encoded[..3],
+            &encoded[3..]
+        );
+        let document = crate::xml::dom::Document::parse(&xml).expect("segmented Base64 XML");
+        let payload =
+            super::XmlBase64Payload::new(document.root_element()).expect("valid Base64 frame");
+        assert_eq!(payload.decoded_len, bytes.len());
+        let decoded = payload.decode().expect("segmented stream decodes");
+        assert_eq!(decoded.capacity(), bytes.len());
+        assert_eq!(decoded, bytes);
+    }
+
+    #[test]
+    fn borrowed_base64_rejects_noncanonical_padding_and_non_xml_whitespace() {
+        // Invalid trailing bits are checked by the stream decoder even when
+        // lexical preflight accepts the alphabet and exact decoded length.
+        for encoded in ["AR==", "AQJ=", "AQ==AQ==", "AQID\u{a0}", "AQI"] {
+            let xml = format!("<value>{encoded}</value>");
+            let document =
+                crate::xml::dom::Document::parse(&xml).expect("invalid Base64 in valid XML");
+            let result = super::XmlBase64Payload::new(document.root_element())
+                .and_then(|payload| payload.decode());
+            assert!(result.is_err(), "{encoded}");
+        }
+    }
 
     #[test]
     fn bounded_base64_normalization_rejects_before_growth() {

@@ -70,8 +70,8 @@ mod xpath;
 pub use builder::{ReferenceBuilder, SignatureBuilder, SignatureBuilderError};
 pub use digest::{DigestAlgorithm, compute_digest, compute_digest_with_provider, constant_time_eq};
 pub use keys::{
-    DefaultKeyResolver, HmacSha1VerificationKey, HmacVerificationKey, KeyResolutionError,
-    KeyResolverConfig, VerificationKey,
+    DefaultKeyResolver, HmacSha1VerificationKey, HmacVerificationKey, InspectedKeyCandidateBudget,
+    KeyResolutionError, KeyResolverConfig, VerificationKey,
 };
 pub use parse::{
     KeyInfo, KeyInfoSource, KeyValueInfo, ParseError, Reference, RetrievalMethodTransforms,

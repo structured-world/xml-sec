@@ -158,6 +158,15 @@ pub(crate) fn verify_x509_certificate_chain_with_provider(
     options: &X509ChainOptions<'_>,
     provider: &dyn crate::provider::CryptoProvider,
 ) -> Result<(), X509ChainError> {
+    verify_x509_certificate_chain_with_provider_and_crls(info, options, provider, &[])
+}
+
+pub(crate) fn verify_x509_certificate_chain_with_provider_and_crls(
+    info: &X509DataInfo,
+    options: &X509ChainOptions<'_>,
+    provider: &dyn crate::provider::CryptoProvider,
+    additional_crls: &[Vec<u8>],
+) -> Result<(), X509ChainError> {
     if options.max_chain_depth == 0 {
         return Err(X509ChainError::InvalidDepth);
     }
@@ -190,7 +199,14 @@ pub(crate) fn verify_x509_certificate_chain_with_provider(
     let verification_time = system_time_to_asn1(options.verification_time)?;
     let embedded_anchor = trusted_anchors.iter().any(|(der, _)| *der == last.as_raw());
     if embedded_anchor {
-        return validate_path(&path_der, info, options, verification_time, provider);
+        return validate_path(
+            &path_der,
+            info,
+            options,
+            verification_time,
+            provider,
+            additional_crls,
+        );
     }
 
     // Use the path-edge verifier here too: x509-parser does not verify legacy
@@ -226,7 +242,14 @@ pub(crate) fn verify_x509_certificate_chain_with_provider(
         }
         let mut candidate_path = candidate_base.to_vec();
         candidate_path.push(anchor_der);
-        match validate_path(&candidate_path, info, options, verification_time, provider) {
+        match validate_path(
+            &candidate_path,
+            info,
+            options,
+            verification_time,
+            provider,
+            additional_crls,
+        ) {
             Ok(()) => return Ok(()),
             Err(error) => first_validation_error.get_or_insert(error),
         };
@@ -241,6 +264,7 @@ fn validate_path(
     options: &X509ChainOptions<'_>,
     verification_time: ASN1Time,
     provider: &dyn crate::provider::CryptoProvider,
+    additional_crls: &[Vec<u8>],
 ) -> Result<(), X509ChainError> {
     if path_der.len() > options.max_chain_depth {
         return Err(X509ChainError::DepthExceeded(options.max_chain_depth));
@@ -283,7 +307,13 @@ fn validate_path(
     }
 
     if options.check_crls {
-        verify_crls(&path, &info.crls, verification_time, provider)?;
+        verify_crls(
+            &path,
+            &info.crls,
+            additional_crls,
+            verification_time,
+            provider,
+        )?;
     }
     Ok(())
 }
@@ -1669,11 +1699,13 @@ fn validate_crl_extension_semantics(
 fn verify_crls(
     path: &[X509Certificate<'_>],
     crl_der: &[Vec<u8>],
+    additional_crls: &[Vec<u8>],
     verification_time: ASN1Time,
     provider: &dyn crate::provider::CryptoProvider,
 ) -> Result<(), X509ChainError> {
     let crls = crl_der
         .iter()
+        .chain(additional_crls)
         .enumerate()
         .map(|(idx, der)| {
             let (rest, crl) = CertificateRevocationList::from_der(der).map_err(|error| {

@@ -185,6 +185,18 @@ headers, or DER structure select encrypted versus plain decoding first: a
 supplied password is ignored for a plain key, while a missing or wrong password
 for an encrypted key fails without a plaintext fallback, before output is
 committed, and is never included in diagnostics.
+`--keys-file FILE` imports a bounded xmlsec `keys.xml` store for sign, verify,
+encrypt, and decrypt. Named HMAC/DSA signers, named HMAC/RSA/EC public
+verification keys, direct AES content keys, and RSA-OAEP encryption recipients are selected
+from the same caller-owned inventory; an imported key never bypasses the
+operation policy. XML `RSAKeyValue` entries are public-only and cannot recover
+an encrypted recipient key; use `--privkey-pem`, `--privkey-der`, or `--pkcs12`
+for RSA decryption. `--pkcs12[:NAME] FILE --pwd PASSWORD` supplies one private
+key and its certificate chain for sign or RSA decryption. Bundles with multiple
+private keys are rejected rather than selecting an arbitrary bag. Neither
+option triggers network lookup or implicit key discovery. See
+[Key management](key-management.md) for the byte-oriented library API and trust
+model.
 
 Verification accepts `-` as the conventional stdin marker. Verification starts
 at the document root and uses the first descendant `Signature` in document order.
@@ -266,6 +278,9 @@ a different recipient. Selector-only `X509Data` (`X509SubjectName`,
 supplied through `--pubkey-cert-pem` or `--pubkey-cert-der`; a bare public key
 cannot satisfy certificate identity metadata. `KeyName` remains a lookup hint
 and empty `X509Data` remains a non-binding placeholder.
+All nested recipient `KeyInfo` elements share the operation's embedded-key,
+X.509 binary-data, and XML Base parsing allowances; each recipient does not
+receive a fresh default limit. Candidate limits are checked before decoding.
 For `--xml-data`, a missing template `Type` is materialized as XML Element
 metadata so a later embedded-document decrypt can perform XML replacement. As
 in libxmlsec1, the input is parsed as an XML document: Element encryption

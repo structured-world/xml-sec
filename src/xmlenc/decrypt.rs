@@ -85,6 +85,28 @@ impl KeyCandidateBudget {
 
 /// Supplies a content-encryption key for parsed XMLEnc data.
 pub trait DecryptionKeyResolver {
+    /// Resolve under the operation's immutable snapshot. RSA resolvers enforce
+    /// `rsa_keys` before provider recovery; wrappers must forward this snapshot.
+    ///
+    /// The default supports direct content keys only and returns
+    /// [`XmlEncError::KeyNotFound`] for recipients without invoking legacy
+    /// resolution. Recipient resolvers must override this method: recovered
+    /// symmetric bytes cannot prove the original key met the operation policy.
+    fn resolve_key_candidates_with_policy(
+        &self,
+        provider: &dyn crate::provider::CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        encrypted_key: Option<&EncryptedKey>,
+        policy: &crate::policy::DecryptionPolicy,
+        budget: &mut KeyCandidateBudget,
+    ) -> Result<Vec<Vec<u8>>, XmlEncError> {
+        policy.validate()?;
+        if encrypted_key.is_some() {
+            return Err(XmlEncError::KeyNotFound);
+        }
+        self.resolve_key_candidates(provider, algorithm, None, budget)
+    }
+
     /// Resolve the symmetric key for `algorithm`, optionally unwrapping `encrypted_key`.
     fn resolve_key(
         &self,
@@ -507,6 +529,20 @@ impl KekDecryptor {
 }
 
 impl DecryptionKeyResolver for KekDecryptor {
+    fn resolve_key_candidates_with_policy(
+        &self,
+        provider: &dyn crate::provider::CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        encrypted_key: Option<&EncryptedKey>,
+        policy: &crate::policy::DecryptionPolicy,
+        budget: &mut KeyCandidateBudget,
+    ) -> Result<Vec<Vec<u8>>, XmlEncError> {
+        policy.validate()?;
+        // This resolver accepts only AES-KW and validates its fixed KEK width
+        // before unwrap; it cannot dispatch an RSA recovery without metadata.
+        self.resolve_key_candidates(provider, algorithm, encrypted_key, budget)
+    }
+
     fn resolve_key(
         &self,
         provider: &dyn crate::provider::CryptoProvider,
@@ -572,13 +608,60 @@ impl PrivateKeyDecryptor {
 }
 
 impl DecryptionKeyResolver for PrivateKeyDecryptor {
+    fn resolve_key_candidates_with_policy(
+        &self,
+        provider: &dyn crate::provider::CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        encrypted_key: Option<&EncryptedKey>,
+        policy: &crate::policy::DecryptionPolicy,
+        budget: &mut KeyCandidateBudget,
+    ) -> Result<Vec<Vec<u8>>, XmlEncError> {
+        policy.validate()?;
+        budget.consume(1)?;
+        self.resolve_key_with_policy(provider, algorithm, encrypted_key, policy)
+            .map(|key| vec![key])
+    }
+
     fn resolve_key(
         &self,
         provider: &dyn crate::provider::CryptoProvider,
         algorithm: DataEncryptionAlgorithm,
         encrypted_key: Option<&EncryptedKey>,
     ) -> Result<Vec<u8>, XmlEncError> {
+        self.resolve_key_with_policy(
+            provider,
+            algorithm,
+            encrypted_key,
+            &crate::policy::DecryptionPolicy::default(),
+        )
+    }
+}
+
+impl PrivateKeyDecryptor {
+    /// Recover one session key using the exact operation policy. This avoids
+    /// a temporary candidate collection when composing ordered RSA key rings.
+    pub fn resolve_key_with_policy(
+        &self,
+        provider: &dyn crate::provider::CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        encrypted_key: Option<&EncryptedKey>,
+        policy: &crate::policy::DecryptionPolicy,
+    ) -> Result<Vec<u8>, XmlEncError> {
+        policy.validate()?;
         let encrypted_key = encrypted_key.ok_or(XmlEncError::KeyNotFound)?;
+        let width = policy.rsa_keys.validate_public_metadata(
+            "decryption",
+            self.key.rsa_modulus_bits(),
+            self.key.rsa_public_exponent(),
+        )?;
+        if width != self.key.ciphertext_len() {
+            return Err(crate::policy::PolicyViolation::InvalidKeyMaterial {
+                operation: "decryption",
+                key_type: "RSA",
+                reason: "ciphertext width disagrees with modulus",
+            }
+            .into());
+        }
         encrypted_key.encryption_method.validate_structure()?;
         let wrapped = STANDARD
             .decode(&encrypted_key.cipher_data.value)
@@ -886,7 +969,7 @@ fn resolve_content_key_candidates(
 ) -> Result<Vec<Vec<u8>>, XmlEncError> {
     let mut last_error = None;
     let mut candidates =
-        match resolve_candidates_with_budget(resolver, provider, algorithm, None, budget) {
+        match resolve_candidates_with_budget(resolver, provider, algorithm, None, policy, budget) {
             Ok(keys) => keys,
             Err(error) => {
                 record_candidate_source_error_or_fail_operation(error, &mut last_error)?;
@@ -906,6 +989,7 @@ fn resolve_content_key_candidates(
             provider,
             algorithm,
             Some(encrypted_key),
+            policy,
             budget,
         ) {
             Ok(keys) => candidates.extend(keys),
@@ -938,10 +1022,17 @@ fn resolve_candidates_with_budget(
     provider: &dyn crate::provider::CryptoProvider,
     algorithm: DataEncryptionAlgorithm,
     encrypted_key: Option<&EncryptedKey>,
+    policy: &crate::policy::DecryptionPolicy,
     budget: &mut KeyCandidateBudget,
 ) -> Result<Vec<Vec<u8>>, XmlEncError> {
     let remaining_before = budget.remaining();
-    let keys = resolver.resolve_key_candidates(provider, algorithm, encrypted_key, budget)?;
+    let keys = resolver.resolve_key_candidates_with_policy(
+        provider,
+        algorithm,
+        encrypted_key,
+        policy,
+        budget,
+    )?;
     budget.account_returned_candidates(remaining_before, keys.len())?;
     Ok(keys)
 }
@@ -1193,7 +1284,10 @@ fn projected_decoded_len_for_encoded_len(encoded_len: usize) -> usize {
         .unwrap_or(usize::MAX)
 }
 
-fn validate_key_len(algorithm: DataEncryptionAlgorithm, key: &[u8]) -> Result<(), XmlEncError> {
+pub(crate) fn validate_key_len(
+    algorithm: DataEncryptionAlgorithm,
+    key: &[u8],
+) -> Result<(), XmlEncError> {
     if key.len() == algorithm.key_len() {
         Ok(())
     } else {
@@ -1345,6 +1439,65 @@ mod tests {
     }
 
     #[test]
+    fn policy_unaware_recipient_resolver_is_not_dispatched() {
+        // An already-recovered AES key cannot prove that its RSA source met
+        // the operation's minimum. Reject the legacy recipient path before
+        // lookup, while keeping direct symmetric resolution available.
+        struct LegacyRecipient {
+            recipient_calls: Cell<usize>,
+            key: Vec<u8>,
+        }
+        impl DecryptionKeyResolver for LegacyRecipient {
+            fn resolve_key(
+                &self,
+                _provider: &dyn crate::provider::CryptoProvider,
+                _algorithm: DataEncryptionAlgorithm,
+                encrypted_key: Option<&EncryptedKey>,
+            ) -> Result<Vec<u8>, XmlEncError> {
+                if encrypted_key.is_none() {
+                    return Err(XmlEncError::KeyNotFound);
+                }
+                self.recipient_calls.set(self.recipient_calls.get() + 1);
+                Ok(self.key.clone())
+            }
+        }
+        let resolver = LegacyRecipient {
+            recipient_calls: Cell::new(0),
+            key: vec![0x63; 16],
+        };
+        let encrypted = encrypted_data_with_recipients(
+            &resolver.key,
+            vec![associated_encrypted_key("recipient", None, None)],
+            None,
+        );
+        assert!(matches!(
+            DecryptContext::new(&resolver).decrypt_data(&encrypted),
+            Err(XmlEncError::KeyNotFound)
+        ));
+        assert_eq!(resolver.recipient_calls.get(), 0);
+
+        let direct = SymmetricKeyDecryptor::new(resolver.key.clone());
+        let mut budget = KeyCandidateBudget::with_limit(1);
+        assert!(matches!(
+            resolver.resolve_key_candidates_with_policy(
+                crate::provider::default_provider(),
+                DataEncryptionAlgorithm::Aes128Gcm,
+                encrypted.encrypted_keys.first(),
+                &crate::policy::DecryptionPolicy::default(),
+                &mut budget,
+            ),
+            Err(XmlEncError::KeyNotFound)
+        ));
+        assert_eq!(budget.remaining(), 1, "no recipient work was performed");
+        assert_eq!(
+            DecryptContext::new(&direct)
+                .decrypt_data(&encrypted)
+                .expect("direct AES does not require RSA metadata"),
+            DecryptedContent::Bytes(b"payload".to_vec())
+        );
+    }
+
+    #[test]
     fn document_decryption_initial_parse_uses_the_policy_work_budget() {
         // Candidate retries and replacement validation must inherit the same
         // allowance consumed by the caller document's initial parse.
@@ -1406,6 +1559,19 @@ mod tests {
     }
 
     impl DecryptionKeyResolver for DirectAndRecipientResolver {
+        fn resolve_key_candidates_with_policy(
+            &self,
+            provider: &dyn crate::provider::CryptoProvider,
+            algorithm: DataEncryptionAlgorithm,
+            encrypted_key: Option<&EncryptedKey>,
+            policy: &crate::policy::DecryptionPolicy,
+            budget: &mut KeyCandidateBudget,
+        ) -> Result<Vec<Vec<u8>>, XmlEncError> {
+            // Prepared test keys simulate source ordering, not RSA recovery.
+            policy.validate()?;
+            self.resolve_key_candidates(provider, algorithm, encrypted_key, budget)
+        }
+
         fn resolve_key(
             &self,
             _provider: &dyn crate::provider::CryptoProvider,
@@ -1421,6 +1587,19 @@ mod tests {
     }
 
     impl DecryptionKeyResolver for FailingDirectResolver {
+        fn resolve_key_candidates_with_policy(
+            &self,
+            provider: &dyn crate::provider::CryptoProvider,
+            algorithm: DataEncryptionAlgorithm,
+            encrypted_key: Option<&EncryptedKey>,
+            policy: &crate::policy::DecryptionPolicy,
+            budget: &mut KeyCandidateBudget,
+        ) -> Result<Vec<Vec<u8>>, XmlEncError> {
+            // Prepared test keys simulate lookup errors, not RSA recovery.
+            policy.validate()?;
+            self.resolve_key_candidates(provider, algorithm, encrypted_key, budget)
+        }
+
         fn resolve_key(
             &self,
             _provider: &dyn crate::provider::CryptoProvider,
@@ -1467,13 +1646,16 @@ mod tests {
             Err(XmlEncError::KeyNotFound)
         }
 
-        fn resolve_key_candidates(
+        fn resolve_key_candidates_with_policy(
             &self,
             _provider: &dyn crate::provider::CryptoProvider,
             _algorithm: DataEncryptionAlgorithm,
             encrypted_key: Option<&EncryptedKey>,
+            policy: &crate::policy::DecryptionPolicy,
             budget: &mut KeyCandidateBudget,
         ) -> Result<Vec<Vec<u8>>, XmlEncError> {
+            // Prepared test keys exercise operation-wide candidate accounting.
+            policy.validate()?;
             if encrypted_key.is_none() {
                 budget.consume(1)?;
                 return Ok(vec![self.direct.clone()]);
@@ -1493,13 +1675,16 @@ mod tests {
             Err(XmlEncError::KeyNotFound)
         }
 
-        fn resolve_key_candidates(
+        fn resolve_key_candidates_with_policy(
             &self,
             _provider: &dyn crate::provider::CryptoProvider,
             _algorithm: DataEncryptionAlgorithm,
             encrypted_key: Option<&EncryptedKey>,
+            policy: &crate::policy::DecryptionPolicy,
             budget: &mut KeyCandidateBudget,
         ) -> Result<Vec<Vec<u8>>, XmlEncError> {
+            // Prepared test keys simulate authenticated candidate ordering.
+            policy.validate()?;
             budget.consume(1)?;
             match encrypted_key.and_then(|key| key.id.as_deref()) {
                 Some("first") => Ok(vec![self.wrong.clone()]),
@@ -1545,13 +1730,16 @@ mod tests {
             Err(XmlEncError::KeyNotFound)
         }
 
-        fn resolve_key_candidates(
+        fn resolve_key_candidates_with_policy(
             &self,
             _provider: &dyn crate::provider::CryptoProvider,
             _algorithm: DataEncryptionAlgorithm,
             encrypted_key: Option<&EncryptedKey>,
+            policy: &crate::policy::DecryptionPolicy,
             budget: &mut KeyCandidateBudget,
         ) -> Result<Vec<Vec<u8>>, XmlEncError> {
+            // Prepared test keys isolate aggregate work from RSA primitives.
+            policy.validate()?;
             let encrypted_key = encrypted_key.ok_or(XmlEncError::KeyNotFound)?;
             let attempts = budget.remaining();
             if attempts == 0 {
@@ -1577,13 +1765,16 @@ mod tests {
             Err(XmlEncError::KeyNotFound)
         }
 
-        fn resolve_key_candidates(
+        fn resolve_key_candidates_with_policy(
             &self,
             _provider: &dyn crate::provider::CryptoProvider,
             _algorithm: DataEncryptionAlgorithm,
             encrypted_key: Option<&EncryptedKey>,
+            policy: &crate::policy::DecryptionPolicy,
             budget: &mut KeyCandidateBudget,
         ) -> Result<Vec<Vec<u8>>, XmlEncError> {
+            // Prepared test keys isolate XMLEnc association selection.
+            policy.validate()?;
             let encrypted_key = encrypted_key.ok_or(XmlEncError::KeyNotFound)?;
             budget.consume(1)?;
             self.visited
@@ -1659,6 +1850,12 @@ mod tests {
     struct OpaqueRecoveryKey;
 
     impl crate::provider::KeyRecoveryKey for OpaqueRecoveryKey {
+        fn rsa_modulus_bits(&self) -> usize {
+            2048
+        }
+        fn rsa_public_exponent(&self) -> Option<u64> {
+            Some(65537)
+        }
         fn ciphertext_len(&self) -> usize {
             256
         }
@@ -1823,6 +2020,19 @@ mod tests {
     }
 
     impl DecryptionKeyResolver for CountingResolver {
+        fn resolve_key_candidates_with_policy(
+            &self,
+            provider: &dyn crate::provider::CryptoProvider,
+            algorithm: DataEncryptionAlgorithm,
+            encrypted_key: Option<&EncryptedKey>,
+            policy: &crate::policy::DecryptionPolicy,
+            budget: &mut KeyCandidateBudget,
+        ) -> Result<Vec<Vec<u8>>, XmlEncError> {
+            // Prepared test keys isolate validation-before-lookup ordering.
+            policy.validate()?;
+            self.resolve_key_candidates(provider, algorithm, encrypted_key, budget)
+        }
+
         fn resolve_key(
             &self,
             _provider: &dyn crate::provider::CryptoProvider,
@@ -1851,6 +2061,19 @@ mod tests {
     }
 
     impl DecryptionKeyResolver for RecipientKeyResolver {
+        fn resolve_key_candidates_with_policy(
+            &self,
+            provider: &dyn crate::provider::CryptoProvider,
+            algorithm: DataEncryptionAlgorithm,
+            encrypted_key: Option<&EncryptedKey>,
+            policy: &crate::policy::DecryptionPolicy,
+            budget: &mut KeyCandidateBudget,
+        ) -> Result<Vec<Vec<u8>>, XmlEncError> {
+            // Prepared test keys simulate recipient labels, not RSA recovery.
+            policy.validate()?;
+            self.resolve_key_candidates(provider, algorithm, encrypted_key, budget)
+        }
+
         fn resolve_key(
             &self,
             _provider: &dyn crate::provider::CryptoProvider,

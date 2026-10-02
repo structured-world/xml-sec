@@ -38,6 +38,12 @@ impl KeyTransportKey for ExternalPublicKey {
 struct ExternalPrivateKey;
 
 impl KeyRecoveryKey for ExternalPrivateKey {
+    fn rsa_modulus_bits(&self) -> usize {
+        2048
+    }
+    fn rsa_public_exponent(&self) -> Option<u64> {
+        Some(65537)
+    }
     fn ciphertext_len(&self) -> usize {
         256
     }
@@ -195,7 +201,7 @@ fn opaque_provider_keys_cross_the_public_encrypt_and_decrypt_pipelines() {
         .expect("external transport provider must produce EncryptedData");
     assert!(encrypted.encrypted_data_xml.contains("rsa-oaep"));
 
-    // The reciprocal public resolver exposes only RSA ciphertext width. The
+    // The reciprocal public resolver exposes RSA public metadata and width. The
     // custom provider recovers the content key and decrypts without accessing
     // private key material through RustCrypto.
     let xml = external_encrypted_xml();
@@ -208,6 +214,81 @@ fn opaque_provider_keys_cross_the_public_encrypt_and_decrypt_pipelines() {
         decrypted,
         xml_sec::xmlenc::DecryptedContent::Bytes(b"external plaintext".to_vec())
     );
+}
+
+#[test]
+fn recovery_key_policy_precedes_opaque_provider_dispatch() {
+    // A structurally valid ciphertext is not permission to recover with a key
+    // below the operation minimum, even when a custom provider supports it.
+    let resolver = PrivateKeyDecryptor::provider_key(Arc::new(ExternalPrivateKey));
+    let mut policy = xml_sec::policy::DecryptionPolicy::default();
+    policy.rsa_keys.minimum_modulus_bits = 4096;
+    assert!(matches!(
+        DecryptContext::new(&resolver)
+            .policy(policy)
+            .provider(&ExternalProvider::RECOVERY_ONLY)
+            .decrypt(&external_encrypted_xml()),
+        Err(XmlEncError::Policy(
+            xml_sec::policy::PolicyViolation::KeySize {
+                operation: "decryption",
+                actual_bits: 2048,
+                minimum_bits: 4096,
+                ..
+            }
+        ))
+    ));
+}
+
+struct RecoveryMetadata {
+    bits: usize,
+    exponent: Option<u64>,
+    width: usize,
+}
+
+impl KeyRecoveryKey for RecoveryMetadata {
+    fn rsa_modulus_bits(&self) -> usize {
+        self.bits
+    }
+    fn rsa_public_exponent(&self) -> Option<u64> {
+        self.exponent
+    }
+    fn ciphertext_len(&self) -> usize {
+        self.width
+    }
+    fn recover_with_provider(
+        &self,
+        _provider: &dyn CryptoProvider,
+        _parameters: &RsaOaepParameters,
+        _ciphertext: &[u8],
+    ) -> Result<Vec<u8>, ProviderError> {
+        panic!("invalid metadata must not reach key recovery")
+    }
+}
+
+#[test]
+fn recovery_metadata_is_checked_without_rounding_or_dispatch() {
+    // Byte width alone hides a too-small non-byte-aligned modulus. Zero,
+    // unsupported exponents, and contradictory widths must also fail closed.
+    for (bits, exponent, width) in [
+        (2047, Some(65537), 256),
+        (0, Some(65537), 256),
+        (8193, Some(65537), 1025),
+        (2048, None, 256),
+        (2048, Some(2), 256),
+        (2048, Some(65537), 255),
+    ] {
+        let resolver = PrivateKeyDecryptor::provider_key(Arc::new(RecoveryMetadata {
+            bits,
+            exponent,
+            width,
+        }));
+        assert!(matches!(
+            DecryptContext::new(&resolver)
+                .provider(&ExternalProvider::RECOVERY_ONLY)
+                .decrypt(&external_encrypted_xml()),
+            Err(XmlEncError::Policy(_))
+        ));
+    }
 }
 
 #[test]
