@@ -7468,11 +7468,7 @@ fn rsa_decryption_accepts_private_key_certificate_companions() {
         pem::encode(&pem::Pem::new("CERTIFICATE", altered)),
     )
     .unwrap();
-    for provider in [
-        "rustcrypto",
-        #[cfg(feature = "aws-lc-fips")]
-        "aws-lc-fips",
-    ] {
+    let check_companion = |provider: &str| {
         let rejected = Command::new(binary())
             .args(["decrypt", "--crypto", provider, "--privkey-pem"])
             .arg(format!(
@@ -7501,7 +7497,10 @@ fn rsa_decryption_accepts_private_key_certificate_companions() {
             String::from_utf8_lossy(&accepted.stderr)
         );
         assert_eq!(accepted.stdout, b"certificate companion");
-    }
+    };
+    check_companion("rustcrypto");
+    #[cfg(feature = "aws-lc-fips")]
+    check_companion("aws-lc-fips");
     let decrypt = Command::new(binary())
         .args(["decrypt", "--privkey-pem"])
         .arg(compound)
