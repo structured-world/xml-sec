@@ -99,6 +99,10 @@ impl HmacVerificationKey {
             }};
         }
         Ok(match algorithm {
+            #[cfg(feature = "legacy-algorithms")]
+            SignatureAlgorithm::HmacMd5 => verify_hmac!(md5::Md5),
+            #[cfg(feature = "legacy-algorithms")]
+            SignatureAlgorithm::HmacRipemd160 => verify_hmac!(ripemd::Ripemd160),
             SignatureAlgorithm::HmacSha1 => verify_hmac!(sha1::Sha1),
             SignatureAlgorithm::HmacSha224 => verify_hmac!(sha2::Sha224),
             SignatureAlgorithm::HmacSha256 => verify_hmac!(sha2::Sha256),
@@ -217,6 +221,18 @@ impl VerifyingKey for VerificationKey {
     }
     fn validate_policy(&self, policy: &crate::policy::VerificationPolicy) -> Result<(), DsigError> {
         let result = match self.algorithm {
+            #[cfg(feature = "legacy-algorithms")]
+            SignatureAlgorithm::RsaMd5 | SignatureAlgorithm::RsaRipemd160 => {
+                validate_rsa_signature_spki_with_minimum(
+                    self.algorithm,
+                    &self.public_key_bytes,
+                    policy.key_trust.rsa_keys.minimum_modulus_bits,
+                )
+            }
+            #[cfg(feature = "legacy-algorithms")]
+            SignatureAlgorithm::HmacMd5
+            | SignatureAlgorithm::HmacRipemd160
+            | SignatureAlgorithm::EcdsaRipemd160 => Ok(()),
             SignatureAlgorithm::Ed25519
             | SignatureAlgorithm::Ed25519Ctx
             | SignatureAlgorithm::Ed25519Ph
@@ -298,6 +314,26 @@ impl VerifyingKey for VerificationKey {
             return Err(KeyResolutionError::AlgorithmMismatch.into());
         }
         let result = match algorithm {
+            #[cfg(feature = "legacy-algorithms")]
+            SignatureAlgorithm::RsaMd5 | SignatureAlgorithm::RsaRipemd160 => {
+                verify_rsa_signature_spki_primitive(
+                    algorithm,
+                    &self.public_key_bytes,
+                    signed_data,
+                    signature_value,
+                )
+            }
+            #[cfg(feature = "legacy-algorithms")]
+            SignatureAlgorithm::EcdsaRipemd160 => verify_ecdsa_signature_spki(
+                algorithm,
+                &self.public_key_bytes,
+                signed_data,
+                signature_value,
+            ),
+            #[cfg(feature = "legacy-algorithms")]
+            SignatureAlgorithm::HmacMd5 | SignatureAlgorithm::HmacRipemd160 => {
+                return Err(KeyResolutionError::AlgorithmMismatch.into());
+            }
             SignatureAlgorithm::Ed25519
             | SignatureAlgorithm::Ed25519Ctx
             | SignatureAlgorithm::Ed25519Ph
@@ -385,14 +421,7 @@ struct PolicyBoundVerificationKey {
 impl VerifyingKey for PolicyBoundVerificationKey {
     fn verification_spki(&self, algorithm: SignatureAlgorithm) -> Result<Option<&[u8]>, DsigError> {
         // Preserve strength checks carried by this resolver-produced handle.
-        if matches!(
-            algorithm,
-            SignatureAlgorithm::RsaSha1
-                | SignatureAlgorithm::RsaSha224
-                | SignatureAlgorithm::RsaSha256
-                | SignatureAlgorithm::RsaSha384
-                | SignatureAlgorithm::RsaSha512
-        ) {
+        if algorithm.is_rsa() {
             validate_rsa_signature_spki_with_minimum(
                 algorithm,
                 &self.key.public_key_bytes,
@@ -453,11 +482,7 @@ impl VerifyingKey for PolicyBoundVerificationKey {
                     self.dsa_minimum_bits,
                 )
             }
-            SignatureAlgorithm::RsaSha1
-            | SignatureAlgorithm::RsaSha224
-            | SignatureAlgorithm::RsaSha256
-            | SignatureAlgorithm::RsaSha384
-            | SignatureAlgorithm::RsaSha512 => verify_rsa_signature_spki_with_minimum(
+            algorithm if algorithm.is_rsa() => verify_rsa_signature_spki_with_minimum(
                 algorithm,
                 &self.key.public_key_bytes,
                 signed_data,
@@ -1209,14 +1234,7 @@ impl DefaultKeyResolver {
                 dsa_key_value_to_spki_der(p, q, g, y)?
             }
             KeyValueInfo::Rsa { modulus, exponent } => {
-                if !matches!(
-                    algorithm,
-                    SignatureAlgorithm::RsaSha1
-                        | SignatureAlgorithm::RsaSha224
-                        | SignatureAlgorithm::RsaSha256
-                        | SignatureAlgorithm::RsaSha384
-                        | SignatureAlgorithm::RsaSha512
-                ) {
+                if !algorithm.is_rsa() {
                     return Err(KeyResolutionError::AlgorithmMismatch);
                 }
                 rsa_key_value_to_spki_der(modulus, exponent)?
@@ -1669,29 +1687,13 @@ fn validate_spki_algorithm(
                 .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
             Ok(())
         }
-        (
-            SignatureAlgorithm::RsaSha1
-            | SignatureAlgorithm::RsaSha224
-            | SignatureAlgorithm::RsaSha256
-            | SignatureAlgorithm::RsaSha384
-            | SignatureAlgorithm::RsaSha512,
-            PublicKey::RSA(_),
-        ) => Ok(()),
-        (
-            SignatureAlgorithm::EcdsaSha1
-            | SignatureAlgorithm::EcdsaSha224
-            | SignatureAlgorithm::EcdsaSha256
-            | SignatureAlgorithm::EcdsaSha384
-            | SignatureAlgorithm::EcdsaSha512
-            | SignatureAlgorithm::EcdsaSha3_224
-            | SignatureAlgorithm::EcdsaSha3_256
-            | SignatureAlgorithm::EcdsaSha3_384
-            | SignatureAlgorithm::EcdsaSha3_512,
-            PublicKey::EC(ec),
-        ) if matches!(
-            curve_oid.as_deref(),
-            Some(EC_P256_OID | EC_P384_OID | EC_P521_OID)
-        ) =>
+        (method, PublicKey::RSA(_)) if method.is_rsa() => Ok(()),
+        (method, PublicKey::EC(ec))
+            if method.ecdsa_digest().is_some()
+                && matches!(
+                    curve_oid.as_deref(),
+                    Some(EC_P256_OID | EC_P384_OID | EC_P521_OID)
+                ) =>
         {
             validate_ec_public_key_encoding(&ec, spki.subject_public_key.data.as_ref())
                 .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
@@ -2050,7 +2052,7 @@ mod tests {
             {
                 return Err(crate::provider::ProviderError::Unsupported {
                     operation: crate::provider::ProviderOperation::VerifyCertificate,
-                    algorithm: Some(algorithm.oid().to_owned()),
+                    algorithm: algorithm.oid().map(str::to_owned),
                 });
             }
             crate::provider::default_provider().verify_x509_signature(

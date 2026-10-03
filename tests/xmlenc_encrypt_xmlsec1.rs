@@ -114,6 +114,94 @@ fn xmlsec1_decrypts_direct_aes_gcm_from_xml_sec() {
     );
 }
 
+#[cfg(feature = "legacy-algorithms")]
+#[test]
+fn xmlsec1_decrypts_all_optional_content_and_transport_methods() {
+    // Independent libxmlsec1 checks the 8-byte TDEA framing, AES-192 nonce/tag
+    // layout, and parameterless RSA-1.5 transport, not just our own round trips.
+    use xml_sec::policy::EncryptionPolicy;
+    use xml_sec::xmlenc::KeyTransportAlgorithm;
+    if !xmlsec1::is_available() {
+        eprintln!("{}", xmlsec1::skip_reason());
+        return;
+    }
+    let plaintext = b"optional legacy mechanism interoperability";
+    for algorithm in [
+        DataEncryptionAlgorithm::TripleDesCbc,
+        DataEncryptionAlgorithm::Aes192Cbc,
+        DataEncryptionAlgorithm::Aes192Gcm,
+    ] {
+        let key = [0x31; 24];
+        let encrypted = EncryptedDataBuilder::new(algorithm)
+            .direct_key(key)
+            .direct_key_name("interop")
+            .policy(EncryptionPolicy {
+                data_algorithms: Some([algorithm].into()),
+                ..EncryptionPolicy::default()
+            })
+            .encrypt_binary(plaintext)
+            .expect("explicitly permitted encryption");
+        let file = TemporaryFile::write("legacy-key", "bin", &key);
+        let option = if algorithm == DataEncryptionAlgorithm::TripleDesCbc {
+            "--deskey:interop"
+        } else {
+            "--aeskey:interop"
+        };
+        assert_eq!(
+            decrypt_with_xmlsec1(&encrypted.encrypted_data_xml, option, &file.path),
+            plaintext
+        );
+    }
+    for algorithm in [
+        xml_sec::xmlenc::KeyWrapAlgorithm::AesKw192,
+        xml_sec::xmlenc::KeyWrapAlgorithm::TripleDes,
+    ] {
+        // Verify emitted CMS and AES-192 key-wrap bytes with the independent
+        // resolver, complementing imported donor ciphertext decryption.
+        let key = [0x31; 24];
+        let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .add_recipient(
+                EncryptionRecipient::aes_key_wrap(key, algorithm).key_name("interop-wrap"),
+            )
+            .policy(EncryptionPolicy {
+                key_wrap_algorithms: Some([algorithm].into()),
+                ..EncryptionPolicy::default()
+            })
+            .encrypt_binary(plaintext)
+            .expect("permitted wrapping");
+        let file = TemporaryFile::write("legacy-kek", "bin", &key);
+        let option = if algorithm == xml_sec::xmlenc::KeyWrapAlgorithm::TripleDes {
+            "--deskey:interop-wrap"
+        } else {
+            "--aeskey:interop-wrap"
+        };
+        assert_eq!(
+            decrypt_with_xmlsec1(&encrypted.encrypted_data_xml, option, &file.path),
+            plaintext
+        );
+    }
+    let public = RsaPublicKey::from_public_key_pem(
+        &fs::read_to_string("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem").expect("public key"),
+    )
+    .expect("RSA SPKI");
+    let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .add_recipient(EncryptionRecipient::rsa_pkcs1v15(public).key_name("interop-rsa"))
+        .policy(EncryptionPolicy {
+            key_transport_algorithms: Some([KeyTransportAlgorithm::RsaPkcs1v15].into()),
+            ..EncryptionPolicy::default()
+        })
+        .encrypt_binary(plaintext)
+        .expect("RSA-1.5 encryption");
+    assert_eq!(
+        decrypt_with_xmlsec1(
+            &encrypted.encrypted_data_xml,
+            "--privkey-pem:interop-rsa",
+            Path::new("tests/fixtures/keys/rsa/rsa-2048-key.pem")
+        ),
+        plaintext
+    );
+}
+
 #[test]
 fn xmlsec1_decrypts_rsa_oaep_wrapped_aes_cbc_from_xml_sec() {
     // This covers generated session-key transport, OAEP digest/MGF metadata,

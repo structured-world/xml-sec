@@ -526,7 +526,19 @@ impl EncryptedDataBuilder {
                 validate_content_key(self.algorithm, key)?;
                 key.clone()
             } else {
-                random_bytes(self.provider.as_ref(), self.algorithm.key_len())?
+                let key = random_bytes(self.provider.as_ref(), self.algorithm.key_len())?;
+                #[cfg(feature = "legacy-algorithms")]
+                let mut key = key;
+                #[cfg(feature = "legacy-algorithms")]
+                if self.algorithm == DataEncryptionAlgorithm::TripleDesCbc {
+                    // RFC 3217 §3.1: generated DES CEKs use odd octet parity.
+                    // Normalize here, not in wrapping, which also accepts AES keys.
+                    // https://www.rfc-editor.org/rfc/rfc3217#section-3.1
+                    for octet in &mut key {
+                        *octet = (*octet & 0xfe) | (((*octet & 0xfe).count_ones() as u8 & 1) ^ 1);
+                    }
+                }
+                key
             };
             let encrypted_keys = self
                 .recipients
@@ -589,17 +601,11 @@ impl EncryptedDataBuilder {
         if let EncryptedDataType::Other(uri) = &self.encrypted_type {
             validate_metadata("EncryptedData Type", Some(uri), metadata_limit)?;
         }
-        if policy
-            .data_algorithms
-            .as_ref()
-            .is_some_and(|allowed| !allowed.contains(&self.algorithm))
-        {
-            return Err(crate::policy::PolicyViolation::Algorithm {
-                operation: "encryption",
-                algorithm: self.algorithm.to_string(),
-            }
-            .into());
-        }
+        crate::policy::check_content_algorithm(
+            policy.data_algorithms.as_ref(),
+            self.algorithm,
+            "encryption",
+        )?;
         if self.recipients.len() > policy.resources.max_encryption_recipients {
             return Err(crate::policy::PolicyViolation::ResourceLimit {
                 resource: crate::policy::resource_name::ENCRYPTION_RECIPIENTS,
@@ -623,12 +629,46 @@ impl EncryptedDataBuilder {
         )?;
         for recipient in &self.recipients {
             match recipient {
+                #[cfg(feature = "legacy-algorithms")]
+                EncryptionRecipient::RsaPkcs1v15 {
+                    public_key,
+                    recipient,
+                    key_name,
+                } => {
+                    let algorithm = super::KeyTransportAlgorithm::RsaPkcs1v15;
+                    if !policy
+                        .key_transport_algorithms
+                        .as_ref()
+                        .is_some_and(|allowed| allowed.contains(&algorithm))
+                    {
+                        return Err(crate::policy::PolicyViolation::Algorithm {
+                            operation: "encryption",
+                            algorithm: algorithm.uri().into(),
+                        }
+                        .into());
+                    }
+                    validate_key_transport_recipient(public_key.as_ref(), policy)?;
+                    validate_metadata(
+                        "EncryptedKey Recipient",
+                        recipient.as_deref(),
+                        metadata_limit,
+                    )?;
+                    validate_key_name("EncryptedKey KeyName", key_name.as_deref(), metadata_limit)?;
+                }
                 EncryptionRecipient::RsaOaep {
                     public_key,
                     parameters,
                     recipient,
                     key_name,
                 } => {
+                    // XMLEnc 1.1 §5.5.1 has no OAEP parameters. Its algorithm
+                    // must use the separate typed recipient, never this OAEP path.
+                    // https://www.w3.org/TR/xmlenc-core1/#sec-RSA-v1.5
+                    if parameters.algorithm.requires_explicit_permission() {
+                        return Err(XmlEncError::InvalidEncryptionConfig(
+                            "RSA-OAEP recipient requires an OAEP algorithm".into(),
+                        ));
+                    }
                     validate_key_transport_recipient(public_key.as_ref(), policy)?;
                     if policy
                         .key_transport_algorithms
@@ -674,7 +714,9 @@ impl EncryptedDataBuilder {
                     if policy
                         .key_wrap_algorithms
                         .as_ref()
-                        .is_some_and(|allowed| !allowed.contains(algorithm))
+                        .map_or(algorithm.requires_explicit_permission(), |allowed| {
+                            !allowed.contains(algorithm)
+                        })
                     {
                         return Err(crate::policy::PolicyViolation::Algorithm {
                             operation: "encryption",
@@ -942,6 +984,29 @@ fn wrap_content_key(
     content_key: &[u8],
 ) -> Result<WrappedKey, XmlEncError> {
     match recipient {
+        #[cfg(feature = "legacy-algorithms")]
+        EncryptionRecipient::RsaPkcs1v15 {
+            public_key,
+            recipient,
+            key_name,
+        } => {
+            provider.require_capability(crate::provider::ProviderCapability::Pkcs1v15Transport)?;
+            let ciphertext = provider.transport_pkcs1v15(public_key.as_ref(), content_key)?;
+            let expected = public_key.rsa_modulus().len();
+            if ciphertext.len() != expected {
+                return Err(XmlEncError::InvalidWrappedKeyLength {
+                    expected,
+                    actual: ciphertext.len(),
+                });
+            }
+            Ok(WrappedKey {
+                algorithm_uri: super::KeyTransportAlgorithm::RsaPkcs1v15.uri(),
+                oaep: None,
+                recipient: recipient.clone(),
+                key_name: key_name.clone(),
+                ciphertext,
+            })
+        }
         EncryptionRecipient::RsaOaep {
             public_key,
             parameters,
@@ -963,7 +1028,7 @@ fn wrap_content_key(
             provider
                 .require_capability(crate::provider::ProviderCapability::KeyWrap(*algorithm))?;
             let wrapped = provider.wrap_key(*algorithm, kek, content_key)?;
-            let expected = content_key.len() + 8;
+            let expected = content_key.len() + algorithm.overhead();
             if wrapped.len() != expected {
                 return Err(XmlEncError::InvalidWrappedKeyLength {
                     expected,

@@ -2449,7 +2449,8 @@ mod tests {
             super::super::DigestAlgorithm::Sha3_512,
         ] {
             let expected = X509SignatureAlgorithm::Ecdsa(digest);
-            let oid = Oid::from_str(expected.oid()).expect("registered SHA3 ECDSA OID must parse");
+            let oid = Oid::from_str(expected.oid().expect("registered signature OID"))
+                .expect("registered SHA3 ECDSA OID must parse");
             assert_eq!(
                 x509_signature_algorithm(&AlgorithmIdentifier::new(oid.clone(), None)),
                 Ok(expected)

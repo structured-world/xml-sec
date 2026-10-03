@@ -15,7 +15,7 @@
     },
     "legacy-policy-tests": {
       "test": "capability_ledger::legacy_algorithm_claims_are_policy_gated",
-      "description": "Legacy SHA-1 signature paths are available only through explicit compatibility policy opt-ins."
+      "description": "Legacy SHA-1 and optional historical mechanisms require explicit compatibility policy permission; optional methods also require the legacy-algorithms build feature."
     },
     "sha1-verification-tests": {
       "test": "capability_ledger::legacy_algorithm_claims_are_policy_gated",
@@ -77,6 +77,14 @@
       "name_regex": "^xmlSecHref(?:DsaSha1|EcdsaSha1|HmacSha1|RsaSha1)$",
       "outcome": "compatibility-profile-only",
       "rationale": "The implementation retains this legacy algorithm for interoperability, but the compiled policy must explicitly permit it.",
+      "evidence": "legacy-policy-tests"
+    },
+    {
+      "id": "feature-gated-legacy-uri",
+      "kinds": ["algorithm-uri"],
+      "name_regex": "^xmlSecHref(?:Aes192Cbc|Aes192Gcm|KWAes192|Des3Cbc|KWDes3|RsaPkcs1|Md5|Ripemd160|RsaMd5|RsaRipemd160|HmacMd5|HmacRipemd160|EcdsaRipemd160)$",
+      "outcome": "compatibility-profile-only",
+      "rationale": "The legacy-algorithms feature implements this mechanism through RustCrypto. Library defaults deny it; an explicit immutable algorithm allowlist is required. Other providers may report the capability unavailable without fallback.",
       "evidence": "legacy-policy-tests"
     },
     {

@@ -148,8 +148,36 @@ pub enum SymmetricKeyKind {
     Hmac,
     /// AES content-encryption key.
     Aes,
-    /// Legacy DES key marker; import rejects it until a DES operation exists.
+    /// Three-key TDEA key, available with `legacy-algorithms`.
     Des,
+}
+
+impl SymmetricKeyKind {
+    /// Whether the compiled mechanism supports this content-key family.
+    pub fn is_encryption_key(self) -> bool {
+        self == Self::Aes || (cfg!(feature = "legacy-algorithms") && self == Self::Des)
+    }
+
+    #[cfg(feature = "xmlenc")]
+    fn accepts_algorithm(self, algorithm: crate::xmlenc::DataEncryptionAlgorithm) -> bool {
+        #[cfg(feature = "legacy-algorithms")]
+        if algorithm == crate::xmlenc::DataEncryptionAlgorithm::TripleDesCbc {
+            return self == Self::Des;
+        }
+        #[cfg(not(feature = "legacy-algorithms"))]
+        let _ = algorithm;
+        self == Self::Aes
+    }
+}
+
+fn des_key_usages(bytes: &[u8]) -> Result<KeyUsages, KeyStoreError> {
+    if cfg!(feature = "legacy-algorithms") && bytes.len() == 24 {
+        Ok(KeyUsages::ENCRYPT.union(KeyUsages::DECRYPT))
+    } else {
+        Err(KeyStoreError::Selection(
+            "unsupported DES key length or mechanism",
+        ))
+    }
 }
 
 #[derive(Default)]
@@ -702,21 +730,24 @@ enum ParsedMaterial {
 type ParsedDsaKey = (KeyValueInfo, Option<Zeroizing<Vec<u8>>>);
 
 #[cfg(feature = "xmlenc")]
-struct InventoryDirectAes(Zeroizing<Vec<u8>>);
+struct InventoryDirectSymmetric {
+    bytes: Zeroizing<Vec<u8>>,
+    kind: SymmetricKeyKind,
+}
 
 #[cfg(feature = "xmlenc")]
-impl crate::xmlenc::DecryptionKeyResolver for InventoryDirectAes {
+impl crate::xmlenc::DecryptionKeyResolver for InventoryDirectSymmetric {
     fn resolve_key(
         &self,
         _provider: &dyn crate::provider::CryptoProvider,
         algorithm: crate::xmlenc::DataEncryptionAlgorithm,
         encrypted_key: Option<&crate::xmlenc::EncryptedKey>,
     ) -> Result<Vec<u8>, crate::xmlenc::XmlEncError> {
-        if encrypted_key.is_some() {
+        if encrypted_key.is_some() || !self.kind.accepts_algorithm(algorithm) {
             return Err(crate::xmlenc::XmlEncError::KeyNotFound);
         }
-        crate::xmlenc::validate_key_len(algorithm, &self.0)?;
-        Ok(self.0.to_vec())
+        crate::xmlenc::validate_key_len(algorithm, &self.bytes)?;
+        Ok(self.bytes.to_vec())
     }
 
     fn resolve_key_candidates(
@@ -748,12 +779,12 @@ impl crate::xmlenc::DecryptionKeyResolver for InventoryDirectAes {
         if encrypted_key.is_some() {
             return Err(crate::xmlenc::XmlEncError::KeyNotFound);
         }
-        check_selected_material_size(self.0.len(), &policy.resources).map_err(
-            |error| match error {
+        check_selected_material_size(self.bytes.len(), &policy.resources).map_err(|error| {
+            match error {
                 KeyStoreError::Policy(violation) => crate::xmlenc::XmlEncError::Policy(violation),
                 other => crate::xmlenc::XmlEncError::InvalidStructure(other.to_string()),
-            },
-        )?;
+            }
+        })?;
         self.resolve_key_candidates(provider, algorithm, None, budget)
     }
 }
@@ -1088,15 +1119,16 @@ impl KeyInventory {
             &mut visited,
             |entry| &entry.name,
         )? {
-            if entry.kind != SymmetricKeyKind::Aes || !entry.usages.allows(KeyUsage::Decrypt) {
+            if !entry.kind.is_encryption_key() || !entry.usages.allows(KeyUsage::Decrypt) {
                 return Err(KeyStoreError::Selection(
                     "key is not authorized for decryption",
                 ));
             }
             check_selected_material_size(entry.bytes.len(), &policy.resources)?;
-            return Ok(Box::new(InventoryDirectAes(Zeroizing::new(
-                entry.bytes.to_vec(),
-            ))));
+            return Ok(Box::new(InventoryDirectSymmetric {
+                bytes: Zeroizing::new(entry.bytes.to_vec()),
+                kind: entry.kind,
+            }));
         }
         let entry = find_named_entry(
             &self.private_keys,
@@ -1160,9 +1192,7 @@ impl KeyInventory {
         let permitted = match kind {
             SymmetricKeyKind::Hmac => KeyUsages::SIGN.union(KeyUsages::VERIFY),
             SymmetricKeyKind::Aes => KeyUsages::ENCRYPT.union(KeyUsages::DECRYPT),
-            SymmetricKeyKind::Des => {
-                return Err(KeyStoreError::Selection("DES encryption is unsupported"));
-            }
+            SymmetricKeyKind::Des => des_key_usages(&bytes)?,
         };
         if usages.0 == 0 || usages.0 & !permitted.0 != 0 {
             return Err(KeyStoreError::Selection(
@@ -2149,9 +2179,7 @@ impl KeyInventory {
                     let usages = match kind {
                         SymmetricKeyKind::Hmac => KeyUsages::SIGN.union(KeyUsages::VERIFY),
                         SymmetricKeyKind::Aes => KeyUsages::ENCRYPT.union(KeyUsages::DECRYPT),
-                        SymmetricKeyKind::Des => {
-                            return Err(KeyStoreError::Selection("DES encryption is unsupported"));
-                        }
+                        SymmetricKeyKind::Des => des_key_usages(&bytes)?,
                     };
                     store.symmetric_keys.push(StoredSymmetricKey {
                         name,
@@ -4176,6 +4204,26 @@ mod tests {
                 .iter()
                 .any(|source| matches!(source, KeyInfoSource::KeyValue(KeyValueInfo::Ec { .. })))
         );
+    }
+
+    #[cfg(feature = "legacy-algorithms")]
+    #[test]
+    fn xml_store_imports_triple_des_without_granting_operation_permission() {
+        // A supported key encoding grants usage, not algorithm policy permission;
+        // an eight-byte DES key must never be mistaken for a three-key TDEA key.
+        let encoded = base64::engine::general_purpose::STANDARD.encode([0x31; 24]);
+        let xml = format!(
+            "<Keys xmlns=\"{XMLSEC_NS}\"><KeyInfo xmlns=\"{XMLDSIG_NS}\"><KeyName>des</KeyName><KeyValue><DESKeyValue xmlns=\"{XMLSEC_NS}\">{encoded}</DESKeyValue></KeyValue></KeyInfo></Keys>"
+        );
+        let store = KeyInventory::from_xml_bytes(
+            xml.as_bytes(),
+            &xml_policy(ResourcePolicy::default()),
+            XmlBackend::default(),
+        )
+        .expect("a three-key TDEA inventory entry is supported");
+        assert_eq!(store.symmetric_keys()[0].kind, SymmetricKeyKind::Des);
+        assert_eq!(store.symmetric_keys()[0].bytes.as_slice(), &[0x31; 24]);
+        assert!(store.symmetric_keys()[0].usages.allows(KeyUsage::Decrypt));
     }
 
     #[test]

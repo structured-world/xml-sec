@@ -165,7 +165,7 @@ fn complete_surface_categories_are_stable() {
         "https://github.com/lsh123/xmlsec"
     );
     assert_eq!(ledger.generated_by, "xml-sec-capability-ledger/2");
-    assert_eq!(ledger.classifications.len(), 20);
+    assert_eq!(ledger.classifications.len(), 21);
     assert_eq!(ledger.availability.len(), 427);
 
     let counts = ledger
@@ -349,8 +349,25 @@ fn native_algorithm_claims_match_the_rust_api() {
                 )
         })
         .collect();
-    assert_eq!(claims.len(), 51);
+    assert_eq!(claims.len(), 64);
     for item in claims {
+        if item.classification == "feature-gated-legacy-uri" {
+            // The ledger records the build requirement, not unconditional API
+            // availability. Thin/default builds must reject every optional URI.
+            let uri = item.detail.as_str();
+            let available = xml_sec::xmldsig::SignatureAlgorithm::from_uri(uri).is_some()
+                || xml_sec::xmldsig::DigestAlgorithm::from_uri(uri).is_some()
+                || xml_sec::xmlenc::DataEncryptionAlgorithm::from_uri(uri).is_ok()
+                || xml_sec::xmlenc::KeyTransportAlgorithm::from_uri(uri).is_ok()
+                || xml_sec::xmlenc::KeyWrapAlgorithm::from_uri(uri).is_ok();
+            assert_eq!(
+                available,
+                cfg!(feature = "legacy-algorithms"),
+                "{}",
+                item_id(item)
+            );
+            continue;
+        }
         assert_native_uri_support(item);
     }
 }
@@ -543,6 +560,19 @@ fn legacy_algorithm_claims_are_policy_gated() {
             "xmlSecHrefEcdsaSha1",
             "xmlSecHrefHmacSha1",
             "xmlSecHrefRsaSha1",
+            "xmlSecHrefAes192Cbc",
+            "xmlSecHrefAes192Gcm",
+            "xmlSecHrefKWAes192",
+            "xmlSecHrefDes3Cbc",
+            "xmlSecHrefKWDes3",
+            "xmlSecHrefRsaPkcs1",
+            "xmlSecHrefMd5",
+            "xmlSecHrefRipemd160",
+            "xmlSecHrefRsaMd5",
+            "xmlSecHrefRsaRipemd160",
+            "xmlSecHrefHmacMd5",
+            "xmlSecHrefHmacRipemd160",
+            "xmlSecHrefEcdsaRipemd160",
         ])
     );
 

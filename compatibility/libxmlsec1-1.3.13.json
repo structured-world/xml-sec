@@ -14,7 +14,7 @@
     },
     "legacy-policy-tests": {
       "test": "capability_ledger::legacy_algorithm_claims_are_policy_gated",
-      "description": "Legacy SHA-1 signature paths are available only through explicit compatibility policy opt-ins."
+      "description": "Legacy SHA-1 and optional historical mechanisms require explicit compatibility policy permission; optional methods also require the legacy-algorithms build feature."
     },
     "native-algorithm-tests": {
       "test": "capability_ledger::native_algorithm_claims_match_the_rust_api",
@@ -68,6 +68,11 @@
       "outcome": "intentionally-unsupported",
       "rationale": "Deprecated C aliases are excluded until the compatibility layer has a concrete ABI contract.",
       "evidence": "unsupported-legacy-surface"
+    },
+    "feature-gated-legacy-uri": {
+      "outcome": "compatibility-profile-only",
+      "rationale": "The legacy-algorithms feature implements this mechanism through RustCrypto. Library defaults deny it; an explicit immutable algorithm allowlist is required. Other providers may report the capability unavailable without fallback.",
+      "evidence": "legacy-policy-tests"
     },
     "native-cli-behavior-options": {
       "outcome": "behavior-compatible",
@@ -4209,7 +4214,7 @@
       "source": "src/strings.c",
       "line": 110,
       "detail": "http://www.w3.org/2001/04/xmlenc#aes192-cbc",
-      "classification": "remaining-uri-surface"
+      "classification": "feature-gated-legacy-uri"
     },
     {
       "kind": "algorithm-uri",
@@ -4217,7 +4222,7 @@
       "source": "src/strings.c",
       "line": 119,
       "detail": "http://www.w3.org/2009/xmlenc11#aes192-gcm",
-      "classification": "remaining-uri-surface"
+      "classification": "feature-gated-legacy-uri"
     },
     {
       "kind": "algorithm-uri",
@@ -4393,7 +4398,7 @@
       "source": "src/strings.c",
       "line": 254,
       "detail": "http://www.w3.org/2001/04/xmlenc#tripledes-cbc",
-      "classification": "remaining-uri-surface"
+      "classification": "feature-gated-legacy-uri"
     },
     {
       "kind": "algorithm-uri",
@@ -4441,7 +4446,7 @@
       "source": "src/strings.c",
       "line": 390,
       "detail": "http://www.w3.org/2007/05/xmldsig-more#ecdsa-ripemd160",
-      "classification": "remaining-uri-surface"
+      "classification": "feature-gated-legacy-uri"
     },
     {
       "kind": "algorithm-uri",
@@ -4697,7 +4702,7 @@
       "source": "src/strings.c",
       "line": 600,
       "detail": "http://www.w3.org/2001/04/xmldsig-more#hmac-md5",
-      "classification": "remaining-uri-surface"
+      "classification": "feature-gated-legacy-uri"
     },
     {
       "kind": "algorithm-uri",
@@ -4705,7 +4710,7 @@
       "source": "src/strings.c",
       "line": 603,
       "detail": "http://www.w3.org/2001/04/xmldsig-more#hmac-ripemd160",
-      "classification": "remaining-uri-surface"
+      "classification": "feature-gated-legacy-uri"
     },
     {
       "kind": "algorithm-uri",
@@ -4761,7 +4766,7 @@
       "source": "src/strings.c",
       "line": 128,
       "detail": "http://www.w3.org/2001/04/xmlenc#kw-aes192",
-      "classification": "remaining-uri-surface"
+      "classification": "feature-gated-legacy-uri"
     },
     {
       "kind": "algorithm-uri",
@@ -4801,7 +4806,7 @@
       "source": "src/strings.c",
       "line": 257,
       "detail": "http://www.w3.org/2001/04/xmlenc#kw-tripledes",
-      "classification": "remaining-uri-surface"
+      "classification": "feature-gated-legacy-uri"
     },
     {
       "kind": "algorithm-uri",
@@ -4873,7 +4878,7 @@
       "source": "src/strings.c",
       "line": 659,
       "detail": "http://www.w3.org/2001/04/xmldsig-more#md5",
-      "classification": "remaining-uri-surface"
+      "classification": "feature-gated-legacy-uri"
     },
     {
       "kind": "algorithm-uri",
@@ -4961,7 +4966,7 @@
       "source": "src/strings.c",
       "line": 710,
       "detail": "http://www.w3.org/2001/04/xmlenc#ripemd160",
-      "classification": "remaining-uri-surface"
+      "classification": "feature-gated-legacy-uri"
     },
     {
       "kind": "algorithm-uri",
@@ -4969,7 +4974,7 @@
       "source": "src/strings.c",
       "line": 725,
       "detail": "http://www.w3.org/2001/04/xmldsig-more#rsa-md5",
-      "classification": "remaining-uri-surface"
+      "classification": "feature-gated-legacy-uri"
     },
     {
       "kind": "algorithm-uri",
@@ -4993,7 +4998,7 @@
       "source": "src/strings.c",
       "line": 746,
       "detail": "http://www.w3.org/2001/04/xmlenc#rsa-1_5",
-      "classification": "remaining-uri-surface"
+      "classification": "feature-gated-legacy-uri"
     },
     {
       "kind": "algorithm-uri",
@@ -5073,7 +5078,7 @@
       "source": "src/strings.c",
       "line": 728,
       "detail": "http://www.w3.org/2001/04/xmldsig-more#rsa-ripemd160",
-      "classification": "remaining-uri-surface"
+      "classification": "feature-gated-legacy-uri"
     },
     {
       "kind": "algorithm-uri",

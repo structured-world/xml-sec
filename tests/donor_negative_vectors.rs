@@ -98,16 +98,24 @@ fn phaos_bad_digest_reports_reference_mismatch_before_key_use() {
 #[test]
 fn phaos_bad_signature_artifact_fails_on_its_unsupported_md5_reference() {
     // Despite its filename, the donor adds a second Reference using MD5 and
-    // omits DigestValue. Unsupported MD5 is encountered first, so treating
-    // this artifact as a SignatureValue mismatch would hide malformed input.
+    // omits DigestValue. Without legacy capability the URI fails first;
+    // with it, the missing mandatory DigestValue fails structural parsing.
     let xml = read_vector("signature-rsa-enveloped-bad-sig.xml");
     let error = verify_signature_with_pem_key(&xml, STRONG_RSA_PUBLIC_KEY, false)
         .expect_err("unsupported donor Reference must fail processing");
 
+    #[cfg(not(feature = "legacy-algorithms"))]
     assert!(matches!(
         error,
         DsigError::ParseSignedInfo(ParseError::UnsupportedAlgorithm { ref uri })
             if uri == "http://www.w3.org/2001/04/xmldsig-more#md5"
+    ));
+    #[cfg(feature = "legacy-algorithms")]
+    assert!(matches!(
+        error,
+        DsigError::ParseSignedInfo(ParseError::MissingElement {
+            element: "DigestValue"
+        })
     ));
 }
 

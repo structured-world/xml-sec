@@ -47,6 +47,28 @@ pub(crate) fn signature_value_matches_algorithm_with_encoding(
     encoding: EcdsaSignatureValueEncoding,
 ) -> bool {
     match algorithm {
+        #[cfg(feature = "legacy-algorithms")]
+        SignatureAlgorithm::RsaMd5 | SignatureAlgorithm::RsaRipemd160 => {
+            (1..=crate::hard_limits::RSA_MODULUS_BIT_CEILING / 8).contains(&signature_value.len())
+        }
+        #[cfg(feature = "legacy-algorithms")]
+        SignatureAlgorithm::HmacMd5 | SignatureAlgorithm::HmacRipemd160 => algorithm
+            .hmac_output_bits()
+            .is_some_and(|bits| (1..=bits / 8).contains(&signature_value.len())),
+        #[cfg(feature = "legacy-algorithms")]
+        SignatureAlgorithm::EcdsaRipemd160 => {
+            [32, 48, 66]
+                .into_iter()
+                .any(|component_len| match encoding {
+                    EcdsaSignatureValueEncoding::XmlDsig => {
+                        signature_value.len() == component_len * 2
+                    }
+                    EcdsaSignatureValueEncoding::XmlSecAsn1Der => {
+                        inspect_der_encoded_ecdsa_signature(signature_value, component_len)
+                            .is_ok_and(|value| value.is_some())
+                    }
+                })
+        }
         SignatureAlgorithm::PostQuantum(algorithm) => {
             signature_value.len() == algorithm.signature_len()
         }
@@ -155,30 +177,12 @@ pub(crate) fn signature_value_matches_spki_with_encoding(
             Ok(algorithm.dsa_component_len() == Some(component_len)
                 && signature_value.len() == component_len * 2)
         }
-        (
-            SignatureAlgorithm::RsaSha1
-            | SignatureAlgorithm::RsaSha224
-            | SignatureAlgorithm::RsaSha256
-            | SignatureAlgorithm::RsaSha384
-            | SignatureAlgorithm::RsaSha512,
-            PublicKey::RSA(_),
-        ) => {
+        (method, PublicKey::RSA(_)) if method.is_rsa() => {
             let key = rsa::RsaPublicKey::from_public_key_der(public_key_spki_der)
                 .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
             Ok(signature_value.len() == key.size())
         }
-        (
-            SignatureAlgorithm::EcdsaSha1
-            | SignatureAlgorithm::EcdsaSha224
-            | SignatureAlgorithm::EcdsaSha256
-            | SignatureAlgorithm::EcdsaSha384
-            | SignatureAlgorithm::EcdsaSha512
-            | SignatureAlgorithm::EcdsaSha3_224
-            | SignatureAlgorithm::EcdsaSha3_256
-            | SignatureAlgorithm::EcdsaSha3_384
-            | SignatureAlgorithm::EcdsaSha3_512,
-            PublicKey::EC(ec),
-        ) => {
+        (method, PublicKey::EC(ec)) if method.ecdsa_digest().is_some() => {
             validate_ec_public_key_encoding(&ec, &spki.subject_public_key.data)?;
             let (_, component_len) = ecdsa_curve_and_component_len(&spki, &ec)?;
             match encoding {
@@ -397,6 +401,14 @@ pub(crate) fn verify_rsa_signature_spki_primitive(
         return Ok(false);
     };
     let verified = match algorithm {
+        #[cfg(feature = "legacy-algorithms")]
+        SignatureAlgorithm::RsaMd5 => RsaVerifyingKey::<md5::Md5>::new(key)
+            .verify(signed_data, &signature)
+            .is_ok(),
+        #[cfg(feature = "legacy-algorithms")]
+        SignatureAlgorithm::RsaRipemd160 => RsaVerifyingKey::<ripemd::Ripemd160>::new(key)
+            .verify(signed_data, &signature)
+            .is_ok(),
         SignatureAlgorithm::RsaSha1 => RsaVerifyingKey::<Sha1>::new(key)
             .verify(signed_data, &signature)
             .is_ok(),
@@ -680,15 +692,12 @@ pub(crate) fn validate_rsa_key_components(
 fn ensure_rsa_signature_algorithm(
     algorithm: SignatureAlgorithm,
 ) -> Result<(), SignatureVerificationError> {
-    match algorithm {
-        SignatureAlgorithm::RsaSha1
-        | SignatureAlgorithm::RsaSha224
-        | SignatureAlgorithm::RsaSha256
-        | SignatureAlgorithm::RsaSha384
-        | SignatureAlgorithm::RsaSha512 => Ok(()),
-        _ => Err(SignatureVerificationError::UnsupportedAlgorithm {
+    if algorithm.is_rsa() {
+        Ok(())
+    } else {
+        Err(SignatureVerificationError::UnsupportedAlgorithm {
             uri: algorithm.uri().to_string(),
-        }),
+        })
     }
 }
 

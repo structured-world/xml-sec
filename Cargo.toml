@@ -117,7 +117,8 @@ aes-gcm = { version = "0.11.1", optional = true }
 aes-kw = { version = "0.3.1", optional = true }
 cbc = { version = "0.2.1", optional = true }
 des = { version = "0.9", optional = true }
-md-5 = { version = "0.11", optional = true }
+md-5 = { version = "0.11", features = ["oid"], optional = true }
+ripemd = { version = "0.2.0", default-features = false, features = ["oid"], optional = true }
 pem = { version = "4", optional = true }
 pkcs12 = { version = "=0.2.0-pre.0", default-features = false, features = ["kdf"], optional = true }
 pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"], optional = true }
@@ -148,6 +149,7 @@ time = "0.3.55"
 tempfile = "3"
 
 [features]
+legacy-algorithms = ["dep:ripemd", "dep:md-5", "dep:des"]
 default = ["std", "xmldsig", "xmlenc", "c14n", "xml-backend-xmloxide"]
 std = ["thiserror/std", "xmlparser/std"]
 aws-lc-fips = ["std", "xmldsig", "dep:aws-lc-rs"]

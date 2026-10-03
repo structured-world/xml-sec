@@ -435,6 +435,14 @@ reported as an invalid per-reference result without changing core `SignedInfo` v
 
 ## Current Scope
 
+The optional `legacy-algorithms` feature adds MD5 and RIPEMD-160 reference digests,
+RSA-MD5/RSA-RIPEMD160, HMAC-MD5/HMAC-RIPEMD160, and ECDSA-RIPEMD160. Secure library
+defaults reject these methods even when compiled. Explicitly allow signature methods through
+`VerificationPolicy::signature_algorithms` / `SigningPolicy::signature_algorithms` and reference
+digests independently through `digest_algorithms`. Permitting a signature never permits its
+reference digest implicitly. ECDSA-RIPEMD160 retains independent curve selection. These are
+historical interoperability mechanisms, not recommended algorithms for new documents.
+
 Implemented signature methods include DSA-SHA1/SHA256; HMAC-SHA1/SHA224/SHA256/SHA384/SHA512;
 RSA PKCS#1 v1.5 with SHA-1/SHA224/SHA256/SHA384/SHA512; and ECDSA
 SHA-1/SHA224/SHA256/SHA384/SHA512 and SHA3-224/256/384/512. ECDSA selects P-256, P-384, or P-521

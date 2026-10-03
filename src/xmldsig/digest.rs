@@ -1,9 +1,10 @@
 //! Digest computation for XMLDSig `<Reference>` processing.
 //!
 //! Implements [XMLDSig §6.1](https://www.w3.org/TR/xmldsig-core1/#sec-DigestMethod):
-//! compute message digests over transform output bytes using SHA-family algorithms.
+//! compute message digests over transform output bytes using the selected algorithm.
 //!
-//! All digest computation uses RustCrypto hash implementations.
+//! Operation digest computation uses the selected `CryptoProvider`; the built-in
+//! standalone convenience path uses RustCrypto.
 
 use subtle::ConstantTimeEq;
 
@@ -13,6 +14,12 @@ use subtle::ConstantTimeEq;
 /// SHA-256 is the recommended default for new signatures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DigestAlgorithm {
+    /// MD5 compatibility capability; operation policy must explicitly permit it.
+    #[cfg(feature = "legacy-algorithms")]
+    Md5,
+    /// RIPEMD-160 compatibility capability; operation policy must explicitly permit it.
+    #[cfg(feature = "legacy-algorithms")]
+    Ripemd160,
     /// SHA-1 (160-bit). Disabled for signing by default.
     Sha1,
     /// SHA-224 (224-bit), required by XMLDSig 1.1 interoperability profiles.
@@ -34,6 +41,26 @@ pub enum DigestAlgorithm {
 }
 
 impl DigestAlgorithm {
+    /// Every compiled digest capability; this registry grants no policy permission.
+    pub const ALL: [Self; 9 + if cfg!(feature = "legacy-algorithms") {
+        2
+    } else {
+        0
+    }] = [
+        #[cfg(feature = "legacy-algorithms")]
+        Self::Md5,
+        #[cfg(feature = "legacy-algorithms")]
+        Self::Ripemd160,
+        Self::Sha1,
+        Self::Sha224,
+        Self::Sha256,
+        Self::Sha384,
+        Self::Sha512,
+        Self::Sha3_224,
+        Self::Sha3_256,
+        Self::Sha3_384,
+        Self::Sha3_512,
+    ];
     /// Parse a digest algorithm from its XML namespace URI.
     ///
     /// Returns `None` for unrecognized URIs.
@@ -49,6 +76,12 @@ impl DigestAlgorithm {
     /// | SHA-512 | `http://www.w3.org/2001/04/xmlenc#sha512` |
     pub fn from_uri(uri: &str) -> Option<Self> {
         match uri {
+            // RFC 9231 §§2.1.1, 2.1.4 assign these exact digest identifiers.
+            // https://www.rfc-editor.org/rfc/rfc9231#section-2.1
+            #[cfg(feature = "legacy-algorithms")]
+            "http://www.w3.org/2001/04/xmldsig-more#md5" => Some(Self::Md5),
+            #[cfg(feature = "legacy-algorithms")]
+            "http://www.w3.org/2001/04/xmlenc#ripemd160" => Some(Self::Ripemd160),
             "http://www.w3.org/2000/09/xmldsig#sha1" => Some(Self::Sha1),
             "http://www.w3.org/2001/04/xmldsig-more#sha224" => Some(Self::Sha224),
             "http://www.w3.org/2001/04/xmlenc#sha256" => Some(Self::Sha256),
@@ -67,6 +100,10 @@ impl DigestAlgorithm {
     /// Return the XML namespace URI for this digest algorithm.
     pub fn uri(self) -> &'static str {
         match self {
+            #[cfg(feature = "legacy-algorithms")]
+            Self::Md5 => "http://www.w3.org/2001/04/xmldsig-more#md5",
+            #[cfg(feature = "legacy-algorithms")]
+            Self::Ripemd160 => "http://www.w3.org/2001/04/xmlenc#ripemd160",
             Self::Sha1 => "http://www.w3.org/2000/09/xmldsig#sha1",
             Self::Sha224 => "http://www.w3.org/2001/04/xmldsig-more#sha224",
             Self::Sha256 => "http://www.w3.org/2001/04/xmlenc#sha256",
@@ -84,12 +121,25 @@ impl DigestAlgorithm {
     /// SHA-1 is deprecated and disabled by secure signing defaults. An explicit
     /// signing policy allowlist can enable it for a trusted compatibility boundary.
     pub fn signing_allowed(self) -> bool {
-        !matches!(self, Self::Sha1)
+        !matches!(self, Self::Sha1) && !self.requires_explicit_permission()
+    }
+
+    /// Whether reference verification requires an explicit digest allowlist entry.
+    pub const fn requires_explicit_permission(self) -> bool {
+        match self {
+            #[cfg(feature = "legacy-algorithms")]
+            Self::Md5 | Self::Ripemd160 => true,
+            _ => false,
+        }
     }
 
     /// The expected output length in bytes.
     pub fn output_len(self) -> usize {
         match self {
+            #[cfg(feature = "legacy-algorithms")]
+            Self::Md5 => 16,
+            #[cfg(feature = "legacy-algorithms")]
+            Self::Ripemd160 => 20,
             Self::Sha1 => 20,
             Self::Sha224 | Self::Sha3_224 => 28,
             Self::Sha256 | Self::Sha3_256 => 32,

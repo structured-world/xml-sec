@@ -1,6 +1,32 @@
 use std::{ffi::OsString, io::Write};
 
 pub const TRANSFORMS: &[&str] = &[
+    #[cfg(feature = "legacy-algorithms")]
+    "md5",
+    #[cfg(feature = "legacy-algorithms")]
+    "ripemd160",
+    #[cfg(feature = "legacy-algorithms")]
+    "rsa-md5",
+    #[cfg(feature = "legacy-algorithms")]
+    "rsa-ripemd160",
+    #[cfg(feature = "legacy-algorithms")]
+    "hmac-md5",
+    #[cfg(feature = "legacy-algorithms")]
+    "hmac-ripemd160",
+    #[cfg(feature = "legacy-algorithms")]
+    "ecdsa-ripemd160",
+    #[cfg(feature = "legacy-algorithms")]
+    "aes192-cbc",
+    #[cfg(feature = "legacy-algorithms")]
+    "aes192-gcm",
+    #[cfg(feature = "legacy-algorithms")]
+    "tripledes-cbc",
+    #[cfg(feature = "legacy-algorithms")]
+    "rsa-1_5",
+    #[cfg(feature = "legacy-algorithms")]
+    "kw-aes192",
+    #[cfg(feature = "legacy-algorithms")]
+    "kw-tripledes",
     "base64",
     "enveloped-signature",
     "c14n",
@@ -152,28 +178,42 @@ pub fn transform_available(name: &str, provider: &dyn xml_sec::provider::CryptoP
                 || provider.supports(C::Verify(algorithm));
         }
     }
-    for algorithm in [
-        D::Sha1,
-        D::Sha224,
-        D::Sha256,
-        D::Sha384,
-        D::Sha512,
-        D::Sha3_224,
-        D::Sha3_256,
-        D::Sha3_384,
-        D::Sha3_512,
-    ] {
+    for algorithm in D::ALL {
         if algorithm.uri().rsplit('#').next() == Some(name) {
             return provider.supports(C::Digest(algorithm));
         }
     }
-    for algorithm in [E::Aes128Cbc, E::Aes256Cbc, E::Aes128Gcm, E::Aes256Gcm] {
+    for algorithm in [
+        E::Aes128Cbc,
+        E::Aes256Cbc,
+        E::Aes128Gcm,
+        E::Aes256Gcm,
+        #[cfg(feature = "legacy-algorithms")]
+        E::Aes192Cbc,
+        #[cfg(feature = "legacy-algorithms")]
+        E::Aes192Gcm,
+        #[cfg(feature = "legacy-algorithms")]
+        E::TripleDesCbc,
+    ] {
         if algorithm.uri().rsplit('#').next() == Some(name) {
             return provider.supports(C::Encrypt(algorithm))
                 || provider.supports(C::Decrypt(algorithm));
         }
     }
     let oaep = match name {
+        #[cfg(feature = "legacy-algorithms")]
+        "rsa-1_5" => {
+            return provider.supports(C::Pkcs1v15Transport)
+                || provider.supports(C::Pkcs1v15Recovery);
+        }
+        #[cfg(feature = "legacy-algorithms")]
+        "kw-aes192" => {
+            return provider.supports(C::KeyWrap(xml_sec::xmlenc::KeyWrapAlgorithm::AesKw192));
+        }
+        #[cfg(feature = "legacy-algorithms")]
+        "kw-tripledes" => {
+            return provider.supports(C::KeyWrap(xml_sec::xmlenc::KeyWrapAlgorithm::TripleDes));
+        }
         "rsa-oaep-mgf1p" => RsaOaepParameters::default(),
         "rsa-oaep-enc11" => {
             RsaOaepParameters::xmlenc11(OaepDigestAlgorithm::Sha256, OaepDigestAlgorithm::Sha256)

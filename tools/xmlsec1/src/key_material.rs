@@ -341,25 +341,13 @@ pub fn decode_signing_key(
     password: Option<&[u8]>,
 ) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
     match algorithm {
-        SignatureAlgorithm::RsaSha1
-        | SignatureAlgorithm::RsaSha224
-        | SignatureAlgorithm::RsaSha256
-        | SignatureAlgorithm::RsaSha384
-        | SignatureAlgorithm::RsaSha512 => decode_rsa_signing_key(path, bytes, format, password),
+        method if method.is_rsa() => decode_rsa_signing_key(path, bytes, format, password),
         SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => {
             // XMLDSig defines DSA signature methods only for SHA-1 and
             // SHA-256. SHA-224 URIs exist for other key families, not DSA.
             decode_dsa_signing_key(path, bytes, format, password)
         }
-        SignatureAlgorithm::EcdsaSha1
-        | SignatureAlgorithm::EcdsaSha224
-        | SignatureAlgorithm::EcdsaSha256
-        | SignatureAlgorithm::EcdsaSha384
-        | SignatureAlgorithm::EcdsaSha512
-        | SignatureAlgorithm::EcdsaSha3_224
-        | SignatureAlgorithm::EcdsaSha3_256
-        | SignatureAlgorithm::EcdsaSha3_384
-        | SignatureAlgorithm::EcdsaSha3_512 => {
+        method if method.ecdsa_digest().is_some() => {
             decode_ecdsa_signing_key(path, bytes, format, password)
         }
         SignatureAlgorithm::HmacSha1

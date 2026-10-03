@@ -143,12 +143,31 @@ inherited from its ancestors. Their `_and_backend` variants retain an explicitly
 backend while revalidating the containing document; the shorter entry points use the build default.
 
 `PrivateKeyDecryptor` unwraps embedded RSA-OAEP `EncryptedKey` values and `KekDecryptor`
-unwraps AES-KW values. RSA PKCS#1 v1.5 transport, `CipherReference`, and unauthenticated external
-resource loading are rejected; only inline `CipherValue` is accepted. Encryption plaintext,
+unwraps AES-KW values. With `legacy-algorithms`, these resolvers additionally support parameterless
+RSA PKCS#1 v1.5 transport, AES-192 key wrap, and RFC 3217 TripleDES key wrap. `CipherReference`
+and unauthenticated external resource loading are rejected; only inline `CipherValue` is accepted. Encryption plaintext,
 recipient counts, and the complete serialized `EncryptedData` fragment are bounded. Decryption
 applies the same aggregate recipient ceiling while parsing, bounds each retained identifier,
 algorithm URI, key name, OAEP label, and reference URI, and rechecks caller-constructed
 `EncryptedData` before decoding or key resolution.
+
+## Optional Compatibility Mechanisms
+
+The `legacy-algorithms` feature compiles AES-192-CBC/GCM, TripleDES-CBC, AES-192-KW,
+TripleDES CMS wrap, and RSA-1.5 transport. Compilation is not permission: explicitly put each
+required method into `EncryptionPolicy` and `DecryptionPolicy`'s `data_algorithms`,
+`key_wrap_algorithms`, or `key_transport_algorithms` allowlist. Default operations reject all of
+these optional methods. AES-192 is included for compatibility completeness, not because its key
+size is cryptographically weak. TripleDES and RSA-1.5 should be restricted to required legacy
+integrations; prefer authenticated AES-GCM and RSA-OAEP for new output.
+
+Use `EncryptionRecipient::rsa_pkcs1v15` (or `provider_pkcs1v15`) for RSA-1.5, not
+`rsa_oaep` with altered parameters. XMLEnc 1.1 §5.5.1 defines no OAEP children for this method;
+the parser rejects them. Recovery uses implicit padding rejection and a fixed-length fallback
+content key; authenticated content must still succeed before plaintext is returned. CBC has no
+authentication, so use it only with a separately authenticated document boundary.
+TripleDES wrapping follows RFC 3217 §§2–3, including its SHA-1 checksum and fixed outer IV;
+it does not reinterpret arbitrary AES key bytes as DES parity-normalized bytes.
 That typed-input check validates the top-level content `EncryptionMethod` and every embedded key
 method before resolver dispatch, and bounds both encoded and projected decoded `CipherValue`
 sizes. Callers therefore cannot bypass parser structural or allocation limits by constructing the
