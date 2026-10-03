@@ -141,6 +141,11 @@ legacy donor documents. This opt-in is local to the CLI. Library callers retain
 the secure defaults and must explicitly allow each legacy algorithm through
 their immutable signing or verification policy.
 
+Certificate and CRL signatures independently use the CLI's explicit `AllSupported`
+compatibility permission, including PQ methods when compiled. This does not grant trust:
+verification still requires caller-supplied anchors, valid paths and provider capability.
+Library callers keep classical-only certificate defaults or choose an exact typed allowlist.
+
 Signing key options accept libxmlsec1's comma-separated certificate form,
 `key.pem,leaf.pem,intermediate.pem,...`. Every certificate is structurally
 validated, and the first certificate must contain the signing key. When the
@@ -385,6 +390,15 @@ aliases. The template signature method selects the key family before decoding,
 while ECDSA keys select their curve from PKCS#8 or SEC1 parameters. Explicit
 PKCS#8 options reject traditional containers rather than silently broadening
 their documented format contract.
+Modern signing uses the same template-selected key loading and `CryptoProvider`
+path: Ed25519, Ed25519ctx, Ed25519ph, Ed448, and Ed448ph accept PKCS#8 keys;
+ECDSA and reference digests support SHA-3. Authenticated signature contexts are
+forwarded unchanged during candidate-key verification. ML-DSA and SHA-2 SLH-DSA
+methods require the `experimental-pq` build feature; capability queries do not
+advertise them in builds without that feature. These experimental XML methods
+are not standardized algorithm URIs; see [XMLDSig details](xmldsig.md).
+The compatibility executable explicitly permits compiled PQ XML methods for both signing
+and verification; core library defaults still require an explicit algorithm allowlist.
 Public verification accepts SubjectPublicKeyInfo,
 PKCS#1 RSA public keys, and X.509 certificates. Encryption accepts RSA public
 keys or RSA X.509 recipient certificates in PEM or DER. Explicit verification

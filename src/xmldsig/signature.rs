@@ -47,6 +47,13 @@ pub(crate) fn signature_value_matches_algorithm_with_encoding(
     encoding: EcdsaSignatureValueEncoding,
 ) -> bool {
     match algorithm {
+        SignatureAlgorithm::PostQuantum(algorithm) => {
+            signature_value.len() == algorithm.signature_len()
+        }
+        SignatureAlgorithm::Ed25519
+        | SignatureAlgorithm::Ed25519Ctx
+        | SignatureAlgorithm::Ed25519Ph => signature_value.len() == 64,
+        SignatureAlgorithm::Ed448 | SignatureAlgorithm::Ed448Ph => signature_value.len() == 114,
         SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => algorithm
             .dsa_component_len()
             .is_some_and(|component_len| signature_value.len() == component_len * 2),
@@ -71,7 +78,11 @@ pub(crate) fn signature_value_matches_algorithm_with_encoding(
         | SignatureAlgorithm::EcdsaSha224
         | SignatureAlgorithm::EcdsaSha256
         | SignatureAlgorithm::EcdsaSha384
-        | SignatureAlgorithm::EcdsaSha512 => {
+        | SignatureAlgorithm::EcdsaSha512
+        | SignatureAlgorithm::EcdsaSha3_224
+        | SignatureAlgorithm::EcdsaSha3_256
+        | SignatureAlgorithm::EcdsaSha3_384
+        | SignatureAlgorithm::EcdsaSha3_512 => {
             [32, 48, 66]
                 .into_iter()
                 .any(|component_len| match encoding {
@@ -106,6 +117,23 @@ pub(crate) fn signature_value_matches_spki_with_encoding(
     signature_value: &[u8],
     encoding: EcdsaSignatureValueEncoding,
 ) -> Result<bool, SignatureVerificationError> {
+    if let Some(length) = algorithm.eddsa_signature_len() {
+        super::modern::validate_public_key(algorithm, public_key_spki_der)?;
+        return Ok(signature_value.len() == length);
+    }
+    if let SignatureAlgorithm::PostQuantum(algorithm) = algorithm {
+        #[cfg(feature = "experimental-pq")]
+        {
+            super::post_quantum::validate_public_key(algorithm, public_key_spki_der)?;
+            return Ok(signature_value.len() == algorithm.signature_len());
+        }
+        #[cfg(not(feature = "experimental-pq"))]
+        {
+            return Err(SignatureVerificationError::UnsupportedAlgorithm {
+                uri: algorithm.uri().to_owned(),
+            });
+        }
+    }
     let (rest, spki) = SubjectPublicKeyInfo::from_der(public_key_spki_der)
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
     if !rest.is_empty() {
@@ -144,7 +172,11 @@ pub(crate) fn signature_value_matches_spki_with_encoding(
             | SignatureAlgorithm::EcdsaSha224
             | SignatureAlgorithm::EcdsaSha256
             | SignatureAlgorithm::EcdsaSha384
-            | SignatureAlgorithm::EcdsaSha512,
+            | SignatureAlgorithm::EcdsaSha512
+            | SignatureAlgorithm::EcdsaSha3_224
+            | SignatureAlgorithm::EcdsaSha3_256
+            | SignatureAlgorithm::EcdsaSha3_384
+            | SignatureAlgorithm::EcdsaSha3_512,
             PublicKey::EC(ec),
         ) => {
             validate_ec_public_key_encoding(&ec, &spki.subject_public_key.data)?;
@@ -539,18 +571,11 @@ pub fn verify_ecdsa_signature_spki_with_encoding(
     signature_value: &[u8],
     encoding: EcdsaSignatureValueEncoding,
 ) -> Result<bool, SignatureVerificationError> {
-    if !matches!(
-        algorithm,
-        SignatureAlgorithm::EcdsaSha1
-            | SignatureAlgorithm::EcdsaSha224
-            | SignatureAlgorithm::EcdsaSha256
-            | SignatureAlgorithm::EcdsaSha384
-            | SignatureAlgorithm::EcdsaSha512
-    ) {
-        return Err(SignatureVerificationError::UnsupportedAlgorithm {
+    let digest_algorithm = algorithm.ecdsa_digest().ok_or_else(|| {
+        SignatureVerificationError::UnsupportedAlgorithm {
             uri: algorithm.uri().to_string(),
-        });
-    }
+        }
+    })?;
 
     let (rest, spki) = SubjectPublicKeyInfo::from_der(public_key_spki_der)
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
@@ -581,14 +606,7 @@ pub fn verify_ecdsa_signature_spki_with_encoding(
                     EcdsaSignatureEncoding::Asn1Der
                 }
             };
-            let prehash = match algorithm {
-                SignatureAlgorithm::EcdsaSha1 => Sha1::digest(signed_data).to_vec(),
-                SignatureAlgorithm::EcdsaSha224 => Sha224::digest(signed_data).to_vec(),
-                SignatureAlgorithm::EcdsaSha256 => Sha256::digest(signed_data).to_vec(),
-                SignatureAlgorithm::EcdsaSha384 => Sha384::digest(signed_data).to_vec(),
-                SignatureAlgorithm::EcdsaSha512 => Sha512::digest(signed_data).to_vec(),
-                _ => unreachable!("ECDSA algorithm was validated above"),
-            };
+            let prehash = super::compute_digest(digest_algorithm, signed_data);
             match curve {
                 EcCurve::P256 => verify_ecdsa_p256(
                     &spki.subject_public_key.data,

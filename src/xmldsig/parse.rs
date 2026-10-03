@@ -54,6 +54,30 @@ const MAX_DER_ENCODED_KEY_VALUE_BASE64_LEN: usize = MAX_DER_ENCODED_KEY_VALUE_LE
 pub(crate) const MAX_KEY_NAME_TEXT_LEN: usize = 4096;
 const MAX_KEY_INFO_CHILD_COUNT: usize = 64;
 const MAX_HMAC_OUTPUT_LENGTH_TEXT_LEN: usize = 32;
+pub(crate) const EXPERIMENTAL_SIGNATURE_NS: &str =
+    "http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#";
+
+/// Cryptographic domain-separation context, bounded by the algorithm wire contract.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SignatureContext(Vec<u8>);
+
+impl SignatureContext {
+    /// RFC 8032 section 5 limits contexts to 255 octets, independently of policy.
+    /// https://www.rfc-editor.org/rfc/rfc8032.html#section-5
+    pub fn new(bytes: &[u8]) -> Result<Self, ParseError> {
+        if bytes.len() > 255 {
+            return Err(ParseError::InvalidStructure(
+                "signature context exceeds 255 octets".into(),
+            ));
+        }
+        Ok(Self(bytes.to_vec()))
+    }
+
+    /// Borrow the domain-separation bytes without copying them at provider boundaries.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
 const MAX_RETRIEVAL_XPATH_TEXT_LEN: usize = 256;
 const MAX_RSA_MODULUS_LEN: usize = 1024;
 const MAX_RSA_EXPONENT_LEN: usize = 8;
@@ -114,11 +138,31 @@ pub enum SignatureAlgorithm {
     EcdsaSha384,
     /// ECDSA with SHA-512; the key selects the elliptic curve.
     EcdsaSha512,
+    /// ECDSA with SHA3-224; the key selects the elliptic curve.
+    EcdsaSha3_224,
+    /// ECDSA with SHA3-256; the key selects the elliptic curve.
+    EcdsaSha3_256,
+    /// ECDSA with SHA3-384; the key selects the elliptic curve.
+    EcdsaSha3_384,
+    /// ECDSA with SHA3-512; the key selects the elliptic curve.
+    EcdsaSha3_512,
+    /// Pure Ed25519 (RFC 8032), without external prehash or context.
+    Ed25519,
+    /// Ed25519 with RFC 8032 domain-separation context, without prehash.
+    Ed25519Ctx,
+    /// Ed25519ph with SHA-512 prehash and RFC 8032 domain separation.
+    Ed25519Ph,
+    /// Pure Ed448 (RFC 8032), with an optional domain-separation context.
+    Ed448,
+    /// Ed448ph with SHAKE256 prehash and RFC 8032 domain separation.
+    Ed448Ph,
+    /// Experimental post-quantum method; compile capability does not grant permission.
+    PostQuantum(super::PqAlgorithm),
 }
 
 impl SignatureAlgorithm {
     /// Every signature algorithm recognized by this release.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 35] = [
         Self::DsaSha1,
         Self::DsaSha256,
         Self::HmacSha1,
@@ -136,7 +180,68 @@ impl SignatureAlgorithm {
         Self::EcdsaSha256,
         Self::EcdsaSha384,
         Self::EcdsaSha512,
+        Self::EcdsaSha3_224,
+        Self::EcdsaSha3_256,
+        Self::EcdsaSha3_384,
+        Self::EcdsaSha3_512,
+        Self::Ed25519,
+        Self::Ed25519Ctx,
+        Self::Ed25519Ph,
+        Self::Ed448,
+        Self::Ed448Ph,
+        Self::PostQuantum(super::PqAlgorithm::MlDsa44),
+        Self::PostQuantum(super::PqAlgorithm::MlDsa65),
+        Self::PostQuantum(super::PqAlgorithm::MlDsa87),
+        Self::PostQuantum(super::PqAlgorithm::SlhDsaSha2_128f),
+        Self::PostQuantum(super::PqAlgorithm::SlhDsaSha2_128s),
+        Self::PostQuantum(super::PqAlgorithm::SlhDsaSha2_192f),
+        Self::PostQuantum(super::PqAlgorithm::SlhDsaSha2_192s),
+        Self::PostQuantum(super::PqAlgorithm::SlhDsaSha2_256f),
+        Self::PostQuantum(super::PqAlgorithm::SlhDsaSha2_256s),
     ];
+
+    /// Digest selected by an ECDSA method, independently of its key's curve.
+    pub(crate) const fn ecdsa_digest(self) -> Option<DigestAlgorithm> {
+        match self {
+            Self::EcdsaSha1 => Some(DigestAlgorithm::Sha1),
+            Self::EcdsaSha224 => Some(DigestAlgorithm::Sha224),
+            Self::EcdsaSha256 => Some(DigestAlgorithm::Sha256),
+            Self::EcdsaSha384 => Some(DigestAlgorithm::Sha384),
+            Self::EcdsaSha512 => Some(DigestAlgorithm::Sha512),
+            Self::EcdsaSha3_224 => Some(DigestAlgorithm::Sha3_224),
+            Self::EcdsaSha3_256 => Some(DigestAlgorithm::Sha3_256),
+            Self::EcdsaSha3_384 => Some(DigestAlgorithm::Sha3_384),
+            Self::EcdsaSha3_512 => Some(DigestAlgorithm::Sha3_512),
+            _ => None,
+        }
+    }
+
+    /// Fixed pure EdDSA signature width from RFC 8032 sections 5.1 and 5.2.
+    pub(crate) const fn eddsa_signature_len(self) -> Option<usize> {
+        match self {
+            Self::Ed25519 | Self::Ed25519Ctx | Self::Ed25519Ph => Some(64),
+            Self::Ed448 | Self::Ed448Ph => Some(114),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn eddsa_key_algorithm(self) -> Option<Self> {
+        match self {
+            Self::Ed25519 | Self::Ed25519Ctx | Self::Ed25519Ph => Some(Self::Ed25519),
+            Self::Ed448 | Self::Ed448Ph => Some(Self::Ed448),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn context_element(self) -> Option<&'static str> {
+        match self {
+            Self::Ed25519Ctx | Self::Ed25519Ph | Self::Ed448 | Self::Ed448Ph => {
+                Some("EdDSAContextString")
+            }
+            Self::PostQuantum(algorithm) => Some(algorithm.context_element()),
+            _ => None,
+        }
+    }
 
     /// Fixed XMLDSig component width for DSA's `r || s` representation.
     pub(crate) const fn dsa_component_len(self) -> Option<usize> {
@@ -181,7 +286,23 @@ impl SignatureAlgorithm {
             "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256" => Some(Self::EcdsaSha256),
             "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384" => Some(Self::EcdsaSha384),
             "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha512" => Some(Self::EcdsaSha512),
-            _ => None,
+            // RFC 9231 section 2.3.6 uses 2021, not the digest method's 2007 namespace:
+            // https://www.rfc-editor.org/rfc/rfc9231.html#section-2.3.6
+            "http://www.w3.org/2021/04/xmldsig-more#ecdsa-sha3-224" => Some(Self::EcdsaSha3_224),
+            "http://www.w3.org/2021/04/xmldsig-more#ecdsa-sha3-256" => Some(Self::EcdsaSha3_256),
+            "http://www.w3.org/2021/04/xmldsig-more#ecdsa-sha3-384" => Some(Self::EcdsaSha3_384),
+            "http://www.w3.org/2021/04/xmldsig-more#ecdsa-sha3-512" => Some(Self::EcdsaSha3_512),
+            // RFC 9231 section 2.3.12: pure EdDSA, not an externally hashed message.
+            // https://www.rfc-editor.org/rfc/rfc9231.html#section-2.3.12
+            "http://www.w3.org/2021/04/xmldsig-more#eddsa-ed25519" => Some(Self::Ed25519),
+            "http://www.w3.org/2021/04/xmldsig-more#eddsa-ed25519ctx" => Some(Self::Ed25519Ctx),
+            "http://www.w3.org/2021/04/xmldsig-more#eddsa-ed25519ph" => Some(Self::Ed25519Ph),
+            "http://www.w3.org/2021/04/xmldsig-more#eddsa-ed448" => Some(Self::Ed448),
+            "http://www.w3.org/2021/04/xmldsig-more#eddsa-ed448ph" => Some(Self::Ed448Ph),
+            _ => super::PqAlgorithm::ALL
+                .into_iter()
+                .find(|algorithm| algorithm.uri() == uri)
+                .map(Self::PostQuantum),
         }
     }
 
@@ -206,6 +327,16 @@ impl SignatureAlgorithm {
             Self::EcdsaSha256 => "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256",
             Self::EcdsaSha384 => "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384",
             Self::EcdsaSha512 => "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha512",
+            Self::EcdsaSha3_224 => "http://www.w3.org/2021/04/xmldsig-more#ecdsa-sha3-224",
+            Self::EcdsaSha3_256 => "http://www.w3.org/2021/04/xmldsig-more#ecdsa-sha3-256",
+            Self::EcdsaSha3_384 => "http://www.w3.org/2021/04/xmldsig-more#ecdsa-sha3-384",
+            Self::EcdsaSha3_512 => "http://www.w3.org/2021/04/xmldsig-more#ecdsa-sha3-512",
+            Self::Ed25519 => "http://www.w3.org/2021/04/xmldsig-more#eddsa-ed25519",
+            Self::Ed25519Ctx => "http://www.w3.org/2021/04/xmldsig-more#eddsa-ed25519ctx",
+            Self::Ed25519Ph => "http://www.w3.org/2021/04/xmldsig-more#eddsa-ed25519ph",
+            Self::Ed448 => "http://www.w3.org/2021/04/xmldsig-more#eddsa-ed448",
+            Self::Ed448Ph => "http://www.w3.org/2021/04/xmldsig-more#eddsa-ed448ph",
+            Self::PostQuantum(algorithm) => algorithm.uri(),
         }
     }
 
@@ -214,7 +345,7 @@ impl SignatureAlgorithm {
     pub fn signing_allowed(self) -> bool {
         !matches!(
             self,
-            Self::RsaSha1 | Self::DsaSha1 | Self::HmacSha1 | Self::EcdsaSha1
+            Self::RsaSha1 | Self::DsaSha1 | Self::HmacSha1 | Self::EcdsaSha1 | Self::PostQuantum(_)
         )
     }
 }
@@ -229,6 +360,8 @@ pub struct SignedInfo {
     pub signature_method: SignatureAlgorithm,
     /// Optional byte-aligned HMAC output length in bits.
     pub hmac_output_length_bits: Option<usize>,
+    /// Domain separation supplied by the selected SignatureMethod extension.
+    pub signature_context: SignatureContext,
     /// One or more `<Reference>` elements.
     pub references: Vec<Reference>,
 }
@@ -503,12 +636,14 @@ pub fn parse_signed_info(signed_info_node: Node) -> Result<SignedInfo, ParseErro
     parse_signed_info_with_xpath_budget(
         signed_info_node,
         &mut transforms::XPathSignatureParseBudget::default(),
+        &crate::policy::ResourcePolicy::default(),
     )
 }
 
 pub(crate) fn parse_signed_info_with_xpath_budget(
     signed_info_node: Node,
     xpath_budget: &mut transforms::XPathSignatureParseBudget,
+    resources: &crate::policy::ResourcePolicy,
 ) -> Result<SignedInfo, ParseError> {
     verify_ds_element(signed_info_node, "SignedInfo")?;
 
@@ -538,7 +673,8 @@ pub(crate) fn parse_signed_info_with_xpath_budget(
     let sig_method_node = children.next().ok_or(ParseError::MissingElement {
         element: "SignatureMethod",
     })?;
-    let (signature_method, hmac_output_length_bits) = parse_signature_method(sig_method_node)?;
+    let (signature_method, hmac_output_length_bits, signature_context) =
+        parse_signature_method(sig_method_node, resources)?;
 
     // 3. One or more Reference elements
     let mut references = Vec::new();
@@ -564,6 +700,7 @@ pub(crate) fn parse_signed_info_with_xpath_budget(
         c14n_method,
         signature_method,
         hmac_output_length_bits,
+        signature_context,
         references,
     })
 }
@@ -573,14 +710,24 @@ struct ByteAlignedHmacOutputLength(usize);
 
 pub(crate) fn parse_signature_method(
     node: Node<'_, '_>,
-) -> Result<(SignatureAlgorithm, Option<usize>), ParseError> {
+    resources: &crate::policy::ResourcePolicy,
+) -> Result<(SignatureAlgorithm, Option<usize>, SignatureContext), ParseError> {
     verify_ds_element(node, "SignatureMethod")?;
     let uri = required_algorithm_attr(node, "SignatureMethod")?;
     let algorithm =
         SignatureAlgorithm::from_uri(uri).ok_or_else(|| ParseError::UnsupportedAlgorithm {
             uri: uri.to_string(),
         })?;
-    Ok((algorithm, parse_hmac_output_length(node, algorithm)?))
+    ensure_no_non_whitespace_text(node, "SignatureMethod")?;
+    let (hmac, context) = if algorithm.context_element().is_some() {
+        (None, parse_signature_context(node, algorithm, resources)?)
+    } else {
+        (
+            parse_hmac_output_length(node, algorithm)?,
+            SignatureContext::default(),
+        )
+    };
+    Ok((algorithm, hmac, context))
 }
 
 impl ByteAlignedHmacOutputLength {
@@ -636,6 +783,49 @@ fn parse_hmac_output_length(
     Ok(Some(
         ByteAlignedHmacOutputLength::parse(&text, maximum_bits)?.bits(),
     ))
+}
+
+fn parse_signature_context(
+    node: Node<'_, '_>,
+    algorithm: SignatureAlgorithm,
+    resources: &crate::policy::ResourcePolicy,
+) -> Result<SignatureContext, ParseError> {
+    let Some(element_name) = algorithm.context_element() else {
+        return Ok(SignatureContext::default());
+    };
+    let mut children = element_children(node);
+    let Some(child) = children.next() else {
+        return Ok(SignatureContext::default());
+    };
+    // RFC 9231 defines method identifiers, not this XML parameter syntax.
+    // This explicit experimental extension matches libxmlsec1 1.3.13.
+    if child.tag_name().namespace() != Some(EXPERIMENTAL_SIGNATURE_NS)
+        || child.tag_name().name() != element_name
+        || children.next().is_some()
+    {
+        return Err(ParseError::InvalidStructure(
+            "SignatureMethod parameters do not match the selected algorithm".into(),
+        ));
+    }
+    // Borrow text and validate widths before allocating. RFC 8032 §5's
+    // 255-octet ceiling implies at most 340 padded Base64 characters:
+    // https://www.rfc-editor.org/rfc/rfc8032.html#section-5
+    // Whitespace is XML text, not decoded context octets; its resource ceiling
+    // comes from the operation snapshot, never a separate context policy.
+    let payload =
+        super::whitespace::XmlBase64Payload::bounded(child, resources.max_xml_document_bytes, 340)
+            .map_err(|reason| {
+                ParseError::InvalidStructure(format!("signature context: {reason}"))
+            })?;
+    if payload.decoded_len > 255 {
+        return Err(ParseError::InvalidStructure(
+            "signature context exceeds 255 octets".into(),
+        ));
+    }
+    let bytes = payload
+        .decode()
+        .map_err(|reason| ParseError::InvalidStructure(format!("signature context: {reason}")))?;
+    Ok(SignatureContext(bytes))
 }
 
 /// Parse a single `<ds:Reference>` element.
@@ -766,6 +956,11 @@ pub fn parse_key_info(key_info_node: Node) -> Result<KeyInfo, ParseError> {
 pub struct KeyInfoParsingSession<'a> {
     resources: &'a crate::policy::ResourcePolicy,
     xml_base: XmlBaseResolutionBudget,
+    usage: KeyInfoParseUsage,
+}
+
+#[derive(Default)]
+struct KeyInfoParseUsage {
     embedded_candidates: usize,
     x509_binary_bytes: usize,
 }
@@ -780,8 +975,7 @@ impl<'a> KeyInfoParsingSession<'a> {
                 resources.effective_xml_base_components(),
                 resources.effective_xml_base_resolution_bytes(),
             ),
-            embedded_candidates: 0,
-            x509_binary_bytes: 0,
+            usage: KeyInfoParseUsage::default(),
         })
     }
 
@@ -793,8 +987,8 @@ impl<'a> KeyInfoParsingSession<'a> {
             &self.xml_base,
             self.resources,
             None,
-            &mut self.embedded_candidates,
-            &mut self.x509_binary_bytes,
+            None,
+            &mut self.usage,
         )
     }
 }
@@ -809,6 +1003,7 @@ pub(crate) fn parse_key_info_with_provider(
         provider,
         &xml_base_budget,
         &crate::policy::ResourcePolicy::default(),
+        None,
     )
 }
 
@@ -817,6 +1012,7 @@ pub(crate) fn parse_key_info_with_policy_budgets(
     provider: &dyn crate::provider::CryptoProvider,
     xml_base_budget: &XmlBaseResolutionBudget,
     resources: &crate::policy::ResourcePolicy,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<KeyInfo, ParseError> {
     parse_key_info_with_policy_budgets_and_document_base(
         key_info_node,
@@ -824,6 +1020,7 @@ pub(crate) fn parse_key_info_with_policy_budgets(
         xml_base_budget,
         resources,
         None,
+        allowed,
     )
 }
 
@@ -833,6 +1030,7 @@ pub(crate) fn parse_key_info_with_policy_budgets_and_document_base(
     xml_base_budget: &XmlBaseResolutionBudget,
     resources: &crate::policy::ResourcePolicy,
     document_base: Option<&str>,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<KeyInfo, ParseError> {
     parse_key_info_in_session(
         key_info_node,
@@ -840,8 +1038,8 @@ pub(crate) fn parse_key_info_with_policy_budgets_and_document_base(
         xml_base_budget,
         resources,
         document_base,
-        &mut 0,
-        &mut 0,
+        allowed,
+        &mut KeyInfoParseUsage::default(),
     )
 }
 
@@ -851,8 +1049,8 @@ fn parse_key_info_in_session(
     xml_base_budget: &XmlBaseResolutionBudget,
     resources: &crate::policy::ResourcePolicy,
     document_base: Option<&str>,
-    embedded_candidate_preflight_count: &mut usize,
-    x509_total_binary_len: &mut usize,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
+    usage: &mut KeyInfoParseUsage,
 ) -> Result<KeyInfo, ParseError> {
     validate_key_info_container(key_info_node)?;
 
@@ -874,17 +1072,18 @@ fn parse_key_info_in_session(
                 sources.push(KeyInfoSource::KeyName(key_name));
             }
             (Some(XMLDSIG_NS), "KeyValue") => {
-                charge_embedded_key_candidate(embedded_candidate_preflight_count, resources)?;
+                charge_embedded_key_candidate(&mut usage.embedded_candidates, resources)?;
                 let key_value = parse_key_value_dispatch(child)?;
                 sources.push(KeyInfoSource::KeyValue(key_value));
             }
             (Some(XMLDSIG_NS), "X509Data") => {
                 let x509 = parse_x509_data_dispatch_with_budget_and_provider(
                     child,
-                    x509_total_binary_len,
-                    embedded_candidate_preflight_count,
+                    &mut usage.x509_binary_bytes,
+                    &mut usage.embedded_candidates,
                     provider,
                     resources,
+                    allowed,
                 )?;
                 sources.push(KeyInfoSource::X509Data(x509));
             }
@@ -934,7 +1133,7 @@ fn parse_key_info_in_session(
                 });
             }
             (Some(XMLDSIG11_NS), "DEREncodedKeyValue") => {
-                charge_embedded_key_candidate(embedded_candidate_preflight_count, resources)?;
+                charge_embedded_key_candidate(&mut usage.embedded_candidates, resources)?;
                 ensure_no_element_children(child, "DEREncodedKeyValue")?;
                 let der = decode_der_encoded_key_value_base64(child)?;
                 sources.push(KeyInfoSource::DerEncodedKeyValue(der));
@@ -1374,6 +1573,7 @@ pub(crate) fn parse_x509_data_dispatch_with_budget_and_provider(
     embedded_key_candidates: &mut usize,
     provider: &dyn crate::provider::CryptoProvider,
     resources: &crate::policy::ResourcePolicy,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<X509DataInfo, ParseError> {
     verify_ds_element(node, "X509Data")?;
     ensure_no_non_whitespace_text(node, "X509Data")?;
@@ -1434,24 +1634,27 @@ pub(crate) fn parse_x509_data_dispatch_with_budget_and_provider(
         }
     }
 
-    info.certificate_chain = build_x509_certificate_chain(&info, provider)?;
+    info.certificate_chain = build_x509_certificate_chain(&info, provider, allowed)?;
     Ok(info)
 }
 
 fn build_x509_certificate_chain(
     info: &X509DataInfo,
     provider: &dyn crate::provider::CryptoProvider,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<Vec<usize>, ParseError> {
     if info.parsed_certificates.is_empty() {
         return Ok(Vec::new());
     }
 
     let signing_idx = select_x509_signing_certificate(info, provider)?;
-    build_x509_certificate_chain_from(info, signing_idx, provider).map_err(ParseError::from)
+    build_x509_certificate_chain_from(info, signing_idx, provider, allowed)
+        .map_err(ParseError::from)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum X509ChainBuildError {
+    Policy(crate::policy::PolicyViolation),
     InconsistentMetadata,
     DepthExceeded,
     Cycle,
@@ -1483,6 +1686,7 @@ impl From<X509ChainBuildError> for ParseError {
                 ));
             }
             X509ChainBuildError::Provider(error) => return Self::Provider(error),
+            X509ChainBuildError::Policy(error) => return Self::Policy(error),
         };
         Self::InvalidStructure(reason.into())
     }
@@ -1493,6 +1697,7 @@ pub(crate) fn build_x509_certificate_chain_from(
     info: &X509DataInfo,
     signing_idx: usize,
     provider: &dyn crate::provider::CryptoProvider,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<Vec<usize>, X509ChainBuildError> {
     if signing_idx >= info.parsed_certificates.len()
         || info.parsed_certificates.len() != info.certificates.len()
@@ -1532,6 +1737,7 @@ pub(crate) fn build_x509_certificate_chain_from(
                         &info.certificates[current_idx],
                         &info.certificates[issuer_idx],
                         provider,
+                        allowed,
                     ) {
                         Ok(true) => verified.push(issuer_idx),
                         Ok(false) => {}
@@ -1548,6 +1754,9 @@ pub(crate) fn build_x509_certificate_chain_from(
                         }
                         Err(super::X509ChainError::UnsupportedSignatureAlgorithm { oid }) => {
                             unsupported_oid.get_or_insert(oid);
+                        }
+                        Err(super::X509ChainError::Policy(error)) => {
+                            return Err(X509ChainBuildError::Policy(error));
                         }
                         Err(_) => return Err(X509ChainBuildError::IssuerSignatureMismatch),
                     }
@@ -1586,6 +1795,7 @@ pub(crate) fn build_x509_certificate_paths_to_trusted_prefix(
     max_depth: usize,
     max_candidate_paths: usize,
     provider: &dyn crate::provider::CryptoProvider,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<Vec<Vec<usize>>, X509ChainBuildError> {
     if trusted_prefix_len > info.certificates.len() {
         return Err(X509ChainBuildError::InconsistentMetadata);
@@ -1595,9 +1805,12 @@ pub(crate) fn build_x509_certificate_paths_to_trusted_prefix(
         signing_idx,
         |index| index < trusted_prefix_len,
         false,
-        max_depth,
-        max_candidate_paths,
+        X509PathBounds {
+            max_depth,
+            max_candidate_paths,
+        },
         provider,
+        allowed,
     )
 }
 
@@ -1611,6 +1824,7 @@ pub(crate) fn build_x509_certificate_paths_to_selector_targets(
     max_depth: usize,
     max_candidate_paths: usize,
     provider: &dyn crate::provider::CryptoProvider,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<Vec<Vec<usize>>, X509ChainBuildError> {
     if targets
         .iter()
@@ -1623,10 +1837,18 @@ pub(crate) fn build_x509_certificate_paths_to_selector_targets(
         signing_idx,
         |index| targets.contains(&index),
         true,
-        max_depth,
-        max_candidate_paths,
+        X509PathBounds {
+            max_depth,
+            max_candidate_paths,
+        },
         provider,
+        allowed,
     )
+}
+
+struct X509PathBounds {
+    max_depth: usize,
+    max_candidate_paths: usize,
 }
 
 fn build_x509_certificate_paths(
@@ -1634,10 +1856,14 @@ fn build_x509_certificate_paths(
     signing_idx: usize,
     is_terminal: impl Fn(usize) -> bool,
     continue_after_terminal: bool,
-    max_depth: usize,
-    max_candidate_paths: usize,
+    bounds: X509PathBounds,
     provider: &dyn crate::provider::CryptoProvider,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<Vec<Vec<usize>>, X509ChainBuildError> {
+    let X509PathBounds {
+        max_depth,
+        max_candidate_paths,
+    } = bounds;
     if signing_idx >= info.parsed_certificates.len()
         || info.parsed_certificates.len() != info.certificates.len()
     {
@@ -1652,6 +1878,7 @@ fn build_x509_certificate_paths(
     let mut generated_paths = 1usize;
     let mut depth_exceeded = false;
     let mut unsupported_oid = None;
+    let mut policy_rejection = None;
     let mut issuer_cache = vec![None; info.parsed_certificates.len()];
     while let Some(path) = pending.pop() {
         let current_idx = *path
@@ -1679,6 +1906,7 @@ fn build_x509_certificate_paths(
                     &info.certificates[current_idx],
                     &info.certificates[issuer_idx],
                     provider,
+                    allowed,
                 ) {
                     Ok(true) => verified.push(issuer_idx),
                     Ok(false) => {}
@@ -1700,6 +1928,15 @@ fn build_x509_certificate_paths(
                         // The mapper rejected this child's AlgorithmIdentifier;
                         // no issuer candidate can alter it on the current path.
                         unsupported_oid.get_or_insert(oid);
+                        break;
+                    }
+                    Err(super::X509ChainError::Policy(error)) => {
+                        // Certificate permission belongs to this child's
+                        // parent edge, not to other cross-certified paths.
+                        // RFC 5280 section 6.1 validates a prospective path;
+                        // discovery among alternatives is our product policy.
+                        // https://www.rfc-editor.org/rfc/rfc5280.html#section-6.1
+                        policy_rejection.get_or_insert(error);
                         break;
                     }
                     Err(_) => return Err(X509ChainBuildError::IssuerSignatureMismatch),
@@ -1727,6 +1964,9 @@ fn build_x509_certificate_paths(
     }
 
     if completed.is_empty() {
+        if let Some(error) = policy_rejection {
+            return Err(X509ChainBuildError::Policy(error));
+        }
         if let Some(oid) = unsupported_oid {
             return Err(X509ChainBuildError::UnsupportedSignatureAlgorithm { oid });
         }
@@ -2842,6 +3082,7 @@ mod tests {
             crate::provider::default_provider(),
             &XmlBaseResolutionBudget::default(),
             &resources,
+            None,
         )
         .expect_err("candidate policy must reject KeyValue before RSA parsing");
 
@@ -2876,6 +3117,7 @@ mod tests {
             crate::provider::default_provider(),
             &XmlBaseResolutionBudget::default(),
             &resources,
+            None,
         )
         .expect_err("candidate policy must reject DEREncodedKeyValue before decoding");
 
@@ -3500,7 +3742,7 @@ BA== </Modulus>
             0
         );
         assert_eq!(
-            build_x509_certificate_chain_from(&info, 0, crate::provider::default_provider())
+            build_x509_certificate_chain_from(&info, 0, crate::provider::default_provider(), None)
                 .unwrap(),
             vec![0, 1, 2]
         );
@@ -3814,8 +4056,8 @@ BA== </Modulus>
             ..X509DataInfo::default()
         };
 
-        let err =
-            build_x509_certificate_chain(&info, crate::provider::default_provider()).unwrap_err();
+        let err = build_x509_certificate_chain(&info, crate::provider::default_provider(), None)
+            .unwrap_err();
         assert!(
             matches!(err, ParseError::InvalidStructure(message) if message.contains("maximum depth"))
         );
@@ -4360,6 +4602,7 @@ BA== </Modulus>
             crate::provider::default_provider(),
             &XmlBaseResolutionBudget::default(),
             &resources,
+            None,
         )
         .expect_err("zero namespace bindings must reject RetrievalMethod XPath");
 
@@ -4397,6 +4640,7 @@ BA== </Modulus>
             crate::provider::default_provider(),
             &XmlBaseResolutionBudget::default(),
             &resources,
+            None,
         )
         .expect_err("zero namespace bytes must reject RetrievalMethod XPath");
 

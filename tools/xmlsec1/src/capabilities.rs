@@ -14,14 +14,49 @@ pub const TRANSFORMS: &[&str] = &[
     "dsa-sha1",
     "ecdsa-sha256",
     "ecdsa-sha384",
+    "ecdsa-sha1",
+    "ecdsa-sha224",
+    "ecdsa-sha512",
+    "ecdsa-sha3-224",
+    "ecdsa-sha3-256",
+    "ecdsa-sha3-384",
+    "ecdsa-sha3-512",
+    "eddsa-ed25519",
+    "eddsa-ed25519ctx",
+    "eddsa-ed25519ph",
+    "eddsa-ed448",
+    "eddsa-ed448ph",
+    #[cfg(feature = "experimental-pq")]
+    "ml-dsa-44",
+    #[cfg(feature = "experimental-pq")]
+    "ml-dsa-65",
+    #[cfg(feature = "experimental-pq")]
+    "ml-dsa-87",
+    #[cfg(feature = "experimental-pq")]
+    "slh-dsa-sha2-128s",
+    #[cfg(feature = "experimental-pq")]
+    "slh-dsa-sha2-128f",
+    #[cfg(feature = "experimental-pq")]
+    "slh-dsa-sha2-192s",
+    #[cfg(feature = "experimental-pq")]
+    "slh-dsa-sha2-192f",
+    #[cfg(feature = "experimental-pq")]
+    "slh-dsa-sha2-256s",
+    #[cfg(feature = "experimental-pq")]
+    "slh-dsa-sha2-256f",
     "rsa-sha1",
     "rsa-sha256",
     "rsa-sha384",
     "rsa-sha512",
     "sha1",
+    "sha224",
     "sha256",
     "sha384",
     "sha512",
+    "sha3-224",
+    "sha3-256",
+    "sha3-384",
+    "sha3-512",
     "aes128-cbc",
     "aes256-cbc",
     "aes128-gcm",
@@ -38,6 +73,11 @@ pub const KEY_DATA: &[&str] = &[
     "aes",
     "rsa",
     "ec",
+    "eddsa",
+    #[cfg(feature = "experimental-pq")]
+    "ml-dsa",
+    #[cfg(feature = "experimental-pq")]
+    "slh-dsa",
     "x509",
     "raw-x509-cert",
 ];
@@ -79,6 +119,19 @@ pub fn all_requested_available(values: &[&str], requested: &[OsString]) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modern_signature_and_digest_capabilities_are_discoverable() {
+        // Capability queries must agree with the actual public signing path.
+        for name in ["ecdsa-sha3-256", "sha3-256", "eddsa-ed25519", "eddsa-ed448"] {
+            assert!(TRANSFORMS.contains(&name), "missing {name}");
+        }
+        assert!(KEY_DATA.contains(&"eddsa"));
+        assert_eq!(
+            TRANSFORMS.contains(&"ml-dsa-44"),
+            cfg!(feature = "experimental-pq")
+        );
+    }
 
     #[test]
     fn checks_comma_separated_and_repeated_capabilities() {

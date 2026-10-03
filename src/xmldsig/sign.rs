@@ -327,6 +327,20 @@ pub enum SigningPublicKeyInfo {
         /// Secret length used for signing policy.
         key_bits: usize,
     },
+    /// EdDSA key metadata; the algorithm fixes its wire format and width.
+    EdDsa {
+        /// Pure EdDSA method supported by this key.
+        algorithm: SignatureAlgorithm,
+        /// DER SubjectPublicKeyInfo with absent RFC 8410 parameters.
+        spki_der: Vec<u8>,
+    },
+    /// Experimental PQ key metadata; permission is independent of this capability.
+    PostQuantum {
+        /// Exact FIPS parameter set.
+        algorithm: super::PqAlgorithm,
+        /// DER SubjectPublicKeyInfo with absent parameters.
+        spki_der: Vec<u8>,
+    },
 }
 
 impl SigningPublicKeyInfo {
@@ -334,9 +348,11 @@ impl SigningPublicKeyInfo {
     #[must_use]
     pub fn spki_der(&self) -> Option<&[u8]> {
         match self {
-            Self::Rsa { spki_der, .. } | Self::Ec { spki_der, .. } | Self::Dsa { spki_der, .. } => {
-                Some(spki_der)
-            }
+            Self::Rsa { spki_der, .. }
+            | Self::Ec { spki_der, .. }
+            | Self::Dsa { spki_der, .. }
+            | Self::EdDsa { spki_der, .. } => Some(spki_der),
+            Self::PostQuantum { spki_der, .. } => Some(spki_der),
             Self::Hmac { .. } => None,
         }
     }
@@ -371,6 +387,22 @@ fn expected_signature_output_len(
     let public_key = key.public_key_info()?;
     let expected = match (algorithm, public_key) {
         (
+            SignatureAlgorithm::PostQuantum(algorithm),
+            SigningPublicKeyInfo::PostQuantum {
+                algorithm: key_algorithm,
+                ..
+            },
+        ) if algorithm == key_algorithm => algorithm.signature_len(),
+        (
+            algorithm,
+            SigningPublicKeyInfo::EdDsa {
+                algorithm: key_algorithm,
+                ..
+            },
+        ) if algorithm.eddsa_key_algorithm() == Some(key_algorithm) => algorithm
+            .eddsa_signature_len()
+            .ok_or(SigningKeyError::InvalidPublicKeyInfo)?,
+        (
             SignatureAlgorithm::RsaSha1
             | SignatureAlgorithm::RsaSha224
             | SignatureAlgorithm::RsaSha256
@@ -387,7 +419,11 @@ fn expected_signature_output_len(
             | SignatureAlgorithm::EcdsaSha224
             | SignatureAlgorithm::EcdsaSha256
             | SignatureAlgorithm::EcdsaSha384
-            | SignatureAlgorithm::EcdsaSha512,
+            | SignatureAlgorithm::EcdsaSha512
+            | SignatureAlgorithm::EcdsaSha3_224
+            | SignatureAlgorithm::EcdsaSha3_256
+            | SignatureAlgorithm::EcdsaSha3_384
+            | SignatureAlgorithm::EcdsaSha3_512,
             SigningPublicKeyInfo::Ec { public_key, .. },
         ) if public_key.first() == Some(&0x04)
             && public_key.len() > 1
@@ -448,7 +484,11 @@ fn expected_signature_output_len(
             | SignatureAlgorithm::EcdsaSha224
             | SignatureAlgorithm::EcdsaSha256
             | SignatureAlgorithm::EcdsaSha384
-            | SignatureAlgorithm::EcdsaSha512,
+            | SignatureAlgorithm::EcdsaSha512
+            | SignatureAlgorithm::EcdsaSha3_224
+            | SignatureAlgorithm::EcdsaSha3_256
+            | SignatureAlgorithm::EcdsaSha3_384
+            | SignatureAlgorithm::EcdsaSha3_512,
             SigningPublicKeyInfo::Rsa { .. }
             | SigningPublicKeyInfo::Dsa { .. }
             | SigningPublicKeyInfo::Hmac { .. },
@@ -475,6 +515,21 @@ fn validate_signature_output(expected: usize, signature: &[u8]) -> Result<(), Si
 
 /// Private key abstraction used by [`SignContext`].
 pub trait SigningKey {
+    /// Primitive hook preserving validated SignatureMethod context.
+    fn sign_with_provider_context(
+        &self,
+        provider: &dyn crate::provider::CryptoProvider,
+        algorithm: SignatureAlgorithm,
+        context: &super::SignatureContext,
+        data: &[u8],
+    ) -> Result<Vec<u8>, SigningKeyError> {
+        if !context.as_bytes().is_empty() {
+            return Err(SigningKeyError::UnsupportedAlgorithm {
+                uri: algorithm.uri().to_owned(),
+            });
+        }
+        self.sign_with_provider(provider, algorithm, data)
+    }
     /// Sign canonicalized `<SignedInfo>` bytes for the declared XMLDSig method.
     fn sign(
         &self,
@@ -610,7 +665,11 @@ impl KeyInfoWriter for KeyValueInfoWriter {
                 encode(&g),
                 encode(&y)
             )),
-            SigningPublicKeyInfo::Hmac { .. } => Err(KeyInfoWriteError::UnsupportedKeyValue),
+            SigningPublicKeyInfo::Hmac { .. }
+            | SigningPublicKeyInfo::EdDsa { .. }
+            | SigningPublicKeyInfo::PostQuantum { .. } => {
+                Err(KeyInfoWriteError::UnsupportedKeyValue)
+            }
         }
     }
 }
@@ -1069,16 +1128,11 @@ fn sign_rsa_pkcs1v15_with_rng(
 fn ecdsa_digest_algorithm(
     algorithm: SignatureAlgorithm,
 ) -> Result<DigestAlgorithm, SigningKeyError> {
-    match algorithm {
-        SignatureAlgorithm::EcdsaSha1 => Ok(DigestAlgorithm::Sha1),
-        SignatureAlgorithm::EcdsaSha224 => Ok(DigestAlgorithm::Sha224),
-        SignatureAlgorithm::EcdsaSha256 => Ok(DigestAlgorithm::Sha256),
-        SignatureAlgorithm::EcdsaSha384 => Ok(DigestAlgorithm::Sha384),
-        SignatureAlgorithm::EcdsaSha512 => Ok(DigestAlgorithm::Sha512),
-        _ => Err(SigningKeyError::UnsupportedAlgorithm {
+    algorithm
+        .ecdsa_digest()
+        .ok_or_else(|| SigningKeyError::UnsupportedAlgorithm {
             uri: algorithm.uri().to_owned(),
-        }),
-    }
+        })
 }
 
 fn sign_ecdsa_with_provider<S, K>(
@@ -1751,8 +1805,8 @@ impl<'a> SignContext<'a> {
         self.policy
             .resources
             .validate_xml_document_len(document.as_xml().len())?;
-        let (algorithm, hmac_output_length_bits, canonical_signed_info) = operation
-            .run_with_budgets(plan_nodes.canonicalization, |budgets| {
+        let (algorithm, hmac_output_length_bits, canonical_signed_info, signature_context) =
+            operation.run_with_budgets(plan_nodes.canonicalization, |budgets| {
                 let result =
                     canonicalize_signed_info(document, &self.policy, budgets, target_signature)?;
                 budgets
@@ -1792,9 +1846,12 @@ impl<'a> SignContext<'a> {
             self.provider
                 .require_capability(crate::provider::ProviderCapability::Sign(algorithm))
                 .map_err(SigningKeyError::from)?;
-            let mut signature_value =
-                self.provider
-                    .sign(self.signing_key, algorithm, &canonical_signed_info)?;
+            let mut signature_value = self.provider.sign_with_context(
+                self.signing_key,
+                algorithm,
+                &signature_context,
+                &canonical_signed_info,
+            )?;
             if algorithm.hmac_output_bits().is_some() {
                 signature_value.truncate(expected_signature_len);
             }
@@ -1951,17 +2008,9 @@ fn projected_signature_output_len(
     raw_signature_len: usize,
     encoding: crate::policy::EcdsaSignatureValueEncoding,
 ) -> Result<usize, SigningError> {
-    if matches!(
-        (algorithm, encoding),
-        (
-            SignatureAlgorithm::EcdsaSha1
-                | SignatureAlgorithm::EcdsaSha224
-                | SignatureAlgorithm::EcdsaSha256
-                | SignatureAlgorithm::EcdsaSha384
-                | SignatureAlgorithm::EcdsaSha512,
-            crate::policy::EcdsaSignatureValueEncoding::XmlSecAsn1Der
-        )
-    ) {
+    if algorithm.ecdsa_digest().is_some()
+        && encoding == crate::policy::EcdsaSignatureValueEncoding::XmlSecAsn1Der
+    {
         return maximum_ecdsa_der_signature_len(raw_signature_len)
             .ok_or(SigningKeyError::InvalidPublicKeyInfo.into());
     }
@@ -2035,17 +2084,9 @@ fn encode_signature_output(
     signature: Vec<u8>,
     encoding: crate::policy::EcdsaSignatureValueEncoding,
 ) -> Result<Vec<u8>, SigningError> {
-    if matches!(
-        (algorithm, encoding),
-        (
-            SignatureAlgorithm::EcdsaSha1
-                | SignatureAlgorithm::EcdsaSha224
-                | SignatureAlgorithm::EcdsaSha256
-                | SignatureAlgorithm::EcdsaSha384
-                | SignatureAlgorithm::EcdsaSha512,
-            crate::policy::EcdsaSignatureValueEncoding::XmlSecAsn1Der
-        )
-    ) {
+    if algorithm.ecdsa_digest().is_some()
+        && encoding == crate::policy::EcdsaSignatureValueEncoding::XmlSecAsn1Der
+    {
         return encode_ecdsa_signature_as_der(&signature)
             .ok_or(SigningKeyError::InvalidPublicKeyInfo.into());
     }
@@ -2802,7 +2843,9 @@ fn validate_signing_signed_info_methods(
             .ok_or(SigningDigestError::MissingElement {
                 element: "SignatureMethod",
             })?;
-    super::parse::parse_signature_method(signature_method).map_err(SigningError::from)
+    super::parse::parse_signature_method(signature_method, &policy.resources)
+        .map(|(algorithm, hmac, _context)| (algorithm, hmac))
+        .map_err(SigningError::from)
 }
 
 struct SigningUriResolution<'a, 'resources> {
@@ -2917,7 +2960,15 @@ fn canonicalize_signed_info(
     policy: &crate::policy::SigningPolicy,
     budgets: &mut SigningOperationBudgets,
     target_signature: usize,
-) -> Result<(SignatureAlgorithm, Option<usize>, Vec<u8>), SigningError> {
+) -> Result<
+    (
+        SignatureAlgorithm,
+        Option<usize>,
+        Vec<u8>,
+        super::SignatureContext,
+    ),
+    SigningError,
+> {
     document.with_view(|view| {
         let doc = view.document();
         let signature =
@@ -2925,8 +2976,11 @@ fn canonicalize_signed_info(
                 .map_err(SigningError::Digest)?;
         let signed_info_node =
             find_required_child(signature, "SignedInfo").map_err(SigningError::Digest)?;
-        let signed_info =
-            parse_signed_info_with_xpath_budget(signed_info_node, &mut budgets.xpath_parse)?;
+        let signed_info = parse_signed_info_with_xpath_budget(
+            signed_info_node,
+            &mut budgets.xpath_parse,
+            &policy.resources,
+        )?;
         if policy
             .transforms
             .allowed_algorithms
@@ -2967,6 +3021,7 @@ fn canonicalize_signed_info(
             signed_info.signature_method,
             signed_info.hmac_output_length_bits,
             canonical_signed_info,
+            signed_info.signature_context,
         ))
     })
 }

@@ -893,6 +893,10 @@ fn xmlsec_compatibility_signing_policy(invocation: &Invocation) -> SigningPolicy
             DigestAlgorithm::Sha256,
             DigestAlgorithm::Sha384,
             DigestAlgorithm::Sha512,
+            DigestAlgorithm::Sha3_224,
+            DigestAlgorithm::Sha3_256,
+            DigestAlgorithm::Sha3_384,
+            DigestAlgorithm::Sha3_512,
         ])),
         manifest_processing: if invocation.flag("ignore-manifests") {
             ManifestProcessing::Ignore
@@ -1337,6 +1341,10 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
     // boundary: both CLI signing and verification use the donor interpretation,
     // while the core library retains the XMLDSig binding by default.
     let mut policy = VerificationPolicy {
+        // The compatibility executable explicitly permits every compiled XML
+        // signature method, including experimental PQ methods. Library defaults
+        // remain restrictive; provider capability still gates execution.
+        signature_algorithms: Some(HashSet::from(SignatureAlgorithm::ALL)),
         manifest_processing: if invocation.flag("ignore-manifests") {
             ManifestProcessing::Ignore
         } else {
@@ -1363,6 +1371,11 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
         SignatureAlgorithm::HmacSha1,
         SignatureAlgorithm::EcdsaSha1,
     ]);
+    // A compatibility boundary opts into provider-supported certificate/CRL
+    // methods independently of XML methods. This includes every valid PSS
+    // salt length without constructing an artificial finite parameter list.
+    policy.key_trust.certificate_signature_algorithms =
+        Some(xml_sec::policy::CertificateSignatureAlgorithms::AllSupported);
     policy.key_trust.dsa_keys.minimum_modulus_bits = 1024;
     policy.hmac = HmacPolicy {
         minimum_key_bits: 40,
@@ -2081,6 +2094,21 @@ impl CandidateVerifyingKey<'_> {
 }
 
 impl VerifyingKey for CandidateVerifyingKey<'_> {
+    fn verify_with_context(
+        &self,
+        algorithm: SignatureAlgorithm,
+        context: &xml_sec::xmldsig::SignatureContext,
+        signed_data: &[u8],
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        // Candidate selection must preserve RFC 8032 section 5 domain
+        // separation; the context is authenticated SignatureMethod data.
+        // https://www.rfc-editor.org/rfc/rfc8032#section-5
+        self.first_accepting(|candidate| {
+            candidate.verify_with_context(algorithm, context, signed_data, signature_value)
+        })
+    }
+
     fn validate_signature_value(
         &self,
         algorithm: SignatureAlgorithm,
@@ -4684,6 +4712,24 @@ mod tests {
                 SignatureAlgorithm::EcdsaSha256,
                 SignatureAlgorithm::EcdsaSha384,
                 SignatureAlgorithm::EcdsaSha512,
+                SignatureAlgorithm::EcdsaSha3_224,
+                SignatureAlgorithm::EcdsaSha3_256,
+                SignatureAlgorithm::EcdsaSha3_384,
+                SignatureAlgorithm::EcdsaSha3_512,
+                SignatureAlgorithm::Ed25519,
+                SignatureAlgorithm::Ed25519Ctx,
+                SignatureAlgorithm::Ed25519Ph,
+                SignatureAlgorithm::Ed448,
+                SignatureAlgorithm::Ed448Ph,
+                SignatureAlgorithm::PostQuantum(xml_sec::xmldsig::PqAlgorithm::MlDsa44),
+                SignatureAlgorithm::PostQuantum(xml_sec::xmldsig::PqAlgorithm::MlDsa65),
+                SignatureAlgorithm::PostQuantum(xml_sec::xmldsig::PqAlgorithm::MlDsa87),
+                SignatureAlgorithm::PostQuantum(xml_sec::xmldsig::PqAlgorithm::SlhDsaSha2_128s),
+                SignatureAlgorithm::PostQuantum(xml_sec::xmldsig::PqAlgorithm::SlhDsaSha2_128f),
+                SignatureAlgorithm::PostQuantum(xml_sec::xmldsig::PqAlgorithm::SlhDsaSha2_192s),
+                SignatureAlgorithm::PostQuantum(xml_sec::xmldsig::PqAlgorithm::SlhDsaSha2_192f),
+                SignatureAlgorithm::PostQuantum(xml_sec::xmldsig::PqAlgorithm::SlhDsaSha2_256s),
+                SignatureAlgorithm::PostQuantum(xml_sec::xmldsig::PqAlgorithm::SlhDsaSha2_256f),
             ]))
         );
         assert_eq!(
@@ -4694,6 +4740,10 @@ mod tests {
                 DigestAlgorithm::Sha256,
                 DigestAlgorithm::Sha384,
                 DigestAlgorithm::Sha512,
+                DigestAlgorithm::Sha3_224,
+                DigestAlgorithm::Sha3_256,
+                DigestAlgorithm::Sha3_384,
+                DigestAlgorithm::Sha3_512,
             ]))
         );
         assert_eq!(policy.dsa_keys.minimum_modulus_bits, 1024);

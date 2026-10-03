@@ -351,7 +351,11 @@ pub fn decode_signing_key(
         | SignatureAlgorithm::EcdsaSha224
         | SignatureAlgorithm::EcdsaSha256
         | SignatureAlgorithm::EcdsaSha384
-        | SignatureAlgorithm::EcdsaSha512 => {
+        | SignatureAlgorithm::EcdsaSha512
+        | SignatureAlgorithm::EcdsaSha3_224
+        | SignatureAlgorithm::EcdsaSha3_256
+        | SignatureAlgorithm::EcdsaSha3_384
+        | SignatureAlgorithm::EcdsaSha3_512 => {
             decode_ecdsa_signing_key(path, bytes, format, password)
         }
         SignatureAlgorithm::HmacSha1
@@ -361,7 +365,86 @@ pub fn decode_signing_key(
         | SignatureAlgorithm::HmacSha512 => {
             Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
         }
+        SignatureAlgorithm::Ed25519
+        | SignatureAlgorithm::Ed25519Ctx
+        | SignatureAlgorithm::Ed25519Ph
+        | SignatureAlgorithm::Ed448
+        | SignatureAlgorithm::Ed448Ph
+        | SignatureAlgorithm::PostQuantum(_) => {
+            decode_modern_signing_key(path, bytes, format, algorithm)
+        }
         _ => Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned())),
+    }
+}
+
+fn decode_modern_signing_key(
+    path: &Path,
+    bytes: &[u8],
+    format: PrivateKeyFormat,
+    algorithm: SignatureAlgorithm,
+) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
+    // Protected PKCS#8 is admitted by the caller's inventory/KDF policy path,
+    // never by a parallel decoder with independent limits.
+    if pkcs8_container_kind(bytes, format) == Some(Pkcs8ContainerKind::Encrypted) {
+        return Err(KeyMaterialError::ProtectedContainer);
+    }
+    let decoded;
+    let der = match format {
+        PrivateKeyFormat::Pem | PrivateKeyFormat::Pkcs8Pem => {
+            decoded = decode_plain_pkcs8_pem(bytes, path)?;
+            decoded.as_slice()
+        }
+        PrivateKeyFormat::Der | PrivateKeyFormat::Pkcs8Der => bytes,
+    };
+    let error = |_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned());
+    match algorithm {
+        #[cfg(feature = "experimental-pq")]
+        SignatureAlgorithm::PostQuantum(parameter) => {
+            xml_sec::xmldsig::PostQuantumSigningKey::from_pkcs8_der(parameter, der)
+                .map(|key| Box::new(key) as Box<dyn SigningKey>)
+                .map_err(error)
+        }
+        _ => xml_sec::xmldsig::EdDsaSigningKey::from_pkcs8_der(algorithm, der)
+            .map(|key| Box::new(key) as Box<dyn SigningKey>)
+            .map_err(error),
+    }
+}
+
+#[cfg(test)]
+mod modern_import_tests {
+    use super::*;
+
+    #[test]
+    fn cli_loads_every_eddsa_variant_from_donor_pkcs8() {
+        // Plain and protected imports must resolve the same modern key family;
+        // this test covers the plain CLI branch, not only inventory loading.
+        for (algorithm, stem) in [
+            (SignatureAlgorithm::Ed25519, "ed25519"),
+            (SignatureAlgorithm::Ed25519Ctx, "ed25519"),
+            (SignatureAlgorithm::Ed25519Ph, "ed25519"),
+            (SignatureAlgorithm::Ed448, "ed448"),
+            (SignatureAlgorithm::Ed448Ph, "ed448"),
+        ] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+                "tests/fixtures/xmldsig/keys/eddsa/eddsa-{stem}-key.der"
+            ));
+            let bytes = std::fs::read(&path).unwrap();
+            assert!(
+                decode_signing_key(&path, &bytes, PrivateKeyFormat::Pkcs8Der, algorithm, None)
+                    .is_ok(),
+                "{algorithm:?}"
+            );
+            assert!(
+                decode_signing_key(
+                    &path,
+                    &bytes[..bytes.len() - 1],
+                    PrivateKeyFormat::Pkcs8Der,
+                    algorithm,
+                    None
+                )
+                .is_err()
+            );
+        }
     }
 }
 
@@ -694,7 +777,7 @@ fn preflight_rsa_der(bytes: &[u8], pkcs8_only: bool, path: &Path) -> Result<(), 
     })
 }
 
-fn decode_plain_rsa_pkcs8_pem(
+fn decode_plain_pkcs8_pem(
     bytes: &[u8],
     path: &Path,
 ) -> Result<Zeroizing<Vec<u8>>, KeyMaterialError> {
@@ -1051,14 +1134,14 @@ pub fn decode_rsa_private_with_inventory(
             let text = std::str::from_utf8(bytes)
                 .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
             if pkcs8_container_kind(bytes, format) == Some(Pkcs8ContainerKind::Plain) {
-                pem_der = decode_plain_rsa_pkcs8_pem(text.as_bytes(), path)?;
+                pem_der = decode_plain_pkcs8_pem(text.as_bytes(), path)?;
                 pem_der.as_slice()
             } else {
                 return decode_traditional_rsa_pem(text, password, path);
             }
         }
         PrivateKeyFormat::Pkcs8Pem => {
-            pem_der = decode_plain_rsa_pkcs8_pem(bytes, path)?;
+            pem_der = decode_plain_pkcs8_pem(bytes, path)?;
             pem_der.as_slice()
         }
         PrivateKeyFormat::Der | PrivateKeyFormat::Pkcs8Der => bytes,

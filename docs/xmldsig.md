@@ -437,8 +437,10 @@ reported as an invalid per-reference result without changing core `SignedInfo` v
 
 Implemented signature methods include DSA-SHA1/SHA256; HMAC-SHA1/SHA224/SHA256/SHA384/SHA512;
 RSA PKCS#1 v1.5 with SHA-1/SHA224/SHA256/SHA384/SHA512; and ECDSA
-SHA-1/SHA224/SHA256/SHA384/SHA512. ECDSA selects P-256, P-384, or P-521 from the key independently
-of the hash identifier. Digest methods include SHA-1/SHA224/SHA256/SHA384/SHA512.
+SHA-1/SHA224/SHA256/SHA384/SHA512 and SHA3-224/256/384/512. ECDSA selects P-256, P-384, or P-521
+from the key independently of the hash identifier. Digest methods include
+SHA-1/SHA224/SHA256/SHA384/SHA512 and SHA3-224/256/384/512. EdDSA supports pure Ed25519,
+Ed25519ctx, Ed25519ph, Ed448, and Ed448ph with their distinct RFC 8032 domain separation.
 HMAC output can be omitted for full width or explicitly truncated on an octet boundary, subject to
 `HmacPolicy` key and output minima.
 The selected length is checked before reference resolution or transforms in both signing and
@@ -446,6 +448,28 @@ verification, and before signing-key callbacks. Unsupported signature methods re
 `SigningError::ParseSignedInfo(ParseError::UnsupportedAlgorithm)` error during signing preflight.
 This early parameter check does not query key metadata; template signing queries it once in
 the key preflight before producing the signature.
+
+`SignatureBuilder::signature_context(SignatureContext)` places context bytes inside the
+authenticated `SignedInfo/SignatureMethod`. Contexts are limited to 255 octets by the
+cryptographic wire contract; a nonempty context on a method without context support is rejected
+rather than ignored. Context-capable methods default to an empty context. The XML context
+elements use libxmlsec1's explicit experimental namespace
+`http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#`; these parameter elements are not
+standardized by RFC 9231. Parsing enforces text and decoded-width bounds before allocating
+context storage and rejects malformed Base64, nested elements, and incompatible parameters.
+The pinned libxmlsec1 1.3.13 oracle does not read the XML context element for pure Ed448;
+it does for Ed448ph. This library supports pure Ed448's RFC 8032 context through the explicit
+extension and validates it against RFC 8032 section 7.4's known-answer vector. For reciprocal
+pure-Ed448 interoperability with that donor, use an empty context.
+
+The optional `experimental-pq` feature compiles ML-DSA-44/65/87 and
+SLH-DSA-SHA2-128f/128s/192f/192s/256f/256s. Their XML signature identifiers are experimental
+libxmlsec1 extensions, not W3C-standardized XML methods. Compilation alone does not grant
+permission: signing and verification require an explicit algorithm allowlist in the immutable
+operation policy. PKCS#8 and SPKI use RFC 9881/RFC 9909 encodings. ML-DSA import accepts
+seed-only, expanded-only, and consistent seed-plus-expanded keys; expanded imports are checked
+before signing. See [the maintained RustCrypto patch](ml-dsa-patch.md) for provenance,
+validation, and reproduction. These key primitives are dispatched through `CryptoProvider`.
 `HMACOutputLength` uses XML Schema integer syntax (including XML whitespace and
 an optional leading plus), not Unicode whitespace. XMLDSig 1.1 requires at least 80 bits and
 half the hash width; the default policy tightens that floor to at least 128 bits. Arbitrary
@@ -469,8 +493,25 @@ metadata that the core cannot inspect.
 Selecting the algorithm in untrusted XML does not opt the operation into legacy cryptography, and
 this gate runs before key resolution.
 X.509 path and CRL authentication additionally supports standard RSA-PSS with SHA-256/SHA-384/
-SHA-512 parameters, including RFC 4055 issuer-key restrictions, and Ed25519. Signature
-`AlgorithmIdentifier` parameters are validated before provider dispatch: DSA, ECDSA, and Ed25519
+SHA-512 parameters, including RFC 4055 issuer-key restrictions, and Ed25519/Ed448.
+With `experimental-pq`, the provider also authenticates pure ML-DSA and supported
+SLH-DSA-SHA2 certificate/CRL signatures using the empty PKIX context, independently
+of the XML context parameter. Certificate/CRL
+permissions come from `KeyTrustPolicy::certificate_signature_algorithms`, independently
+of the XML signature allowlist. `None` permits supported classical methods but rejects PQ;
+`Some(CertificateSignatureAlgorithms::Allowlist(...))` permits only exact listed methods
+(including RSA-PSS digest, MGF digest and salt length). The compatibility CLI explicitly
+selects `AllSupported`, leaving provider capability and strict AlgorithmIdentifier validation
+in force without artificially restricting PSS salt lengths. This borrowed permission reaches
+candidate path selection, complete path and CRL
+validation before provider dispatch. Compiling `experimental-pq` alone never grants trust.
+Permission rejection removes only the affected candidate path; another permitted path to an
+explicit trust anchor remains usable. If no permitted path exists, the policy rejection is returned.
+Legal XML Base64 whitespace in context and SignatureValue text consumes the operation's
+document resource budget; normalized payloads retain their protocol and implementation width limits.
+Signature
+`AlgorithmIdentifier` parameters are validated before provider dispatch: DSA, ECDSA, EdDSA,
+and these post-quantum methods
 require absent parameters; RSA PKCS#1 accepts NULL or absent; RSA-PSS requires valid typed
 parameters. An `id-RSASSA-PSS` issuer key with absent parameters imposes no parameter restrictions,
 as required by RFC 4055 section 3.3; present key parameters constrain the signature hash, MGF,

@@ -58,13 +58,28 @@ use super::uri::{ExternalResourceMapError, UriReferenceResolver, validate_extern
 use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_bytes};
 
 const MAX_SIGNATURE_VALUE_LEN: usize = 8192;
-const MAX_SIGNATURE_VALUE_TEXT_LEN: usize = 65_536;
 const MAX_RETRIEVAL_METHOD_COUNT: usize = 64;
 /// Cryptographic verifier used by [`VerifyContext`].
 ///
 /// This trait intentionally has no `Send + Sync` supertraits so lightweight
 /// single-threaded verifiers can be used without additional bounds.
 pub trait VerifyingKey {
+    /// Verify with validated domain separation, rejecting unsupported contexts.
+    fn verify_with_context(
+        &self,
+        algorithm: SignatureAlgorithm,
+        context: &super::SignatureContext,
+        data: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, DsigError> {
+        if !context.as_bytes().is_empty() {
+            return Err(super::SignatureVerificationError::UnsupportedAlgorithm {
+                uri: algorithm.uri().to_owned(),
+            }
+            .into());
+        }
+        self.verify(algorithm, data, signature)
+    }
     /// Validate this key against the operation's immutable trust policy.
     ///
     /// Built-in keys override this hook so pre-resolved and resolver-produced
@@ -1660,6 +1675,36 @@ pub fn verify_signature_with_pem_key(
     }
 
     impl VerifyingKey for PemVerifyingKey<'_> {
+        fn verify_with_context(
+            &self,
+            algorithm: SignatureAlgorithm,
+            context: &super::SignatureContext,
+            signed_data: &[u8],
+            signature_value: &[u8],
+        ) -> Result<bool, DsigError> {
+            if context.as_bytes().is_empty() {
+                return self.verify(algorithm, signed_data, signature_value);
+            }
+            if algorithm.context_element().is_none() {
+                return Err(SignatureVerificationError::UnsupportedAlgorithm {
+                    uri: algorithm.uri().to_owned(),
+                }
+                .into());
+            }
+            let (rest, pem) = x509_parser::pem::parse_x509_pem(self.public_key_pem.as_bytes())
+                .map_err(|_| SignatureVerificationError::InvalidKeyPem)?;
+            if !rest.iter().all(|byte| byte.is_ascii_whitespace()) || pem.label != "PUBLIC KEY" {
+                return Err(SignatureVerificationError::InvalidKeyPem.into());
+            }
+            Ok(super::modern::verify_with_context(
+                algorithm,
+                &pem.contents,
+                context,
+                signed_data,
+                signature_value,
+            )?)
+        }
+
         fn verify(
             &self,
             algorithm: SignatureAlgorithm,
@@ -2052,6 +2097,10 @@ fn verify_signature_node<'a>(
                     ctx.provider,
                     operation.budgets().transforms.xml_base_resolution(),
                     &ctx.policy.resources,
+                    ctx.policy
+                        .key_trust
+                        .certificate_signature_algorithms
+                        .as_ref(),
                 )
             })
             .transpose()
@@ -2063,6 +2112,7 @@ fn verify_signature_node<'a>(
     let signed_info = parse_signed_info_with_xpath_budget(
         signed_info_node,
         &mut operation.budgets().xpath_parse.borrow_mut(),
+        &ctx.policy.resources,
     )?;
     if signed_info.references.len() > ctx.policy.resources.max_references {
         return Err(crate::policy::PolicyViolation::ResourceLimit {
@@ -2166,6 +2216,11 @@ fn verify_signature_node<'a>(
                     xpath_parse: &mut xpath_parse,
                     execution: &budgets.transforms,
                     resources: &ctx.policy.resources,
+                    certificate_signature_algorithms: ctx
+                        .policy
+                        .key_trust
+                        .certificate_signature_algorithms
+                        .as_ref(),
                     xml_backend: ctx.xml_backend,
                 };
                 let mut materialization = budgets.key_info_materialization.borrow_mut();
@@ -2328,7 +2383,11 @@ fn verify_signature_node<'a>(
         Ok::<_, SignatureVerificationPipelineError>(canonical_signed_info)
     })?;
 
-    let signature_value = decode_signature_value(signature_children.signature_value_node)?;
+    let signature_value = decode_signature_value(
+        signature_children.signature_value_node,
+        signed_info.signature_method,
+        &ctx.policy.resources,
+    )?;
     if let Some(full_output_bits) = signed_info.signature_method.hmac_output_bits() {
         let expected_bits = signed_info
             .hmac_output_length_bits
@@ -2382,9 +2441,10 @@ fn verify_signature_node<'a>(
             key: verifier,
             policy: &ctx.policy,
         };
-        ctx.provider.verify(
+        ctx.provider.verify_with_context(
             &policy_verifier,
             signed_info.signature_method,
+            &signed_info.signature_context,
             &canonical_signed_info,
             &signature_value,
         )
@@ -2462,6 +2522,20 @@ struct PolicyVerifyingKey<'a> {
 }
 
 impl VerifyingKey for PolicyVerifyingKey<'_> {
+    fn verify_with_context(
+        &self,
+        algorithm: SignatureAlgorithm,
+        context: &super::SignatureContext,
+        data: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, DsigError> {
+        if context.as_bytes().is_empty() {
+            self.verify(algorithm, data, signature)
+        } else {
+            self.key
+                .verify_with_context(algorithm, context, data, signature)
+        }
+    }
     fn validate_policy(&self, policy: &crate::policy::VerificationPolicy) -> Result<(), DsigError> {
         self.key.validate_policy(policy)
     }
@@ -2500,6 +2574,7 @@ impl RetrievalMaterialization {
 }
 
 struct RetrievalMaterializationBudgets<'a> {
+    certificate_signature_algorithms: Option<&'a crate::policy::CertificateSignatureAlgorithms>,
     xpath_parse: &'a mut XPathSignatureParseBudget,
     execution: &'a TransformExecutionBudget,
     resources: &'a crate::policy::ResourcePolicy,
@@ -2513,6 +2588,9 @@ struct KeyInfoMaterializationState {
 }
 
 trait KeyInfoReferencePolicy {
+    fn certificate_signature_algorithms(
+        &self,
+    ) -> Option<&crate::policy::CertificateSignatureAlgorithms>;
     fn resources(&self) -> &crate::policy::ResourcePolicy;
     fn xml(&self) -> &crate::policy::XmlInputPolicy;
     fn key_info_reference_uris(&self) -> UriTypeSet;
@@ -2522,6 +2600,11 @@ trait KeyInfoReferencePolicy {
 }
 
 impl KeyInfoReferencePolicy for crate::policy::SigningPolicy {
+    fn certificate_signature_algorithms(
+        &self,
+    ) -> Option<&crate::policy::CertificateSignatureAlgorithms> {
+        None
+    }
     fn resources(&self) -> &crate::policy::ResourcePolicy {
         &self.resources
     }
@@ -2548,6 +2631,11 @@ impl KeyInfoReferencePolicy for crate::policy::SigningPolicy {
 }
 
 impl KeyInfoReferencePolicy for crate::policy::VerificationPolicy {
+    fn certificate_signature_algorithms(
+        &self,
+    ) -> Option<&crate::policy::CertificateSignatureAlgorithms> {
+        self.key_trust.certificate_signature_algorithms.as_ref()
+    }
     fn resources(&self) -> &crate::policy::ResourcePolicy {
         &self.resources
     }
@@ -2660,6 +2748,7 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
                         context.provider,
                         context.budgets.execution.xml_base_resolution(),
                         context.policy.resources(),
+                        context.policy.certificate_signature_algorithms(),
                     )
                     .map_err(map_key_info_parse_error)?,
                     RetrievalMaterialization::default(),
@@ -2732,6 +2821,7 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
                         context.budgets.execution.xml_base_resolution(),
                         context.policy.resources(),
                         Some(resource_uri),
+                        context.policy.certificate_signature_algorithms(),
                     )
                     .map_err(map_key_info_parse_error)?;
                     let mut nested_outcome = visit(
@@ -2823,6 +2913,7 @@ fn materialize_key_info_references_for_policy<P: KeyInfoReferencePolicy>(
         xpath_parse: &mut xpath_parse_budget,
         execution: &execution_budget,
         resources: policy.resources(),
+        certificate_signature_algorithms: policy.certificate_signature_algorithms(),
         xml_backend,
     };
     let mut materialization = KeyInfoMaterializationState::default();
@@ -3063,6 +3154,7 @@ fn materialize_retrieval_methods_with_budgets(
                 candidate_work,
                 provider,
                 budgets.resources,
+                budgets.certificate_signature_algorithms,
             )
             .map_err(map_key_info_parse_error)?;
             materialized.push(super::parse::KeyInfoSource::X509Data(data));
@@ -3135,6 +3227,7 @@ fn materialize_retrieval_methods(
         xpath_parse: &mut xpath_parse_budget,
         execution: &execution_budget,
         resources: &resources,
+        certificate_signature_algorithms: None,
         xml_backend: crate::XmlBackend::default(),
     };
     let mut candidate_work = key_info.embedded_candidate_count();
@@ -3870,7 +3963,41 @@ pub(super) fn parse_signature_children<'a, 'input>(
 
 fn decode_signature_value(
     signature_value_node: Node<'_, '_>,
+    algorithm: SignatureAlgorithm,
+    resources: &crate::policy::ResourcePolicy,
 ) -> Result<Vec<u8>, SignatureVerificationPipelineError> {
+    if matches!(algorithm, SignatureAlgorithm::PostQuantum(_)) {
+        let (maximum, raw_maximum) = signature_value_limits(algorithm, resources);
+        // PQ signatures can be tens of kilobytes: borrow their XML text and
+        // stream directly into the decoded allocation, without a second
+        // full-size normalized Base64 buffer.
+        let payload = super::whitespace::XmlBase64Payload::bounded(
+            signature_value_node,
+            raw_maximum,
+            maximum,
+        )
+        .map_err(
+            |reason| SignatureVerificationPipelineError::InvalidStructure {
+                reason: match reason {
+                    "unexpected nested element" => {
+                        "SignatureValue must not contain element children"
+                    }
+                    "maximum allowed text length" => {
+                        "SignatureValue exceeds maximum allowed text length"
+                    }
+                    "maximum allowed base64 length" => {
+                        "SignatureValue exceeds maximum allowed length"
+                    }
+                    _ => "SignatureValue contains malformed Base64",
+                },
+            },
+        )?;
+        return payload.decode().map_err(|_| {
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "SignatureValue contains malformed Base64",
+            }
+        });
+    }
     if signature_value_node
         .children()
         .any(|child| child.is_element())
@@ -3880,14 +4007,50 @@ fn decode_signature_value(
         });
     }
 
-    let mut normalized = Vec::new();
+    // Count bounded borrowed text first: comments may split a
+    // signature into many tiny text nodes. Reserving per node would repeatedly
+    // copy the accumulated payload; one exact reservation keeps this linear.
+    let (maximum, raw_maximum) = signature_value_limits(algorithm, resources);
+    let mut text_len = 0usize;
+    let mut normalized_len = 0usize;
+    for child in signature_value_node
+        .children()
+        .filter(|child| child.is_text())
+    {
+        if let Some(text) = child.text() {
+            if text.len() > raw_maximum - text_len {
+                return Err(SignatureVerificationPipelineError::InvalidStructure {
+                    reason: "SignatureValue exceeds maximum allowed text length",
+                });
+            }
+            text_len += text.len();
+            for byte in text.bytes() {
+                if matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
+                    continue;
+                }
+                if normalized_len == maximum {
+                    return Err(SignatureVerificationPipelineError::InvalidStructure {
+                        reason: "SignatureValue exceeds maximum allowed length",
+                    });
+                }
+                normalized_len += 1;
+            }
+        }
+    }
+    let mut normalized = Vec::with_capacity(normalized_len);
     let mut raw_text_len = 0usize;
     for child in signature_value_node
         .children()
         .filter(|child| child.is_text())
     {
         if let Some(text) = child.text() {
-            push_normalized_signature_text(text, &mut raw_text_len, &mut normalized)?;
+            push_normalized_signature_text(
+                text,
+                &mut raw_text_len,
+                &mut normalized,
+                algorithm,
+                resources,
+            )?;
         }
     }
 
@@ -3898,13 +4061,25 @@ fn push_normalized_signature_text(
     text: &str,
     raw_text_len: &mut usize,
     normalized: &mut Vec<u8>,
+    algorithm: SignatureAlgorithm,
+    resources: &crate::policy::ResourcePolicy,
 ) -> Result<(), SignatureVerificationPipelineError> {
-    if raw_text_len.saturating_add(text.len()) > MAX_SIGNATURE_VALUE_TEXT_LEN {
+    let (maximum, raw_maximum) = signature_value_limits(algorithm, resources);
+    if text.len() > raw_maximum - *raw_text_len {
         return Err(SignatureVerificationPipelineError::InvalidStructure {
             reason: "SignatureValue exceeds maximum allowed text length",
         });
     }
-    *raw_text_len = raw_text_len.saturating_add(text.len());
+    *raw_text_len += text.len();
+    let additional = text
+        .bytes()
+        .filter(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        .count();
+    if additional > maximum - normalized.len() {
+        return Err(SignatureVerificationPipelineError::InvalidStructure {
+            reason: "SignatureValue exceeds maximum allowed length",
+        });
+    }
 
     normalize_xml_base64_bytes(text.as_bytes(), normalized, |_| true).map_err(|err| {
         SignatureVerificationPipelineError::SignatureValueBase64(base64::DecodeError::InvalidByte(
@@ -3912,13 +4087,25 @@ fn push_normalized_signature_text(
             err.invalid_byte,
         ))
     })?;
-    if normalized.len() > MAX_SIGNATURE_VALUE_LEN {
-        return Err(SignatureVerificationPipelineError::InvalidStructure {
-            reason: "SignatureValue exceeds maximum allowed length",
-        });
-    }
 
     Ok(())
+}
+
+fn signature_value_limits(
+    algorithm: SignatureAlgorithm,
+    resources: &crate::policy::ResourcePolicy,
+) -> (usize, usize) {
+    // FIPS 205 table 2 includes signatures up to 49,856 octets. The old
+    // RSA-oriented encoded-text ceiling is not their wire contract.
+    // https://doi.org/10.6028/NIST.FIPS.205
+    // XSD 1.0 section 3.2.16 fixes base64Binary whitespace to collapse:
+    // https://www.w3.org/TR/2004/REC-xmlschema-2-20041028/#base64Binary
+    // Raw text is bounded by the operation's XML budget, not the wire width.
+    let encoded = match algorithm {
+        SignatureAlgorithm::PostQuantum(parameter) => parameter.signature_len().div_ceil(3) * 4,
+        _ => MAX_SIGNATURE_VALUE_LEN,
+    };
+    (encoded, resources.max_xml_document_bytes)
 }
 
 fn verify_with_algorithm(
@@ -3928,6 +4115,24 @@ fn verify_with_algorithm(
     signature_value: &[u8],
 ) -> Result<bool, SignatureVerificationPipelineError> {
     match algorithm {
+        SignatureAlgorithm::Ed25519
+        | SignatureAlgorithm::Ed25519Ctx
+        | SignatureAlgorithm::Ed25519Ph
+        | SignatureAlgorithm::Ed448
+        | SignatureAlgorithm::Ed448Ph
+        | SignatureAlgorithm::PostQuantum(_) => {
+            let (rest, pem) = x509_parser::pem::parse_x509_pem(public_key_pem.as_bytes())
+                .map_err(|_| SignatureVerificationError::InvalidKeyPem)?;
+            if !rest.iter().all(|byte| byte.is_ascii_whitespace()) || pem.label != "PUBLIC KEY" {
+                return Err(SignatureVerificationError::InvalidKeyPem.into());
+            }
+            Ok(super::modern::verify(
+                algorithm,
+                &pem.contents,
+                signed_data,
+                signature_value,
+            )?)
+        }
         SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => {
             let (rest, pem) = x509_parser::pem::parse_x509_pem(public_key_pem.as_bytes())
                 .map_err(|_| SignatureVerificationError::InvalidKeyPem)?;
@@ -3963,7 +4168,11 @@ fn verify_with_algorithm(
         | SignatureAlgorithm::EcdsaSha224
         | SignatureAlgorithm::EcdsaSha256
         | SignatureAlgorithm::EcdsaSha384
-        | SignatureAlgorithm::EcdsaSha512 => {
+        | SignatureAlgorithm::EcdsaSha512
+        | SignatureAlgorithm::EcdsaSha3_224
+        | SignatureAlgorithm::EcdsaSha3_256
+        | SignatureAlgorithm::EcdsaSha3_384
+        | SignatureAlgorithm::EcdsaSha3_512 => {
             // Malformed ECDSA signature bytes are treated as a verification miss
             // (Ok(false)) instead of a pipeline error; only key/algorithm and
             // crypto-operation failures propagate as Err.
@@ -6977,6 +7186,10 @@ mod tests {
             xpath_parse: &mut xpath_parse_budget,
             execution: &execution_budget,
             resources: &policy.resources,
+            certificate_signature_algorithms: policy
+                .key_trust
+                .certificate_signature_algorithms
+                .as_ref(),
             xml_backend: crate::XmlBackend::default(),
         };
         let mut materialization = KeyInfoMaterializationState::default();
@@ -7023,6 +7236,10 @@ mod tests {
             xpath_parse: &mut xpath_parse_budget,
             execution: &execution_budget,
             resources: &policy.resources,
+            certificate_signature_algorithms: policy
+                .key_trust
+                .certificate_signature_algorithms
+                .as_ref(),
             xml_backend: crate::XmlBackend::default(),
         };
         let mut materialization = KeyInfoMaterializationState::default();
@@ -7077,6 +7294,10 @@ mod tests {
             xpath_parse: &mut xpath_parse_budget,
             execution: &execution_budget,
             resources: &policy.resources,
+            certificate_signature_algorithms: policy
+                .key_trust
+                .certificate_signature_algorithms
+                .as_ref(),
             xml_backend: crate::XmlBackend::default(),
         };
         let mut materialization = KeyInfoMaterializationState::default();
@@ -7351,6 +7572,10 @@ mod tests {
             xpath_parse: &mut xpath_parse_budget,
             execution: &execution_budget,
             resources: &policy.resources,
+            certificate_signature_algorithms: policy
+                .key_trust
+                .certificate_signature_algorithms
+                .as_ref(),
             xml_backend: crate::XmlBackend::default(),
         };
         let mut materialization = KeyInfoMaterializationState::default();
@@ -7392,6 +7617,10 @@ mod tests {
             xpath_parse: &mut xpath_parse_budget,
             execution: &execution_budget,
             resources: &policy.resources,
+            certificate_signature_algorithms: policy
+                .key_trust
+                .certificate_signature_algorithms
+                .as_ref(),
             xml_backend: crate::XmlBackend::default(),
         };
         let mut materialization = KeyInfoMaterializationState::default();
@@ -7571,6 +7800,7 @@ mod tests {
             xpath_parse: &mut xpath_parse_budget,
             execution: &execution_budget,
             resources: &resource_policy,
+            certificate_signature_algorithms: None,
             xml_backend: crate::XmlBackend::default(),
         };
         let mut candidate_work = key_info.embedded_candidate_count();
@@ -8376,12 +8606,55 @@ mod tests {
     }
 
     #[test]
+    fn fragmented_pq_signature_value_decodes_at_exact_wire_limit() {
+        // Comments split the largest supported signature into tiny text nodes;
+        // decoding must preserve bytes and reject an oversized aggregate.
+        let parameter = super::super::pq_algorithm::PqAlgorithm::SlhDsaSha2_256f;
+        let bytes = vec![0x5a; parameter.signature_len()];
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let mut xml = String::from("<SignatureValue>");
+        for chunk in encoded.as_bytes().chunks(4) {
+            xml.push_str(std::str::from_utf8(chunk).unwrap());
+            xml.push_str("<!--split-->\n");
+        }
+        xml.push_str("</SignatureValue>");
+        let document = Document::parse(&xml).unwrap();
+        let algorithm = SignatureAlgorithm::PostQuantum(parameter);
+        assert_eq!(
+            decode_signature_value(
+                document.root_element(),
+                algorithm,
+                &crate::policy::ResourcePolicy::default()
+            )
+            .unwrap(),
+            bytes
+        );
+        let oversized = xml.replace("</SignatureValue>", "AAAA</SignatureValue>");
+        let document = Document::parse(&oversized).unwrap();
+        assert!(matches!(
+            decode_signature_value(
+                document.root_element(),
+                algorithm,
+                &crate::policy::ResourcePolicy::default()
+            ),
+            Err(SignatureVerificationPipelineError::InvalidStructure {
+                reason: "SignatureValue exceeds maximum allowed length"
+            })
+        ));
+    }
+
+    #[test]
     fn push_normalized_signature_text_rejects_form_feed() {
         let mut normalized = Vec::new();
         let mut raw_text_len = 0usize;
-        let err =
-            push_normalized_signature_text("ab\u{000C}cd", &mut raw_text_len, &mut normalized)
-                .expect_err("form-feed must not be treated as XML base64 whitespace");
+        let err = push_normalized_signature_text(
+            "ab\u{000C}cd",
+            &mut raw_text_len,
+            &mut normalized,
+            SignatureAlgorithm::RsaSha256,
+            &crate::policy::ResourcePolicy::default(),
+        )
+        .expect_err("form-feed must not be treated as XML base64 whitespace");
         assert!(matches!(
             err,
             SignatureVerificationPipelineError::SignatureValueBase64(
@@ -8394,8 +8667,14 @@ mod tests {
     fn push_normalized_signature_text_enforces_byte_limit_for_multibyte_chars() {
         let mut normalized = vec![b'A'; MAX_SIGNATURE_VALUE_LEN - 1];
         let mut raw_text_len = normalized.len();
-        let err = push_normalized_signature_text("é", &mut raw_text_len, &mut normalized)
-            .expect_err("multibyte characters must not bypass byte-size limit");
+        let err = push_normalized_signature_text(
+            "é",
+            &mut raw_text_len,
+            &mut normalized,
+            SignatureAlgorithm::RsaSha256,
+            &crate::policy::ResourcePolicy::default(),
+        )
+        .expect_err("multibyte characters must not bypass byte-size limit");
         assert!(matches!(
             err,
             SignatureVerificationPipelineError::InvalidStructure {

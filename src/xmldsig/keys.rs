@@ -182,8 +182,43 @@ pub struct VerificationKey {
 }
 
 impl VerifyingKey for VerificationKey {
+    fn verify_with_context(
+        &self,
+        algorithm: SignatureAlgorithm,
+        context: &super::SignatureContext,
+        data: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, DsigError> {
+        if algorithm != self.algorithm {
+            return Err(KeyResolutionError::AlgorithmMismatch.into());
+        }
+        if algorithm.eddsa_signature_len().is_some()
+            || matches!(algorithm, SignatureAlgorithm::PostQuantum(_))
+        {
+            return super::modern::verify_with_context(
+                algorithm,
+                &self.public_key_bytes,
+                context,
+                data,
+                signature,
+            )
+            .map_err(DsigError::Crypto);
+        }
+        if !context.as_bytes().is_empty() {
+            return Err(KeyResolutionError::AlgorithmMismatch.into());
+        }
+        self.verify(algorithm, data, signature)
+    }
     fn validate_policy(&self, policy: &crate::policy::VerificationPolicy) -> Result<(), DsigError> {
         let result = match self.algorithm {
+            SignatureAlgorithm::Ed25519
+            | SignatureAlgorithm::Ed25519Ctx
+            | SignatureAlgorithm::Ed25519Ph
+            | SignatureAlgorithm::Ed448
+            | SignatureAlgorithm::Ed448Ph
+            | SignatureAlgorithm::PostQuantum(_) => {
+                super::modern::validate_public_key(self.algorithm, &self.public_key_bytes)
+            }
             SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => {
                 validate_dsa_signature_spki_with_minimum(
                     &self.public_key_bytes,
@@ -208,7 +243,11 @@ impl VerifyingKey for VerificationKey {
             | SignatureAlgorithm::EcdsaSha224
             | SignatureAlgorithm::EcdsaSha256
             | SignatureAlgorithm::EcdsaSha384
-            | SignatureAlgorithm::EcdsaSha512 => Ok(()),
+            | SignatureAlgorithm::EcdsaSha512
+            | SignatureAlgorithm::EcdsaSha3_224
+            | SignatureAlgorithm::EcdsaSha3_256
+            | SignatureAlgorithm::EcdsaSha3_384
+            | SignatureAlgorithm::EcdsaSha3_512 => Ok(()),
         };
         result.map_err(DsigError::Crypto)
     }
@@ -253,6 +292,17 @@ impl VerifyingKey for VerificationKey {
             return Err(KeyResolutionError::AlgorithmMismatch.into());
         }
         let result = match algorithm {
+            SignatureAlgorithm::Ed25519
+            | SignatureAlgorithm::Ed25519Ctx
+            | SignatureAlgorithm::Ed25519Ph
+            | SignatureAlgorithm::Ed448
+            | SignatureAlgorithm::Ed448Ph
+            | SignatureAlgorithm::PostQuantum(_) => super::modern::verify(
+                algorithm,
+                &self.public_key_bytes,
+                signed_data,
+                signature_value,
+            ),
             SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => {
                 verify_dsa_signature_spki_primitive(
                     algorithm,
@@ -282,7 +332,11 @@ impl VerifyingKey for VerificationKey {
             | SignatureAlgorithm::EcdsaSha224
             | SignatureAlgorithm::EcdsaSha256
             | SignatureAlgorithm::EcdsaSha384
-            | SignatureAlgorithm::EcdsaSha512 => verify_ecdsa_signature_spki(
+            | SignatureAlgorithm::EcdsaSha512
+            | SignatureAlgorithm::EcdsaSha3_224
+            | SignatureAlgorithm::EcdsaSha3_256
+            | SignatureAlgorithm::EcdsaSha3_384
+            | SignatureAlgorithm::EcdsaSha3_512 => verify_ecdsa_signature_spki(
                 algorithm,
                 &self.public_key_bytes,
                 signed_data,
@@ -302,14 +356,7 @@ impl VerifyingKey for VerificationKey {
         if algorithm != self.algorithm {
             return Err(KeyResolutionError::AlgorithmMismatch.into());
         }
-        if matches!(
-            algorithm,
-            SignatureAlgorithm::EcdsaSha1
-                | SignatureAlgorithm::EcdsaSha224
-                | SignatureAlgorithm::EcdsaSha256
-                | SignatureAlgorithm::EcdsaSha384
-                | SignatureAlgorithm::EcdsaSha512
-        ) {
+        if algorithm.ecdsa_digest().is_some() {
             return verify_ecdsa_signature_spki_with_encoding(
                 algorithm,
                 &self.public_key_bytes,
@@ -330,6 +377,19 @@ struct PolicyBoundVerificationKey {
 }
 
 impl VerifyingKey for PolicyBoundVerificationKey {
+    fn verify_with_context(
+        &self,
+        algorithm: SignatureAlgorithm,
+        context: &super::SignatureContext,
+        data: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, DsigError> {
+        if context.as_bytes().is_empty() {
+            return self.verify(algorithm, data, signature);
+        }
+        self.key
+            .verify_with_context(algorithm, context, data, signature)
+    }
     fn validate_signature_value(
         &self,
         algorithm: SignatureAlgorithm,
@@ -391,14 +451,7 @@ impl VerifyingKey for PolicyBoundVerificationKey {
         signed_data: &[u8],
         signature_value: &[u8],
     ) -> Result<bool, DsigError> {
-        if matches!(
-            algorithm,
-            SignatureAlgorithm::EcdsaSha1
-                | SignatureAlgorithm::EcdsaSha224
-                | SignatureAlgorithm::EcdsaSha256
-                | SignatureAlgorithm::EcdsaSha384
-                | SignatureAlgorithm::EcdsaSha512
-        ) {
+        if algorithm.ecdsa_digest().is_some() {
             return self
                 .key
                 .verify_with_policy(policy, algorithm, signed_data, signature_value);
@@ -786,6 +839,7 @@ impl DefaultKeyResolver {
             allowed_extended_key_usages: Some(&trust.allowed_extended_key_usages),
             rsa_keys: trust.rsa_keys,
             dsa_keys: trust.dsa_keys,
+            certificate_signature_algorithms: trust.certificate_signature_algorithms.as_ref(),
         };
         verify_x509_certificate_chain_with_provider_and_crls(
             info,
@@ -876,9 +930,13 @@ impl DefaultKeyResolver {
             trust.max_x509_chain_depth,
             trust.max_x509_candidate_paths,
             provider,
+            trust.certificate_signature_algorithms.as_ref(),
         )
         .map_err(|error| match error {
             X509ChainBuildError::AmbiguousIssuer => KeyResolutionError::AmbiguousCertificate,
+            X509ChainBuildError::Policy(error) => {
+                KeyResolutionError::Chain(super::X509ChainError::Policy(error))
+            }
             X509ChainBuildError::Provider(error) => {
                 KeyResolutionError::Chain(super::X509ChainError::Provider(error))
             }
@@ -942,9 +1000,13 @@ impl DefaultKeyResolver {
             trust.max_x509_chain_depth,
             trust.max_x509_candidate_paths,
             provider,
+            trust.certificate_signature_algorithms.as_ref(),
         )
         .map_err(|error| match error {
             X509ChainBuildError::AmbiguousIssuer => KeyResolutionError::AmbiguousCertificate,
+            X509ChainBuildError::Policy(error) => {
+                KeyResolutionError::Chain(super::X509ChainError::Policy(error))
+            }
             X509ChainBuildError::Provider(error) => {
                 KeyResolutionError::Chain(super::X509ChainError::Provider(error))
             }
@@ -1138,14 +1200,7 @@ impl DefaultKeyResolver {
                 curve_oid,
                 public_key,
             } => {
-                if !matches!(
-                    algorithm,
-                    SignatureAlgorithm::EcdsaSha1
-                        | SignatureAlgorithm::EcdsaSha224
-                        | SignatureAlgorithm::EcdsaSha256
-                        | SignatureAlgorithm::EcdsaSha384
-                        | SignatureAlgorithm::EcdsaSha512
-                ) {
+                if algorithm.ecdsa_digest().is_none() {
                     return Ok(None);
                 }
                 ec_key_value_to_spki_der(curve_oid, public_key)?
@@ -1563,6 +1618,12 @@ fn validate_spki_algorithm(
     public_key_bytes: &[u8],
     algorithm: SignatureAlgorithm,
 ) -> Result<(), KeyResolutionError> {
+    if algorithm.eddsa_signature_len().is_some()
+        || matches!(algorithm, SignatureAlgorithm::PostQuantum(_))
+    {
+        return super::modern::validate_public_key(algorithm, public_key_bytes)
+            .map_err(|_| KeyResolutionError::InvalidPublicKey);
+    }
     let (rest, spki) = SubjectPublicKeyInfo::from_der(public_key_bytes)
         .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
     if !rest.is_empty() {
@@ -1596,7 +1657,11 @@ fn validate_spki_algorithm(
             | SignatureAlgorithm::EcdsaSha224
             | SignatureAlgorithm::EcdsaSha256
             | SignatureAlgorithm::EcdsaSha384
-            | SignatureAlgorithm::EcdsaSha512,
+            | SignatureAlgorithm::EcdsaSha512
+            | SignatureAlgorithm::EcdsaSha3_224
+            | SignatureAlgorithm::EcdsaSha3_256
+            | SignatureAlgorithm::EcdsaSha3_384
+            | SignatureAlgorithm::EcdsaSha3_512,
             PublicKey::EC(ec),
         ) if matches!(
             curve_oid.as_deref(),
@@ -1616,6 +1681,26 @@ pub(crate) fn supported_parsed_spki_is_rsa(
     spki: &SubjectPublicKeyInfo<'_>,
     public_key_bytes: &[u8],
 ) -> Result<bool, KeyResolutionError> {
+    let borrowed = pkcs8::SubjectPublicKeyInfoRef::try_from(public_key_bytes)
+        .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
+    if let Some(parameter) = super::PqAlgorithm::from_oid(borrowed.algorithm.oid) {
+        super::modern::validate_public_key(
+            SignatureAlgorithm::PostQuantum(parameter),
+            public_key_bytes,
+        )
+        .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
+        return Ok(false);
+    }
+    let eddsa = match spki.algorithm.algorithm.to_id_string().as_str() {
+        "1.3.101.112" => Some(SignatureAlgorithm::Ed25519),
+        "1.3.101.113" => Some(SignatureAlgorithm::Ed448),
+        _ => None,
+    };
+    if let Some(algorithm) = eddsa {
+        super::modern::validate_public_key(algorithm, public_key_bytes)
+            .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
+        return Ok(false);
+    }
     let parsed = spki
         .parsed()
         .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
@@ -3188,6 +3273,7 @@ mod tests {
                 9,
                 2,
                 crate::provider::default_provider(),
+                None,
             ),
             Err(X509ChainBuildError::AmbiguousIssuer)
         ));
@@ -3271,6 +3357,90 @@ mod tests {
     }
 
     #[test]
+    fn x509_path_builder_skips_policy_rejected_alternatives() {
+        use crate::provider::X509SignatureAlgorithm;
+        use std::collections::HashSet;
+        // One cross-signed issuer has a forbidden parent-edge algorithm;
+        // neither its position nor traversal order may hide a permitted path.
+        let root = rcgen::CertifiedIssuer::self_signed(
+            generated_certificate_params("policy root", true),
+            rcgen::KeyPair::generate().expect("root key"),
+        )
+        .expect("root certificate");
+        let alternate_root = rcgen::CertifiedIssuer::self_signed(
+            generated_certificate_params("policy alternate root", true),
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384)
+                .expect("alternate root key"),
+        )
+        .expect("alternate root certificate");
+        let shared_params = generated_certificate_params("policy shared issuer", true);
+        let shared_key = rcgen::KeyPair::generate().expect("issuer key");
+        let rejected = shared_params
+            .signed_by(&shared_key, &alternate_root)
+            .expect("cross-signed issuer");
+        let shared = rcgen::CertifiedIssuer::signed_by(shared_params, shared_key, &root)
+            .expect("issuer certificate");
+        let leaf = generated_certificate_params("policy leaf", false)
+            .signed_by(&rcgen::KeyPair::generate().expect("leaf key"), &shared)
+            .expect("leaf certificate");
+        let rejected = rejected.der().to_vec();
+        let allowed = crate::policy::CertificateSignatureAlgorithms::Allowlist(HashSet::from([
+            X509SignatureAlgorithm::Ecdsa(super::super::DigestAlgorithm::Sha256),
+        ]));
+        for rejected_first in [true, false] {
+            let mut alternatives = vec![shared.der().to_vec(), rejected.clone()];
+            if rejected_first {
+                alternatives.reverse();
+            }
+            let permitted_index = if rejected_first { 3 } else { 2 };
+            let info = x509_info(
+                vec![
+                    root.der().to_vec(),
+                    leaf.der().to_vec(),
+                    alternatives.remove(0),
+                    alternatives.remove(0),
+                    alternate_root.der().to_vec(),
+                ],
+                1,
+            );
+            assert_eq!(
+                build_x509_certificate_paths_to_trusted_prefix(
+                    &info,
+                    1,
+                    1,
+                    4,
+                    8,
+                    crate::provider::default_provider(),
+                    Some(&allowed),
+                )
+                .expect("forbidden alternative must not abort search"),
+                vec![vec![1, permitted_index, 0]]
+            );
+        }
+        let info = x509_info(
+            vec![
+                root.der().to_vec(),
+                leaf.der().to_vec(),
+                rejected,
+                alternate_root.der().to_vec(),
+            ],
+            1,
+        );
+        assert!(matches!(
+            build_x509_certificate_paths_to_trusted_prefix(
+                &info,
+                1,
+                1,
+                4,
+                8,
+                crate::provider::default_provider(),
+                Some(&allowed),
+            ),
+            Err(X509ChainBuildError::Policy(_))
+        ));
+    }
+
+    #[test]
     fn x509_path_builder_skips_branch_local_unsupported_algorithms() {
         // An untrusted intermediate can share both the subject and public key
         // of the valid path while using an unsupported signature algorithm on
@@ -3319,6 +3489,7 @@ mod tests {
                 &ordered,
                 0,
                 &key_selective_provider,
+                None,
             )
             .expect("one unsupported issuer key must not suppress a usable candidate"),
             vec![0, 2, 3]
@@ -3347,6 +3518,7 @@ mod tests {
                 4,
                 8,
                 &first_candidate_unsupported,
+                None,
             )
             .expect("a later same-DN issuer must survive an earlier provider capability miss"),
             vec![vec![1, 3, 0]]
@@ -3385,6 +3557,7 @@ mod tests {
                 4,
                 8,
                 crate::provider::default_provider(),
+                None,
             )
             .expect("a branch-local provider gap must not abort path enumeration"),
             vec![vec![1, 2, 0]]
@@ -3406,6 +3579,7 @@ mod tests {
                 4,
                 8,
                 crate::provider::default_provider(),
+                None,
             ),
             Err(X509ChainBuildError::UnsupportedSignatureAlgorithm { ref oid })
                 if oid == "1.2.840.10045.4.3.5"

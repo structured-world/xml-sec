@@ -23,6 +23,14 @@ pub enum DigestAlgorithm {
     Sha384,
     /// SHA-512 (512-bit).
     Sha512,
+    /// SHA3-224 (224-bit).
+    Sha3_224,
+    /// SHA3-256 (256-bit).
+    Sha3_256,
+    /// SHA3-384 (384-bit).
+    Sha3_384,
+    /// SHA3-512 (512-bit).
+    Sha3_512,
 }
 
 impl DigestAlgorithm {
@@ -46,6 +54,12 @@ impl DigestAlgorithm {
             "http://www.w3.org/2001/04/xmlenc#sha256" => Some(Self::Sha256),
             "http://www.w3.org/2001/04/xmldsig-more#sha384" => Some(Self::Sha384),
             "http://www.w3.org/2001/04/xmlenc#sha512" => Some(Self::Sha512),
+            // RFC 9231 section 2.1.5 fixes the SHA-3 namespace and digest widths:
+            // https://www.rfc-editor.org/rfc/rfc9231.html#section-2.1.5
+            "http://www.w3.org/2007/05/xmldsig-more#sha3-224" => Some(Self::Sha3_224),
+            "http://www.w3.org/2007/05/xmldsig-more#sha3-256" => Some(Self::Sha3_256),
+            "http://www.w3.org/2007/05/xmldsig-more#sha3-384" => Some(Self::Sha3_384),
+            "http://www.w3.org/2007/05/xmldsig-more#sha3-512" => Some(Self::Sha3_512),
             _ => None,
         }
     }
@@ -58,6 +72,10 @@ impl DigestAlgorithm {
             Self::Sha256 => "http://www.w3.org/2001/04/xmlenc#sha256",
             Self::Sha384 => "http://www.w3.org/2001/04/xmldsig-more#sha384",
             Self::Sha512 => "http://www.w3.org/2001/04/xmlenc#sha512",
+            Self::Sha3_224 => "http://www.w3.org/2007/05/xmldsig-more#sha3-224",
+            Self::Sha3_256 => "http://www.w3.org/2007/05/xmldsig-more#sha3-256",
+            Self::Sha3_384 => "http://www.w3.org/2007/05/xmldsig-more#sha3-384",
+            Self::Sha3_512 => "http://www.w3.org/2007/05/xmldsig-more#sha3-512",
         }
     }
 
@@ -73,10 +91,10 @@ impl DigestAlgorithm {
     pub fn output_len(self) -> usize {
         match self {
             Self::Sha1 => 20,
-            Self::Sha224 => 28,
-            Self::Sha256 => 32,
-            Self::Sha384 => 48,
-            Self::Sha512 => 64,
+            Self::Sha224 | Self::Sha3_224 => 28,
+            Self::Sha256 | Self::Sha3_256 => 32,
+            Self::Sha384 | Self::Sha3_384 => 48,
+            Self::Sha512 | Self::Sha3_512 => 64,
         }
     }
 }

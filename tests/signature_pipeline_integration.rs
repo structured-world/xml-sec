@@ -606,16 +606,19 @@ fn oversized_signature_value_is_rejected_early() {
 }
 
 #[test]
-fn excessive_signature_value_whitespace_is_rejected_early() {
+fn signature_value_whitespace_within_document_budget_is_accepted() {
+    // Base64 whitespace does not alter the signature. The operation's document
+    // budget bounds raw text; normalized signature width remains independently bounded.
     let xml = read_fixture(Path::new(
         "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",
     ));
     let public_key_pem = read_fixture(Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"));
     let tampered_xml = inject_excessive_xml_whitespace_in_signature_value(&xml);
 
-    let err = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
-        .expect_err("SignatureValue with excessive XML whitespace must be rejected");
-    assert_invalid_structure_reason(err, "SignatureValue exceeds maximum allowed text length");
+    let result = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
+        .expect("legal SignatureValue whitespace within the document budget must be accepted");
+    assert!(all_signed_info_refs_valid(&result.signed_info_references));
+    assert_eq!(result.status, DsigStatus::Valid);
 }
 
 #[test]

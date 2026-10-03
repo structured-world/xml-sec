@@ -5,6 +5,15 @@ readonly repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly XMLSEC1_VERSION="1.3.13"
 readonly XMLSEC1_COMMIT="$(<"$repo_root/compatibility/libxmlsec1-1.3.13-donor-commit.txt")"
 readonly XMLSEC1_REPOSITORY="https://github.com/lsh123/xmlsec.git"
+# libxmlsec1 enables EdDSA only with the OpenSSL 3.5 API. This isolated
+# test-oracle dependency never replaces the host OpenSSL or enters Rust runtime.
+readonly ORACLE_OPENSSL_VERSION="3.5.9"
+readonly ORACLE_OPENSSL_SHA256="603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a"
+modern_oracle="${XMLSEC1_MODERN_ORACLE:-0}"
+if [[ "$modern_oracle" != 0 && "$modern_oracle" != 1 ]]; then
+  printf 'XMLSEC1_MODERN_ORACLE must be 0 or 1\n' >&2
+  exit 1
+fi
 
 if [[ ! "$XMLSEC1_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
   printf 'invalid xmlsec1 donor commit: %s\n' "$XMLSEC1_COMMIT" >&2
@@ -14,14 +23,25 @@ fi
 prefix="${XMLSEC1_PREFIX:-$repo_root/.tools/xmlsec1-${XMLSEC1_VERSION}-${XMLSEC1_COMMIT:0:12}}"
 marker="$prefix/.xmlsec-source-commit"
 
-xmlsec_version_output() {
+xmlsec_output() {
   if [[ "$(uname -s)" == "Darwin" ]]; then
     DYLD_LIBRARY_PATH="$prefix/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" \
-      "$prefix/bin/xmlsec1" --version
+      "$prefix/bin/xmlsec1" "$@"
   else
     LD_LIBRARY_PATH="$prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-      "$prefix/bin/xmlsec1" --version
+      "$prefix/bin/xmlsec1" "$@"
   fi
+}
+
+xmlsec_version_output() { xmlsec_output --version; }
+
+xmlsec_required_capabilities() {
+  [[ "$modern_oracle" == 1 ]] || return 0
+  local output transform
+  output="$(xmlsec_output --list-transforms)" || return 1
+  for transform in eddsa-ed25519 eddsa-ed25519ctx eddsa-ed25519ph eddsa-ed448 eddsa-ed448ph; do
+    [[ "$output" == *"\"$transform\""* ]] || return 1
+  done
 }
 
 xmlsec_version_is_expected() {
@@ -40,7 +60,8 @@ fi
 if [[ -x "$prefix/bin/xmlsec1" && -f "$marker" ]] \
   && [[ "$(<"$marker")" == "$XMLSEC1_COMMIT" ]]; then
   if version_output="$(xmlsec_version_output)" \
-    && xmlsec_version_is_expected "$version_output"; then
+    && xmlsec_version_is_expected "$version_output" \
+    && xmlsec_required_capabilities; then
     printf '%s\n' "$version_output"
     printf 'xmlsec1 %s is already installed at %s\n' "$XMLSEC1_VERSION" "$prefix"
     exit 0
@@ -83,6 +104,40 @@ source_dir="$work_dir/xmlsec"
 build_dir="$work_dir/build"
 stage_dir="$work_dir/stage"
 
+if command -v nproc >/dev/null 2>&1; then
+  build_jobs="$(nproc)"
+else
+  build_jobs="$(sysctl -n hw.ncpu)"
+fi
+openssl_option="--with-openssl"
+prepare_modern_openssl() {
+if [[ "$modern_oracle" == 1 ]]; then
+  openssl_archive="$work_dir/openssl.tar.gz"
+  curl --fail --location --retry 3 \
+    "https://github.com/openssl/openssl/releases/download/openssl-${ORACLE_OPENSSL_VERSION}/openssl-${ORACLE_OPENSSL_VERSION}.tar.gz" \
+    --output "$openssl_archive"
+  if command -v sha256sum >/dev/null 2>&1; then
+    archive_digest="$(sha256sum "$openssl_archive")"
+  else
+    archive_digest="$(shasum -a 256 "$openssl_archive")"
+  fi
+  if [[ "${archive_digest%% *}" != "$ORACLE_OPENSSL_SHA256" ]]; then
+    printf 'OpenSSL oracle source checksum mismatch\n' >&2
+    exit 1
+  fi
+  tar -xzf "$openssl_archive" -C "$work_dir"
+  openssl_source="$work_dir/openssl-${ORACLE_OPENSSL_VERSION}"
+  openssl_prefix="$work_dir/openssl-install"
+  # A PIC static libcrypto is embedded in the oracle's shared backend; deleting
+  # the build directory cannot leave a runtime dependency on this temporary path.
+  (cd "$openssl_source" && ./Configure no-shared no-module no-tests -fPIC \
+    --prefix="$openssl_prefix" --libdir=lib)
+  make --directory "$openssl_source" --jobs "$build_jobs"
+  make --directory "$openssl_source" install_sw
+  openssl_option="--with-openssl=$openssl_prefix"
+fi
+}
+
 if [[ -n "${XMLSEC1_SOURCE_DIR:-}" ]]; then
   local_source_dir="$XMLSEC1_SOURCE_DIR"
   if [[ "$local_source_dir" != /* || ! -d "$local_source_dir" ]]; then
@@ -117,19 +172,14 @@ else
   git -C "$source_dir" checkout --detach "$XMLSEC1_COMMIT"
 fi
 
+prepare_modern_openssl
 mkdir -p "$build_dir" "$stage_dir"
 OBJ_DIR="$build_dir" "$source_dir/autogen.sh" \
   --prefix="$prefix" \
   --disable-static \
   --without-gnutls \
   --without-nss \
-  --with-openssl
-
-if command -v nproc >/dev/null 2>&1; then
-  build_jobs="$(nproc)"
-else
-  build_jobs="$(sysctl -n hw.ncpu)"
-fi
+  "$openssl_option"
 make --directory "$build_dir" --jobs "$build_jobs"
 make --directory "$build_dir" install DESTDIR="$stage_dir"
 
@@ -146,6 +196,10 @@ version_output="$(xmlsec_version_output)"
 if ! xmlsec_version_is_expected "$version_output"; then
   printf 'xmlsec1 version mismatch: expected xmlsec1 %s, got %s\n' \
     "$XMLSEC1_VERSION" "${version_output:-<empty output>}" >&2
+  exit 1
+fi
+if ! xmlsec_required_capabilities; then
+  printf 'xmlsec1 oracle is missing required EdDSA transforms\n' >&2
   exit 1
 fi
 printf '%s\n' "$version_output"

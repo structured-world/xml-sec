@@ -40,12 +40,19 @@ pub struct X509ChainOptions<'a> {
     pub rsa_keys: RsaKeyPolicy,
     /// DSA strength requirements for every issuer key used by the path.
     pub dsa_keys: DsaKeyPolicy,
+    /// Borrowed certificate/CRL permissions from the operation's trust policy.
+    /// `None` rejects PQ signatures; explicit permissions can select an exact
+    /// allowlist or all provider-supported algorithms for compatibility.
+    pub certificate_signature_algorithms: Option<&'a crate::policy::CertificateSignatureAlgorithms>,
 }
 
 /// Certificate-chain validation failure.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum X509ChainError {
+    /// The operation does not permit this certificate or CRL signature method.
+    #[error("X.509 signature policy rejected authentication: {0}")]
+    Policy(#[from] crate::policy::PolicyViolation),
     /// The selected cryptographic provider rejected path authentication.
     #[error("cryptographic provider rejected X.509 authentication: {0}")]
     Provider(#[from] crate::provider::ProviderError),
@@ -213,11 +220,20 @@ pub(crate) fn verify_x509_certificate_chain_with_provider_and_crls(
     // DSA-SHA1 roots, while our fallback must recognize them for rollover.
     let replace_untrusted_root = if path_der.len() > 1
         && certificate_names_equal(last.subject(), last.issuer())
-        && verify_certificate_signature_with_provider(&last, &last, provider)?
-    {
+        && verify_certificate_signature_with_provider(
+            &last,
+            &last,
+            provider,
+            options.certificate_signature_algorithms,
+        )? {
         let child = parse_certificate(path_der[path_der.len() - 2])?;
         certificate_names_equal(child.issuer(), last.subject())
-            && verify_certificate_signature_with_provider(&child, &last, provider)?
+            && verify_certificate_signature_with_provider(
+                &child,
+                &last,
+                provider,
+                options.certificate_signature_algorithms,
+            )?
     } else {
         false
     };
@@ -236,7 +252,12 @@ pub(crate) fn verify_x509_certificate_chain_with_provider_and_crls(
     let mut first_validation_error = None;
     for (anchor_der, cert) in &trusted_anchors {
         if !certificate_names_equal(cert.subject(), candidate_child.issuer())
-            || !verify_certificate_signature_with_provider(&candidate_child, cert, provider)?
+            || !verify_certificate_signature_with_provider(
+                &candidate_child,
+                cert,
+                provider,
+                options.certificate_signature_algorithms,
+            )?
         {
             continue;
         }
@@ -300,7 +321,12 @@ fn validate_path(
         };
         validate_issuer_key_policy(issuer, position + 1, options.rsa_keys, options.dsa_keys)?;
         if !certificate_names_equal(child.issuer(), issuer.subject())
-            || !verify_certificate_signature_with_provider(child, issuer, provider)?
+            || !verify_certificate_signature_with_provider(
+                child,
+                issuer,
+                provider,
+                options.certificate_signature_algorithms,
+            )?
         {
             return Err(X509ChainError::InvalidSignature(position));
         }
@@ -313,6 +339,7 @@ fn validate_path(
             additional_crls,
             verification_time,
             provider,
+            options.certificate_signature_algorithms,
         )?;
     }
     Ok(())
@@ -736,6 +763,7 @@ fn verify_certificate_signature(
         certificate,
         issuer,
         crate::provider::default_provider(),
+        None,
     )
     .unwrap_or(false)
 }
@@ -744,6 +772,7 @@ fn verify_certificate_signature_with_provider(
     certificate: &X509Certificate<'_>,
     issuer: &X509Certificate<'_>,
     provider: &dyn crate::provider::CryptoProvider,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<bool, X509ChainError> {
     // RFC 5280 sections 4.1.1.2 and 4.1.2.3 require the outer and signed
     // AlgorithmIdentifier values to be identical. Enforce this independently
@@ -755,6 +784,7 @@ fn verify_certificate_signature_with_provider(
         certificate.tbs_certificate.as_ref(),
         issuer.public_key().raw,
         provider,
+        allowed,
     )
 }
 
@@ -768,6 +798,7 @@ pub(crate) fn certificate_signature_matches(certificate_der: &[u8], issuer_der: 
         certificate_der,
         issuer_der,
         crate::provider::default_provider(),
+        None,
     )
     .unwrap_or(false)
 }
@@ -776,6 +807,7 @@ pub(crate) fn certificate_signature_matches_with_provider(
     certificate_der: &[u8],
     issuer_der: &[u8],
     provider: &dyn crate::provider::CryptoProvider,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<bool, X509ChainError> {
     let (Ok(certificate), Ok(issuer)) = (
         parse_certificate(certificate_der),
@@ -783,7 +815,7 @@ pub(crate) fn certificate_signature_matches_with_provider(
     ) else {
         return Ok(false);
     };
-    verify_certificate_signature_with_provider(&certificate, &issuer, provider)
+    verify_certificate_signature_with_provider(&certificate, &issuer, provider, allowed)
 }
 
 fn certificate_names_equal(
@@ -798,7 +830,7 @@ fn certificate_names_equal(
 
 #[cfg(test)]
 fn verify_crl_signature(crl: &CertificateRevocationList<'_>, issuer: &X509Certificate<'_>) -> bool {
-    verify_crl_signature_with_provider(crl, issuer, crate::provider::default_provider())
+    verify_crl_signature_with_provider(crl, issuer, crate::provider::default_provider(), None)
         .unwrap_or(false)
 }
 
@@ -806,6 +838,7 @@ fn verify_crl_signature_with_provider(
     crl: &CertificateRevocationList<'_>,
     issuer: &X509Certificate<'_>,
     provider: &dyn crate::provider::CryptoProvider,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<bool, X509ChainError> {
     // RFC 5280 sections 5.1.1.2 and 5.1.2.2 impose the same equality rule on
     // CRLs as certificates.
@@ -816,6 +849,7 @@ fn verify_crl_signature_with_provider(
         crl.tbs_cert_list.as_ref(),
         issuer.public_key().raw,
         provider,
+        allowed,
     )
 }
 
@@ -826,6 +860,7 @@ fn verify_x509_signed_object_with_provider(
     signed_data: &[u8],
     issuer_spki_der: &[u8],
     provider: &dyn crate::provider::CryptoProvider,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<bool, X509ChainError> {
     if outer_algorithm != signed_algorithm {
         return Ok(false);
@@ -836,6 +871,7 @@ fn verify_x509_signed_object_with_provider(
         signed_data,
         issuer_spki_der,
         provider,
+        allowed,
     )
 }
 
@@ -845,8 +881,10 @@ fn verify_x509_signature_with_provider(
     signed_data: &[u8],
     issuer_spki_der: &[u8],
     provider: &dyn crate::provider::CryptoProvider,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<bool, X509ChainError> {
     let algorithm = x509_signature_algorithm(algorithm_identifier)?;
+    crate::policy::KeyTrustPolicy::check_certificate_signature_algorithm(algorithm, allowed)?;
     provider
         .require_capability(crate::provider::ProviderCapability::VerifyCertificate(
             algorithm,
@@ -888,13 +926,44 @@ fn x509_signature_algorithm(
         "1.2.840.10045.4.3.2" => X509SignatureAlgorithm::Ecdsa(super::DigestAlgorithm::Sha256),
         "1.2.840.10045.4.3.3" => X509SignatureAlgorithm::Ecdsa(super::DigestAlgorithm::Sha384),
         "1.2.840.10045.4.3.4" => X509SignatureAlgorithm::Ecdsa(super::DigestAlgorithm::Sha512),
+        // NIST CSOR, "ECDSA with SHA-3 family", assigns these identifiers.
+        // https://csrc.nist.gov/projects/computer-security-objects-register/algorithm-registration
+        // The shared ECDSA parameter check below also applies to SHA-3.
+        "2.16.840.1.101.3.4.3.9" => X509SignatureAlgorithm::Ecdsa(super::DigestAlgorithm::Sha3_224),
+        "2.16.840.1.101.3.4.3.10" => {
+            X509SignatureAlgorithm::Ecdsa(super::DigestAlgorithm::Sha3_256)
+        }
+        "2.16.840.1.101.3.4.3.11" => {
+            X509SignatureAlgorithm::Ecdsa(super::DigestAlgorithm::Sha3_384)
+        }
+        "2.16.840.1.101.3.4.3.12" => {
+            X509SignatureAlgorithm::Ecdsa(super::DigestAlgorithm::Sha3_512)
+        }
         "1.3.101.112" => X509SignatureAlgorithm::Ed25519,
-        _ => return Err(X509ChainError::UnsupportedSignatureAlgorithm { oid }),
+        // RFC 8410 sections 3 and 6 require absent Ed448 parameters:
+        // https://www.rfc-editor.org/rfc/rfc8410.html#section-3
+        "1.3.101.113" => X509SignatureAlgorithm::Ed448,
+        _ => {
+            let Some(algorithm) = super::PqAlgorithm::ALL
+                .into_iter()
+                .find(|algorithm| algorithm.oid() == oid)
+            else {
+                return Err(X509ChainError::UnsupportedSignatureAlgorithm { oid });
+            };
+            X509SignatureAlgorithm::PostQuantum(algorithm)
+        }
     };
     match &algorithm {
         X509SignatureAlgorithm::Dsa(_)
         | X509SignatureAlgorithm::Ecdsa(_)
-        | X509SignatureAlgorithm::Ed25519 => require_absent_signature_parameters(identifier)?,
+        | X509SignatureAlgorithm::Ed25519
+        | X509SignatureAlgorithm::Ed448 => require_absent_signature_parameters(identifier)?,
+        X509SignatureAlgorithm::PostQuantum(_) => {
+            // RFC 9881 §2 / RFC 9909 §3 forbid even NULL parameters.
+            // https://www.rfc-editor.org/rfc/rfc9881.html#section-2
+            // https://www.rfc-editor.org/rfc/rfc9909.html#section-3
+            require_absent_signature_parameters(identifier)?;
+        }
         X509SignatureAlgorithm::RsaPkcs1v15(_) => {
             require_null_or_absent_signature_parameters(identifier)?;
         }
@@ -1702,6 +1771,7 @@ fn verify_crls(
     additional_crls: &[Vec<u8>],
     verification_time: ASN1Time,
     provider: &dyn crate::provider::CryptoProvider,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<(), X509ChainError> {
     let crls = crl_der
         .iter()
@@ -1737,7 +1807,7 @@ fn verify_crls(
             if authority_key_match == Some(false) {
                 continue;
             }
-            if !verify_crl_signature_with_provider(crl, issuer, provider)? {
+            if !verify_crl_signature_with_provider(crl, issuer, provider, allowed)? {
                 if authority_key_match == Some(true) {
                     return Err(X509ChainError::InvalidCrl(*crl_index));
                 }
@@ -1893,6 +1963,7 @@ mod tests {
                 allowed_extended_key_usages,
                 rsa_keys: RsaKeyPolicy::default(),
                 dsa_keys: DsaKeyPolicy::default(),
+                certificate_signature_algorithms: None,
             },
         )
     }
@@ -2075,6 +2146,87 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "experimental-pq")]
+    fn pq_certificate_verification_requires_explicit_trust_permission() {
+        use super::super::{
+            PostQuantumSigningKey, PqAlgorithm, SignatureAlgorithm, SignatureContext, SigningKey,
+        };
+        // The provider must support a valid pure PKIX signature, but that
+        // compiled capability cannot authorize certificate/CRL trust by itself.
+        let parameter = PqAlgorithm::MlDsa44;
+        let key = PostQuantumSigningKey::from_pkcs8_der(
+            parameter,
+            include_bytes!("../../tests/fixtures/xmldsig/keys/ml-dsa/ml-dsa-44-key.der"),
+        )
+        .expect("donor ML-DSA private key must import");
+        let data = b"PKIX signed data";
+        let provider = crate::provider::default_provider();
+        let signature = provider
+            .sign_with_context(
+                &key,
+                SignatureAlgorithm::PostQuantum(parameter),
+                &SignatureContext::default(),
+                data,
+            )
+            .expect("ML-DSA key must sign PKIX data");
+        let public = key.public_key_info().expect("public key must export");
+        let spki = public.spki_der().expect("PQ public key must contain SPKI");
+        let algorithm = X509SignatureAlgorithm::PostQuantum(parameter);
+        assert!(
+            provider
+                .verify_x509_signature(algorithm, data, &signature, spki)
+                .expect("provider must verify valid PQ signature")
+        );
+        let identifier = AlgorithmIdentifier::new(
+            parameter
+                .oid()
+                .parse()
+                .expect("registered PQ OID must parse"),
+            None,
+        );
+        assert!(
+            verify_x509_signature_with_provider(
+                &identifier,
+                &signature,
+                data,
+                spki,
+                provider,
+                None
+            )
+            .is_err(),
+            "default certificate policy must reject PQ before provider verification"
+        );
+        let permitted =
+            crate::policy::CertificateSignatureAlgorithms::Allowlist(HashSet::from([algorithm]));
+        assert!(
+            verify_x509_signed_object_with_provider(
+                &identifier,
+                &identifier,
+                &signature,
+                data,
+                spki,
+                provider,
+                Some(&permitted)
+            )
+            .expect("explicit permission must enable valid PQ authentication")
+        );
+        assert!(matches!(
+            verify_x509_signed_object_with_provider(
+                &identifier,
+                &identifier,
+                &signature,
+                data,
+                spki,
+                provider,
+                Some(&crate::policy::CertificateSignatureAlgorithms::Allowlist(
+                    HashSet::new()
+                ))
+            ),
+            Err(X509ChainError::Policy(_))
+        ));
+    }
+
+    #[test]
     fn x509_ecdsa_hash_oid_does_not_select_the_issuer_curve() {
         // RFC 5758 signature OIDs select the digest while SubjectPublicKeyInfo
         // selects the curve. Both non-default pairings must therefore reach
@@ -2098,6 +2250,7 @@ mod tests {
                 data,
                 p384_spki.as_bytes(),
                 crate::provider::default_provider(),
+                None,
             )
             .expect("P-384 with SHA-256 must be a supported X.509 pairing")
         );
@@ -2118,6 +2271,7 @@ mod tests {
                 data,
                 p256_spki.as_bytes(),
                 crate::provider::default_provider(),
+                None,
             )
             .expect("P-256 with SHA-384 must be a supported X.509 pairing")
         );
@@ -2195,6 +2349,26 @@ mod tests {
     }
 
     #[test]
+    fn ed448_certificate_signature_identifier_requires_absent_parameters() {
+        use x509_parser::asn1_rs::{Any, Tag};
+
+        // RFC 8410 sections 3 and 6 assign Ed448's OID and require absent
+        // parameters, not ASN.1 NULL, for its signature identifier.
+        let oid = Oid::from_str("1.3.101.113").expect("RFC 8410 Ed448 OID must parse");
+        assert!(x509_signature_algorithm(&AlgorithmIdentifier::new(oid.clone(), None)).is_ok());
+        assert!(matches!(
+            x509_signature_algorithm(&AlgorithmIdentifier::new(
+                oid,
+                Some(Any::from_tag_and_data(Tag::Null, &[]))
+            )),
+            Err(X509ChainError::InvalidDer {
+                kind: "X.509 signature AlgorithmIdentifier parameters",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn every_modeled_non_parameterized_x509_algorithm_reaches_the_provider() {
         // Parsing and provider capability are separate contracts. Once an OID
         // has a typed representation, custom providers must get the chance to
@@ -2238,6 +2412,55 @@ mod tests {
                 None,
             );
             assert_eq!(x509_signature_algorithm(&identifier), Ok(expected), "{oid}");
+        }
+    }
+
+    #[test]
+    fn pq_certificate_identifiers_require_absent_parameters() {
+        use x509_parser::asn1_rs::{Any, Tag};
+
+        // RFC 9881 §2 and RFC 9909 §3 require parameters to be absent,
+        // including when the primitive is not compiled into this provider.
+        for algorithm in super::super::PqAlgorithm::ALL {
+            let oid = Oid::from_str(algorithm.oid()).expect("registered PQ signature OID");
+            assert!(x509_signature_algorithm(&AlgorithmIdentifier::new(oid.clone(), None)).is_ok());
+            assert!(matches!(
+                x509_signature_algorithm(&AlgorithmIdentifier::new(
+                    oid,
+                    Some(Any::from_tag_and_data(Tag::Null, &[]))
+                )),
+                Err(X509ChainError::InvalidDer {
+                    kind: "X.509 signature AlgorithmIdentifier parameters",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn sha3_ecdsa_certificate_identifiers_require_absent_parameters() {
+        use x509_parser::asn1_rs::{Any, Tag};
+        // Every advertised SHA3-ECDSA capability must survive identifier
+        // parsing; malformed parameters must fail before provider dispatch.
+        for digest in [
+            super::super::DigestAlgorithm::Sha3_224,
+            super::super::DigestAlgorithm::Sha3_256,
+            super::super::DigestAlgorithm::Sha3_384,
+            super::super::DigestAlgorithm::Sha3_512,
+        ] {
+            let expected = X509SignatureAlgorithm::Ecdsa(digest);
+            let oid = Oid::from_str(expected.oid()).expect("registered SHA3 ECDSA OID must parse");
+            assert_eq!(
+                x509_signature_algorithm(&AlgorithmIdentifier::new(oid.clone(), None)),
+                Ok(expected)
+            );
+            assert!(matches!(
+                x509_signature_algorithm(&AlgorithmIdentifier::new(
+                    oid,
+                    Some(Any::from_tag_and_data(Tag::Null, &[]))
+                )),
+                Err(X509ChainError::InvalidDer { .. })
+            ));
         }
     }
 
@@ -2402,6 +2625,7 @@ mod tests {
             dsa_keys: DsaKeyPolicy {
                 minimum_modulus_bits: 1024,
             },
+            certificate_signature_algorithms: None,
         };
 
         verify_x509_certificate_chain(&info, &options)
@@ -2431,6 +2655,7 @@ mod tests {
             allowed_extended_key_usages: None,
             rsa_keys: RsaKeyPolicy::default(),
             dsa_keys: DsaKeyPolicy::default(),
+            certificate_signature_algorithms: None,
         };
 
         assert!(matches!(

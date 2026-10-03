@@ -154,6 +154,43 @@ impl InstallHarness {
 }
 
 #[test]
+fn modern_oracle_rejects_a_version_correct_cache_without_eddsa() {
+    // A source/version marker cannot prove that OpenSSL compiled the required
+    // algorithms. An old cached backend must never satisfy modern interop CI.
+    let harness = InstallHarness::new();
+    std::fs::write(harness.prefix.join(".xmlsec-source-commit"), DONOR_COMMIT).unwrap();
+    let binary = harness.prefix.join("bin/xmlsec1");
+    std::fs::write(&binary, "#!/bin/sh\nprintf 'xmlsec1 1.3.13 (openssl)\\n'\n").unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    harness.root.tool("curl", "#!/bin/sh\nexit 42\n");
+    let inherited = std::env::var_os("PATH").unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(harness.tools.clone()).chain(std::env::split_paths(&inherited)),
+    )
+    .unwrap();
+    let result = Command::new("bash")
+        .arg("scripts/install-xmlsec1.sh")
+        .env("PATH", path)
+        .env("XMLSEC1_PREFIX", &harness.prefix)
+        .env("XMLSEC1_MODERN_ORACLE", "1")
+        .env(
+            "GIT_FETCHED_COMMIT_FILE",
+            harness.root.path().join("fetched-commit"),
+        )
+        .env("MV_COUNT_FILE", harness.root.path().join("mv-count"))
+        .status()
+        .unwrap();
+    assert!(
+        !result.success(),
+        "a missing-capability cache must require rebuilding"
+    );
+    assert!(
+        harness.prefix.join("sentinel").exists(),
+        "a failed rebuild must preserve the old installation"
+    );
+}
+
+#[test]
 fn failed_install_replacement_restores_previous_xmlsec() {
     // The staged directory move is the commit point. A failure there must
     // leave the previously working installation intact rather than letting

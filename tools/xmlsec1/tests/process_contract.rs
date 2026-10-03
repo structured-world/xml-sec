@@ -48,6 +48,268 @@ fn project_root() -> &'static Path {
 }
 
 #[test]
+fn modern_eddsa_signing_completes_cli_process_pipeline() {
+    // Exercise actual process arguments, key loading, SHA-3 reference digests,
+    // and signature-context forwarding, not only the key decoder in isolation.
+    for (algorithm, stem) in [
+        (SignatureAlgorithm::Ed25519, "ed25519"),
+        (SignatureAlgorithm::Ed25519Ctx, "ed25519"),
+        (SignatureAlgorithm::Ed25519Ph, "ed25519"),
+        (SignatureAlgorithm::Ed448, "ed448"),
+        (SignatureAlgorithm::Ed448Ph, "ed448"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let template = temp.path().join("template.xml");
+        let signed = temp.path().join("signed.xml");
+        let mut builder =
+            SignatureBuilder::new(C14nAlgorithm::new(C14nMode::Exclusive1_0, false), algorithm)
+                .add_reference(
+                    ReferenceBuilder::new(DigestAlgorithm::Sha3_256)
+                        .uri("")
+                        .transform(Transform::Enveloped),
+                );
+        if algorithm != SignatureAlgorithm::Ed25519 {
+            builder =
+                builder.signature_context(xml_sec::xmldsig::SignatureContext::new(b"foo").unwrap());
+        }
+        let xml =
+            append_signature_to_root("<root>payload</root>", &builder.build_template().unwrap())
+                .unwrap();
+        fs::write(&template, xml).unwrap();
+        let key = project_root().join(format!(
+            "tests/fixtures/xmldsig/keys/eddsa/eddsa-{stem}-key.der"
+        ));
+        let result = Command::new(binary())
+            .args(["sign", "--pkcs8-der"])
+            .arg(key)
+            .arg("--output")
+            .arg(&signed)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{algorithm:?}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let result = Command::new(binary())
+            .args(["verify", "--pubkey-pem"])
+            .arg(project_root().join(format!(
+                "tests/fixtures/xmldsig/keys/eddsa/eddsa-{stem}-pubkey.pem"
+            )))
+            .arg(&signed)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{algorithm:?}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let xml = fs::read_to_string(&signed)
+            .unwrap()
+            .replace("payload", "tampered");
+        fs::write(&signed, xml).unwrap();
+        let rejected = Command::new(binary())
+            .args(["verify", "--pubkey-pem"])
+            .arg(project_root().join(format!(
+                "tests/fixtures/xmldsig/keys/eddsa/eddsa-{stem}-pubkey.pem"
+            )))
+            .arg(&signed)
+            .output()
+            .unwrap();
+        assert!(!rejected.status.success());
+    }
+}
+
+#[cfg(feature = "experimental-pq")]
+#[test]
+fn pq_signing_and_verification_complete_cli_process_pipeline() {
+    use xml_sec::xmldsig::PqAlgorithm as P;
+    // Capability alone must not enable core PQ verification, while the
+    // explicit compatibility CLI must opt in consistently for both commands.
+    for (parameter, directory, stem) in [
+        (P::MlDsa44, "ml-dsa", "ml-dsa-44"),
+        (P::MlDsa65, "ml-dsa", "ml-dsa-65"),
+        (P::MlDsa87, "ml-dsa", "ml-dsa-87"),
+        (P::SlhDsaSha2_128s, "slh-dsa", "slh-dsa-sha2-128s"),
+        (P::SlhDsaSha2_128f, "slh-dsa", "slh-dsa-sha2-128f"),
+        (P::SlhDsaSha2_192s, "slh-dsa", "slh-dsa-sha2-192s"),
+        (P::SlhDsaSha2_192f, "slh-dsa", "slh-dsa-sha2-192f"),
+        (P::SlhDsaSha2_256s, "slh-dsa", "slh-dsa-sha2-256s"),
+        (P::SlhDsaSha2_256f, "slh-dsa", "slh-dsa-sha2-256f"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let template = temp.path().join("template.xml");
+        let signed = temp.path().join("signed.xml");
+        let builder = SignatureBuilder::new(
+            C14nAlgorithm::new(C14nMode::Exclusive1_0, false),
+            SignatureAlgorithm::PostQuantum(parameter),
+        )
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("")
+                .transform(Transform::Enveloped),
+        );
+        let policy = xml_sec::policy::SigningPolicy {
+            signature_algorithms: Some([SignatureAlgorithm::PostQuantum(parameter)].into()),
+            ..Default::default()
+        };
+        fs::write(
+            &template,
+            append_signature_to_root(
+                "<root>payload</root>",
+                &builder.build_template_with_policy(&policy).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let keys = project_root().join(format!("tests/fixtures/xmldsig/keys/{directory}"));
+        let result = Command::new(binary())
+            .args(["sign", "--pkcs8-der"])
+            .arg(keys.join(format!("{stem}-key.der")))
+            .arg("--output")
+            .arg(&signed)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{parameter:?}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let verify = || {
+            Command::new(binary())
+                .args(["verify", "--pubkey-pem"])
+                .arg(keys.join(format!("{stem}-pubkey.pem")))
+                .arg(&signed)
+                .output()
+                .unwrap()
+        };
+        let result = verify();
+        assert!(
+            result.status.success(),
+            "{parameter:?}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        fs::write(
+            &signed,
+            fs::read_to_string(&signed)
+                .unwrap()
+                .replace("payload", "tampered"),
+        )
+        .unwrap();
+        assert!(
+            !verify().status.success(),
+            "tampering must fail for {parameter:?}"
+        );
+    }
+}
+
+#[cfg(feature = "experimental-pq")]
+#[test]
+fn compatibility_cli_verifies_a_pq_signed_certificate_path() {
+    use der::{
+        Decode as _,
+        asn1::{Any, BitString, ObjectIdentifier},
+    };
+    use xml_sec::xmldsig::{
+        EcdsaP256SigningKey, PostQuantumSigningKey, PqAlgorithm, SignatureContext, SigningKey,
+    };
+    // A trusted root with a PQ key must authenticate the classical XML
+    // signer's certificate; XML and certificate algorithms are independent.
+    let temp = tempfile::tempdir().unwrap();
+    let mut params = CertificateParams::new(Vec::new()).unwrap();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "PQ CLI root");
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    let root = rcgen::CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap();
+    let leaf_key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(Vec::new()).unwrap();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "PQ CLI leaf");
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    let leaf = params.signed_by(&leaf_key, &root).unwrap();
+    let pq = PostQuantumSigningKey::from_pkcs8_der(
+        PqAlgorithm::MlDsa44,
+        include_bytes!("../../../tests/fixtures/xmldsig/keys/ml-dsa/ml-dsa-44-key.der"),
+    )
+    .unwrap();
+    let mut root = Vec::<Any>::from_der(root.der()).unwrap();
+    let mut tbs = Vec::<Any>::from_der(&root[0].to_der().unwrap()).unwrap();
+    tbs[6] = Any::from_der(pq.public_key_info().unwrap().spki_der().unwrap()).unwrap();
+    root[0] = Any::from_der(&tbs.to_der().unwrap()).unwrap();
+    let root_path = temp.path().join("root.der");
+    fs::write(&root_path, root.to_der().unwrap()).unwrap();
+    let mut leaf = Vec::<Any>::from_der(leaf.der()).unwrap();
+    let mut tbs = Vec::<Any>::from_der(&leaf[0].to_der().unwrap()).unwrap();
+    let identifier = Any::from_der(
+        &vec![
+            Any::encode_from(
+                &PqAlgorithm::MlDsa44
+                    .oid()
+                    .parse::<ObjectIdentifier>()
+                    .unwrap(),
+            )
+            .unwrap(),
+        ]
+        .to_der()
+        .unwrap(),
+    )
+    .unwrap();
+    tbs[2] = identifier.clone();
+    leaf[1] = identifier;
+    let tbs = tbs.to_der().unwrap();
+    let signature = default_provider()
+        .sign_with_context(
+            &pq,
+            SignatureAlgorithm::PostQuantum(PqAlgorithm::MlDsa44),
+            &SignatureContext::default(),
+            &tbs,
+        )
+        .unwrap();
+    leaf[0] = Any::from_der(&tbs).unwrap();
+    leaf[2] = Any::encode_from(&BitString::from_bytes(&signature).unwrap()).unwrap();
+    let leaf_path = temp.path().join("leaf.der");
+    fs::write(&leaf_path, leaf.to_der().unwrap()).unwrap();
+    let key = EcdsaP256SigningKey::from_pkcs8_der(&leaf_key.serialize_der()).unwrap();
+    let builder = SignatureBuilder::new(
+        C14nAlgorithm::new(C14nMode::Exclusive1_0, false),
+        SignatureAlgorithm::EcdsaSha256,
+    )
+    .add_reference(
+        ReferenceBuilder::new(DigestAlgorithm::Sha256)
+            .uri("")
+            .transform(Transform::Enveloped),
+    );
+    let signed = SignContext::new(&key)
+        .sign_with_builder("<root>payload</root>", &builder)
+        .unwrap();
+    let signed_path = temp.path().join("signed.xml");
+    fs::write(&signed_path, &signed).unwrap();
+    let verify = || {
+        Command::new(binary())
+            .args(["verify", "--pubkey-cert-der"])
+            .arg(&leaf_path)
+            .arg("--trusted-der")
+            .arg(&root_path)
+            .arg(&signed_path)
+            .output()
+            .unwrap()
+    };
+    let accepted = verify();
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    fs::write(&signed_path, signed.replace("payload", "tampered")).unwrap();
+    assert!(!verify().status.success());
+}
+
+#[test]
 fn mislabeled_encrypted_pem_cannot_sign() {
     // Generic private-key loading must honor PEM protection labels, not retry
     // plaintext DER; rejection must leave no signed output on disk.
