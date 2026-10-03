@@ -6,6 +6,79 @@ use xml_sec::provider::{
 use xml_sec::xmldsig::DigestAlgorithm;
 
 #[test]
+fn rsa_verifier_size_limit_is_unsupported_not_signature_mismatch() {
+    // A caller may allow 1024-bit RSA; native capability limits must still be
+    // distinguished from a cryptographically incorrect signature in both APIs.
+    use rand_chacha::{ChaCha8Rng, rand_core::SeedableRng as _};
+    use rsa::pkcs8::{EncodePrivateKey as _, EncodePublicKey as _};
+    use xml_sec::provider::{ProviderError, X509SignatureAlgorithm};
+    use xml_sec::xmldsig::{
+        DsigError, RsaSigningKey, SignatureAlgorithm, SignatureVerificationError, SigningKey as _,
+        VerificationKey,
+    };
+    let mut rng = ChaCha8Rng::seed_from_u64(17);
+    let private = rsa::RsaPrivateKey::new(&mut rng, 1024).unwrap();
+    let spki = private.to_public_key().to_public_key_der().unwrap();
+    let signer = RsaSigningKey::from_pkcs8_der(private.to_pkcs8_der().unwrap().as_bytes()).unwrap();
+    let algorithm = SignatureAlgorithm::RsaSha256;
+    let data = b"valid signature under a caller-permitted small key";
+    let signature = signer.sign(algorithm, data).unwrap();
+    let key = VerificationKey {
+        algorithm,
+        public_key_bytes: spki.as_bytes().to_vec(),
+        certificate_der: None,
+        name: None,
+    };
+    assert!(
+        RustCryptoProvider
+            .verify(&key, algorithm, data, &signature)
+            .unwrap()
+    );
+    assert!(matches!(
+        AwsLcFipsProvider.verify(&key, algorithm, data, &signature),
+        Err(DsigError::Crypto(
+            SignatureVerificationError::UnsupportedAlgorithm { .. }
+        ))
+    ));
+    assert!(matches!(
+        AwsLcFipsProvider.verify_x509_signature(
+            X509SignatureAlgorithm::RsaPkcs1v15(DigestAlgorithm::Sha256),
+            data,
+            &signature,
+            spki.as_bytes(),
+        ),
+        Err(ProviderError::Unsupported { .. })
+    ));
+    let mut signing_policy = xml_sec::policy::SigningPolicy::default();
+    signing_policy.rsa_keys.minimum_modulus_bits = 1024;
+    let signed = xml_sec::xmldsig::SignContext::new(&signer)
+        .policy(signing_policy)
+        .sign_template(include_str!("fixtures/saml/response_signing_template.xml"))
+        .unwrap();
+    let mut verification_policy = xml_sec::policy::VerificationPolicy::default();
+    verification_policy.key_trust.rsa_keys.minimum_modulus_bits = 1024;
+    assert_eq!(
+        xml_sec::xmldsig::VerifyContext::new()
+            .key(&key)
+            .policy(verification_policy.clone())
+            .verify(&signed)
+            .unwrap()
+            .status,
+        xml_sec::xmldsig::DsigStatus::Valid
+    );
+    assert!(matches!(
+        xml_sec::xmldsig::VerifyContext::new()
+            .key(&key)
+            .policy(verification_policy)
+            .provider(&AwsLcFipsProvider)
+            .verify(&signed),
+        Err(DsigError::Crypto(
+            SignatureVerificationError::UnsupportedAlgorithm { .. }
+        ))
+    ));
+}
+
+#[test]
 fn native_primitives_match_published_known_answers() {
     assert!(!AwsLcFipsProvider.module_version().is_empty());
     assert!(AwsLcFipsProvider.fips_module_version().is_some());

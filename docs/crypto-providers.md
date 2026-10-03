@@ -35,7 +35,10 @@ ECDSA encoding rather than XMLDSig's fixed-width encoding.
 SHA3-224, DSA, HMAC signatures, EdDSA, post-quantum signatures, RSA-PSS certificate
 signatures, mixed-digest OAEP, and unavailable ECDSA combinations return unsupported
 errors. Consult `CryptoProvider::supports` before requesting a mechanism; actual
-key parameters are checked at import/use as well. Availability never overrides policy.
+key parameters are checked at import/use as well. RSA PKCS#1 verification supports
+2048-8192-bit moduli, including certificate and CRL issuer keys. Keys outside this
+native range return unsupported rather than a signature mismatch, even when caller
+policy permits their size. Availability never overrides policy.
 
 ## FIPS boundary
 

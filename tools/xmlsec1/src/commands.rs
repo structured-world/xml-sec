@@ -3849,24 +3849,7 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                                     "recovery key exposes no public identity".into(),
                                 )
                             })?;
-                            let (_, public) = x509_parser::x509::SubjectPublicKeyInfo::from_der(
-                                spki,
-                            )
-                            .map_err(|_| {
-                                CommandError::Encryption("invalid recovery public key".into())
-                            })?;
-                            let (_, certificate) =
-                                x509_parser::prelude::X509Certificate::from_der(&certificates[0])
-                                    .map_err(|_| {
-                                    CommandError::Encryption("invalid recipient certificate".into())
-                                })?;
-                            if public.subject_public_key.data
-                                != certificate.public_key().subject_public_key.data
-                            {
-                                return Err(CommandError::Encryption(
-                                    "recipient certificate does not match private key".into(),
-                                ));
-                            }
+                            ensure_leaf_certificate_matches_spki(&certificates[0], spki)?;
                         }
                         return Ok(RecipientPrivateKey {
                             inner: PrivateKeyDecryptor::provider_key(key),
@@ -4249,12 +4232,25 @@ fn ensure_leaf_certificate_matches_rsa_key(
     certificate_der: &[u8],
     private_key: &rsa::RsaPrivateKey,
 ) -> Result<(), CommandError> {
-    let (_, certificate) = x509_parser::certificate::X509Certificate::from_der(certificate_der)
-        .map_err(|_| CommandError::Encryption("invalid X.509 certificate".into()))?;
     let public_key = RsaPublicKey::from(private_key)
         .to_public_key_der()
         .map_err(|error| CommandError::Encryption(error.to_string()))?;
-    if certificate.public_key().raw != public_key.as_bytes() {
+    ensure_leaf_certificate_matches_spki(certificate_der, public_key.as_bytes())
+}
+
+fn ensure_leaf_certificate_matches_spki(
+    certificate_der: &[u8],
+    public_spki: &[u8],
+) -> Result<(), CommandError> {
+    let (rest, certificate) = x509_parser::certificate::X509Certificate::from_der(certificate_der)
+        .map_err(|_| CommandError::Encryption("invalid X.509 certificate".into()))?;
+    if !rest.is_empty() {
+        return Err(CommandError::Encryption("invalid X.509 certificate".into()));
+    }
+    // RFC 5280 §4.1.2.7: SPKI includes AlgorithmIdentifier and its parameters,
+    // not just key bits. The companion must match this complete key identity.
+    // https://www.rfc-editor.org/rfc/rfc5280#section-4.1.2.7
+    if certificate.public_key().raw != public_spki {
         return Err(CommandError::Encryption(
             "X.509 certificate public key does not match private key".into(),
         ));

@@ -546,7 +546,7 @@ fn verification_algorithm(
 {
     use SignatureAlgorithm as A;
     use signature::*;
-    let rsa: Option<&'static dyn VerificationAlgorithm> = match algorithm {
+    let rsa: Option<&'static RsaParameters> = match algorithm {
         A::RsaSha1 => Some(&RSA_PKCS1_2048_8192_SHA1_FOR_LEGACY_USE_ONLY),
         A::RsaSha256 => Some(&RSA_PKCS1_2048_8192_SHA256),
         A::RsaSha384 => Some(&RSA_PKCS1_2048_8192_SHA384),
@@ -554,6 +554,32 @@ fn verification_algorithm(
         _ => None,
     };
     if let Some(rsa) = rsa {
+        use crate::xmldsig::SignatureVerificationError::InvalidKeyDer;
+        use der::Decode as _;
+        let public =
+            rsa::pkcs8::SubjectPublicKeyInfoRef::from_der(spki).map_err(|_| InvalidKeyDer)?;
+        if public.algorithm.oid != rsa::pkcs1::ALGORITHM_OID {
+            return Err(InvalidKeyDer);
+        }
+        let bytes = public.subject_public_key.as_bytes().ok_or(InvalidKeyDer)?;
+        let key = rsa::pkcs1::RsaPublicKey::from_der(bytes).map_err(|_| InvalidKeyDer)?;
+        let modulus = key.modulus.as_bytes();
+        let first = *modulus.first().ok_or(InvalidKeyDer)?;
+        if first == 0 {
+            return Err(InvalidKeyDer);
+        }
+        // These are the selected native verifier's capabilities, not strength
+        // policy. AWS-LC defers this check until verify_sig and uses the same
+        // error for a size it cannot handle and a bad signature; distinguish
+        // them before dispatch without allocating a native key or bigint.
+        // https://docs.rs/aws-lc-rs/1.18.1/aws_lc_rs/signature/struct.RsaParameters.html
+        if modulus.len() > (rsa.max_modulus_len() as usize).div_ceil(8) {
+            return Err(verification_unsupported(algorithm));
+        }
+        let bits = modulus.len() * 8 - first.leading_zeros() as usize;
+        if bits < rsa.min_modulus_len() as usize || bits > rsa.max_modulus_len() as usize {
+            return Err(verification_unsupported(algorithm));
+        }
         return Ok(rsa);
     }
     let curve = spki_curve(spki)?;
@@ -841,5 +867,80 @@ impl super::KeyRecoveryKey for AwsLcRsaPrivateKey {
             .len();
         output.truncate(len);
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use der::{
+        Encode as _,
+        asn1::{BitStringRef, UintRef},
+    };
+
+    #[test]
+    fn rsa_verifier_checks_exact_bit_boundaries_without_bigints() {
+        // Byte-aligned rounding would accept 2047 or 8193 bits. Exercise the
+        // dispatch gate independently of signature correctness and strength policy.
+        for (bits, accepted) in [
+            (2047usize, false),
+            (2048, true),
+            (8192, true),
+            (8193, false),
+        ] {
+            let mut modulus = vec![0; bits.div_ceil(8)];
+            modulus[0] = 1 << ((bits - 1) % 8);
+            *modulus.last_mut().expect("nonempty boundary modulus") |= 1;
+            let rsa = rsa::pkcs1::RsaPublicKey {
+                modulus: UintRef::new(&modulus).expect("unsigned boundary modulus"),
+                public_exponent: UintRef::new(&[1, 0, 1]).expect("unsigned exponent"),
+            }
+            .to_der()
+            .expect("RSA public key DER");
+            let spki = rsa::pkcs8::SubjectPublicKeyInfoRef {
+                algorithm: rsa::pkcs1::ALGORITHM_ID,
+                subject_public_key: BitStringRef::new(0, &rsa).expect("octet-aligned key bits"),
+            }
+            .to_der()
+            .expect("RSA SPKI DER");
+            for algorithm in [
+                SignatureAlgorithm::RsaSha1,
+                SignatureAlgorithm::RsaSha256,
+                SignatureAlgorithm::RsaSha384,
+                SignatureAlgorithm::RsaSha512,
+            ] {
+                let result = verification_algorithm(
+                    algorithm,
+                    &spki,
+                    crate::policy::EcdsaSignatureValueEncoding::XmlDsig,
+                );
+                if accepted {
+                    assert!(result.is_ok(), "{bits} {algorithm:?}");
+                } else {
+                    assert!(
+                        matches!(
+                            result,
+                            Err(
+                                crate::xmldsig::SignatureVerificationError::UnsupportedAlgorithm { .. }
+                            )
+                        ),
+                        "{bits} {algorithm:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_rsa_spki_is_not_a_capability_failure() {
+        // Invalid DER must remain invalid key data, not unsupported or bad signature.
+        assert!(matches!(
+            verification_algorithm(
+                SignatureAlgorithm::RsaSha256,
+                b"not DER",
+                crate::policy::EcdsaSignatureValueEncoding::XmlDsig
+            ),
+            Err(crate::xmldsig::SignatureVerificationError::InvalidKeyDer)
+        ));
     }
 }

@@ -7437,6 +7437,71 @@ fn rsa_decryption_accepts_private_key_certificate_companions() {
     assert!(encrypt.status.success());
 
     let compound = format!("{},{}", private_key.display(), certificate.display());
+    // The companion's algorithm is part of SPKI identity (RFC 5280 §4.1.2.7).
+    // Keep the exact RSA bits but change rsaEncryption to RSASSA-PSS; merely
+    // comparing the BIT STRING must not accept this structurally valid certificate.
+    let certificate_pem = pem::parse(fs::read(&certificate).unwrap()).unwrap();
+    let mut altered = certificate_pem.contents().to_vec();
+    let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(&altered).unwrap();
+    let spki = parsed.public_key().raw;
+    let original_bits = parsed.public_key().subject_public_key.data.to_vec();
+    let offset = altered
+        .windows(spki.len())
+        .position(|bytes| bytes == spki)
+        .unwrap();
+    let oid = [
+        0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01,
+    ];
+    let algorithm_offset = spki
+        .windows(oid.len())
+        .position(|bytes| bytes == oid)
+        .unwrap();
+    altered[offset + algorithm_offset + oid.len() - 1] = 0x0a;
+    let (_, changed) = x509_parser::certificate::X509Certificate::from_der(&altered).unwrap();
+    assert_eq!(
+        changed.public_key().subject_public_key.data.as_ref(),
+        original_bits
+    );
+    let altered_certificate = temp.path().join("changed-algorithm.pem");
+    fs::write(
+        &altered_certificate,
+        pem::encode(&pem::Pem::new("CERTIFICATE", altered)),
+    )
+    .unwrap();
+    for provider in [
+        "rustcrypto",
+        #[cfg(feature = "aws-lc-fips")]
+        "aws-lc-fips",
+    ] {
+        let rejected = Command::new(binary())
+            .args(["decrypt", "--crypto", provider, "--privkey-pem"])
+            .arg(format!(
+                "{},{}",
+                private_key.display(),
+                altered_certificate.display()
+            ))
+            .arg(&encrypted)
+            .output()
+            .unwrap();
+        assert!(
+            !rejected.status.success(),
+            "{provider} accepted a different SPKI algorithm"
+        );
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("does not match"));
+        assert!(rejected.stdout.is_empty());
+        let accepted = Command::new(binary())
+            .args(["decrypt", "--crypto", provider, "--privkey-pem"])
+            .arg(&compound)
+            .arg(&encrypted)
+            .output()
+            .unwrap();
+        assert!(
+            accepted.status.success(),
+            "{}",
+            String::from_utf8_lossy(&accepted.stderr)
+        );
+        assert_eq!(accepted.stdout, b"certificate companion");
+    }
     let decrypt = Command::new(binary())
         .args(["decrypt", "--privkey-pem"])
         .arg(compound)
