@@ -85,6 +85,7 @@ peresil = { version = "0.3", optional = true }
 snafu = { version = "0.9", optional = true }
 
 # Crypto
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["fips"], optional = true }
 rsa = { package = "sad-rsa", version = "0.10.2", features = ["sha1", "sha2"], optional = true }
 sha1 = { version = "0.11", features = ["oid"], optional = true }
 sha2 = { version = "0.11", features = ["oid"], optional = true }
@@ -149,6 +150,7 @@ tempfile = "3"
 [features]
 default = ["std", "xmldsig", "xmlenc", "c14n", "xml-backend-xmloxide"]
 std = ["thiserror/std", "xmlparser/std"]
+aws-lc-fips = ["std", "xmldsig", "dep:aws-lc-rs"]
 xml-backend-xmloxide = ["dep:xmloxide"]
 xml-backend-roxmltree = ["dep:roxmltree"]
 xml-backends-all = ["xml-backend-xmloxide", "xml-backend-roxmltree"]

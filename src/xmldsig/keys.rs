@@ -182,6 +182,12 @@ pub struct VerificationKey {
 }
 
 impl VerifyingKey for VerificationKey {
+    fn verification_spki(&self, algorithm: SignatureAlgorithm) -> Result<Option<&[u8]>, DsigError> {
+        if algorithm != self.algorithm {
+            return Err(KeyResolutionError::AlgorithmMismatch.into());
+        }
+        Ok(Some(&self.public_key_bytes))
+    }
     fn verify_with_context(
         &self,
         algorithm: SignatureAlgorithm,
@@ -377,6 +383,25 @@ struct PolicyBoundVerificationKey {
 }
 
 impl VerifyingKey for PolicyBoundVerificationKey {
+    fn verification_spki(&self, algorithm: SignatureAlgorithm) -> Result<Option<&[u8]>, DsigError> {
+        // Preserve strength checks carried by this resolver-produced handle.
+        if matches!(
+            algorithm,
+            SignatureAlgorithm::RsaSha1
+                | SignatureAlgorithm::RsaSha224
+                | SignatureAlgorithm::RsaSha256
+                | SignatureAlgorithm::RsaSha384
+                | SignatureAlgorithm::RsaSha512
+        ) {
+            validate_rsa_signature_spki_with_minimum(
+                algorithm,
+                &self.key.public_key_bytes,
+                self.rsa_minimum_bits,
+            )
+            .map_err(DsigError::Crypto)?;
+        }
+        self.key.verification_spki(algorithm)
+    }
     fn verify_with_context(
         &self,
         algorithm: SignatureAlgorithm,

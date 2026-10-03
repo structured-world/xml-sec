@@ -3,6 +3,8 @@
 use std::collections::HashSet;
 
 #[cfg(test)]
+use crate::xmldsig::DsaSigningKey;
+#[cfg(test)]
 use base64::Engine as _;
 use crypto_bigint::{
     BoxedUint,
@@ -35,10 +37,9 @@ use crate::{
     xmldsig::keys::InspectedKeyCandidateBudget,
     xmldsig::parse::XMLDSIG11_NS,
     xmldsig::{
-        DefaultKeyResolver, DsaSigningKey, DsigError, EcdsaP256SigningKey, EcdsaP384SigningKey,
-        EcdsaP521SigningKey, HmacSigningKey, HmacVerificationKey, KeyInfo, KeyInfoSource,
-        KeyResolver, KeyResolverConfig, KeyValueInfo, RsaSigningKey, SignatureAlgorithm,
-        SigningKey, VerifyingKey, X509DataInfo, validate_signing_key,
+        DefaultKeyResolver, DsigError, HmacSigningKey, HmacVerificationKey, KeyInfo, KeyInfoSource,
+        KeyResolver, KeyResolverConfig, KeyValueInfo, SignatureAlgorithm, SigningKey, VerifyingKey,
+        X509DataInfo, validate_signing_key,
     },
 };
 
@@ -973,7 +974,46 @@ impl KeyInventory {
         policy: &crate::policy::SigningPolicy,
         budget: &mut SigningLookupBudget,
     ) -> Result<Box<dyn SigningKey>, KeyStoreError> {
+        self.signing_key_with_provider_and_budget(
+            name,
+            algorithm,
+            policy,
+            crate::provider::default_provider(),
+            budget,
+        )
+    }
+
+    /// Select an authorized key and import it into the explicitly chosen engine.
+    pub fn signing_key_with_provider(
+        &self,
+        name: &str,
+        algorithm: SignatureAlgorithm,
+        policy: &crate::policy::SigningPolicy,
+        provider: &dyn crate::provider::CryptoProvider,
+    ) -> Result<Box<dyn SigningKey>, KeyStoreError> {
+        self.signing_key_with_provider_and_budget(
+            name,
+            algorithm,
+            policy,
+            provider,
+            &mut SigningLookupBudget::default(),
+        )
+    }
+
+    /// Provider-aware selection sharing the operation's retry budget.
+    pub fn signing_key_with_provider_and_budget(
+        &self,
+        name: &str,
+        algorithm: SignatureAlgorithm,
+        policy: &crate::policy::SigningPolicy,
+        provider: &dyn crate::provider::CryptoProvider,
+        budget: &mut SigningLookupBudget,
+    ) -> Result<Box<dyn SigningKey>, KeyStoreError> {
         policy.validate()?;
+        policy.check_signature_algorithm(algorithm)?;
+        provider
+            .require_capability(crate::provider::ProviderCapability::Sign(algorithm))
+            .map_err(|_| KeyStoreError::Selection("provider does not support signing method"))?;
         if algorithm.hmac_output_bits().is_some() {
             let entry = find_named_entry(
                 &self.symmetric_keys,
@@ -1014,54 +1054,9 @@ impl KeyInventory {
         {
             preflight_dsa_pkcs8_components(&info)?;
         }
-        let key: Box<dyn SigningKey> = match algorithm {
-            #[cfg(feature = "experimental-pq")]
-            SignatureAlgorithm::PostQuantum(parameter) => Box::new(
-                crate::xmldsig::PostQuantumSigningKey::from_pkcs8_der(parameter, der)
-                    .map_err(|_| KeyStoreError::Selection("incompatible PQ signing key"))?,
-            ),
-            SignatureAlgorithm::Ed25519
-            | SignatureAlgorithm::Ed25519Ctx
-            | SignatureAlgorithm::Ed25519Ph
-            | SignatureAlgorithm::Ed448
-            | SignatureAlgorithm::Ed448Ph => Box::new(
-                crate::xmldsig::EdDsaSigningKey::from_pkcs8_der(algorithm, der)
-                    .map_err(|_| KeyStoreError::Selection("incompatible EdDSA signing key"))?,
-            ),
-            SignatureAlgorithm::RsaSha1
-            | SignatureAlgorithm::RsaSha224
-            | SignatureAlgorithm::RsaSha256
-            | SignatureAlgorithm::RsaSha384
-            | SignatureAlgorithm::RsaSha512 => Box::new(
-                RsaSigningKey::from_pkcs8_der(der)
-                    .map_err(|_| KeyStoreError::Selection("incompatible RSA signing key"))?,
-            ),
-            SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => Box::new(
-                DsaSigningKey::from_pkcs8_der(der)
-                    .map_err(|_| KeyStoreError::Selection("incompatible DSA signing key"))?,
-            ),
-            SignatureAlgorithm::EcdsaSha1
-            | SignatureAlgorithm::EcdsaSha224
-            | SignatureAlgorithm::EcdsaSha256
-            | SignatureAlgorithm::EcdsaSha384
-            | SignatureAlgorithm::EcdsaSha512
-            | SignatureAlgorithm::EcdsaSha3_224
-            | SignatureAlgorithm::EcdsaSha3_256
-            | SignatureAlgorithm::EcdsaSha3_384
-            | SignatureAlgorithm::EcdsaSha3_512 => {
-                if let Ok(key) = EcdsaP256SigningKey::from_pkcs8_der(der) {
-                    Box::new(key)
-                } else if let Ok(key) = EcdsaP384SigningKey::from_pkcs8_der(der) {
-                    Box::new(key)
-                } else {
-                    Box::new(
-                        EcdsaP521SigningKey::from_pkcs8_der(der)
-                            .map_err(|_| KeyStoreError::Selection("incompatible EC signing key"))?,
-                    )
-                }
-            }
-            _ => return Err(KeyStoreError::Selection("unsupported signature method")),
-        };
+        let key = provider
+            .import_signing_key(algorithm, der)
+            .map_err(|_| KeyStoreError::Selection("incompatible signing key for provider"))?;
         validate_signing_key(key.as_ref(), algorithm, policy).map_err(signing_policy_error)?;
         Ok(key)
     }
@@ -1072,6 +1067,17 @@ impl KeyInventory {
         &self,
         name: &str,
         policy: &crate::policy::DecryptionPolicy,
+    ) -> Result<Box<dyn crate::xmlenc::DecryptionKeyResolver>, KeyStoreError> {
+        self.decryption_resolver_with_provider(name, policy, crate::provider::default_provider())
+    }
+
+    /// Select an authorized recovery key owned by the chosen native engine.
+    #[cfg(feature = "xmlenc")]
+    pub fn decryption_resolver_with_provider(
+        &self,
+        name: &str,
+        policy: &crate::policy::DecryptionPolicy,
+        provider: &dyn crate::provider::CryptoProvider,
     ) -> Result<Box<dyn crate::xmlenc::DecryptionKeyResolver>, KeyStoreError> {
         policy.validate()?;
         let mut visited = 0;
@@ -1117,9 +1123,12 @@ impl KeyInventory {
             components.modulus.as_bytes(),
             components.public_exponent.as_bytes(),
         )?;
-        let key = RsaPrivateKey::from_pkcs8_der(&entry.pkcs8_der)
+        let key = provider
+            .import_recovery_key(&entry.pkcs8_der)
             .map_err(|_| KeyStoreError::Selection("incompatible RSA decryption key"))?;
-        Ok(Box::new(crate::xmlenc::PrivateKeyDecryptor::new(key)))
+        Ok(Box::new(crate::xmlenc::PrivateKeyDecryptor::provider_key(
+            key,
+        )))
     }
     /// Build a resolver from this inventory and one immutable key-store snapshot.
     /// Trust anchors are copied once, not on each candidate lookup.

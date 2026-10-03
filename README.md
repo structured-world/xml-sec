@@ -9,7 +9,8 @@
 Pure Rust XML Security for **XMLDSig**, **XML Encryption**, **C14N**, **SAML 2.0**, and
 **X.509**, built to replace libxmlsec1 workflows without a C toolchain or system libraries.
 
-**No C dependencies. No CMake. No system XML or crypto packages. Just `cargo add xml-sec`.**
+**No C dependencies in the default build. No CMake. No system XML or crypto packages.
+Just `cargo add xml-sec`.**
 
 > [!WARNING]
 > Early-stage pre-release. The API is unstable, XMLDSig/XMLEnc coverage is still incomplete,
@@ -24,6 +25,8 @@ Pure Rust XML Security for **XMLDSig**, **XML Encryption**, **C14N**, **SAML 2.0
   canonicalization, and strict same-document ID handling.
 - **Pure Rust deployment**: RustCrypto, `x509-parser`, and selectable Rust XML backends replace
   the libxml2/OpenSSL-style native dependency stack.
+- **Optional AWS-LC FIPS provider**: select a native cryptographic engine explicitly through
+  the same provider contracts, without silent fallback to RustCrypto.
 - **Fail-closed security policy**: typed immutable policy controls algorithms, trust, XML parsing,
   transforms, external resources, and cumulative operation budgets.
 - **Identity-bound verification evidence**: bounded multi-signature reports, explicit trusted-key
@@ -66,7 +69,7 @@ xml-sec = { version = "0.1", default-features = false, features = ["xmldsig", "c
 | Key management | Caller-owned named inventory, usage-restricted keys, xmlsec `keys.xml`, encrypted PKCS#8, and bounded RustCrypto-backed PKCS#12 import |
 | SAML 2.0 | Signed assertions and encrypted-assertion workflows covered by integration tests |
 | XML input | Strict bounded byte decoding, entity/depth/node limits, stable node identities, and generation-safe mutation |
-| Crypto | Provider-neutral contracts and opaque key handles with pure-Rust RustCrypto as the default implementation |
+| Crypto | RustCrypto by default; optional AWS-LC FIPS through provider-neutral contracts and opaque native private-key handles |
 | CLI | Native `xmlsec1` process interface for sign, verify, encrypt, decrypt, keys, and capability discovery |
 
 Unsupported algorithms, unavailable provider capabilities, untrusted key sources, implicit external
@@ -172,6 +175,11 @@ The binary covers sign/verify, template-preserving encrypt/decrypt, AES key gene
 queries, donor option syntax, and deterministic process statuses through the same policy and
 provider pipelines as the library. A fat build accepts
 `--xml-backend xmloxide|roxmltree|differential`; a thin build rejects unavailable backends.
+
+With the optional `aws-lc-fips` feature, `--crypto aws-lc-fips` selects the FIPS-linked
+engine; `--crypto rustcrypto` remains the default. Unsupported mechanisms fail explicitly,
+not through another engine. See [cryptographic providers](docs/crypto-providers.md) for the
+API, supported mechanisms, native build requirements, and FIPS deployment boundaries.
 
 See the [CLI compatibility guide](docs/cli.md) for commands, formats, key lookup, diagnostics, and
 interoperability boundaries.

@@ -236,14 +236,31 @@ pub fn execute(
             None => help(stdout),
         },
         Command::HelpAll => help_all(stdout),
-        Command::Version => writeln!(stdout, "xmlsec1 1.3.13 (rustcrypto)").map_err(stdout_error),
+        Command::Version => writeln!(
+            stdout,
+            "xmlsec1 1.3.13 ({})",
+            selected_provider(&invocation)?.name()
+        )
+        .map_err(stdout_error),
         Command::ListTransforms => {
             validate_options(&invocation, &[])?;
-            capabilities::list("transform klasses", TRANSFORMS, stdout).map_err(stdout_error)
+            let provider = selected_provider(&invocation)?;
+            capabilities::list_available(
+                "transform klasses",
+                TRANSFORMS,
+                |name| capabilities::transform_available(name, provider),
+                stdout,
+            )
+            .map_err(stdout_error)
         }
         Command::CheckTransforms => {
             validate_options(&invocation, &[])?;
-            if capabilities::all_requested_available(TRANSFORMS, &invocation.positional) {
+            let provider = selected_provider(&invocation)?;
+            if capabilities::all_requested_available_where(
+                TRANSFORMS,
+                &invocation.positional,
+                |name| capabilities::transform_available(name, provider),
+            ) {
                 Ok(())
             } else {
                 Err(CommandError::CapabilityUnavailable)
@@ -251,11 +268,23 @@ pub fn execute(
         }
         Command::ListKeyData => {
             validate_options(&invocation, &[])?;
-            capabilities::list("key data klasses", KEY_DATA, stdout).map_err(stdout_error)
+            let provider = selected_provider(&invocation)?;
+            capabilities::list_available(
+                "key data klasses",
+                KEY_DATA,
+                |name| capabilities::key_data_available(name, provider),
+                stdout,
+            )
+            .map_err(stdout_error)
         }
         Command::CheckKeyData => {
             validate_options(&invocation, &[])?;
-            if capabilities::all_requested_available(KEY_DATA, &invocation.positional) {
+            let provider = selected_provider(&invocation)?;
+            if capabilities::all_requested_available_where(
+                KEY_DATA,
+                &invocation.positional,
+                |name| capabilities::key_data_available(name, provider),
+            ) {
                 Ok(())
             } else {
                 Err(CommandError::CapabilityUnavailable)
@@ -356,12 +385,17 @@ fn command_contract(command: Command) -> Option<(&'static str, &'static [&'stati
 }
 
 fn validate_provider(invocation: &Invocation) -> Result<(), CommandError> {
-    if let Some(provider) = option_text(invocation, "crypto")?
-        && !matches!(provider, "rustcrypto" | "default")
-    {
-        return Err(CommandError::UnsupportedProvider(provider.to_owned()));
-    }
+    selected_provider(invocation)?;
     Ok(())
+}
+
+fn selected_provider(invocation: &Invocation) -> Result<&'static dyn CryptoProvider, CommandError> {
+    match option_text(invocation, "crypto")?.unwrap_or("default") {
+        "rustcrypto" | "default" => Ok(default_provider()),
+        #[cfg(feature = "aws-lc-fips")]
+        "aws-lc-fips" => Ok(&xml_sec::provider::AwsLcFipsProvider),
+        name => Err(CommandError::UnsupportedProvider(name.to_owned())),
+    }
 }
 
 fn validate_crypto_config(invocation: &Invocation) -> Result<(), CommandError> {
@@ -783,6 +817,7 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
         &id_attributes,
         &policy,
         xml_backend,
+        selected_provider(invocation)?,
     )?;
     let has_key_store = invocation.values("keys-file").next().is_some();
     if has_key_store
@@ -849,6 +884,7 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
             signature.key_info.as_ref(),
             &policy,
             lax_candidates,
+            selected_provider(invocation)?,
         )?
     } else {
         select_signing_key(
@@ -861,6 +897,7 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
         )?
     };
     let mut context = SignContext::new(selected.key.as_ref())
+        .provider(selected_provider(invocation)?)
         .policy(policy)
         .xml_backend(xml_backend)
         .signature_template_selection(SignatureTemplateSelection::FirstDescendant);
@@ -951,12 +988,19 @@ fn select_store_signing_key<'a>(
     key_info: Option<&KeyInfo>,
     policy: &SigningPolicy,
     lax: bool,
+    provider: &dyn CryptoProvider,
 ) -> Result<SigningKeyCandidate, CommandError> {
     let mut last_error = None;
     let mut lookup_budget = key_manager::SigningLookupBudget::default();
     for name in candidates {
         let attempt = store
-            .signing_key_with_budget(name, algorithm, policy, &mut lookup_budget)
+            .signing_key_with_provider_and_budget(
+                name,
+                algorithm,
+                policy,
+                provider,
+                &mut lookup_budget,
+            )
             .map_err(CommandError::from)
             .and_then(|key| {
                 let candidate = SigningKeyCandidate {
@@ -964,7 +1008,7 @@ fn select_store_signing_key<'a>(
                     certificate_writer: None,
                     leaf_certificate_der: None,
                 };
-                validate_signing_key_info(key_info, &candidate)?;
+                validate_signing_key_info(key_info, &candidate, provider)?;
                 Ok(candidate)
             });
         match attempt {
@@ -1031,9 +1075,10 @@ fn select_signing_key(
             policy,
             password,
             &mut material_budget,
+            selected_provider(invocation)?,
         )
         .and_then(|candidate| {
-            validate_signing_key_info(key_info, &candidate)?;
+            validate_signing_key_info(key_info, &candidate, selected_provider(invocation)?)?;
             Ok(candidate)
         });
         match attempt {
@@ -1059,12 +1104,31 @@ fn prepare_signing_key_candidate(
     policy: &SigningPolicy,
     password: Option<&[u8]>,
     material_budget: &mut ExternalMaterialBudget,
+    provider: &dyn CryptoProvider,
 ) -> Result<SigningKeyCandidate, CommandError> {
+    provider
+        .require_capability(xml_sec::provider::ProviderCapability::Sign(algorithm))
+        .map_err(|error| CommandError::Signature(error.to_string()))?;
     material_budget.with_key_import(&policy.resources, |budget, inventory, resources| {
         prepare_signing_key_candidate_inner(
-            option, algorithm, policy, password, budget, inventory, resources,
+            option,
+            algorithm,
+            policy,
+            password,
+            SigningKeyImport {
+                material_budget: budget,
+                inventory,
+                resources,
+            },
+            provider,
         )
     })
+}
+
+struct SigningKeyImport<'a> {
+    material_budget: &'a mut ExternalMaterialBudget,
+    inventory: &'a mut KeyInventory,
+    resources: &'a xml_sec::policy::ResourcePolicy,
 }
 
 fn prepare_signing_key_candidate_inner(
@@ -1072,10 +1136,14 @@ fn prepare_signing_key_candidate_inner(
     algorithm: SignatureAlgorithm,
     policy: &SigningPolicy,
     password: Option<&[u8]>,
-    material_budget: &mut ExternalMaterialBudget,
-    inventory: &mut KeyInventory,
-    resources: &xml_sec::policy::ResourcePolicy,
+    import: SigningKeyImport<'_>,
+    provider: &dyn CryptoProvider,
 ) -> Result<SigningKeyCandidate, CommandError> {
+    let SigningKeyImport {
+        material_budget,
+        inventory,
+        resources,
+    } = import;
     if algorithm.hmac_output_bits().is_some() {
         let path = option.value.as_deref().unwrap_or_default();
         let key_bytes = key_material::read(path)?;
@@ -1098,7 +1166,7 @@ fn prepare_signing_key_candidate_inner(
             .ok_or(key_manager::KeyStoreError::ProtectedContainer)?;
         let name = option.parameter.clone().unwrap_or_else(|| "pkcs12".into());
         inventory.add_pkcs12(name.clone(), &bytes, password, resources)?;
-        let key = inventory.signing_key(&name, algorithm, policy)?;
+        let key = inventory.signing_key_with_provider(&name, algorithm, policy, provider)?;
         let imported = inventory
             .private_keys()
             .first()
@@ -1127,31 +1195,26 @@ fn prepare_signing_key_candidate_inner(
     let key_bytes = key_material::read(path)?;
     material_budget.charge(key_bytes.len())?;
     let format = private_key_format(option);
-    let key = if key_material::is_encrypted_pkcs8_container(&key_bytes, format) {
+    let key = if provider.name() != "rustcrypto"
+        || key_material::is_encrypted_pkcs8_container(&key_bytes, format)
+    {
         // All protected PKCS#8 aliases share the inventory's pre-decryption KDF gate;
         // selecting a CLI spelling must never change import policy enforcement.
         let name = option.parameter.as_deref().unwrap_or("explicit");
-        match format {
-            key_material::PrivateKeyFormat::Pem | key_material::PrivateKeyFormat::Pkcs8Pem => {
-                inventory.add_private_pem(
-                    name.into(),
-                    &key_bytes,
-                    password,
-                    key_manager::KeyUsages::SIGN,
-                    resources,
-                )?;
-            }
-            key_material::PrivateKeyFormat::Der | key_material::PrivateKeyFormat::Pkcs8Der => {
-                inventory.add_private_der(
-                    name.into(),
-                    &key_bytes,
-                    password,
-                    key_manager::KeyUsages::SIGN,
-                    resources,
-                )?;
-            }
-        }
-        inventory.signing_key(name, algorithm, policy)?
+        import_explicit_private_key(
+            inventory,
+            &key_bytes,
+            key_material::PrivateKeyImport {
+                path: Path::new(path),
+                name,
+                format,
+                password,
+                usages: key_manager::KeyUsages::SIGN,
+                resources,
+            },
+            material_budget,
+        )?;
+        inventory.signing_key_with_provider(name, algorithm, policy, provider)?
     } else {
         key_material::decode_signing_key(Path::new(path), &key_bytes, format, algorithm, password)?
     };
@@ -1188,6 +1251,7 @@ fn prepare_signing_key_candidate_inner(
 fn validate_signing_key_info(
     key_info: Option<&KeyInfo>,
     selected: &SigningKeyCandidate,
+    provider: &dyn CryptoProvider,
 ) -> Result<(), CommandError> {
     let Some(key_info) = key_info else {
         return Ok(());
@@ -1255,7 +1319,7 @@ fn validate_signing_key_info(
                                 "X509Data selectors require a signing certificate companion",
                             )
                         })?;
-                    x509_certificate_matches_selectors(data, certificate, default_provider())
+                    x509_certificate_matches_selectors(data, certificate, provider)
                         .map_err(|error| CommandError::Signature(error.to_string()))?
                 }
             }
@@ -1469,6 +1533,7 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
         &policy,
         key_name_resolution,
         xml_backend,
+        selected_provider(invocation)?,
     )?;
     let algorithm = signature.algorithm;
     let selected_keys = if explicit_keys.is_empty() {
@@ -1542,6 +1607,7 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
             policy.key_trust.check_crls,
         );
         verification_context(policy, start_node_id, &id_attributes, xml_backend)
+            .provider(selected_provider(invocation)?)
             .key_resolver(&resolver)
             .verify(&xml)
             .map_err(|error| CommandError::Signature(error.to_string()))?
@@ -1574,6 +1640,7 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
             policy.key_trust.check_crls,
         );
         verification_context(policy, start_node_id, &id_attributes, xml_backend)
+            .provider(selected_provider(invocation)?)
             .key_resolver(&resolver)
             .verify(&xml)
             .map_err(|error| CommandError::Signature(error.to_string()))?
@@ -1601,6 +1668,7 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
             policy.key_trust.check_crls,
         );
         verification_context(policy, start_node_id, &id_attributes, xml_backend)
+            .provider(selected_provider(invocation)?)
             .key_resolver(&resolver)
             .verify(&xml)
             .map_err(|error| CommandError::Signature(error.to_string()))?
@@ -1608,6 +1676,7 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
         let config = configured_certificates.into_resolver_config();
         let resolver = DefaultKeyResolver::new(config);
         verification_context(policy, start_node_id, &id_attributes, xml_backend)
+            .provider(selected_provider(invocation)?)
             .key_resolver(&resolver)
             .verify(&xml)
             .map_err(|error| CommandError::Signature(error.to_string()))?
@@ -1731,6 +1800,38 @@ impl ExternalMaterialBudget {
         self.kdf_work += inventory.key_import_kdf_work();
         result
     }
+}
+
+fn import_explicit_private_key(
+    inventory: &mut KeyInventory,
+    bytes: &[u8],
+    import: key_material::PrivateKeyImport<'_>,
+    budget: &ExternalMaterialBudget,
+) -> Result<(), CommandError> {
+    // Container normalization is provider-independent. Already charged material
+    // stays live; the importer may use only the remaining operation workspace.
+    debug_assert!(budget.total_bytes >= bytes.len());
+    let mut remaining = import.resources.clone();
+    remaining.max_external_resource_total_bytes = remaining
+        .max_external_resource_total_bytes
+        .min(budget.maximum_bytes)
+        .checked_sub(budget.total_bytes - bytes.len())
+        .ok_or(CommandError::ExternalMaterialTooLarge {
+            maximum: budget.maximum_bytes,
+        })?;
+    key_material::import_private_key(
+        inventory,
+        bytes,
+        key_material::PrivateKeyImport {
+            resources: &remaining,
+            ..import
+        },
+    )
+    .map_err(|error| match error {
+        key_material::KeyMaterialError::KeyStore(error) => CommandError::KeyStore(error),
+        error => CommandError::Key(error),
+    })?;
+    Ok(())
 }
 
 fn read_key_material_with_budget(
@@ -2094,6 +2195,12 @@ impl CandidateVerifyingKey<'_> {
 }
 
 impl VerifyingKey for CandidateVerifyingKey<'_> {
+    fn verify_candidate_keys(
+        &self,
+        verify: &mut dyn FnMut(&dyn VerifyingKey) -> Result<bool, DsigError>,
+    ) -> Result<Option<bool>, DsigError> {
+        self.first_accepting(verify).map(Some)
+    }
     fn verify_with_context(
         &self,
         algorithm: SignatureAlgorithm,
@@ -2177,6 +2284,7 @@ fn load_explicit_certificate_key_info(
 }
 
 fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
+    let provider = selected_provider(invocation)?;
     validate_options(invocation, ENCRYPT_OPTIONS)?;
     let xml_backend = selected_xml_backend(invocation)?;
     validate_supported_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
@@ -2205,6 +2313,12 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     let explicit_xml_type = metadata.explicit_xml_type;
     let template_placement = metadata.placement;
     let mut builder = EncryptedDataBuilder::new(algorithm)
+        .provider(match provider.name() {
+            "rustcrypto" => std::sync::Arc::new(xml_sec::provider::RustCryptoProvider),
+            #[cfg(feature = "aws-lc-fips")]
+            "aws-lc-fips" => std::sync::Arc::new(xml_sec::provider::AwsLcFipsProvider),
+            name => return Err(CommandError::UnsupportedProvider(name.to_owned())),
+        })
         .policy(policy.clone())
         .xml_backend(xml_backend);
     let aes_keys = invocation.values("aes-key").collect::<Vec<_>>();
@@ -2332,6 +2446,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             &policy,
             template_recipients.len(),
             xml_backend,
+            selected_provider(invocation)?,
         )?;
         let mut store_candidate_budget =
             KeyCandidateBudget::with_limit(policy.resources.max_key_candidates);
@@ -2388,7 +2503,8 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                             }
                         }
                         reserved = available.loaded.as_ref().is_some_and(|candidate| {
-                            validate_recipient_key_metadata(metadata.as_ref(), candidate).is_ok()
+                            validate_recipient_key_metadata(metadata.as_ref(), candidate, provider)
+                                .is_ok()
                         });
                     } else {
                         reserved = true;
@@ -2467,7 +2583,11 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                         && reserved_slots[slot]
                         && exact.is_some_and(|selected| std::ptr::eq(selected, entry)))
                     {
-                        validate_recipient_key_metadata(metadata.as_ref(), &candidate)?;
+                        validate_recipient_key_metadata(
+                            metadata.as_ref(),
+                            &candidate,
+                            selected_provider(invocation)?,
+                        )?;
                     }
                     Ok(candidate)
                 });
@@ -2526,6 +2646,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             &policy,
             template_recipients.len(),
             xml_backend,
+            selected_provider(invocation)?,
         )?;
         for (template_recipient, metadata) in
             template_recipients.into_iter().zip(recipient_metadata)
@@ -2553,7 +2674,11 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                     &mut certificate_budget,
                 )
                 .and_then(|key| {
-                    validate_recipient_key_metadata(metadata.as_ref(), &key)?;
+                    validate_recipient_key_metadata(
+                        metadata.as_ref(),
+                        &key,
+                        selected_provider(invocation)?,
+                    )?;
                     Ok(key)
                 }) {
                     Ok(key) => {
@@ -2878,6 +3003,7 @@ fn recipient_key_metadata(
     policy: &EncryptionPolicy,
     expected_recipients: usize,
     xml_backend: XmlBackend,
+    provider: &dyn CryptoProvider,
 ) -> Result<Vec<Option<ParsedRecipientKeyMetadata>>, CommandError> {
     let document =
         parse_encryption_document(template, &policy.xml, &policy.resources, xml_backend)?;
@@ -2902,7 +3028,11 @@ fn recipient_key_metadata(
         .into_iter()
         .map(|encrypted_key| {
             direct_child_element(encrypted_key, XMLDSIG_NS, "KeyInfo")
-                .map(|node| parsing.parse(node).map(ParsedRecipientKeyMetadata))
+                .map(|node| {
+                    parsing
+                        .parse_with_provider(node, provider)
+                        .map(ParsedRecipientKeyMetadata)
+                })
                 .transpose()
                 .map_err(|error| CommandError::Encryption(error.to_string()))
         })
@@ -2912,6 +3042,7 @@ fn recipient_key_metadata(
 fn validate_recipient_key_metadata(
     metadata: Option<&ParsedRecipientKeyMetadata>,
     selected_key: &RecipientPublicKeyCandidate,
+    provider: &dyn CryptoProvider,
 ) -> Result<(), CommandError> {
     if let Some(metadata) = metadata {
         for source in &metadata.0.sources {
@@ -2966,7 +3097,7 @@ fn validate_recipient_key_metadata(
                                     "X509Data selectors require a selected RSA certificate",
                                 )
                             })?;
-                        x509_certificate_matches_selectors(data, certificate, default_provider())
+                        x509_certificate_matches_selectors(data, certificate, provider)
                             .map_err(|error| CommandError::Encryption(error.to_string()))?
                     }
                 }
@@ -3588,7 +3719,10 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             standalone,
             policy,
             &id_attributes,
-            xml_backend,
+            CommandBackends {
+                xml: xml_backend,
+                crypto: selected_provider(invocation)?,
+            },
         )?
     } else if has_key_store {
         let mut budget =
@@ -3634,7 +3768,10 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             standalone,
             policy,
             &id_attributes,
-            xml_backend,
+            CommandBackends {
+                xml: xml_backend,
+                crypto: selected_provider(invocation)?,
+            },
         )?
     } else if !private_keys.is_empty() {
         let selected = select_recipient_private_keys(
@@ -3665,6 +3802,15 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                         let imported = inventory.private_keys().first().ok_or_else(|| {
                             CommandError::Usage("PKCS#12 contains no usable private key".into())
                         })?;
+                        if selected_provider(invocation)?.name() != "rustcrypto" {
+                            let key = selected_provider(invocation)?
+                                .import_recovery_key(&imported.pkcs8_der)
+                                .map_err(|error| CommandError::Encryption(error.to_string()))?;
+                            return Ok(RecipientPrivateKey {
+                                inner: PrivateKeyDecryptor::provider_key(key),
+                                key_name: option.parameter.clone(),
+                            });
+                        }
                         let private_key = key_material::decode_rsa_private_with_password(
                             path,
                             &imported.pkcs8_der,
@@ -3680,6 +3826,54 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                     let (path, certificate_paths) =
                         split_key_and_certificates(option.value.as_deref().unwrap_or_default())?;
                     let bytes = read_key_material_with_budget(Path::new(path), certificate_budget)?;
+                    if selected_provider(invocation)?.name() != "rustcrypto" {
+                        let format = private_key_format(option);
+                        import_explicit_private_key(
+                            inventory,
+                            &bytes,
+                            key_material::PrivateKeyImport {
+                                path: Path::new(path),
+                                name: "explicit",
+                                format,
+                                password,
+                                usages: key_manager::KeyUsages::DECRYPT,
+                                resources,
+                            },
+                            certificate_budget,
+                        )?;
+                        let imported = inventory.private_keys().last().ok_or_else(|| {
+                            CommandError::Usage("no RSA private key imported".into())
+                        })?;
+                        let key = selected_provider(invocation)?
+                            .import_recovery_key(&imported.pkcs8_der)
+                            .map_err(|error| CommandError::Encryption(error.to_string()))?;
+                        if !certificate_paths.is_empty() {
+                            let encoding = if matches!(
+                                format,
+                                key_material::PrivateKeyFormat::Der
+                                    | key_material::PrivateKeyFormat::Pkcs8Der
+                            ) {
+                                key_material::CertificateEncoding::Der
+                            } else {
+                                key_material::CertificateEncoding::Pem
+                            };
+                            let certificates = load_certificate_companions(
+                                &certificate_paths,
+                                encoding,
+                                certificate_budget,
+                            )?;
+                            let spki = key.public_spki().ok_or_else(|| {
+                                CommandError::Encryption(
+                                    "recovery key exposes no public identity".into(),
+                                )
+                            })?;
+                            ensure_leaf_certificate_matches_spki(&certificates[0], spki)?;
+                        }
+                        return Ok(RecipientPrivateKey {
+                            inner: PrivateKeyDecryptor::provider_key(key),
+                            key_name: option.parameter.clone(),
+                        });
+                    }
                     let private_key = key_material::decode_rsa_private_with_inventory(
                         Path::new(path),
                         &bytes,
@@ -3737,7 +3931,10 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             standalone,
             policy,
             &id_attributes,
-            xml_backend,
+            CommandBackends {
+                xml: xml_backend,
+                crypto: selected_provider(invocation)?,
+            },
         )?
     } else {
         return Err(CommandError::Usage(
@@ -3940,6 +4137,11 @@ impl NamedRecipientDecryptor {
     }
 }
 
+struct CommandBackends<'a> {
+    xml: XmlBackend,
+    crypto: &'a dyn CryptoProvider,
+}
+
 fn decrypt_input(
     resolver: &dyn DecryptionKeyResolver,
     xml: &str,
@@ -3947,11 +4149,12 @@ fn decrypt_input(
     standalone: bool,
     policy: DecryptionPolicy,
     id_attributes: &[IdAttributeRegistration],
-    xml_backend: XmlBackend,
+    backends: CommandBackends<'_>,
 ) -> Result<Vec<u8>, CommandError> {
     let context = DecryptContext::new(resolver)
+        .provider(backends.crypto)
         .policy(policy)
-        .xml_backend(xml_backend)
+        .xml_backend(backends.xml)
         .id_attributes(id_attributes);
     if standalone {
         return context
@@ -4047,12 +4250,25 @@ fn ensure_leaf_certificate_matches_rsa_key(
     certificate_der: &[u8],
     private_key: &rsa::RsaPrivateKey,
 ) -> Result<(), CommandError> {
-    let (_, certificate) = x509_parser::certificate::X509Certificate::from_der(certificate_der)
-        .map_err(|_| CommandError::Encryption("invalid X.509 certificate".into()))?;
     let public_key = RsaPublicKey::from(private_key)
         .to_public_key_der()
         .map_err(|error| CommandError::Encryption(error.to_string()))?;
-    if certificate.public_key().raw != public_key.as_bytes() {
+    ensure_leaf_certificate_matches_spki(certificate_der, public_key.as_bytes())
+}
+
+fn ensure_leaf_certificate_matches_spki(
+    certificate_der: &[u8],
+    public_spki: &[u8],
+) -> Result<(), CommandError> {
+    let (rest, certificate) = x509_parser::certificate::X509Certificate::from_der(certificate_der)
+        .map_err(|_| CommandError::Encryption("invalid X.509 certificate".into()))?;
+    if !rest.is_empty() {
+        return Err(CommandError::Encryption("invalid X.509 certificate".into()));
+    }
+    // RFC 5280 §4.1.2.7: SPKI includes AlgorithmIdentifier and its parameters,
+    // not just key bits. The companion must match this complete key identity.
+    // https://www.rfc-editor.org/rfc/rfc5280#section-4.1.2.7
+    if certificate.public_key().raw != public_spki {
         return Err(CommandError::Encryption(
             "X.509 certificate public key does not match private key".into(),
         ));
@@ -4239,7 +4455,7 @@ fn keys(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
         let size = capabilities::generated_key_len(algorithm)
             .ok_or(CommandError::CapabilityUnavailable)?;
         let mut key = vec![0_u8; size];
-        default_provider()
+        selected_provider(invocation)?
             .fill_random(&mut key)
             .map_err(|error| CommandError::Encryption(error.to_string()))?;
         let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key);
@@ -4376,10 +4592,17 @@ mod tests {
         };
         let mut policy = EncryptionPolicy::default();
         policy.resources.max_key_candidates = 2;
-        let error =
-            recipient_key_metadata(&template(""), None, &[], &policy, 3, XmlBackend::default())
-                .err()
-                .expect("aggregate candidate limit");
+        let error = recipient_key_metadata(
+            &template(""),
+            None,
+            &[],
+            &policy,
+            3,
+            XmlBackend::default(),
+            default_provider(),
+        )
+        .err()
+        .expect("aggregate candidate limit");
         assert_eq!(
             error.to_string(),
             "XML encryption operation failed: XMLDSig policy violation: key candidates exceeds policy maximum 2: got 3"
@@ -4393,6 +4616,7 @@ mod tests {
                 &policy,
                 3,
                 XmlBackend::default(),
+                default_provider(),
             )
             .is_ok()
         );
@@ -4641,6 +4865,7 @@ mod tests {
                     &policy,
                     Some(b"wrong"),
                     &mut budget,
+                    default_provider(),
                 );
                 assert!(
                     matches!(
@@ -4996,6 +5221,7 @@ mod tests {
                 Some(&info),
                 &policy,
                 false,
+                default_provider(),
             )
             .is_err()
         );
@@ -5007,6 +5233,7 @@ mod tests {
                 Some(&info),
                 &policy,
                 true,
+                default_provider(),
             )
             .is_ok()
         );
@@ -5056,6 +5283,7 @@ mod tests {
                 Some(&info),
                 &policy,
                 true,
+                default_provider(),
             )
             .is_err()
         );
@@ -5126,6 +5354,7 @@ mod tests {
             &SigningPolicy::default(),
             Some(b"secret"),
             &mut budget,
+            default_provider(),
         )
         .unwrap();
         assert!(candidate.certificate_writer.is_none());
@@ -5947,6 +6176,7 @@ mod tests {
                 &SigningPolicy::default(),
                 None,
                 &mut budget,
+                default_provider(),
             ),
             Err(CommandError::ExternalMaterialTooLarge { maximum: 1 })
         ));

@@ -120,6 +120,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - rust: "1.92.0"
+            xml-backend: aws-fips-xmloxide
+            native-fips: true
+            cargo-args: --no-default-features --features aws-lc-fips,xmlenc,c14n,xml-backend-xmloxide
+          - rust: "1.92.0"
+            xml-backend: aws-fips-roxmltree
+            native-fips: true
+            cargo-args: --no-default-features --features aws-lc-fips,xmlenc,c14n,xml-backend-roxmltree
+          - rust: "1.92.0"
+            xml-backend: aws-fips-differential
+            native-fips: true
+            cargo-args: --no-default-features --features aws-lc-fips,xmlenc,c14n,xml-backend-differential
+          - rust: "1.92.0"
+            xml-backend: aws-fips-fat-runtime
+            native-fips: true
+            cargo-args: --no-default-features --features aws-lc-fips,xmlenc,c14n,xml-backends-all
           - rust: stable
             xml-backend: xmloxide
             cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-xmloxide
@@ -169,6 +185,12 @@ jobs:
           scripts/install-xmlsec1.sh
           "$XMLSEC1_BIN" --version
       - uses: Swatinem/rust-cache@v2
+      - name: Check FIPS provider without encryption
+        if: matrix.native-fips
+        run: cargo check --no-default-features --features aws-lc-fips,xml-backend-xmloxide
+      - name: Lint FIPS provider configuration
+        if: matrix.native-fips
+        run: cargo clippy --all-targets ${{ matrix.cargo-args }} -- -D warnings
       - run: >-
           cargo nextest run --workspace ${{ matrix.cargo-args }}
           -E 'not binary(libxslt_oracle)'

@@ -91,12 +91,27 @@ pub fn generated_key_len(algorithm: &str) -> Option<usize> {
         .find_map(|(name, bytes)| (*name == algorithm).then_some(*bytes))
 }
 
+#[cfg(test)]
 pub fn list(label: &str, values: &[&str], output: &mut dyn Write) -> std::io::Result<()> {
+    list_available(label, values, |_| true, output)
+}
+
+pub fn list_available(
+    label: &str,
+    values: &[&str],
+    available: impl Fn(&str) -> bool,
+    output: &mut dyn Write,
+) -> std::io::Result<()> {
     writeln!(output, "Registered {label}:")?;
-    if values.is_empty() {
+    let mut values = values
+        .iter()
+        .copied()
+        .filter(|value| available(value))
+        .peekable();
+    if values.peek().is_none() {
         return writeln!(output, "(none)");
     }
-    for (index, value) in values.iter().enumerate() {
+    for (index, value) in values.enumerate() {
         if index > 0 {
             write!(output, ",")?;
         }
@@ -105,15 +120,80 @@ pub fn list(label: &str, values: &[&str], output: &mut dyn Write) -> std::io::Re
     writeln!(output)
 }
 
+#[cfg(test)]
 pub fn all_requested_available(values: &[&str], requested: &[OsString]) -> bool {
+    all_requested_available_where(values, requested, |_| true)
+}
+
+pub fn all_requested_available_where(
+    values: &[&str],
+    requested: &[OsString],
+    available: impl Fn(&str) -> bool,
+) -> bool {
     // libxmlsec1 treats an empty check as a vacuously successful query. Keep
     // that process contract distinct from fail-closed handling of unknown names.
     requested
         .iter()
         .map(|value| value.to_str())
         .flat_map(|value| value.into_iter().flat_map(|value| value.split(',')))
-        .all(|value| values.contains(&value))
+        .all(|value| values.contains(&value) && available(value))
         && requested.iter().all(|value| value.to_str().is_some())
+}
+
+pub fn transform_available(name: &str, provider: &dyn xml_sec::provider::CryptoProvider) -> bool {
+    use xml_sec::{
+        provider::ProviderCapability as C,
+        xmldsig::{DigestAlgorithm as D, SignatureAlgorithm as S},
+        xmlenc::{DataEncryptionAlgorithm as E, OaepDigestAlgorithm, RsaOaepParameters},
+    };
+    for algorithm in S::ALL {
+        if algorithm.uri().rsplit('#').next() == Some(name) {
+            return provider.supports(C::Sign(algorithm))
+                || provider.supports(C::Verify(algorithm));
+        }
+    }
+    for algorithm in [
+        D::Sha1,
+        D::Sha224,
+        D::Sha256,
+        D::Sha384,
+        D::Sha512,
+        D::Sha3_224,
+        D::Sha3_256,
+        D::Sha3_384,
+        D::Sha3_512,
+    ] {
+        if algorithm.uri().rsplit('#').next() == Some(name) {
+            return provider.supports(C::Digest(algorithm));
+        }
+    }
+    for algorithm in [E::Aes128Cbc, E::Aes256Cbc, E::Aes128Gcm, E::Aes256Gcm] {
+        if algorithm.uri().rsplit('#').next() == Some(name) {
+            return provider.supports(C::Encrypt(algorithm))
+                || provider.supports(C::Decrypt(algorithm));
+        }
+    }
+    let oaep = match name {
+        "rsa-oaep-mgf1p" => RsaOaepParameters::default(),
+        "rsa-oaep-enc11" => {
+            RsaOaepParameters::xmlenc11(OaepDigestAlgorithm::Sha256, OaepDigestAlgorithm::Sha256)
+        }
+        // Remaining registered transforms are XML processing, not cryptography.
+        _ => return true,
+    };
+    provider.supports(C::KeyTransport(&oaep)) || provider.supports(C::KeyRecovery(&oaep))
+}
+
+pub fn key_data_available(name: &str, provider: &dyn xml_sec::provider::CryptoProvider) -> bool {
+    match name {
+        "eddsa" => {
+            transform_available("eddsa-ed25519", provider)
+                || transform_available("eddsa-ed448", provider)
+        }
+        "ml-dsa" => transform_available("ml-dsa-44", provider),
+        "slh-dsa" => transform_available("slh-dsa-sha2-128s", provider),
+        _ => true,
+    }
 }
 
 #[cfg(test)]

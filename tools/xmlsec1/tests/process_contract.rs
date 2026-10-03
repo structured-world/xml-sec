@@ -47,6 +47,121 @@ fn project_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
+#[cfg(feature = "aws-lc-fips")]
+#[test]
+fn aws_lc_selection_signs_and_verifies_through_cli() {
+    // Real CLI selection must import native handles and interoperate with the default engine.
+    let temp = tempfile::tempdir().unwrap();
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let private = project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    let public = project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    for signer in ["rustcrypto", "aws-lc-fips"] {
+        let signed = temp.path().join(format!("{signer}.xml"));
+        let result = Command::new(binary())
+            .args(["sign", "--crypto", signer, "--privkey-pem"])
+            .arg(&private)
+            .arg("--output")
+            .arg(&signed)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        for verifier in ["rustcrypto", "aws-lc-fips"] {
+            let result = Command::new(binary())
+                .args(["verify", "--crypto", verifier, "--pubkey-pem"])
+                .arg(&public)
+                .arg(&signed)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+    }
+    let result = Command::new(binary())
+        .args(["version", "--crypto", "unavailable"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+}
+
+#[cfg(feature = "aws-lc-fips")]
+#[test]
+fn aws_lc_capability_queries_do_not_advertise_other_engine_mechanisms() {
+    // Selection must constrain discovery as well as actual cryptographic execution.
+    for (name, available) in [
+        ("rsa-sha256", true),
+        ("sha3-224", false),
+        ("eddsa-ed25519", false),
+    ] {
+        let output = Command::new(binary())
+            .args(["check-transforms", "--crypto", "aws-lc-fips", name])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), available, "{name}");
+    }
+    let output = Command::new(binary())
+        .args(["check-key-data", "--crypto", "aws-lc-fips", "eddsa"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+}
+
+#[cfg(feature = "aws-lc-fips")]
+#[test]
+fn aws_lc_cli_encrypts_and_decrypts_without_provider_fallback() {
+    // Process-level encryption exercises option forwarding and XML ciphertext framing.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("template.xml");
+    let plaintext = temp.path().join("input.bin");
+    let key = temp.path().join("key.bin");
+    fs::write(&template, r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#).unwrap();
+    fs::write(&plaintext, b"native payload\0").unwrap();
+    fs::write(&key, b"0123456789abcdef").unwrap();
+    for encryptor in ["rustcrypto", "aws-lc-fips"] {
+        let encrypted = temp.path().join(format!("{encryptor}.xml"));
+        let result = Command::new(binary())
+            .args(["encrypt", "--crypto", encryptor, "--aeskey"])
+            .arg(&key)
+            .arg("--binary-data")
+            .arg(&plaintext)
+            .arg("--output")
+            .arg(&encrypted)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        for decryptor in ["rustcrypto", "aws-lc-fips"] {
+            let output = temp.path().join(format!("{encryptor}-{decryptor}.bin"));
+            let result = Command::new(binary())
+                .args(["decrypt", "--crypto", decryptor, "--aeskey"])
+                .arg(&key)
+                .arg("--output")
+                .arg(&output)
+                .arg(&encrypted)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(fs::read(output).unwrap(), b"native payload\0");
+        }
+    }
+}
+
 #[test]
 fn modern_eddsa_signing_completes_cli_process_pipeline() {
     // Exercise actual process arguments, key loading, SHA-3 reference digests,
@@ -509,17 +624,45 @@ fn lax_decryption_stops_on_traditional_encrypted_rsa_pem_failure() {
         "{}",
         String::from_utf8_lossy(&encrypt.stderr)
     );
-    let decrypt = Command::new(binary())
-        .args(["decrypt", "--lax-key-search", "--privkey-pem:first"])
-        .arg(keys.join("rsa-2048-key-traditional-encrypted.pem"))
-        .arg("--privkey-pem:second")
-        .arg(keys.join("rsa-2048-key.pem"))
-        .args(["--pwd", "wrong-legacy-password-sentinel"])
-        .arg(&encrypted)
-        .output()
-        .unwrap();
-    assert!(!decrypt.status.success());
-    assert!(!String::from_utf8_lossy(&decrypt.stderr).contains("wrong-legacy-password-sentinel"));
+    let providers = ["rustcrypto"]
+        .into_iter()
+        .chain(cfg!(feature = "aws-lc-fips").then_some("aws-lc-fips"));
+    for provider in providers {
+        let decrypt = Command::new(binary())
+            .args(["decrypt", "--crypto", provider, "--privkey-pem"])
+            .arg(keys.join("rsa-2048-key-traditional-encrypted.pem"))
+            .args(["--pwd", "legacy-rsa-password"])
+            .arg(&encrypted)
+            .output()
+            .unwrap();
+        assert!(
+            decrypt.status.success(),
+            "{provider}: {}",
+            String::from_utf8_lossy(&decrypt.stderr)
+        );
+        assert_eq!(decrypt.stdout, b"protected RSA recipient");
+
+        let rejected = Command::new(binary())
+            .args([
+                "decrypt",
+                "--crypto",
+                provider,
+                "--lax-key-search",
+                "--privkey-pem:first",
+            ])
+            .arg(keys.join("rsa-2048-key-traditional-encrypted.pem"))
+            .arg("--privkey-pem:second")
+            .arg(keys.join("rsa-2048-key.pem"))
+            .args(["--pwd", "wrong-legacy-password-sentinel"])
+            .arg(&encrypted)
+            .output()
+            .unwrap();
+        assert!(!rejected.status.success(), "{provider}");
+        assert!(rejected.stdout.is_empty(), "{provider}");
+        assert!(
+            !String::from_utf8_lossy(&rejected.stderr).contains("wrong-legacy-password-sentinel")
+        );
+    }
 }
 
 #[test]
@@ -1637,6 +1780,7 @@ fn compatibility_cli_accepts_generic_sec1_ecdsa_keys() {
 
     assert_sec1_cli_round_trip(
         temp.path(),
+        "rustcrypto",
         "p256",
         p256.to_sec1_pem(pkcs8::LineEnding::LF).unwrap().as_bytes(),
         p256.to_sec1_der().unwrap().as_ref(),
@@ -1644,6 +1788,7 @@ fn compatibility_cli_accepts_generic_sec1_ecdsa_keys() {
     );
     assert_sec1_cli_round_trip(
         temp.path(),
+        "rustcrypto",
         "p384",
         p384.to_sec1_pem(pkcs8::LineEnding::LF).unwrap().as_bytes(),
         p384.to_sec1_der().unwrap().as_ref(),
@@ -1651,11 +1796,120 @@ fn compatibility_cli_accepts_generic_sec1_ecdsa_keys() {
     );
     assert_sec1_cli_round_trip(
         temp.path(),
+        "rustcrypto",
         "p521",
         p521.to_sec1_pem(pkcs8::LineEnding::LF).unwrap().as_bytes(),
         p521.to_sec1_der().unwrap().as_ref(),
         p521.public_key().to_public_key_der().unwrap().as_bytes(),
     );
+}
+
+#[cfg(feature = "aws-lc-fips")]
+#[test]
+fn aws_lc_accepts_generic_sec1_ecdsa_keys() {
+    // Provider selection changes cryptographic execution, not accepted containers.
+    let temp = tempfile::tempdir().unwrap();
+    let p256 = P256SecretKey::from_slice(&[0x11; 32]).unwrap();
+    let p384 = P384SecretKey::from_slice(&[0x22; 48]).unwrap();
+    let p521 = P521SecretKey::from_slice(&[0x01; 66]).unwrap();
+    assert_sec1_cli_round_trip(
+        temp.path(),
+        "aws-lc-fips",
+        "p256",
+        p256.to_sec1_pem(pkcs8::LineEnding::LF).unwrap().as_bytes(),
+        p256.to_sec1_der().unwrap().as_ref(),
+        p256.public_key().to_public_key_der().unwrap().as_bytes(),
+    );
+    assert_sec1_cli_round_trip(
+        temp.path(),
+        "aws-lc-fips",
+        "p384",
+        p384.to_sec1_pem(pkcs8::LineEnding::LF).unwrap().as_bytes(),
+        p384.to_sec1_der().unwrap().as_ref(),
+        p384.public_key().to_public_key_der().unwrap().as_bytes(),
+    );
+    assert_sec1_cli_round_trip(
+        temp.path(),
+        "aws-lc-fips",
+        "p521",
+        p521.to_sec1_pem(pkcs8::LineEnding::LF).unwrap().as_bytes(),
+        p521.to_sec1_der().unwrap().as_ref(),
+        p521.public_key().to_public_key_der().unwrap().as_bytes(),
+    );
+}
+
+#[cfg(feature = "aws-lc-fips")]
+#[test]
+fn aws_lc_signs_with_traditional_encrypted_private_keys() {
+    // Protected RSA and EC envelopes normalize before native import; wrong or
+    // absent passwords must stay terminal and never produce an output file.
+    let temp = tempfile::tempdir().unwrap();
+    for (name, template, private, public, password, public_option) in [
+        (
+            "rsa",
+            signature_template_without_key_info(),
+            "tests/fixtures/keys/rsa/rsa-2048-key-traditional-encrypted.pem",
+            "tests/fixtures/keys/rsa/rsa-2048-pubkey.pem",
+            "legacy-rsa-password",
+            "--pubkey-pem",
+        ),
+        (
+            "ec",
+            ecdsa_signature_template(),
+            "tests/fixtures/keys/ec/p256-key-traditional-encrypted.pem",
+            "tests/fixtures/xmldsig/xmldsig11-interop-2012/keys/p256-key.der",
+            "legacy-ec-password",
+            "--pubkey-der",
+        ),
+    ] {
+        let source = temp.path().join(format!("{name}-template.xml"));
+        fs::write(&source, template).unwrap();
+        for (index, supplied) in [Some(password), None, Some("wrong-password-sentinel")]
+            .into_iter()
+            .enumerate()
+        {
+            let signed = temp.path().join(format!("{name}-{index}.xml"));
+            let mut sign = Command::new(binary());
+            sign.args(["sign", "--crypto", "aws-lc-fips", "--privkey-pem"])
+                .arg(project_root().join(private));
+            if let Some(supplied) = supplied {
+                sign.args(["--pwd", supplied]);
+            }
+            let result = sign
+                .arg("--output")
+                .arg(&signed)
+                .arg(&source)
+                .output()
+                .unwrap();
+            if index == 0 {
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                let verified = Command::new(binary())
+                    .args(["verify", public_option])
+                    .arg(project_root().join(public))
+                    .arg(&signed)
+                    .output()
+                    .unwrap();
+                assert!(
+                    verified.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&verified.stderr)
+                );
+            } else {
+                assert!(!result.status.success());
+                assert!(!signed.exists());
+                assert!(
+                    String::from_utf8_lossy(&result.stderr).contains("protected key container")
+                );
+                assert!(
+                    !String::from_utf8_lossy(&result.stderr).contains("wrong-password-sentinel")
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -1724,6 +1978,7 @@ fn compatibility_cli_signs_with_traditional_encrypted_sec1_pem() {
 
 fn assert_sec1_cli_round_trip(
     directory: &Path,
+    provider: &str,
     name: &str,
     private_pem: &[u8],
     private_der: &[u8],
@@ -1731,7 +1986,17 @@ fn assert_sec1_cli_round_trip(
 ) {
     let template = directory.join(format!("{name}-template.xml"));
     let public_key = directory.join(format!("{name}-public.der"));
-    fs::write(&template, ecdsa_signature_template()).unwrap();
+    // Exercise each curve with a digest supported by the selected native engine.
+    let algorithm = if provider == "aws-lc-fips" && name == "p384" {
+        "ecdsa-sha384"
+    } else {
+        "ecdsa-sha256"
+    };
+    fs::write(
+        &template,
+        ecdsa_signature_template().replace("ecdsa-sha256", algorithm),
+    )
+    .unwrap();
     fs::write(&public_key, public_der).unwrap();
 
     for (encoding, bytes) in [("pem", private_pem), ("der", private_der)] {
@@ -1740,7 +2005,7 @@ fn assert_sec1_cli_round_trip(
         fs::write(&private_key, bytes).unwrap();
 
         let sign = Command::new(binary())
-            .arg("sign")
+            .args(["sign", "--crypto", provider])
             .arg(format!("--privkey-{encoding}"))
             .arg(&private_key)
             .arg("--output")
@@ -1767,7 +2032,7 @@ fn assert_sec1_cli_round_trip(
         );
 
         let rejected = Command::new(binary())
-            .arg("sign")
+            .args(["sign", "--crypto", provider])
             .arg(format!("--pkcs8-{encoding}"))
             .arg(&private_key)
             .arg(&template)
@@ -7322,6 +7587,70 @@ fn rsa_decryption_accepts_private_key_certificate_companions() {
     assert!(encrypt.status.success());
 
     let compound = format!("{},{}", private_key.display(), certificate.display());
+    // The companion's algorithm is part of SPKI identity (RFC 5280 §4.1.2.7).
+    // Keep the exact RSA bits but change rsaEncryption to RSASSA-PSS; merely
+    // comparing the BIT STRING must not accept this structurally valid certificate.
+    let certificate_pem = pem::parse(fs::read(&certificate).unwrap()).unwrap();
+    let mut altered = certificate_pem.contents().to_vec();
+    let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(&altered).unwrap();
+    let spki = parsed.public_key().raw;
+    let original_bits = parsed.public_key().subject_public_key.data.to_vec();
+    let offset = altered
+        .windows(spki.len())
+        .position(|bytes| bytes == spki)
+        .unwrap();
+    let oid = [
+        0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01,
+    ];
+    let algorithm_offset = spki
+        .windows(oid.len())
+        .position(|bytes| bytes == oid)
+        .unwrap();
+    altered[offset + algorithm_offset + oid.len() - 1] = 0x0a;
+    let (_, changed) = x509_parser::certificate::X509Certificate::from_der(&altered).unwrap();
+    assert_eq!(
+        changed.public_key().subject_public_key.data.as_ref(),
+        original_bits
+    );
+    let altered_certificate = temp.path().join("changed-algorithm.pem");
+    fs::write(
+        &altered_certificate,
+        pem::encode(&pem::Pem::new("CERTIFICATE", altered)),
+    )
+    .unwrap();
+    let check_companion = |provider: &str| {
+        let rejected = Command::new(binary())
+            .args(["decrypt", "--crypto", provider, "--privkey-pem"])
+            .arg(format!(
+                "{},{}",
+                private_key.display(),
+                altered_certificate.display()
+            ))
+            .arg(&encrypted)
+            .output()
+            .unwrap();
+        assert!(
+            !rejected.status.success(),
+            "{provider} accepted a different SPKI algorithm"
+        );
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("does not match"));
+        assert!(rejected.stdout.is_empty());
+        let accepted = Command::new(binary())
+            .args(["decrypt", "--crypto", provider, "--privkey-pem"])
+            .arg(&compound)
+            .arg(&encrypted)
+            .output()
+            .unwrap();
+        assert!(
+            accepted.status.success(),
+            "{}",
+            String::from_utf8_lossy(&accepted.stderr)
+        );
+        assert_eq!(accepted.stdout, b"certificate companion");
+    };
+    check_companion("rustcrypto");
+    #[cfg(feature = "aws-lc-fips")]
+    check_companion("aws-lc-fips");
     let decrypt = Command::new(binary())
         .args(["decrypt", "--privkey-pem"])
         .arg(compound)
