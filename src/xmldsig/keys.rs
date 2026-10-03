@@ -3357,6 +3357,90 @@ mod tests {
     }
 
     #[test]
+    fn x509_path_builder_skips_policy_rejected_alternatives() {
+        use crate::provider::X509SignatureAlgorithm;
+        use std::collections::HashSet;
+        // One cross-signed issuer has a forbidden parent-edge algorithm;
+        // neither its position nor traversal order may hide a permitted path.
+        let root = rcgen::CertifiedIssuer::self_signed(
+            generated_certificate_params("policy root", true),
+            rcgen::KeyPair::generate().expect("root key"),
+        )
+        .expect("root certificate");
+        let alternate_root = rcgen::CertifiedIssuer::self_signed(
+            generated_certificate_params("policy alternate root", true),
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384)
+                .expect("alternate root key"),
+        )
+        .expect("alternate root certificate");
+        let shared_params = generated_certificate_params("policy shared issuer", true);
+        let shared_key = rcgen::KeyPair::generate().expect("issuer key");
+        let rejected = shared_params
+            .signed_by(&shared_key, &alternate_root)
+            .expect("cross-signed issuer");
+        let shared = rcgen::CertifiedIssuer::signed_by(shared_params, shared_key, &root)
+            .expect("issuer certificate");
+        let leaf = generated_certificate_params("policy leaf", false)
+            .signed_by(&rcgen::KeyPair::generate().expect("leaf key"), &shared)
+            .expect("leaf certificate");
+        let rejected = rejected.der().to_vec();
+        let allowed = crate::policy::CertificateSignatureAlgorithms::Allowlist(HashSet::from([
+            X509SignatureAlgorithm::Ecdsa(super::super::DigestAlgorithm::Sha256),
+        ]));
+        for rejected_first in [true, false] {
+            let mut alternatives = vec![shared.der().to_vec(), rejected.clone()];
+            if rejected_first {
+                alternatives.reverse();
+            }
+            let permitted_index = if rejected_first { 3 } else { 2 };
+            let info = x509_info(
+                vec![
+                    root.der().to_vec(),
+                    leaf.der().to_vec(),
+                    alternatives.remove(0),
+                    alternatives.remove(0),
+                    alternate_root.der().to_vec(),
+                ],
+                1,
+            );
+            assert_eq!(
+                build_x509_certificate_paths_to_trusted_prefix(
+                    &info,
+                    1,
+                    1,
+                    4,
+                    8,
+                    crate::provider::default_provider(),
+                    Some(&allowed),
+                )
+                .expect("forbidden alternative must not abort search"),
+                vec![vec![1, permitted_index, 0]]
+            );
+        }
+        let info = x509_info(
+            vec![
+                root.der().to_vec(),
+                leaf.der().to_vec(),
+                rejected,
+                alternate_root.der().to_vec(),
+            ],
+            1,
+        );
+        assert!(matches!(
+            build_x509_certificate_paths_to_trusted_prefix(
+                &info,
+                1,
+                1,
+                4,
+                8,
+                crate::provider::default_provider(),
+                Some(&allowed),
+            ),
+            Err(X509ChainBuildError::Policy(_))
+        ));
+    }
+
+    #[test]
     fn x509_path_builder_skips_branch_local_unsupported_algorithms() {
         // An untrusted intermediate can share both the subject and public key
         // of the valid path while using an unsupported signature algorithm on

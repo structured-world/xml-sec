@@ -976,8 +976,9 @@ pub struct KeyTrustPolicy {
     pub allowed_legacy_signature_algorithms: HashSet<SignatureAlgorithm>,
     /// Certificate and CRL signature permissions, independent of XML signatures.
     /// `None` permits supported classical algorithms but rejects PQ algorithms;
-    /// `Some` permits only exact listed algorithms, including PSS parameters.
-    pub certificate_signature_algorithms: Option<HashSet<crate::provider::X509SignatureAlgorithm>>,
+    /// Explicit permissions select either an exact allowlist (including PSS
+    /// parameters) or all provider-supported algorithms for compatibility.
+    pub certificate_signature_algorithms: Option<CertificateSignatureAlgorithms>,
     /// RSA requirements enforced for resolved verification keys and issuer keys.
     pub rsa_keys: RsaKeyPolicy,
     /// DSA requirements enforced for resolved verification keys.
@@ -1015,16 +1016,30 @@ impl Default for KeyTrustPolicy {
 }
 
 #[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Explicit certificate/CRL permissions, independent of XML signature methods.
+pub enum CertificateSignatureAlgorithms {
+    /// Permit any algorithm the selected provider implements, including PQ.
+    /// This is an explicit compatibility opt-in, not a provider fallback.
+    AllSupported,
+    /// Permit only exact algorithms, including every RSA-PSS parameter.
+    Allowlist(HashSet<crate::provider::X509SignatureAlgorithm>),
+}
+
+#[cfg(feature = "xmldsig")]
 impl KeyTrustPolicy {
     pub(crate) fn check_certificate_signature_algorithm(
         algorithm: crate::provider::X509SignatureAlgorithm,
-        allowed: Option<&HashSet<crate::provider::X509SignatureAlgorithm>>,
+        allowed: Option<&CertificateSignatureAlgorithms>,
     ) -> Result<(), PolicyViolation> {
         // This is deployment permission, not a PKIX syntax requirement.
         // Algorithm parameters are validated before this gate; compiled
         // provider capability is checked only after permission is established.
         let permitted = match allowed {
-            Some(allowed) => allowed.contains(&algorithm),
+            Some(CertificateSignatureAlgorithms::AllSupported) => true,
+            Some(CertificateSignatureAlgorithms::Allowlist(allowed)) => {
+                allowed.contains(&algorithm)
+            }
             None => !matches!(
                 algorithm,
                 crate::provider::X509SignatureAlgorithm::PostQuantum(_)
@@ -1312,6 +1327,51 @@ impl DecryptionPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "xmldsig")]
+    #[test]
+    fn certificate_permissions_keep_exact_pss_and_compatibility_distinct() {
+        use crate::provider::X509SignatureAlgorithm;
+        use crate::xmldsig::{DigestAlgorithm, PqAlgorithm};
+        // Compatibility permission cannot impose an arbitrary PSS salt list;
+        // exact allowlists must still distinguish every parameter tuple.
+        let exact = X509SignatureAlgorithm::RsaPss {
+            digest: DigestAlgorithm::Sha256,
+            mgf_digest: DigestAlgorithm::Sha256,
+            salt_len: 32,
+        };
+        let allowed = CertificateSignatureAlgorithms::Allowlist(HashSet::from([exact]));
+        assert!(
+            KeyTrustPolicy::check_certificate_signature_algorithm(exact, Some(&allowed)).is_ok()
+        );
+        for salt_len in [0, 17, 64, 255] {
+            let method = X509SignatureAlgorithm::RsaPss {
+                digest: DigestAlgorithm::Sha256,
+                mgf_digest: DigestAlgorithm::Sha256,
+                salt_len,
+            };
+            assert!(
+                KeyTrustPolicy::check_certificate_signature_algorithm(method, Some(&allowed))
+                    .is_err()
+            );
+            assert!(
+                KeyTrustPolicy::check_certificate_signature_algorithm(
+                    method,
+                    Some(&CertificateSignatureAlgorithms::AllSupported)
+                )
+                .is_ok()
+            );
+        }
+        let pq = X509SignatureAlgorithm::PostQuantum(PqAlgorithm::MlDsa44);
+        assert!(KeyTrustPolicy::check_certificate_signature_algorithm(pq, None).is_err());
+        assert!(
+            KeyTrustPolicy::check_certificate_signature_algorithm(
+                pq,
+                Some(&CertificateSignatureAlgorithms::AllSupported)
+            )
+            .is_ok()
+        );
+    }
 
     #[test]
     fn resource_policy_cannot_exceed_implementation_ceiling() {

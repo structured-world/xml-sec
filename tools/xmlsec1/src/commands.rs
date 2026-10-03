@@ -1371,6 +1371,11 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
         SignatureAlgorithm::HmacSha1,
         SignatureAlgorithm::EcdsaSha1,
     ]);
+    // A compatibility boundary opts into provider-supported certificate/CRL
+    // methods independently of XML methods. This includes every valid PSS
+    // salt length without constructing an artificial finite parameter list.
+    policy.key_trust.certificate_signature_algorithms =
+        Some(xml_sec::policy::CertificateSignatureAlgorithms::AllSupported);
     policy.key_trust.dsa_keys.minimum_modulus_bits = 1024;
     policy.hmac = HmacPolicy {
         minimum_key_bits: 40,

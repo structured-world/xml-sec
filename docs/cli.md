@@ -141,6 +141,11 @@ legacy donor documents. This opt-in is local to the CLI. Library callers retain
 the secure defaults and must explicitly allow each legacy algorithm through
 their immutable signing or verification policy.
 
+Certificate and CRL signatures independently use the CLI's explicit `AllSupported`
+compatibility permission, including PQ methods when compiled. This does not grant trust:
+verification still requires caller-supplied anchors, valid paths and provider capability.
+Library callers keep classical-only certificate defaults or choose an exact typed allowlist.
+
 Signing key options accept libxmlsec1's comma-separated certificate form,
 `key.pem,leaf.pem,intermediate.pem,...`. Every certificate is structurally
 validated, and the first certificate must contain the signing key. When the

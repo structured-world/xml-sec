@@ -499,9 +499,16 @@ SLH-DSA-SHA2 certificate/CRL signatures using the empty PKIX context, independen
 of the XML context parameter. Certificate/CRL
 permissions come from `KeyTrustPolicy::certificate_signature_algorithms`, independently
 of the XML signature allowlist. `None` permits supported classical methods but rejects PQ;
-`Some` permits only exact listed methods (including RSA-PSS digest, MGF digest and salt
-length). This borrowed permission reaches candidate path selection, complete path and CRL
+`Some(CertificateSignatureAlgorithms::Allowlist(...))` permits only exact listed methods
+(including RSA-PSS digest, MGF digest and salt length). The compatibility CLI explicitly
+selects `AllSupported`, leaving provider capability and strict AlgorithmIdentifier validation
+in force without artificially restricting PSS salt lengths. This borrowed permission reaches
+candidate path selection, complete path and CRL
 validation before provider dispatch. Compiling `experimental-pq` alone never grants trust.
+Permission rejection removes only the affected candidate path; another permitted path to an
+explicit trust anchor remains usable. If no permitted path exists, the policy rejection is returned.
+Legal XML Base64 whitespace in context and SignatureValue text consumes the operation's
+document resource budget; normalized payloads retain their protocol and implementation width limits.
 Signature
 `AlgorithmIdentifier` parameters are validated before provider dispatch: DSA, ECDSA, EdDSA,
 and these post-quantum methods

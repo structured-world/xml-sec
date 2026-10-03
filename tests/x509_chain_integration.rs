@@ -194,11 +194,13 @@ fn pq_issuer_path_requires_the_independent_certificate_allowlist() {
     ));
     let policy = xml_sec::policy::KeyTrustPolicy {
         certificate_signature_algorithms: Some(
-            [
-                X509SignatureAlgorithm::Ecdsa(DigestAlgorithm::Sha256),
-                X509SignatureAlgorithm::PostQuantum(parameter),
-            ]
-            .into(),
+            xml_sec::policy::CertificateSignatureAlgorithms::Allowlist(
+                [
+                    X509SignatureAlgorithm::Ecdsa(DigestAlgorithm::Sha256),
+                    X509SignatureAlgorithm::PostQuantum(parameter),
+                ]
+                .into(),
+            ),
         ),
         ..Default::default()
     };
@@ -206,7 +208,9 @@ fn pq_issuer_path_requires_the_independent_certificate_allowlist() {
     verify_x509_certificate_chain(&info, &options).unwrap();
     let restricted = xml_sec::policy::KeyTrustPolicy {
         certificate_signature_algorithms: Some(
-            [X509SignatureAlgorithm::Ecdsa(DigestAlgorithm::Sha256)].into(),
+            xml_sec::policy::CertificateSignatureAlgorithms::Allowlist(
+                [X509SignatureAlgorithm::Ecdsa(DigestAlgorithm::Sha256)].into(),
+            ),
         ),
         ..Default::default()
     };

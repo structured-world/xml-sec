@@ -21,7 +21,7 @@ use der::{
     Decode,
     asn1::{Ia5StringRef, ObjectIdentifier},
 };
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use x509_cert::ext::pkix::name::DirectoryString;
 use x509_cert::name::Name;
 use x509_parser::extensions::ParsedExtension;
@@ -1012,7 +1012,7 @@ pub(crate) fn parse_key_info_with_policy_budgets(
     provider: &dyn crate::provider::CryptoProvider,
     xml_base_budget: &XmlBaseResolutionBudget,
     resources: &crate::policy::ResourcePolicy,
-    allowed: Option<&HashSet<crate::provider::X509SignatureAlgorithm>>,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<KeyInfo, ParseError> {
     parse_key_info_with_policy_budgets_and_document_base(
         key_info_node,
@@ -1030,7 +1030,7 @@ pub(crate) fn parse_key_info_with_policy_budgets_and_document_base(
     xml_base_budget: &XmlBaseResolutionBudget,
     resources: &crate::policy::ResourcePolicy,
     document_base: Option<&str>,
-    allowed: Option<&HashSet<crate::provider::X509SignatureAlgorithm>>,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<KeyInfo, ParseError> {
     parse_key_info_in_session(
         key_info_node,
@@ -1049,7 +1049,7 @@ fn parse_key_info_in_session(
     xml_base_budget: &XmlBaseResolutionBudget,
     resources: &crate::policy::ResourcePolicy,
     document_base: Option<&str>,
-    allowed: Option<&HashSet<crate::provider::X509SignatureAlgorithm>>,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
     usage: &mut KeyInfoParseUsage,
 ) -> Result<KeyInfo, ParseError> {
     validate_key_info_container(key_info_node)?;
@@ -1573,7 +1573,7 @@ pub(crate) fn parse_x509_data_dispatch_with_budget_and_provider(
     embedded_key_candidates: &mut usize,
     provider: &dyn crate::provider::CryptoProvider,
     resources: &crate::policy::ResourcePolicy,
-    allowed: Option<&HashSet<crate::provider::X509SignatureAlgorithm>>,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<X509DataInfo, ParseError> {
     verify_ds_element(node, "X509Data")?;
     ensure_no_non_whitespace_text(node, "X509Data")?;
@@ -1641,7 +1641,7 @@ pub(crate) fn parse_x509_data_dispatch_with_budget_and_provider(
 fn build_x509_certificate_chain(
     info: &X509DataInfo,
     provider: &dyn crate::provider::CryptoProvider,
-    allowed: Option<&HashSet<crate::provider::X509SignatureAlgorithm>>,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<Vec<usize>, ParseError> {
     if info.parsed_certificates.is_empty() {
         return Ok(Vec::new());
@@ -1697,7 +1697,7 @@ pub(crate) fn build_x509_certificate_chain_from(
     info: &X509DataInfo,
     signing_idx: usize,
     provider: &dyn crate::provider::CryptoProvider,
-    allowed: Option<&HashSet<crate::provider::X509SignatureAlgorithm>>,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<Vec<usize>, X509ChainBuildError> {
     if signing_idx >= info.parsed_certificates.len()
         || info.parsed_certificates.len() != info.certificates.len()
@@ -1795,7 +1795,7 @@ pub(crate) fn build_x509_certificate_paths_to_trusted_prefix(
     max_depth: usize,
     max_candidate_paths: usize,
     provider: &dyn crate::provider::CryptoProvider,
-    allowed: Option<&HashSet<crate::provider::X509SignatureAlgorithm>>,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<Vec<Vec<usize>>, X509ChainBuildError> {
     if trusted_prefix_len > info.certificates.len() {
         return Err(X509ChainBuildError::InconsistentMetadata);
@@ -1824,7 +1824,7 @@ pub(crate) fn build_x509_certificate_paths_to_selector_targets(
     max_depth: usize,
     max_candidate_paths: usize,
     provider: &dyn crate::provider::CryptoProvider,
-    allowed: Option<&HashSet<crate::provider::X509SignatureAlgorithm>>,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<Vec<Vec<usize>>, X509ChainBuildError> {
     if targets
         .iter()
@@ -1858,7 +1858,7 @@ fn build_x509_certificate_paths(
     continue_after_terminal: bool,
     bounds: X509PathBounds,
     provider: &dyn crate::provider::CryptoProvider,
-    allowed: Option<&HashSet<crate::provider::X509SignatureAlgorithm>>,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<Vec<Vec<usize>>, X509ChainBuildError> {
     let X509PathBounds {
         max_depth,
@@ -1878,6 +1878,7 @@ fn build_x509_certificate_paths(
     let mut generated_paths = 1usize;
     let mut depth_exceeded = false;
     let mut unsupported_oid = None;
+    let mut policy_rejection = None;
     let mut issuer_cache = vec![None; info.parsed_certificates.len()];
     while let Some(path) = pending.pop() {
         let current_idx = *path
@@ -1930,7 +1931,13 @@ fn build_x509_certificate_paths(
                         break;
                     }
                     Err(super::X509ChainError::Policy(error)) => {
-                        return Err(X509ChainBuildError::Policy(error));
+                        // Certificate permission belongs to this child's
+                        // parent edge, not to other cross-certified paths.
+                        // RFC 5280 section 6.1 validates a prospective path;
+                        // discovery among alternatives is our product policy.
+                        // https://www.rfc-editor.org/rfc/rfc5280.html#section-6.1
+                        policy_rejection.get_or_insert(error);
+                        break;
                     }
                     Err(_) => return Err(X509ChainBuildError::IssuerSignatureMismatch),
                 }
@@ -1957,6 +1964,9 @@ fn build_x509_certificate_paths(
     }
 
     if completed.is_empty() {
+        if let Some(error) = policy_rejection {
+            return Err(X509ChainBuildError::Policy(error));
+        }
         if let Some(oid) = unsupported_oid {
             return Err(X509ChainBuildError::UnsupportedSignatureAlgorithm { oid });
         }

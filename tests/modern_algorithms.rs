@@ -382,6 +382,68 @@ macro_rules! ml_pipeline_test {
 }
 
 #[cfg(feature = "experimental-pq")]
+#[test]
+fn pq_signature_whitespace_uses_the_operation_document_budget() {
+    use xml_sec::policy::{SigningPolicy, VerificationPolicy};
+    use xml_sec::xmldsig::{
+        DsigStatus, PostQuantumSigningKey, PqAlgorithm, SignContext, SignatureAlgorithm,
+        SigningKey, VerificationKey, VerifyContext,
+    };
+    // Legal base64 whitespace must obey the document policy rather than an
+    // unrelated legacy signature-text ceiling, even across comment boundaries.
+    let method = SignatureAlgorithm::PostQuantum(PqAlgorithm::MlDsa44);
+    let key = PostQuantumSigningKey::from_pkcs8_der(
+        PqAlgorithm::MlDsa44,
+        include_bytes!("fixtures/xmldsig/keys/ml-dsa/ml-dsa-44-key.der"),
+    )
+    .unwrap();
+    let signed = SignContext::new(&key)
+        .policy(SigningPolicy {
+            signature_algorithms: Some([method].into()),
+            ..Default::default()
+        })
+        .sign_template(&template(method))
+        .unwrap();
+    let verifier = VerificationKey {
+        algorithm: method,
+        public_key_bytes: key.public_key_info().unwrap().spki_der().unwrap().to_vec(),
+        certificate_der: None,
+        name: None,
+    };
+    let policy = VerificationPolicy {
+        signature_algorithms: Some([method].into()),
+        ..Default::default()
+    };
+    for whitespace in [
+        " ".repeat(70_000),
+        format!("{}<!--split-->{}", " ".repeat(35_000), "\t".repeat(35_000)),
+    ] {
+        let padded = signed.replace(
+            "</SignatureValue>",
+            &format!("{whitespace}</SignatureValue>"),
+        );
+        assert_eq!(
+            VerifyContext::new()
+                .key(&verifier)
+                .policy(policy.clone())
+                .verify(&padded)
+                .unwrap()
+                .status,
+            DsigStatus::Valid
+        );
+        let mut restricted = policy.clone();
+        restricted.resources.max_xml_document_bytes = padded.len() - 1;
+        assert!(
+            VerifyContext::new()
+                .key(&verifier)
+                .policy(restricted)
+                .verify(&padded)
+                .is_err()
+        );
+    }
+}
+
+#[cfg(feature = "experimental-pq")]
 ml_pipeline_test!(ml_dsa44_complete_pipeline, ml_dsa::MlDsa44, MlDsa44);
 #[cfg(feature = "experimental-pq")]
 ml_pipeline_test!(ml_dsa65_complete_pipeline, ml_dsa::MlDsa65, MlDsa65);

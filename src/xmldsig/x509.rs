@@ -41,8 +41,9 @@ pub struct X509ChainOptions<'a> {
     /// DSA strength requirements for every issuer key used by the path.
     pub dsa_keys: DsaKeyPolicy,
     /// Borrowed certificate/CRL permissions from the operation's trust policy.
-    /// `None` rejects PQ signatures; `Some` is an exact algorithm allowlist.
-    pub certificate_signature_algorithms: Option<&'a HashSet<X509SignatureAlgorithm>>,
+    /// `None` rejects PQ signatures; explicit permissions can select an exact
+    /// allowlist or all provider-supported algorithms for compatibility.
+    pub certificate_signature_algorithms: Option<&'a crate::policy::CertificateSignatureAlgorithms>,
 }
 
 /// Certificate-chain validation failure.
@@ -771,7 +772,7 @@ fn verify_certificate_signature_with_provider(
     certificate: &X509Certificate<'_>,
     issuer: &X509Certificate<'_>,
     provider: &dyn crate::provider::CryptoProvider,
-    allowed: Option<&HashSet<X509SignatureAlgorithm>>,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<bool, X509ChainError> {
     // RFC 5280 sections 4.1.1.2 and 4.1.2.3 require the outer and signed
     // AlgorithmIdentifier values to be identical. Enforce this independently
@@ -806,7 +807,7 @@ pub(crate) fn certificate_signature_matches_with_provider(
     certificate_der: &[u8],
     issuer_der: &[u8],
     provider: &dyn crate::provider::CryptoProvider,
-    allowed: Option<&HashSet<X509SignatureAlgorithm>>,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<bool, X509ChainError> {
     let (Ok(certificate), Ok(issuer)) = (
         parse_certificate(certificate_der),
@@ -837,7 +838,7 @@ fn verify_crl_signature_with_provider(
     crl: &CertificateRevocationList<'_>,
     issuer: &X509Certificate<'_>,
     provider: &dyn crate::provider::CryptoProvider,
-    allowed: Option<&HashSet<X509SignatureAlgorithm>>,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<bool, X509ChainError> {
     // RFC 5280 sections 5.1.1.2 and 5.1.2.2 impose the same equality rule on
     // CRLs as certificates.
@@ -859,7 +860,7 @@ fn verify_x509_signed_object_with_provider(
     signed_data: &[u8],
     issuer_spki_der: &[u8],
     provider: &dyn crate::provider::CryptoProvider,
-    allowed: Option<&HashSet<X509SignatureAlgorithm>>,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<bool, X509ChainError> {
     if outer_algorithm != signed_algorithm {
         return Ok(false);
@@ -880,7 +881,7 @@ fn verify_x509_signature_with_provider(
     signed_data: &[u8],
     issuer_spki_der: &[u8],
     provider: &dyn crate::provider::CryptoProvider,
-    allowed: Option<&HashSet<X509SignatureAlgorithm>>,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<bool, X509ChainError> {
     let algorithm = x509_signature_algorithm(algorithm_identifier)?;
     crate::policy::KeyTrustPolicy::check_certificate_signature_algorithm(algorithm, allowed)?;
@@ -1770,7 +1771,7 @@ fn verify_crls(
     additional_crls: &[Vec<u8>],
     verification_time: ASN1Time,
     provider: &dyn crate::provider::CryptoProvider,
-    allowed: Option<&HashSet<X509SignatureAlgorithm>>,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<(), X509ChainError> {
     let crls = crl_der
         .iter()
@@ -2195,7 +2196,8 @@ mod tests {
             .is_err(),
             "default certificate policy must reject PQ before provider verification"
         );
-        let permitted = HashSet::from([algorithm]);
+        let permitted =
+            crate::policy::CertificateSignatureAlgorithms::Allowlist(HashSet::from([algorithm]));
         assert!(
             verify_x509_signed_object_with_provider(
                 &identifier,
@@ -2216,7 +2218,9 @@ mod tests {
                 data,
                 spki,
                 provider,
-                Some(&HashSet::new())
+                Some(&crate::policy::CertificateSignatureAlgorithms::Allowlist(
+                    HashSet::new()
+                ))
             ),
             Err(X509ChainError::Policy(_))
         ));
