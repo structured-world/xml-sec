@@ -1201,26 +1201,19 @@ fn prepare_signing_key_candidate_inner(
         // All protected PKCS#8 aliases share the inventory's pre-decryption KDF gate;
         // selecting a CLI spelling must never change import policy enforcement.
         let name = option.parameter.as_deref().unwrap_or("explicit");
-        match format {
-            key_material::PrivateKeyFormat::Pem | key_material::PrivateKeyFormat::Pkcs8Pem => {
-                inventory.add_private_pem(
-                    name.into(),
-                    &key_bytes,
-                    password,
-                    key_manager::KeyUsages::SIGN,
-                    resources,
-                )?;
-            }
-            key_material::PrivateKeyFormat::Der | key_material::PrivateKeyFormat::Pkcs8Der => {
-                inventory.add_private_der(
-                    name.into(),
-                    &key_bytes,
-                    password,
-                    key_manager::KeyUsages::SIGN,
-                    resources,
-                )?;
-            }
-        }
+        import_explicit_private_key(
+            inventory,
+            &key_bytes,
+            key_material::PrivateKeyImport {
+                path: Path::new(path),
+                name,
+                format,
+                password,
+                usages: key_manager::KeyUsages::SIGN,
+                resources,
+            },
+            material_budget,
+        )?;
         inventory.signing_key_with_provider(name, algorithm, policy, provider)?
     } else {
         key_material::decode_signing_key(Path::new(path), &key_bytes, format, algorithm, password)?
@@ -1807,6 +1800,38 @@ impl ExternalMaterialBudget {
         self.kdf_work += inventory.key_import_kdf_work();
         result
     }
+}
+
+fn import_explicit_private_key(
+    inventory: &mut KeyInventory,
+    bytes: &[u8],
+    import: key_material::PrivateKeyImport<'_>,
+    budget: &ExternalMaterialBudget,
+) -> Result<(), CommandError> {
+    // Container normalization is provider-independent. Already charged material
+    // stays live; the importer may use only the remaining operation workspace.
+    debug_assert!(budget.total_bytes >= bytes.len());
+    let mut remaining = import.resources.clone();
+    remaining.max_external_resource_total_bytes = remaining
+        .max_external_resource_total_bytes
+        .min(budget.maximum_bytes)
+        .checked_sub(budget.total_bytes - bytes.len())
+        .ok_or(CommandError::ExternalMaterialTooLarge {
+            maximum: budget.maximum_bytes,
+        })?;
+    key_material::import_private_key(
+        inventory,
+        bytes,
+        key_material::PrivateKeyImport {
+            resources: &remaining,
+            ..import
+        },
+    )
+    .map_err(|error| match error {
+        key_material::KeyMaterialError::KeyStore(error) => CommandError::KeyStore(error),
+        error => CommandError::Key(error),
+    })?;
+    Ok(())
 }
 
 fn read_key_material_with_budget(
@@ -3803,26 +3828,19 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                     let bytes = read_key_material_with_budget(Path::new(path), certificate_budget)?;
                     if selected_provider(invocation)?.name() != "rustcrypto" {
                         let format = private_key_format(option);
-                        match format {
-                            key_material::PrivateKeyFormat::Pem
-                            | key_material::PrivateKeyFormat::Pkcs8Pem => inventory
-                                .add_private_pem(
-                                    "explicit".into(),
-                                    &bytes,
-                                    password,
-                                    key_manager::KeyUsages::DECRYPT,
-                                    resources,
-                                )?,
-                            key_material::PrivateKeyFormat::Der
-                            | key_material::PrivateKeyFormat::Pkcs8Der => inventory
-                                .add_private_der(
-                                    "explicit".into(),
-                                    &bytes,
-                                    password,
-                                    key_manager::KeyUsages::DECRYPT,
-                                    resources,
-                                )?,
-                        }
+                        import_explicit_private_key(
+                            inventory,
+                            &bytes,
+                            key_material::PrivateKeyImport {
+                                path: Path::new(path),
+                                name: "explicit",
+                                format,
+                                password,
+                                usages: key_manager::KeyUsages::DECRYPT,
+                                resources,
+                            },
+                            certificate_budget,
+                        )?;
                         let imported = inventory.private_keys().last().ok_or_else(|| {
                             CommandError::Usage("no RSA private key imported".into())
                         })?;

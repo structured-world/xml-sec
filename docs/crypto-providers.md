@@ -16,6 +16,13 @@ public SPKI bytes can be verified by either engine. There is no automatic fallba
 Key-container decoding remains a distinct inventory import boundary: encrypted
 PKCS#8 and PKCS#12 password-based container processing uses the existing RustCrypto
 importer. Selecting AWS-LC does not turn that importer into an approved FIPS service.
+The CLI's generic `--privkey-pem`/`--privkey-der` options also preserve traditional
+RSA PKCS#1 and EC SEC1 containers independently of the provider. Traditional
+OpenSSL encrypted PEM is decrypted at this same container boundary. Normalization
+is resource-bounded; selecting AWS-LC still imports the resulting key into its
+native handle without falling back to RustCrypto for the requested operation.
+Explicit `--pkcs8-pem`/`--pkcs8-der` options remain PKCS#8-only. Missing or incorrect
+passwords are terminal, including during lax key search.
 Applications requiring an exclusively native secret-processing boundary should supply
 plain PKCS#8 directly to `AwsLcSigningKey::from_pkcs8_der` or
 `AwsLcRsaPrivateKey::from_pkcs8_der`, rather than using protected-container import.
