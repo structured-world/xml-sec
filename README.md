@@ -18,6 +18,8 @@ Pure Rust XML Security for **XMLDSig**, **XML Encryption**, **C14N**, **SAML 2.0
 ## Why xml-sec?
 
 - **End-to-end XML security**: sign, verify, encrypt, and decrypt through public Rust APIs.
+- **Modern signature algorithms**: curve-independent ECDSA with SHA-2/SHA-3, Ed25519/Ed448
+  with context/prehash variants, and opt-in experimental ML-DSA/SLH-DSA through `CryptoProvider`.
 - **SAML-ready primitives**: enveloped signatures, encrypted assertions, X.509 keys, XPath,
   canonicalization, and strict same-document ID handling.
 - **Pure Rust deployment**: RustCrypto, `x509-parser`, and selectable Rust XML backends replace

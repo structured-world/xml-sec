@@ -88,12 +88,24 @@ snafu = { version = "0.9", optional = true }
 rsa = { package = "sad-rsa", version = "0.10.2", features = ["sha1", "sha2"], optional = true }
 sha1 = { version = "0.11", features = ["oid"], optional = true }
 sha2 = { version = "0.11", features = ["oid"], optional = true }
+sha3 = { version = "0.12", default-features = false, features = ["oid"], optional = true }
+ed448-goldilocks = { version = "=0.14.0-pre.15", default-features = false, features = ["alloc", "signing", "pkcs8"], optional = true }
+# Dependencies of the embedded, patched RustCrypto ML-DSA implementation.
+common = { package = "crypto-common", version = "0.2", default-features = false, features = ["rand_core"], optional = true }
+ctutils = { version = "0.4", default-features = false, optional = true }
+hybrid-array = { version = "0.4", default-features = false, features = ["extra-sizes", "alloc", "zeroize"], optional = true }
+module-lattice = { version = "0.2.3", default-features = false, features = ["ctutils", "alloc", "zeroize"], optional = true }
+shake = { version = "0.1", default-features = false, optional = true }
+const-oid = { version = "0.10", default-features = false, features = ["db"], optional = true }
+slh-dsa = { version = "=0.2.0-rc.5", default-features = false, features = ["alloc", "zeroize"], optional = true }
 p256 = { version = "0.14", features = ["ecdsa"], optional = true }
 p384 = { version = "0.14", features = ["ecdsa"], optional = true }
 p521 = { version = "0.14", features = ["ecdsa"], optional = true }
 dsa = { version = "0.7", features = ["hazmat"], optional = true }
 pkcs8 = { version = "0.11", features = ["encryption"], optional = true }
-ed25519-dalek = { version = "3", features = ["pkcs8"], optional = true }
+ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "digest", "fast", "hazmat", "pkcs8", "zeroize"], optional = true }
+# Expose the same curve primitive already used by dalek for RFC 8032 Ed25519ctx.
+curve25519-dalek = { version = "5", default-features = false, features = ["alloc", "precomputed-tables", "zeroize"], optional = true }
 hmac = { version = "0.13", optional = true }
 signature = { version = "3", optional = true }
 subtle = { version = "2", optional = true }
@@ -124,6 +136,8 @@ base64 = "0.23"
 thiserror = "2"
 
 [dev-dependencies]
+ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc", "pkcs8", "rand_core", "zeroize"] }
+hex-literal = "1"
 roxmltree = { version = "0.21", features = ["positions"] }
 rcgen = "0.14.6"
 rand_chacha = "0.10"
@@ -150,6 +164,8 @@ xmldsig = [            # XML Digital Signatures (sign + verify)
     "dep:dsa",
     "dep:des",
     "dep:ed25519-dalek",
+    "dep:curve25519-dalek",
+    "dep:ed448-goldilocks",
     "dep:getrandom",
     "dep:hmac",
     "dep:md-5",
@@ -166,6 +182,7 @@ xmldsig = [            # XML Digital Signatures (sign + verify)
     "dep:rsa",
     "dep:sha1",
     "dep:sha2",
+    "dep:sha3",
     "dep:signature",
     "dep:snafu",
     "dep:subtle",
@@ -189,6 +206,8 @@ xmlenc = [             # XML Encryption (encrypt + decrypt)
     "dep:sha2",
 ]
 c14n = []              # XML Canonicalization (inclusive + exclusive)
+# Experimental libxmlsec1 algorithm identifiers; build capability is not policy permission.
+experimental-pq = ["xmldsig", "dep:slh-dsa", "dep:common", "dep:ctutils", "dep:hybrid-array", "dep:module-lattice", "dep:shake", "dep:const-oid", "signature/digest", "signature/alloc", "signature/rand_core"]
 no-unsafe = []
 embedded = []
 

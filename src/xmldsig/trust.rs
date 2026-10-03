@@ -114,6 +114,16 @@ impl TrustedPublicKey {
 }
 
 impl VerifyingKey for TrustedPublicKey {
+    fn verify_with_context(
+        &self,
+        algorithm: SignatureAlgorithm,
+        context: &super::SignatureContext,
+        data: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, DsigError> {
+        self.key
+            .verify_with_context(algorithm, context, data, signature)
+    }
     fn validate_policy(&self, policy: &VerificationPolicy) -> Result<(), DsigError> {
         if self.trust != policy.key_trust {
             return Err(PolicyViolation::KeyTrust {

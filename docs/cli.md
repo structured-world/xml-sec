@@ -385,6 +385,13 @@ aliases. The template signature method selects the key family before decoding,
 while ECDSA keys select their curve from PKCS#8 or SEC1 parameters. Explicit
 PKCS#8 options reject traditional containers rather than silently broadening
 their documented format contract.
+Modern signing uses the same template-selected key loading and `CryptoProvider`
+path: Ed25519, Ed25519ctx, Ed25519ph, Ed448, and Ed448ph accept PKCS#8 keys;
+ECDSA and reference digests support SHA-3. Authenticated signature contexts are
+forwarded unchanged during candidate-key verification. ML-DSA and SHA-2 SLH-DSA
+methods require the `experimental-pq` build feature; capability queries do not
+advertise them in builds without that feature. These experimental XML methods
+are not standardized algorithm URIs; see [XMLDSig details](xmldsig.md).
 Public verification accepts SubjectPublicKeyInfo,
 PKCS#1 RSA public keys, and X.509 certificates. Encryption accepts RSA public
 keys or RSA X.509 recipient certificates in PEM or DER. Explicit verification

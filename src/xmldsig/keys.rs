@@ -182,8 +182,43 @@ pub struct VerificationKey {
 }
 
 impl VerifyingKey for VerificationKey {
+    fn verify_with_context(
+        &self,
+        algorithm: SignatureAlgorithm,
+        context: &super::SignatureContext,
+        data: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, DsigError> {
+        if algorithm != self.algorithm {
+            return Err(KeyResolutionError::AlgorithmMismatch.into());
+        }
+        if algorithm.eddsa_signature_len().is_some()
+            || matches!(algorithm, SignatureAlgorithm::PostQuantum(_))
+        {
+            return super::modern::verify_with_context(
+                algorithm,
+                &self.public_key_bytes,
+                context,
+                data,
+                signature,
+            )
+            .map_err(DsigError::Crypto);
+        }
+        if !context.as_bytes().is_empty() {
+            return Err(KeyResolutionError::AlgorithmMismatch.into());
+        }
+        self.verify(algorithm, data, signature)
+    }
     fn validate_policy(&self, policy: &crate::policy::VerificationPolicy) -> Result<(), DsigError> {
         let result = match self.algorithm {
+            SignatureAlgorithm::Ed25519
+            | SignatureAlgorithm::Ed25519Ctx
+            | SignatureAlgorithm::Ed25519Ph
+            | SignatureAlgorithm::Ed448
+            | SignatureAlgorithm::Ed448Ph
+            | SignatureAlgorithm::PostQuantum(_) => {
+                super::modern::validate_public_key(self.algorithm, &self.public_key_bytes)
+            }
             SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => {
                 validate_dsa_signature_spki_with_minimum(
                     &self.public_key_bytes,
@@ -208,7 +243,11 @@ impl VerifyingKey for VerificationKey {
             | SignatureAlgorithm::EcdsaSha224
             | SignatureAlgorithm::EcdsaSha256
             | SignatureAlgorithm::EcdsaSha384
-            | SignatureAlgorithm::EcdsaSha512 => Ok(()),
+            | SignatureAlgorithm::EcdsaSha512
+            | SignatureAlgorithm::EcdsaSha3_224
+            | SignatureAlgorithm::EcdsaSha3_256
+            | SignatureAlgorithm::EcdsaSha3_384
+            | SignatureAlgorithm::EcdsaSha3_512 => Ok(()),
         };
         result.map_err(DsigError::Crypto)
     }
@@ -253,6 +292,17 @@ impl VerifyingKey for VerificationKey {
             return Err(KeyResolutionError::AlgorithmMismatch.into());
         }
         let result = match algorithm {
+            SignatureAlgorithm::Ed25519
+            | SignatureAlgorithm::Ed25519Ctx
+            | SignatureAlgorithm::Ed25519Ph
+            | SignatureAlgorithm::Ed448
+            | SignatureAlgorithm::Ed448Ph
+            | SignatureAlgorithm::PostQuantum(_) => super::modern::verify(
+                algorithm,
+                &self.public_key_bytes,
+                signed_data,
+                signature_value,
+            ),
             SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => {
                 verify_dsa_signature_spki_primitive(
                     algorithm,
@@ -282,7 +332,11 @@ impl VerifyingKey for VerificationKey {
             | SignatureAlgorithm::EcdsaSha224
             | SignatureAlgorithm::EcdsaSha256
             | SignatureAlgorithm::EcdsaSha384
-            | SignatureAlgorithm::EcdsaSha512 => verify_ecdsa_signature_spki(
+            | SignatureAlgorithm::EcdsaSha512
+            | SignatureAlgorithm::EcdsaSha3_224
+            | SignatureAlgorithm::EcdsaSha3_256
+            | SignatureAlgorithm::EcdsaSha3_384
+            | SignatureAlgorithm::EcdsaSha3_512 => verify_ecdsa_signature_spki(
                 algorithm,
                 &self.public_key_bytes,
                 signed_data,
@@ -302,14 +356,7 @@ impl VerifyingKey for VerificationKey {
         if algorithm != self.algorithm {
             return Err(KeyResolutionError::AlgorithmMismatch.into());
         }
-        if matches!(
-            algorithm,
-            SignatureAlgorithm::EcdsaSha1
-                | SignatureAlgorithm::EcdsaSha224
-                | SignatureAlgorithm::EcdsaSha256
-                | SignatureAlgorithm::EcdsaSha384
-                | SignatureAlgorithm::EcdsaSha512
-        ) {
+        if algorithm.ecdsa_digest().is_some() {
             return verify_ecdsa_signature_spki_with_encoding(
                 algorithm,
                 &self.public_key_bytes,
@@ -330,6 +377,19 @@ struct PolicyBoundVerificationKey {
 }
 
 impl VerifyingKey for PolicyBoundVerificationKey {
+    fn verify_with_context(
+        &self,
+        algorithm: SignatureAlgorithm,
+        context: &super::SignatureContext,
+        data: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, DsigError> {
+        if context.as_bytes().is_empty() {
+            return self.verify(algorithm, data, signature);
+        }
+        self.key
+            .verify_with_context(algorithm, context, data, signature)
+    }
     fn validate_signature_value(
         &self,
         algorithm: SignatureAlgorithm,
@@ -391,14 +451,7 @@ impl VerifyingKey for PolicyBoundVerificationKey {
         signed_data: &[u8],
         signature_value: &[u8],
     ) -> Result<bool, DsigError> {
-        if matches!(
-            algorithm,
-            SignatureAlgorithm::EcdsaSha1
-                | SignatureAlgorithm::EcdsaSha224
-                | SignatureAlgorithm::EcdsaSha256
-                | SignatureAlgorithm::EcdsaSha384
-                | SignatureAlgorithm::EcdsaSha512
-        ) {
+        if algorithm.ecdsa_digest().is_some() {
             return self
                 .key
                 .verify_with_policy(policy, algorithm, signed_data, signature_value);
@@ -1138,14 +1191,7 @@ impl DefaultKeyResolver {
                 curve_oid,
                 public_key,
             } => {
-                if !matches!(
-                    algorithm,
-                    SignatureAlgorithm::EcdsaSha1
-                        | SignatureAlgorithm::EcdsaSha224
-                        | SignatureAlgorithm::EcdsaSha256
-                        | SignatureAlgorithm::EcdsaSha384
-                        | SignatureAlgorithm::EcdsaSha512
-                ) {
+                if algorithm.ecdsa_digest().is_none() {
                     return Ok(None);
                 }
                 ec_key_value_to_spki_der(curve_oid, public_key)?
@@ -1563,6 +1609,12 @@ fn validate_spki_algorithm(
     public_key_bytes: &[u8],
     algorithm: SignatureAlgorithm,
 ) -> Result<(), KeyResolutionError> {
+    if algorithm.eddsa_signature_len().is_some()
+        || matches!(algorithm, SignatureAlgorithm::PostQuantum(_))
+    {
+        return super::modern::validate_public_key(algorithm, public_key_bytes)
+            .map_err(|_| KeyResolutionError::InvalidPublicKey);
+    }
     let (rest, spki) = SubjectPublicKeyInfo::from_der(public_key_bytes)
         .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
     if !rest.is_empty() {
@@ -1596,7 +1648,11 @@ fn validate_spki_algorithm(
             | SignatureAlgorithm::EcdsaSha224
             | SignatureAlgorithm::EcdsaSha256
             | SignatureAlgorithm::EcdsaSha384
-            | SignatureAlgorithm::EcdsaSha512,
+            | SignatureAlgorithm::EcdsaSha512
+            | SignatureAlgorithm::EcdsaSha3_224
+            | SignatureAlgorithm::EcdsaSha3_256
+            | SignatureAlgorithm::EcdsaSha3_384
+            | SignatureAlgorithm::EcdsaSha3_512,
             PublicKey::EC(ec),
         ) if matches!(
             curve_oid.as_deref(),
@@ -1616,6 +1672,26 @@ pub(crate) fn supported_parsed_spki_is_rsa(
     spki: &SubjectPublicKeyInfo<'_>,
     public_key_bytes: &[u8],
 ) -> Result<bool, KeyResolutionError> {
+    let borrowed = pkcs8::SubjectPublicKeyInfoRef::try_from(public_key_bytes)
+        .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
+    if let Some(parameter) = super::PqAlgorithm::from_oid(borrowed.algorithm.oid) {
+        super::modern::validate_public_key(
+            SignatureAlgorithm::PostQuantum(parameter),
+            public_key_bytes,
+        )
+        .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
+        return Ok(false);
+    }
+    let eddsa = match spki.algorithm.algorithm.to_id_string().as_str() {
+        "1.3.101.112" => Some(SignatureAlgorithm::Ed25519),
+        "1.3.101.113" => Some(SignatureAlgorithm::Ed448),
+        _ => None,
+    };
+    if let Some(algorithm) = eddsa {
+        super::modern::validate_public_key(algorithm, public_key_bytes)
+            .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
+        return Ok(false);
+    }
     let parsed = spki
         .parsed()
         .map_err(|_| KeyResolutionError::InvalidPublicKey)?;

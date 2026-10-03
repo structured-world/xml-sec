@@ -889,12 +889,30 @@ fn x509_signature_algorithm(
         "1.2.840.10045.4.3.3" => X509SignatureAlgorithm::Ecdsa(super::DigestAlgorithm::Sha384),
         "1.2.840.10045.4.3.4" => X509SignatureAlgorithm::Ecdsa(super::DigestAlgorithm::Sha512),
         "1.3.101.112" => X509SignatureAlgorithm::Ed25519,
-        _ => return Err(X509ChainError::UnsupportedSignatureAlgorithm { oid }),
+        // RFC 8410 sections 3 and 6 require absent Ed448 parameters:
+        // https://www.rfc-editor.org/rfc/rfc8410.html#section-3
+        "1.3.101.113" => X509SignatureAlgorithm::Ed448,
+        _ => {
+            let Some(algorithm) = super::PqAlgorithm::ALL
+                .into_iter()
+                .find(|algorithm| algorithm.oid() == oid)
+            else {
+                return Err(X509ChainError::UnsupportedSignatureAlgorithm { oid });
+            };
+            X509SignatureAlgorithm::PostQuantum(algorithm)
+        }
     };
     match &algorithm {
         X509SignatureAlgorithm::Dsa(_)
         | X509SignatureAlgorithm::Ecdsa(_)
-        | X509SignatureAlgorithm::Ed25519 => require_absent_signature_parameters(identifier)?,
+        | X509SignatureAlgorithm::Ed25519
+        | X509SignatureAlgorithm::Ed448 => require_absent_signature_parameters(identifier)?,
+        X509SignatureAlgorithm::PostQuantum(_) => {
+            // RFC 9881 §2 / RFC 9909 §3 forbid even NULL parameters.
+            // https://www.rfc-editor.org/rfc/rfc9881.html#section-2
+            // https://www.rfc-editor.org/rfc/rfc9909.html#section-3
+            require_absent_signature_parameters(identifier)?;
+        }
         X509SignatureAlgorithm::RsaPkcs1v15(_) => {
             require_null_or_absent_signature_parameters(identifier)?;
         }
@@ -2195,6 +2213,26 @@ mod tests {
     }
 
     #[test]
+    fn ed448_certificate_signature_identifier_requires_absent_parameters() {
+        use x509_parser::asn1_rs::{Any, Tag};
+
+        // RFC 8410 sections 3 and 6 assign Ed448's OID and require absent
+        // parameters, not ASN.1 NULL, for its signature identifier.
+        let oid = Oid::from_str("1.3.101.113").expect("RFC 8410 Ed448 OID must parse");
+        assert!(x509_signature_algorithm(&AlgorithmIdentifier::new(oid.clone(), None)).is_ok());
+        assert!(matches!(
+            x509_signature_algorithm(&AlgorithmIdentifier::new(
+                oid,
+                Some(Any::from_tag_and_data(Tag::Null, &[]))
+            )),
+            Err(X509ChainError::InvalidDer {
+                kind: "X.509 signature AlgorithmIdentifier parameters",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn every_modeled_non_parameterized_x509_algorithm_reaches_the_provider() {
         // Parsing and provider capability are separate contracts. Once an OID
         // has a typed representation, custom providers must get the chance to
@@ -2238,6 +2276,28 @@ mod tests {
                 None,
             );
             assert_eq!(x509_signature_algorithm(&identifier), Ok(expected), "{oid}");
+        }
+    }
+
+    #[test]
+    fn pq_certificate_identifiers_require_absent_parameters() {
+        use x509_parser::asn1_rs::{Any, Tag};
+
+        // RFC 9881 §2 and RFC 9909 §3 require parameters to be absent,
+        // including when the primitive is not compiled into this provider.
+        for algorithm in super::super::PqAlgorithm::ALL {
+            let oid = Oid::from_str(algorithm.oid()).expect("registered PQ signature OID");
+            assert!(x509_signature_algorithm(&AlgorithmIdentifier::new(oid.clone(), None)).is_ok());
+            assert!(matches!(
+                x509_signature_algorithm(&AlgorithmIdentifier::new(
+                    oid,
+                    Some(Any::from_tag_and_data(Tag::Null, &[]))
+                )),
+                Err(X509ChainError::InvalidDer {
+                    kind: "X.509 signature AlgorithmIdentifier parameters",
+                    ..
+                })
+            ));
         }
     }
 

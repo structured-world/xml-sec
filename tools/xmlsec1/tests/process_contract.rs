@@ -48,6 +48,80 @@ fn project_root() -> &'static Path {
 }
 
 #[test]
+fn modern_eddsa_signing_completes_cli_process_pipeline() {
+    // Exercise actual process arguments, key loading, SHA-3 reference digests,
+    // and signature-context forwarding, not only the key decoder in isolation.
+    for (algorithm, stem) in [
+        (SignatureAlgorithm::Ed25519, "ed25519"),
+        (SignatureAlgorithm::Ed25519Ctx, "ed25519"),
+        (SignatureAlgorithm::Ed25519Ph, "ed25519"),
+        (SignatureAlgorithm::Ed448, "ed448"),
+        (SignatureAlgorithm::Ed448Ph, "ed448"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let template = temp.path().join("template.xml");
+        let signed = temp.path().join("signed.xml");
+        let mut builder =
+            SignatureBuilder::new(C14nAlgorithm::new(C14nMode::Exclusive1_0, false), algorithm)
+                .add_reference(
+                    ReferenceBuilder::new(DigestAlgorithm::Sha3_256)
+                        .uri("")
+                        .transform(Transform::Enveloped),
+                );
+        if algorithm != SignatureAlgorithm::Ed25519 {
+            builder =
+                builder.signature_context(xml_sec::xmldsig::SignatureContext::new(b"foo").unwrap());
+        }
+        let xml =
+            append_signature_to_root("<root>payload</root>", &builder.build_template().unwrap())
+                .unwrap();
+        fs::write(&template, xml).unwrap();
+        let key = project_root().join(format!(
+            "tests/fixtures/xmldsig/keys/eddsa/eddsa-{stem}-key.der"
+        ));
+        let result = Command::new(binary())
+            .args(["sign", "--pkcs8-der"])
+            .arg(key)
+            .arg("--output")
+            .arg(&signed)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{algorithm:?}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let result = Command::new(binary())
+            .args(["verify", "--pubkey-pem"])
+            .arg(project_root().join(format!(
+                "tests/fixtures/xmldsig/keys/eddsa/eddsa-{stem}-pubkey.pem"
+            )))
+            .arg(&signed)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{algorithm:?}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let xml = fs::read_to_string(&signed)
+            .unwrap()
+            .replace("payload", "tampered");
+        fs::write(&signed, xml).unwrap();
+        let rejected = Command::new(binary())
+            .args(["verify", "--pubkey-pem"])
+            .arg(project_root().join(format!(
+                "tests/fixtures/xmldsig/keys/eddsa/eddsa-{stem}-pubkey.pem"
+            )))
+            .arg(&signed)
+            .output()
+            .unwrap();
+        assert!(!rejected.status.success());
+    }
+}
+
+#[test]
 fn mislabeled_encrypted_pem_cannot_sign() {
     // Generic private-key loading must honor PEM protection labels, not retry
     // plaintext DER; rejection must leave no signed output on disk.

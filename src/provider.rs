@@ -204,6 +204,10 @@ pub enum X509SignatureAlgorithm {
     Ecdsa(DigestAlgorithm),
     /// Pure Ed25519 as specified by RFC 8410.
     Ed25519,
+    /// Pure Ed448 as specified by RFC 8410.
+    Ed448,
+    /// Pure ML-DSA or SLH-DSA with the PKIX-mandated empty context.
+    PostQuantum(crate::xmldsig::PqAlgorithm),
 }
 
 #[cfg(feature = "xmldsig")]
@@ -217,18 +221,32 @@ impl X509SignatureAlgorithm {
             Self::Dsa(DigestAlgorithm::Sha256) => "2.16.840.1.101.3.4.3.2",
             Self::Dsa(DigestAlgorithm::Sha384) => "2.16.840.1.101.3.4.3.3",
             Self::Dsa(DigestAlgorithm::Sha512) => "2.16.840.1.101.3.4.3.4",
+            Self::Dsa(DigestAlgorithm::Sha3_224) => "2.16.840.1.101.3.4.3.5",
+            Self::Dsa(DigestAlgorithm::Sha3_256) => "2.16.840.1.101.3.4.3.6",
+            Self::Dsa(DigestAlgorithm::Sha3_384) => "2.16.840.1.101.3.4.3.7",
+            Self::Dsa(DigestAlgorithm::Sha3_512) => "2.16.840.1.101.3.4.3.8",
             Self::RsaPkcs1v15(DigestAlgorithm::Sha1) => "1.2.840.113549.1.1.5",
             Self::RsaPkcs1v15(DigestAlgorithm::Sha224) => "1.2.840.113549.1.1.14",
             Self::RsaPkcs1v15(DigestAlgorithm::Sha256) => "1.2.840.113549.1.1.11",
             Self::RsaPkcs1v15(DigestAlgorithm::Sha384) => "1.2.840.113549.1.1.12",
             Self::RsaPkcs1v15(DigestAlgorithm::Sha512) => "1.2.840.113549.1.1.13",
+            Self::RsaPkcs1v15(DigestAlgorithm::Sha3_224) => "2.16.840.1.101.3.4.3.13",
+            Self::RsaPkcs1v15(DigestAlgorithm::Sha3_256) => "2.16.840.1.101.3.4.3.14",
+            Self::RsaPkcs1v15(DigestAlgorithm::Sha3_384) => "2.16.840.1.101.3.4.3.15",
+            Self::RsaPkcs1v15(DigestAlgorithm::Sha3_512) => "2.16.840.1.101.3.4.3.16",
             Self::RsaPss { .. } => "1.2.840.113549.1.1.10",
             Self::Ecdsa(DigestAlgorithm::Sha1) => "1.2.840.10045.4.1",
             Self::Ecdsa(DigestAlgorithm::Sha224) => "1.2.840.10045.4.3.1",
             Self::Ecdsa(DigestAlgorithm::Sha256) => "1.2.840.10045.4.3.2",
             Self::Ecdsa(DigestAlgorithm::Sha384) => "1.2.840.10045.4.3.3",
             Self::Ecdsa(DigestAlgorithm::Sha512) => "1.2.840.10045.4.3.4",
+            Self::Ecdsa(DigestAlgorithm::Sha3_224) => "2.16.840.1.101.3.4.3.9",
+            Self::Ecdsa(DigestAlgorithm::Sha3_256) => "2.16.840.1.101.3.4.3.10",
+            Self::Ecdsa(DigestAlgorithm::Sha3_384) => "2.16.840.1.101.3.4.3.11",
+            Self::Ecdsa(DigestAlgorithm::Sha3_512) => "2.16.840.1.101.3.4.3.12",
             Self::Ed25519 => "1.3.101.112",
+            Self::Ed448 => "1.3.101.113",
+            Self::PostQuantum(algorithm) => algorithm.oid(),
         }
     }
 }
@@ -423,6 +441,44 @@ pub trait CryptoProvider: Send + Sync {
         data: &[u8],
         signature: &[u8],
     ) -> Result<bool, crate::xmldsig::DsigError>;
+
+    /// Sign with explicit domain separation; unsupported contexts must not be discarded.
+    #[cfg(feature = "xmldsig")]
+    fn sign_with_context(
+        &self,
+        key: &dyn crate::xmldsig::SigningKey,
+        algorithm: crate::xmldsig::SignatureAlgorithm,
+        context: &crate::xmldsig::SignatureContext,
+        data: &[u8],
+    ) -> Result<Vec<u8>, crate::xmldsig::SigningKeyError> {
+        if !context.as_bytes().is_empty() {
+            return Err(crate::xmldsig::SigningKeyError::UnsupportedAlgorithm {
+                uri: algorithm.uri().to_owned(),
+            });
+        }
+        self.sign(key, algorithm, data)
+    }
+
+    /// Verify with explicit domain separation; unsupported contexts fail closed.
+    #[cfg(feature = "xmldsig")]
+    fn verify_with_context(
+        &self,
+        key: &dyn crate::xmldsig::VerifyingKey,
+        algorithm: crate::xmldsig::SignatureAlgorithm,
+        context: &crate::xmldsig::SignatureContext,
+        data: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, crate::xmldsig::DsigError> {
+        if !context.as_bytes().is_empty() {
+            return Err(
+                crate::xmldsig::SignatureVerificationError::UnsupportedAlgorithm {
+                    uri: algorithm.uri().to_owned(),
+                }
+                .into(),
+            );
+        }
+        self.verify(key, algorithm, data, signature)
+    }
 
     /// Verify an X.509 certificate or CRL signature under its issuer SPKI.
     #[cfg(feature = "xmldsig")]
@@ -747,7 +803,12 @@ impl CryptoProvider for RustCryptoProvider {
             #[cfg(feature = "xmldsig")]
             // Opaque keys own these primitives and reject unsupported methods
             // during dispatch; the provider advertises its dispatch surface.
-            ProviderCapability::Sign(_) | ProviderCapability::Verify(_) => true,
+            ProviderCapability::Sign(algorithm) | ProviderCapability::Verify(algorithm) => {
+                !matches!(
+                    algorithm,
+                    crate::xmldsig::SignatureAlgorithm::PostQuantum(_)
+                ) || cfg!(feature = "experimental-pq")
+            }
             #[cfg(feature = "xmldsig")]
             ProviderCapability::VerifyCertificate(algorithm) => {
                 is_supported_x509_signature(algorithm)
@@ -785,12 +846,17 @@ impl CryptoProvider for RustCryptoProvider {
     fn digest(&self, algorithm: DigestAlgorithm, data: &[u8]) -> Result<Vec<u8>, ProviderError> {
         use sha1::Sha1;
         use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
+        use sha3::{Sha3_224, Sha3_256, Sha3_384, Sha3_512};
         Ok(match algorithm {
             DigestAlgorithm::Sha1 => Sha1::digest(data).to_vec(),
             DigestAlgorithm::Sha224 => Sha224::digest(data).to_vec(),
             DigestAlgorithm::Sha256 => Sha256::digest(data).to_vec(),
             DigestAlgorithm::Sha384 => Sha384::digest(data).to_vec(),
             DigestAlgorithm::Sha512 => Sha512::digest(data).to_vec(),
+            DigestAlgorithm::Sha3_224 => Sha3_224::digest(data).to_vec(),
+            DigestAlgorithm::Sha3_256 => Sha3_256::digest(data).to_vec(),
+            DigestAlgorithm::Sha3_384 => Sha3_384::digest(data).to_vec(),
+            DigestAlgorithm::Sha3_512 => Sha3_512::digest(data).to_vec(),
         })
     }
 
@@ -803,6 +869,31 @@ impl CryptoProvider for RustCryptoProvider {
     ) -> Result<Vec<u8>, crate::xmldsig::SigningKeyError> {
         self.require_capability(ProviderCapability::Sign(algorithm))?;
         key.sign_with_provider(self, algorithm, data)
+    }
+
+    #[cfg(feature = "xmldsig")]
+    fn sign_with_context(
+        &self,
+        key: &dyn crate::xmldsig::SigningKey,
+        algorithm: crate::xmldsig::SignatureAlgorithm,
+        context: &crate::xmldsig::SignatureContext,
+        data: &[u8],
+    ) -> Result<Vec<u8>, crate::xmldsig::SigningKeyError> {
+        self.require_capability(ProviderCapability::Sign(algorithm))?;
+        key.sign_with_provider_context(self, algorithm, context, data)
+    }
+
+    #[cfg(feature = "xmldsig")]
+    fn verify_with_context(
+        &self,
+        key: &dyn crate::xmldsig::VerifyingKey,
+        algorithm: crate::xmldsig::SignatureAlgorithm,
+        context: &crate::xmldsig::SignatureContext,
+        data: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, crate::xmldsig::DsigError> {
+        self.require_capability(ProviderCapability::Verify(algorithm))?;
+        key.verify_with_context(algorithm, context, data, signature)
     }
 
     #[cfg(feature = "xmldsig")]
@@ -895,9 +986,18 @@ impl CryptoProvider for RustCryptoProvider {
 fn is_supported_x509_signature(algorithm: X509SignatureAlgorithm) -> bool {
     match algorithm {
         X509SignatureAlgorithm::Dsa(DigestAlgorithm::Sha1)
-        | X509SignatureAlgorithm::RsaPkcs1v15(_)
-        | X509SignatureAlgorithm::Ecdsa(_)
-        | X509SignatureAlgorithm::Ed25519 => true,
+        | X509SignatureAlgorithm::Ed25519
+        | X509SignatureAlgorithm::Ed448 => true,
+        X509SignatureAlgorithm::Ecdsa(_) => true,
+        X509SignatureAlgorithm::PostQuantum(_) => cfg!(feature = "experimental-pq"),
+        X509SignatureAlgorithm::RsaPkcs1v15(digest) => matches!(
+            digest,
+            DigestAlgorithm::Sha1
+                | DigestAlgorithm::Sha224
+                | DigestAlgorithm::Sha256
+                | DigestAlgorithm::Sha384
+                | DigestAlgorithm::Sha512
+        ),
         X509SignatureAlgorithm::RsaPss {
             digest, mgf_digest, ..
         } => {
@@ -1001,6 +1101,33 @@ mod rustcrypto_x509 {
                 };
                 Ok(key.verify_strict(signed_data, &signature).is_ok())
             }
+            X509SignatureAlgorithm::Ed448 => {
+                // RFC 8410 sections 3 and 6 select pure Ed448 without context
+                // or external prehash: https://www.rfc-editor.org/rfc/rfc8410.html#section-6
+                let Ok(key) = ed448_goldilocks::VerifyingKey::from_public_key_der(issuer_spki_der)
+                else {
+                    return Ok(false);
+                };
+                let Ok(signature) = ed448_goldilocks::Signature::try_from(signature) else {
+                    return Ok(false);
+                };
+                Ok(key.verify_raw(&signature, signed_data).is_ok())
+            }
+            #[cfg(feature = "experimental-pq")]
+            X509SignatureAlgorithm::PostQuantum(algorithm) => {
+                // RFC 9881 §3 and RFC 9909 §§1, 4 require pure signatures
+                // over the DER object with an empty context, not an XML context.
+                // https://www.rfc-editor.org/rfc/rfc9881.html#section-3
+                // https://www.rfc-editor.org/rfc/rfc9909.html#section-4
+                Ok(crate::xmldsig::post_quantum::verify(
+                    algorithm,
+                    issuer_spki_der,
+                    &crate::xmldsig::SignatureContext::default(),
+                    signed_data,
+                    signature,
+                )
+                .unwrap_or(false))
+            }
             _ => unsupported(algorithm),
         }
     }
@@ -1050,7 +1177,7 @@ mod rustcrypto_x509 {
                 RsaPssVerifyingKey::<Sha512>::new_with_salt_len(key, salt_len)
                     .verify(signed_data, &signature)
             }
-            DigestAlgorithm::Sha1 | DigestAlgorithm::Sha224 => {
+            _ => {
                 return unsupported(X509SignatureAlgorithm::RsaPss {
                     digest,
                     mgf_digest: digest,
@@ -1150,6 +1277,7 @@ mod rustcrypto_x509 {
             DigestAlgorithm::Sha256 => Some(SignatureAlgorithm::RsaSha256),
             DigestAlgorithm::Sha384 => Some(SignatureAlgorithm::RsaSha384),
             DigestAlgorithm::Sha512 => Some(SignatureAlgorithm::RsaSha512),
+            _ => None,
         }
     }
 
@@ -1160,6 +1288,10 @@ mod rustcrypto_x509 {
             DigestAlgorithm::Sha256 => Some(SignatureAlgorithm::EcdsaSha256),
             DigestAlgorithm::Sha384 => Some(SignatureAlgorithm::EcdsaSha384),
             DigestAlgorithm::Sha512 => Some(SignatureAlgorithm::EcdsaSha512),
+            DigestAlgorithm::Sha3_224 => Some(SignatureAlgorithm::EcdsaSha3_224),
+            DigestAlgorithm::Sha3_256 => Some(SignatureAlgorithm::EcdsaSha3_256),
+            DigestAlgorithm::Sha3_384 => Some(SignatureAlgorithm::EcdsaSha3_384),
+            DigestAlgorithm::Sha3_512 => Some(SignatureAlgorithm::EcdsaSha3_512),
         }
     }
 

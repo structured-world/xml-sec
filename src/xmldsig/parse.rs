@@ -54,6 +54,30 @@ const MAX_DER_ENCODED_KEY_VALUE_BASE64_LEN: usize = MAX_DER_ENCODED_KEY_VALUE_LE
 pub(crate) const MAX_KEY_NAME_TEXT_LEN: usize = 4096;
 const MAX_KEY_INFO_CHILD_COUNT: usize = 64;
 const MAX_HMAC_OUTPUT_LENGTH_TEXT_LEN: usize = 32;
+pub(crate) const EXPERIMENTAL_SIGNATURE_NS: &str =
+    "http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#";
+
+/// Cryptographic domain-separation context, bounded by the algorithm wire contract.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SignatureContext(Vec<u8>);
+
+impl SignatureContext {
+    /// RFC 8032 section 5 limits contexts to 255 octets, independently of policy.
+    /// https://www.rfc-editor.org/rfc/rfc8032.html#section-5
+    pub fn new(bytes: &[u8]) -> Result<Self, ParseError> {
+        if bytes.len() > 255 {
+            return Err(ParseError::InvalidStructure(
+                "signature context exceeds 255 octets".into(),
+            ));
+        }
+        Ok(Self(bytes.to_vec()))
+    }
+
+    /// Borrow the domain-separation bytes without copying them at provider boundaries.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
 const MAX_RETRIEVAL_XPATH_TEXT_LEN: usize = 256;
 const MAX_RSA_MODULUS_LEN: usize = 1024;
 const MAX_RSA_EXPONENT_LEN: usize = 8;
@@ -114,11 +138,31 @@ pub enum SignatureAlgorithm {
     EcdsaSha384,
     /// ECDSA with SHA-512; the key selects the elliptic curve.
     EcdsaSha512,
+    /// ECDSA with SHA3-224; the key selects the elliptic curve.
+    EcdsaSha3_224,
+    /// ECDSA with SHA3-256; the key selects the elliptic curve.
+    EcdsaSha3_256,
+    /// ECDSA with SHA3-384; the key selects the elliptic curve.
+    EcdsaSha3_384,
+    /// ECDSA with SHA3-512; the key selects the elliptic curve.
+    EcdsaSha3_512,
+    /// Pure Ed25519 (RFC 8032), without external prehash or context.
+    Ed25519,
+    /// Ed25519 with RFC 8032 domain-separation context, without prehash.
+    Ed25519Ctx,
+    /// Ed25519ph with SHA-512 prehash and RFC 8032 domain separation.
+    Ed25519Ph,
+    /// Pure Ed448 (RFC 8032), with an optional domain-separation context.
+    Ed448,
+    /// Ed448ph with SHAKE256 prehash and RFC 8032 domain separation.
+    Ed448Ph,
+    /// Experimental post-quantum method; compile capability does not grant permission.
+    PostQuantum(super::PqAlgorithm),
 }
 
 impl SignatureAlgorithm {
     /// Every signature algorithm recognized by this release.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 35] = [
         Self::DsaSha1,
         Self::DsaSha256,
         Self::HmacSha1,
@@ -136,7 +180,68 @@ impl SignatureAlgorithm {
         Self::EcdsaSha256,
         Self::EcdsaSha384,
         Self::EcdsaSha512,
+        Self::EcdsaSha3_224,
+        Self::EcdsaSha3_256,
+        Self::EcdsaSha3_384,
+        Self::EcdsaSha3_512,
+        Self::Ed25519,
+        Self::Ed25519Ctx,
+        Self::Ed25519Ph,
+        Self::Ed448,
+        Self::Ed448Ph,
+        Self::PostQuantum(super::PqAlgorithm::MlDsa44),
+        Self::PostQuantum(super::PqAlgorithm::MlDsa65),
+        Self::PostQuantum(super::PqAlgorithm::MlDsa87),
+        Self::PostQuantum(super::PqAlgorithm::SlhDsaSha2_128f),
+        Self::PostQuantum(super::PqAlgorithm::SlhDsaSha2_128s),
+        Self::PostQuantum(super::PqAlgorithm::SlhDsaSha2_192f),
+        Self::PostQuantum(super::PqAlgorithm::SlhDsaSha2_192s),
+        Self::PostQuantum(super::PqAlgorithm::SlhDsaSha2_256f),
+        Self::PostQuantum(super::PqAlgorithm::SlhDsaSha2_256s),
     ];
+
+    /// Digest selected by an ECDSA method, independently of its key's curve.
+    pub(crate) const fn ecdsa_digest(self) -> Option<DigestAlgorithm> {
+        match self {
+            Self::EcdsaSha1 => Some(DigestAlgorithm::Sha1),
+            Self::EcdsaSha224 => Some(DigestAlgorithm::Sha224),
+            Self::EcdsaSha256 => Some(DigestAlgorithm::Sha256),
+            Self::EcdsaSha384 => Some(DigestAlgorithm::Sha384),
+            Self::EcdsaSha512 => Some(DigestAlgorithm::Sha512),
+            Self::EcdsaSha3_224 => Some(DigestAlgorithm::Sha3_224),
+            Self::EcdsaSha3_256 => Some(DigestAlgorithm::Sha3_256),
+            Self::EcdsaSha3_384 => Some(DigestAlgorithm::Sha3_384),
+            Self::EcdsaSha3_512 => Some(DigestAlgorithm::Sha3_512),
+            _ => None,
+        }
+    }
+
+    /// Fixed pure EdDSA signature width from RFC 8032 sections 5.1 and 5.2.
+    pub(crate) const fn eddsa_signature_len(self) -> Option<usize> {
+        match self {
+            Self::Ed25519 | Self::Ed25519Ctx | Self::Ed25519Ph => Some(64),
+            Self::Ed448 | Self::Ed448Ph => Some(114),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn eddsa_key_algorithm(self) -> Option<Self> {
+        match self {
+            Self::Ed25519 | Self::Ed25519Ctx | Self::Ed25519Ph => Some(Self::Ed25519),
+            Self::Ed448 | Self::Ed448Ph => Some(Self::Ed448),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn context_element(self) -> Option<&'static str> {
+        match self {
+            Self::Ed25519Ctx | Self::Ed25519Ph | Self::Ed448 | Self::Ed448Ph => {
+                Some("EdDSAContextString")
+            }
+            Self::PostQuantum(algorithm) => Some(algorithm.context_element()),
+            _ => None,
+        }
+    }
 
     /// Fixed XMLDSig component width for DSA's `r || s` representation.
     pub(crate) const fn dsa_component_len(self) -> Option<usize> {
@@ -181,7 +286,23 @@ impl SignatureAlgorithm {
             "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256" => Some(Self::EcdsaSha256),
             "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384" => Some(Self::EcdsaSha384),
             "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha512" => Some(Self::EcdsaSha512),
-            _ => None,
+            // RFC 9231 section 2.3.6 uses 2021, not the digest method's 2007 namespace:
+            // https://www.rfc-editor.org/rfc/rfc9231.html#section-2.3.6
+            "http://www.w3.org/2021/04/xmldsig-more#ecdsa-sha3-224" => Some(Self::EcdsaSha3_224),
+            "http://www.w3.org/2021/04/xmldsig-more#ecdsa-sha3-256" => Some(Self::EcdsaSha3_256),
+            "http://www.w3.org/2021/04/xmldsig-more#ecdsa-sha3-384" => Some(Self::EcdsaSha3_384),
+            "http://www.w3.org/2021/04/xmldsig-more#ecdsa-sha3-512" => Some(Self::EcdsaSha3_512),
+            // RFC 9231 section 2.3.12: pure EdDSA, not an externally hashed message.
+            // https://www.rfc-editor.org/rfc/rfc9231.html#section-2.3.12
+            "http://www.w3.org/2021/04/xmldsig-more#eddsa-ed25519" => Some(Self::Ed25519),
+            "http://www.w3.org/2021/04/xmldsig-more#eddsa-ed25519ctx" => Some(Self::Ed25519Ctx),
+            "http://www.w3.org/2021/04/xmldsig-more#eddsa-ed25519ph" => Some(Self::Ed25519Ph),
+            "http://www.w3.org/2021/04/xmldsig-more#eddsa-ed448" => Some(Self::Ed448),
+            "http://www.w3.org/2021/04/xmldsig-more#eddsa-ed448ph" => Some(Self::Ed448Ph),
+            _ => super::PqAlgorithm::ALL
+                .into_iter()
+                .find(|algorithm| algorithm.uri() == uri)
+                .map(Self::PostQuantum),
         }
     }
 
@@ -206,6 +327,16 @@ impl SignatureAlgorithm {
             Self::EcdsaSha256 => "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256",
             Self::EcdsaSha384 => "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384",
             Self::EcdsaSha512 => "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha512",
+            Self::EcdsaSha3_224 => "http://www.w3.org/2021/04/xmldsig-more#ecdsa-sha3-224",
+            Self::EcdsaSha3_256 => "http://www.w3.org/2021/04/xmldsig-more#ecdsa-sha3-256",
+            Self::EcdsaSha3_384 => "http://www.w3.org/2021/04/xmldsig-more#ecdsa-sha3-384",
+            Self::EcdsaSha3_512 => "http://www.w3.org/2021/04/xmldsig-more#ecdsa-sha3-512",
+            Self::Ed25519 => "http://www.w3.org/2021/04/xmldsig-more#eddsa-ed25519",
+            Self::Ed25519Ctx => "http://www.w3.org/2021/04/xmldsig-more#eddsa-ed25519ctx",
+            Self::Ed25519Ph => "http://www.w3.org/2021/04/xmldsig-more#eddsa-ed25519ph",
+            Self::Ed448 => "http://www.w3.org/2021/04/xmldsig-more#eddsa-ed448",
+            Self::Ed448Ph => "http://www.w3.org/2021/04/xmldsig-more#eddsa-ed448ph",
+            Self::PostQuantum(algorithm) => algorithm.uri(),
         }
     }
 
@@ -214,7 +345,7 @@ impl SignatureAlgorithm {
     pub fn signing_allowed(self) -> bool {
         !matches!(
             self,
-            Self::RsaSha1 | Self::DsaSha1 | Self::HmacSha1 | Self::EcdsaSha1
+            Self::RsaSha1 | Self::DsaSha1 | Self::HmacSha1 | Self::EcdsaSha1 | Self::PostQuantum(_)
         )
     }
 }
@@ -229,6 +360,8 @@ pub struct SignedInfo {
     pub signature_method: SignatureAlgorithm,
     /// Optional byte-aligned HMAC output length in bits.
     pub hmac_output_length_bits: Option<usize>,
+    /// Domain separation supplied by the selected SignatureMethod extension.
+    pub signature_context: SignatureContext,
     /// One or more `<Reference>` elements.
     pub references: Vec<Reference>,
 }
@@ -538,7 +671,8 @@ pub(crate) fn parse_signed_info_with_xpath_budget(
     let sig_method_node = children.next().ok_or(ParseError::MissingElement {
         element: "SignatureMethod",
     })?;
-    let (signature_method, hmac_output_length_bits) = parse_signature_method(sig_method_node)?;
+    let (signature_method, hmac_output_length_bits, signature_context) =
+        parse_signature_method(sig_method_node)?;
 
     // 3. One or more Reference elements
     let mut references = Vec::new();
@@ -564,6 +698,7 @@ pub(crate) fn parse_signed_info_with_xpath_budget(
         c14n_method,
         signature_method,
         hmac_output_length_bits,
+        signature_context,
         references,
     })
 }
@@ -573,14 +708,23 @@ struct ByteAlignedHmacOutputLength(usize);
 
 pub(crate) fn parse_signature_method(
     node: Node<'_, '_>,
-) -> Result<(SignatureAlgorithm, Option<usize>), ParseError> {
+) -> Result<(SignatureAlgorithm, Option<usize>, SignatureContext), ParseError> {
     verify_ds_element(node, "SignatureMethod")?;
     let uri = required_algorithm_attr(node, "SignatureMethod")?;
     let algorithm =
         SignatureAlgorithm::from_uri(uri).ok_or_else(|| ParseError::UnsupportedAlgorithm {
             uri: uri.to_string(),
         })?;
-    Ok((algorithm, parse_hmac_output_length(node, algorithm)?))
+    ensure_no_non_whitespace_text(node, "SignatureMethod")?;
+    let (hmac, context) = if algorithm.context_element().is_some() {
+        (None, parse_signature_context(node, algorithm)?)
+    } else {
+        (
+            parse_hmac_output_length(node, algorithm)?,
+            SignatureContext::default(),
+        )
+    };
+    Ok((algorithm, hmac, context))
 }
 
 impl ByteAlignedHmacOutputLength {
@@ -636,6 +780,43 @@ fn parse_hmac_output_length(
     Ok(Some(
         ByteAlignedHmacOutputLength::parse(&text, maximum_bits)?.bits(),
     ))
+}
+
+fn parse_signature_context(
+    node: Node<'_, '_>,
+    algorithm: SignatureAlgorithm,
+) -> Result<SignatureContext, ParseError> {
+    let Some(element_name) = algorithm.context_element() else {
+        return Ok(SignatureContext::default());
+    };
+    let mut children = element_children(node);
+    let Some(child) = children.next() else {
+        return Ok(SignatureContext::default());
+    };
+    // RFC 9231 defines method identifiers, not this XML parameter syntax.
+    // This explicit experimental extension matches libxmlsec1 1.3.13.
+    if child.tag_name().namespace() != Some(EXPERIMENTAL_SIGNATURE_NS)
+        || child.tag_name().name() != element_name
+        || children.next().is_some()
+    {
+        return Err(ParseError::InvalidStructure(
+            "SignatureMethod parameters do not match the selected algorithm".into(),
+        ));
+    }
+    // Borrow text and validate widths before allocating. RFC 8032 §5's
+    // 255-octet ceiling implies at most 340 padded Base64 characters:
+    // https://www.rfc-editor.org/rfc/rfc8032.html#section-5
+    let payload = super::whitespace::XmlBase64Payload::bounded(child, 4096, 340)
+        .map_err(|reason| ParseError::InvalidStructure(format!("signature context: {reason}")))?;
+    if payload.decoded_len > 255 {
+        return Err(ParseError::InvalidStructure(
+            "signature context exceeds 255 octets".into(),
+        ));
+    }
+    let bytes = payload
+        .decode()
+        .map_err(|reason| ParseError::InvalidStructure(format!("signature context: {reason}")))?;
+    Ok(SignatureContext(bytes))
 }
 
 /// Parse a single `<ds:Reference>` element.

@@ -65,6 +65,22 @@ const MAX_RETRIEVAL_METHOD_COUNT: usize = 64;
 /// This trait intentionally has no `Send + Sync` supertraits so lightweight
 /// single-threaded verifiers can be used without additional bounds.
 pub trait VerifyingKey {
+    /// Verify with validated domain separation, rejecting unsupported contexts.
+    fn verify_with_context(
+        &self,
+        algorithm: SignatureAlgorithm,
+        context: &super::SignatureContext,
+        data: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, DsigError> {
+        if !context.as_bytes().is_empty() {
+            return Err(super::SignatureVerificationError::UnsupportedAlgorithm {
+                uri: algorithm.uri().to_owned(),
+            }
+            .into());
+        }
+        self.verify(algorithm, data, signature)
+    }
     /// Validate this key against the operation's immutable trust policy.
     ///
     /// Built-in keys override this hook so pre-resolved and resolver-produced
@@ -1660,6 +1676,36 @@ pub fn verify_signature_with_pem_key(
     }
 
     impl VerifyingKey for PemVerifyingKey<'_> {
+        fn verify_with_context(
+            &self,
+            algorithm: SignatureAlgorithm,
+            context: &super::SignatureContext,
+            signed_data: &[u8],
+            signature_value: &[u8],
+        ) -> Result<bool, DsigError> {
+            if context.as_bytes().is_empty() {
+                return self.verify(algorithm, signed_data, signature_value);
+            }
+            if algorithm.context_element().is_none() {
+                return Err(SignatureVerificationError::UnsupportedAlgorithm {
+                    uri: algorithm.uri().to_owned(),
+                }
+                .into());
+            }
+            let (rest, pem) = x509_parser::pem::parse_x509_pem(self.public_key_pem.as_bytes())
+                .map_err(|_| SignatureVerificationError::InvalidKeyPem)?;
+            if !rest.iter().all(|byte| byte.is_ascii_whitespace()) || pem.label != "PUBLIC KEY" {
+                return Err(SignatureVerificationError::InvalidKeyPem.into());
+            }
+            Ok(super::modern::verify_with_context(
+                algorithm,
+                &pem.contents,
+                context,
+                signed_data,
+                signature_value,
+            )?)
+        }
+
         fn verify(
             &self,
             algorithm: SignatureAlgorithm,
@@ -2328,7 +2374,10 @@ fn verify_signature_node<'a>(
         Ok::<_, SignatureVerificationPipelineError>(canonical_signed_info)
     })?;
 
-    let signature_value = decode_signature_value(signature_children.signature_value_node)?;
+    let signature_value = decode_signature_value(
+        signature_children.signature_value_node,
+        signed_info.signature_method,
+    )?;
     if let Some(full_output_bits) = signed_info.signature_method.hmac_output_bits() {
         let expected_bits = signed_info
             .hmac_output_length_bits
@@ -2382,9 +2431,10 @@ fn verify_signature_node<'a>(
             key: verifier,
             policy: &ctx.policy,
         };
-        ctx.provider.verify(
+        ctx.provider.verify_with_context(
             &policy_verifier,
             signed_info.signature_method,
+            &signed_info.signature_context,
             &canonical_signed_info,
             &signature_value,
         )
@@ -2462,6 +2512,20 @@ struct PolicyVerifyingKey<'a> {
 }
 
 impl VerifyingKey for PolicyVerifyingKey<'_> {
+    fn verify_with_context(
+        &self,
+        algorithm: SignatureAlgorithm,
+        context: &super::SignatureContext,
+        data: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, DsigError> {
+        if context.as_bytes().is_empty() {
+            self.verify(algorithm, data, signature)
+        } else {
+            self.key
+                .verify_with_context(algorithm, context, data, signature)
+        }
+    }
     fn validate_policy(&self, policy: &crate::policy::VerificationPolicy) -> Result<(), DsigError> {
         self.key.validate_policy(policy)
     }
@@ -3870,7 +3934,40 @@ pub(super) fn parse_signature_children<'a, 'input>(
 
 fn decode_signature_value(
     signature_value_node: Node<'_, '_>,
+    algorithm: SignatureAlgorithm,
 ) -> Result<Vec<u8>, SignatureVerificationPipelineError> {
+    if matches!(algorithm, SignatureAlgorithm::PostQuantum(_)) {
+        let (maximum, raw_maximum) = signature_value_limits(algorithm);
+        // PQ signatures can be tens of kilobytes: borrow their XML text and
+        // stream directly into the decoded allocation, without a second
+        // full-size normalized Base64 buffer.
+        let payload = super::whitespace::XmlBase64Payload::bounded(
+            signature_value_node,
+            raw_maximum,
+            maximum,
+        )
+        .map_err(
+            |reason| SignatureVerificationPipelineError::InvalidStructure {
+                reason: match reason {
+                    "unexpected nested element" => {
+                        "SignatureValue must not contain element children"
+                    }
+                    "maximum allowed text length" => {
+                        "SignatureValue exceeds maximum allowed text length"
+                    }
+                    "maximum allowed base64 length" => {
+                        "SignatureValue exceeds maximum allowed length"
+                    }
+                    _ => "SignatureValue contains malformed Base64",
+                },
+            },
+        )?;
+        return payload.decode().map_err(|_| {
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "SignatureValue contains malformed Base64",
+            }
+        });
+    }
     if signature_value_node
         .children()
         .any(|child| child.is_element())
@@ -3880,14 +3977,44 @@ fn decode_signature_value(
         });
     }
 
-    let mut normalized = Vec::new();
+    // Count bounded borrowed text first: comments may split a
+    // signature into many tiny text nodes. Reserving per node would repeatedly
+    // copy the accumulated payload; one exact reservation keeps this linear.
+    let (maximum, raw_maximum) = signature_value_limits(algorithm);
+    let mut text_len = 0usize;
+    let mut normalized_len = 0usize;
+    for child in signature_value_node
+        .children()
+        .filter(|child| child.is_text())
+    {
+        if let Some(text) = child.text() {
+            if text.len() > raw_maximum - text_len {
+                return Err(SignatureVerificationPipelineError::InvalidStructure {
+                    reason: "SignatureValue exceeds maximum allowed text length",
+                });
+            }
+            text_len += text.len();
+            for byte in text.bytes() {
+                if matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
+                    continue;
+                }
+                if normalized_len == maximum {
+                    return Err(SignatureVerificationPipelineError::InvalidStructure {
+                        reason: "SignatureValue exceeds maximum allowed length",
+                    });
+                }
+                normalized_len += 1;
+            }
+        }
+    }
+    let mut normalized = Vec::with_capacity(normalized_len);
     let mut raw_text_len = 0usize;
     for child in signature_value_node
         .children()
         .filter(|child| child.is_text())
     {
         if let Some(text) = child.text() {
-            push_normalized_signature_text(text, &mut raw_text_len, &mut normalized)?;
+            push_normalized_signature_text(text, &mut raw_text_len, &mut normalized, algorithm)?;
         }
     }
 
@@ -3898,13 +4025,24 @@ fn push_normalized_signature_text(
     text: &str,
     raw_text_len: &mut usize,
     normalized: &mut Vec<u8>,
+    algorithm: SignatureAlgorithm,
 ) -> Result<(), SignatureVerificationPipelineError> {
-    if raw_text_len.saturating_add(text.len()) > MAX_SIGNATURE_VALUE_TEXT_LEN {
+    let (maximum, raw_maximum) = signature_value_limits(algorithm);
+    if text.len() > raw_maximum - *raw_text_len {
         return Err(SignatureVerificationPipelineError::InvalidStructure {
             reason: "SignatureValue exceeds maximum allowed text length",
         });
     }
-    *raw_text_len = raw_text_len.saturating_add(text.len());
+    *raw_text_len += text.len();
+    let additional = text
+        .bytes()
+        .filter(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        .count();
+    if additional > maximum - normalized.len() {
+        return Err(SignatureVerificationPipelineError::InvalidStructure {
+            reason: "SignatureValue exceeds maximum allowed length",
+        });
+    }
 
     normalize_xml_base64_bytes(text.as_bytes(), normalized, |_| true).map_err(|err| {
         SignatureVerificationPipelineError::SignatureValueBase64(base64::DecodeError::InvalidByte(
@@ -3912,13 +4050,23 @@ fn push_normalized_signature_text(
             err.invalid_byte,
         ))
     })?;
-    if normalized.len() > MAX_SIGNATURE_VALUE_LEN {
-        return Err(SignatureVerificationPipelineError::InvalidStructure {
-            reason: "SignatureValue exceeds maximum allowed length",
-        });
-    }
 
     Ok(())
+}
+
+fn signature_value_limits(algorithm: SignatureAlgorithm) -> (usize, usize) {
+    // FIPS 205 table 2 includes signatures up to 49,856 octets. The old
+    // RSA-oriented encoded-text ceiling is not their wire contract.
+    // https://doi.org/10.6028/NIST.FIPS.205
+    // Keep the existing whitespace allowance, but bound PQ payload by its
+    // exact parameter-set width before normalization grows its allocation.
+    match algorithm {
+        SignatureAlgorithm::PostQuantum(parameter) => {
+            let encoded = parameter.signature_len().div_ceil(3) * 4;
+            (encoded, MAX_SIGNATURE_VALUE_TEXT_LEN + encoded)
+        }
+        _ => (MAX_SIGNATURE_VALUE_LEN, MAX_SIGNATURE_VALUE_TEXT_LEN),
+    }
 }
 
 fn verify_with_algorithm(
@@ -3928,6 +4076,24 @@ fn verify_with_algorithm(
     signature_value: &[u8],
 ) -> Result<bool, SignatureVerificationPipelineError> {
     match algorithm {
+        SignatureAlgorithm::Ed25519
+        | SignatureAlgorithm::Ed25519Ctx
+        | SignatureAlgorithm::Ed25519Ph
+        | SignatureAlgorithm::Ed448
+        | SignatureAlgorithm::Ed448Ph
+        | SignatureAlgorithm::PostQuantum(_) => {
+            let (rest, pem) = x509_parser::pem::parse_x509_pem(public_key_pem.as_bytes())
+                .map_err(|_| SignatureVerificationError::InvalidKeyPem)?;
+            if !rest.iter().all(|byte| byte.is_ascii_whitespace()) || pem.label != "PUBLIC KEY" {
+                return Err(SignatureVerificationError::InvalidKeyPem.into());
+            }
+            Ok(super::modern::verify(
+                algorithm,
+                &pem.contents,
+                signed_data,
+                signature_value,
+            )?)
+        }
         SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => {
             let (rest, pem) = x509_parser::pem::parse_x509_pem(public_key_pem.as_bytes())
                 .map_err(|_| SignatureVerificationError::InvalidKeyPem)?;
@@ -3963,7 +4129,11 @@ fn verify_with_algorithm(
         | SignatureAlgorithm::EcdsaSha224
         | SignatureAlgorithm::EcdsaSha256
         | SignatureAlgorithm::EcdsaSha384
-        | SignatureAlgorithm::EcdsaSha512 => {
+        | SignatureAlgorithm::EcdsaSha512
+        | SignatureAlgorithm::EcdsaSha3_224
+        | SignatureAlgorithm::EcdsaSha3_256
+        | SignatureAlgorithm::EcdsaSha3_384
+        | SignatureAlgorithm::EcdsaSha3_512 => {
             // Malformed ECDSA signature bytes are treated as a verification miss
             // (Ok(false)) instead of a pipeline error; only key/algorithm and
             // crypto-operation failures propagate as Err.
@@ -8376,12 +8546,45 @@ mod tests {
     }
 
     #[test]
+    fn fragmented_pq_signature_value_decodes_at_exact_wire_limit() {
+        // Comments split the largest supported signature into tiny text nodes;
+        // decoding must preserve bytes and reject an oversized aggregate.
+        let parameter = super::super::pq_algorithm::PqAlgorithm::SlhDsaSha2_256f;
+        let bytes = vec![0x5a; parameter.signature_len()];
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let mut xml = String::from("<SignatureValue>");
+        for chunk in encoded.as_bytes().chunks(4) {
+            xml.push_str(std::str::from_utf8(chunk).unwrap());
+            xml.push_str("<!--split-->\n");
+        }
+        xml.push_str("</SignatureValue>");
+        let document = Document::parse(&xml).unwrap();
+        let algorithm = SignatureAlgorithm::PostQuantum(parameter);
+        assert_eq!(
+            decode_signature_value(document.root_element(), algorithm).unwrap(),
+            bytes
+        );
+        let oversized = xml.replace("</SignatureValue>", "AAAA</SignatureValue>");
+        let document = Document::parse(&oversized).unwrap();
+        assert!(matches!(
+            decode_signature_value(document.root_element(), algorithm),
+            Err(SignatureVerificationPipelineError::InvalidStructure {
+                reason: "SignatureValue exceeds maximum allowed length"
+            })
+        ));
+    }
+
+    #[test]
     fn push_normalized_signature_text_rejects_form_feed() {
         let mut normalized = Vec::new();
         let mut raw_text_len = 0usize;
-        let err =
-            push_normalized_signature_text("ab\u{000C}cd", &mut raw_text_len, &mut normalized)
-                .expect_err("form-feed must not be treated as XML base64 whitespace");
+        let err = push_normalized_signature_text(
+            "ab\u{000C}cd",
+            &mut raw_text_len,
+            &mut normalized,
+            SignatureAlgorithm::RsaSha256,
+        )
+        .expect_err("form-feed must not be treated as XML base64 whitespace");
         assert!(matches!(
             err,
             SignatureVerificationPipelineError::SignatureValueBase64(
@@ -8394,8 +8597,13 @@ mod tests {
     fn push_normalized_signature_text_enforces_byte_limit_for_multibyte_chars() {
         let mut normalized = vec![b'A'; MAX_SIGNATURE_VALUE_LEN - 1];
         let mut raw_text_len = normalized.len();
-        let err = push_normalized_signature_text("é", &mut raw_text_len, &mut normalized)
-            .expect_err("multibyte characters must not bypass byte-size limit");
+        let err = push_normalized_signature_text(
+            "é",
+            &mut raw_text_len,
+            &mut normalized,
+            SignatureAlgorithm::RsaSha256,
+        )
+        .expect_err("multibyte characters must not bypass byte-size limit");
         assert!(matches!(
             err,
             SignatureVerificationPipelineError::InvalidStructure {

@@ -55,6 +55,13 @@
 pub mod builder;
 pub mod digest;
 pub mod keys;
+mod modern;
+#[cfg(feature = "experimental-pq")]
+pub(crate) mod post_quantum;
+mod pq_algorithm;
+#[cfg(feature = "experimental-pq")]
+pub use post_quantum::PostQuantumSigningKey;
+pub use pq_algorithm::PqAlgorithm;
 pub mod mutation;
 pub mod parse;
 pub mod sign;
@@ -74,10 +81,11 @@ pub use keys::{
     DefaultKeyResolver, HmacSha1VerificationKey, HmacVerificationKey, InspectedKeyCandidateBudget,
     KeyResolutionError, KeyResolverConfig, VerificationKey,
 };
+pub use modern::EdDsaSigningKey;
 pub use parse::{
     KeyInfo, KeyInfoSource, KeyValueInfo, ParseError, Reference, RetrievalMethodTransforms,
-    SignatureAlgorithm, SignedInfo, X509DataInfo, find_signature_node, parse_key_info,
-    parse_reference, parse_signed_info, x509_certificate_matches_selectors,
+    SignatureAlgorithm, SignatureContext, SignedInfo, X509DataInfo, find_signature_node,
+    parse_key_info, parse_reference, parse_signed_info, x509_certificate_matches_selectors,
 };
 pub use sign::{
     ComputedReferenceDigest, DerEncodedKeyValueInfoWriter, DsaSigningKey, EcdsaP256SigningKey,

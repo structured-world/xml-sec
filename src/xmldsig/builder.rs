@@ -22,8 +22,8 @@ use super::transforms::{
 };
 use super::uri::validate_signing_reference_uri;
 use super::{
-    BASE64_TRANSFORM_URI, DigestAlgorithm, ENVELOPED_SIGNATURE_URI, SignatureAlgorithm, Transform,
-    XPATH_FILTER2_TRANSFORM_URI, XPATH_TRANSFORM_URI, XPathExpression,
+    BASE64_TRANSFORM_URI, DigestAlgorithm, ENVELOPED_SIGNATURE_URI, SignatureAlgorithm,
+    SignatureContext, Transform, XPATH_FILTER2_TRANSFORM_URI, XPATH_TRANSFORM_URI, XPathExpression,
 };
 
 const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
@@ -63,6 +63,9 @@ pub enum SignatureBuilderError {
     /// The selected algorithm is disabled by the immutable signing policy.
     #[error("algorithm is not allowed for signing: {0}")]
     SigningAlgorithmDisabled(&'static str),
+    /// The selected signature method cannot carry a cryptographic context.
+    #[error("signature context is not applicable to algorithm: {0}")]
+    SignatureContextNotApplicable(&'static str),
     /// The XML writer failed.
     #[error("XML serialization error: {0}")]
     Serialization(#[from] std::io::Error),
@@ -143,6 +146,7 @@ impl ReferenceBuilder {
 pub struct SignatureBuilder {
     c14n_method: C14nAlgorithm,
     sign_method: SignatureAlgorithm,
+    signature_context: SignatureContext,
     ns_prefix: Option<String>,
     signature_id: Option<String>,
     references: Vec<ReferenceBuilder>,
@@ -156,6 +160,7 @@ impl SignatureBuilder {
         Self {
             c14n_method,
             sign_method,
+            signature_context: SignatureContext::default(),
             ns_prefix: None,
             signature_id: None,
             references: Vec::new(),
@@ -174,6 +179,14 @@ impl SignatureBuilder {
     #[must_use]
     pub fn signature_id(mut self, id: impl Into<String>) -> Self {
         self.signature_id = Some(id.into());
+        self
+    }
+
+    /// Set the authenticated cryptographic context for a context-capable method.
+    /// Nonempty contexts on other methods are rejected, never silently ignored.
+    #[must_use]
+    pub fn signature_context(mut self, context: SignatureContext) -> Self {
+        self.signature_context = context;
         self
     }
 
@@ -256,12 +269,35 @@ impl SignatureBuilder {
             "CanonicalizationMethod",
             self.c14n_method.uri(),
         )?;
-        write_algorithm(
-            &mut writer,
-            prefix,
-            "SignatureMethod",
-            self.sign_method.uri(),
-        )?;
+        if self.signature_context.as_bytes().is_empty() {
+            write_algorithm(
+                &mut writer,
+                prefix,
+                "SignatureMethod",
+                self.sign_method.uri(),
+            )?;
+        } else {
+            let method_name = qualified_name(prefix, "SignatureMethod");
+            writer.start(&method_name, [("Algorithm", self.sign_method.uri())])?;
+            // RFC 8032 §5 defines the octet context; this XML parameter is an
+            // explicit libxmlsec1 extension, not part of RFC 9231's URI contract.
+            // https://www.rfc-editor.org/rfc/rfc8032.html#section-5
+            // Use a local default namespace to avoid collisions with caller prefixes.
+            let context_name = self.sign_method.context_element().ok_or(
+                SignatureBuilderError::SignatureContextNotApplicable(self.sign_method.uri()),
+            )?;
+            writer.start(
+                context_name,
+                [("xmlns", super::parse::EXPERIMENTAL_SIGNATURE_NS)],
+            )?;
+            let mut encoded = [0_u8; 340];
+            let length = base64::engine::general_purpose::STANDARD
+                .encode_slice(self.signature_context.as_bytes(), &mut encoded)
+                .map_err(std::io::Error::other)?;
+            writer.text(std::str::from_utf8(&encoded[..length]).map_err(std::io::Error::other)?)?;
+            writer.end(context_name)?;
+            writer.end(&method_name)?;
+        }
         for reference in &self.references {
             write_reference(&mut writer, prefix, reference)?;
         }
@@ -376,6 +412,13 @@ impl SignatureBuilder {
         policy: &SigningPolicy,
         xpath_signature_budget: &mut XPathSignatureParseBudget,
     ) -> Result<(), SignatureBuilderError> {
+        if !self.signature_context.as_bytes().is_empty()
+            && self.sign_method.context_element().is_none()
+        {
+            return Err(SignatureBuilderError::SignatureContextNotApplicable(
+                self.sign_method.uri(),
+            ));
+        }
         if let Some(prefix) = &self.ns_prefix
             && !is_namespace_prefix(prefix)
         {

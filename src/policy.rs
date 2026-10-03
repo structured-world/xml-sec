@@ -1100,6 +1100,17 @@ impl VerificationPolicy {
         &self,
         algorithm: SignatureAlgorithm,
     ) -> Result<(), PolicyViolation> {
+        if matches!(algorithm, SignatureAlgorithm::PostQuantum(_))
+            && !self
+                .signature_algorithms
+                .as_ref()
+                .is_some_and(|allowed| allowed.contains(&algorithm))
+        {
+            return Err(PolicyViolation::Algorithm {
+                operation: "verification",
+                algorithm: algorithm.uri().to_owned(),
+            });
+        }
         if matches!(
             algorithm,
             SignatureAlgorithm::RsaSha1

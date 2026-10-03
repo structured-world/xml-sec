@@ -45,6 +45,13 @@ pub mod document;
 pub mod encoding;
 pub mod error;
 mod hard_limits;
+// Checksum-pinned RustCrypto ML-DSA with checked expanded-key import. Keep it
+// inside the published package: Cargo patches do not propagate to consumers.
+#[cfg(feature = "experimental-pq")]
+#[allow(dead_code, unused_imports, missing_docs)]
+#[cfg_attr(test, allow(clippy::unwrap_used, deprecated))]
+#[path = "rustcrypto_ml_dsa/lib.rs"]
+mod rustcrypto_ml_dsa;
 #[cfg(feature = "xmldsig")]
 // The same sources also build as standalone crates for the XSLT workspace member.
 // Only their XPath-facing surface is used by this package.

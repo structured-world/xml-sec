@@ -1015,6 +1015,19 @@ impl KeyInventory {
             preflight_dsa_pkcs8_components(&info)?;
         }
         let key: Box<dyn SigningKey> = match algorithm {
+            #[cfg(feature = "experimental-pq")]
+            SignatureAlgorithm::PostQuantum(parameter) => Box::new(
+                crate::xmldsig::PostQuantumSigningKey::from_pkcs8_der(parameter, der)
+                    .map_err(|_| KeyStoreError::Selection("incompatible PQ signing key"))?,
+            ),
+            SignatureAlgorithm::Ed25519
+            | SignatureAlgorithm::Ed25519Ctx
+            | SignatureAlgorithm::Ed25519Ph
+            | SignatureAlgorithm::Ed448
+            | SignatureAlgorithm::Ed448Ph => Box::new(
+                crate::xmldsig::EdDsaSigningKey::from_pkcs8_der(algorithm, der)
+                    .map_err(|_| KeyStoreError::Selection("incompatible EdDSA signing key"))?,
+            ),
             SignatureAlgorithm::RsaSha1
             | SignatureAlgorithm::RsaSha224
             | SignatureAlgorithm::RsaSha256
@@ -1031,7 +1044,11 @@ impl KeyInventory {
             | SignatureAlgorithm::EcdsaSha224
             | SignatureAlgorithm::EcdsaSha256
             | SignatureAlgorithm::EcdsaSha384
-            | SignatureAlgorithm::EcdsaSha512 => {
+            | SignatureAlgorithm::EcdsaSha512
+            | SignatureAlgorithm::EcdsaSha3_224
+            | SignatureAlgorithm::EcdsaSha3_256
+            | SignatureAlgorithm::EcdsaSha3_384
+            | SignatureAlgorithm::EcdsaSha3_512 => {
                 if let Ok(key) = EcdsaP256SigningKey::from_pkcs8_der(der) {
                     Box::new(key)
                 } else if let Ok(key) = EcdsaP384SigningKey::from_pkcs8_der(der) {
@@ -2334,6 +2351,13 @@ fn named_material_length(
 
 // Public identity stays borrowed (RSA), native (DSA), or stack-sized (EC).
 // Import validation must not serialize an unaccounted SPKI beside live input.
+#[cfg_attr(
+    feature = "experimental-pq",
+    expect(
+        clippy::large_enum_variant,
+        reason = "A transient, wire-bounded 2592-byte public key avoids a heap allocation during identity comparison"
+    )
+)]
 enum PrivateKeyIdentity<'a> {
     Rsa(rsa::pkcs1::RsaPrivateKey<'a>),
     Dsa {
@@ -2345,12 +2369,60 @@ enum PrivateKeyIdentity<'a> {
         point: [u8; 133],
         length: usize,
     },
+    EdDsa {
+        algorithm: rsa::pkcs8::AlgorithmIdentifierRef<'a>,
+        public: [u8; 57],
+        length: usize,
+    },
+    #[cfg(feature = "experimental-pq")]
+    PostQuantum {
+        algorithm: rsa::pkcs8::AlgorithmIdentifierRef<'a>,
+        public: [u8; 2592],
+        length: usize,
+    },
 }
 
 impl<'a> PrivateKeyIdentity<'a> {
     fn decode(der: &'a [u8]) -> Result<Self, KeyStoreError> {
         let info = PrivateKeyInfoRef::try_from(der)
             .map_err(|_| KeyStoreError::Selection("unsupported PKCS#12 private key"))?;
+        #[cfg(feature = "experimental-pq")]
+        if let Some(parameter) = crate::xmldsig::PqAlgorithm::from_oid(info.algorithm.oid) {
+            let key = crate::xmldsig::PostQuantumSigningKey::from_pkcs8_der(parameter, der)
+                .map_err(|_| KeyStoreError::Selection("invalid PQ private key"))?;
+            // RFC 9881 section 4 / RFC 9909 section 5: identity is the raw
+            // public bytes, not a separately allocated ASN.1 serialization.
+            let mut public = [0; 2592];
+            let length = key.copy_public(&mut public);
+            return Ok(Self::PostQuantum {
+                algorithm: info.algorithm,
+                public,
+                length,
+            });
+        }
+        // RFC 8410 sections 3 and 7 require absent parameters and a nested
+        // octet string: https://www.rfc-editor.org/rfc/rfc8410.html#section-7
+        // Primitive decoding validates that contract before deriving identity.
+        if info.algorithm.oid == der::asn1::ObjectIdentifier::new_unwrap("1.3.101.112") {
+            let key = ed25519_dalek::SigningKey::from_pkcs8_der(der)
+                .map_err(|_| KeyStoreError::Selection("invalid Ed25519 private key"))?;
+            let mut public = [0; 57];
+            public[..32].copy_from_slice(&key.verifying_key().to_bytes());
+            return Ok(Self::EdDsa {
+                algorithm: info.algorithm,
+                public,
+                length: 32,
+            });
+        }
+        if info.algorithm.oid == der::asn1::ObjectIdentifier::new_unwrap("1.3.101.113") {
+            let key = ed448_goldilocks::SigningKey::from_pkcs8_der(der)
+                .map_err(|_| KeyStoreError::Selection("invalid Ed448 private key"))?;
+            return Ok(Self::EdDsa {
+                algorithm: info.algorithm,
+                public: key.verifying_key().to_bytes(),
+                length: 57,
+            });
+        }
         if info.algorithm.oid == rsa::pkcs1::ALGORITHM_OID {
             preflight_rsa_pkcs1_components(info.private_key.as_bytes())?;
             RsaPrivateKey::from_pkcs8_der(der)
@@ -2397,6 +2469,17 @@ impl<'a> PrivateKeyIdentity<'a> {
             return false;
         };
         match self {
+            #[cfg(feature = "experimental-pq")]
+            Self::PostQuantum {
+                algorithm,
+                public,
+                length,
+            } => spki.algorithm == *algorithm && bytes == &public[..*length],
+            Self::EdDsa {
+                algorithm,
+                public,
+                length,
+            } => spki.algorithm == *algorithm && bytes == &public[..*length],
             Self::Rsa(key) => {
                 if spki.algorithm != rsa::pkcs1::ALGORITHM_ID {
                     return false;
@@ -6174,18 +6257,48 @@ mod tests {
     }
 
     #[test]
+    fn eddsa_private_identity_matches_only_its_corresponding_spki() {
+        use pkcs8::{EncodePrivateKey, EncodePublicKey};
+        // PKCS#12 leaf selection must bind exact algorithm and public bytes,
+        // without retaining or allocating a second serialized public key.
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        let der = key.to_pkcs8_der().expect("Ed25519 private encoding");
+        let public = key
+            .verifying_key()
+            .to_public_key_der()
+            .expect("Ed25519 public encoding");
+        let identity = PrivateKeyIdentity::decode(der.as_bytes()).expect("Ed25519 identity");
+        assert!(identity.matches_spki(public.as_bytes()));
+        let wrong = ed25519_dalek::SigningKey::from_bytes(&[0x43; 32])
+            .verifying_key()
+            .to_public_key_der()
+            .expect("different Ed25519 public encoding");
+        assert!(!identity.matches_spki(wrong.as_bytes()));
+        let key = ed448_goldilocks::SigningKey::try_from(&[0x42; 57][..]).expect("Ed448 seed");
+        let der = key.to_pkcs8_der().expect("Ed448 private encoding");
+        let public = key
+            .verifying_key()
+            .to_public_key_der()
+            .expect("Ed448 public encoding");
+        let identity = PrivateKeyIdentity::decode(der.as_bytes()).expect("Ed448 identity");
+        assert!(identity.matches_spki(public.as_bytes()));
+        assert!(!identity.matches_spki(wrong.as_bytes()));
+    }
+
+    #[test]
     fn unsupported_spki_is_rejected_at_import() {
-        // A syntactically valid Ed25519 SPKI must not acquire VERIFY usage.
-        let mut ed25519_spki = vec![
-            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+        // A syntactically valid X25519 agreement key is not an Ed25519
+        // signing key and must not acquire VERIFY usage (RFC 8410 section 5).
+        let mut agreement_spki = vec![
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e, 0x03, 0x21, 0x00,
         ];
-        ed25519_spki.extend_from_slice(&[1; 32]);
+        agreement_spki.extend_from_slice(&[1; 32]);
         let mut inventory = KeyInventory::default();
         assert!(
             inventory
                 .add_public_der(
                     "unsupported".into(),
-                    ed25519_spki,
+                    agreement_spki,
                     &ResourcePolicy::default()
                 )
                 .is_err()
@@ -6976,23 +7089,25 @@ mod tests {
     }
 
     #[test]
-    fn public_certificate_import_rejects_unsupported_key_family() {
-        // A syntactically valid certificate cannot advertise verification when
-        // none of the supported XMLDSig verifiers can consume its public key.
+    fn public_certificate_import_accepts_supported_ed25519_key() {
+        // Ed25519 can now acquire verification usage, but importing a
+        // certificate still does not promote it into the trusted anchor set.
         let pair =
             rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("Ed25519 key generation");
         let params = rcgen::CertificateParams::new(vec!["example.test".into()])
             .expect("certificate parameters");
         let certificate = params.self_signed(&pair).expect("certificate generation");
+        let mut inventory = KeyInventory::default();
         assert!(
-            KeyInventory::default()
+            inventory
                 .add_public_der(
-                    "unsupported".into(),
+                    "ed25519".into(),
                     certificate.der().to_vec(),
                     &ResourcePolicy::default()
                 )
-                .is_err()
+                .is_ok()
         );
+        assert!(inventory.trusted_certificates.is_empty());
     }
 
     #[cfg(feature = "xmlenc")]

@@ -101,6 +101,21 @@ leaf and CA at a fixed modern verification time without modifying donor data.
 
 ## Test Contract
 
+### Modern key fixtures
+
+`keys/eddsa`, `keys/ml-dsa`, and `keys/slh-dsa` preserve the complete donor key
+directories from the pinned snapshot. They include plaintext and protected
+PKCS#8, public keys, certificates, and PKCS#12 containers. The modern-algorithm
+integration tests compare imported PQ private-key identities against the
+certificate SPKIs and run signing/verification with explicit experimental
+policy permission. The donor PQ certificates have RSA issuer signatures;
+they must not be mistaken for independently generated PQ-signed certificates.
+PKIX provider tests separately exercise the mandated empty signature context,
+changed signed bytes, and truncated signatures. Container tests cover plain
+PEM/DER, encrypted PKCS#8 PEM/DER, and standard/Windows PKCS#12 for both EdDSA
+key sizes and every imported PQ parameter set. Wrong passwords must fail
+without installing partial private or public keys.
+
 Merlin `.tmpl` files are byte-preserved donor templates whose relative URIs are
 interpreted from the upstream xmlsec runner working directory. Their paths are
 not rewritten to the repository fixture layout. The corresponding signed `.xml`
