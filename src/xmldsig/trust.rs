@@ -114,6 +114,20 @@ impl TrustedPublicKey {
 }
 
 impl VerifyingKey for TrustedPublicKey {
+    fn verification_spki(&self, algorithm: SignatureAlgorithm) -> Result<Option<&[u8]>, DsigError> {
+        self.key.verification_spki(algorithm)
+    }
+
+    fn ecdsa_encoding(&self) -> crate::policy::EcdsaSignatureValueEncoding {
+        self.key.ecdsa_encoding()
+    }
+
+    fn verify_candidate_keys(
+        &self,
+        verify: &mut dyn FnMut(&dyn VerifyingKey) -> Result<bool, DsigError>,
+    ) -> Result<Option<bool>, DsigError> {
+        self.key.verify_candidate_keys(verify)
+    }
     fn verify_with_context(
         &self,
         algorithm: SignatureAlgorithm,

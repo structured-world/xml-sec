@@ -981,9 +981,18 @@ impl<'a> KeyInfoParsingSession<'a> {
 
     /// Parse another element without resetting this operation's allowance.
     pub fn parse(&mut self, node: Node) -> Result<KeyInfo, ParseError> {
+        self.parse_with_provider(node, crate::provider::default_provider())
+    }
+
+    /// Parse with the operation's explicit crypto engine and existing allowance.
+    pub fn parse_with_provider(
+        &mut self,
+        node: Node,
+        provider: &dyn crate::provider::CryptoProvider,
+    ) -> Result<KeyInfo, ParseError> {
         parse_key_info_in_session(
             node,
-            crate::provider::default_provider(),
+            provider,
             &self.xml_base,
             self.resources,
             None,

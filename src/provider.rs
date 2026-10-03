@@ -5,6 +5,13 @@
 //! operation-specific handles; this provider owns primitive dispatch and
 //! randomness.
 
+#[cfg(feature = "aws-lc-fips")]
+mod aws_lc;
+#[cfg(all(feature = "aws-lc-fips", feature = "xmlenc"))]
+pub use aws_lc::AwsLcRsaPrivateKey;
+#[cfg(feature = "aws-lc-fips")]
+pub use aws_lc::{AwsLcFipsProvider, AwsLcSigningKey};
+
 #[cfg(feature = "xmlenc")]
 use std::borrow::Cow;
 
@@ -370,6 +377,14 @@ pub trait KeyTransportKey: Send + Sync {
 /// public metadata required to reject malformed RSA inputs before dispatch.
 #[cfg(feature = "xmlenc")]
 pub trait KeyRecoveryKey: Send + Sync {
+    /// Native engine binding; an incompatible provider must reject this handle.
+    fn provider_name(&self) -> Option<&'static str> {
+        None
+    }
+    /// Borrow the matching public SPKI when available for certificate binding.
+    fn public_spki(&self) -> Option<&[u8]> {
+        None
+    }
     /// Exact mathematical bit length of the recovery key's public modulus,
     /// excluding leading zero padding. Not the rounded ciphertext width.
     fn rsa_modulus_bits(&self) -> usize;
@@ -401,6 +416,33 @@ pub trait KeyAgreementKey: Send + Sync {
 pub trait CryptoProvider: Send + Sync {
     /// Stable provider name for diagnostics and capability reporting.
     fn name(&self) -> &'static str;
+
+    /// Import original PKCS#8 input into this engine without exporting another
+    /// provider's private handle. Policy and input budgets are enforced by the caller.
+    #[cfg(feature = "xmldsig")]
+    fn import_signing_key(
+        &self,
+        algorithm: crate::xmldsig::SignatureAlgorithm,
+        _pkcs8: &[u8],
+    ) -> Result<Box<dyn crate::xmldsig::SigningKey>, crate::xmldsig::SigningKeyError> {
+        Err(ProviderError::Unsupported {
+            operation: ProviderOperation::Sign,
+            algorithm: Some(algorithm.uri().into()),
+        }
+        .into())
+    }
+
+    /// Import original PKCS#8 input into a provider-owned RSA recovery handle.
+    #[cfg(feature = "xmlenc")]
+    fn import_recovery_key(
+        &self,
+        _pkcs8: &[u8],
+    ) -> Result<std::sync::Arc<dyn KeyRecoveryKey>, ProviderError> {
+        Err(ProviderError::Unsupported {
+            operation: ProviderOperation::KeyRecovery,
+            algorithm: None,
+        })
+    }
 
     /// Return whether this build can dispatch the requested capability.
     ///
@@ -794,6 +836,64 @@ impl TryCryptoRng for ProviderRng<'_> {}
 impl CryptoProvider for RustCryptoProvider {
     fn name(&self) -> &'static str {
         "rustcrypto"
+    }
+
+    #[cfg(feature = "xmlenc")]
+    fn import_recovery_key(
+        &self,
+        pkcs8: &[u8],
+    ) -> Result<std::sync::Arc<dyn KeyRecoveryKey>, ProviderError> {
+        use rsa::pkcs8::DecodePrivateKey as _;
+        let key = rsa::RsaPrivateKey::from_pkcs8_der(pkcs8).map_err(|_| {
+            ProviderError::InvalidInput(ProviderInputError::PrimitiveInitialization(
+                "RSA recovery key",
+            ))
+        })?;
+        Ok(std::sync::Arc::new(RustCryptoRsaPrivateKey::new(key)))
+    }
+
+    #[cfg(feature = "xmldsig")]
+    fn import_signing_key(
+        &self,
+        algorithm: crate::xmldsig::SignatureAlgorithm,
+        der: &[u8],
+    ) -> Result<Box<dyn crate::xmldsig::SigningKey>, crate::xmldsig::SigningKeyError> {
+        use crate::xmldsig::{SignatureAlgorithm as A, *};
+        Ok(match algorithm {
+            #[cfg(feature = "experimental-pq")]
+            A::PostQuantum(parameter) => {
+                Box::new(PostQuantumSigningKey::from_pkcs8_der(parameter, der)?)
+            }
+            A::Ed25519 | A::Ed25519Ctx | A::Ed25519Ph | A::Ed448 | A::Ed448Ph => {
+                Box::new(EdDsaSigningKey::from_pkcs8_der(algorithm, der)?)
+            }
+            A::RsaSha1 | A::RsaSha224 | A::RsaSha256 | A::RsaSha384 | A::RsaSha512 => {
+                Box::new(RsaSigningKey::from_pkcs8_der(der)?)
+            }
+            A::DsaSha1 | A::DsaSha256 => Box::new(DsaSigningKey::from_pkcs8_der(der)?),
+            A::EcdsaSha1
+            | A::EcdsaSha224
+            | A::EcdsaSha256
+            | A::EcdsaSha384
+            | A::EcdsaSha512
+            | A::EcdsaSha3_224
+            | A::EcdsaSha3_256
+            | A::EcdsaSha3_384
+            | A::EcdsaSha3_512 => {
+                if let Ok(key) = EcdsaP256SigningKey::from_pkcs8_der(der) {
+                    Box::new(key)
+                } else if let Ok(key) = EcdsaP384SigningKey::from_pkcs8_der(der) {
+                    Box::new(key)
+                } else {
+                    Box::new(EcdsaP521SigningKey::from_pkcs8_der(der)?)
+                }
+            }
+            _ => {
+                return Err(SigningKeyError::UnsupportedAlgorithm {
+                    uri: algorithm.uri().into(),
+                });
+            }
+        })
     }
 
     fn supports(&self, capability: ProviderCapability<'_>) -> bool {

@@ -64,7 +64,7 @@ UTF-8 inputs likewise require an absent declaration or a case-insensitive
 `UTF-8`/`UTF8` declaration; labels for a different byte encoding are rejected before
 the document reaches signing, verification, or encryption processing.
 `--print-crypto-library-errors` is accepted for donor argv compatibility. The
-fixed RustCrypto provider has no process-global OpenSSL error queue, so the flag
+provider adapters expose no process-global OpenSSL error queue, so the flag
 does not add a second diagnostic stream beyond the operation error already
 reported by the CLI.
 `--verbose` is likewise accepted so unmodified donor runners can invoke the
@@ -82,8 +82,11 @@ backend is preserved through metadata discovery, recursive external XML,
 transforms, mutation validation, and the complete operation pipeline. A thin
 binary rejects an implementation that was not compiled; no parser fallback is
 performed. Crypto backend selection is equally strict: `--crypto rustcrypto` and
-`--crypto default` select the built-in provider; other backend names do not
-fall back to RustCrypto. The upstream runners pass `--crypto-config` for every
+`--crypto default` select the built-in provider. Builds with `aws-lc-fips` also
+accept `--crypto aws-lc-fips`; unsupported or uncompiled engines never fall back
+to RustCrypto. `list-*` and `check-*` filter cryptographic mechanisms by the
+selected engine's capabilities, independently of policy permission. See
+[provider mechanisms and FIPS boundaries](crypto-providers.md). The upstream runners pass `--crypto-config` for every
 backend. RustCrypto accepts an absent or empty configuration directory because
 it has no external backend configuration; a non-empty path is rejected rather
 than ignored.

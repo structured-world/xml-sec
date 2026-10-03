@@ -515,6 +515,10 @@ fn validate_signature_output(expected: usize, signature: &[u8]) -> Result<(), Si
 
 /// Private key abstraction used by [`SignContext`].
 pub trait SigningKey {
+    /// Native engine binding, if this handle must not run under another provider.
+    fn provider_name(&self) -> Option<&'static str> {
+        None
+    }
     /// Primitive hook preserving validated SignatureMethod context.
     fn sign_with_provider_context(
         &self,

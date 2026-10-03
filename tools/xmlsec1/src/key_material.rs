@@ -29,8 +29,7 @@ use xml_sec::xmldsig::{
     DsaSigningKey, DsigError, EcdsaP256SigningKey, EcdsaP384SigningKey, EcdsaP521SigningKey,
     KeyInfo, ReferenceProcessingError, RsaSigningKey, SignatureAlgorithm, SigningKey,
     VerificationKey, find_signature_node, materialize_signing_key_info_references,
-    materialize_verification_key_info_references, parse_key_info, parse_signed_info,
-    uri::UriReferenceResolver,
+    materialize_verification_key_info_references, parse_signed_info, uri::UriReferenceResolver,
 };
 use xml_sec::{
     XmlDomDocument as Document, XmlDomNode as Node, XmlDomParsingOptions as ParsingOptions,
@@ -165,6 +164,7 @@ pub fn verification_signature_metadata(
     policy: &VerificationPolicy,
     key_name_resolution: VerificationKeyNameResolution,
     xml_backend: xml_sec::XmlBackend,
+    provider: &dyn xml_sec::provider::CryptoProvider,
 ) -> Result<SignatureMetadata, KeyMaterialError> {
     policy.validate()?;
     let document = parse_signature_document(
@@ -184,8 +184,10 @@ pub fn verification_signature_metadata(
     let key_info = if key_name_resolution == VerificationKeyNameResolution::IgnoreDocumentKeyInfo {
         None
     } else {
+        let mut parsing = xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&policy.resources)
+            .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
         let mut key_info = signature_key_info(signature)
-            .map(parse_key_info)
+            .map(|node| parsing.parse_with_provider(node, provider))
             .transpose()
             .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
         if let Some(key_info) = &mut key_info {
@@ -194,7 +196,7 @@ pub fn verification_signature_metadata(
                 key_info,
                 resolver,
                 policy,
-                xml_sec::provider::default_provider(),
+                provider,
                 xml_backend,
             )
             .map_err(map_key_info_reference_error)?;
@@ -213,6 +215,7 @@ pub fn signing_signature_metadata(
     id_attributes: &[xml_sec::IdAttributeRegistration],
     policy: &SigningPolicy,
     xml_backend: xml_sec::XmlBackend,
+    provider: &dyn xml_sec::provider::CryptoProvider,
 ) -> Result<SigningTemplateMetadata, KeyMaterialError> {
     policy.validate()?;
     let document = parse_signature_document(
@@ -235,20 +238,16 @@ pub fn signing_signature_metadata(
     let algorithm = SignatureAlgorithm::from_uri(algorithm_uri).ok_or_else(|| {
         KeyMaterialError::Signature(format!("unsupported signature algorithm: {algorithm_uri}"))
     })?;
+    let mut parsing = xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&policy.resources)
+        .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
     let mut key_info = signature_key_info(signature)
-        .map(parse_key_info)
+        .map(|node| parsing.parse_with_provider(node, provider))
         .transpose()
         .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
     if let Some(key_info) = &mut key_info {
         let resolver = UriReferenceResolver::with_id_registrations(&document, id_attributes);
-        materialize_signing_key_info_references(
-            key_info,
-            resolver,
-            policy,
-            xml_sec::provider::default_provider(),
-            xml_backend,
-        )
-        .map_err(map_key_info_reference_error)?;
+        materialize_signing_key_info_references(key_info, resolver, policy, provider, xml_backend)
+            .map_err(map_key_info_reference_error)?;
     }
     Ok(SigningTemplateMetadata {
         algorithm,
@@ -1618,6 +1617,7 @@ mod tests {
                 &[],
                 &SigningPolicy::default(),
                 xml_sec::XmlBackend::default(),
+                xml_sec::provider::default_provider(),
             )
             .expect_err("invalid KeyInfoReference graph must be rejected");
             assert!(error.to_string().contains(expected), "{error}");
@@ -1649,6 +1649,7 @@ mod tests {
             &[],
             &SigningPolicy::default(),
             xml_sec::XmlBackend::default(),
+            xml_sec::provider::default_provider(),
         )
         .expect_err("over-deep KeyInfoReference chain must be rejected");
         assert!(
@@ -1674,6 +1675,7 @@ mod tests {
             &[],
             &policy,
             xml_sec::XmlBackend::default(),
+            xml_sec::provider::default_provider(),
         )
         .expect_err("aggregate candidate work must respect operation policy");
         assert!(
@@ -1700,6 +1702,7 @@ mod tests {
             &[],
             &policy,
             xml_sec::XmlBackend::default(),
+            xml_sec::provider::default_provider(),
         )
         .expect_err("disabled KeyInfoReference URI class must be rejected");
         assert!(
@@ -2035,6 +2038,7 @@ mod tests {
             &xml_sec::policy::VerificationPolicy::default(),
             VerificationKeyNameResolution::IgnoreDocumentKeyInfo,
             xml_sec::XmlBackend::default(),
+            xml_sec::provider::default_provider(),
         )
         .unwrap();
         assert_eq!(metadata.algorithm, SignatureAlgorithm::EcdsaSha256);
@@ -2056,6 +2060,7 @@ mod tests {
             &VerificationPolicy::default(),
             VerificationKeyNameResolution::IgnoreDocumentKeyInfo,
             xml_sec::XmlBackend::default(),
+            xml_sec::provider::default_provider(),
         )
         .expect("unused malformed document keys must not block a pinned key");
 
@@ -2079,6 +2084,7 @@ mod tests {
             &xml_sec::policy::VerificationPolicy::default(),
             VerificationKeyNameResolution::ResolveDocumentKeyInfo,
             xml_sec::XmlBackend::default(),
+            xml_sec::provider::default_provider(),
         )
         .unwrap();
 
@@ -2101,6 +2107,7 @@ mod tests {
             &VerificationPolicy::default(),
             VerificationKeyNameResolution::ResolveDocumentKeyInfo,
             xml_sec::XmlBackend::default(),
+            xml_sec::provider::default_provider(),
         )
         .expect("same-document KeyInfoReference must resolve before candidate selection");
 
@@ -2115,6 +2122,7 @@ mod tests {
             &disabled,
             VerificationKeyNameResolution::ResolveDocumentKeyInfo,
             xml_sec::XmlBackend::default(),
+            xml_sec::provider::default_provider(),
         )
         .expect_err("metadata selection must honor the verification key-source policy");
         assert!(error.to_string().contains("key sources are disabled"));
@@ -2143,6 +2151,7 @@ mod tests {
             &policy,
             VerificationKeyNameResolution::IgnoreDocumentKeyInfo,
             xml_sec::XmlBackend::default(),
+            xml_sec::provider::default_provider(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("nodes limit"));

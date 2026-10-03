@@ -47,6 +47,121 @@ fn project_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
+#[cfg(feature = "aws-lc-fips")]
+#[test]
+fn aws_lc_selection_signs_and_verifies_through_cli() {
+    // Real CLI selection must import native handles and interoperate with the default engine.
+    let temp = tempfile::tempdir().unwrap();
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let private = project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    let public = project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    for signer in ["rustcrypto", "aws-lc-fips"] {
+        let signed = temp.path().join(format!("{signer}.xml"));
+        let result = Command::new(binary())
+            .args(["sign", "--crypto", signer, "--privkey-pem"])
+            .arg(&private)
+            .arg("--output")
+            .arg(&signed)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        for verifier in ["rustcrypto", "aws-lc-fips"] {
+            let result = Command::new(binary())
+                .args(["verify", "--crypto", verifier, "--pubkey-pem"])
+                .arg(&public)
+                .arg(&signed)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+    }
+    let result = Command::new(binary())
+        .args(["version", "--crypto", "unavailable"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+}
+
+#[cfg(feature = "aws-lc-fips")]
+#[test]
+fn aws_lc_capability_queries_do_not_advertise_other_engine_mechanisms() {
+    // Selection must constrain discovery as well as actual cryptographic execution.
+    for (name, available) in [
+        ("rsa-sha256", true),
+        ("sha3-224", false),
+        ("eddsa-ed25519", false),
+    ] {
+        let output = Command::new(binary())
+            .args(["check-transforms", "--crypto", "aws-lc-fips", name])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), available, "{name}");
+    }
+    let output = Command::new(binary())
+        .args(["check-key-data", "--crypto", "aws-lc-fips", "eddsa"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+}
+
+#[cfg(feature = "aws-lc-fips")]
+#[test]
+fn aws_lc_cli_encrypts_and_decrypts_without_provider_fallback() {
+    // Process-level encryption exercises option forwarding and XML ciphertext framing.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("template.xml");
+    let plaintext = temp.path().join("input.bin");
+    let key = temp.path().join("key.bin");
+    fs::write(&template, r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#).unwrap();
+    fs::write(&plaintext, b"native payload\0").unwrap();
+    fs::write(&key, b"0123456789abcdef").unwrap();
+    for encryptor in ["rustcrypto", "aws-lc-fips"] {
+        let encrypted = temp.path().join(format!("{encryptor}.xml"));
+        let result = Command::new(binary())
+            .args(["encrypt", "--crypto", encryptor, "--aeskey"])
+            .arg(&key)
+            .arg("--binary-data")
+            .arg(&plaintext)
+            .arg("--output")
+            .arg(&encrypted)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        for decryptor in ["rustcrypto", "aws-lc-fips"] {
+            let output = temp.path().join(format!("{encryptor}-{decryptor}.bin"));
+            let result = Command::new(binary())
+                .args(["decrypt", "--crypto", decryptor, "--aeskey"])
+                .arg(&key)
+                .arg("--output")
+                .arg(&output)
+                .arg(&encrypted)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(fs::read(output).unwrap(), b"native payload\0");
+        }
+    }
+}
+
 #[test]
 fn modern_eddsa_signing_completes_cli_process_pipeline() {
     // Exercise actual process arguments, key loading, SHA-3 reference digests,

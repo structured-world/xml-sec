@@ -64,6 +64,28 @@ const MAX_RETRIEVAL_METHOD_COUNT: usize = 64;
 /// This trait intentionally has no `Send + Sync` supertraits so lightweight
 /// single-threaded verifiers can be used without additional bounds.
 pub trait VerifyingKey {
+    /// Composite resolvers may try individual keys through the selected engine.
+    /// `None` identifies a leaf handle. Wrappers must preserve per-key policy
+    /// when forwarding the visitor; no public/private key copy is required.
+    fn verify_candidate_keys(
+        &self,
+        _verify: &mut dyn FnMut(&dyn VerifyingKey) -> Result<bool, DsigError>,
+    ) -> Result<Option<bool>, DsigError> {
+        Ok(None)
+    }
+    /// Borrow public SPKI for native verification, validating method/key binding.
+    /// Opaque external keys may return `None`; native providers then fail closed.
+    fn verification_spki(
+        &self,
+        _algorithm: SignatureAlgorithm,
+    ) -> Result<Option<&[u8]>, DsigError> {
+        Ok(None)
+    }
+
+    /// Wire encoding already selected by the immutable verification policy.
+    fn ecdsa_encoding(&self) -> crate::policy::EcdsaSignatureValueEncoding {
+        crate::policy::EcdsaSignatureValueEncoding::XmlDsig
+    }
     /// Verify with validated domain separation, rejecting unsupported contexts.
     fn verify_with_context(
         &self,
@@ -2522,6 +2544,25 @@ struct PolicyVerifyingKey<'a> {
 }
 
 impl VerifyingKey for PolicyVerifyingKey<'_> {
+    fn verify_candidate_keys(
+        &self,
+        verify: &mut dyn FnMut(&dyn VerifyingKey) -> Result<bool, DsigError>,
+    ) -> Result<Option<bool>, DsigError> {
+        self.key.verify_candidate_keys(&mut |key| {
+            key.validate_policy(self.policy)?;
+            verify(&PolicyVerifyingKey {
+                key,
+                policy: self.policy,
+            })
+        })
+    }
+    fn verification_spki(&self, algorithm: SignatureAlgorithm) -> Result<Option<&[u8]>, DsigError> {
+        self.key.verification_spki(algorithm)
+    }
+
+    fn ecdsa_encoding(&self) -> crate::policy::EcdsaSignatureValueEncoding {
+        self.policy.ecdsa_signature_value_encoding
+    }
     fn verify_with_context(
         &self,
         algorithm: SignatureAlgorithm,
