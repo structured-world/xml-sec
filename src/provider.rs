@@ -184,7 +184,7 @@ pub struct KdfParameters<'a> {
 
 /// Provider-neutral X.509 certificate and CRL signature parameters.
 #[cfg(feature = "xmldsig")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum X509SignatureAlgorithm {
     /// DSA with the selected message digest.

@@ -196,6 +196,62 @@ fn all_eddsa_context_and_prehash_methods_complete_xml_pipeline() {
 }
 
 #[test]
+fn context_whitespace_uses_the_operation_document_budget() {
+    use pkcs8::EncodePrivateKey;
+    use xml_sec::policy::{SigningPolicy, VerificationPolicy};
+    use xml_sec::xmldsig::{
+        EdDsaSigningKey, SignContext, SignatureAlgorithm, SigningKey, VerifyContext,
+    };
+    // Base64 whitespace has no RFC 8032 context-width meaning. Both public
+    // operations must accept it within their document budget, and reject a
+    // caller's smaller budget before cryptographic work.
+    let algorithm = SignatureAlgorithm::Ed25519Ctx;
+    let der = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])
+        .to_pkcs8_der()
+        .unwrap();
+    let key = EdDsaSigningKey::from_pkcs8_der(algorithm, der.as_bytes()).unwrap();
+    let marker = format!("<SignatureMethod Algorithm=\"{}\"/>", algorithm.uri());
+    let method = format!(
+        "<SignatureMethod Algorithm=\"{}\"><e:EdDSAContextString xmlns:e=\"http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#\">{}Zm9v</e:EdDSAContextString></SignatureMethod>",
+        algorithm.uri(),
+        " ".repeat(4097)
+    );
+    let xml = template(algorithm).replace(&marker, &method);
+    let signed = SignContext::new(&key).sign_template(&xml).unwrap();
+    let verifier = xml_sec::xmldsig::VerificationKey {
+        algorithm,
+        public_key_bytes: key.public_key_info().unwrap().spki_der().unwrap().to_vec(),
+        certificate_der: None,
+        name: None,
+    };
+    assert_eq!(
+        VerifyContext::new()
+            .key(&verifier)
+            .verify(&signed)
+            .unwrap()
+            .status,
+        xml_sec::xmldsig::DsigStatus::Valid
+    );
+    let mut signing = SigningPolicy::default();
+    signing.resources.max_xml_document_bytes = xml.len() - 1;
+    assert!(
+        SignContext::new(&key)
+            .policy(signing)
+            .sign_template(&xml)
+            .is_err()
+    );
+    let mut verification = VerificationPolicy::default();
+    verification.resources.max_xml_document_bytes = signed.len() - 1;
+    assert!(
+        VerifyContext::new()
+            .key(&verifier)
+            .policy(verification)
+            .verify(&signed)
+            .is_err()
+    );
+}
+
+#[test]
 fn context_parameter_accepts_exact_wire_limit_and_rejects_malformed_base64() {
     use base64::Engine;
     use pkcs8::EncodePrivateKey;

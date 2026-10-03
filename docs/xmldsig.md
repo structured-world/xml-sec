@@ -496,7 +496,13 @@ X.509 path and CRL authentication additionally supports standard RSA-PSS with SH
 SHA-512 parameters, including RFC 4055 issuer-key restrictions, and Ed25519/Ed448.
 With `experimental-pq`, the provider also authenticates pure ML-DSA and supported
 SLH-DSA-SHA2 certificate/CRL signatures using the empty PKIX context, independently
-of the XML context parameter. Signature
+of the XML context parameter. Certificate/CRL
+permissions come from `KeyTrustPolicy::certificate_signature_algorithms`, independently
+of the XML signature allowlist. `None` permits supported classical methods but rejects PQ;
+`Some` permits only exact listed methods (including RSA-PSS digest, MGF digest and salt
+length). This borrowed permission reaches candidate path selection, complete path and CRL
+validation before provider dispatch. Compiling `experimental-pq` alone never grants trust.
+Signature
 `AlgorithmIdentifier` parameters are validated before provider dispatch: DSA, ECDSA, EdDSA,
 and these post-quantum methods
 require absent parameters; RSA PKCS#1 accepts NULL or absent; RSA-PSS requires valid typed

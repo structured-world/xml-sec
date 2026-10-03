@@ -121,6 +121,90 @@ fn modern_eddsa_signing_completes_cli_process_pipeline() {
     }
 }
 
+#[cfg(feature = "experimental-pq")]
+#[test]
+fn pq_signing_and_verification_complete_cli_process_pipeline() {
+    use xml_sec::xmldsig::PqAlgorithm as P;
+    // Capability alone must not enable core PQ verification, while the
+    // explicit compatibility CLI must opt in consistently for both commands.
+    for (parameter, directory, stem) in [
+        (P::MlDsa44, "ml-dsa", "ml-dsa-44"),
+        (P::MlDsa65, "ml-dsa", "ml-dsa-65"),
+        (P::MlDsa87, "ml-dsa", "ml-dsa-87"),
+        (P::SlhDsaSha2_128s, "slh-dsa", "slh-dsa-sha2-128s"),
+        (P::SlhDsaSha2_128f, "slh-dsa", "slh-dsa-sha2-128f"),
+        (P::SlhDsaSha2_192s, "slh-dsa", "slh-dsa-sha2-192s"),
+        (P::SlhDsaSha2_192f, "slh-dsa", "slh-dsa-sha2-192f"),
+        (P::SlhDsaSha2_256s, "slh-dsa", "slh-dsa-sha2-256s"),
+        (P::SlhDsaSha2_256f, "slh-dsa", "slh-dsa-sha2-256f"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let template = temp.path().join("template.xml");
+        let signed = temp.path().join("signed.xml");
+        let builder = SignatureBuilder::new(
+            C14nAlgorithm::new(C14nMode::Exclusive1_0, false),
+            SignatureAlgorithm::PostQuantum(parameter),
+        )
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("")
+                .transform(Transform::Enveloped),
+        );
+        let policy = xml_sec::policy::SigningPolicy {
+            signature_algorithms: Some([SignatureAlgorithm::PostQuantum(parameter)].into()),
+            ..Default::default()
+        };
+        fs::write(
+            &template,
+            append_signature_to_root(
+                "<root>payload</root>",
+                &builder.build_template_with_policy(&policy).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let keys = project_root().join(format!("tests/fixtures/xmldsig/keys/{directory}"));
+        let result = Command::new(binary())
+            .args(["sign", "--pkcs8-der"])
+            .arg(keys.join(format!("{stem}-key.der")))
+            .arg("--output")
+            .arg(&signed)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{parameter:?}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let verify = || {
+            Command::new(binary())
+                .args(["verify", "--pubkey-pem"])
+                .arg(keys.join(format!("{stem}-pubkey.pem")))
+                .arg(&signed)
+                .output()
+                .unwrap()
+        };
+        let result = verify();
+        assert!(
+            result.status.success(),
+            "{parameter:?}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        fs::write(
+            &signed,
+            fs::read_to_string(&signed)
+                .unwrap()
+                .replace("payload", "tampered"),
+        )
+        .unwrap();
+        assert!(
+            !verify().status.success(),
+            "tampering must fail for {parameter:?}"
+        );
+    }
+}
+
 #[test]
 fn mislabeled_encrypted_pem_cannot_sign() {
     // Generic private-key loading must honor PEM protection labels, not retry

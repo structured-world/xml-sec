@@ -392,6 +392,8 @@ forwarded unchanged during candidate-key verification. ML-DSA and SHA-2 SLH-DSA
 methods require the `experimental-pq` build feature; capability queries do not
 advertise them in builds without that feature. These experimental XML methods
 are not standardized algorithm URIs; see [XMLDSig details](xmldsig.md).
+The compatibility executable explicitly permits compiled PQ XML methods for both signing
+and verification; core library defaults still require an explicit algorithm allowlist.
 Public verification accepts SubjectPublicKeyInfo,
 PKCS#1 RSA public keys, and X.509 certificates. Encryption accepts RSA public
 keys or RSA X.509 recipient certificates in PEM or DER. Explicit verification

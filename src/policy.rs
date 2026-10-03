@@ -974,6 +974,10 @@ pub struct KeyTrustPolicy {
     pub max_x509_candidate_paths: usize,
     /// Legacy signature algorithms explicitly permitted for verification.
     pub allowed_legacy_signature_algorithms: HashSet<SignatureAlgorithm>,
+    /// Certificate and CRL signature permissions, independent of XML signatures.
+    /// `None` permits supported classical algorithms but rejects PQ algorithms;
+    /// `Some` permits only exact listed algorithms, including PSS parameters.
+    pub certificate_signature_algorithms: Option<HashSet<crate::provider::X509SignatureAlgorithm>>,
     /// RSA requirements enforced for resolved verification keys and issuer keys.
     pub rsa_keys: RsaKeyPolicy,
     /// DSA requirements enforced for resolved verification keys.
@@ -1000,6 +1004,7 @@ impl Default for KeyTrustPolicy {
             max_x509_chain_depth: crate::hard_limits::X509_CHAIN_DEPTH_CEILING,
             max_x509_candidate_paths: crate::hard_limits::X509_CANDIDATE_PATH_CEILING,
             allowed_legacy_signature_algorithms: HashSet::new(),
+            certificate_signature_algorithms: None,
             rsa_keys: RsaKeyPolicy::default(),
             dsa_keys: DsaKeyPolicy::default(),
             allowed_extended_key_usages: HashSet::new(),
@@ -1011,6 +1016,29 @@ impl Default for KeyTrustPolicy {
 
 #[cfg(feature = "xmldsig")]
 impl KeyTrustPolicy {
+    pub(crate) fn check_certificate_signature_algorithm(
+        algorithm: crate::provider::X509SignatureAlgorithm,
+        allowed: Option<&HashSet<crate::provider::X509SignatureAlgorithm>>,
+    ) -> Result<(), PolicyViolation> {
+        // This is deployment permission, not a PKIX syntax requirement.
+        // Algorithm parameters are validated before this gate; compiled
+        // provider capability is checked only after permission is established.
+        let permitted = match allowed {
+            Some(allowed) => allowed.contains(&algorithm),
+            None => !matches!(
+                algorithm,
+                crate::provider::X509SignatureAlgorithm::PostQuantum(_)
+            ),
+        };
+        if !permitted {
+            return Err(PolicyViolation::Algorithm {
+                operation: "certificate/CRL verification",
+                algorithm: algorithm.oid().to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate(&self) -> Result<(), PolicyViolation> {
         if self.check_crls && !self.verify_x509_chains {
             return Err(PolicyViolation::KeyTrust {

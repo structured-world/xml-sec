@@ -1341,6 +1341,10 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
     // boundary: both CLI signing and verification use the donor interpretation,
     // while the core library retains the XMLDSig binding by default.
     let mut policy = VerificationPolicy {
+        // The compatibility executable explicitly permits every compiled XML
+        // signature method, including experimental PQ methods. Library defaults
+        // remain restrictive; provider capability still gates execution.
+        signature_algorithms: Some(HashSet::from(SignatureAlgorithm::ALL)),
         manifest_processing: if invocation.flag("ignore-manifests") {
             ManifestProcessing::Ignore
         } else {

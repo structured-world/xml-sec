@@ -163,8 +163,9 @@ jobs:
       - name: Build pinned xmlsec1 for external-oracle tests
         env:
           XMLSEC1_SOURCE_DIR: ${{ github.workspace }}/donors/xmlsec
+          XMLSEC1_MODERN_ORACLE: "1"
         run: |
-          sudo apt-get install --yes autoconf automake build-essential libltdl-dev libssl-dev libtool libxml2-dev pkg-config
+          sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev perl pkg-config
           scripts/install-xmlsec1.sh
           "$XMLSEC1_BIN" --version
       - uses: Swatinem/rust-cache@v2

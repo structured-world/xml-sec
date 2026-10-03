@@ -2843,7 +2843,7 @@ fn validate_signing_signed_info_methods(
             .ok_or(SigningDigestError::MissingElement {
                 element: "SignatureMethod",
             })?;
-    super::parse::parse_signature_method(signature_method)
+    super::parse::parse_signature_method(signature_method, &policy.resources)
         .map(|(algorithm, hmac, _context)| (algorithm, hmac))
         .map_err(SigningError::from)
 }
@@ -2976,8 +2976,11 @@ fn canonicalize_signed_info(
                 .map_err(SigningError::Digest)?;
         let signed_info_node =
             find_required_child(signature, "SignedInfo").map_err(SigningError::Digest)?;
-        let signed_info =
-            parse_signed_info_with_xpath_budget(signed_info_node, &mut budgets.xpath_parse)?;
+        let signed_info = parse_signed_info_with_xpath_budget(
+            signed_info_node,
+            &mut budgets.xpath_parse,
+            &policy.resources,
+        )?;
         if policy
             .transforms
             .allowed_algorithms

@@ -87,6 +87,7 @@ fn options<'a>(trusted_certs: &'a [Vec<u8>], check_crls: bool) -> X509ChainOptio
         allowed_extended_key_usages: None,
         rsa_keys: xml_sec::policy::RsaKeyPolicy::default(),
         dsa_keys: xml_sec::policy::DsaKeyPolicy::default(),
+        certificate_signature_algorithms: None,
     }
 }
 
@@ -134,6 +135,86 @@ fn generated_info(certificates: Vec<Vec<u8>>) -> X509DataInfo {
     info.certificate_chain = (0..certificates.len()).collect();
     info.certificates = certificates;
     info
+}
+
+#[test]
+#[cfg(feature = "experimental-pq")]
+fn pq_issuer_path_requires_the_independent_certificate_allowlist() {
+    use der::asn1::{Any, ObjectIdentifier};
+    use xml_sec::provider::X509SignatureAlgorithm;
+    use xml_sec::xmldsig::{
+        DigestAlgorithm, PostQuantumSigningKey, PqAlgorithm, SignatureAlgorithm, SignatureContext,
+        SigningKey,
+    };
+    // A classical XML signature can use a PQ-authenticated certificate path;
+    // certificate permission is independent and must survive public validation.
+    let (leaf, intermediate, root) = generated_chain(
+        BasicConstraints::Unconstrained,
+        IsCa::Ca(BasicConstraints::Unconstrained),
+        vec![KeyUsagePurpose::KeyCertSign],
+    );
+    let parameter = PqAlgorithm::MlDsa44;
+    let key = PostQuantumSigningKey::from_pkcs8_der(
+        parameter,
+        include_bytes!("fixtures/xmldsig/keys/ml-dsa/ml-dsa-44-key.der"),
+    )
+    .unwrap();
+    let mut root = Vec::<Any>::from_der(&root).unwrap();
+    let mut root_tbs = Vec::<Any>::from_der(&root[0].to_der().unwrap()).unwrap();
+    root_tbs[6] = Any::from_der(key.public_key_info().unwrap().spki_der().unwrap()).unwrap();
+    root[0] = Any::from_der(&root_tbs.to_der().unwrap()).unwrap();
+    let root = root.to_der().unwrap();
+    let mut intermediate = Vec::<Any>::from_der(&intermediate).unwrap();
+    let mut tbs = Vec::<Any>::from_der(&intermediate[0].to_der().unwrap()).unwrap();
+    let identifier = Any::from_der(
+        &vec![Any::encode_from(&parameter.oid().parse::<ObjectIdentifier>().unwrap()).unwrap()]
+            .to_der()
+            .unwrap(),
+    )
+    .unwrap();
+    tbs[2] = identifier.clone();
+    intermediate[1] = identifier;
+    let tbs_der = tbs.to_der().unwrap();
+    let signature = xml_sec::provider::default_provider()
+        .sign_with_context(
+            &key,
+            SignatureAlgorithm::PostQuantum(parameter),
+            &SignatureContext::default(),
+            &tbs_der,
+        )
+        .unwrap();
+    intermediate[0] = Any::from_der(&tbs_der).unwrap();
+    intermediate[2] = Any::encode_from(&BitString::from_bytes(&signature).unwrap()).unwrap();
+    let info = generated_info(vec![leaf, intermediate.to_der().unwrap(), root.clone()]);
+    let anchors = [root];
+    let mut options = options(&anchors, false);
+    assert!(matches!(
+        verify_x509_certificate_chain(&info, &options),
+        Err(X509ChainError::Policy(_))
+    ));
+    let policy = xml_sec::policy::KeyTrustPolicy {
+        certificate_signature_algorithms: Some(
+            [
+                X509SignatureAlgorithm::Ecdsa(DigestAlgorithm::Sha256),
+                X509SignatureAlgorithm::PostQuantum(parameter),
+            ]
+            .into(),
+        ),
+        ..Default::default()
+    };
+    options.certificate_signature_algorithms = policy.certificate_signature_algorithms.as_ref();
+    verify_x509_certificate_chain(&info, &options).unwrap();
+    let restricted = xml_sec::policy::KeyTrustPolicy {
+        certificate_signature_algorithms: Some(
+            [X509SignatureAlgorithm::Ecdsa(DigestAlgorithm::Sha256)].into(),
+        ),
+        ..Default::default()
+    };
+    options.certificate_signature_algorithms = restricted.certificate_signature_algorithms.as_ref();
+    assert!(matches!(
+        verify_x509_certificate_chain(&info, &options),
+        Err(X509ChainError::Policy(_))
+    ));
 }
 
 #[test]

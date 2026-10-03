@@ -839,6 +839,7 @@ impl DefaultKeyResolver {
             allowed_extended_key_usages: Some(&trust.allowed_extended_key_usages),
             rsa_keys: trust.rsa_keys,
             dsa_keys: trust.dsa_keys,
+            certificate_signature_algorithms: trust.certificate_signature_algorithms.as_ref(),
         };
         verify_x509_certificate_chain_with_provider_and_crls(
             info,
@@ -929,9 +930,13 @@ impl DefaultKeyResolver {
             trust.max_x509_chain_depth,
             trust.max_x509_candidate_paths,
             provider,
+            trust.certificate_signature_algorithms.as_ref(),
         )
         .map_err(|error| match error {
             X509ChainBuildError::AmbiguousIssuer => KeyResolutionError::AmbiguousCertificate,
+            X509ChainBuildError::Policy(error) => {
+                KeyResolutionError::Chain(super::X509ChainError::Policy(error))
+            }
             X509ChainBuildError::Provider(error) => {
                 KeyResolutionError::Chain(super::X509ChainError::Provider(error))
             }
@@ -995,9 +1000,13 @@ impl DefaultKeyResolver {
             trust.max_x509_chain_depth,
             trust.max_x509_candidate_paths,
             provider,
+            trust.certificate_signature_algorithms.as_ref(),
         )
         .map_err(|error| match error {
             X509ChainBuildError::AmbiguousIssuer => KeyResolutionError::AmbiguousCertificate,
+            X509ChainBuildError::Policy(error) => {
+                KeyResolutionError::Chain(super::X509ChainError::Policy(error))
+            }
             X509ChainBuildError::Provider(error) => {
                 KeyResolutionError::Chain(super::X509ChainError::Provider(error))
             }
@@ -3264,6 +3273,7 @@ mod tests {
                 9,
                 2,
                 crate::provider::default_provider(),
+                None,
             ),
             Err(X509ChainBuildError::AmbiguousIssuer)
         ));
@@ -3395,6 +3405,7 @@ mod tests {
                 &ordered,
                 0,
                 &key_selective_provider,
+                None,
             )
             .expect("one unsupported issuer key must not suppress a usable candidate"),
             vec![0, 2, 3]
@@ -3423,6 +3434,7 @@ mod tests {
                 4,
                 8,
                 &first_candidate_unsupported,
+                None,
             )
             .expect("a later same-DN issuer must survive an earlier provider capability miss"),
             vec![vec![1, 3, 0]]
@@ -3461,6 +3473,7 @@ mod tests {
                 4,
                 8,
                 crate::provider::default_provider(),
+                None,
             )
             .expect("a branch-local provider gap must not abort path enumeration"),
             vec![vec![1, 2, 0]]
@@ -3482,6 +3495,7 @@ mod tests {
                 4,
                 8,
                 crate::provider::default_provider(),
+                None,
             ),
             Err(X509ChainBuildError::UnsupportedSignatureAlgorithm { ref oid })
                 if oid == "1.2.840.10045.4.3.5"

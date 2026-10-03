@@ -2098,6 +2098,10 @@ fn verify_signature_node<'a>(
                     ctx.provider,
                     operation.budgets().transforms.xml_base_resolution(),
                     &ctx.policy.resources,
+                    ctx.policy
+                        .key_trust
+                        .certificate_signature_algorithms
+                        .as_ref(),
                 )
             })
             .transpose()
@@ -2109,6 +2113,7 @@ fn verify_signature_node<'a>(
     let signed_info = parse_signed_info_with_xpath_budget(
         signed_info_node,
         &mut operation.budgets().xpath_parse.borrow_mut(),
+        &ctx.policy.resources,
     )?;
     if signed_info.references.len() > ctx.policy.resources.max_references {
         return Err(crate::policy::PolicyViolation::ResourceLimit {
@@ -2212,6 +2217,11 @@ fn verify_signature_node<'a>(
                     xpath_parse: &mut xpath_parse,
                     execution: &budgets.transforms,
                     resources: &ctx.policy.resources,
+                    certificate_signature_algorithms: ctx
+                        .policy
+                        .key_trust
+                        .certificate_signature_algorithms
+                        .as_ref(),
                     xml_backend: ctx.xml_backend,
                 };
                 let mut materialization = budgets.key_info_materialization.borrow_mut();
@@ -2564,6 +2574,7 @@ impl RetrievalMaterialization {
 }
 
 struct RetrievalMaterializationBudgets<'a> {
+    certificate_signature_algorithms: Option<&'a HashSet<crate::provider::X509SignatureAlgorithm>>,
     xpath_parse: &'a mut XPathSignatureParseBudget,
     execution: &'a TransformExecutionBudget,
     resources: &'a crate::policy::ResourcePolicy,
@@ -2577,6 +2588,9 @@ struct KeyInfoMaterializationState {
 }
 
 trait KeyInfoReferencePolicy {
+    fn certificate_signature_algorithms(
+        &self,
+    ) -> Option<&std::collections::HashSet<crate::provider::X509SignatureAlgorithm>>;
     fn resources(&self) -> &crate::policy::ResourcePolicy;
     fn xml(&self) -> &crate::policy::XmlInputPolicy;
     fn key_info_reference_uris(&self) -> UriTypeSet;
@@ -2586,6 +2600,11 @@ trait KeyInfoReferencePolicy {
 }
 
 impl KeyInfoReferencePolicy for crate::policy::SigningPolicy {
+    fn certificate_signature_algorithms(
+        &self,
+    ) -> Option<&std::collections::HashSet<crate::provider::X509SignatureAlgorithm>> {
+        None
+    }
     fn resources(&self) -> &crate::policy::ResourcePolicy {
         &self.resources
     }
@@ -2612,6 +2631,11 @@ impl KeyInfoReferencePolicy for crate::policy::SigningPolicy {
 }
 
 impl KeyInfoReferencePolicy for crate::policy::VerificationPolicy {
+    fn certificate_signature_algorithms(
+        &self,
+    ) -> Option<&std::collections::HashSet<crate::provider::X509SignatureAlgorithm>> {
+        self.key_trust.certificate_signature_algorithms.as_ref()
+    }
     fn resources(&self) -> &crate::policy::ResourcePolicy {
         &self.resources
     }
@@ -2724,6 +2748,7 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
                         context.provider,
                         context.budgets.execution.xml_base_resolution(),
                         context.policy.resources(),
+                        context.policy.certificate_signature_algorithms(),
                     )
                     .map_err(map_key_info_parse_error)?,
                     RetrievalMaterialization::default(),
@@ -2796,6 +2821,7 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
                         context.budgets.execution.xml_base_resolution(),
                         context.policy.resources(),
                         Some(resource_uri),
+                        context.policy.certificate_signature_algorithms(),
                     )
                     .map_err(map_key_info_parse_error)?;
                     let mut nested_outcome = visit(
@@ -2887,6 +2913,7 @@ fn materialize_key_info_references_for_policy<P: KeyInfoReferencePolicy>(
         xpath_parse: &mut xpath_parse_budget,
         execution: &execution_budget,
         resources: policy.resources(),
+        certificate_signature_algorithms: policy.certificate_signature_algorithms(),
         xml_backend,
     };
     let mut materialization = KeyInfoMaterializationState::default();
@@ -3127,6 +3154,7 @@ fn materialize_retrieval_methods_with_budgets(
                 candidate_work,
                 provider,
                 budgets.resources,
+                budgets.certificate_signature_algorithms,
             )
             .map_err(map_key_info_parse_error)?;
             materialized.push(super::parse::KeyInfoSource::X509Data(data));
@@ -3199,6 +3227,7 @@ fn materialize_retrieval_methods(
         xpath_parse: &mut xpath_parse_budget,
         execution: &execution_budget,
         resources: &resources,
+        certificate_signature_algorithms: None,
         xml_backend: crate::XmlBackend::default(),
     };
     let mut candidate_work = key_info.embedded_candidate_count();
@@ -7147,6 +7176,10 @@ mod tests {
             xpath_parse: &mut xpath_parse_budget,
             execution: &execution_budget,
             resources: &policy.resources,
+            certificate_signature_algorithms: policy
+                .key_trust
+                .certificate_signature_algorithms
+                .as_ref(),
             xml_backend: crate::XmlBackend::default(),
         };
         let mut materialization = KeyInfoMaterializationState::default();
@@ -7193,6 +7226,10 @@ mod tests {
             xpath_parse: &mut xpath_parse_budget,
             execution: &execution_budget,
             resources: &policy.resources,
+            certificate_signature_algorithms: policy
+                .key_trust
+                .certificate_signature_algorithms
+                .as_ref(),
             xml_backend: crate::XmlBackend::default(),
         };
         let mut materialization = KeyInfoMaterializationState::default();
@@ -7247,6 +7284,10 @@ mod tests {
             xpath_parse: &mut xpath_parse_budget,
             execution: &execution_budget,
             resources: &policy.resources,
+            certificate_signature_algorithms: policy
+                .key_trust
+                .certificate_signature_algorithms
+                .as_ref(),
             xml_backend: crate::XmlBackend::default(),
         };
         let mut materialization = KeyInfoMaterializationState::default();
@@ -7521,6 +7562,10 @@ mod tests {
             xpath_parse: &mut xpath_parse_budget,
             execution: &execution_budget,
             resources: &policy.resources,
+            certificate_signature_algorithms: policy
+                .key_trust
+                .certificate_signature_algorithms
+                .as_ref(),
             xml_backend: crate::XmlBackend::default(),
         };
         let mut materialization = KeyInfoMaterializationState::default();
@@ -7562,6 +7607,10 @@ mod tests {
             xpath_parse: &mut xpath_parse_budget,
             execution: &execution_budget,
             resources: &policy.resources,
+            certificate_signature_algorithms: policy
+                .key_trust
+                .certificate_signature_algorithms
+                .as_ref(),
             xml_backend: crate::XmlBackend::default(),
         };
         let mut materialization = KeyInfoMaterializationState::default();
@@ -7741,6 +7790,7 @@ mod tests {
             xpath_parse: &mut xpath_parse_budget,
             execution: &execution_budget,
             resources: &resource_policy,
+            certificate_signature_algorithms: None,
             xml_backend: crate::XmlBackend::default(),
         };
         let mut candidate_work = key_info.embedded_candidate_count();
