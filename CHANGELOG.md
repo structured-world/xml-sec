@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.18](https://github.com/structured-world/xml-sec/compare/v0.1.17...v0.1.18) - 2026-10-03
+
+### Added
+
+- *(crypto)* add AWS-LC FIPS provider ([#181](https://github.com/structured-world/xml-sec/pull/181))
+- *(xmldsig)* add modern signature algorithms ([#179](https://github.com/structured-world/xml-sec/pull/179))
+- *(xmldsig)* add verification evidence ([#175](https://github.com/structured-world/xml-sec/pull/175))
+- *(x509)* require explicit key authorization ([#173](https://github.com/structured-world/xml-sec/pull/173))
+- *(keys)* add caller-owned key inventory ([#170](https://github.com/structured-world/xml-sec/pull/170))
+
+### Fixed
+
+- *(xmldsig)* validate HMAC before reference work ([#177](https://github.com/structured-world/xml-sec/pull/177))
+
 ## [0.1.17](https://github.com/structured-world/xml-sec/compare/v0.1.16...v0.1.17) - 2026-09-29
 
 ### Added
