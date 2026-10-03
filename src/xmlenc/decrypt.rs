@@ -320,18 +320,11 @@ impl<'a> DecryptContext<'a> {
             )?;
             let algorithm =
                 DataEncryptionAlgorithm::from_uri(&encrypted.encryption_method.algorithm)?;
-            if operation
-                .policy()
-                .data_algorithms
-                .as_ref()
-                .is_some_and(|allowed| !allowed.contains(&algorithm))
-            {
-                return Err(crate::policy::PolicyViolation::Algorithm {
-                    operation: "decryption",
-                    algorithm: encrypted.encryption_method.algorithm.clone(),
-                }
-                .into());
-            }
+            crate::policy::check_content_algorithm(
+                operation.policy().data_algorithms.as_ref(),
+                algorithm,
+                "decryption",
+            )?;
             self.provider
                 .require_capability(crate::provider::ProviderCapability::Decrypt(algorithm))?;
             validate_typed_cipher_values(
@@ -564,7 +557,7 @@ impl DecryptionKeyResolver for KekDecryptor {
                 actual: self.kek.len(),
             });
         }
-        let expected_wrapped_len = algorithm.key_len() + 8;
+        let expected_wrapped_len = algorithm.key_len() + wrap_algorithm.overhead();
         if wrapped.len() != expected_wrapped_len {
             return Err(XmlEncError::InvalidWrappedKeyLength {
                 expected: expected_wrapped_len,
@@ -674,6 +667,20 @@ impl PrivateKeyDecryptor {
         let transport =
             KeyTransportAlgorithm::from_uri(&encrypted_key.encryption_method.algorithm)?;
         let key = match transport {
+            #[cfg(feature = "legacy-algorithms")]
+            KeyTransportAlgorithm::RsaPkcs1v15 => {
+                if wrapped.len() != self.key.ciphertext_len() {
+                    return Err(XmlEncError::InvalidWrappedKeyLength {
+                        expected: self.key.ciphertext_len(),
+                        actual: wrapped.len(),
+                    });
+                }
+                provider
+                    .require_capability(crate::provider::ProviderCapability::Pkcs1v15Recovery)?;
+                provider
+                    .recover_pkcs1v15(self.key.as_ref(), &wrapped, algorithm.key_len())
+                    .map_err(XmlEncError::Provider)
+            }
             KeyTransportAlgorithm::RsaOaepMgf1p => self.decrypt_oaep_mgf1p(
                 provider,
                 encrypted_key.encryption_method.oaep_digest.as_deref(),
@@ -1099,12 +1106,7 @@ fn validate_decryption_key_candidates(
         }
         .into());
     }
-    if actual > 1
-        && matches!(
-            algorithm,
-            DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc
-        )
-    {
+    if actual > 1 && algorithm.cbc_block_len().is_some() {
         return Err(XmlEncError::AmbiguousKeyCandidates { algorithm, actual });
     }
     Ok(())
@@ -1120,13 +1122,19 @@ fn validate_encrypted_key_policy(
         if policy
             .key_transport_algorithms
             .as_ref()
-            .is_some_and(|allowed| !allowed.contains(&transport))
+            .map_or(transport.requires_explicit_permission(), |allowed| {
+                !allowed.contains(&transport)
+            })
         {
             return Err(crate::policy::PolicyViolation::Algorithm {
                 operation: "decryption",
                 algorithm: uri.clone(),
             }
             .into());
+        }
+        #[cfg(feature = "legacy-algorithms")]
+        if transport == KeyTransportAlgorithm::RsaPkcs1v15 {
+            return Ok(());
         }
         let method = &encrypted_key.encryption_method;
         let digest = parse_oaep_digest(method.oaep_digest.as_deref())?;
@@ -1162,7 +1170,9 @@ fn validate_encrypted_key_policy(
         if policy
             .key_wrap_algorithms
             .as_ref()
-            .is_some_and(|allowed| !allowed.contains(&wrap))
+            .map_or(wrap.requires_explicit_permission(), |allowed| {
+                !allowed.contains(&wrap)
+            })
         {
             return Err(crate::policy::PolicyViolation::Algorithm {
                 operation: "decryption",
@@ -1209,17 +1219,11 @@ fn validate_typed_cipher_values(
     maximum_plaintext: usize,
     maximum_cipher_values: usize,
 ) -> Result<(), XmlEncError> {
-    let maximum_ciphertext = match algorithm {
-        DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc => {
-            (maximum_plaintext / 16)
-                .saturating_add(1)
-                .saturating_mul(16)
-                .saturating_add(16)
-        }
-        DataEncryptionAlgorithm::Aes128Gcm | DataEncryptionAlgorithm::Aes256Gcm => {
-            maximum_plaintext.saturating_add(28)
-        }
-    };
+    let maximum_ciphertext = algorithm
+        .ciphertext_len_for_plaintext(maximum_plaintext)
+        .ok_or(XmlEncError::InvalidEncryptionConfig(
+            "ciphertext size overflow".into(),
+        ))?;
     let projected = validate_cipher_value_len(&encrypted.cipher_data.value, maximum_ciphertext)?;
     if projected > maximum_ciphertext {
         return Err(crate::policy::PolicyViolation::ResourceLimit {
@@ -1304,7 +1308,7 @@ fn validate_possible_plaintext_len(
     ciphertext_len: usize,
     maximum: usize,
 ) -> Result<(), XmlEncError> {
-    // CBC's minimum includes a 16-byte IV and one padded block; using that
+    // CBC's minimum includes an IV and one padded block; using that
     // maximum-padding case yields the safe pre-decryption plaintext lower bound.
     let framing = algorithm.minimum_ciphertext_len();
     validate_plaintext_len(ciphertext_len.saturating_sub(framing), maximum)
@@ -1317,8 +1321,8 @@ fn validate_provider_plaintext_len(
 ) -> Result<(), XmlEncError> {
     use crate::provider::{ProviderError, ProviderOperation};
 
-    match algorithm {
-        DataEncryptionAlgorithm::Aes128Gcm | DataEncryptionAlgorithm::Aes256Gcm => {
+    match algorithm.cbc_block_len() {
+        None => {
             let expected = ciphertext_len - algorithm.minimum_ciphertext_len();
             if plaintext_len != expected {
                 return Err(ProviderError::InvalidOutputSize {
@@ -1329,9 +1333,9 @@ fn validate_provider_plaintext_len(
                 .into());
             }
         }
-        DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc => {
-            let padded_len = ciphertext_len - 16;
-            let minimum = padded_len - 16;
+        Some(block) => {
+            let padded_len = ciphertext_len - block;
+            let minimum = padded_len - block;
             let maximum = padded_len - 1;
             if !(minimum..=maximum).contains(&plaintext_len) {
                 return Err(ProviderError::InvalidOutputSizeRange {
@@ -1367,41 +1371,53 @@ fn map_data_decryption_error(
 ) -> XmlEncError {
     use crate::provider::ProviderError;
 
-    match (algorithm, error) {
-        (
-            DataEncryptionAlgorithm::Aes128Gcm | DataEncryptionAlgorithm::Aes256Gcm,
-            ProviderError::AuthenticationFailed,
-        ) => XmlEncError::AeadAuthenticationFailed,
-        (
-            DataEncryptionAlgorithm::Aes128Gcm | DataEncryptionAlgorithm::Aes256Gcm,
-            ProviderError::InvalidInput(crate::provider::ProviderInputError::AesGcmFraming),
-        ) => XmlEncError::DataTooShort {
-            algorithm: "AES-GCM",
-            minimum: 28,
-            actual: ciphertext_len,
-        },
-        (
-            DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc,
-            ProviderError::InvalidInput(crate::provider::ProviderInputError::AesCbcFraming),
-        ) if ciphertext_len < 32 => XmlEncError::DataTooShort {
-            algorithm: "AES-CBC",
-            minimum: 32,
-            actual: ciphertext_len,
-        },
-        (
-            DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc,
-            ProviderError::InvalidInput(crate::provider::ProviderInputError::AesCbcFraming),
-        ) => XmlEncError::InvalidCbcCiphertextLength(ciphertext_len.saturating_sub(16)),
-        (
-            DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc,
-            ProviderError::InvalidInput(crate::provider::ProviderInputError::AesCbcCiphertext),
-        ) => XmlEncError::InvalidPadding,
-        (_, error) => XmlEncError::Provider(error),
+    match error {
+        ProviderError::AuthenticationFailed if algorithm.cbc_block_len().is_none() => {
+            XmlEncError::AeadAuthenticationFailed
+        }
+        ProviderError::InvalidInput(crate::provider::ProviderInputError::AesGcmFraming)
+            if algorithm.cbc_block_len().is_none() =>
+        {
+            XmlEncError::DataTooShort {
+                algorithm: "AES-GCM",
+                minimum: 28,
+                actual: ciphertext_len,
+            }
+        }
+        error @ ProviderError::InvalidInput(crate::provider::ProviderInputError::AesCbcFraming)
+            if algorithm.cbc_block_len().is_some() =>
+        {
+            match super::types::validate_ciphertext_framing(algorithm, ciphertext_len) {
+                Err(error) => error,
+                Ok(()) => XmlEncError::Provider(error),
+            }
+        }
+        ProviderError::InvalidInput(crate::provider::ProviderInputError::AesCbcCiphertext)
+            if algorithm.cbc_block_len().is_some() =>
+        {
+            XmlEncError::InvalidPadding
+        }
+        error => XmlEncError::Provider(error),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "legacy-algorithms")]
+    #[test]
+    fn legacy_cbc_rejects_ambiguous_candidates_before_decryption() {
+        // CBC has no authentication tag: selecting a candidate by padding
+        // success is unsafe for DES and AES-192 just as for existing AES modes.
+        for algorithm in [
+            super::DataEncryptionAlgorithm::TripleDesCbc,
+            super::DataEncryptionAlgorithm::Aes192Cbc,
+        ] {
+            assert!(matches!(
+                super::validate_decryption_key_candidates(algorithm, 2),
+                Err(super::XmlEncError::AmbiguousKeyCandidates { actual: 2, .. })
+            ));
+        }
+    }
     use std::cell::{Cell, RefCell};
     use std::sync::atomic::{AtomicUsize, Ordering};
 

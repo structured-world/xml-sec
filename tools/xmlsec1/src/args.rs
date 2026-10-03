@@ -220,6 +220,8 @@ pub(crate) const OPTION_SPECS: &[OptionSpec] = &[
     option_spec!("untrusted-pem", ["untrusted"], VALUE, false, MULTIPLE),
     option_spec!("untrusted-der", [], VALUE, false, MULTIPLE),
     option_spec!("aes-key", ["aeskey"], VALUE, true, MULTIPLE),
+    #[cfg(feature = "legacy-algorithms")]
+    option_spec!("des-key", ["deskey"], VALUE, true, MULTIPLE),
     option_spec!("hmac-key", ["hmackey"], VALUE, true, MULTIPLE),
     option_spec!("pwd", [], VALUE, false, SINGLE),
     option_spec!("enabled-key-data", [], VALUE, false, MULTIPLE),

@@ -41,6 +41,8 @@ impl AwsLcFipsProvider {
 
 fn digest_algorithm(algorithm: DigestAlgorithm) -> Option<&'static digest::Algorithm> {
     Some(match algorithm {
+        #[cfg(feature = "legacy-algorithms")]
+        DigestAlgorithm::Md5 | DigestAlgorithm::Ripemd160 => return None,
         DigestAlgorithm::Sha1 => &digest::SHA1_FOR_LEGACY_USE_ONLY,
         DigestAlgorithm::Sha224 => &digest::SHA224,
         DigestAlgorithm::Sha256 => &digest::SHA256,
@@ -100,10 +102,22 @@ impl CryptoProvider for AwsLcFipsProvider {
                 certificate_method(algorithm).is_some()
             }
             #[cfg(feature = "xmlenc")]
-            ProviderCapability::Encrypt(_)
-            | ProviderCapability::Decrypt(_)
-            | ProviderCapability::KeyWrap(_)
-            | ProviderCapability::KeyUnwrap(_) => true,
+            ProviderCapability::Encrypt(algorithm) | ProviderCapability::Decrypt(algorithm) => {
+                matches!(
+                    algorithm,
+                    DataEncryptionAlgorithm::Aes128Cbc
+                        | DataEncryptionAlgorithm::Aes256Cbc
+                        | DataEncryptionAlgorithm::Aes128Gcm
+                        | DataEncryptionAlgorithm::Aes256Gcm
+                )
+            }
+            #[cfg(feature = "xmlenc")]
+            ProviderCapability::KeyWrap(algorithm) | ProviderCapability::KeyUnwrap(algorithm) => {
+                matches!(
+                    algorithm,
+                    KeyWrapAlgorithm::AesKw128 | KeyWrapAlgorithm::AesKw256
+                )
+            }
             #[cfg(feature = "xmlenc")]
             ProviderCapability::KeyTransport(parameters)
             | ProviderCapability::KeyRecovery(parameters) => oaep_algorithm(parameters).is_some(),
@@ -201,8 +215,15 @@ impl CryptoProvider for AwsLcFipsProvider {
         key: &[u8],
         plaintext: &[u8],
     ) -> Result<Vec<u8>, ProviderError> {
+        self.require_capability(ProviderCapability::Encrypt(algorithm))?;
         check_key(algorithm.key_len(), key)?;
         match algorithm {
+            #[cfg(feature = "legacy-algorithms")]
+            DataEncryptionAlgorithm::TripleDesCbc
+            | DataEncryptionAlgorithm::Aes192Cbc
+            | DataEncryptionAlgorithm::Aes192Gcm => {
+                Err(unsupported(ProviderCapability::Encrypt(algorithm)))
+            }
             DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc => {
                 let padding = 16 - plaintext.len() % 16;
                 let mut output = vec![0; framed_len(plaintext.len(), 16 + padding)?];
@@ -254,8 +275,15 @@ impl CryptoProvider for AwsLcFipsProvider {
         key: &[u8],
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, ProviderError> {
+        self.require_capability(ProviderCapability::Decrypt(algorithm))?;
         check_key(algorithm.key_len(), key)?;
         match algorithm {
+            #[cfg(feature = "legacy-algorithms")]
+            DataEncryptionAlgorithm::TripleDesCbc
+            | DataEncryptionAlgorithm::Aes192Cbc
+            | DataEncryptionAlgorithm::Aes192Gcm => {
+                Err(unsupported(ProviderCapability::Decrypt(algorithm)))
+            }
             DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc => {
                 if ciphertext.len() < 32 || !ciphertext.len().is_multiple_of(16) {
                     return Err(ProviderError::InvalidInput(
@@ -311,6 +339,7 @@ impl CryptoProvider for AwsLcFipsProvider {
         kek: &[u8],
         key: &[u8],
     ) -> Result<Vec<u8>, ProviderError> {
+        self.require_capability(ProviderCapability::KeyWrap(algorithm))?;
         check_key(algorithm.key_len(), kek)?;
         if key.len() < 16 || !key.len().is_multiple_of(8) || key.len() > i32::MAX as usize - 8 {
             return Err(ProviderError::InvalidInput(
@@ -331,6 +360,7 @@ impl CryptoProvider for AwsLcFipsProvider {
         kek: &[u8],
         wrapped: &[u8],
     ) -> Result<Vec<u8>, ProviderError> {
+        self.require_capability(ProviderCapability::KeyUnwrap(algorithm))?;
         check_key(algorithm.key_len(), kek)?;
         if wrapped.len() < 24
             || !wrapped.len().is_multiple_of(8)
@@ -464,6 +494,10 @@ fn wrapping_key(
     kek: &[u8],
 ) -> Result<key_wrap::KeyEncryptionKey<key_wrap::AesBlockCipher>, ProviderError> {
     let cipher = match algorithm {
+        #[cfg(feature = "legacy-algorithms")]
+        KeyWrapAlgorithm::AesKw192 | KeyWrapAlgorithm::TripleDes => {
+            return Err(unsupported(ProviderCapability::KeyWrap(algorithm)));
+        }
         KeyWrapAlgorithm::AesKw128 => &key_wrap::AES_128,
         KeyWrapAlgorithm::AesKw256 => &key_wrap::AES_256,
     };
@@ -877,6 +911,40 @@ mod tests {
         Encode as _,
         asn1::{BitStringRef, UintRef},
     };
+
+    #[cfg(all(feature = "legacy-algorithms", feature = "xmlenc"))]
+    #[test]
+    fn optional_legacy_capabilities_fail_without_another_engine() {
+        // Compiling RustCrypto compatibility mechanisms cannot make AWS native
+        // capability checks silently dispatch into that different provider.
+        for algorithm in [
+            DataEncryptionAlgorithm::TripleDesCbc,
+            DataEncryptionAlgorithm::Aes192Cbc,
+            DataEncryptionAlgorithm::Aes192Gcm,
+        ] {
+            assert!(!AwsLcFipsProvider.supports(ProviderCapability::Encrypt(algorithm)));
+            assert!(matches!(
+                AwsLcFipsProvider.encrypt_data(algorithm, &[0x31; 24], b"test"),
+                Err(ProviderError::Unsupported { .. })
+            ));
+        }
+        for algorithm in [KeyWrapAlgorithm::AesKw192, KeyWrapAlgorithm::TripleDes] {
+            assert!(!AwsLcFipsProvider.supports(ProviderCapability::KeyWrap(algorithm)));
+            assert!(matches!(
+                AwsLcFipsProvider.wrap_key(algorithm, &[0x31; 24], &[0x42; 16]),
+                Err(ProviderError::Unsupported { .. })
+            ));
+        }
+        assert!(!AwsLcFipsProvider.supports(ProviderCapability::Pkcs1v15Transport));
+        assert!(!AwsLcFipsProvider.supports(ProviderCapability::Pkcs1v15Recovery));
+        for digest in [DigestAlgorithm::Md5, DigestAlgorithm::Ripemd160] {
+            assert!(!AwsLcFipsProvider.supports(ProviderCapability::Digest(digest)));
+            assert!(matches!(
+                AwsLcFipsProvider.digest(digest, b"test"),
+                Err(ProviderError::Unsupported { .. })
+            ));
+        }
+    }
 
     #[test]
     fn rsa_verifier_checks_exact_bit_boundaries_without_bigints() {

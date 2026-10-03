@@ -1038,6 +1038,8 @@ fn every_ecdsa_curve_and_modern_digest_runs_the_full_pipeline() {
     ];
     for (curve, key) in keys.iter().enumerate() {
         for algorithm in [
+            #[cfg(feature = "legacy-algorithms")]
+            SignatureAlgorithm::EcdsaRipemd160,
             SignatureAlgorithm::EcdsaSha1,
             SignatureAlgorithm::EcdsaSha224,
             SignatureAlgorithm::EcdsaSha256,
@@ -1054,7 +1056,9 @@ fn every_ecdsa_curve_and_modern_digest_runs_the_full_pipeline() {
             };
             // Legacy capability needs explicit policy permission; the matrix
             // includes SHA-1 without weakening the default secure profile.
-            if algorithm == SignatureAlgorithm::EcdsaSha1 {
+            if algorithm == SignatureAlgorithm::EcdsaSha1
+                || algorithm.requires_explicit_permission()
+            {
                 assert!(
                     SignContext::new(key.as_ref())
                         .sign_template(&template(algorithm))
@@ -1219,7 +1223,15 @@ fn assert_bidirectional_xmlsec1(
     let template_path = directory.path().join("template.xml");
     let signed_path = directory.path().join("signed.xml");
     let oracle_path = directory.path().join("oracle.xml");
-    let signed = SignContext::new(key).sign_template(&xml).unwrap();
+    let signing_policy = xml_sec::policy::SigningPolicy {
+        signature_algorithms: Some([algorithm].into()),
+        digest_algorithms: Some(xml_sec::xmldsig::DigestAlgorithm::ALL.into()),
+        ..xml_sec::policy::SigningPolicy::default()
+    };
+    let signed = SignContext::new(key)
+        .policy(signing_policy)
+        .sign_template(&xml)
+        .unwrap();
     std::fs::write(&signed_path, signed).unwrap();
     let verified = xmlsec1::command()
         .args(["verify", "--lax-key-search", "--privkey-pem"])
@@ -1256,10 +1268,47 @@ fn assert_bidirectional_xmlsec1(
     assert_eq!(
         VerifyContext::new()
             .key(&verifier)
+            .policy(xml_sec::policy::VerificationPolicy {
+                signature_algorithms: Some([algorithm].into()),
+                digest_algorithms: Some(xml_sec::xmldsig::DigestAlgorithm::ALL.into()),
+                ..xml_sec::policy::VerificationPolicy::default()
+            })
             .verify(&signed)
             .unwrap()
             .status,
         DsigStatus::Valid
+    );
+}
+
+#[cfg(feature = "legacy-algorithms")]
+#[test]
+fn historical_rsa_and_ecdsa_interoperate_bidirectionally() {
+    // Both directions detect shared signer/verifier defects, including legacy
+    // reference digests independently selected from the signature method.
+    use xml_sec::xmldsig::{
+        DigestAlgorithm, EcdsaP256SigningKey, RsaSigningKey, SignatureAlgorithm,
+    };
+    if !xmlsec1::is_available() {
+        eprintln!("{}", xmlsec1::skip_reason());
+        return;
+    }
+    let rsa_path = std::path::Path::new("tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    let rsa = RsaSigningKey::from_pkcs8_pem(&std::fs::read_to_string(rsa_path).unwrap()).unwrap();
+    for (algorithm, digest) in [
+        (SignatureAlgorithm::RsaMd5, DigestAlgorithm::Md5),
+        (SignatureAlgorithm::RsaRipemd160, DigestAlgorithm::Ripemd160),
+    ] {
+        let xml = template(algorithm).replace(DigestAlgorithm::Sha256.uri(), digest.uri());
+        assert_bidirectional_xmlsec1(&rsa, rsa_path, algorithm, xml);
+    }
+    let ec_path = std::path::Path::new("tests/fixtures/keys/ec/ec-prime256v1-key.pem");
+    let ec =
+        EcdsaP256SigningKey::from_pkcs8_pem(&std::fs::read_to_string(ec_path).unwrap()).unwrap();
+    assert_bidirectional_xmlsec1(
+        &ec,
+        ec_path,
+        SignatureAlgorithm::EcdsaRipemd160,
+        template(SignatureAlgorithm::EcdsaRipemd160),
     );
 }
 

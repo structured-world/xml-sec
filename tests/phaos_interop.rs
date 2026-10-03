@@ -16,6 +16,7 @@ const PHAOS: &str = "tests/fixtures/xmldsig/phaos-xmldsig-three";
 const RFC3161: &str = "tests/fixtures/xmldsig/external-data/rfc3161.txt";
 const VERIFY_2009: u64 = 1_230_804_000;
 const XSLT_URI: &str = "http://www.w3.org/TR/1999/REC-xslt-19991116";
+#[cfg(not(feature = "legacy-algorithms"))]
 const MD5_URI: &str = "http://www.w3.org/2001/04/xmldsig-more#md5";
 const HMAC_MD5_URI: &str = "http://www.w3.org/2001/04/xmldsig-more#hmac-md5";
 
@@ -30,9 +31,13 @@ enum Setup {
 
 #[derive(Clone, Copy, Debug)]
 enum Expected {
-    Valid { manifest_references: usize },
+    Valid {
+        manifest_references: usize,
+    },
     ValidWithManifestFailure,
     BadDigest,
+    #[cfg(feature = "legacy-algorithms")]
+    MissingDigestValue,
     UnsupportedSignature(&'static str),
     UnsupportedTransform(&'static str),
     UnsupportedCertificateSignature(&'static str),
@@ -157,7 +162,10 @@ const CASES: &[Case] = &[
     Case {
         name: "signature-rsa-enveloped-bad-sig.xml",
         setup: Setup::Rsa,
+        #[cfg(not(feature = "legacy-algorithms"))]
         expected: Expected::UnsupportedSignature(MD5_URI),
+        #[cfg(feature = "legacy-algorithms")]
+        expected: Expected::MissingDigestValue,
     },
     Case {
         name: "signature-rsa-enveloped.xml",
@@ -399,10 +407,29 @@ fn check_expected(
             result.status
                 == DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
         }
+        #[cfg(feature = "legacy-algorithms")]
+        (
+            Expected::MissingDigestValue,
+            Err(DsigError::ParseSignedInfo(ParseError::MissingElement {
+                element: "DigestValue",
+            })),
+        ) => true,
         (
             Expected::UnsupportedSignature(uri),
             Err(DsigError::ParseSignedInfo(ParseError::UnsupportedAlgorithm { uri: actual })),
         ) => actual == uri,
+        #[cfg(feature = "legacy-algorithms")]
+        (
+            Expected::UnsupportedSignature(uri),
+            Err(DsigError::Policy(xml_sec::policy::PolicyViolation::Algorithm {
+                operation: "verification",
+                algorithm,
+            })),
+        ) => {
+            algorithm == uri
+                && SignatureAlgorithm::from_uri(uri)
+                    .is_some_and(|method| method.requires_explicit_permission())
+        }
         (
             Expected::UnsupportedTransform(uri),
             Err(DsigError::ParseSignedInfo(ParseError::Transform(

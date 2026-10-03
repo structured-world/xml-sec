@@ -2169,18 +2169,7 @@ fn verify_signature_node<'a>(
         )?;
     }
     for reference in &signed_info.references {
-        if ctx
-            .policy
-            .digest_algorithms
-            .as_ref()
-            .is_some_and(|allowed| !allowed.contains(&reference.digest_method))
-        {
-            return Err(crate::policy::PolicyViolation::Algorithm {
-                operation: "verification",
-                algorithm: reference.digest_method.uri().to_string(),
-            }
-            .into());
-        }
+        ctx.policy.check_digest_algorithm(reference.digest_method)?;
     }
     enforce_reference_policies(
         &signed_info.references,
@@ -3494,9 +3483,8 @@ fn process_authenticated_manifest_references(
                                 > ctx.policy.resources.max_transforms_per_reference
                             || ctx
                                 .policy
-                                .digest_algorithms
-                                .as_ref()
-                                .is_some_and(|allowed| !allowed.contains(&reference.digest_method))
+                                .check_digest_algorithm(reference.digest_method)
+                                .is_err()
                         {
                             manifest_reference_invalid_result(
                                 reference,
@@ -4156,6 +4144,24 @@ fn verify_with_algorithm(
     signature_value: &[u8],
 ) -> Result<bool, SignatureVerificationPipelineError> {
     match algorithm {
+        #[cfg(feature = "legacy-algorithms")]
+        SignatureAlgorithm::RsaMd5 | SignatureAlgorithm::RsaRipemd160 => Ok(
+            verify_rsa_signature_pem(algorithm, public_key_pem, signed_data, signature_value)?,
+        ),
+        #[cfg(feature = "legacy-algorithms")]
+        SignatureAlgorithm::EcdsaRipemd160 => Ok(verify_ecdsa_signature_pem(
+            algorithm,
+            public_key_pem,
+            signed_data,
+            signature_value,
+        )?),
+        #[cfg(feature = "legacy-algorithms")]
+        SignatureAlgorithm::HmacMd5 | SignatureAlgorithm::HmacRipemd160 => {
+            Err(SignatureVerificationError::UnsupportedAlgorithm {
+                uri: algorithm.uri().to_owned(),
+            }
+            .into())
+        }
         SignatureAlgorithm::Ed25519
         | SignatureAlgorithm::Ed25519Ctx
         | SignatureAlgorithm::Ed25519Ph

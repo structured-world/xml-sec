@@ -3139,6 +3139,83 @@ fn explicit_legacy_sha1_policy_builds_signs_and_verifies() {
     assert_eq!(result.status, DsigStatus::Valid);
 }
 
+#[cfg(feature = "legacy-algorithms")]
+#[test]
+fn historical_rsa_methods_require_independent_digest_permission() {
+    // Optional primitives do not weaken either policy: the signature and each
+    // reference digest require explicit permission, including KeyValue resolution.
+    let key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .unwrap();
+    for (method, digest) in [
+        (SignatureAlgorithm::RsaMd5, DigestAlgorithm::Md5),
+        (SignatureAlgorithm::RsaRipemd160, DigestAlgorithm::Ripemd160),
+    ] {
+        let builder = SignatureBuilder::new(exclusive_c14n(), method)
+            .add_reference(
+                ReferenceBuilder::new(digest)
+                    .uri("#payload")
+                    .transform(Transform::C14n(exclusive_c14n())),
+            )
+            .key_info(true);
+        assert!(builder.build_template().is_err());
+        let source = "<root><payload ID=\"payload\">historical interop</payload></root>";
+        let mut signing = SigningPolicy {
+            signature_algorithms: Some(HashSet::from([method])),
+            ..SigningPolicy::default()
+        };
+        assert!(
+            SignContext::new(&key)
+                .policy(signing.clone())
+                .sign_with_builder(source, &builder)
+                .is_err()
+        );
+        signing.digest_algorithms = Some(HashSet::from([digest]));
+        let signed = SignContext::new(&key)
+            .policy(signing)
+            .key_info_writer(&KeyValueInfoWriter)
+            .sign_with_builder(source, &builder)
+            .unwrap();
+        let resolver = DefaultKeyResolver::default();
+        assert!(
+            VerifyContext::new()
+                .key_resolver(&resolver)
+                .verify(&signed)
+                .is_err()
+        );
+        let mut verification = VerificationPolicy::default();
+        verification.key_trust.mode = xml_sec::policy::VerificationTrustMode::CryptographicOnly;
+        verification.signature_algorithms = Some(HashSet::from([method]));
+        assert!(
+            VerifyContext::new()
+                .policy(verification.clone())
+                .key_resolver(&resolver)
+                .verify(&signed)
+                .is_err()
+        );
+        verification.digest_algorithms = Some(HashSet::from([digest]));
+        assert_eq!(
+            VerifyContext::new()
+                .policy(verification.clone())
+                .key_resolver(&resolver)
+                .verify(&signed)
+                .unwrap()
+                .status,
+            DsigStatus::Valid
+        );
+        let altered = signed.replace("historical interop", "altered interop");
+        assert_ne!(
+            VerifyContext::new()
+                .policy(verification)
+                .key_resolver(&resolver)
+                .verify(&altered)
+                .unwrap()
+                .status,
+            DsigStatus::Valid
+        );
+    }
+}
+
 #[test]
 fn signs_ecdsa_donor_templates_and_verifies_round_trip() {
     // The donor enveloped ECDSA templates include an XPath transform, which is

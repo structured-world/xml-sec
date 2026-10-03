@@ -104,6 +104,21 @@ pub(crate) const MAX_X509_DATA_TOTAL_BINARY_LEN: usize = 1_048_576;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum SignatureAlgorithm {
+    /// RSA PKCS#1 v1.5 with MD5; explicit compatibility permission required.
+    #[cfg(feature = "legacy-algorithms")]
+    RsaMd5,
+    /// RSA PKCS#1 v1.5 with RIPEMD-160; explicit compatibility permission required.
+    #[cfg(feature = "legacy-algorithms")]
+    RsaRipemd160,
+    /// HMAC-MD5; explicit compatibility permission required.
+    #[cfg(feature = "legacy-algorithms")]
+    HmacMd5,
+    /// HMAC-RIPEMD-160; explicit compatibility permission required.
+    #[cfg(feature = "legacy-algorithms")]
+    HmacRipemd160,
+    /// ECDSA-RIPEMD-160; the public key selects the curve.
+    #[cfg(feature = "legacy-algorithms")]
+    EcdsaRipemd160,
     /// DSA with SHA-1. Legacy algorithm disabled for signing by default.
     DsaSha1,
     /// DSA with SHA-256 as defined by XMLDSig 1.1.
@@ -162,7 +177,22 @@ pub enum SignatureAlgorithm {
 
 impl SignatureAlgorithm {
     /// Every signature algorithm recognized by this release.
-    pub const ALL: [Self; 35] = [
+    pub const ALL: [Self;
+        35 + if cfg!(feature = "legacy-algorithms") {
+            5
+        } else {
+            0
+        }] = [
+        #[cfg(feature = "legacy-algorithms")]
+        Self::RsaMd5,
+        #[cfg(feature = "legacy-algorithms")]
+        Self::RsaRipemd160,
+        #[cfg(feature = "legacy-algorithms")]
+        Self::HmacMd5,
+        #[cfg(feature = "legacy-algorithms")]
+        Self::HmacRipemd160,
+        #[cfg(feature = "legacy-algorithms")]
+        Self::EcdsaRipemd160,
         Self::DsaSha1,
         Self::DsaSha256,
         Self::HmacSha1,
@@ -201,8 +231,10 @@ impl SignatureAlgorithm {
     ];
 
     /// Digest selected by an ECDSA method, independently of its key's curve.
-    pub(crate) const fn ecdsa_digest(self) -> Option<DigestAlgorithm> {
+    pub const fn ecdsa_digest(self) -> Option<DigestAlgorithm> {
         match self {
+            #[cfg(feature = "legacy-algorithms")]
+            Self::EcdsaRipemd160 => Some(DigestAlgorithm::Ripemd160),
             Self::EcdsaSha1 => Some(DigestAlgorithm::Sha1),
             Self::EcdsaSha224 => Some(DigestAlgorithm::Sha224),
             Self::EcdsaSha256 => Some(DigestAlgorithm::Sha256),
@@ -256,6 +288,10 @@ impl SignatureAlgorithm {
     #[must_use]
     pub const fn hmac_output_bits(self) -> Option<usize> {
         match self {
+            #[cfg(feature = "legacy-algorithms")]
+            Self::HmacMd5 => Some(128),
+            #[cfg(feature = "legacy-algorithms")]
+            Self::HmacRipemd160 => Some(160),
             Self::HmacSha1 => Some(160),
             Self::HmacSha224 => Some(224),
             Self::HmacSha256 => Some(256),
@@ -269,6 +305,18 @@ impl SignatureAlgorithm {
     #[must_use]
     pub fn from_uri(uri: &str) -> Option<Self> {
         match uri {
+            #[cfg(feature = "legacy-algorithms")]
+            "http://www.w3.org/2001/04/xmldsig-more#rsa-md5" => Some(Self::RsaMd5),
+            #[cfg(feature = "legacy-algorithms")]
+            "http://www.w3.org/2001/04/xmldsig-more#rsa-ripemd160" => Some(Self::RsaRipemd160),
+            #[cfg(feature = "legacy-algorithms")]
+            "http://www.w3.org/2001/04/xmldsig-more#hmac-md5" => Some(Self::HmacMd5),
+            #[cfg(feature = "legacy-algorithms")]
+            "http://www.w3.org/2001/04/xmldsig-more#hmac-ripemd160" => Some(Self::HmacRipemd160),
+            // RFC 9231 §2.3.6 assigns the 2007 namespace to ECDSA-RIPEMD160.
+            // https://www.rfc-editor.org/rfc/rfc9231.html#section-2.3.6
+            #[cfg(feature = "legacy-algorithms")]
+            "http://www.w3.org/2007/05/xmldsig-more#ecdsa-ripemd160" => Some(Self::EcdsaRipemd160),
             "http://www.w3.org/2000/09/xmldsig#dsa-sha1" => Some(Self::DsaSha1),
             "http://www.w3.org/2009/xmldsig11#dsa-sha256" => Some(Self::DsaSha256),
             "http://www.w3.org/2000/09/xmldsig#hmac-sha1" => Some(Self::HmacSha1),
@@ -310,6 +358,16 @@ impl SignatureAlgorithm {
     #[must_use]
     pub fn uri(self) -> &'static str {
         match self {
+            #[cfg(feature = "legacy-algorithms")]
+            Self::RsaMd5 => "http://www.w3.org/2001/04/xmldsig-more#rsa-md5",
+            #[cfg(feature = "legacy-algorithms")]
+            Self::RsaRipemd160 => "http://www.w3.org/2001/04/xmldsig-more#rsa-ripemd160",
+            #[cfg(feature = "legacy-algorithms")]
+            Self::HmacMd5 => "http://www.w3.org/2001/04/xmldsig-more#hmac-md5",
+            #[cfg(feature = "legacy-algorithms")]
+            Self::HmacRipemd160 => "http://www.w3.org/2001/04/xmldsig-more#hmac-ripemd160",
+            #[cfg(feature = "legacy-algorithms")]
+            Self::EcdsaRipemd160 => "http://www.w3.org/2007/05/xmldsig-more#ecdsa-ripemd160",
             Self::DsaSha1 => "http://www.w3.org/2000/09/xmldsig#dsa-sha1",
             Self::DsaSha256 => "http://www.w3.org/2009/xmldsig11#dsa-sha256",
             Self::HmacSha1 => "http://www.w3.org/2000/09/xmldsig#hmac-sha1",
@@ -343,10 +401,40 @@ impl SignatureAlgorithm {
     /// Whether this algorithm is allowed for signing (not just verification).
     #[must_use]
     pub fn signing_allowed(self) -> bool {
+        if self.requires_explicit_permission() {
+            return false;
+        }
         !matches!(
             self,
             Self::RsaSha1 | Self::DsaSha1 | Self::HmacSha1 | Self::EcdsaSha1 | Self::PostQuantum(_)
         )
+    }
+
+    /// Whether this optional historical method requires explicit policy permission.
+    pub const fn requires_explicit_permission(self) -> bool {
+        match self {
+            #[cfg(feature = "legacy-algorithms")]
+            Self::RsaMd5
+            | Self::RsaRipemd160
+            | Self::HmacMd5
+            | Self::HmacRipemd160
+            | Self::EcdsaRipemd160 => true,
+            _ => false,
+        }
+    }
+
+    /// Whether this method uses an RSA key and PKCS#1 signature encoding.
+    pub const fn is_rsa(self) -> bool {
+        match self {
+            #[cfg(feature = "legacy-algorithms")]
+            Self::RsaMd5 | Self::RsaRipemd160 => true,
+            Self::RsaSha1
+            | Self::RsaSha224
+            | Self::RsaSha256
+            | Self::RsaSha384
+            | Self::RsaSha512 => true,
+            _ => false,
+        }
     }
 }
 
