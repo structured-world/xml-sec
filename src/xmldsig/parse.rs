@@ -1735,6 +1735,40 @@ pub(crate) fn parse_x509_data_dispatch_with_budget_and_provider(
     Ok(info)
 }
 
+/// Check untrusted selector requests before parsing hashes embedded certificates.
+/// This borrows the operation's existing policy, without a parallel policy knob.
+pub(crate) fn validate_x509_digest_policy(
+    node: Node,
+    check: &impl Fn(DigestAlgorithm) -> Result<(), crate::policy::PolicyViolation>,
+) -> Result<(), ParseError> {
+    fn check_data(
+        data: Node,
+        check: &impl Fn(DigestAlgorithm) -> Result<(), crate::policy::PolicyViolation>,
+    ) -> Result<(), ParseError> {
+        for child in element_children(data) {
+            if child.has_tag_name((XMLDSIG11_NS, "X509Digest")) {
+                let uri = required_algorithm_attr(child, "X509Digest")?;
+                // Unknown URIs retain the parser/resolver's unsupported-
+                // algorithm error, not a policy denial; no primitive can run
+                // for them. Gate every recognized selector before hashing.
+                if let Some(algorithm) = DigestAlgorithm::from_uri(uri) {
+                    check(algorithm)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    if node.has_tag_name((XMLDSIG_NS, "X509Data")) {
+        return check_data(node, check);
+    }
+    for child in element_children(node) {
+        if child.has_tag_name((XMLDSIG_NS, "X509Data")) {
+            check_data(child, check)?;
+        }
+    }
+    Ok(())
+}
+
 fn build_x509_certificate_chain(
     info: &X509DataInfo,
     provider: &dyn crate::provider::CryptoProvider,

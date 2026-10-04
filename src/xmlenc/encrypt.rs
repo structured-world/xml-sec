@@ -2761,7 +2761,7 @@ mod tests {
                 .expect_err("malformed provider output must fail before XML serialization");
             assert!(matches!(
                 error,
-                XmlEncError::DataTooShort { .. } | XmlEncError::InvalidCbcCiphertextLength(_)
+                XmlEncError::DataTooShort { .. } | XmlEncError::InvalidCbcCiphertextLength { .. }
             ));
         }
     }

@@ -2114,6 +2114,9 @@ fn verify_signature_node<'a>(
         signature_children
             .key_info_node
             .map(|node| {
+                super::parse::validate_x509_digest_policy(node, &|algorithm| {
+                    ctx.policy.check_digest_algorithm(algorithm)
+                })?;
                 parse_key_info_with_policy_budgets(
                     node,
                     ctx.provider,
@@ -2246,8 +2249,7 @@ fn verify_signature_node<'a>(
                 outcome.merge(materialize_retrieval_methods_with_budgets(
                     info,
                     resolver,
-                    ctx.policy.uris.retrieval_methods,
-                    ctx.allowed_transform_uris(),
+                    &ctx.policy,
                     ctx.provider,
                     &mut retrieval_budgets,
                     &mut materialization.candidate_work,
@@ -2618,6 +2620,10 @@ struct KeyInfoMaterializationState {
 }
 
 trait KeyInfoReferencePolicy {
+    fn check_digest_algorithm(
+        &self,
+        algorithm: DigestAlgorithm,
+    ) -> Result<(), crate::policy::PolicyViolation>;
     fn certificate_signature_algorithms(
         &self,
     ) -> Option<&crate::policy::CertificateSignatureAlgorithms>;
@@ -2630,6 +2636,12 @@ trait KeyInfoReferencePolicy {
 }
 
 impl KeyInfoReferencePolicy for crate::policy::SigningPolicy {
+    fn check_digest_algorithm(
+        &self,
+        algorithm: DigestAlgorithm,
+    ) -> Result<(), crate::policy::PolicyViolation> {
+        self.check_digest_algorithm(algorithm)
+    }
     fn certificate_signature_algorithms(
         &self,
     ) -> Option<&crate::policy::CertificateSignatureAlgorithms> {
@@ -2661,6 +2673,12 @@ impl KeyInfoReferencePolicy for crate::policy::SigningPolicy {
 }
 
 impl KeyInfoReferencePolicy for crate::policy::VerificationPolicy {
+    fn check_digest_algorithm(
+        &self,
+        algorithm: DigestAlgorithm,
+    ) -> Result<(), crate::policy::PolicyViolation> {
+        self.check_digest_algorithm(algorithm)
+    }
     fn certificate_signature_algorithms(
         &self,
     ) -> Option<&crate::policy::CertificateSignatureAlgorithms> {
@@ -2772,6 +2790,10 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
                         reason: "KeyInfoReference target must be KeyInfo",
                     });
                 }
+                super::parse::validate_x509_digest_policy(node, &|algorithm| {
+                    context.policy.check_digest_algorithm(algorithm)
+                })
+                .map_err(map_key_info_parse_error)?;
                 (
                     parse_key_info_with_policy_budgets(
                         node,
@@ -2845,6 +2867,10 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
                             reason: "KeyInfoReference external target must be KeyInfo",
                         });
                     }
+                    super::parse::validate_x509_digest_policy(target, &|algorithm| {
+                        context.policy.check_digest_algorithm(algorithm)
+                    })
+                    .map_err(map_key_info_parse_error)?;
                     let mut referenced = parse_key_info_with_policy_budgets_and_document_base(
                         target,
                         context.provider,
@@ -2864,8 +2890,7 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
                     nested_outcome.merge(materialize_retrieval_methods_with_budgets(
                         &mut referenced,
                         &external_resolver,
-                        context.policy.retrieval_method_uris(),
-                        context.policy.allowed_transforms(),
+                        context.policy,
                         context.provider,
                         context.budgets,
                         &mut materialization.candidate_work,
@@ -3012,15 +3037,16 @@ pub fn materialize_verification_key_info_references(
     materialize_key_info_references_for_policy(key_info, resolver, policy, provider, xml_backend)
 }
 
-fn materialize_retrieval_methods_with_budgets(
+fn materialize_retrieval_methods_with_budgets<P: KeyInfoReferencePolicy>(
     key_info: &mut KeyInfo,
     resolver: &UriReferenceResolver<'_>,
-    allowed_uri_types: UriTypeSet,
-    allowed_transforms: Option<&HashSet<String>>,
+    policy: &P,
     provider: &dyn crate::provider::CryptoProvider,
     budgets: &mut RetrievalMaterializationBudgets<'_>,
     candidate_work: &mut usize,
 ) -> Result<RetrievalMaterialization, SignatureVerificationPipelineError> {
+    let allowed_uri_types = policy.retrieval_method_uris();
+    let allowed_transforms = policy.allowed_transforms();
     let retrieval_count = key_info
         .sources
         .iter()
@@ -3178,6 +3204,10 @@ fn materialize_retrieval_methods_with_budgets(
                     });
                 }
             };
+            super::parse::validate_x509_digest_policy(node, &|algorithm| {
+                policy.check_digest_algorithm(algorithm)
+            })
+            .map_err(map_key_info_parse_error)?;
             let data = parse_x509_data_dispatch_with_budget_and_provider(
                 node,
                 &mut total_binary_len,
@@ -3261,11 +3291,13 @@ fn materialize_retrieval_methods(
         xml_backend: crate::XmlBackend::default(),
     };
     let mut candidate_work = key_info.embedded_candidate_count();
+    let mut policy = crate::policy::VerificationPolicy::default();
+    policy.uris.retrieval_methods = allowed_uri_types;
+    policy.transforms.allowed_algorithms = allowed_transforms.cloned();
     materialize_retrieval_methods_with_budgets(
         key_info,
         resolver,
-        allowed_uri_types,
-        allowed_transforms,
+        &policy,
         provider,
         &mut budgets,
         &mut candidate_work,
@@ -7364,8 +7396,7 @@ mod tests {
                 outcome.merge(materialize_retrieval_methods_with_budgets(
                     &mut key_info,
                     &resolver,
-                    policy.uris.retrieval_methods,
-                    policy.transforms.allowed_algorithms.as_ref(),
+                    &policy,
                     crate::provider::default_provider(),
                     &mut budgets,
                     &mut materialization.candidate_work,
@@ -7852,11 +7883,12 @@ mod tests {
         };
         let mut candidate_work = key_info.embedded_candidate_count();
 
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.uris.retrieval_methods = UriTypeSet::ALL;
         let error = materialize_retrieval_methods_with_budgets(
             &mut key_info,
             &resolver,
-            UriTypeSet::ALL,
-            None,
+            &policy,
             crate::provider::default_provider(),
             &mut budgets,
             &mut candidate_work,

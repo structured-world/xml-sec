@@ -155,9 +155,11 @@ pub(crate) fn validate_ciphertext_framing(
     if let Some(block) = algorithm.cbc_block_len()
         && !(ciphertext_len - block).is_multiple_of(block)
     {
-        return Err(XmlEncError::InvalidCbcCiphertextLength(
-            ciphertext_len - block,
-        ));
+        return Err(XmlEncError::InvalidCbcCiphertextLength {
+            algorithm,
+            block,
+            actual: ciphertext_len - block,
+        });
     }
     Ok(())
 }
@@ -789,9 +791,18 @@ pub enum XmlEncError {
         /// Actual byte length.
         actual: usize,
     },
-    /// CBC ciphertext is not a non-empty multiple of the AES block size.
-    #[error("AES-CBC ciphertext length must be a non-zero multiple of 16 bytes, got {0}")]
-    InvalidCbcCiphertextLength(usize),
+    /// CBC ciphertext is not a non-empty multiple of the selected cipher's block size.
+    #[error(
+        "{algorithm} ciphertext length must be a non-zero multiple of {block} bytes, got {actual}"
+    )]
+    InvalidCbcCiphertextLength {
+        /// Selected content cipher.
+        algorithm: DataEncryptionAlgorithm,
+        /// Cipher's block width in bytes.
+        block: usize,
+        /// Ciphertext body width, excluding the IV.
+        actual: usize,
+    },
     /// XMLEnc random padding is invalid.
     ///
     /// No decrypted padding details are exposed. This does not authenticate CBC
@@ -900,5 +911,31 @@ impl fmt::Display for DataEncryptionAlgorithm {
             Self::Aes128Gcm => "AES-128-GCM",
             Self::Aes256Gcm => "AES-256-GCM",
         })
+    }
+}
+
+#[cfg(test)]
+mod framing_tests {
+    use super::*;
+
+    #[test]
+    fn cbc_framing_error_names_the_selected_cipher() {
+        // Diagnostics must identify the actual cipher and its block width,
+        // rather than reporting AES framing for a DES input.
+        let error = validate_ciphertext_framing(DataEncryptionAlgorithm::Aes128Cbc, 33)
+            .expect_err("AES ciphertext body is not block-aligned");
+        assert_eq!(
+            error.to_string(),
+            "AES-128-CBC ciphertext length must be a non-zero multiple of 16 bytes, got 17"
+        );
+        #[cfg(feature = "legacy-algorithms")]
+        {
+            let error = validate_ciphertext_framing(DataEncryptionAlgorithm::TripleDesCbc, 17)
+                .expect_err("3DES ciphertext body is not block-aligned");
+            assert_eq!(
+                error.to_string(),
+                "Triple DES CBC ciphertext length must be a non-zero multiple of 8 bytes, got 9"
+            );
+        }
     }
 }

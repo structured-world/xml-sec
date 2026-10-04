@@ -1328,6 +1328,14 @@ impl DefaultKeyResolver {
                 !document_sources || matches!(source, KeyInfoSource::KeyName(_));
             let resolved = match source {
                 KeyInfoSource::X509Data(info) => {
+                    // Enforce selector permissions before candidate work or
+                    // hashing, including direct callers of this resolver.
+                    for (uri, _) in &info.digests {
+                        let algorithm = super::DigestAlgorithm::from_uri(uri).ok_or_else(|| {
+                            KeyResolutionError::UnsupportedDigestAlgorithm(uri.clone())
+                        })?;
+                        policy.check_digest_algorithm(algorithm)?;
+                    }
                     if if info.certificate_chain.is_empty() {
                         x509_data_has_lookup_identifiers(info)
                     } else {
@@ -4598,6 +4606,129 @@ mod tests {
             ),
             "unexpected error: {error:?}"
         );
+    }
+
+    #[cfg(feature = "legacy-algorithms")]
+    #[test]
+    fn x509_digest_selectors_obey_operation_policy() {
+        // Both lookup-only and embedded selectors must reject a denied digest
+        // before certificate selection; explicit permission must still work.
+        for algorithm in [
+            super::super::DigestAlgorithm::Md5,
+            super::super::DigestAlgorithm::Ripemd160,
+        ] {
+            let certificate = certificate_der(RSA_4096_CERTIFICATE);
+            let digest = super::super::compute_digest(algorithm, &certificate);
+            let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+                lookup_certs: vec![certificate.clone()],
+                trusted_certs: vec![
+                    certificate.clone(),
+                    certificate_der(include_str!("../../tests/fixtures/keys/ca2cert.pem")),
+                    certificate_der(include_str!("../../tests/fixtures/keys/cacert.pem")),
+                ],
+                ..KeyResolverConfig::default()
+            });
+            for embedded in [false, true] {
+                let cert_xml = if embedded {
+                    format!(
+                        "<X509Certificate>{}</X509Certificate>",
+                        STANDARD.encode(&certificate)
+                    )
+                } else {
+                    String::new()
+                };
+                let xml = replace_unprefixed_key_info(
+                    X509_DIGEST_SIGNATURE,
+                    &format!(
+                        "<KeyInfo><X509Data>{cert_xml}<X509Digest xmlns=\"http://www.w3.org/2009/xmldsig11#\" Algorithm=\"{}\">{}</X509Digest></X509Data></KeyInfo>",
+                        algorithm.uri(),
+                        STANDARD.encode(&digest)
+                    ),
+                );
+                let provider = RejectSecondSha512Provider {
+                    sha512_calls: AtomicUsize::new(0),
+                    verification_calls: AtomicUsize::new(0),
+                    reject_verification_call: None,
+                    rejected_verification_data: None,
+                };
+                assert!(
+                    matches!(super::super::VerifyContext::new().key_resolver(&resolver).provider(&provider).verify(&xml),
+                    Err(DsigError::Policy(crate::policy::PolicyViolation::Algorithm { algorithm: uri, .. })) if uri == algorithm.uri())
+                );
+                assert_eq!(provider.sha512_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(provider.verification_calls.load(Ordering::SeqCst), 0);
+                // Direct resolver callers must not bypass the same snapshot.
+                let info = KeyInfo {
+                    sources: vec![KeyInfoSource::X509Data(X509DataInfo {
+                        digests: vec![(algorithm.uri().into(), digest.clone())],
+                        ..X509DataInfo::default()
+                    })],
+                };
+                assert!(matches!(
+                    resolver.resolve_with_policy(
+                        Some(&info),
+                        SignatureAlgorithm::RsaSha512,
+                        &crate::policy::VerificationPolicy::default()
+                    ),
+                    Err(DsigError::Policy(_))
+                ));
+                let policy = crate::policy::VerificationPolicy {
+                    digest_algorithms: Some(
+                        [algorithm, super::super::DigestAlgorithm::Sha512].into(),
+                    ),
+                    ..crate::policy::VerificationPolicy::default()
+                };
+                assert_eq!(
+                    super::super::VerifyContext::new()
+                        .key_resolver(&resolver)
+                        .policy(policy.clone())
+                        .verify(&xml)
+                        .expect("explicitly permitted selector must verify")
+                        .status,
+                    super::super::DsigStatus::Valid
+                );
+                // Referenced KeyInfo and retrieved X509Data must not create a
+                // separate algorithm permission path during materialization.
+                let start = xml.find("<KeyInfo>").expect("fixture has KeyInfo");
+                let end =
+                    xml.find("</KeyInfo>").expect("fixture closes KeyInfo") + "</KeyInfo>".len();
+                let target = &xml[start..end];
+                let referenced = replace_unprefixed_key_info(
+                    &xml,
+                    &format!(
+                        "<KeyInfo><KeyInfoReference xmlns=\"http://www.w3.org/2009/xmldsig11#\" URI=\"#selector\"/></KeyInfo><Object>{}</Object>",
+                        target.replace("<KeyInfo>", "<KeyInfo Id=\"selector\">")
+                    ),
+                );
+                let retrieved = replace_unprefixed_key_info(
+                    &xml,
+                    &format!(
+                        "<KeyInfo><RetrievalMethod URI=\"#selector\" Type=\"http://www.w3.org/2000/09/xmldsig#X509Data\"/></KeyInfo><Object>{}</Object>",
+                        target
+                            .strip_prefix("<KeyInfo>")
+                            .expect("selected range starts at KeyInfo")
+                            .strip_suffix("</KeyInfo>")
+                            .expect("selected range ends at KeyInfo")
+                            .replace("<X509Data>", "<X509Data Id=\"selector\">")
+                    ),
+                );
+                for indirect in [referenced, retrieved] {
+                    assert!(
+                        matches!(super::super::VerifyContext::new().key_resolver(&resolver).verify(&indirect),
+                        Err(DsigError::Policy(crate::policy::PolicyViolation::Algorithm { algorithm: uri, .. })) if uri == algorithm.uri())
+                    );
+                    assert_eq!(
+                        super::super::VerifyContext::new()
+                            .key_resolver(&resolver)
+                            .policy(policy.clone())
+                            .verify(&indirect)
+                            .expect("permitted indirect selector must verify")
+                            .status,
+                        super::super::DsigStatus::Valid
+                    );
+                }
+            }
+        }
     }
 
     #[test]

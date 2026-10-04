@@ -64,6 +64,8 @@ impl DigestAlgorithm {
     /// Parse a digest algorithm from its XML namespace URI.
     ///
     /// Returns `None` for unrecognized URIs.
+    /// Recognition is capability, not permission: operation callers must check
+    /// their compiled digest policy before hashing, including X509Digest selectors.
     ///
     /// # URIs
     ///

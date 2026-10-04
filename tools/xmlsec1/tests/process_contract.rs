@@ -5589,7 +5589,9 @@ fn named_aes_key_ring_selects_one_key_for_encryption_and_decryption() {
         .output()
         .unwrap();
     assert!(!ambiguous.status.success());
-    assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("multiple AES key"));
+    // The shared selector identifies symmetric keys, including DES, rather
+    // than labeling every ambiguous candidate ring as AES-only.
+    assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("multiple symmetric key"));
 
     // Lax lookup intentionally ignores duplicate identity metadata and searches
     // by key kind, so the first compatible entry can complete the round trip.

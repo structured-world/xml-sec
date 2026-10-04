@@ -677,6 +677,10 @@ impl PrivateKeyDecryptor {
                 }
                 provider
                     .require_capability(crate::provider::ProviderCapability::Pkcs1v15Recovery)?;
+                // Recovery conceals padding/range rejection with a random CEK;
+                // only operational provider failures propagate here. The RFC
+                // padding-error rule is RFC 8017 §7.2.2's note:
+                // https://www.rfc-editor.org/rfc/rfc8017#section-7.2.2.
                 provider
                     .recover_pkcs1v15(self.key.as_ref(), &wrapped, algorithm.key_len())
                     .map_err(XmlEncError::Provider)

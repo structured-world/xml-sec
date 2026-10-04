@@ -95,6 +95,18 @@ fn pkcs1v15_transport_is_parameterless_and_explicitly_permitted() {
     let short = encrypted
         .encrypted_data_xml
         .replace(wrapped, &STANDARD.encode(&corrupt[..corrupt.len() - 1]));
+    // An out-of-range RSA representative must reach the same authenticated
+    // content check as a padding failure, never a distinct provider error.
+    corrupt.fill(0xff);
+    let out_of_range = encrypted
+        .encrypted_data_xml
+        .replace(wrapped, &STANDARD.encode(&corrupt));
+    assert!(matches!(
+        DecryptContext::new(&resolver)
+            .policy(policy.clone())
+            .decrypt(&out_of_range),
+        Err(XmlEncError::AeadAuthenticationFailed)
+    ));
     assert!(
         DecryptContext::new(&resolver)
             .policy(policy.clone())

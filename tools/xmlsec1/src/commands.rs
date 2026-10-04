@@ -2363,7 +2363,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             &requested_names,
             invocation.flag("lax-key-search"),
             true,
-            "AES key",
+            "symmetric key",
         )?;
         KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
             .consume(candidates.len())
@@ -2392,7 +2392,8 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             }
         }
         let (option, key) = selected.ok_or_else(|| {
-            last_error.unwrap_or_else(|| CommandError::Usage("no compatible AES key input".into()))
+            last_error
+                .unwrap_or_else(|| CommandError::Usage("no compatible symmetric key input".into()))
         })?;
         builder = builder.direct_key(key);
         if let Some(name) = option.parameter.as_deref() {
@@ -2423,7 +2424,9 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         let selected = candidates
             .into_iter()
             .find(|entry| entry.bytes.len() == algorithm.key_len())
-            .ok_or_else(|| CommandError::Usage("no compatible AES key in --keys-file".into()))?;
+            .ok_or_else(|| {
+                CommandError::Usage("no compatible symmetric key in --keys-file".into())
+            })?;
         let key =
             key_material::decode_symmetric(selected.bytes.to_vec(), Some(algorithm.key_len()))?;
         builder = builder.direct_key(key).direct_key_name(&selected.name);
@@ -2560,9 +2563,9 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             let mut last_error = None;
             for entry in exact.into_iter().chain(fallbacks) {
                 if !exact.is_some_and(|selected| std::ptr::eq(selected, entry))
-                    && !available_public_keys_by_name
+                    && available_public_keys_by_name
                         .get(entry.name.as_str())
-                        .is_some_and(|available| available.reservations == 0)
+                        .is_none_or(|available| available.reservations != 0)
                 {
                     continue;
                 }
@@ -3710,7 +3713,7 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             &requested_names,
             invocation.flag("lax-key-search"),
             true,
-            "AES key",
+            "symmetric key",
         )?;
         KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
             .consume(candidates.len())
@@ -3729,8 +3732,9 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             }
         }
         if keys.is_empty() {
-            return Err(last_error
-                .unwrap_or_else(|| CommandError::Usage("no compatible AES key input".into())));
+            return Err(last_error.unwrap_or_else(|| {
+                CommandError::Usage("no compatible symmetric key input".into())
+            }));
         }
         decrypt_input(
             &CandidateSymmetricKeyDecryptor { keys },

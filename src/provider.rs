@@ -1224,7 +1224,7 @@ fn is_supported_x509_signature(algorithm: X509SignatureAlgorithm) -> bool {
         X509SignatureAlgorithm::Dsa(DigestAlgorithm::Sha1)
         | X509SignatureAlgorithm::Ed25519
         | X509SignatureAlgorithm::Ed448 => true,
-        X509SignatureAlgorithm::Ecdsa(_) => true,
+        X509SignatureAlgorithm::Ecdsa(digest) => rustcrypto_x509::ecdsa_algorithm(digest).is_some(),
         X509SignatureAlgorithm::PostQuantum(_) => cfg!(feature = "experimental-pq"),
         X509SignatureAlgorithm::RsaPkcs1v15(digest) => matches!(
             digest,
@@ -1517,7 +1517,7 @@ mod rustcrypto_x509 {
         }
     }
 
-    const fn ecdsa_algorithm(digest: DigestAlgorithm) -> Option<SignatureAlgorithm> {
+    pub(super) const fn ecdsa_algorithm(digest: DigestAlgorithm) -> Option<SignatureAlgorithm> {
         match digest {
             #[cfg(feature = "legacy-algorithms")]
             DigestAlgorithm::Md5 | DigestAlgorithm::Ripemd160 => None,
@@ -1959,16 +1959,25 @@ mod rustcrypto {
                 ProviderInputError::PrimitiveInitialization("XMLEnc content-key width"),
             ));
         }
-        // RFC 8017 §7.2.2 requires indistinguishable decryption errors. The
-        // normative error rule is https://www.rfc-editor.org/rfc/rfc8017#section-7.2.2.
-        // primitive uses implicit rejection; also conceal a wrong CEK width by
-        // retaining a random fixed-width key for the subsequent content check.
+        // RFC 8017 §7.2.2's note requires indistinguishable Step 3 padding
+        // errors: https://www.rfc-editor.org/rfc/rfc8017#section-7.2.2.
+        // The primitive already rejects invalid padding implicitly. We also
+        // conceal ciphertext-width/range errors (Steps 1/2) by retaining the
+        // random fixed-width CEK for the content check. This extends the error
+        // contract, not a claim that the primitive's early exits take equal time.
+        // RNG and key/configuration failures remain operational errors.
         let mut output = zeroize::Zeroizing::new(vec![0_u8; key_len]);
         provider.fill_random(&mut output)?;
         let recovered = zeroize::Zeroizing::new(
-            rsa::Pkcs1v15Encrypt
-                .decrypt(Some(&mut super::ProviderRng(provider)), key, ciphertext)
-                .map_err(map_rsa_error)?,
+            match rsa::Pkcs1v15Encrypt.decrypt(
+                Some(&mut super::ProviderRng(provider)),
+                key,
+                ciphertext,
+            ) {
+                Ok(recovered) => recovered,
+                Err(rsa::Error::Decryption) => Vec::new(),
+                Err(error) => return Err(map_rsa_error(error)),
+            },
         );
         let same_width = Choice::from(u8::from(recovered.len() == key_len));
         for (index, byte) in output.iter_mut().enumerate() {
@@ -2434,6 +2443,16 @@ mod tests {
         for digest in [DigestAlgorithm::Sha1, DigestAlgorithm::Sha512] {
             assert!(
                 RUST_CRYPTO_PROVIDER.supports(ProviderCapability::VerifyCertificate(
+                    X509SignatureAlgorithm::Ecdsa(digest)
+                ))
+            );
+        }
+        // Certificate capabilities must agree with the actual execution
+        // mapping, not merely with the presence of an ECDSA primitive.
+        #[cfg(feature = "legacy-algorithms")]
+        for digest in [DigestAlgorithm::Md5, DigestAlgorithm::Ripemd160] {
+            assert!(
+                !RUST_CRYPTO_PROVIDER.supports(ProviderCapability::VerifyCertificate(
                     X509SignatureAlgorithm::Ecdsa(digest)
                 ))
             );
