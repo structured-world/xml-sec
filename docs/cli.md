@@ -147,7 +147,11 @@ their immutable signing or verification policy.
 Building with `--features legacy-algorithms` extends that explicit CLI compatibility policy to
 MD5/RIPEMD-160 signatures and reference digests, AES-192, TripleDES, and RSA-1.5 transport.
 Use `--deskey[:NAME] FILE` for a 24-byte TripleDES content key and `--aeskey[:NAME] FILE`
-for AES; equal key lengths do not make these types interchangeable. RSA-1.5 is selected by the
+for AES; equal key lengths do not make these types interchangeable. For `kw-aes192` or
+`kw-tripledes` recipient templates,
+the corresponding symmetric option supplies a KEK, and its name matches the recipient's
+`KeyName`, not the generated content key. Symmetric key-store entries work through the same
+wrap/unwrap path. RSA-1.5 is selected by the
 recipient template's method URI and cannot carry OAEP parameters. `list-transforms` reports only
 mechanisms available through the selected provider. Library defaults remain unchanged, and
 selecting `--crypto aws-lc-fips` never falls back for an unavailable compatibility method.

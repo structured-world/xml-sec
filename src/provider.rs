@@ -7,6 +7,60 @@
 
 #[cfg(feature = "aws-lc-fips")]
 mod aws_lc;
+#[cfg(all(feature = "xmlenc", feature = "legacy-algorithms"))]
+mod rsa_pkcs1v15;
+
+/// Secret candidate whose recovery validity is retained until content work ends.
+/// Debug output never exposes key bytes or padding validity.
+#[cfg(feature = "xmlenc")]
+pub struct RecoveredContentKey {
+    bytes: zeroize::Zeroizing<Vec<u8>>,
+    valid: subtle::Choice,
+}
+
+#[cfg(feature = "xmlenc")]
+impl std::fmt::Debug for RecoveredContentKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoveredContentKey")
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "xmlenc")]
+impl RecoveredContentKey {
+    /// An explicitly supplied key, or one recovered by an integrity-checking
+    /// mechanism such as OAEP or key wrap. Not for implicit-rejection output.
+    pub fn confirmed(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes: zeroize::Zeroizing::new(bytes),
+            valid: subtle::Choice::from(1),
+        }
+    }
+
+    #[cfg(feature = "legacy-algorithms")]
+    /// Preserve a trusted provider's constant-time padding-validation result.
+    /// `bytes` must already contain the fixed-width real-or-fallback candidate;
+    /// the caller must not branch on `valid` during recovery. The enclosing
+    /// content operation consumes this state only after primitive decryption.
+    pub fn recovery(bytes: zeroize::Zeroizing<Vec<u8>>, valid: subtle::Choice) -> Self {
+        Self { bytes, valid }
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    pub(crate) fn valid(&self) -> bool {
+        bool::from(self.valid)
+    }
+    /// Consume a completed recovery outside a content operation. Content
+    /// operations must retain the candidate until after primitive decryption.
+    pub fn into_key(mut self) -> Result<Vec<u8>, ProviderError> {
+        if !self.valid() {
+            return Err(ProviderError::AuthenticationFailed);
+        }
+        Ok(core::mem::take(&mut *self.bytes))
+    }
+}
 #[cfg(all(feature = "aws-lc-fips", feature = "xmlenc"))]
 pub use aws_lc::AwsLcRsaPrivateKey;
 #[cfg(feature = "aws-lc-fips")]
@@ -418,7 +472,7 @@ pub trait KeyRecoveryKey: Send + Sync {
         _provider: &dyn CryptoProvider,
         _ciphertext: &[u8],
         _key_len: usize,
-    ) -> Result<Vec<u8>, ProviderError> {
+    ) -> Result<RecoveredContentKey, ProviderError> {
         Err(ProviderError::Unsupported {
             operation: ProviderOperation::KeyRecovery,
             algorithm: Some(
@@ -671,7 +725,7 @@ pub trait CryptoProvider: Send + Sync {
         _key: &dyn KeyRecoveryKey,
         _ciphertext: &[u8],
         _key_len: usize,
-    ) -> Result<Vec<u8>, ProviderError> {
+    ) -> Result<RecoveredContentKey, ProviderError> {
         Err(ProviderError::Unsupported {
             operation: ProviderOperation::KeyRecovery,
             algorithm: Some(
@@ -847,8 +901,8 @@ impl KeyRecoveryKey for RustCryptoRsaPrivateKey {
         provider: &dyn CryptoProvider,
         ciphertext: &[u8],
         key_len: usize,
-    ) -> Result<Vec<u8>, ProviderError> {
-        rustcrypto::recover_pkcs1v15(provider, &self.key, ciphertext, key_len)
+    ) -> Result<RecoveredContentKey, ProviderError> {
+        rsa_pkcs1v15::recover(provider, &self.key, ciphertext, key_len)
     }
     fn rsa_modulus_bits(&self) -> usize {
         KeyRecoveryKey::rsa_modulus_bits(&self.key)
@@ -878,8 +932,8 @@ impl KeyRecoveryKey for rsa::RsaPrivateKey {
         provider: &dyn CryptoProvider,
         ciphertext: &[u8],
         key_len: usize,
-    ) -> Result<Vec<u8>, ProviderError> {
-        rustcrypto::recover_pkcs1v15(provider, self, ciphertext, key_len)
+    ) -> Result<RecoveredContentKey, ProviderError> {
+        rsa_pkcs1v15::recover(provider, self, ciphertext, key_len)
     }
     fn rsa_modulus_bits(&self) -> usize {
         use rsa::traits::PublicKeyParts as _;
@@ -970,7 +1024,7 @@ impl CryptoProvider for RustCryptoProvider {
         key: &dyn KeyRecoveryKey,
         ciphertext: &[u8],
         key_len: usize,
-    ) -> Result<Vec<u8>, ProviderError> {
+    ) -> Result<RecoveredContentKey, ProviderError> {
         self.require_capability(ProviderCapability::Pkcs1v15Recovery)?;
         key.recover_pkcs1v15(self, ciphertext, key_len)
     }
@@ -1946,47 +2000,6 @@ mod rustcrypto {
             .map_err(map_rsa_error)
     }
 
-    #[cfg(feature = "legacy-algorithms")]
-    pub(super) fn recover_pkcs1v15(
-        provider: &dyn CryptoProvider,
-        key: &rsa::RsaPrivateKey,
-        ciphertext: &[u8],
-        key_len: usize,
-    ) -> Result<Vec<u8>, ProviderError> {
-        use subtle::{Choice, ConditionallySelectable as _};
-        if !matches!(key_len, 16 | 24 | 32) {
-            return Err(ProviderError::InvalidInput(
-                ProviderInputError::PrimitiveInitialization("XMLEnc content-key width"),
-            ));
-        }
-        // RFC 8017 §7.2.2's note requires indistinguishable Step 3 padding
-        // errors: https://www.rfc-editor.org/rfc/rfc8017#section-7.2.2.
-        // The primitive already rejects invalid padding implicitly. We also
-        // conceal ciphertext-width/range errors (Steps 1/2) by retaining the
-        // random fixed-width CEK for the content check. This extends the error
-        // contract, not a claim that the primitive's early exits take equal time.
-        // RNG and key/configuration failures remain operational errors.
-        let mut output = zeroize::Zeroizing::new(vec![0_u8; key_len]);
-        provider.fill_random(&mut output)?;
-        let recovered = zeroize::Zeroizing::new(
-            match rsa::Pkcs1v15Encrypt.decrypt(
-                Some(&mut super::ProviderRng(provider)),
-                key,
-                ciphertext,
-            ) {
-                Ok(recovered) => recovered,
-                Err(rsa::Error::Decryption) => Vec::new(),
-                Err(error) => return Err(map_rsa_error(error)),
-            },
-        );
-        let same_width = Choice::from(u8::from(recovered.len() == key_len));
-        for (index, byte) in output.iter_mut().enumerate() {
-            let candidate = recovered.get(index).copied().unwrap_or(0);
-            *byte = u8::conditional_select(byte, &candidate, same_width);
-        }
-        Ok(core::mem::take(&mut *output))
-    }
-
     pub(super) fn transport_key(
         provider: &dyn CryptoProvider,
         key: &rsa::RsaPublicKey,
@@ -2129,7 +2142,7 @@ mod rustcrypto {
         result.map_err(map_rsa_error)
     }
 
-    fn map_rsa_error(error: rsa::Error) -> ProviderError {
+    pub(super) fn map_rsa_error(error: rsa::Error) -> ProviderError {
         match error {
             rsa::Error::Rng => ProviderError::Random("RSA randomness failed".into()),
             _ => ProviderError::AuthenticationFailed,

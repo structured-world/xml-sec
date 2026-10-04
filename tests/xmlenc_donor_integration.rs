@@ -485,7 +485,10 @@ fn decrypts_all_phaos_legacy_transport_and_wrap_vectors() {
     let private = PrivateKeyDecryptor::new(read_phaos_private_key());
     let keys_xml = std::fs::read_to_string(format!("{PHAOS_DIR}/keys.xml")).unwrap();
     let keys_doc = Document::parse(&keys_xml).unwrap();
-    let mut keys = read_aes_keys(Path::new(&format!("{PHAOS_DIR}/keys.xml")));
+    let mut keys: HashMap<_, _> = read_aes_keys(Path::new(&format!("{PHAOS_DIR}/keys.xml")))
+        .into_iter()
+        .map(|(name, bytes)| (name, (xml_sec::key_manager::SymmetricKeyKind::Aes, bytes)))
+        .collect();
     for entry in keys_doc
         .descendants()
         .filter(|node| node.tag_name().name() == "KeyInfo")
@@ -502,15 +505,18 @@ fn decrypts_all_phaos_legacy_transport_and_wrap_vectors() {
                 .unwrap();
             keys.insert(
                 name.into(),
-                STANDARD
-                    .decode(
-                        value
-                            .text()
-                            .unwrap()
-                            .split_ascii_whitespace()
-                            .collect::<String>(),
-                    )
-                    .unwrap(),
+                (
+                    xml_sec::key_manager::SymmetricKeyKind::Des,
+                    STANDARD
+                        .decode(
+                            value
+                                .text()
+                                .unwrap()
+                                .split_ascii_whitespace()
+                                .collect::<String>(),
+                        )
+                        .unwrap(),
+                ),
             );
         }
     }
@@ -535,7 +541,10 @@ fn decrypts_all_phaos_legacy_transport_and_wrap_vectors() {
         let expected = std::fs::read(format!("{PHAOS_DIR}/{name}.data")).unwrap();
         let resolver: Box<dyn xml_sec::xmlenc::DecryptionKeyResolver> = match key_name {
             None => Box::new(private.clone()),
-            Some(name) => Box::new(KekDecryptor::new(keys.get(name).unwrap().clone())),
+            Some(name) => {
+                let (kind, bytes) = keys.get(name).unwrap();
+                Box::new(KekDecryptor::with_kind(bytes.clone(), *kind))
+            }
         };
         let actual = DecryptContext::new(resolver.as_ref())
             .policy(policy.clone())

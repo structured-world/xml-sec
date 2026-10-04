@@ -163,11 +163,22 @@ integrations; prefer authenticated AES-GCM and RSA-OAEP for new output.
 
 Use `EncryptionRecipient::rsa_pkcs1v15` (or `provider_pkcs1v15`) for RSA-1.5, not
 `rsa_oaep` with altered parameters. XMLEnc 1.1 §5.5.1 defines no OAEP children for this method;
-the parser rejects them. Recovery uses implicit padding rejection and a fixed-length fallback
-content key; authenticated content must still succeed before plaintext is returned. CBC has no
-authentication, so use it only with a separately authenticated document boundary.
+the parser rejects them. Fixed-width recovery retains its padding-validity mask alongside a
+zeroized content-key candidate; invalid padding selects a random fallback key. Content decryption
+runs before the operation checks that mask, and an invalid recovery can never release plaintext,
+even when CBC padding happens to succeed. This does not authenticate CBC or eliminate its
+chosen-ciphertext risks (XMLEnc 1.1 §6.1.2); use CBC only with a separately authenticated boundary.
+`DecryptionKeyResolver` wrappers must forward `resolve_content_keys_with_policy` to preserve
+this state. The low-level byte-returning resolver APIs reject invalid recovery rather than
+exposing fallback key bytes. See [the RSA recovery adaptation](rsa-recovery-patch.md).
 TripleDES wrapping follows RFC 3217 §§2–3, including its SHA-1 checksum and fixed outer IV;
 it does not reinterpret arbitrary AES key bytes as DES parity-normalized bytes.
+`SymmetricKeyDecryptor::new` and `KekDecryptor::new` bind keys to AES, irrespective of length. For TripleDES, explicitly
+use `with_kind(key, SymmetricKeyKind::Des)`; the family is trusted request input, never inferred
+from an untrusted algorithm URI. Borrowed KEKs use `KekDecryptor::borrowed_with_kind` to retain
+the same family boundary without copying key material. Both families may supply CLI KEKs through `--aes-key:name`,
+`--des-key:name`, or symmetric `--keys-file` entries when the template contains a corresponding
+key-wrap method. Key names identify the wrapping recipient, not the generated content key.
 That typed-input check validates the top-level content `EncryptionMethod` and every embedded key
 method before resolver dispatch, and bounds both encoded and projected decoded `CipherValue`
 sizes. Callers therefore cannot bypass parser structural or allocation limits by constructing the

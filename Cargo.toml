@@ -86,7 +86,7 @@ snafu = { version = "0.9", optional = true }
 
 # Crypto
 aws-lc-rs = { version = "1.18.1", default-features = false, features = ["fips"], optional = true }
-rsa = { package = "sad-rsa", version = "0.10.2", features = ["sha1", "sha2"], optional = true }
+rsa = { package = "sad-rsa", version = "0.10.2", features = ["sha1", "sha2", "hazmat"], optional = true }
 sha1 = { version = "0.11", features = ["oid"], optional = true }
 sha2 = { version = "0.11", features = ["oid"], optional = true }
 sha3 = { version = "0.12", default-features = false, features = ["oid"], optional = true }

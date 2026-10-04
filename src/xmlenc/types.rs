@@ -48,6 +48,15 @@ pub enum DataEncryptionAlgorithm {
 }
 
 impl DataEncryptionAlgorithm {
+    /// Key family required independently of the byte length (AES-192 and
+    /// three-key Triple DES both use 24 bytes).
+    pub const fn key_kind(self) -> crate::key_manager::SymmetricKeyKind {
+        #[cfg(feature = "legacy-algorithms")]
+        if matches!(self, Self::TripleDesCbc) {
+            return crate::key_manager::SymmetricKeyKind::Des;
+        }
+        crate::key_manager::SymmetricKeyKind::Aes
+    }
     /// Parse a supported XMLEnc content-encryption URI.
     pub fn from_uri(uri: &str) -> Result<Self, XmlEncError> {
         match uri {
@@ -196,6 +205,14 @@ impl KeyTransportAlgorithm {
 }
 
 impl KeyWrapAlgorithm {
+    /// Family of the wrapping key, not of the wrapped content key.
+    pub const fn key_kind(self) -> crate::key_manager::SymmetricKeyKind {
+        #[cfg(feature = "legacy-algorithms")]
+        if matches!(self, Self::TripleDes) {
+            return crate::key_manager::SymmetricKeyKind::Des;
+        }
+        crate::key_manager::SymmetricKeyKind::Aes
+    }
     /// Parse a supported XMLEnc symmetric key-wrap URI.
     pub fn from_uri(uri: &str) -> Result<Self, XmlEncError> {
         match uri {

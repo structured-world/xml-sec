@@ -35,8 +35,8 @@ use xml_sec::{
     xmlenc::{
         DataEncryptionAlgorithm, DecryptContext, DecryptedContent, DecryptionKeyResolver,
         EncryptedDataBuilder, EncryptedDataType, EncryptedKey, EncryptionMethod,
-        EncryptionRecipient, KeyCandidateBudget, KeyTransportAlgorithm, OaepDigestAlgorithm,
-        PrivateKeyDecryptor, RsaOaepParameters, XmlEncError,
+        EncryptionRecipient, KekDecryptor, KeyCandidateBudget, KeyTransportAlgorithm,
+        KeyWrapAlgorithm, OaepDigestAlgorithm, PrivateKeyDecryptor, RsaOaepParameters, XmlEncError,
         parse_encrypted_data_template_node_with_policy_and_backend, validate_rsa_recipient_key,
     },
 };
@@ -2342,7 +2342,20 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             "encrypt cannot combine explicit AES and RSA recipient keys".into(),
         ));
     }
-    if !aes_keys.is_empty() {
+    if metadata
+        .recipients
+        .iter()
+        .any(|recipient| recipient.wrap.is_some())
+    {
+        builder = configure_wrapping_recipients(
+            builder,
+            &metadata.recipients,
+            invocation,
+            &aes_keys,
+            &policy,
+            xml_backend,
+        )?;
+    } else if !aes_keys.is_empty() {
         if metadata.has_encrypted_key_recipient {
             return Err(CommandError::Usage(
                 "direct AES key cannot satisfy an EncryptedKey recipient in the template".into(),
@@ -2438,6 +2451,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             vec![EncryptionTemplateRecipient {
                 key_name: None,
                 transport: None,
+                wrap: None,
                 oaep_parameters: None,
             }]
         } else {
@@ -2632,6 +2646,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             vec![EncryptionTemplateRecipient {
                 key_name: None,
                 transport: None,
+                wrap: None,
                 oaep_parameters: None,
             }]
         } else {
@@ -3678,6 +3693,30 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     let standalone = encrypted_data == document.root_element();
     let content_key_name = encrypted_data_key_name(encrypted_data)?;
     let recipient_key_names = encrypted_key_recipient_names(encrypted_data)?;
+    let has_wrap_recipients = encrypted_data
+        .children()
+        .filter(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
+        .flat_map(|node| node.children())
+        .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
+        .any(|node| {
+            node.children()
+                .filter(|child| child.has_tag_name((XMLENC_NS, "EncryptionMethod")))
+                .any(|method| {
+                    method
+                        .attribute("Algorithm")
+                        .is_some_and(|uri| KeyWrapAlgorithm::from_uri(uri).is_ok())
+                })
+        });
+    let requested_symmetric_names = content_key_name
+        .iter()
+        .chain(
+            recipient_key_names
+                .iter()
+                .flatten()
+                .filter(|_| has_wrap_recipients),
+        )
+        .cloned()
+        .collect::<Vec<_>>();
     let aes_keys = invocation
         .ordered_values(&["aes-key", "des-key"])
         .collect::<Vec<_>>();
@@ -3707,10 +3746,9 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             .copied()
             .map(|option| (option, ()))
             .collect::<Vec<_>>();
-        let requested_names = content_key_name.iter().cloned().collect::<Vec<_>>();
         let candidates = named_candidate_search(
             &candidates,
-            &requested_names,
+            &requested_symmetric_names,
             invocation.flag("lax-key-search"),
             true,
             "symmetric key",
@@ -3723,10 +3761,11 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         let mut last_error = None;
         for (option, ()) in candidates {
             match key_material::load_symmetric(option.value.as_deref().unwrap_or_default(), None) {
-                Ok(key) => keys.push((
-                    symmetric_option_kind(&option.name),
-                    std::borrow::Cow::Owned(key),
-                )),
+                Ok(key) => keys.push(SymmetricCandidate {
+                    kind: symmetric_option_kind(&option.name),
+                    bytes: Cow::Owned(key),
+                    name: option.parameter.as_deref().map(Cow::Borrowed),
+                }),
                 Err(error) if lax_key_search => last_error = Some(CommandError::from(error)),
                 Err(error) => return Err(error.into()),
             }
@@ -3737,7 +3776,12 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             }));
         }
         decrypt_input(
-            &CandidateSymmetricKeyDecryptor { keys },
+            &CandidateSymmetricKeyDecryptor {
+                keys,
+                lax_key_search,
+                content_key_name: content_key_name.as_deref(),
+                wrapping_only: has_wrap_recipients && content_key_name.is_none(),
+            },
             &xml,
             encrypted_data_id,
             standalone,
@@ -3765,13 +3809,12 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                 "--keys-file does not supply RSA recipient private keys for decrypt: RSAKeyValue imports are public-only; use --privkey-pem, --privkey-der, or --pkcs12".into(),
             ));
         }
-        let requested_names = content_key_name.iter().cloned().collect::<Vec<_>>();
         let selected = select_store_candidates(
             store.symmetric_keys().iter().filter(|entry| {
                 entry.kind.is_encryption_key()
                     && entry.usages.allows(key_manager::KeyUsage::Decrypt)
             }),
-            &requested_names,
+            &requested_symmetric_names,
             invocation.flag("lax-key-search"),
             policy.resources.max_key_candidates,
             |entry| &entry.name,
@@ -3782,13 +3825,15 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         let resolver = CandidateSymmetricKeyDecryptor {
             keys: selected
                 .into_iter()
-                .map(|entry| {
-                    (
-                        entry.kind,
-                        std::borrow::Cow::Borrowed(entry.bytes.as_slice()),
-                    )
+                .map(|entry| SymmetricCandidate {
+                    kind: entry.kind,
+                    bytes: Cow::Borrowed(entry.bytes.as_slice()),
+                    name: Some(Cow::Borrowed(entry.name.as_str())),
                 })
                 .collect(),
+            lax_key_search: invocation.flag("lax-key-search"),
+            content_key_name: content_key_name.as_deref(),
+            wrapping_only: has_wrap_recipients && content_key_name.is_none(),
         };
         decrypt_input(
             &resolver,
@@ -4040,8 +4085,33 @@ struct RecipientPrivateKey {
     key_name: Option<String>,
 }
 
+struct SymmetricCandidate<'a> {
+    kind: SymmetricKeyKind,
+    bytes: Cow<'a, [u8]>,
+    name: Option<Cow<'a, str>>,
+}
+
 struct CandidateSymmetricKeyDecryptor<'a> {
-    keys: Vec<(key_manager::SymmetricKeyKind, std::borrow::Cow<'a, [u8]>)>,
+    keys: Vec<SymmetricCandidate<'a>>,
+    lax_key_search: bool,
+    content_key_name: Option<&'a str>,
+    wrapping_only: bool,
+}
+
+impl CandidateSymmetricKeyDecryptor<'_> {
+    fn direct_candidate(
+        &self,
+        kind: SymmetricKeyKind,
+        name: Option<&str>,
+        algorithm: DataEncryptionAlgorithm,
+    ) -> bool {
+        !self.wrapping_only
+            && symmetric_kind_accepts(kind, algorithm)
+            && (self.lax_key_search
+                || name.is_none()
+                || self.content_key_name.is_none()
+                || name == self.content_key_name)
+    }
 }
 
 fn symmetric_option_kind(name: &str) -> key_manager::SymmetricKeyKind {
@@ -4056,13 +4126,7 @@ fn symmetric_kind_accepts(
     kind: key_manager::SymmetricKeyKind,
     algorithm: DataEncryptionAlgorithm,
 ) -> bool {
-    #[cfg(feature = "legacy-algorithms")]
-    if algorithm == DataEncryptionAlgorithm::TripleDesCbc {
-        return kind == key_manager::SymmetricKeyKind::Des;
-    }
-    #[cfg(not(feature = "legacy-algorithms"))]
-    let _ = algorithm;
-    kind == key_manager::SymmetricKeyKind::Aes
+    kind == algorithm.key_kind()
 }
 
 impl DecryptionKeyResolver for CandidateSymmetricKeyDecryptor<'_> {
@@ -4074,32 +4138,100 @@ impl DecryptionKeyResolver for CandidateSymmetricKeyDecryptor<'_> {
     ) -> Result<Vec<u8>, XmlEncError> {
         self.keys
             .iter()
-            .find(|(kind, _)| symmetric_kind_accepts(*kind, algorithm))
-            .map(|(_, key)| key.as_ref().to_vec())
+            .find(|key| self.direct_candidate(key.kind, key.name.as_deref(), algorithm))
+            .map(|key| key.bytes.as_ref().to_vec())
             .ok_or(XmlEncError::KeyNotFound)
     }
 
     fn resolve_key_candidates(
         &self,
-        _provider: &dyn CryptoProvider,
+        provider: &dyn CryptoProvider,
         algorithm: DataEncryptionAlgorithm,
         encrypted_key: Option<&EncryptedKey>,
         budget: &mut KeyCandidateBudget,
     ) -> Result<Vec<Vec<u8>>, XmlEncError> {
-        if encrypted_key.is_none() {
-            budget.consume(self.keys.len())?;
-            let keys = self
-                .keys
-                .iter()
-                .filter(|(kind, _)| symmetric_kind_accepts(*kind, algorithm))
-                .map(|(_, key)| key.as_ref().to_vec())
-                .collect::<Vec<_>>();
-            if keys.is_empty() {
-                return Err(XmlEncError::KeyNotFound);
+        if encrypted_key.is_some() {
+            return Err(XmlEncError::KeyNotFound);
+        }
+        self.resolve_key_candidates_with_policy(
+            provider,
+            algorithm,
+            None,
+            &DecryptionPolicy::default(),
+            budget,
+        )
+    }
+
+    fn resolve_key_candidates_with_policy(
+        &self,
+        provider: &dyn CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        encrypted_key: Option<&EncryptedKey>,
+        policy: &DecryptionPolicy,
+        budget: &mut KeyCandidateBudget,
+    ) -> Result<Vec<Vec<u8>>, XmlEncError> {
+        self.resolve_content_keys_with_policy(provider, algorithm, encrypted_key, policy, budget)?
+            .into_iter()
+            .map(|key| key.into_key().map_err(XmlEncError::from))
+            .collect()
+    }
+
+    fn resolve_content_keys_with_policy(
+        &self,
+        provider: &dyn CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        encrypted_key: Option<&EncryptedKey>,
+        policy: &DecryptionPolicy,
+        budget: &mut KeyCandidateBudget,
+    ) -> Result<Vec<xml_sec::provider::RecoveredContentKey>, XmlEncError> {
+        policy.validate()?;
+        let Some(recipient) = encrypted_key else {
+            let mut keys = Vec::new();
+            for key in &self.keys {
+                if !self.direct_candidate(key.kind, key.name.as_deref(), algorithm) {
+                    continue;
+                }
+                budget.consume(1)?;
+                keys.push(xml_sec::provider::RecoveredContentKey::confirmed(
+                    key.bytes.to_vec(),
+                ));
             }
-            Ok(keys)
+            return if keys.is_empty() {
+                Err(XmlEncError::KeyNotFound)
+            } else {
+                Ok(keys)
+            };
+        };
+        let wrap = KeyWrapAlgorithm::from_uri(&recipient.encryption_method.algorithm)?;
+        let mut keys = Vec::new();
+        let mut last_error = XmlEncError::KeyNotFound;
+        for key in &self.keys {
+            if key.kind != wrap.key_kind() {
+                continue;
+            }
+            if !self.lax_key_search
+                && recipient.key_name.as_deref() != key.name.as_deref()
+                && !(recipient.key_name.is_none() && self.keys.len() == 1)
+            {
+                continue;
+            }
+            match KekDecryptor::borrowed_with_kind(&key.bytes, key.kind)
+                .resolve_content_keys_with_policy(
+                    provider,
+                    algorithm,
+                    Some(recipient),
+                    policy,
+                    budget,
+                ) {
+                Ok(mut recovered) => keys.append(&mut recovered),
+                Err(error @ XmlEncError::Policy(_)) => return Err(error),
+                Err(error) => last_error = error,
+            }
+        }
+        if keys.is_empty() {
+            Err(last_error)
         } else {
-            Err(XmlEncError::KeyNotFound)
+            Ok(keys)
         }
     }
 }
@@ -4158,6 +4290,20 @@ impl DecryptionKeyResolver for NamedRecipientDecryptor {
         policy: &DecryptionPolicy,
         budget: &mut KeyCandidateBudget,
     ) -> Result<Vec<Vec<u8>>, XmlEncError> {
+        self.resolve_content_keys_with_policy(provider, algorithm, encrypted_key, policy, budget)?
+            .into_iter()
+            .map(|key| key.into_key().map_err(XmlEncError::Provider))
+            .collect()
+    }
+
+    fn resolve_content_keys_with_policy(
+        &self,
+        provider: &dyn CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        encrypted_key: Option<&EncryptedKey>,
+        policy: &DecryptionPolicy,
+        budget: &mut KeyCandidateBudget,
+    ) -> Result<Vec<xml_sec::provider::RecoveredContentKey>, XmlEncError> {
         policy.validate()?;
         let Some(encrypted_key) = encrypted_key else {
             return Err(XmlEncError::KeyNotFound);
@@ -4282,6 +4428,121 @@ fn xmlsec_compatibility_encryption_policy() -> EncryptionPolicy {
     }
 }
 
+fn configure_wrapping_recipients(
+    mut builder: EncryptedDataBuilder,
+    recipients: &[EncryptionTemplateRecipient],
+    invocation: &Invocation,
+    explicit: &[&crate::OptionValue],
+    policy: &EncryptionPolicy,
+    backend: XmlBackend,
+) -> Result<EncryptedDataBuilder, CommandError> {
+    if recipients.iter().any(|recipient| recipient.wrap.is_none()) {
+        return Err(CommandError::Usage(
+            "encrypt cannot mix symmetric KEK and RSA recipients in one invocation".into(),
+        ));
+    }
+    let mut material =
+        ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
+    let store = if invocation.values("keys-file").next().is_some() {
+        Some(load_xml_key_stores(
+            invocation,
+            policy,
+            backend,
+            &mut material,
+        )?)
+    } else {
+        None
+    };
+    let mut budget = KeyCandidateBudget::with_limit(policy.resources.max_key_candidates);
+    let mut decoded = HashMap::<usize, zeroize::Zeroizing<Vec<u8>>>::new();
+    for recipient in recipients {
+        let wrap = recipient.wrap.expect("all recipient methods checked above");
+        let requested = recipient.key_name.iter().cloned().collect::<Vec<_>>();
+        let (name, key) = if let Some(store) = &store {
+            let candidates = select_store_candidates(
+                store.symmetric_keys().iter().filter(|entry| {
+                    entry.kind == wrap.key_kind()
+                        && entry.usages.allows(key_manager::KeyUsage::Encrypt)
+                }),
+                &requested,
+                invocation.flag("lax-key-search"),
+                policy.resources.max_key_candidates,
+                |entry| &entry.name,
+            )?;
+            budget
+                .consume(candidates.len())
+                .map_err(|error| CommandError::Encryption(error.to_string()))?;
+            let selected = candidates
+                .into_iter()
+                .find(|entry| entry.bytes.len() == wrap.key_len())
+                .ok_or_else(|| {
+                    CommandError::Usage("no compatible wrapping key in --keys-file".into())
+                })?;
+            (Some(selected.name.clone()), selected.bytes.to_vec())
+        } else {
+            let candidates = explicit
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, option)| symmetric_option_kind(&option.name) == wrap.key_kind())
+                .map(|(index, option)| (option, index))
+                .collect::<Vec<_>>();
+            let candidates = named_candidate_search(
+                &candidates,
+                &requested,
+                invocation.flag("lax-key-search"),
+                true,
+                "wrapping key",
+            )?;
+            budget
+                .consume(candidates.len())
+                .map_err(|error| CommandError::Encryption(error.to_string()))?;
+            let mut selected = None;
+            let mut last_error = None;
+            for (option, index) in candidates {
+                if let Some(key) = decoded.get(&index) {
+                    if key.len() == wrap.key_len() {
+                        selected = Some((option.parameter.clone(), key.to_vec()));
+                        break;
+                    }
+                    last_error = Some(CommandError::Usage(
+                        "wrapping key length does not match the template method".into(),
+                    ));
+                    continue;
+                }
+                match load_symmetric_with_budget(
+                    option.value.as_deref().unwrap_or_default(),
+                    Some(wrap.key_len()),
+                    &mut material,
+                ) {
+                    Ok(key) => {
+                        // Recipient builders retain their own key bytes. Cache
+                        // only batched inputs to avoid repeated filesystem I/O;
+                        // single-recipient operations have no cache allocation.
+                        if recipients.len() > 1 {
+                            decoded.insert(index, zeroize::Zeroizing::new(key.clone()));
+                        }
+                        selected = Some((option.parameter.clone(), key));
+                        break;
+                    }
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            selected.ok_or_else(|| {
+                last_error.unwrap_or_else(|| {
+                    CommandError::Usage("no compatible wrapping key input".into())
+                })
+            })?
+        };
+        let mut configured = EncryptionRecipient::aes_key_wrap(key, wrap);
+        if let Some(name) = name {
+            configured = configured.key_name(name);
+        }
+        builder = builder.add_recipient(configured);
+    }
+    Ok(builder)
+}
+
 fn xmlsec_compatibility_decryption_policy() -> DecryptionPolicy {
     let compatibility = xmlsec_compatibility_encryption_policy();
     DecryptionPolicy {
@@ -4314,6 +4575,7 @@ enum EncryptionTemplatePlacement {
 struct EncryptionTemplateRecipient {
     key_name: Option<String>,
     transport: Option<KeyTransportAlgorithm>,
+    wrap: Option<KeyWrapAlgorithm>,
     oaep_parameters: Option<RsaOaepParameters>,
 }
 
@@ -4350,13 +4612,23 @@ fn encryption_template(
         .encrypted_keys
         .into_iter()
         .map(|encrypted_key| {
+            let wrap = KeyWrapAlgorithm::from_uri(&encrypted_key.encryption_method.algorithm).ok();
             Ok(EncryptionTemplateRecipient {
                 key_name: encrypted_key.key_name,
-                transport: Some(
-                    KeyTransportAlgorithm::from_uri(&encrypted_key.encryption_method.algorithm)
-                        .map_err(|error| CommandError::Encryption(error.to_string()))?,
-                ),
-                oaep_parameters: template_oaep_parameters(&encrypted_key.encryption_method)?,
+                transport: if wrap.is_some() {
+                    None
+                } else {
+                    Some(
+                        KeyTransportAlgorithm::from_uri(&encrypted_key.encryption_method.algorithm)
+                            .map_err(|error| CommandError::Encryption(error.to_string()))?,
+                    )
+                },
+                wrap,
+                oaep_parameters: if wrap.is_some() {
+                    None
+                } else {
+                    template_oaep_parameters(&encrypted_key.encryption_method)?
+                },
             })
         })
         .collect::<Result<Vec<_>, CommandError>>()?;
@@ -5145,10 +5417,14 @@ mod tests {
     fn direct_candidates_do_not_cross_aes_and_triple_des_families() {
         // Equal 24-byte lengths must not turn an AES key into a TDEA key.
         let resolver = CandidateSymmetricKeyDecryptor {
-            keys: vec![(
-                key_manager::SymmetricKeyKind::Aes,
-                std::borrow::Cow::Borrowed(&[1; 24]),
-            )],
+            keys: vec![SymmetricCandidate {
+                kind: key_manager::SymmetricKeyKind::Aes,
+                bytes: Cow::Borrowed(&[1; 24]),
+                name: None,
+            }],
+            lax_key_search: false,
+            content_key_name: None,
+            wrapping_only: false,
         };
         assert!(matches!(
             resolver.resolve_key(
