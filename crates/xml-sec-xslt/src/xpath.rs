@@ -9329,7 +9329,7 @@ fn validate_decimal_subpattern(
             ));
         }
     }
-    if !has_digit && !(number.len() == 1 && saw_decimal) {
+    if !(has_digit || number.len() == 1 && saw_decimal) {
         return Err(invalid_decimal_pattern("subpattern has no digit"));
     }
     Ok(())
