@@ -1,5 +1,54 @@
 # Cryptographic providers
 
+## Optional PKCS#11 external keys
+
+The `pkcs11` feature enables the `cryptoki` adapter. Load and initialize
+the module explicitly, then create `provider::pkcs11::Pkcs11Provider` from that
+module and a caller-selected slot and call `login`. The core never discovers a
+module, reads a PIN from configuration, initializes a token, or retries credentials.
+Keep the module loaded until worker threads have stopped: native modules can
+register thread-local cleanup callbacks that must run before library unloading.
+
+Resolve persistent objects by exact binary `CKA_ID` with `rsa_private_key`,
+`rsa_public_key`, `aes_key`, or `agreement_key`. Ambiguous IDs are rejected.
+RSA PKCS#1 v1.5 signatures/verification with SHA-1/224/256/384/512, RSA-OAEP
+recovery, AES-CBC/GCM decryption, AES key unwrap and P-256/P-384/P-521 ECDH run
+in the token. Private RSA/EC attributes are never
+read. AES-unwrapped content keys are sensitive, non-extractable session objects;
+`RecoveredContentKey::into_key` rejects their export. ECDH returns the derived
+shared secret for an explicitly selected subsequent KDF, not the private scalar.
+RSA-OAEP recovery uses token-side `C_Decrypt`, validates the recovered CEK width,
+then imports it as a non-extractable session object. The transient host CEK is
+zeroized on success and failure. This is not a guarantee that RSA-recovered
+symmetric bytes never enter host memory; private RSA key material never does.
+
+Pass the provider to the existing XML operation context. Use
+`PrivateKeyDecryptor::provider_key`, `OpaqueContentKeyResolver`, or
+`OpaqueKekDecryptor` for RSA recipients, direct opaque CEKs, or opaque KEKs.
+One immutable operation policy still controls acceptance; token `CKA_SIGN`,
+`CKA_VERIFY`, `CKA_DECRYPT`, `CKA_UNWRAP` and `CKA_DERIVE` enforce key usage
+independently. A handle is bound to its exact provider instance, not just the
+engine name. Clones share a serialized session; independent instances use
+independent sessions. There is no fallback to software keys or another engine.
+Selection is currently through the library API; the CLI does not discover modules
+or accept token credentials.
+
+Mechanism enumeration cannot prove support for every parameter combination.
+For example SoftHSM rejects SHA-256 OAEP parameters despite listing OAEP; this
+is an explicit unsupported-parameters result, not permission to downgrade to
+SHA-1. Operational errors expose typed redacted classes, never raw module
+diagnostics or credentials. RSA-PSS/ECDSA signing, certificate/CRL verification,
+private software key import, raw symmetric encryption, and KDF execution are
+not advertised by this adapter.
+
+Run `bash scripts/test-pkcs11.sh /absolute/path/to/libsofthsm2.so` for the
+integration suite, or add `--workspace` for all workspace tests with this
+feature. The harness creates and removes its own token store and cannot reset
+tokens from a normal SoftHSM configuration. Tests cover complete XML signature
+and encryption pipelines, usage restrictions, wrong PINs, tampering, stale
+objects, provider binding and concurrent operations. CI runs both parser
+backends and differential mode against this same harness.
+
 RustCrypto is the default. Enable `aws-lc-fips` to additionally compile the official
 `aws-lc-rs` wrapper with its `fips` feature and without its default features. This
 links the AWS-LC FIPS module, not the ordinary AWS-LC module. It requires the native

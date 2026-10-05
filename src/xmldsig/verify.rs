@@ -64,6 +64,10 @@ const MAX_RETRIEVAL_METHOD_COUNT: usize = 64;
 /// This trait intentionally has no `Send + Sync` supertraits so lightweight
 /// single-threaded verifiers can be used without additional bounds.
 pub trait VerifyingKey {
+    /// Exact external execution domain; a key cannot be moved between token sessions.
+    fn provider_binding(&self) -> Option<&crate::provider::ProviderBinding> {
+        None
+    }
     /// Composite resolvers may try individual keys through the selected engine.
     /// `None` identifies a leaf handle. Wrappers must preserve per-key policy
     /// when forwarding the visitor; no public/private key copy is required.
@@ -2535,6 +2539,9 @@ struct PolicyVerifyingKey<'a> {
 }
 
 impl VerifyingKey for PolicyVerifyingKey<'_> {
+    fn provider_binding(&self) -> Option<&crate::provider::ProviderBinding> {
+        self.key.provider_binding()
+    }
     fn verify_candidate_keys(
         &self,
         verify: &mut dyn FnMut(&dyn VerifyingKey) -> Result<bool, DsigError>,

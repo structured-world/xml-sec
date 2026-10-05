@@ -23,8 +23,8 @@ mod types;
 
 pub use decrypt::{
     DecryptContext, DecryptionKeyResolver, DocumentDecryptionOptions, KekDecryptor,
-    KeyCandidateBudget, PrivateKeyDecryptor, SymmetricKeyDecryptor, decrypt, decrypt_data,
-    decrypt_document, decrypt_document_with_options,
+    KeyCandidateBudget, OpaqueContentKeyResolver, OpaqueKekDecryptor, PrivateKeyDecryptor,
+    SymmetricKeyDecryptor, decrypt, decrypt_data, decrypt_document, decrypt_document_with_options,
 };
 pub use encrypt::{
     EncryptedDataBuilder, validate_key_transport_recipient, validate_rsa_recipient_key,

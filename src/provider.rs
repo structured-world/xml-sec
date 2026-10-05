@@ -7,6 +7,8 @@
 
 #[cfg(feature = "aws-lc-fips")]
 mod aws_lc;
+#[cfg(feature = "pkcs11")]
+pub mod pkcs11;
 #[cfg(all(feature = "xmlenc", feature = "legacy-algorithms"))]
 mod rsa_pkcs1v15;
 
@@ -16,6 +18,7 @@ mod rsa_pkcs1v15;
 pub struct RecoveredContentKey {
     bytes: zeroize::Zeroizing<Vec<u8>>,
     valid: subtle::Choice,
+    opaque: Option<std::sync::Arc<dyn ContentDecryptionKey>>,
 }
 
 #[cfg(feature = "xmlenc")]
@@ -34,6 +37,7 @@ impl RecoveredContentKey {
         Self {
             bytes: zeroize::Zeroizing::new(bytes),
             valid: subtle::Choice::from(1),
+            opaque: None,
         }
     }
 
@@ -43,9 +47,50 @@ impl RecoveredContentKey {
     /// the caller must not branch on `valid` during recovery. The enclosing
     /// content operation consumes this state only after primitive decryption.
     pub fn recovery(bytes: zeroize::Zeroizing<Vec<u8>>, valid: subtle::Choice) -> Self {
-        Self { bytes, valid }
+        Self {
+            bytes,
+            valid,
+            opaque: None,
+        }
     }
 
+    /// Retain a non-exportable content key until the content operation ends.
+    pub fn opaque(key: std::sync::Arc<dyn ContentDecryptionKey>) -> Self {
+        Self {
+            bytes: zeroize::Zeroizing::new(Vec::new()),
+            valid: subtle::Choice::from(1),
+            opaque: Some(key),
+        }
+    }
+
+    /// Public content-key width without exposing the key value.
+    pub fn key_len(&self) -> usize {
+        self.opaque
+            .as_ref()
+            .map_or(self.bytes.len(), |key| key.key_len())
+    }
+
+    pub(crate) fn same_candidate(&self, other: &Self) -> bool {
+        match (&self.opaque, &other.opaque) {
+            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+            (None, None) => self.bytes == other.bytes && self.valid() == other.valid(),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn decrypt(
+        &self,
+        provider: &dyn CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, ProviderError> {
+        match &self.opaque {
+            Some(key) => provider.decrypt_content_key(algorithm, key.as_ref(), ciphertext),
+            None => provider.decrypt_data(algorithm, &self.bytes, ciphertext),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -55,6 +100,9 @@ impl RecoveredContentKey {
     /// Consume a completed recovery outside a content operation. Content
     /// operations must retain the candidate until after primitive decryption.
     pub fn into_key(mut self) -> Result<Vec<u8>, ProviderError> {
+        if self.opaque.is_some() {
+            return Err(ProviderError::KeyNotExportable);
+        }
         if !self.valid() {
             return Err(ProviderError::AuthenticationFailed);
         }
@@ -362,6 +410,12 @@ pub enum ProviderInputError {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ProviderError {
+    /// A secret-bearing external handle cannot be exported as bytes.
+    #[error("key is not exportable")]
+    KeyNotExportable,
+    /// Redacted external-provider failure: never includes credentials or selectors.
+    #[error("external cryptographic provider failed: {0}")]
+    External(ExternalProviderError),
     /// The selected provider does not implement the operation/parameters.
     #[error("provider does not support {operation:?} with algorithm {algorithm:?}")]
     Unsupported {
@@ -417,6 +471,72 @@ pub enum ProviderError {
     Random(String),
 }
 
+/// Operational failure classes for an explicitly selected external provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ExternalProviderError {
+    /// The module, token or device is unavailable.
+    #[error("module or token unavailable")]
+    Unavailable,
+    /// Authentication failed or the operation requires authentication.
+    #[error("authentication failed")]
+    Credentials,
+    /// The selected object does not exist, is ambiguous, or has expired.
+    #[error("key object unavailable or ambiguous")]
+    Object,
+    /// Token key usage does not authorize this primitive.
+    #[error("key usage denied")]
+    Usage,
+    /// The key and selected provider do not share an execution domain.
+    #[error("key provider binding mismatch")]
+    Binding,
+    /// A provider-side operation or synchronization failed.
+    #[error("token operation failed")]
+    Operation,
+}
+
+/// Caller-owned identity for external-provider handles, independent of engine name.
+#[derive(Clone, Default)]
+pub struct ProviderBinding(std::sync::Arc<()>);
+
+impl ProviderBinding {
+    /// Test identity without copying secret or public key material.
+    pub fn matches(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// Non-exportable symmetric key used for content decryption.
+#[cfg(feature = "xmlenc")]
+pub trait ContentDecryptionKey: Send + Sync {
+    /// Exact external domain owning this handle.
+    fn provider_binding(&self) -> &ProviderBinding;
+    /// Public key width in bytes.
+    fn key_len(&self) -> usize;
+    /// Execute within the selected provider's execution domain.
+    fn decrypt_with_provider(
+        &self,
+        provider: &dyn CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, ProviderError>;
+}
+
+/// An opaque KEK that unwraps directly into a non-exportable content key.
+#[cfg(feature = "xmlenc")]
+pub trait KeyUnwrappingKey: Send + Sync {
+    /// Exact external domain owning this handle.
+    fn provider_binding(&self) -> &ProviderBinding;
+    /// Unwrap within the selected execution domain without reading CKA_VALUE.
+    fn unwrap_with_provider(
+        &self,
+        provider: &dyn CryptoProvider,
+        algorithm: KeyWrapAlgorithm,
+        content_algorithm: DataEncryptionAlgorithm,
+        wrapped: &[u8],
+    ) -> Result<RecoveredContentKey, ProviderError>;
+}
+
 /// Opaque public-key handle used for asymmetric key transport.
 ///
 /// Implementations own their key material and operation. The orchestration
@@ -424,6 +544,10 @@ pub enum ProviderError {
 /// and output framing; it cannot recover a backend-specific key object.
 #[cfg(feature = "xmlenc")]
 pub trait KeyTransportKey: Send + Sync {
+    /// External execution domain, or `None` for software-owned public keys.
+    fn provider_binding(&self) -> Option<&ProviderBinding> {
+        None
+    }
     /// Execute historical transport; unsupported opaque handles never fall back.
     #[cfg(feature = "legacy-algorithms")]
     fn transport_pkcs1v15(
@@ -465,6 +589,17 @@ pub trait KeyTransportKey: Send + Sync {
 /// public metadata required to reject malformed RSA inputs before dispatch.
 #[cfg(feature = "xmlenc")]
 pub trait KeyRecoveryKey: Send + Sync {
+    /// Recover without exporting a CEK when supported by the execution domain.
+    fn recover_content_with_provider(
+        &self,
+        provider: &dyn CryptoProvider,
+        parameters: &RsaOaepParameters,
+        _content_algorithm: DataEncryptionAlgorithm,
+        ciphertext: &[u8],
+    ) -> Result<RecoveredContentKey, ProviderError> {
+        self.recover_with_provider(provider, parameters, ciphertext)
+            .map(RecoveredContentKey::confirmed)
+    }
     /// Recover a content key of the caller's already validated algorithm width.
     #[cfg(feature = "legacy-algorithms")]
     fn recover_pkcs1v15(
@@ -513,12 +648,62 @@ pub trait KeyRecoveryKey: Send + Sync {
 
 /// Opaque private-key handle used for provider-defined key agreement.
 pub trait KeyAgreementKey: Send + Sync {
+    /// External execution domain, when the private key resides outside this process.
+    fn provider_binding(&self) -> Option<&ProviderBinding> {
+        None
+    }
     /// Derive the raw shared secret for the supplied peer and parameters.
     fn agree(&self, parameters: &KeyAgreementParameters<'_>) -> Result<Vec<u8>, ProviderError>;
 }
 
-/// Stateless provider operations used by the XML Security pipelines.
+/// Provider operations used by the XML Security pipelines.
 pub trait CryptoProvider: Send + Sync {
+    /// External execution domain. Different instances of one engine are not interchangeable.
+    fn binding(&self) -> Option<&ProviderBinding> {
+        None
+    }
+
+    /// Recover a candidate without requiring its symmetric value to leave the provider.
+    #[cfg(feature = "xmlenc")]
+    fn recover_content_key(
+        &self,
+        key: &dyn KeyRecoveryKey,
+        parameters: &RsaOaepParameters,
+        _content_algorithm: DataEncryptionAlgorithm,
+        ciphertext: &[u8],
+    ) -> Result<RecoveredContentKey, ProviderError> {
+        self.recover_key(key, parameters, ciphertext)
+            .map(RecoveredContentKey::confirmed)
+    }
+
+    /// Unwrap into an opaque content key. Providers must opt in explicitly.
+    #[cfg(feature = "xmlenc")]
+    fn unwrap_content_key(
+        &self,
+        _key: &dyn KeyUnwrappingKey,
+        algorithm: KeyWrapAlgorithm,
+        _content_algorithm: DataEncryptionAlgorithm,
+        _wrapped: &[u8],
+    ) -> Result<RecoveredContentKey, ProviderError> {
+        Err(ProviderError::Unsupported {
+            operation: ProviderOperation::KeyUnwrap,
+            algorithm: Some(algorithm.uri().into()),
+        })
+    }
+
+    /// Decrypt with an opaque key; capability remains distinct from policy permission.
+    #[cfg(feature = "xmlenc")]
+    fn decrypt_content_key(
+        &self,
+        algorithm: DataEncryptionAlgorithm,
+        _key: &dyn ContentDecryptionKey,
+        _ciphertext: &[u8],
+    ) -> Result<Vec<u8>, ProviderError> {
+        Err(ProviderError::Unsupported {
+            operation: ProviderOperation::Decrypt,
+            algorithm: Some(algorithm.uri().into()),
+        })
+    }
     /// Stable provider name for diagnostics and capability reporting.
     fn name(&self) -> &'static str;
 
@@ -743,6 +928,13 @@ pub trait CryptoProvider: Send + Sync {
         parameters: &KeyAgreementParameters<'_>,
     ) -> Result<Vec<u8>, ProviderError> {
         self.require_capability(ProviderCapability::KeyAgreement(parameters))?;
+        if let Some(binding) = key.provider_binding()
+            && !self
+                .binding()
+                .is_some_and(|selected| selected.matches(binding))
+        {
+            return Err(ProviderError::External(ExternalProviderError::Binding));
+        }
         key.agree(parameters)
     }
 
@@ -1183,6 +1375,9 @@ impl CryptoProvider for RustCryptoProvider {
         signature: &[u8],
     ) -> Result<bool, crate::xmldsig::DsigError> {
         self.require_capability(ProviderCapability::Verify(algorithm))?;
+        if key.provider_binding().is_some() {
+            return Err(ProviderError::External(ExternalProviderError::Binding).into());
+        }
         key.verify_with_context(algorithm, context, data, signature)
     }
 
@@ -1195,6 +1390,9 @@ impl CryptoProvider for RustCryptoProvider {
         signature: &[u8],
     ) -> Result<bool, crate::xmldsig::DsigError> {
         self.require_capability(ProviderCapability::Verify(algorithm))?;
+        if key.provider_binding().is_some() {
+            return Err(ProviderError::External(ExternalProviderError::Binding).into());
+        }
         key.verify(algorithm, data, signature)
     }
 
