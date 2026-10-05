@@ -1005,12 +1005,8 @@ pub struct DsaSigningKey {
 impl DsaSigningKey {
     /// Parse an unencrypted PKCS#8 `PRIVATE KEY` PEM block.
     pub fn from_pkcs8_pem(private_key_pem: &str) -> Result<Self, SigningKeyError> {
-        let (label, private_key_der) = pkcs8::SecretDocument::from_pem(private_key_pem)
-            .map_err(|_| SigningKeyError::InvalidKeyDer)?;
-        if label != "PRIVATE KEY" {
-            return Err(SigningKeyError::InvalidKeyDer);
-        }
-        Self::from_pkcs8_der(private_key_der.as_bytes())
+        let private_key_der = parse_private_key_pem(private_key_pem)?;
+        Self::from_pkcs8_der(&private_key_der)
     }
 
     /// Parse unencrypted PKCS#8 private key DER.
@@ -1117,6 +1113,33 @@ mod dsa_import_tests {
         .expect("valid encrypted DSA fixture")
         .decrypt(b"secret123")
         .expect("known fixture password")
+    }
+
+    #[test]
+    fn dsa_plain_pem_reports_the_failing_format_layer() -> Result<(), Box<dyn std::error::Error>> {
+        // PEM syntax, block labels and decoded DER are distinct public errors;
+        // checked DSA decoding must not collapse the PEM-layer diagnostics.
+        assert!(matches!(
+            DsaSigningKey::from_pkcs8_pem("invalid PEM"),
+            Err(SigningKeyError::InvalidKeyPem)
+        ));
+        let wrong_label = pem::encode(&pem::Pem::new("PUBLIC KEY", vec![1, 2, 3]));
+        assert!(matches!(
+            DsaSigningKey::from_pkcs8_pem(&wrong_label),
+            Err(SigningKeyError::InvalidKeyFormat { label }) if label == "PUBLIC KEY"
+        ));
+        let bad_der = pem::encode(&pem::Pem::new("PRIVATE KEY", vec![1, 2, 3]));
+        assert!(matches!(
+            DsaSigningKey::from_pkcs8_pem(&bad_der),
+            Err(SigningKeyError::InvalidKeyDer)
+        ));
+        let valid = plaintext().to_pem("PRIVATE KEY", der::pem::LineEnding::LF)?;
+        assert!(DsaSigningKey::from_pkcs8_pem(&valid).is_ok());
+        assert!(matches!(
+            DsaSigningKey::from_pkcs8_pem(&format!("{}unexpected trailing data", valid.as_str())),
+            Err(SigningKeyError::InvalidKeyPem)
+        ));
+        Ok(())
     }
 
     #[test]

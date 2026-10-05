@@ -119,6 +119,10 @@ otherwise import fails. Plain and password-encrypted PEM/DER use the same decode
 also used for key-manager identity matching. Reciprocal xmlsec1 1.3.13 tests cover
 1024/160, 2048/256 and 3072/256 keys, raw signature widths, embedded `DSAKeyValue`,
 tampering, and explicit legacy-policy refusal.
+Unencrypted DSA PEM imports distinguish malformed PEM (`InvalidKeyPem`), an
+unexpected block label (`InvalidKeyFormat`), and invalid decoded PKCS#8 DER
+(`InvalidKeyDer`). Non-whitespace trailing data is rejected at the PEM layer;
+the private-key buffer passed to the DER decoder is zeroized on drop.
 P-521 signing and verification use the same key-selected ECDSA framing contract
 as P-256 and P-384.
 Recursive `KeyInfoReference` materialization shares one candidate-work budget
