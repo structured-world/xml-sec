@@ -212,6 +212,12 @@ pub(crate) fn verify(
     let Ok(value) = BoxedUint::from_be_slice(signature, key.n_bits_precision()) else {
         return false;
     };
+    // RSAVP1 rejects representatives outside [0, n); raw modular arithmetic
+    // alone would accept the alternate encoding s+n of a valid signature.
+    // RFC 8017 section 5.2.2: https://www.rfc-editor.org/rfc/rfc8017.html#section-5.2.2
+    if value >= *key.n().as_ref() {
+        return false;
+    }
     let Ok(value) = rsa::hazmat::rsa_encrypt(key, &value) else {
         return false;
     };

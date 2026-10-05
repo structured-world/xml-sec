@@ -555,7 +555,12 @@ malformed parameters, and salt lengths outside the nonnegative `xs:int` range. K
 rejects salts that cannot fit the RSA encoded message before signing work.
 
 SHA-1 in either the message digest or MGF requires explicit legacy permission for the exact
-signature method. An `id-RSASSA-PSS` public key also enforces its hash, MGF, minimum salt length,
+signature method, or an explicit `KeyTrustPolicy::parameterized_rsa_pss` family permission.
+`RsaPssPermission::AllSupported` in the signing or verification policy grants the parameterized
+family without enumerating salt lengths; verification retains the independent legacy trust gate.
+All family permissions default to `ExactOnly`. The compatibility CLI sets both permissions before
+reading input, never deriving policy from a document's parameters.
+An `id-RSASSA-PSS` public key also enforces its hash, MGF, minimum salt length,
 and trailer restrictions; an unrestricted RSA key does not add those restrictions.
 
 RustCrypto supports independent hashes and exact salts. Other providers expose only their native
@@ -563,3 +568,5 @@ capabilities, with no fallback; see [provider capabilities](crypto-providers.md)
 [local RSA-PSS adaptation](rsa-pss-patch.md) retains the existing RSA arithmetic, blinding, and
 fault checks. Tests cover every pinned xmlsec1 RSA-PSS fixture, reciprocal signing, restricted
 keys, malformed encodings, mixed hashes, and salt/modulus boundaries.
+Saved OpenSSL vectors run without external programs; set `OPENSSL_BIN` to additionally require
+live reciprocal OpenSSL checks. A configured but unavailable oracle fails the test. CI enables it.

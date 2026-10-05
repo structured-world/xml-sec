@@ -16,6 +16,25 @@ use crate::xmlenc::{
     DataEncryptionAlgorithm, KeyTransportAlgorithm, KeyWrapAlgorithm, OaepDigestAlgorithm,
 };
 
+/// Permission for the unbounded parameterized RSA-PSS family.
+/// Exact permissions continue to use the signature algorithm allowlist.
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RsaPssPermission {
+    /// No additional family grant; existing allowlists and secure defaults apply.
+    #[default]
+    ExactOnly,
+    /// Permit every supported tuple; capability and key restrictions still apply.
+    AllSupported,
+}
+
+#[cfg(feature = "xmldsig")]
+impl RsaPssPermission {
+    fn permits(self, algorithm: SignatureAlgorithm) -> bool {
+        self == Self::AllSupported && matches!(algorithm, SignatureAlgorithm::RsaPss(_))
+    }
+}
+
 /// Canonical diagnostics for limits represented by [`ResourcePolicy`].
 ///
 /// Validation and every enforcement point use the same names so callers can
@@ -974,6 +993,8 @@ pub struct KeyTrustPolicy {
     pub max_x509_candidate_paths: usize,
     /// Legacy signature algorithms explicitly permitted for verification.
     pub allowed_legacy_signature_algorithms: HashSet<SignatureAlgorithm>,
+    /// Independent legacy-hash permission for parameterized RSA-PSS verification.
+    pub parameterized_rsa_pss: RsaPssPermission,
     /// Certificate and CRL signature permissions, independent of XML signatures.
     /// `None` permits supported classical algorithms but rejects PQ algorithms;
     /// Explicit permissions select either an exact allowlist (including PSS
@@ -1005,6 +1026,7 @@ impl Default for KeyTrustPolicy {
             max_x509_chain_depth: crate::hard_limits::X509_CHAIN_DEPTH_CEILING,
             max_x509_candidate_paths: crate::hard_limits::X509_CANDIDATE_PATH_CEILING,
             allowed_legacy_signature_algorithms: HashSet::new(),
+            parameterized_rsa_pss: RsaPssPermission::ExactOnly,
             certificate_signature_algorithms: None,
             rsa_keys: RsaKeyPolicy::default(),
             dsa_keys: DsaKeyPolicy::default(),
@@ -1106,7 +1128,11 @@ pub enum ManifestProcessing {
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Default)]
 pub struct VerificationPolicy {
-    /// Allowed signature methods; `None` accepts every implemented method subject to
+    /// Family permission selected by the caller, never derived from document input.
+    /// Legacy hashes additionally require the independent key-trust permission.
+    pub parameterized_rsa_pss: RsaPssPermission,
+    /// Exact signature methods, supplemented by `parameterized_rsa_pss`.
+    /// `None` accepts every implemented method subject to
     /// independent gates such as [`KeyTrustPolicy::allowed_legacy_signature_algorithms`].
     pub signature_algorithms: Option<HashSet<SignatureAlgorithm>>,
     /// Allowed reference digest methods; `None` accepts every implemented method.
@@ -1188,6 +1214,7 @@ impl VerificationPolicy {
                 .key_trust
                 .allowed_legacy_signature_algorithms
                 .contains(&algorithm)
+            && !self.key_trust.parameterized_rsa_pss.permits(algorithm)
         {
             return Err(PolicyViolation::Algorithm {
                 operation: "verification",
@@ -1198,6 +1225,7 @@ impl VerificationPolicy {
             .signature_algorithms
             .as_ref()
             .is_some_and(|allowed| !allowed.contains(&algorithm))
+            && !self.parameterized_rsa_pss.permits(algorithm)
         {
             return Err(PolicyViolation::Algorithm {
                 operation: "verification",
@@ -1212,7 +1240,10 @@ impl VerificationPolicy {
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Default)]
 pub struct SigningPolicy {
-    /// Allowed signing methods; `None` uses the implemented secure defaults.
+    /// Explicit parameterized RSA-PSS family permission, including legacy hashes.
+    pub parameterized_rsa_pss: RsaPssPermission,
+    /// Exact signing methods, supplemented by `parameterized_rsa_pss`.
+    /// `None` uses the implemented secure defaults.
     pub signature_algorithms: Option<HashSet<SignatureAlgorithm>>,
     /// Allowed reference digest methods; `None` uses the implemented secure defaults.
     pub digest_algorithms: Option<HashSet<DigestAlgorithm>>,
@@ -1251,6 +1282,9 @@ impl SigningPolicy {
         &self,
         algorithm: SignatureAlgorithm,
     ) -> Result<(), PolicyViolation> {
+        if self.parameterized_rsa_pss.permits(algorithm) {
+            return Ok(());
+        }
         check_signing_algorithm(
             self.signature_algorithms.as_ref(),
             algorithm,

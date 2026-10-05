@@ -811,7 +811,7 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
     let password = invocation.password_bytes();
     // This binary is an explicit libxmlsec1 compatibility boundary. Its sign
     // and verify commands must bind XPath here() identically for round trips.
-    let mut policy = xmlsec_compatibility_signing_policy(invocation);
+    let policy = xmlsec_compatibility_signing_policy(invocation);
     let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
     let start_node_id = option_text(invocation, "node-id")?;
     let id_attributes = id_attribute_registrations(invocation)?;
@@ -824,15 +824,6 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
         selected_provider(invocation)?,
     )?;
     let has_key_store = invocation.values("keys-file").next().is_some();
-    if matches!(signature.algorithm, SignatureAlgorithm::RsaPss(_)) {
-        // The CLI explicitly permits all implemented PSS parameter combinations;
-        // the finite URI inventory cannot enumerate every exact salt/hash tuple.
-        policy
-            .signature_algorithms
-            .as_mut()
-            .expect("CLI algorithm allowlist")
-            .insert(signature.algorithm);
-    }
     if has_key_store
         && invocation
             .ordered_values(&[
@@ -936,6 +927,7 @@ fn xmlsec_compatibility_signing_policy(invocation: &Invocation) -> SigningPolicy
     // allowlists opt its sign command into every implemented libxmlsec1 method,
     // including legacy SHA-1, without weakening the core library defaults.
     let mut policy = SigningPolicy {
+        parameterized_rsa_pss: xml_sec::policy::RsaPssPermission::AllSupported,
         signature_algorithms: Some(HashSet::from(SignatureAlgorithm::ALL)),
         digest_algorithms: Some(HashSet::from(DigestAlgorithm::ALL)),
         manifest_processing: if invocation.flag("ignore-manifests") {
@@ -1408,6 +1400,7 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
     // boundary: both CLI signing and verification use the donor interpretation,
     // while the core library retains the XMLDSig binding by default.
     let mut policy = VerificationPolicy {
+        parameterized_rsa_pss: xml_sec::policy::RsaPssPermission::AllSupported,
         digest_algorithms: Some(HashSet::from(DigestAlgorithm::ALL)),
         // The compatibility executable explicitly permits every compiled XML
         // signature method, including experimental PQ methods. Library defaults
@@ -1440,6 +1433,7 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
         SignatureAlgorithm::HmacSha1,
         SignatureAlgorithm::EcdsaSha1,
     ]);
+    policy.key_trust.parameterized_rsa_pss = xml_sec::policy::RsaPssPermission::AllSupported;
     // A compatibility boundary opts into provider-supported certificate/CRL
     // methods independently of XML methods. This includes every valid PSS
     // salt length without constructing an artificial finite parameter list.
@@ -1519,7 +1513,7 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
     if lax_key_search && explicit_keys.is_empty() && !has_key_store {
         return Err(CommandError::UnsupportedOption("lax-key-search".into()));
     }
-    let mut policy = xmlsec_compatibility_verification_policy(invocation);
+    let policy = xmlsec_compatibility_verification_policy(invocation);
     let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
     let start_node_id = option_text(invocation, "node-id")?;
     let id_attributes = id_attribute_registrations(invocation)?;
@@ -1541,17 +1535,6 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
         selected_provider(invocation)?,
     )?;
     let algorithm = signature.algorithm;
-    if matches!(algorithm, SignatureAlgorithm::RsaPss(_)) {
-        policy
-            .signature_algorithms
-            .as_mut()
-            .expect("CLI algorithm allowlist")
-            .insert(algorithm);
-        policy
-            .key_trust
-            .allowed_legacy_signature_algorithms
-            .insert(algorithm);
-    }
     let selected_keys = if explicit_keys.is_empty() {
         Vec::new()
     } else {
@@ -5340,6 +5323,10 @@ mod tests {
         // Keep the CLI compatibility boundary complete when algorithms evolve.
         let policy = xmlsec_compatibility_signing_policy(&invocation(&["xmlsec1", "sign"]));
         assert_eq!(
+            policy.parameterized_rsa_pss,
+            xml_sec::policy::RsaPssPermission::AllSupported
+        );
+        assert_eq!(
             policy.signature_algorithms,
             Some(HashSet::from([
                 #[cfg(feature = "legacy-algorithms")]
@@ -6274,6 +6261,21 @@ mod tests {
             "verify",
             "input.xml",
         ]));
+        // Every tuple is authorized by the profile before any XML is parsed.
+        for salt_len in [0, 17, 32, 64] {
+            let method = SignatureAlgorithm::RsaPss(xml_sec::xmldsig::RsaPssParameters {
+                digest: DigestAlgorithm::Sha256,
+                mgf_digest: DigestAlgorithm::Sha1,
+                salt_len,
+            });
+            assert!(policy.check_signature_algorithm(method).is_ok());
+            assert!(
+                !policy
+                    .key_trust
+                    .allowed_legacy_signature_algorithms
+                    .contains(&method)
+            );
+        }
         assert_eq!(
             policy.transforms.xpath_here_semantics,
             xml_sec::xmldsig::XPathHereSemantics::XmlSecLegacy

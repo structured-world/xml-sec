@@ -17,6 +17,9 @@ govern encoding and checking. Verification requires the exact selected salt
 length; it never guesses one from the signature. Modulus capacity is checked
 before randomness or padding allocation, and nonzero leading representative
 octets are rejected rather than silently truncated for non-byte-aligned keys.
+RSAVP1 rejects signature integers greater than or equal to the modulus before
+exponentiation, as required by [RFC 8017 section 5.2.2](https://www.rfc-editor.org/rfc/rfc8017.html#section-5.2.2);
+raw modular exponentiation would otherwise accept aliases of a valid signature.
 The signing padding buffer, including its random salt, is zeroized on drop.
 
 When updating sad-rsa, compare the named donor functions and hazmat interfaces

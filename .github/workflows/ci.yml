@@ -10,6 +10,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # RSA-PSS vectors always run; CI additionally requires reciprocal live checks.
+  OPENSSL_BIN: openssl
   RUSTFLAGS: -Dwarnings
   XMLSEC1_PREFIX: ${{ github.workspace }}/.tools/xmlsec1-1.3.13
   XMLSEC1_BIN: ${{ github.workspace }}/.tools/xmlsec1-1.3.13/bin/xmlsec1

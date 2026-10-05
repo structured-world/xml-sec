@@ -1689,6 +1689,16 @@ fn validate_spki_algorithm(
     public_key_bytes: &[u8],
     algorithm: SignatureAlgorithm,
 ) -> Result<(), KeyResolutionError> {
+    if algorithm.rsa_pss_parameters().is_some() {
+        // RFC 4055 section 1.2 requires id-RSASSA-PSS for PSS-only keys.
+        // Share the borrowed RSA validator so resolver and provider enforce the
+        // same parameter restrictions; the generic parser recognizes only rsaEncryption.
+        // https://www.rfc-editor.org/rfc/rfc4055.html#section-1.2
+        // Eight bits is structural validation only; the selected policy's
+        // strength minimum is enforced on the resolved key before execution.
+        return validate_rsa_signature_spki_with_minimum(algorithm, public_key_bytes, 8)
+            .map_err(|_| KeyResolutionError::InvalidPublicKey);
+    }
     if algorithm.eddsa_signature_len().is_some()
         || matches!(algorithm, SignatureAlgorithm::PostQuantum(_))
     {

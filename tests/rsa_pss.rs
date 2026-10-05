@@ -146,6 +146,60 @@ fn pss_legacy_hash_permission_covers_message_and_mgf() {
 }
 
 #[test]
+fn pss_family_permission_preserves_independent_legacy_gate() {
+    // A family permission is chosen before XML input; it must not grant legacy trust.
+    let method = SignatureAlgorithm::RsaPss(RsaPssParameters {
+        mgf_digest: DigestAlgorithm::Sha1,
+        salt_len: 17,
+        ..RsaPssParameters::DEFAULT
+    });
+    let mut policy = xml_sec::policy::VerificationPolicy::default();
+    policy.parameterized_rsa_pss = xml_sec::policy::RsaPssPermission::AllSupported;
+    assert!(policy.check_signature_algorithm(method).is_err());
+    policy.key_trust.parameterized_rsa_pss = xml_sec::policy::RsaPssPermission::AllSupported;
+    assert!(policy.check_signature_algorithm(method).is_ok());
+    policy.signature_algorithms = Some(Default::default());
+    assert!(policy.check_signature_algorithm(method).is_ok());
+    policy.parameterized_rsa_pss = xml_sec::policy::RsaPssPermission::ExactOnly;
+    assert!(policy.check_signature_algorithm(method).is_err());
+    let key = RsaSigningKey::from_pkcs8_pem(PRIVATE).unwrap();
+    let builder = SignatureBuilder::new(C14nAlgorithm::new(C14nMode::Exclusive1_0, false), method)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("")
+                .transform(xml_sec::xmldsig::Transform::Enveloped),
+        );
+    assert!(matches!(
+        SignContext::new(&key).sign_with_builder("<root/>", &builder),
+        Err(xml_sec::xmldsig::SigningError::Policy(
+            xml_sec::policy::PolicyViolation::Algorithm { .. }
+        ))
+    ));
+    let signing = xml_sec::policy::SigningPolicy {
+        parameterized_rsa_pss: xml_sec::policy::RsaPssPermission::AllSupported,
+        signature_algorithms: Some(Default::default()),
+        ..Default::default()
+    };
+    let signed = SignContext::new(&key)
+        .policy(signing)
+        .sign_with_builder("<root/>", &builder)
+        .unwrap();
+    policy.parameterized_rsa_pss = xml_sec::policy::RsaPssPermission::AllSupported;
+    let verification = xml_sec::xmldsig::VerificationKey {
+        algorithm: method,
+        public_key_bytes: pem::parse(PUBLIC).unwrap().into_contents(),
+        certificate_der: None,
+        name: None,
+    };
+    let result = xml_sec::xmldsig::VerifyContext::new()
+        .policy(policy)
+        .key(&verification)
+        .verify(&signed)
+        .unwrap();
+    assert_eq!(result.status, DsigStatus::Valid);
+}
+
+#[test]
 fn pss_signatures_cross_verify_with_dependency() {
     // Independent sad-rsa padding checks our PSS implementation in both directions.
     let private = rsa::RsaPrivateKey::from_pkcs8_pem(PRIVATE).unwrap();
@@ -182,6 +236,38 @@ fn pss_signatures_cross_verify_with_dependency() {
         assert!(!verify_rsa_signature_pem(wrong_salt, PUBLIC, b"PSS message", &signature).unwrap());
     }
     assert_eq!(public.size(), 256);
+}
+
+#[test]
+fn pss_rejects_modular_alias_of_valid_signature() {
+    // RSAVP1 must reject s+n, even when it fits the signature width and
+    // modular exponentiation would recover exactly the valid encoded message.
+    let private = rsa::RsaPrivateKey::from_pkcs8_pem(PRIVATE).unwrap();
+    let public = rsa::RsaPublicKey::from(&private);
+    let modulus = public.n().to_be_bytes();
+    let method = SignatureAlgorithm::RsaPss(RsaPssParameters {
+        salt_len: 0,
+        ..RsaPssParameters::DEFAULT
+    });
+    let key = RsaSigningKey::from_pkcs8_pem(PRIVATE).unwrap();
+    for counter in 0u32..128 {
+        let message = counter.to_be_bytes();
+        let signature = key.sign(method, &message).unwrap();
+        let mut alias = signature.clone();
+        let mut carry = 0u16;
+        for (byte, modulus_byte) in alias.iter_mut().zip(modulus.iter()).rev() {
+            let sum = u16::from(*byte) + u16::from(*modulus_byte) + carry;
+            *byte = sum as u8;
+            carry = sum >> 8;
+        }
+        if carry != 0 {
+            continue;
+        }
+        assert!(verify_rsa_signature_pem(method, PUBLIC, &message, &signature).unwrap());
+        assert!(!verify_rsa_signature_pem(method, PUBLIC, &message, &alias).unwrap());
+        return;
+    }
+    panic!("test key did not produce a modulus-width alias");
 }
 
 #[test]
@@ -383,6 +469,43 @@ fn pss_restricted_spki_enforces_hashes_and_minimum_salt() {
         parameters: Some(params),
     };
     let encoded = spki.to_der().unwrap();
+    let certificate = x509_cert::Certificate::from_der(
+        pem::parse(include_str!("fixtures/keys/rsa/rsa-2048-cert.pem"))
+            .unwrap()
+            .contents(),
+    )
+    .unwrap();
+    // This checks key extraction, not certificate-chain authentication. Replacing
+    // the SPKI OID keeps the RSA key while intentionally invalidating the issuer signature.
+    let old_spki = certificate
+        .tbs_certificate()
+        .subject_public_key_info()
+        .to_der()
+        .unwrap();
+    let tbs = der::asn1::Any::from_der(&certificate.tbs_certificate().to_der().unwrap()).unwrap();
+    let offset = tbs
+        .value()
+        .windows(old_spki.len())
+        .position(|bytes| bytes == old_spki)
+        .unwrap();
+    let mut tbs_bytes = tbs.value()[..offset].to_vec();
+    tbs_bytes.extend_from_slice(&encoded);
+    tbs_bytes.extend_from_slice(&tbs.value()[offset + old_spki.len()..]);
+    let mut certificate_bytes = der::asn1::Any::new(der::Tag::Sequence, tbs_bytes)
+        .unwrap()
+        .to_der()
+        .unwrap();
+    certificate_bytes.extend_from_slice(&certificate.signature_algorithm().to_der().unwrap());
+    certificate_bytes.extend_from_slice(&certificate.signature().to_der().unwrap());
+    let certificate = der::asn1::Any::new(der::Tag::Sequence, certificate_bytes).unwrap();
+    use base64::Engine as _;
+    let certificate_info = format!(
+        "<KeyInfo xmlns=\"{DS}\"><X509Data><X509Certificate>{}</X509Certificate></X509Data></KeyInfo>",
+        base64::engine::general_purpose::STANDARD.encode(certificate.to_der().unwrap())
+    );
+    let certificate_document = XmlDomDocument::parse(&certificate_info).unwrap();
+    let certificate_info =
+        xml_sec::xmldsig::parse_key_info(certificate_document.root_element()).unwrap();
     let key = RsaSigningKey::from_pkcs8_pem(PRIVATE).unwrap();
     for salt_len in [32, 33] {
         let method = SignatureAlgorithm::RsaPss(RsaPssParameters {
@@ -396,6 +519,29 @@ fn pss_restricted_spki_enforces_hashes_and_minimum_salt() {
             certificate_der: None,
             name: None,
         };
+        // Restricted SPKIs must survive both document and caller-store resolution,
+        // not merely the direct primitive verifier.
+        use xml_sec::xmldsig::{KeyInfo, KeyInfoSource, KeyResolver as _, KeyResolverConfig};
+        let mut config = KeyResolverConfig::default();
+        config
+            .named_keys
+            .insert("restricted".into(), public.clone());
+        let resolver = xml_sec::xmldsig::DefaultKeyResolver::new(config);
+        for source in [
+            KeyInfoSource::DerEncodedKeyValue(encoded.clone()),
+            KeyInfoSource::KeyName("restricted".into()),
+            certificate_info.sources[0].clone(),
+        ] {
+            let mut info = KeyInfo::default();
+            info.sources.push(source);
+            let mut policy = xml_sec::policy::VerificationPolicy::default();
+            policy.key_trust.mode = xml_sec::policy::VerificationTrustMode::CryptographicOnly;
+            let resolved = resolver
+                .resolve_with_policy(Some(&info), method, &policy)
+                .expect("restricted PSS key is valid")
+                .expect("restricted PSS key resolves");
+            assert!(resolved.verify(method, b"restricted", &signature).unwrap());
+        }
         assert!(
             RustCryptoProvider
                 .verify(&public, method, b"restricted", &signature)
@@ -432,6 +578,17 @@ fn pss_restricted_spki_enforces_hashes_and_minimum_salt() {
         assert!(
             RustCryptoProvider
                 .verify(&public, method, b"restricted", &signature)
+                .is_err()
+        );
+        use xml_sec::xmldsig::{KeyInfo, KeyInfoSource, KeyResolver as _};
+        let mut info = KeyInfo::default();
+        info.sources
+            .push(KeyInfoSource::DerEncodedKeyValue(encoded.clone()));
+        let mut policy = xml_sec::policy::VerificationPolicy::default();
+        policy.key_trust.mode = xml_sec::policy::VerificationTrustMode::CryptographicOnly;
+        assert!(
+            xml_sec::xmldsig::DefaultKeyResolver::default()
+                .resolve_with_policy(Some(&info), method, &policy)
                 .is_err()
         );
     }
@@ -471,6 +628,51 @@ fn pss_spki_rejects_unrecognized_parameter_fields() {
 
 #[test]
 fn pss_independent_mgf_cross_verifies_with_openssl() {
+    use base64::Engine as _;
+    // Generated by OpenSSL 3.6.4: dgst -sha512 -sign rsa-2048-key.pem
+    // -sigopt rsa_padding_mode:pss -sigopt rsa_mgf1_md:sha256
+    // -sigopt rsa_pss_saltlen:{0,17,64}, over exactly "independent MGF".
+    // These independent vectors always run, even on hosts without OpenSSL.
+    for (salt_len, encoded) in [
+        (
+            0,
+            "b0Bp5/P3bbC9Bwl5fKkHRKoZJY4OekXDHNb/IhBculwfEtiGPZjq6OpBGV02YvKg5gnoki7EcGoO7ffxfAo6GNOpt4cL6AP8yseBp1F/ATuDAPEvJQHlxLt9bFbsscf7A8WGfj2Z2rmQBOyzgOJRf8xrodZb3XEif3QWUbEIpDbGeY+tL9lrsubtL0+0narA19SGVrZjBoLTdSiAyf4u3cyZ0Ij6VECjawF3ZQHWsu6mMga64Uj7+vBPY4hIRvPYKuGBw+0/EzDV/yFoeevVvskmT1ABmRSuQTnPVf+qQD6qEx//LkKBY717v6byOmyQQqzOpurUAmHmuEiWqttzyQ==",
+        ),
+        (
+            17,
+            "q2SyacHIO99s+kYTCpJ5fZRvNoMPgSjOkL6w1xRjkgHTwksxTCmc00iC+hXeKcyc9khTgslV+M7ueYB02Lo+tyXDkSrvr2X9sCwlTVL7XkZAy8VFE3l/RAh2q+OD0crqQDeTI3HUJLDYZXgJ0Ka+nssZOCF+lLnznAvOIeC9G+pXnQFW7+cHWL++d4Q2XBVrhefKPhHszWCxb4utnPuhFbFITd17V82bX/ysWWRorCgMFSy7rDBc9cZR6u+m57zbxSjTcKSLcydkrUgByXpconY8NDuLi8kN9kyug2y3P6xAr18Nb7DhfK7T3T2SVapNdBSHPBXPF7c52e5Z5ewqEg==",
+        ),
+        (
+            64,
+            "A9FfiAOy7OwsBg3oMJspE/Gr1e9w8x+olQ7gFfZRSD94qCwbetishFppbA2YanzVvg4OkdEfS/B5yBhI0qsyxRN4Hpk6h63SDQ6tk2nw8IBh2kVejqv/mYe0nN6Q+6HEjbMRSzvbs0o8DAPygMXum/C96zxUVBVpdVmrrw/1SAGPCafkYNIE34CxJ+jADnWEPKonAGzoDv16D/RzbzwDvSYj4A1+UTHM318bvpiO42b3VVepa+n13urPLqVICHOzlb9QaCH/aOm7hjxD+eWlU9/C7aGs0x9e/9jCmdKDS+/il4ZRbzt1MAm9T0jmhxGH01/UqGDWKTlDSuVV6tM3jg==",
+        ),
+    ] {
+        let method = SignatureAlgorithm::RsaPss(RsaPssParameters {
+            digest: DigestAlgorithm::Sha512,
+            mgf_digest: DigestAlgorithm::Sha256,
+            salt_len,
+        });
+        let signature = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        assert!(verify_rsa_signature_pem(method, PUBLIC, b"independent MGF", &signature).unwrap());
+        assert!(!verify_rsa_signature_pem(method, PUBLIC, b"tampered", &signature).unwrap());
+        assert!(
+            !verify_rsa_signature_pem(
+                SignatureAlgorithm::RsaPssSha512,
+                PUBLIC,
+                b"independent MGF",
+                &signature
+            )
+            .unwrap()
+        );
+    }
+    if let Some(binary) = std::env::var_os("OPENSSL_BIN") {
+        cross_verify_pss_with_openssl(&binary);
+    }
+}
+
+fn cross_verify_pss_with_openssl(binary: &std::ffi::OsStr) {
     // RFC 8017 permits different message/MGF hashes; OpenSSL is the independent
     // oracle for both directions, including empty and non-digest-sized salts.
     let directory = tempfile::tempdir().unwrap();
@@ -494,7 +696,7 @@ fn pss_independent_mgf_cross_verifies_with_openssl() {
         )
         .unwrap();
         for sign in [false, true] {
-            let mut command = std::process::Command::new("openssl");
+            let mut command = std::process::Command::new(binary);
             command.args(["dgst", "-sha512"]);
             if sign {
                 command
@@ -520,7 +722,7 @@ fn pss_independent_mgf_cross_verifies_with_openssl() {
                 .arg(format!("rsa_pss_saltlen:{salt_len}"))
                 .arg(&message)
                 .output()
-                .unwrap();
+                .expect("configured OPENSSL_BIN must execute; oracle failures are not skipped");
             assert!(
                 output.status.success(),
                 "{}",
