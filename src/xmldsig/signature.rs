@@ -429,10 +429,12 @@ pub(crate) fn verify_rsa_signature_spki_primitive(
     Ok(verified)
 }
 
-/// Verify an XMLDSig DSA-SHA1 signature using a DER SPKI public key.
+/// Verify an XMLDSig DSA-SHA1 or DSA-SHA256 signature using a DER SPKI public key.
 ///
-/// XMLDSig 1.0 encodes the signature as the fixed-width 20-byte `r` followed
-/// by the fixed-width 20-byte `s`, rather than ASN.1 DER.
+/// Signatures contain fixed-width `r || s`, rather than ASN.1 DER: 20-byte
+/// components for SHA1 and 32-byte components for SHA256. The direct helper
+/// enforces the default DSA key minimum; use a policy-aware verification
+/// context for explicitly authorized historical 1024-bit keys.
 #[must_use = "discarding the verification result skips signature validation"]
 pub fn verify_dsa_signature_spki(
     algorithm: SignatureAlgorithm,

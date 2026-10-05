@@ -17,10 +17,10 @@ use xml_sec::policy::{
     VerificationPolicy,
 };
 use xml_sec::xmldsig::{
-    DefaultKeyResolver, DigestAlgorithm, DsigStatus, EcdsaP256SigningKey, EcdsaP384SigningKey,
-    FailureReason, ReferenceBuilder, RsaSigningKey, SignContext, SignatureAlgorithm,
-    SignatureBuilder, SigningKey, SigningPublicKeyInfo, Transform, VerificationKey, VerifyContext,
-    XPathExpression, XPathFilter, XPathFilterOperation,
+    DefaultKeyResolver, DigestAlgorithm, DsaSigningKey, DsigStatus, EcdsaP256SigningKey,
+    EcdsaP384SigningKey, FailureReason, KeyValueInfoWriter, ReferenceBuilder, RsaSigningKey,
+    SignContext, SignatureAlgorithm, SignatureBuilder, SigningKey, SigningPublicKeyInfo, Transform,
+    VerificationKey, VerifyContext, XPathExpression, XPathFilter, XPathFilterOperation,
 };
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -632,6 +632,160 @@ fn xmlsec1_verifies_ecdsa_signatures_from_xml_sec() {
         &p384_signed,
         "tests/fixtures/keys/ec/ec-prime384v1-pubkey.pem",
     );
+}
+
+#[test]
+fn dsa_signatures_interoperate_in_both_directions() {
+    // All XMLDSig 1.1 DSA (L,N) pairs exercise real oracle signing, embedded
+    // DSAKeyValue resolution, exact wire widths, legacy policy and tampering.
+    if !xmlsec1::is_available() {
+        eprintln!("{}", xmlsec1::skip_reason());
+        return;
+    }
+    for (bits, algorithm, digest, width) in [
+        (1024, SignatureAlgorithm::DsaSha1, DigestAlgorithm::Sha1, 40),
+        (
+            2048,
+            SignatureAlgorithm::DsaSha256,
+            DigestAlgorithm::Sha256,
+            64,
+        ),
+        (
+            3072,
+            SignatureAlgorithm::DsaSha256,
+            DigestAlgorithm::Sha256,
+            64,
+        ),
+    ] {
+        let private_path = format!("tests/fixtures/xmldsig/keys/dsa/dsa-{bits}-key.p8-der");
+        let public_path = format!("tests/fixtures/xmldsig/keys/dsa/dsa-{bits}-pubkey.pem");
+        let key = DsaSigningKey::from_pkcs8_encrypted_der(
+            fs::read(&private_path).unwrap().as_slice(),
+            b"secret123",
+        )
+        .unwrap();
+        let mut signing = SigningPolicy::default();
+        let mut verification = VerificationPolicy::default();
+        verification.key_trust.mode = xml_sec::policy::VerificationTrustMode::CryptographicOnly;
+        if bits == 1024 {
+            signing.signature_algorithms = Some(std::collections::HashSet::from([algorithm]));
+            signing.digest_algorithms = Some(std::collections::HashSet::from([digest]));
+            verification.digest_algorithms = Some(std::collections::HashSet::from([digest]));
+            signing.dsa_keys.minimum_modulus_bits = 1024;
+            verification
+                .key_trust
+                .allowed_legacy_signature_algorithms
+                .insert(algorithm);
+            verification.key_trust.dsa_keys.minimum_modulus_bits = 1024;
+        }
+        let builder = signing_builder(algorithm, digest).key_info(true);
+        let payload = "<root ID=\"payload\"><payload>external verifier contract</payload></root>";
+        let signed = SignContext::new(&key)
+            .policy(signing.clone())
+            .key_info_writer(&KeyValueInfoWriter)
+            .sign_with_builder(payload, &builder)
+            .unwrap();
+        let document = roxmltree::Document::parse(&signed).unwrap();
+        let value = document
+            .descendants()
+            .find(|node| {
+                node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignatureValue"))
+            })
+            .unwrap()
+            .text()
+            .unwrap();
+        use base64::Engine as _;
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(value)
+                .unwrap()
+                .len(),
+            width
+        );
+        assert_xmlsec1_accepts(&signed, &public_path);
+        let resolver = DefaultKeyResolver::default();
+        let context = || {
+            VerifyContext::new()
+                .key_resolver(&resolver)
+                .policy(verification.clone())
+        };
+        assert_eq!(context().verify(&signed).unwrap().status, DsigStatus::Valid);
+        assert_ne!(
+            context()
+                .verify(&signed.replace("external verifier contract", "tampered payload"))
+                .unwrap()
+                .status,
+            DsigStatus::Valid
+        );
+
+        let template = builder.build_template_with_policy(&signing).unwrap();
+        // xmlsec1 fills only explicitly requested KeyValue placeholders.
+        // An empty KeyInfo would test direct verification but not resolution.
+        assert!(template.contains("<KeyInfo/>"));
+        let template = template.replace("<KeyInfo/>", "<KeyInfo><KeyValue/></KeyInfo>");
+        let template =
+            xml_sec::xmldsig::mutation::append_signature_to_root(payload, &template).unwrap();
+        let input = TemporaryXmlFile::write("dsa-template", &template);
+        let output_file = TemporaryXmlFile::write("dsa-signed", "");
+        let output = xmlsec1::command()
+            .args([
+                "--sign",
+                "--lax-key-search",
+                // xmlsec1 1.3.13 disables KeyValue processing by default.
+                "--enabled-key-data",
+                "key-value,dsa",
+                "--add-id-attr",
+                "ID",
+                "--pkcs8-der",
+            ])
+            .arg(&private_path)
+            .args(["--pwd", "secret123", "--output"])
+            .arg(&output_file.path)
+            .arg(&input.path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let SigningPublicKeyInfo::Dsa { spki_der, .. } = key.public_key_info().unwrap() else {
+            panic!("DSA key expected")
+        };
+        let public = VerificationKey {
+            algorithm,
+            public_key_bytes: spki_der,
+            certificate_der: None,
+            name: None,
+        };
+        let oracle_signed = fs::read_to_string(&output_file.path).unwrap();
+        assert_eq!(
+            context().verify(&oracle_signed).unwrap().status,
+            DsigStatus::Valid
+        );
+        assert_eq!(
+            VerifyContext::new()
+                .key(&public)
+                .policy(verification)
+                .verify(&oracle_signed)
+                .unwrap()
+                .status,
+            DsigStatus::Valid
+        );
+        if bits == 1024 {
+            assert!(
+                SignContext::new(&key)
+                    .sign_with_builder(payload, &builder)
+                    .is_err()
+            );
+            assert!(
+                VerifyContext::new()
+                    .key(&public)
+                    .verify(&oracle_signed)
+                    .is_err()
+            );
+        }
+    }
 }
 
 #[test]

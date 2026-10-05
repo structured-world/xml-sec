@@ -2468,13 +2468,10 @@ impl<'a> PrivateKeyIdentity<'a> {
                 .map(Self::Rsa)
                 .map_err(|_| KeyStoreError::Selection("invalid RSA private key"));
         } else if info.algorithm.oid == dsa::OID {
-            preflight_dsa_pkcs8_components(&info)?;
-            return NativeDsaSigningKey::from_pkcs8_der(der)
-                .map(|key| Self::Dsa {
-                    algorithm: info.algorithm,
-                    key,
-                })
-                .map_err(|_| KeyStoreError::Selection("invalid DSA private key"));
+            let algorithm = info.algorithm;
+            return crate::xmldsig::sign::decode_dsa_signing_key(info)
+                .map(|key| Self::Dsa { algorithm, key })
+                .map_err(|_| KeyStoreError::Selection("invalid or oversized DSA private key"));
         }
         macro_rules! try_ec {
             ($key:ty) => {
@@ -2595,34 +2592,9 @@ pub fn preflight_rsa_pkcs1_components(der: &[u8]) -> Result<(), KeyStoreError> {
     Ok(())
 }
 
-#[derive(der::Sequence)]
-struct BorrowedDsaParameters<'a> {
-    p: der::asn1::UintRef<'a>,
-    q: der::asn1::UintRef<'a>,
-    g: der::asn1::UintRef<'a>,
-}
-
 fn preflight_dsa_pkcs8_components(info: &PrivateKeyInfoRef<'_>) -> Result<(), KeyStoreError> {
-    let parameters = info
-        .algorithm
-        .parameters
-        .as_ref()
-        .ok_or(KeyStoreError::Selection("missing DSA parameters"))?
-        .decode_as::<BorrowedDsaParameters<'_>>()
-        .map_err(|_| KeyStoreError::Selection("invalid DSA parameters"))?;
-    let x = der::asn1::UintRef::from_der(info.private_key.as_bytes())
-        .map_err(|_| KeyStoreError::Selection("invalid DSA private exponent"))?;
-    if [parameters.p, parameters.q, parameters.g, x]
-        .into_iter()
-        .any(|component| {
-            component.as_bytes().len() > crate::hard_limits::DSA_KEY_COMPONENT_BYTE_CEILING
-        })
-    {
-        return Err(KeyStoreError::Selection(
-            "DSA component exceeds safety limit",
-        ));
-    }
-    Ok(())
+    crate::xmldsig::sign::preflight_dsa_private_key(info)
+        .map_err(|_| KeyStoreError::Selection("invalid or oversized DSA private key"))
 }
 
 // Borrow the frame and stream whitespace-separated Base64 into one preflighted
@@ -7439,7 +7411,13 @@ mod tests {
                 &ResourcePolicy::default(),
             )
             .expect_err("oversized DSA parameter must fail preflight");
-        assert!(error.to_string().contains("safety limit"), "{error}");
+        assert!(
+            matches!(
+                error,
+                KeyStoreError::Selection("invalid or oversized DSA private key")
+            ),
+            "{error}"
+        );
     }
 
     #[test]
