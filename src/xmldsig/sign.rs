@@ -407,9 +407,23 @@ fn expected_signature_output_len(
             SigningPublicKeyInfo::Rsa {
                 modulus, exponent, ..
             },
-        ) if method.is_rsa() => policy
-            .rsa_keys
-            .validate_components("signing", &modulus, &exponent)?,
+        ) if method.is_rsa() => {
+            let width = policy
+                .rsa_keys
+                .validate_components("signing", &modulus, &exponent)?;
+            if let Some(parameters) = method.rsa_pss_parameters() {
+                let normalized = modulus
+                    .iter()
+                    .position(|byte| *byte != 0)
+                    .map(|start| &modulus[start..])
+                    .ok_or(SigningKeyError::InvalidPublicKeyInfo)?;
+                let bits = normalized.len() * 8 - normalized[0].leading_zeros() as usize;
+                if !parameters.fits_modulus_bits(bits) {
+                    return Err(SigningKeyError::InvalidPublicKeyInfo.into());
+                }
+            }
+            width
+        }
         (method, SigningPublicKeyInfo::Ec { public_key, .. })
             if method.ecdsa_digest().is_some()
                 && public_key.first() == Some(&0x04)
@@ -880,6 +894,14 @@ impl SigningKey for RsaSigningKey {
         algorithm: SignatureAlgorithm,
         canonical_signed_info: &[u8],
     ) -> Result<Vec<u8>, SigningKeyError> {
+        if let Some(parameters) = algorithm.rsa_pss_parameters() {
+            return crate::provider::rsa_pss::sign(
+                provider,
+                &self.key,
+                parameters,
+                canonical_signed_info,
+            );
+        }
         match algorithm {
             #[cfg(feature = "legacy-algorithms")]
             SignatureAlgorithm::RsaMd5 => sign_rsa_pkcs1v15_with_rng(

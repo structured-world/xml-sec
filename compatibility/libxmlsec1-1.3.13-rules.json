@@ -48,6 +48,22 @@
   },
   "rules": [
     {
+      "id": "native-rsa-pss-uri",
+      "kinds": ["algorithm-uri"],
+      "name_regex": "^xmlSecHrefRsaPssSha(?:224|256|384|512|3_224|3_256|3_384|3_512)$",
+      "outcome": "behavior-compatible",
+      "rationale": "RSA-PSS fixed URI signing and verification execute through CryptoProvider with exact digest-sized salt and matching MGF1; the complete upstream PSS family is exercised by public pipeline tests.",
+      "evidence": "native-algorithm-tests"
+    },
+    {
+      "id": "legacy-rsa-pss-uri",
+      "kinds": ["algorithm-uri"],
+      "name_regex": "^xmlSecHrefRsaPssSha1$",
+      "outcome": "compatibility-profile-only",
+      "rationale": "RSA-PSS SHA-1 is implemented but requires explicit legacy signature policy permission.",
+      "evidence": "legacy-policy-tests"
+    },
+    {
       "id": "native-xpath-uri",
       "kinds": ["algorithm-uri"],
       "name_regex": "^xmlSecXPath2?Ns$",

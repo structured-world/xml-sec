@@ -198,7 +198,8 @@ fn fixture_file_count_matches_expected() {
         // Complete modern donor key directories add 11 files for each of
         // two EdDSA, three ML-DSA, and six SLH-DSA parameter sets (121 total).
         // Five DSA inputs cover reciprocal 1024/2048/3072-bit signing.
-        ("xmldsig", 333),
+        // All 17 upstream PSS cases include both signed XML and its template.
+        ("xmldsig", 367),
         ("saml", 2),
         ("xmlenc", 485),
     ];

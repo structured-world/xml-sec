@@ -15,7 +15,7 @@ use cryptoki::{
     mechanism::{
         Mechanism, MechanismInfo, MechanismType,
         elliptic_curve::{EcKdf, Ecdh1DeriveParams},
-        rsa::{PkcsMgfType, PkcsOaepParams, PkcsOaepSource},
+        rsa::{PkcsMgfType, PkcsOaepParams, PkcsOaepSource, PkcsPssParams},
     },
     object::{Attribute, AttributeType, KeyType, ObjectClass, ObjectHandle},
     session::{Session, UserType},
@@ -356,6 +356,32 @@ fn require_usage(
 }
 
 fn signature_mechanism(algorithm: SignatureAlgorithm) -> Option<Mechanism<'static>> {
+    if let Some(parameters) = algorithm.rsa_pss_parameters() {
+        if parameters.salt_len > i32::MAX as usize {
+            return None;
+        }
+        let mgf = match parameters.mgf_digest {
+            DigestAlgorithm::Sha1 => PkcsMgfType::MGF1_SHA1,
+            DigestAlgorithm::Sha224 => PkcsMgfType::MGF1_SHA224,
+            DigestAlgorithm::Sha256 => PkcsMgfType::MGF1_SHA256,
+            DigestAlgorithm::Sha384 => PkcsMgfType::MGF1_SHA384,
+            DigestAlgorithm::Sha512 => PkcsMgfType::MGF1_SHA512,
+            _ => return None,
+        };
+        let hash_alg = digest_mechanism(parameters.digest)?.mechanism_type();
+        let params = PkcsPssParams {
+            hash_alg,
+            mgf,
+            s_len: parameters.salt_len.try_into().ok()?,
+        };
+        return match parameters.digest {
+            DigestAlgorithm::Sha1 => Some(Mechanism::Sha1RsaPkcsPss(params)),
+            DigestAlgorithm::Sha256 => Some(Mechanism::Sha256RsaPkcsPss(params)),
+            DigestAlgorithm::Sha384 => Some(Mechanism::Sha384RsaPkcsPss(params)),
+            DigestAlgorithm::Sha512 => Some(Mechanism::Sha512RsaPkcsPss(params)),
+            _ => None,
+        };
+    }
     match algorithm {
         SignatureAlgorithm::RsaSha1 => Some(Mechanism::Sha1RsaPkcs),
         SignatureAlgorithm::RsaSha224 => Some(Mechanism::Sha224RsaPkcs),
@@ -410,6 +436,18 @@ pub struct Pkcs11RsaKey {
     spki: Vec<u8>,
 }
 
+impl Pkcs11RsaKey {
+    fn parameters_fit(&self, algorithm: SignatureAlgorithm) -> bool {
+        let Some(parameters) = algorithm.rsa_pss_parameters() else {
+            return true;
+        };
+        let Some(first) = self.modulus.first() else {
+            return false;
+        };
+        parameters.fits_modulus_bits(self.modulus.len() * 8 - first.leading_zeros() as usize)
+    }
+}
+
 impl SigningKey for Pkcs11RsaKey {
     fn provider_name(&self) -> Option<&'static str> {
         Some("pkcs11")
@@ -426,6 +464,9 @@ impl SigningKey for Pkcs11RsaKey {
         self.token.check_binding(provider)?;
         let capability = ProviderCapability::Sign(algorithm);
         provider.require_capability(capability)?;
+        if !self.parameters_fit(algorithm) {
+            return Err(SigningKeyError::SigningFailed);
+        }
         let mechanism = signature_mechanism(algorithm).ok_or_else(|| unsupported(capability))?;
         let session = self.token.session()?;
         require_usage(&session, self.object, AttributeType::Sign)?;
@@ -461,6 +502,9 @@ impl VerifyingKey for Pkcs11RsaKey {
         data: &[u8],
         signature: &[u8],
     ) -> Result<bool, DsigError> {
+        if !self.parameters_fit(algorithm) {
+            return Ok(false);
+        }
         let mechanism = signature_mechanism(algorithm)
             .ok_or_else(|| unsupported(ProviderCapability::Verify(algorithm)))?;
         let session = self.token.session()?;

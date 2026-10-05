@@ -172,6 +172,13 @@ impl CryptoProvider for AwsLcFipsProvider {
             return Ok(false);
         }
         let native = verification_algorithm(algorithm, spki, key.ecdsa_encoding())?;
+        if let Some(parameters) = algorithm.rsa_pss_parameters() {
+            let encoded = super::rsa_pss::encoded_public_key(spki, parameters)
+                .ok_or(crate::xmldsig::SignatureVerificationError::InvalidKeyDer)?;
+            return Ok(signature::UnparsedPublicKey::new(native, encoded)
+                .verify(data, signature)
+                .is_ok());
+        }
         let public = signature::ParsedPublicKey::new(native, spki)
             .map_err(|_| crate::xmldsig::SignatureVerificationError::InvalidKeyDer)?;
         Ok(public.verify_sig(data, signature).is_ok())
@@ -505,6 +512,12 @@ fn wrapping_key(
 }
 
 fn signing_supported(algorithm: SignatureAlgorithm) -> bool {
+    if let Some(digest) = native_pss_digest(algorithm) {
+        return matches!(
+            digest,
+            DigestAlgorithm::Sha256 | DigestAlgorithm::Sha384 | DigestAlgorithm::Sha512
+        );
+    }
     matches!(
         algorithm,
         SignatureAlgorithm::RsaSha256
@@ -517,6 +530,15 @@ fn signing_supported(algorithm: SignatureAlgorithm) -> bool {
             | SignatureAlgorithm::EcdsaSha3_384
             | SignatureAlgorithm::EcdsaSha3_512
     )
+}
+
+fn native_pss_digest(algorithm: SignatureAlgorithm) -> Option<DigestAlgorithm> {
+    let parameters = algorithm.rsa_pss_parameters()?;
+    // AWS-LC's high-level PSS encodings require matching MGF1 and digest-sized salt.
+    // This is a provider capability restriction, not an XMLDSig policy default.
+    (parameters.digest == parameters.mgf_digest
+        && parameters.salt_len == parameters.digest.output_len())
+    .then_some(parameters.digest)
 }
 
 fn certificate_method(algorithm: super::X509SignatureAlgorithm) -> Option<SignatureAlgorithm> {
@@ -580,11 +602,14 @@ fn verification_algorithm(
 {
     use SignatureAlgorithm as A;
     use signature::*;
-    let rsa: Option<&'static RsaParameters> = match algorithm {
-        A::RsaSha1 => Some(&RSA_PKCS1_2048_8192_SHA1_FOR_LEGACY_USE_ONLY),
-        A::RsaSha256 => Some(&RSA_PKCS1_2048_8192_SHA256),
-        A::RsaSha384 => Some(&RSA_PKCS1_2048_8192_SHA384),
-        A::RsaSha512 => Some(&RSA_PKCS1_2048_8192_SHA512),
+    let rsa: Option<&'static RsaParameters> = match (algorithm, native_pss_digest(algorithm)) {
+        (_, Some(DigestAlgorithm::Sha256)) => Some(&RSA_PSS_2048_8192_SHA256),
+        (_, Some(DigestAlgorithm::Sha384)) => Some(&RSA_PSS_2048_8192_SHA384),
+        (_, Some(DigestAlgorithm::Sha512)) => Some(&RSA_PSS_2048_8192_SHA512),
+        (A::RsaSha1, _) => Some(&RSA_PKCS1_2048_8192_SHA1_FOR_LEGACY_USE_ONLY),
+        (A::RsaSha256, _) => Some(&RSA_PKCS1_2048_8192_SHA256),
+        (A::RsaSha384, _) => Some(&RSA_PKCS1_2048_8192_SHA384),
+        (A::RsaSha512, _) => Some(&RSA_PKCS1_2048_8192_SHA512),
         _ => None,
     };
     if let Some(rsa) = rsa {
@@ -592,10 +617,14 @@ fn verification_algorithm(
         use der::Decode as _;
         let public =
             rsa::pkcs8::SubjectPublicKeyInfoRef::from_der(spki).map_err(|_| InvalidKeyDer)?;
-        if public.algorithm.oid != rsa::pkcs1::ALGORITHM_OID {
-            return Err(InvalidKeyDer);
-        }
-        let bytes = public.subject_public_key.as_bytes().ok_or(InvalidKeyDer)?;
+        let bytes = if let Some(parameters) = algorithm.rsa_pss_parameters() {
+            super::rsa_pss::encoded_public_key(spki, parameters).ok_or(InvalidKeyDer)?
+        } else {
+            if public.algorithm.oid != rsa::pkcs1::ALGORITHM_OID {
+                return Err(InvalidKeyDer);
+            }
+            public.subject_public_key.as_bytes().ok_or(InvalidKeyDer)?
+        };
         let key = rsa::pkcs1::RsaPublicKey::from_der(bytes).map_err(|_| InvalidKeyDer)?;
         let modulus = key.modulus.as_bytes();
         let first = *modulus.first().ok_or(InvalidKeyDer)?;
@@ -666,7 +695,7 @@ impl AwsLcSigningKey {
                 uri: algorithm.uri().into(),
             });
         }
-        let (key, spki) = if matches!(algorithm, A::RsaSha256 | A::RsaSha384 | A::RsaSha512) {
+        let (key, spki) = if algorithm.is_rsa() {
             let key = signature::RsaKeyPair::from_pkcs8(der)
                 .map_err(|_| SigningKeyError::InvalidKeyDer)?;
             let spki: PublicKeyX509Der<'static> = key
@@ -775,10 +804,13 @@ impl SigningKey for AwsLcSigningKey {
         }
         match &self.key {
             NativeSigningKey::Rsa(key) => {
-                let encoding = match algorithm {
-                    SignatureAlgorithm::RsaSha256 => &signature::RSA_PKCS1_SHA256,
-                    SignatureAlgorithm::RsaSha384 => &signature::RSA_PKCS1_SHA384,
-                    SignatureAlgorithm::RsaSha512 => &signature::RSA_PKCS1_SHA512,
+                let encoding = match (algorithm, native_pss_digest(algorithm)) {
+                    (_, Some(DigestAlgorithm::Sha256)) => &signature::RSA_PSS_SHA256,
+                    (_, Some(DigestAlgorithm::Sha384)) => &signature::RSA_PSS_SHA384,
+                    (_, Some(DigestAlgorithm::Sha512)) => &signature::RSA_PSS_SHA512,
+                    (SignatureAlgorithm::RsaSha256, _) => &signature::RSA_PKCS1_SHA256,
+                    (SignatureAlgorithm::RsaSha384, _) => &signature::RSA_PKCS1_SHA384,
+                    (SignatureAlgorithm::RsaSha512, _) => &signature::RSA_PKCS1_SHA512,
                     _ => {
                         return Err(SigningKeyError::UnsupportedAlgorithm {
                             uri: algorithm.uri().into(),

@@ -66,6 +66,9 @@ pub enum SignatureBuilderError {
     /// The selected signature method cannot carry a cryptographic context.
     #[error("signature context is not applicable to algorithm: {0}")]
     SignatureContextNotApplicable(&'static str),
+    /// RSA-PSS salt length cannot be represented by the XML xs:int contract.
+    #[error("RSA-PSS salt length exceeds xs:int")]
+    InvalidRsaPssParameters,
     /// The XML writer failed.
     #[error("XML serialization error: {0}")]
     Serialization(#[from] std::io::Error),
@@ -269,7 +272,37 @@ impl SignatureBuilder {
             "CanonicalizationMethod",
             self.c14n_method.uri(),
         )?;
-        if self.signature_context.as_bytes().is_empty() {
+        if let SignatureAlgorithm::RsaPss(parameters) = self.sign_method {
+            let method_name = qualified_name(prefix, "SignatureMethod");
+            writer.start(&method_name, [("Algorithm", self.sign_method.uri())])?;
+            // RFC 9231 section 2.3.9 defines the parameter order and namespaces.
+            // https://www.rfc-editor.org/rfc/rfc9231.html#section-2.3.9
+            writer.start("RSAPSSParams", [("xmlns", super::parse::RSA_PSS_NS)])?;
+            writer.empty(
+                "DigestMethod",
+                [
+                    ("xmlns", XMLDSIG_NS),
+                    ("Algorithm", parameters.digest.uri()),
+                ],
+            )?;
+            writer.start(
+                "MaskGenerationFunction",
+                [("Algorithm", "http://www.w3.org/2007/05/xmldsig-more#MGF1")],
+            )?;
+            writer.empty(
+                "DigestMethod",
+                [
+                    ("xmlns", XMLDSIG_NS),
+                    ("Algorithm", parameters.mgf_digest.uri()),
+                ],
+            )?;
+            writer.end("MaskGenerationFunction")?;
+            writer.start("SaltLength", std::iter::empty::<(&str, &str)>())?;
+            writer.text(&parameters.salt_len.to_string())?;
+            writer.end("SaltLength")?;
+            writer.end("RSAPSSParams")?;
+            writer.end(&method_name)?;
+        } else if self.signature_context.as_bytes().is_empty() {
             write_algorithm(
                 &mut writer,
                 prefix,
@@ -412,6 +445,11 @@ impl SignatureBuilder {
         policy: &SigningPolicy,
         xpath_signature_budget: &mut XPathSignatureParseBudget,
     ) -> Result<(), SignatureBuilderError> {
+        if let Some(parameters) = self.sign_method.rsa_pss_parameters()
+            && parameters.salt_len > i32::MAX as usize
+        {
+            return Err(SignatureBuilderError::InvalidRsaPssParameters);
+        }
         if !self.signature_context.as_bytes().is_empty()
             && self.sign_method.context_element().is_none()
         {

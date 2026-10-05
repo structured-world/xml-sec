@@ -114,6 +114,15 @@ if (( ${#fixture_paths[@]} == 0 )); then
     "xmlenc/aleksey-xmlenc-01/enc-aes256-kt-rsa_oaep_sha1-params.tmpl"
     "xmlenc/aleksey-xmlenc-01/enc-aes256-kt-rsa_oaep_enc11_sha512_mgf1_sha512.tmpl"
   )
+  # Complete fixed-URI RSA-PSS family from the upstream DSig runner.
+  for hash in sha1 sha224 sha256 sha384 sha512 sha3_224 sha3_256 sha3_384 sha3_512; do
+    for extension in xml tmpl; do
+      fixture_paths+=("xmldsig/aleksey-xmldsig-01/enveloping-rsa-pss-$hash.$extension")
+      if [[ "$hash" != sha1 ]]; then
+        fixture_paths+=("xmldsig/aleksey-xmldsig-01/enveloped-$hash-rsa-pss-$hash.$extension")
+      fi
+    done
+  done
 fi
 
 for relative_path in "${fixture_paths[@]}"; do

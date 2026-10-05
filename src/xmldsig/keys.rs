@@ -251,7 +251,17 @@ impl VerifyingKey for VerificationKey {
             | SignatureAlgorithm::RsaSha224
             | SignatureAlgorithm::RsaSha256
             | SignatureAlgorithm::RsaSha384
-            | SignatureAlgorithm::RsaSha512 => validate_rsa_signature_spki_with_minimum(
+            | SignatureAlgorithm::RsaSha512
+            | SignatureAlgorithm::RsaPssSha1
+            | SignatureAlgorithm::RsaPssSha224
+            | SignatureAlgorithm::RsaPssSha256
+            | SignatureAlgorithm::RsaPssSha384
+            | SignatureAlgorithm::RsaPssSha512
+            | SignatureAlgorithm::RsaPssSha3_224
+            | SignatureAlgorithm::RsaPssSha3_256
+            | SignatureAlgorithm::RsaPssSha3_384
+            | SignatureAlgorithm::RsaPssSha3_512
+            | SignatureAlgorithm::RsaPss(_) => validate_rsa_signature_spki_with_minimum(
                 self.algorithm,
                 &self.public_key_bytes,
                 policy.key_trust.rsa_keys.minimum_modulus_bits,
@@ -364,7 +374,17 @@ impl VerifyingKey for VerificationKey {
             | SignatureAlgorithm::RsaSha224
             | SignatureAlgorithm::RsaSha256
             | SignatureAlgorithm::RsaSha384
-            | SignatureAlgorithm::RsaSha512 => verify_rsa_signature_spki_primitive(
+            | SignatureAlgorithm::RsaSha512
+            | SignatureAlgorithm::RsaPssSha1
+            | SignatureAlgorithm::RsaPssSha224
+            | SignatureAlgorithm::RsaPssSha256
+            | SignatureAlgorithm::RsaPssSha384
+            | SignatureAlgorithm::RsaPssSha512
+            | SignatureAlgorithm::RsaPssSha3_224
+            | SignatureAlgorithm::RsaPssSha3_256
+            | SignatureAlgorithm::RsaPssSha3_384
+            | SignatureAlgorithm::RsaPssSha3_512
+            | SignatureAlgorithm::RsaPss(_) => verify_rsa_signature_spki_primitive(
                 algorithm,
                 &self.public_key_bytes,
                 signed_data,

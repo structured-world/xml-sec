@@ -230,7 +230,7 @@ pub fn signing_signature_metadata(
         xml_backend,
     )?;
     let signature = select_signature(&document, start_node_id, id_attributes)?;
-    let algorithm_uri = signature
+    let method = signature
         .children()
         .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignedInfo")))
         .and_then(|signed_info| {
@@ -238,11 +238,10 @@ pub fn signing_signature_metadata(
                 node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignatureMethod"))
             })
         })
-        .and_then(|method| method.attribute("Algorithm"))
         .ok_or(KeyMaterialError::MissingSignedInfo)?;
-    let algorithm = SignatureAlgorithm::from_uri(algorithm_uri).ok_or_else(|| {
-        KeyMaterialError::Signature(format!("unsupported signature algorithm: {algorithm_uri}"))
-    })?;
+    let algorithm = xml_sec::xmldsig::parse::parse_signature_method(method, &policy.resources)
+        .map(|(algorithm, _, _)| algorithm)
+        .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
     let mut parsing = xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&policy.resources)
         .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
     let mut key_info = signature_key_info(signature)

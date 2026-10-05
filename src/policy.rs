@@ -1176,16 +1176,18 @@ impl VerificationPolicy {
                 algorithm: algorithm.uri().to_owned(),
             });
         }
-        if matches!(
-            algorithm,
-            SignatureAlgorithm::RsaSha1
-                | SignatureAlgorithm::DsaSha1
-                | SignatureAlgorithm::HmacSha1
-                | SignatureAlgorithm::EcdsaSha1
-        ) && !self
-            .key_trust
-            .allowed_legacy_signature_algorithms
-            .contains(&algorithm)
+        if (algorithm.uses_legacy_pss_hash()
+            || matches!(
+                algorithm,
+                SignatureAlgorithm::RsaSha1
+                    | SignatureAlgorithm::DsaSha1
+                    | SignatureAlgorithm::HmacSha1
+                    | SignatureAlgorithm::EcdsaSha1
+            ))
+            && !self
+                .key_trust
+                .allowed_legacy_signature_algorithms
+                .contains(&algorithm)
         {
             return Err(PolicyViolation::Algorithm {
                 operation: "verification",

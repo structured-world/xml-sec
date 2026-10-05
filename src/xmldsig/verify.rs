@@ -4244,7 +4244,17 @@ fn verify_with_algorithm(
         | SignatureAlgorithm::RsaSha224
         | SignatureAlgorithm::RsaSha256
         | SignatureAlgorithm::RsaSha384
-        | SignatureAlgorithm::RsaSha512 => Ok(verify_rsa_signature_pem(
+        | SignatureAlgorithm::RsaSha512
+        | SignatureAlgorithm::RsaPssSha1
+        | SignatureAlgorithm::RsaPssSha224
+        | SignatureAlgorithm::RsaPssSha256
+        | SignatureAlgorithm::RsaPssSha384
+        | SignatureAlgorithm::RsaPssSha512
+        | SignatureAlgorithm::RsaPssSha3_224
+        | SignatureAlgorithm::RsaPssSha3_256
+        | SignatureAlgorithm::RsaPssSha3_384
+        | SignatureAlgorithm::RsaPssSha3_512
+        | SignatureAlgorithm::RsaPss(_) => Ok(verify_rsa_signature_pem(
             algorithm,
             public_key_pem,
             signed_data,

@@ -47,6 +47,73 @@ fn project_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
+#[test]
+fn parameterized_rsa_pss_cli_preserves_effective_parameters() {
+    // Real commands must read the full SignatureMethod, not recover the URI's
+    // defaults and silently replace a non-default MGF hash/salt length.
+    let temp = tempfile::tempdir().unwrap();
+    let key = RsaSigningKey::from_pkcs8_pem(include_str!(
+        "../../../tests/fixtures/keys/rsa/rsa-2048-key.pem"
+    ))
+    .unwrap();
+    let algorithm = SignatureAlgorithm::RsaPss(xml_sec::xmldsig::RsaPssParameters {
+        digest: DigestAlgorithm::Sha512,
+        mgf_digest: DigestAlgorithm::Sha256,
+        salt_len: 17,
+    });
+    let builder =
+        SignatureBuilder::new(C14nAlgorithm::new(C14nMode::Exclusive1_0, false), algorithm)
+            .add_reference(
+                ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                    .uri("")
+                    .transform(Transform::Enveloped),
+            );
+    let signed = SignContext::new(&key)
+        .sign_with_builder("<root>CLI PSS</root>", &builder)
+        .unwrap();
+    let template = temp.path().join("template.xml");
+    let output = temp.path().join("signed.xml");
+    fs::write(&template, signed).unwrap();
+    let result = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+        .arg("--output")
+        .arg(&output)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let result = Command::new(binary())
+        .args(["verify", "--pubkey-pem"])
+        .arg(project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"))
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let verified = VerifyContext::new()
+        .key(&xml_sec::xmldsig::VerificationKey {
+            algorithm,
+            public_key_bytes: pem::parse(include_str!(
+                "../../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"
+            ))
+            .unwrap()
+            .into_contents(),
+            certificate_der: None,
+            name: None,
+        })
+        .verify(&fs::read_to_string(output).unwrap())
+        .unwrap();
+    assert_eq!(verified.status, xml_sec::xmldsig::DsigStatus::Valid);
+}
+
 #[cfg(feature = "legacy-algorithms")]
 #[test]
 fn symmetric_recipient_wraps_are_executable_through_cli() {

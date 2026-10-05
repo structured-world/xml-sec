@@ -11,6 +11,8 @@ mod aws_lc;
 pub mod pkcs11;
 #[cfg(all(feature = "xmlenc", feature = "legacy-algorithms"))]
 mod rsa_pkcs1v15;
+#[cfg(feature = "xmldsig")]
+pub(crate) mod rsa_pss;
 
 /// Secret candidate whose recovery validity is retained until content work ends.
 /// Debug output never exposes key bytes or padding validity.
@@ -1280,6 +1282,11 @@ impl CryptoProvider for RustCryptoProvider {
             // Opaque keys own these primitives and reject unsupported methods
             // during dispatch; the provider advertises its dispatch surface.
             ProviderCapability::Sign(algorithm) | ProviderCapability::Verify(algorithm) => {
+                if let Some(parameters) = algorithm.rsa_pss_parameters()
+                    && parameters.salt_len > i32::MAX as usize
+                {
+                    return false;
+                }
                 !matches!(
                     algorithm,
                     crate::xmldsig::SignatureAlgorithm::PostQuantum(_)
@@ -1499,7 +1506,7 @@ fn is_supported_x509_signature(algorithm: X509SignatureAlgorithm) -> bool {
 }
 
 #[cfg(feature = "xmldsig")]
-mod rustcrypto_x509 {
+pub(crate) mod rustcrypto_x509 {
     use der::Decode as _;
     use dsa::pkcs8::DecodePublicKey as _;
     use rsa::{
@@ -1694,11 +1701,14 @@ mod rustcrypto_x509 {
             .is_some_and(|required| required <= em_len)
     }
 
-    fn compatible_rsa_pss_public_key_from_spki(
+    pub(crate) fn compatible_rsa_pss_public_key_from_spki(
         spki_der: &[u8],
         signature_algorithm: X509SignatureAlgorithm,
     ) -> Option<RsaPublicKey> {
-        let (_, spki) = x509_parser::x509::SubjectPublicKeyInfo::from_der(spki_der).ok()?;
+        let (rest, spki) = x509_parser::x509::SubjectPublicKeyInfo::from_der(spki_der).ok()?;
+        if !rest.is_empty() {
+            return None;
+        }
         match spki.algorithm.algorithm.to_id_string().as_str() {
             "1.2.840.113549.1.1.1" => RsaPublicKey::from_public_key_der(spki_der).ok(),
             "1.2.840.113549.1.1.10" => {
@@ -1720,7 +1730,7 @@ mod rustcrypto_x509 {
         }
     }
 
-    fn rsa_pss_key_parameters_allow(
+    pub(crate) fn rsa_pss_key_parameters_allow(
         parameters: &x509_parser::asn1_rs::Any<'_>,
         signature_algorithm: X509SignatureAlgorithm,
     ) -> bool {
@@ -1754,6 +1764,10 @@ mod rustcrypto_x509 {
             "2.16.840.1.101.3.4.2.1" => Some(DigestAlgorithm::Sha256),
             "2.16.840.1.101.3.4.2.2" => Some(DigestAlgorithm::Sha384),
             "2.16.840.1.101.3.4.2.3" => Some(DigestAlgorithm::Sha512),
+            "2.16.840.1.101.3.4.2.7" => Some(DigestAlgorithm::Sha3_224),
+            "2.16.840.1.101.3.4.2.8" => Some(DigestAlgorithm::Sha3_256),
+            "2.16.840.1.101.3.4.2.9" => Some(DigestAlgorithm::Sha3_384),
+            "2.16.840.1.101.3.4.2.10" => Some(DigestAlgorithm::Sha3_512),
             _ => None,
         }
     }
