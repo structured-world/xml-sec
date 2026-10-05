@@ -4,7 +4,9 @@
 
 The `pkcs11` feature enables the `cryptoki` adapter. Load and initialize
 the module explicitly, then create `provider::pkcs11::Pkcs11Provider` from that
-module and a caller-selected slot and call `login`. The core never discovers a
+module and a caller-selected slot and call `login`. The adapter opens a read-only
+session: cryptographic operations and transient session objects do not require
+token-write access. The core never discovers a
 module, reads a PIN from configuration, initializes a token, or retries credentials.
 Keep the module loaded until worker threads have stopped: native modules can
 register thread-local cleanup callbacks that must run before library unloading.
@@ -37,7 +39,10 @@ Mechanism enumeration cannot prove support for every parameter combination.
 For example SoftHSM rejects SHA-256 OAEP parameters despite listing OAEP; this
 is an explicit unsupported-parameters result, not permission to downgrade to
 SHA-1. Operational errors expose typed redacted classes, never raw module
-diagnostics or credentials. RSA-PSS/ECDSA signing, certificate/CRL verification,
+diagnostics or credentials. An explicit invalid-ciphertext result maps to
+`AuthenticationFailed`; a module's generic failure remains an operational error,
+not proof of a bad authentication tag. Both paths release no plaintext.
+RSA-PSS/ECDSA signing, certificate/CRL verification,
 private software key import, raw symmetric encryption, and KDF execution are
 not advertised by this adapter.
 

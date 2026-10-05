@@ -92,14 +92,18 @@ impl std::fmt::Debug for Pkcs11Provider {
 }
 
 impl Pkcs11Provider {
-    /// Open a session on an explicitly initialized module and slot. Discovering
+    /// Open a read-only session on an explicitly initialized module and slot. Discovering
     /// mechanisms and opening the session through the same module prevents
     /// caller-supplied sessions from being paired with another module's capabilities.
     pub fn new(
         module: &cryptoki::context::Pkcs11,
         slot: cryptoki::slot::Slot,
     ) -> Result<Self, ProviderError> {
-        let session = module.open_rw_session(slot).map_err(map_error)?;
+        // PKCS#11 Base 2.40 §§5.6-5.7: write-protected tokens permit only R/O
+        // sessions; those sessions still allow our CKA_TOKEN=false objects.
+        // This adapter never creates or changes persistent token objects.
+        // https://docs.oasis-open.org/pkcs11/pkcs11-base/v2.40/os/pkcs11-base-v2.40-os.html
+        let session = module.open_ro_session(slot).map_err(map_error)?;
         let random = module.get_token_info(slot).map_err(map_error)?.rng();
         let mechanisms = module
             .get_mechanism_list(slot)
@@ -244,6 +248,10 @@ fn oaep_error(error: Error, capability: ProviderCapability<'_>) -> ProviderError
 }
 
 fn map_error(error: Error) -> ProviderError {
+    // PKCS#11 Base 2.40 §§5.1.1, 5.1.6: GENERAL_ERROR/FUNCTION_FAILED
+    // do not identify invalid ciphertext. Preserve operational failures even
+    // when a particular module uses them for a failed GCM authentication check.
+    // https://docs.oasis-open.org/pkcs11/pkcs11-base/v2.40/os/pkcs11-base-v2.40-os.html
     match error {
         Error::Pkcs11(
             RvError::SignatureInvalid

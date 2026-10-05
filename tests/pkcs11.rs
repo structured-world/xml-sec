@@ -56,6 +56,19 @@ fn isolated_token_operations_and_failures() {
         session.init_pin(&pin).unwrap();
     }
     let provider = Pkcs11Provider::new(module, slot).unwrap();
+    // PKCS#11 Base 2.40 §5.6: the provider must not require token-write access.
+    // A live R/O session prevents SO login, proving the mode without exposing
+    // the provider's private session or modifying a real token's protection flags.
+    {
+        let admin = module.open_rw_session(slot).unwrap();
+        assert!(matches!(
+            admin.login(UserType::So, Some(&so)),
+            Err(cryptoki::error::Error::Pkcs11(
+                cryptoki::error::RvError::SessionReadOnlyExists,
+                _
+            ))
+        ));
+    }
     // Wrong credentials stay typed and never include token, PIN or module details.
     let error = provider
         .login(&AuthPin::new("wrong-pin".into()))
@@ -198,7 +211,7 @@ fn isolated_token_operations_and_failures() {
     });
     let kek = [0x31; 16];
     let cek = [0x72; 16];
-    session
+    let native_aes = session
         .create_object(&[
             Attribute::Class(ObjectClass::SECRET_KEY),
             Attribute::KeyType(KeyType::AES),
@@ -226,13 +239,42 @@ fn isolated_token_operations_and_failures() {
             .decrypt_with_provider(&other, DataEncryptionAlgorithm::Aes128Gcm, &ciphertext)
             .is_err()
     );
-    // GCM authentication and CBC framing are checked before exposing plaintext.
+    // Corrupt GCM must release no plaintext. Compare the exact native failure:
+    // SoftHSM 2.6 SymDecrypt returns GENERAL_ERROR from decryptFinal, while 2.7
+    // distinguishes ENCRYPTED_DATA_INVALID. Do not fabricate authentication
+    // evidence from an opaque operational error or weaken this to is_err().
+    // https://github.com/softhsm/SoftHSMv2/blob/2.6.1/src/lib/SoftHSM.cpp#L3071-L3076
     let mut corrupted = ciphertext.clone();
     *corrupted.last_mut().unwrap() ^= 1;
-    assert!(matches!(
-        provider.decrypt_content_key(DataEncryptionAlgorithm::Aes128Gcm, &opaque, &corrupted),
-        Err(ProviderError::AuthenticationFailed)
-    ));
+    let mut nonce: [u8; 12] = corrupted[..12].try_into().unwrap();
+    let params = cryptoki::mechanism::aead::GcmParams::new(&mut nonce, &[], 128.into()).unwrap();
+    let native_error = session
+        .decrypt(&Mechanism::AesGcm(params), native_aes, &corrupted[12..])
+        .unwrap_err();
+    let expected = match native_error {
+        cryptoki::error::Error::Pkcs11(
+            cryptoki::error::RvError::EncryptedDataInvalid,
+            cryptoki::context::Function::Decrypt,
+        ) => ProviderError::AuthenticationFailed,
+        cryptoki::error::Error::Pkcs11(
+            cryptoki::error::RvError::GeneralError,
+            cryptoki::context::Function::Decrypt,
+        ) => ProviderError::External(ExternalProviderError::Operation),
+        error => panic!("unexpected native GCM failure: {error:?}"),
+    };
+    assert_eq!(
+        provider
+            .decrypt_content_key(DataEncryptionAlgorithm::Aes128Gcm, &opaque, &corrupted)
+            .unwrap_err(),
+        expected
+    );
+    // An authentication/operation failure must not poison the next invocation.
+    assert_eq!(
+        provider
+            .decrypt_content_key(DataEncryptionAlgorithm::Aes128Gcm, &opaque, &ciphertext)
+            .unwrap(),
+        message
+    );
     let cbc = RustCryptoProvider
         .encrypt_data(DataEncryptionAlgorithm::Aes128Cbc, &kek, message)
         .unwrap();
