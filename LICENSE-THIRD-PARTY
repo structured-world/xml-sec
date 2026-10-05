@@ -1,11 +1,12 @@
 The xml-sec crate includes code derived from the following projects. Their
 copyright and permission notices are preserved below.
 
-sad-rsa 0.10.2 (src/provider/rsa_pkcs1v15.rs)
+sad-rsa 0.10.2 (src/provider/rsa_pkcs1v15.rs, src/provider/rsa_pss.rs)
 ------------------------------------------
 
 Source: https://github.com/sadco-io/sad-rsa
 Local fixed-width recovery adaptation: docs/rsa-recovery-patch.md
+Local parameterized PSS adaptation: docs/rsa-pss-patch.md
 
 Copyright (c) 2025-2026 Sadco Security Team
 Copyright (c) 2015-2025 RustCrypto Developers

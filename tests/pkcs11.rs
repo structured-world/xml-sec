@@ -107,6 +107,47 @@ fn isolated_token_operations_and_failures() {
     let private = Arc::new(provider.rsa_private_key(&[1]).unwrap());
     let public = provider.rsa_public_key(&[1]).unwrap();
     let message = b"opaque key operation";
+    // PSS parameters reach the token unchanged, rather than a software fallback.
+    for salt_len in [0, 32] {
+        let algorithm = SignatureAlgorithm::RsaPss(xml_sec::xmldsig::RsaPssParameters {
+            digest: DigestAlgorithm::Sha256,
+            mgf_digest: DigestAlgorithm::Sha256,
+            salt_len,
+        });
+        let signature = provider.sign(private.as_ref(), algorithm, message).unwrap();
+        assert!(
+            provider
+                .verify(&public, algorithm, message, &signature)
+                .unwrap()
+        );
+        assert!(
+            !provider
+                .verify(&public, algorithm, b"changed", &signature)
+                .unwrap()
+        );
+        let wrong = SignatureAlgorithm::RsaPss(xml_sec::xmldsig::RsaPssParameters {
+            digest: DigestAlgorithm::Sha256,
+            mgf_digest: DigestAlgorithm::Sha256,
+            salt_len: if salt_len == 0 { 32 } else { 0 },
+        });
+        assert!(
+            !provider
+                .verify(&public, wrong, message, &signature)
+                .unwrap()
+        );
+    }
+    // SoftHSM rejects a different MGF hash: propagate the token failure and
+    // never silently sign with matching hashes or a software-held key.
+    let unsupported_tuple = SignatureAlgorithm::RsaPss(xml_sec::xmldsig::RsaPssParameters {
+        digest: DigestAlgorithm::Sha256,
+        mgf_digest: DigestAlgorithm::Sha384,
+        salt_len: 32,
+    });
+    assert!(
+        provider
+            .sign(private.as_ref(), unsupported_tuple, message)
+            .is_err()
+    );
     let signature = provider
         .sign(private.as_ref(), SignatureAlgorithm::RsaSha256, message)
         .unwrap();

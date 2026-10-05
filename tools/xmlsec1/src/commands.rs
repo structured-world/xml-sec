@@ -927,6 +927,7 @@ fn xmlsec_compatibility_signing_policy(invocation: &Invocation) -> SigningPolicy
     // allowlists opt its sign command into every implemented libxmlsec1 method,
     // including legacy SHA-1, without weakening the core library defaults.
     let mut policy = SigningPolicy {
+        parameterized_rsa_pss: xml_sec::policy::RsaPssPermission::AllSupported,
         signature_algorithms: Some(HashSet::from(SignatureAlgorithm::ALL)),
         digest_algorithms: Some(HashSet::from(DigestAlgorithm::ALL)),
         manifest_processing: if invocation.flag("ignore-manifests") {
@@ -1399,6 +1400,7 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
     // boundary: both CLI signing and verification use the donor interpretation,
     // while the core library retains the XMLDSig binding by default.
     let mut policy = VerificationPolicy {
+        parameterized_rsa_pss: xml_sec::policy::RsaPssPermission::AllSupported,
         digest_algorithms: Some(HashSet::from(DigestAlgorithm::ALL)),
         // The compatibility executable explicitly permits every compiled XML
         // signature method, including experimental PQ methods. Library defaults
@@ -1426,10 +1428,12 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
     };
     policy.key_trust.allowed_legacy_signature_algorithms = HashSet::from([
         SignatureAlgorithm::RsaSha1,
+        SignatureAlgorithm::RsaPssSha1,
         SignatureAlgorithm::DsaSha1,
         SignatureAlgorithm::HmacSha1,
         SignatureAlgorithm::EcdsaSha1,
     ]);
+    policy.key_trust.parameterized_rsa_pss = xml_sec::policy::RsaPssPermission::AllSupported;
     // A compatibility boundary opts into provider-supported certificate/CRL
     // methods independently of XML methods. This includes every valid PSS
     // salt length without constructing an artificial finite parameter list.
@@ -5319,6 +5323,10 @@ mod tests {
         // Keep the CLI compatibility boundary complete when algorithms evolve.
         let policy = xmlsec_compatibility_signing_policy(&invocation(&["xmlsec1", "sign"]));
         assert_eq!(
+            policy.parameterized_rsa_pss,
+            xml_sec::policy::RsaPssPermission::AllSupported
+        );
+        assert_eq!(
             policy.signature_algorithms,
             Some(HashSet::from([
                 #[cfg(feature = "legacy-algorithms")]
@@ -5343,6 +5351,16 @@ mod tests {
                 SignatureAlgorithm::RsaSha256,
                 SignatureAlgorithm::RsaSha384,
                 SignatureAlgorithm::RsaSha512,
+                SignatureAlgorithm::RsaPssSha1,
+                SignatureAlgorithm::RsaPssSha224,
+                SignatureAlgorithm::RsaPssSha256,
+                SignatureAlgorithm::RsaPssSha384,
+                SignatureAlgorithm::RsaPssSha512,
+                SignatureAlgorithm::RsaPssSha3_224,
+                SignatureAlgorithm::RsaPssSha3_256,
+                SignatureAlgorithm::RsaPssSha3_384,
+                SignatureAlgorithm::RsaPssSha3_512,
+                SignatureAlgorithm::RsaPss(xml_sec::xmldsig::RsaPssParameters::DEFAULT),
                 SignatureAlgorithm::EcdsaSha1,
                 SignatureAlgorithm::EcdsaSha224,
                 SignatureAlgorithm::EcdsaSha256,
@@ -6243,6 +6261,21 @@ mod tests {
             "verify",
             "input.xml",
         ]));
+        // Every tuple is authorized by the profile before any XML is parsed.
+        for salt_len in [0, 17, 32, 64] {
+            let method = SignatureAlgorithm::RsaPss(xml_sec::xmldsig::RsaPssParameters {
+                digest: DigestAlgorithm::Sha256,
+                mgf_digest: DigestAlgorithm::Sha1,
+                salt_len,
+            });
+            assert!(policy.check_signature_algorithm(method).is_ok());
+            assert!(
+                !policy
+                    .key_trust
+                    .allowed_legacy_signature_algorithms
+                    .contains(&method)
+            );
+        }
         assert_eq!(
             policy.transforms.xpath_here_semantics,
             xml_sec::xmldsig::XPathHereSemantics::XmlSecLegacy

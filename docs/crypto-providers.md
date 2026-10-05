@@ -42,7 +42,11 @@ SHA-1. Operational errors expose typed redacted classes, never raw module
 diagnostics or credentials. An explicit invalid-ciphertext result maps to
 `AuthenticationFailed`; a module's generic failure remains an operational error,
 not proof of a bad authentication tag. Both paths release no plaintext.
-RSA-PSS/ECDSA signing, certificate/CRL verification,
+RSA-PSS signing/verification supports SHA-1/256/384/512 with independent
+MGF1 SHA-1/224/256/384/512 and explicit salt length, when the token accepts
+the selected parameters. SHA-224/SHA-3 PSS message digests are not advertised
+because the adapter does not expose matching combined token mechanisms.
+ECDSA signing, certificate/CRL verification,
 private software key import, raw symmetric encryption, and KDF execution are
 not advertised by this adapter.
 
@@ -86,6 +90,15 @@ Without it, that selection is an explicit unavailable-provider error.
 
 ## Mechanisms
 
+RustCrypto implements all nine fixed RSA-PSS SHA-1/SHA-2/SHA-3 signature URIs
+and parameterized `rsa-pss` via `SignatureAlgorithm::RsaPss(RsaPssParameters)`.
+Message hash and MGF1 hash may differ; salt length is exact, including zero,
+and must fit the RSA modulus. XML defaults are SHA-256, digest-sized salt and
+trailer 1 ([RFC 9231 section 2.3.9](https://www.rfc-editor.org/rfc/rfc9231.html#section-2.3.9)).
+SHA-1 in either hash requires explicit legacy policy permission. Fixed URI
+variants reject parameters rather than silently overriding their contract.
+The narrow [local padding adaptation](rsa-pss-patch.md) retains sad-rsa arithmetic.
+
 `legacy-algorithms` adds RustCrypto MD5/RIPEMD-160 signatures and digests, AES-192
 content encryption and key wrap, TripleDES content encryption and CMS wrap, and RSA-1.5
 transport. All operations still go through `CryptoProvider` and require explicit library policy
@@ -95,6 +108,7 @@ every primitive present in the underlying AWS-LC library or an approved-service 
 
 The AWS provider supports SHA-1/SHA-2 and SHA3-256/384/512 digests; RSA PKCS#1 v1.5
 signing with SHA-256/384/512 and verification with those digests or SHA-1; native
+RSA-PSS signing/verification with SHA-256/384/512, matching MGF1 and digest-sized salt;
 ECDSA curve/digest combinations exposed by AWS-LC; AES-128/256 CBC and GCM;
 AES-128/256 key wrap; and RSA-OAEP with SHA-1/256/384/512 when MGF uses the same
 digest. RSA-OAEP labels are preserved. Certificate and CRL verification uses DER

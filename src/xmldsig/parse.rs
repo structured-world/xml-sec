@@ -100,6 +100,45 @@ const MAX_X509_SERIAL_NUMBER_BYTES: usize = 20;
 const MAX_X509_DATA_ENTRY_COUNT: usize = 64;
 pub(crate) const MAX_X509_DATA_TOTAL_BINARY_LEN: usize = 1_048_576;
 
+/// Parameters of RFC 9231 section 2.3.9 RSA-PSS, not algorithm permissions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RsaPssParameters {
+    /// Hash applied to the message and PSS encoding.
+    pub digest: DigestAlgorithm,
+    /// Independent hash underlying MGF1.
+    pub mgf_digest: DigestAlgorithm,
+    /// Exact salt width in octets; zero is permitted by RFC 8017.
+    pub salt_len: usize,
+}
+
+impl Default for RsaPssParameters {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl RsaPssParameters {
+    /// XML defaults, which intentionally differ from ASN.1 PSS defaults.
+    pub const DEFAULT: Self = Self {
+        digest: DigestAlgorithm::Sha256,
+        mgf_digest: DigestAlgorithm::Sha256,
+        salt_len: 32,
+    };
+
+    pub(crate) fn fits_modulus_bits(self, bits: usize) -> bool {
+        // RFC 8017 section 9.1.1 step 3, before allocation or RNG.
+        // https://www.rfc-editor.org/rfc/rfc8017.html#section-9.1.1
+        if bits < 2 || self.salt_len > i32::MAX as usize {
+            return false;
+        }
+        let em_len = (bits - 1).div_ceil(8);
+        let hash_len = self.digest.output_len();
+        em_len >= hash_len + 2 && self.salt_len <= em_len - hash_len - 2
+    }
+}
+
+pub(crate) const RSA_PSS_NS: &str = "http://www.w3.org/2007/05/xmldsig-more#";
+
 /// Signature algorithms supported for signing and verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -143,6 +182,26 @@ pub enum SignatureAlgorithm {
     RsaSha384,
     /// RSA with SHA-512.
     RsaSha512,
+    /// RSA-PSS with SHA1, matching MGF1 and digest-sized salt.
+    RsaPssSha1,
+    /// RSA-PSS with SHA224, matching MGF1 and digest-sized salt.
+    RsaPssSha224,
+    /// RSA-PSS with SHA256, matching MGF1 and digest-sized salt.
+    RsaPssSha256,
+    /// RSA-PSS with SHA384, matching MGF1 and digest-sized salt.
+    RsaPssSha384,
+    /// RSA-PSS with SHA512, matching MGF1 and digest-sized salt.
+    RsaPssSha512,
+    /// RSA-PSS with SHA3-224, matching MGF1 and digest-sized salt.
+    RsaPssSha3_224,
+    /// RSA-PSS with SHA3-256, matching MGF1 and digest-sized salt.
+    RsaPssSha3_256,
+    /// RSA-PSS with SHA3-384, matching MGF1 and digest-sized salt.
+    RsaPssSha3_384,
+    /// RSA-PSS with SHA3-512, matching MGF1 and digest-sized salt.
+    RsaPssSha3_512,
+    /// Parameterized RSA-PSS under RFC 9231 section 2.3.9.
+    RsaPss(RsaPssParameters),
     /// ECDSA with SHA-1; the key selects the elliptic curve.
     EcdsaSha1,
     /// ECDSA with SHA-224; the key selects the elliptic curve.
@@ -176,9 +235,44 @@ pub enum SignatureAlgorithm {
 }
 
 impl SignatureAlgorithm {
+    /// Effective PSS parameters for fixed and parameterized method identifiers.
+    pub fn rsa_pss_parameters(self) -> Option<RsaPssParameters> {
+        let digest = match self {
+            Self::RsaPss(parameters) => return Some(parameters),
+            Self::RsaPssSha1 => DigestAlgorithm::Sha1,
+            Self::RsaPssSha224 => DigestAlgorithm::Sha224,
+            Self::RsaPssSha256 => DigestAlgorithm::Sha256,
+            Self::RsaPssSha384 => DigestAlgorithm::Sha384,
+            Self::RsaPssSha512 => DigestAlgorithm::Sha512,
+            Self::RsaPssSha3_224 => DigestAlgorithm::Sha3_224,
+            Self::RsaPssSha3_256 => DigestAlgorithm::Sha3_256,
+            Self::RsaPssSha3_384 => DigestAlgorithm::Sha3_384,
+            Self::RsaPssSha3_512 => DigestAlgorithm::Sha3_512,
+            _ => return None,
+        };
+        Some(RsaPssParameters {
+            digest,
+            mgf_digest: digest,
+            salt_len: digest.output_len(),
+        })
+    }
+
+    /// Whether either PSS hash needs explicit historical-algorithm permission.
+    pub fn uses_legacy_pss_hash(self) -> bool {
+        self.rsa_pss_parameters().is_some_and(|parameters| {
+            [parameters.digest, parameters.mgf_digest]
+                .into_iter()
+                .any(|digest| match digest {
+                    DigestAlgorithm::Sha1 => true,
+                    #[cfg(feature = "legacy-algorithms")]
+                    DigestAlgorithm::Md5 | DigestAlgorithm::Ripemd160 => true,
+                    _ => false,
+                })
+        })
+    }
     /// Every signature algorithm recognized by this release.
     pub const ALL: [Self;
-        35 + if cfg!(feature = "legacy-algorithms") {
+        45 + if cfg!(feature = "legacy-algorithms") {
             5
         } else {
             0
@@ -205,6 +299,16 @@ impl SignatureAlgorithm {
         Self::RsaSha256,
         Self::RsaSha384,
         Self::RsaSha512,
+        Self::RsaPssSha1,
+        Self::RsaPssSha224,
+        Self::RsaPssSha256,
+        Self::RsaPssSha384,
+        Self::RsaPssSha512,
+        Self::RsaPssSha3_224,
+        Self::RsaPssSha3_256,
+        Self::RsaPssSha3_384,
+        Self::RsaPssSha3_512,
+        Self::RsaPss(RsaPssParameters::DEFAULT),
         Self::EcdsaSha1,
         Self::EcdsaSha224,
         Self::EcdsaSha256,
@@ -305,6 +409,26 @@ impl SignatureAlgorithm {
     #[must_use]
     pub fn from_uri(uri: &str) -> Option<Self> {
         match uri {
+            "http://www.w3.org/2007/05/xmldsig-more#sha1-rsa-MGF1" => Some(Self::RsaPssSha1),
+            "http://www.w3.org/2007/05/xmldsig-more#sha224-rsa-MGF1" => Some(Self::RsaPssSha224),
+            "http://www.w3.org/2007/05/xmldsig-more#sha256-rsa-MGF1" => Some(Self::RsaPssSha256),
+            "http://www.w3.org/2007/05/xmldsig-more#sha384-rsa-MGF1" => Some(Self::RsaPssSha384),
+            "http://www.w3.org/2007/05/xmldsig-more#sha512-rsa-MGF1" => Some(Self::RsaPssSha512),
+            "http://www.w3.org/2007/05/xmldsig-more#sha3-224-rsa-MGF1" => {
+                Some(Self::RsaPssSha3_224)
+            }
+            "http://www.w3.org/2007/05/xmldsig-more#sha3-256-rsa-MGF1" => {
+                Some(Self::RsaPssSha3_256)
+            }
+            "http://www.w3.org/2007/05/xmldsig-more#sha3-384-rsa-MGF1" => {
+                Some(Self::RsaPssSha3_384)
+            }
+            "http://www.w3.org/2007/05/xmldsig-more#sha3-512-rsa-MGF1" => {
+                Some(Self::RsaPssSha3_512)
+            }
+            "http://www.w3.org/2007/05/xmldsig-more#rsa-pss" => {
+                Some(Self::RsaPss(RsaPssParameters::DEFAULT))
+            }
             #[cfg(feature = "legacy-algorithms")]
             "http://www.w3.org/2001/04/xmldsig-more#rsa-md5" => Some(Self::RsaMd5),
             #[cfg(feature = "legacy-algorithms")]
@@ -358,6 +482,16 @@ impl SignatureAlgorithm {
     #[must_use]
     pub fn uri(self) -> &'static str {
         match self {
+            Self::RsaPssSha1 => "http://www.w3.org/2007/05/xmldsig-more#sha1-rsa-MGF1",
+            Self::RsaPssSha224 => "http://www.w3.org/2007/05/xmldsig-more#sha224-rsa-MGF1",
+            Self::RsaPssSha256 => "http://www.w3.org/2007/05/xmldsig-more#sha256-rsa-MGF1",
+            Self::RsaPssSha384 => "http://www.w3.org/2007/05/xmldsig-more#sha384-rsa-MGF1",
+            Self::RsaPssSha512 => "http://www.w3.org/2007/05/xmldsig-more#sha512-rsa-MGF1",
+            Self::RsaPssSha3_224 => "http://www.w3.org/2007/05/xmldsig-more#sha3-224-rsa-MGF1",
+            Self::RsaPssSha3_256 => "http://www.w3.org/2007/05/xmldsig-more#sha3-256-rsa-MGF1",
+            Self::RsaPssSha3_384 => "http://www.w3.org/2007/05/xmldsig-more#sha3-384-rsa-MGF1",
+            Self::RsaPssSha3_512 => "http://www.w3.org/2007/05/xmldsig-more#sha3-512-rsa-MGF1",
+            Self::RsaPss(_) => "http://www.w3.org/2007/05/xmldsig-more#rsa-pss",
             #[cfg(feature = "legacy-algorithms")]
             Self::RsaMd5 => "http://www.w3.org/2001/04/xmldsig-more#rsa-md5",
             #[cfg(feature = "legacy-algorithms")]
@@ -401,7 +535,7 @@ impl SignatureAlgorithm {
     /// Whether this algorithm is allowed for signing (not just verification).
     #[must_use]
     pub fn signing_allowed(self) -> bool {
-        if self.requires_explicit_permission() {
+        if self.requires_explicit_permission() || self.uses_legacy_pss_hash() {
             return false;
         }
         !matches!(
@@ -426,6 +560,16 @@ impl SignatureAlgorithm {
     /// Whether this method uses an RSA key and PKCS#1 signature encoding.
     pub const fn is_rsa(self) -> bool {
         match self {
+            Self::RsaPssSha1 => true,
+            Self::RsaPssSha224 => true,
+            Self::RsaPssSha256 => true,
+            Self::RsaPssSha384 => true,
+            Self::RsaPssSha512 => true,
+            Self::RsaPssSha3_224 => true,
+            Self::RsaPssSha3_256 => true,
+            Self::RsaPssSha3_384 => true,
+            Self::RsaPssSha3_512 => true,
+            Self::RsaPss(_) => true,
             #[cfg(feature = "legacy-algorithms")]
             Self::RsaMd5 | Self::RsaRipemd160 => true,
             Self::RsaSha1
@@ -796,17 +940,24 @@ pub(crate) fn parse_signed_info_with_xpath_budget(
 #[derive(Clone, Copy)]
 struct ByteAlignedHmacOutputLength(usize);
 
-pub(crate) fn parse_signature_method(
+/// Parse a complete SignatureMethod, including its bounded algorithm parameters.
+/// This is also usable for unsigned templates whose DigestValue placeholders
+/// are not yet valid signature input; callers still apply operation policy.
+pub fn parse_signature_method(
     node: Node<'_, '_>,
     resources: &crate::policy::ResourcePolicy,
 ) -> Result<(SignatureAlgorithm, Option<usize>, SignatureContext), ParseError> {
     verify_ds_element(node, "SignatureMethod")?;
     let uri = required_algorithm_attr(node, "SignatureMethod")?;
-    let algorithm =
+    let mut algorithm =
         SignatureAlgorithm::from_uri(uri).ok_or_else(|| ParseError::UnsupportedAlgorithm {
             uri: uri.to_string(),
         })?;
     ensure_no_non_whitespace_text(node, "SignatureMethod")?;
+    if matches!(algorithm, SignatureAlgorithm::RsaPss(_)) {
+        algorithm = SignatureAlgorithm::RsaPss(parse_rsa_pss_parameters(node)?);
+        return Ok((algorithm, None, SignatureContext::default()));
+    }
     let (hmac, context) = if algorithm.context_element().is_some() {
         (None, parse_signature_context(node, algorithm, resources)?)
     } else {
@@ -816,6 +967,152 @@ pub(crate) fn parse_signature_method(
         )
     };
     Ok((algorithm, hmac, context))
+}
+
+fn parse_rsa_pss_parameters(node: Node<'_, '_>) -> Result<RsaPssParameters, ParseError> {
+    // RFC 9231 section 2.3.9 defines an ordered sequence of optional
+    // DigestMethod, MaskGenerationFunction, SaltLength and TrailerField.
+    // https://www.rfc-editor.org/rfc/rfc9231.html#section-2.3.9
+    let mut parameters = RsaPssParameters::DEFAULT;
+    let mut children = element_children(node);
+    let Some(params) = children.next() else {
+        return Ok(parameters);
+    };
+    if !params.has_tag_name((RSA_PSS_NS, "RSAPSSParams")) || children.next().is_some() {
+        return Err(ParseError::InvalidStructure(
+            "invalid RSAPSSParams element".into(),
+        ));
+    }
+    ensure_no_non_whitespace_text(params, "RSAPSSParams")?;
+    let mut last = 0;
+    let mut salt_seen = false;
+    let mut mgf_seen = false;
+    for child in element_children(params) {
+        let rank = match (child.tag_name().namespace(), child.tag_name().name()) {
+            (Some(XMLDSIG_NS), "DigestMethod") => 1,
+            (Some(RSA_PSS_NS), "MaskGenerationFunction") => 2,
+            (Some(RSA_PSS_NS), "SaltLength") => 3,
+            (Some(RSA_PSS_NS), "TrailerField") => 4,
+            _ => {
+                return Err(ParseError::InvalidStructure(
+                    "unknown RSAPSSParams child".into(),
+                ));
+            }
+        };
+        if rank <= last {
+            return Err(ParseError::InvalidStructure(
+                "duplicate or unordered RSAPSSParams child".into(),
+            ));
+        }
+        last = rank;
+        match rank {
+            1 => parameters.digest = parse_pss_digest(child)?,
+            2 => {
+                ensure_no_non_whitespace_text(child, "MaskGenerationFunction")?;
+                if child
+                    .attribute("Algorithm")
+                    .is_some_and(|uri| uri != "http://www.w3.org/2007/05/xmldsig-more#MGF1")
+                {
+                    return Err(ParseError::InvalidStructure(
+                        "unsupported PSS mask generation function".into(),
+                    ));
+                }
+                let mut digests = element_children(child);
+                parameters.mgf_digest = match digests.next() {
+                    Some(digest) => parse_pss_digest(digest)?,
+                    // RFC 9231 section 2.3.9 uses SHA-256 when this explicit
+                    // hash-bearing parameter omits its DigestMethod. An absent
+                    // MGF parameter instead inherits the message hash below.
+                    None => DigestAlgorithm::Sha256,
+                };
+                if digests.next().is_some() {
+                    return Err(ParseError::InvalidStructure(
+                        "duplicate MGF1 DigestMethod".into(),
+                    ));
+                }
+                mgf_seen = true;
+            }
+            3 => {
+                parameters.salt_len = parse_pss_integer(child)?;
+                salt_seen = true;
+            }
+            4 => {
+                if parse_pss_integer(child)? != 1 {
+                    // RFC 8017 appendix A.2.3 supports only trailerFieldBC.
+                    // https://www.rfc-editor.org/rfc/rfc8017.html#appendix-A.2.3
+                    return Err(ParseError::InvalidStructure(
+                        "PSS TrailerField must be 1".into(),
+                    ));
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    if !mgf_seen {
+        parameters.mgf_digest = parameters.digest;
+    }
+    if !salt_seen {
+        parameters.salt_len = parameters.digest.output_len();
+    }
+    Ok(parameters)
+}
+
+fn parse_pss_digest(node: Node<'_, '_>) -> Result<DigestAlgorithm, ParseError> {
+    verify_ds_element(node, "DigestMethod")?;
+    ensure_no_element_children(node, "DigestMethod")?;
+    ensure_no_non_whitespace_text(node, "DigestMethod")?;
+    let uri = required_algorithm_attr(node, "DigestMethod")?;
+    DigestAlgorithm::from_uri(uri)
+        .ok_or_else(|| ParseError::UnsupportedAlgorithm { uri: uri.into() })
+}
+
+fn parse_pss_integer(node: Node<'_, '_>) -> Result<usize, ParseError> {
+    ensure_no_element_children(node, "PSS integer")?;
+    // xs:int lexical space permits XML whitespace and either sign; -0 is zero.
+    // Stream text chunks, including around comments, without a temporary String.
+    // https://www.w3.org/TR/2004/REC-xmlschema-2-20041028/#int
+    let invalid = || ParseError::InvalidStructure("PSS integer must be nonnegative xs:int".into());
+    let mut value = 0usize;
+    let mut started = false;
+    let mut digit_seen = false;
+    let mut ended = false;
+    let mut negative = false;
+    for character in node
+        .children()
+        .filter_map(|child| child.text().filter(|_| child.is_text()))
+        .flat_map(str::chars)
+    {
+        if matches!(character, ' ' | '\t' | '\r' | '\n') {
+            if started {
+                ended = true;
+            }
+            continue;
+        }
+        if ended {
+            return Err(invalid());
+        }
+        if !started && matches!(character, '+' | '-') {
+            started = true;
+            negative = character == '-';
+            continue;
+        }
+        let Some(digit) = character
+            .to_digit(10)
+            .filter(|_| character.is_ascii_digit())
+        else {
+            return Err(invalid());
+        };
+        if value > (i32::MAX as usize - digit as usize) / 10 {
+            return Err(invalid());
+        }
+        value = value * 10 + digit as usize;
+        started = true;
+        digit_seen = true;
+    }
+    if !digit_seen || (negative && value != 0) {
+        return Err(invalid());
+    }
+    Ok(value)
 }
 
 impl ByteAlignedHmacOutputLength {

@@ -46,6 +46,10 @@ pub(crate) fn signature_value_matches_algorithm_with_encoding(
     signature_value: &[u8],
     encoding: EcdsaSignatureValueEncoding,
 ) -> bool {
+    if algorithm.rsa_pss_parameters().is_some() {
+        return (1..=crate::hard_limits::RSA_MODULUS_BIT_CEILING / 8)
+            .contains(&signature_value.len());
+    }
     match algorithm {
         #[cfg(feature = "legacy-algorithms")]
         SignatureAlgorithm::RsaMd5 | SignatureAlgorithm::RsaRipemd160 => {
@@ -96,6 +100,16 @@ pub(crate) fn signature_value_matches_algorithm_with_encoding(
         | SignatureAlgorithm::RsaSha512 => {
             (1..=crate::hard_limits::RSA_MODULUS_BIT_CEILING / 8).contains(&signature_value.len())
         }
+        SignatureAlgorithm::RsaPssSha1
+        | SignatureAlgorithm::RsaPssSha224
+        | SignatureAlgorithm::RsaPssSha256
+        | SignatureAlgorithm::RsaPssSha384
+        | SignatureAlgorithm::RsaPssSha512
+        | SignatureAlgorithm::RsaPssSha3_224
+        | SignatureAlgorithm::RsaPssSha3_256
+        | SignatureAlgorithm::RsaPssSha3_384
+        | SignatureAlgorithm::RsaPssSha3_512
+        | SignatureAlgorithm::RsaPss(_) => unreachable!("PSS handled before dispatch"),
         SignatureAlgorithm::EcdsaSha1
         | SignatureAlgorithm::EcdsaSha224
         | SignatureAlgorithm::EcdsaSha256
@@ -155,6 +169,19 @@ pub(crate) fn signature_value_matches_spki_with_encoding(
                 uri: algorithm.uri().to_owned(),
             });
         }
+    }
+    if let Some(parameters) = algorithm.rsa_pss_parameters() {
+        use der::Decode as _;
+        let bytes = crate::provider::rsa_pss::encoded_public_key(public_key_spki_der, parameters)
+            .ok_or(SignatureVerificationError::InvalidKeyDer)?;
+        let key = rsa::pkcs1::RsaPublicKey::from_der(bytes)
+            .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+        let modulus = key.modulus.as_bytes();
+        let Some(first) = modulus.first() else {
+            return Err(SignatureVerificationError::InvalidKeyDer);
+        };
+        let bits = modulus.len() * 8 - first.leading_zeros() as usize;
+        return Ok(parameters.fits_modulus_bits(bits) && signature_value.len() == modulus.len());
     }
     let (rest, spki) = SubjectPublicKeyInfo::from_der(public_key_spki_der)
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
@@ -372,6 +399,27 @@ pub(crate) fn validate_rsa_signature_spki_with_minimum(
     public_key_spki_der: &[u8],
     minimum_modulus_bits: usize,
 ) -> Result<(), SignatureVerificationError> {
+    if let Some(parameters) = algorithm.rsa_pss_parameters() {
+        use der::Decode as _;
+        let bytes = crate::provider::rsa_pss::encoded_public_key(public_key_spki_der, parameters)
+            .ok_or(SignatureVerificationError::InvalidKeyDer)?;
+        let key = rsa::pkcs1::RsaPublicKey::from_der(bytes)
+            .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+        let modulus = key.modulus.as_bytes();
+        validate_rsa_key_components(
+            modulus,
+            key.public_exponent.as_bytes(),
+            minimum_modulus_bits,
+        )?;
+        let bits = modulus.len() * 8 - modulus[0].leading_zeros() as usize;
+        return if parameters.fits_modulus_bits(bits) {
+            Ok(())
+        } else {
+            Err(SignatureVerificationError::KeyAlgorithmMismatch {
+                uri: algorithm.uri().into(),
+            })
+        };
+    }
     let (rest, spki) = SubjectPublicKeyInfo::from_der(public_key_spki_der)
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
     if !rest.is_empty() {
@@ -395,6 +443,16 @@ pub(crate) fn verify_rsa_signature_spki_primitive(
     signature_value: &[u8],
 ) -> Result<bool, SignatureVerificationError> {
     ensure_rsa_signature_algorithm(algorithm)?;
+    if let Some(parameters) = algorithm.rsa_pss_parameters() {
+        let key = crate::provider::rsa_pss::public_key(public_key_spki_der, parameters)
+            .ok_or(SignatureVerificationError::InvalidKeyDer)?;
+        return Ok(crate::provider::rsa_pss::verify(
+            &key,
+            parameters,
+            signed_data,
+            signature_value,
+        ));
+    }
     let key = rsa::RsaPublicKey::from_public_key_der(public_key_spki_der)
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
     let Ok(signature) = RsaPkcs1v15Signature::try_from(signature_value) else {
@@ -674,7 +732,22 @@ fn validate_rsa_public_key(
     minimum_modulus_bits: usize,
 ) -> Result<(), SignatureVerificationError> {
     ensure_rsa_signature_algorithm(algorithm)?;
-    validate_rsa_key_components(rsa.modulus, rsa.exponent, minimum_modulus_bits)
+    validate_rsa_key_components(rsa.modulus, rsa.exponent, minimum_modulus_bits)?;
+    if let Some(parameters) = algorithm.rsa_pss_parameters() {
+        let modulus = rsa
+            .modulus
+            .iter()
+            .position(|byte| *byte != 0)
+            .map(|start| &rsa.modulus[start..])
+            .ok_or(SignatureVerificationError::InvalidKeyDer)?;
+        let bits = modulus.len() * 8 - modulus[0].leading_zeros() as usize;
+        if !parameters.fits_modulus_bits(bits) {
+            return Err(SignatureVerificationError::KeyAlgorithmMismatch {
+                uri: algorithm.uri().into(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Apply the RSA key-strength invariant shared by XMLDSig and X.509 algorithms.

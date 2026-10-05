@@ -13,7 +13,7 @@ use wildcard match arms and obtain `SignedInfo` through the parser.
 The `xmldsig` feature provides signing and verification pipelines for same-document XML
 signatures and detached references whose payloads the caller supplies. It supports inclusive and
 exclusive canonicalization, enveloped signatures,
-Base64, XPath 1.0, and XPath Filter 2.0 transforms, RSA PKCS#1 v1.5, DSA,
+Base64, XPath 1.0, and XPath Filter 2.0 transforms, RSA PKCS#1 v1.5, RSA-PSS, DSA,
 ECDSA with P-256/P-384/P-521 keys, HMAC truncation, embedded X.509 certificates,
 and configured key resolution.
 
@@ -230,8 +230,8 @@ implementation only when the provider has no primitive work to observe.
 `VerifyContext::provider` covers every verification-time cryptographic operation, including
 reference digests, document signatures, `X509Digest` selector evaluation, X.509 candidate-path
 edges, complete certificate paths, and CRL authentication performed by `DefaultKeyResolver`.
-Certificate authentication uses a separate typed algorithm contract so RSA-PSS parameters and
-Ed25519 are not collapsed into the narrower XMLDSig `SignatureMethod` enum. Unsupported certificate
+Certificate authentication uses a separate typed algorithm contract because certificate encodings
+and algorithm permissions are independent of XMLDSig `SignatureMethod`. Unsupported certificate
 OIDs remain typed path errors rather than ordinary signature mismatches. Every certificate OID
 represented by that contract reaches the selected provider; the built-in provider may reject a
 capability such as ECDSA-SHA512 while a custom provider can implement it. For an
@@ -458,7 +458,8 @@ These are
 historical interoperability mechanisms, not recommended algorithms for new documents.
 
 Implemented signature methods include DSA-SHA1/SHA256; HMAC-SHA1/SHA224/SHA256/SHA384/SHA512;
-RSA PKCS#1 v1.5 with SHA-1/SHA224/SHA256/SHA384/SHA512; and ECDSA
+RSA PKCS#1 v1.5 with SHA-1/SHA224/SHA256/SHA384/SHA512; RSA-PSS with SHA-1,
+SHA224/SHA256/SHA384/SHA512 and SHA3-224/256/384/512; and ECDSA
 SHA-1/SHA224/SHA256/SHA384/SHA512 and SHA3-224/256/384/512. ECDSA selects P-256, P-384, or P-521
 from the key independently of the hash identifier. Digest methods include
 SHA-1/SHA224/SHA256/SHA384/SHA512 and SHA3-224/256/384/512. EdDSA supports pure Ed25519,
@@ -537,5 +538,35 @@ and these post-quantum methods
 require absent parameters; RSA PKCS#1 accepts NULL or absent; RSA-PSS requires valid typed
 parameters. An `id-RSASSA-PSS` issuer key with absent parameters imposes no parameter restrictions,
 as required by RFC 4055 section 3.3; present key parameters constrain the signature hash, MGF,
-minimum salt length, and trailer field. XMLDSig `SignatureMethod` RSA-PSS and implicit external
-resource loading are not currently supported.
+minimum salt length, and trailer field. Implicit external resource loading is not supported.
+
+## RSA-PSS Parameters
+
+The nine fixed RSA-PSS methods use MGF1 with the signature digest and a salt of that digest's
+width. `SignatureAlgorithm::RsaPss(RsaPssParameters)` represents the parameterized method from
+[RFC 9231 section 2.3.9](https://www.rfc-editor.org/rfc/rfc9231.html#section-2.3.9), with independent
+`digest`, `mgf_digest`, and exact `salt_len`. The builder emits `RSAPSSParams`; template signing
+and verification parse the same typed parameters.
+
+An omitted digest defaults to SHA-256. An omitted MGF uses the signature digest; an explicit
+MGF1 element without its digest uses SHA-256. An omitted salt length uses the signature digest's
+width. Only trailer field 1 is supported. Parsing rejects duplicate, reordered, unknown, or
+malformed parameters, and salt lengths outside the nonnegative `xs:int` range. Key preflight
+rejects salts that cannot fit the RSA encoded message before signing work.
+
+SHA-1 in either the message digest or MGF requires explicit legacy permission for the exact
+signature method, or an explicit `KeyTrustPolicy::parameterized_rsa_pss` family permission.
+`RsaPssPermission::AllSupported` in the signing or verification policy grants the parameterized
+family without enumerating salt lengths; verification retains the independent legacy trust gate.
+All family permissions default to `ExactOnly`. The compatibility CLI sets both permissions before
+reading input, never deriving policy from a document's parameters.
+An `id-RSASSA-PSS` public key also enforces its hash, MGF, minimum salt length,
+and trailer restrictions; an unrestricted RSA key does not add those restrictions.
+
+RustCrypto supports independent hashes and exact salts. Other providers expose only their native
+capabilities, with no fallback; see [provider capabilities](crypto-providers.md). The narrow
+[local RSA-PSS adaptation](rsa-pss-patch.md) retains the existing RSA arithmetic, blinding, and
+fault checks. Tests cover every pinned xmlsec1 RSA-PSS fixture, reciprocal signing, restricted
+keys, malformed encodings, mixed hashes, and salt/modulus boundaries.
+Saved OpenSSL vectors run without external programs; set `OPENSSL_BIN` to additionally require
+live reciprocal OpenSSL checks. A configured but unavailable oracle fails the test. CI enables it.

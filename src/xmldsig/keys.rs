@@ -251,7 +251,17 @@ impl VerifyingKey for VerificationKey {
             | SignatureAlgorithm::RsaSha224
             | SignatureAlgorithm::RsaSha256
             | SignatureAlgorithm::RsaSha384
-            | SignatureAlgorithm::RsaSha512 => validate_rsa_signature_spki_with_minimum(
+            | SignatureAlgorithm::RsaSha512
+            | SignatureAlgorithm::RsaPssSha1
+            | SignatureAlgorithm::RsaPssSha224
+            | SignatureAlgorithm::RsaPssSha256
+            | SignatureAlgorithm::RsaPssSha384
+            | SignatureAlgorithm::RsaPssSha512
+            | SignatureAlgorithm::RsaPssSha3_224
+            | SignatureAlgorithm::RsaPssSha3_256
+            | SignatureAlgorithm::RsaPssSha3_384
+            | SignatureAlgorithm::RsaPssSha3_512
+            | SignatureAlgorithm::RsaPss(_) => validate_rsa_signature_spki_with_minimum(
                 self.algorithm,
                 &self.public_key_bytes,
                 policy.key_trust.rsa_keys.minimum_modulus_bits,
@@ -364,7 +374,17 @@ impl VerifyingKey for VerificationKey {
             | SignatureAlgorithm::RsaSha224
             | SignatureAlgorithm::RsaSha256
             | SignatureAlgorithm::RsaSha384
-            | SignatureAlgorithm::RsaSha512 => verify_rsa_signature_spki_primitive(
+            | SignatureAlgorithm::RsaSha512
+            | SignatureAlgorithm::RsaPssSha1
+            | SignatureAlgorithm::RsaPssSha224
+            | SignatureAlgorithm::RsaPssSha256
+            | SignatureAlgorithm::RsaPssSha384
+            | SignatureAlgorithm::RsaPssSha512
+            | SignatureAlgorithm::RsaPssSha3_224
+            | SignatureAlgorithm::RsaPssSha3_256
+            | SignatureAlgorithm::RsaPssSha3_384
+            | SignatureAlgorithm::RsaPssSha3_512
+            | SignatureAlgorithm::RsaPss(_) => verify_rsa_signature_spki_primitive(
                 algorithm,
                 &self.public_key_bytes,
                 signed_data,
@@ -1669,6 +1689,16 @@ fn validate_spki_algorithm(
     public_key_bytes: &[u8],
     algorithm: SignatureAlgorithm,
 ) -> Result<(), KeyResolutionError> {
+    if algorithm.rsa_pss_parameters().is_some() {
+        // RFC 4055 section 1.2 requires id-RSASSA-PSS for PSS-only keys.
+        // Share the borrowed RSA validator so resolver and provider enforce the
+        // same parameter restrictions; the generic parser recognizes only rsaEncryption.
+        // https://www.rfc-editor.org/rfc/rfc4055.html#section-1.2
+        // Eight bits is structural validation only; the selected policy's
+        // strength minimum is enforced on the resolved key before execution.
+        return validate_rsa_signature_spki_with_minimum(algorithm, public_key_bytes, 8)
+            .map_err(|_| KeyResolutionError::InvalidPublicKey);
+    }
     if algorithm.eddsa_signature_len().is_some()
         || matches!(algorithm, SignatureAlgorithm::PostQuantum(_))
     {

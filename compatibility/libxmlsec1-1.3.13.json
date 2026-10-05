@@ -74,6 +74,11 @@
       "rationale": "The legacy-algorithms feature implements this mechanism through RustCrypto. Library defaults deny it; an explicit immutable algorithm allowlist is required. Other providers may report the capability unavailable without fallback.",
       "evidence": "legacy-policy-tests"
     },
+    "legacy-rsa-pss-uri": {
+      "outcome": "compatibility-profile-only",
+      "rationale": "RSA-PSS SHA-1 is implemented but requires explicit legacy signature policy permission.",
+      "evidence": "legacy-policy-tests"
+    },
     "native-cli-behavior-options": {
       "outcome": "behavior-compatible",
       "rationale": "The native CLI implements this provider-independent option with donor-compatible parsing and command behavior.",
@@ -93,6 +98,11 @@
       "outcome": "provider-limited",
       "rationale": "The native CLI implements this option only for the formats, algorithms, or fixed RustCrypto provider behavior advertised by its capability registry.",
       "evidence": "native-cli-tests"
+    },
+    "native-rsa-pss-uri": {
+      "outcome": "behavior-compatible",
+      "rationale": "RSA-PSS fixed URI signing and verification execute through CryptoProvider with exact digest-sized salt and matching MGF1; the complete upstream PSS family is exercised by public pipeline tests.",
+      "evidence": "native-algorithm-tests"
     },
     "native-sha1-verification-uri": {
       "outcome": "behavior-compatible",
@@ -5006,7 +5016,7 @@
       "source": "src/strings.c",
       "line": 766,
       "detail": "http://www.w3.org/2007/05/xmldsig-more#sha1-rsa-MGF1",
-      "classification": "remaining-uri-surface"
+      "classification": "legacy-rsa-pss-uri"
     },
     {
       "kind": "algorithm-uri",
@@ -5014,7 +5024,7 @@
       "source": "src/strings.c",
       "line": 769,
       "detail": "http://www.w3.org/2007/05/xmldsig-more#sha224-rsa-MGF1",
-      "classification": "remaining-uri-surface"
+      "classification": "native-rsa-pss-uri"
     },
     {
       "kind": "algorithm-uri",
@@ -5022,7 +5032,7 @@
       "source": "src/strings.c",
       "line": 772,
       "detail": "http://www.w3.org/2007/05/xmldsig-more#sha256-rsa-MGF1",
-      "classification": "remaining-uri-surface"
+      "classification": "native-rsa-pss-uri"
     },
     {
       "kind": "algorithm-uri",
@@ -5030,7 +5040,7 @@
       "source": "src/strings.c",
       "line": 775,
       "detail": "http://www.w3.org/2007/05/xmldsig-more#sha384-rsa-MGF1",
-      "classification": "remaining-uri-surface"
+      "classification": "native-rsa-pss-uri"
     },
     {
       "kind": "algorithm-uri",
@@ -5038,7 +5048,7 @@
       "source": "src/strings.c",
       "line": 781,
       "detail": "http://www.w3.org/2007/05/xmldsig-more#sha3-224-rsa-MGF1",
-      "classification": "remaining-uri-surface"
+      "classification": "native-rsa-pss-uri"
     },
     {
       "kind": "algorithm-uri",
@@ -5046,7 +5056,7 @@
       "source": "src/strings.c",
       "line": 784,
       "detail": "http://www.w3.org/2007/05/xmldsig-more#sha3-256-rsa-MGF1",
-      "classification": "remaining-uri-surface"
+      "classification": "native-rsa-pss-uri"
     },
     {
       "kind": "algorithm-uri",
@@ -5054,7 +5064,7 @@
       "source": "src/strings.c",
       "line": 787,
       "detail": "http://www.w3.org/2007/05/xmldsig-more#sha3-384-rsa-MGF1",
-      "classification": "remaining-uri-surface"
+      "classification": "native-rsa-pss-uri"
     },
     {
       "kind": "algorithm-uri",
@@ -5062,7 +5072,7 @@
       "source": "src/strings.c",
       "line": 790,
       "detail": "http://www.w3.org/2007/05/xmldsig-more#sha3-512-rsa-MGF1",
-      "classification": "remaining-uri-surface"
+      "classification": "native-rsa-pss-uri"
     },
     {
       "kind": "algorithm-uri",
@@ -5070,7 +5080,7 @@
       "source": "src/strings.c",
       "line": 778,
       "detail": "http://www.w3.org/2007/05/xmldsig-more#sha512-rsa-MGF1",
-      "classification": "remaining-uri-surface"
+      "classification": "native-rsa-pss-uri"
     },
     {
       "kind": "algorithm-uri",

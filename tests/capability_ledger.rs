@@ -165,7 +165,7 @@ fn complete_surface_categories_are_stable() {
         "https://github.com/lsh123/xmlsec"
     );
     assert_eq!(ledger.generated_by, "xml-sec-capability-ledger/2");
-    assert_eq!(ledger.classifications.len(), 21);
+    assert_eq!(ledger.classifications.len(), 23);
     assert_eq!(ledger.availability.len(), 427);
 
     let counts = ledger
@@ -349,7 +349,7 @@ fn native_algorithm_claims_match_the_rust_api() {
                 )
         })
         .collect();
-    assert_eq!(claims.len(), 64);
+    assert_eq!(claims.len(), 73);
     for item in claims {
         if item.classification == "feature-gated-legacy-uri" {
             // The ledger records the build requirement, not unconditional API
@@ -412,7 +412,16 @@ fn assert_native_uri_support(item: &Item) {
         | "xmlSecHrefRsaSha224"
         | "xmlSecHrefRsaSha256"
         | "xmlSecHrefRsaSha384"
-        | "xmlSecHrefRsaSha512" => {
+        | "xmlSecHrefRsaSha512"
+        | "xmlSecHrefRsaPssSha1"
+        | "xmlSecHrefRsaPssSha224"
+        | "xmlSecHrefRsaPssSha256"
+        | "xmlSecHrefRsaPssSha384"
+        | "xmlSecHrefRsaPssSha512"
+        | "xmlSecHrefRsaPssSha3_224"
+        | "xmlSecHrefRsaPssSha3_256"
+        | "xmlSecHrefRsaPssSha3_384"
+        | "xmlSecHrefRsaPssSha3_512" => {
             assert_eq!(SignatureAlgorithm::from_uri(uri).unwrap().uri(), uri);
         }
         "xmlSecHrefSha1" | "xmlSecHrefSha224" | "xmlSecHrefSha256" | "xmlSecHrefSha384"
@@ -560,6 +569,7 @@ fn legacy_algorithm_claims_are_policy_gated() {
             "xmlSecHrefEcdsaSha1",
             "xmlSecHrefHmacSha1",
             "xmlSecHrefRsaSha1",
+            "xmlSecHrefRsaPssSha1",
             "xmlSecHrefAes192Cbc",
             "xmlSecHrefAes192Gcm",
             "xmlSecHrefKWAes192",

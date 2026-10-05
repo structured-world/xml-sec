@@ -47,6 +47,91 @@ fn project_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
+#[test]
+fn parameterized_rsa_pss_cli_preserves_effective_parameters() {
+    // Real commands must read the full SignatureMethod, not recover the URI's
+    // defaults and silently replace a non-default MGF hash/salt length.
+    let temp = tempfile::tempdir().unwrap();
+    let key = RsaSigningKey::from_pkcs8_pem(include_str!(
+        "../../../tests/fixtures/keys/rsa/rsa-2048-key.pem"
+    ))
+    .unwrap();
+    // Compatibility permission must already cover legacy parameter tuples before
+    // metadata parsing, not be minted from the selected document afterward.
+    for (digest, mgf_digest) in [
+        (DigestAlgorithm::Sha512, DigestAlgorithm::Sha256),
+        (DigestAlgorithm::Sha256, DigestAlgorithm::Sha1),
+        (DigestAlgorithm::Sha1, DigestAlgorithm::Sha256),
+        #[cfg(feature = "legacy-algorithms")]
+        (DigestAlgorithm::Md5, DigestAlgorithm::Ripemd160),
+    ] {
+        let algorithm = SignatureAlgorithm::RsaPss(xml_sec::xmldsig::RsaPssParameters {
+            digest,
+            mgf_digest,
+            salt_len: 17,
+        });
+        let builder =
+            SignatureBuilder::new(C14nAlgorithm::new(C14nMode::Exclusive1_0, false), algorithm)
+                .add_reference(
+                    ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                        .uri("")
+                        .transform(Transform::Enveloped),
+                );
+        let signed = SignContext::new(&key)
+            .policy(xml_sec::policy::SigningPolicy {
+                parameterized_rsa_pss: xml_sec::policy::RsaPssPermission::AllSupported,
+                ..Default::default()
+            })
+            .sign_with_builder("<root>CLI PSS</root>", &builder)
+            .unwrap();
+        let template = temp.path().join("template.xml");
+        let output = temp.path().join("signed.xml");
+        fs::write(&template, signed).unwrap();
+        let result = Command::new(binary())
+            .args(["sign", "--privkey-pem"])
+            .arg(project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .arg("--output")
+            .arg(&output)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let result = Command::new(binary())
+            .args(["verify", "--pubkey-pem"])
+            .arg(project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"))
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let mut policy = xml_sec::policy::VerificationPolicy::default();
+        policy.parameterized_rsa_pss = xml_sec::policy::RsaPssPermission::AllSupported;
+        policy.key_trust.parameterized_rsa_pss = xml_sec::policy::RsaPssPermission::AllSupported;
+        let verified = VerifyContext::new()
+            .policy(policy)
+            .key(&xml_sec::xmldsig::VerificationKey {
+                algorithm,
+                public_key_bytes: pem::parse(include_str!(
+                    "../../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"
+                ))
+                .unwrap()
+                .into_contents(),
+                certificate_der: None,
+                name: None,
+            })
+            .verify(&fs::read_to_string(output).unwrap())
+            .unwrap();
+        assert_eq!(verified.status, xml_sec::xmldsig::DsigStatus::Valid);
+    }
+}
+
 #[cfg(feature = "legacy-algorithms")]
 #[test]
 fn symmetric_recipient_wraps_are_executable_through_cli() {
