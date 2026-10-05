@@ -16,6 +16,31 @@ env:
   LD_LIBRARY_PATH: ${{ github.workspace }}/.tools/xmlsec1-1.3.13/lib
 
 jobs:
+  pkcs11:
+    name: PKCS11 (${{ matrix.backend }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [xmloxide, roxmltree, differential]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.92.0"
+      - uses: taiki-e/install-action@nextest
+      - uses: Swatinem/rust-cache@v2
+      - name: Install isolated token oracle
+        run: sudo apt-get update && sudo apt-get install -y softhsm2
+      - name: Check optional provider
+        run: cargo clippy --no-default-features --features pkcs11,c14n,xml-backend-${{ matrix.backend }} --all-targets -- -D warnings
+      - name: Check provider and policy contracts
+        run: cargo nextest run --lib --no-default-features --features pkcs11,c14n,xml-backend-${{ matrix.backend }}
+      - name: Exercise token operations with disposable storage
+        run: bash scripts/test-pkcs11.sh /usr/lib/softhsm/libsofthsm2.so --no-default-features --features c14n,xml-backend-${{ matrix.backend }}
+
   capability-ledger:
     runs-on: ubuntu-latest
     steps:
@@ -205,11 +230,12 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
-    needs: [test-matrix, xslt-oracle]
+    needs: [test-matrix, xslt-oracle, pkcs11]
     if: ${{ always() }}
     steps:
       - run: test "${{ needs.test-matrix.result }}" = "success"
       - run: test "${{ needs.xslt-oracle.result }}" = "success"
+      - run: test "${{ needs.pkcs11.result }}" = "success"
 
   xslt-oracle:
     name: XSLT oracle (libxslt 1.1.45)

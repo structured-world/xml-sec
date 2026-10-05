@@ -157,6 +157,99 @@ pub trait DecryptionKeyResolver {
     }
 }
 
+/// Direct non-exportable content key, with no private-key or symmetric-byte export.
+pub struct OpaqueContentKeyResolver {
+    key: std::sync::Arc<dyn crate::provider::ContentDecryptionKey>,
+}
+
+impl OpaqueContentKeyResolver {
+    /// Retain a caller-selected handle; policy remains in the operation context.
+    pub fn new(key: std::sync::Arc<dyn crate::provider::ContentDecryptionKey>) -> Self {
+        Self { key }
+    }
+}
+
+impl DecryptionKeyResolver for OpaqueContentKeyResolver {
+    fn resolve_key(
+        &self,
+        _provider: &dyn crate::provider::CryptoProvider,
+        _algorithm: DataEncryptionAlgorithm,
+        _encrypted_key: Option<&EncryptedKey>,
+    ) -> Result<Vec<u8>, XmlEncError> {
+        Err(crate::provider::ProviderError::KeyNotExportable.into())
+    }
+    fn resolve_content_keys_with_policy(
+        &self,
+        provider: &dyn crate::provider::CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        encrypted_key: Option<&EncryptedKey>,
+        policy: &crate::policy::DecryptionPolicy,
+        budget: &mut KeyCandidateBudget,
+    ) -> Result<Vec<crate::provider::RecoveredContentKey>, XmlEncError> {
+        policy.validate()?;
+        if encrypted_key.is_some() {
+            return Err(XmlEncError::KeyNotFound);
+        }
+        budget.consume(1)?;
+        provider.require_capability(crate::provider::ProviderCapability::Decrypt(algorithm))?;
+        validate_content_key_len(algorithm, self.key.key_len())?;
+        Ok(vec![crate::provider::RecoveredContentKey::opaque(
+            self.key.clone(),
+        )])
+    }
+}
+
+/// Opaque KEK recipient resolver that retains the unwrapped CEK in its provider.
+pub struct OpaqueKekDecryptor {
+    key: std::sync::Arc<dyn crate::provider::KeyUnwrappingKey>,
+}
+
+impl OpaqueKekDecryptor {
+    /// Select a caller-owned KEK without adding a second policy surface.
+    pub fn new(key: std::sync::Arc<dyn crate::provider::KeyUnwrappingKey>) -> Self {
+        Self { key }
+    }
+}
+
+impl DecryptionKeyResolver for OpaqueKekDecryptor {
+    fn resolve_key(
+        &self,
+        _provider: &dyn crate::provider::CryptoProvider,
+        _algorithm: DataEncryptionAlgorithm,
+        _encrypted_key: Option<&EncryptedKey>,
+    ) -> Result<Vec<u8>, XmlEncError> {
+        Err(crate::provider::ProviderError::KeyNotExportable.into())
+    }
+    fn resolve_content_keys_with_policy(
+        &self,
+        provider: &dyn crate::provider::CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        encrypted_key: Option<&EncryptedKey>,
+        policy: &crate::policy::DecryptionPolicy,
+        budget: &mut KeyCandidateBudget,
+    ) -> Result<Vec<crate::provider::RecoveredContentKey>, XmlEncError> {
+        policy.validate()?;
+        let encrypted_key = encrypted_key.ok_or(XmlEncError::KeyNotFound)?;
+        validate_encrypted_key_policy(encrypted_key, policy)?;
+        encrypted_key.encryption_method.validate_structure()?;
+        let wrap = KeyWrapAlgorithm::from_uri(&encrypted_key.encryption_method.algorithm)?;
+        provider.require_capability(crate::provider::ProviderCapability::KeyUnwrap(wrap))?;
+        budget.consume(1)?;
+        let wrapped = STANDARD
+            .decode(&encrypted_key.cipher_data.value)
+            .map_err(|error| XmlEncError::Base64(error.to_string()))?;
+        if wrapped.len() != algorithm.key_len() + wrap.overhead() {
+            return Err(XmlEncError::InvalidWrappedKeyLength {
+                expected: algorithm.key_len() + wrap.overhead(),
+                actual: wrapped.len(),
+            });
+        }
+        let key = provider.unwrap_content_key(self.key.as_ref(), wrap, algorithm, &wrapped)?;
+        validate_content_key_len(algorithm, key.key_len())?;
+        Ok(vec![key])
+    }
+}
+
 /// Caller-owned target selection for document decryption.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DocumentDecryptionOptions<'a> {
@@ -383,10 +476,8 @@ impl<'a> DecryptContext<'a> {
             let mut last_error = None;
             for key in keys {
                 let attempt = (|| {
-                    validate_key_len(algorithm, key.bytes())?;
-                    let result = self
-                        .provider
-                        .decrypt_data(algorithm, key.bytes(), &ciphertext);
+                    validate_content_key_len(algorithm, key.key_len())?;
+                    let result = key.decrypt(self.provider, algorithm, &ciphertext);
                     // XMLEnc 1.1 §6.1.2: fallback recovery must still perform
                     // content work. Never release a CBC result merely because
                     // its unauthenticated padding happened to be valid.
@@ -813,26 +904,24 @@ impl PrivateKeyDecryptor {
                     .recover_pkcs1v15(self.key.as_ref(), &wrapped, algorithm.key_len())
                     .map_err(XmlEncError::Provider)
             }
-            KeyTransportAlgorithm::RsaOaepMgf1p => self
-                .decrypt_oaep_mgf1p(
-                    provider,
-                    encrypted_key.encryption_method.oaep_digest.as_deref(),
-                    encrypted_key.encryption_method.mgf_algorithm.as_deref(),
-                    label,
-                    &wrapped,
-                )
-                .map(crate::provider::RecoveredContentKey::confirmed),
-            KeyTransportAlgorithm::RsaOaep11 => self
-                .decrypt_oaep11(
-                    provider,
-                    encrypted_key.encryption_method.oaep_digest.as_deref(),
-                    encrypted_key.encryption_method.mgf_algorithm.as_deref(),
-                    label,
-                    &wrapped,
-                )
-                .map(crate::provider::RecoveredContentKey::confirmed),
+            KeyTransportAlgorithm::RsaOaepMgf1p => self.decrypt_oaep_mgf1p(
+                provider,
+                encrypted_key.encryption_method.oaep_digest.as_deref(),
+                encrypted_key.encryption_method.mgf_algorithm.as_deref(),
+                label,
+                &wrapped,
+                algorithm,
+            ),
+            KeyTransportAlgorithm::RsaOaep11 => self.decrypt_oaep11(
+                provider,
+                encrypted_key.encryption_method.oaep_digest.as_deref(),
+                encrypted_key.encryption_method.mgf_algorithm.as_deref(),
+                label,
+                &wrapped,
+                algorithm,
+            ),
         }?;
-        validate_key_len(algorithm, key.bytes())?;
+        validate_content_key_len(algorithm, key.key_len())?;
         Ok(key)
     }
 }
@@ -845,14 +934,15 @@ impl PrivateKeyDecryptor {
         mgf: Option<&str>,
         label: Vec<u8>,
         wrapped: &[u8],
-    ) -> Result<Vec<u8>, XmlEncError> {
+        algorithm: DataEncryptionAlgorithm,
+    ) -> Result<crate::provider::RecoveredContentKey, XmlEncError> {
         let parameters = RsaOaepParameters {
             algorithm: KeyTransportAlgorithm::RsaOaepMgf1p,
             digest: parse_oaep_digest(digest)?,
             mgf_digest: parse_oaep_mgf_digest(mgf)?,
             label,
         };
-        recover_rsa_oaep(provider, self.key.as_ref(), &parameters, wrapped)
+        recover_rsa_oaep(provider, self.key.as_ref(), &parameters, wrapped, algorithm)
     }
 
     fn decrypt_oaep11(
@@ -862,14 +952,15 @@ impl PrivateKeyDecryptor {
         mgf: Option<&str>,
         label: Vec<u8>,
         wrapped: &[u8],
-    ) -> Result<Vec<u8>, XmlEncError> {
+        algorithm: DataEncryptionAlgorithm,
+    ) -> Result<crate::provider::RecoveredContentKey, XmlEncError> {
         let parameters = RsaOaepParameters {
             algorithm: KeyTransportAlgorithm::RsaOaep11,
             digest: parse_oaep_digest(digest)?,
             mgf_digest: parse_oaep_mgf_digest(mgf)?,
             label,
         };
-        recover_rsa_oaep(provider, self.key.as_ref(), &parameters, wrapped)
+        recover_rsa_oaep(provider, self.key.as_ref(), &parameters, wrapped, algorithm)
     }
 }
 
@@ -890,7 +981,8 @@ fn recover_rsa_oaep(
     key: &dyn crate::provider::KeyRecoveryKey,
     parameters: &RsaOaepParameters,
     wrapped: &[u8],
-) -> Result<Vec<u8>, XmlEncError> {
+    algorithm: DataEncryptionAlgorithm,
+) -> Result<crate::provider::RecoveredContentKey, XmlEncError> {
     let expected = key.ciphertext_len();
     if wrapped.len() != expected {
         return Err(XmlEncError::InvalidWrappedKeyLength {
@@ -900,7 +992,7 @@ fn recover_rsa_oaep(
     }
     provider.require_capability(crate::provider::ProviderCapability::KeyRecovery(parameters))?;
     provider
-        .recover_key(key, parameters, wrapped)
+        .recover_content_key(key, parameters, algorithm, wrapped)
         .map_err(|error| match error {
             crate::provider::ProviderError::Random(message) => XmlEncError::Rng(message),
             error @ (crate::provider::ProviderError::AuthenticationFailed
@@ -1216,11 +1308,11 @@ fn compatible_decryption_key_candidates(
     let mut last_error = None;
     for index in 0..keys.len() {
         let key = &keys[index];
-        match validate_key_len(algorithm, key.bytes()) {
+        match validate_content_key_len(algorithm, key.key_len()) {
             Ok(())
-                if !keys[..accepted].iter().any(|existing| {
-                    existing.bytes() == key.bytes() && existing.valid() == key.valid()
-                }) =>
+                if !keys[..accepted]
+                    .iter()
+                    .any(|existing| existing.same_candidate(key)) =>
             {
                 // Accepted entries form a stable prefix. Swapping an earlier
                 // rejected slot never moves an unvisited entry, and avoids a
@@ -1438,13 +1530,20 @@ pub(crate) fn validate_key_len(
     algorithm: DataEncryptionAlgorithm,
     key: &[u8],
 ) -> Result<(), XmlEncError> {
-    if key.len() == algorithm.key_len() {
+    validate_content_key_len(algorithm, key.len())
+}
+
+fn validate_content_key_len(
+    algorithm: DataEncryptionAlgorithm,
+    actual: usize,
+) -> Result<(), XmlEncError> {
+    if actual == algorithm.key_len() {
         Ok(())
     } else {
         Err(XmlEncError::InvalidKeySize {
             algorithm,
             expected: algorithm.key_len(),
-            actual: key.len(),
+            actual,
         })
     }
 }
@@ -3203,6 +3302,7 @@ mod tests {
                     &private_key,
                     &RsaOaepParameters::default(),
                     &vec![0_u8; actual],
+                    DataEncryptionAlgorithm::Aes128Gcm,
                 ),
                 Err(XmlEncError::InvalidWrappedKeyLength {
                     expected: 256,

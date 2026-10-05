@@ -70,7 +70,7 @@ xml-sec = { version = "0.1", default-features = false, features = ["xmldsig", "c
 | Key management | Caller-owned named inventory, usage-restricted keys, xmlsec `keys.xml`, encrypted PKCS#8, and bounded RustCrypto-backed PKCS#12 import |
 | SAML 2.0 | Signed assertions and encrypted-assertion workflows covered by integration tests |
 | XML input | Strict bounded byte decoding, entity/depth/node limits, stable node identities, and generation-safe mutation |
-| Crypto | RustCrypto by default; optional AWS-LC FIPS through provider-neutral contracts and opaque native private-key handles |
+| Crypto | RustCrypto by default; optional AWS-LC FIPS and PKCS#11 external-key adapters through provider-neutral contracts and opaque private-key handles |
 | CLI | Native `xmlsec1` process interface for sign, verify, encrypt, decrypt, keys, and capability discovery |
 
 Unsupported algorithms, unavailable provider capabilities, untrusted key sources, implicit external
