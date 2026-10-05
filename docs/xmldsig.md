@@ -101,7 +101,7 @@ unchanged. Every staged mutation checks the active projected node count before c
 Custom `KeyInfoWriter` output is treated as a separate untrusted XML input: its
 byte ceiling is enforced before namespace wrapping or parsing, and its merged nodes remain under
 the same operation ceiling as the rest of the signature.
-Built-in writers emit `RSAKeyValue`/`ECKeyValue`, `DEREncodedKeyValue`, embedded
+Built-in writers emit `RSAKeyValue`/`DSAKeyValue`/`ECKeyValue`, `DEREncodedKeyValue`, embedded
 X.509 certificate chains, or `X509Digest` selectors. Cryptographic writer work,
 including the certificate digest used by `X509Digest`, runs through the same
 operation provider as reference digests and signature generation. RSA, DSA, P-256, P-384, and
@@ -112,6 +112,13 @@ XMLDSig's fixed-width `r || s` value;
 DSA-SHA1 requires a 160-bit `q`, while DSA-SHA256 requires a 256-bit `q`, so a
 key whose component width cannot be represented by the selected wire format is
 rejected before signing.
+DSA imports inspect borrowed PKCS#8 integers before allocating large-number
+storage, including the optional RFC 5958 public component. When that component
+is present it must agree with the public key derived from the private exponent;
+otherwise import fails. Plain and password-encrypted PEM/DER use the same decoder,
+also used for key-manager identity matching. Reciprocal xmlsec1 1.3.13 tests cover
+1024/160, 2048/256 and 3072/256 keys, raw signature widths, embedded `DSAKeyValue`,
+tampering, and explicit legacy-policy refusal.
 P-521 signing and verification use the same key-selected ECDSA framing contract
 as P-256 and P-384.
 Recursive `KeyInfoReference` materialization shares one candidate-work budget

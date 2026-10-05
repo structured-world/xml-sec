@@ -1005,14 +1005,20 @@ pub struct DsaSigningKey {
 impl DsaSigningKey {
     /// Parse an unencrypted PKCS#8 `PRIVATE KEY` PEM block.
     pub fn from_pkcs8_pem(private_key_pem: &str) -> Result<Self, SigningKeyError> {
-        let private_key_der = parse_private_key_pem(private_key_pem)?;
-        Self::from_pkcs8_der(&private_key_der)
+        let (label, private_key_der) = pkcs8::SecretDocument::from_pem(private_key_pem)
+            .map_err(|_| SigningKeyError::InvalidKeyDer)?;
+        if label != "PRIVATE KEY" {
+            return Err(SigningKeyError::InvalidKeyDer);
+        }
+        Self::from_pkcs8_der(private_key_der.as_bytes())
     }
 
     /// Parse unencrypted PKCS#8 private key DER.
     pub fn from_pkcs8_der(private_key_der: &[u8]) -> Result<Self, SigningKeyError> {
-        let key = dsa::SigningKey::from_pkcs8_der(private_key_der)
+        use der::Decode;
+        let info = pkcs8::PrivateKeyInfoRef::from_der(private_key_der)
             .map_err(|_| SigningKeyError::InvalidKeyDer)?;
+        let key = decode_dsa_signing_key(info)?;
         Ok(Self { key })
     }
 
@@ -1021,9 +1027,12 @@ impl DsaSigningKey {
         private_key_pem: &str,
         password: impl AsRef<[u8]>,
     ) -> Result<Self, SigningKeyError> {
-        let key = dsa::SigningKey::from_pkcs8_encrypted_pem(private_key_pem, password)
+        let (label, encrypted) = pkcs8::SecretDocument::from_pem(private_key_pem)
             .map_err(|_| SigningKeyError::InvalidKeyDer)?;
-        Ok(Self { key })
+        if label != "ENCRYPTED PRIVATE KEY" {
+            return Err(SigningKeyError::InvalidKeyDer);
+        }
+        Self::from_pkcs8_encrypted_der(encrypted.as_bytes(), password)
     }
 
     /// Decrypt and parse password-protected PKCS#8 DER.
@@ -1031,9 +1040,253 @@ impl DsaSigningKey {
         private_key_der: &[u8],
         password: impl AsRef<[u8]>,
     ) -> Result<Self, SigningKeyError> {
-        let key = dsa::SigningKey::from_pkcs8_encrypted_der(private_key_der, password)
+        use der::Decode;
+        let encrypted = pkcs8::EncryptedPrivateKeyInfoRef::from_der(private_key_der)
             .map_err(|_| SigningKeyError::InvalidKeyDer)?;
-        Ok(Self { key })
+        let plain = encrypted
+            .decrypt(password)
+            .map_err(|_| SigningKeyError::InvalidKeyDer)?;
+        Self::from_pkcs8_der(plain.as_bytes())
+    }
+}
+
+pub(crate) fn preflight_dsa_private_key(
+    info: &pkcs8::PrivateKeyInfoRef<'_>,
+) -> Result<(), SigningKeyError> {
+    use der::Decode;
+    if info.algorithm.oid != dsa::OID {
+        return Err(SigningKeyError::InvalidKeyDer);
+    }
+    let parameters = info
+        .algorithm
+        .parameters
+        .as_ref()
+        .ok_or(SigningKeyError::InvalidKeyDer)?
+        .decode_as::<super::signature::BorrowedDsaPublicParameters<'_>>()
+        .map_err(|_| SigningKeyError::InvalidKeyDer)?;
+    let x = der::asn1::UintRef::from_der(info.private_key.as_bytes())
+        .map_err(|_| SigningKeyError::InvalidKeyDer)?;
+    // Process-safety ceiling, not deployment policy: inspect borrowed DER
+    // before the provider allocates bigints or derives a public component.
+    for component in [parameters.p, parameters.q, parameters.g, x] {
+        if component.as_bytes().len() > crate::hard_limits::DSA_KEY_COMPONENT_BYTE_CEILING {
+            return Err(SigningKeyError::InvalidKeyDer);
+        }
+    }
+    if let Some(public) = info.public_key {
+        let bytes = public.as_bytes().ok_or(SigningKeyError::InvalidKeyDer)?;
+        let y = der::asn1::UintRef::from_der(bytes).map_err(|_| SigningKeyError::InvalidKeyDer)?;
+        if y.as_bytes().len() > crate::hard_limits::DSA_KEY_COMPONENT_BYTE_CEILING {
+            return Err(SigningKeyError::InvalidKeyDer);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn decode_dsa_signing_key(
+    mut info: pkcs8::PrivateKeyInfoRef<'_>,
+) -> Result<dsa::SigningKey, SigningKeyError> {
+    use der::Decode;
+    preflight_dsa_private_key(&info)?;
+    let public = info.public_key.take();
+    // RFC 5958 section 2 carries both components of one asymmetric key:
+    // https://www.rfc-editor.org/rfc/rfc5958.html#section-2
+    // Derive y from x rather than trusting the optional supplied publicKey.
+    // Rejecting inconsistency is our import invariant, not an RFC validation algorithm.
+    let key = dsa::SigningKey::try_from(info).map_err(|_| SigningKeyError::InvalidKeyDer)?;
+    if let Some(public) = public {
+        let y = der::asn1::UintRef::from_der(public.raw_bytes())
+            .map_err(|_| SigningKeyError::InvalidKeyDer)?;
+        let supplied = crypto_bigint::BoxedUint::from_be_slice_vartime(y.as_bytes());
+        if supplied != **key.verifying_key().y() {
+            return Err(SigningKeyError::InvalidKeyDer);
+        }
+    }
+    Ok(key)
+}
+
+#[cfg(test)]
+mod dsa_import_tests {
+    use super::*;
+    use der::{Decode, Encode};
+
+    fn plaintext() -> pkcs8::SecretDocument {
+        pkcs8::EncryptedPrivateKeyInfoRef::from_der(include_bytes!(
+            "../../tests/fixtures/xmldsig/keys/dsa/dsa-2048-key.p8-der"
+        ))
+        .expect("valid encrypted DSA fixture")
+        .decrypt(b"secret123")
+        .expect("known fixture password")
+    }
+
+    #[test]
+    fn dsa_pkcs8_import_formats_and_password_failures() -> Result<(), Box<dyn std::error::Error>> {
+        // All public constructors converge on the same checked native decoder;
+        // a wrong password or label cannot select a more permissive path.
+        let plain = plaintext();
+        let pem = plain.to_pem("PRIVATE KEY", der::pem::LineEnding::LF)?;
+        let encrypted = include_bytes!("../../tests/fixtures/xmldsig/keys/dsa/dsa-2048-key.p8-der");
+        let encrypted_doc = pkcs8::SecretDocument::try_from(encrypted.as_slice())?;
+        let encrypted_pem =
+            encrypted_doc.to_pem("ENCRYPTED PRIVATE KEY", der::pem::LineEnding::LF)?;
+        let key = DsaSigningKey::from_pkcs8_der(plain.as_bytes())?;
+        let expected = key.public_key_info()?;
+        for imported in [
+            DsaSigningKey::from_pkcs8_pem(&pem)?,
+            DsaSigningKey::from_pkcs8_encrypted_der(encrypted, b"secret123")?,
+            DsaSigningKey::from_pkcs8_encrypted_pem(&encrypted_pem, b"secret123")?,
+        ] {
+            assert_eq!(imported.public_key_info()?, expected);
+        }
+        assert!(DsaSigningKey::from_pkcs8_encrypted_der(encrypted, b"wrong").is_err());
+        assert!(DsaSigningKey::from_pkcs8_encrypted_pem(&encrypted_pem, b"wrong").is_err());
+        assert!(DsaSigningKey::from_pkcs8_encrypted_pem(&pem, b"secret123").is_err());
+        assert!(DsaSigningKey::from_pkcs8_pem(&encrypted_pem).is_err());
+        assert!(DsaSigningKey::from_pkcs8_pem("invalid PEM").is_err());
+        assert!(DsaSigningKey::from_pkcs8_der(b"invalid DER").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn dsa_preflight_bounds_every_private_key_component() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Oversized p/q/g/x/publicKey must be rejected by borrowed preflight,
+        // independently of whether the downstream crypto decoder would reject it.
+        let plain = plaintext();
+        let original = pkcs8::PrivateKeyInfoRef::from_der(plain.as_bytes())?;
+        let oversized = vec![0x7f; crate::hard_limits::DSA_KEY_COMPONENT_BYTE_CEILING + 1];
+        let large = der::asn1::UintRef::new(&oversized)?;
+        for field in 0..5 {
+            let mut parameters = original
+                .algorithm
+                .parameters
+                .as_ref()
+                .expect("DSA fixture parameters")
+                .decode_as::<super::super::signature::BorrowedDsaPublicParameters<'_>>()?;
+            match field {
+                0 => parameters.p = large,
+                1 => parameters.q = large,
+                2 => parameters.g = large,
+                _ => {}
+            }
+            let encoded_parameters = parameters.to_der()?;
+            let encoded_large = large.to_der()?;
+            let mut info = original.clone();
+            info.algorithm.parameters = Some(der::asn1::AnyRef::from_der(&encoded_parameters)?);
+            if field == 3 {
+                info.private_key = der::asn1::OctetStringRef::new(&encoded_large)?;
+            }
+            if field == 4 {
+                info.public_key = Some(der::asn1::BitStringRef::new(0, &encoded_large)?);
+            }
+            assert!(preflight_dsa_private_key(&info).is_err(), "field {field}");
+            assert!(
+                DsaSigningKey::from_pkcs8_der(&info.to_der()?).is_err(),
+                "field {field}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_dsa_pkcs8_with_consistent_public_component() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // The optional RFC 5958 publicKey is legal: consistency validation
+        // must not reject a correctly bound OneAsymmetricKey.
+        let plain = plaintext();
+        let key = DsaSigningKey::from_pkcs8_der(plain.as_bytes())?;
+        let SigningPublicKeyInfo::Dsa { spki_der, .. } = key.public_key_info()? else {
+            panic!("DSA key")
+        };
+        let spki = pkcs8::SubjectPublicKeyInfoRef::from_der(&spki_der)?;
+        let mut info = pkcs8::PrivateKeyInfoRef::from_der(plain.as_bytes())?;
+        info.public_key = Some(spki.subject_public_key);
+        let encoded = info.to_der()?;
+        assert_eq!(
+            DsaSigningKey::from_pkcs8_der(&encoded)?.public_key_info()?,
+            key.public_key_info()?
+        );
+        // Inventory identity matching must accept the same bound public component.
+        crate::key_manager::KeyInventory::default().add_private_der(
+            "consistent-dsa".into(),
+            &encoded,
+            None,
+            crate::key_manager::KeyUsages::SIGN,
+            &crate::policy::ResourcePolicy::default(),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_dsa_private_exponents_and_parameters()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Zero and x >= q are not DSA private keys. Malformed parameters,
+        // missing parameters and unrelated algorithm OIDs must fail import.
+        let plain = plaintext();
+        let original = pkcs8::PrivateKeyInfoRef::from_der(plain.as_bytes())?;
+        let parameters = original
+            .algorithm
+            .parameters
+            .as_ref()
+            .expect("DSA fixture parameters")
+            .decode_as::<super::super::signature::BorrowedDsaPublicParameters<'_>>()?;
+        for exponent in [der::asn1::UintRef::new(&[0])?, parameters.q] {
+            let encoded = exponent.to_der()?;
+            let mut info = original.clone();
+            info.private_key = der::asn1::OctetStringRef::new(&encoded)?;
+            assert!(DsaSigningKey::from_pkcs8_der(&info.to_der()?).is_err());
+        }
+        let mut info = original.clone();
+        info.algorithm.parameters = None;
+        assert!(DsaSigningKey::from_pkcs8_der(&info.to_der()?).is_err());
+        // An INTEGER cannot substitute for the Dss-Parms SEQUENCE.
+        let mut info = original.clone();
+        info.algorithm.parameters = Some(der::asn1::AnyRef::from_der(&[0x02, 0x01, 0x01])?);
+        assert!(DsaSigningKey::from_pkcs8_der(&info.to_der()?).is_err());
+        // DSA publicKey encodes a complete DER INTEGER, not partial bits.
+        let mut info = original.clone();
+        info.public_key = Some(der::asn1::BitStringRef::new(1, &[0x02])?);
+        assert!(DsaSigningKey::from_pkcs8_der(&info.to_der()?).is_err());
+        let mut info = original;
+        info.algorithm.oid = rsa::pkcs1::ALGORITHM_OID;
+        assert!(DsaSigningKey::from_pkcs8_der(&info.to_der()?).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_dsa_pkcs8_with_inconsistent_public_component()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // RFC 5958 section 2 binds publicKey to the privateKey. A valid
+        // subgroup element belonging to a different key must not be accepted.
+        let plain = plaintext();
+        let mut info = pkcs8::PrivateKeyInfoRef::from_der(plain.as_bytes())?;
+        let parameters = info
+            .algorithm
+            .parameters
+            .as_ref()
+            .expect("DSA fixture parameters")
+            .decode_as::<super::super::signature::BorrowedDsaPublicParameters<'_>>()?;
+        let wrong_public = parameters.g.to_der()?;
+        info.public_key = Some(der::asn1::BitStringRef::new(0, &wrong_public)?);
+        let encoded = info.to_der()?;
+        assert!(matches!(
+            DsaSigningKey::from_pkcs8_der(&encoded),
+            Err(SigningKeyError::InvalidKeyDer)
+        ));
+        // The key-manager public import cannot trust a different y either.
+        assert!(matches!(
+            crate::key_manager::KeyInventory::default().add_private_der(
+                "inconsistent-dsa".into(),
+                &encoded,
+                None,
+                crate::key_manager::KeyUsages::SIGN,
+                &crate::policy::ResourcePolicy::default(),
+            ),
+            Err(crate::key_manager::KeyStoreError::Selection(
+                "invalid or oversized DSA private key"
+            ))
+        ));
+        Ok(())
     }
 }
 
