@@ -252,9 +252,25 @@ fn classifies_complete_nist_aes_gcm_corpus() {
             let key_name = vector_key_name(&xml);
             let key = keys.get(&key_name).expect("NIST vector key must exist");
             let data_path = xml_path.with_extension("data");
-            let result = decrypt(&xml, &SymmetricKeyDecryptor::new(key.clone()));
+            let resolver = SymmetricKeyDecryptor::new(key.clone());
+            #[cfg(feature = "legacy-algorithms")]
+            let result = DecryptContext::new(&resolver)
+                .policy(xml_sec::policy::DecryptionPolicy {
+                    data_algorithms: Some(
+                        [
+                            xml_sec::xmlenc::DataEncryptionAlgorithm::Aes128Gcm,
+                            xml_sec::xmlenc::DataEncryptionAlgorithm::Aes192Gcm,
+                            xml_sec::xmlenc::DataEncryptionAlgorithm::Aes256Gcm,
+                        ]
+                        .into(),
+                    ),
+                    ..xml_sec::policy::DecryptionPolicy::default()
+                })
+                .decrypt(&xml);
+            #[cfg(not(feature = "legacy-algorithms"))]
+            let result = decrypt(&xml, &resolver);
 
-            if bits == 192 {
+            if bits == 192 && !cfg!(feature = "legacy-algorithms") {
                 assert!(
                     matches!(result, Err(XmlEncError::UnsupportedAlgorithm(_))),
                     "{}",
@@ -290,7 +306,14 @@ fn classifies_complete_nist_aes_gcm_corpus() {
         rejected > 0,
         "corpus must contain invalid supported vectors"
     );
-    assert!(unsupported > 0, "corpus must account for AES-192 vectors");
+    if cfg!(feature = "legacy-algorithms") {
+        assert_eq!(
+            unsupported, 0,
+            "all AES-192 vectors must execute with permission"
+        );
+    } else {
+        assert!(unsupported > 0, "corpus must account for AES-192 vectors");
+    }
     assert_eq!(
         supported + rejected + unsupported,
         180,
@@ -443,6 +466,98 @@ fn decrypts_supported_phaos_rsa_oaep_and_aes_kw_vectors() {
     }
 }
 
+#[cfg(feature = "legacy-algorithms")]
+#[test]
+fn decrypts_all_phaos_legacy_transport_and_wrap_vectors() {
+    use xml_sec::policy::DecryptionPolicy;
+    use xml_sec::xmlenc::{
+        DataEncryptionAlgorithm as D, KeyTransportAlgorithm as T, KeyWrapAlgorithm as W,
+    };
+    // Independent donor bytes cover all newly implemented content/transport/wrap
+    // mechanisms, not ciphertext produced by the same implementation under test.
+    let mut policy = DecryptionPolicy {
+        data_algorithms: Some([D::TripleDesCbc, D::Aes128Cbc, D::Aes192Cbc, D::Aes256Cbc].into()),
+        key_transport_algorithms: Some([T::RsaPkcs1v15, T::RsaOaepMgf1p].into()),
+        key_wrap_algorithms: Some([W::TripleDes, W::AesKw128, W::AesKw192, W::AesKw256].into()),
+        ..DecryptionPolicy::default()
+    };
+    policy.rsa_keys.minimum_modulus_bits = 1024;
+    let private = PrivateKeyDecryptor::new(read_phaos_private_key());
+    let keys_xml = std::fs::read_to_string(format!("{PHAOS_DIR}/keys.xml")).unwrap();
+    let keys_doc = Document::parse(&keys_xml).unwrap();
+    let mut keys: HashMap<_, _> = read_aes_keys(Path::new(&format!("{PHAOS_DIR}/keys.xml")))
+        .into_iter()
+        .map(|(name, bytes)| (name, (xml_sec::key_manager::SymmetricKeyKind::Aes, bytes)))
+        .collect();
+    for entry in keys_doc
+        .descendants()
+        .filter(|node| node.tag_name().name() == "KeyInfo")
+    {
+        if let Some(value) = entry
+            .descendants()
+            .find(|node| node.tag_name().name() == "DESKeyValue")
+        {
+            let name = entry
+                .descendants()
+                .find(|node| node.tag_name().name() == "KeyName")
+                .unwrap()
+                .text()
+                .unwrap();
+            keys.insert(
+                name.into(),
+                (
+                    xml_sec::key_manager::SymmetricKeyKind::Des,
+                    STANDARD
+                        .decode(
+                            value
+                                .text()
+                                .unwrap()
+                                .split_ascii_whitespace()
+                                .collect::<String>(),
+                        )
+                        .unwrap(),
+                ),
+            );
+        }
+    }
+    for (name, key_name) in [
+        ("enc-element-3des-kt-rsa1_5", None),
+        ("enc-element-3des-kt-rsa_oaep_sha1", None),
+        ("enc-element-3des-kt-rsa_oaep_sha256", None),
+        ("enc-element-3des-kt-rsa_oaep_sha512", None),
+        ("enc-element-aes192-kt-rsa_oaep_sha1", None),
+        ("enc-text-aes192-kt-rsa1_5", None),
+        ("enc-content-aes256-kt-rsa1_5", None),
+        ("enc-element-aes128-kt-rsa1_5", None),
+        ("enc-content-3des-kw-aes192", Some("my-aes192-key")),
+        ("enc-element-3des-kw-3des", Some("my-tripledes-key")),
+        ("enc-text-3des-kw-aes256", Some("my-aes256-key")),
+        ("enc-content-aes192-kw-aes256", Some("my-aes256-key")),
+        ("enc-element-aes192-kw-aes192", Some("my-aes192-key")),
+        ("enc-content-aes128-kw-3des", Some("my-3des-key")),
+        ("enc-text-aes128-kw-aes192", Some("my-aes192-key")),
+    ] {
+        let encrypted = std::fs::read_to_string(format!("{PHAOS_DIR}/{name}.xml")).unwrap();
+        let expected = std::fs::read(format!("{PHAOS_DIR}/{name}.data")).unwrap();
+        let resolver: Box<dyn xml_sec::xmlenc::DecryptionKeyResolver> = match key_name {
+            None => Box::new(private.clone()),
+            Some(name) => {
+                let (kind, bytes) = keys.get(name).unwrap();
+                Box::new(KekDecryptor::with_kind(bytes.clone(), *kind))
+            }
+        };
+        let actual = DecryptContext::new(resolver.as_ref())
+            .policy(policy.clone())
+            .decrypt_document(&encrypted, Some("ED"))
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert_eq!(
+            canonicalize_fixture_document(actual.as_bytes()),
+            canonicalize_fixture_document(&expected),
+            "{name}"
+        );
+    }
+}
+
 /// Asserts that a donor vector fails at its explicitly classified algorithm URI.
 fn assert_unsupported(
     name: &str,
@@ -452,6 +567,17 @@ fn assert_unsupported(
     let xml = std::fs::read_to_string(format!("{PHAOS_DIR}/{name}.xml"))
         .expect("tracked Phaos vector must be readable");
     let result = decrypt_document(&xml, Some("ED"), resolver);
+    #[cfg(feature = "legacy-algorithms")]
+    if xml_sec::xmlenc::DataEncryptionAlgorithm::from_uri(expected_uri).is_ok()
+        || xml_sec::xmlenc::KeyWrapAlgorithm::from_uri(expected_uri).is_ok()
+        || xml_sec::xmlenc::KeyTransportAlgorithm::from_uri(expected_uri).is_ok()
+    {
+        assert!(
+            matches!(&result, Err(XmlEncError::Policy(xml_sec::policy::PolicyViolation::Algorithm { operation: "decryption", algorithm })) if algorithm == expected_uri),
+            "{name} must deny unpermitted {expected_uri}, got {result:?}"
+        );
+        return;
+    }
     assert!(
         matches!(&result, Err(XmlEncError::UnsupportedAlgorithm(uri)) if uri == expected_uri),
         "{name} must reject {expected_uri}, got {result:?}"

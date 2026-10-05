@@ -29,13 +29,20 @@ fn every_hmac_algorithm_and_legal_octet_length_round_trips() {
     let verifying_key = HmacVerificationKey::new(vec![0x42; 32]).unwrap();
     let wrong_key = HmacVerificationKey::new(vec![0x43; 32]).unwrap();
     for (algorithm, width) in [
+        #[cfg(feature = "legacy-algorithms")]
+        (SignatureAlgorithm::HmacMd5, 128),
+        #[cfg(feature = "legacy-algorithms")]
+        (SignatureAlgorithm::HmacRipemd160, 160),
         (SignatureAlgorithm::HmacSha1, 160),
         (SignatureAlgorithm::HmacSha224, 224),
         (SignatureAlgorithm::HmacSha256, 256),
         (SignatureAlgorithm::HmacSha384, 384),
         (SignatureAlgorithm::HmacSha512, 512),
     ] {
-        let mut policy = VerificationPolicy::default();
+        let mut policy = VerificationPolicy {
+            signature_algorithms: Some(std::collections::HashSet::from([algorithm])),
+            ..VerificationPolicy::default()
+        };
         policy
             .key_trust
             .allowed_legacy_signature_algorithms
@@ -158,12 +165,19 @@ fn all_hmac_methods_interoperate_bidirectionally_with_xmlsec1() {
         (SignatureAlgorithm::HmacSha256, 128, 256),
         (SignatureAlgorithm::HmacSha384, 192, 384),
         (SignatureAlgorithm::HmacSha512, 256, 512),
+        #[cfg(feature = "legacy-algorithms")]
+        (SignatureAlgorithm::HmacMd5, 128, 128),
+        #[cfg(feature = "legacy-algorithms")]
+        (SignatureAlgorithm::HmacRipemd160, 128, 160),
     ] {
         let signing_policy = SigningPolicy {
             signature_algorithms: Some(std::collections::HashSet::from([algorithm])),
             ..SigningPolicy::default()
         };
-        let mut verification_policy = VerificationPolicy::default();
+        let mut verification_policy = VerificationPolicy {
+            signature_algorithms: Some([algorithm].into()),
+            ..VerificationPolicy::default()
+        };
         verification_policy
             .key_trust
             .allowed_legacy_signature_algorithms

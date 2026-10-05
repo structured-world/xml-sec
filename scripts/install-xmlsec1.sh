@@ -36,9 +36,14 @@ xmlsec_output() {
 xmlsec_version_output() { xmlsec_output --version; }
 
 xmlsec_required_capabilities() {
-  [[ "$modern_oracle" == 1 ]] || return 0
   local output transform
   output="$(xmlsec_output --list-transforms)" || return 1
+  # Historical algorithms are disabled by default upstream. The test oracle
+  # must expose them to independently validate our optional compatibility path.
+  for transform in md5 ripemd160 rsa-md5 rsa-ripemd160 hmac-md5 hmac-ripemd160 ecdsa-ripemd160; do
+    [[ "$output" == *"\"$transform\""* ]] || return 1
+  done
+  [[ "$modern_oracle" == 1 ]] || return 0
   for transform in eddsa-ed25519 eddsa-ed25519ctx eddsa-ed25519ph eddsa-ed448 eddsa-ed448ph; do
     [[ "$output" == *"\"$transform\""* ]] || return 1
   done
@@ -179,6 +184,8 @@ OBJ_DIR="$build_dir" "$source_dir/autogen.sh" \
   --disable-static \
   --without-gnutls \
   --without-nss \
+  --enable-md5 \
+  --enable-ripemd160 \
   "$openssl_option"
 make --directory "$build_dir" --jobs "$build_jobs"
 make --directory "$build_dir" install DESTDIR="$stage_dir"
@@ -199,7 +206,7 @@ if ! xmlsec_version_is_expected "$version_output"; then
   exit 1
 fi
 if ! xmlsec_required_capabilities; then
-  printf 'xmlsec1 oracle is missing required EdDSA transforms\n' >&2
+  printf 'xmlsec1 oracle is missing required compatibility or EdDSA transforms\n' >&2
   exit 1
 fi
 printf '%s\n' "$version_output"

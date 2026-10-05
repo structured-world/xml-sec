@@ -120,6 +120,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - rust: stable
+            xml-backend: legacy-fat-runtime
+            cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backends-all,legacy-algorithms
+          - rust: "1.92.0"
+            xml-backend: legacy-aws-fips
+            native-fips: true
+            cargo-args: --no-default-features --features aws-lc-fips,xmlenc,c14n,xml-backend-xmloxide,legacy-algorithms
           - rust: "1.92.0"
             xml-backend: aws-fips-xmloxide
             native-fips: true

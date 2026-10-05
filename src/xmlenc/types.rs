@@ -28,6 +28,15 @@ pub enum EncryptedDataType {
 /// Supported content-encryption algorithms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DataEncryptionAlgorithm {
+    /// Legacy three-key Triple DES CBC, available only with explicit policy permission.
+    #[cfg(feature = "legacy-algorithms")]
+    TripleDesCbc,
+    /// AES-192 CBC compatibility capability.
+    #[cfg(feature = "legacy-algorithms")]
+    Aes192Cbc,
+    /// AES-192 GCM compatibility capability.
+    #[cfg(feature = "legacy-algorithms")]
+    Aes192Gcm,
     /// AES-128 in CBC mode with XMLEnc padding.
     Aes128Cbc,
     /// AES-256 in CBC mode with XMLEnc padding.
@@ -39,9 +48,24 @@ pub enum DataEncryptionAlgorithm {
 }
 
 impl DataEncryptionAlgorithm {
+    /// Key family required independently of the byte length (AES-192 and
+    /// three-key Triple DES both use 24 bytes).
+    pub const fn key_kind(self) -> crate::key_manager::SymmetricKeyKind {
+        #[cfg(feature = "legacy-algorithms")]
+        if matches!(self, Self::TripleDesCbc) {
+            return crate::key_manager::SymmetricKeyKind::Des;
+        }
+        crate::key_manager::SymmetricKeyKind::Aes
+    }
     /// Parse a supported XMLEnc content-encryption URI.
     pub fn from_uri(uri: &str) -> Result<Self, XmlEncError> {
         match uri {
+            #[cfg(feature = "legacy-algorithms")]
+            "http://www.w3.org/2001/04/xmlenc#tripledes-cbc" => Ok(Self::TripleDesCbc),
+            #[cfg(feature = "legacy-algorithms")]
+            "http://www.w3.org/2001/04/xmlenc#aes192-cbc" => Ok(Self::Aes192Cbc),
+            #[cfg(feature = "legacy-algorithms")]
+            "http://www.w3.org/2009/xmlenc11#aes192-gcm" => Ok(Self::Aes192Gcm),
             "http://www.w3.org/2001/04/xmlenc#aes128-cbc" => Ok(Self::Aes128Cbc),
             "http://www.w3.org/2001/04/xmlenc#aes256-cbc" => Ok(Self::Aes256Cbc),
             "http://www.w3.org/2009/xmlenc11#aes128-gcm" => Ok(Self::Aes128Gcm),
@@ -53,6 +77,8 @@ impl DataEncryptionAlgorithm {
     /// Required symmetric key length in bytes.
     pub const fn key_len(self) -> usize {
         match self {
+            #[cfg(feature = "legacy-algorithms")]
+            Self::TripleDesCbc | Self::Aes192Cbc | Self::Aes192Gcm => 24,
             Self::Aes128Cbc | Self::Aes128Gcm => 16,
             Self::Aes256Cbc | Self::Aes256Gcm => 32,
         }
@@ -61,6 +87,12 @@ impl DataEncryptionAlgorithm {
     /// Return the standard XMLEnc algorithm URI.
     pub const fn uri(self) -> &'static str {
         match self {
+            #[cfg(feature = "legacy-algorithms")]
+            Self::TripleDesCbc => "http://www.w3.org/2001/04/xmlenc#tripledes-cbc",
+            #[cfg(feature = "legacy-algorithms")]
+            Self::Aes192Cbc => "http://www.w3.org/2001/04/xmlenc#aes192-cbc",
+            #[cfg(feature = "legacy-algorithms")]
+            Self::Aes192Gcm => "http://www.w3.org/2009/xmlenc11#aes192-gcm",
             Self::Aes128Cbc => "http://www.w3.org/2001/04/xmlenc#aes128-cbc",
             Self::Aes256Cbc => "http://www.w3.org/2001/04/xmlenc#aes256-cbc",
             Self::Aes128Gcm => "http://www.w3.org/2009/xmlenc11#aes128-gcm",
@@ -70,20 +102,44 @@ impl DataEncryptionAlgorithm {
 
     /// Minimum standard wire length for ciphertext produced by this algorithm.
     pub(crate) const fn minimum_ciphertext_len(self) -> usize {
+        match self.cbc_block_len() {
+            Some(block) => block * 2,
+            None => 28,
+        }
+    }
+
+    /// Compile-time capability is not the operation's permission.
+    /// Whether this capability must be explicitly selected in the operation allowlist.
+    pub const fn requires_explicit_permission(self) -> bool {
         match self {
-            Self::Aes128Cbc | Self::Aes256Cbc => 32,
-            Self::Aes128Gcm | Self::Aes256Gcm => 28,
+            #[cfg(feature = "legacy-algorithms")]
+            Self::TripleDesCbc | Self::Aes192Cbc | Self::Aes192Gcm => true,
+            _ => false,
+        }
+    }
+
+    pub(crate) const fn cbc_block_len(self) -> Option<usize> {
+        // XMLEnc 1.1 §§5.2.2-5.2.4: CBC frames prefix one cipher block;
+        // GCM instead prefixes a 96-bit nonce and appends a 128-bit tag.
+        // https://www.w3.org/TR/xmlenc-core1/#sec-Block-Encryption
+        match self {
+            Self::Aes128Cbc | Self::Aes256Cbc => Some(16),
+            #[cfg(feature = "legacy-algorithms")]
+            Self::Aes192Cbc => Some(16),
+            #[cfg(feature = "legacy-algorithms")]
+            Self::TripleDesCbc => Some(8),
+            _ => None,
         }
     }
 
     /// Exact wire length produced when encrypting the given plaintext length.
     pub(crate) fn ciphertext_len_for_plaintext(self, plaintext_len: usize) -> Option<usize> {
-        match self {
-            Self::Aes128Cbc | Self::Aes256Cbc => (plaintext_len / 16)
+        match self.cbc_block_len() {
+            Some(block) => (plaintext_len / block)
                 .checked_add(1)?
-                .checked_mul(16)?
-                .checked_add(16),
-            Self::Aes128Gcm | Self::Aes256Gcm => plaintext_len.checked_add(28),
+                .checked_mul(block)?
+                .checked_add(block),
+            None => plaintext_len.checked_add(28),
         }
     }
 }
@@ -94,9 +150,10 @@ pub(crate) fn validate_ciphertext_framing(
 ) -> Result<(), XmlEncError> {
     let minimum = algorithm.minimum_ciphertext_len();
     if ciphertext_len < minimum {
-        let algorithm_name = match algorithm {
-            DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc => "AES-CBC",
-            DataEncryptionAlgorithm::Aes128Gcm | DataEncryptionAlgorithm::Aes256Gcm => "AES-GCM",
+        let algorithm_name = match algorithm.cbc_block_len() {
+            Some(8) => "Triple DES CBC",
+            Some(_) => "AES-CBC",
+            None => "AES-GCM",
         };
         return Err(XmlEncError::DataTooShort {
             algorithm: algorithm_name,
@@ -104,22 +161,34 @@ pub(crate) fn validate_ciphertext_framing(
             actual: ciphertext_len,
         });
     }
-    if matches!(
-        algorithm,
-        DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc
-    ) && !(ciphertext_len - 16).is_multiple_of(16)
+    if let Some(block) = algorithm.cbc_block_len()
+        && !(ciphertext_len - block).is_multiple_of(block)
     {
-        return Err(XmlEncError::InvalidCbcCiphertextLength(ciphertext_len - 16));
+        return Err(XmlEncError::InvalidCbcCiphertextLength {
+            algorithm,
+            block,
+            actual: ciphertext_len - block,
+        });
     }
     Ok(())
 }
 
 impl KeyTransportAlgorithm {
+    /// Historical transport is never enabled merely by compiling its primitive.
+    pub const fn requires_explicit_permission(self) -> bool {
+        match self {
+            #[cfg(feature = "legacy-algorithms")]
+            Self::RsaPkcs1v15 => true,
+            _ => false,
+        }
+    }
     /// Parse a supported XMLEnc key-transport URI.
     pub fn from_uri(uri: &str) -> Result<Self, XmlEncError> {
         match uri {
             "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p" => Ok(Self::RsaOaepMgf1p),
             "http://www.w3.org/2009/xmlenc11#rsa-oaep" => Ok(Self::RsaOaep11),
+            #[cfg(feature = "legacy-algorithms")]
+            "http://www.w3.org/2001/04/xmlenc#rsa-1_5" => Ok(Self::RsaPkcs1v15),
             _ => Err(XmlEncError::UnsupportedAlgorithm(uri.to_owned())),
         }
     }
@@ -129,14 +198,28 @@ impl KeyTransportAlgorithm {
         match self {
             Self::RsaOaepMgf1p => "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p",
             Self::RsaOaep11 => "http://www.w3.org/2009/xmlenc11#rsa-oaep",
+            #[cfg(feature = "legacy-algorithms")]
+            Self::RsaPkcs1v15 => "http://www.w3.org/2001/04/xmlenc#rsa-1_5",
         }
     }
 }
 
 impl KeyWrapAlgorithm {
+    /// Family of the wrapping key, not of the wrapped content key.
+    pub const fn key_kind(self) -> crate::key_manager::SymmetricKeyKind {
+        #[cfg(feature = "legacy-algorithms")]
+        if matches!(self, Self::TripleDes) {
+            return crate::key_manager::SymmetricKeyKind::Des;
+        }
+        crate::key_manager::SymmetricKeyKind::Aes
+    }
     /// Parse a supported XMLEnc symmetric key-wrap URI.
     pub fn from_uri(uri: &str) -> Result<Self, XmlEncError> {
         match uri {
+            #[cfg(feature = "legacy-algorithms")]
+            "http://www.w3.org/2001/04/xmlenc#kw-aes192" => Ok(Self::AesKw192),
+            #[cfg(feature = "legacy-algorithms")]
+            "http://www.w3.org/2001/04/xmlenc#kw-tripledes" => Ok(Self::TripleDes),
             "http://www.w3.org/2001/04/xmlenc#kw-aes128" => Ok(Self::AesKw128),
             "http://www.w3.org/2001/04/xmlenc#kw-aes256" => Ok(Self::AesKw256),
             _ => Err(XmlEncError::UnsupportedAlgorithm(uri.to_owned())),
@@ -146,6 +229,8 @@ impl KeyWrapAlgorithm {
     /// Required key-encryption-key length in bytes.
     pub const fn key_len(self) -> usize {
         match self {
+            #[cfg(feature = "legacy-algorithms")]
+            Self::AesKw192 | Self::TripleDes => 24,
             Self::AesKw128 => 16,
             Self::AesKw256 => 32,
         }
@@ -154,8 +239,32 @@ impl KeyWrapAlgorithm {
     /// Return the standard XMLEnc key-wrap URI.
     pub const fn uri(self) -> &'static str {
         match self {
+            #[cfg(feature = "legacy-algorithms")]
+            Self::AesKw192 => "http://www.w3.org/2001/04/xmlenc#kw-aes192",
+            #[cfg(feature = "legacy-algorithms")]
+            Self::TripleDes => "http://www.w3.org/2001/04/xmlenc#kw-tripledes",
             Self::AesKw128 => "http://www.w3.org/2001/04/xmlenc#kw-aes128",
             Self::AesKw256 => "http://www.w3.org/2001/04/xmlenc#kw-aes256",
+        }
+    }
+
+    /// Whether use requires an explicit compiled-policy allowlist entry.
+    pub const fn requires_explicit_permission(self) -> bool {
+        match self {
+            #[cfg(feature = "legacy-algorithms")]
+            Self::AesKw192 | Self::TripleDes => true,
+            _ => false,
+        }
+    }
+
+    pub(crate) const fn overhead(self) -> usize {
+        // XMLEnc 1.1 §5.7.1 / RFC 3217 §§2-3: CMS wrapping includes
+        // an 8-byte checksum and an 8-byte IV, unlike RFC 3394's A register.
+        // https://www.w3.org/TR/xmlenc-core1/#sec-CMS-3DES
+        match self {
+            #[cfg(feature = "legacy-algorithms")]
+            Self::TripleDes => 16,
+            _ => 8,
         }
     }
 }
@@ -163,6 +272,9 @@ impl KeyWrapAlgorithm {
 /// Supported asymmetric session-key transport algorithms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyTransportAlgorithm {
+    /// Historical RSAES-PKCS1-v1_5 transport; explicit policy permission is required.
+    #[cfg(feature = "legacy-algorithms")]
+    RsaPkcs1v15,
     /// XML Encryption 1.0 OAEP URI with SHA-1/MGF1-SHA1 absent-field defaults.
     ///
     /// An explicit DigestMethod or XMLEnc 1.1 MGF child overrides the corresponding default,
@@ -175,6 +287,12 @@ pub enum KeyTransportAlgorithm {
 /// Supported symmetric key-wrap algorithms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyWrapAlgorithm {
+    /// AES-192 RFC 3394 key wrap, explicitly permitted by compatibility policy.
+    #[cfg(feature = "legacy-algorithms")]
+    AesKw192,
+    /// CMS Triple DES key wrap, including XMLEnc's optional non-DES key inputs.
+    #[cfg(feature = "legacy-algorithms")]
+    TripleDes,
     /// RFC 3394 AES key wrap with a 128-bit KEK.
     AesKw128,
     /// RFC 3394 AES key wrap with a 256-bit KEK.
@@ -334,6 +452,16 @@ impl Default for RsaOaepParameters {
 /// One recipient of a generated content-encryption key.
 #[derive(Clone)]
 pub enum EncryptionRecipient {
+    /// Historical RSA transport, admitted only by explicit compiled policy.
+    #[cfg(feature = "legacy-algorithms")]
+    RsaPkcs1v15 {
+        /// Opaque RSA public key used by the selected provider.
+        public_key: Arc<dyn crate::provider::KeyTransportKey>,
+        /// Optional recipient identifier.
+        recipient: Option<String>,
+        /// Optional key hint.
+        key_name: Option<String>,
+    },
     /// Wrap the content key with an RSA public key and OAEP.
     RsaOaep {
         /// Opaque recipient public-key handle.
@@ -361,6 +489,17 @@ pub enum EncryptionRecipient {
 impl fmt::Debug for EncryptionRecipient {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            #[cfg(feature = "legacy-algorithms")]
+            Self::RsaPkcs1v15 {
+                recipient,
+                key_name,
+                ..
+            } => formatter
+                .debug_struct("EncryptionRecipient::RsaPkcs1v15")
+                .field("public_key", &"[PUBLIC KEY]")
+                .field("recipient", recipient)
+                .field("key_name", key_name)
+                .finish(),
             Self::RsaOaep {
                 parameters,
                 recipient,
@@ -390,6 +529,23 @@ impl fmt::Debug for EncryptionRecipient {
 }
 
 impl EncryptionRecipient {
+    /// Create a historical RSAES-PKCS1-v1_5 recipient. Defaults still deny it.
+    #[cfg(feature = "legacy-algorithms")]
+    pub fn rsa_pkcs1v15(public_key: RsaPublicKey) -> Self {
+        Self::provider_pkcs1v15(Arc::new(crate::provider::RustCryptoRsaPublicKey::new(
+            public_key,
+        )))
+    }
+
+    /// Create a historical RSA recipient without extracting provider-owned keys.
+    #[cfg(feature = "legacy-algorithms")]
+    pub fn provider_pkcs1v15(public_key: Arc<dyn crate::provider::KeyTransportKey>) -> Self {
+        Self::RsaPkcs1v15 {
+            public_key,
+            recipient: None,
+            key_name: None,
+        }
+    }
     /// Create an RSA-OAEP recipient using SHA-256 and MGF1-SHA-256.
     ///
     /// XMLEnc 1.1 assigns SHA-1 and MGF1-SHA-1 when these parameters are
@@ -436,6 +592,8 @@ impl EncryptionRecipient {
     /// Set the recipient identifier emitted on `EncryptedKey`.
     pub fn recipient(mut self, value: impl Into<String>) -> Self {
         match &mut self {
+            #[cfg(feature = "legacy-algorithms")]
+            Self::RsaPkcs1v15 { recipient, .. } => *recipient = Some(value.into()),
             Self::RsaOaep { recipient, .. } | Self::AesKeyWrap { recipient, .. } => {
                 *recipient = Some(value.into());
             }
@@ -446,6 +604,8 @@ impl EncryptionRecipient {
     /// Set the key name emitted inside the encrypted key's `KeyInfo`.
     pub fn key_name(mut self, value: impl Into<String>) -> Self {
         match &mut self {
+            #[cfg(feature = "legacy-algorithms")]
+            Self::RsaPkcs1v15 { key_name, .. } => *key_name = Some(value.into()),
             Self::RsaOaep { key_name, .. } | Self::AesKeyWrap { key_name, .. } => {
                 *key_name = Some(value.into());
             }
@@ -648,9 +808,18 @@ pub enum XmlEncError {
         /// Actual byte length.
         actual: usize,
     },
-    /// CBC ciphertext is not a non-empty multiple of the AES block size.
-    #[error("AES-CBC ciphertext length must be a non-zero multiple of 16 bytes, got {0}")]
-    InvalidCbcCiphertextLength(usize),
+    /// CBC ciphertext is not a non-empty multiple of the selected cipher's block size.
+    #[error(
+        "{algorithm} ciphertext length must be a non-zero multiple of {block} bytes, got {actual}"
+    )]
+    InvalidCbcCiphertextLength {
+        /// Selected content cipher.
+        algorithm: DataEncryptionAlgorithm,
+        /// Cipher's block width in bytes.
+        block: usize,
+        /// Ciphertext body width, excluding the IV.
+        actual: usize,
+    },
     /// XMLEnc random padding is invalid.
     ///
     /// No decrypted padding details are exposed. This does not authenticate CBC
@@ -748,10 +917,42 @@ impl From<crate::operation::OperationPlanError> for XmlEncError {
 impl fmt::Display for DataEncryptionAlgorithm {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            #[cfg(feature = "legacy-algorithms")]
+            Self::TripleDesCbc => "Triple DES CBC",
+            #[cfg(feature = "legacy-algorithms")]
+            Self::Aes192Cbc => "AES-192-CBC",
+            #[cfg(feature = "legacy-algorithms")]
+            Self::Aes192Gcm => "AES-192-GCM",
             Self::Aes128Cbc => "AES-128-CBC",
             Self::Aes256Cbc => "AES-256-CBC",
             Self::Aes128Gcm => "AES-128-GCM",
             Self::Aes256Gcm => "AES-256-GCM",
         })
+    }
+}
+
+#[cfg(test)]
+mod framing_tests {
+    use super::*;
+
+    #[test]
+    fn cbc_framing_error_names_the_selected_cipher() {
+        // Diagnostics must identify the actual cipher and its block width,
+        // rather than reporting AES framing for a DES input.
+        let error = validate_ciphertext_framing(DataEncryptionAlgorithm::Aes128Cbc, 33)
+            .expect_err("AES ciphertext body is not block-aligned");
+        assert_eq!(
+            error.to_string(),
+            "AES-128-CBC ciphertext length must be a non-zero multiple of 16 bytes, got 17"
+        );
+        #[cfg(feature = "legacy-algorithms")]
+        {
+            let error = validate_ciphertext_framing(DataEncryptionAlgorithm::TripleDesCbc, 17)
+                .expect_err("3DES ciphertext body is not block-aligned");
+            assert_eq!(
+                error.to_string(),
+                "Triple DES CBC ciphertext length must be a non-zero multiple of 8 bytes, got 9"
+            );
+        }
     }
 }

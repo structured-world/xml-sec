@@ -85,6 +85,24 @@ impl KeyCandidateBudget {
 
 /// Supplies a content-encryption key for parsed XMLEnc data.
 pub trait DecryptionKeyResolver {
+    /// Resolve operation candidates without dropping implicit-rejection state.
+    /// Wrappers around recipient resolvers must forward this method; converting
+    /// recovered candidates to raw bytes loses the final content acceptance gate.
+    fn resolve_content_keys_with_policy(
+        &self,
+        provider: &dyn crate::provider::CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        encrypted_key: Option<&EncryptedKey>,
+        policy: &crate::policy::DecryptionPolicy,
+        budget: &mut KeyCandidateBudget,
+    ) -> Result<Vec<crate::provider::RecoveredContentKey>, XmlEncError> {
+        self.resolve_key_candidates_with_policy(provider, algorithm, encrypted_key, policy, budget)
+            .map(|keys| {
+                keys.into_iter()
+                    .map(crate::provider::RecoveredContentKey::confirmed)
+                    .collect()
+            })
+    }
     /// Resolve under the operation's immutable snapshot. RSA resolvers enforce
     /// `rsa_keys` before provider recovery; wrappers must forward this snapshot.
     ///
@@ -320,18 +338,11 @@ impl<'a> DecryptContext<'a> {
             )?;
             let algorithm =
                 DataEncryptionAlgorithm::from_uri(&encrypted.encryption_method.algorithm)?;
-            if operation
-                .policy()
-                .data_algorithms
-                .as_ref()
-                .is_some_and(|allowed| !allowed.contains(&algorithm))
-            {
-                return Err(crate::policy::PolicyViolation::Algorithm {
-                    operation: "decryption",
-                    algorithm: encrypted.encryption_method.algorithm.clone(),
-                }
-                .into());
-            }
+            crate::policy::check_content_algorithm(
+                operation.policy().data_algorithms.as_ref(),
+                algorithm,
+                "decryption",
+            )?;
             self.provider
                 .require_capability(crate::provider::ProviderCapability::Decrypt(algorithm))?;
             validate_typed_cipher_values(
@@ -372,13 +383,27 @@ impl<'a> DecryptContext<'a> {
             let mut last_error = None;
             for key in keys {
                 let attempt = (|| {
-                    validate_key_len(algorithm, &key)?;
-                    let plaintext = self
+                    validate_key_len(algorithm, key.bytes())?;
+                    let result = self
                         .provider
-                        .decrypt_data(algorithm, &key, &ciphertext)
-                        .map_err(|error| {
-                            map_data_decryption_error(algorithm, ciphertext.len(), error)
-                        })?;
+                        .decrypt_data(algorithm, key.bytes(), &ciphertext);
+                    // XMLEnc 1.1 §6.1.2: fallback recovery must still perform
+                    // content work. Never release a CBC result merely because
+                    // its unauthenticated padding happened to be valid.
+                    // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-bleichenbacher-attack
+                    if !key.valid() {
+                        if let Ok(mut plaintext) = result {
+                            zeroize::Zeroize::zeroize(&mut plaintext);
+                        }
+                        return Err(if algorithm.cbc_block_len().is_some() {
+                            XmlEncError::InvalidPadding
+                        } else {
+                            XmlEncError::AeadAuthenticationFailed
+                        });
+                    }
+                    let plaintext = result.map_err(|error| {
+                        map_data_decryption_error(algorithm, ciphertext.len(), error)
+                    })?;
                     validate_provider_plaintext_len(algorithm, ciphertext.len(), plaintext.len())?;
                     validate_plaintext_len(
                         plaintext.len(),
@@ -470,6 +495,7 @@ impl<'a> DecryptContext<'a> {
 #[derive(Clone)]
 pub struct SymmetricKeyDecryptor {
     key: Vec<u8>,
+    kind: crate::key_manager::SymmetricKeyKind,
 }
 
 impl fmt::Debug for SymmetricKeyDecryptor {
@@ -482,19 +508,50 @@ impl fmt::Debug for SymmetricKeyDecryptor {
 }
 
 impl SymmetricKeyDecryptor {
-    /// Create a direct symmetric-key resolver.
+    /// Create a direct AES-key resolver. Key length never selects another family.
     pub fn new(key: impl Into<Vec<u8>>) -> Self {
-        Self { key: key.into() }
+        Self::with_kind(key, crate::key_manager::SymmetricKeyKind::Aes)
+    }
+
+    /// Bind a pre-shared key to its trusted family before reading an algorithm
+    /// from the document. XMLEnc 1.1 §6.1.3 recommends key separation:
+    /// https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-backwards-compatibility-attacks
+    pub fn with_kind(key: impl Into<Vec<u8>>, kind: crate::key_manager::SymmetricKeyKind) -> Self {
+        Self {
+            key: key.into(),
+            kind,
+        }
     }
 }
 
 impl DecryptionKeyResolver for SymmetricKeyDecryptor {
+    fn resolve_content_keys_with_policy(
+        &self,
+        provider: &dyn crate::provider::CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        encrypted_key: Option<&EncryptedKey>,
+        policy: &crate::policy::DecryptionPolicy,
+        budget: &mut KeyCandidateBudget,
+    ) -> Result<Vec<crate::provider::RecoveredContentKey>, XmlEncError> {
+        policy.validate()?;
+        if encrypted_key.is_some() {
+            return Err(XmlEncError::KeyNotFound);
+        }
+        budget.consume(1)?;
+        Ok(vec![crate::provider::RecoveredContentKey::confirmed(
+            self.resolve_key(provider, algorithm, None)?,
+        )])
+    }
+
     fn resolve_key(
         &self,
         _provider: &dyn crate::provider::CryptoProvider,
         algorithm: DataEncryptionAlgorithm,
         _encrypted_key: Option<&EncryptedKey>,
     ) -> Result<Vec<u8>, XmlEncError> {
+        if self.kind != algorithm.key_kind() {
+            return Err(XmlEncError::KeyNotFound);
+        }
         validate_key_len(algorithm, &self.key)?;
         Ok(self.key.clone())
     }
@@ -506,29 +563,71 @@ pub struct PrivateKeyDecryptor {
     key: Arc<dyn crate::provider::KeyRecoveryKey>,
 }
 
-/// Resolver backed by a pre-shared AES key-encryption key (KEK).
+/// Resolver backed by a pre-shared, algorithm-family-bound key-encryption key.
 #[derive(Clone)]
-pub struct KekDecryptor {
-    kek: Vec<u8>,
+pub struct KekDecryptor<'a> {
+    kek: std::borrow::Cow<'a, [u8]>,
+    kind: crate::key_manager::SymmetricKeyKind,
 }
 
-impl fmt::Debug for KekDecryptor {
+impl fmt::Debug for KekDecryptor<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("KekDecryptor")
             .field("kek", &"[REDACTED]")
+            .field("kind", &self.kind)
             .finish()
     }
 }
 
-impl KekDecryptor {
+impl KekDecryptor<'static> {
     /// Create a resolver for RFC 3394 AES key-wrap `EncryptedKey` elements.
     pub fn new(kek: impl Into<Vec<u8>>) -> Self {
-        Self { kek: kek.into() }
+        Self::with_kind(kek, crate::key_manager::SymmetricKeyKind::Aes)
+    }
+
+    /// Bind owned key material to its trusted family, independently of input XML.
+    pub fn with_kind(kek: impl Into<Vec<u8>>, kind: crate::key_manager::SymmetricKeyKind) -> Self {
+        Self {
+            kek: std::borrow::Cow::Owned(kek.into()),
+            kind,
+        }
     }
 }
 
-impl DecryptionKeyResolver for KekDecryptor {
+impl<'a> KekDecryptor<'a> {
+    /// Borrow a KEK for operation-scoped recovery without copying secret material.
+    pub fn borrowed(kek: &'a [u8]) -> Self {
+        Self::borrowed_with_kind(kek, crate::key_manager::SymmetricKeyKind::Aes)
+    }
+
+    /// Borrow key material while retaining its caller-declared algorithm family.
+    pub fn borrowed_with_kind(kek: &'a [u8], kind: crate::key_manager::SymmetricKeyKind) -> Self {
+        Self {
+            kek: std::borrow::Cow::Borrowed(kek),
+            kind,
+        }
+    }
+}
+
+impl DecryptionKeyResolver for KekDecryptor<'_> {
+    fn resolve_content_keys_with_policy(
+        &self,
+        provider: &dyn crate::provider::CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        encrypted_key: Option<&EncryptedKey>,
+        policy: &crate::policy::DecryptionPolicy,
+        budget: &mut KeyCandidateBudget,
+    ) -> Result<Vec<crate::provider::RecoveredContentKey>, XmlEncError> {
+        policy.validate()?;
+        let encrypted_key = encrypted_key.ok_or(XmlEncError::KeyNotFound)?;
+        validate_encrypted_key_policy(encrypted_key, policy)?;
+        budget.consume(1)?;
+        Ok(vec![crate::provider::RecoveredContentKey::confirmed(
+            self.resolve_key(provider, algorithm, Some(encrypted_key))?,
+        )])
+    }
+
     fn resolve_key_candidates_with_policy(
         &self,
         provider: &dyn crate::provider::CryptoProvider,
@@ -537,10 +636,10 @@ impl DecryptionKeyResolver for KekDecryptor {
         policy: &crate::policy::DecryptionPolicy,
         budget: &mut KeyCandidateBudget,
     ) -> Result<Vec<Vec<u8>>, XmlEncError> {
-        policy.validate()?;
-        // This resolver accepts only AES-KW and validates its fixed KEK width
-        // before unwrap; it cannot dispatch an RSA recovery without metadata.
-        self.resolve_key_candidates(provider, algorithm, encrypted_key, budget)
+        self.resolve_content_keys_with_policy(provider, algorithm, encrypted_key, policy, budget)?
+            .into_iter()
+            .map(|key| key.into_key().map_err(XmlEncError::from))
+            .collect()
     }
 
     fn resolve_key(
@@ -551,11 +650,17 @@ impl DecryptionKeyResolver for KekDecryptor {
     ) -> Result<Vec<u8>, XmlEncError> {
         let encrypted_key = encrypted_key.ok_or(XmlEncError::KeyNotFound)?;
         encrypted_key.encryption_method.validate_structure()?;
+        let wrap_algorithm =
+            KeyWrapAlgorithm::from_uri(&encrypted_key.encryption_method.algorithm)?;
+        // XMLEnc 1.1 section 6.1.3 recommends key separation between algorithms:
+        // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-backwards-compatibility-attacks
+        // Equal AES-192 and TripleDES widths do not establish key identity.
+        if self.kind != wrap_algorithm.key_kind() {
+            return Err(XmlEncError::KeyNotFound);
+        }
         let wrapped = STANDARD
             .decode(&encrypted_key.cipher_data.value)
             .map_err(|error| XmlEncError::Base64(error.to_string()))?;
-        let wrap_algorithm =
-            KeyWrapAlgorithm::from_uri(&encrypted_key.encryption_method.algorithm)?;
         let expected_kek_len = wrap_algorithm.key_len();
         if self.kek.len() != expected_kek_len {
             return Err(XmlEncError::InvalidKekSize {
@@ -564,7 +669,7 @@ impl DecryptionKeyResolver for KekDecryptor {
                 actual: self.kek.len(),
             });
         }
-        let expected_wrapped_len = algorithm.key_len() + 8;
+        let expected_wrapped_len = algorithm.key_len() + wrap_algorithm.overhead();
         if wrapped.len() != expected_wrapped_len {
             return Err(XmlEncError::InvalidWrappedKeyLength {
                 expected: expected_wrapped_len,
@@ -608,6 +713,19 @@ impl PrivateKeyDecryptor {
 }
 
 impl DecryptionKeyResolver for PrivateKeyDecryptor {
+    fn resolve_content_keys_with_policy(
+        &self,
+        provider: &dyn crate::provider::CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        encrypted_key: Option<&EncryptedKey>,
+        policy: &crate::policy::DecryptionPolicy,
+        budget: &mut KeyCandidateBudget,
+    ) -> Result<Vec<crate::provider::RecoveredContentKey>, XmlEncError> {
+        policy.validate()?;
+        budget.consume(1)?;
+        self.resolve_key_with_policy(provider, algorithm, encrypted_key, policy)
+            .map(|key| vec![key])
+    }
     fn resolve_key_candidates_with_policy(
         &self,
         provider: &dyn crate::provider::CryptoProvider,
@@ -619,6 +737,7 @@ impl DecryptionKeyResolver for PrivateKeyDecryptor {
         policy.validate()?;
         budget.consume(1)?;
         self.resolve_key_with_policy(provider, algorithm, encrypted_key, policy)
+            .and_then(|key| key.into_key().map_err(XmlEncError::Provider))
             .map(|key| vec![key])
     }
 
@@ -634,6 +753,7 @@ impl DecryptionKeyResolver for PrivateKeyDecryptor {
             encrypted_key,
             &crate::policy::DecryptionPolicy::default(),
         )
+        .and_then(|key| key.into_key().map_err(XmlEncError::Provider))
     }
 }
 
@@ -646,9 +766,10 @@ impl PrivateKeyDecryptor {
         algorithm: DataEncryptionAlgorithm,
         encrypted_key: Option<&EncryptedKey>,
         policy: &crate::policy::DecryptionPolicy,
-    ) -> Result<Vec<u8>, XmlEncError> {
+    ) -> Result<crate::provider::RecoveredContentKey, XmlEncError> {
         policy.validate()?;
         let encrypted_key = encrypted_key.ok_or(XmlEncError::KeyNotFound)?;
+        validate_encrypted_key_policy(encrypted_key, policy)?;
         let width = policy.rsa_keys.validate_public_metadata(
             "decryption",
             self.key.rsa_modulus_bits(),
@@ -674,22 +795,44 @@ impl PrivateKeyDecryptor {
         let transport =
             KeyTransportAlgorithm::from_uri(&encrypted_key.encryption_method.algorithm)?;
         let key = match transport {
-            KeyTransportAlgorithm::RsaOaepMgf1p => self.decrypt_oaep_mgf1p(
-                provider,
-                encrypted_key.encryption_method.oaep_digest.as_deref(),
-                encrypted_key.encryption_method.mgf_algorithm.as_deref(),
-                label,
-                &wrapped,
-            ),
-            KeyTransportAlgorithm::RsaOaep11 => self.decrypt_oaep11(
-                provider,
-                encrypted_key.encryption_method.oaep_digest.as_deref(),
-                encrypted_key.encryption_method.mgf_algorithm.as_deref(),
-                label,
-                &wrapped,
-            ),
+            #[cfg(feature = "legacy-algorithms")]
+            KeyTransportAlgorithm::RsaPkcs1v15 => {
+                if wrapped.len() != self.key.ciphertext_len() {
+                    return Err(XmlEncError::InvalidWrappedKeyLength {
+                        expected: self.key.ciphertext_len(),
+                        actual: wrapped.len(),
+                    });
+                }
+                provider
+                    .require_capability(crate::provider::ProviderCapability::Pkcs1v15Recovery)?;
+                // Recovery conceals padding/range rejection with a random CEK;
+                // only operational provider failures propagate here. The RFC
+                // padding-error rule is RFC 8017 §7.2.2's note:
+                // https://www.rfc-editor.org/rfc/rfc8017#section-7.2.2.
+                provider
+                    .recover_pkcs1v15(self.key.as_ref(), &wrapped, algorithm.key_len())
+                    .map_err(XmlEncError::Provider)
+            }
+            KeyTransportAlgorithm::RsaOaepMgf1p => self
+                .decrypt_oaep_mgf1p(
+                    provider,
+                    encrypted_key.encryption_method.oaep_digest.as_deref(),
+                    encrypted_key.encryption_method.mgf_algorithm.as_deref(),
+                    label,
+                    &wrapped,
+                )
+                .map(crate::provider::RecoveredContentKey::confirmed),
+            KeyTransportAlgorithm::RsaOaep11 => self
+                .decrypt_oaep11(
+                    provider,
+                    encrypted_key.encryption_method.oaep_digest.as_deref(),
+                    encrypted_key.encryption_method.mgf_algorithm.as_deref(),
+                    label,
+                    &wrapped,
+                )
+                .map(crate::provider::RecoveredContentKey::confirmed),
         }?;
-        validate_key_len(algorithm, &key)?;
+        validate_key_len(algorithm, key.bytes())?;
         Ok(key)
     }
 }
@@ -966,7 +1109,7 @@ fn resolve_content_key_candidates(
     resolver: &dyn DecryptionKeyResolver,
     policy: &crate::policy::DecryptionPolicy,
     budget: &mut KeyCandidateBudget,
-) -> Result<Vec<Vec<u8>>, XmlEncError> {
+) -> Result<Vec<crate::provider::RecoveredContentKey>, XmlEncError> {
     let mut last_error = None;
     let mut candidates =
         match resolve_candidates_with_budget(resolver, provider, algorithm, None, policy, budget) {
@@ -1024,9 +1167,9 @@ fn resolve_candidates_with_budget(
     encrypted_key: Option<&EncryptedKey>,
     policy: &crate::policy::DecryptionPolicy,
     budget: &mut KeyCandidateBudget,
-) -> Result<Vec<Vec<u8>>, XmlEncError> {
+) -> Result<Vec<crate::provider::RecoveredContentKey>, XmlEncError> {
     let remaining_before = budget.remaining();
-    let keys = resolver.resolve_key_candidates_with_policy(
+    let keys = resolver.resolve_content_keys_with_policy(
         provider,
         algorithm,
         encrypted_key,
@@ -1067,23 +1210,33 @@ fn encrypted_key_applies_to_data(
 
 fn compatible_decryption_key_candidates(
     algorithm: DataEncryptionAlgorithm,
-    keys: Vec<Vec<u8>>,
-) -> Result<Vec<Vec<u8>>, XmlEncError> {
-    let mut compatible = Vec::with_capacity(keys.len());
+    mut keys: Vec<crate::provider::RecoveredContentKey>,
+) -> Result<Vec<crate::provider::RecoveredContentKey>, XmlEncError> {
+    let mut accepted = 0;
     let mut last_error = None;
-    for key in keys {
-        match validate_key_len(algorithm, &key) {
-            Ok(()) if !compatible.iter().any(|existing| existing == &key) => {
-                compatible.push(key);
+    for index in 0..keys.len() {
+        let key = &keys[index];
+        match validate_key_len(algorithm, key.bytes()) {
+            Ok(())
+                if !keys[..accepted].iter().any(|existing| {
+                    existing.bytes() == key.bytes() && existing.valid() == key.valid()
+                }) =>
+            {
+                // Accepted entries form a stable prefix. Swapping an earlier
+                // rejected slot never moves an unvisited entry, and avoids a
+                // second allocation without changing candidate precedence.
+                keys.swap(accepted, index);
+                accepted += 1;
             }
             Ok(()) => {}
             Err(error) => last_error = Some(error),
         }
     }
-    if compatible.is_empty() {
+    keys.truncate(accepted);
+    if keys.is_empty() {
         return Err(last_error.unwrap_or(XmlEncError::KeyNotFound));
     }
-    Ok(compatible)
+    Ok(keys)
 }
 
 fn validate_decryption_key_candidates(
@@ -1099,12 +1252,7 @@ fn validate_decryption_key_candidates(
         }
         .into());
     }
-    if actual > 1
-        && matches!(
-            algorithm,
-            DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc
-        )
-    {
+    if actual > 1 && algorithm.cbc_block_len().is_some() {
         return Err(XmlEncError::AmbiguousKeyCandidates { algorithm, actual });
     }
     Ok(())
@@ -1120,13 +1268,19 @@ fn validate_encrypted_key_policy(
         if policy
             .key_transport_algorithms
             .as_ref()
-            .is_some_and(|allowed| !allowed.contains(&transport))
+            .map_or(transport.requires_explicit_permission(), |allowed| {
+                !allowed.contains(&transport)
+            })
         {
             return Err(crate::policy::PolicyViolation::Algorithm {
                 operation: "decryption",
                 algorithm: uri.clone(),
             }
             .into());
+        }
+        #[cfg(feature = "legacy-algorithms")]
+        if transport == KeyTransportAlgorithm::RsaPkcs1v15 {
+            return Ok(());
         }
         let method = &encrypted_key.encryption_method;
         let digest = parse_oaep_digest(method.oaep_digest.as_deref())?;
@@ -1162,7 +1316,9 @@ fn validate_encrypted_key_policy(
         if policy
             .key_wrap_algorithms
             .as_ref()
-            .is_some_and(|allowed| !allowed.contains(&wrap))
+            .map_or(wrap.requires_explicit_permission(), |allowed| {
+                !allowed.contains(&wrap)
+            })
         {
             return Err(crate::policy::PolicyViolation::Algorithm {
                 operation: "decryption",
@@ -1209,17 +1365,11 @@ fn validate_typed_cipher_values(
     maximum_plaintext: usize,
     maximum_cipher_values: usize,
 ) -> Result<(), XmlEncError> {
-    let maximum_ciphertext = match algorithm {
-        DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc => {
-            (maximum_plaintext / 16)
-                .saturating_add(1)
-                .saturating_mul(16)
-                .saturating_add(16)
-        }
-        DataEncryptionAlgorithm::Aes128Gcm | DataEncryptionAlgorithm::Aes256Gcm => {
-            maximum_plaintext.saturating_add(28)
-        }
-    };
+    let maximum_ciphertext = algorithm
+        .ciphertext_len_for_plaintext(maximum_plaintext)
+        .ok_or(XmlEncError::InvalidEncryptionConfig(
+            "ciphertext size overflow".into(),
+        ))?;
     let projected = validate_cipher_value_len(&encrypted.cipher_data.value, maximum_ciphertext)?;
     if projected > maximum_ciphertext {
         return Err(crate::policy::PolicyViolation::ResourceLimit {
@@ -1304,7 +1454,7 @@ fn validate_possible_plaintext_len(
     ciphertext_len: usize,
     maximum: usize,
 ) -> Result<(), XmlEncError> {
-    // CBC's minimum includes a 16-byte IV and one padded block; using that
+    // CBC's minimum includes an IV and one padded block; using that
     // maximum-padding case yields the safe pre-decryption plaintext lower bound.
     let framing = algorithm.minimum_ciphertext_len();
     validate_plaintext_len(ciphertext_len.saturating_sub(framing), maximum)
@@ -1317,8 +1467,8 @@ fn validate_provider_plaintext_len(
 ) -> Result<(), XmlEncError> {
     use crate::provider::{ProviderError, ProviderOperation};
 
-    match algorithm {
-        DataEncryptionAlgorithm::Aes128Gcm | DataEncryptionAlgorithm::Aes256Gcm => {
+    match algorithm.cbc_block_len() {
+        None => {
             let expected = ciphertext_len - algorithm.minimum_ciphertext_len();
             if plaintext_len != expected {
                 return Err(ProviderError::InvalidOutputSize {
@@ -1329,9 +1479,9 @@ fn validate_provider_plaintext_len(
                 .into());
             }
         }
-        DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc => {
-            let padded_len = ciphertext_len - 16;
-            let minimum = padded_len - 16;
+        Some(block) => {
+            let padded_len = ciphertext_len - block;
+            let minimum = padded_len - block;
             let maximum = padded_len - 1;
             if !(minimum..=maximum).contains(&plaintext_len) {
                 return Err(ProviderError::InvalidOutputSizeRange {
@@ -1367,41 +1517,53 @@ fn map_data_decryption_error(
 ) -> XmlEncError {
     use crate::provider::ProviderError;
 
-    match (algorithm, error) {
-        (
-            DataEncryptionAlgorithm::Aes128Gcm | DataEncryptionAlgorithm::Aes256Gcm,
-            ProviderError::AuthenticationFailed,
-        ) => XmlEncError::AeadAuthenticationFailed,
-        (
-            DataEncryptionAlgorithm::Aes128Gcm | DataEncryptionAlgorithm::Aes256Gcm,
-            ProviderError::InvalidInput(crate::provider::ProviderInputError::AesGcmFraming),
-        ) => XmlEncError::DataTooShort {
-            algorithm: "AES-GCM",
-            minimum: 28,
-            actual: ciphertext_len,
-        },
-        (
-            DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc,
-            ProviderError::InvalidInput(crate::provider::ProviderInputError::AesCbcFraming),
-        ) if ciphertext_len < 32 => XmlEncError::DataTooShort {
-            algorithm: "AES-CBC",
-            minimum: 32,
-            actual: ciphertext_len,
-        },
-        (
-            DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc,
-            ProviderError::InvalidInput(crate::provider::ProviderInputError::AesCbcFraming),
-        ) => XmlEncError::InvalidCbcCiphertextLength(ciphertext_len.saturating_sub(16)),
-        (
-            DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc,
-            ProviderError::InvalidInput(crate::provider::ProviderInputError::AesCbcCiphertext),
-        ) => XmlEncError::InvalidPadding,
-        (_, error) => XmlEncError::Provider(error),
+    match error {
+        ProviderError::AuthenticationFailed if algorithm.cbc_block_len().is_none() => {
+            XmlEncError::AeadAuthenticationFailed
+        }
+        ProviderError::InvalidInput(crate::provider::ProviderInputError::AesGcmFraming)
+            if algorithm.cbc_block_len().is_none() =>
+        {
+            XmlEncError::DataTooShort {
+                algorithm: "AES-GCM",
+                minimum: 28,
+                actual: ciphertext_len,
+            }
+        }
+        error @ ProviderError::InvalidInput(crate::provider::ProviderInputError::AesCbcFraming)
+            if algorithm.cbc_block_len().is_some() =>
+        {
+            match super::types::validate_ciphertext_framing(algorithm, ciphertext_len) {
+                Err(error) => error,
+                Ok(()) => XmlEncError::Provider(error),
+            }
+        }
+        ProviderError::InvalidInput(crate::provider::ProviderInputError::AesCbcCiphertext)
+            if algorithm.cbc_block_len().is_some() =>
+        {
+            XmlEncError::InvalidPadding
+        }
+        error => XmlEncError::Provider(error),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "legacy-algorithms")]
+    #[test]
+    fn legacy_cbc_rejects_ambiguous_candidates_before_decryption() {
+        // CBC has no authentication tag: selecting a candidate by padding
+        // success is unsafe for DES and AES-192 just as for existing AES modes.
+        for algorithm in [
+            super::DataEncryptionAlgorithm::TripleDesCbc,
+            super::DataEncryptionAlgorithm::Aes192Cbc,
+        ] {
+            assert!(matches!(
+                super::validate_decryption_key_candidates(algorithm, 2),
+                Err(super::XmlEncError::AmbiguousKeyCandidates { actual: 2, .. })
+            ));
+        }
+    }
     use std::cell::{Cell, RefCell};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1871,6 +2033,15 @@ mod tests {
     }
 
     impl crate::provider::CryptoProvider for PermissiveUnwrapProvider {
+        #[cfg(feature = "legacy-algorithms")]
+        fn recover_pkcs1v15(
+            &self,
+            key: &dyn crate::provider::KeyRecoveryKey,
+            ciphertext: &[u8],
+            key_len: usize,
+        ) -> Result<crate::provider::RecoveredContentKey, crate::provider::ProviderError> {
+            key.recover_pkcs1v15(self, ciphertext, key_len)
+        }
         fn name(&self) -> &'static str {
             "permissive-unwrap-test"
         }
@@ -3040,6 +3211,87 @@ mod tests {
             ));
         }
         assert_eq!(provider.recover_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[cfg(feature = "legacy-algorithms")]
+    #[test]
+    fn invalid_rsa_recovery_cannot_release_successful_cbc_plaintext() {
+        // Force the CBC provider to accept its padding, making this regression
+        // deterministic instead of waiting for random fallback plaintext.
+        let key = RsaPrivateKey::from_pkcs8_pem(include_str!(
+            "../../tests/fixtures/keys/rsa/rsa-2048-key.pem"
+        ))
+        .expect("valid RSA fixture");
+        let resolver = PrivateKeyDecryptor::new(key);
+        for algorithm in [
+            DataEncryptionAlgorithm::Aes128Cbc,
+            DataEncryptionAlgorithm::Aes192Cbc,
+            DataEncryptionAlgorithm::Aes256Cbc,
+            DataEncryptionAlgorithm::TripleDesCbc,
+            DataEncryptionAlgorithm::Aes128Gcm,
+        ] {
+            let provider = PermissiveUnwrapProvider {
+                plaintext: b"accepted CBC plaintext".to_vec(),
+                ..PermissiveUnwrapProvider::default()
+            };
+            let mut encrypted = encrypted_data_with_recipients(
+                &[0; 16],
+                vec![associated_encrypted_key("recipient", None, None)],
+                None,
+            );
+            encrypted.encryption_method.algorithm = algorithm.uri().into();
+            encrypted.cipher_data.value = STANDARD.encode(vec![
+                0;
+                algorithm
+                    .ciphertext_len_for_plaintext(provider.plaintext.len())
+                    .expect("bounded test frame")
+            ]);
+            encrypted.encrypted_keys[0].encryption_method.algorithm =
+                KeyTransportAlgorithm::RsaPkcs1v15.uri().into();
+            encrypted.encrypted_keys[0].cipher_data.value = STANDARD.encode([0; 256]);
+            let result = DecryptContext::new(&resolver)
+                .provider(&provider)
+                .policy(crate::policy::DecryptionPolicy {
+                    data_algorithms: Some([algorithm].into()),
+                    key_transport_algorithms: Some([KeyTransportAlgorithm::RsaPkcs1v15].into()),
+                    ..crate::policy::DecryptionPolicy::default()
+                })
+                .decrypt_data(&encrypted);
+            assert!(
+                result.is_err(),
+                "invalid RSA padding must never release fallback plaintext"
+            );
+            assert_eq!(
+                provider.decrypt_calls.load(Ordering::Relaxed),
+                1,
+                "content decryption must run before rejecting the recovery"
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_filter_reuses_storage_and_preserves_precedence() {
+        // Compact invalid widths and non-adjacent duplicates in place without
+        // reordering distinct candidates or allocating a second candidate list.
+        let keys = [
+            vec![0; 8],
+            vec![2; 16],
+            vec![3; 16],
+            vec![2; 16],
+            vec![4; 32],
+            vec![5; 16],
+        ]
+        .into_iter()
+        .map(crate::provider::RecoveredContentKey::confirmed)
+        .collect::<Vec<_>>();
+        let allocation = keys.as_ptr();
+        let keys = compatible_decryption_key_candidates(DataEncryptionAlgorithm::Aes128Gcm, keys)
+            .expect("compatible candidates survive");
+        assert_eq!(keys.as_ptr(), allocation);
+        assert_eq!(keys.len(), 3);
+        for (key, expected) in keys.iter().zip([2, 3, 5]) {
+            assert_eq!(key.bytes(), &[expected; 16]);
+        }
     }
 
     #[test]

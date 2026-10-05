@@ -7,6 +7,60 @@
 
 #[cfg(feature = "aws-lc-fips")]
 mod aws_lc;
+#[cfg(all(feature = "xmlenc", feature = "legacy-algorithms"))]
+mod rsa_pkcs1v15;
+
+/// Secret candidate whose recovery validity is retained until content work ends.
+/// Debug output never exposes key bytes or padding validity.
+#[cfg(feature = "xmlenc")]
+pub struct RecoveredContentKey {
+    bytes: zeroize::Zeroizing<Vec<u8>>,
+    valid: subtle::Choice,
+}
+
+#[cfg(feature = "xmlenc")]
+impl std::fmt::Debug for RecoveredContentKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoveredContentKey")
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "xmlenc")]
+impl RecoveredContentKey {
+    /// An explicitly supplied key, or one recovered by an integrity-checking
+    /// mechanism such as OAEP or key wrap. Not for implicit-rejection output.
+    pub fn confirmed(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes: zeroize::Zeroizing::new(bytes),
+            valid: subtle::Choice::from(1),
+        }
+    }
+
+    #[cfg(feature = "legacy-algorithms")]
+    /// Preserve a trusted provider's constant-time padding-validation result.
+    /// `bytes` must already contain the fixed-width real-or-fallback candidate;
+    /// the caller must not branch on `valid` during recovery. The enclosing
+    /// content operation consumes this state only after primitive decryption.
+    pub fn recovery(bytes: zeroize::Zeroizing<Vec<u8>>, valid: subtle::Choice) -> Self {
+        Self { bytes, valid }
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    pub(crate) fn valid(&self) -> bool {
+        bool::from(self.valid)
+    }
+    /// Consume a completed recovery outside a content operation. Content
+    /// operations must retain the candidate until after primitive decryption.
+    pub fn into_key(mut self) -> Result<Vec<u8>, ProviderError> {
+        if !self.valid() {
+            return Err(ProviderError::AuthenticationFailed);
+        }
+        Ok(core::mem::take(&mut *self.bytes))
+    }
+}
 #[cfg(all(feature = "aws-lc-fips", feature = "xmlenc"))]
 pub use aws_lc::AwsLcRsaPrivateKey;
 #[cfg(feature = "aws-lc-fips")]
@@ -99,6 +153,12 @@ pub enum ProviderCapability<'a> {
     /// RSA-OAEP key recovery with complete digest, MGF, and label parameters.
     #[cfg(feature = "xmlenc")]
     KeyRecovery(&'a RsaOaepParameters),
+    /// Historical RSAES-PKCS1-v1_5 transport, without OAEP parameters.
+    #[cfg(all(feature = "xmlenc", feature = "legacy-algorithms"))]
+    Pkcs1v15Transport,
+    /// Historical RSAES-PKCS1-v1_5 fixed-length content-key recovery.
+    #[cfg(all(feature = "xmlenc", feature = "legacy-algorithms"))]
+    Pkcs1v15Recovery,
     /// Provider-defined key agreement identified by its standard URI.
     KeyAgreement(&'a KeyAgreementParameters<'a>),
     /// Provider-defined key derivation identified by its standard URI.
@@ -132,6 +192,10 @@ impl ProviderCapability<'_> {
             Self::KeyTransport(_) => ProviderOperation::KeyTransport,
             #[cfg(feature = "xmlenc")]
             Self::KeyRecovery(_) => ProviderOperation::KeyRecovery,
+            #[cfg(all(feature = "xmlenc", feature = "legacy-algorithms"))]
+            Self::Pkcs1v15Transport => ProviderOperation::KeyTransport,
+            #[cfg(all(feature = "xmlenc", feature = "legacy-algorithms"))]
+            Self::Pkcs1v15Recovery => ProviderOperation::KeyRecovery,
             Self::KeyAgreement(_) => ProviderOperation::KeyAgreement,
             Self::Kdf(_) => ProviderOperation::Kdf,
             Self::Random => ProviderOperation::Random,
@@ -147,7 +211,7 @@ impl ProviderCapability<'_> {
             #[cfg(feature = "xmldsig")]
             Self::Sign(algorithm) | Self::Verify(algorithm) => Some(algorithm.uri()),
             #[cfg(feature = "xmldsig")]
-            Self::VerifyCertificate(algorithm) => Some(algorithm.oid()),
+            Self::VerifyCertificate(algorithm) => algorithm.oid(),
             #[cfg(feature = "xmlenc")]
             Self::Encrypt(algorithm) | Self::Decrypt(algorithm) => Some(algorithm.uri()),
             #[cfg(feature = "xmlenc")]
@@ -157,6 +221,10 @@ impl ProviderCapability<'_> {
                 Some(parameters.algorithm.uri())
             }
             Self::KeyAgreement(parameters) => Some(parameters.algorithm),
+            #[cfg(all(feature = "xmlenc", feature = "legacy-algorithms"))]
+            Self::Pkcs1v15Transport | Self::Pkcs1v15Recovery => {
+                Some(crate::xmlenc::KeyTransportAlgorithm::RsaPkcs1v15.uri())
+            }
             Self::Kdf(parameters) => Some(parameters.algorithm),
             Self::Random => None,
         }
@@ -219,10 +287,14 @@ pub enum X509SignatureAlgorithm {
 
 #[cfg(feature = "xmldsig")]
 impl X509SignatureAlgorithm {
-    /// Return the standard AlgorithmIdentifier OID used for capability queries.
+    /// Return the assigned AlgorithmIdentifier OID, or `None` for unsupported combinations.
     #[must_use]
-    pub const fn oid(self) -> &'static str {
-        match self {
+    pub const fn oid(self) -> Option<&'static str> {
+        Some(match self {
+            #[cfg(feature = "legacy-algorithms")]
+            Self::Dsa(DigestAlgorithm::Md5 | DigestAlgorithm::Ripemd160)
+            | Self::RsaPkcs1v15(DigestAlgorithm::Md5 | DigestAlgorithm::Ripemd160)
+            | Self::Ecdsa(DigestAlgorithm::Md5 | DigestAlgorithm::Ripemd160) => return None,
             Self::Dsa(DigestAlgorithm::Sha1) => "1.2.840.10040.4.3",
             Self::Dsa(DigestAlgorithm::Sha224) => "2.16.840.1.101.3.4.3.1",
             Self::Dsa(DigestAlgorithm::Sha256) => "2.16.840.1.101.3.4.3.2",
@@ -254,7 +326,7 @@ impl X509SignatureAlgorithm {
             Self::Ed25519 => "1.3.101.112",
             Self::Ed448 => "1.3.101.113",
             Self::PostQuantum(algorithm) => algorithm.oid(),
-        }
+        })
     }
 }
 
@@ -352,6 +424,22 @@ pub enum ProviderError {
 /// and output framing; it cannot recover a backend-specific key object.
 #[cfg(feature = "xmlenc")]
 pub trait KeyTransportKey: Send + Sync {
+    /// Execute historical transport; unsupported opaque handles never fall back.
+    #[cfg(feature = "legacy-algorithms")]
+    fn transport_pkcs1v15(
+        &self,
+        _provider: &dyn CryptoProvider,
+        _plaintext: &[u8],
+    ) -> Result<Vec<u8>, ProviderError> {
+        Err(ProviderError::Unsupported {
+            operation: ProviderOperation::KeyTransport,
+            algorithm: Some(
+                crate::xmlenc::KeyTransportAlgorithm::RsaPkcs1v15
+                    .uri()
+                    .into(),
+            ),
+        })
+    }
     /// RSA modulus bytes without redundant leading zero octets.
     ///
     /// These components must identify the exact key used by
@@ -377,6 +465,23 @@ pub trait KeyTransportKey: Send + Sync {
 /// public metadata required to reject malformed RSA inputs before dispatch.
 #[cfg(feature = "xmlenc")]
 pub trait KeyRecoveryKey: Send + Sync {
+    /// Recover a content key of the caller's already validated algorithm width.
+    #[cfg(feature = "legacy-algorithms")]
+    fn recover_pkcs1v15(
+        &self,
+        _provider: &dyn CryptoProvider,
+        _ciphertext: &[u8],
+        _key_len: usize,
+    ) -> Result<RecoveredContentKey, ProviderError> {
+        Err(ProviderError::Unsupported {
+            operation: ProviderOperation::KeyRecovery,
+            algorithm: Some(
+                crate::xmlenc::KeyTransportAlgorithm::RsaPkcs1v15
+                    .uri()
+                    .into(),
+            ),
+        })
+    }
     /// Native engine binding; an incompatible provider must reject this handle.
     fn provider_name(&self) -> Option<&'static str> {
         None
@@ -534,7 +639,7 @@ pub trait CryptoProvider: Send + Sync {
         let _ = (signed_data, signature, issuer_spki_der);
         Err(ProviderError::Unsupported {
             operation: ProviderOperation::VerifyCertificate,
-            algorithm: Some(algorithm.oid().to_owned()),
+            algorithm: algorithm.oid().map(str::to_owned),
         })
     }
 
@@ -595,6 +700,41 @@ pub trait CryptoProvider: Send + Sync {
         parameters: &RsaOaepParameters,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, ProviderError>;
+
+    /// Transport using RSAES-PKCS1-v1_5; not an OAEP configuration.
+    #[cfg(all(feature = "xmlenc", feature = "legacy-algorithms"))]
+    fn transport_pkcs1v15(
+        &self,
+        _key: &dyn KeyTransportKey,
+        _plaintext: &[u8],
+    ) -> Result<Vec<u8>, ProviderError> {
+        Err(ProviderError::Unsupported {
+            operation: ProviderOperation::KeyTransport,
+            algorithm: Some(
+                crate::xmlenc::KeyTransportAlgorithm::RsaPkcs1v15
+                    .uri()
+                    .into(),
+            ),
+        })
+    }
+
+    /// Recover a fixed-width content key without exposing padding validity.
+    #[cfg(all(feature = "xmlenc", feature = "legacy-algorithms"))]
+    fn recover_pkcs1v15(
+        &self,
+        _key: &dyn KeyRecoveryKey,
+        _ciphertext: &[u8],
+        _key_len: usize,
+    ) -> Result<RecoveredContentKey, ProviderError> {
+        Err(ProviderError::Unsupported {
+            operation: ProviderOperation::KeyRecovery,
+            algorithm: Some(
+                crate::xmlenc::KeyTransportAlgorithm::RsaPkcs1v15
+                    .uri()
+                    .into(),
+            ),
+        })
+    }
 
     /// Perform key agreement with an opaque provider-owned private key.
     fn agree_key(
@@ -668,6 +808,14 @@ impl From<rsa::RsaPublicKey> for RustCryptoRsaPublicKey {
 
 #[cfg(feature = "xmlenc")]
 impl KeyTransportKey for RustCryptoRsaPublicKey {
+    #[cfg(feature = "legacy-algorithms")]
+    fn transport_pkcs1v15(
+        &self,
+        provider: &dyn CryptoProvider,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, ProviderError> {
+        rustcrypto::transport_pkcs1v15(provider, &self.key, plaintext)
+    }
     fn rsa_modulus(&self) -> Cow<'_, [u8]> {
         Cow::Borrowed(&self.modulus)
     }
@@ -688,6 +836,14 @@ impl KeyTransportKey for RustCryptoRsaPublicKey {
 
 #[cfg(feature = "xmlenc")]
 impl KeyTransportKey for rsa::RsaPublicKey {
+    #[cfg(feature = "legacy-algorithms")]
+    fn transport_pkcs1v15(
+        &self,
+        provider: &dyn CryptoProvider,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, ProviderError> {
+        rustcrypto::transport_pkcs1v15(provider, self, plaintext)
+    }
     fn rsa_modulus(&self) -> Cow<'_, [u8]> {
         use rsa::traits::PublicKeyParts as _;
         Cow::Owned(self.n().to_be_bytes_trimmed_vartime().into_vec())
@@ -739,6 +895,15 @@ impl From<rsa::RsaPrivateKey> for RustCryptoRsaPrivateKey {
 
 #[cfg(feature = "xmlenc")]
 impl KeyRecoveryKey for RustCryptoRsaPrivateKey {
+    #[cfg(feature = "legacy-algorithms")]
+    fn recover_pkcs1v15(
+        &self,
+        provider: &dyn CryptoProvider,
+        ciphertext: &[u8],
+        key_len: usize,
+    ) -> Result<RecoveredContentKey, ProviderError> {
+        rsa_pkcs1v15::recover(provider, &self.key, ciphertext, key_len)
+    }
     fn rsa_modulus_bits(&self) -> usize {
         KeyRecoveryKey::rsa_modulus_bits(&self.key)
     }
@@ -761,6 +926,15 @@ impl KeyRecoveryKey for RustCryptoRsaPrivateKey {
 
 #[cfg(feature = "xmlenc")]
 impl KeyRecoveryKey for rsa::RsaPrivateKey {
+    #[cfg(feature = "legacy-algorithms")]
+    fn recover_pkcs1v15(
+        &self,
+        provider: &dyn CryptoProvider,
+        ciphertext: &[u8],
+        key_len: usize,
+    ) -> Result<RecoveredContentKey, ProviderError> {
+        rsa_pkcs1v15::recover(provider, self, ciphertext, key_len)
+    }
     fn rsa_modulus_bits(&self) -> usize {
         use rsa::traits::PublicKeyParts as _;
         self.n().bits_vartime() as usize
@@ -834,6 +1008,26 @@ impl TryRng for ProviderRng<'_> {
 impl TryCryptoRng for ProviderRng<'_> {}
 
 impl CryptoProvider for RustCryptoProvider {
+    #[cfg(all(feature = "xmlenc", feature = "legacy-algorithms"))]
+    fn transport_pkcs1v15(
+        &self,
+        key: &dyn KeyTransportKey,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, ProviderError> {
+        self.require_capability(ProviderCapability::Pkcs1v15Transport)?;
+        key.transport_pkcs1v15(self, plaintext)
+    }
+
+    #[cfg(all(feature = "xmlenc", feature = "legacy-algorithms"))]
+    fn recover_pkcs1v15(
+        &self,
+        key: &dyn KeyRecoveryKey,
+        ciphertext: &[u8],
+        key_len: usize,
+    ) -> Result<RecoveredContentKey, ProviderError> {
+        self.require_capability(ProviderCapability::Pkcs1v15Recovery)?;
+        key.recover_pkcs1v15(self, ciphertext, key_len)
+    }
     fn name(&self) -> &'static str {
         "rustcrypto"
     }
@@ -867,19 +1061,9 @@ impl CryptoProvider for RustCryptoProvider {
             A::Ed25519 | A::Ed25519Ctx | A::Ed25519Ph | A::Ed448 | A::Ed448Ph => {
                 Box::new(EdDsaSigningKey::from_pkcs8_der(algorithm, der)?)
             }
-            A::RsaSha1 | A::RsaSha224 | A::RsaSha256 | A::RsaSha384 | A::RsaSha512 => {
-                Box::new(RsaSigningKey::from_pkcs8_der(der)?)
-            }
+            method if method.is_rsa() => Box::new(RsaSigningKey::from_pkcs8_der(der)?),
             A::DsaSha1 | A::DsaSha256 => Box::new(DsaSigningKey::from_pkcs8_der(der)?),
-            A::EcdsaSha1
-            | A::EcdsaSha224
-            | A::EcdsaSha256
-            | A::EcdsaSha384
-            | A::EcdsaSha512
-            | A::EcdsaSha3_224
-            | A::EcdsaSha3_256
-            | A::EcdsaSha3_384
-            | A::EcdsaSha3_512 => {
+            method if method.ecdsa_digest().is_some() => {
                 if let Ok(key) = EcdsaP256SigningKey::from_pkcs8_der(der) {
                     Box::new(key)
                 } else if let Ok(key) = EcdsaP384SigningKey::from_pkcs8_der(der) {
@@ -919,6 +1103,8 @@ impl CryptoProvider for RustCryptoProvider {
             ProviderCapability::KeyWrap(_) | ProviderCapability::KeyUnwrap(_) => true,
             #[cfg(feature = "xmlenc")]
             ProviderCapability::KeyTransport(_) | ProviderCapability::KeyRecovery(_) => true,
+            #[cfg(all(feature = "xmlenc", feature = "legacy-algorithms"))]
+            ProviderCapability::Pkcs1v15Transport | ProviderCapability::Pkcs1v15Recovery => true,
             ProviderCapability::Random => true,
             ProviderCapability::KeyAgreement(_) | ProviderCapability::Kdf(_) => false,
         }
@@ -948,6 +1134,10 @@ impl CryptoProvider for RustCryptoProvider {
         use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
         use sha3::{Sha3_224, Sha3_256, Sha3_384, Sha3_512};
         Ok(match algorithm {
+            #[cfg(feature = "legacy-algorithms")]
+            DigestAlgorithm::Md5 => md5::Md5::digest(data).to_vec(),
+            #[cfg(feature = "legacy-algorithms")]
+            DigestAlgorithm::Ripemd160 => ripemd::Ripemd160::digest(data).to_vec(),
             DigestAlgorithm::Sha1 => Sha1::digest(data).to_vec(),
             DigestAlgorithm::Sha224 => Sha224::digest(data).to_vec(),
             DigestAlgorithm::Sha256 => Sha256::digest(data).to_vec(),
@@ -1046,7 +1236,7 @@ impl CryptoProvider for RustCryptoProvider {
         kek: &[u8],
         key: &[u8],
     ) -> Result<Vec<u8>, ProviderError> {
-        rustcrypto::wrap_key(algorithm, kek, key)
+        rustcrypto::wrap_key(self, algorithm, kek, key)
     }
 
     #[cfg(feature = "xmlenc")]
@@ -1088,7 +1278,7 @@ fn is_supported_x509_signature(algorithm: X509SignatureAlgorithm) -> bool {
         X509SignatureAlgorithm::Dsa(DigestAlgorithm::Sha1)
         | X509SignatureAlgorithm::Ed25519
         | X509SignatureAlgorithm::Ed448 => true,
-        X509SignatureAlgorithm::Ecdsa(_) => true,
+        X509SignatureAlgorithm::Ecdsa(digest) => rustcrypto_x509::ecdsa_algorithm(digest).is_some(),
         X509SignatureAlgorithm::PostQuantum(_) => cfg!(feature = "experimental-pq"),
         X509SignatureAlgorithm::RsaPkcs1v15(digest) => matches!(
             digest,
@@ -1381,8 +1571,10 @@ mod rustcrypto_x509 {
         }
     }
 
-    const fn ecdsa_algorithm(digest: DigestAlgorithm) -> Option<SignatureAlgorithm> {
+    pub(super) const fn ecdsa_algorithm(digest: DigestAlgorithm) -> Option<SignatureAlgorithm> {
         match digest {
+            #[cfg(feature = "legacy-algorithms")]
+            DigestAlgorithm::Md5 | DigestAlgorithm::Ripemd160 => None,
             DigestAlgorithm::Sha1 => Some(SignatureAlgorithm::EcdsaSha1),
             DigestAlgorithm::Sha224 => Some(SignatureAlgorithm::EcdsaSha224),
             DigestAlgorithm::Sha256 => Some(SignatureAlgorithm::EcdsaSha256),
@@ -1398,13 +1590,15 @@ mod rustcrypto_x509 {
     fn unsupported<T>(algorithm: X509SignatureAlgorithm) -> Result<T, ProviderError> {
         Err(ProviderError::Unsupported {
             operation: super::ProviderOperation::VerifyCertificate,
-            algorithm: Some(algorithm.oid().to_owned()),
+            algorithm: algorithm.oid().map(str::to_owned),
         })
     }
 }
 
 #[cfg(feature = "xmlenc")]
 mod rustcrypto {
+    #[cfg(feature = "legacy-algorithms")]
+    use aes::Aes192;
     use aes::{
         Aes128, Aes256,
         cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit, block_padding::NoPadding},
@@ -1415,6 +1609,8 @@ mod rustcrypto {
     };
     use aes_kw::{KwAes128, KwAes256};
     use cbc::{Decryptor, Encryptor};
+    #[cfg(feature = "legacy-algorithms")]
+    use des::TdesEde3;
     use rsa::{Oaep, traits::PaddingScheme};
     use sha1::Sha1;
     use sha2::{Sha256, Sha384, Sha512};
@@ -1432,6 +1628,16 @@ mod rustcrypto {
     ) -> Result<Vec<u8>, ProviderError> {
         check_key(algorithm.key_len(), key)?;
         match algorithm {
+            #[cfg(feature = "legacy-algorithms")]
+            DataEncryptionAlgorithm::TripleDesCbc => {
+                encrypt_cbc::<TdesEde3>(provider, key, plaintext)
+            }
+            #[cfg(feature = "legacy-algorithms")]
+            DataEncryptionAlgorithm::Aes192Cbc => encrypt_cbc::<Aes192>(provider, key, plaintext),
+            #[cfg(feature = "legacy-algorithms")]
+            DataEncryptionAlgorithm::Aes192Gcm => encrypt_gcm::<
+                aes_gcm::AesGcm<Aes192, aes_gcm::aead::consts::U12>,
+            >(provider, key, plaintext),
             DataEncryptionAlgorithm::Aes128Cbc => encrypt_cbc::<Aes128>(provider, key, plaintext),
             DataEncryptionAlgorithm::Aes256Cbc => encrypt_cbc::<Aes256>(provider, key, plaintext),
             DataEncryptionAlgorithm::Aes128Gcm => {
@@ -1450,6 +1656,14 @@ mod rustcrypto {
     ) -> Result<Vec<u8>, ProviderError> {
         check_key(algorithm.key_len(), key)?;
         match algorithm {
+            #[cfg(feature = "legacy-algorithms")]
+            DataEncryptionAlgorithm::TripleDesCbc => decrypt_cbc::<TdesEde3>(key, ciphertext),
+            #[cfg(feature = "legacy-algorithms")]
+            DataEncryptionAlgorithm::Aes192Cbc => decrypt_cbc::<Aes192>(key, ciphertext),
+            #[cfg(feature = "legacy-algorithms")]
+            DataEncryptionAlgorithm::Aes192Gcm => {
+                decrypt_gcm::<aes_gcm::AesGcm<Aes192, aes_gcm::aead::consts::U12>>(key, ciphertext)
+            }
             DataEncryptionAlgorithm::Aes128Cbc => decrypt_cbc::<Aes128>(key, ciphertext),
             DataEncryptionAlgorithm::Aes256Cbc => decrypt_cbc::<Aes256>(key, ciphertext),
             DataEncryptionAlgorithm::Aes128Gcm => decrypt_gcm::<Aes128Gcm>(key, ciphertext),
@@ -1476,43 +1690,49 @@ mod rustcrypto {
     where
         C: aes::cipher::BlockCipherEncrypt + aes::cipher::KeyInit,
     {
-        let mut iv = [0_u8; 16];
-        provider.fill_random(&mut iv)?;
-        let pad_len = 16 - (plaintext.len() % 16);
-        let mut padded = vec![0_u8; plaintext.len() + pad_len];
+        let block = C::block_size();
+        let pad_len = block - (plaintext.len() % block);
+        let length = plaintext
+            .len()
+            .checked_add(pad_len)
+            .and_then(|len| len.checked_add(block))
+            .ok_or(ProviderError::InvalidInput(
+                ProviderInputError::AesCbcFraming,
+            ))?;
+        let mut output = zeroize::Zeroizing::new(vec![0_u8; length]);
+        let (iv, padded) = output.split_at_mut(block);
+        provider.fill_random(iv)?;
         padded[..plaintext.len()].copy_from_slice(plaintext);
         if pad_len > 1 {
             let last = padded.len() - 1;
             provider.fill_random(&mut padded[plaintext.len()..last])?;
         }
         *padded.last_mut().expect("padding is non-empty") = pad_len as u8;
-        Encryptor::<C>::new_from_slices(key, &iv)
+        Encryptor::<C>::new_from_slices(key, iv)
             .map_err(|_| {
                 ProviderError::InvalidInput(ProviderInputError::PrimitiveInitialization("AES-CBC"))
             })?
-            .encrypt_padded::<NoPadding>(&mut padded, plaintext.len() + pad_len)
+            .encrypt_padded::<NoPadding>(padded, plaintext.len() + pad_len)
             .map_err(|_| {
                 ProviderError::InvalidInput(ProviderInputError::PrimitiveInitialization(
                     "AES-CBC padding",
                 ))
             })?;
-        let mut output = Vec::with_capacity(16 + padded.len());
-        output.extend_from_slice(&iv);
-        output.extend_from_slice(&padded);
-        Ok(output)
+        Ok(core::mem::take(&mut *output))
     }
 
     fn decrypt_cbc<C>(key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, ProviderError>
     where
         C: aes::cipher::BlockCipherDecrypt + aes::cipher::KeyInit,
     {
-        if ciphertext.len() < 32 || !(ciphertext.len() - 16).is_multiple_of(16) {
+        let block = C::block_size();
+        if ciphertext.len() < 2 * block || !(ciphertext.len() - block).is_multiple_of(block) {
             return Err(ProviderError::InvalidInput(
                 ProviderInputError::AesCbcFraming,
             ));
         }
-        let (iv, body) = ciphertext.split_at(16);
-        let mut plaintext = body.to_vec();
+        let (iv, body) = ciphertext.split_at(block);
+        let mut plaintext = zeroize::Zeroizing::new(body.to_vec());
         Decryptor::<C>::new_from_slices(key, iv)
             .map_err(|_| {
                 ProviderError::InvalidInput(ProviderInputError::PrimitiveInitialization("AES-CBC"))
@@ -1523,13 +1743,14 @@ mod rustcrypto {
             ProviderInputError::AesCbcCiphertext,
         ))?;
         let padding_bytes = usize::from(pad_len);
-        if !(1..=16).contains(&padding_bytes) || padding_bytes > plaintext.len() {
+        if !(1..=block).contains(&padding_bytes) || padding_bytes > plaintext.len() {
             return Err(ProviderError::InvalidInput(
                 ProviderInputError::AesCbcCiphertext,
             ));
         }
-        plaintext.truncate(plaintext.len() - padding_bytes);
-        Ok(plaintext)
+        let length = plaintext.len() - padding_bytes;
+        plaintext.truncate(length);
+        Ok(core::mem::take(&mut *plaintext))
     }
 
     fn encrypt_gcm<C>(
@@ -1545,19 +1766,27 @@ mod rustcrypto {
         let cipher = C::new_from_slice(key).map_err(|_| {
             ProviderError::InvalidInput(ProviderInputError::PrimitiveInitialization("AES-GCM"))
         })?;
-        let mut output = plaintext.to_vec();
+        let length = plaintext
+            .len()
+            .checked_add(28)
+            .ok_or(ProviderError::InvalidInput(
+                ProviderInputError::PrimitiveInitialization("AES-GCM length"),
+            ))?;
+        // Encrypt directly in the final nonce-prefixed allocation rather than
+        // copying an intermediate ciphertext into another document-sized Vec.
+        let mut output = zeroize::Zeroizing::new(Vec::with_capacity(length));
+        output.extend_from_slice(&nonce);
+        output.extend_from_slice(plaintext);
         let nonce = Nonce::try_from(nonce.as_slice()).map_err(|_| {
             ProviderError::InvalidInput(ProviderInputError::PrimitiveInitialization(
                 "AES-GCM nonce",
             ))
         })?;
-        cipher
-            .encrypt_in_place(&nonce, &[], &mut output)
+        let tag = cipher
+            .encrypt_inout_detached(&nonce, &[], output[12..].as_mut().into())
             .map_err(|_| ProviderError::AuthenticationFailed)?;
-        let mut framed = Vec::with_capacity(12 + output.len());
-        framed.extend_from_slice(&nonce);
-        framed.extend_from_slice(&output);
-        Ok(framed)
+        output.extend_from_slice(&tag);
+        Ok(core::mem::take(&mut *output))
     }
 
     fn decrypt_gcm<C>(key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, ProviderError>
@@ -1573,26 +1802,57 @@ mod rustcrypto {
         let cipher = C::new_from_slice(key).map_err(|_| {
             ProviderError::InvalidInput(ProviderInputError::PrimitiveInitialization("AES-GCM"))
         })?;
-        let mut plaintext = body.to_vec();
+        let mut plaintext = zeroize::Zeroizing::new(body.to_vec());
         let nonce = Nonce::try_from(nonce).map_err(|_| {
             ProviderError::InvalidInput(ProviderInputError::PrimitiveInitialization(
                 "AES-GCM nonce",
             ))
         })?;
         cipher
-            .decrypt_in_place(&nonce, &[], &mut plaintext)
+            .decrypt_in_place(&nonce, &[], &mut *plaintext)
             .map_err(|_| ProviderError::AuthenticationFailed)?;
-        Ok(plaintext)
+        Ok(core::mem::take(&mut *plaintext))
     }
 
     pub(super) fn wrap_key(
+        provider: &dyn CryptoProvider,
         algorithm: KeyWrapAlgorithm,
         kek: &[u8],
         key: &[u8],
     ) -> Result<Vec<u8>, ProviderError> {
         check_key(algorithm.key_len(), kek)?;
-        let mut output = vec![0_u8; key.len() + 8];
+        #[cfg(feature = "legacy-algorithms")]
+        if algorithm == KeyWrapAlgorithm::TripleDes {
+            return wrap_des3(provider, kek, key);
+        }
+        #[cfg(not(feature = "legacy-algorithms"))]
+        let _ = provider;
+        // RFC 3394 §2.2.1 requires at least two 64-bit plaintext blocks.
+        // Reject before allocating: the primitive also accepts the one-block
+        // degenerate case, which is not this XML Encryption algorithm.
+        // https://www.rfc-editor.org/rfc/rfc3394.html#section-2.2.1
+        if key.len() < 16 || !key.len().is_multiple_of(8) {
+            return Err(ProviderError::InvalidInput(
+                ProviderInputError::AesKeyWrapFraming,
+            ));
+        }
+        let length =
+            key.len()
+                .checked_add(algorithm.overhead())
+                .ok_or(ProviderError::InvalidInput(
+                    ProviderInputError::AesKeyWrapFraming,
+                ))?;
+        let mut output = vec![0_u8; length];
         match algorithm {
+            #[cfg(feature = "legacy-algorithms")]
+            KeyWrapAlgorithm::AesKw192 => aes_kw::KwAes192::new_from_slice(kek)
+                .map_err(|_| ProviderError::InvalidKeySize {
+                    expected: 24,
+                    actual: kek.len(),
+                })?
+                .wrap_key(key, &mut output),
+            #[cfg(feature = "legacy-algorithms")]
+            KeyWrapAlgorithm::TripleDes => unreachable!("CMS wrapping dispatched before AES"),
             KeyWrapAlgorithm::AesKw128 => KwAes128::new_from_slice(kek)
                 .map_err(|_| ProviderError::InvalidKeySize {
                     expected: 16,
@@ -1616,13 +1876,26 @@ mod rustcrypto {
         wrapped: &[u8],
     ) -> Result<Vec<u8>, ProviderError> {
         check_key(algorithm.key_len(), kek)?;
-        if wrapped.len() < 16 || !wrapped.len().is_multiple_of(8) {
+        #[cfg(feature = "legacy-algorithms")]
+        if algorithm == KeyWrapAlgorithm::TripleDes {
+            return unwrap_des3(kek, wrapped);
+        }
+        if wrapped.len() < 24 || !wrapped.len().is_multiple_of(8) {
             return Err(ProviderError::InvalidInput(
                 ProviderInputError::AesKeyWrapFraming,
             ));
         }
-        let mut output = vec![0_u8; wrapped.len() - 8];
-        let key = match algorithm {
+        let mut output = zeroize::Zeroizing::new(vec![0_u8; wrapped.len() - 8]);
+        match algorithm {
+            #[cfg(feature = "legacy-algorithms")]
+            KeyWrapAlgorithm::AesKw192 => aes_kw::KwAes192::new_from_slice(kek)
+                .map_err(|_| ProviderError::InvalidKeySize {
+                    expected: 24,
+                    actual: kek.len(),
+                })?
+                .unwrap_key(wrapped, &mut output),
+            #[cfg(feature = "legacy-algorithms")]
+            KeyWrapAlgorithm::TripleDes => unreachable!("CMS unwrapping dispatched before AES"),
             KeyWrapAlgorithm::AesKw128 => KwAes128::new_from_slice(kek)
                 .map_err(|_| ProviderError::InvalidKeySize {
                     expected: 16,
@@ -1637,7 +1910,94 @@ mod rustcrypto {
                 .unwrap_key(wrapped, &mut output),
         }
         .map_err(|_| ProviderError::AuthenticationFailed)?;
-        Ok(key.to_vec())
+        Ok(core::mem::take(&mut *output))
+    }
+
+    #[cfg(feature = "legacy-algorithms")]
+    const CMS_IV: [u8; 8] = [0x4a, 0xdd, 0xa2, 0x2c, 0x79, 0xe8, 0x21, 0x05];
+
+    #[cfg(feature = "legacy-algorithms")]
+    fn wrap_des3(
+        provider: &dyn CryptoProvider,
+        kek: &[u8],
+        key: &[u8],
+    ) -> Result<Vec<u8>, ProviderError> {
+        use sha1::Digest as _;
+        // XMLEnc 1.1 §5.7.1 permits other key types in addition to RFC 3217's
+        // DES CEK. Preserve opaque key octets (especially AES); generated DES
+        // content keys are normalized to odd parity at their generation boundary.
+        // https://www.w3.org/TR/xmlenc-core1/#sec-CMS-3DES
+        if key.len() < 16 || !key.len().is_multiple_of(8) {
+            return Err(ProviderError::InvalidInput(
+                ProviderInputError::AesKeyWrapFraming,
+            ));
+        }
+        let length = key
+            .len()
+            .checked_add(16)
+            .ok_or(ProviderError::InvalidInput(
+                ProviderInputError::AesKeyWrapFraming,
+            ))?;
+        let mut output = zeroize::Zeroizing::new(vec![0; length]);
+        provider.fill_random(&mut output[..8])?;
+        output[8..8 + key.len()].copy_from_slice(key);
+        output[8 + key.len()..].copy_from_slice(&Sha1::digest(key)[..8]);
+        let (iv, body) = output.split_at_mut(8);
+        let body_len = body.len();
+        Encryptor::<TdesEde3>::new_from_slices(kek, iv)
+            .map_err(|_| ProviderError::AuthenticationFailed)?
+            .encrypt_padded::<NoPadding>(body, body_len)
+            .map_err(|_| ProviderError::AuthenticationFailed)?;
+        output.reverse();
+        Encryptor::<TdesEde3>::new_from_slices(kek, &CMS_IV)
+            .map_err(|_| ProviderError::AuthenticationFailed)?
+            .encrypt_padded::<NoPadding>(&mut output, length)
+            .map_err(|_| ProviderError::AuthenticationFailed)?;
+        Ok(core::mem::take(&mut *output))
+    }
+
+    #[cfg(feature = "legacy-algorithms")]
+    fn unwrap_des3(kek: &[u8], wrapped: &[u8]) -> Result<Vec<u8>, ProviderError> {
+        use sha1::Digest as _;
+        use subtle::ConstantTimeEq as _;
+        // RFC 3217 §3.2: undo the outer CBC, octet reversal and inner CBC,
+        // then authenticate the checksum before exposing any recovered bytes.
+        // https://www.rfc-editor.org/rfc/rfc3217#section-3.2
+        if wrapped.len() < 32 || !wrapped.len().is_multiple_of(8) {
+            return Err(ProviderError::InvalidInput(
+                ProviderInputError::AesKeyWrapFraming,
+            ));
+        }
+        let mut output = zeroize::Zeroizing::new(wrapped.to_vec());
+        Decryptor::<TdesEde3>::new_from_slices(kek, &CMS_IV)
+            .map_err(|_| ProviderError::AuthenticationFailed)?
+            .decrypt_padded::<NoPadding>(&mut output)
+            .map_err(|_| ProviderError::AuthenticationFailed)?;
+        output.reverse();
+        let (iv, body) = output.split_at_mut(8);
+        Decryptor::<TdesEde3>::new_from_slices(kek, iv)
+            .map_err(|_| ProviderError::AuthenticationFailed)?
+            .decrypt_padded::<NoPadding>(body)
+            .map_err(|_| ProviderError::AuthenticationFailed)?;
+        let key_len = body.len() - 8;
+        if !bool::from(Sha1::digest(&body[..key_len])[..8].ct_eq(&body[key_len..])) {
+            return Err(ProviderError::AuthenticationFailed);
+        }
+        output.copy_within(8..8 + key_len, 0);
+        zeroize::Zeroize::zeroize(&mut output[key_len..]);
+        output.truncate(key_len);
+        Ok(core::mem::take(&mut *output))
+    }
+
+    #[cfg(feature = "legacy-algorithms")]
+    pub(super) fn transport_pkcs1v15(
+        provider: &dyn CryptoProvider,
+        key: &rsa::RsaPublicKey,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, ProviderError> {
+        rsa::Pkcs1v15Encrypt
+            .encrypt(&mut super::ProviderRng(provider), key, plaintext)
+            .map_err(map_rsa_error)
     }
 
     pub(super) fn transport_key(
@@ -1646,6 +2006,11 @@ mod rustcrypto {
         parameters: &RsaOaepParameters,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, ProviderError> {
+        if parameters.algorithm.requires_explicit_permission() {
+            return Err(ProviderError::InvalidInput(
+                ProviderInputError::PrimitiveInitialization("RSA-OAEP algorithm"),
+            ));
+        }
         let mut rng = super::ProviderRng(provider);
         macro_rules! encrypt_with {
             ($digest:ty, $mgf:ty) => {
@@ -1712,6 +2077,11 @@ mod rustcrypto {
         parameters: &RsaOaepParameters,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, ProviderError> {
+        if parameters.algorithm.requires_explicit_permission() {
+            return Err(ProviderError::InvalidInput(
+                ProviderInputError::PrimitiveInitialization("RSA-OAEP algorithm"),
+            ));
+        }
         let mut rng = super::ProviderRng(provider);
         macro_rules! decrypt_with {
             ($digest:ty, $mgf:ty) => {
@@ -1772,9 +2142,9 @@ mod rustcrypto {
         result.map_err(map_rsa_error)
     }
 
-    fn map_rsa_error(error: rsa::Error) -> ProviderError {
+    pub(super) fn map_rsa_error(error: rsa::Error) -> ProviderError {
         match error {
-            rsa::Error::Rng => ProviderError::Random("RSA-OAEP randomness failed".into()),
+            rsa::Error::Rng => ProviderError::Random("RSA randomness failed".into()),
             _ => ProviderError::AuthenticationFailed,
         }
     }
@@ -1787,6 +2157,154 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+
+    #[cfg(all(feature = "legacy-algorithms", feature = "xmlenc"))]
+    #[test]
+    fn legacy_ciphers_cover_empty_and_block_boundary_plaintexts() {
+        // Each cipher's own framing, including DES's 8-byte blocks, must agree
+        // with the public size preflight for empty and non-aligned messages.
+        for algorithm in [
+            DataEncryptionAlgorithm::TripleDesCbc,
+            DataEncryptionAlgorithm::Aes192Cbc,
+            DataEncryptionAlgorithm::Aes192Gcm,
+        ] {
+            let key = [0x31; 24];
+            for length in [0, 1, 7, 8, 15, 16, 17, 31, 32, 33] {
+                let plaintext = vec![0x41; length];
+                let ciphertext = RUST_CRYPTO_PROVIDER
+                    .encrypt_data(algorithm, &key, &plaintext)
+                    .expect("valid legacy encryption must succeed");
+                assert_eq!(
+                    Some(ciphertext.len()),
+                    algorithm.ciphertext_len_for_plaintext(length)
+                );
+                assert_eq!(
+                    RUST_CRYPTO_PROVIDER
+                        .decrypt_data(algorithm, &key, &ciphertext)
+                        .expect("matching legacy key must recover plaintext"),
+                    plaintext
+                );
+                assert!(
+                    RUST_CRYPTO_PROVIDER
+                        .encrypt_data(algorithm, &key[..23], &plaintext)
+                        .is_err()
+                );
+                assert!(
+                    RUST_CRYPTO_PROVIDER
+                        .decrypt_data(algorithm, &key[..23], &ciphertext)
+                        .is_err()
+                );
+                assert!(
+                    RUST_CRYPTO_PROVIDER
+                        .decrypt_data(algorithm, &key, &ciphertext[..ciphertext.len() - 1])
+                        .is_err()
+                );
+                if algorithm == DataEncryptionAlgorithm::Aes192Gcm {
+                    let mut corrupted = ciphertext;
+                    corrupted[12] ^= 1;
+                    assert!(matches!(
+                        RUST_CRYPTO_PROVIDER.decrypt_data(algorithm, &key, &corrupted),
+                        Err(ProviderError::AuthenticationFailed)
+                    ));
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "legacy-algorithms", feature = "xmlenc"))]
+    #[test]
+    fn cms_triple_des_unwrap_matches_rfc3217_vector() {
+        // RFC 3217 §3.4 independently validates both CBC passes and reversal;
+        // a round-trip alone could hide matching errors in wrap and unwrap.
+        // https://www.rfc-editor.org/rfc/rfc3217.html#section-3.4
+        let kek = hex_literal::hex!("255e0d1c07b646dfb3134cc843ba8aa71f025b7c0838251f");
+        let key = hex_literal::hex!("2923bf85e06dd6ae529149f1f1bae9eab3a7da3d860d3e98");
+        let wrapped = hex_literal::hex!(
+            "690107618ef092b3b48ca1796b234ae9fa33ebb4159604037db5d6a84eb3aac2768c632775a467d4"
+        );
+        assert_eq!(
+            RUST_CRYPTO_PROVIDER
+                .unwrap_key(KeyWrapAlgorithm::TripleDes, &kek, &wrapped)
+                .expect("RFC 3217 vector must authenticate"),
+            key
+        );
+        for offset in 0..wrapped.len() {
+            let mut corrupted = wrapped;
+            corrupted[offset] ^= 1;
+            assert!(matches!(
+                RUST_CRYPTO_PROVIDER.unwrap_key(KeyWrapAlgorithm::TripleDes, &kek, &corrupted),
+                Err(ProviderError::AuthenticationFailed)
+            ));
+        }
+    }
+
+    #[cfg(all(feature = "legacy-algorithms", feature = "xmlenc"))]
+    #[test]
+    fn legacy_wrap_preserves_opaque_key_bytes_and_checks_integrity() {
+        // XMLEnc permits wrapping non-DES keys; parity normalization must not
+        // corrupt opaque AES key octets. Each algorithm has its own overhead.
+        for algorithm in [KeyWrapAlgorithm::AesKw192, KeyWrapAlgorithm::TripleDes] {
+            let kek = [0x37; 24];
+            for length in [16, 24, 32] {
+                let key: Vec<_> = (0..length).map(|byte| byte as u8).collect();
+                let mut wrapped = RUST_CRYPTO_PROVIDER
+                    .wrap_key(algorithm, &kek, &key)
+                    .expect("valid content key must wrap");
+                assert_eq!(wrapped.len(), key.len() + algorithm.overhead());
+                assert_eq!(
+                    RUST_CRYPTO_PROVIDER
+                        .unwrap_key(algorithm, &kek, &wrapped)
+                        .expect("matching KEK must recover exact key octets"),
+                    key
+                );
+                assert!(
+                    RUST_CRYPTO_PROVIDER
+                        .unwrap_key(algorithm, &[0x38; 24], &wrapped)
+                        .is_err()
+                );
+                wrapped[0] ^= 1;
+                assert!(
+                    RUST_CRYPTO_PROVIDER
+                        .unwrap_key(algorithm, &kek, &wrapped)
+                        .is_err()
+                );
+            }
+            for length in [0, 1, 8, 15, 17] {
+                assert!(
+                    RUST_CRYPTO_PROVIDER
+                        .wrap_key(algorithm, &kek, &vec![0; length])
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[cfg(all(feature = "legacy-algorithms", feature = "xmldsig"))]
+    #[test]
+    fn legacy_digests_match_known_answers() {
+        // Published empty/abc answers prevent URI wiring from silently choosing
+        // a different hash with the same output width.
+        for (algorithm, expected) in [
+            (
+                DigestAlgorithm::Md5,
+                &hex_literal::hex!("900150983cd24fb0d6963f7d28e17f72")[..],
+            ),
+            (
+                DigestAlgorithm::Ripemd160,
+                &hex_literal::hex!("8eb208f7e05d987a9b044a8e98c6b087f15a0bfc")[..],
+            ),
+        ] {
+            assert_eq!(
+                RUST_CRYPTO_PROVIDER
+                    .digest(algorithm, b"abc")
+                    .expect("compiled digest must be supported"),
+                expected
+            );
+            assert_eq!(DigestAlgorithm::from_uri(algorithm.uri()), Some(algorithm));
+            assert!(algorithm.requires_explicit_permission());
+            assert!(!algorithm.signing_allowed());
+        }
+    }
 
     #[cfg(feature = "xmldsig")]
     struct CountingRandomProvider {
@@ -1938,6 +2456,16 @@ mod tests {
         for digest in [DigestAlgorithm::Sha1, DigestAlgorithm::Sha512] {
             assert!(
                 RUST_CRYPTO_PROVIDER.supports(ProviderCapability::VerifyCertificate(
+                    X509SignatureAlgorithm::Ecdsa(digest)
+                ))
+            );
+        }
+        // Certificate capabilities must agree with the actual execution
+        // mapping, not merely with the presence of an ECDSA primitive.
+        #[cfg(feature = "legacy-algorithms")]
+        for digest in [DigestAlgorithm::Md5, DigestAlgorithm::Ripemd160] {
+            assert!(
+                !RUST_CRYPTO_PROVIDER.supports(ProviderCapability::VerifyCertificate(
                     X509SignatureAlgorithm::Ecdsa(digest)
                 ))
             );

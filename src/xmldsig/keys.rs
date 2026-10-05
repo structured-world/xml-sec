@@ -99,6 +99,10 @@ impl HmacVerificationKey {
             }};
         }
         Ok(match algorithm {
+            #[cfg(feature = "legacy-algorithms")]
+            SignatureAlgorithm::HmacMd5 => verify_hmac!(md5::Md5),
+            #[cfg(feature = "legacy-algorithms")]
+            SignatureAlgorithm::HmacRipemd160 => verify_hmac!(ripemd::Ripemd160),
             SignatureAlgorithm::HmacSha1 => verify_hmac!(sha1::Sha1),
             SignatureAlgorithm::HmacSha224 => verify_hmac!(sha2::Sha224),
             SignatureAlgorithm::HmacSha256 => verify_hmac!(sha2::Sha256),
@@ -217,6 +221,18 @@ impl VerifyingKey for VerificationKey {
     }
     fn validate_policy(&self, policy: &crate::policy::VerificationPolicy) -> Result<(), DsigError> {
         let result = match self.algorithm {
+            #[cfg(feature = "legacy-algorithms")]
+            SignatureAlgorithm::RsaMd5 | SignatureAlgorithm::RsaRipemd160 => {
+                validate_rsa_signature_spki_with_minimum(
+                    self.algorithm,
+                    &self.public_key_bytes,
+                    policy.key_trust.rsa_keys.minimum_modulus_bits,
+                )
+            }
+            #[cfg(feature = "legacy-algorithms")]
+            SignatureAlgorithm::HmacMd5
+            | SignatureAlgorithm::HmacRipemd160
+            | SignatureAlgorithm::EcdsaRipemd160 => Ok(()),
             SignatureAlgorithm::Ed25519
             | SignatureAlgorithm::Ed25519Ctx
             | SignatureAlgorithm::Ed25519Ph
@@ -298,6 +314,26 @@ impl VerifyingKey for VerificationKey {
             return Err(KeyResolutionError::AlgorithmMismatch.into());
         }
         let result = match algorithm {
+            #[cfg(feature = "legacy-algorithms")]
+            SignatureAlgorithm::RsaMd5 | SignatureAlgorithm::RsaRipemd160 => {
+                verify_rsa_signature_spki_primitive(
+                    algorithm,
+                    &self.public_key_bytes,
+                    signed_data,
+                    signature_value,
+                )
+            }
+            #[cfg(feature = "legacy-algorithms")]
+            SignatureAlgorithm::EcdsaRipemd160 => verify_ecdsa_signature_spki(
+                algorithm,
+                &self.public_key_bytes,
+                signed_data,
+                signature_value,
+            ),
+            #[cfg(feature = "legacy-algorithms")]
+            SignatureAlgorithm::HmacMd5 | SignatureAlgorithm::HmacRipemd160 => {
+                return Err(KeyResolutionError::AlgorithmMismatch.into());
+            }
             SignatureAlgorithm::Ed25519
             | SignatureAlgorithm::Ed25519Ctx
             | SignatureAlgorithm::Ed25519Ph
@@ -385,14 +421,7 @@ struct PolicyBoundVerificationKey {
 impl VerifyingKey for PolicyBoundVerificationKey {
     fn verification_spki(&self, algorithm: SignatureAlgorithm) -> Result<Option<&[u8]>, DsigError> {
         // Preserve strength checks carried by this resolver-produced handle.
-        if matches!(
-            algorithm,
-            SignatureAlgorithm::RsaSha1
-                | SignatureAlgorithm::RsaSha224
-                | SignatureAlgorithm::RsaSha256
-                | SignatureAlgorithm::RsaSha384
-                | SignatureAlgorithm::RsaSha512
-        ) {
+        if algorithm.is_rsa() {
             validate_rsa_signature_spki_with_minimum(
                 algorithm,
                 &self.key.public_key_bytes,
@@ -453,11 +482,7 @@ impl VerifyingKey for PolicyBoundVerificationKey {
                     self.dsa_minimum_bits,
                 )
             }
-            SignatureAlgorithm::RsaSha1
-            | SignatureAlgorithm::RsaSha224
-            | SignatureAlgorithm::RsaSha256
-            | SignatureAlgorithm::RsaSha384
-            | SignatureAlgorithm::RsaSha512 => verify_rsa_signature_spki_with_minimum(
+            algorithm if algorithm.is_rsa() => verify_rsa_signature_spki_with_minimum(
                 algorithm,
                 &self.key.public_key_bytes,
                 signed_data,
@@ -1209,14 +1234,7 @@ impl DefaultKeyResolver {
                 dsa_key_value_to_spki_der(p, q, g, y)?
             }
             KeyValueInfo::Rsa { modulus, exponent } => {
-                if !matches!(
-                    algorithm,
-                    SignatureAlgorithm::RsaSha1
-                        | SignatureAlgorithm::RsaSha224
-                        | SignatureAlgorithm::RsaSha256
-                        | SignatureAlgorithm::RsaSha384
-                        | SignatureAlgorithm::RsaSha512
-                ) {
+                if !algorithm.is_rsa() {
                     return Err(KeyResolutionError::AlgorithmMismatch);
                 }
                 rsa_key_value_to_spki_der(modulus, exponent)?
@@ -1310,6 +1328,14 @@ impl DefaultKeyResolver {
                 !document_sources || matches!(source, KeyInfoSource::KeyName(_));
             let resolved = match source {
                 KeyInfoSource::X509Data(info) => {
+                    // Enforce selector permissions before candidate work or
+                    // hashing, including direct callers of this resolver.
+                    for (uri, _) in &info.digests {
+                        let algorithm = super::DigestAlgorithm::from_uri(uri).ok_or_else(|| {
+                            KeyResolutionError::UnsupportedDigestAlgorithm(uri.clone())
+                        })?;
+                        policy.check_digest_algorithm(algorithm)?;
+                    }
                     if if info.certificate_chain.is_empty() {
                         x509_data_has_lookup_identifiers(info)
                     } else {
@@ -1669,29 +1695,13 @@ fn validate_spki_algorithm(
                 .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
             Ok(())
         }
-        (
-            SignatureAlgorithm::RsaSha1
-            | SignatureAlgorithm::RsaSha224
-            | SignatureAlgorithm::RsaSha256
-            | SignatureAlgorithm::RsaSha384
-            | SignatureAlgorithm::RsaSha512,
-            PublicKey::RSA(_),
-        ) => Ok(()),
-        (
-            SignatureAlgorithm::EcdsaSha1
-            | SignatureAlgorithm::EcdsaSha224
-            | SignatureAlgorithm::EcdsaSha256
-            | SignatureAlgorithm::EcdsaSha384
-            | SignatureAlgorithm::EcdsaSha512
-            | SignatureAlgorithm::EcdsaSha3_224
-            | SignatureAlgorithm::EcdsaSha3_256
-            | SignatureAlgorithm::EcdsaSha3_384
-            | SignatureAlgorithm::EcdsaSha3_512,
-            PublicKey::EC(ec),
-        ) if matches!(
-            curve_oid.as_deref(),
-            Some(EC_P256_OID | EC_P384_OID | EC_P521_OID)
-        ) =>
+        (method, PublicKey::RSA(_)) if method.is_rsa() => Ok(()),
+        (method, PublicKey::EC(ec))
+            if method.ecdsa_digest().is_some()
+                && matches!(
+                    curve_oid.as_deref(),
+                    Some(EC_P256_OID | EC_P384_OID | EC_P521_OID)
+                ) =>
         {
             validate_ec_public_key_encoding(&ec, spki.subject_public_key.data.as_ref())
                 .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
@@ -2050,7 +2060,7 @@ mod tests {
             {
                 return Err(crate::provider::ProviderError::Unsupported {
                     operation: crate::provider::ProviderOperation::VerifyCertificate,
-                    algorithm: Some(algorithm.oid().to_owned()),
+                    algorithm: algorithm.oid().map(str::to_owned),
                 });
             }
             crate::provider::default_provider().verify_x509_signature(
@@ -4596,6 +4606,129 @@ mod tests {
             ),
             "unexpected error: {error:?}"
         );
+    }
+
+    #[cfg(feature = "legacy-algorithms")]
+    #[test]
+    fn x509_digest_selectors_obey_operation_policy() {
+        // Both lookup-only and embedded selectors must reject a denied digest
+        // before certificate selection; explicit permission must still work.
+        for algorithm in [
+            super::super::DigestAlgorithm::Md5,
+            super::super::DigestAlgorithm::Ripemd160,
+        ] {
+            let certificate = certificate_der(RSA_4096_CERTIFICATE);
+            let digest = super::super::compute_digest(algorithm, &certificate);
+            let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+                lookup_certs: vec![certificate.clone()],
+                trusted_certs: vec![
+                    certificate.clone(),
+                    certificate_der(include_str!("../../tests/fixtures/keys/ca2cert.pem")),
+                    certificate_der(include_str!("../../tests/fixtures/keys/cacert.pem")),
+                ],
+                ..KeyResolverConfig::default()
+            });
+            for embedded in [false, true] {
+                let cert_xml = if embedded {
+                    format!(
+                        "<X509Certificate>{}</X509Certificate>",
+                        STANDARD.encode(&certificate)
+                    )
+                } else {
+                    String::new()
+                };
+                let xml = replace_unprefixed_key_info(
+                    X509_DIGEST_SIGNATURE,
+                    &format!(
+                        "<KeyInfo><X509Data>{cert_xml}<X509Digest xmlns=\"http://www.w3.org/2009/xmldsig11#\" Algorithm=\"{}\">{}</X509Digest></X509Data></KeyInfo>",
+                        algorithm.uri(),
+                        STANDARD.encode(&digest)
+                    ),
+                );
+                let provider = RejectSecondSha512Provider {
+                    sha512_calls: AtomicUsize::new(0),
+                    verification_calls: AtomicUsize::new(0),
+                    reject_verification_call: None,
+                    rejected_verification_data: None,
+                };
+                assert!(
+                    matches!(super::super::VerifyContext::new().key_resolver(&resolver).provider(&provider).verify(&xml),
+                    Err(DsigError::Policy(crate::policy::PolicyViolation::Algorithm { algorithm: uri, .. })) if uri == algorithm.uri())
+                );
+                assert_eq!(provider.sha512_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(provider.verification_calls.load(Ordering::SeqCst), 0);
+                // Direct resolver callers must not bypass the same snapshot.
+                let info = KeyInfo {
+                    sources: vec![KeyInfoSource::X509Data(X509DataInfo {
+                        digests: vec![(algorithm.uri().into(), digest.clone())],
+                        ..X509DataInfo::default()
+                    })],
+                };
+                assert!(matches!(
+                    resolver.resolve_with_policy(
+                        Some(&info),
+                        SignatureAlgorithm::RsaSha512,
+                        &crate::policy::VerificationPolicy::default()
+                    ),
+                    Err(DsigError::Policy(_))
+                ));
+                let policy = crate::policy::VerificationPolicy {
+                    digest_algorithms: Some(
+                        [algorithm, super::super::DigestAlgorithm::Sha512].into(),
+                    ),
+                    ..crate::policy::VerificationPolicy::default()
+                };
+                assert_eq!(
+                    super::super::VerifyContext::new()
+                        .key_resolver(&resolver)
+                        .policy(policy.clone())
+                        .verify(&xml)
+                        .expect("explicitly permitted selector must verify")
+                        .status,
+                    super::super::DsigStatus::Valid
+                );
+                // Referenced KeyInfo and retrieved X509Data must not create a
+                // separate algorithm permission path during materialization.
+                let start = xml.find("<KeyInfo>").expect("fixture has KeyInfo");
+                let end =
+                    xml.find("</KeyInfo>").expect("fixture closes KeyInfo") + "</KeyInfo>".len();
+                let target = &xml[start..end];
+                let referenced = replace_unprefixed_key_info(
+                    &xml,
+                    &format!(
+                        "<KeyInfo><KeyInfoReference xmlns=\"http://www.w3.org/2009/xmldsig11#\" URI=\"#selector\"/></KeyInfo><Object>{}</Object>",
+                        target.replace("<KeyInfo>", "<KeyInfo Id=\"selector\">")
+                    ),
+                );
+                let retrieved = replace_unprefixed_key_info(
+                    &xml,
+                    &format!(
+                        "<KeyInfo><RetrievalMethod URI=\"#selector\" Type=\"http://www.w3.org/2000/09/xmldsig#X509Data\"/></KeyInfo><Object>{}</Object>",
+                        target
+                            .strip_prefix("<KeyInfo>")
+                            .expect("selected range starts at KeyInfo")
+                            .strip_suffix("</KeyInfo>")
+                            .expect("selected range ends at KeyInfo")
+                            .replace("<X509Data>", "<X509Data Id=\"selector\">")
+                    ),
+                );
+                for indirect in [referenced, retrieved] {
+                    assert!(
+                        matches!(super::super::VerifyContext::new().key_resolver(&resolver).verify(&indirect),
+                        Err(DsigError::Policy(crate::policy::PolicyViolation::Algorithm { algorithm: uri, .. })) if uri == algorithm.uri())
+                    );
+                    assert_eq!(
+                        super::super::VerifyContext::new()
+                            .key_resolver(&resolver)
+                            .policy(policy.clone())
+                            .verify(&indirect)
+                            .expect("permitted indirect selector must verify")
+                            .status,
+                        super::super::DsigStatus::Valid
+                    );
+                }
+            }
+        }
     }
 
     #[test]

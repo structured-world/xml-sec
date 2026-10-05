@@ -1048,7 +1048,9 @@ impl KeyTrustPolicy {
         if !permitted {
             return Err(PolicyViolation::Algorithm {
                 operation: "certificate/CRL verification",
-                algorithm: algorithm.oid().to_owned(),
+                algorithm: algorithm
+                    .oid()
+                    .map_or_else(|| format!("{algorithm:?}"), str::to_owned),
             });
         }
         Ok(())
@@ -1131,6 +1133,25 @@ pub struct VerificationPolicy {
 
 #[cfg(feature = "xmldsig")]
 impl VerificationPolicy {
+    pub(crate) fn check_digest_algorithm(
+        &self,
+        algorithm: DigestAlgorithm,
+    ) -> Result<(), PolicyViolation> {
+        if self
+            .digest_algorithms
+            .as_ref()
+            .map_or(!algorithm.requires_explicit_permission(), |allowed| {
+                allowed.contains(&algorithm)
+            })
+        {
+            Ok(())
+        } else {
+            Err(PolicyViolation::Algorithm {
+                operation: "verification",
+                algorithm: algorithm.uri().to_owned(),
+            })
+        }
+    }
     /// Validate the complete snapshot against implementation hard ceilings.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
         self.resources.validate()?;
@@ -1143,7 +1164,8 @@ impl VerificationPolicy {
         &self,
         algorithm: SignatureAlgorithm,
     ) -> Result<(), PolicyViolation> {
-        if matches!(algorithm, SignatureAlgorithm::PostQuantum(_))
+        if (matches!(algorithm, SignatureAlgorithm::PostQuantum(_))
+            || algorithm.requires_explicit_permission())
             && !self
                 .signature_algorithms
                 .as_ref()
@@ -1265,6 +1287,25 @@ fn check_signing_algorithm<T: Eq + std::hash::Hash>(
     }
 }
 
+/// Enforce the shared content-cipher permission contract before dispatch.
+#[cfg(feature = "xmlenc")]
+pub(crate) fn check_content_algorithm(
+    allowlist: Option<&HashSet<DataEncryptionAlgorithm>>,
+    algorithm: DataEncryptionAlgorithm,
+    operation: &'static str,
+) -> Result<(), PolicyViolation> {
+    if allowlist.map_or(!algorithm.requires_explicit_permission(), |allowed| {
+        allowed.contains(&algorithm)
+    }) {
+        Ok(())
+    } else {
+        Err(PolicyViolation::Algorithm {
+            operation,
+            algorithm: algorithm.uri().to_owned(),
+        })
+    }
+}
+
 /// Immutable policy snapshot for XMLEnc encryption.
 #[cfg(feature = "xmlenc")]
 #[derive(Debug, Clone, Default)]
@@ -1327,6 +1368,45 @@ impl DecryptionPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(feature = "legacy-algorithms", feature = "xmldsig"))]
+    #[test]
+    fn legacy_digest_permission_is_explicit_and_operation_local() {
+        // Capability does not imply acceptance, and permission for one digest
+        // or operation must never enable another digest or operation.
+        for algorithm in [DigestAlgorithm::Md5, DigestAlgorithm::Ripemd160] {
+            assert!(
+                VerificationPolicy::default()
+                    .check_digest_algorithm(algorithm)
+                    .is_err()
+            );
+            assert!(
+                SigningPolicy::default()
+                    .check_digest_algorithm(algorithm)
+                    .is_err()
+            );
+            let verification = VerificationPolicy {
+                digest_algorithms: Some(HashSet::from([algorithm])),
+                ..VerificationPolicy::default()
+            };
+            let signing = SigningPolicy {
+                digest_algorithms: Some(HashSet::from([algorithm])),
+                ..SigningPolicy::default()
+            };
+            assert!(verification.check_digest_algorithm(algorithm).is_ok());
+            assert!(signing.check_digest_algorithm(algorithm).is_ok());
+            assert!(
+                verification
+                    .check_digest_algorithm(DigestAlgorithm::Sha256)
+                    .is_err()
+            );
+            assert!(
+                signing
+                    .check_digest_algorithm(DigestAlgorithm::Sha256)
+                    .is_err()
+            );
+        }
+    }
 
     #[cfg(feature = "xmldsig")]
     #[test]

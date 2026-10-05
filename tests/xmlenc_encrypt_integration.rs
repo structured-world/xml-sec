@@ -23,6 +23,261 @@ const RSA_2048_PUBLIC: &str = "tests/fixtures/keys/rsa/rsa-2048-pubkey.pem";
 const RSA_4096_PRIVATE: &str = "tests/fixtures/keys/rsa/rsa-4096-key.pem";
 const RSA_4096_PUBLIC: &str = "tests/fixtures/keys/rsa/rsa-4096-pubkey.pem";
 
+#[cfg(feature = "legacy-algorithms")]
+#[test]
+fn direct_aes_key_cannot_be_used_for_tripledes() {
+    use xml_sec::xmlenc::DecryptionKeyResolver;
+    // Equal byte lengths are not algorithm identity. The legacy constructor
+    // declares AES, and must reject untrusted selection of TripleDES.
+    assert!(
+        SymmetricKeyDecryptor::new([0x31; 24])
+            .resolve_key(
+                xml_sec::provider::default_provider(),
+                DataEncryptionAlgorithm::TripleDesCbc,
+                None
+            )
+            .is_err()
+    );
+}
+
+#[cfg(feature = "legacy-algorithms")]
+#[test]
+fn aes_kek_cannot_be_used_for_tripledes_wrap() {
+    use xml_sec::policy::EncryptionPolicy;
+    use xml_sec::xmlenc::DecryptionKeyResolver;
+    // A permitted wrap algorithm cannot redefine the trusted KEK's family.
+    let kek = vec![0x31; 24];
+    let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .add_recipient(EncryptionRecipient::aes_key_wrap(
+            kek.clone(),
+            KeyWrapAlgorithm::TripleDes,
+        ))
+        .policy(EncryptionPolicy {
+            key_wrap_algorithms: Some([KeyWrapAlgorithm::TripleDes].into()),
+            ..EncryptionPolicy::default()
+        })
+        .encrypt_binary(b"KEK family boundary")
+        .unwrap();
+    let parsed = parse_encrypted_data(&encrypted.encrypted_data_xml).unwrap();
+    assert!(matches!(
+        KekDecryptor::new(kek.clone()).resolve_key(
+            xml_sec::provider::default_provider(),
+            DataEncryptionAlgorithm::Aes128Gcm,
+            parsed.encrypted_keys.first(),
+        ),
+        Err(XmlEncError::KeyNotFound)
+    ));
+    assert!(
+        KekDecryptor::with_kind(kek, xml_sec::key_manager::SymmetricKeyKind::Des)
+            .resolve_key(
+                xml_sec::provider::default_provider(),
+                DataEncryptionAlgorithm::Aes128Gcm,
+                parsed.encrypted_keys.first(),
+            )
+            .is_ok()
+    );
+}
+
+#[cfg(feature = "legacy-algorithms")]
+#[test]
+fn direct_resolvers_enforce_legacy_method_permissions() {
+    use xml_sec::policy::{DecryptionPolicy, EncryptionPolicy};
+    use xml_sec::xmlenc::{DecryptionKeyResolver, KeyCandidateBudget};
+    // Direct public resolver calls must enforce the same permission as the
+    // enclosing context, before decoding or dispatching a denied recipient.
+    for wrap in [KeyWrapAlgorithm::AesKw192, KeyWrapAlgorithm::TripleDes] {
+        let kek = vec![0x33; wrap.key_len()];
+        let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .add_recipient(EncryptionRecipient::aes_key_wrap(kek.clone(), wrap))
+            .policy(EncryptionPolicy {
+                key_wrap_algorithms: Some([wrap].into()),
+                ..EncryptionPolicy::default()
+            })
+            .encrypt_binary(b"policy boundary")
+            .unwrap();
+        let parsed = parse_encrypted_data(&encrypted.encrypted_data_xml).unwrap();
+        let resolver = KekDecryptor::with_kind(kek, wrap.key_kind());
+        assert!(matches!(
+            resolver.resolve_key_candidates_with_policy(
+                xml_sec::provider::default_provider(),
+                DataEncryptionAlgorithm::Aes128Gcm,
+                parsed.encrypted_keys.first(),
+                &DecryptionPolicy::default(),
+                &mut KeyCandidateBudget::for_operation()
+            ),
+            Err(XmlEncError::Policy(_))
+        ));
+    }
+    let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .add_recipient(EncryptionRecipient::rsa_pkcs1v15(public_key(
+            RSA_2048_PUBLIC,
+        )))
+        .policy(EncryptionPolicy {
+            key_transport_algorithms: Some([KeyTransportAlgorithm::RsaPkcs1v15].into()),
+            ..EncryptionPolicy::default()
+        })
+        .encrypt_binary(b"policy boundary")
+        .unwrap();
+    let parsed = parse_encrypted_data(&encrypted.encrypted_data_xml).unwrap();
+    assert!(matches!(
+        PrivateKeyDecryptor::new(private_key(RSA_2048_PRIVATE)).resolve_key_with_policy(
+            xml_sec::provider::default_provider(),
+            DataEncryptionAlgorithm::Aes128Gcm,
+            parsed.encrypted_keys.first(),
+            &DecryptionPolicy::default()
+        ),
+        Err(XmlEncError::Policy(_))
+    ));
+}
+
+#[cfg(feature = "legacy-algorithms")]
+#[test]
+fn pkcs1v15_transport_is_parameterless_and_explicitly_permitted() {
+    use xml_sec::policy::{DecryptionPolicy, EncryptionPolicy};
+    use xml_sec::xmlenc::DecryptContext;
+    // Transport permission is independent on both sides. No OAEP digest/MGF
+    // defaults may leak into a parameterless RSA-1.5 EncryptionMethod.
+    let public = public_key(RSA_2048_PUBLIC);
+    let recipient = EncryptionRecipient::rsa_pkcs1v15(public);
+    assert!(
+        EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .add_recipient(recipient.clone())
+            .encrypt_binary(b"legacy transport")
+            .is_err()
+    );
+    let transport = KeyTransportAlgorithm::RsaPkcs1v15;
+    let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .add_recipient(recipient)
+        .policy(EncryptionPolicy {
+            key_transport_algorithms: Some([transport].into()),
+            ..EncryptionPolicy::default()
+        })
+        .encrypt_binary(b"legacy transport")
+        .unwrap();
+    assert!(!encrypted.encrypted_data_xml.contains("OAEPparams"));
+    assert!(!encrypted.encrypted_data_xml.contains("DigestMethod"));
+    let resolver = PrivateKeyDecryptor::new(private_key(RSA_2048_PRIVATE));
+    assert!(decrypt(&encrypted.encrypted_data_xml, &resolver).is_err());
+    let policy = DecryptionPolicy {
+        key_transport_algorithms: Some([transport].into()),
+        ..DecryptionPolicy::default()
+    };
+    assert_eq!(
+        DecryptContext::new(&resolver)
+            .policy(policy.clone())
+            .decrypt(&encrypted.encrypted_data_xml)
+            .unwrap(),
+        DecryptedContent::Bytes(b"legacy transport".to_vec())
+    );
+    // Implicit RSA padding rejection must not release plaintext with a wrong
+    // key; authenticated content checks the recovered/fallback CEK uniformly.
+    let wrong_key = PrivateKeyDecryptor::new(private_key(RSA_4096_PRIVATE));
+    assert!(
+        DecryptContext::new(&wrong_key)
+            .policy(policy.clone())
+            .decrypt(&encrypted.encrypted_data_xml)
+            .is_err()
+    );
+    let document = roxmltree::Document::parse(&encrypted.encrypted_data_xml).unwrap();
+    let wrapped = document
+        .descendants()
+        .find(|node| node.tag_name().name() == "EncryptedKey")
+        .unwrap()
+        .descendants()
+        .find(|node| node.tag_name().name() == "CipherValue")
+        .unwrap()
+        .text()
+        .unwrap();
+    let mut corrupt = STANDARD.decode(wrapped).unwrap();
+    corrupt.fill(0);
+    let damaged = encrypted
+        .encrypted_data_xml
+        .replace(wrapped, &STANDARD.encode(&corrupt));
+    assert!(
+        DecryptContext::new(&resolver)
+            .policy(policy.clone())
+            .decrypt(&damaged)
+            .is_err()
+    );
+    let short = encrypted
+        .encrypted_data_xml
+        .replace(wrapped, &STANDARD.encode(&corrupt[..corrupt.len() - 1]));
+    // An out-of-range RSA representative must reach the same authenticated
+    // content check as a padding failure, never a distinct provider error.
+    corrupt.fill(0xff);
+    let out_of_range = encrypted
+        .encrypted_data_xml
+        .replace(wrapped, &STANDARD.encode(&corrupt));
+    assert!(matches!(
+        DecryptContext::new(&resolver)
+            .policy(policy.clone())
+            .decrypt(&out_of_range),
+        Err(XmlEncError::AeadAuthenticationFailed)
+    ));
+    assert!(
+        DecryptContext::new(&resolver)
+            .policy(policy.clone())
+            .decrypt(&short)
+            .is_err()
+    );
+    let malformed = encrypted.encrypted_data_xml.replace(
+        &format!("Algorithm=\"{}\"/>", transport.uri()),
+        &format!(
+            "Algorithm=\"{}\"><OAEPparams>AA==</OAEPparams></EncryptionMethod>",
+            transport.uri()
+        ),
+    );
+    assert_ne!(malformed, encrypted.encrypted_data_xml);
+    assert!(
+        DecryptContext::new(&resolver)
+            .policy(policy)
+            .decrypt(&malformed)
+            .is_err()
+    );
+}
+
+#[cfg(feature = "legacy-algorithms")]
+#[test]
+fn legacy_content_requires_permission_on_both_public_paths() {
+    use xml_sec::policy::{DecryptionPolicy, EncryptionPolicy};
+    use xml_sec::xmlenc::DecryptContext;
+    // Compiling a mechanism must not grant permission. Both public operation
+    // boundaries independently enforce the immutable allowlist snapshot.
+    for algorithm in [
+        DataEncryptionAlgorithm::TripleDesCbc,
+        DataEncryptionAlgorithm::Aes192Cbc,
+        DataEncryptionAlgorithm::Aes192Gcm,
+    ] {
+        let key = [0x31; 24];
+        assert!(
+            EncryptedDataBuilder::new(algorithm)
+                .direct_key(key)
+                .encrypt_binary(b"secret")
+                .is_err()
+        );
+        let encrypted = EncryptedDataBuilder::new(algorithm)
+            .direct_key(key)
+            .policy(EncryptionPolicy {
+                data_algorithms: Some([algorithm].into()),
+                ..EncryptionPolicy::default()
+            })
+            .encrypt_binary(b"secret")
+            .unwrap();
+        let resolver = SymmetricKeyDecryptor::with_kind(key, algorithm.key_kind());
+        assert!(decrypt(&encrypted.encrypted_data_xml, &resolver).is_err());
+        assert_eq!(
+            DecryptContext::new(&resolver)
+                .policy(DecryptionPolicy {
+                    data_algorithms: Some([algorithm].into()),
+                    ..DecryptionPolicy::default()
+                })
+                .decrypt(&encrypted.encrypted_data_xml)
+                .unwrap(),
+            DecryptedContent::Bytes(b"secret".to_vec())
+        );
+    }
+}
+
 fn private_key(path: &str) -> RsaPrivateKey {
     RsaPrivateKey::from_pkcs8_pem(&fs::read_to_string(path).expect("RSA fixture must load"))
         .expect("RSA fixture must contain a PKCS#8 private key")

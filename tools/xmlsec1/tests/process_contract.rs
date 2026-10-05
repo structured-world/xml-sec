@@ -47,6 +47,109 @@ fn project_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
+#[cfg(feature = "legacy-algorithms")]
+#[test]
+fn symmetric_recipient_wraps_are_executable_through_cli() {
+    // Advertised transforms must be reachable through real commands, including
+    // a KEK family different from the content cipher and named recipient keys.
+    let temp = tempfile::tempdir().unwrap();
+    let plaintext = temp.path().join("plain.bin");
+    let key = temp.path().join("kek.bin");
+    fs::write(&plaintext, b"wrapped content").unwrap();
+    fs::write(&key, [0x31; 24]).unwrap();
+    for (wrap, option) in [
+        ("kw-aes192", "--aes-key:kek"),
+        ("kw-tripledes", "--des-key:kek"),
+    ] {
+        let template = temp.path().join("template.xml");
+        let encrypted = temp.path().join("encrypted.xml");
+        let decrypted = temp.path().join("decrypted.bin");
+        fs::write(&template, format!(
+            "<EncryptedData xmlns='http://www.w3.org/2001/04/xmlenc#'><EncryptionMethod Algorithm='http://www.w3.org/2009/xmlenc11#aes128-gcm'/><ds:KeyInfo xmlns:ds='http://www.w3.org/2000/09/xmldsig#'><EncryptedKey><EncryptionMethod Algorithm='http://www.w3.org/2001/04/xmlenc#{wrap}'/><ds:KeyInfo><ds:KeyName>kek</ds:KeyName></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"
+        )).unwrap();
+        let result = Command::new(binary())
+            .args(["encrypt", option])
+            .arg(&key)
+            .arg("--binary-data")
+            .arg(&plaintext)
+            .arg("--output")
+            .arg(&encrypted)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{wrap}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let result = Command::new(binary())
+            .args(["decrypt", option])
+            .arg(&key)
+            .arg("--output")
+            .arg(&decrypted)
+            .arg(&encrypted)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{wrap}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(fs::read(&decrypted).unwrap(), b"wrapped content");
+        let wrong_option = if option == "--aes-key:kek" {
+            "--des-key:kek"
+        } else {
+            "--aes-key:kek"
+        };
+        let rejected = Command::new(binary())
+            .args(["decrypt", wrong_option])
+            .arg(&key)
+            .arg(&encrypted)
+            .output()
+            .unwrap();
+        assert!(
+            !rejected.status.success(),
+            "{wrap} must reject the wrong key family"
+        );
+        // Stored keys must follow the same KEK path as explicitly named files.
+        let store = temp.path().join("keys.xml");
+        let value_name = if option == "--aes-key:kek" {
+            "AESKeyValue"
+        } else {
+            "DESKeyValue"
+        };
+        let encoded = base64::engine::general_purpose::STANDARD.encode([0x31; 24]);
+        fs::write(&store, format!("<Keys xmlns='http://www.aleksey.com/xmlsec/2002'><ds:KeyInfo xmlns:ds='http://www.w3.org/2000/09/xmldsig#'><ds:KeyName>kek</ds:KeyName><ds:KeyValue><{value_name}>{encoded}</{value_name}></ds:KeyValue></ds:KeyInfo></Keys>")).unwrap();
+        let result = Command::new(binary())
+            .args(["encrypt", "--keys-file"])
+            .arg(&store)
+            .arg("--binary-data")
+            .arg(&plaintext)
+            .arg("--output")
+            .arg(&encrypted)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{wrap} store encrypt: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let result = Command::new(binary())
+            .args(["decrypt", "--keys-file"])
+            .arg(&store)
+            .arg(&encrypted)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{wrap} store decrypt: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(result.stdout, b"wrapped content");
+    }
+}
+
 #[cfg(feature = "aws-lc-fips")]
 #[test]
 fn aws_lc_selection_signs_and_verifies_through_cli() {
@@ -5589,7 +5692,9 @@ fn named_aes_key_ring_selects_one_key_for_encryption_and_decryption() {
         .output()
         .unwrap();
     assert!(!ambiguous.status.success());
-    assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("multiple AES key"));
+    // The shared selector identifies symmetric keys, including DES, rather
+    // than labeling every ambiguous candidate ring as AES-only.
+    assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("multiple symmetric key"));
 
     // Lax lookup intentionally ignores duplicate identity metadata and searches
     // by key kind, so the first compatible entry can complete the round trip.

@@ -8,8 +8,9 @@
 //! RSA-OAEP or AES-KW recipients. The reciprocal decrypt APIs accept the same
 //! inline `CipherValue` profile.
 //!
-//! External `CipherReference` resources, RSA PKCS#1 v1.5 key transport, and
-//! unauthenticated legacy ciphers are intentionally outside this profile.
+//! External `CipherReference` resources are outside this profile. Optional
+//! `legacy-algorithms` adds independently policy-gated RSA-1.5 and TripleDES
+//! mechanisms; it does not grant permission or authenticate CBC content.
 #![doc = include_str!("../../docs/xmlenc.md")]
 
 use crate::xml::dom::Node;

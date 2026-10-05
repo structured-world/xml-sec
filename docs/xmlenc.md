@@ -143,12 +143,42 @@ inherited from its ancestors. Their `_and_backend` variants retain an explicitly
 backend while revalidating the containing document; the shorter entry points use the build default.
 
 `PrivateKeyDecryptor` unwraps embedded RSA-OAEP `EncryptedKey` values and `KekDecryptor`
-unwraps AES-KW values. RSA PKCS#1 v1.5 transport, `CipherReference`, and unauthenticated external
-resource loading are rejected; only inline `CipherValue` is accepted. Encryption plaintext,
+unwraps AES-KW values. With `legacy-algorithms`, these resolvers additionally support parameterless
+RSA PKCS#1 v1.5 transport, AES-192 key wrap, and RFC 3217 TripleDES key wrap. `CipherReference`
+and unauthenticated external resource loading are rejected; only inline `CipherValue` is accepted. Encryption plaintext,
 recipient counts, and the complete serialized `EncryptedData` fragment are bounded. Decryption
 applies the same aggregate recipient ceiling while parsing, bounds each retained identifier,
 algorithm URI, key name, OAEP label, and reference URI, and rechecks caller-constructed
 `EncryptedData` before decoding or key resolution.
+
+## Optional Compatibility Mechanisms
+
+The `legacy-algorithms` feature compiles AES-192-CBC/GCM, TripleDES-CBC, AES-192-KW,
+TripleDES CMS wrap, and RSA-1.5 transport. Compilation is not permission: explicitly put each
+required method into `EncryptionPolicy` and `DecryptionPolicy`'s `data_algorithms`,
+`key_wrap_algorithms`, or `key_transport_algorithms` allowlist. Default operations reject all of
+these optional methods. AES-192 is included for compatibility completeness, not because its key
+size is cryptographically weak. TripleDES and RSA-1.5 should be restricted to required legacy
+integrations; prefer authenticated AES-GCM and RSA-OAEP for new output.
+
+Use `EncryptionRecipient::rsa_pkcs1v15` (or `provider_pkcs1v15`) for RSA-1.5, not
+`rsa_oaep` with altered parameters. XMLEnc 1.1 §5.5.1 defines no OAEP children for this method;
+the parser rejects them. Fixed-width recovery retains its padding-validity mask alongside a
+zeroized content-key candidate; invalid padding selects a random fallback key. Content decryption
+runs before the operation checks that mask, and an invalid recovery can never release plaintext,
+even when CBC padding happens to succeed. This does not authenticate CBC or eliminate its
+chosen-ciphertext risks (XMLEnc 1.1 §6.1.2); use CBC only with a separately authenticated boundary.
+`DecryptionKeyResolver` wrappers must forward `resolve_content_keys_with_policy` to preserve
+this state. The low-level byte-returning resolver APIs reject invalid recovery rather than
+exposing fallback key bytes. See [the RSA recovery adaptation](rsa-recovery-patch.md).
+TripleDES wrapping follows RFC 3217 §§2–3, including its SHA-1 checksum and fixed outer IV;
+it does not reinterpret arbitrary AES key bytes as DES parity-normalized bytes.
+`SymmetricKeyDecryptor::new` and `KekDecryptor::new` bind keys to AES, irrespective of length. For TripleDES, explicitly
+use `with_kind(key, SymmetricKeyKind::Des)`; the family is trusted request input, never inferred
+from an untrusted algorithm URI. Borrowed KEKs use `KekDecryptor::borrowed_with_kind` to retain
+the same family boundary without copying key material. Both families may supply CLI KEKs through `--aes-key:name`,
+`--des-key:name`, or symmetric `--keys-file` entries when the template contains a corresponding
+key-wrap method. Key names identify the wrapping recipient, not the generated content key.
 That typed-input check validates the top-level content `EncryptionMethod` and every embedded key
 method before resolver dispatch, and bounds both encoded and projected decoded `CipherValue`
 sizes. Callers therefore cannot bypass parser structural or allocation limits by constructing the

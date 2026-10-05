@@ -403,31 +403,18 @@ fn expected_signature_output_len(
             .eddsa_signature_len()
             .ok_or(SigningKeyError::InvalidPublicKeyInfo)?,
         (
-            SignatureAlgorithm::RsaSha1
-            | SignatureAlgorithm::RsaSha224
-            | SignatureAlgorithm::RsaSha256
-            | SignatureAlgorithm::RsaSha384
-            | SignatureAlgorithm::RsaSha512,
+            method,
             SigningPublicKeyInfo::Rsa {
                 modulus, exponent, ..
             },
-        ) => policy
+        ) if method.is_rsa() => policy
             .rsa_keys
             .validate_components("signing", &modulus, &exponent)?,
-        (
-            SignatureAlgorithm::EcdsaSha1
-            | SignatureAlgorithm::EcdsaSha224
-            | SignatureAlgorithm::EcdsaSha256
-            | SignatureAlgorithm::EcdsaSha384
-            | SignatureAlgorithm::EcdsaSha512
-            | SignatureAlgorithm::EcdsaSha3_224
-            | SignatureAlgorithm::EcdsaSha3_256
-            | SignatureAlgorithm::EcdsaSha3_384
-            | SignatureAlgorithm::EcdsaSha3_512,
-            SigningPublicKeyInfo::Ec { public_key, .. },
-        ) if public_key.first() == Some(&0x04)
-            && public_key.len() > 1
-            && (public_key.len() - 1).is_multiple_of(2) =>
+        (method, SigningPublicKeyInfo::Ec { public_key, .. })
+            if method.ecdsa_digest().is_some()
+                && public_key.first() == Some(&0x04)
+                && public_key.len() > 1
+                && (public_key.len() - 1).is_multiple_of(2) =>
         {
             // XMLDSig serializes ECDSA as fixed-width r || s. An uncompressed
             // SEC1 public point is 0x04 || x || y with the same field width.
@@ -453,14 +440,9 @@ fn expected_signature_output_len(
             }
             component_len.saturating_mul(2)
         }
-        (
-            SignatureAlgorithm::HmacSha1
-            | SignatureAlgorithm::HmacSha224
-            | SignatureAlgorithm::HmacSha256
-            | SignatureAlgorithm::HmacSha384
-            | SignatureAlgorithm::HmacSha512,
-            SigningPublicKeyInfo::Hmac { key_bits },
-        ) => {
+        (method, SigningPublicKeyInfo::Hmac { key_bits })
+            if method.hmac_output_bits().is_some() =>
+        {
             policy.hmac.validate_key_bits(key_bits)?;
             let output_bits = hmac_output_length_bits.unwrap_or(
                 algorithm
@@ -899,6 +881,18 @@ impl SigningKey for RsaSigningKey {
         canonical_signed_info: &[u8],
     ) -> Result<Vec<u8>, SigningKeyError> {
         match algorithm {
+            #[cfg(feature = "legacy-algorithms")]
+            SignatureAlgorithm::RsaMd5 => sign_rsa_pkcs1v15_with_rng(
+                provider,
+                RsaPkcs1v15SigningKey::<md5::Md5>::new(self.key.clone()),
+                canonical_signed_info,
+            ),
+            #[cfg(feature = "legacy-algorithms")]
+            SignatureAlgorithm::RsaRipemd160 => sign_rsa_pkcs1v15_with_rng(
+                provider,
+                RsaPkcs1v15SigningKey::<ripemd::Ripemd160>::new(self.key.clone()),
+                canonical_signed_info,
+            ),
             SignatureAlgorithm::RsaSha1 => sign_rsa_pkcs1v15_with_rng(
                 provider,
                 RsaPkcs1v15SigningKey::<Sha1>::new(self.key.clone()),
@@ -979,6 +973,10 @@ impl SigningKey for HmacSigningKey {
             }};
         }
         Ok(match algorithm {
+            #[cfg(feature = "legacy-algorithms")]
+            SignatureAlgorithm::HmacMd5 => sign_hmac!(md5::Md5),
+            #[cfg(feature = "legacy-algorithms")]
+            SignatureAlgorithm::HmacRipemd160 => sign_hmac!(ripemd::Ripemd160),
             SignatureAlgorithm::HmacSha1 => sign_hmac!(sha1::Sha1),
             SignatureAlgorithm::HmacSha224 => sign_hmac!(sha2::Sha224),
             SignatureAlgorithm::HmacSha256 => sign_hmac!(sha2::Sha256),

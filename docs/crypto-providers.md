@@ -32,6 +32,13 @@ Without it, that selection is an explicit unavailable-provider error.
 
 ## Mechanisms
 
+`legacy-algorithms` adds RustCrypto MD5/RIPEMD-160 signatures and digests, AES-192
+content encryption and key wrap, TripleDES content encryption and CMS wrap, and RSA-1.5
+transport. All operations still go through `CryptoProvider` and require explicit library policy
+permission. The AWS FIPS adapter reports these optional mechanisms unavailable; compiling both
+providers never falls back to RustCrypto. This describes the adapter's supported operations, not
+every primitive present in the underlying AWS-LC library or an approved-service claim.
+
 The AWS provider supports SHA-1/SHA-2 and SHA3-256/384/512 digests; RSA PKCS#1 v1.5
 signing with SHA-256/384/512 and verification with those digests or SHA-1; native
 ECDSA curve/digest combinations exposed by AWS-LC; AES-128/256 CBC and GCM;

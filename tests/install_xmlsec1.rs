@@ -80,7 +80,24 @@ impl InstallHarness {
         root.tool("nproc", "#!/bin/sh\nprintf '1\\n'\n");
         root.tool(
           "make",
-          "#!/bin/sh\nfor arg in \"$@\"; do\n  case \"$arg\" in DESTDIR=*) dest=${arg#DESTDIR=} ;; esac\ndone\nif [ -n \"${dest:-}\" ]; then\n  mkdir -p \"$dest$XMLSEC1_PREFIX/bin\"\n  printf '#!/bin/sh\\nprintf \"%%s\\\\n\" \"${XMLSEC1_SMOKE_OUTPUT-xmlsec1 1.3.13 (openssl)}\"\\nexit \"${XMLSEC1_SMOKE_EXIT:-0}\"\\n' > \"$dest$XMLSEC1_PREFIX/bin/xmlsec1\"\n  chmod +x \"$dest$XMLSEC1_PREFIX/bin/xmlsec1\"\nfi\n",
+          r#"#!/bin/sh
+for arg in "$@"; do
+  case "$arg" in DESTDIR=*) dest=${arg#DESTDIR=} ;; esac
+done
+if [ -n "${dest:-}" ]; then
+  mkdir -p "$dest$XMLSEC1_PREFIX/bin"
+  cat > "$dest$XMLSEC1_PREFIX/bin/xmlsec1" <<'ORACLE'
+#!/bin/sh
+if [ "$1" = "--list-transforms" ]; then
+  printf '%s\n' '"md5","ripemd160","rsa-md5","rsa-ripemd160","hmac-md5","hmac-ripemd160","ecdsa-ripemd160"'
+  exit 0
+fi
+printf '%s\n' "${XMLSEC1_SMOKE_OUTPUT-xmlsec1 1.3.13 (openssl)}"
+exit "${XMLSEC1_SMOKE_EXIT:-0}"
+ORACLE
+  chmod +x "$dest$XMLSEC1_PREFIX/bin/xmlsec1"
+fi
+"#,
         );
         root.tool(
             "mv",
