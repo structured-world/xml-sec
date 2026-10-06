@@ -15,19 +15,35 @@
 
 use crate::xml::dom::Node;
 
+mod agreement;
+mod cipher_reference;
+pub use agreement::{AgreementDecryptor, AgreementMethod};
 mod decrypt;
+pub use cipher_reference::CipherReferenceContext;
+mod derived_key;
 pub(crate) use decrypt::validate_key_len;
+pub use derived_key::DerivedKey;
 mod encrypt;
+mod hkdf_agreement;
+mod key_derivation;
+pub use hkdf_agreement::{HkdfAgreement, parse_hkdf_agreement_method};
+mod key_establishment_budget;
+pub use key_establishment_budget::KeyEstablishmentBudget;
 mod parse;
 mod types;
 
 pub use decrypt::{
-    DecryptContext, DecryptionKeyResolver, DocumentDecryptionOptions, KekDecryptor,
-    KeyCandidateBudget, OpaqueContentKeyResolver, OpaqueKekDecryptor, PrivateKeyDecryptor,
-    SymmetricKeyDecryptor, decrypt, decrypt_data, decrypt_document, decrypt_document_with_options,
+    DecryptContext, DecryptionKeyResolver, DerivedKeyDecryptor, DerivedKeyInput,
+    DocumentDecryptionOptions, KekDecryptor, KeyCandidateBudget, KeyEncryptionKeySource,
+    OpaqueContentKeyResolver, OpaqueKekDecryptor, PrivateKeyDecryptor, SymmetricKeyDecryptor,
+    decrypt, decrypt_data, decrypt_document, decrypt_document_with_options,
 };
 pub use encrypt::{
     EncryptedDataBuilder, validate_key_transport_recipient, validate_rsa_recipient_key,
+};
+pub use key_derivation::{
+    ConcatKdfField, KeyDerivationMethod, parse_key_derivation_method,
+    parse_key_derivation_method_with_backend,
 };
 pub use parse::{
     parse_encrypted_data, parse_encrypted_data_node_with_policy,
@@ -37,9 +53,9 @@ pub use parse::{
 };
 pub use types::{
     CipherData, DataEncryptionAlgorithm, DecryptedContent, DocumentEncryptionOptions,
-    EncryptedData, EncryptedDataType, EncryptedKey, EncryptionMethod, EncryptionRecipient,
-    EncryptionResult, KeyTransportAlgorithm, KeyWrapAlgorithm, OaepDigestAlgorithm, ReferenceList,
-    ReplacementMode, RsaOaepParameters, XmlEncError,
+    EncryptedData, EncryptedDataType, EncryptedKey, EncryptionKeySources, EncryptionMethod,
+    EncryptionRecipient, EncryptionResult, KeyTransportAlgorithm, KeyWrapAlgorithm,
+    OaepDigestAlgorithm, ReferenceList, ReplacementMode, RsaOaepParameters, XmlEncError,
 };
 
 fn map_document_error(

@@ -1269,7 +1269,8 @@ impl DefaultKeyResolver {
                 ec_key_value_to_spki_der(curve_oid, public_key)?
             }
             KeyValueInfo::InvalidEcKeyValue => return Err(KeyResolutionError::InvalidPublicKey),
-            KeyValueInfo::Unsupported { .. } => return Ok(None),
+            // DH key agreement keys cannot verify an XML signature.
+            KeyValueInfo::Dh { .. } | KeyValueInfo::Unsupported { .. } => return Ok(None),
         };
         validate_spki_algorithm(&public_key_bytes, algorithm)?;
 

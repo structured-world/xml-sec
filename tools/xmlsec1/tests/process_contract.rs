@@ -43,6 +43,69 @@ fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_xmlsec1")
 }
 
+#[test]
+fn decrypt_nested_wrapping_keys_through_the_cli() {
+    // The native process must recover an intermediate KEK, not mistake it for
+    // the content key; authentication failure must preserve existing output.
+    let directory = tempfile::tempdir().unwrap();
+    let root = [9; 16];
+    let intermediate = [7; 16];
+    let content = [3; 16];
+    let wrap = xml_sec::xmlenc::KeyWrapAlgorithm::AesKw128;
+    let inner = default_provider()
+        .wrap_key(wrap, &root, &intermediate)
+        .unwrap();
+    let outer = default_provider()
+        .wrap_key(wrap, &intermediate, &content)
+        .unwrap();
+    let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    let inner = format!(
+        "<xenc:EncryptedKey><xenc:EncryptionMethod Algorithm='{}'/><ds:KeyInfo><ds:KeyName>root</ds:KeyName></ds:KeyInfo><xenc:CipherData><xenc:CipherValue>{}</xenc:CipherValue></xenc:CipherData></xenc:EncryptedKey>",
+        wrap.uri(),
+        encode(&inner)
+    );
+    let keys = format!(
+        "<ds:KeyInfo><xenc:EncryptedKey><xenc:EncryptionMethod Algorithm='{}'/><ds:KeyInfo>{inner}</ds:KeyInfo><xenc:CipherData><xenc:CipherValue>{}</xenc:CipherValue></xenc:CipherData></xenc:EncryptedKey></ds:KeyInfo>",
+        wrap.uri(),
+        encode(&outer)
+    );
+    let generated = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .direct_key(content)
+        .encrypt_binary(b"nested CLI recipient")
+        .unwrap();
+    let wire = generated.encrypted_data_xml.replacen(
+        "<xenc:CipherData>",
+        &format!("{keys}<xenc:CipherData>"),
+        1,
+    );
+    let input = directory.path().join("input.xml");
+    let key = directory.path().join("root.bin");
+    let output = directory.path().join("output.bin");
+    fs::write(&input, wire).unwrap();
+    fs::write(&key, root).unwrap();
+    let run = || {
+        Command::new(binary())
+            .args(["decrypt", "--aeskey:root"])
+            .arg(&key)
+            .arg("--output")
+            .arg(&output)
+            .arg(&input)
+            .output()
+            .unwrap()
+    };
+    let result = run();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(fs::read(&output).unwrap(), b"nested CLI recipient");
+    fs::write(&key, [8; 16]).unwrap();
+    fs::write(&output, b"preserved").unwrap();
+    assert!(!run().status.success());
+    assert_eq!(fs::read(&output).unwrap(), b"preserved");
+}
+
 fn project_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }

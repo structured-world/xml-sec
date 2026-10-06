@@ -7,8 +7,12 @@
 
 #[cfg(feature = "aws-lc-fips")]
 mod aws_lc;
+#[cfg(feature = "xmlenc")]
+mod key_establishment;
 #[cfg(feature = "pkcs11")]
 pub mod pkcs11;
+#[cfg(feature = "xmlenc")]
+pub use key_establishment::{EcdhCurve, RustCryptoDhKey, RustCryptoEcdhKey, RustCryptoX25519Key};
 #[cfg(all(feature = "xmlenc", feature = "legacy-algorithms"))]
 mod rsa_pkcs1v15;
 #[cfg(feature = "xmldsig")]
@@ -20,6 +24,7 @@ pub(crate) mod rsa_pss;
 pub struct RecoveredContentKey {
     bytes: zeroize::Zeroizing<Vec<u8>>,
     valid: subtle::Choice,
+    implicit_rejection: bool,
     opaque: Option<std::sync::Arc<dyn ContentDecryptionKey>>,
 }
 
@@ -39,6 +44,7 @@ impl RecoveredContentKey {
         Self {
             bytes: zeroize::Zeroizing::new(bytes),
             valid: subtle::Choice::from(1),
+            implicit_rejection: false,
             opaque: None,
         }
     }
@@ -52,6 +58,7 @@ impl RecoveredContentKey {
         Self {
             bytes,
             valid,
+            implicit_rejection: true,
             opaque: None,
         }
     }
@@ -61,6 +68,7 @@ impl RecoveredContentKey {
         Self {
             bytes: zeroize::Zeroizing::new(Vec::new()),
             valid: subtle::Choice::from(1),
+            implicit_rejection: false,
             opaque: Some(key),
         }
     }
@@ -98,6 +106,64 @@ impl RecoveredContentKey {
     }
     pub(crate) fn valid(&self) -> bool {
         bool::from(self.valid)
+    }
+    /// A nested transport feeds a wrapping operation, not a content cipher.
+    /// Preserve recovery validity across every level until content work ends.
+    pub(crate) fn unwrap_nested(
+        &self,
+        provider: &dyn CryptoProvider,
+        algorithm: KeyWrapAlgorithm,
+        ciphertext: &[u8],
+        output_len: usize,
+    ) -> Result<Self, ProviderError> {
+        if self.opaque.is_some() {
+            return Err(ProviderError::KeyNotExportable);
+        }
+        if self.implicit_rejection {
+            // XMLEnc 1.1 §6.1.2: process content even after RSA-v1.5 rejection.
+            // The same protection must survive intermediate wrapping layers.
+            // Branch on the public recovery mechanism, never padding validity.
+            // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-bleichenbacher-attack
+            provider.require_capability(ProviderCapability::Random)?;
+            let mut fallback = zeroize::Zeroizing::new(vec![0; output_len]);
+            provider.fill_random(&mut fallback)?;
+            let mut candidate = match provider.unwrap_key(algorithm, &self.bytes, ciphertext) {
+                Ok(bytes) => zeroize::Zeroizing::new(bytes),
+                Err(ProviderError::AuthenticationFailed) => {
+                    return Ok(Self {
+                        bytes: fallback,
+                        valid: subtle::Choice::from(0),
+                        implicit_rejection: true,
+                        opaque: None,
+                    });
+                }
+                Err(error) => return Err(error),
+            };
+            if candidate.len() != output_len {
+                return Err(ProviderError::InvalidOutputSize {
+                    operation: ProviderOperation::KeyUnwrap,
+                    expected: output_len,
+                    actual: candidate.len(),
+                });
+            }
+            use subtle::ConditionallySelectable;
+            for (byte, random) in candidate.iter_mut().zip(fallback.iter()) {
+                *byte = u8::conditional_select(random, byte, self.valid);
+            }
+            return Ok(Self {
+                bytes: candidate,
+                valid: self.valid,
+                implicit_rejection: true,
+                opaque: None,
+            });
+        }
+        let bytes = provider.unwrap_key(algorithm, &self.bytes, ciphertext)?;
+        Ok(Self {
+            bytes: zeroize::Zeroizing::new(bytes),
+            valid: self.valid,
+            implicit_rejection: false,
+            opaque: None,
+        })
     }
     /// Consume a completed recovery outside a content operation. Content
     /// operations must retain the candidate until after primitive decryption.
@@ -290,6 +356,29 @@ pub struct KeyAgreementParameters<'a> {
     pub peer_public_key: &'a [u8],
 }
 
+/// Provider-neutral context octets or significant bits for key derivation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KdfContext<'a> {
+    /// XMLEnc 1.1 section 5.6.2.2 legacy DH framing. KeySize is derived from
+    /// output_len; callers cannot supply a contradictory decimal key width.
+    LegacyDh {
+        /// URI of the consuming EncryptionMethod, not AgreementMethod.
+        encryption_algorithm: &'a str,
+        /// Decoded KA-Nonce octets, empty when the XML element is absent.
+        nonce: &'a [u8],
+    },
+    /// Complete octets, as used by HKDF info and byte-aligned ConcatKDF.
+    Octets(&'a [u8]),
+    /// An MSB-first bit string. Its last octet must have zero unused low bits;
+    /// the byte slice must have exactly `bit_len.div_ceil(8)` octets.
+    Bits {
+        /// Packed bits, without the XMLEnc attribute's padding-count prefix.
+        bytes: &'a [u8],
+        /// Number of significant bits, not rounded to the next octet.
+        bit_len: usize,
+    },
+}
+
 /// Provider-neutral parameters for a key-derivation operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KdfParameters<'a> {
@@ -299,8 +388,8 @@ pub struct KdfParameters<'a> {
     pub digest: Option<&'a str>,
     /// Caller-provided salt, when the KDF defines one.
     pub salt: &'a [u8],
-    /// Algorithm-specific context bytes such as ConcatKDF OtherInfo or HKDF info.
-    pub info: &'a [u8],
+    /// Algorithm-specific context such as ConcatKDF OtherInfo bits or HKDF info octets.
+    pub info: KdfContext<'a>,
     /// Policy-validated iteration count for iterative KDFs; zero when not applicable.
     pub iterations: u64,
     /// Policy-validated requested output length in bytes.
@@ -384,6 +473,24 @@ impl X509SignatureAlgorithm {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ProviderInputError {
+    /// An EC scalar or peer point is not valid for the selected named curve.
+    #[error("invalid ECDH key material")]
+    EcdhKey,
+    /// Finite-field domain, scalar, or peer fails DH validation.
+    #[error("invalid DH key material")]
+    DhKey,
+    /// An HKDF request violates the primitive's parameter or output contract.
+    #[error("invalid HKDF parameters")]
+    HkdfParameters,
+    /// A PBKDF2 request has invalid iterations, length, or unrelated context.
+    #[error("invalid PBKDF2 parameters")]
+    Pbkdf2Parameters,
+    /// A ConcatKDF request violates its bit-string or counter contract.
+    #[error("invalid ConcatKDF parameters")]
+    ConcatKdfParameters,
+    /// A legacy DH KDF request has invalid framing or exceeds its byte counter.
+    #[error("invalid legacy DH KDF parameters")]
+    LegacyDhKdfParameters,
     /// A primitive rejected a key or IV after its public preconditions were checked.
     #[error("failed to initialize {0}")]
     PrimitiveInitialization(&'static str),
@@ -650,6 +757,11 @@ pub trait KeyRecoveryKey: Send + Sync {
 
 /// Opaque private-key handle used for provider-defined key agreement.
 pub trait KeyAgreementKey: Send + Sync {
+    /// Public modulus/subgroup bit widths for finite-field DH. Operations use
+    /// these to recheck key strength under their own policy; no secret is exported.
+    fn dh_domain_bits(&self) -> Option<(usize, usize)> {
+        None
+    }
     /// External execution domain, when the private key resides outside this process.
     fn provider_binding(&self) -> Option<&ProviderBinding> {
         None
@@ -1305,7 +1417,34 @@ impl CryptoProvider for RustCryptoProvider {
             #[cfg(all(feature = "xmlenc", feature = "legacy-algorithms"))]
             ProviderCapability::Pkcs1v15Transport | ProviderCapability::Pkcs1v15Recovery => true,
             ProviderCapability::Random => true,
-            ProviderCapability::KeyAgreement(_) | ProviderCapability::Kdf(_) => false,
+            ProviderCapability::KeyAgreement(parameters) => {
+                #[cfg(feature = "xmlenc")]
+                {
+                    matches!(
+                        parameters.algorithm,
+                        key_establishment::X25519_URI
+                            | key_establishment::ECDH_URI
+                            | key_establishment::DH_ES_URI
+                            | key_establishment::DH_URI
+                    )
+                }
+                #[cfg(not(feature = "xmlenc"))]
+                {
+                    let _ = parameters;
+                    false
+                }
+            }
+            ProviderCapability::Kdf(parameters) => {
+                #[cfg(feature = "xmlenc")]
+                {
+                    key_establishment::supports_kdf(parameters)
+                }
+                #[cfg(not(feature = "xmlenc"))]
+                {
+                    let _ = parameters;
+                    false
+                }
+            }
         }
     }
 
@@ -1318,13 +1457,21 @@ impl CryptoProvider for RustCryptoProvider {
     fn derive_key(
         &self,
         parameters: &KdfParameters<'_>,
-        _secret: &[u8],
+        secret: &[u8],
     ) -> Result<Vec<u8>, ProviderError> {
         self.require_capability(ProviderCapability::Kdf(parameters))?;
-        Err(ProviderError::Unsupported {
-            operation: ProviderOperation::Kdf,
-            algorithm: Some(parameters.algorithm.to_owned()),
-        })
+        #[cfg(feature = "xmlenc")]
+        {
+            key_establishment::derive_key(parameters, secret)
+        }
+        #[cfg(not(feature = "xmlenc"))]
+        {
+            let _ = secret;
+            Err(ProviderError::Unsupported {
+                operation: ProviderOperation::Kdf,
+                algorithm: Some(parameters.algorithm.to_owned()),
+            })
+        }
     }
 
     #[cfg(feature = "xmldsig")]
@@ -2812,7 +2959,7 @@ mod tests {
             algorithm: "urn:example:kdf",
             digest: Some("urn:example:digest"),
             salt: b"salt",
-            info: b"info",
+            info: KdfContext::Octets(b"info"),
             iterations: 1,
             output_len: 32,
         };

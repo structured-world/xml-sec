@@ -7,6 +7,7 @@ pub(crate) struct XmlBase64Payload<'a, 'input> {
     pub(crate) decoded_len: usize,
     pub(crate) normalized_len: usize,
     pub(crate) text_len: usize,
+    tail: [u8; 4],
 }
 
 impl<'a, 'input> XmlBase64Payload<'a, 'input> {
@@ -22,6 +23,7 @@ impl<'a, 'input> XmlBase64Payload<'a, 'input> {
         let mut normalized_len = 0_usize;
         let mut padding = 0_usize;
         let mut text_len = 0_usize;
+        let mut tail = [0; 4];
         for child in node.children() {
             if child.is_element() {
                 return Err("unexpected nested element");
@@ -53,6 +55,7 @@ impl<'a, 'input> XmlBase64Payload<'a, 'input> {
                 {
                     return Err("invalid base64 character or XML whitespace");
                 }
+                tail[normalized_len % 4] = byte;
                 normalized_len = normalized_len
                     .checked_add(1)
                     .ok_or("base64 size overflow")?;
@@ -69,6 +72,7 @@ impl<'a, 'input> XmlBase64Payload<'a, 'input> {
             decoded_len,
             normalized_len,
             text_len,
+            tail,
         })
     }
 
@@ -78,15 +82,41 @@ impl<'a, 'input> XmlBase64Payload<'a, 'input> {
         Ok(output)
     }
 
-    pub(crate) fn decode_into(&self, output: &mut [u8]) -> Result<(), &'static str> {
-        use std::io::Read as _;
-        let input = self
-            .node
+    /// Validate padding bits without allocating a decoded ciphertext copy.
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        use base64::Engine as _;
+        // Lexical preflight already checked every character and frame length.
+        // Only the final quartet can contain padding or unused trailing bits.
+        if self.normalized_len != 0 {
+            base64::engine::general_purpose::STANDARD
+                .decode_slice(self.tail, &mut [0; 3])
+                .map_err(|_| "invalid base64 padding or trailing bits")?;
+        }
+        Ok(())
+    }
+
+    /// Retain only the normalized wire value after allocation-free validation.
+    pub(crate) fn normalized(&self) -> Result<String, &'static str> {
+        self.validate()?;
+        let mut value = String::with_capacity(self.normalized_len);
+        for byte in self.normalized_bytes() {
+            value.push(char::from(byte));
+        }
+        Ok(value)
+    }
+
+    fn normalized_bytes(&self) -> impl Iterator<Item = u8> + '_ {
+        self.node
             .children()
             .filter(|child| child.is_text())
             .filter_map(|child| child.text())
             .flat_map(str::bytes)
-            .filter(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n'));
+            .filter(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+    }
+
+    pub(crate) fn decode_into(&self, output: &mut [u8]) -> Result<(), &'static str> {
+        use std::io::Read as _;
+        let input = self.normalized_bytes();
         let mut decoder = base64::read::DecoderReader::new(
             Base64ByteReader(input),
             &base64::engine::general_purpose::STANDARD,

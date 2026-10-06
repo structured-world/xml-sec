@@ -3,6 +3,7 @@
 #[cfg(test)]
 use crate::xml::dom::ParsingOptions;
 use crate::xml::dom::{Document, Node};
+#[cfg(test)]
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 use crate::document::{
@@ -19,6 +20,8 @@ use super::types::{
 pub(super) struct ParsingPolicy<'a> {
     xml: &'a crate::policy::XmlInputPolicy,
     resources: &'a crate::policy::ResourcePolicy,
+    uris: Option<&'a crate::policy::UriPolicy>,
+    transforms: Option<&'a crate::policy::TransformPolicy>,
 }
 
 impl<'a> From<&'a crate::policy::EncryptionPolicy> for ParsingPolicy<'a> {
@@ -26,6 +29,8 @@ impl<'a> From<&'a crate::policy::EncryptionPolicy> for ParsingPolicy<'a> {
         Self {
             xml: &policy.xml,
             resources: &policy.resources,
+            uris: None,
+            transforms: None,
         }
     }
 }
@@ -35,13 +40,124 @@ impl<'a> From<&'a crate::policy::DecryptionPolicy> for ParsingPolicy<'a> {
         Self {
             xml: &policy.xml,
             resources: &policy.resources,
+            uris: Some(&policy.uris),
+            transforms: Some(&policy.transforms),
         }
     }
 }
 
 struct ParsedKeyInfo {
+    source_nodes: Vec<crate::NodeId>,
     key_name: Option<String>,
     encrypted_keys: Vec<EncryptedKey>,
+    derived_keys: Vec<super::DerivedKey>,
+    agreement_methods: Vec<super::AgreementMethod>,
+}
+
+struct SharedKeySourceParseBudget<'a> {
+    count: usize,
+    retained_cipher_bytes: usize,
+    transforms: crate::xmldsig::transforms::XPathSignatureParseBudget,
+    key_info: crate::xmldsig::parse::KeyInfoParsingSession<'a>,
+    reference_ancestry: Vec<(Option<String>, [u8; 32])>,
+}
+
+impl<'a> SharedKeySourceParseBudget<'a> {
+    fn new(resources: &'a crate::policy::ResourcePolicy) -> Result<Self, XmlEncError> {
+        Ok(Self {
+            count: 0,
+            retained_cipher_bytes: 0,
+            transforms: crate::xmldsig::transforms::XPathSignatureParseBudget::from_resources(
+                resources,
+            ),
+            key_info: crate::xmldsig::parse::KeyInfoParsingSession::new(resources)
+                .map_err(super::agreement::map_key_info_error)?,
+            reference_ancestry: Vec::new(),
+        })
+    }
+}
+
+struct KeySourceParseBudget<'a, 'doc, 'shared> {
+    policy: ParsingPolicy<'a>,
+    provider: &'a dyn crate::provider::CryptoProvider,
+    shared: &'shared mut SharedKeySourceParseBudget<'a>,
+    references: Option<&'a super::CipherReferenceContext<'a>>,
+    xml_parse: Option<&'a XmlParseWorkBudget>,
+    document_base: Option<String>,
+    resolver: Option<crate::xmldsig::uri::UriReferenceResolver<'doc>>,
+    registrations: &'a [crate::IdAttributeRegistration],
+    ancestry: Vec<crate::NodeId>,
+    origins: Vec<Option<crate::NodeId>>,
+    detached: Option<Vec<crate::NodeId>>,
+}
+
+impl<'a, 'doc, 'shared> KeySourceParseBudget<'a, 'doc, 'shared> {
+    fn referenced_node(
+        &mut self,
+        source: Node<'doc, 'doc>,
+        uri: &str,
+    ) -> Result<Node<'doc, 'doc>, XmlEncError> {
+        let resolver = self.resolver.get_or_insert_with(|| {
+            crate::xmldsig::uri::UriReferenceResolver::with_id_registrations(
+                source.document(),
+                self.registrations,
+            )
+            .with_same_document_id_semantics(
+                self.policy.transforms.map_or(Default::default(), |policy| {
+                    policy.same_document_id_semantics
+                }),
+            )
+        });
+        resolver
+            .node_for_same_document_reference(uri)?
+            .ok_or_else(|| {
+                XmlEncError::InvalidStructure(
+                    "encryption key reference target is absent or ambiguous".into(),
+                )
+            })
+    }
+    fn new(
+        policy: ParsingPolicy<'a>,
+        registrations: &'a [crate::IdAttributeRegistration],
+        provider: &'a dyn crate::provider::CryptoProvider,
+        shared: &'shared mut SharedKeySourceParseBudget<'a>,
+    ) -> Self {
+        Self {
+            policy,
+            provider,
+            shared,
+            references: None,
+            xml_parse: None,
+            document_base: None,
+            resolver: None,
+            registrations,
+            ancestry: Vec::new(),
+            origins: Vec::new(),
+            detached: None,
+        }
+    }
+
+    fn charge(&mut self, resources: &crate::policy::ResourcePolicy) -> Result<(), XmlEncError> {
+        resources.validate_key_candidates(self.shared.count + 1)?;
+        self.shared.count += 1;
+        Ok(())
+    }
+
+    fn charge_recipient(
+        &mut self,
+        resources: &crate::policy::ResourcePolicy,
+        existing: usize,
+    ) -> Result<(), XmlEncError> {
+        if existing >= resources.max_encryption_recipients {
+            return Err(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::ENCRYPTION_RECIPIENTS,
+                maximum: resources.max_encryption_recipients,
+                actual: existing + 1,
+            }
+            .into());
+        }
+        self.charge(resources)
+    }
 }
 
 /// Parse one `xenc:EncryptedData` document fragment.
@@ -77,7 +193,17 @@ pub(super) fn parse_encrypted_data_with_policy_backend_and_budget(
         DocumentParseSettings::from_policy(&policy.xml, &policy.resources).with_backend(backend);
     let document = parse_borrowed_with_settings_and_budget(xml, settings, Some(parse_budget))
         .map_err(|error| map_document_error(error, settings))?;
-    parse_encrypted_data_node(document.root_element(), policy.into(), false)
+    let references = super::CipherReferenceContext::new(policy, None, backend, &[])?;
+    parse_encrypted_data_node_with_origins(
+        document.root_element(),
+        policy.into(),
+        false,
+        &[],
+        crate::provider::default_provider(),
+        Some(&references),
+        Some(parse_budget),
+    )
+    .map(|(data, _)| data)
 }
 
 /// Parse a selected `xenc:EncryptedData` node under an immutable policy snapshot.
@@ -111,9 +237,19 @@ pub(super) fn parse_encrypted_data_node_with_policy_and_budget(
     backend: crate::XmlBackend,
 ) -> Result<EncryptedData, XmlEncError> {
     policy.validate()?;
+    let references = super::CipherReferenceContext::new(policy, None, backend, &[])?;
     let policy = ParsingPolicy::from(policy);
     validate_node_document_policy(node, policy, parse_budget, backend)?;
-    parse_encrypted_data_node(node, policy, false)
+    parse_encrypted_data_node_with_origins(
+        node,
+        policy,
+        false,
+        &[],
+        crate::provider::default_provider(),
+        Some(&references),
+        Some(parse_budget),
+    )
+    .map(|(data, _)| data)
 }
 
 /// Parse an `xenc:EncryptedData` template under an immutable policy snapshot.
@@ -168,12 +304,37 @@ fn parse_policy_document<'a>(
         .map_err(|error| map_document_error(error, settings))
 }
 
-fn parse_encrypted_data_node(
+pub(super) fn parse_encrypted_data_node(
     node: Node<'_, '_>,
     policy: ParsingPolicy<'_>,
     allow_empty_cipher_values: bool,
 ) -> Result<EncryptedData, XmlEncError> {
+    parse_encrypted_data_node_with_origins(
+        node,
+        policy,
+        allow_empty_cipher_values,
+        &[],
+        crate::provider::default_provider(),
+        None,
+        None,
+    )
+    .map(|(data, _)| data)
+}
+
+pub(super) fn parse_encrypted_data_node_with_origins(
+    node: Node<'_, '_>,
+    policy: ParsingPolicy<'_>,
+    allow_empty_cipher_values: bool,
+    registrations: &[crate::IdAttributeRegistration],
+    provider: &dyn crate::provider::CryptoProvider,
+    references: Option<&super::CipherReferenceContext<'_>>,
+    xml_parse: Option<&XmlParseWorkBudget>,
+) -> Result<(EncryptedData, Vec<Option<crate::NodeId>>), XmlEncError> {
     require_element(node, XMLENC_NS, "EncryptedData")?;
+    let mut shared = SharedKeySourceParseBudget::new(policy.resources)?;
+    let mut budget = KeySourceParseBudget::new(policy, registrations, provider, &mut shared);
+    budget.references = references;
+    budget.xml_parse = xml_parse;
     validate_encrypted_type_attributes(node, policy)?;
     let mut children = element_children(node);
     let encryption_method = parse_encryption_method_with_limit(
@@ -189,16 +350,11 @@ fn parse_encrypted_data_node(
         ));
     }
 
-    let key_info = match children.peek() {
-        Some(child) if child.has_tag_name((XMLDSIG_NS, "KeyInfo")) => parse_key_info(
-            next_required(&mut children, "KeyInfo")?,
-            policy,
-            allow_empty_cipher_values,
-        )?,
-        _ => ParsedKeyInfo {
-            key_name: None,
-            encrypted_keys: Vec::new(),
-        },
+    let key_info_node = match children.peek() {
+        Some(child) if child.has_tag_name((XMLDSIG_NS, "KeyInfo")) => {
+            Some(next_required(&mut children, "KeyInfo")?)
+        }
+        _ => None,
     };
     if children
         .peek()
@@ -212,6 +368,9 @@ fn parse_encrypted_data_node(
     let cipher_data = parse_cipher_data(
         next_required(&mut children, "CipherData")?,
         allow_empty_cipher_values,
+        policy,
+        &mut budget.shared.transforms,
+        &mut budget.shared.retained_cipher_bytes,
     )?;
     consume_encryption_properties(&mut children);
     if children.next().is_some() {
@@ -220,27 +379,79 @@ fn parse_encrypted_data_node(
         ));
     }
 
+    // Reject the containing value and policy before indirect KeyInfo processing
+    // can resolve resources or execute transforms.
+    if let Some(references) = references {
+        references.validate_method(&encryption_method, true, provider)?;
+        references.preflight_cipher_data(&cipher_data)?;
+    }
+    let mut key_info = match key_info_node {
+        Some(key_info) => {
+            parse_key_info(key_info, policy, allow_empty_cipher_values, &mut budget, 0)?
+        }
+        None => ParsedKeyInfo {
+            source_nodes: Vec::new(),
+            key_name: None,
+            encrypted_keys: Vec::new(),
+            derived_keys: Vec::new(),
+            agreement_methods: Vec::new(),
+        },
+    };
+    append_detached_keys(
+        node,
+        &mut key_info,
+        policy,
+        allow_empty_cipher_values,
+        &mut budget,
+        0,
+    )?;
+
     let encrypted = EncryptedData {
         id: bounded_attribute(node, "Id", policy)?,
         encrypted_type: parse_encrypted_data_type(node.attribute("Type")),
         key_name: key_info.key_name,
         encryption_method,
         encrypted_keys: key_info.encrypted_keys,
+        derived_keys: key_info.derived_keys,
+        agreement_methods: key_info.agreement_methods,
         cipher_data,
     };
     validate_encrypted_data_metadata(&encrypted, policy)?;
-    Ok(encrypted)
+    Ok((encrypted, budget.origins))
 }
 
-fn parse_key_info(
-    node: Node<'_, '_>,
+fn parse_key_info<'doc>(
+    node: Node<'doc, 'doc>,
     policy: ParsingPolicy<'_>,
     allow_empty_cipher_values: bool,
+    budget: &mut KeySourceParseBudget<'_, 'doc, '_>,
+    depth: usize,
 ) -> Result<ParsedKeyInfo, XmlEncError> {
     require_element(node, XMLDSIG_NS, "KeyInfo")?;
+    policy.resources.validate_key_info_reference_depth(depth)?;
+    let recipients = node
+        .children()
+        .filter(|child| child.has_tag_name((XMLENC_NS, "EncryptedKey")))
+        .count();
+    if recipients > policy.resources.max_encryption_recipients {
+        return Err(crate::policy::PolicyViolation::ResourceLimit {
+            resource: crate::policy::resource_name::ENCRYPTION_RECIPIENTS,
+            maximum: policy.resources.max_encryption_recipients,
+            actual: recipients,
+        }
+        .into());
+    }
+    if budget.ancestry.contains(&node.id()) {
+        return Err(XmlEncError::InvalidStructure(
+            "cyclic encryption KeyInfo reference".into(),
+        ));
+    }
+    budget.ancestry.push(node.id());
     let mut key_name = None;
+    let mut source_nodes = Vec::new();
     let mut encrypted_keys = Vec::new();
-    let mut unsupported_agreement = None;
+    let mut derived_keys = Vec::new();
+    let mut agreement_methods = Vec::new();
     for child in node.children().filter(Node::is_element) {
         if child.has_tag_name((XMLDSIG_NS, "KeyName")) {
             if key_name.is_some() {
@@ -250,53 +461,478 @@ fn parse_key_info(
             }
             key_name = Some(parse_key_name(child, policy)?);
         } else if child.has_tag_name((XMLENC_NS, "EncryptedKey")) {
-            if encrypted_keys.len() == policy.resources.max_encryption_recipients {
-                return Err(crate::policy::PolicyViolation::ResourceLimit {
-                    resource: crate::policy::resource_name::ENCRYPTION_RECIPIENTS,
-                    maximum: policy.resources.max_encryption_recipients,
-                    actual: encrypted_keys.len() + 1,
-                }
-                .into());
-            }
+            budget.charge_recipient(policy.resources, encrypted_keys.len())?;
+            source_nodes.push(child.id());
             encrypted_keys.push(parse_encrypted_key(
                 child,
                 policy,
                 allow_empty_cipher_values,
+                budget,
+                depth + 1,
             )?);
+        } else if child.has_tag_name((XMLENC11_NS, "DerivedKey")) {
+            budget.charge(policy.resources)?;
+            derived_keys.push(super::derived_key::parse(child, policy.resources)?);
         } else if child.has_tag_name((XMLENC_NS, "AgreementMethod")) {
-            // Agreement methods require a separate key-derivation trust boundary.
-            // Keep the URI as a fallback error while allowing another advertised
-            // key candidate to be selected by the caller's resolver.
-            let algorithm = child
-                .attribute("Algorithm")
-                .ok_or(XmlEncError::MissingRequired(
-                    "AgreementMethod Algorithm attribute",
-                ))?;
-            validate_metadata_len(
-                algorithm.len(),
-                policy.resources.max_encryption_metadata_bytes,
-            )?;
-            unsupported_agreement.get_or_insert_with(|| algorithm.to_owned());
+            budget.charge(policy.resources)?;
+            for role in child.children().filter(|node| {
+                node.has_tag_name((XMLENC_NS, "OriginatorKeyInfo"))
+                    || node.has_tag_name((XMLENC_NS, "RecipientKeyInfo"))
+            }) {
+                for source in role.children().filter(Node::is_element) {
+                    if source.has_tag_name((XMLDSIG_NS, "KeyValue"))
+                        || source.has_tag_name((
+                            crate::xmldsig::parse::XMLDSIG11_NS,
+                            "DEREncodedKeyValue",
+                        ))
+                    {
+                        budget.charge(policy.resources)?;
+                    } else if source.has_tag_name((XMLDSIG_NS, "X509Data")) {
+                        for _ in source
+                            .children()
+                            .filter(|node| node.has_tag_name((XMLDSIG_NS, "X509Certificate")))
+                        {
+                            budget.charge(policy.resources)?;
+                        }
+                    }
+                }
+            }
+            agreement_methods.push(super::agreement::parse(
+                child,
+                policy.resources,
+                &mut budget.shared.key_info,
+                budget.provider,
+            )?);
+        } else if child.has_tag_name((XMLDSIG_NS, "RetrievalMethod")) {
+            // XMLDSig 1.1 section 4.5.3 defines element-only content here.
+            // KeyInfo's mixed content must not leak into this child grammar.
+            // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-RetrievalMethod
+            if child.children().any(|node| {
+                node.is_text()
+                    && node.text().is_some_and(|text| {
+                        !text
+                            .bytes()
+                            .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+                    })
+            }) {
+                return Err(XmlEncError::InvalidStructure(
+                    "RetrievalMethod contains non-whitespace text".into(),
+                ));
+            }
+            // XMLEnc 1.1 §3.5.3 defines both EncryptedKey and DerivedKey
+            // retrieval. An explicit Type must agree with the actual target.
+            // Resolve against one ID index and retain the original key node.
+            // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-Extensions-to-KeyInfo
+            let uri = child
+                .attribute("URI")
+                .ok_or(XmlEncError::MissingRequired("RetrievalMethod URI"))?;
+            validate_metadata_len(uri.len(), policy.resources.max_encryption_metadata_bytes)?;
+            let allowed = policy
+                .uris
+                .map_or(crate::xmldsig::UriTypeSet::SAME_DOCUMENT, |uris| {
+                    uris.retrieval_methods
+                });
+            if !allowed.allows(uri) {
+                return Err(crate::policy::PolicyViolation::Algorithm {
+                    operation: "encryption key retrieval URI",
+                    algorithm: uri.to_owned(),
+                }
+                .into());
+            }
+            let mut transform_children = element_children(child);
+            let transforms = match transform_children.next() {
+                Some(container) if container.has_tag_name((XMLDSIG_NS, "Transforms")) => {
+                    if transform_children.next().is_some()
+                        || !container.children().any(|node| node.is_element())
+                    {
+                        return Err(XmlEncError::InvalidStructure(
+                            "RetrievalMethod requires one nonempty ds:Transforms container".into(),
+                        ));
+                    }
+                    crate::xmldsig::transforms::parse_reference_transforms_with_budget(
+                        container,
+                        XMLDSIG_NS,
+                        &mut budget.shared.transforms,
+                    )?
+                }
+                Some(_) => {
+                    return Err(XmlEncError::InvalidStructure(
+                        "unexpected RetrievalMethod child".into(),
+                    ));
+                }
+                None => Vec::new(),
+            };
+            let declared_type = child.attribute("Type");
+            if let Some(kind) = declared_type {
+                validate_metadata_len(kind.len(), policy.resources.max_encryption_metadata_bytes)?;
+                if !matches!(
+                    kind,
+                    "http://www.w3.org/2001/04/xmlenc#EncryptedKey"
+                        | "http://www.w3.org/2001/04/xmlenc#DerivedKey"
+                ) {
+                    return Err(XmlEncError::InvalidStructure(
+                        "unsupported encryption RetrievalMethod Type".into(),
+                    ));
+                }
+            }
+            if !uri.is_empty() && !uri.starts_with('#') || !transforms.is_empty() {
+                budget.charge(policy.resources)?;
+                match parse_processed_key_reference(
+                    child,
+                    uri,
+                    &transforms,
+                    declared_type,
+                    allow_empty_cipher_values,
+                    budget,
+                    depth + 1,
+                )? {
+                    RetrievedKey::Encrypted(key) => {
+                        if encrypted_keys.len() >= policy.resources.max_encryption_recipients {
+                            return Err(crate::policy::PolicyViolation::ResourceLimit {
+                                resource: crate::policy::resource_name::ENCRYPTION_RECIPIENTS,
+                                maximum: policy.resources.max_encryption_recipients,
+                                actual: encrypted_keys.len() + 1,
+                            }
+                            .into());
+                        }
+                        encrypted_keys.push(key);
+                    }
+                    RetrievedKey::Derived(key) => derived_keys.push(key),
+                }
+                continue;
+            }
+            let target = budget.referenced_node(child, uri)?;
+            if target.has_tag_name((XMLENC11_NS, "DerivedKey")) {
+                if declared_type
+                    .is_some_and(|kind| kind != "http://www.w3.org/2001/04/xmlenc#DerivedKey")
+                {
+                    return Err(XmlEncError::InvalidStructure(
+                        "RetrievalMethod Type disagrees with DerivedKey target".into(),
+                    ));
+                }
+                budget.charge(policy.resources)?;
+                derived_keys.push(super::derived_key::parse(target, policy.resources)?);
+                continue;
+            }
+            if declared_type
+                .is_some_and(|kind| kind != "http://www.w3.org/2001/04/xmlenc#EncryptedKey")
+            {
+                return Err(XmlEncError::InvalidStructure(
+                    "RetrievalMethod Type disagrees with EncryptedKey target".into(),
+                ));
+            }
+            budget.charge_recipient(policy.resources, encrypted_keys.len())?;
+            source_nodes.push(target.id());
+            encrypted_keys.push(parse_encrypted_key(
+                target,
+                policy,
+                allow_empty_cipher_values,
+                budget,
+                depth + 1,
+            )?);
+        } else if child.has_tag_name((crate::xmldsig::parse::XMLDSIG11_NS, "KeyInfoReference")) {
+            // XMLDSig 1.1 §4.5.10 requires a KeyInfo target, without
+            // RetrievalMethod transforms. The same recursion budget and
+            // ancestry track indirect and embedded encryption sources.
+            // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-KeyInfoReference
+            let uri = child
+                .attribute("URI")
+                .ok_or(XmlEncError::MissingRequired("KeyInfoReference URI"))?;
+            validate_metadata_len(uri.len(), policy.resources.max_encryption_metadata_bytes)?;
+            if child.children().any(|node| {
+                node.is_element()
+                    || node.is_text()
+                        && node.text().is_some_and(|text| {
+                            !text
+                                .bytes()
+                                .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+                        })
+            }) {
+                return Err(XmlEncError::InvalidStructure(
+                    "KeyInfoReference must be empty".into(),
+                ));
+            }
+            let allowed = policy
+                .uris
+                .map_or(crate::xmldsig::UriTypeSet::SAME_DOCUMENT, |uris| {
+                    uris.key_info_references
+                });
+            if !allowed.allows(uri) {
+                return Err(crate::policy::PolicyViolation::Algorithm {
+                    operation: "encryption KeyInfo reference URI",
+                    algorithm: uri.to_owned(),
+                }
+                .into());
+            }
+            budget.charge(policy.resources)?;
+            let target = budget.referenced_node(child, uri)?;
+            let info =
+                parse_key_info(target, policy, allow_empty_cipher_values, budget, depth + 1)?;
+            if let Some(name) = info.key_name {
+                if key_name.is_some() {
+                    return Err(XmlEncError::InvalidStructure(
+                        "indirect KeyInfo contains conflicting KeyName".into(),
+                    ));
+                }
+                key_name = Some(name);
+            }
+            if encrypted_keys.len() + info.encrypted_keys.len()
+                > policy.resources.max_encryption_recipients
+            {
+                return Err(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::ENCRYPTION_RECIPIENTS,
+                    maximum: policy.resources.max_encryption_recipients,
+                    actual: encrypted_keys.len() + info.encrypted_keys.len(),
+                }
+                .into());
+            }
+            encrypted_keys.extend(info.encrypted_keys);
+            source_nodes.extend(info.source_nodes);
+            derived_keys.extend(info.derived_keys);
+            agreement_methods.extend(info.agreement_methods);
         }
     }
-    if key_name.is_none()
-        && encrypted_keys.is_empty()
-        && let Some(algorithm) = unsupported_agreement
-    {
-        return Err(XmlEncError::UnsupportedAlgorithm(algorithm));
-    }
+    budget.ancestry.pop();
     Ok(ParsedKeyInfo {
+        source_nodes,
         key_name,
         encrypted_keys,
+        derived_keys,
+        agreement_methods,
     })
 }
 
-fn parse_encrypted_key(
-    node: Node<'_, '_>,
+enum RetrievedKey {
+    Encrypted(EncryptedKey),
+    Derived(super::DerivedKey),
+}
+
+fn parse_processed_key_reference(
+    source: Node<'_, '_>,
+    uri: &str,
+    transforms: &[crate::xmldsig::transforms::Transform],
+    declared_type: Option<&str>,
+    allow_empty: bool,
+    budget: &mut KeySourceParseBudget<'_, '_, '_>,
+    depth: usize,
+) -> Result<RetrievedKey, XmlEncError> {
+    use sha2::Digest as _;
+    let policy = budget.policy;
+    policy.resources.validate_key_info_reference_depth(depth)?;
+    let context = budget.references.ok_or_else(|| {
+        XmlEncError::InvalidStructure(
+            "processed key retrieval requires an operation resource context".into(),
+        )
+    })?;
+    let parse = budget
+        .xml_parse
+        .ok_or_else(|| XmlEncError::OperationPlan("missing key resource parse budget".into()))?;
+    let (bytes, base) = context.resolve_key_reference(
+        source,
+        uri,
+        transforms,
+        budget.document_base.as_deref(),
+        parse,
+    )?;
+    policy.resources.validate_xml_document_len(bytes.len())?;
+    // Equality is over the selected, bounded result, never a phase-local node
+    // handle or a scan/hash of every unused caller resource.
+    let fingerprint: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+    if budget
+        .shared
+        .reference_ancestry
+        .iter()
+        .any(|(identity, hash)| identity == &base && hash == &fingerprint)
+    {
+        return Err(XmlEncError::InvalidStructure(
+            "cyclic processed encryption key reference".into(),
+        ));
+    }
+    budget
+        .shared
+        .reference_ancestry
+        .push((base.clone(), fingerprint));
+    let settings = DocumentParseSettings::from_policy(policy.xml, policy.resources)
+        .with_backend(context.backend());
+    let xml = crate::document::decode_xml_with_budget(
+        &bytes,
+        policy.resources.max_xml_document_bytes,
+        Some(parse),
+    )
+    .map_err(|error| map_document_error(error, settings))?;
+    let document = parse_policy_document(&xml, policy, parse, context.backend())?;
+    let mut child_budget = KeySourceParseBudget::new(
+        budget.policy,
+        budget.registrations,
+        budget.provider,
+        &mut *budget.shared,
+    );
+    child_budget.references = Some(context);
+    child_budget.xml_parse = Some(parse);
+    child_budget.document_base = base;
+    let target = document.root_element();
+    let result = if target.has_tag_name((XMLENC11_NS, "DerivedKey")) {
+        if declared_type.is_some_and(|kind| kind != "http://www.w3.org/2001/04/xmlenc#DerivedKey") {
+            return Err(XmlEncError::InvalidStructure(
+                "RetrievalMethod Type disagrees with DerivedKey target".into(),
+            ));
+        }
+        RetrievedKey::Derived(super::derived_key::parse(target, policy.resources)?)
+    } else {
+        if declared_type.is_some_and(|kind| kind != "http://www.w3.org/2001/04/xmlenc#EncryptedKey")
+        {
+            return Err(XmlEncError::InvalidStructure(
+                "RetrievalMethod Type disagrees with EncryptedKey target".into(),
+            ));
+        }
+        let mut key = parse_encrypted_key(target, policy, allow_empty, &mut child_budget, depth)?;
+        let bound =
+            context.bind_document_with_base(&document, child_budget.document_base.as_deref());
+        let mut origins = child_budget.origins.iter();
+        super::decrypt::resolve_nested_cipher_references(
+            core::slice::from_mut(&mut key),
+            &document,
+            &mut origins,
+            &bound,
+            parse,
+        )?;
+        if origins.next().is_some() {
+            return Err(XmlEncError::OperationPlan(
+                "unused processed key origin".into(),
+            ));
+        }
+        RetrievedKey::Encrypted(key)
+    };
+    budget
+        .origins
+        .extend(child_budget.origins.iter().map(|_| None));
+    budget.shared.reference_ancestry.pop();
+    Ok(result)
+}
+
+fn append_detached_keys<'doc>(
+    node: Node<'doc, 'doc>,
+    info: &mut ParsedKeyInfo,
     policy: ParsingPolicy<'_>,
     allow_empty_cipher_values: bool,
+    budget: &mut KeySourceParseBudget<'_, 'doc, '_>,
+    depth: usize,
+) -> Result<(), XmlEncError> {
+    // XMLEnc §§3.5, 3.5.1 and 3.6 bind detached transports to either
+    // encrypted-object class. Inventory node IDs once, not the document once
+    // per recursive key. Original nodes retain namespaces and provenance.
+    // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-ReferenceList
+    if budget.detached.is_none() {
+        let mut candidates = Vec::new();
+        for candidate in node
+            .document()
+            .descendants()
+            .filter(|candidate| candidate.has_tag_name((XMLENC_NS, "EncryptedKey")))
+        {
+            policy
+                .resources
+                .validate_key_candidates(candidates.len() + 1)?;
+            candidates.push(candidate.id());
+        }
+        budget.detached = Some(candidates);
+    }
+    let count = budget
+        .detached
+        .as_ref()
+        .expect("inventory initialized")
+        .len();
+    for index in 0..count {
+        let id = budget.detached.as_ref().expect("inventory initialized")[index];
+        let candidate = node
+            .document()
+            .get_node(id)
+            .expect("inventory belongs to this document");
+        let named = info.key_name.as_deref().is_some_and(|expected| {
+            candidate
+                .children()
+                .find(|child| child.has_tag_name((XMLENC_NS, "CarriedKeyName")))
+                .is_some_and(|label| {
+                    !label.children().any(|child| child.is_element())
+                        && label
+                            .children()
+                            .filter_map(|child| child.text())
+                            .flat_map(str::bytes)
+                            .eq(expected.bytes())
+                })
+        });
+        let mut referenced = false;
+        if let Some(list) = candidate
+            .children()
+            .find(|child| child.has_tag_name((XMLENC_NS, "ReferenceList")))
+        {
+            let data_target = node.has_tag_name((XMLENC_NS, "EncryptedData"));
+            visit_reference_list(list, policy.resources, |data_reference, uri| {
+                if data_reference != data_target || !uri.is_empty() && !uri.starts_with('#') {
+                    return Ok(());
+                }
+                let resolver = budget.resolver.get_or_insert_with(|| {
+                    crate::xmldsig::uri::UriReferenceResolver::with_id_registrations(
+                        node.document(),
+                        budget.registrations,
+                    )
+                    .with_same_document_id_semantics(
+                        policy.transforms.map_or(Default::default(), |policy| {
+                            policy.same_document_id_semantics
+                        }),
+                    )
+                });
+                if resolver
+                    .node_for_same_document_reference(uri)?
+                    .is_some_and(|target| target.id() == node.id())
+                {
+                    referenced = true;
+                }
+                Ok(())
+            })?;
+        }
+        if !named && !referenced {
+            continue;
+        }
+        if budget.ancestry.contains(&id) {
+            return Err(XmlEncError::InvalidStructure(
+                "cyclic detached EncryptedKey association".into(),
+            ));
+        }
+        if info.source_nodes.contains(&id) {
+            continue;
+        }
+        budget.charge_recipient(policy.resources, info.encrypted_keys.len())?;
+        info.source_nodes.push(id);
+        info.encrypted_keys.push(parse_encrypted_key(
+            candidate,
+            policy,
+            allow_empty_cipher_values,
+            budget,
+            depth + 1,
+        )?);
+    }
+    Ok(())
+}
+
+fn parse_encrypted_key<'doc>(
+    node: Node<'doc, 'doc>,
+    policy: ParsingPolicy<'_>,
+    allow_empty_cipher_values: bool,
+    budget: &mut KeySourceParseBudget<'_, 'doc, '_>,
+    depth: usize,
 ) -> Result<EncryptedKey, XmlEncError> {
     require_element(node, XMLENC_NS, "EncryptedKey")?;
+    // XMLEnc §3.5 allows EncryptedKey inside another key's KeyInfo. The
+    // product indirection ceiling bounds both parsing and execution stacks.
+    // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-Extensions-to-KeyInfo
+    policy.resources.validate_key_info_reference_depth(depth)?;
+    if budget.ancestry.contains(&node.id()) {
+        return Err(XmlEncError::InvalidStructure(
+            "cyclic EncryptedKey reference".into(),
+        ));
+    }
+    budget.ancestry.push(node.id());
+    budget.origins.push(Some(node.id()));
     validate_encrypted_type_attributes(node, policy)?;
     let mut children = element_children(node);
     let encryption_method = parse_encryption_method_with_limit(
@@ -311,11 +947,11 @@ fn parse_encrypted_key(
             "EncryptedKey contains more than one direct EncryptionMethod".into(),
         ));
     }
-    let key_name = if children
+    let key_info_node = if children
         .peek()
         .is_some_and(|child| child.has_tag_name((XMLDSIG_NS, "KeyInfo")))
     {
-        parse_key_name_hint(next_required(&mut children, "KeyInfo")?, policy)?
+        Some(next_required(&mut children, "KeyInfo")?)
     } else {
         None
     };
@@ -330,6 +966,9 @@ fn parse_encrypted_key(
     let cipher_data = parse_cipher_data(
         next_required(&mut children, "CipherData")?,
         allow_empty_cipher_values,
+        policy,
+        &mut budget.shared.transforms,
+        &mut budget.shared.retained_cipher_bytes,
     )?;
     consume_encryption_properties(&mut children);
     let reference_list = if children
@@ -359,10 +998,50 @@ fn parse_encrypted_key(
             "EncryptedKey has unexpected child after CipherData".into(),
         ));
     }
+    if let Some(references) = budget.references {
+        // Unsupported unused recipients remain skippable. Preflight a key
+        // method here only when its key source would initiate indirect work.
+        if key_info_node.is_some_and(|info| {
+            info.descendants().any(|child| {
+                child.has_tag_name((XMLDSIG_NS, "RetrievalMethod"))
+                    || child.has_tag_name((crate::xmldsig::parse::XMLDSIG11_NS, "KeyInfoReference"))
+            })
+        }) {
+            references.validate_method(&encryption_method, false, budget.provider)?;
+        }
+        references.preflight_cipher_data(&cipher_data)?;
+    }
+    let mut key_info = match key_info_node {
+        Some(key_info) => Some(parse_key_info(
+            key_info,
+            policy,
+            allow_empty_cipher_values,
+            budget,
+            depth,
+        )?),
+        None => None,
+    };
+    let info = key_info.get_or_insert_with(|| ParsedKeyInfo {
+        source_nodes: Vec::new(),
+        key_name: None,
+        encrypted_keys: Vec::new(),
+        derived_keys: Vec::new(),
+        agreement_methods: Vec::new(),
+    });
+    append_detached_keys(node, info, policy, allow_empty_cipher_values, budget, depth)?;
+    budget.ancestry.pop();
     Ok(EncryptedKey {
+        sources: key_info
+            .as_mut()
+            .map(|info| super::EncryptionKeySources {
+                encrypted_keys: core::mem::take(&mut info.encrypted_keys),
+                derived_keys: core::mem::take(&mut info.derived_keys),
+                agreement_methods: core::mem::take(&mut info.agreement_methods),
+            })
+            .unwrap_or_default(),
         id: bounded_attribute(node, "Id", policy)?,
         recipient: bounded_attribute(node, "Recipient", policy)?,
-        key_name,
+        key_name: key_info.and_then(|info| info.key_name),
         encryption_method,
         cipher_data,
         reference_list,
@@ -384,25 +1063,6 @@ fn parse_carried_key_name(
     Ok(value)
 }
 
-fn parse_key_name_hint(
-    node: Node<'_, '_>,
-    policy: ParsingPolicy<'_>,
-) -> Result<Option<String>, XmlEncError> {
-    require_element(node, XMLDSIG_NS, "KeyInfo")?;
-    let mut key_names = node
-        .children()
-        .filter(|child| child.has_tag_name((XMLDSIG_NS, "KeyName")));
-    let Some(key_name) = key_names.next() else {
-        return Ok(None);
-    };
-    if key_names.next().is_some() {
-        return Err(XmlEncError::InvalidStructure(
-            "EncryptedKey KeyInfo contains more than one direct KeyName".into(),
-        ));
-    }
-    parse_key_name(key_name, policy).map(Some)
-}
-
 fn parse_key_name(node: Node<'_, '_>, policy: ParsingPolicy<'_>) -> Result<String, XmlEncError> {
     let value = bounded_simple_text(node, "KeyName", policy)?;
     if value.is_empty() {
@@ -415,36 +1075,87 @@ fn parse_reference_list(
     node: Node<'_, '_>,
     policy: ParsingPolicy<'_>,
 ) -> Result<ReferenceList, XmlEncError> {
+    parse_reference_list_with_resources(node, policy.resources)
+}
+
+pub(super) fn parse_reference_list_with_resources(
+    node: Node<'_, '_>,
+    resources: &crate::policy::ResourcePolicy,
+) -> Result<ReferenceList, XmlEncError> {
     require_element(node, XMLENC_NS, "ReferenceList")?;
     let mut data_references = Vec::new();
     let mut key_references = Vec::new();
-    for child in node.children().filter(Node::is_element) {
-        let uri = child
-            .attribute("URI")
-            .filter(|uri| !uri.is_empty())
-            .ok_or(XmlEncError::MissingRequired("Reference URI attribute"))?;
-        validate_metadata_len(uri.len(), policy.resources.max_encryption_metadata_bytes)?;
-        let uri = uri.to_owned();
-        match (child.tag_name().namespace(), child.tag_name().name()) {
-            (Some(XMLENC_NS), "DataReference") => data_references.push(uri),
-            (Some(XMLENC_NS), "KeyReference") => key_references.push(uri),
-            _ => {
-                return Err(XmlEncError::InvalidStructure(format!(
-                    "unsupported ReferenceList child {}",
-                    child.tag_name().name()
-                )));
-            }
+    visit_reference_list(node, resources, |data_reference, uri| {
+        if data_reference {
+            data_references.push(uri.to_owned());
+        } else {
+            key_references.push(uri.to_owned());
         }
-    }
-    if data_references.is_empty() && key_references.is_empty() {
-        return Err(XmlEncError::InvalidStructure(
-            "ReferenceList must contain at least one reference".into(),
-        ));
-    }
+        Ok(())
+    })?;
     Ok(ReferenceList {
         data_references,
         key_references,
     })
+}
+
+fn visit_reference_list(
+    node: Node<'_, '_>,
+    resources: &crate::policy::ResourcePolicy,
+    mut visit: impl FnMut(bool, &str) -> Result<(), XmlEncError>,
+) -> Result<(), XmlEncError> {
+    require_element(node, XMLENC_NS, "ReferenceList")?;
+    let mut count = 0;
+    // XMLEnc 1.1 §3.6: an element-only choice of DataReference/KeyReference;
+    // URI is required, but its anyURI type does not require a nonempty value.
+    // Validate the choice before allocating its URI or consulting a resolver.
+    // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-ReferenceList
+    for child in node.children() {
+        if child.is_text()
+            && child.text().is_some_and(|text| {
+                !text
+                    .bytes()
+                    .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+            })
+        {
+            return Err(XmlEncError::InvalidStructure(
+                "ReferenceList contains character data".into(),
+            ));
+        }
+        if !child.is_element() {
+            continue;
+        }
+        let data_reference = match (child.tag_name().namespace(), child.tag_name().name()) {
+            (Some(XMLENC_NS), "DataReference") => true,
+            (Some(XMLENC_NS), "KeyReference") => false,
+            _ => {
+                return Err(XmlEncError::InvalidStructure(format!(
+                    "unsupported ReferenceList child {}",
+                    child.tag_name().name(),
+                )));
+            }
+        };
+        count += 1;
+        if count > resources.max_references {
+            return Err(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::ENCRYPTION_REFERENCES,
+                maximum: resources.max_references,
+                actual: count,
+            }
+            .into());
+        }
+        let uri = child
+            .attribute("URI")
+            .ok_or(XmlEncError::MissingRequired("Reference URI attribute"))?;
+        validate_metadata_len(uri.len(), resources.max_encryption_metadata_bytes)?;
+        visit(data_reference, uri)?;
+    }
+    if count == 0 {
+        return Err(XmlEncError::InvalidStructure(
+            "ReferenceList must contain at least one reference".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn consume_encryption_properties<'a, I>(children: &mut std::iter::Peekable<I>)
@@ -492,7 +1203,11 @@ fn parse_encryption_method_with_limit(
                 key_size_bits = Some(parse_key_size(child, metadata_limit)?);
             }
             (Some(XMLENC_NS), "OAEPparams") if oaep_params.is_none() => {
-                oaep_params = Some(decode_bounded_base64_text(child, metadata_limit)?);
+                oaep_params = Some(decode_bounded_base64_text(
+                    child,
+                    "OAEPparams",
+                    metadata_limit,
+                )?);
             }
             (Some(XMLDSIG_NS), "DigestMethod") if oaep_digest.is_none() => {
                 let digest = child
@@ -544,32 +1259,65 @@ fn parse_key_size(node: Node<'_, '_>, metadata_limit: usize) -> Result<usize, Xm
     Ok(bits)
 }
 
-fn parse_cipher_data(node: Node<'_, '_>, allow_empty: bool) -> Result<CipherData, XmlEncError> {
+fn parse_cipher_data(
+    node: Node<'_, '_>,
+    allow_empty: bool,
+    policy: ParsingPolicy<'_>,
+    transform_budget: &mut crate::xmldsig::transforms::XPathSignatureParseBudget,
+    retained_cipher_bytes: &mut usize,
+) -> Result<CipherData, XmlEncError> {
     require_element(node, XMLENC_NS, "CipherData")?;
     let mut children = element_children(node);
     let value = next_required(&mut children, "CipherValue")?;
-    require_element(value, XMLENC_NS, "CipherValue")?;
     if children.next().is_some() {
         return Err(XmlEncError::InvalidStructure(
-            "CipherData must contain exactly one CipherValue".into(),
+            "CipherData must contain exactly one CipherValue or CipherReference".into(),
         ));
     }
-    Ok(CipherData {
-        value: normalize_base64_with_empty(&simple_text(value, "CipherValue")?, allow_empty)?,
-    })
-}
-
-fn simple_text(node: Node<'_, '_>, element_name: &str) -> Result<String, XmlEncError> {
-    if node.children().any(|child| child.is_element()) {
-        return Err(XmlEncError::InvalidStructure(format!(
-            "{element_name} must not contain element children"
-        )));
+    // XMLEnc 1.1 section 3.3 defines a choice, not two optional siblings.
+    // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-CipherData
+    if value.has_tag_name((XMLENC_NS, "CipherReference")) {
+        let (uri, transforms) =
+            super::cipher_reference::parse_reference(value, policy.resources, transform_budget)?;
+        return Ok(CipherData::Reference {
+            uri: uri.to_owned(),
+            transforms,
+        });
     }
-    Ok(node
-        .children()
-        .filter(Node::is_text)
-        .filter_map(|child| child.text())
-        .collect())
+    require_element(value, XMLENC_NS, "CipherValue")?;
+    // XSD 1.0 section 3.2.16 permits only XML whitespace in base64Binary.
+    // Borrow text across comments/CDATA; validate before retaining one buffer.
+    // https://www.w3.org/TR/2004/REC-xmlschema-2-20041028/#base64Binary
+    let payload = crate::xmldsig::whitespace::XmlBase64Payload::bounded(
+        value,
+        usize::MAX,
+        MAX_CIPHER_VALUE_BASE64_LEN,
+    )
+    .map_err(|reason| {
+        if reason == "unexpected nested element" {
+            XmlEncError::InvalidStructure("CipherValue must not contain element children".into())
+        } else {
+            XmlEncError::Base64(format!("CipherValue: {reason}"))
+        }
+    })?;
+    if payload.normalized_len == 0 && !allow_empty {
+        return Err(XmlEncError::Base64("CipherValue is empty".into()));
+    }
+    let maximum = policy.resources.max_xml_document_bytes;
+    if payload.normalized_len > maximum - *retained_cipher_bytes {
+        return Err(crate::policy::PolicyViolation::ResourceLimit {
+            resource: crate::policy::resource_name::AGGREGATE_ENCRYPTION_CIPHER_VALUE_BYTES,
+            maximum,
+            actual: retained_cipher_bytes.saturating_add(payload.normalized_len),
+        }
+        .into());
+    }
+    *retained_cipher_bytes += payload.normalized_len;
+    Ok(CipherData::Value {
+        value: payload
+            .normalized()
+            .map_err(|reason| XmlEncError::Base64(format!("CipherValue: {reason}")))?,
+    })
 }
 
 fn bounded_simple_text(
@@ -580,7 +1328,7 @@ fn bounded_simple_text(
     bounded_simple_text_with_limit(node, field, policy.resources.max_encryption_metadata_bytes)
 }
 
-fn bounded_simple_text_with_limit(
+pub(super) fn bounded_simple_text_with_limit(
     node: Node<'_, '_>,
     field: &'static str,
     maximum: usize,
@@ -615,7 +1363,7 @@ fn bounded_attribute(
     Ok(Some(value.to_owned()))
 }
 
-fn validate_metadata_len(actual: usize, maximum: usize) -> Result<(), XmlEncError> {
+pub(super) fn validate_metadata_len(actual: usize, maximum: usize) -> Result<(), XmlEncError> {
     if actual <= maximum {
         Ok(())
     } else {
@@ -646,21 +1394,107 @@ pub(super) fn validate_encrypted_data_metadata<'a>(
     }
     validate(encrypted.key_name.as_deref())?;
     validate_encryption_method_metadata(&encrypted.encryption_method, maximum)?;
-    for key in &encrypted.encrypted_keys {
+    validate_key_sources(
+        &encrypted.encrypted_keys,
+        &encrypted.derived_keys,
+        &encrypted.agreement_methods,
+        policy,
+        0,
+        &mut 0,
+    )
+}
+
+fn validate_key_sources(
+    keys: &[EncryptedKey],
+    derived: &[super::DerivedKey],
+    agreements: &[super::AgreementMethod],
+    policy: ParsingPolicy<'_>,
+    depth: usize,
+    count: &mut usize,
+) -> Result<(), XmlEncError> {
+    policy.resources.validate_key_info_reference_depth(depth)?;
+    let actual = count
+        .saturating_add(keys.len())
+        .saturating_add(derived.len())
+        .saturating_add(agreements.len());
+    policy.resources.validate_key_candidates(actual)?;
+    *count = actual;
+    let maximum = policy.resources.max_encryption_metadata_bytes;
+    let validate = |value: Option<&str>| validate_metadata_len(value.map_or(0, str::len), maximum);
+    for descriptor in agreements {
+        validate(Some(descriptor.algorithm.uri()))?;
+        validate(descriptor.legacy_digest.as_deref())?;
+        validate_metadata_len(descriptor.nonce.len(), maximum)?;
+        for role in descriptor.originator.iter().chain(&descriptor.recipient) {
+            super::agreement::validate_role_metadata(role, maximum)?;
+            *count = count.saturating_add(role.embedded_candidate_count());
+            policy.resources.validate_key_candidates(*count)?;
+        }
+        if let Some(method) = &descriptor.method {
+            method.validate_metadata(maximum)?;
+        }
+    }
+    for descriptor in derived {
+        validate(descriptor.id.as_deref())?;
+        validate(descriptor.recipient.as_deref())?;
+        validate(descriptor.key_type.as_deref())?;
+        validate(descriptor.derived_key_name.as_deref())?;
+        validate(descriptor.master_key_name.as_deref())?;
+        if let Some(method) = &descriptor.method {
+            method.validate_metadata(maximum)?;
+        }
+        if let Some(list) = &descriptor.reference_list {
+            validate_reference_list(list, policy.resources)?;
+        }
+    }
+    for key in keys {
         validate(key.id.as_deref())?;
         validate(key.recipient.as_deref())?;
         validate(key.key_name.as_deref())?;
         validate(key.carried_key_name.as_deref())?;
         validate_encryption_method_metadata(&key.encryption_method, maximum)?;
         if let Some(references) = key.reference_list.as_ref() {
-            for uri in references
-                .data_references
-                .iter()
-                .chain(&references.key_references)
-            {
-                validate(Some(uri))?;
-            }
+            validate_reference_list(references, policy.resources)?;
         }
+        validate_key_sources(
+            &key.sources.encrypted_keys,
+            &key.sources.derived_keys,
+            &key.sources.agreement_methods,
+            policy,
+            depth + 1,
+            count,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_reference_list(
+    references: &ReferenceList,
+    resources: &crate::policy::ResourcePolicy,
+) -> Result<(), XmlEncError> {
+    let count = references
+        .data_references
+        .len()
+        .saturating_add(references.key_references.len());
+    if count > resources.max_references {
+        return Err(crate::policy::PolicyViolation::ResourceLimit {
+            resource: crate::policy::resource_name::ENCRYPTION_REFERENCES,
+            maximum: resources.max_references,
+            actual: count,
+        }
+        .into());
+    }
+    if count == 0 {
+        return Err(XmlEncError::InvalidStructure(
+            "ReferenceList must contain at least one reference".into(),
+        ));
+    }
+    for uri in references
+        .data_references
+        .iter()
+        .chain(&references.key_references)
+    {
+        validate_metadata_len(uri.len(), resources.max_encryption_metadata_bytes)?;
     }
     Ok(())
 }
@@ -689,9 +1523,11 @@ fn validate_encrypted_type_attributes(
     // Both EncryptedData and EncryptedKey derive these attributes from the XML
     // Encryption EncryptedType schema. Template mutation preserves attributes
     // that are not represented in the cryptographic model, so bound them here.
-    bounded_attribute(node, "Type", policy)?;
-    bounded_attribute(node, "MimeType", policy)?;
-    bounded_attribute(node, "Encoding", policy)?;
+    for attribute in ["Id", "Recipient", "Type", "MimeType", "Encoding"] {
+        if let Some(value) = node.attribute(attribute) {
+            validate_metadata_len(value.len(), policy.resources.max_encryption_metadata_bytes)?;
+        }
+    }
     Ok(())
 }
 
@@ -703,78 +1539,66 @@ fn parse_encrypted_data_type(value: Option<&str>) -> Option<EncryptedDataType> {
     })
 }
 
-fn decode_bounded_base64_text(node: Node<'_, '_>, maximum: usize) -> Result<Vec<u8>, XmlEncError> {
+pub(super) fn decode_bounded_base64_text(
+    node: Node<'_, '_>,
+    field: &'static str,
+    maximum: usize,
+) -> Result<Vec<u8>, XmlEncError> {
     if node.children().any(|child| child.is_element()) {
-        return Err(XmlEncError::InvalidStructure(
-            "OAEPparams must not contain element children".into(),
-        ));
+        return Err(XmlEncError::InvalidStructure(format!(
+            "{field} must not contain element children"
+        )));
     }
     let encoded_limit = maximum.div_ceil(3).saturating_mul(4);
-    let mut normalized = String::with_capacity(encoded_limit);
-    for character in node
-        .children()
-        .filter(Node::is_text)
-        .filter_map(|child| child.text())
-        .flat_map(str::chars)
-    {
-        if !character.is_ascii() {
-            return Err(XmlEncError::Base64(
-                "OAEPparams contains non-ASCII data".into(),
-            ));
-        }
-        if !character.is_ascii_whitespace() {
-            if normalized.len() == encoded_limit {
-                return Err(crate::policy::PolicyViolation::ResourceLimit {
-                    resource: crate::policy::resource_name::ENCRYPTION_METADATA_BYTES,
-                    maximum,
-                    actual: maximum.saturating_add(1),
+    // XSD Datatypes 1.0 §3.2.16 permits only XML whitespace in base64Binary.
+    // Borrow fragmented text; reject size before allocating the exact output.
+    // https://www.w3.org/TR/2004/REC-xmlschema-2-20041028/#base64Binary
+    let payload =
+        crate::xmldsig::whitespace::XmlBase64Payload::bounded(node, usize::MAX, encoded_limit)
+            .map_err(|reason| {
+                if reason == "maximum allowed base64 length" {
+                    XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                        resource: crate::policy::resource_name::ENCRYPTION_METADATA_BYTES,
+                        maximum,
+                        actual: maximum.saturating_add(1),
+                    })
+                } else {
+                    XmlEncError::Base64(format!("{field}: {reason}"))
                 }
-                .into());
-            }
-            normalized.push(character);
-        }
-    }
-    let decoded = STANDARD
-        .decode(normalized)
-        .map_err(|error| XmlEncError::Base64(error.to_string()))?;
-    validate_metadata_len(decoded.len(), maximum)?;
-    Ok(decoded)
-}
-
-fn normalize_base64_with_empty(value: &str, allow_empty: bool) -> Result<String, XmlEncError> {
-    let mut normalized = String::with_capacity(value.len().min(MAX_CIPHER_VALUE_BASE64_LEN));
-    for character in value.chars() {
-        if !character.is_ascii() {
-            return Err(XmlEncError::Base64(
-                "CipherValue contains non-ASCII data".into(),
-            ));
-        }
-        if !character.is_ascii_whitespace() {
-            if normalized.len() == MAX_CIPHER_VALUE_BASE64_LEN {
-                return Err(XmlEncError::Base64(format!(
-                    "CipherValue exceeds {MAX_CIPHER_VALUE_BASE64_LEN}-byte limit"
-                )));
-            }
-            normalized.push(character);
-        }
-    }
-    if normalized.is_empty() && !allow_empty {
-        return Err(XmlEncError::Base64("CipherValue is empty".into()));
-    }
-    if !normalized.is_empty() {
-        STANDARD
-            .decode(&normalized)
-            .map_err(|error| XmlEncError::Base64(error.to_string()))?;
-    }
-    Ok(normalized)
+            })?;
+    validate_metadata_len(payload.decoded_len, maximum)?;
+    payload
+        .decode()
+        .map_err(|reason| XmlEncError::Base64(format!("{field}: {reason}")))
 }
 
 #[cfg(test)]
 fn normalize_base64(value: &str) -> Result<String, XmlEncError> {
-    normalize_base64_with_empty(value, false)
+    // Exercise the production node parser, not a second normalization algorithm.
+    let xml =
+        format!("<CipherData xmlns='{XMLENC_NS}'><CipherValue>{value}</CipherValue></CipherData>");
+    let document = Document::parse(&xml).expect("base64 test text forms XML");
+    let policy = crate::policy::DecryptionPolicy::default();
+    let mut budget =
+        crate::xmldsig::transforms::XPathSignatureParseBudget::from_resources(&policy.resources);
+    let CipherData::Value { value } = parse_cipher_data(
+        document.root_element(),
+        false,
+        (&policy).into(),
+        &mut budget,
+        &mut 0,
+    )?
+    else {
+        unreachable!("inline fixture")
+    };
+    Ok(value)
 }
 
-fn require_element(node: Node<'_, '_>, namespace: &str, name: &str) -> Result<(), XmlEncError> {
+pub(super) fn require_element(
+    node: Node<'_, '_>,
+    namespace: &str,
+    name: &str,
+) -> Result<(), XmlEncError> {
     if node.has_tag_name((namespace, name)) {
         Ok(())
     } else {
@@ -812,7 +1636,7 @@ mod tests {
     fn parses_supported_encrypted_data_and_normalizes_cipher_value() {
         // XML base64 permits line wrapping, but the retained value must be canonical.
         let parsed = parse_encrypted_data(DATA).expect("valid XMLEnc data must parse");
-        assert_eq!(parsed.cipher_data.value, "YWJjZA==");
+        assert_eq!(parsed.cipher_data.inline_value(), Some("YWJjZA=="));
         assert_eq!(parsed.encrypted_type, Some(EncryptedDataType::Element));
     }
 
@@ -1075,12 +1899,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cipher_reference_and_trailing_children() {
-        // External CipherReference retrieval would cross a caller-controlled trust boundary.
+    fn parses_cipher_reference_without_performing_retrieval() {
+        // Parsing the source descriptor grants no URI permission or I/O.
         let xml = "<xenc:EncryptedData xmlns:xenc=\"http://www.w3.org/2001/04/xmlenc#\"><xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><xenc:CipherData><xenc:CipherReference URI=\"https://attacker.invalid/key\"/></xenc:CipherData></xenc:EncryptedData>";
         assert!(
-            parse_encrypted_data(xml).is_err(),
-            "CipherReference must fail closed"
+            matches!(parse_encrypted_data(xml).expect("reference descriptor").cipher_data,
+            CipherData::Reference { ref uri, .. } if uri == "https://attacker.invalid/key")
         );
     }
 
@@ -1090,7 +1914,7 @@ mod tests {
         // CipherValue schema and must not be silently ignored.
         let split = DATA.replace("YWJj\nZA==", "YW<!-- split -->Jj\nZA==");
         let parsed = parse_encrypted_data(&split).expect("comment-split base64 must parse");
-        assert_eq!(parsed.cipher_data.value, "YWJjZA==");
+        assert_eq!(parsed.cipher_data.inline_value(), Some("YWJjZA=="));
 
         let nested = DATA.replace("YWJj\nZA==", "YW<xenc:Unexpected/>JjZA==");
         assert!(matches!(
@@ -1130,35 +1954,40 @@ mod tests {
         );
     }
 
-    /// Verifies that a lone unsupported agreement reports its algorithm URI.
+    /// Known agreement metadata parses independently of execution permission;
+    /// unknown mechanisms retain their exact URI and missing algorithms fail.
     #[test]
     fn rejects_unsupported_key_agreement_explicitly() {
-        // AgreementMethod is outside the supported secure profile. Reporting its
-        // URI avoids misclassifying a present but unsupported key as missing.
         let xml = format!(
             r#"<xenc:EncryptedData xmlns:xenc="{XMLENC_NS}" xmlns:ds="{XMLDSIG_NS}"><xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes128-cbc"/><ds:KeyInfo><xenc:AgreementMethod Algorithm="http://www.w3.org/2001/04/xmlenc#dh"/></ds:KeyInfo><xenc:CipherData><xenc:CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData>"#
         );
+        let parsed = parse_encrypted_data(&xml).expect("legacy DH descriptor parses");
+        assert_eq!(
+            parsed.agreement_methods[0].algorithm,
+            crate::policy::KeyAgreementAlgorithm::LegacyDh
+        );
+        let unknown = xml.replace(
+            "http://www.w3.org/2001/04/xmlenc#dh",
+            "urn:unknown:agreement",
+        );
         assert!(matches!(
-            parse_encrypted_data(&xml),
+            parse_encrypted_data(&unknown),
             Err(XmlEncError::UnsupportedAlgorithm(uri))
-                if uri == "http://www.w3.org/2001/04/xmlenc#dh"
+                if uri == "urn:unknown:agreement"
         ));
 
         let missing_algorithm =
             xml.replace(" Algorithm=\"http://www.w3.org/2001/04/xmlenc#dh\"", "");
         assert!(matches!(
             parse_encrypted_data(&missing_algorithm),
-            Err(XmlEncError::MissingRequired(
-                "AgreementMethod Algorithm attribute"
-            ))
+            Err(XmlEncError::MissingRequired("AgreementMethod Algorithm"))
         ));
     }
 
-    /// Verifies that unsupported agreement metadata does not hide usable keys.
+    /// Multiple supported mechanisms remain independent ordered candidates.
     #[test]
     fn retains_supported_key_candidates_alongside_unsupported_agreement() {
-        // Multi-recipient KeyInfo may advertise an unsupported agreement method
-        // before a key candidate that the configured resolver can actually use.
+        // Parsing legacy DH does not discard an independent wrapped recipient.
         let xml = format!(
             r#"<xenc:EncryptedData xmlns:xenc="{XMLENC_NS}" xmlns:ds="{XMLDSIG_NS}"><xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes128-cbc"/><ds:KeyInfo><xenc:AgreementMethod Algorithm="http://www.w3.org/2001/04/xmlenc#dh"/><ds:KeyName>content-key</ds:KeyName><xenc:EncryptedKey Recipient="alice"><xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#kw-aes128"/><xenc:CipherData><xenc:CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA</xenc:CipherValue></xenc:CipherData></xenc:EncryptedKey></ds:KeyInfo><xenc:CipherData><xenc:CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData>"#
         );
@@ -1167,6 +1996,7 @@ mod tests {
             .expect("a supported key candidate must take precedence over agreement fallback");
         assert_eq!(parsed.key_name.as_deref(), Some("content-key"));
         assert_eq!(parsed.encrypted_keys.len(), 1);
+        assert_eq!(parsed.agreement_methods.len(), 1);
         assert_eq!(parsed.encrypted_keys[0].recipient.as_deref(), Some("alice"));
     }
 
@@ -1416,12 +2246,18 @@ mod tests {
 
     #[test]
     fn bounds_normalized_cipher_value_before_decode() {
-        // The bound applies after XML whitespace removal and before base64 allocates
-        // its decoded output, preventing oversized transient allocations.
+        // The public document ceiling rejects an over-ceiling inline value
+        // before its text can be retained or decoded by CipherData parsing.
         let oversized = "A".repeat(MAX_CIPHER_VALUE_BASE64_LEN + 1);
+        let xml = DATA.replace("YWJj\nZA==", &oversized);
         assert!(matches!(
-            normalize_base64(&oversized),
-            Err(XmlEncError::Base64(_))
+            parse_encrypted_data(&xml),
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_DOCUMENT,
+                    ..
+                }
+            ))
         ));
     }
 
@@ -1523,10 +2359,10 @@ mod tests {
             Err(XmlEncError::Base64(_))
         ));
 
-        let mut boundary = "A".repeat(MAX_CIPHER_VALUE_BASE64_LEN - 1);
-        boundary.push('é');
+        // At an admitted document size the production lexical preflight
+        // rejects Unicode, including immediately after a full quartet.
         assert!(matches!(
-            normalize_base64(&boundary),
+            normalize_base64("AAAAé"),
             Err(XmlEncError::Base64(_))
         ));
     }

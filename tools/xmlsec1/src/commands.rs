@@ -4103,6 +4103,19 @@ struct CandidateSymmetricKeyDecryptor<'a> {
 }
 
 impl CandidateSymmetricKeyDecryptor<'_> {
+    fn wrapping_candidate(
+        &self,
+        key: &SymmetricCandidate<'_>,
+        recipient: &EncryptedKey,
+        wrap: KeyWrapAlgorithm,
+    ) -> bool {
+        if key.kind != wrap.key_kind() {
+            return false;
+        }
+        self.lax_key_search
+            || recipient.key_name.as_deref() == key.name.as_deref()
+            || recipient.key_name.is_none() && self.keys.len() == 1
+    }
     fn direct_candidate(
         &self,
         kind: SymmetricKeyKind,
@@ -4134,6 +4147,43 @@ fn symmetric_kind_accepts(
 }
 
 impl DecryptionKeyResolver for CandidateSymmetricKeyDecryptor<'_> {
+    fn resolve_key_encryption_keys_with_policy(
+        &self,
+        provider: &dyn CryptoProvider,
+        algorithm: KeyWrapAlgorithm,
+        source: xml_sec::xmlenc::KeyEncryptionKeySource<'_>,
+        policy: &DecryptionPolicy,
+        budget: &mut KeyCandidateBudget,
+    ) -> Result<Vec<xml_sec::provider::RecoveredContentKey>, XmlEncError> {
+        let xml_sec::xmlenc::KeyEncryptionKeySource::Encrypted(recipient) = source else {
+            return Err(XmlEncError::KeyNotFound);
+        };
+        let transport = KeyWrapAlgorithm::from_uri(&recipient.encryption_method.algorithm)?;
+        let mut resolved = Vec::new();
+        let mut last_error = XmlEncError::KeyNotFound;
+        for key in &self.keys {
+            if !self.wrapping_candidate(key, recipient, transport) {
+                continue;
+            }
+            match KekDecryptor::borrowed_with_kind(&key.bytes, key.kind)
+                .resolve_key_encryption_keys_with_policy(
+                    provider,
+                    algorithm,
+                    xml_sec::xmlenc::KeyEncryptionKeySource::Encrypted(recipient),
+                    policy,
+                    budget,
+                ) {
+                Ok(mut keys) => resolved.append(&mut keys),
+                Err(error @ XmlEncError::Policy(_)) => return Err(error),
+                Err(error) => last_error = error,
+            }
+        }
+        if resolved.is_empty() {
+            Err(last_error)
+        } else {
+            Ok(resolved)
+        }
+    }
     fn resolve_key(
         &self,
         _provider: &dyn CryptoProvider,
@@ -4210,13 +4260,7 @@ impl DecryptionKeyResolver for CandidateSymmetricKeyDecryptor<'_> {
         let mut keys = Vec::new();
         let mut last_error = XmlEncError::KeyNotFound;
         for key in &self.keys {
-            if key.kind != wrap.key_kind() {
-                continue;
-            }
-            if !self.lax_key_search
-                && recipient.key_name.as_deref() != key.name.as_deref()
-                && !(recipient.key_name.is_none() && self.keys.len() == 1)
-            {
+            if !self.wrapping_candidate(key, recipient, wrap) {
                 continue;
             }
             match KekDecryptor::borrowed_with_kind(&key.bytes, key.kind)
@@ -4247,6 +4291,39 @@ struct NamedRecipientDecryptor {
 }
 
 impl DecryptionKeyResolver for NamedRecipientDecryptor {
+    fn resolve_key_encryption_keys_with_policy(
+        &self,
+        provider: &dyn CryptoProvider,
+        algorithm: KeyWrapAlgorithm,
+        source: xml_sec::xmlenc::KeyEncryptionKeySource<'_>,
+        policy: &DecryptionPolicy,
+        budget: &mut KeyCandidateBudget,
+    ) -> Result<Vec<xml_sec::provider::RecoveredContentKey>, XmlEncError> {
+        let xml_sec::xmlenc::KeyEncryptionKeySource::Encrypted(recipient) = source else {
+            return Err(XmlEncError::KeyNotFound);
+        };
+        let mut resolved = Vec::new();
+        let mut last_error = XmlEncError::KeyNotFound;
+        for key in self.applicable_keys(recipient) {
+            budget.consume(1)?;
+            match key.inner.resolve_key_encryption_keys_with_policy(
+                provider,
+                algorithm,
+                xml_sec::xmlenc::KeyEncryptionKeySource::Encrypted(recipient),
+                policy,
+                budget,
+            ) {
+                Ok(mut keys) => resolved.append(&mut keys),
+                Err(error @ XmlEncError::Policy(_)) => return Err(error),
+                Err(error) => last_error = error,
+            }
+        }
+        if resolved.is_empty() {
+            Err(last_error)
+        } else {
+            Ok(resolved)
+        }
+    }
     fn resolve_key(
         &self,
         provider: &dyn CryptoProvider,
@@ -6913,6 +6990,7 @@ mod tests {
             unnamed_single_key_fallback: false,
         };
         let encrypted_key = EncryptedKey {
+            sources: Default::default(),
             id: None,
             recipient: None,
             key_name: None,
@@ -6923,7 +7001,7 @@ mod tests {
                 mgf_algorithm: None,
                 oaep_params: None,
             },
-            cipher_data: xml_sec::xmlenc::CipherData {
+            cipher_data: xml_sec::xmlenc::CipherData::Value {
                 value: base64::Engine::encode(
                     &base64::engine::general_purpose::STANDARD,
                     [0_u8; 256],

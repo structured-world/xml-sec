@@ -698,16 +698,63 @@ fn fixed_aes_key_size(algorithm: &str) -> Option<usize> {
     Some(key_len * 8)
 }
 
-/// Inline ciphertext data.
+/// Ciphertext storage specified by XMLEnc 1.1 section 3.3.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CipherData {
+pub enum CipherData {
     /// Whitespace-normalized base64 text from `CipherValue`.
-    pub value: String,
+    Value {
+        /// Encoded ciphertext, not plaintext or key material.
+        value: String,
+    },
+    /// A source-anchored reference, resolved before cryptographic dispatch.
+    Reference {
+        /// Required URI, including an explicitly empty URI.
+        uri: String,
+        /// Ordered transforms retained with their original XPath source identity.
+        transforms: Vec<crate::xmldsig::transforms::Transform>,
+    },
+    /// Ciphertext octets resolved by the operation or supplied by the caller.
+    Bytes(Vec<u8>),
+}
+
+impl CipherData {
+    pub(super) fn octets(&self) -> Result<std::borrow::Cow<'_, [u8]>, XmlEncError> {
+        use base64::Engine as _;
+        match self {
+            Self::Value { value } => base64::engine::general_purpose::STANDARD
+                .decode(value)
+                .map(std::borrow::Cow::Owned)
+                .map_err(|error| XmlEncError::Base64(error.to_string())),
+            Self::Bytes(bytes) => Ok(std::borrow::Cow::Borrowed(bytes)),
+            Self::Reference { .. } => Err(XmlEncError::InvalidStructure(
+                "CipherReference requires its original document context".into(),
+            )),
+        }
+    }
+
+    /// Return an inline base64 value, if this ciphertext is enveloped.
+    pub fn inline_value(&self) -> Option<&str> {
+        match self {
+            Self::Value { value } => Some(value),
+            Self::Reference { .. } | Self::Bytes(_) => None,
+        }
+    }
+
+    /// Mutably access an inline value without changing its storage variant.
+    pub fn inline_value_mut(&mut self) -> Option<&mut String> {
+        match self {
+            Self::Value { value } => Some(value),
+            Self::Reference { .. } | Self::Bytes(_) => None,
+        }
+    }
 }
 
 /// Parsed embedded `EncryptedKey` used to recover a content-encryption key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncryptedKey {
+    /// Sources of the key which protects this transported key. These are not
+    /// alternative content keys: their output feeds this key's EncryptionMethod.
+    pub sources: EncryptionKeySources,
     /// Optional XML identifier.
     pub id: Option<String>,
     /// Optional recipient hint.
@@ -722,6 +769,26 @@ pub struct EncryptedKey {
     pub reference_list: Option<ReferenceList>,
     /// Optional name associated with the transported plaintext key.
     pub carried_key_name: Option<String>,
+}
+
+/// Typed establishment sources inside an encrypted key's `ds:KeyInfo`.
+/// Recursion is checked against the operation's depth and candidate allowances.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EncryptionKeySources {
+    /// Keys transporting the wrapping key, rather than the final content key.
+    pub encrypted_keys: Vec<EncryptedKey>,
+    /// Derivations producing the wrapping key.
+    pub derived_keys: Vec<super::DerivedKey>,
+    /// Agreements producing the wrapping key.
+    pub agreement_methods: Vec<super::AgreementMethod>,
+}
+
+impl EncryptionKeySources {
+    pub(super) fn is_empty(&self) -> bool {
+        self.encrypted_keys.is_empty()
+            && self.derived_keys.is_empty()
+            && self.agreement_methods.is_empty()
+    }
 }
 
 /// References associated with an `EncryptedKey`.
@@ -746,6 +813,10 @@ pub struct EncryptedData {
     pub encryption_method: EncryptionMethod,
     /// Embedded recipient session keys in `KeyInfo` document order.
     pub encrypted_keys: Vec<EncryptedKey>,
+    /// Ordered XML derivation candidates. Master material remains request-owned.
+    pub derived_keys: Vec<super::DerivedKey>,
+    /// Agreement candidates; trusted private keys remain in request context.
+    pub agreement_methods: Vec<super::AgreementMethod>,
     /// Content ciphertext in base64 form.
     pub cipher_data: CipherData,
 }
@@ -763,6 +834,9 @@ pub enum DecryptedContent {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum XmlEncError {
+    /// URI resolution or ciphertext transforms failed.
+    #[error("ciphertext reference error: {0}")]
+    Transform(#[from] crate::xmldsig::TransformError),
     /// The compiled encryption or decryption policy rejected an operation input.
     #[error("XML Encryption policy violation: {0}")]
     Policy(#[from] crate::policy::PolicyViolation),

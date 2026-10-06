@@ -664,7 +664,31 @@ fn classifies_complete_phaos_decryption_corpus() {
         "enc-element-aes192-ka-dh",
         "enc-element-aes256-ka-dh",
     ] {
-        assert_unsupported(name, DH, &direct);
+        // Agreement is now parsed. A direct symmetric resolver must not claim
+        // to perform DH, nor bypass the donor's transported party descriptors.
+        let xml = std::fs::read_to_string(format!("{PHAOS_DIR}/{name}.xml")).unwrap();
+        let document = Document::parse(&xml).unwrap();
+        let node = document
+            .descendants()
+            .find(|node| node.tag_name().name() == "EncryptedData")
+            .unwrap();
+        let parsed = xml_sec::xmlenc::parse_encrypted_data_node_with_policy(
+            node,
+            &xml_sec::policy::DecryptionPolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(parsed.agreement_methods[0].algorithm.uri(), DH);
+        match name {
+            "enc-element-3des-ka-dh" => assert_unsupported(name, TRIPLEDES, &direct),
+            "enc-element-aes192-ka-dh" => assert_unsupported(name, AES192, &direct),
+            _ => assert!(
+                matches!(
+                    decrypt_document(&xml, Some("ED"), &direct),
+                    Err(XmlEncError::KeyNotFound)
+                ),
+                "{name}"
+            ),
+        }
         classified += 1;
     }
 

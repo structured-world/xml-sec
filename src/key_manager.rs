@@ -90,18 +90,35 @@ fn check_selected_public_material(
                 // before resolution materializes its SPKI.
                 let lengths = match value {
                     KeyValueInfo::Rsa { modulus, exponent } => {
-                        [modulus.len(), exponent.len(), 0, 0]
+                        [modulus.len(), exponent.len(), 0, 0, 0, 0]
                     }
                     KeyValueInfo::Dsa { p, q, g, y } => [
                         p.as_ref().map_or(0, Vec::len),
                         q.as_ref().map_or(0, Vec::len),
                         g.as_ref().map_or(0, Vec::len),
                         y.len(),
+                        0,
+                        0,
+                    ],
+                    KeyValueInfo::Dh {
+                        p,
+                        q,
+                        generator,
+                        public,
+                        seed,
+                        pgen_counter,
+                    } => [
+                        p.as_ref().map_or(0, Vec::len),
+                        q.as_ref().map_or(0, Vec::len),
+                        generator.as_ref().map_or(0, Vec::len),
+                        public.len(),
+                        seed.as_ref().map_or(0, Vec::len),
+                        pgen_counter.as_ref().map_or(0, Vec::len),
                     ],
                     KeyValueInfo::Ec {
                         curve_oid,
                         public_key,
-                    } => [curve_oid.len(), public_key.len(), 0, 0],
+                    } => [curve_oid.len(), public_key.len(), 0, 0, 0, 0],
                     KeyValueInfo::InvalidEcKeyValue | KeyValueInfo::Unsupported { .. } => continue,
                 };
                 let length = lengths.into_iter().try_fold(0_usize, |sum, length| {
@@ -7674,6 +7691,7 @@ mod tests {
             .decryption_resolver("direct", &crate::policy::DecryptionPolicy::default())
             .expect("AES resolver");
         let recipient = EncryptedKey {
+            sources: Default::default(),
             id: None,
             recipient: None,
             key_name: None,
@@ -7684,7 +7702,7 @@ mod tests {
                 mgf_algorithm: None,
                 oaep_params: None,
             },
-            cipher_data: CipherData {
+            cipher_data: CipherData::Value {
                 value: String::new(),
             },
             reference_list: None,

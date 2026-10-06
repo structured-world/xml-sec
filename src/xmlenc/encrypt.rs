@@ -1,7 +1,7 @@
 //! XMLEnc content encryption, key wrapping, and XML generation.
 
 use crate::xml_input as xml_sec_xml_input;
-use std::{fmt, sync::Arc};
+use std::{fmt, io::Write, sync::Arc};
 
 use crate::xml::dom::{Document, Node};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -61,12 +61,41 @@ pub struct EncryptedDataBuilder {
     algorithm: DataEncryptionAlgorithm,
     encrypted_type: EncryptedDataType,
     id: Option<String>,
-    direct_key: Option<Vec<u8>>,
+    direct_key: Option<DirectEncryptionKey>,
     direct_key_name: Option<String>,
     recipients: Vec<EncryptionRecipient>,
     policy: crate::policy::EncryptionPolicy,
     provider: Arc<dyn crate::provider::CryptoProvider>,
     xml_backend: crate::XmlBackend,
+}
+
+#[derive(Clone)]
+enum DirectEncryptionKey {
+    Raw(zeroize::Zeroizing<Vec<u8>>),
+    Derived {
+        method: super::KeyDerivationMethod,
+        secret: zeroize::Zeroizing<Vec<u8>>,
+    },
+    Agreement {
+        method: super::KeyDerivationMethod,
+        key: Arc<dyn crate::provider::KeyAgreementKey>,
+        algorithm: crate::policy::KeyAgreementAlgorithm,
+        peer_public_key: Vec<u8>,
+    },
+}
+
+enum OperationContentKey<'a> {
+    Borrowed(&'a [u8]),
+    Owned(zeroize::Zeroizing<Vec<u8>>),
+}
+
+impl AsRef<[u8]> for OperationContentKey<'_> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Owned(bytes) => bytes,
+        }
+    }
 }
 
 struct GeneratedEncryption {
@@ -85,12 +114,14 @@ struct EncryptionPlanNodes {
 
 struct EncryptionOperationBudgets {
     xml_parse: XmlParseWorkBudget,
+    key_establishment: std::cell::RefCell<super::key_establishment_budget::KeyEstablishmentUsage>,
 }
 
 impl EncryptionOperationBudgets {
     fn from_policy(policy: &crate::policy::EncryptionPolicy) -> Self {
         Self {
             xml_parse: XmlParseWorkBudget::from_resources(&policy.resources),
+            key_establishment: Default::default(),
         }
     }
 }
@@ -231,7 +262,45 @@ impl EncryptedDataBuilder {
 
     /// Use a caller-managed content key instead of generating and wrapping one.
     pub fn direct_key(mut self, key: impl Into<Vec<u8>>) -> Self {
-        self.direct_key = Some(key.into());
+        self.direct_key = Some(DirectEncryptionKey::Raw(zeroize::Zeroizing::new(
+            key.into(),
+        )));
+        self
+    }
+
+    /// Derive the direct content key inside the operation's key-resolution gate.
+    /// Parameters and secret are explicit request inputs; the final builder
+    /// policy controls execution, not the policy used to parse parameters.
+    pub fn derived_key(
+        mut self,
+        method: super::KeyDerivationMethod,
+        secret: impl Into<Vec<u8>>,
+    ) -> Self {
+        self.direct_key = Some(DirectEncryptionKey::Derived {
+            method,
+            secret: zeroize::Zeroizing::new(secret.into()),
+        });
+        self
+    }
+
+    /// Establish the direct content key through an opaque private-key handle.
+    ///
+    /// The peer is an explicit request input. Agreement and derivation execute
+    /// through the selected provider only after the final policy has permitted
+    /// both mechanisms and reserved their operation-wide workspace.
+    pub fn agreement_key(
+        mut self,
+        method: super::KeyDerivationMethod,
+        key: Arc<dyn crate::provider::KeyAgreementKey>,
+        algorithm: crate::policy::KeyAgreementAlgorithm,
+        peer_public_key: impl Into<Vec<u8>>,
+    ) -> Self {
+        self.direct_key = Some(DirectEncryptionKey::Agreement {
+            method,
+            key,
+            algorithm,
+            peer_public_key: peer_public_key.into(),
+        });
         self
     }
 
@@ -519,31 +588,85 @@ impl EncryptedDataBuilder {
         )?;
         // `plaintext` is immutably borrowed for this call, so the fingerprint
         // computed after preflight remains the exact observed input identity.
-        operation.run_with_resource(plan.document, &input_resource, || Ok::<_, XmlEncError>(()))?;
+        let derivation_xml = operation.run_with_resource(plan.document, &input_resource, || {
+            match &self.direct_key {
+                Some(DirectEncryptionKey::Derived { method, .. }) => {
+                    method.to_xml(&operation.policy().resources).map(Some)
+                }
+                Some(DirectEncryptionKey::Agreement { method, .. }) => {
+                    method.to_xml(&operation.policy().resources).map(Some)
+                }
+                _ => Ok(None),
+            }
+        })?;
 
         let (content_key, encrypted_keys) = operation.run_batch(&plan.keys, || {
-            let content_key = if let Some(key) = &self.direct_key {
-                validate_content_key(self.algorithm, key)?;
-                key.clone()
-            } else {
-                let key = random_bytes(self.provider.as_ref(), self.algorithm.key_len())?;
-                #[cfg(feature = "legacy-algorithms")]
-                let mut key = key;
-                #[cfg(feature = "legacy-algorithms")]
-                if self.algorithm == DataEncryptionAlgorithm::TripleDesCbc {
-                    // RFC 3217 §3.1: generated DES CEKs use odd octet parity.
-                    // Normalize here, not in wrapping, which also accepts AES keys.
-                    // https://www.rfc-editor.org/rfc/rfc3217#section-3.1
-                    for octet in &mut key {
-                        *octet = (*octet & 0xfe) | (((*octet & 0xfe).count_ones() as u8 & 1) ^ 1);
-                    }
+            let content_key = match &self.direct_key {
+                Some(DirectEncryptionKey::Raw(key)) => {
+                    validate_content_key(self.algorithm, key)?;
+                    OperationContentKey::Borrowed(key)
                 }
-                key
+                Some(DirectEncryptionKey::Derived { method, secret }) => {
+                    let parameters = method.parameters(self.algorithm.key_len())?;
+                    let key = operation
+                        .budgets()
+                        .key_establishment
+                        .borrow_mut()
+                        .derive_key(
+                            &operation.policy().key_establishment,
+                            self.provider.as_ref(),
+                            &parameters,
+                            secret,
+                        )?;
+                    OperationContentKey::Owned(key)
+                }
+                Some(DirectEncryptionKey::Agreement {
+                    method,
+                    key,
+                    algorithm,
+                    peer_public_key,
+                }) => {
+                    let parameters = method.parameters(self.algorithm.key_len())?;
+                    let agreement = crate::provider::KeyAgreementParameters {
+                        algorithm: algorithm.uri(),
+                        peer_public_key,
+                    };
+                    let content_key = operation
+                        .budgets()
+                        .key_establishment
+                        .borrow_mut()
+                        .agree_and_derive(
+                            &operation.policy().key_establishment,
+                            self.provider.as_ref(),
+                            key.as_ref(),
+                            &agreement,
+                            &parameters,
+                        )?;
+                    OperationContentKey::Owned(content_key)
+                }
+                None => {
+                    let key = random_bytes(self.provider.as_ref(), self.algorithm.key_len())?;
+                    #[cfg(feature = "legacy-algorithms")]
+                    let mut key = key;
+                    #[cfg(feature = "legacy-algorithms")]
+                    if self.algorithm == DataEncryptionAlgorithm::TripleDesCbc {
+                        // RFC 3217 §3.1: generated DES CEKs use odd octet parity.
+                        // Normalize here, not in wrapping, which also accepts AES keys.
+                        // https://www.rfc-editor.org/rfc/rfc3217#section-3.1
+                        for octet in &mut key {
+                            *octet =
+                                (*octet & 0xfe) | (((*octet & 0xfe).count_ones() as u8 & 1) ^ 1);
+                        }
+                    }
+                    OperationContentKey::Owned(zeroize::Zeroizing::new(key))
+                }
             };
             let encrypted_keys = self
                 .recipients
                 .iter()
-                .map(|recipient| wrap_content_key(self.provider.as_ref(), recipient, &content_key))
+                .map(|recipient| {
+                    wrap_content_key(self.provider.as_ref(), recipient, content_key.as_ref())
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok::<_, XmlEncError>((content_key, encrypted_keys))
         })?;
@@ -551,18 +674,26 @@ impl EncryptedDataBuilder {
             encrypt_content(
                 self.provider.as_ref(),
                 self.algorithm,
-                &content_key,
+                content_key.as_ref(),
                 plaintext,
             )
         })?;
         let (encrypted_data_xml, xml_nodes) = operation.run(plan.evidence, || {
             let encrypted_data_xml = render_encrypted_data(
-                self.algorithm,
-                encrypted_type.as_ref(),
-                self.id.as_deref(),
-                self.direct_key_name.as_deref(),
-                &encrypted_keys,
-                &ciphertext,
+                &EncryptionXml {
+                    algorithm: self.algorithm,
+                    encrypted_type: encrypted_type.as_ref(),
+                    id: self.id.as_deref(),
+                    direct_key_name: self.direct_key_name.as_deref(),
+                    derivation_xml: derivation_xml.as_deref(),
+                    agreement_algorithm: match &self.direct_key {
+                        Some(DirectEncryptionKey::Agreement { algorithm, .. }) => Some(*algorithm),
+                        _ => None,
+                    },
+                    encrypted_keys: &encrypted_keys,
+                    ciphertext: &ciphertext,
+                },
+                operation.policy().resources.max_xml_document_bytes,
             )?;
             validate_document_len(
                 encrypted_data_xml.len(),
@@ -1074,54 +1205,127 @@ fn wrap_rsa_oaep(
     Ok(ciphertext)
 }
 
-fn render_encrypted_data(
+struct EncryptionXml<'a> {
     algorithm: DataEncryptionAlgorithm,
-    encrypted_type: Option<&EncryptedDataType>,
-    id: Option<&str>,
-    direct_key_name: Option<&str>,
-    encrypted_keys: &[WrappedKey],
-    ciphertext: &[u8],
+    encrypted_type: Option<&'a EncryptedDataType>,
+    id: Option<&'a str>,
+    direct_key_name: Option<&'a str>,
+    derivation_xml: Option<&'a str>,
+    agreement_algorithm: Option<crate::policy::KeyAgreementAlgorithm>,
+    encrypted_keys: &'a [WrappedKey],
+    ciphertext: &'a [u8],
+}
+
+fn render_encrypted_data(
+    output: &EncryptionXml<'_>,
+    maximum: usize,
 ) -> Result<String, XmlEncError> {
-    let mut writer = Writer::new(Vec::new());
-    let mut root_attributes = vec![
-        ("xmlns:xenc", XMLENC_NS),
-        ("xmlns:xenc11", XMLENC11_NS),
-        ("xmlns:ds", XMLDSIG_NS),
-    ];
-    if let Some(id) = id {
-        root_attributes.push(("Id", id));
-    }
-    let encrypted_type_uri;
-    if let Some(encrypted_type) = encrypted_type {
-        encrypted_type_uri = match encrypted_type {
-            EncryptedDataType::Element => format!("{XMLENC_NS}Element"),
-            EncryptedDataType::Content => format!("{XMLENC_NS}Content"),
-            EncryptedDataType::Other(uri) => uri.clone(),
-        };
-        root_attributes.push(("Type", encrypted_type_uri.as_str()));
-    }
-    write_start(&mut writer, "xenc:EncryptedData", root_attributes)?;
-    write_empty_with_algorithm(&mut writer, "xenc:EncryptionMethod", algorithm.uri())?;
-
-    if direct_key_name.is_some() || !encrypted_keys.is_empty() {
-        write_start(&mut writer, "ds:KeyInfo", [])?;
-        if let Some(key_name) = direct_key_name {
-            write_text_element(&mut writer, "ds:KeyName", key_name)?;
-        }
-        for encrypted_key in encrypted_keys {
-            write_encrypted_key(&mut writer, encrypted_key)?;
-        }
-        write_end(&mut writer, "ds:KeyInfo")?;
-    }
-
-    write_cipher_data(&mut writer, ciphertext)?;
-    write_end(&mut writer, "xenc:EncryptedData")?;
+    let mut counter = Writer::new(EncryptionXmlSize { length: 0 });
+    write_encrypted_data(&mut counter, output)?;
+    let length = counter.into_inner().length;
+    validate_document_len(length, maximum)?;
+    let mut writer = Writer::new(Vec::with_capacity(length));
+    write_encrypted_data(&mut writer, output)?;
     String::from_utf8(writer.into_inner())
         .map_err(|error| XmlEncError::XmlSerialize(error.to_string()))
 }
 
-fn write_encrypted_key(
-    writer: &mut Writer<Vec<u8>>,
+struct EncryptionXmlSize {
+    length: usize,
+}
+
+impl Write for EncryptionXmlSize {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.length = self
+            .length
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("encrypted XML size overflow"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn write_encrypted_data<W: Write>(
+    writer: &mut Writer<W>,
+    output: &EncryptionXml<'_>,
+) -> Result<(), XmlEncError> {
+    let EncryptionXml {
+        algorithm,
+        encrypted_type,
+        id,
+        direct_key_name,
+        derivation_xml,
+        agreement_algorithm,
+        encrypted_keys,
+        ciphertext,
+    } = *output;
+    let encrypted_type_uri = encrypted_type.map(|value| match value {
+        EncryptedDataType::Element => "http://www.w3.org/2001/04/xmlenc#Element",
+        EncryptedDataType::Content => "http://www.w3.org/2001/04/xmlenc#Content",
+        EncryptedDataType::Other(uri) => uri.as_str(),
+    });
+    let root_attributes = [
+        ("xmlns:xenc", XMLENC_NS),
+        ("xmlns:xenc11", XMLENC11_NS),
+        ("xmlns:ds", XMLDSIG_NS),
+    ]
+    .into_iter()
+    .chain(id.map(|value| ("Id", value)))
+    .chain(encrypted_type_uri.map(|value| ("Type", value)));
+    write_start(writer, "xenc:EncryptedData", root_attributes)?;
+    write_empty_with_algorithm(writer, "xenc:EncryptionMethod", algorithm.uri())?;
+
+    if direct_key_name.is_some() || !encrypted_keys.is_empty() || derivation_xml.is_some() {
+        write_start(writer, "ds:KeyInfo", [])?;
+        if let Some(key_name) = direct_key_name {
+            write_text_element(writer, "ds:KeyName", key_name)?;
+        }
+        if let Some(derivation_xml) = derivation_xml {
+            if let Some(algorithm) = agreement_algorithm {
+                // XMLEnc 1.1 §5.6 permits both parties to be known from the
+                // application context; retain the algorithm/KDF invocation in
+                // XML rather than emitting an unmarked raw content key.
+                // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-Alg-KeyAgreement
+                write_start(
+                    writer,
+                    "xenc:AgreementMethod",
+                    [("Algorithm", algorithm.uri())],
+                )?;
+            } else {
+                write_start(writer, "xenc11:DerivedKey", [])?;
+            }
+            writer
+                .raw(derivation_xml)
+                .map_err(|error| XmlEncError::XmlSerialize(error.to_string()))?;
+            if let Some(name) = direct_key_name
+                && agreement_algorithm.is_none()
+            {
+                write_text_element(writer, "xenc11:DerivedKeyName", name)?;
+            }
+            write_end(
+                writer,
+                if agreement_algorithm.is_some() {
+                    "xenc:AgreementMethod"
+                } else {
+                    "xenc11:DerivedKey"
+                },
+            )?;
+        }
+        for encrypted_key in encrypted_keys {
+            write_encrypted_key(writer, encrypted_key)?;
+        }
+        write_end(writer, "ds:KeyInfo")?;
+    }
+
+    write_cipher_data(writer, ciphertext)?;
+    write_end(writer, "xenc:EncryptedData")
+}
+
+fn write_encrypted_key<W: Write>(
+    writer: &mut Writer<W>,
     encrypted_key: &WrappedKey,
 ) -> Result<(), XmlEncError> {
     write_start(
@@ -1130,8 +1334,7 @@ fn write_encrypted_key(
         encrypted_key
             .recipient
             .as_deref()
-            .map(|recipient| vec![("Recipient", recipient)])
-            .unwrap_or_default(),
+            .map(|recipient| ("Recipient", recipient)),
     )?;
 
     if let Some(parameters) = encrypted_key.oaep.as_ref() {
@@ -1167,14 +1370,29 @@ fn write_encrypted_key(
     write_end(writer, "xenc:EncryptedKey")
 }
 
-fn write_cipher_data(writer: &mut Writer<Vec<u8>>, value: &[u8]) -> Result<(), XmlEncError> {
+fn write_cipher_data<W: Write>(writer: &mut Writer<W>, value: &[u8]) -> Result<(), XmlEncError> {
     write_start(writer, "xenc:CipherData", [])?;
-    write_text_element(writer, "xenc:CipherValue", &STANDARD.encode(value))?;
+    write_start(writer, "xenc:CipherValue", [])?;
+    // RFC 4648 §4: complete three-octet groups can be encoded independently;
+    // only the final chunk receives padding. Its alphabet needs no XML escaping.
+    // https://www.rfc-editor.org/rfc/rfc4648.html#section-4
+    let mut encoded = [0_u8; 4096];
+    for chunk in value.chunks(3072) {
+        let length = STANDARD
+            .encode_slice(chunk, &mut encoded)
+            .map_err(|error| XmlEncError::XmlSerialize(error.to_string()))?;
+        let text = std::str::from_utf8(&encoded[..length])
+            .map_err(|error| XmlEncError::XmlSerialize(error.to_string()))?;
+        writer
+            .raw(text)
+            .map_err(|error| XmlEncError::XmlSerialize(error.to_string()))?;
+    }
+    write_end(writer, "xenc:CipherValue")?;
     write_end(writer, "xenc:CipherData")
 }
 
-fn write_empty_with_algorithm(
-    writer: &mut Writer<Vec<u8>>,
+fn write_empty_with_algorithm<W: Write>(
+    writer: &mut Writer<W>,
     name: &str,
     algorithm: &str,
 ) -> Result<(), XmlEncError> {
@@ -1183,8 +1401,8 @@ fn write_empty_with_algorithm(
         .map_err(|error| XmlEncError::XmlSerialize(error.to_string()))
 }
 
-fn write_text_element(
-    writer: &mut Writer<Vec<u8>>,
+fn write_text_element<W: Write>(
+    writer: &mut Writer<W>,
     name: &str,
     text: &str,
 ) -> Result<(), XmlEncError> {
@@ -1195,8 +1413,8 @@ fn write_text_element(
     write_end(writer, name)
 }
 
-fn write_start<'a>(
-    writer: &mut Writer<Vec<u8>>,
+fn write_start<'a, W: Write>(
+    writer: &mut Writer<W>,
     name: &str,
     attributes: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> Result<(), XmlEncError> {
@@ -1205,7 +1423,7 @@ fn write_start<'a>(
         .map_err(|error| XmlEncError::XmlSerialize(error.to_string()))
 }
 
-fn write_end(writer: &mut Writer<Vec<u8>>, name: &str) -> Result<(), XmlEncError> {
+fn write_end<W: Write>(writer: &mut Writer<W>, name: &str) -> Result<(), XmlEncError> {
     writer
         .end(name)
         .map_err(|error| XmlEncError::XmlSerialize(error.to_string()))
@@ -1369,6 +1587,66 @@ mod tests {
         KekDecryptor, OaepDigestAlgorithm, PrivateKeyDecryptor, SymmetricKeyDecryptor, decrypt,
         decrypt_document, parse_encrypted_data,
     };
+
+    #[test]
+    fn streamed_ciphertext_preserves_chunk_boundaries_and_padding() {
+        // Complete three-byte groups must not introduce interior padding;
+        // every boundary around the stack buffer matches the standard encoder.
+        for length in [0, 1, 2, 3, 3071, 3072, 3073, 3074, 6144, 6145] {
+            let bytes: Vec<_> = (0..length).map(|index| index as u8).collect();
+            let mut writer = Writer::new(Vec::new());
+            writer
+                .start("root", [("xmlns:xenc", XMLENC_NS)])
+                .expect("bound namespace");
+            write_cipher_data(&mut writer, &bytes).expect("streamed ciphertext");
+            writer.end("root").expect("close wrapper");
+            let output = String::from_utf8(writer.into_inner()).expect("base64 XML is UTF-8");
+            assert_eq!(
+                output,
+                format!(
+                    "<root xmlns:xenc=\"{XMLENC_NS}\"><xenc:CipherData><xenc:CipherValue>{}</xenc:CipherValue></xenc:CipherData></root>",
+                    STANDARD.encode(bytes),
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn generated_xml_size_counts_escaping_and_checks_exact_boundary() {
+        // The preflight uses the same serializer, including expansion of names
+        // and attributes; a tight ceiling cannot be bypassed by XML escaping.
+        let render = |maximum| {
+            render_encrypted_data(
+                &EncryptionXml {
+                    algorithm: DataEncryptionAlgorithm::Aes128Gcm,
+                    encrypted_type: Some(&EncryptedDataType::Element),
+                    id: Some("id&value"),
+                    direct_key_name: Some("key<&\r"),
+                    derivation_xml: None,
+                    agreement_algorithm: None,
+                    encrypted_keys: &[],
+                    ciphertext: &[7; 28],
+                },
+                maximum,
+            )
+        };
+        let output = render(MAX_ENCRYPTION_DOCUMENT_LEN).expect("generous output ceiling");
+        assert_eq!(render(output.len()).expect("exact output ceiling"), output);
+        assert!(matches!(render(output.len() - 1),
+            Err(XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_DOCUMENT,
+                maximum,
+                actual,
+            })) if maximum == output.len() - 1 && actual == output.len()
+        ));
+        let document = Document::parse(&output).expect("serialized XML");
+        assert_eq!(document.root_element().attribute("Id"), Some("id&value"));
+        let name = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyName")))
+            .expect("serialized KeyName");
+        assert_eq!(name.text(), Some("key<&\r"));
+    }
 
     #[test]
     fn document_encryption_requires_a_compiled_mutation_node() {

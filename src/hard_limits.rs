@@ -61,6 +61,16 @@ pub(crate) const KEY_IMPORT_KDF_WORK_CEILING: u64 = 10_000_000;
 /// Maximum workspace reserved by one imported password key derivation.
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const KEY_IMPORT_KDF_MEMORY_CEILING: usize = 32 * 1024 * 1024;
+/// Bounds hash compression work induced by XML key-establishment parameters.
+#[cfg(feature = "xmlenc")]
+pub(crate) const KEY_ESTABLISHMENT_HASH_BLOCK_CEILING: usize = 10_000_000;
+/// Bounds cumulative derived-key output reservations.
+#[cfg(feature = "xmlenc")]
+pub(crate) const KEY_ESTABLISHMENT_BYTE_CEILING: usize = 32 * 1024 * 1024;
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const DH_MODULUS_BIT_CEILING: usize = 16_384;
+#[cfg(feature = "xmlenc")]
+pub(crate) const KEY_ESTABLISHMENT_MODULAR_WORK_CEILING: usize = 1_000_000_000;
 /// Stack-safety ceiling for BER construction and nested PKCS#12 safe bags.
 #[cfg(feature = "xmldsig")]
 pub(crate) const PKCS12_NESTING_CEILING: usize = 32;
