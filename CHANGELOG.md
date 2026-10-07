@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.20](https://github.com/structured-world/xml-sec/compare/v0.1.19...v0.1.20) - 2026-10-07
+
+### Added
+
+- *(xslt)* enforce resolver grants ([#195](https://github.com/structured-world/xml-sec/pull/195))
+- *(xmlenc)* complete key establishment ([#193](https://github.com/structured-world/xml-sec/pull/193))
+- *(xmldsig)* implement rsa-pss ([#191](https://github.com/structured-world/xml-sec/pull/191))
+- *(pkcs11)* add opaque external keys ([#186](https://github.com/structured-world/xml-sec/pull/186))
+
+### Fixed
+
+- *(dsa)* validate imports and prove interoperability ([#189](https://github.com/structured-world/xml-sec/pull/189))
+
 ## [0.1.19](https://github.com/structured-world/xml-sec/compare/v0.1.18...v0.1.19) - 2026-10-05
 
 ### Added
