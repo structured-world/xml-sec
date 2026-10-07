@@ -999,22 +999,50 @@ pub fn execute_transforms<'a>(
     initial_data: TransformData<'a>,
     transforms: &[Transform],
 ) -> Result<Vec<u8>, TransformError> {
-    execute_transforms_with_options(
+    execute_transforms_with_policy(
         signature_node,
         initial_data,
         transforms,
-        TransformOptions::default(),
+        &crate::policy::VerificationPolicy::default(),
     )
 }
 
-/// Execute a transform chain with explicit compatibility options.
-pub(crate) fn execute_transforms_with_options<'a>(
+/// Execute a standalone reference chain with a trusted verification policy snapshot.
+///
+/// Applies transform permissions, OPC edition, XPath semantics, XML allowances,
+/// and aggregate resource limits. This does not verify a signature or resolve keys.
+pub fn execute_transforms_with_policy<'a>(
     signature_node: Node<'a, 'a>,
     initial_data: TransformData<'a>,
     transforms: &[Transform],
-    options: TransformOptions,
+    policy: &crate::policy::VerificationPolicy,
 ) -> Result<Vec<u8>, TransformError> {
-    let budget = TransformExecutionBudget::default();
+    policy.validate()?;
+    if transforms.len() > policy.resources.max_transforms_per_reference {
+        return Err(transform_resource_limit(
+            crate::policy::resource_name::REFERENCE_TRANSFORMS,
+            policy.resources.max_transforms_per_reference,
+            transforms.len(),
+        ));
+    }
+    let parameters =
+        relationship::WorkspaceBudget::parameters(policy.resources.max_opc_parameter_bytes);
+    for transform in transforms {
+        if let Transform::Relationship(selectors) = transform {
+            relationship::validate_owned_selectors(selectors, &parameters)?;
+        }
+    }
+    validate_transform_policy(
+        matches!(&initial_data, TransformData::Binary(_)),
+        transforms,
+        policy.transforms.allowed_algorithms.as_ref(),
+        "transform execution",
+    )?;
+    let options = TransformOptions::default()
+        .opc_relationship_edition(policy.transforms.opc_relationship_edition)
+        .xpath_here_semantics(policy.transforms.xpath_here_semantics)
+        .allow_internal_dtd(policy.xml.allow_internal_dtd);
+    let budget = TransformExecutionBudget::from_resources(&policy.resources);
     execute_transforms_with_options_and_budget(
         signature_node,
         initial_data,
@@ -1627,6 +1655,15 @@ pub(crate) fn validate_signing_transform_policy(
     transforms: &[Transform],
     allowed: Option<&HashSet<String>>,
 ) -> Result<(), crate::policy::PolicyViolation> {
+    validate_transform_policy(initial_binary, transforms, allowed, "signing transform")
+}
+
+fn validate_transform_policy(
+    initial_binary: bool,
+    transforms: &[Transform],
+    allowed: Option<&HashSet<String>>,
+    operation: &'static str,
+) -> Result<(), crate::policy::PolicyViolation> {
     let Some(allowed) = allowed else {
         return Ok(());
     };
@@ -1634,7 +1671,7 @@ pub(crate) fn validate_signing_transform_policy(
         let algorithm = transform.algorithm_uri();
         if !allowed.contains(algorithm) {
             return Err(crate::policy::PolicyViolation::Algorithm {
-                operation: "signing transform",
+                operation,
                 algorithm: algorithm.to_owned(),
             });
         }
@@ -1643,7 +1680,7 @@ pub(crate) fn validate_signing_transform_policy(
         && !allowed.contains(DEFAULT_IMPLICIT_C14N_URI)
     {
         return Err(crate::policy::PolicyViolation::Algorithm {
-            operation: "signing transform",
+            operation,
             algorithm: DEFAULT_IMPLICIT_C14N_URI.to_owned(),
         });
     }

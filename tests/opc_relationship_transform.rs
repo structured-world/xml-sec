@@ -16,6 +16,86 @@ const REL: &str = "http://schemas.openxmlformats.org/package/2006/relationships"
 const PARAM: &str = "http://schemas.openxmlformats.org/package/2006/digital-signature";
 const URI: &str = "http://schemas.openxmlformats.org/package/2006/RelationshipTransform";
 
+#[test]
+fn public_executor_can_select_2012_policy() {
+    // The public executor must honor trusted policy rather than hard-code 2021 case folding.
+    let xml = format!(
+        "<Relationships xmlns=\"{REL}\"><Relationship Id=\"x\" Type=\"urn:t\" Target=\"a\"/></Relationships>"
+    );
+    let document = Document::parse(&xml).unwrap();
+    let chain = [
+        Transform::Relationship(vec![RelationshipSelector::SourceId("X".into())]),
+        Transform::C14n(C14nAlgorithm::new(C14nMode::Inclusive1_0, false)),
+    ];
+    let mut policy = VerificationPolicy::default();
+    policy.transforms.opc_relationship_edition = OpcRelationshipEdition::Ecma2012;
+    let output = xml_sec::xmldsig::execute_transforms_with_policy(
+        document.root_element(),
+        TransformData::NodeSet(NodeSet::entire_document_with_comments(&document).unwrap()),
+        &chain,
+        &policy,
+    )
+    .unwrap();
+    assert_eq!(
+        output,
+        format!("<Relationships xmlns=\"{REL}\"></Relationships>").as_bytes()
+    );
+    policy.transforms.opc_relationship_edition = OpcRelationshipEdition::Ecma2021;
+    let input =
+        || TransformData::NodeSet(NodeSet::entire_document_with_comments(&document).unwrap());
+    let output = xml_sec::xmldsig::execute_transforms_with_policy(
+        document.root_element(),
+        input(),
+        &chain,
+        &policy,
+    )
+    .unwrap();
+    assert_eq!(output, format!("<Relationships xmlns=\"{REL}\"><Relationship Id=\"x\" Target=\"a\" TargetMode=\"Internal\" Type=\"urn:t\"></Relationship></Relationships>").as_bytes());
+    policy.resources.max_opc_workspace_bytes = 0;
+    assert!(
+        xml_sec::xmldsig::execute_transforms_with_policy(
+            document.root_element(),
+            input(),
+            &chain,
+            &policy
+        )
+        .is_err()
+    );
+    policy.resources = Default::default();
+    policy.resources.max_transforms_per_reference = 1;
+    assert!(
+        xml_sec::xmldsig::execute_transforms_with_policy(
+            document.root_element(),
+            input(),
+            &chain,
+            &policy
+        )
+        .is_err()
+    );
+    policy.resources = Default::default();
+    policy.resources.max_opc_parameter_bytes = 0;
+    assert!(
+        xml_sec::xmldsig::execute_transforms_with_policy(
+            document.root_element(),
+            input(),
+            &chain,
+            &policy
+        )
+        .is_err()
+    );
+    policy.resources = Default::default();
+    policy.transforms.allowed_algorithms = Some(Default::default());
+    assert!(
+        xml_sec::xmldsig::execute_transforms_with_policy(
+            document.root_element(),
+            input(),
+            &chain,
+            &policy
+        )
+        .is_err()
+    );
+}
+
 #[path = "common/xmlsec1.rs"]
 mod xmlsec1;
 

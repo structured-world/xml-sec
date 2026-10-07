@@ -20,6 +20,10 @@ policy.transforms.opc_relationship_edition = OpcRelationshipEdition::Ecma2012;
 Pass that policy to `VerifyContext::policy`; select the same edition in
 `SigningPolicy` when signing. `DecryptionPolicy` uses the same typed field for
 CipherReference transforms. Verification never retries another edition.
+For standalone chains, pass the same `VerificationPolicy` snapshot to
+`xmldsig::execute_transforms_with_policy`; it enforces transform permissions,
+XML allowances and resource limits as well as the edition. `execute_transforms`
+uses the default snapshot.
 
 | Contract | Selection | Preparation |
 | --- | --- | --- |
@@ -65,8 +69,10 @@ fetch URLs; per-file and aggregate operation limits bound mapped bytes.
 MCE processing follows ECMA-376 Part 3 §§7 and 9, with only the Relationships
 application namespace understood. Ignorable and ProcessContent bindings retain
 their declaring namespace scope, AlternateContent selects the first understood
-Choice or its Fallback, and preservation attributes do not preserve discarded
-content. Traversal is iterative and charged to operation limits.
+Choice or its Fallback. `mc:PreserveElements` and `mc:PreserveAttributes` are
+unknown attributes in both supported vocabularies (Part 3:2012 §10;
+Part 3:2015 §7), not silently ignored preservation requests.
+Traversal is iterative and charged to operation limits.
 
 `ResourcePolicy.max_opc_parameter_bytes` bounds cumulative parameter allocations;
 `max_opc_workspace_bytes` bounds cumulative normalization workspace. Shared XML,
@@ -81,8 +87,8 @@ does not receive. Acceptance by this transform does not assert package membershi
 Relationship simple content is removed in both editions; non-whitespace text
 in the Relationships container and child elements in Relationship remain invalid.
 Selector simple content is permitted and ignored; selection uses only SourceId
-or SourceType (2012 D.3; 2021 C.2). Relationship Type must contain an absolute IRI
-scheme, even when unselected; Unicode in its remainder and its lexical spelling
+or SourceType (2012 D.3; 2021 C.2). Relationship Type must be a complete absolute IRI
+(RFC 3987 §2.2), even when unselected; Unicode in its remainder and its lexical spelling
 are preserved (2012 §§3, 9.3.2; 2021 §§3.2.8, 6.5.3.4).
 Generic SignedInfo and CipherReference execution therefore remain available.
 Successful XMLDSig verification is not OPC package conformance: the package

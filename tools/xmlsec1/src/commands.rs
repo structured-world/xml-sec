@@ -803,13 +803,24 @@ fn select_store_candidates<'a, T>(
 }
 
 fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
+    sign_with_policy(
+        invocation,
+        stdout,
+        xmlsec_compatibility_signing_policy(invocation),
+    )
+}
+
+fn sign_with_policy(
+    invocation: &Invocation,
+    stdout: &mut dyn Write,
+    policy: SigningPolicy,
+) -> Result<(), CommandError> {
     validate_options(invocation, SIGN_OPTIONS)?;
     let xml_backend = selected_xml_backend(invocation)?;
     validate_supported_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
     let password = invocation.password_bytes();
     // This binary is an explicit libxmlsec1 compatibility boundary. Its sign
     // and verify commands must bind XPath here() identically for round trips.
-    let policy = xmlsec_compatibility_signing_policy(invocation);
     let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
     let start_node_id = option_text(invocation, "node-id")?;
     let id_attributes = id_attribute_registrations(invocation)?;
@@ -839,6 +850,8 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
             "sign cannot combine --keys-file with explicit key options".into(),
         ));
     }
+    let mut external_budget =
+        ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
     let selected = if has_key_store {
         if signature.key_names.is_empty() && !invocation.flag("lax-key-search") {
             return Err(CommandError::Usage(
@@ -846,9 +859,7 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
                     .into(),
             ));
         }
-        let mut budget =
-            ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
-        let store = load_xml_key_stores(invocation, &policy, xml_backend, &mut budget)?;
+        let store = load_xml_key_stores(invocation, &policy, xml_backend, &mut external_budget)?;
         let lax_candidates = invocation.flag("lax-key-search");
         let candidates = if signature.algorithm.hmac_output_bits().is_some() {
             select_store_candidates(
@@ -896,10 +907,9 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
             signature.key_info.as_ref(),
             &policy,
             password,
+            &mut external_budget,
         )?
     };
-    let mut external_budget =
-        ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
     let external_resources =
         load_mapped_reference_resources(invocation, &policy.resources, &mut external_budget)?;
     let mut context = SignContext::new(selected.key.as_ref())
@@ -1031,6 +1041,7 @@ fn select_signing_key(
     key_info: Option<&KeyInfo>,
     policy: &SigningPolicy,
     password: Option<&[u8]>,
+    material_budget: &mut ExternalMaterialBudget,
 ) -> Result<SigningKeyCandidate, CommandError> {
     let hmac = algorithm.hmac_output_bits().is_some();
     let key_options: &[&str] = if hmac {
@@ -1068,15 +1079,13 @@ fn select_signing_key(
         .map_err(|error| CommandError::Signature(error.to_string()))?;
     let lax_key_search = invocation.flag("lax-key-search");
     let mut last_error: Option<CommandError> = None;
-    let mut material_budget =
-        ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
     for (option, ()) in candidates {
         let attempt = prepare_signing_key_candidate(
             option,
             algorithm,
             policy,
             password,
-            &mut material_budget,
+            material_budget,
             selected_provider(invocation)?,
         )
         .and_then(|candidate| {
@@ -5172,6 +5181,60 @@ mod tests {
     }
 
     #[test]
+    fn signing_material_and_mappings_share_one_budget() {
+        // Reference acquisition must not reset the allowance consumed by signing keys.
+        let directory = tempfile::tempdir().unwrap();
+        let key = directory.path().join("key");
+        let part = directory.path().join("part");
+        let template = directory.path().join("template.xml");
+        fs::write(&key, [7; 32]).unwrap();
+        fs::write(&part, b"abc").unwrap();
+        fs::write(&template, br#"<Signature xmlns="http://www.w3.org/2000/09/xmldsig#"><SignedInfo><CanonicalizationMethod Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/><SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"/><Reference URI="urn:part"><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue/></Reference></SignedInfo><SignatureValue/></Signature>"#).unwrap();
+        let request = invocation(&[
+            "xmlsec1",
+            "sign",
+            "--hmac-key",
+            key.to_str().unwrap(),
+            "--url-map:urn:part",
+            part.to_str().unwrap(),
+            template.to_str().unwrap(),
+        ]);
+        let mut policy = xmlsec_compatibility_signing_policy(&request);
+        policy.resources.max_external_resource_total_bytes = 34;
+        let result = sign_with_policy(&request, &mut Vec::new(), policy);
+        assert!(
+            matches!(result, Err(CommandError::ExternalMaterialTooLarge { .. })),
+            "{result:?}"
+        );
+        let mut policy = xmlsec_compatibility_signing_policy(&request);
+        policy.resources.max_external_resource_total_bytes = 35;
+        sign_with_policy(&request, &mut Vec::new(), policy).expect("exact combined allowance");
+        let store = directory.path().join("keys.xml");
+        fs::write(&store, br#"<Keys xmlns="http://www.aleksey.com/xmlsec/2002"><KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><KeyName>only-key</KeyName><KeyValue><HMACKeyValue xmlns="http://www.aleksey.com/xmlsec/2002">c2VjcmV0</HMACKeyValue></KeyValue></KeyInfo></Keys>"#).unwrap();
+        let request = invocation(&[
+            "xmlsec1",
+            "sign",
+            "--keys-file",
+            store.to_str().unwrap(),
+            "--lax-key-search",
+            "--url-map:urn:part",
+            part.to_str().unwrap(),
+            template.to_str().unwrap(),
+        ]);
+        let mut policy = xmlsec_compatibility_signing_policy(&request);
+        let store_bytes = fs::metadata(&store).unwrap().len() as usize;
+        // Leave headroom for the importer's decoded material, but make the map
+        // exceed the bytes remaining after acquisition of the store itself.
+        policy.resources.max_external_resource_total_bytes = store_bytes * 4;
+        fs::write(&part, vec![0; store_bytes * 3 + 1]).unwrap();
+        let result = sign_with_policy(&request, &mut Vec::new(), policy);
+        assert!(
+            matches!(result, Err(CommandError::ExternalMaterialTooLarge { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[test]
     fn mapped_references_enforce_individual_and_aggregate_limits() {
         // Limits apply before file-sized allocations, including existing
         // invocation material. An exact-boundary file remains usable.
@@ -7086,6 +7149,7 @@ mod tests {
                 None,
                 &policy,
                 None,
+                &mut ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes),
             ),
             Err(CommandError::ExternalMaterialTooLarge { maximum })
                 if maximum == valid_len as usize + 1

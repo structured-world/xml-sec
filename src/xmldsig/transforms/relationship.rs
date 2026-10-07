@@ -364,7 +364,7 @@ pub(super) fn normalize<'a>(
                     .attribute("Type")
                     .ok_or_else(|| invalid("missing relationship Type"))?;
                 budget.node_filter.charge(kind.len())?;
-                validate_relationship_type_scheme(kind)?;
+                validate_relationship_type_iri(kind)?;
                 let target = node
                     .attribute("Target")
                     .ok_or_else(|| invalid("missing relationship Target"))?;
@@ -678,7 +678,10 @@ fn validate_mc_attributes(
                     namespace(node, prefix, budget)?;
                 }
             }
-            "ProcessContent" | "PreserveElements" | "PreserveAttributes" => {
+            "ProcessContent" => {
+                // Part 3:2012 §10 and Part 3:2015 §7 both exclude the
+                // preservation attributes of the original 2006 vocabulary.
+                // https://ecma-international.org/publications-and-standards/standards/ecma-376/
                 for token in tokens(attribute.value()) {
                     let (prefix, local) = token
                         .split_once(':')
@@ -802,30 +805,29 @@ fn alternate_content<'a>(
     Ok(chosen.or(fallback))
 }
 
-fn validate_relationship_type_scheme(kind: &str) -> Result<(), TransformError> {
+fn validate_relationship_type_iri(kind: &str) -> Result<(), TransformError> {
     // ECMA-376 Part 2:2021 §§3.2.8, 6.5.3.4 (2012 §§3, 9.3.2)
     // requires an absolute IRI, including on unselected relationships.
-    // RFC 3987 §2.2 requires an ASCII scheme; the remaining IRI may be Unicode.
+    // RFC 3987 §2.2 requires an ASCII scheme, allows Unicode in components,
+    // and excludes fragments from the absolute-IRI production.
     // https://ecma-international.org/publications-and-standards/standards/ecma-376/
     // https://www.rfc-editor.org/rfc/rfc3987#section-2.2
     // Check the collapsed anyURI value without changing its lexical infoset.
-    let mut bytes = kind.trim_matches(xml_whitespace).bytes();
-    if !bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic()) {
-        return Err(invalid(
-            "relationship Type must have an absolute IRI scheme",
-        ));
+    let value = kind.trim_matches(xml_whitespace);
+    if let Some((scheme, remainder)) = value.split_once(':')
+        && scheme
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphabetic)
+        && scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+        && !remainder.contains('#')
+        && valid_iri_reference(remainder, false)
+    {
+        return Ok(());
     }
-    for byte in bytes {
-        if byte == b':' {
-            return Ok(());
-        }
-        if !byte.is_ascii_alphanumeric() && !matches!(byte, b'+' | b'-' | b'.') {
-            break;
-        }
-    }
-    Err(invalid(
-        "relationship Type must have an absolute IRI scheme",
-    ))
+    Err(invalid("relationship Type must be an absolute IRI"))
 }
 
 fn validate_internal_target_reference_syntax(target: &str) -> Result<(), TransformError> {
@@ -836,17 +838,139 @@ fn validate_internal_target_reference_syntax(target: &str) -> Result<(), Transfo
     // Do not equate relative-reference syntax with package target resolution.
     // https://www.rfc-editor.org/rfc/rfc3986#section-4.2
     // xsd:anyURI collapses edge whitespace before lexical validation.
-    for byte in target.trim_matches(xml_whitespace).bytes() {
-        if byte == b'/' || byte == b'?' || byte == b'#' {
-            break;
-        }
-        if byte == b':' {
-            return Err(invalid(
-                "Internal relationship Target must be a relative reference",
-            ));
-        }
+    if !valid_iri_reference(target.trim_matches(xml_whitespace), true) {
+        return Err(invalid(
+            "Internal relationship Target must be a relative reference",
+        ));
     }
     Ok(())
+}
+
+// RFC 3987 §2.2: validate components on borrowed slices, preserving the lexical
+// infoset. Relative references differ only by forbidding ':' in the first
+// non-slash path segment. No resolution, decoding, or scheme-specific rewriting.
+// https://www.rfc-editor.org/rfc/rfc3987#section-2.2
+fn valid_iri_reference(value: &str, relative: bool) -> bool {
+    let (value, fragment) = value
+        .split_once('#')
+        .map_or((value, None), |(v, f)| (v, Some(f)));
+    if let Some(fragment) = fragment
+        && !iri_component(fragment, |c| iri_pchar(c) || matches!(c, '/' | '?'))
+    {
+        return false;
+    }
+    let (path, query) = value
+        .split_once('?')
+        .map_or((value, None), |(v, q)| (v, Some(q)));
+    if let Some(query) = query
+        && !iri_component(query, |c| {
+            iri_pchar(c)
+                || matches!(c, '/' | '?')
+                || matches!(c as u32, 0xe000..=0xf8ff | 0xf0000..=0xffffd | 0x100000..=0x10fffd)
+        })
+    {
+        return false;
+    }
+    if let Some(authority_path) = path.strip_prefix("//") {
+        let (authority, path) = authority_path
+            .split_once('/')
+            .map_or((authority_path, ""), |(a, p)| (a, p));
+        return valid_iri_authority(authority) && iri_component(path, |c| iri_pchar(c) || c == '/');
+    }
+    if relative
+        && !path.starts_with('/')
+        && path
+            .split('/')
+            .next()
+            .is_some_and(|segment| segment.contains(':'))
+    {
+        return false;
+    }
+    iri_component(path, |c| iri_pchar(c) || c == '/')
+}
+
+fn valid_iri_authority(authority: &str) -> bool {
+    let host_port = if let Some((userinfo, host_port)) = authority.split_once('@') {
+        if !iri_component(userinfo, |c| {
+            iri_unreserved(c) || iri_sub_delim(c) || c == ':'
+        }) {
+            return false;
+        }
+        host_port
+    } else {
+        authority
+    };
+    if let Some(literal) = host_port.strip_prefix('[') {
+        let Some((address, suffix)) = literal.split_once(']') else {
+            return false;
+        };
+        if !suffix.is_empty()
+            && !suffix
+                .strip_prefix(':')
+                .is_some_and(|port| port.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return false;
+        }
+        if address.parse::<std::net::Ipv6Addr>().is_ok() {
+            return true;
+        }
+        if let Some(future) = address.strip_prefix(['v', 'V'])
+            && let Some((version, address)) = future.split_once('.')
+        {
+            return !version.is_empty()
+                && version.bytes().all(|b| b.is_ascii_hexdigit())
+                && !address.is_empty()
+                && address
+                    .chars()
+                    .all(|c| c.is_ascii() && (iri_unreserved(c) || iri_sub_delim(c) || c == ':'));
+        }
+        return false;
+    }
+    let host = if let Some((host, port)) = host_port.split_once(':') {
+        if !port.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        host
+    } else {
+        host_port
+    };
+    iri_component(host, |c| iri_unreserved(c) || iri_sub_delim(c))
+}
+
+fn iri_component(value: &str, allowed: impl Fn(char) -> bool) -> bool {
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            if !chars.next().is_some_and(|c| c.is_ascii_hexdigit())
+                || !chars.next().is_some_and(|c| c.is_ascii_hexdigit())
+            {
+                return false;
+            }
+        } else if !allowed(c) {
+            return false;
+        }
+    }
+    true
+}
+
+fn iri_unreserved(c: char) -> bool {
+    let code = c as u32;
+    c.is_ascii_alphanumeric()
+        || matches!(c, '-' | '.' | '_' | '~')
+        || matches!(code, 0xa0..=0xd7ff | 0xf900..=0xfdcf | 0xfdf0..=0xffef)
+        || ((0x10000..=0xdfffd).contains(&code) && code & 0xffff <= 0xfffd)
+        || (0xe1000..=0xefffd).contains(&code)
+}
+
+fn iri_sub_delim(c: char) -> bool {
+    matches!(
+        c,
+        '!' | '$' | '&' | '\'' | '(' | ')' | '*' | '+' | ',' | ';' | '='
+    )
+}
+
+fn iri_pchar(c: char) -> bool {
+    iri_unreserved(c) || iri_sub_delim(c) || matches!(c, ':' | '@')
 }
 
 fn ncname(value: &str) -> bool {
@@ -862,6 +986,100 @@ mod tests {
     use super::*;
 
     #[test]
+    fn complete_relationship_iri_syntax() {
+        // A scheme alone is insufficient: every component must satisfy RFC 3987.
+        for value in [
+            "urn:%ZZ",
+            "urn:a b",
+            "urn:x#fragment",
+            "http://[broken]/x",
+            "http://host:port/x",
+            "urn:\u{e000}",
+            "urn:\u{fdd0}",
+            "urn:\u{1fffe}",
+            "http://user@@host/x",
+            "http://[::1%25zone]/x",
+            "http://[v1.]/x",
+            "http://[vG.a]/x",
+            "http://[::1]suffix/x",
+        ] {
+            assert!(validate_relationship_type_iri(value).is_err(), "{value}");
+        }
+        for value in [
+            "urn:%20",
+            "https://例え.example/役割",
+            "http://[::1]:80/x",
+            "urn:x?\u{e000}",
+            "http://user:pass@host:/x",
+            "http://[v1.a:b]/x",
+            "urn:\u{10000}\u{e1000}",
+        ] {
+            assert!(validate_relationship_type_iri(value).is_ok(), "{value}");
+        }
+    }
+
+    #[test]
+    fn complete_internal_target_syntax() {
+        // Relative references include network paths, but not malformed escapes/authorities.
+        for value in [
+            "part%GG.xml",
+            "a%",
+            "a%2",
+            "a b",
+            "//[broken]/x",
+            "//host:port/x",
+            "a\\b",
+            "//user@@host/path",
+            "a#b#c",
+            "a#\u{e000}",
+        ] {
+            assert!(
+                validate_internal_target_reference_syntax(value).is_err(),
+                "{value}"
+            );
+        }
+        for value in [
+            "part%20.xml",
+            "//host/path",
+            "//[::1]/x",
+            "a?b#c",
+            "../役割.xml",
+            "//user:pass@host:80/path",
+            "//[V1.a:b]/path",
+            "/a:b",
+            "a?\u{f0000}",
+        ] {
+            assert!(
+                validate_internal_target_reference_syntax(value).is_ok(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn mce_preservation_attributes_follow_selected_edition() {
+        // Neither selected MCE vocabulary includes the original preservation attributes.
+        for attribute in ["PreserveElements", "PreserveAttributes"] {
+            let xml = format!(
+                "<Relationships xmlns=\"{REL}\" xmlns:mc=\"{MC}\" xmlns:e=\"urn:extension\" mc:Ignorable=\"e\" mc:{attribute}=\"e:*\"><Relationship Id=\"x\" Type=\"urn:t\" Target=\"a\"/></Relationships>"
+            );
+            let document = Document::parse(&xml).expect("well-formed MCE document");
+            for edition in [
+                OpcRelationshipEdition::Ecma2012,
+                OpcRelationshipEdition::Ecma2021,
+            ] {
+                let result = normalize(
+                    &document,
+                    &[RelationshipSelector::SourceId("x".into())],
+                    edition,
+                    &TransformExecutionBudget::default(),
+                );
+                assert!(result.is_err(), "{edition:?}: {attribute}");
+            }
+        }
+    }
+
+    #[test]
     fn relationship_type_requires_an_absolute_iri_scheme_before_selection() {
         // Type defines a role by absolute IRI in both editions. The scheme
         // uses ASCII grammar, but its remainder can contain Unicode.
@@ -875,6 +1093,9 @@ mod tests {
             "x/y:type",
             "?x:type",
             "#x:type",
+            "urn:%ZZ",
+            "http://[broken]/type",
+            "urn:a b",
         ] {
             let xml = format!(
                 "<Relationships xmlns=\"{REL}\"><Relationship Id=\"x\" Type=\"{kind}\" Target=\"a\"/></Relationships>"
@@ -920,7 +1141,7 @@ mod tests {
                     edition,
                     &TransformExecutionBudget::default(),
                 )
-                .expect("absolute IRI scheme is accepted");
+                .expect("absolute IRI is accepted");
                 let expected = format!(
                     "<Relationships xmlns=\"{REL}\"><Relationship Id=\"x\" Target=\"a\" TargetMode=\"Internal\" Type=\"{kind}\"></Relationship></Relationships>"
                 );
