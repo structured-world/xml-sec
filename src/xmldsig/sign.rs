@@ -3583,8 +3583,29 @@ fn generation_transform_uris<'a>(
 fn generation_chain_produces_binary(initial_binary: bool, algorithms: &[&str]) -> bool {
     algorithms.last().map_or(initial_binary, |algorithm| {
         *algorithm == BASE64_TRANSFORM_URI
+            || *algorithm == super::RELATIONSHIP_TRANSFORM_URI
             || crate::c14n::C14nAlgorithm::from_uri(algorithm).is_some()
     })
+}
+
+#[cfg(test)]
+mod generation_output_tests {
+    use super::*;
+    use crate::xmldsig::transforms::transform_chain_produces_binary;
+
+    #[test]
+    fn relationship_output_classifiers_agree() {
+        // Both generation preflight and the typed executor classify the
+        // algorithm's output, independently of subsequent chain validation.
+        assert!(generation_chain_produces_binary(
+            false,
+            &[super::super::RELATIONSHIP_TRANSFORM_URI]
+        ));
+        assert!(transform_chain_produces_binary(
+            false,
+            &[Transform::Relationship(vec![])]
+        ));
+    }
 }
 
 fn xml_qualifier(prefix: &str) -> String {

@@ -89,6 +89,75 @@ fn opc_relationship_cli_uses_the_2012_contract() {
 }
 
 #[test]
+fn opc_detached_parts_require_explicit_url_maps() {
+    // Explicit maps must work with the original detached donor template;
+    // no map may fall back to opening a URI-controlled local filename.
+    let temp = tempfile::tempdir().unwrap();
+    let root = project_root();
+    let fixture = root.join("tools/xmlsec1/tests/fixtures/upstream/aleksey-xmldsig-01");
+    let template = fixture.join("enveloping-sha256-rsa-sha256-relationship.tmpl");
+    let part = fixture.join("relationship/xml-base-input.xml");
+    let signed = temp.path().join("signed.xml");
+    let sign = |mapped: bool| {
+        let mut command = Command::new(binary());
+        command
+            .current_dir(&fixture)
+            .args(["sign", "--lax-key-search", "--privkey-pem"])
+            .arg(root.join("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .arg("--output")
+            .arg(&signed);
+        if mapped {
+            command
+                .arg("--url-map:relationship/xml-base-input.xml")
+                .arg(&part);
+        }
+        command.arg(&template).output().unwrap()
+    };
+    assert!(!sign(false).status.success());
+    assert!(!signed.exists());
+    let result = sign(true);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let verify = |mapped: bool| {
+        let mut command = Command::new(binary());
+        command
+            .current_dir(&fixture)
+            .args(["verify", "--pubkey-pem"])
+            .arg(root.join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"));
+        if mapped {
+            command
+                .arg("--url-map:relationship/xml-base-input.xml")
+                .arg(&part);
+        }
+        command.arg(&signed).output().unwrap()
+    };
+    assert!(!verify(false).status.success());
+    let result = verify(true);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let corrupted = fs::read_to_string(&part)
+        .unwrap()
+        .replace("word/document.xml", "word/tampered.xml");
+    let changed = temp.path().join("changed.xml");
+    fs::write(&changed, corrupted).unwrap();
+    let result = Command::new(binary())
+        .args(["verify", "--pubkey-pem"])
+        .arg(root.join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"))
+        .arg("--url-map:relationship/xml-base-input.xml")
+        .arg(changed)
+        .arg(signed)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+}
+
+#[test]
 fn decrypt_nested_wrapping_keys_through_the_cli() {
     // The native process must recover an intermediate KEK, not mistake it for
     // the content key; authentication failure must preserve existing output.

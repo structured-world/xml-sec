@@ -729,6 +729,10 @@ fn write_transform<W: Write>(
 ) -> Result<(), std::io::Error> {
     match transform {
         Transform::Relationship(selectors) => {
+            // This builder emits generic XMLDSig references, not an OPC package
+            // signature. ECMA-376 Part 2 (2021) §10.5.8.2 Manifest placement
+            // and per-part uniqueness require a separate package validator.
+            // https://ecma-international.org/publications-and-standards/standards/ecma-376/
             let name = qualified_name(prefix, "Transform");
             writer.start(&name, [("Algorithm", super::RELATIONSHIP_TRANSFORM_URI)])?;
             for selector in selectors {

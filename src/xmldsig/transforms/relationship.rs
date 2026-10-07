@@ -125,6 +125,11 @@ fn invalid(message: &str) -> TransformError {
     TransformError::Relationship(message.to_owned())
 }
 
+/// Validate one algorithm chain, not an OPC package signature.
+/// ECMA-376 Part 2 (2021) §10.5.8.2 also constrains package Manifest
+/// placement and per-part uniqueness; those require a package-level validator,
+/// not restrictions on this reusable XMLDSig/XMLEnc transform mechanism.
+/// https://ecma-international.org/publications-and-standards/standards/ecma-376/
 pub(crate) fn validate_chain(chain: &[Transform]) -> Result<(), TransformError> {
     let mut seen = false;
     for (index, transform) in chain.iter().enumerate() {
@@ -137,7 +142,7 @@ pub(crate) fn validate_chain(chain: &[Transform]) -> Result<(), TransformError> 
                 || !matches!(chain.get(index + 1), Some(Transform::C14n(_)))
             {
                 return Err(invalid(
-                    "one relationship transform with selectors must be immediately followed by canonicalization",
+                    "each chain permits one relationship transform with selectors, immediately followed by canonicalization",
                 ));
             }
             seen = true;
@@ -151,18 +156,17 @@ pub(crate) fn validate_edition(
     edition: OpcRelationshipEdition,
 ) -> Result<(), TransformError> {
     validate_chain(chain)?;
-    // 2021 §10.5.5 says packages "shall use only" C14N 1.0 ±comments.
-    // 2012 §13.2.4.4 requires support for these methods, not exclusive use.
+    // 2021 §§10.5.5, 10.5.8.2 and 2012 §13.2.4.4 restrict OPC
+    // canonicalization to inclusive C14N 1.0 with/without comments. In 2012,
+    // consumers "shall fail the validation" for other methods (M6.34).
     // https://ecma-international.org/publications-and-standards/standards/ecma-376/
-    if edition == OpcRelationshipEdition::Ecma2021 {
-        for pair in chain.windows(2) {
-            if let [Transform::Relationship(_), Transform::C14n(algorithm)] = pair
-                && algorithm.mode() != C14nMode::Inclusive1_0
-            {
-                return Err(invalid(
-                    "OPC 2021 requires C14N 1.0 after relationship normalization",
-                ));
-            }
+    for pair in chain.windows(2) {
+        if let [Transform::Relationship(_), Transform::C14n(algorithm)] = pair
+            && algorithm.mode() != C14nMode::Inclusive1_0
+        {
+            return Err(invalid(&format!(
+                "OPC {edition:?} requires C14N 1.0 after relationship normalization"
+            )));
         }
     }
     Ok(())
@@ -361,6 +365,24 @@ pub(super) fn normalize<'a>(
                 if mode != "Internal" && mode != "External" {
                     return Err(invalid("invalid relationship TargetMode"));
                 }
+                budget.node_filter.charge(target.len())?;
+                // ECMA-376 Part 2 (2021) §6.5.3.4 / 2012 §9.3.2.2:
+                // Internal targets are relative references. RFC 3986 §4.2
+                // permits absolute/network paths but forbids ':' in the first
+                // path-noscheme segment. xsd:anyURI collapses edge whitespace.
+                // https://www.rfc-editor.org/rfc/rfc3986#section-4.2
+                if mode == "Internal" {
+                    for byte in target.trim_matches(xml_whitespace).bytes() {
+                        if byte == b'/' || byte == b'?' || byte == b'#' {
+                            break;
+                        }
+                        if byte == b':' {
+                            return Err(invalid(
+                                "Internal relationship Target must be a relative reference",
+                            ));
+                        }
+                    }
+                }
                 let index = records.len();
                 budget.opc_workspace.push(
                     &mut records,
@@ -434,15 +456,18 @@ pub(super) fn normalize<'a>(
                 .charge(expected.len().max(actual.len()))?;
             // ECMA-376 Part 2 (2021) §10.6 step 2 changes selector
             // comparison only; sorting still compares case-sensitive Ids.
-            record.selected = match edition {
+            let matches = match edition {
                 OpcRelationshipEdition::Ecma2012 => actual == expected,
                 OpcRelationshipEdition::Ecma2021 => actual.eq_ignore_ascii_case(expected),
             };
-            if record.selected {
-                first_selected.get_or_insert(index);
-                last_selected = index;
+            if matches {
+                record.selected = true;
                 break;
             }
+        }
+        if record.selected {
+            first_selected.get_or_insert(index);
+            last_selected = index;
         }
     }
     let mut output = Output {
@@ -791,19 +816,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_chain_permits_other_supported_canonicalization_methods() {
-        // 2012 requires C14N 1.0 support, not its exclusive use; M6.26
-        // requires a canonicalization transform immediately after OPC.
-        let chain = [
-            Transform::Relationship(vec![RelationshipSelector::SourceId("x".into())]),
-            Transform::C14n(crate::c14n::C14nAlgorithm::new(
+    fn selection_union_survives_nonmatching_selectors_on_either_side() {
+        // A later nonmatch must never undo membership in the selector union.
+        let xml = format!(
+            "<Relationships xmlns=\"{REL}\"><Relationship Id=\"x\" Type=\"urn:t\" Target=\"a\"/></Relationships>"
+        );
+        let document = Document::parse(&xml).expect("valid relationship document");
+        for edition in [
+            OpcRelationshipEdition::Ecma2012,
+            OpcRelationshipEdition::Ecma2021,
+        ] {
+            let output = normalize(
+                &document,
+                &[
+                    RelationshipSelector::SourceId("absent".into()),
+                    RelationshipSelector::SourceType("urn:t".into()),
+                    RelationshipSelector::SourceId("other".into()),
+                ],
+                edition,
+                &TransformExecutionBudget::default(),
+            )
+            .expect("selector union normalization succeeds");
+            assert!(
+                std::str::from_utf8(&output)
+                    .expect("normalized relationships are UTF-8")
+                    .contains("Id=\"x\"")
+            );
+        }
+    }
+
+    #[test]
+    fn both_editions_require_inclusive_c14n_1_0() {
+        // Both editions reject other canonicalization methods after OPC.
+        for edition in [
+            OpcRelationshipEdition::Ecma2012,
+            OpcRelationshipEdition::Ecma2021,
+        ] {
+            for mode in [
+                C14nMode::Inclusive1_0,
                 C14nMode::Inclusive1_1,
-                false,
-            )),
-        ];
-        assert!(validate_chain(&chain).is_ok());
-        assert!(validate_edition(&chain, OpcRelationshipEdition::Ecma2012).is_ok());
-        assert!(validate_edition(&chain, OpcRelationshipEdition::Ecma2021).is_err());
+                C14nMode::Exclusive1_0,
+            ] {
+                for comments in [false, true] {
+                    let chain = [
+                        Transform::Relationship(vec![RelationshipSelector::SourceId("x".into())]),
+                        Transform::C14n(crate::c14n::C14nAlgorithm::new(mode, comments)),
+                    ];
+                    assert!(validate_chain(&chain).is_ok());
+                    assert_eq!(
+                        validate_edition(&chain, edition).is_ok(),
+                        mode == C14nMode::Inclusive1_0
+                    );
+                }
+            }
+        }
     }
 
     #[test]

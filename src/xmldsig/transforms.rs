@@ -689,7 +689,10 @@ pub enum Transform {
     Base64Decode,
 
     /// Normalize an OPC Relationships part before explicit canonicalization.
-    /// The 2021 edition requires C14N 1.0; 2012 permits other supported methods.
+    /// This is a reusable algorithm, not validation of an OPC package signature:
+    /// Manifest-only placement and per-package part uniqueness belong to that
+    /// protocol's validator, not generic SignedInfo or CipherReference execution.
+    /// Both editions require inclusive C14N 1.0, with or without comments.
     /// Selection semantics come from the operation's typed `TransformPolicy`.
     Relationship(Vec<RelationshipSelector>),
 }

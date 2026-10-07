@@ -887,7 +887,9 @@ pub struct XmlInputPolicy {
     pub allow_internal_dtd: bool,
 }
 
-/// Trusted ECMA-376 contract used by the OPC Relationship Transform.
+/// Trusted edition of relationship selection and normalization.
+/// This is not an OPC package-conformance profile: signature placement and
+/// package-wide part identity constraints require a package validator.
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum OpcRelationshipEdition {
@@ -938,7 +940,7 @@ pub struct TransformPolicy {
     pub xpath_here_semantics: XPathHereSemantics,
     /// Interpretation of bare same-document ID fragments.
     pub same_document_id_semantics: SameDocumentIdSemantics,
-    /// Trusted OPC contract edition; never inferred from the signed document.
+    /// Trusted normalization edition, not package validation; never inferred from XML.
     pub opc_relationship_edition: OpcRelationshipEdition,
 }
 

@@ -48,7 +48,19 @@ let reference = ReferenceBuilder::new(DigestAlgorithm::Sha256)
 Provide external part bytes through the operation's caller-owned resource map and
 explicitly permit the URI class in policy. The core performs no filesystem or
 network discovery. A canonicalization transform must immediately follow the
-Relationship Transform; the 2021 contract permits C14N 1.0 with or without comments.
+Relationship Transform; both editions require inclusive C14N 1.0 with or without
+comments (2012 §13.2.4.4; 2021 §10.5.8.2).
+
+The CLI accepts detached reference bytes through explicit mappings:
+
+```sh
+xmlsec1 sign --privkey-pem key.pem --url-map:part.rels part.rels --output signed.xml template.xml
+xmlsec1 verify --pubkey-pem public.pem --url-map:part.rels part.rels signed.xml
+```
+
+The mapping matches the resolved reference URI exactly. Duplicate mappings and
+missing URL parameters are rejected. Unmapped references never open files or
+fetch URLs; per-file and aggregate operation limits bound mapped bytes.
 
 MCE processing follows ECMA-376 Part 3 §§7 and 9, with only the Relationships
 application namespace understood. Ignorable and ProcessContent bindings retain
@@ -62,5 +74,9 @@ node-filter work, and canonical output limits also apply. Node-set input respect
 its visibility mask; byte input uses the selected XML backend and shared decoder,
 including UTF-16. This transform is not a complete OPC package validator: package
 part existence, target resolution, and signature packaging rules remain separate.
+Generic SignedInfo and CipherReference execution therefore remain available.
+Successful XMLDSig verification is not OPC package conformance: the package
+adapter must independently enforce Manifest placement and one Relationship
+Transform per package part (2021 §10.5.8.2; 2012 §§13.2.4.7, 13.2.4.23).
 
 The normative editions are available from [Ecma International](https://ecma-international.org/publications-and-standards/standards/ecma-376/).

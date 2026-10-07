@@ -121,6 +121,36 @@ fn malformed_parameters_and_canonicalization_chains_fail_before_execution() {
 }
 
 #[test]
+fn internal_relationship_targets_cannot_have_a_scheme() {
+    // ECMA-376 Part 2 §6.5.3.4 requires Internal targets to be relative;
+    // selection must not hide invalid unselected relationships.
+    let selectors = format!("<RelationshipReference xmlns=\"{PARAM}\" SourceId=\"absent\"/>");
+    for target in [
+        "https://example.com/a",
+        "urn:part:a",
+        "file:/a",
+        " HTTP://example.com/a ",
+    ] {
+        for mode in ["", " TargetMode=\"Internal\""] {
+            let input = format!(
+                "<Relationships xmlns=\"{REL}\"><Relationship Id=\"x\" Type=\"urn:t\" Target=\"{target}\"{mode}/></Relationships>"
+            );
+            assert!(normalize(&input, &selectors).is_err(), "{target} {mode}");
+        }
+    }
+    for target in ["a", "../a", "/a", "//example.com/a", "a/b:c", "a%3Ab"] {
+        let input = format!(
+            "<Relationships xmlns=\"{REL}\"><Relationship Id=\"x\" Type=\"urn:t\" Target=\"{target}\"/></Relationships>"
+        );
+        assert!(normalize(&input, &selectors).is_ok(), "{target}");
+    }
+    let external = format!(
+        "<Relationships xmlns=\"{REL}\"><Relationship Id=\"x\" Type=\"urn:t\" Target=\"https://example.com/a\" TargetMode=\"External\"/></Relationships>"
+    );
+    assert!(normalize(&external, &selectors).is_ok());
+}
+
+#[test]
 fn builder_enforces_parameter_budget_before_template_generation() {
     // A denied parameter budget must stop before copying the selector chain.
     let key = RsaSigningKey::from_pkcs8_pem(
