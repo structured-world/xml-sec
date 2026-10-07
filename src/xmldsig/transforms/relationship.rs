@@ -277,6 +277,13 @@ pub(super) fn normalize<'a>(
             continue;
         }
         if node.is_text() {
+            // CT_Relationship extends xsd:string (2012 D.4 / 2021 C.5).
+            // 2012 §13.2.4.24 step 3(2) removes its contents; 2021 §10.6
+            // step 3(a) removes text. CT_Relationships remains element-only.
+            // https://ecma-international.org/publications-and-standards/standards/ecma-376/
+            if matches!(parent, Parent::Relationship(_)) {
+                continue;
+            }
             if !node.text().is_some_and(super::is_xml_whitespace_only) {
                 return Err(invalid("Relationships part has character data"));
             }
@@ -366,22 +373,8 @@ pub(super) fn normalize<'a>(
                     return Err(invalid("invalid relationship TargetMode"));
                 }
                 budget.node_filter.charge(target.len())?;
-                // ECMA-376 Part 2 (2021) §6.5.3.4 / 2012 §9.3.2.2:
-                // Internal targets are relative references. RFC 3986 §4.2
-                // permits absolute/network paths but forbids ':' in the first
-                // path-noscheme segment. xsd:anyURI collapses edge whitespace.
-                // https://www.rfc-editor.org/rfc/rfc3986#section-4.2
                 if mode == "Internal" {
-                    for byte in target.trim_matches(xml_whitespace).bytes() {
-                        if byte == b'/' || byte == b'?' || byte == b'#' {
-                            break;
-                        }
-                        if byte == b':' {
-                            return Err(invalid(
-                                "Internal relationship Target must be a relative reference",
-                            ));
-                        }
-                    }
+                    validate_internal_target_reference_syntax(target)?;
                 }
                 let index = records.len();
                 budget.opc_workspace.push(
@@ -764,7 +757,13 @@ fn alternate_content<'a>(
             continue;
         }
         let tag = child.tag_name();
-        if tag.namespace() != Some(MC) && ignorable(child, tag.namespace(), budget)? {
+        // Part 3 (2015) §9.2 marks ProcessContent matches as unwrapped,
+        // not ignored. §9.4(3a) permits only ignored extension children here.
+        // https://ecma-international.org/publications-and-standards/standards/ecma-376/
+        if tag.namespace() != Some(MC)
+            && ignorable(child, tag.namespace(), budget)?
+            && !process_content(child, budget)?
+        {
             continue;
         }
         validate_mc_attributes(child, budget)?;
@@ -803,6 +802,27 @@ fn alternate_content<'a>(
     Ok(chosen.or(fallback))
 }
 
+fn validate_internal_target_reference_syntax(target: &str) -> Result<(), TransformError> {
+    // ECMA-376 Part 2 (2021) §6.5.3.4 / 2012 §9.3.2.2 requires a
+    // relative reference. RFC 3986 §4.2 includes network-path references;
+    // §5.2.2 can resolve one to the SAME pack authority. Without the base
+    // pack IRI (2021 §§6.5.2.2-3), this transform cannot check membership.
+    // Do not equate relative-reference syntax with package target resolution.
+    // https://www.rfc-editor.org/rfc/rfc3986#section-4.2
+    // xsd:anyURI collapses edge whitespace before lexical validation.
+    for byte in target.trim_matches(xml_whitespace).bytes() {
+        if byte == b'/' || byte == b'?' || byte == b'#' {
+            break;
+        }
+        if byte == b':' {
+            return Err(invalid(
+                "Internal relationship Target must be a relative reference",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn ncname(value: &str) -> bool {
     !value.contains(':') && crate::xml_input::lexical::is_qname(value)
 }
@@ -814,6 +834,89 @@ fn xml_whitespace(value: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alternate_content_distinguishes_ignored_and_unwrapped_extensions() {
+        // Part 3 §9.4(3a) allows ignored extension children, not unwrapped
+        // ones. ProcessContent may be inherited or local and use a wildcard.
+        for declaration in [
+            "",
+            "mc:ProcessContent=\"u:extension\"",
+            "mc:ProcessContent=\"u:*\"",
+        ] {
+            for local in [false, true] {
+                let (root_attributes, child_attributes) = if local {
+                    ("", declaration)
+                } else {
+                    (declaration, "")
+                };
+                let xml = format!(
+                    "<Relationships xmlns=\"{REL}\" xmlns:mc=\"{MC}\" xmlns:r=\"{REL}\" xmlns:u=\"urn:unknown\" mc:Ignorable=\"u\" {root_attributes}><mc:AlternateContent><u:extension {child_attributes}/><mc:Choice Requires=\"r\"><Relationship Id=\"x\" Type=\"urn:t\" Target=\"a\"/></mc:Choice></mc:AlternateContent></Relationships>"
+                );
+                let document = Document::parse(&xml).expect("well-formed MCE input");
+                for edition in [
+                    OpcRelationshipEdition::Ecma2012,
+                    OpcRelationshipEdition::Ecma2021,
+                ] {
+                    let result = normalize(
+                        &document,
+                        &[RelationshipSelector::SourceId("x".into())],
+                        edition,
+                        &TransformExecutionBudget::default(),
+                    );
+                    assert_eq!(
+                        result.is_ok(),
+                        declaration.is_empty(),
+                        "{edition:?}: {declaration}, local={local}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn relationship_simple_content_is_removed_but_invalid_structure_is_rejected() {
+        // CT_Relationship is xsd:string simple content in both editions.
+        // Stripping it must not permit container text or child elements.
+        for edition in [
+            OpcRelationshipEdition::Ecma2012,
+            OpcRelationshipEdition::Ecma2021,
+        ] {
+            for (content, accepted) in [
+                (
+                    "<Relationship Id=\"x\" Type=\"urn:t\" Target=\"a\">metadata &amp; <![CDATA[value]]></Relationship>",
+                    true,
+                ),
+                (
+                    "metadata<Relationship Id=\"x\" Type=\"urn:t\" Target=\"a\"/>",
+                    false,
+                ),
+                (
+                    "<Relationship Id=\"x\" Type=\"urn:t\" Target=\"a\"><child/></Relationship>",
+                    false,
+                ),
+            ] {
+                let xml = format!("<Relationships xmlns=\"{REL}\">{content}</Relationships>");
+                let document = Document::parse(&xml).expect("well-formed XML");
+                let result = normalize(
+                    &document,
+                    &[RelationshipSelector::SourceId("x".into())],
+                    edition,
+                    &TransformExecutionBudget::default(),
+                );
+                assert_eq!(result.is_ok(), accepted, "{edition:?}: {content}");
+                if accepted {
+                    let expected = format!(
+                        "<Relationships xmlns=\"{REL}\"><Relationship Id=\"x\" Target=\"a\" TargetMode=\"Internal\" Type=\"urn:t\"></Relationship></Relationships>"
+                    );
+                    assert_eq!(
+                        result.expect("simple content is valid"),
+                        expected.as_bytes()
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn selection_union_survives_nonmatching_selectors_on_either_side() {

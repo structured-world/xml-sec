@@ -74,6 +74,12 @@ node-filter work, and canonical output limits also apply. Node-set input respect
 its visibility mask; byte input uses the selected XML backend and shared decoder,
 including UTF-16. This transform is not a complete OPC package validator: package
 part existence, target resolution, and signature packaging rules remain separate.
+Internal Target syntax must be a relative reference; network-path references
+are permitted by RFC 3986 §4.2. Determining whether they resolve inside the
+same package requires its base pack IRI (2021 §§6.5.2.2-3), which the normalizer
+does not receive. Acceptance by this transform does not assert package membership.
+Relationship simple content is removed in both editions; non-whitespace text
+in the Relationships container and child elements in Relationship remain invalid.
 Generic SignedInfo and CipherReference execution therefore remain available.
 Successful XMLDSig verification is not OPC package conformance: the package
 adapter must independently enforce Manifest placement and one Relationship

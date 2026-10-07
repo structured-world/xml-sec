@@ -121,7 +121,7 @@ fn malformed_parameters_and_canonicalization_chains_fail_before_execution() {
 }
 
 #[test]
-fn internal_relationship_targets_cannot_have_a_scheme() {
+fn internal_relationship_target_syntax_is_not_package_resolution() {
     // ECMA-376 Part 2 §6.5.3.4 requires Internal targets to be relative;
     // selection must not hide invalid unselected relationships.
     let selectors = format!("<RelationshipReference xmlns=\"{PARAM}\" SourceId=\"absent\"/>");
@@ -138,16 +138,28 @@ fn internal_relationship_targets_cannot_have_a_scheme() {
             assert!(normalize(&input, &selectors).is_err(), "{target} {mode}");
         }
     }
-    for target in ["a", "../a", "/a", "//example.com/a", "a/b:c", "a%3Ab"] {
+    // RFC 3986 §§4.2, 5.2.2: an authority is allowed in a relative reference.
+    // The encoded pack authority can equal the base's authority; only a
+    // package validator with that base can decide package membership.
+    for target in [
+        "a",
+        "../a",
+        "/a",
+        "//http%3a,,example.com,package/a",
+        "a/b:c",
+        "a%3Ab",
+    ] {
         let input = format!(
             "<Relationships xmlns=\"{REL}\"><Relationship Id=\"x\" Type=\"urn:t\" Target=\"{target}\"/></Relationships>"
         );
         assert!(normalize(&input, &selectors).is_ok(), "{target}");
     }
-    let external = format!(
-        "<Relationships xmlns=\"{REL}\"><Relationship Id=\"x\" Type=\"urn:t\" Target=\"https://example.com/a\" TargetMode=\"External\"/></Relationships>"
-    );
-    assert!(normalize(&external, &selectors).is_ok());
+    for target in ["https://example.com/a", "//example.com/a"] {
+        let external = format!(
+            "<Relationships xmlns=\"{REL}\"><Relationship Id=\"x\" Type=\"urn:t\" Target=\"{target}\" TargetMode=\"External\"/></Relationships>"
+        );
+        assert!(normalize(&external, &selectors).is_ok());
+    }
 }
 
 #[test]
@@ -211,7 +223,7 @@ fn cipher_reference_uses_typed_edition_and_selected_backend_for_encoded_input() 
     // The XMLEnc adapter must share edition policy and octet decoding, not
     // silently use its own default transform configuration.
     let source = format!(
-        "<Relationships xmlns=\"{REL}\"><Relationship Id=\"RID\" Type=\"urn:t\" Target=\"a\"/></Relationships>"
+        "<Relationships xmlns=\"{REL}\"><Relationship Id=\"RID\" Type=\"urn:t\" Target=\"a\">metadata &amp; <![CDATA[данные]]></Relationship></Relationships>"
     );
     let utf16 = std::iter::once(0xfeffu16)
         .chain(source.encode_utf16())
