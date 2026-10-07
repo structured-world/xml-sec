@@ -74,6 +74,17 @@ public SPKI bytes can be verified by either engine. There is no automatic fallba
 Key-container decoding remains a distinct inventory import boundary: encrypted
 PKCS#8 and PKCS#12 password-based container processing uses the existing RustCrypto
 importer. Selecting AWS-LC does not turn that importer into an approved FIPS service.
+RSA key-container codecs use current RustCrypto `pkcs1`/`pkcs8` types through
+`rsa_encoding::{RsaPrivateKeyEncoding, RsaPublicKeyEncoding}` extension traits.
+These traits operate on the existing `sad-rsa` keys; its bundled encoding feature
+is disabled until its codec supports the current dependency API. RSA validation,
+arithmetic, blinding, and implicit rejection remain in `sad-rsa`; operation
+dispatch still belongs to `CryptoProvider`. Private serialized-component buffers
+and DER/PEM output documents are zeroized. This narrow adaptation does not fork
+the RSA engine or introduce a second cryptographic implementation.
+The corresponding upstream fix is proposed in
+[sad-rsa #61](https://github.com/sadco-io/sad-rsa/pull/61); published xml-sec builds
+do not depend on that PR being accepted or on a consumer-side Cargo patch.
 The CLI's generic `--privkey-pem`/`--privkey-der` options also preserve traditional
 RSA PKCS#1 and EC SEC1 containers independently of the provider. Traditional
 OpenSSL encrypted PEM is decrypted at this same container boundary. Normalization
@@ -182,7 +193,13 @@ final content authentication. Non-exportable handles are never converted into
 software keys to satisfy an unsupported provider operation.
 
 `EncryptedDataBuilder::derived_key` retains an explicit KDF request and a
-zeroizing secret; `agreement_key` retains an opaque handle and public peer.
+zeroizing secret; `agreement_key` takes an owned opaque handle and public peer.
+For ECDH-ES, the caller supplies a fresh sender pair for each message and exports
+its public role before transferring the private handle. The builder consumes
+that handle once at actual agreement dispatch, also across clones or failed
+agreement attempts; policy and capability rejection do not consume it. This
+enforces the per-message lifetime required by XMLEnc 1.1 section 5.6.4 without
+implicitly selecting a key-generation engine or exporting a provider's secrets.
 Both defer cryptographic execution to the operation's key-resolution gate.
 Replacing the builder policy therefore affects the actual derivation, rather
 than accepting a key generated under an earlier policy. Direct raw content keys
@@ -209,6 +226,15 @@ and has separate exact-bit tests: libxmlsec1's `xmlSecTransformConcatKdfParamsRe
 rejects such fields, so that donor limitation is not imposed on xml-sec.
 Reciprocal ECDH tests additionally execute XML agreement with P-256, P-384 and
 P-521 keys and ConcatKDF against libxmlsec1, in both directions.
+
+The key-establishment acceptance tests in `xmlenc_encrypt_xmlsec1` require the
+independent oracle, including local runs: an unavailable oracle is a setup
+failure, not a successful skipped check. Install it with
+`bash scripts/install-xmlsec1.sh`, then set `XMLSEC1_BIN` to the reported
+installation's `bin/xmlsec1`. Set `DYLD_LIBRARY_PATH` (macOS) or
+`LD_LIBRARY_PATH` (Linux) to that installation's `lib` directory when required
+by the dynamic loader. CI provisions the same oracle. Run with
+`cargo nextest run -p xml-sec --test xmlenc_encrypt_xmlsec1`.
 
 `parse_hkdf_agreement_method` separately adapts the
 [RFC 9231 section 2.8.1](https://www.rfc-editor.org/rfc/rfc9231.html#section-2.8.1)

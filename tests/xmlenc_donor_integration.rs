@@ -13,9 +13,10 @@ use aes_gcm::{
 };
 use aes_kw::KwAes256;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use rsa::{RsaPrivateKey, pkcs1::DecodeRsaPrivateKey, pkcs8::DecodePrivateKey};
+use rsa::RsaPrivateKey;
 use xml_sec as roxmltree;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize, canonicalize_xml};
+use xml_sec::rsa_encoding::RsaPrivateKeyEncoding as _;
 use xml_sec::xmlenc::{
     DecryptContext, DecryptedContent, KekDecryptor, PrivateKeyDecryptor, SymmetricKeyDecryptor,
     XmlEncError, decrypt, decrypt_data, decrypt_document, parse_encrypted_data,

@@ -10,8 +10,8 @@ fn rsa_verifier_size_limit_is_unsupported_not_signature_mismatch() {
     // A caller may allow 1024-bit RSA; native capability limits must still be
     // distinguished from a cryptographically incorrect signature in both APIs.
     use rand_chacha::{ChaCha8Rng, rand_core::SeedableRng as _};
-    use rsa::pkcs8::{EncodePrivateKey as _, EncodePublicKey as _};
     use xml_sec::provider::{ProviderError, X509SignatureAlgorithm};
+    use xml_sec::rsa_encoding::{RsaPrivateKeyEncoding as _, RsaPublicKeyEncoding as _};
     use xml_sec::xmldsig::{
         DsigError, RsaSigningKey, SignatureAlgorithm, SignatureVerificationError, SigningKey as _,
         VerificationKey,
@@ -419,9 +419,9 @@ fn native_rsa_signing_and_backend_binding() {
 #[test]
 fn rsa_recipient_xml_pipeline_interoperates_with_native_recovery() {
     // Exercise session-key generation, RSA transport, KeyInfo parsing and native recovery.
-    use rsa::pkcs8::DecodePrivateKey as _;
     use std::sync::Arc;
     use xml_sec::provider::AwsLcRsaPrivateKey;
+    use xml_sec::rsa_encoding::RsaPrivateKeyEncoding as _;
     use xml_sec::xmlenc::{
         DataEncryptionAlgorithm, DecryptContext, DecryptedContent, DecryptionKeyResolver,
         EncryptedDataBuilder, EncryptionRecipient, PrivateKeyDecryptor,
@@ -600,8 +600,8 @@ fn key_wrap_engines_match_and_reject_invalid_input() {
 #[test]
 fn native_oaep_interoperates_and_rejects_wrong_label() {
     // Labels and MGF parameters must not be ignored or silently handled by another engine.
-    use rsa::pkcs8::DecodePrivateKey as _;
     use xml_sec::provider::{AwsLcRsaPrivateKey, RustCryptoRsaPrivateKey, RustCryptoRsaPublicKey};
+    use xml_sec::rsa_encoding::RsaPrivateKeyEncoding as _;
     use xml_sec::xmlenc::{OaepDigestAlgorithm as D, RsaOaepParameters};
     let pem = pem::parse(include_bytes!("fixtures/keys/rsa/rsa-2048-key.pem")).unwrap();
     let key = rsa::RsaPrivateKey::from_pkcs8_der(pem.contents()).unwrap();

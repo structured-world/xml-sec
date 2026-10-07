@@ -476,6 +476,9 @@ pub enum ProviderInputError {
     /// An EC scalar or peer point is not valid for the selected named curve.
     #[error("invalid ECDH key material")]
     EcdhKey,
+    /// An operation-owned ephemeral sender key has already been consumed.
+    #[error("ECDH-ES sender key already consumed; supply a fresh key pair")]
+    ConsumedEphemeralKey,
     /// Finite-field domain, scalar, or peer fails DH validation.
     #[error("invalid DH key material")]
     DhKey,
@@ -1343,7 +1346,7 @@ impl CryptoProvider for RustCryptoProvider {
         &self,
         pkcs8: &[u8],
     ) -> Result<std::sync::Arc<dyn KeyRecoveryKey>, ProviderError> {
-        use rsa::pkcs8::DecodePrivateKey as _;
+        use crate::rsa_encoding::RsaPrivateKeyEncoding as _;
         let key = rsa::RsaPrivateKey::from_pkcs8_der(pkcs8).map_err(|_| {
             ProviderError::InvalidInput(ProviderInputError::PrimitiveInitialization(
                 "RSA recovery key",
@@ -1654,11 +1657,11 @@ fn is_supported_x509_signature(algorithm: X509SignatureAlgorithm) -> bool {
 
 #[cfg(feature = "xmldsig")]
 pub(crate) mod rustcrypto_x509 {
+    use crate::rsa_encoding::RsaPublicKeyEncoding as _;
     use der::Decode as _;
     use dsa::pkcs8::DecodePublicKey as _;
     use rsa::{
         RsaPublicKey,
-        pkcs1::DecodeRsaPublicKey as _,
         pss::{Signature as RsaPssSignature, VerifyingKey as RsaPssVerifyingKey},
         traits::PublicKeyParts as _,
     };
@@ -3164,9 +3167,10 @@ mod tests {
     #[cfg(feature = "xmldsig")]
     #[test]
     fn rustcrypto_provider_verifies_parameterized_rsa_pss_certificates() {
+        use crate::rsa_encoding::RsaPublicKeyEncoding as _;
         use der::{Decode as _, Encode as _};
         use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng};
-        use rsa::{RsaPrivateKey, pkcs8::EncodePublicKey, pss::SigningKey as RsaPssSigningKey};
+        use rsa::{RsaPrivateKey, pss::SigningKey as RsaPssSigningKey};
         use sha2::Sha256;
         use signature::{RandomizedSigner, SignatureEncoding};
         use x509_cert::spki::{AlgorithmIdentifierOwned, ObjectIdentifier};
@@ -3323,8 +3327,9 @@ mod tests {
     #[cfg(feature = "xmldsig")]
     #[test]
     fn primitive_provider_does_not_embed_rsa_strength_policy() {
+        use crate::rsa_encoding::RsaPublicKeyEncoding as _;
         use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng};
-        use rsa::{RsaPrivateKey, pkcs8::EncodePublicKey, pss::SigningKey as RsaPssSigningKey};
+        use rsa::{RsaPrivateKey, pss::SigningKey as RsaPssSigningKey};
         use sha2::Sha256;
         use signature::{RandomizedSigner, SignatureEncoding};
 
@@ -3362,8 +3367,9 @@ mod tests {
     #[cfg(feature = "xmldsig")]
     #[test]
     fn oversized_rsa_pss_salt_is_a_verification_miss() {
+        use crate::rsa_encoding::RsaPublicKeyEncoding as _;
         use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng};
-        use rsa::{RsaPrivateKey, pkcs8::EncodePublicKey as _, traits::PublicKeyParts as _};
+        use rsa::{RsaPrivateKey, traits::PublicKeyParts as _};
 
         // ASN.1 saltLength is attacker-controlled. It must not reach the
         // dependency's unchecked hLen + saltLen + 2 arithmetic.

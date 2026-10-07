@@ -9,6 +9,7 @@ pub use cryptoki;
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use crate::rsa_encoding::RsaPublicKeyEncoding as _;
 use crypto_bigint::BoxedUint;
 use cryptoki::{
     error::{Error, RvError},
@@ -21,7 +22,7 @@ use cryptoki::{
     session::{Session, UserType},
     types::AuthPin,
 };
-use rsa::{RsaPublicKey, pkcs8::EncodePublicKey, traits::PublicKeyParts};
+use rsa::{RsaPublicKey, traits::PublicKeyParts};
 
 use super::{
     ContentDecryptionKey, CryptoProvider, ExternalProviderError, KeyAgreementKey,

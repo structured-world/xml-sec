@@ -506,6 +506,116 @@ fn carried_key_name_finds_detached_key_without_retrieval_method() {
 }
 
 #[test]
+fn detached_inventory_does_not_charge_unrelated_keys_as_candidates() {
+    // Candidate limits govern keys usable for this object, not unrelated
+    // encrypted payloads elsewhere in a multi-recipient document.
+    let selected = key("").replace(
+        "</x:EncryptedKey>",
+        "<x:CarriedKeyName>selected</x:CarriedKeyName></x:EncryptedKey>",
+    );
+    let wire = format!(
+        "<root xmlns:x='{X}' xmlns:d='{D}'>{}{}{selected}</root>",
+        data("<d:KeyName>selected</d:KeyName>"),
+        key("").repeat(65)
+    );
+    let document = xml_sec::XmlDomDocument::parse(&wire).unwrap();
+    let node = document
+        .descendants()
+        .find(|node| node.has_tag_name((X, "EncryptedData")))
+        .unwrap();
+    let mut policy = xml_sec::policy::DecryptionPolicy::default();
+    policy.resources.max_key_candidates = 1;
+    let parsed = xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &policy).unwrap();
+    assert_eq!(parsed.encrypted_keys.len(), 1);
+}
+
+#[test]
+fn detached_reference_validation_is_scoped_to_associated_keys() {
+    // Malformed or oversized unrelated lists cannot abort this selection.
+    // Once a key is associated, its complete list remains strictly validated.
+    for bad in [
+        "<x:DataReference/>",
+        "<x:Other/>",
+        "text",
+        "<x:DataReference URI='#elsewhere'/><x:DataReference URI='#elsewhere'/>",
+        "<x:DataReference URI='#xpointer(bad)'/>",
+    ] {
+        for associated in [false, true] {
+            let carried = if associated {
+                "<x:CarriedKeyName>selected</x:CarriedKeyName>"
+            } else {
+                ""
+            };
+            let detached = key("").replace(
+                "</x:EncryptedKey>",
+                &format!("<x:ReferenceList>{bad}</x:ReferenceList>{carried}</x:EncryptedKey>"),
+            );
+            let wire = format!(
+                "<root xmlns:x='{X}' xmlns:d='{D}'>{}{detached}</root>",
+                data("<d:KeyName>selected</d:KeyName>")
+            );
+            let document = xml_sec::XmlDomDocument::parse(&wire).unwrap();
+            let node = document
+                .descendants()
+                .find(|node| node.has_tag_name((X, "EncryptedData")))
+                .unwrap();
+            let mut policy = xml_sec::policy::DecryptionPolicy::default();
+            policy.resources.max_references = 1;
+            let parsed = xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &policy);
+            assert_eq!(
+                parsed.is_err(),
+                associated,
+                "associated={associated}, list={bad}: {parsed:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn detached_selected_reference_validates_the_whole_list_and_candidate_limit() {
+    // A relevant reference after malformed siblings still selects the key,
+    // exposing strict validation; two relevant keys still exceed a one-key cap.
+    for malformed in [false, true] {
+        let list = format!(
+            "<x:ReferenceList>{}<x:DataReference URI='#payload'/></x:ReferenceList>",
+            if malformed { "<x:Other/>" } else { "" }
+        );
+        let detached = key("").replace("</x:EncryptedKey>", &format!("{list}</x:EncryptedKey>"));
+        let payload = data("").replace("<x:EncryptedData ", "<x:EncryptedData Id='payload' ");
+        let wire = format!(
+            "<root xmlns:x='{X}' xmlns:d='{D}'>{payload}{}</root>",
+            detached.repeat(if malformed { 1 } else { 2 })
+        );
+        let document = xml_sec::XmlDomDocument::parse(&wire).unwrap();
+        let node = document
+            .descendants()
+            .find(|node| node.has_tag_name((X, "EncryptedData")))
+            .unwrap();
+        let mut policy = xml_sec::policy::DecryptionPolicy::default();
+        policy.resources.max_key_candidates = 1;
+        assert!(xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &policy).is_err());
+    }
+}
+
+#[test]
+fn detached_selection_does_not_hide_a_second_relevant_reference_list() {
+    // A malformed key with a later association must be selected for strict
+    // rejection, not treated as unrelated because its first list is irrelevant.
+    let detached = key("").replace("</x:EncryptedKey>", "<x:ReferenceList><x:DataReference URI='#other'/></x:ReferenceList><x:ReferenceList><x:DataReference URI='#payload'/></x:ReferenceList></x:EncryptedKey>");
+    let payload = data("").replace("<x:EncryptedData ", "<x:EncryptedData Id='payload' ");
+    let wire = format!("<root xmlns:x='{X}' xmlns:d='{D}'>{payload}{detached}</root>");
+    let document = xml_sec::XmlDomDocument::parse(&wire).unwrap();
+    let node = document
+        .descendants()
+        .find(|node| node.has_tag_name((X, "EncryptedData")))
+        .unwrap();
+    assert!(matches!(
+        xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &Default::default()),
+        Err(XmlEncError::InvalidStructure(_))
+    ));
+}
+
+#[test]
 fn data_reference_finds_detached_key_without_key_info() {
     // Association can be expressed solely by the detached transport's
     // ReferenceList, including an explicit XPointer ID reference.
@@ -623,7 +733,7 @@ fn nested_encrypted_key_recovers_the_outer_kek_not_a_second_content_key() {
 #[cfg(feature = "legacy-algorithms")]
 #[test]
 fn nested_implicit_rejection_reaches_final_content_authentication() {
-    use rsa::pkcs8::DecodePrivateKey;
+    use xml_sec::rsa_encoding::RsaPrivateKeyEncoding as _;
     // A nested RSA-1.5 rejection must not become an early AES-KW oracle.
     // Even a failed intermediate unwrap carries fallback bytes to final GCM.
     let private =

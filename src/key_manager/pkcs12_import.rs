@@ -1368,7 +1368,7 @@ mod tests {
         let der = sequence(&[
             integer(0),
             sequence(&[
-                oid(rsa::pkcs8::spki::ObjectIdentifier::new_unwrap(
+                oid(pkcs8::spki::ObjectIdentifier::new_unwrap(
                     "1.2.840.113549.1.1.1",
                 )),
                 encoded(5, &[]),

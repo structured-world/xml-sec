@@ -87,7 +87,7 @@ snafu = { version = "0.9", optional = true }
 # Crypto
 cryptoki = { version = "0.12.1", optional = true }
 aws-lc-rs = { version = "1.18.1", default-features = false, features = ["fips"], optional = true }
-rsa = { package = "sad-rsa", version = "0.10.2", features = ["sha1", "sha2", "hazmat"], optional = true }
+rsa = { package = "sad-rsa", version = "0.10.2", default-features = false, features = ["sha1", "sha2", "hazmat"], optional = true }
 sha1 = { version = "0.11", features = ["oid", "zeroize"], optional = true }
 sha2 = { version = "0.11", features = ["oid", "zeroize"], optional = true }
 sha3 = { version = "0.12", default-features = false, features = ["oid"], optional = true }
@@ -104,7 +104,8 @@ p256 = { version = "0.14", features = ["ecdsa"], optional = true }
 p384 = { version = "0.14", features = ["ecdsa"], optional = true }
 p521 = { version = "0.14", features = ["ecdsa"], optional = true }
 dsa = { version = "0.7", features = ["hazmat"], optional = true }
-pkcs8 = { version = "0.11", features = ["encryption"], optional = true }
+pkcs8 = { version = "0.11", features = ["encryption", "pem"], optional = true }
+pkcs1 = { version = "0.8.0-rc.5", default-features = false, features = ["alloc", "pem"], optional = true }
 ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "digest", "fast", "hazmat", "pkcs8", "zeroize"], optional = true }
 # Expose the same curve primitive already used by dalek for RFC 8032 Ed25519ctx.
 curve25519-dalek = { version = "5", default-features = false, features = ["alloc", "precomputed-tables", "zeroize"], optional = true }
@@ -188,6 +189,7 @@ xmldsig = [            # XML Digital Signatures (sign + verify)
     "dep:p384",
     "dep:p521",
     "dep:pkcs8",
+    "dep:pkcs1",
     "dep:rsa",
     "dep:sha1",
     "dep:sha2",

@@ -68,7 +68,7 @@ pub(super) fn recover(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rsa::pkcs8::DecodePrivateKey as _;
+    use crate::rsa_encoding::RsaPrivateKeyEncoding as _;
 
     fn private_key() -> RsaPrivateKey {
         RsaPrivateKey::from_pkcs8_pem(include_str!(

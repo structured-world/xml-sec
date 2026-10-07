@@ -5,6 +5,7 @@
 //! instead of [`crate::xmldsig::parse::parse_signed_info`], because verification
 //! must continue to reject empty or malformed stored digest values.
 
+use crate::rsa_encoding::{RsaPrivateKeyEncoding as _, RsaPublicKeyEncoding as _};
 use crate::xml::dom::{Document, Node, NodeId};
 use base64::Engine;
 use hmac::{KeyInit, Mac};
@@ -1293,7 +1294,7 @@ mod dsa_import_tests {
         info.public_key = Some(der::asn1::BitStringRef::new(1, &[0x02])?);
         assert!(DsaSigningKey::from_pkcs8_der(&info.to_der()?).is_err());
         let mut info = original;
-        info.algorithm.oid = rsa::pkcs1::ALGORITHM_OID;
+        info.algorithm.oid = pkcs1::ALGORITHM_OID;
         assert!(DsaSigningKey::from_pkcs8_der(&info.to_der()?).is_err());
         Ok(())
     }

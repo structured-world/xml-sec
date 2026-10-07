@@ -2612,6 +2612,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use crate::rsa_encoding::RsaPrivateKeyEncoding as _;
     use aes_gcm::{
         Aes128Gcm,
         aead::{AeadInOut, KeyInit},
@@ -2619,7 +2620,7 @@ mod tests {
     use aes_kw::KwAes128;
     use base64::engine::general_purpose::STANDARD;
     use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng};
-    use rsa::{Oaep, RsaPublicKey, pkcs8::DecodePrivateKey};
+    use rsa::{Oaep, RsaPublicKey};
     use sha1::Sha1;
     use sha2::{Sha256, Sha384};
 

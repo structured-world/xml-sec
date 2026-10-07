@@ -139,6 +139,16 @@ impl KeyEstablishmentPolicy {
                 });
             }
         }
+        // XMLEnc 1.1 §5.6.1: p = j*q + 1, j >= 2, hence q needs fewer
+        // bits than p. Equality is valid for the modulus minimum, not q's.
+        // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-DHKeyValue
+        if self.minimum_dh_subgroup_bits >= self.max_dh_modulus_bits {
+            return Err(PolicyViolation::InvalidResourceLimit {
+                resource: super::resource_name::DH_SUBGROUP_BITS,
+                actual: self.minimum_dh_subgroup_bits,
+                requirement: "subgroup minimum must be strictly below modulus maximum",
+            });
+        }
         super::ResourcePolicy::within(
             super::resource_name::DH_MODULUS_BITS,
             self.max_dh_modulus_bits,

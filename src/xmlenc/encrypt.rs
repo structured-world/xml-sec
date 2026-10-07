@@ -84,6 +84,39 @@ enum DirectEncryptionKey {
     },
 }
 
+/// One owned sender key, shared only so builder clones cannot reuse it.
+struct EphemeralSenderKey {
+    binding: Option<crate::provider::ProviderBinding>,
+    key: std::sync::Mutex<Option<Box<dyn crate::provider::KeyAgreementKey>>>,
+}
+
+impl crate::provider::KeyAgreementKey for EphemeralSenderKey {
+    fn provider_binding(&self) -> Option<&crate::provider::ProviderBinding> {
+        self.binding.as_ref()
+    }
+
+    fn agree(
+        &self,
+        parameters: &crate::provider::KeyAgreementParameters<'_>,
+    ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+        // XMLEnc 1.1 §5.6.4 requires a fresh originator pair per message.
+        // Consume immediately before actual agreement, after the shared policy,
+        // provider-binding and workspace gates. Failure never restores the key.
+        // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-ECDH-ES
+        let key = self
+            .key
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+            .ok_or(crate::provider::ProviderError::InvalidInput(
+                crate::provider::ProviderInputError::ConsumedEphemeralKey,
+            ))?;
+        // The mutex is released before provider work; the private handle dies
+        // with this one attempt rather than remaining in reusable builder state.
+        key.agree(parameters)
+    }
+}
+
 enum OperationContentKey<'a> {
     Borrowed(&'a [u8]),
     Owned(zeroize::Zeroizing<Vec<u8>>),
@@ -288,13 +321,25 @@ impl EncryptedDataBuilder {
     /// The peer is an explicit request input. Agreement and derivation execute
     /// through the selected provider only after the final policy has permitted
     /// both mechanisms and reserved their operation-wide workspace.
+    /// For ECDH-ES, supply a freshly generated sender pair. The owned key is
+    /// consumed at most once, including across builder clones and failed
+    /// agreement attempts. Export its public role before transferring ownership.
     pub fn agreement_key(
         mut self,
         method: super::KeyDerivationMethod,
-        key: Arc<dyn crate::provider::KeyAgreementKey>,
+        key: Box<dyn crate::provider::KeyAgreementKey>,
         algorithm: crate::policy::KeyAgreementAlgorithm,
         peer_public_key: impl Into<Vec<u8>>,
     ) -> Self {
+        let key: Arc<dyn crate::provider::KeyAgreementKey> =
+            if algorithm == crate::policy::KeyAgreementAlgorithm::EcdhEs {
+                Arc::new(EphemeralSenderKey {
+                    binding: key.provider_binding().cloned(),
+                    key: std::sync::Mutex::new(Some(key)),
+                })
+            } else {
+                Arc::from(key)
+            };
         self.direct_key = Some(DirectEncryptionKey::Agreement {
             method,
             key,
@@ -1571,9 +1616,9 @@ mod tests {
 
     use std::sync::Arc;
 
+    use crate::rsa_encoding::RsaPublicKeyEncoding as _;
     use getrandom::SysRng;
     use getrandom::rand_core::UnwrapErr;
-    use rsa::pkcs8::DecodePublicKey as _;
     use rsa::{RsaPrivateKey, RsaPublicKey};
 
     use super::*;

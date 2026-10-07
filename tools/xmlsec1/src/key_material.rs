@@ -17,17 +17,12 @@ use dsa::{
     Components as DsaComponents, SigningKey as NativeDsaSigningKey, VerifyingKey as DsaVerifyingKey,
 };
 use md5::{Digest as _, Md5};
-use rsa::{
-    RsaPrivateKey, RsaPublicKey,
-    pkcs1::{DecodeRsaPrivateKey as _, DecodeRsaPublicKey as _},
-    pkcs8::{
-        DecodePrivateKey as _, DecodePublicKey as _, EncodePrivateKey as _, EncodePublicKey as _,
-        EncryptedPrivateKeyInfoRef, PrivateKeyInfoRef,
-    },
-};
+use pkcs8::{EncodePrivateKey as _, EncryptedPrivateKeyInfoRef, PrivateKeyInfoRef};
+use rsa::{RsaPrivateKey, RsaPublicKey};
 use x509_parser::prelude::FromDer as _;
 use xml_sec::key_manager::{KeyInventory, KeyUsages};
 use xml_sec::policy::{PolicyViolation, ResourcePolicy, SigningPolicy, VerificationPolicy};
+use xml_sec::rsa_encoding::{RsaPrivateKeyEncoding as _, RsaPublicKeyEncoding as _};
 use xml_sec::xmldsig::{
     DsaSigningKey, DsigError, EcdsaP256SigningKey, EcdsaP384SigningKey, EcdsaP521SigningKey,
     KeyInfo, ReferenceProcessingError, RsaSigningKey, SignatureAlgorithm, SigningKey,
@@ -479,7 +474,7 @@ pub(crate) fn is_encrypted_pkcs8_container(bytes: &[u8], format: PrivateKeyForma
 fn pkcs8_container_kind(bytes: &[u8], format: PrivateKeyFormat) -> Option<Pkcs8ContainerKind> {
     match format {
         PrivateKeyFormat::Pem | PrivateKeyFormat::Pkcs8Pem => {
-            match rsa::pkcs8::der::pem::decode_label(bytes).ok()? {
+            match pkcs8::der::pem::decode_label(bytes).ok()? {
                 "PRIVATE KEY" => Some(Pkcs8ContainerKind::Plain),
                 "ENCRYPTED PRIVATE KEY" => Some(Pkcs8ContainerKind::Encrypted),
                 _ => None,
@@ -755,7 +750,7 @@ fn decode_traditional_rsa_pem(
 
 fn preflight_rsa_der(bytes: &[u8], pkcs8_only: bool, path: &Path) -> Result<(), KeyMaterialError> {
     let components = match PrivateKeyInfoRef::try_from(bytes) {
-        Ok(info) if info.algorithm.oid == rsa::pkcs1::ALGORITHM_OID => info.private_key.as_bytes(),
+        Ok(info) if info.algorithm.oid == pkcs1::ALGORITHM_OID => info.private_key.as_bytes(),
         Ok(_) => return Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned())),
         Err(_) if !pkcs8_only => bytes,
         Err(_) => return Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned())),
@@ -1545,7 +1540,6 @@ mod tests {
     use aes::cipher::BlockModeEncrypt as _;
     use base64::Engine as _;
     use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng as _};
-    use rsa::pkcs1::{EncodeRsaPrivateKey as _, EncodeRsaPublicKey as _};
 
     use super::*;
 
@@ -1630,7 +1624,7 @@ mod tests {
         let info = PrivateKeyInfoRef::try_from(der.as_slice()).expect("fixture PKCS#8");
         let oversized = vec![1_u8; 1025];
         for modulus in [true, false] {
-            let mut key = rsa::pkcs1::RsaPrivateKey::from_der(info.private_key.as_bytes()).unwrap();
+            let mut key = pkcs1::RsaPrivateKeyRef::from_der(info.private_key.as_bytes()).unwrap();
             if modulus {
                 key.modulus = UintRef::new(&oversized).unwrap();
             } else {
@@ -1638,7 +1632,7 @@ mod tests {
             }
             let pkcs1 = key.to_der().unwrap();
             let pkcs8 = PrivateKeyInfoRef::new(
-                rsa::pkcs1::ALGORITHM_ID,
+                pkcs1::ALGORITHM_ID,
                 der::asn1::OctetStringRef::new(&pkcs1).unwrap(),
             )
             .to_der()

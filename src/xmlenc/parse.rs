@@ -92,12 +92,11 @@ struct KeySourceParseBudget<'a, 'doc, 'shared> {
 }
 
 impl<'a, 'doc, 'shared> KeySourceParseBudget<'a, 'doc, 'shared> {
-    fn referenced_node(
+    fn resolver(
         &mut self,
         source: Node<'doc, 'doc>,
-        uri: &str,
-    ) -> Result<Node<'doc, 'doc>, XmlEncError> {
-        let resolver = self.resolver.get_or_insert_with(|| {
+    ) -> &crate::xmldsig::uri::UriReferenceResolver<'doc> {
+        self.resolver.get_or_insert_with(|| {
             crate::xmldsig::uri::UriReferenceResolver::with_id_registrations(
                 source.document(),
                 self.registrations,
@@ -107,8 +106,15 @@ impl<'a, 'doc, 'shared> KeySourceParseBudget<'a, 'doc, 'shared> {
                     policy.same_document_id_semantics
                 }),
             )
-        });
-        resolver
+        })
+    }
+
+    fn referenced_node(
+        &mut self,
+        source: Node<'doc, 'doc>,
+        uri: &str,
+    ) -> Result<Node<'doc, 'doc>, XmlEncError> {
+        self.resolver(source)
             .node_for_same_document_reference(uri)?
             .ok_or_else(|| {
                 XmlEncError::InvalidStructure(
@@ -824,15 +830,21 @@ fn append_detached_keys<'doc>(
     // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-ReferenceList
     if budget.detached.is_none() {
         let mut candidates = Vec::new();
-        for candidate in node
-            .document()
-            .descendants()
-            .filter(|candidate| candidate.has_tag_name((XMLENC_NS, "EncryptedKey")))
-        {
-            policy
-                .resources
-                .validate_key_candidates(candidates.len() + 1)?;
-            candidates.push(candidate.id());
+        let maximum = policy.resources.effective_xml_nodes() as usize;
+        for (index, candidate) in node.document().descendants().enumerate() {
+            // Inventory is bounded document work, not candidate execution.
+            // Gate the scan before retaining any additional node identities.
+            if index >= maximum {
+                return Err(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_NODES,
+                    maximum,
+                    actual: index + 1,
+                }
+                .into());
+            }
+            if candidate.has_tag_name((XMLENC_NS, "EncryptedKey")) {
+                candidates.push(candidate.id());
+            }
         }
         budget.detached = Some(candidates);
     }
@@ -861,37 +873,63 @@ fn append_detached_keys<'doc>(
                 })
         });
         let mut referenced = false;
-        if let Some(list) = candidate
+        for list in candidate
             .children()
-            .find(|child| child.has_tag_name((XMLENC_NS, "ReferenceList")))
+            .filter(|child| child.has_tag_name((XMLENC_NS, "ReferenceList")))
         {
             let data_target = node.has_tag_name((XMLENC_NS, "EncryptedData"));
-            visit_reference_list(list, policy.resources, |data_reference, uri| {
-                if data_reference != data_target || !uri.is_empty() && !uri.starts_with('#') {
-                    return Ok(());
+            // Association is a borrowed, allocation-free prefilter, not full
+            // validation of every key in the document. Errors in unrelated
+            // metadata cannot invalidate the selected encrypted object.
+            for child in list.children() {
+                if !child.has_tag_name((
+                    XMLENC_NS,
+                    if data_target {
+                        "DataReference"
+                    } else {
+                        "KeyReference"
+                    },
+                )) {
+                    continue;
                 }
-                let resolver = budget.resolver.get_or_insert_with(|| {
-                    crate::xmldsig::uri::UriReferenceResolver::with_id_registrations(
-                        node.document(),
-                        budget.registrations,
-                    )
-                    .with_same_document_id_semantics(
-                        policy.transforms.map_or(Default::default(), |policy| {
-                            policy.same_document_id_semantics
-                        }),
-                    )
-                });
-                if resolver
-                    .node_for_same_document_reference(uri)?
-                    .is_some_and(|target| target.id() == node.id())
+                let Some(uri) = child.attribute("URI") else {
+                    continue;
+                };
+                if !uri.is_empty() && !uri.starts_with('#') {
+                    continue;
+                }
+                if uri.len() > policy.resources.max_encryption_metadata_bytes {
+                    continue;
+                }
+                if budget
+                    .resolver(node)
+                    .same_document_reference_targets(uri, node.id())
                 {
                     referenced = true;
+                    break;
                 }
-                Ok(())
-            })?;
+            }
+            if referenced {
+                break;
+            }
         }
         if !named && !referenced {
             continue;
+        }
+        // Once associated, validate the entire list, including malformed
+        // siblings and URI grammar, before parsing or resolving key sources.
+        for list in candidate
+            .children()
+            .filter(|child| child.has_tag_name((XMLENC_NS, "ReferenceList")))
+        {
+            visit_reference_list(list, policy.resources, |_, uri| {
+                if uri.is_empty() || uri.starts_with('#') {
+                    budget
+                        .resolver(candidate)
+                        .node_for_same_document_reference(uri)?;
+                }
+                Ok(())
+            })?;
         }
         if budget.ancestry.contains(&id) {
             return Err(XmlEncError::InvalidStructure(

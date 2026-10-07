@@ -279,7 +279,6 @@ fn malformed_dh_domains_and_private_scalars_are_rejected() {
 fn finite_field_key_agreement_reaches_public_encryption_pipeline() {
     // Opposite opaque DH handles derive the AES key inside each operation.
     // Modular allowance must be carried into encrypt/decrypt, not reset by KDF.
-    use std::sync::Arc;
     use xml_sec::policy::{DecryptionPolicy, EncryptionPolicy};
     use xml_sec::xmlenc::{
         DataEncryptionAlgorithm, DecryptContext, DecryptedContent, DerivedKeyDecryptor,
@@ -288,7 +287,7 @@ fn finite_field_key_agreement_reaches_public_encryption_pipeline() {
     let (p, q, g) = domain();
     let permission = policy();
     let mut budget = KeyEstablishmentBudget::new(&permission).unwrap();
-    let sender = Arc::new(
+    let sender = Box::new(
         RustCryptoDhKey::from_components(&RUST_CRYPTO_PROVIDER, &mut budget, &p, &q, &g, &[2])
             .unwrap(),
     );

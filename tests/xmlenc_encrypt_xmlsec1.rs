@@ -12,7 +12,8 @@ use std::{
 #[path = "common/xmlsec1.rs"]
 mod xmlsec1;
 
-use rsa::{RsaPublicKey, pkcs8::DecodePublicKey};
+use rsa::RsaPublicKey;
+use xml_sec::rsa_encoding::RsaPublicKeyEncoding as _;
 use xml_sec::xmlenc::{
     DataEncryptionAlgorithm, EncryptedDataBuilder, EncryptionRecipient, OaepDigestAlgorithm,
     RsaOaepParameters,
@@ -20,6 +21,15 @@ use xml_sec::xmlenc::{
 use xml_sec::{key_manager::KeyInventory, policy::ResourcePolicy};
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn require_key_establishment_oracle() {
+    // These acceptance tests intentionally require independent execution;
+    // reporting success without an oracle would hide missing interoperability.
+    assert!(
+        xmlsec1::is_available(),
+        "key-establishment interoperability requires xmlsec1 >= 1.3.13; run bash scripts/install-xmlsec1.sh and set XMLSEC1_BIN (see docs/crypto-providers.md)"
+    );
+}
 
 struct TemporaryFile {
     path: PathBuf,
@@ -91,10 +101,7 @@ fn xmlsec1_version_gate_accepts_ci_version() {
 fn cipher_reference_has_reciprocal_libxmlsec1_interoperability() {
     // CipherReference dereferences a source node and applies ds:base64, rather
     // than accidentally treating its XML text or serialized subtree as bytes.
-    assert!(
-        xmlsec1::is_available(),
-        "CipherReference interoperability requires xmlsec1 >= 1.3.13"
-    );
+    require_key_establishment_oracle();
     use xml_sec::xmlenc::{DecryptContext, DecryptedContent, SymmetricKeyDecryptor};
     fn referenced(wire: &str) -> String {
         let parsed = xml_sec::xmlenc::parse_encrypted_data(wire).expect("inline oracle data");
@@ -170,10 +177,7 @@ fn cipher_reference_has_reciprocal_libxmlsec1_interoperability() {
 fn kdf_xml_has_reciprocal_libxmlsec1_interoperability() {
     // Exercise actual transported descriptors, not prederived AES keys: each
     // supported SHA family/KDF runs in BOTH directions against libxmlsec1.
-    assert!(
-        xmlsec1::is_available(),
-        "KDF interoperability requires xmlsec1 >= 1.3.13"
-    );
+    require_key_establishment_oracle();
     use xml_sec::xmlenc::{DecryptContext, DecryptedContent, DerivedKeyDecryptor, DerivedKeyInput};
     const NS: &str = "http://www.w3.org/2009/xmlenc11#";
     const MORE: &str = "http://www.w3.org/2021/04/xmldsig-more#";
@@ -298,15 +302,11 @@ fn kdf_xml_has_reciprocal_libxmlsec1_interoperability() {
 #[test]
 fn ecdh_xml_has_reciprocal_libxmlsec1_interoperability() {
     use p256::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
-    use std::sync::Arc;
     use xml_sec::provider::{EcdhCurve, RustCryptoEcdhKey};
     use xml_sec::xmlenc::{AgreementDecryptor, DecryptContext, DecryptedContent};
     // Independently loaded private/public keys exercise the actual agreement,
     // XML KDF descriptor and content cipher in both directions, not raw AES.
-    assert!(
-        xmlsec1::is_available(),
-        "ECDH oracle requires xmlsec1 >= 1.3.13"
-    );
+    require_key_establishment_oracle();
     for (curve, width) in [
         (EcdhCurve::P256, 32),
         (EcdhCurve::P384, 48),
@@ -347,8 +347,8 @@ fn ecdh_xml_has_reciprocal_libxmlsec1_interoperability() {
             TemporaryFile::write("ecdh-recipient", "pem", recipient_pem.as_bytes());
         let recipient_public =
             TemporaryFile::write("ecdh-recipient-public", "pem", recipient_pub.as_bytes());
-        let sender_handle =
-            Arc::new(RustCryptoEcdhKey::from_scalar(curve, &sender_scalar).unwrap());
+        let sender_handle = RustCryptoEcdhKey::from_scalar(curve, &sender_scalar).unwrap();
+        let sender_peer = sender_handle.public_key();
         let recipient_handle = RustCryptoEcdhKey::from_scalar(curve, &recipient_scalar).unwrap();
         let method = xml_sec::xmlenc::parse_key_derivation_method(
         "<KeyDerivationMethod xmlns='http://www.w3.org/2009/xmlenc11#' Algorithm='http://www.w3.org/2009/xmlenc11#ConcatKDF'><ConcatKDFParams AlgorithmID='00123456' PartyUInfo='00123456' PartyVInfo='00123456'><DigestMethod xmlns='http://www.w3.org/2000/09/xmldsig#' Algorithm='http://www.w3.org/2001/04/xmlenc#sha256'/></ConcatKDFParams></KeyDerivationMethod>",
@@ -357,7 +357,7 @@ fn ecdh_xml_has_reciprocal_libxmlsec1_interoperability() {
         let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
             .agreement_key(
                 method,
-                sender_handle.clone(),
+                Box::new(sender_handle),
                 xml_sec::policy::KeyAgreementAlgorithm::EcdhEs,
                 recipient_handle.public_key(),
             )
@@ -408,11 +408,10 @@ fn ecdh_xml_has_reciprocal_libxmlsec1_interoperability() {
             "{}",
             String::from_utf8_lossy(&status.stderr)
         );
-        let peer = sender_handle.public_key();
         let resolver = AgreementDecryptor::content(
             descriptor,
             &recipient_handle,
-            &peer,
+            &sender_peer,
             DataEncryptionAlgorithm::Aes128Gcm,
         );
         assert_eq!(

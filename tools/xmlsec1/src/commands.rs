@@ -7,12 +7,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rsa::{
-    RsaPublicKey,
-    pkcs8::{DecodePublicKey as _, EncodePublicKey as _},
-    traits::PublicKeyParts as _,
-};
+use rsa::{RsaPublicKey, traits::PublicKeyParts as _};
 use x509_parser::prelude::FromDer as _;
+use xml_sec::rsa_encoding::RsaPublicKeyEncoding as _;
 use xml_sec::xml_input as xml_sec_xml_input;
 use xml_sec::{
     IdAttributeRegistration, XmlBackend,
@@ -5107,7 +5104,7 @@ mod tests {
     #[test]
     fn temporary_private_imports_keep_kdf_work_after_failure() {
         use der::Encode as _;
-        use rsa::pkcs8::{
+        use pkcs8::{
             EncryptedPrivateKeyInfoRef,
             pkcs5::{EncryptionScheme, pbes2},
         };
@@ -5299,13 +5296,13 @@ mod tests {
         // Explicit PEM/DER options, including generic private-key aliases, must
         // reject KDF policy violations before password-dependent decryption.
         use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng as _};
-        use rsa::pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _};
+        use xml_sec::rsa_encoding::RsaPrivateKeyEncoding as _;
         let rsa = rsa::RsaPrivateKey::from_pkcs8_pem(include_str!(
             "../../../tests/fixtures/keys/rsa/rsa-2048-key.pem"
         ))
         .unwrap();
         let plain = rsa.to_pkcs8_der().unwrap();
-        let encrypted = rsa::pkcs8::PrivateKeyInfoRef::try_from(plain.as_bytes())
+        let encrypted = pkcs8::PrivateKeyInfoRef::try_from(plain.as_bytes())
             .unwrap()
             .encrypt_with_rng(&mut ChaCha20Rng::seed_from_u64(42), b"correct")
             .unwrap();

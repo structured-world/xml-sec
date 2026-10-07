@@ -10,11 +10,12 @@
 //! - ECDSA keys are validated as uncompressed SEC1 points from the SPKI bit
 //!   string and verified with RustCrypto curve crates (`p256`/`p384`/`p521`).
 
+use crate::rsa_encoding::RsaPublicKeyEncoding as _;
 use der::Decode as _;
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
 use p384::ecdsa::{Signature as P384Signature, VerifyingKey as P384VerifyingKey};
 use p521::ecdsa::{Signature as P521Signature, VerifyingKey as P521VerifyingKey};
-use rsa::pkcs8::DecodePublicKey;
+use pkcs8::DecodePublicKey as _;
 use rsa::signature::hazmat::PrehashVerifier;
 use rsa::{
     pkcs1v15::{Signature as RsaPkcs1v15Signature, VerifyingKey as RsaVerifyingKey},
@@ -174,7 +175,7 @@ pub(crate) fn signature_value_matches_spki_with_encoding(
         use der::Decode as _;
         let bytes = crate::provider::rsa_pss::encoded_public_key(public_key_spki_der, parameters)
             .ok_or(SignatureVerificationError::InvalidKeyDer)?;
-        let key = rsa::pkcs1::RsaPublicKey::from_der(bytes)
+        let key = pkcs1::RsaPublicKeyRef::from_der(bytes)
             .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
         let modulus = key.modulus.as_bytes();
         let Some(first) = modulus.first() else {
@@ -403,7 +404,7 @@ pub(crate) fn validate_rsa_signature_spki_with_minimum(
         use der::Decode as _;
         let bytes = crate::provider::rsa_pss::encoded_public_key(public_key_spki_der, parameters)
             .ok_or(SignatureVerificationError::InvalidKeyDer)?;
-        let key = rsa::pkcs1::RsaPublicKey::from_der(bytes)
+        let key = pkcs1::RsaPublicKeyRef::from_der(bytes)
             .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
         let modulus = key.modulus.as_bytes();
         validate_rsa_key_components(
@@ -552,7 +553,7 @@ pub(crate) fn decode_dsa_verifying_key(
     // Component size is a process-safety bound, not a DSA conformance rule.
     // Inspect borrowed DER integers before any allocating bigint conversion,
     // including certificate signatures and signature-framing checks.
-    let spki = rsa::pkcs8::SubjectPublicKeyInfoRef::from_der(bytes)
+    let spki = pkcs8::SubjectPublicKeyInfoRef::from_der(bytes)
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
     let parameters = spki
         .algorithm

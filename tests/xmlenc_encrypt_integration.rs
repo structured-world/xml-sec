@@ -6,10 +6,8 @@ use std::fs;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use roxmltree::Node;
-use rsa::{
-    RsaPrivateKey, RsaPublicKey,
-    pkcs8::{DecodePrivateKey, DecodePublicKey},
-};
+use rsa::{RsaPrivateKey, RsaPublicKey};
+use xml_sec::rsa_encoding::{RsaPrivateKeyEncoding as _, RsaPublicKeyEncoding as _};
 use xml_sec::xmlenc::{
     DataEncryptionAlgorithm, DecryptedContent, DocumentEncryptionOptions, EncryptedDataBuilder,
     EncryptedDataType, EncryptionRecipient, KekDecryptor, KeyTransportAlgorithm, KeyWrapAlgorithm,

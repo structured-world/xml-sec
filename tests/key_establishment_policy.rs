@@ -184,7 +184,6 @@ fn public_ecdh_encryption_roundtrips_each_named_curve() {
     // ECDH field widths differ from the AES width. Every supported named curve
     // must preserve its fixed-width ZZ and derive the same consuming key on
     // opposite sides, rather than accidentally using the public point as IKM.
-    use std::sync::Arc;
     use xml_sec::provider::{EcdhCurve, KeyAgreementParameters, RustCryptoEcdhKey};
     use xml_sec::xmlenc::{
         DataEncryptionAlgorithm, DecryptContext, DerivedKeyDecryptor, EncryptedDataBuilder,
@@ -197,7 +196,7 @@ fn public_ecdh_encryption_roundtrips_each_named_curve() {
     ] {
         let mut scalar = vec![0; width];
         scalar[width - 1] = 7;
-        let sender = Arc::new(RustCryptoEcdhKey::from_scalar(curve, &scalar).unwrap());
+        let sender = Box::new(RustCryptoEcdhKey::from_scalar(curve, &scalar).unwrap());
         scalar[width - 1] = 9;
         let recipient = RustCryptoEcdhKey::from_scalar(curve, &scalar).unwrap();
         let sender_public = sender.public_key();
@@ -240,7 +239,7 @@ fn public_encryption_and_decryption_agree_without_exporting_secret() {
     use xml_sec::xmlenc::{
         DataEncryptionAlgorithm, DecryptContext, DerivedKeyDecryptor, EncryptedDataBuilder,
     };
-    let sender = Arc::new(RustCryptoX25519Key::from_bytes([7; 32]));
+    let sender = Box::new(RustCryptoX25519Key::from_bytes([7; 32]));
     let recipient = RustCryptoX25519Key::from_bytes([9; 32]);
     let sender_public = sender.public_key();
     let recipient_public = recipient.public_key();
@@ -299,7 +298,7 @@ fn public_encryption_and_decryption_agree_without_exporting_secret() {
         let invalid_peer = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
             .agreement_key(
                 method.clone(),
-                Arc::new(RustCryptoX25519Key::from_bytes([7; 32])),
+                Box::new(RustCryptoX25519Key::from_bytes([7; 32])),
                 KeyAgreementAlgorithm::X25519,
                 peer,
             )
@@ -1134,4 +1133,19 @@ fn parsed_xml_uses_one_policy_and_budget() {
         Err(XmlEncError::Policy(_))
     ));
     assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn dh_subgroup_minimum_must_leave_room_for_the_modulus() {
+    // p = j*q + 1, j >= 2: equality is an impossible policy, while the
+    // modulus minimum itself may equal the permitted modulus maximum.
+    for subgroup in [2047, 2048, 2049] {
+        let policy = KeyEstablishmentPolicy {
+            max_dh_modulus_bits: 2048,
+            minimum_dh_modulus_bits: 2048,
+            minimum_dh_subgroup_bits: subgroup,
+            ..Default::default()
+        };
+        assert_eq!(policy.validate().is_ok(), subgroup < 2048);
+    }
 }

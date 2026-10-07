@@ -7,6 +7,7 @@ pub(crate) struct XmlBase64Payload<'a, 'input> {
     pub(crate) decoded_len: usize,
     pub(crate) normalized_len: usize,
     pub(crate) text_len: usize,
+    #[cfg(feature = "xmlenc")]
     tail: [u8; 4],
 }
 
@@ -23,6 +24,7 @@ impl<'a, 'input> XmlBase64Payload<'a, 'input> {
         let mut normalized_len = 0_usize;
         let mut padding = 0_usize;
         let mut text_len = 0_usize;
+        #[cfg(feature = "xmlenc")]
         let mut tail = [0; 4];
         for child in node.children() {
             if child.is_element() {
@@ -55,7 +57,10 @@ impl<'a, 'input> XmlBase64Payload<'a, 'input> {
                 {
                     return Err("invalid base64 character or XML whitespace");
                 }
-                tail[normalized_len % 4] = byte;
+                #[cfg(feature = "xmlenc")]
+                {
+                    tail[normalized_len % 4] = byte;
+                }
                 normalized_len = normalized_len
                     .checked_add(1)
                     .ok_or("base64 size overflow")?;
@@ -72,6 +77,7 @@ impl<'a, 'input> XmlBase64Payload<'a, 'input> {
             decoded_len,
             normalized_len,
             text_len,
+            #[cfg(feature = "xmlenc")]
             tail,
         })
     }
@@ -83,6 +89,7 @@ impl<'a, 'input> XmlBase64Payload<'a, 'input> {
     }
 
     /// Validate padding bits without allocating a decoded ciphertext copy.
+    #[cfg(feature = "xmlenc")]
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
         use base64::Engine as _;
         // Lexical preflight already checked every character and frame length.
@@ -96,6 +103,7 @@ impl<'a, 'input> XmlBase64Payload<'a, 'input> {
     }
 
     /// Retain only the normalized wire value after allocation-free validation.
+    #[cfg(feature = "xmlenc")]
     pub(crate) fn normalized(&self) -> Result<String, &'static str> {
         self.validate()?;
         let mut value = String::with_capacity(self.normalized_len);

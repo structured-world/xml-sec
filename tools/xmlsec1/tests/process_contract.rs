@@ -10,21 +10,16 @@ use der::{Encode as _, asn1::UintRef};
 use p256::SecretKey as P256SecretKey;
 use p384::SecretKey as P384SecretKey;
 use p521::SecretKey as P521SecretKey;
+use pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _, EncodePublicKey as _};
 use rand_chacha::{ChaCha8Rng, rand_core::SeedableRng as _};
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateRevocationListParams, IsCa, Issuer,
     KeyIdMethod, KeyPair, KeyUsagePurpose, RevokedCertParams, SerialNumber,
 };
-use rsa::{
-    RsaPrivateKey, RsaPublicKey,
-    pkcs1::DecodeRsaPrivateKey as _,
-    pkcs8::{
-        DecodePrivateKey as _, DecodePublicKey as _, EncodePrivateKey as _, EncodePublicKey as _,
-    },
-    traits::PublicKeyParts as _,
-};
+use rsa::{RsaPrivateKey, RsaPublicKey, traits::PublicKeyParts as _};
 use time::{Duration, OffsetDateTime};
 use x509_parser::{extensions::ParsedExtension, prelude::FromDer as _};
+use xml_sec::rsa_encoding::{RsaPrivateKeyEncoding as _, RsaPublicKeyEncoding as _};
 use xml_sec::{
     c14n::{C14nAlgorithm, C14nMode},
     policy::{EncryptionPolicy, HmacPolicy, VerificationPolicy},

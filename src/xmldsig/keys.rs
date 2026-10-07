@@ -2,10 +2,10 @@
 
 use std::{collections::HashMap, fmt, time::SystemTime};
 
+use crate::rsa_encoding::RsaPublicKeyEncoding as _;
 use crypto_bigint::BoxedUint;
 use dsa::pkcs8::EncodePublicKey as DsaEncodePublicKey;
 use hmac::{KeyInit, Mac};
-use rsa::pkcs8::DecodePublicKey as _;
 use x509_parser::{
     prelude::{FromDer, X509Certificate},
     public_key::PublicKey,
@@ -1843,11 +1843,12 @@ mod tests {
 
     use base64::{Engine, engine::general_purpose::STANDARD};
     use der::Decode as _;
+    use pkcs8::DecodePublicKey as _;
     use rcgen::{
         CertificateRevocationListParams, Issuer, KeyIdMethod, KeyPair, KeyUsagePurpose,
         RevokedCertParams, SerialNumber, date_time_ymd,
     };
-    use rsa::{pkcs8::DecodePublicKey, traits::PublicKeyParts};
+    use rsa::traits::PublicKeyParts;
 
     use super::*;
 
@@ -1979,8 +1980,8 @@ mod tests {
         .expect("parameters encode");
         let y = der::Encode::to_der(&der::asn1::UintRef::new(&one).expect("positive Y"))
             .expect("public value encodes");
-        let spki = rsa::pkcs8::SubjectPublicKeyInfoRef {
-            algorithm: rsa::pkcs8::AlgorithmIdentifierRef {
+        let spki = pkcs8::SubjectPublicKeyInfoRef {
+            algorithm: pkcs8::AlgorithmIdentifierRef {
                 oid: dsa::OID,
                 parameters: Some(der::asn1::AnyRef::from_der(&params).expect("parameters")),
             },

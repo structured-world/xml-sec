@@ -28,6 +28,91 @@ fn expected() -> AgreementMethod {
 }
 
 #[test]
+fn ecdh_sender_is_single_use_across_builder_clones() {
+    // A new ciphertext is a new message, even through a cloned builder;
+    // XMLEnc ECDH-ES must not reuse its originator private key.
+    let sender = RustCryptoEcdhKey::from_scalar(EcdhCurve::P256, &[3; 32]).unwrap();
+    let recipient = RustCryptoEcdhKey::from_scalar(EcdhCurve::P256, &[5; 32]).unwrap();
+    let builder = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm).agreement_key(
+        method(),
+        Box::new(sender),
+        KeyAgreementAlgorithm::EcdhEs,
+        recipient.public_key(),
+    );
+    let clone = builder.clone();
+    assert!(builder.encrypt_binary(b"first message").is_ok());
+    assert!(builder.encrypt_binary(b"second message").is_err());
+    assert!(clone.encrypt_binary(b"cloned message").is_err());
+}
+
+#[test]
+fn ecdh_preflight_rejection_does_not_consume_the_sender() {
+    // Policy/resource rejection precedes any key execution; a corrected
+    // request may still use the pair, but successful dispatch consumes it.
+    let sender = RustCryptoEcdhKey::from_scalar(EcdhCurve::P256, &[3; 32]).unwrap();
+    let recipient = RustCryptoEcdhKey::from_scalar(EcdhCurve::P256, &[5; 32]).unwrap();
+    let builder = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm).agreement_key(
+        method(),
+        Box::new(sender),
+        KeyAgreementAlgorithm::EcdhEs,
+        recipient.public_key(),
+    );
+    let mut policy = xml_sec::policy::EncryptionPolicy::default();
+    policy.key_establishment.agreement_algorithms = Some(Default::default());
+    assert!(
+        builder
+            .clone()
+            .policy(policy)
+            .encrypt_binary(b"denied")
+            .is_err()
+    );
+    let mut policy = xml_sec::policy::EncryptionPolicy::default();
+    policy.key_establishment.max_owned_bytes = 0;
+    assert!(
+        builder
+            .clone()
+            .policy(policy)
+            .encrypt_binary(b"exhausted")
+            .is_err()
+    );
+    assert!(builder.encrypt_binary(b"permitted").is_ok());
+}
+
+#[test]
+fn ecdh_failed_dispatch_consumes_the_sender() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use xml_sec::provider::{KeyAgreementKey, KeyAgreementParameters, ProviderError};
+    struct FailingKey(Arc<AtomicUsize>);
+    impl KeyAgreementKey for FailingKey {
+        fn agree(&self, _: &KeyAgreementParameters<'_>) -> Result<Vec<u8>, ProviderError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Err(ProviderError::AuthenticationFailed)
+        }
+    }
+    // A failure after dispatch is not permission to repeat the same scalar
+    // multiplication. Concurrent clones must attempt the primitive only once.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let recipient = RustCryptoEcdhKey::from_scalar(EcdhCurve::P256, &[5; 32]).unwrap();
+    let builder = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm).agreement_key(
+        method(),
+        Box::new(FailingKey(calls.clone())),
+        KeyAgreementAlgorithm::EcdhEs,
+        recipient.public_key(),
+    );
+    let clone = builder.clone();
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| builder.encrypt_binary(b"first"));
+        let second = scope.spawn(|| clone.encrypt_binary(b"second"));
+        assert!(first.join().unwrap().is_err());
+        assert!(second.join().unwrap().is_err());
+    });
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+}
+
+#[test]
 fn dh_agreement_roles_require_complete_parameter_groups() {
     // XMLEnc 1.1 §5.6.1 permits application-supplied domain parameters,
     // but never a partial P/Q/Generator or seed/pgenCounter sequence.
