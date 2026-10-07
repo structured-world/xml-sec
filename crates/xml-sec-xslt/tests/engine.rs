@@ -4,10 +4,11 @@ use std::{collections::HashMap, sync::Mutex};
 
 use pretty_assertions::assert_eq;
 use xml_sec_xslt::{
-    Attribute, BudgetKind, Clock, CompileBudget, Compiler, Document, Error, ExecutionBudget,
-    ExecutionEnvironment, ExecutionOptions, ExpandedName, FixedClock, NoResolver, NodeKind,
-    NodeReference, Parameters, ResolvePurpose, ResolveRequest, ResolvedResource, Resolver,
-    ResourceIdentity, SystemClock, TransformResult, Value,
+    AccessDenialReason, Attribute, BudgetKind, Clock, CompileBudget, Compiler, Document, Error,
+    ErrorKind, ExecutionBudget, ExecutionEnvironment, ExecutionOptions, ExpandedName, FixedClock,
+    NoResolver, NodeKind, NodeReference, Parameters, ResolvePurpose, ResolveRequest,
+    ResolvedResource, Resolver, ResourceAccess, ResourceIdentity, SystemClock, TransformResult,
+    Value,
 };
 
 #[derive(Clone, Copy)]
@@ -76,6 +77,440 @@ fn execution_budget(source_bytes: usize) -> ExecutionBudget {
         messages: 100,
         owned_bytes: 8 << 20,
     }
+}
+
+#[test]
+fn compiled_dependencies_require_execution_authorization() {
+    // Compilation permission is not an execution grant: a reusable stylesheet must not let
+    // retained include bytes bypass the resolver selected by its next caller.
+    struct DeniedResolver;
+    impl Resolver for DeniedResolver {
+        fn authorize(&self, access: ResourceAccess<'_>) -> xml_sec_xslt::Result<()> {
+            let resource = match access {
+                ResourceAccess::Request(request) => request.uri,
+                ResourceAccess::Retained { request, .. } => request.uri,
+                ResourceAccess::Dependency(identity) => &identity.0,
+            };
+            Err(Error::Resolver {
+                uri: resource.into(),
+                message: "execution access revoked".into(),
+            })
+        }
+        fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
+            Err(Error::Resolver {
+                uri: request.uri.into(),
+                message: "execution access revoked".into(),
+            })
+        }
+    }
+    let resolver = Arc::new(MemoryResolver {
+        resources: Mutex::new(HashMap::from([("module.xsl".into(),
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template name="module"><result/></xsl:template></xsl:stylesheet>"#.into())])),
+    });
+    let stylesheet = Compiler::new(resolver, CompileBudget::new(1 << 20, 16, 256, 4 << 20))
+        .compile(r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:include href="module.xsl"/><xsl:template match="/"><xsl:call-template name="module"/></xsl:template></xsl:stylesheet>"#, None)
+        .expect("include compiles under the original grant");
+    let result = stylesheet.execute(
+        &Document::parse("<root/>", None).expect("source parses"),
+        &Parameters::new(),
+        Arc::new(DeniedResolver),
+        ExecutionOptions {
+            budget: execution_budget(1024),
+            initial_mode: None,
+            initial_template: None,
+        },
+    );
+    assert!(
+        matches!(result, Err(Error::Resolver { ref message, .. }) if message == "execution access revoked")
+    );
+}
+
+struct LeaseResolver {
+    refusal: Arc<Mutex<Option<AccessDenialReason>>>,
+    authorizations: AtomicUsize,
+    acquisitions: AtomicUsize,
+    resources: HashMap<String, String>,
+}
+
+impl LeaseResolver {
+    fn new(resources: HashMap<String, String>) -> Self {
+        Self {
+            refusal: Arc::new(Mutex::new(None)),
+            authorizations: AtomicUsize::new(0),
+            acquisitions: AtomicUsize::new(0),
+            resources,
+        }
+    }
+}
+
+impl Resolver for LeaseResolver {
+    fn authorize(&self, access: ResourceAccess<'_>) -> xml_sec_xslt::Result<()> {
+        self.authorizations.fetch_add(1, Ordering::Relaxed);
+        let resource = match access {
+            ResourceAccess::Request(request) => request.uri,
+            ResourceAccess::Retained { request, .. } => request.uri,
+            ResourceAccess::Dependency(identity) => &identity.0,
+        };
+        if let Some(reason) = *self.refusal.lock().expect("lease lock") {
+            return Err(Error::ResourceAccessDenied {
+                resource: resource.into(),
+                reason,
+            });
+        }
+        if let ResourceAccess::Dependency(identity) | ResourceAccess::Retained { identity, .. } =
+            access
+            && !self.resources.contains_key(&identity.0)
+        {
+            return Err(Error::StaleResource {
+                identity: identity.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
+        self.acquisitions.fetch_add(1, Ordering::Relaxed);
+        let bytes = self
+            .resources
+            .get(request.uri)
+            .ok_or_else(|| Error::ResourceNotFound {
+                uri: request.uri.into(),
+            })?;
+        Ok(ResolvedResource {
+            canonical_uri: format!("memory:{}", request.uri),
+            identity: ResourceIdentity(request.uri.into()),
+            bytes: bytes.as_bytes().to_vec(),
+            media_type: None,
+            encoding: None,
+        })
+    }
+}
+
+struct RevokeLeaseClock {
+    refusal: Arc<Mutex<Option<AccessDenialReason>>>,
+    reason: AccessDenialReason,
+}
+
+impl Clock for RevokeLeaseClock {
+    fn now_local(&self) -> xml_sec_xslt::Result<time::OffsetDateTime> {
+        *self.refusal.lock().expect("lease lock") = Some(self.reason);
+        Ok(time::OffsetDateTime::UNIX_EPOCH)
+    }
+}
+
+#[test]
+fn cached_document_access_obeys_revocation_and_expiry() {
+    // Permission must be checked before returning positive AND negative cache hits. A clock
+    // callback simulates trusted lease expiry between two separate document() instructions.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:date="http://exslt.org/dates-and-times"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="document('value.xml')/value"/><xsl:value-of select="date:year()"/><xsl:value-of select="document('value.xml')/value"/></xsl:template></xsl:stylesheet>"#,
+    );
+    for reason in [AccessDenialReason::Revoked, AccessDenialReason::Expired] {
+        for resources in [
+            HashMap::new(),
+            HashMap::from([("value.xml".into(), "<value>first</value>".into())]),
+        ] {
+            let resolver = Arc::new(LeaseResolver::new(resources));
+            let environment = ExecutionEnvironment::new(Arc::clone(&resolver)).with_clock(
+                Arc::new(RevokeLeaseClock {
+                    refusal: Arc::clone(&resolver.refusal),
+                    reason,
+                }),
+            );
+            let error = stylesheet
+                .execute_with_environment(
+                    &Document::parse("<root/>", None).expect("source parses"),
+                    &Parameters::new(),
+                    environment,
+                    ExecutionOptions {
+                        budget: execution_budget(1024),
+                        initial_mode: None,
+                        initial_template: None,
+                    },
+                )
+                .expect_err("cached resource must not bypass expired or revoked permission");
+            assert_eq!(error.kind(), ErrorKind::Policy);
+            assert!(
+                matches!(error, Error::ResourceAccessDenied { reason: actual, ref resource } if actual == reason && resource == "value.xml")
+            );
+            assert_eq!(resolver.acquisitions.load(Ordering::Relaxed), 1);
+        }
+    }
+}
+
+#[test]
+fn authorized_cache_hits_do_not_reacquire_bytes() {
+    // Lease checks are borrowed metadata callbacks, not repeated parsing or byte acquisition.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="document('value.xml')/value"/><xsl:value-of select="document('value.xml')/value"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let resolver = Arc::new(LeaseResolver::new(HashMap::from([(
+        "value.xml".into(),
+        "<value>ok</value>".into(),
+    )])));
+    let result = stylesheet
+        .execute(
+            &Document::parse("<root/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::clone(&resolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("permanent lease permits repeated access");
+    assert_eq!(result.serialized.bytes, b"okok");
+    assert_eq!(resolver.acquisitions.load(Ordering::Relaxed), 1);
+    assert_eq!(resolver.authorizations.load(Ordering::Relaxed), 4);
+}
+
+#[test]
+fn compile_cache_reuse_rechecks_the_exact_dependency_grant() {
+    // The import/include scanner revisits modules. A cached resource must not retain an expired
+    // grant, and checking it must not fetch the module's bytes a second time.
+    struct ExpiringModules {
+        resolver: LeaseResolver,
+        retained_checks: AtomicUsize,
+    }
+    impl Resolver for ExpiringModules {
+        fn authorize(&self, access: ResourceAccess<'_>) -> xml_sec_xslt::Result<()> {
+            if let ResourceAccess::Retained { identity, .. } = access {
+                assert_eq!(identity.0, "module.xsl");
+                if self.retained_checks.fetch_add(1, Ordering::Relaxed) > 0 {
+                    return Err(access.denied(AccessDenialReason::Expired));
+                }
+            }
+            self.resolver.authorize(access)
+        }
+        fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
+            self.resolver.resolve(request)
+        }
+    }
+    for directive in ["include", "import"] {
+        let resolver = Arc::new(ExpiringModules {
+            resolver: LeaseResolver::new(HashMap::from([("module.xsl".into(), r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"/>"#.into())])),
+            retained_checks: AtomicUsize::new(0),
+        });
+        let source = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:{directive} href="module.xsl"/><xsl:{directive} href="module.xsl"/></xsl:stylesheet>"#
+        );
+        let error = Compiler::new(
+            Arc::clone(&resolver),
+            CompileBudget::new(1 << 20, 8, 256, 4 << 20),
+        )
+        .compile(&source, None)
+        .expect_err("expired cache grant cannot compile");
+        assert!(matches!(
+            error,
+            Error::ResourceAccessDenied {
+                reason: AccessDenialReason::Expired,
+                ..
+            }
+        ));
+        assert_eq!(resolver.resolver.acquisitions.load(Ordering::Relaxed), 1);
+        assert_eq!(resolver.retained_checks.load(Ordering::Relaxed), 2);
+    }
+}
+
+#[test]
+fn compiled_dependency_expiry_is_checked_before_source_processing() {
+    // Reused IR needs the execution caller's grant for the exact dependency identity. A stale
+    // dependency must fail before XInclude or any template can execute.
+    let resolver = Arc::new(LeaseResolver::new(HashMap::from([(
+        "module.xsl".into(),
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"/>"#
+            .into(),
+    )])));
+    let stylesheet = Compiler::new(Arc::clone(&resolver), CompileBudget::new(1 << 20, 8, 256, 4 << 20))
+        .compile(r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:include href="module.xsl"/></xsl:stylesheet>"#, None).expect("authorized graph compiles");
+    *resolver.refusal.lock().expect("lease lock") = Some(AccessDenialReason::Expired);
+    let acquisitions = resolver.acquisitions.load(Ordering::Relaxed);
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="never.xml"/></root>"#,
+        None,
+    )
+    .expect("source parses");
+    let error = stylesheet
+        .execute_with_environment(
+            &source,
+            &Parameters::new(),
+            ExecutionEnvironment::new(Arc::clone(&resolver)).with_xinclude(),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect_err("compiled grant expired");
+    assert!(
+        matches!(error, Error::ResourceAccessDenied { reason: AccessDenialReason::Expired, ref resource } if resource == "module.xsl")
+    );
+    assert_eq!(resolver.acquisitions.load(Ordering::Relaxed), acquisitions);
+    let wrong_resolver = Arc::new(LeaseResolver::new(HashMap::new()));
+    let error = stylesheet
+        .execute(
+            &source,
+            &Parameters::new(),
+            wrong_resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect_err("dependency identity is unavailable to this caller");
+    assert!(matches!(error, Error::StaleResource { ref identity } if identity.0 == "module.xsl"));
+}
+
+#[test]
+fn xinclude_fallback_cannot_swallow_a_policy_refusal() {
+    // Missing transport resources may use xi:fallback; denied capabilities must stay fatal.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:copy-of select="root"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let resolver = Arc::new(LeaseResolver::new(HashMap::new()));
+    *resolver.refusal.lock().expect("lease lock") = Some(AccessDenialReason::NotGranted);
+    let source = Document::parse(r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="denied.xml"><xi:fallback><allowed/></xi:fallback></xi:include></root>"#, None).expect("source parses");
+    let error = stylesheet
+        .execute_with_environment(
+            &source,
+            &Parameters::new(),
+            ExecutionEnvironment::new(Arc::clone(&resolver)).with_xinclude(),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect_err("policy denial cannot become successful fallback");
+    assert!(matches!(
+        error,
+        Error::ResourceAccessDenied {
+            reason: AccessDenialReason::NotGranted,
+            ..
+        }
+    ));
+    assert_eq!(resolver.acquisitions.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn resolved_identity_is_authorized_before_parsing_or_fallback() {
+    // A grant for a URI is not a grant for arbitrary bytes returned by a resolver. All acquisition
+    // paths must reject an unadmitted identity before parsing those bytes or using xi:fallback.
+    struct UnadmittedIdentity;
+    impl Resolver for UnadmittedIdentity {
+        fn authorize(&self, access: ResourceAccess<'_>) -> xml_sec_xslt::Result<()> {
+            match access {
+                ResourceAccess::Request(_) => Ok(()),
+                ResourceAccess::Retained { identity, .. } => {
+                    assert_eq!(identity.0, "unadmitted");
+                    Err(access.denied(AccessDenialReason::NotGranted))
+                }
+                ResourceAccess::Dependency(_) => panic!("no dependency can have compiled"),
+            }
+        }
+        fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
+            Ok(ResolvedResource {
+                canonical_uri: request.uri.into(),
+                identity: ResourceIdentity("unadmitted".into()),
+                bytes: b"not XML".to_vec(),
+                media_type: None,
+                encoding: None,
+            })
+        }
+    }
+    for directive in ["include", "import"] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:{directive} href="module.xsl"/></xsl:stylesheet>"#
+        );
+        let error = Compiler::new(
+            Arc::new(UnadmittedIdentity),
+            CompileBudget::new(1 << 20, 8, 256, 4 << 20),
+        )
+        .compile(&stylesheet, None)
+        .expect_err("module identity must be admitted before parsing");
+        assert!(matches!(error, Error::ResourceAccessDenied { .. }));
+    }
+    for xinclude in [false, true] {
+        let stylesheet = compile(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:value-of select="document('resource.xml')"/></xsl:template></xsl:stylesheet>"#,
+        );
+        let source = Document::parse(
+            r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="resource.xml"><xi:fallback><safe/></xi:fallback></xi:include></root>"#,
+            None,
+        )
+        .expect("principal source parses");
+        let environment = ExecutionEnvironment::new(Arc::new(UnadmittedIdentity));
+        let environment = if xinclude {
+            environment.with_xinclude()
+        } else {
+            environment
+        };
+        let error = stylesheet
+            .execute_with_environment(
+                &source,
+                &Parameters::new(),
+                environment,
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            )
+            .expect_err("unadmitted identity cannot parse or fall back");
+        assert!(matches!(error, Error::ResourceAccessDenied { .. }));
+    }
+}
+
+#[test]
+fn exhausted_resource_budgets_stop_before_authorization() {
+    // Authorization itself is an observable caller callback. Zero acquisition limits must stop
+    // before either permission checks or byte acquisition for include, document() and XInclude.
+    let resolver = Arc::new(LeaseResolver::new(HashMap::new()));
+    assert!(matches!(Compiler::new(Arc::clone(&resolver), CompileBudget::new(1 << 20, 0, 256, 4 << 20))
+        .compile(r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:include href="never.xsl"/></xsl:stylesheet>"#, None), Err(Error::Budget { kind: BudgetKind::ImportedModules, .. })));
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:value-of select="document('never.xml')"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let mut budget = execution_budget(1024);
+    budget.external_documents = 0;
+    let options = ExecutionOptions {
+        budget,
+        initial_mode: None,
+        initial_template: None,
+    };
+    assert!(matches!(
+        stylesheet.execute(
+            &Document::parse("<root/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::clone(&resolver),
+            options.clone()
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::ExternalDocuments,
+            ..
+        })
+    ));
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="never.xml"/></root>"#,
+        None,
+    )
+    .expect("source parses");
+    assert!(matches!(
+        stylesheet.execute_with_environment(
+            &source,
+            &Parameters::new(),
+            ExecutionEnvironment::new(Arc::clone(&resolver)).with_xinclude(),
+            options
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::ExternalDocuments,
+            ..
+        })
+    ));
+    assert_eq!(resolver.authorizations.load(Ordering::Relaxed), 0);
+    assert_eq!(resolver.acquisitions.load(Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -1474,6 +1909,10 @@ struct XIncludeNegotiationRequest {
 }
 
 impl Resolver for XIncludeNegotiationResolver {
+    fn authorize(&self, _: ResourceAccess<'_>) -> xml_sec_xslt::Result<()> {
+        // The immutable negotiation fixture is explicitly available to this test.
+        Ok(())
+    }
     fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
         self.requests
             .lock()
@@ -1741,6 +2180,10 @@ struct MemoryResolver {
 }
 
 impl Resolver for MemoryResolver {
+    fn authorize(&self, _: ResourceAccess<'_>) -> xml_sec_xslt::Result<()> {
+        // The test caller grants access to the in-memory resource store, including missing URIs.
+        Ok(())
+    }
     fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
         let uri = request.uri;
         let bytes = self
@@ -3780,6 +4223,9 @@ fn included_module_document_is_retained_for_document_empty_uri() {
         calls: Mutex<Vec<ResolvePurpose>>,
     }
     impl Resolver for ModuleResolver {
+        fn authorize(&self, _: ResourceAccess<'_>) -> xml_sec_xslt::Result<()> {
+            Ok(())
+        }
         fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
             let ResolveRequest { uri, purpose, .. } = request;
             self.calls.lock().expect("calls lock").push(purpose);
@@ -3828,6 +4274,9 @@ fn module_document_identity_disambiguates_equal_canonical_uris() {
     struct AliasingResolver;
 
     impl Resolver for AliasingResolver {
+        fn authorize(&self, _: ResourceAccess<'_>) -> xml_sec_xslt::Result<()> {
+            Ok(())
+        }
         fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
             let (identity, template, marker) = match request.uri {
                 "first.xsl" => ("first", "read-first", "first"),
@@ -4616,6 +5065,10 @@ struct ContextResolver {
 }
 
 impl Resolver for ContextResolver {
+    fn authorize(&self, _: ResourceAccess<'_>) -> xml_sec_xslt::Result<()> {
+        // Provenance tests grant access independently of whether acquisition succeeds.
+        Ok(())
+    }
     fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
         let ResolveRequest {
             uri,
@@ -4847,7 +5300,7 @@ fn lower_precedence_attribute_sets_keep_equal_precedence_ordering() {
                 encoding: Some("UTF-8".into()),
             },
         );
-    let stylesheet = Compiler::new(resolver, CompileBudget::new(1 << 20, 8, 32, 1 << 20))
+    let stylesheet = Compiler::new(Arc::clone(&resolver), CompileBudget::new(1 << 20, 8, 32, 1 << 20))
         .compile(
             r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:import href="imported.xsl"/><xsl:output omit-xml-declaration="yes"/><xsl:attribute-set name="shared"><xsl:attribute name="y">principal</xsl:attribute></xsl:attribute-set><xsl:template match="/"><out xsl:use-attribute-sets="shared"/></xsl:template></xsl:stylesheet>"#,
             Some("memory:principal.xsl"),
@@ -4857,7 +5310,7 @@ fn lower_precedence_attribute_sets_keep_equal_precedence_ordering() {
         .execute(
             &Document::parse("<root/>", None).expect("source parses"),
             &Parameters::new(),
-            Arc::new(NoResolver),
+            resolver,
             ExecutionOptions {
                 budget: execution_budget(1024),
                 initial_mode: None,
@@ -6327,7 +6780,7 @@ fn xinclude_fallback_handles_only_resource_errors() {
         .execute_with_source_processing(
             &source,
             &Parameters::new(),
-            Arc::new(NoResolver),
+            Arc::new(LeaseResolver::new(HashMap::new())),
             ExecutionOptions {
                 budget: execution_budget(1024),
                 initial_mode: None,
@@ -6335,7 +6788,7 @@ fn xinclude_fallback_handles_only_resource_errors() {
             },
             SourceProcessing::XInclude,
         )
-        .expect("an unavailable XPointer selection activates fallback");
+        .expect("an authorized missing resource activates fallback");
     assert_eq!(
         String::from_utf8(result.serialized.bytes).expect("result is UTF-8"),
         "<?xml version=\"1.0\"?>\n<root xmlns:xi=\"http://www.w3.org/2001/XInclude\"><selected/></root>\n"
@@ -6350,7 +6803,7 @@ fn xinclude_fallback_handles_only_resource_errors() {
         stylesheet.execute_with_source_processing(
             &source,
             &Parameters::new(),
-            Arc::new(NoResolver),
+            Arc::new(LeaseResolver::new(HashMap::new())),
             ExecutionOptions {
                 budget: execution_budget(1024),
                 initial_mode: None,
@@ -6358,9 +6811,7 @@ fn xinclude_fallback_handles_only_resource_errors() {
             },
             SourceProcessing::XInclude,
         ),
-        Err(Error::Resolver { uri, message })
-            if uri == "unused.xml"
-                && message == "external resource access is not configured"
+        Err(Error::ResourceNotFound { uri }) if uri == "unused.xml"
     ));
 
     let resolver = Arc::new(MemoryResolver::default());
@@ -7352,6 +7803,9 @@ fn missing_document_resolution_consumes_the_external_document_budget() {
     // A failed resolver attempt is still attacker-controlled external work.
     struct MissingResolver;
     impl Resolver for MissingResolver {
+        fn authorize(&self, _: ResourceAccess<'_>) -> xml_sec_xslt::Result<()> {
+            Ok(())
+        }
         fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
             let uri = request.uri;
             Err(Error::ResourceNotFound { uri: uri.into() })
@@ -7428,6 +7882,9 @@ fn format_number_localizes_generated_digits_without_rewriting_literals() {
 struct EncodedStylesheetResolver;
 
 impl Resolver for EncodedStylesheetResolver {
+    fn authorize(&self, _: ResourceAccess<'_>) -> xml_sec_xslt::Result<()> {
+        Ok(())
+    }
     fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
         let ResolveRequest { uri, purpose, .. } = request;
         assert_eq!(uri, "latin1.xsl");
@@ -7787,6 +8244,9 @@ struct IncludeChainResolver {
 }
 
 impl Resolver for IncludeChainResolver {
+    fn authorize(&self, _: ResourceAccess<'_>) -> xml_sec_xslt::Result<()> {
+        Ok(())
+    }
     fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
         let ResolveRequest { uri, purpose, .. } = request;
         assert_eq!(purpose, ResolvePurpose::Include);
@@ -8084,6 +8544,9 @@ struct CountingResolver {
 }
 
 impl Resolver for CountingResolver {
+    fn authorize(&self, _: ResourceAccess<'_>) -> xml_sec_xslt::Result<()> {
+        Ok(())
+    }
     fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
         let uri = request.uri;
         self.calls.fetch_add(1, Ordering::Relaxed);
@@ -8160,6 +8623,9 @@ fn imported_stylesheets_charge_retained_resolver_metadata() {
     struct MetadataResolver;
 
     impl Resolver for MetadataResolver {
+        fn authorize(&self, _: ResourceAccess<'_>) -> xml_sec_xslt::Result<()> {
+            Ok(())
+        }
         fn resolve(&self, _request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
             let large = "m".repeat(2 << 20);
             Ok(ResolvedResource {
@@ -8198,6 +8664,9 @@ fn runtime_resource_caches_charge_resolver_metadata_before_retaining_it() {
     struct MetadataResolver;
 
     impl Resolver for MetadataResolver {
+        fn authorize(&self, _: ResourceAccess<'_>) -> xml_sec_xslt::Result<()> {
+            Ok(())
+        }
         fn resolve(&self, _request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
             let metadata = "m".repeat(2 << 20);
             Ok(ResolvedResource {
@@ -9972,6 +10441,9 @@ struct ByteResolver {
 }
 
 impl Resolver for ByteResolver {
+    fn authorize(&self, _: ResourceAccess<'_>) -> xml_sec_xslt::Result<()> {
+        Ok(())
+    }
     fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
         let uri = request.uri;
         Ok(ResolvedResource {
@@ -10373,6 +10845,9 @@ struct CanonicalIdentityResolver {
 }
 
 impl Resolver for CanonicalIdentityResolver {
+    fn authorize(&self, _: ResourceAccess<'_>) -> xml_sec_xslt::Result<()> {
+        Ok(())
+    }
     fn resolve(&self, _request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         Ok(ResolvedResource {
@@ -13373,6 +13848,9 @@ struct EncodedDocumentResolver {
 }
 
 impl Resolver for EncodedDocumentResolver {
+    fn authorize(&self, _: ResourceAccess<'_>) -> xml_sec_xslt::Result<()> {
+        Ok(())
+    }
     fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
         let ResolveRequest { uri, purpose, .. } = request;
         assert_eq!(uri, "encoded.xml");
@@ -14151,6 +14629,11 @@ fn include_and_import_validate_content_before_resolving() {
     struct CountingResolver(AtomicUsize);
 
     impl Resolver for CountingResolver {
+        fn authorize(&self, _: ResourceAccess<'_>) -> xml_sec_xslt::Result<()> {
+            // Invalid module syntax must prevent even authorization callbacks.
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
         fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Err(Error::Resolver {

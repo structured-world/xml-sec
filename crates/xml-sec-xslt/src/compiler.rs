@@ -455,6 +455,14 @@ impl<R: Resolver> Compiler<R> {
             purpose,
         };
         if let Some(resource) = state.resolved_requests.get(&request) {
+            self.resolver.authorize(crate::ResourceAccess::Retained {
+                request: crate::ResolveRequest::new(
+                    resource_href,
+                    effective_base.as_deref(),
+                    purpose,
+                ),
+                identity: &resource.identity,
+            })?;
             let resource = Arc::clone(resource);
             state.release_owned(request_owned_bytes);
             return Ok(ResolvedModule::External { resource, fragment });
@@ -465,6 +473,12 @@ impl<R: Resolver> Compiler<R> {
             state.budget.imported_modules,
             state.imported_modules,
         )?;
+        self.resolver
+            .authorize(crate::ResourceAccess::Request(crate::ResolveRequest::new(
+                resource_href,
+                effective_base.as_deref(),
+                purpose,
+            )))?;
         let resolved = match self.resolver.resolve(crate::ResolveRequest::new(
             resource_href,
             effective_base.as_deref(),
@@ -476,6 +490,10 @@ impl<R: Resolver> Compiler<R> {
                 return Err(error);
             }
         };
+        self.resolver.authorize(crate::ResourceAccess::Retained {
+            request: crate::ResolveRequest::new(resource_href, effective_base.as_deref(), purpose),
+            identity: &resolved.identity,
+        })?;
         let (resource, document_id, new_identity) =
             if let Some(previous) = state.resolved_identities.get(&resolved.identity) {
                 if previous.resource.as_ref() != &resolved {
@@ -5350,6 +5368,10 @@ mod tests {
     }
 
     impl Resolver for RepeatedIncludeResolver {
+        fn authorize(&self, _: crate::ResourceAccess<'_>) -> Result<()> {
+            // This fixture has a permanent grant for its immutable in-memory module.
+            Ok(())
+        }
         fn resolve(&self, request: crate::ResolveRequest<'_>) -> Result<ResolvedResource> {
             let crate::ResolveRequest { uri, purpose, .. } = request;
             assert_eq!(uri, "module.xsl");
@@ -5365,6 +5387,10 @@ mod tests {
     }
 
     impl Resolver for FragmentModuleResolver {
+        fn authorize(&self, _: crate::ResourceAccess<'_>) -> Result<()> {
+            // Fragment variants share the same permanently authorized fixture bytes.
+            Ok(())
+        }
         fn resolve(&self, request: crate::ResolveRequest<'_>) -> Result<ResolvedResource> {
             assert_eq!(request.uri, "module.xml");
             assert!(matches!(

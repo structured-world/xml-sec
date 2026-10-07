@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
-use sxd_xpath_no_unsafe::{Context, Value, function};
+use sxd_xpath_no_unsafe::{Value, context::ScopedContext, function};
 
 use crate::Clock;
 
 pub(crate) const NAMESPACE: &str = "http://exslt.org/dates-and-times";
-pub(crate) fn register(context: &mut Context<'_>, clock: Option<Arc<dyn Clock>>) {
+pub(crate) fn register(context: &mut ScopedContext<'_, '_>, clock: Option<Arc<dyn Clock>>) {
     for &(name, operation) in FUNCTIONS {
         context.set_function(
             (NAMESPACE, name),

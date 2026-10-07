@@ -15,7 +15,7 @@ use crate::nodeset::{Node, OrderedNodes};
 use crate::{OwnedQName, Value};
 
 /// A mapping of names to XPath functions.
-type Functions = QNameMap<Box<dyn function::Function + 'static>>;
+type Functions<'f> = QNameMap<Box<dyn function::Function + 'f>>;
 /// A mapping of names to XPath variables.
 type Variables<'d> = QNameMap<Value<'d>>;
 /// A mapping of namespace prefixes to namespace URIs.
@@ -130,8 +130,12 @@ impl<V> QNameMap<V> {
 /// the `evaluate` method and is not the root of the tree but the
 /// top-most element.
 ///
-pub struct Context<'d> {
-    functions: Functions,
+pub type Context<'d> = ScopedContext<'static, 'd>;
+
+/// An XPath context whose function captures and document values have independent lifetimes.
+/// Borrowed callbacks need only outlive evaluation, not the XML document they inspect.
+pub struct ScopedContext<'f, 'd> {
+    functions: Functions<'f>,
     variables: Variables<'d>,
     namespaces: Namespaces,
     string_allocations: StringAllocationBudget,
@@ -154,7 +158,7 @@ struct WorkBudget {
     exceeded: Cell<Option<usize>>,
 }
 
-impl<'d> Context<'d> {
+impl<'f, 'd> ScopedContext<'f, 'd> {
     /// Registers the core XPath 1.0 functions.
     pub fn new() -> Self {
         let mut context = Self::without_core_functions();
@@ -164,7 +168,7 @@ impl<'d> Context<'d> {
 
     /// No functions, variables or namespaces will be defined.
     pub fn without_core_functions() -> Self {
-        Context {
+        Self {
             functions: Default::default(),
             variables: Default::default(),
             namespaces: Default::default(),
@@ -250,11 +254,11 @@ impl<'d> Context<'d> {
         reserve_allocation(&self.string_allocations, bytes)
     }
 
-    /// Register a function within the context
+    /// Register a function within the context. Its state may borrow for the context lifetime.
     pub fn set_function<N, F>(&mut self, name: N, function: F)
     where
         N: Into<OwnedQName>,
-        F: function::Function + 'static,
+        F: function::Function + 'f,
     {
         self.functions.insert(name.into(), Box::new(function));
     }
@@ -280,9 +284,9 @@ impl<'d> Context<'d> {
     }
 }
 
-impl<'d> Default for Context<'d> {
+impl<'f, 'd> Default for ScopedContext<'f, 'd> {
     fn default() -> Self {
-        Context::new()
+        Self::new()
     }
 }
 
@@ -304,7 +308,7 @@ pub struct Evaluation<'c, 'd> {
     pub position: usize,
     /// The context size
     pub size: usize,
-    functions: &'c Functions,
+    functions: &'c Functions<'c>,
     variables: &'c Variables<'d>,
     namespaces: &'c Namespaces,
     string_allocations: &'c StringAllocationBudget,
@@ -318,7 +322,7 @@ impl<'c, 'd> Copy for Evaluation<'c, 'd> {}
 
 impl<'c, 'd> Evaluation<'c, 'd> {
     /// Prepares the context used while evaluating the XPath expression
-    pub fn new(context: &'c Context<'d>, node: Node<'d>) -> Evaluation<'c, 'd> {
+    pub fn new(context: &'c ScopedContext<'_, 'd>, node: Node<'d>) -> Evaluation<'c, 'd> {
         Evaluation {
             node,
             functions: &context.functions,
@@ -498,6 +502,39 @@ mod tests {
     use super::Context;
     #[cfg(feature = "embedded")]
     use super::sxd_document_no_unsafe;
+
+    #[test]
+    fn registered_functions_borrow_context_scoped_state() {
+        // Permission callbacks must borrow caller state without cloning an Arc or allocating
+        // another ownership wrapper on every XPath evaluation.
+        struct Borrowed<'a>(&'a std::cell::Cell<usize>);
+        impl crate::function::Function for Borrowed<'_> {
+            fn evaluate<'c, 'd>(
+                &self,
+                _: &super::Evaluation<'c, 'd>,
+                _: Vec<crate::Value<'d>>,
+            ) -> Result<crate::Value<'d>, crate::function::Error> {
+                self.0.set(self.0.get() + 1);
+                Ok(crate::Value::Boolean(true))
+            }
+        }
+        let calls = std::cell::Cell::new(0);
+        let mut context = super::ScopedContext::new();
+        context.set_function("borrowed", Borrowed(&calls));
+        // The document is destroyed before this context. Function capture lifetimes must not
+        // force it to outlive the context's destructor when no document value is retained.
+        let package = sxd_document_no_unsafe::Package::new();
+        let expression = crate::Factory::new()
+            .build("borrowed()")
+            .expect("XPath compiles");
+        assert_eq!(
+            expression
+                .evaluate(&context, package.as_document().root())
+                .expect("borrowed callback executes"),
+            crate::Value::Boolean(true)
+        );
+        assert_eq!(calls.get(), 1);
+    }
 
     #[test]
     fn qname_lookup_does_not_allocate() {

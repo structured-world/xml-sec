@@ -123,6 +123,49 @@ fn percent_decode_uri_path(uri: &str) -> xml_sec_xslt::Result<String> {
 }
 
 impl Resolver for CorpusResolver {
+    fn authorize(&self, access: xml_sec_xslt::ResourceAccess<'_>) -> xml_sec_xslt::Result<()> {
+        let (uri, base) = match access {
+            xml_sec_xslt::ResourceAccess::Request(request) => (request.uri, request.base_uri),
+            xml_sec_xslt::ResourceAccess::Retained { request, .. } => {
+                (request.uri, request.base_uri)
+            }
+            xml_sec_xslt::ResourceAccess::Dependency(identity) => (
+                identity
+                    .0
+                    .strip_prefix("libxslt-1.1.45:")
+                    .ok_or_else(|| Error::StaleResource {
+                        identity: identity.clone(),
+                    })?,
+                None,
+            ),
+        };
+        // The corpus caller explicitly grants only paths confined to its fixture root.
+        match self.resolve_path(uri, base) {
+            Ok(path) => {
+                if let xml_sec_xslt::ResourceAccess::Retained { identity, .. }
+                | xml_sec_xslt::ResourceAccess::Dependency(identity) = access
+                {
+                    let expected = format!(
+                        "libxslt-1.1.45:{}",
+                        path.strip_prefix(&self.root)
+                            .expect("authorized path is corpus-confined")
+                            .display()
+                    );
+                    if identity.0 != expected {
+                        return Err(Error::StaleResource {
+                            identity: identity.clone(),
+                        });
+                    }
+                }
+            }
+            // Absence is acquisition failure, not a permission refusal. Let document() use its
+            // specified missing-resource recovery without weakening confinement for live paths.
+            Err(Error::ResourceNotFound { .. })
+                if matches!(access, xml_sec_xslt::ResourceAccess::Request(_)) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
     fn resolve(&self, request: ResolveRequest<'_>) -> xml_sec_xslt::Result<ResolvedResource> {
         let ResolveRequest { uri, base_uri, .. } = request;
         let path = self.resolve_path(uri, base_uri)?;

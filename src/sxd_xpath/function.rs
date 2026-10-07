@@ -772,7 +772,7 @@ fn round() -> NumberConvert {
 /// Adds the [XPath 1.0 core function library][corelib].
 ///
 /// [corelib]: https://www.w3.org/TR/xpath/#corelib
-pub fn register_core_functions(context: &mut context::Context<'_>) {
+pub fn register_core_functions(context: &mut context::ScopedContext<'_, '_>) {
     context.set_function("last", Last);
     context.set_function("position", Position);
     context.set_function("count", Count);

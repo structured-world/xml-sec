@@ -10,6 +10,15 @@ Compilation produces an immutable `Stylesheet` that can be shared and executed
 repeatedly. Callers provide explicit compile/execution budgets and a resolver
 contract; `NoResolver` denies external access.
 
+`Resolver::authorize` checks borrowed requests before acquisition and exact resource identities
+before cache reuse. It also admits every retained include/import dependency before a compiled
+stylesheet starts a new execution. Callers enforce lease expiry, revocation and identity binding
+there; the engine never reads an ambient clock to make those decisions. `ResourceAccess::denied`
+constructs typed `NotGranted`, `Revoked` or `Expired` refusals (`ErrorKind::Policy`). These failures
+are fatal: neither `document()` missing-resource recovery nor `xi:fallback` swallows them.
+Permanent in-memory grants can explicitly return `Ok(())`; authorization must not reacquire bytes.
+Acquisition must enforce the same grant atomically if permission can change concurrently.
+
 Execution capabilities are explicit through `ExecutionEnvironment`. The default grants a
 caller-owned resolver but neither XInclude processing nor ambient clock access. Callers may grant
 XInclude with `with_xinclude()` and may inject `FixedClock` for reproducible zero-argument EXSLT

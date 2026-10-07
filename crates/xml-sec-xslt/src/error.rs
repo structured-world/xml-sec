@@ -1,4 +1,4 @@
-use crate::{BudgetKind, ResourceIdentity};
+use crate::{AccessDenialReason, BudgetKind, ResourceIdentity};
 
 /// Result type returned by the XSLT engine.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -12,6 +12,7 @@ pub enum ErrorKind {
     Dynamic,
     Resource,
     Resolver,
+    Policy,
     Budget,
     Serialization,
     Unsupported,
@@ -27,12 +28,17 @@ pub enum Error {
     Static(String),
     #[error("XSLT dynamic error: {0}")]
     Dynamic(String),
-    #[error("resource {identity:?} changed while compiling the stylesheet")]
+    #[error("resource {identity:?} changed during XSLT processing")]
     StaleResource { identity: ResourceIdentity },
     #[error("resource not found: {uri}")]
     ResourceNotFound { uri: String },
     #[error("resource resolution failed for {uri}: {message}")]
     Resolver { uri: String, message: String },
+    #[error("resource access denied for {resource}: {reason:?}")]
+    ResourceAccessDenied {
+        resource: String,
+        reason: AccessDenialReason,
+    },
     #[error("{kind:?} budget exceeded: limit {limit}, attempted {actual}")]
     Budget {
         kind: BudgetKind,
@@ -55,6 +61,7 @@ impl Error {
             Self::Dynamic(_) => ErrorKind::Dynamic,
             Self::StaleResource { .. } | Self::ResourceNotFound { .. } => ErrorKind::Resource,
             Self::Resolver { .. } => ErrorKind::Resolver,
+            Self::ResourceAccessDenied { .. } => ErrorKind::Policy,
             Self::Budget { .. } => ErrorKind::Budget,
             Self::Serialization(_) => ErrorKind::Serialization,
             Self::Unsupported(_) => ErrorKind::Unsupported,

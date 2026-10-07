@@ -183,6 +183,13 @@ impl Stylesheet {
     ) -> Result<TransformResult> {
         let source_bytes = source.source_bytes();
         let mut meter = Meter::new(options.budget, source_bytes)?;
+        // Retained module IR is still derived from caller-owned resources. A previous compile
+        // grant must not authorize a new operation after its lease expires or is revoked.
+        for identity in self.resource_identities() {
+            environment
+                .resolver
+                .authorize(crate::ResourceAccess::Dependency(identity))?;
+        }
         let effective_globals = effective_globals(self, &mut meter)?;
         // XSLT 1.0 section 11.4 defines externally bindable stylesheet parameters through
         // top-level xsl:param and leaves the passing mechanism implementation-defined:

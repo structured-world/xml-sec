@@ -54,7 +54,8 @@ pub use model::{
     Attribute, Document, ExpandedName, Namespace, Node, NodeId, NodeKind, NodeReference,
 };
 pub use resolver::{
-    NoResolver, ResolvePurpose, ResolveRequest, ResolvedResource, Resolver, ResourceIdentity,
+    AccessDenialReason, NoResolver, ResolvePurpose, ResolveRequest, ResolvedResource, Resolver,
+    ResourceAccess, ResourceIdentity,
 };
 pub use runtime::{ExecutionOptions, Message, Parameters, SecondaryOutput, TransformResult};
 pub use serializer::{OutputDefinition, OutputMethod, SerializedOutput};
