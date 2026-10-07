@@ -89,6 +89,55 @@ fn opc_relationship_cli_uses_the_2012_contract() {
 }
 
 #[test]
+fn url_maps_do_not_authorize_external_key_retrieval() {
+    // Reference payload authorization must not grant key-source authorization.
+    // Same-document X509Data retrieval remains a supported metadata path.
+    let directory = tempfile::tempdir().unwrap();
+    let root = project_root();
+    let key = RsaSigningKey::from_pkcs8_pem(
+        &fs::read_to_string(root.join("tests/fixtures/keys/rsa/rsa-2048-key.pem")).unwrap(),
+    )
+    .unwrap();
+    let signed = SignContext::new(&key)
+        .sign_template(signature_template_without_key_info())
+        .unwrap();
+    let certificate =
+        pem::parse(fs::read(root.join("tests/fixtures/keys/rsa/rsa-2048-cert.pem")).unwrap())
+            .unwrap();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(certificate.contents());
+    let mapped = directory.path().join("payload.der");
+    fs::write(&mapped, certificate.contents()).unwrap();
+    for (uri, kind, accepted) in [
+        ("urn:payload", "rawX509Certificate", false),
+        ("#keys", "X509Data", true),
+    ] {
+        let xml = signed
+            .replace("</SignatureValue>", &format!("</SignatureValue><KeyInfo><RetrievalMethod URI=\"{uri}\" Type=\"http://www.w3.org/2000/09/xmldsig#{kind}\"/></KeyInfo>"))
+            .replace("</Signature>", &format!("<Object><X509Data Id=\"keys\"><X509Certificate>{encoded}</X509Certificate></X509Data></Object></Signature>"));
+        let input = directory.path().join("signed.xml");
+        fs::write(&input, xml).unwrap();
+        let output = Command::new(binary())
+            .args(["verify", "--insecure", "--url-map:urn:payload"])
+            .arg(&mapped)
+            .arg(&input)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            accepted,
+            "{uri}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !accepted {
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("retrieval method URI class is not permitted")
+            );
+        }
+    }
+}
+
+#[test]
 fn opc_detached_parts_require_explicit_url_maps() {
     // Explicit maps must work with the original detached donor template;
     // no map may fall back to opening a URI-controlled local filename.

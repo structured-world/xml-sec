@@ -205,7 +205,8 @@ no filesystem or network fallback. Mapped file capacity is checked before
 allocation against individual and aggregate compiled resource limits, including
 transient reallocation if a file grows during reading. Verification also charges
 mapped bytes against the budget shared with configured certificate/key material.
-This option supplies reference data, not external KeyInfo metadata. Both commands
+This option supplies reference data, not external KeyInfo metadata; verification
+permits only same-document RetrievalMethod and KeyInfoReference URIs. Both commands
 use the 2012 OPC Relationship Transform normalization contract; package-level
 conformance is separate from XMLDSig signature verification.
 

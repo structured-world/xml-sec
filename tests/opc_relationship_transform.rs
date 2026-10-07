@@ -41,8 +41,9 @@ fn relationship_transform_selects_groups_and_normalizes() {
     let input = format!(
         "<r:Relationships xmlns:r=\"{REL}\"><r:Relationship Id=\"z\" Type=\"urn:test\" Target=\"z&amp;x\"/><r:Relationship Id=\"A\" Type=\"urn:test\" Target=\"a\"/><r:Relationship Id=\"other\" Type=\"urn:other\" Target=\"b\"/></r:Relationships>"
     );
-    let selectors =
-        format!("<RelationshipsGroupReference xmlns=\"{PARAM}\" SourceType=\"URN:TEST\"/>");
+    let selectors = format!(
+        "<RelationshipsGroupReference xmlns=\"{PARAM}\" SourceType=\"URN:TEST\">metadata &amp; <![CDATA[value]]></RelationshipsGroupReference>"
+    );
     let expected = format!(
         "<Relationships xmlns=\"{REL}\"><Relationship Id=\"A\" Target=\"a\" TargetMode=\"Internal\" Type=\"urn:test\"></Relationship><Relationship Id=\"z\" Target=\"z&amp;x\" TargetMode=\"Internal\" Type=\"urn:test\"></Relationship></Relationships>"
     );
@@ -497,6 +498,7 @@ fn invalid_relationship_shapes_and_mce_are_rejected() {
     let selector = format!("<RelationshipReference xmlns=\"{PARAM}\" SourceId=\"none\"/>");
     for content in [
         "<Relationship Id=\"x\" Target=\"a\"/>",
+        "<Relationship Id=\"x\" Type=\"relative/type\" Target=\"a\"/>",
         "<Relationship Id=\"x\" Type=\"urn:t\" Target=\"a\" TargetMode=\"invalid\"/>",
         "<Relationship Id=\"x\" Type=\"urn:t\" Target=\"a\" Extra=\"value\"/>",
         "<Relationship Id=\"x\" Type=\"urn:t\" Target=\"a\"><Relationship/></Relationship>",

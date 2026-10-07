@@ -190,14 +190,12 @@ pub(super) fn parse_selectors(
             (Some(PARAM), "RelationshipsGroupReference") => "SourceType",
             _ => return Err(invalid("unexpected relationship selector")),
         };
-        if child.attributes().len() != 1
-            || child.children().any(|n| {
-                n.is_element()
-                    || (n.is_text() && !n.text().is_some_and(super::is_xml_whitespace_only))
-            })
-        {
+        // ECMA-376 Part 2: 2021 C.2 / 2012 D.3 extend xsd:string.
+        // Character content is permitted but does not participate in selection.
+        // https://ecma-international.org/publications-and-standards/standards/ecma-376/
+        if child.attributes().len() != 1 || child.children().any(|n| n.is_element()) {
             return Err(invalid(
-                "relationship selector must contain only its required attribute",
+                "relationship selector requires exactly its named attribute and no child elements",
             ));
         }
         let value = child
@@ -365,6 +363,8 @@ pub(super) fn normalize<'a>(
                 let kind = node
                     .attribute("Type")
                     .ok_or_else(|| invalid("missing relationship Type"))?;
+                budget.node_filter.charge(kind.len())?;
+                validate_relationship_type_scheme(kind)?;
                 let target = node
                     .attribute("Target")
                     .ok_or_else(|| invalid("missing relationship Target"))?;
@@ -802,6 +802,32 @@ fn alternate_content<'a>(
     Ok(chosen.or(fallback))
 }
 
+fn validate_relationship_type_scheme(kind: &str) -> Result<(), TransformError> {
+    // ECMA-376 Part 2:2021 §§3.2.8, 6.5.3.4 (2012 §§3, 9.3.2)
+    // requires an absolute IRI, including on unselected relationships.
+    // RFC 3987 §2.2 requires an ASCII scheme; the remaining IRI may be Unicode.
+    // https://ecma-international.org/publications-and-standards/standards/ecma-376/
+    // https://www.rfc-editor.org/rfc/rfc3987#section-2.2
+    // Check the collapsed anyURI value without changing its lexical infoset.
+    let mut bytes = kind.trim_matches(xml_whitespace).bytes();
+    if !bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic()) {
+        return Err(invalid(
+            "relationship Type must have an absolute IRI scheme",
+        ));
+    }
+    for byte in bytes {
+        if byte == b':' {
+            return Ok(());
+        }
+        if !byte.is_ascii_alphanumeric() && !matches!(byte, b'+' | b'-' | b'.') {
+            break;
+        }
+    }
+    Err(invalid(
+        "relationship Type must have an absolute IRI scheme",
+    ))
+}
+
 fn validate_internal_target_reference_syntax(target: &str) -> Result<(), TransformError> {
     // ECMA-376 Part 2 (2021) §6.5.3.4 / 2012 §9.3.2.2 requires a
     // relative reference. RFC 3986 §4.2 includes network-path references;
@@ -834,6 +860,118 @@ fn xml_whitespace(value: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relationship_type_requires_an_absolute_iri_scheme_before_selection() {
+        // Type defines a role by absolute IRI in both editions. The scheme
+        // uses ASCII grammar, but its remainder can contain Unicode.
+        for kind in [
+            "",
+            "relative/type",
+            "//example.com/type",
+            ":type",
+            "1urn:type",
+            "x_y:type",
+            "x/y:type",
+            "?x:type",
+            "#x:type",
+        ] {
+            let xml = format!(
+                "<Relationships xmlns=\"{REL}\"><Relationship Id=\"x\" Type=\"{kind}\" Target=\"a\"/></Relationships>"
+            );
+            let document = Document::parse(&xml).expect("well-formed relationship XML");
+            for edition in [
+                OpcRelationshipEdition::Ecma2012,
+                OpcRelationshipEdition::Ecma2021,
+            ] {
+                for id in ["x", "absent"] {
+                    assert!(
+                        normalize(
+                            &document,
+                            &[RelationshipSelector::SourceId(id.into())],
+                            edition,
+                            &TransformExecutionBudget::default()
+                        )
+                        .is_err(),
+                        "{edition:?}, {id}, {kind}"
+                    );
+                }
+            }
+        }
+        for kind in [
+            "urn:t",
+            "https://example.com/type",
+            "https://例え.example/役割",
+            "urn:роль",
+            "x+y.z-1:type",
+            " urn:t ",
+        ] {
+            let xml = format!(
+                "<Relationships xmlns=\"{REL}\"><Relationship Id=\"x\" Type=\"{kind}\" Target=\"a\"/></Relationships>"
+            );
+            let document = Document::parse(&xml).expect("well-formed relationship XML");
+            for edition in [
+                OpcRelationshipEdition::Ecma2012,
+                OpcRelationshipEdition::Ecma2021,
+            ] {
+                let output = normalize(
+                    &document,
+                    &[RelationshipSelector::SourceId("x".into())],
+                    edition,
+                    &TransformExecutionBudget::default(),
+                )
+                .expect("absolute IRI scheme is accepted");
+                let expected = format!(
+                    "<Relationships xmlns=\"{REL}\"><Relationship Id=\"x\" Target=\"a\" TargetMode=\"Internal\" Type=\"{kind}\"></Relationship></Relationships>"
+                );
+                assert_eq!(output, expected.as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn selector_simple_content_does_not_change_selection() {
+        // Both selector schemas extend xsd:string; only their attribute
+        // participates in selection, and nested elements remain invalid.
+        for (name, attribute, value) in [
+            ("RelationshipReference", "SourceId", "x"),
+            ("RelationshipsGroupReference", "SourceType", "urn:t"),
+        ] {
+            for content in ["", "metadata &amp; <![CDATA[value]]>", "<child/>"] {
+                let parameters = format!(
+                    "<Transform><{name} xmlns=\"{PARAM}\" {attribute}=\"{value}\">{content}</{name}></Transform>"
+                );
+                let parameters = Document::parse(&parameters).expect("well-formed selector XML");
+                let parsed =
+                    parse_selectors(parameters.root_element(), &WorkspaceBudget::default());
+                if content == "<child/>" {
+                    assert!(parsed.is_err());
+                    continue;
+                }
+                let parsed = parsed.expect("selector simple content is valid");
+                let xml = format!(
+                    "<Relationships xmlns=\"{REL}\"><Relationship Id=\"x\" Type=\"urn:t\" Target=\"a\"/></Relationships>"
+                );
+                let document = Document::parse(&xml).expect("well-formed relationship XML");
+                for edition in [
+                    OpcRelationshipEdition::Ecma2012,
+                    OpcRelationshipEdition::Ecma2021,
+                ] {
+                    let output = normalize(
+                        &document,
+                        &parsed,
+                        edition,
+                        &TransformExecutionBudget::default(),
+                    )
+                    .expect("selector simple content is ignored");
+                    let expected = format!(
+                        "<Relationships xmlns=\"{REL}\"><Relationship Id=\"x\" Target=\"a\" TargetMode=\"Internal\" Type=\"urn:t\"></Relationship></Relationships>"
+                    );
+                    assert_eq!(output, expected.as_bytes());
+                }
+            }
+        }
+    }
 
     #[test]
     fn alternate_content_distinguishes_ignored_and_unwrapped_extensions() {

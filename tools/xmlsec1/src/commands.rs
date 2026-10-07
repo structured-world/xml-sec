@@ -1420,9 +1420,9 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
         },
         uris: UriPolicy {
             references: UriTypeSet::ALL,
-            retrieval_methods: UriTypeSet::ALL,
-            // CLI metadata selection has no request-scoped external resource
-            // resolver, so advertise only the URI classes it can execute.
+            // URL mappings authorize signed reference payloads, not key
+            // material. Keep metadata URI permissions independent of them.
+            retrieval_methods: UriTypeSet::SAME_DOCUMENT,
             key_info_references: UriTypeSet::SAME_DOCUMENT,
         },
         transforms: TransformPolicy {

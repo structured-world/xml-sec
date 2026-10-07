@@ -80,6 +80,10 @@ same package requires its base pack IRI (2021 §§6.5.2.2-3), which the normaliz
 does not receive. Acceptance by this transform does not assert package membership.
 Relationship simple content is removed in both editions; non-whitespace text
 in the Relationships container and child elements in Relationship remain invalid.
+Selector simple content is permitted and ignored; selection uses only SourceId
+or SourceType (2012 D.3; 2021 C.2). Relationship Type must contain an absolute IRI
+scheme, even when unselected; Unicode in its remainder and its lexical spelling
+are preserved (2012 §§3, 9.3.2; 2021 §§3.2.8, 6.5.3.4).
 Generic SignedInfo and CipherReference execution therefore remain available.
 Successful XMLDSig verification is not OPC package conformance: the package
 adapter must independently enforce Manifest placement and one Relationship
