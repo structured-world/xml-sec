@@ -109,6 +109,16 @@ pub(super) struct BoundCipherReferenceContext<'context, 'doc> {
 }
 
 impl<'context: 'doc, 'doc> BoundCipherReferenceContext<'context, 'doc> {
+    pub(super) fn resolver(&self) -> &crate::xmldsig::uri::UriReferenceResolver<'doc> {
+        self.resolver.get_or_init(|| {
+            self.context.external.bind(
+                self.document,
+                self.context.id_attributes,
+                self.context.policy.transforms.same_document_id_semantics,
+            )
+        })
+    }
+
     pub(super) fn resolve_parsed(
         &self,
         node: Node<'_, '_>,
@@ -122,19 +132,12 @@ impl<'context: 'doc, 'doc> BoundCipherReferenceContext<'context, 'doc> {
                 "foreign CipherReference origin".into(),
             ));
         }
-        let resolver = self.resolver.get_or_init(|| {
-            self.context.external.bind(
-                self.document,
-                self.context.id_attributes,
-                self.context.policy.transforms.same_document_id_semantics,
-            )
-        });
         self.context.resolve_with_resolver(
             node,
             uri,
             transforms,
             xml_parse,
-            resolver,
+            self.resolver(),
             self.document_base,
         )
     }

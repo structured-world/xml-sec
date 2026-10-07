@@ -478,6 +478,7 @@ fn parse_key_info<'doc>(
             )?);
         } else if child.has_tag_name((XMLENC11_NS, "DerivedKey")) {
             budget.charge(policy.resources)?;
+            source_nodes.push(child.id());
             derived_keys.push(super::derived_key::parse(child, policy.resources)?);
         } else if child.has_tag_name((XMLENC_NS, "AgreementMethod")) {
             budget.charge(policy.resources)?;
@@ -569,18 +570,15 @@ fn parse_key_info<'doc>(
                 None => Vec::new(),
             };
             let declared_type = child.attribute("Type");
-            if let Some(kind) = declared_type {
-                validate_metadata_len(kind.len(), policy.resources.max_encryption_metadata_bytes)?;
-                if !matches!(
-                    kind,
-                    "http://www.w3.org/2001/04/xmlenc#EncryptedKey"
-                        | "http://www.w3.org/2001/04/xmlenc#DerivedKey"
-                ) {
-                    return Err(XmlEncError::InvalidStructure(
-                        "unsupported encryption RetrievalMethod Type".into(),
-                    ));
-                }
-            }
+            let declared_type = declared_type
+                .map(|kind| {
+                    validate_metadata_len(
+                        kind.len(),
+                        policy.resources.max_encryption_metadata_bytes,
+                    )?;
+                    RetrievedKeyType::parse(kind)
+                })
+                .transpose()?;
             if !uri.is_empty() && !uri.starts_with('#') || !transforms.is_empty() {
                 budget.charge(policy.resources)?;
                 match parse_processed_key_reference(
@@ -608,24 +606,14 @@ fn parse_key_info<'doc>(
                 continue;
             }
             let target = budget.referenced_node(child, uri)?;
+            if let Some(kind) = declared_type {
+                kind.validate_target(target)?;
+            }
             if target.has_tag_name((XMLENC11_NS, "DerivedKey")) {
-                if declared_type
-                    .is_some_and(|kind| kind != "http://www.w3.org/2001/04/xmlenc#DerivedKey")
-                {
-                    return Err(XmlEncError::InvalidStructure(
-                        "RetrievalMethod Type disagrees with DerivedKey target".into(),
-                    ));
-                }
                 budget.charge(policy.resources)?;
+                source_nodes.push(target.id());
                 derived_keys.push(super::derived_key::parse(target, policy.resources)?);
                 continue;
-            }
-            if declared_type
-                .is_some_and(|kind| kind != "http://www.w3.org/2001/04/xmlenc#EncryptedKey")
-            {
-                return Err(XmlEncError::InvalidStructure(
-                    "RetrievalMethod Type disagrees with EncryptedKey target".into(),
-                ));
             }
             budget.charge_recipient(policy.resources, encrypted_keys.len())?;
             source_nodes.push(target.id());
@@ -713,11 +701,49 @@ enum RetrievedKey {
     Derived(super::DerivedKey),
 }
 
+#[derive(Clone, Copy)]
+enum RetrievedKeyType {
+    Encrypted,
+    Derived,
+}
+
+impl RetrievedKeyType {
+    fn parse(uri: &str) -> Result<Self, XmlEncError> {
+        // XMLEnc 1.1 §3.5.2 specifies the xmlenc11 identifier, while §3.5.3
+        // prints xmlenc. Accept the latter as an interoperability alias; both
+        // still require an xenc11:DerivedKey target, including after transforms.
+        // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-DerivedKey
+        // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-RetrievalMethod
+        match uri {
+            "http://www.w3.org/2001/04/xmlenc#EncryptedKey" => Ok(Self::Encrypted),
+            "http://www.w3.org/2009/xmlenc11#DerivedKey"
+            | "http://www.w3.org/2001/04/xmlenc#DerivedKey" => Ok(Self::Derived),
+            _ => Err(XmlEncError::InvalidStructure(
+                "unsupported encryption RetrievalMethod Type".into(),
+            )),
+        }
+    }
+
+    fn validate_target(self, node: Node<'_, '_>) -> Result<(), XmlEncError> {
+        let (namespace, tag) = match self {
+            Self::Encrypted => (XMLENC_NS, "EncryptedKey"),
+            Self::Derived => (XMLENC11_NS, "DerivedKey"),
+        };
+        if node.has_tag_name((namespace, tag)) {
+            Ok(())
+        } else {
+            Err(XmlEncError::InvalidStructure(format!(
+                "RetrievalMethod Type disagrees with {tag} target"
+            )))
+        }
+    }
+}
+
 fn parse_processed_key_reference(
     source: Node<'_, '_>,
     uri: &str,
     transforms: &[crate::xmldsig::transforms::Transform],
-    declared_type: Option<&str>,
+    declared_type: Option<RetrievedKeyType>,
     allow_empty: bool,
     budget: &mut KeySourceParseBudget<'_, '_, '_>,
     depth: usize,
@@ -777,20 +803,12 @@ fn parse_processed_key_reference(
     child_budget.xml_parse = Some(parse);
     child_budget.document_base = base;
     let target = document.root_element();
+    if let Some(kind) = declared_type {
+        kind.validate_target(target)?;
+    }
     let result = if target.has_tag_name((XMLENC11_NS, "DerivedKey")) {
-        if declared_type.is_some_and(|kind| kind != "http://www.w3.org/2001/04/xmlenc#DerivedKey") {
-            return Err(XmlEncError::InvalidStructure(
-                "RetrievalMethod Type disagrees with DerivedKey target".into(),
-            ));
-        }
         RetrievedKey::Derived(super::derived_key::parse(target, policy.resources)?)
     } else {
-        if declared_type.is_some_and(|kind| kind != "http://www.w3.org/2001/04/xmlenc#EncryptedKey")
-        {
-            return Err(XmlEncError::InvalidStructure(
-                "RetrievalMethod Type disagrees with EncryptedKey target".into(),
-            ));
-        }
         let mut key = parse_encrypted_key(target, policy, allow_empty, &mut child_budget, depth)?;
         let bound =
             context.bind_document_with_base(&document, child_budget.document_base.as_deref());
@@ -824,7 +842,7 @@ fn append_detached_keys<'doc>(
     budget: &mut KeySourceParseBudget<'_, 'doc, '_>,
     depth: usize,
 ) -> Result<(), XmlEncError> {
-    // XMLEnc §§3.5, 3.5.1 and 3.6 bind detached transports to either
+    // XMLEnc §§3.5.1, 3.5.2 and 3.6 bind detached transports/derivations to either
     // encrypted-object class. Inventory node IDs once, not the document once
     // per recursive key. Original nodes retain namespaces and provenance.
     // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-ReferenceList
@@ -842,7 +860,9 @@ fn append_detached_keys<'doc>(
                 }
                 .into());
             }
-            if candidate.has_tag_name((XMLENC_NS, "EncryptedKey")) {
+            if candidate.has_tag_name((XMLENC_NS, "EncryptedKey"))
+                || candidate.has_tag_name((XMLENC11_NS, "DerivedKey"))
+            {
                 candidates.push(candidate.id());
             }
         }
@@ -859,10 +879,17 @@ fn append_detached_keys<'doc>(
             .document()
             .get_node(id)
             .expect("inventory belongs to this document");
+        let derived = candidate.has_tag_name((XMLENC11_NS, "DerivedKey"));
         let named = info.key_name.as_deref().is_some_and(|expected| {
             candidate
                 .children()
-                .find(|child| child.has_tag_name((XMLENC_NS, "CarriedKeyName")))
+                .find(|child| {
+                    child.has_tag_name(if derived {
+                        (XMLENC11_NS, "DerivedKeyName")
+                    } else {
+                        (XMLENC_NS, "CarriedKeyName")
+                    })
+                })
                 .is_some_and(|label| {
                     !label.children().any(|child| child.is_element())
                         && label
@@ -937,6 +964,13 @@ fn append_detached_keys<'doc>(
             ));
         }
         if info.source_nodes.contains(&id) {
+            continue;
+        }
+        if derived {
+            budget.charge(policy.resources)?;
+            info.source_nodes.push(id);
+            info.derived_keys
+                .push(super::derived_key::parse(candidate, policy.resources)?);
             continue;
         }
         budget.charge_recipient(policy.resources, info.encrypted_keys.len())?;

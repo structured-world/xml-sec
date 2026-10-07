@@ -903,7 +903,7 @@ impl<'a> DecryptContext<'a> {
             self.id_attributes,
         )?
         .with_operation(&reference_gate);
-        let (encrypted, algorithm, ciphertext) = operation.run(plan_nodes.ciphertext, || {
+        let parsed = operation.run(plan_nodes.ciphertext, || {
             // The graph gates parser work as well as cryptographic callbacks.
             // Typed inputs stay borrowed; XML inputs consume the same operation
             // parse allowance used later for plaintext and controlled mutation.
@@ -1009,9 +1009,18 @@ impl<'a> DecryptContext<'a> {
                 ciphertext.len(),
                 operation.policy().resources.max_encryption_plaintext_bytes,
             )?;
-            Ok::<_, XmlEncError>((encrypted, algorithm, ciphertext))
-        })?;
+            Ok::<_, XmlEncError>((encrypted, algorithm, ciphertext, origins, bound_references))
+        });
+        let (encrypted, algorithm, ciphertext, origins, bound_references) = parsed?;
         let keys = operation.run(plan_nodes.key, || {
+            let document = match (source_document.as_ref(), bound_references.as_ref()) {
+                (Some((document, start)), Some(bound)) => Some(KeySourceDocument {
+                    references: bound,
+                    target: selected_encrypted_node(document, *start)?.id(),
+                    origins: &origins,
+                }),
+                _ => None,
+            };
             resolve_content_key_candidates(
                 self.provider,
                 algorithm,
@@ -1019,6 +1028,7 @@ impl<'a> DecryptContext<'a> {
                 self.resolver,
                 operation.policy(),
                 &mut operation.budgets().key_candidates.borrow_mut(),
+                document,
             )
         })?;
         let keys = compatible_decryption_key_candidates(algorithm, keys)?;
@@ -1863,6 +1873,7 @@ fn resolve_content_key_candidates(
     resolver: &dyn DecryptionKeyResolver,
     policy: &crate::policy::DecryptionPolicy,
     budget: &mut KeyCandidateBudget,
+    mut document: Option<KeySourceDocument<'_, '_>>,
 ) -> Result<Vec<crate::provider::RecoveredContentKey>, XmlEncError> {
     let mut last_error = None;
     let mut candidates = if encrypted.derived_keys.is_empty()
@@ -1891,9 +1902,10 @@ fn resolve_content_key_candidates(
         }
     }
     for descriptor in &encrypted.derived_keys {
-        if !reference_list_applies_to_local_data(
+        if !reference_list_applies_to_target(
             descriptor.reference_list.as_ref(),
-            encrypted.id.as_deref(),
+            ReferenceTarget::new(document, encrypted.id.as_deref()),
+            ReferenceKind::Data,
         ) {
             continue;
         }
@@ -1909,7 +1921,15 @@ fn resolve_content_key_candidates(
         }
     }
     for encrypted_key in &encrypted.encrypted_keys {
-        if !encrypted_key_applies_to_data(encrypted_key, encrypted) {
+        let source = KeySourceView {
+            key: encrypted_key,
+            document: take_key_document(&mut document, encrypted_key)?,
+        };
+        if !encrypted_key_applies_to_data(
+            encrypted_key,
+            encrypted,
+            ReferenceTarget::new(document, encrypted.id.as_deref()),
+        ) {
             continue;
         }
         if let Err(error) = validate_encrypted_key_policy(encrypted_key, policy) {
@@ -1928,7 +1948,7 @@ fn resolve_content_key_candidates(
         } else {
             resolve_nested_key(
                 provider,
-                encrypted_key,
+                source,
                 algorithm.key_len(),
                 resolver,
                 policy,
@@ -1985,13 +2005,16 @@ pub(super) fn resolve_nested_cipher_references<'a>(
 
 fn resolve_nested_key(
     provider: &dyn crate::provider::CryptoProvider,
-    key: &EncryptedKey,
+    source: KeySourceView<'_, '_>,
     output_len: usize,
     resolver: &dyn DecryptionKeyResolver,
     policy: &crate::policy::DecryptionPolicy,
     budget: &mut KeyCandidateBudget,
     depth: usize,
 ) -> Result<Vec<crate::provider::RecoveredContentKey>, XmlEncError> {
+    let key = source.key;
+    let mut document = source.document;
+    let target = ReferenceTarget::new(document, key.id.as_deref());
     policy.resources.validate_key_info_reference_depth(depth)?;
     validate_encrypted_key_policy(key, policy)?;
     let wrap = KeyWrapAlgorithm::from_uri(&key.encryption_method.algorithm)?;
@@ -2023,10 +2046,25 @@ fn resolve_nested_key(
         resolve_source(KeyEncryptionKeySource::Agreement(agreement))?;
     }
     for derived in &key.sources.derived_keys {
+        if !reference_list_applies_to_target(
+            derived.reference_list.as_ref(),
+            target,
+            ReferenceKind::Key,
+        ) {
+            continue;
+        }
         resolve_source(KeyEncryptionKeySource::Derived(derived))?;
     }
     for nested in &key.sources.encrypted_keys {
-        if !reference_list_applies_to_local_key(nested.reference_list.as_ref(), key.id.as_deref()) {
+        let source = KeySourceView {
+            key: nested,
+            document: take_key_document(&mut document, nested)?,
+        };
+        if !reference_list_applies_to_target(
+            nested.reference_list.as_ref(),
+            target,
+            ReferenceKind::Key,
+        ) {
             continue;
         }
         let resolved = if nested.sources.is_empty() {
@@ -2047,7 +2085,7 @@ fn resolve_nested_key(
         } else {
             resolve_nested_key(
                 provider,
-                nested,
+                source,
                 wrap.key_len(),
                 resolver,
                 policy,
@@ -2092,18 +2130,89 @@ fn resolve_nested_key(
     }
 }
 
-fn reference_list_applies_to_local_key(
-    references: Option<&super::ReferenceList>,
-    id: Option<&str>,
-) -> bool {
-    match references {
-        Some(list) if !list.key_references.is_empty() => id.is_some_and(|id| {
-            list.key_references
-                .iter()
-                .any(|uri| reference_targets_id(uri, id))
-        }),
-        _ => true,
+#[derive(Clone, Copy)]
+struct KeySourceDocument<'a, 'doc> {
+    references: &'a super::cipher_reference::BoundCipherReferenceContext<'doc, 'doc>,
+    target: crate::NodeId,
+    origins: &'a [Option<crate::NodeId>],
+}
+
+struct KeySourceView<'a, 'doc> {
+    key: &'a EncryptedKey,
+    document: Option<KeySourceDocument<'a, 'doc>>,
+}
+
+fn key_origin_count(key: &EncryptedKey) -> usize {
+    // Metadata validation has already bounded total candidates and recursion.
+    // Each identity is counted at most once per bounded key-indirection level.
+    1 + key
+        .sources
+        .encrypted_keys
+        .iter()
+        .map(key_origin_count)
+        .sum::<usize>()
+}
+
+fn take_key_document<'a, 'doc>(
+    document: &mut Option<KeySourceDocument<'a, 'doc>>,
+    key: &EncryptedKey,
+) -> Result<Option<KeySourceDocument<'a, 'doc>>, XmlEncError> {
+    let Some(parent) = document else {
+        return Ok(None);
+    };
+    let count = key_origin_count(key);
+    if count > parent.origins.len() {
+        return Err(XmlEncError::OperationPlan(
+            "missing key association origin".into(),
+        ));
     }
+    let (subtree, remaining) = parent.origins.split_at(count);
+    parent.origins = remaining;
+    Ok(subtree[0].map(|target| KeySourceDocument {
+        references: parent.references,
+        target,
+        origins: &subtree[1..],
+    }))
+}
+
+#[derive(Clone, Copy)]
+enum ReferenceTarget<'a, 'doc> {
+    Document {
+        references: &'a super::cipher_reference::BoundCipherReferenceContext<'doc, 'doc>,
+        node: crate::NodeId,
+    },
+    TypedId(Option<&'a str>),
+}
+
+impl<'a, 'doc> ReferenceTarget<'a, 'doc> {
+    fn new(document: Option<KeySourceDocument<'a, 'doc>>, id: Option<&'a str>) -> Self {
+        match document {
+            Some(source) => Self::Document {
+                references: source.references,
+                node: source.target,
+            },
+            None => Self::TypedId(id),
+        }
+    }
+
+    fn matches(self, uri: &str) -> bool {
+        // XMLEnc 1.1 §3.6 references objects through URIs, not specifically the
+        // lexical Id attribute. XML operations retain the original document's
+        // registered IDs, ambiguity checks and configured fragment grammar.
+        // Typed-only requests have no DOM and can use only their explicit Id.
+        // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-ReferenceList
+        match self {
+            Self::Document { references, node } => references
+                .resolver()
+                .same_document_reference_targets(uri, node),
+            Self::TypedId(id) => id.is_some_and(|id| reference_targets_id(uri, id)),
+        }
+    }
+}
+
+enum ReferenceKind {
+    Data,
+    Key,
 }
 
 fn record_candidate_source_error_or_fail_operation(
@@ -2143,13 +2252,15 @@ fn resolve_candidates_with_budget(
 fn encrypted_key_applies_to_data(
     encrypted_key: &EncryptedKey,
     encrypted_data: &EncryptedData,
+    target: ReferenceTarget<'_, '_>,
 ) -> bool {
     // XMLEnc association metadata is optional, but authoritative when present:
     // DataReference identifies encrypted objects and CarriedKeyName identifies
     // the transported key referenced by the enclosing ds:KeyName.
-    if !reference_list_applies_to_local_data(
+    if !reference_list_applies_to_target(
         encrypted_key.reference_list.as_ref(),
-        encrypted_data.id.as_deref(),
+        target,
+        ReferenceKind::Data,
     ) {
         return false;
     }
@@ -2163,21 +2274,23 @@ fn encrypted_key_applies_to_data(
     true
 }
 
-fn reference_list_applies_to_local_data(
+fn reference_list_applies_to_target(
     references: Option<&super::ReferenceList>,
-    id: Option<&str>,
+    target: ReferenceTarget<'_, '_>,
+    kind: ReferenceKind,
 ) -> bool {
     let Some(references) = references else {
         return true;
     };
-    if references.data_references.is_empty() {
+    let uris = match kind {
+        ReferenceKind::Data => &references.data_references,
+        ReferenceKind::Key => &references.key_references,
+    };
+    if uris.is_empty() {
         return true;
     }
-    let Some(id) = id else {
-        return false;
-    };
-    for uri in &references.data_references {
-        if reference_targets_id(uri, id) {
+    for uri in uris {
+        if target.matches(uri) {
             return true;
         }
     }

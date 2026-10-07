@@ -194,6 +194,395 @@ fn retrieval_method_resolves_derived_keys_and_checks_declared_type() {
 }
 
 #[test]
+fn derived_retrieval_accepts_both_specification_identifiers() {
+    // Sections 3.5.2 and 3.5.3 print different identifiers. Both must select
+    // DerivedKey, including after an external resource has been processed.
+    let derived = "<i:DerivedKey xmlns:i='http://www.w3.org/2009/xmlenc11#' Id='derived'><i:MasterKeyName>master</i:MasterKeyName></i:DerivedKey>";
+    for kind in [
+        "http://www.w3.org/2009/xmlenc11#DerivedKey",
+        "http://www.w3.org/2001/04/xmlenc#DerivedKey",
+    ] {
+        let wire = format!(
+            "<root xmlns:x='{X}' xmlns:d='{D}'>{}{derived}</root>",
+            data(&format!(
+                "<d:RetrievalMethod URI='#derived' Type='{kind}'/>"
+            ))
+        );
+        let document = xml_sec::XmlDomDocument::parse(&wire).unwrap();
+        let node = document
+            .descendants()
+            .find(|node| node.has_tag_name((X, "EncryptedData")))
+            .unwrap();
+        let parsed =
+            xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &Default::default())
+                .expect("specified DerivedKey identifier");
+        assert_eq!(parsed.derived_keys.len(), 1);
+        // Transformed/external retrieval must enforce the same type contract.
+        let method_xml = derivation_method_xml();
+        let method =
+            xml_sec::xmlenc::parse_key_derivation_method(&method_xml, &Default::default()).unwrap();
+        let secret = b"request secret";
+        let resolver = xml_sec::xmlenc::DerivedKeyDecryptor::content(
+            &method,
+            xml_sec::xmlenc::DerivedKeyInput::Secret(secret),
+            DataEncryptionAlgorithm::Aes128Gcm,
+        )
+        .master_key_name("master");
+        let content = RUST_CRYPTO_PROVIDER
+            .derive_key(&method.parameters(16).unwrap(), secret)
+            .unwrap();
+        let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .direct_key(content.to_vec())
+            .encrypt_binary(b"external derived")
+            .unwrap();
+        let ciphertext = parse_encrypted_data(&encrypted.encrypted_data_xml).unwrap();
+        let resources = std::collections::HashMap::from([(
+            "https://example.test/derived.b64".into(),
+            STANDARD.encode(derived).into_bytes(),
+        )]);
+        let mut policy = xml_sec::policy::DecryptionPolicy::default();
+        policy.uris.retrieval_methods = xml_sec::xmldsig::UriTypeSet::ALL;
+        let wire = data(&format!("<d:RetrievalMethod URI='https://example.test/derived.b64' Type='{kind}'><d:Transforms><d:Transform Algorithm='{D}base64'/></d:Transforms></d:RetrievalMethod>")).replace("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==", ciphertext.cipher_data.inline_value().unwrap());
+        assert_eq!(
+            DecryptContext::new(&resolver)
+                .policy(policy.clone())
+                .external_resources(&resources)
+                .decrypt(&wire)
+                .unwrap(),
+            DecryptedContent::Bytes(b"external derived".to_vec())
+        );
+        let wrong = wire.replace(kind, &format!("{X}EncryptedKey"));
+        assert!(matches!(
+            DecryptContext::new(&resolver)
+                .policy(policy)
+                .external_resources(&resources)
+                .decrypt(&wrong),
+            Err(XmlEncError::InvalidStructure(_))
+        ));
+    }
+}
+
+fn derivation_method_xml() -> String {
+    format!(
+        "<i:KeyDerivationMethod xmlns:i='http://www.w3.org/2009/xmlenc11#' Algorithm='http://www.w3.org/2009/xmlenc11#ConcatKDF'><i:ConcatKDFParams><d:DigestMethod xmlns:d='{D}' Algorithm='{X}sha256'/></i:ConcatKDFParams></i:KeyDerivationMethod>"
+    )
+}
+
+#[test]
+fn detached_derivation_executes_for_content_and_nested_wrapping() {
+    // Discovery must reach actual KDF/unwrap/decrypt work for both consumer
+    // classes; unrelated malformed descriptors cannot poison the chosen source.
+    let i = "http://www.w3.org/2009/xmlenc11#";
+    let method_xml = derivation_method_xml();
+    let method =
+        xml_sec::xmlenc::parse_key_derivation_method(&method_xml, &Default::default()).unwrap();
+    let secret = b"request secret";
+    let derived = RUST_CRYPTO_PROVIDER
+        .derive_key(&method.parameters(16).unwrap(), secret)
+        .unwrap();
+    for nested in [false, true] {
+        for named in [false, true] {
+            let content = if nested {
+                vec![3; 16]
+            } else {
+                derived.to_vec()
+            };
+            let generated = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .direct_key(content.clone())
+                .encrypt_xml("<secret>derived</secret>")
+                .unwrap();
+            let cipher = parse_encrypted_data(&generated.encrypted_data_xml).unwrap();
+            let reference_kind = if nested {
+                "KeyReference"
+            } else {
+                "DataReference"
+            };
+            let association = if named {
+                "<i:DerivedKeyName>content</i:DerivedKeyName>".to_owned()
+            } else {
+                format!("<x:ReferenceList><x:{reference_kind} URI='#payload'/></x:ReferenceList>")
+            };
+            let selected = if named {
+                "<d:KeyName>content</d:KeyName>"
+            } else {
+                ""
+            };
+            let keys = if nested {
+                let wrapped = RUST_CRYPTO_PROVIDER
+                    .wrap_key(KeyWrapAlgorithm::AesKw128, &derived, &content)
+                    .unwrap();
+                key(&format!("<d:KeyInfo>{selected}</d:KeyInfo>"))
+                    .replace("<x:EncryptedKey>", "<x:EncryptedKey ID='payload'>")
+                    .replace(
+                        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                        &STANDARD.encode(wrapped),
+                    )
+            } else {
+                selected.to_owned()
+            };
+            let payload = data(&keys)
+                .replace(
+                    "<x:EncryptedData ",
+                    &format!(
+                        "<x:EncryptedData Type='{X}Element' {}",
+                        if nested { "" } else { "ID='payload' " }
+                    ),
+                )
+                .replace(
+                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+                    cipher.cipher_data.inline_value().unwrap(),
+                );
+            let descriptor = format!(
+                "<i:DerivedKey>{method_xml}{association}<i:MasterKeyName>master</i:MasterKeyName></i:DerivedKey>"
+            );
+            let wire = format!(
+                "<root xmlns:x='{X}' xmlns:d='{D}' xmlns:i='{i}'>{payload}<i:DerivedKey><i:Unknown/></i:DerivedKey>{descriptor}</root>"
+            );
+            let registrations = [xml_sec::IdAttributeRegistration::global("ID")];
+            let resolver = if nested {
+                xml_sec::xmlenc::DerivedKeyDecryptor::wrapping(
+                    &method,
+                    xml_sec::xmlenc::DerivedKeyInput::Secret(secret),
+                    KeyWrapAlgorithm::AesKw128,
+                )
+            } else {
+                xml_sec::xmlenc::DerivedKeyDecryptor::content(
+                    &method,
+                    xml_sec::xmlenc::DerivedKeyInput::Secret(secret),
+                    DataEncryptionAlgorithm::Aes128Gcm,
+                )
+            }
+            .master_key_name("master");
+            let result = DecryptContext::new(&resolver)
+                .id_attributes(&registrations)
+                .decrypt_document(&wire, None)
+                .expect("detached derivation execution");
+            assert!(result.contains("<secret>derived</secret>"));
+            let wrong = wire.replace(
+                &association,
+                &association
+                    .replace("content", "other")
+                    .replace("#payload", "#absent"),
+            );
+            // XMLEnc §3.5 also permits application-context keys. Test discovery
+            // separately so this negative case does not forbid that valid path.
+            let wrong = wrong.replace("ID='payload'", "Id='payload'");
+            let document = xml_sec::XmlDomDocument::parse(&wrong).unwrap();
+            let node = document
+                .descendants()
+                .find(|node| node.has_tag_name((X, "EncryptedData")))
+                .unwrap();
+            let parsed =
+                xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &Default::default())
+                    .unwrap();
+            let sources = if nested {
+                &parsed.encrypted_keys[0].sources.derived_keys
+            } else {
+                &parsed.derived_keys
+            };
+            assert!(sources.is_empty(), "{nested}/{named}");
+            let malformed = wire.replace(
+                "</i:DerivedKey></root>",
+                "<i:Unknown/></i:DerivedKey></root>",
+            );
+            assert!(matches!(
+                DecryptContext::new(&resolver)
+                    .id_attributes(&registrations)
+                    .decrypt_document(&malformed, None),
+                Err(XmlEncError::InvalidStructure(_))
+            ));
+            let mut policy = xml_sec::policy::DecryptionPolicy::default();
+            policy.resources.max_key_candidates = 1;
+            if nested {
+                assert!(matches!(
+                    DecryptContext::new(&resolver)
+                        .policy(policy)
+                        .id_attributes(&registrations)
+                        .decrypt_document(&wire, None),
+                    Err(XmlEncError::Policy(_))
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn detached_derived_keys_are_discovered_by_name_and_reference() {
+    // A standalone descriptor has the same association mechanisms as an
+    // embedded derivation, and retrieving it explicitly must not duplicate it.
+    let i = "http://www.w3.org/2009/xmlenc11#";
+    for (selector, association) in [
+        (
+            "<d:KeyName>content</d:KeyName>",
+            "<i:DerivedKeyName>content</i:DerivedKeyName>",
+        ),
+        (
+            "",
+            "<x:ReferenceList><x:DataReference URI='#payload'/></x:ReferenceList>",
+        ),
+        (
+            "<d:RetrievalMethod URI='#derived'/>",
+            "<x:ReferenceList><x:DataReference URI='#payload'/></x:ReferenceList>",
+        ),
+    ] {
+        let payload = data(selector).replace("<x:EncryptedData ", "<x:EncryptedData Id='payload' ");
+        let wire = format!(
+            "<root xmlns:x='{X}' xmlns:d='{D}' xmlns:i='{i}'>{payload}<i:DerivedKey Id='derived'>{association}<i:MasterKeyName>master</i:MasterKeyName></i:DerivedKey></root>"
+        );
+        let document = xml_sec::XmlDomDocument::parse(&wire).unwrap();
+        let node = document
+            .descendants()
+            .find(|node| node.has_tag_name((X, "EncryptedData")))
+            .unwrap();
+        let parsed =
+            xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &Default::default())
+                .unwrap();
+        assert_eq!(parsed.derived_keys.len(), 1, "{selector}");
+    }
+}
+
+#[test]
+fn detached_derived_inventory_limits_only_associated_candidates() {
+    // Inventory includes unrelated derivations, but candidate execution does
+    // not. Selected descriptors still consume the shared cap and parse strictly.
+    let i = "http://www.w3.org/2009/xmlenc11#";
+    let selected = "<i:DerivedKey><i:DerivedKeyName>content</i:DerivedKeyName><i:MasterKeyName>master</i:MasterKeyName></i:DerivedKey>";
+    let unrelated = "<i:DerivedKey><i:Unknown/></i:DerivedKey>".repeat(65);
+    let mut policy = xml_sec::policy::DecryptionPolicy::default();
+    policy.resources.max_key_candidates = 1;
+    for (copies, malformed) in [(1, false), (2, false), (1, true)] {
+        let chosen = if malformed {
+            selected.replace("</i:DerivedKey>", "<i:Unknown/></i:DerivedKey>")
+        } else {
+            selected.repeat(copies)
+        };
+        let wire = format!(
+            "<root xmlns:x='{X}' xmlns:d='{D}' xmlns:i='{i}'>{}{unrelated}{chosen}</root>",
+            data("<d:KeyName>content</d:KeyName>")
+        );
+        let document = xml_sec::XmlDomDocument::parse(&wire).unwrap();
+        let node = document
+            .descendants()
+            .find(|node| node.has_tag_name((X, "EncryptedData")))
+            .unwrap();
+        let parsed = xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &policy);
+        match (copies, malformed) {
+            (1, false) => assert_eq!(parsed.unwrap().derived_keys.len(), 1),
+            (_, true) => assert!(matches!(parsed, Err(XmlEncError::InvalidStructure(_)))),
+            _ => assert!(matches!(
+                parsed,
+                Err(XmlEncError::Policy(
+                    xml_sec::policy::PolicyViolation::ResourceLimit {
+                        resource: "key candidates",
+                        maximum: 1,
+                        actual: 2
+                    }
+                ))
+            )),
+        }
+    }
+}
+
+#[test]
+fn detached_key_association_preserves_registered_ids() {
+    // Association is to the resolved node, not only its unqualified Id. Two
+    // registered IDs on the same node must work without rewriting public Id.
+    let kek = [9; 16];
+    let content = [3; 16];
+    let wrapped = RUST_CRYPTO_PROVIDER
+        .wrap_key(KeyWrapAlgorithm::AesKw128, &kek, &content)
+        .unwrap();
+    let generated = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .direct_key(content)
+        .encrypt_xml("<secret>registered</secret>")
+        .unwrap();
+    let parsed = parse_encrypted_data(&generated.encrypted_data_xml).unwrap();
+    let registrations = [
+        xml_sec::IdAttributeRegistration::global("ID"),
+        xml_sec::IdAttributeRegistration::global("ExternalId"),
+        xml_sec::IdAttributeRegistration::global("Id"),
+    ];
+    for (attributes, target) in [
+        ("ID='payload' ExternalId='alternate'", "payload"),
+        ("ID='payload' ExternalId='alternate'", "alternate"),
+        ("xmlns:wsu='urn:security' wsu:Id='payload'", "payload"),
+    ] {
+        let payload = data("")
+            .replace(
+                "<x:EncryptedData ",
+                &format!("<x:EncryptedData {attributes} Type='{X}Element' "),
+            )
+            .replace(
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+                parsed.cipher_data.inline_value().unwrap(),
+            );
+        let detached = key("").replace("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", &STANDARD.encode(&wrapped)).replace("</x:EncryptedKey>", &format!("<x:ReferenceList><x:DataReference URI='#{target}'/></x:ReferenceList></x:EncryptedKey>"));
+        let wire = format!("<root xmlns:x='{X}' xmlns:d='{D}'>{payload}{detached}</root>");
+        let resolver = KekDecryptor::new(kek);
+        let result = DecryptContext::new(&resolver)
+            .id_attributes(&registrations)
+            .decrypt_document(&wire, None)
+            .expect("registered node association");
+        assert!(result.contains("<secret>registered</secret>"));
+        // Duplicate registered values must never become an ID-string match
+        // after the source document's resolver refused the ambiguous identity.
+        let ambiguous = wire.replace("</root>", &format!("<other ID='{target}'/></root>"));
+        assert!(matches!(
+            DecryptContext::new(&resolver)
+                .id_attributes(&registrations)
+                .decrypt_document(&ambiguous, None),
+            Err(XmlEncError::KeyNotFound)
+        ));
+    }
+}
+
+#[test]
+fn detached_nested_key_association_keeps_registered_consumer_identity() {
+    // KeyReference selects the outer transport's registered ID. A skipped
+    // earlier subtree must not shift the preorder origin cursor for that key.
+    let root = [9; 16];
+    let middle = [7; 16];
+    let content = [3; 16];
+    let inner_bytes = RUST_CRYPTO_PROVIDER
+        .wrap_key(KeyWrapAlgorithm::AesKw128, &root, &middle)
+        .unwrap();
+    let outer_bytes = RUST_CRYPTO_PROVIDER
+        .wrap_key(KeyWrapAlgorithm::AesKw128, &middle, &content)
+        .unwrap();
+    let outer = key("")
+        .replace("<x:EncryptedKey>", "<x:EncryptedKey ID='transport'>")
+        .replace(
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            &STANDARD.encode(outer_bytes),
+        );
+    let inner = key("").replace("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", &STANDARD.encode(inner_bytes)).replace("</x:EncryptedKey>", "<x:ReferenceList><x:KeyReference URI='#transport'/></x:ReferenceList></x:EncryptedKey>");
+    let skipped = key(&format!("<d:KeyInfo>{}</d:KeyInfo>", key(""))).replace("</x:CipherData></x:EncryptedKey>", "</x:CipherData><x:ReferenceList><x:DataReference URI='#other'/></x:ReferenceList></x:EncryptedKey>");
+    let generated = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .direct_key(content)
+        .encrypt_xml("<secret>registered nested</secret>")
+        .unwrap();
+    let parsed = parse_encrypted_data(&generated.encrypted_data_xml).unwrap();
+    let payload = data(&format!("{skipped}{outer}"))
+        .replace(
+            "<x:EncryptedData ",
+            &format!("<x:EncryptedData Type='{X}Element' "),
+        )
+        .replace(
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+            parsed.cipher_data.inline_value().unwrap(),
+        );
+    let wire =
+        format!("<root xmlns:x='{X}' xmlns:d='{D}'>{payload}<other Id='other'/>{inner}</root>");
+    let registrations = [xml_sec::IdAttributeRegistration::global("ID")];
+    let resolver = KekDecryptor::new(root);
+    let result = DecryptContext::new(&resolver)
+        .id_attributes(&registrations)
+        .decrypt_document(&wire, None)
+        .expect("registered nested-key association");
+    assert!(result.contains("<secret>registered nested</secret>"));
+}
+
+#[test]
 fn retrieval_uses_the_operation_same_document_id_semantics() {
     // Compatibility grammar is an explicit operation policy, not an implicit
     // default in the indirect-key parser. Specification mode stays strict.

@@ -159,9 +159,18 @@ each selected resource joins the same execution graph before processing.
 Containing syntax, identifiers and content-algorithm policy are checked before
 key retrieval. Repeated key references charge each retained CipherValue copy
 against the operation's aggregate allowance, before allocation.
-Detached keys can also be associated through `CarriedKeyName` or
-`ReferenceList/DataReference`; detached intermediate KEKs use
+Detached encrypted keys can also be associated through `CarriedKeyName` or
+`ReferenceList/DataReference`; detached derived-key descriptors use
+`DerivedKeyName` or the same references. Detached intermediate KEKs use
 `ReferenceList/KeyReference`. Key names retain significant whitespace.
+XML operations resolve these associations against the original document's ID
+index, including caller-registered attributes and ambiguity checks, rather than
+comparing only the unqualified `Id` field. Typed-only `decrypt_data` requests
+have no source DOM and can compare references only with their explicit `Id`.
+Derived-key retrieval accepts the canonical `http://www.w3.org/2009/xmlenc11#DerivedKey`
+identifier from XMLEnc 1.1 §3.5.2 and the `http://www.w3.org/2001/04/xmlenc#DerivedKey`
+spelling printed in §3.5.3 as an interoperability alias. Both require an
+`xenc11:DerivedKey` target, also after retrieval transforms.
 Agreement roles support DH public values with optional complete domain parameters;
 the application still supplies trusted private keys. Role metadata and embedded
 public keys share the operation's metadata and candidate limits, and role parsing
