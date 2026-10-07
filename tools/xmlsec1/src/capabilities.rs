@@ -37,6 +37,7 @@ pub const TRANSFORMS: &[&str] = &[
     "exc-c14n-with-comments",
     "xpath",
     "xpath2",
+    "relationship",
     "dsa-sha1",
     "ecdsa-sha256",
     "ecdsa-sha384",

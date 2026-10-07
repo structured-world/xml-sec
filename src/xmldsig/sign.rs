@@ -2002,7 +2002,8 @@ impl<'a> SignContext<'a> {
         })?;
         let transform_options = TransformOptions::default()
             .allow_internal_dtd(self.policy.xml.allow_internal_dtd)
-            .xpath_here_semantics(self.policy.transforms.xpath_here_semantics);
+            .xpath_here_semantics(self.policy.transforms.xpath_here_semantics)
+            .opc_relationship_edition(self.policy.transforms.opc_relationship_edition);
         let external_resources = ExternalResourceContext::new(
             self.external_resources,
             self.policy.resources.max_external_resource_bytes,
@@ -3082,6 +3083,12 @@ fn validate_signing_references(
         .into());
     }
     for reference in references {
+        super::transforms::validate_relationship_chain(
+            &reference.transforms,
+            policy.map_or(crate::policy::OpcRelationshipEdition::default(), |policy| {
+                policy.transforms.opc_relationship_edition
+            }),
+        )?;
         if let Some(policy) = policy {
             validate_signing_reference_uri(&reference.uri, policy)?;
             validate_signing_reference_request(&reference.uri, has_external_resources)?;
@@ -3563,6 +3570,7 @@ fn generation_transform_uris<'a>(
             && algorithm != BASE64_TRANSFORM_URI
             && algorithm != XPATH_TRANSFORM_URI
             && algorithm != XPATH_FILTER2_TRANSFORM_URI
+            && algorithm != super::RELATIONSHIP_TRANSFORM_URI
             && crate::c14n::C14nAlgorithm::from_uri(algorithm).is_none()
         {
             return Err(TransformError::UnsupportedTransform(algorithm.to_owned()).into());

@@ -22,6 +22,10 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
 
+mod relationship;
+pub(crate) use relationship::validate_edition as validate_relationship_chain;
+pub use relationship::{RELATIONSHIP_TRANSFORM_URI, RelationshipSelector};
+
 use crate::xml::dom::{Document, Node, NodeId, NodeType};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use sha2::{Digest as _, Sha256};
@@ -107,6 +111,7 @@ pub enum XPathHereSemantics {
 pub(crate) struct TransformOptions {
     xpath_here_semantics: XPathHereSemantics,
     allow_internal_dtd: bool,
+    opc_relationship_edition: crate::policy::OpcRelationshipEdition,
 }
 
 pub(crate) struct TransformExecutionBudget {
@@ -119,6 +124,7 @@ pub(crate) struct TransformExecutionBudget {
     xml_parse_work: XmlParseWorkBudget,
     xml_parse_settings: DocumentParseSettings,
     state: TransformChainState,
+    opc_workspace: relationship::WorkspaceBudget,
 }
 
 impl Default for TransformExecutionBudget {
@@ -321,6 +327,7 @@ impl TransformExecutionBudget {
             ),
             xml_parse_settings: DocumentParseSettings::default(),
             state: TransformChainState::default(),
+            opc_workspace: relationship::WorkspaceBudget::default(),
         }
     }
 
@@ -340,6 +347,7 @@ impl TransformExecutionBudget {
             ),
             xml_parse_settings: DocumentParseSettings::default(),
             state: TransformChainState::default(),
+            opc_workspace: relationship::WorkspaceBudget::default(),
         }
     }
 
@@ -350,6 +358,7 @@ impl TransformExecutionBudget {
             c14n: C14nOutputBudget::default(),
             node_filter: NodeFilterWorkBudget::default(),
             node_set_materialization: NodeSetMaterializationBudget::with_limit(limit),
+            opc_workspace: relationship::WorkspaceBudget::default(),
             xml_base_resolution: XmlBaseResolutionBudget::default(),
             xml_parse_work: XmlParseWorkBudget::from_resources(
                 &crate::policy::ResourcePolicy::default(),
@@ -394,6 +403,7 @@ impl TransformExecutionBudget {
             xml_parse_work: XmlParseWorkBudget::from_resources(resources),
             xml_parse_settings: DocumentParseSettings::for_transform_output(resources),
             state: TransformChainState::default(),
+            opc_workspace: relationship::WorkspaceBudget::new(resources.max_opc_workspace_bytes),
         }
     }
 
@@ -450,6 +460,13 @@ impl TransformExecutionBudget {
 }
 
 impl TransformOptions {
+    pub(crate) fn opc_relationship_edition(
+        mut self,
+        edition: crate::policy::OpcRelationshipEdition,
+    ) -> Self {
+        self.opc_relationship_edition = edition;
+        self
+    }
     /// Select the node returned by the XPath `here()` extension function.
     #[must_use]
     pub(crate) fn xpath_here_semantics(mut self, semantics: XPathHereSemantics) -> Self {
@@ -670,6 +687,11 @@ pub enum Transform {
     ///
     /// Input: `NodeSet` or `Binary` → Output: `Binary`
     Base64Decode,
+
+    /// Normalize an OPC Relationships part before explicit canonicalization.
+    /// The 2021 edition requires C14N 1.0; 2012 permits other supported methods.
+    /// Selection semantics come from the operation's typed `TransformPolicy`.
+    Relationship(Vec<RelationshipSelector>),
 }
 
 impl Transform {
@@ -680,6 +702,7 @@ impl Transform {
             Self::XPathFilter2(_) => XPATH_FILTER2_TRANSFORM_URI,
             Self::C14n(algorithm) => algorithm.uri(),
             Self::Base64Decode => BASE64_TRANSFORM_URI,
+            Self::Relationship(_) => RELATIONSHIP_TRANSFORM_URI,
         }
     }
 }
@@ -706,6 +729,7 @@ pub(crate) fn apply_transform<'a>(
         TransformOptions::default(),
         &budget,
         &state,
+        &budget.xml_parse_work,
     )
 }
 
@@ -725,6 +749,7 @@ pub(super) fn apply_transform_with_options<'s, 'd>(
         options,
         budget,
         &state,
+        &budget.xml_parse_work,
     )
 }
 
@@ -735,8 +760,30 @@ fn apply_transform_with_options_and_state<'s, 'd>(
     options: TransformOptions,
     budget: &TransformExecutionBudget,
     state: &TransformChainState,
+    xml_parse: &XmlParseWorkBudget,
 ) -> Result<TransformData<'d>, TransformError> {
     match transform {
+        Transform::Relationship(selectors) => {
+            let bytes = finalize_transform_data(input, budget)?;
+            xml_parse.charge_policy(bytes.len())?;
+            let xml =
+                crate::encoding::decode_xml_octets(&bytes, budget.xml_parse_settings.max_bytes)
+                    .map_err(map_transform_xml_decode_error)?;
+            let settings = DocumentParseSettings {
+                allow_dtd: options.internal_dtd_allowed(),
+                ..budget.xml_parse_settings
+            };
+            let document = parse_borrowed_with_settings_and_budget(&xml, settings, Some(xml_parse))
+                .map_err(|error| map_transform_xml_parse_error(error, settings))?;
+            state.document_reparsed();
+            relationship::normalize(
+                &document,
+                selectors,
+                options.opc_relationship_edition,
+                budget,
+            )
+            .map(TransformData::Binary)
+        }
         Transform::Enveloped => {
             let mut nodes = input.into_node_set()?;
             // Exclude the Signature element and all its descendants from
@@ -1004,6 +1051,7 @@ pub(crate) fn execute_reference_transforms_with_budget<'a>(
     xml_parse: &XmlParseWorkBudget,
 ) -> Result<Vec<u8>, TransformError> {
     ensure_transform_count(transforms.len())?;
+    relationship::validate_edition(transforms, options.opc_relationship_edition)?;
     budget.state.begin_chain();
     let context = TransformExecutionContext {
         options,
@@ -1074,6 +1122,7 @@ pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
     tracked_nodes: Vec<(usize, NodeId)>,
 ) -> Result<TransformDependencyOutput, TransformError> {
     ensure_transform_count(transforms.len())?;
+    relationship::validate_edition(transforms, options.opc_relationship_edition)?;
     budget.state.begin_chain();
     let mut active_nodes = Vec::with_capacity(tracked_nodes.len());
     let mut opaque_dependencies = HashSet::new();
@@ -1353,6 +1402,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
             context.options,
             context.budget,
             context.state,
+            context.xml_parse,
         )?;
         return execute_transform_chain(
             source_signature,
@@ -1372,6 +1422,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
         context.options,
         context.budget,
         context.state,
+        context.xml_parse,
     )?;
     if let Some(tracking) = &mut dependency_tracking {
         match &data {
@@ -1467,7 +1518,10 @@ fn dependency_indexes(tracking: Option<DependencyTracking>) -> HashSet<usize> {
 }
 
 fn transform_requires_node_set(transform: &Transform) -> bool {
-    !matches!(transform, Transform::Base64Decode)
+    !matches!(
+        transform,
+        Transform::Base64Decode | Transform::Relationship(_)
+    )
 }
 
 fn finalize_transform_data(
@@ -1521,7 +1575,10 @@ pub(crate) fn transform_chain_produces_binary(
     transforms: &[Transform],
 ) -> bool {
     transforms.last().map_or(initial_binary, |transform| {
-        matches!(transform, Transform::C14n(_) | Transform::Base64Decode)
+        matches!(
+            transform,
+            Transform::C14n(_) | Transform::Base64Decode | Transform::Relationship(_)
+        )
     })
 }
 
@@ -1670,6 +1727,11 @@ pub(crate) fn parse_reference_transforms_with_budget(
             parse_xpath_transform_with_state(child, &mut xpath_state)?
         } else if uri == XPATH_FILTER2_TRANSFORM_URI {
             parse_xpath_filter2_transform(child, &mut xpath_state)?
+        } else if uri == RELATIONSHIP_TRANSFORM_URI {
+            Transform::Relationship(relationship::parse_selectors(
+                child,
+                &xpath_state.signature_budget.opc_workspace,
+            )?)
         } else if let Some(mut algo) = C14nAlgorithm::from_uri(uri) {
             // For exclusive C14N, check for InclusiveNamespaces child
             if algo.mode() == c14n::C14nMode::Exclusive1_0
@@ -1684,6 +1746,7 @@ pub(crate) fn parse_reference_transforms_with_budget(
         chain.push(transform);
     }
 
+    relationship::validate_chain(&chain)?;
     Ok(chain)
 }
 
@@ -1923,6 +1986,7 @@ impl<'a> XPathParseState<'a> {
 /// Parse/compile work shared by every Reference in one Signature, including
 /// repeated Manifest parses required by dependency-ordered signing.
 pub(crate) struct XPathSignatureParseBudget {
+    opc_workspace: relationship::WorkspaceBudget,
     expressions: usize,
     max_expressions: usize,
     max_expression_bytes: usize,
@@ -1935,6 +1999,9 @@ pub(crate) struct XPathSignatureParseBudget {
 impl Default for XPathSignatureParseBudget {
     fn default() -> Self {
         Self {
+            opc_workspace: relationship::WorkspaceBudget::parameters(
+                crate::hard_limits::OPC_PARAMETER_BYTE_CEILING,
+            ),
             expressions: 0,
             max_expressions: MAX_XPATH_EXPRESSIONS_PER_SIGNATURE,
             max_expression_bytes: MAX_XPATH_EXPRESSION_BYTES,
@@ -1947,8 +2014,18 @@ impl Default for XPathSignatureParseBudget {
 }
 
 impl XPathSignatureParseBudget {
+    pub(crate) fn validate_relationship_selectors(
+        &self,
+        selectors: &[RelationshipSelector],
+    ) -> Result<(), TransformError> {
+        relationship::validate_owned_selectors(selectors, &self.opc_workspace)
+    }
+
     pub(crate) fn from_resources(resources: &crate::policy::ResourcePolicy) -> Self {
         Self {
+            opc_workspace: relationship::WorkspaceBudget::parameters(
+                resources.max_opc_parameter_bytes,
+            ),
             expressions: 0,
             max_expressions: resources.max_xpath_expressions,
             max_expression_bytes: resources.max_xpath_expression_bytes,

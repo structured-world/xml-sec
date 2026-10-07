@@ -60,6 +60,10 @@ pub enum SignatureBuilderError {
     /// An XPath parameter cannot be parsed or exceeds its resource bounds.
     #[error("invalid XPath expression: {0}")]
     InvalidXPath(String),
+
+    /// A generated transform chain or its parameters violates its contract.
+    #[error("invalid transform: {0}")]
+    InvalidTransform(String),
     /// The selected algorithm is disabled by the immutable signing policy.
     #[error("algorithm is not allowed for signing: {0}")]
     SigningAlgorithmDisabled(&'static str),
@@ -485,7 +489,26 @@ impl SignatureBuilder {
         }
         for reference in &self.references {
             validate_signing_reference_uri(&reference.uri, policy)?;
+            // Bound newly introduced owned parameters before cloning the chain
+            // or serializing a generated template.
+            for transform in &reference.transforms {
+                if let Transform::Relationship(selectors) = transform {
+                    xpath_signature_budget
+                        .validate_relationship_selectors(selectors)
+                        .map_err(|error| match error {
+                            super::TransformError::Policy(violation) => {
+                                SignatureBuilderError::Policy(violation)
+                            }
+                            other => SignatureBuilderError::InvalidTransform(other.to_string()),
+                        })?;
+                }
+            }
             let generated_transforms = reference_transforms_for_generation(reference);
+            super::transforms::validate_relationship_chain(
+                &generated_transforms,
+                policy.transforms.opc_relationship_edition,
+            )
+            .map_err(|error| SignatureBuilderError::InvalidTransform(error.to_string()))?;
             if generated_transforms.len() > policy.resources.max_transforms_per_reference {
                 return Err(PolicyViolation::ResourceLimit {
                     resource: crate::policy::resource_name::REFERENCE_TRANSFORMS,
@@ -705,6 +728,24 @@ fn write_transform<W: Write>(
     transform: &Transform,
 ) -> Result<(), std::io::Error> {
     match transform {
+        Transform::Relationship(selectors) => {
+            let name = qualified_name(prefix, "Transform");
+            writer.start(&name, [("Algorithm", super::RELATIONSHIP_TRANSFORM_URI)])?;
+            for selector in selectors {
+                let (element, attribute, value) = selector.parameter();
+                writer.empty(
+                    element,
+                    [
+                        (
+                            "xmlns",
+                            "http://schemas.openxmlformats.org/package/2006/digital-signature",
+                        ),
+                        (attribute, value),
+                    ],
+                )?;
+            }
+            writer.end(&name)
+        }
         Transform::Enveloped => {
             write_algorithm(writer, prefix, "Transform", ENVELOPED_SIGNATURE_URI)
         }

@@ -557,6 +557,7 @@ impl<'a> VerifyContext<'a> {
         TransformOptions::default()
             .allow_internal_dtd(self.policy.xml.allow_internal_dtd)
             .xpath_here_semantics(self.policy.transforms.xpath_here_semantics)
+            .opc_relationship_edition(self.policy.transforms.opc_relationship_edition)
     }
 
     /// Verify one XMLDSig signature using this context.
@@ -2177,6 +2178,11 @@ fn verify_signature_node<'a>(
     }
     for reference in &signed_info.references {
         ctx.policy.check_digest_algorithm(reference.digest_method)?;
+        super::transforms::validate_relationship_chain(
+            &reference.transforms,
+            ctx.policy.transforms.opc_relationship_edition,
+        )
+        .map_err(ReferenceProcessingError::Transform)?;
     }
     enforce_reference_policies(
         &signed_info.references,
@@ -3518,6 +3524,11 @@ fn process_authenticated_manifest_references(
                             provider: ctx.provider,
                         };
                         let mut result = if execution.transform_budget.remaining_c14n_output() == 0
+                            || super::transforms::validate_relationship_chain(
+                                &reference.transforms,
+                                ctx.policy.transforms.opc_relationship_edition,
+                            )
+                            .is_err()
                             || reference.transforms.len()
                                 > ctx.policy.resources.max_transforms_per_reference
                             || ctx
@@ -3774,7 +3785,8 @@ fn transform_preserves_manifest_structure(transform: &Transform) -> bool {
         | Transform::XpathExcludeAllSignatures
         | Transform::XPath(_)
         | Transform::XPathFilter2(_)
-        | Transform::Base64Decode => false,
+        | Transform::Base64Decode
+        | Transform::Relationship(_) => false,
     }
 }
 

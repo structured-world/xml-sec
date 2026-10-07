@@ -934,6 +934,7 @@ fn xmlsec_compatibility_signing_policy(invocation: &Invocation) -> SigningPolicy
         },
         transforms: TransformPolicy {
             xpath_here_semantics: XMLSEC_COMPATIBILITY_HERE_SEMANTICS,
+            opc_relationship_edition: xml_sec::policy::OpcRelationshipEdition::Ecma2012,
             same_document_id_semantics: same_document_id_semantics(invocation),
             ..TransformPolicy::default()
         },
@@ -1417,6 +1418,7 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
         },
         transforms: TransformPolicy {
             xpath_here_semantics: XMLSEC_COMPATIBILITY_HERE_SEMANTICS,
+            opc_relationship_edition: xml_sec::policy::OpcRelationshipEdition::Ecma2012,
             same_document_id_semantics: same_document_id_semantics(invocation),
             ..TransformPolicy::default()
         },
@@ -5397,6 +5399,10 @@ mod tests {
         // Keep the CLI compatibility boundary complete when algorithms evolve.
         let policy = xmlsec_compatibility_signing_policy(&invocation(&["xmlsec1", "sign"]));
         assert_eq!(
+            policy.transforms.opc_relationship_edition,
+            xml_sec::policy::OpcRelationshipEdition::Ecma2012
+        );
+        assert_eq!(
             policy.parameterized_rsa_pss,
             xml_sec::policy::RsaPssPermission::AllSupported
         );
@@ -6353,6 +6359,10 @@ mod tests {
         assert_eq!(
             policy.transforms.xpath_here_semantics,
             xml_sec::xmldsig::XPathHereSemantics::XmlSecLegacy
+        );
+        assert_eq!(
+            policy.transforms.opc_relationship_edition,
+            xml_sec::policy::OpcRelationshipEdition::Ecma2012
         );
         assert_eq!(policy.key_trust.dsa_keys.minimum_modulus_bits, 1024);
         assert_eq!(policy.hmac.minimum_key_bits, 40);

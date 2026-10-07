@@ -63,7 +63,7 @@ xml-sec = { version = "0.1", default-features = false, features = ["xmldsig", "c
 | Area | Available today |
 |------|-----------------|
 | Canonicalization | Canonical XML 1.0/1.1, Exclusive C14N, comments, and document subsets |
-| XML signatures | XMLDSig signing and verification, RSA-PSS/PKCS#1, DSA/ECDSA/HMAC, XPath transforms, `Manifest`, `KeyInfo`, and caller-provided references |
+| XML signatures | XMLDSig signing and verification, RSA-PSS/PKCS#1, DSA/ECDSA/HMAC, XPath and [OPC Relationship transforms](docs/relationship-transforms.md), `Manifest`, `KeyInfo`, and caller-provided references |
 | XML encryption | AES-CBC/GCM, RSA-OAEP, AES Key Wrap, ECDH/X25519/DH, bounded KDFs, referenced ciphertext, nested recipients, and Element/Content replacement |
 | Optional compatibility algorithms | `legacy-algorithms`: MD5/RIPEMD-160 signatures and digests, AES-192, TripleDES-CBC/CMS wrap, and RSA-1.5 transport; library policy denies these by default |
 | X.509 | Certificate key extraction, chain validation, CRLs, required key authorization by default, and typed trust evidence |

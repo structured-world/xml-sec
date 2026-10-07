@@ -340,6 +340,10 @@ impl<'a> CipherReferenceContext<'a> {
         uri: &str,
         transforms: &[crate::xmldsig::transforms::Transform],
     ) -> Result<(), XmlEncError> {
+        crate::xmldsig::transforms::validate_relationship_chain(
+            transforms,
+            self.policy.transforms.opc_relationship_edition,
+        )?;
         if !self.policy.uris.references.allows(uri) {
             return Err(crate::policy::PolicyViolation::Algorithm {
                 operation: "cipher reference URI",
@@ -421,6 +425,7 @@ impl<'a> CipherReferenceContext<'a> {
                 transforms,
                 TransformOptions::default()
                     .xpath_here_semantics(self.policy.transforms.xpath_here_semantics)
+                    .opc_relationship_edition(self.policy.transforms.opc_relationship_edition)
                     .allow_internal_dtd(self.policy.xml.allow_internal_dtd),
                 &self.transforms,
                 xml_parse,

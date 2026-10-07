@@ -39,6 +39,56 @@ fn binary() -> &'static str {
 }
 
 #[test]
+fn opc_relationship_cli_uses_the_2012_contract() {
+    // The native sign/verify boundary must select case-sensitive 2012 semantics,
+    // not silently inherit the library's ASCII-insensitive 2021 default.
+    use sha2::{Digest as _, Sha256};
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = project_root();
+    let source = root.join("tools/xmlsec1/tests/fixtures/upstream/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256-relationship.tmpl");
+    let namespace = "http://schemas.openxmlformats.org/package/2006/relationships";
+    let template = fs::read_to_string(source)
+        .unwrap()
+        .replace("relationship/xml-base-input.xml", "")
+        .replace("SourceId=\"rId1\"", "SourceId=\"RID1\"")
+        .replace("<Transforms>", &format!("<Transforms><Transform Algorithm=\"http://www.w3.org/TR/1999/REC-xpath-19991116\"><XPath xmlns:r=\"{namespace}\">ancestor-or-self::r:Relationships</XPath></Transform>"))
+        .replace("</Signature>", &format!("<Object><Relationships xmlns=\"{namespace}\"><Relationship Id=\"rId1\" Type=\"urn:t\" Target=\"a\"/></Relationships></Object></Signature>"));
+    fs::write(temp.path().join("template.xml"), template).unwrap();
+    let signed = Command::new(binary())
+        .current_dir(temp.path())
+        .args(["sign", "--lax-key-search", "--privkey-pem"])
+        .arg(root.join("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+        .args(["--output", "signed.xml", "template.xml"])
+        .output()
+        .unwrap();
+    assert!(
+        signed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&signed.stderr)
+    );
+    let empty = format!("<Relationships xmlns=\"{namespace}\"></Relationships>");
+    let digest = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(empty.as_bytes()));
+    assert!(
+        fs::read_to_string(temp.path().join("signed.xml"))
+            .unwrap()
+            .contains(&format!("<DigestValue>{digest}</DigestValue>"))
+    );
+    let verified = Command::new(binary())
+        .current_dir(temp.path())
+        .args(["verify", "--pubkey-pem"])
+        .arg(root.join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"))
+        .arg("signed.xml")
+        .output()
+        .unwrap();
+    assert!(
+        verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+}
+
+#[test]
 fn decrypt_nested_wrapping_keys_through_the_cli() {
     // The native process must recover an intermediate KEK, not mistake it for
     // the content key; authentication failure must preserve existing output.
