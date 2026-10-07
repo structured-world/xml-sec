@@ -502,7 +502,7 @@ impl XPath {
     /// [`Context`]: context/struct.Context.html
     pub fn evaluate<'d, N>(
         &self,
-        context: &Context<'d>,
+        context: &context::ScopedContext<'_, 'd>,
         node: N,
     ) -> Result<Value<'d>, ExecutionError>
     where

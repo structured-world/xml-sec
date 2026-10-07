@@ -55,8 +55,56 @@ pub struct ResolvedResource {
     pub encoding: Option<String>,
 }
 
+/// Borrowed access checked independently of acquiring or caching resource bytes.
+#[derive(Debug, Clone, Copy)]
+pub enum ResourceAccess<'a> {
+    /// A URI request, including repeated uses satisfied by the operation cache.
+    Request(ResolveRequest<'a>),
+    /// Use the exact immutable resource obtained for a request, including a cache hit.
+    Retained {
+        request: ResolveRequest<'a>,
+        identity: &'a ResourceIdentity,
+    },
+    /// A retained stylesheet dependency admitted before each execution.
+    Dependency(&'a ResourceIdentity),
+}
+
+/// Caller-owned resource permission refusal, independent of transport failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AccessDenialReason {
+    NotGranted,
+    Revoked,
+    Expired,
+}
+
+impl ResourceAccess<'_> {
+    /// Construct a typed permission refusal without conflating it with transport failure.
+    #[must_use]
+    pub fn denied(self, reason: AccessDenialReason) -> crate::Error {
+        let resource = match self {
+            Self::Request(request) | Self::Retained { request, .. } => request.uri,
+            Self::Dependency(identity) => &identity.0,
+        };
+        crate::Error::ResourceAccessDenied {
+            resource: resource.into(),
+            reason,
+        }
+    }
+}
+
 /// Explicit resource boundary used by compilation and execution.
 pub trait Resolver: Send + Sync {
+    /// Authorize use under the caller's current grant, without acquiring resource bytes.
+    ///
+    /// Called before acquisition and on external document/module cache hits, and for every
+    /// compiled dependency before an execution starts. Check expiry, revocation and identity
+    /// here: the engine deliberately has no ambient clock or transport policy. Successful
+    /// authorization binds the immediately following use; callers must keep identities immutable
+    /// and make the acquisition enforce the same grant atomically where revocation can race.
+    /// In-memory resolvers with permanent grants may explicitly return `Ok(())`.
+    fn authorize(&self, access: ResourceAccess<'_>) -> Result<()>;
+
     /// Resolve one URI reference and return stable provenance with its bytes.
     ///
     /// Path-like fallback resolution preserves lexical `..` segments. A resolver
@@ -151,17 +199,64 @@ pub(crate) fn decode_resource(
 pub struct NoResolver;
 
 impl Resolver for NoResolver {
+    fn authorize(&self, access: ResourceAccess<'_>) -> Result<()> {
+        Err(access.denied(AccessDenialReason::NotGranted))
+    }
+
     fn resolve(&self, request: ResolveRequest<'_>) -> Result<ResolvedResource> {
-        Err(crate::Error::Resolver {
-            uri: request.uri.to_owned(),
-            message: "external resource access is not configured".into(),
-        })
+        Err(ResourceAccess::Request(request).denied(AccessDenialReason::NotGranted))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{decode_resource, resolve_uri_reference};
+
+    #[test]
+    fn default_denials_preserve_the_policy_error_category() {
+        // Missing capabilities are not missing resources: neither fallback nor transport retry
+        // may reinterpret the default denial, irrespective of request or retained provenance.
+        use super::{
+            AccessDenialReason, NoResolver, ResolvePurpose, ResolveRequest, Resolver,
+            ResourceAccess, ResourceIdentity,
+        };
+        let request = ResolveRequest::new("resource.xml", None, ResolvePurpose::Document);
+        let identity = ResourceIdentity("immutable-resource".into());
+        for access in [
+            ResourceAccess::Request(request),
+            ResourceAccess::Retained {
+                request,
+                identity: &identity,
+            },
+            ResourceAccess::Dependency(&identity),
+        ] {
+            let error = NoResolver
+                .authorize(access)
+                .expect_err("default resolver denies every capability");
+            assert_eq!(error.kind(), crate::ErrorKind::Policy);
+            assert!(matches!(
+                error,
+                crate::Error::ResourceAccessDenied {
+                    reason: AccessDenialReason::NotGranted,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                access.denied(AccessDenialReason::Expired),
+                crate::Error::ResourceAccessDenied {
+                    reason: AccessDenialReason::Expired,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(
+            NoResolver
+                .resolve(request)
+                .expect_err("direct acquisition is also denied")
+                .kind(),
+            crate::ErrorKind::Policy
+        );
+    }
 
     #[test]
     fn path_like_resolution_preserves_root_absolute_references() {

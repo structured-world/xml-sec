@@ -207,6 +207,8 @@ deterministic budgets, and XML/HTML/text serialization. Its `ExecutionEnvironmen
 access, XInclude processing, and operation time explicit. The default grants no XInclude or ambient
 clock access; callers may supply a fixed clock for reproducible EXSLT date functions or explicitly
 request host-clock compatibility.
+Resolver authorization also gates cached documents and retained stylesheet dependencies, with
+typed expiry/revocation failures that cannot be hidden by resource fallback.
 
 The engine currently remains an in-repository workspace crate rather than a separately published
 package; `xml-sec` is the only crate published to crates.io. The main crate continues to reject XMLDSig

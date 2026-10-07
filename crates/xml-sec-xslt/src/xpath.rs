@@ -7,7 +7,9 @@ use std::sync::{Arc, OnceLock};
 
 use sxd_document_no_unsafe::dom::{Document as SxdDocument, Element as SxdElement};
 use sxd_document_no_unsafe::{Package, QName, StorageRequirements};
-use sxd_xpath_no_unsafe::{Context, Factory, Value as SxdValue, XPath, function, nodeset};
+#[cfg(test)]
+use sxd_xpath_no_unsafe::Context;
+use sxd_xpath_no_unsafe::{Factory, Value as SxdValue, XPath, function, nodeset};
 
 use crate::budget::{
     Meter, ParseBudget, XINCLUDE_RECURSION_DEPTH_CEILING, reconcile_replacement_growth,
@@ -491,12 +493,17 @@ struct DocumentCacheIndexBytes {
     roots: usize,
 }
 
+struct CachedDocumentRoots {
+    paths: Vec<NodePath>,
+    identity: Option<Arc<ResourceIdentity>>,
+}
+
 fn seed_document_cache(
     request: DocumentRequest,
     root: NodeId,
     maps: &NodeMaps,
     documents: &mut HashMap<DocumentRequest, Vec<SourceNode>>,
-    document_roots: &mut HashMap<DocumentRequest, Vec<NodePath>>,
+    document_roots: &mut HashMap<DocumentRequest, CachedDocumentRoots>,
     index_bytes: &mut DocumentCacheIndexBytes,
     meter: &mut Meter,
 ) -> Result<()> {
@@ -518,7 +525,13 @@ fn seed_document_cache(
             .capacity()
             .saturating_mul(std::mem::size_of::<SourceNode>()),
     )?;
-    document_roots.insert(request.clone(), roots);
+    document_roots.insert(
+        request.clone(),
+        CachedDocumentRoots {
+            paths: roots,
+            identity: None,
+        },
+    );
     documents.insert(request, nodes);
     Ok(())
 }
@@ -767,13 +780,13 @@ pub(crate) struct Evaluator {
     resolver: Arc<dyn Resolver>,
     documents: HashMap<DocumentRequest, Vec<SourceNode>>,
     document_cache_index_bytes: DocumentCacheIndexBytes,
-    document_roots: Rc<RefCell<HashMap<DocumentRequest, Vec<NodePath>>>>,
+    document_roots: Rc<RefCell<HashMap<DocumentRequest, CachedDocumentRoots>>>,
     pending_document_requests: Rc<RefCell<PendingDocumentRequests>>,
     pending_dynamic_variables: HashSet<ExpandedName>,
     pending_dynamic_variable_index_bytes: usize,
     pending_dynamic_variable_payload_bytes: usize,
     resource_identities: HashMap<ResourceIdentity, ResolvedResource>,
-    resource_documents: HashMap<ResourceIdentity, SourceNode>,
+    resource_documents: HashMap<ResourceIdentity, (SourceNode, Arc<ResourceIdentity>)>,
     result_tree_fragments: HashMap<u64, (SourceNode, Arc<Document>)>,
     result_tree_fragment_index_bytes: usize,
     node_base_uri_index_bytes: usize,
@@ -1402,7 +1415,7 @@ impl Evaluator {
             source_base_uri(&self.source, &root),
             Some(EmptyDocumentId::Logical(logical_document)),
         );
-        self.cache_document(empty_uri, vec![root.clone()], meter)?;
+        self.cache_document(empty_uri, vec![root.clone()], None, meter)?;
         Ok(root)
     }
 
@@ -1410,6 +1423,7 @@ impl Evaluator {
         &mut self,
         request: DocumentRequest,
         nodes: Vec<SourceNode>,
+        identity: Option<&Arc<ResourceIdentity>>,
         meter: &mut Meter,
     ) -> Result<()> {
         if self.documents.contains_key(&request) {
@@ -1442,9 +1456,13 @@ impl Evaluator {
             meter.charge(BudgetKind::OwnedBytes, path.owned_bytes())?;
             roots.push(path.clone());
         }
-        self.document_roots
-            .borrow_mut()
-            .insert(request.clone(), roots);
+        self.document_roots.borrow_mut().insert(
+            request.clone(),
+            CachedDocumentRoots {
+                paths: roots,
+                identity: identity.map(Arc::clone),
+            },
+        );
         self.documents.insert(request, nodes);
         Ok(())
     }
@@ -2229,7 +2247,8 @@ impl Evaluator {
         // strings, and variable slots. Their complete representation bound is included in the
         // adapter preflight above, before any of these allocations can occur. Runtime QName
         // lookup is borrowed and allocation-free in the vendored XPath engine.
-        let mut context = Context::new();
+        let document_access_error = RefCell::new(None);
+        let mut context = sxd_xpath_no_unsafe::context::ScopedContext::new();
         // XPath 1.0 section 2.2 confines `following` and `preceding` to the same document as the
         // context node. Each projected logical document therefore supplies its wrapper as the
         // evaluator root instead of exposing sibling source/module projections.
@@ -2334,6 +2353,8 @@ impl Evaluator {
         context.set_function(
             "document",
             DocumentFunction {
+                resolver: self.resolver.as_ref(),
+                access_error: &document_access_error,
                 static_base_uri: expression.static_base_uri.clone(),
                 static_document: expression.stylesheet_document,
                 roots: Rc::clone(&self.document_roots),
@@ -2469,6 +2490,9 @@ impl Evaluator {
             BudgetKind::ExtensionOperations,
             context.extension_work_used(),
         )?;
+        if let Some(error) = document_access_error.borrow_mut().take() {
+            return Err(error);
+        }
         if let Some(attempted) = context.evaluation_work_exceeded() {
             return Err(Error::Budget {
                 kind: BudgetKind::XPathOperations,
@@ -2566,8 +2590,23 @@ impl Evaluator {
                     request.base_uri.clone(),
                     request.empty_document,
                 );
-                let root = if let Some(nodes) = self.documents.get(&resource_request) {
-                    nodes.first().cloned()
+                if !self.documents.contains_key(&resource_request) {
+                    // Even authorization is caller work: exhausted acquisition budgets must
+                    // stop before crossing that boundary, not merely before fetching bytes.
+                    meter.check_additional(BudgetKind::ExternalDocuments, 1)?;
+                }
+                let cached_identity = self
+                    .document_roots
+                    .borrow()
+                    .get(&resource_request)
+                    .and_then(|cached| cached.identity.as_ref().map(Arc::clone));
+                authorize_document_request(
+                    self.resolver.as_ref(),
+                    &request,
+                    cached_identity.as_deref(),
+                )?;
+                let (root, identity) = if let Some(nodes) = self.documents.get(&resource_request) {
+                    (nodes.first().cloned(), cached_identity)
                 } else {
                     meter.charge(BudgetKind::ExternalDocuments, 1)?;
                     let resource = match self.resolver.resolve(ResolveRequest::new(
@@ -2577,12 +2616,17 @@ impl Evaluator {
                     )) {
                         Ok(resource) => resource,
                         Err(Error::ResourceNotFound { .. }) => {
-                            self.cache_document(resource_request.clone(), Vec::new(), meter)?;
-                            self.cache_document(request, Vec::new(), meter)?;
+                            self.cache_document(resource_request.clone(), Vec::new(), None, meter)?;
+                            self.cache_document(request, Vec::new(), None, meter)?;
                             continue;
                         }
                         Err(error) => return Err(error),
                     };
+                    authorize_document_request(
+                        self.resolver.as_ref(),
+                        &request,
+                        Some(&resource.identity),
+                    )?;
                     let identity_is_new = match self.resource_identities.get(&resource.identity) {
                         Some(previous) if previous != &resource => {
                             return Err(Error::StaleResource {
@@ -2592,9 +2636,16 @@ impl Evaluator {
                         Some(_) => false,
                         None => true,
                     };
-                    if let Some(root) = self.resource_documents.get(&resource.identity).cloned() {
-                        self.cache_document(resource_request.clone(), vec![root.clone()], meter)?;
-                        Some(root)
+                    if let Some((root, identity)) =
+                        self.resource_documents.get(&resource.identity).cloned()
+                    {
+                        self.cache_document(
+                            resource_request.clone(),
+                            vec![root.clone()],
+                            Some(&identity),
+                            meter,
+                        )?;
+                        (Some(root), Some(identity))
                     } else {
                         let xml = decode_resource_for_xml_parse(&resource, meter)?;
                         let (document, parsed_reservation) = parse_external_document_metered(
@@ -2643,24 +2694,37 @@ impl Evaluator {
                             BudgetKind::OwnedBytes,
                             resource_document_cache_entry_owned_bytes(&resource_identity),
                         )?;
+                        meter.charge(
+                            BudgetKind::OwnedBytes,
+                            resource_identity.0.len().saturating_add(
+                                std::mem::size_of::<ResourceIdentity>()
+                                    + 2 * std::mem::size_of::<usize>(),
+                            ),
+                        )?;
+                        let identity = Arc::new(resource_identity.clone());
                         self.resource_documents
-                            .insert(resource_identity, root.clone());
-                        self.cache_document(resource_request.clone(), vec![root.clone()], meter)?;
-                        Some(root)
+                            .insert(resource_identity, (root.clone(), Arc::clone(&identity)));
+                        self.cache_document(
+                            resource_request.clone(),
+                            vec![root.clone()],
+                            Some(&identity),
+                            meter,
+                        )?;
+                        (Some(root), Some(identity))
                     }
                 };
                 let Some(root) = root else {
-                    self.cache_document(request, Vec::new(), meter)?;
+                    self.cache_document(request, Vec::new(), identity.as_ref(), meter)?;
                     continue;
                 };
                 if let Some(fragment_offset) = fragment_offset {
                     reserve_temporary_vec_slot(&mut fragments, meter, &mut fragments_owned_bytes)?;
-                    fragments.push((request, root, fragment_offset));
+                    fragments.push((request, root, fragment_offset, identity));
                 } else if request != resource_request {
-                    self.cache_document(request, vec![root], meter)?;
+                    self.cache_document(request, vec![root], identity.as_ref(), meter)?;
                 }
             }
-            for (request, root, fragment_offset) in fragments.drain(..) {
+            for (request, root, fragment_offset, identity) in fragments.drain(..) {
                 let raw_fragment = &request.href[fragment_offset..];
                 let (fragment, reserved_bytes) = decode_document_fragment(raw_fragment, meter)?;
                 let Some(expression) = fragment
@@ -2689,7 +2753,7 @@ impl Evaluator {
                         .into_iter()
                         .collect();
                     meter.release_owned_bytes(reserved_bytes);
-                    self.cache_document(request, selected, meter)?;
+                    self.cache_document(request, selected, identity.as_ref(), meter)?;
                     continue;
                 };
                 let selected = self.evaluate_core(
@@ -2708,7 +2772,7 @@ impl Evaluator {
                         "document fragment `{fragment}` did not select nodes"
                     )));
                 };
-                self.cache_document(request, nodes, meter)?;
+                self.cache_document(request, nodes, identity.as_ref(), meter)?;
             }
             Ok(())
         })();
@@ -5032,23 +5096,29 @@ fn resolve_xinclude(
     meter
         .charge(BudgetKind::ExternalDocuments, 1)
         .map_err(XIncludeFailure::Fatal)?;
-    let resource = resolver
-        .resolve(ResolveRequest {
-            uri: href,
-            base_uri: node.base_uri.as_deref(),
-            purpose: ResolvePurpose::XInclude,
-            // XInclude 1.0 section 3.1 defines these values as HTTP content-negotiation inputs.
-            // The engine preserves them without interpreting transport semantics.
-            // https://www.w3.org/TR/xinclude/#include_element
-            accept: attribute("accept"),
-            accept_language: attribute("accept-language"),
+    // XInclude 1.0 section 3.1 defines these values as HTTP content-negotiation inputs.
+    // Preserve them without interpreting transport semantics.
+    // https://www.w3.org/TR/2006/REC-xinclude-20061115/#include_element
+    let request = ResolveRequest {
+        uri: href,
+        base_uri: node.base_uri.as_deref(),
+        purpose: ResolvePurpose::XInclude,
+        accept: attribute("accept"),
+        accept_language: attribute("accept-language"),
+    };
+    resolver
+        .authorize(crate::ResourceAccess::Request(request))
+        .map_err(XIncludeFailure::Fatal)?;
+    let resource = resolver.resolve(request).map_err(|error| match error {
+        Error::ResourceNotFound { .. } | Error::Resolver { .. } => XIncludeFailure::Resource(error),
+        error => XIncludeFailure::Fatal(error),
+    })?;
+    resolver
+        .authorize(crate::ResourceAccess::Retained {
+            request,
+            identity: &resource.identity,
         })
-        .map_err(|error| match error {
-            Error::ResourceNotFound { .. } | Error::Resolver { .. } => {
-                XIncludeFailure::Resource(error)
-            }
-            error => XIncludeFailure::Fatal(error),
-        })?;
+        .map_err(XIncludeFailure::Fatal)?;
     let identity_is_new = match identities.get(&resource.identity) {
         Some(previous) if previous != &resource => {
             return Err(XIncludeFailure::Fatal(Error::StaleResource {
@@ -5554,7 +5624,8 @@ fn cache_new_resource_identity(
 }
 
 fn resource_document_cache_entry_owned_bytes(identity: &ResourceIdentity) -> usize {
-    hash_entry_storage::<ResourceIdentity, NodeReference>().saturating_add(identity.0.len())
+    hash_entry_storage::<ResourceIdentity, (SourceNode, Arc<ResourceIdentity>)>()
+        .saturating_add(identity.0.len())
 }
 
 fn decode_resource_metered(
@@ -7169,12 +7240,36 @@ impl function::Function for UnparsedEntityUriFunction {
     }
 }
 
-struct DocumentFunction {
-    roots: Rc<RefCell<HashMap<DocumentRequest, Vec<NodePath>>>>,
+struct DocumentFunction<'a, R: Resolver + ?Sized> {
+    resolver: &'a R,
+    access_error: &'a RefCell<Option<Error>>,
+    roots: Rc<RefCell<HashMap<DocumentRequest, CachedDocumentRoots>>>,
     pending: Rc<RefCell<PendingDocumentRequests>>,
     node_base_uris: Rc<RefCell<HashMap<Vec<usize>, Option<String>>>>,
     static_base_uri: Option<Arc<str>>,
     static_document: StylesheetDocumentId,
+}
+
+fn authorize_document_request<R: Resolver + ?Sized>(
+    resolver: &R,
+    request: &DocumentRequest,
+    identity: Option<&ResourceIdentity>,
+) -> Result<()> {
+    if request.empty_document.is_some() {
+        return Ok(());
+    }
+    // XSLT 1.0 section 12.1 preserves document identity on repeated access. Cache ownership is
+    // not permission: fail-closed lease checks are product policy rather than the specification's
+    // optional empty node-set recovery. https://www.w3.org/TR/1999/REC-xslt-19991116#document
+    let uri = request
+        .href
+        .split_once('#')
+        .map_or(request.href.as_str(), |(uri, _)| uri);
+    let request = ResolveRequest::new(uri, request.base_uri.as_deref(), ResolvePurpose::Document);
+    resolver.authorize(match identity {
+        Some(identity) => crate::ResourceAccess::Retained { request, identity },
+        None => crate::ResourceAccess::Request(request),
+    })
 }
 
 enum DocumentBaseSelection {
@@ -7193,7 +7288,10 @@ fn clone_metered_optional_string(
     Ok(value.map(str::to_owned))
 }
 
-fn register_exslt_functions(context: &mut Context<'_>, clock: Option<Arc<dyn Clock>>) {
+fn register_exslt_functions(
+    context: &mut sxd_xpath_no_unsafe::context::ScopedContext<'_, '_>,
+    clock: Option<Arc<dyn Clock>>,
+) {
     macro_rules! register {
         ($namespace:expr, $name:expr, $function:expr) => {{
             context.set_function(($namespace, $name), $function);
@@ -8084,7 +8182,7 @@ fn percent_decoded_uri_len(value: &str) -> std::result::Result<Option<usize>, fu
     Ok(Some(decoded_len))
 }
 
-impl function::Function for DocumentFunction {
+impl<R: Resolver + ?Sized> function::Function for DocumentFunction<'_, R> {
     fn evaluate<'c, 'd>(
         &self,
         context: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
@@ -8123,7 +8221,7 @@ impl function::Function for DocumentFunction {
         let mut result = nodeset::Nodeset::new();
         let roots = self.roots.borrow();
         let mut process = |request: DocumentRequest| -> std::result::Result<(), function::Error> {
-            let Some(paths) = roots.get(&request) else {
+            let Some(cached) = roots.get(&request) else {
                 let mut pending = self.pending.borrow_mut();
                 if !pending.items.contains(&request) {
                     let capacity = pending.items.capacity();
@@ -8146,7 +8244,17 @@ impl function::Function for DocumentFunction {
                 }
                 return Ok(());
             };
-            for path in paths {
+            if let Err(error) =
+                authorize_document_request(self.resolver, &request, cached.identity.as_deref())
+            {
+                // Preserve the typed refusal across the XPath callback's private error enum.
+                // No cached node is exposed after revocation, including negative cache hits.
+                *self.access_error.borrow_mut() = Some(error);
+                return Err(function::Error::Other {
+                    what: "document resource access denied".into(),
+                });
+            }
+            for path in &cached.paths {
                 let node =
                     resolve_node_path(context, path)?.ok_or_else(|| function::Error::Other {
                         what: format!("document resource `{}` is stale", request.href),
@@ -9847,6 +9955,8 @@ mod tests {
         context.set_string_allocation_limit(0);
         let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&context, root.into());
         let function = DocumentFunction {
+            resolver: &crate::NoResolver,
+            access_error: &RefCell::new(None),
             roots: Rc::new(RefCell::new(HashMap::new())),
             pending: Rc::new(RefCell::new(PendingDocumentRequests::default())),
             node_base_uris: Rc::new(RefCell::new(HashMap::new())),
@@ -10644,6 +10754,10 @@ mod tests {
     }
 
     impl Resolver for StaticResolver {
+        fn authorize(&self, _: crate::ResourceAccess<'_>) -> Result<()> {
+            // This test resolver owns a permanently authorized immutable byte buffer.
+            Ok(())
+        }
         fn resolve(&self, request: ResolveRequest<'_>) -> Result<ResolvedResource> {
             let uri = request.uri;
             Ok(ResolvedResource {
@@ -11372,6 +11486,8 @@ mod tests {
         ));
 
         let document_function = DocumentFunction {
+            resolver: &crate::NoResolver,
+            access_error: &RefCell::new(None),
             roots: Rc::new(RefCell::new(HashMap::new())),
             pending: Rc::new(RefCell::new(PendingDocumentRequests::default())),
             node_base_uris: Rc::new(RefCell::new(HashMap::new())),
@@ -11397,6 +11513,8 @@ mod tests {
         context.set_evaluation_work_limit(0);
         let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&context, logical.into());
         let document_function = DocumentFunction {
+            resolver: &crate::NoResolver,
+            access_error: &RefCell::new(None),
             roots: Rc::new(RefCell::new(HashMap::new())),
             pending: Rc::new(RefCell::new(PendingDocumentRequests::default())),
             node_base_uris: Rc::new(RefCell::new(HashMap::new())),
@@ -12120,6 +12238,8 @@ mod tests {
         let path = typed_path_to(&nodeset::Node::Element(base));
         let base_uri = "memory:base/".repeat(32);
         let function = DocumentFunction {
+            resolver: &crate::NoResolver,
+            access_error: &RefCell::new(None),
             roots: Rc::new(RefCell::new(HashMap::new())),
             pending: Rc::new(RefCell::new(PendingDocumentRequests::default())),
             node_base_uris: Rc::new(RefCell::new(HashMap::from([(

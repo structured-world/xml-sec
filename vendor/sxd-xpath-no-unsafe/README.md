@@ -12,6 +12,10 @@ including string-allocation accounting, tokenizer failure fusion, namespace-erro
 parser nesting limits, result-tree-fragment comparisons, and XPath 1.0 comma disambiguation.
 Keep these changes when refreshing the upstream source.
 
+`context::ScopedContext` registers borrowed function state independently of document lifetimes.
+The ordinary `Context` remains its owned-function specialization; both share evaluation and
+budget enforcement without an extra dispatch layer or ownership wrapper.
+
 The safe indexed DOM is selected by default. The legacy pointer backend requires
 `--no-default-features --features raw-pointer-backend` explicitly.
 
