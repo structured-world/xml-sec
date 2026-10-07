@@ -4,7 +4,8 @@
 //! test public key solely to demonstrate the API; applications must resolve
 //! recipient keys from authenticated configuration or certificate metadata.
 
-use rsa::{RsaPublicKey, pkcs8::DecodePublicKey};
+use rsa::RsaPublicKey;
+use xml_sec::rsa_encoding::RsaPublicKeyEncoding as _;
 use xml_sec::xmlenc::{DataEncryptionAlgorithm, EncryptedDataBuilder, EncryptionRecipient};
 
 const PUBLIC_KEY_PEM: &str = include_str!("../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");

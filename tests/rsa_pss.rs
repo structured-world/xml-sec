@@ -3,8 +3,9 @@
 //! RSA-PSS public pipeline, parameter grammar and independent primitive coverage.
 
 use rand_chacha::{ChaCha8Rng, rand_core::SeedableRng as _};
-use rsa::{pkcs8::DecodePrivateKey as _, traits::PublicKeyParts as _};
+use rsa::traits::PublicKeyParts as _;
 use sha2::Digest as _;
+use xml_sec::rsa_encoding::RsaPrivateKeyEncoding as _;
 use xml_sec::{
     XmlDomDocument,
     c14n::{C14nAlgorithm, C14nMode},
@@ -321,7 +322,7 @@ fn pss_rejects_malformed_encoded_messages_and_modulus_boundary() {
 fn pss_non_byte_aligned_modulus_preserves_representative_width() {
     // For modBits == 1 mod 8, emLen is one octet smaller than the signature:
     // RFC 8017 section 8.1.2 must reject a nonzero discarded leading octet.
-    use rsa::pkcs8::EncodePublicKey as _;
+    use xml_sec::rsa_encoding::RsaPublicKeyEncoding as _;
     let private = rsa::RsaPrivateKey::new(&mut ChaCha8Rng::seed_from_u64(2049), 2049).unwrap();
     let public = rsa::RsaPublicKey::from(&private);
     let method = SignatureAlgorithm::RsaPssSha256;

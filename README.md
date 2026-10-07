@@ -64,7 +64,7 @@ xml-sec = { version = "0.1", default-features = false, features = ["xmldsig", "c
 |------|-----------------|
 | Canonicalization | Canonical XML 1.0/1.1, Exclusive C14N, comments, and document subsets |
 | XML signatures | XMLDSig signing and verification, RSA-PSS/PKCS#1, DSA/ECDSA/HMAC, XPath transforms, `Manifest`, `KeyInfo`, and caller-provided references |
-| XML encryption | AES-CBC/GCM, RSA-OAEP, AES Key Wrap, multiple recipients, and Element/Content replacement |
+| XML encryption | AES-CBC/GCM, RSA-OAEP, AES Key Wrap, ECDH/X25519/DH, bounded KDFs, referenced ciphertext, nested recipients, and Element/Content replacement |
 | Optional compatibility algorithms | `legacy-algorithms`: MD5/RIPEMD-160 signatures and digests, AES-192, TripleDES-CBC/CMS wrap, and RSA-1.5 transport; library policy denies these by default |
 | X.509 | Certificate key extraction, chain validation, CRLs, required key authorization by default, and typed trust evidence |
 | Key management | Caller-owned named inventory, usage-restricted keys, xmlsec `keys.xml`, encrypted PKCS#8, and bounded RustCrypto-backed PKCS#12 import |
@@ -97,8 +97,8 @@ password handling, and CLI key-store behavior.
 
 ## XML Encryption
 
-`EncryptedDataBuilder` supports direct symmetric keys, RSA-OAEP recipients, AES Key Wrap
-recipients, and Element/Content document replacement:
+`EncryptedDataBuilder` supports direct symmetric keys, policy-bound key derivation and
+agreement, RSA-OAEP/AES Key Wrap recipients, and Element/Content document replacement:
 
 ```rust
 use xml_sec::xmlenc::{DataEncryptionAlgorithm, EncryptedDataBuilder};
@@ -118,8 +118,11 @@ fn example() -> Result<(), Box<dyn std::error::Error>> {
 RSA encryption and decryption default to a 2048-bit minimum. Applications accepting legacy
 keys must explicitly select a lower operation-policy minimum; importing a key does not bypass it.
 
-See [XML Encryption](docs/xmlenc.md) for reciprocal decryption, key transport, recipient selection,
-document replacement, and parser policy.
+Decryption supports caller-owned `CipherReference` resources, transformed key retrieval,
+nested/detached `EncryptedKey`, and trusted application bindings for ConcatKDF, HKDF,
+PBKDF2 and ECDH/X25519/DH. No document can trigger implicit filesystem or network access.
+See [XML Encryption](docs/xmlenc.md) and [crypto providers](docs/crypto-providers.md)
+for key establishment, cumulative budgets, interoperability and provider capabilities.
 
 ## XML Backends
 

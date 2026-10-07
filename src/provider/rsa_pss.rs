@@ -4,9 +4,9 @@
 //! RSA arithmetic, blinding and fault checks remain in sad-rsa. Only the
 //! padding module is adapted here, as with the fixed-width recovery patch.
 
+use crate::rsa_encoding::RsaPublicKeyEncoding as _;
 use crypto_bigint::BoxedUint;
 use der::{Decode as _, Reader as _, Tagged as _};
-use rsa::pkcs1::DecodeRsaPublicKey as _;
 use rsa::{RsaPrivateKey, RsaPublicKey, traits::PublicKeyParts};
 use sha2::Digest as _;
 use subtle::ConstantTimeEq as _;
@@ -77,7 +77,7 @@ pub(crate) fn public_key(spki: &[u8], parameters: RsaPssParameters) -> Option<Rs
 /// providers share this preflight without allocating software RSA bigints.
 pub(crate) fn encoded_public_key(spki: &[u8], parameters: RsaPssParameters) -> Option<&[u8]> {
     use x509_parser::prelude::FromDer as _;
-    let public = rsa::pkcs8::SubjectPublicKeyInfoRef::from_der(spki).ok()?;
+    let public = pkcs8::SubjectPublicKeyInfoRef::from_der(spki).ok()?;
     let (_, parsed) = x509_parser::x509::SubjectPublicKeyInfo::from_der(spki).ok()?;
     match parsed.algorithm.algorithm.as_bytes() {
         [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01] => {
@@ -138,13 +138,12 @@ fn valid_parameter_encoding(parameters: der::asn1::AnyRef<'_>) -> bool {
                 previous = Some(number.0);
                 match number.0 {
                     0 | 1 => {
-                        let algorithm =
-                            rsa::pkcs8::AlgorithmIdentifierRef::from_der(field.value())?;
+                        let algorithm = pkcs8::AlgorithmIdentifierRef::from_der(field.value())?;
                         let hash = if number.0 == 1 {
                             algorithm
                                 .parameters
                                 .ok_or(field.tag().value_error())?
-                                .decode_as::<rsa::pkcs8::AlgorithmIdentifierRef<'_>>()?
+                                .decode_as::<pkcs8::AlgorithmIdentifierRef<'_>>()?
                         } else {
                             algorithm
                         };

@@ -541,6 +541,7 @@ struct TransformExecutionContext<'a> {
     options: TransformOptions,
     budget: &'a TransformExecutionBudget,
     state: &'a TransformChainState,
+    xml_parse: &'a XmlParseWorkBudget,
 }
 
 /// An XPath 1.0 expression and the namespace bindings in scope where it was declared.
@@ -635,7 +636,7 @@ impl XPathFilter {
 }
 
 /// A single transform in the pipeline.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Transform {
     /// Enveloped signature: removes the `<Signature>` element subtree
     /// that contains the `<Reference>` being processed.
@@ -980,16 +981,39 @@ pub(crate) fn execute_transforms_with_options_and_budget<'a>(
     options: TransformOptions,
     budget: &TransformExecutionBudget,
 ) -> Result<Vec<u8>, TransformError> {
+    execute_reference_transforms_with_budget(
+        signature_node,
+        Some(signature_node),
+        initial_data,
+        transforms,
+        options,
+        budget,
+        budget.xml_parse_work(),
+    )
+}
+
+/// Execute a reference in its actual source context. The caller supplies any
+/// enclosing Signature; XPath `here()` still uses the original source XML.
+pub(crate) fn execute_reference_transforms_with_budget<'a>(
+    source_node: Node<'a, 'a>,
+    enveloped_signature: Option<Node<'a, 'a>>,
+    initial_data: TransformData<'a>,
+    transforms: &[Transform],
+    options: TransformOptions,
+    budget: &TransformExecutionBudget,
+    xml_parse: &XmlParseWorkBudget,
+) -> Result<Vec<u8>, TransformError> {
     ensure_transform_count(transforms.len())?;
     budget.state.begin_chain();
     let context = TransformExecutionContext {
         options,
         budget,
         state: &budget.state,
+        xml_parse,
     };
     execute_transform_chain(
-        signature_node,
-        Some(signature_node),
+        source_node,
+        enveloped_signature,
         initial_data,
         transforms,
         None,
@@ -1077,6 +1101,7 @@ pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
         options,
         budget,
         state: &budget.state,
+        xml_parse: budget.xml_parse_work(),
     };
     let output = execute_transform_chain(
         signature_node,
@@ -1143,7 +1168,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
         // signature-wide canonicalization work budget.
         // Decoding is a separate input pass, including malformed-input failures. Reserve it
         // before any transcoding; the subsequent parser charges its own decoded-byte passes.
-        context.budget.xml_parse_work.charge_policy(bytes.len())?;
+        context.xml_parse.charge_policy(bytes.len())?;
         let xml =
             crate::encoding::decode_xml_octets(&bytes, context.budget.xml_parse_settings.max_bytes)
                 .map_err(map_transform_xml_decode_error)?;
@@ -1151,12 +1176,9 @@ fn execute_transform_chain<'s, 'e, 'd>(
             allow_dtd: context.options.internal_dtd_allowed(),
             ..context.budget.xml_parse_settings
         };
-        let document = parse_borrowed_with_settings_and_budget(
-            &xml,
-            settings,
-            Some(&context.budget.xml_parse_work),
-        )
-        .map_err(|error| map_transform_xml_parse_error(error, settings))?;
+        let document =
+            parse_borrowed_with_settings_and_budget(&xml, settings, Some(context.xml_parse))
+                .map_err(|error| map_transform_xml_parse_error(error, settings))?;
         context.state.document_reparsed();
         let nodes = super::types::NodeSet::entire_document_with_comments_with_budget(
             &document,
@@ -1584,6 +1606,14 @@ pub(crate) fn parse_transforms_with_budget(
     transforms_node: Node,
     signature_budget: &mut XPathSignatureParseBudget,
 ) -> Result<Vec<Transform>, TransformError> {
+    parse_reference_transforms_with_budget(transforms_node, XMLDSIG_NS, signature_budget)
+}
+
+pub(crate) fn parse_reference_transforms_with_budget(
+    transforms_node: Node,
+    container_namespace: &str,
+    signature_budget: &mut XPathSignatureParseBudget,
+) -> Result<Vec<Transform>, TransformError> {
     // Validate that we received a <ds:Transforms> element.
     if !transforms_node.is_element() {
         return Err(TransformError::UnsupportedTransform(
@@ -1591,9 +1621,11 @@ pub(crate) fn parse_transforms_with_budget(
         ));
     }
     let transforms_tag = transforms_node.tag_name();
-    if transforms_tag.name() != "Transforms" || transforms_tag.namespace() != Some(XMLDSIG_NS) {
+    if transforms_tag.name() != "Transforms"
+        || transforms_tag.namespace() != Some(container_namespace)
+    {
         return Err(TransformError::UnsupportedTransform(
-            "expected <ds:Transforms> element in XMLDSig namespace".into(),
+            "Transforms container has the wrong namespace".into(),
         ));
     }
 
@@ -1602,6 +1634,15 @@ pub(crate) fn parse_transforms_with_budget(
 
     for child in transforms_node.children() {
         if !child.is_element() {
+            // XMLDSig 1.1 section 4.4.3.4 and XMLEnc 1.1 section 3.3.1
+            // define element-only Transforms content, not arbitrary text.
+            // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-Transforms
+            // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-CipherReference
+            if child.is_text() && !child.text().is_some_and(is_xml_whitespace_only) {
+                return Err(TransformError::UnsupportedTransform(
+                    "Transforms must not contain character data".into(),
+                ));
+            }
             continue;
         }
         ensure_transform_count(chain.len() + 1)?;

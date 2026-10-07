@@ -395,7 +395,7 @@ impl CryptoProvider for AwsLcFipsProvider {
         self.require_capability(ProviderCapability::KeyTransport(parameters))?;
         let modulus = key.rsa_modulus();
         let exponent = key.rsa_exponent();
-        let public = rsa::pkcs1::RsaPublicKey {
+        let public = pkcs1::RsaPublicKeyRef {
             modulus: der::asn1::UintRef::new(&modulus)
                 .map_err(|_| initialization("RSA public key"))?,
             public_exponent: der::asn1::UintRef::new(&exponent)
@@ -405,7 +405,7 @@ impl CryptoProvider for AwsLcFipsProvider {
         .map_err(|_| initialization("RSA public key"))?;
         let spki = pkcs8::SubjectPublicKeyInfoRef {
             algorithm: pkcs8::AlgorithmIdentifierRef {
-                oid: rsa::pkcs1::ALGORITHM_OID,
+                oid: pkcs1::ALGORITHM_OID,
                 parameters: Some(der::asn1::AnyRef::NULL),
             },
             subject_public_key: der::asn1::BitStringRef::new(0, &public)
@@ -615,17 +615,16 @@ fn verification_algorithm(
     if let Some(rsa) = rsa {
         use crate::xmldsig::SignatureVerificationError::InvalidKeyDer;
         use der::Decode as _;
-        let public =
-            rsa::pkcs8::SubjectPublicKeyInfoRef::from_der(spki).map_err(|_| InvalidKeyDer)?;
+        let public = pkcs8::SubjectPublicKeyInfoRef::from_der(spki).map_err(|_| InvalidKeyDer)?;
         let bytes = if let Some(parameters) = algorithm.rsa_pss_parameters() {
             super::rsa_pss::encoded_public_key(spki, parameters).ok_or(InvalidKeyDer)?
         } else {
-            if public.algorithm.oid != rsa::pkcs1::ALGORITHM_OID {
+            if public.algorithm.oid != pkcs1::ALGORITHM_OID {
                 return Err(InvalidKeyDer);
             }
             public.subject_public_key.as_bytes().ok_or(InvalidKeyDer)?
         };
-        let key = rsa::pkcs1::RsaPublicKey::from_der(bytes).map_err(|_| InvalidKeyDer)?;
+        let key = pkcs1::RsaPublicKeyRef::from_der(bytes).map_err(|_| InvalidKeyDer)?;
         let modulus = key.modulus.as_bytes();
         let first = *modulus.first().ok_or(InvalidKeyDer)?;
         if first == 0 {
@@ -991,14 +990,14 @@ mod tests {
             let mut modulus = vec![0; bits.div_ceil(8)];
             modulus[0] = 1 << ((bits - 1) % 8);
             *modulus.last_mut().expect("nonempty boundary modulus") |= 1;
-            let rsa = rsa::pkcs1::RsaPublicKey {
+            let rsa = pkcs1::RsaPublicKeyRef {
                 modulus: UintRef::new(&modulus).expect("unsigned boundary modulus"),
                 public_exponent: UintRef::new(&[1, 0, 1]).expect("unsigned exponent"),
             }
             .to_der()
             .expect("RSA public key DER");
-            let spki = rsa::pkcs8::SubjectPublicKeyInfoRef {
-                algorithm: rsa::pkcs1::ALGORITHM_ID,
+            let spki = pkcs8::SubjectPublicKeyInfoRef {
+                algorithm: pkcs1::ALGORITHM_ID,
                 subject_public_key: BitStringRef::new(0, &rsa).expect("octet-aligned key bits"),
             }
             .to_der()

@@ -560,38 +560,37 @@ impl<'a> UriReferenceResolver<'a> {
             };
             Ok(TransformData::NodeSet(nodes))
         } else {
-            let (id, with_comments) = self.same_document_id_fragment(fragment)?;
+            let (id, with_comments) = self
+                .same_document_id_fragment(fragment)
+                .ok_or_else(|| TransformError::UnsupportedUri(format!("#{fragment}")))?;
             self.resolve_id(id, budget, with_comments)
         }
     }
 
-    fn same_document_id_fragment<'uri>(
-        &self,
-        fragment: &'uri str,
-    ) -> Result<(&'uri str, bool), TransformError> {
+    fn same_document_id_fragment<'uri>(&self, fragment: &'uri str) -> Option<(&'uri str, bool)> {
         if let Some(id) = parse_xpointer_id_fragment(fragment) {
             // Explicit XPointer dereference retains comments, unlike every
             // barename mode, including libxmlsec1's internal wrapper.
             if id.is_empty() {
-                return Err(TransformError::UnsupportedUri(format!("#{fragment}")));
+                return None;
             }
-            return Ok((id, true));
+            return Some((id, true));
         }
         if fragment.starts_with("xpointer(") {
-            return Err(TransformError::UnsupportedUri(format!("#{fragment}")));
+            return None;
         }
         match self.same_document_id_semantics {
             SameDocumentIdSemantics::Specification if !is_xml_ncname(fragment) => {
-                return Err(TransformError::UnsupportedUri(format!("#{fragment}")));
+                return None;
             }
             SameDocumentIdSemantics::XmlSecBarename if fragment.contains('\'') => {
-                return Err(TransformError::UnsupportedUri(format!("#{fragment}")));
+                return None;
             }
             SameDocumentIdSemantics::Specification
             | SameDocumentIdSemantics::XmlSecBarename
             | SameDocumentIdSemantics::XmlSecVisa3d => {}
         }
-        Ok((fragment, false))
+        Some((fragment, false))
     }
 
     /// Look up an element by its ID attribute value and return a subtree node set.
@@ -646,6 +645,25 @@ impl<'a> UriReferenceResolver<'a> {
             .and_then(|id| self.doc.get_node(id)))
     }
 
+    /// Borrowed association prefilter, sharing the normal URI grammar and ID
+    /// index without constructing errors for unrelated or malformed references.
+    #[cfg(feature = "xmlenc")]
+    pub(crate) fn same_document_reference_targets(&self, uri: &str, target: NodeId) -> bool {
+        if uri.is_empty() {
+            return self.doc.root_element().id() == target;
+        }
+        let Some(fragment) = uri.strip_prefix('#') else {
+            return false;
+        };
+        if fragment.is_empty() || fragment == "xpointer(/)" {
+            return false;
+        }
+        let Some((id, _)) = self.same_document_id_fragment(fragment) else {
+            return false;
+        };
+        self.id_index.node_id(id) == Some(target)
+    }
+
     /// Resolve a same-document URI to a stable node identity under the
     /// configured grammar, for secondary consumers such as Manifest trust.
     pub(crate) fn node_id_for_same_document_reference(
@@ -658,7 +676,9 @@ impl<'a> UriReferenceResolver<'a> {
         if fragment.is_empty() || fragment == "xpointer(/)" {
             return Err(TransformError::UnsupportedUri(uri.to_owned()));
         }
-        let (id, _) = self.same_document_id_fragment(fragment)?;
+        let (id, _) = self
+            .same_document_id_fragment(fragment)
+            .ok_or_else(|| TransformError::UnsupportedUri(uri.to_owned()))?;
         Ok(self.id_index.node_id(id))
     }
 

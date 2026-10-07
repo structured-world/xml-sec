@@ -74,6 +74,17 @@ public SPKI bytes can be verified by either engine. There is no automatic fallba
 Key-container decoding remains a distinct inventory import boundary: encrypted
 PKCS#8 and PKCS#12 password-based container processing uses the existing RustCrypto
 importer. Selecting AWS-LC does not turn that importer into an approved FIPS service.
+RSA key-container codecs use current RustCrypto `pkcs1`/`pkcs8` types through
+`rsa_encoding::{RsaPrivateKeyEncoding, RsaPublicKeyEncoding}` extension traits.
+These traits operate on the existing `sad-rsa` keys; its bundled encoding feature
+is disabled until its codec supports the current dependency API. RSA validation,
+arithmetic, blinding, and implicit rejection remain in `sad-rsa`; operation
+dispatch still belongs to `CryptoProvider`. Private serialized-component buffers
+and DER/PEM output documents are zeroized. This narrow adaptation does not fork
+the RSA engine or introduce a second cryptographic implementation.
+The corresponding upstream fix is proposed in
+[sad-rsa #61](https://github.com/sadco-io/sad-rsa/pull/61); published xml-sec builds
+do not depend on that PR being accepted or on a consumer-side Cargo patch.
 The CLI's generic `--privkey-pem`/`--privkey-der` options also preserve traditional
 RSA PKCS#1 and EC SEC1 containers independently of the provider. Traditional
 OpenSSL encrypted PEM is decrypted at this same container boundary. Normalization
@@ -89,6 +100,150 @@ The native `xmlsec1` accepts `--crypto aws-lc-fips` when this feature is compile
 Without it, that selection is an explicit unavailable-provider error.
 
 ## Mechanisms
+
+With `xmlenc`, RustCrypto exposes X25519 and P-256/P-384/P-521 ECDH through
+`CryptoProvider::agree_key`, using opaque `RustCryptoX25519Key` and
+`RustCryptoEcdhKey` handles. ECDH validates peer points and preserves fixed-width
+shared secrets; X25519 rejects noncontributory peers. These handles do not expose
+private-key bytes. Returned shared-secret bytes belong to the caller, which must
+retain them in zeroizing storage until derivation finishes.
+
+`RustCryptoDhKey` adds finite-field DH with explicitly supplied p/q/g/private
+components. Import borrows the shared `KeyEstablishmentBudget` and selected
+provider's randomness. Prime checks use bounded independent Miller-Rabin bases;
+domain/order and peer-subgroup checks precede private exponentiation. The handle
+preserves the modulus-width shared secret, including leading zero octets. This is
+probable-prime validation, not proof of generation provenance or FIPS approval.
+DH is denied by default. Granting it does not disable the policy's default
+2048-bit modulus and 224-bit subgroup minima; legacy domains need explicit
+lower minima, which are rechecked under the policy of every consuming operation.
+Finite-field modular work and boxed workspace consume the same monotonic
+operation allowance as agreement and derivation, including failed attempts.
+
+`CryptoProvider::derive_key` supports HKDF extract-and-expand with
+HMAC-SHA-1/224/256/384/512, preserving salt, info and requested output length.
+The [RFC 5869 section 2.3](https://www.rfc-editor.org/rfc/rfc5869.html#section-2.3)
+output bound is checked before output allocation. Primitive capability is not
+XML operation support or policy permission: callers must enforce their operation
+policy and cumulative resource budgets before dispatch.
+
+The same provider also implements PBKDF2 with explicit HMAC-SHA-1/224/256/384/512
+PRFs and ConcatKDF with SHA-1/224/256/384/512. PBKDF2 accepts positive iteration
+counts without truncating the API's 64-bit value. ConcatKDF preserves arbitrary
+MSB-first context bit strings through `KdfContext::Bits`; malformed padding is
+rejected rather than silently hashing storage octets. SHA framing uses RustCrypto
+compression, with no per-block concatenation allocation. These primitive APIs
+do not themselves resolve `AgreementMethod`, `DerivedKey`, or external resources.
+
+The legacy DH KDF uses `KdfContext::LegacyDh` to keep the consuming algorithm URI
+and decoded nonce distinct. Decimal KeySize is derived from the requested output
+width; the two-character uppercase counter is bounded to 255 digest blocks.
+This follows [XMLEnc 1.1 section 5.6.2.2](https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-DHKeyAgreementLegacyKDF),
+including the corrected example digest in [erratum E01](https://www.w3.org/2008/xmlsec/errata/xmlenc-core-11-errata.html).
+KDF capability does not imply finite-field DH key-agreement capability.
+
+`xmlenc::parse_key_derivation_method` validates the ConcatKDF, PBKDF2 and
+libxmlsec1 HKDFParams XML layouts under the operation's XML/metadata policy.
+`KeyDerivationMethod::parameters` rejects a contradictory explicit KeyLength.
+ConcatKDF retains both the unpadded combined bit string and individual field
+boundaries for application-specific algorithm/party identity validation, without
+duplicating field buffers. Parsing parameters is not permission to execute them.
+
+`KeyDerivationMethod::derive_key` uses a caller's shared `KeyEstablishmentBudget`
+to check the compiled `KeyEstablishmentPolicy` before provider dispatch. The
+same policy type is composed into encryption and decryption policy snapshots.
+Its default permits SHA-2 KDFs and ECDH/X25519 agreement, not legacy DH or SHA-1;
+those require explicit grants independent of primitive capability. Budgets count
+conservative SHA compression blocks (including HMAC framing), not just PBKDF2
+iterations, and reserve cumulative shared-secret and derived-key output bytes
+before allocation.
+Every recipient and retry in an enclosing operation must share the budget;
+provider failures do not refund it. Returned derived keys use zeroizing storage.
+
+`DerivedKeyDecryptor::content` and `DerivedKeyDecryptor::wrapping` bind parsed
+KDF parameters and borrowed application secrets to an explicitly selected
+content or wrapping algorithm. `DerivedKeyInput` accepts borrowed secret bytes
+or a caller-owned opaque agreement handle and encoded peer. Public decrypt
+invokes agreement and derivation inside its
+operation's key-resolution gate and uses the operation snapshot, regardless of
+the policy used earlier to parse parameters. Nested resolvers must forward the
+same `KeyCandidateBudget`; its `derive_key` and `agree_and_derive` methods retain cumulative KDF usage
+across sources and failed attempts. Agreement checks KDF permission and reserves
+both shared-secret and derived-key buffers before scalar multiplication.
+Wrapping-key recovery reuses the existing
+policy-aware KEK path without copying the derived KEK. The complete attempt's
+candidate allowance is checked before agreement or derivation, so an exhausted
+unwrap allowance does not initiate unusable KDF work. Parsed `DerivedKey`
+descriptors are matched against the explicit request before provider dispatch;
+`MasterKeyName` is whitespace significant and requires the caller's exact
+`master_key_name` association. An omitted XML method requires the request's
+explicit method. Raw content-key resolvers cannot bypass a transported derivation.
+Parsed `AgreementMethod` descriptors preserve originator/recipient key metadata,
+KDF parameters and legacy DH nonce/digest fields. `AgreementDecryptor::content`
+and `AgreementDecryptor::wrapping` bind the complete expected descriptor to
+caller-owned handles, peer bytes and the consuming algorithm. Descriptor
+agreement is checked before the provider runs; a raw KEK or content resolver
+cannot bypass an advertised agreement source.
+
+Nested encrypted keys resolve through the distinct
+`resolve_key_encryption_keys_with_policy` callback. Its consuming algorithm is
+the actual key-wrap algorithm, not a same-width content-cipher proxy. Every
+level shares the operation budget and preserves implicit-rejection state until
+final content authentication. Non-exportable handles are never converted into
+software keys to satisfy an unsupported provider operation.
+
+`EncryptedDataBuilder::derived_key` retains an explicit KDF request and a
+zeroizing secret; `agreement_key` takes an owned opaque handle and public peer.
+For ECDH-ES, the caller supplies a fresh sender pair for each message and exports
+its public role before transferring the private handle. The builder consumes
+that handle once at actual agreement dispatch, also across clones or failed
+agreement attempts; policy and capability rejection do not consume it. This
+enforces the per-message lifetime required by XMLEnc 1.1 section 5.6.4 without
+implicitly selecting a key-generation engine or exporting a provider's secrets.
+Both defer cryptographic execution to the operation's key-resolution gate.
+Replacing the builder policy therefore affects the actual derivation, rather
+than accepting a key generated under an earlier policy. Direct raw content keys
+are borrowed during execution, not cloned for encryption. Generated keys and
+derived outputs are zeroized on success and error paths. `derived_key` emits an
+XML `DerivedKey` descriptor; the matching master material remains request-owned.
+`KeyDerivationMethod::to_xml` preserves ConcatKDF field bit boundaries and checks
+metadata and output size before allocating the serialized result. The final
+EncryptedData serializer preflights escaped output size and streams base64 with
+a fixed scratch buffer rather than copying the entire ciphertext encoding.
+`agreement_key` emits `AgreementMethod` and its KDF descriptor. Public key role
+metadata may be omitted when the agreement keys are explicitly supplied by
+application context, as permitted by XMLEnc 1.1 section 5.6.
+`KA-Nonce` is preserved in descriptor matching and enters the legacy DH KDF
+exactly as specified in section 5.6.2.2. Explicit KDFs consume their declared
+salt/context fields; xml-sec does not invent an extra nonce concatenation.
+Applications requiring fresh output with the same agreement keys must vary
+those explicit KDF inputs as well, not merely the transported nonce.
+
+Reciprocal libxmlsec1 1.3.13 tests cover all five SHA-1/SHA-2 families for PBKDF2,
+HKDFParams and byte-aligned ConcatKDF fields. Non-octet-aligned ConcatKDF follows
+[XMLEnc 1.1 section 5.4.1](https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-ConcatKDF)
+and has separate exact-bit tests: libxmlsec1's `xmlSecTransformConcatKdfParamsReadsBitsAttr`
+rejects such fields, so that donor limitation is not imposed on xml-sec.
+Reciprocal ECDH tests additionally execute XML agreement with P-256, P-384 and
+P-521 keys and ConcatKDF against libxmlsec1, in both directions.
+
+The key-establishment acceptance tests in `xmlenc_encrypt_xmlsec1` require the
+independent oracle, including local runs: an unavailable oracle is a setup
+failure, not a successful skipped check. Install it with
+`bash scripts/install-xmlsec1.sh`, then set `XMLSEC1_BIN` to the reported
+installation's `bin/xmlsec1`. Set `DYLD_LIBRARY_PATH` (macOS) or
+`LD_LIBRARY_PATH` (Linux) to that installation's `lib` directory when required
+by the dynamic loader. CI provisions the same oracle. Run with
+`cargo nextest run -p xml-sec --test xmlenc_encrypt_xmlsec1`.
+
+`parse_hkdf_agreement_method` separately adapts the
+[RFC 9231 section 2.8.1](https://www.rfc-editor.org/rfc/rfc9231.html#section-2.8.1)
+HKDF layout. Its salt, initial key material and KA-Nonce are hexadecimal;
+its worked-example KeySize is an octet count, not EncryptionMethod's bit count.
+Both the hash URI described by the text and the HMAC URI used by its example
+normalize to one HKDF PRF. An absent initial key material value requires an
+explicit caller request; simultaneous XML and caller values are rejected.
+This adapter does not resolve asymmetric agreement keys or external resources.
 
 RustCrypto implements all nine fixed RSA-PSS SHA-1/SHA-2/SHA-3 signature URIs
 and parameterized `rsa-pss` via `SignatureAlgorithm::RsaPss(RsaPssParameters)`.

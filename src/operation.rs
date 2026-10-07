@@ -42,6 +42,8 @@ pub(crate) enum OperationStage {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OperationNodeKind {
     Document,
+    #[cfg(feature = "xmlenc")]
+    Ciphertext,
     #[cfg(feature = "xmldsig")]
     Manifest {
         index: usize,
@@ -63,6 +65,13 @@ pub(crate) enum OperationNodeKind {
 /// Identity whose provenance must remain stable for the complete operation.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum OperationResourceIdentity {
+    /// Original immutable DOM node, valid only while its operation borrows the
+    /// document. Never used as a cross-parse or persistent cache identity.
+    #[cfg(feature = "xmlenc")]
+    BorrowedDocumentNode {
+        document: usize,
+        node: crate::NodeId,
+    },
     #[cfg(feature = "xmldsig")]
     DocumentNode(NodeIdentity),
     External {
@@ -257,6 +266,8 @@ impl CompiledOperationPlan {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OperationDecisionReason {
     Completed,
+    #[cfg(feature = "xmlenc")]
+    CiphertextResolved,
     #[cfg(feature = "xmldsig")]
     ReferenceDigestVerified,
     #[cfg(feature = "xmldsig")]
@@ -291,7 +302,7 @@ pub(crate) struct OperationExecutionContext<P, B> {
     _policy: PhantomData<P>,
     budgets: B,
     builder: Option<OperationPlanBuilder>,
-    plan: Option<CompiledOperationPlan>,
+    plan: RefCell<Option<CompiledOperationPlan>>,
     document: Option<(DocumentIdentity, Cell<u64>)>,
     executed: RefCell<HashSet<OperationNodeId>>,
     #[cfg(feature = "xmldsig")]
@@ -311,7 +322,7 @@ impl<P, B> OperationExecutionContext<P, B> {
             _policy: PhantomData,
             budgets,
             builder: Some(OperationPlanBuilder::default()),
-            plan: None,
+            plan: RefCell::new(None),
             document: document.map(|(identity, generation)| (identity, Cell::new(generation))),
             executed: RefCell::new(HashSet::new()),
             #[cfg(feature = "xmldsig")]
@@ -335,10 +346,11 @@ impl<P, B> OperationExecutionContext<P, B> {
         &mut self.budgets
     }
 
-    pub(crate) fn plan(&self) -> &CompiledOperationPlan {
-        self.plan
-            .as_ref()
-            .expect("operation plan must be compiled before execution")
+    pub(crate) fn plan(&self) -> std::cell::Ref<'_, CompiledOperationPlan> {
+        std::cell::Ref::map(self.plan.borrow(), |plan| {
+            plan.as_ref()
+                .expect("operation plan must be compiled before execution")
+        })
     }
 
     pub(crate) fn add_node(
@@ -369,7 +381,7 @@ impl<P, B> OperationExecutionContext<P, B> {
             .builder
             .take()
             .expect("operation plan cannot be compiled more than once");
-        self.plan = Some(builder.compile()?);
+        *self.plan.get_mut() = Some(builder.compile()?);
         Ok(())
     }
 
@@ -380,9 +392,80 @@ impl<P, B> OperationExecutionContext<P, B> {
     pub(crate) fn extend(&mut self) {
         let plan = self
             .plan
+            .get_mut()
             .take()
             .expect("operation plan must be compiled before it can be extended");
         self.builder = Some(plan.builder());
+    }
+
+    /// Add a resource discovered after parsing without cloning/recompiling the
+    /// graph or resetting its budgets. New edges cannot cycle: the prerequisite
+    /// is already complete and the dependent has not completed yet.
+    #[cfg(feature = "xmlenc")]
+    pub(crate) fn run_discovered_resource<T, E>(
+        &self,
+        requires: OperationNodeId,
+        dependent: OperationNodeId,
+        identity: &OperationResourceIdentity,
+        action: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<OperationPlanError>,
+    {
+        let resource = {
+            let mut state = self.plan.borrow_mut();
+            let plan = state.as_mut().expect("compiled operation plan");
+            let required = plan
+                .nodes
+                .get(requires.index())
+                .ok_or(OperationPlanError::UnknownNode)
+                .map_err(E::from)?;
+            let consumer = plan
+                .nodes
+                .get(dependent.index())
+                .ok_or(OperationPlanError::UnknownNode)
+                .map_err(E::from)?;
+            if !self.is_executed(requires) {
+                return Err(E::from(OperationPlanError::DependencyNotExecuted {
+                    node: dependent,
+                    requires,
+                }));
+            }
+            if self.is_executed(dependent) {
+                return Err(E::from(OperationPlanError::AlreadyExecuted));
+            }
+            if required.stage > consumer.stage {
+                return Err(E::from(OperationPlanError::StageRegression {
+                    requires: required.stage,
+                    dependent: consumer.stage,
+                }));
+            }
+            let stage = consumer.stage;
+            let resource = OperationNodeId(plan.nodes.len());
+            plan.nodes.push(OperationNode {
+                kind: OperationNodeKind::Ciphertext,
+                stage,
+                resource: Some(identity.clone()),
+            });
+            plan.edges.insert(OperationEdge {
+                requires,
+                dependent: resource,
+            });
+            plan.edges.insert(OperationEdge {
+                requires: resource,
+                dependent,
+            });
+            #[cfg(test)]
+            plan.order.insert(
+                plan.order
+                    .iter()
+                    .position(|node| *node == dependent)
+                    .unwrap_or(plan.order.len()),
+                resource,
+            );
+            resource
+        };
+        self.run_with_resource(resource, identity, action)
     }
 
     pub(crate) fn validate_document_view(
@@ -435,6 +518,8 @@ impl<P, B> OperationExecutionContext<P, B> {
 
     fn completion_reason(&self, node: OperationNodeId) -> OperationDecisionReason {
         match self.plan().kind(node) {
+            #[cfg(feature = "xmlenc")]
+            OperationNodeKind::Ciphertext => OperationDecisionReason::CiphertextResolved,
             OperationNodeKind::Key { .. } => OperationDecisionReason::KeyResolved,
             #[cfg(feature = "xmldsig")]
             OperationNodeKind::Digest { .. } => OperationDecisionReason::ReferenceDigestVerified,
@@ -596,9 +681,18 @@ impl<P, B> OperationExecutionContext<P, B> {
         &self,
         node: OperationNodeId,
         action: impl FnOnce() -> Result<T, E>,
-    ) -> Result<T, E> {
+    ) -> Result<T, E>
+    where
+        E: From<OperationPlanError>,
+    {
+        let edges_before = self.plan().edges.len();
         match action() {
             Ok(value) => {
+                if self.plan().edges.len() != edges_before {
+                    let plan = self.plan();
+                    self.validate_ready(node, plan.resource(node))
+                        .map_err(E::from)?;
+                }
                 self.executed.borrow_mut().insert(node);
                 self.record(node, true, self.completion_reason(node));
                 Ok(value)
@@ -676,6 +770,91 @@ mod tests {
 
     #[cfg(feature = "xmlenc")]
     #[test]
+    fn discovered_resources_gate_work_and_join_the_original_graph() {
+        // Resources discovered by metadata parsing retain the same budget and
+        // evidence owner. No resource action runs before document completion.
+        let mut context = OperationExecutionContext::new((), 7_u8, None);
+        let document = context.add_node(OperationNodeKind::Document, OperationStage::Parse, None);
+        let cipher = context.add_node(OperationNodeKind::Ciphertext, OperationStage::Resolve, None);
+        context
+            .add_dependency(cipher, document)
+            .expect("document dependency");
+        context.compile().expect("base plan");
+        let identity =
+            OperationResourceIdentity::external("https://example.test/cipher", b"cipher bytes");
+        let called = Cell::new(0);
+        let action = || {
+            called.set(called.get() + 1);
+            Ok::<_, OperationPlanError>(())
+        };
+        assert!(matches!(
+            context.run_discovered_resource(document, cipher, &identity, action),
+            Err(OperationPlanError::DependencyNotExecuted { .. })
+        ));
+        assert_eq!(called.get(), 0);
+        context
+            .run(document, || Ok::<_, OperationPlanError>(()))
+            .expect("document");
+        context
+            .run(cipher, || {
+                context.run_discovered_resource(document, cipher, &identity, action)
+            })
+            .expect("resource inside ciphertext gate");
+        assert_eq!(called.get(), 1);
+        assert_eq!(*context.budgets(), 7);
+        assert_eq!(
+            context
+                .decisions
+                .borrow()
+                .iter()
+                .filter(
+                    |decision| decision.resource.as_ref() == Some(&identity) && decision.accepted
+                )
+                .count(),
+            1
+        );
+        assert_eq!(
+            context.run_discovered_resource(document, cipher, &identity, action),
+            Err(OperationPlanError::AlreadyExecuted)
+        );
+        assert_eq!(called.get(), 1);
+    }
+
+    #[cfg(feature = "xmlenc")]
+    #[test]
+    fn failed_discovered_resource_prevents_consumer_completion() {
+        // A failed scoped action cannot be hidden by returning success from
+        // the enclosing closure; its dynamic dependency remains incomplete.
+        let mut context = OperationExecutionContext::new((), (), None);
+        let document = context.add_node(OperationNodeKind::Document, OperationStage::Parse, None);
+        let cipher = context.add_node(OperationNodeKind::Ciphertext, OperationStage::Resolve, None);
+        context
+            .add_dependency(cipher, document)
+            .expect("document dependency");
+        context.compile().expect("plan");
+        context
+            .run(document, || Ok::<_, OperationPlanError>(()))
+            .expect("document");
+        let identity = OperationResourceIdentity::external("resource", b"bytes");
+        let result = context.run(cipher, || {
+            assert_eq!(
+                context.run_discovered_resource(document, cipher, &identity, || Err::<(), _>(
+                    OperationPlanError::StaleResourceIdentity
+                )),
+                Err(OperationPlanError::StaleResourceIdentity)
+            );
+            Ok::<_, OperationPlanError>(())
+        });
+        assert!(matches!(
+            result,
+            Err(OperationPlanError::DependencyNotExecuted { .. })
+        ));
+        assert!(!context.is_executed(cipher));
+        assert!(context.first_failure.borrow().is_some());
+    }
+
+    #[cfg(feature = "xmlenc")]
+    #[test]
     fn xml_encryption_operation_retains_its_policy_snapshot() {
         let context = OperationExecutionContext::new("xmlenc-policy", (), None);
 
@@ -727,7 +906,7 @@ mod tests {
         let plan = builder.compile().expect("valid plan");
         let mut context = OperationExecutionContext::new((), (), None);
         context.builder = None;
-        context.plan = Some(plan);
+        *context.plan.get_mut() = Some(plan);
         let ran = Cell::new(false);
         assert_eq!(
             context.run(crypto, || {
@@ -762,7 +941,7 @@ mod tests {
             Some((document.identity(), document.generation())),
         );
         context.builder = None;
-        context.plan = Some(plan);
+        *context.plan.get_mut() = Some(plan);
         let target = document.with_view(|view| view.root_element());
         document
             .replace_element(target, "<changed/>")

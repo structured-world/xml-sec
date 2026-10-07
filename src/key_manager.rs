@@ -16,13 +16,14 @@ use dsa::{
     VerifyingKey as DsaVerifyingKey, pkcs8::EncodePrivateKey as _,
 };
 mod pkcs12_import;
-use pkcs12_import::Limits as Pkcs12Limits;
-use rsa::{
-    RsaPrivateKey,
-    pkcs8::{DecodePrivateKey as _, EncryptedPrivateKeyInfoRef, PrivateKeyInfoRef},
-};
+use crate::rsa_encoding::RsaPrivateKeyEncoding as _;
 #[cfg(feature = "xmlenc")]
-use rsa::{RsaPublicKey, pkcs8::DecodePublicKey as _};
+use crate::rsa_encoding::RsaPublicKeyEncoding as _;
+use pkcs8::{DecodePrivateKey as _, EncryptedPrivateKeyInfoRef, PrivateKeyInfoRef};
+use pkcs12_import::Limits as Pkcs12Limits;
+use rsa::RsaPrivateKey;
+#[cfg(feature = "xmlenc")]
+use rsa::RsaPublicKey;
 use x509_parser::prelude::{FromDer as _, X509Certificate};
 use zeroize::Zeroizing;
 
@@ -90,18 +91,35 @@ fn check_selected_public_material(
                 // before resolution materializes its SPKI.
                 let lengths = match value {
                     KeyValueInfo::Rsa { modulus, exponent } => {
-                        [modulus.len(), exponent.len(), 0, 0]
+                        [modulus.len(), exponent.len(), 0, 0, 0, 0]
                     }
                     KeyValueInfo::Dsa { p, q, g, y } => [
                         p.as_ref().map_or(0, Vec::len),
                         q.as_ref().map_or(0, Vec::len),
                         g.as_ref().map_or(0, Vec::len),
                         y.len(),
+                        0,
+                        0,
+                    ],
+                    KeyValueInfo::Dh {
+                        p,
+                        q,
+                        generator,
+                        public,
+                        seed,
+                        pgen_counter,
+                    } => [
+                        p.as_ref().map_or(0, Vec::len),
+                        q.as_ref().map_or(0, Vec::len),
+                        generator.as_ref().map_or(0, Vec::len),
+                        public.len(),
+                        seed.as_ref().map_or(0, Vec::len),
+                        pgen_counter.as_ref().map_or(0, Vec::len),
                     ],
                     KeyValueInfo::Ec {
                         curve_oid,
                         public_key,
-                    } => [curve_oid.len(), public_key.len(), 0, 0],
+                    } => [curve_oid.len(), public_key.len(), 0, 0, 0, 0],
                     KeyValueInfo::InvalidEcKeyValue | KeyValueInfo::Unsupported { .. } => continue,
                 };
                 let length = lengths.into_iter().try_fold(0_usize, |sum, length| {
@@ -1148,7 +1166,7 @@ impl KeyInventory {
         // permission is not an exemption from the decryption snapshot.
         let info = PrivateKeyInfoRef::try_from(entry.pkcs8_der.as_slice())
             .map_err(|_| KeyStoreError::Selection("incompatible RSA decryption key"))?;
-        let components = rsa::pkcs1::RsaPrivateKey::from_der(info.private_key.as_bytes())
+        let components = pkcs1::RsaPrivateKeyRef::from_der(info.private_key.as_bytes())
             .map_err(|_| KeyStoreError::Selection("incompatible RSA decryption key"))?;
         policy.rsa_keys.validate_components(
             "decryption",
@@ -1381,7 +1399,7 @@ impl KeyInventory {
             "PUBLIC KEY" => decoded,
             "RSA PUBLIC KEY" => {
                 use der::Encode as _;
-                let components = rsa::pkcs1::RsaPublicKey::from_der(&decoded)
+                let components = pkcs1::RsaPublicKeyRef::from_der(&decoded)
                     .map_err(|_| KeyStoreError::Selection("invalid RSA public key"))?;
                 crate::xmldsig::keys::bounded_rsa_public_components(
                     components.modulus.as_bytes(),
@@ -1390,8 +1408,8 @@ impl KeyInventory {
                 .map_err(|_| KeyStoreError::Selection("RSA public key exceeds safety limit"))?;
                 // Wrap borrowed PKCS#1 bytes directly; the final SPKI importer
                 // performs native RSA validation once, without an intermediate key.
-                let spki = rsa::pkcs8::SubjectPublicKeyInfoRef {
-                    algorithm: rsa::pkcs1::ALGORITHM_ID,
+                let spki = pkcs8::SubjectPublicKeyInfoRef {
+                    algorithm: pkcs1::ALGORITHM_ID,
                     subject_public_key: der::asn1::BitStringRef::new(0, &decoded)
                         .map_err(|_| KeyStoreError::Selection("invalid RSA public key"))?,
                 };
@@ -1533,7 +1551,7 @@ impl KeyInventory {
             // octets directly, avoiding bigint re-encoding and two owned DERs.
             // https://www.rfc-editor.org/rfc/rfc5958#section-2
             let normalized = PrivateKeyInfoRef::new(
-                rsa::pkcs1::ALGORITHM_ID,
+                pkcs1::ALGORITHM_ID,
                 der::asn1::OctetStringRef::new(bytes)
                     .map_err(|_| KeyStoreError::Selection("invalid RSA private key"))?,
             );
@@ -2396,24 +2414,24 @@ fn named_material_length(
     )
 )]
 enum PrivateKeyIdentity<'a> {
-    Rsa(rsa::pkcs1::RsaPrivateKey<'a>),
+    Rsa(pkcs1::RsaPrivateKeyRef<'a>),
     Dsa {
-        algorithm: rsa::pkcs8::AlgorithmIdentifierRef<'a>,
+        algorithm: pkcs8::AlgorithmIdentifierRef<'a>,
         key: NativeDsaSigningKey,
     },
     Ec {
-        algorithm: rsa::pkcs8::AlgorithmIdentifierRef<'a>,
+        algorithm: pkcs8::AlgorithmIdentifierRef<'a>,
         point: [u8; 133],
         length: usize,
     },
     EdDsa {
-        algorithm: rsa::pkcs8::AlgorithmIdentifierRef<'a>,
+        algorithm: pkcs8::AlgorithmIdentifierRef<'a>,
         public: [u8; 57],
         length: usize,
     },
     #[cfg(feature = "experimental-pq")]
     PostQuantum {
-        algorithm: rsa::pkcs8::AlgorithmIdentifierRef<'a>,
+        algorithm: pkcs8::AlgorithmIdentifierRef<'a>,
         public: [u8; 2592],
         length: usize,
     },
@@ -2460,11 +2478,11 @@ impl<'a> PrivateKeyIdentity<'a> {
                 length: 57,
             });
         }
-        if info.algorithm.oid == rsa::pkcs1::ALGORITHM_OID {
+        if info.algorithm.oid == pkcs1::ALGORITHM_OID {
             preflight_rsa_pkcs1_components(info.private_key.as_bytes())?;
             RsaPrivateKey::from_pkcs8_der(der)
                 .map_err(|_| KeyStoreError::Selection("invalid RSA private key"))?;
-            return rsa::pkcs1::RsaPrivateKey::from_der(info.private_key.as_bytes())
+            return pkcs1::RsaPrivateKeyRef::from_der(info.private_key.as_bytes())
                 .map(Self::Rsa)
                 .map_err(|_| KeyStoreError::Selection("invalid RSA private key"));
         } else if info.algorithm.oid == dsa::OID {
@@ -2496,7 +2514,7 @@ impl<'a> PrivateKeyIdentity<'a> {
     }
 
     fn matches_spki(&self, der: &[u8]) -> bool {
-        let Ok(spki) = rsa::pkcs8::SubjectPublicKeyInfoRef::from_der(der) else {
+        let Ok(spki) = pkcs8::SubjectPublicKeyInfoRef::from_der(der) else {
             return false;
         };
         let Some(bytes) = spki.subject_public_key.as_bytes() else {
@@ -2515,10 +2533,10 @@ impl<'a> PrivateKeyIdentity<'a> {
                 length,
             } => spki.algorithm == *algorithm && bytes == &public[..*length],
             Self::Rsa(key) => {
-                if spki.algorithm != rsa::pkcs1::ALGORITHM_ID {
+                if spki.algorithm != pkcs1::ALGORITHM_ID {
                     return false;
                 }
-                let Ok(public) = rsa::pkcs1::RsaPublicKey::from_der(bytes) else {
+                let Ok(public) = pkcs1::RsaPublicKeyRef::from_der(bytes) else {
                     return false;
                 };
                 key.modulus == public.modulus && key.public_exponent == public.public_exponent
@@ -2555,7 +2573,7 @@ impl<'a> PrivateKeyIdentity<'a> {
 /// Container adapters must call this before constructing native big integers.
 /// This checks ingestion safety, not the operation's RSA algorithm/key policy.
 pub fn preflight_rsa_pkcs1_components(der: &[u8]) -> Result<(), KeyStoreError> {
-    let key = rsa::pkcs1::RsaPrivateKey::from_der(der)
+    let key = pkcs1::RsaPrivateKeyRef::from_der(der)
         .map_err(|_| KeyStoreError::Selection("invalid RSA private key"))?;
     let modulus = key.modulus.as_bytes();
     let maximum = crate::hard_limits::RSA_MODULUS_BIT_CEILING;
@@ -3218,10 +3236,11 @@ fn parse_xmlsec_dsa_key_value(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "xmlenc"))]
+    use crate::rsa_encoding::RsaPublicKeyEncoding as _;
+    use pkcs8::EncodePublicKey as _;
     use rand_chacha::{ChaCha8Rng, rand_core::SeedableRng as _};
     use rsa::RsaPublicKey;
-    use rsa::pkcs1::EncodeRsaPrivateKey as _;
-    use rsa::pkcs8::EncodePublicKey as _;
 
     use super::*;
 
@@ -4558,7 +4577,7 @@ mod tests {
         // The borrowed ASN.1 modulus is checked before RSA allocates integers.
         let modulus = vec![1_u8; crate::hard_limits::RSA_MODULUS_BIT_CEILING.div_ceil(8) + 1];
         let exponent = [1_u8, 0, 1];
-        let public = rsa::pkcs1::RsaPublicKey {
+        let public = pkcs1::RsaPublicKeyRef {
             modulus: der::asn1::UintRef::new(&modulus).expect("valid modulus"),
             public_exponent: der::asn1::UintRef::new(&exponent).expect("valid exponent"),
         };
@@ -5291,8 +5310,6 @@ mod tests {
 
     #[test]
     fn public_pem_import_accounts_for_simultaneous_buffers() {
-        use rsa::pkcs1::EncodeRsaPublicKey as _;
-        use rsa::pkcs8::DecodePublicKey as _;
         // Caller PEM, decoded bytes and a normalized SPKI coexist; neither
         // prior inventory material nor any intermediate may reuse that budget.
         let pem = include_bytes!("../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
@@ -5340,7 +5357,6 @@ mod tests {
 
     #[test]
     fn plaintext_private_import_checks_all_live_copies() {
-        use rsa::pkcs1::EncodeRsaPrivateKey as _;
         // Borrowed input, decoded PEM and retained DER coexist. Reject one
         // byte below that peak without retaining a key, and accept exactly it.
         let der = pem::parse(include_bytes!(
@@ -6193,10 +6209,10 @@ mod tests {
         let block = single_pem_block(pem, ResourcePolicy::default().max_external_resource_bytes)
             .expect("fixture PEM");
         let info = PrivateKeyInfoRef::try_from(block.contents()).expect("fixture PKCS#8");
-        let original = rsa::pkcs1::RsaPrivateKey::from_der(info.private_key.as_bytes())
-            .expect("fixture PKCS#1");
+        let original =
+            pkcs1::RsaPrivateKeyRef::from_der(info.private_key.as_bytes()).expect("fixture PKCS#1");
         let oversized_modulus = vec![1_u8; 1025];
-        let oversized = rsa::pkcs1::RsaPrivateKey {
+        let oversized = pkcs1::RsaPrivateKeyRef {
             modulus: der::asn1::UintRef::new(&oversized_modulus).expect("positive modulus"),
             public_exponent: original.public_exponent,
             private_exponent: original.private_exponent,
@@ -6209,7 +6225,7 @@ mod tests {
         };
         let pkcs1 = der::Encode::to_der(&oversized).expect("PKCS#1 encodes");
         let octets = der::asn1::OctetStringRef::new(&pkcs1).expect("PKCS#8 octets");
-        let pkcs8 = der::Encode::to_der(&PrivateKeyInfoRef::new(rsa::pkcs1::ALGORITHM_ID, octets))
+        let pkcs8 = der::Encode::to_der(&PrivateKeyInfoRef::new(pkcs1::ALGORITHM_ID, octets))
             .expect("PKCS#8 encodes");
         let mut inventory = KeyInventory::default();
         let error = inventory
@@ -6224,7 +6240,7 @@ mod tests {
         assert!(error.to_string().contains("safety limit"), "{error}");
 
         let oversized_exponent = vec![1_u8; 1025];
-        let oversized = rsa::pkcs1::RsaPrivateKey {
+        let oversized = pkcs1::RsaPrivateKeyRef {
             modulus: original.modulus,
             public_exponent: original.public_exponent,
             private_exponent: der::asn1::UintRef::new(&oversized_exponent)
@@ -6732,7 +6748,7 @@ mod tests {
     fn named_verification_bounds_complete_key_value() {
         // A broadly imported XML key must obey the tighter operation snapshot
         // before the resolver constructs an SPKI from its components.
-        use rsa::{pkcs8::DecodePublicKey as _, traits::PublicKeyParts as _};
+        use rsa::traits::PublicKeyParts as _;
         let public = RsaPublicKey::from_public_key_pem(include_str!(
             "../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"
         ))
@@ -7394,7 +7410,7 @@ mod tests {
         .expect("DSA parameters encode");
         let x = der::Encode::to_der(&der::asn1::UintRef::new(&one).expect("positive X"))
             .expect("DSA X encodes");
-        let algorithm = rsa::pkcs8::AlgorithmIdentifierRef {
+        let algorithm = pkcs8::AlgorithmIdentifierRef {
             oid: dsa::OID,
             parameters: Some(der::asn1::AnyRef::from_der(&parameters).expect("parameters")),
         };
@@ -7433,7 +7449,7 @@ mod tests {
                 single_pem_block(pem, ResourcePolicy::default().max_external_resource_bytes)
                     .expect("EC fixture")
                     .into_contents();
-            let spki = rsa::pkcs8::SubjectPublicKeyInfoRef::from_der(&original).expect("SPKI");
+            let spki = pkcs8::SubjectPublicKeyInfoRef::from_der(&original).expect("SPKI");
             let point = spki
                 .subject_public_key
                 .as_bytes()
@@ -7441,7 +7457,7 @@ mod tests {
             let coordinate_len = (point.len() - 1) / 2;
             let mut compressed = vec![2 | (point.last().expect("Y coordinate") & 1)];
             compressed.extend_from_slice(&point[1..=coordinate_len]);
-            let encoded = der::Encode::to_der(&rsa::pkcs8::SubjectPublicKeyInfoRef {
+            let encoded = der::Encode::to_der(&pkcs8::SubjectPublicKeyInfoRef {
                 algorithm: spki.algorithm,
                 subject_public_key: der::asn1::BitStringRef::from_bytes(&compressed)
                     .expect("point"),
@@ -7674,6 +7690,7 @@ mod tests {
             .decryption_resolver("direct", &crate::policy::DecryptionPolicy::default())
             .expect("AES resolver");
         let recipient = EncryptedKey {
+            sources: Default::default(),
             id: None,
             recipient: None,
             key_name: None,
@@ -7684,7 +7701,7 @@ mod tests {
                 mgf_algorithm: None,
                 oaep_params: None,
             },
-            cipher_data: CipherData {
+            cipher_data: CipherData::Value {
                 value: String::new(),
             },
             reference_list: None,

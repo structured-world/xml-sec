@@ -16,6 +16,13 @@ use crate::xmlenc::{
     DataEncryptionAlgorithm, KeyTransportAlgorithm, KeyWrapAlgorithm, OaepDigestAlgorithm,
 };
 
+#[cfg(feature = "xmlenc")]
+mod key_establishment;
+#[cfg(feature = "xmlenc")]
+pub use key_establishment::{
+    KeyAgreementAlgorithm, KeyDerivationAlgorithm, KeyEstablishmentPolicy,
+};
+
 /// Permission for the unbounded parameterized RSA-PSS family.
 /// Exact permissions continue to use the signature algorithm allowlist.
 #[cfg(feature = "xmldsig")]
@@ -44,6 +51,8 @@ pub(crate) mod resource_name {
     pub const XML_DEPTH: &str = "XML element depth";
     pub const XML_NAMESPACE_BINDINGS: &str = "XML namespace bindings";
     pub const SIGNATURE_REFERENCES: &str = "signature references";
+    #[cfg(feature = "xmlenc")]
+    pub const ENCRYPTION_REFERENCES: &str = "encryption key references";
     pub const VERIFICATION_SIGNATURES: &str = "verification signatures";
     pub const REFERENCE_TRANSFORMS: &str = "reference transforms";
     pub const XML_BASE_COMPONENTS: &str = "XML Base components";
@@ -62,6 +71,16 @@ pub(crate) mod resource_name {
     pub const KEY_CANDIDATES: &str = "key candidates";
     pub const KEY_IMPORT_KDF_WORK: &str = "key import KDF work";
     pub const KEY_IMPORT_KDF_MEMORY: &str = "key import KDF memory bytes";
+    #[cfg(feature = "xmlenc")]
+    pub const KEY_ESTABLISHMENT_HASH_BLOCKS: &str = "key establishment hash blocks";
+    #[cfg(feature = "xmlenc")]
+    pub const KEY_ESTABLISHMENT_OWNED_BYTES: &str = "key establishment owned bytes";
+    #[cfg(feature = "xmlenc")]
+    pub const DH_MODULUS_BITS: &str = "DH modulus bits";
+    #[cfg(feature = "xmlenc")]
+    pub const DH_SUBGROUP_BITS: &str = "DH subgroup bits";
+    #[cfg(feature = "xmlenc")]
+    pub const KEY_ESTABLISHMENT_MODULAR_WORK: &str = "key establishment modular work";
     pub const KEY_INFO_REFERENCE_DEPTH: &str = "KeyInfoReference depth";
     pub const BASE64_TRANSFORM_INPUT_BYTES: &str = "Base64 transform input bytes";
     pub const BASE64_TRANSFORM_OUTPUT_BYTES: &str = "Base64 transform output bytes";
@@ -159,7 +178,7 @@ pub enum PolicyViolation {
         /// Non-sensitive reason suitable for diagnostics.
         reason: &'static str,
     },
-    /// An RSA key falls outside the operation's configured strength range.
+    /// An asymmetric key/domain falls outside the operation's strength range.
     #[error(
         "{operation} policy requires {key_type} keys between {minimum_bits} and {maximum_bits} bits: got {actual_bits}"
     )]
@@ -168,11 +187,11 @@ pub enum PolicyViolation {
         operation: &'static str,
         /// Stable key-family diagnostic.
         key_type: &'static str,
-        /// Configured minimum modulus width.
+        /// Configured minimum width of the named key/domain component.
         minimum_bits: usize,
-        /// Non-configurable implementation ceiling.
+        /// Effective maximum, bounded by the implementation ceiling.
         maximum_bits: usize,
-        /// Observed normalized modulus width.
+        /// Observed normalized width of the named key/domain component.
         actual_bits: usize,
     },
     /// RSA key material is structurally invalid.
@@ -1356,6 +1375,8 @@ pub struct EncryptionPolicy {
     pub oaep_digests: Option<HashSet<OaepDigestAlgorithm>>,
     /// RSA requirements enforced when producing OAEP key transport.
     pub rsa_keys: RsaKeyPolicy,
+    /// Shared agreement/KDF permission and cumulative work requirements.
+    pub key_establishment: KeyEstablishmentPolicy,
     /// XML parser rules.
     pub xml: XmlInputPolicy,
     /// Resource ceilings.
@@ -1367,6 +1388,7 @@ impl EncryptionPolicy {
     /// Validate the complete snapshot before outbound encryption work begins.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
         self.resources.validate()?;
+        self.key_establishment.validate()?;
         self.rsa_keys.validate()
     }
 }
@@ -1375,6 +1397,10 @@ impl EncryptionPolicy {
 #[cfg(feature = "xmlenc")]
 #[derive(Debug, Clone, Default)]
 pub struct DecryptionPolicy {
+    /// URI-class permissions for ciphertext and indirect key references.
+    pub uris: UriPolicy,
+    /// Shared transform permissions and same-document reference semantics.
+    pub transforms: TransformPolicy,
     /// Allowed content-decryption algorithms.
     pub data_algorithms: Option<HashSet<DataEncryptionAlgorithm>>,
     /// Allowed RSA key-transport algorithms accepted on input.
@@ -1386,6 +1412,8 @@ pub struct DecryptionPolicy {
     /// RSA requirements enforced before OAEP recovery; defaults to 2048 bits.
     /// Legacy input requires an explicit caller-selected lower minimum.
     pub rsa_keys: RsaKeyPolicy,
+    /// Shared agreement/KDF permission and cumulative work requirements.
+    pub key_establishment: KeyEstablishmentPolicy,
     /// XML parser rules.
     pub xml: XmlInputPolicy,
     /// Resource ceilings.
@@ -1397,6 +1425,7 @@ impl DecryptionPolicy {
     /// Validate the complete snapshot before inbound decryption work begins.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
         self.resources.validate()?;
+        self.key_establishment.validate()?;
         self.rsa_keys.validate()
     }
 }

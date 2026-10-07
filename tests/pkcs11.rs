@@ -491,7 +491,7 @@ fn isolated_token_operations_and_failures() {
         recovered.into_key(),
         Err(ProviderError::KeyNotExportable)
     ));
-    use rsa::pkcs8::DecodePublicKey;
+    use xml_sec::rsa_encoding::RsaPublicKeyEncoding as _;
     let xml_sec::xmldsig::SigningPublicKeyInfo::Rsa { spki_der, .. } =
         xml_sec::xmldsig::SigningKey::public_key_info(private.as_ref()).unwrap()
     else {
@@ -514,7 +514,7 @@ fn isolated_token_operations_and_failures() {
         xml_sec::xmlenc::DecryptedContent::Bytes(message.to_vec())
     );
     // Both sides derive the same secret without reading either private scalar.
-    use rsa::pkcs8::der::{Decode, asn1::OctetStringRef};
+    use pkcs8::der::{Decode, asn1::OctetStringRef};
     for (curve, width, first_id) in [
         (&[6, 8, 42, 134, 72, 206, 61, 3, 1, 7][..], 32, 4),
         (&[6, 5, 43, 129, 4, 0, 34][..], 48, 6),

@@ -693,6 +693,21 @@ pub enum RetrievalMethodTransforms {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum KeyValueInfo {
+    /// XMLEnc 1.1 §5.6.1 DH public value and optional complete domain group.
+    Dh {
+        /// Optional prime modulus, present together with Q and Generator.
+        p: Option<Vec<u8>>,
+        /// Optional subgroup prime.
+        q: Option<Vec<u8>>,
+        /// Optional generator.
+        generator: Option<Vec<u8>>,
+        /// Required unsigned public value; private exponents are never parsed.
+        public: Vec<u8>,
+        /// Optional parameter-generation seed, paired with pgenCounter.
+        seed: Option<Vec<u8>>,
+        /// Optional parameter-generation counter.
+        pgen_counter: Option<Vec<u8>>,
+    },
     /// `<DSAKeyValue>` public parameters.
     Dsa {
         /// Optional prime modulus P, present only together with Q.
@@ -1385,6 +1400,34 @@ impl<'a> KeyInfoParsingSession<'a> {
             &mut self.usage,
         )
     }
+
+    /// Parse the KeyInfoType carried by an XML Encryption agreement role.
+    /// Keep the original node for XML Base and share this session's allowance.
+    #[cfg(feature = "xmlenc")]
+    pub(crate) fn parse_agreement_role(
+        &mut self,
+        node: Node,
+        provider: &dyn crate::provider::CryptoProvider,
+    ) -> Result<KeyInfo, ParseError> {
+        let namespace = "http://www.w3.org/2001/04/xmlenc#";
+        if !node.has_tag_name((namespace, "OriginatorKeyInfo"))
+            && !node.has_tag_name((namespace, "RecipientKeyInfo"))
+        {
+            return Err(ParseError::InvalidStructure(
+                "invalid agreement key role".into(),
+            ));
+        }
+        ensure_no_non_whitespace_text(node, "agreement KeyInfo")?;
+        parse_key_info_contents_in_session(
+            node,
+            provider,
+            &self.xml_base,
+            self.resources,
+            None,
+            None,
+            &mut self.usage,
+        )
+    }
 }
 
 pub(crate) fn parse_key_info_with_provider(
@@ -1448,6 +1491,26 @@ fn parse_key_info_in_session(
 ) -> Result<KeyInfo, ParseError> {
     validate_key_info_container(key_info_node)?;
 
+    parse_key_info_contents_in_session(
+        key_info_node,
+        provider,
+        xml_base_budget,
+        resources,
+        document_base,
+        allowed,
+        usage,
+    )
+}
+
+fn parse_key_info_contents_in_session(
+    key_info_node: Node,
+    provider: &dyn crate::provider::CryptoProvider,
+    xml_base_budget: &XmlBaseResolutionBudget,
+    resources: &crate::policy::ResourcePolicy,
+    document_base: Option<&str>,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
+    usage: &mut KeyInfoParseUsage,
+) -> Result<KeyInfo, ParseError> {
     let mut sources = Vec::new();
     // KeyInfo is parsed before source selection, so preflight the cardinality
     // of every embedded key before decoding or algorithm-specific parsing.
@@ -1740,6 +1803,9 @@ pub(crate) fn parse_key_value_dispatch(node: Node) -> Result<KeyValueInfo, Parse
         (Some(XMLDSIG_NS), "RSAKeyValue") => parse_rsa_key_value(first_child),
         (Some(XMLDSIG_NS), "DSAKeyValue") => parse_dsa_key_value(first_child),
         (Some(XMLDSIG11_NS), "ECKeyValue") => parse_ec_key_value(first_child),
+        (Some("http://www.w3.org/2001/04/xmlenc#"), "DHKeyValue") => {
+            parse_dh_key_value(first_child)
+        }
         (namespace, child_name) => Ok(KeyValueInfo::Unsupported {
             namespace: namespace.map(str::to_string),
             local_name: child_name.to_string(),
@@ -1781,6 +1847,56 @@ fn parse_dsa_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
         ));
     }
     Ok(KeyValueInfo::Dsa { p, q, g, y })
+}
+
+fn parse_dh_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
+    const NS: &str = "http://www.w3.org/2001/04/xmlenc#";
+    ensure_no_non_whitespace_text(node, "DHKeyValue")?;
+    let mut children = element_children(node).peekable();
+    let mut take = |name: &'static str| -> Result<Option<Vec<u8>>, ParseError> {
+        if !children
+            .peek()
+            .is_some_and(|child| child.has_tag_name((NS, name)))
+        {
+            return Ok(None);
+        }
+        let child = children.next().expect("peeked child");
+        ensure_no_element_children(child, name)?;
+        decode_crypto_binary(
+            child,
+            name,
+            crate::hard_limits::DH_MODULUS_BIT_CEILING.div_ceil(8),
+        )
+        .map(Some)
+    };
+    // XMLEnc 1.1 §5.6.1 has optional sequences, not independently optional
+    // fields; absent parameters must come from trusted application state.
+    // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-DHKeyValue
+    let p = take("P")?;
+    let q = take("Q")?;
+    let generator = take("Generator")?;
+    if p.is_some() != q.is_some() || p.is_some() != generator.is_some() {
+        return Err(ParseError::InvalidStructure(
+            "DHKeyValue requires P, Q and Generator together".into(),
+        ));
+    }
+    let public = take("Public")?
+        .ok_or_else(|| ParseError::InvalidStructure("DHKeyValue requires Public".into()))?;
+    let seed = take("seed")?;
+    let pgen_counter = take("pgenCounter")?;
+    if seed.is_some() != pgen_counter.is_some() || children.next().is_some() {
+        return Err(ParseError::InvalidStructure(
+            "DHKeyValue children do not match the XMLEnc schema order".into(),
+        ));
+    }
+    Ok(KeyValueInfo::Dh {
+        p,
+        q,
+        generator,
+        public,
+        seed,
+        pgen_counter,
+    })
 }
 
 fn take_dsa_crypto_binary(
