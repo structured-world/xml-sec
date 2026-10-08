@@ -145,6 +145,10 @@ local names match across namespaces, preserving the CLI `--id-attr` contract. Re
 to the built-in `ID`/`Id`/`id` spellings, `xml:id`, and internal-DTD ID declarations; they do not
 remove these defaults. `xml:id` and DTD ID values are normalized in the shared semantic DOM,
 so borrowed and retained-document resolution, XPath, and canonicalization see the same value.
+`Attribute::xml_id_error()` exposes non-fatal invalid-NCName and non-ID-declaration diagnostics.
+As required by [xml:id 1.0 sections 4 and 6](https://www.w3.org/TR/2005/REC-xml-id-20050909/#processing),
+ID assignment is preserved even when a diagnostic is present; callers can inspect it before
+relying on such an attribute. Duplicate values on different elements remain ambiguous.
 `SignContext::sign_template` selects the last descendant `Signature` template by default, preserving
 append-then-sign workflows when a document already contains signatures. Process compatibility
 boundaries that use donor document-order lookup can explicitly select

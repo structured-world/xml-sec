@@ -8,6 +8,45 @@ use xml_sec::xmldsig::NodeSet;
 use xml_sec::xmldsig::uri::UriReferenceResolver;
 
 #[test]
+fn xml_id_errors_are_reported_without_losing_id_assignment() {
+    // xml:id sections 4/6 specify non-fatal diagnostics, not parse rejection.
+    for backend in xml_sec::XmlBackend::available() {
+        for (xml, expected) in [
+            (
+                "<root xml:id=' bad value '/>",
+                Some(xml_sec::XmlIdError::InvalidNcName),
+            ),
+            (
+                "<!DOCTYPE root [<!ATTLIST root xml:id CDATA #IMPLIED>]><root xml:id=' bad value '/>",
+                Some(xml_sec::XmlIdError::InvalidNcNameAndDeclaredType),
+            ),
+            (
+                "<!DOCTYPE root [<!ATTLIST root xml:id CDATA #IMPLIED>]><root xml:id='target'/>",
+                Some(xml_sec::XmlIdError::InvalidDeclaredType),
+            ),
+            (
+                "<!DOCTYPE root [<!ATTLIST root xml:id ID #IMPLIED><!ATTLIST root xml:id CDATA #IMPLIED>]><root xml:id='target'/>",
+                Some(xml_sec::XmlIdError::InvalidDeclaredType),
+            ),
+            ("<root xml:id=' valid '/>", None),
+        ] {
+            let document = xml_sec::Document::parse_with_options_and_backend(
+                xml,
+                xml_sec::ParsingOptions {
+                    allow_dtd: true,
+                    ..Default::default()
+                },
+                backend,
+            )
+            .unwrap();
+            let attribute = document.root_element().attributes().next().unwrap();
+            assert!(attribute.is_id());
+            assert_eq!(attribute.xml_id_error(), expected, "{backend:?}: {xml}");
+        }
+    }
+}
+
+#[test]
 fn dtd_ids_and_xml_ids_share_the_normalized_semantic_index() {
     // Internal DTD ID assignment and xml:id normalization must be identical
     // across parsers, borrowed resolution and retained document identities.

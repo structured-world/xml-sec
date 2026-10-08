@@ -25,9 +25,15 @@ struct SourceNode {
 
 type DtdAttributeName<'a> = (Option<&'a str>, &'a str, Option<&'a str>, &'a str);
 
+#[derive(Clone, Copy)]
+pub(super) struct DtdAttributeInfo {
+    pub(super) kind: crate::document::DtdAttributeType,
+    pub(super) has_non_id_declaration: bool,
+}
+
 pub(super) struct LexicalPreflight<'input> {
     nodes: Vec<SourceNode>,
-    attributes: HashMap<DtdAttributeName<'input>, crate::document::DtdAttributeType>,
+    attributes: HashMap<DtdAttributeName<'input>, DtdAttributeInfo>,
     #[cfg(feature = "xml-backend-roxmltree")]
     doctype: Option<Range<usize>>,
 }
@@ -108,7 +114,18 @@ impl<'input> LexicalPreflight<'input> {
                                     attribute_prefix,
                                     attribute_local,
                                 ))
-                                .or_insert(kind);
+                                .and_modify(|info: &mut DtdAttributeInfo| {
+                                    // xml:id section 4 constrains ALL declarations,
+                                    // even those shadowed by the first binding.
+                                    // https://www.w3.org/TR/2005/REC-xml-id-20050909/#processing
+                                    info.has_non_id_declaration |=
+                                        kind != crate::document::DtdAttributeType::Id;
+                                })
+                                .or_insert(DtdAttributeInfo {
+                                    kind,
+                                    has_non_id_declaration: kind
+                                        != crate::document::DtdAttributeType::Id,
+                                });
                         },
                     );
                     #[cfg(feature = "xml-backend-roxmltree")]
@@ -132,13 +149,13 @@ impl<'input> LexicalPreflight<'input> {
         })
     }
 
-    pub(super) fn attribute_type(
+    pub(super) fn attribute_declaration(
         &self,
         element_prefix: Option<&str>,
         element_local: &str,
         attribute_prefix: Option<&str>,
         attribute_local: &str,
-    ) -> Option<crate::document::DtdAttributeType> {
+    ) -> Option<DtdAttributeInfo> {
         self.attributes
             .get(&(
                 element_prefix,

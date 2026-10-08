@@ -83,6 +83,18 @@ pub(super) struct AttributeData {
     pub(super) prefix: Option<String>,
     pub(super) value: String,
     pub(super) is_id: bool,
+    pub(super) xml_id_error: Option<XmlIdError>,
+}
+
+/// Non-fatal xml:id constraint diagnostic; ID type assignment is preserved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XmlIdError {
+    /// The normalized value is not an XML NCName.
+    InvalidNcName,
+    /// A declaration assigns a type other than ID to this xml:id attribute.
+    InvalidDeclaredType,
+    /// Both the normalized value and a declared type violate the constraints.
+    InvalidNcNameAndDeclaredType,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -196,20 +208,37 @@ impl<'input> TreeBuilder<'input> {
             } = &mut node.kind
             {
                 for attribute in attributes {
-                    attribute.is_id = (attribute.namespace.as_deref() == Some(XML_NAMESPACE_URI)
-                        && attribute.name == "id")
-                        || preflight.attribute_type(
-                            prefix.as_deref(),
-                            name,
-                            attribute.prefix.as_deref(),
-                            &attribute.name,
-                        ) == Some(crate::document::DtdAttributeType::Id);
+                    let xml_id = attribute.namespace.as_deref() == Some(XML_NAMESPACE_URI)
+                        && attribute.name == "id";
+                    let declaration = preflight.attribute_declaration(
+                        prefix.as_deref(),
+                        name,
+                        attribute.prefix.as_deref(),
+                        &attribute.name,
+                    );
+                    attribute.is_id = xml_id
+                        || declaration
+                            .is_some_and(|info| info.kind == crate::document::DtdAttributeType::Id);
                     if attribute.is_id {
                         // xml:id section 4 and XML 1.0 section 3.3.3 require
                         // ID normalization in the infoset, not just the index.
                         // https://www.w3.org/TR/2005/REC-xml-id-20050909/#processing
                         // https://www.w3.org/TR/2008/REC-xml-20081126/#AVNormalize
                         normalize_id_value(&mut attribute.value);
+                        if xml_id {
+                            // xml:id sections 4/6: report constraints without
+                            // suppressing assignment or making parsing fatal.
+                            // https://www.w3.org/TR/2005/REC-xml-id-20050909/#processing
+                            let invalid_value = !crate::xml::is_xml_ncname(&attribute.value);
+                            let invalid_type =
+                                declaration.is_some_and(|info| info.has_non_id_declaration);
+                            attribute.xml_id_error = match (invalid_value, invalid_type) {
+                                (true, false) => Some(XmlIdError::InvalidNcName),
+                                (false, true) => Some(XmlIdError::InvalidDeclaredType),
+                                (true, true) => Some(XmlIdError::InvalidNcNameAndDeclaredType),
+                                (false, false) => None,
+                            };
+                        }
                     }
                 }
             }
@@ -857,6 +886,14 @@ pub struct Attribute<'a> {
     data: &'a AttributeData,
 }
 impl<'a> Attribute<'a> {
+    /// Report non-fatal xml:id errors without changing ID type assignment.
+    ///
+    /// xml:id 1.0 sections 4 and 6 require assignment even for invalid values;
+    /// applications may inspect this diagnostic before relying on an ID.
+    /// https://www.w3.org/TR/2005/REC-xml-id-20050909/#processing
+    pub fn xml_id_error(self) -> Option<XmlIdError> {
+        self.data.xml_id_error
+    }
     /// Whether XML processing assigned the ID type (DTD or xml:id).
     pub fn is_id(self) -> bool {
         self.data.is_id

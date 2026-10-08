@@ -107,6 +107,7 @@ fn project_document<'document, 'input>(
                                     .map(str::to_owned),
                                 value: attribute.value().to_owned(),
                                 is_id: false,
+                                xml_id_error: None,
                             })
                             .collect(),
                         namespaces: source

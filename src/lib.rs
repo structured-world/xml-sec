@@ -107,7 +107,7 @@ pub use xml::dom::{
     Ancestors, Attribute, Attributes, Children, Descendants, Document, Document as XmlDomDocument,
     ExpandedName, Namespace, Namespaces, Node, Node as XmlDomNode, NodeId, NodeId as XmlDomNodeId,
     NodeType, PI, ParseError, ParseError as XmlDomParseError, ParsingOptions,
-    ParsingOptions as XmlDomParsingOptions, XmlBackend,
+    ParsingOptions as XmlDomParsingOptions, XmlBackend, XmlIdError,
 };
 
 #[cfg(feature = "xmldsig")]

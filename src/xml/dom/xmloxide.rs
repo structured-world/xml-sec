@@ -129,6 +129,7 @@ impl Projector<'_, '_, '_> {
                                         prefix: attribute.prefix.clone(),
                                         value: attribute.value.clone(),
                                         is_id: false,
+                                        xml_id_error: None,
                                     });
                                 }
                             }

@@ -262,6 +262,9 @@ impl<'a> ResolverIdIndex<'a> {
 }
 
 impl<'a> UriReferenceResolver<'a> {
+    pub(crate) fn id_registrations(&self) -> &[crate::IdAttributeRegistration] {
+        &self.id_registrations
+    }
     /// Build a resolver with default ID attribute names (`ID`, `Id`, `id`).
     pub fn new(doc: &'a Document<'a>) -> Self {
         Self::with_id_attrs(doc, &[])
@@ -685,13 +688,34 @@ impl<'a> UriReferenceResolver<'a> {
         &self,
         uri: &str,
     ) -> Result<Option<NodeId>, TransformError> {
+        let target = self.node_id_for_reference_resource(uri, None)?;
+        if uri.is_empty() || target == Some(self.doc.root().id()) {
+            return Err(TransformError::UnsupportedUri(uri.to_owned()));
+        }
+        Ok(target)
+    }
+
+    /// Classify the resource once using the same normalization as dereference;
+    /// unlike element-only consumers, evidence may bind the document root.
+    pub(crate) fn node_id_for_reference_resource(
+        &self,
+        uri: &str,
+        budget: Option<&NodeSetMaterializationBudget>,
+    ) -> Result<Option<NodeId>, TransformError> {
+        if uri.is_empty() {
+            return Ok(Some(self.doc.root().id()));
+        }
         let fragment = uri
             .strip_prefix('#')
             .ok_or_else(|| TransformError::UnsupportedUri(uri.to_owned()))?;
-        let normalized = Self::normalize_fragment(fragment, None, self.same_document_id_semantics)?;
+        let normalized =
+            Self::normalize_fragment(fragment, budget, self.same_document_id_semantics)?;
         let fragment = normalized.as_ref();
-        if fragment.is_empty() || is_xpointer_root(fragment) {
+        if fragment.is_empty() {
             return Err(TransformError::UnsupportedUri(uri.to_owned()));
+        }
+        if is_xpointer_root(fragment) {
+            return Ok(Some(self.doc.root().id()));
         }
         let (id, _) = self
             .same_document_id_fragment(fragment)
@@ -721,9 +745,13 @@ impl<'a> UriReferenceResolver<'a> {
         let mut result = Cow::Borrowed(fragment);
         // XPointer Framework sections 3 and 4 reverse URI escaping before
         // evaluating the pointer. libxmlsec1's barename/Visa3D modes instead
-        // use literal ID strings; preserve that intentional compatibility rule.
+        // use literal bare ID strings. Explicit pointers still follow the
+        // Framework, independently of the selected barename compatibility mode.
         // https://www.w3.org/TR/2003/REC-xptr-framework-20030325/#escaping
-        if semantics == SameDocumentIdSemantics::Specification && fragment.contains('%') {
+        if fragment.contains('%')
+            && (semantics == SameDocumentIdSemantics::Specification
+                || has_encoded_xpointer_prefix(fragment))
+        {
             if let Some(budget) = budget {
                 budget.reserve_workspace(fragment.len())?;
             }
@@ -812,6 +840,29 @@ fn hex_digit(byte: u8) -> Option<u8> {
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
+}
+
+fn has_encoded_xpointer_prefix(fragment: &str) -> bool {
+    // Recognize URI-escaped scheme syntax without materializing a candidate.
+    let mut bytes = fragment.bytes();
+    for expected in b"xpointer(" {
+        let Some(mut actual) = bytes.next() else {
+            return false;
+        };
+        if actual == b'%' {
+            let Some(high) = bytes.next().and_then(hex_digit) else {
+                return false;
+            };
+            let Some(low) = bytes.next().and_then(hex_digit) else {
+                return false;
+            };
+            actual = high * 16 + low;
+        }
+        if actual != *expected {
+            return false;
+        }
+    }
+    true
 }
 
 fn is_xpointer_root(fragment: &str) -> bool {
@@ -1660,6 +1711,26 @@ mod tests {
             resolver.dereference("#visa'3d"),
             Err(TransformError::UnsupportedUri(uri)) if uri == "#visa'3d"
         ));
+    }
+
+    #[test]
+    fn explicit_xpointer_decoding_is_independent_of_barename_mode() {
+        // Compatibility modes change bare IDs, not explicit XPointer escaping.
+        let document = Document::parse("<root><item ID='café'/></root>").unwrap();
+        for semantics in [
+            SameDocumentIdSemantics::Specification,
+            SameDocumentIdSemantics::XmlSecBarename,
+            SameDocumentIdSemantics::XmlSecVisa3d,
+        ] {
+            let resolver =
+                UriReferenceResolver::new(&document).with_same_document_id_semantics(semantics);
+            for uri in [
+                "#xpointer(id('caf%C3%A9'))",
+                "#%78pointer%28id('caf%C3%A9')%29",
+            ] {
+                assert!(resolver.dereference(uri).is_ok(), "{semantics:?}: {uri}");
+            }
+        }
     }
 
     #[test]
