@@ -16,9 +16,9 @@ use crate::xmlenc::{
     DataEncryptionAlgorithm, KeyTransportAlgorithm, KeyWrapAlgorithm, OaepDigestAlgorithm,
 };
 
-#[cfg(feature = "xmlenc")]
+#[cfg(feature = "xmldsig")]
 mod key_establishment;
-#[cfg(feature = "xmlenc")]
+#[cfg(feature = "xmldsig")]
 pub use key_establishment::{
     KeyAgreementAlgorithm, KeyDerivationAlgorithm, KeyEstablishmentPolicy,
 };
@@ -71,15 +71,15 @@ pub(crate) mod resource_name {
     pub const KEY_CANDIDATES: &str = "key candidates";
     pub const KEY_IMPORT_KDF_WORK: &str = "key import KDF work";
     pub const KEY_IMPORT_KDF_MEMORY: &str = "key import KDF memory bytes";
-    #[cfg(feature = "xmlenc")]
+    #[cfg(feature = "xmldsig")]
     pub const KEY_ESTABLISHMENT_HASH_BLOCKS: &str = "key establishment hash blocks";
-    #[cfg(feature = "xmlenc")]
+    #[cfg(feature = "xmldsig")]
     pub const KEY_ESTABLISHMENT_OWNED_BYTES: &str = "key establishment owned bytes";
-    #[cfg(feature = "xmlenc")]
+    #[cfg(feature = "xmldsig")]
     pub const DH_MODULUS_BITS: &str = "DH modulus bits";
-    #[cfg(feature = "xmlenc")]
+    #[cfg(feature = "xmldsig")]
     pub const DH_SUBGROUP_BITS: &str = "DH subgroup bits";
-    #[cfg(feature = "xmlenc")]
+    #[cfg(feature = "xmldsig")]
     pub const KEY_ESTABLISHMENT_MODULAR_WORK: &str = "key establishment modular work";
     pub const KEY_INFO_REFERENCE_DEPTH: &str = "KeyInfoReference depth";
     pub const BASE64_TRANSFORM_INPUT_BYTES: &str = "Base64 transform input bytes";
@@ -1180,6 +1180,8 @@ pub enum ManifestProcessing {
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Default)]
 pub struct VerificationPolicy {
+    /// Shared key-establishment permissions and cumulative operation limits.
+    pub key_establishment: KeyEstablishmentPolicy,
     /// Family permission selected by the caller, never derived from document input.
     /// Legacy hashes additionally require the independent key-trust permission.
     pub parameterized_rsa_pss: RsaPssPermission,
@@ -1233,6 +1235,7 @@ impl VerificationPolicy {
     /// Validate the complete snapshot against implementation hard ceilings.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
         self.resources.validate()?;
+        self.key_establishment.validate()?;
         self.key_trust.validate()?;
         self.hmac.validate()
     }
@@ -1292,6 +1295,8 @@ impl VerificationPolicy {
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Default)]
 pub struct SigningPolicy {
+    /// Shared key-establishment permissions and cumulative operation limits.
+    pub key_establishment: KeyEstablishmentPolicy,
     /// Explicit parameterized RSA-PSS family permission, including legacy hashes.
     pub parameterized_rsa_pss: RsaPssPermission,
     /// Exact signing methods, supplemented by `parameterized_rsa_pss`.
@@ -1325,6 +1330,7 @@ impl SigningPolicy {
     /// Validate the complete snapshot before signing work begins.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
         self.resources.validate()?;
+        self.key_establishment.validate()?;
         self.rsa_keys.validate()?;
         self.dsa_keys.validate()?;
         self.hmac.validate()

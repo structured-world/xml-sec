@@ -338,6 +338,7 @@ pub enum SignatureSelection<'a> {
 #[must_use = "configure the context and call verify(), or store it for reuse"]
 #[derive(Clone)]
 pub struct VerifyContext<'a> {
+    decapsulation_key: Option<&'a dyn crate::provider::KeyDecapsulationKey>,
     key: Option<&'a dyn VerifyingKey>,
     key_resolver: Option<&'a dyn KeyResolver>,
     policy: crate::policy::VerificationPolicy,
@@ -360,6 +361,7 @@ impl<'a> VerifyContext<'a> {
     /// - pre-digest buffers not stored
     pub fn new() -> Self {
         Self {
+            decapsulation_key: None,
             key: None,
             key_resolver: None,
             policy: crate::policy::VerificationPolicy::default(),
@@ -380,6 +382,14 @@ impl<'a> VerifyContext<'a> {
     /// key metadata that the core cannot inspect.
     pub fn key(mut self, key: &'a dyn VerifyingKey) -> Self {
         self.key = Some(key);
+        self
+    }
+
+    /// Recover the HMAC secret using an explicit recipient private key.
+    /// Policy must grant the exact experimental KEM. A valid KEM/HMAC result
+    /// is not evidence of sender identity.
+    pub fn decapsulation_key(mut self, key: &'a dyn crate::provider::KeyDecapsulationKey) -> Self {
+        self.decapsulation_key = Some(key);
         self
     }
 
@@ -1062,6 +1072,7 @@ struct CanonicalizedDataBudget {
 }
 
 struct VerificationOperationBudgets {
+    key_establishment: RefCell<crate::key_establishment::KeyEstablishmentUsage>,
     transforms: TransformExecutionBudget,
     canonicalized: CanonicalizedDataBudget,
     xpath_parse: RefCell<XPathSignatureParseBudget>,
@@ -1077,6 +1088,7 @@ impl VerificationOperationBudgets {
         transforms: TransformExecutionBudget,
     ) -> Self {
         Self {
+            key_establishment: Default::default(),
             transforms,
             canonicalized: CanonicalizedDataBudget::with_limit(
                 policy.resources.effective_canonicalized_bytes(),
@@ -1531,6 +1543,9 @@ pub struct VerifyResult {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum DsigError {
+    /// Key establishment failed before the consuming MAC.
+    #[error(transparent)]
+    KeyEstablishment(#[from] crate::key_establishment::KeyEstablishmentError),
     /// Caller-supplied request identities or requirements are inconsistent.
     #[error("invalid verification request: {reason}")]
     InvalidRequest {
@@ -2104,6 +2119,39 @@ fn verify_signature_node<'a>(
     }
     let doc = view.document();
     let signature_children = parse_signature_children(signature_node)?;
+    let encapsulation = signature_children
+        .key_info_node
+        .map(|info| crate::key_establishment::direct_encapsulation(info, false))
+        .transpose()?
+        .flatten();
+    if encapsulation.is_some() != ctx.decapsulation_key.is_some() {
+        return Err(crate::key_establishment::KeyEstablishmentError::Structure(
+            "mechanism and explicit recipient key must be supplied together",
+        )
+        .into());
+    }
+    if let Some(mechanism) = &encapsulation {
+        // Public-key encapsulation establishes a recipient secret, not sender
+        // identity. Reject an impossible trust requirement before key work.
+        if ctx.policy.key_trust.mode != crate::policy::VerificationTrustMode::CryptographicOnly {
+            return Err(crate::policy::PolicyViolation::KeyTrust {
+                reason: "KEM/HMAC does not authenticate sender identity",
+            }
+            .into());
+        }
+        ctx.policy
+            .key_establishment
+            .check_encapsulation(mechanism.algorithm)?;
+        if ctx
+            .decapsulation_key
+            .is_some_and(|key| key.algorithm() != mechanism.algorithm)
+        {
+            return Err(crate::key_establishment::KeyEstablishmentError::Structure(
+                "recipient parameter set mismatch",
+            )
+            .into());
+        }
+    }
     let signed_info_node = signature_children.signed_info_node;
     let should_parse_key_info = match (key, ctx.key_resolver) {
         (Some(_), _) => false,
@@ -2417,6 +2465,45 @@ fn verify_signature_node<'a>(
         }
     }
     let resolved_key = operation.run(plan_nodes.key, || {
+        if let Some(recipient) = ctx.decapsulation_key {
+            if key.is_some() || ctx.key_resolver.is_some() {
+                return Err(crate::key_establishment::KeyEstablishmentError::Structure(
+                    "ambiguous verification key request",
+                )
+                .into());
+            }
+            require_verifying_key_candidate_capacity(&ctx.policy)?;
+            if !ctx.policy.key_sources.preset_key
+                || signed_info.signature_method.hmac_output_bits().is_none()
+            {
+                return Err(crate::key_establishment::KeyEstablishmentError::Structure(
+                    "encapsulation requires permitted explicit key and HMAC",
+                )
+                .into());
+            }
+            ctx.policy.hmac.validate_key_bits(256)?;
+            let mechanism = encapsulation.as_ref().ok_or(
+                crate::key_establishment::KeyEstablishmentError::Structure("missing mechanism"),
+            )?;
+            operation
+                .budgets()
+                .key_establishment
+                .borrow_mut()
+                .commit_all(&ctx.policy.key_establishment, 0, 0, 32)?;
+            let secret = operation
+                .budgets()
+                .key_establishment
+                .borrow_mut()
+                .decapsulate(
+                    &ctx.policy.key_establishment,
+                    ctx.provider,
+                    recipient,
+                    mechanism.algorithm,
+                    mechanism.ciphertext(),
+                )?;
+            let hmac = super::HmacVerificationKey::new(secret.to_vec())?;
+            return Ok(Some(ResolvedVerifyingKey::Established(hmac)));
+        }
         resolve_verifying_key(ctx, key, key_info.as_ref(), signed_info.signature_method)
     })?;
     let Some(resolved_key) = resolved_key else {
@@ -3790,6 +3877,7 @@ fn transform_preserves_manifest_structure(transform: &Transform) -> bool {
     reason = "single bounded authorization result avoids heap allocation"
 )]
 enum ResolvedVerifyingKey<'a> {
+    Established(super::HmacVerificationKey),
     Borrowed(&'a dyn VerifyingKey),
     Owned(super::ResolvedVerificationKey<'a>),
 }
@@ -3800,6 +3888,16 @@ impl ResolvedVerifyingKey<'_> {
         policy: &crate::policy::VerificationPolicy,
     ) -> Result<super::KeyTrustEvidence, DsigError> {
         match self {
+            Self::Established(_) => {
+                if policy.key_trust.mode != crate::policy::VerificationTrustMode::CryptographicOnly
+                {
+                    return Err(crate::policy::PolicyViolation::KeyTrust {
+                        reason: "KEM/HMAC does not authenticate sender identity",
+                    }
+                    .into());
+                }
+                Ok(super::KeyTrustEvidence::NotEstablished)
+            }
             Self::Borrowed(_)
                 if policy.key_trust.mode
                     == crate::policy::VerificationTrustMode::CryptographicOnly =>
@@ -3812,6 +3910,7 @@ impl ResolvedVerifyingKey<'_> {
     }
     fn as_ref(&self) -> &dyn VerifyingKey {
         match self {
+            Self::Established(key) => key,
             Self::Borrowed(key) => *key,
             Self::Owned(key) => key.as_ref(),
         }
@@ -3915,7 +4014,7 @@ fn enforce_transform_allowed(
 pub(super) struct SignatureChildNodes<'a, 'input> {
     signed_info_node: Node<'a, 'input>,
     signature_value_node: Node<'a, 'input>,
-    key_info_node: Option<Node<'a, 'input>>,
+    pub(super) key_info_node: Option<Node<'a, 'input>>,
 }
 
 pub(super) fn parse_signature_children<'a, 'input>(

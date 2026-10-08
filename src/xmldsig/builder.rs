@@ -229,6 +229,7 @@ impl SignatureBuilder {
         self.build_template_with_policy_and_signature_output_len(
             policy,
             None,
+            None,
             &budget,
             &mut xpath_parse_budget,
         )
@@ -238,12 +239,14 @@ impl SignatureBuilder {
         &self,
         policy: &SigningPolicy,
         signature_output_len: usize,
+        encapsulation: Option<crate::provider::KeyEncapsulationAlgorithm>,
         budget: &TransformExecutionBudget,
         xpath_parse_budget: &mut XPathSignatureParseBudget,
     ) -> Result<String, SignatureBuilderError> {
         self.build_template_with_policy_and_signature_output_len(
             policy,
             Some(signature_output_len),
+            encapsulation,
             budget,
             xpath_parse_budget,
         )
@@ -253,6 +256,7 @@ impl SignatureBuilder {
         &self,
         policy: &SigningPolicy,
         signature_output_len: Option<usize>,
+        encapsulation: Option<crate::provider::KeyEncapsulationAlgorithm>,
         budget: &TransformExecutionBudget,
         xpath_parse_budget: &mut XPathSignatureParseBudget,
     ) -> Result<String, SignatureBuilderError> {
@@ -340,7 +344,26 @@ impl SignatureBuilder {
         }
         write_end(&mut writer, prefix, "SignedInfo")?;
         write_empty(&mut writer, prefix, "SignatureValue")?;
-        if self.include_key_info {
+        if let Some(algorithm) = encapsulation {
+            policy.key_establishment.check_encapsulation(algorithm)?;
+            write_start(&mut writer, prefix, "KeyInfo")?;
+            writer.start(
+                "EncapsulationMechanism",
+                [
+                    ("xmlns", crate::key_establishment::ENCAPSULATION_NS),
+                    ("Algorithm", algorithm.uri()),
+                ],
+            )?;
+            writer.empty("KeyInfo", [("xmlns", XMLDSIG_NS)])?;
+            writer.start(
+                "CipherData",
+                [("xmlns", "http://www.w3.org/2001/04/xmlenc#")],
+            )?;
+            writer.empty("CipherValue", std::iter::empty::<(&str, &str)>())?;
+            writer.end("CipherData")?;
+            writer.end("EncapsulationMechanism")?;
+            write_end(&mut writer, prefix, "KeyInfo")?;
+        } else if self.include_key_info {
             write_empty(&mut writer, prefix, "KeyInfo")?;
         }
         writer.end(&signature_name)?;

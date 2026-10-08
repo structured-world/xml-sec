@@ -23,6 +23,7 @@
 //! ```
 
 mod escape;
+#[cfg(feature = "xmldsig")]
 pub(crate) use escape::escape_attr;
 mod ns_common;
 pub(crate) mod ns_exclusive;

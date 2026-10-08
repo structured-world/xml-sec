@@ -25,6 +25,24 @@ must verify, invalid vectors must return their exact failure class, and vectors
 that depend on an unavailable capability such as XSLT or HMAC-MD5 must fail at
 an explicit typed boundary rather than being skipped.
 
+## Experimental Recipient Encapsulation
+
+`experimental-pq` supports libxmlsec1 1.3.13's experimental
+`EncapsulationMechanism` inside signature `KeyInfo`. It is an extension, not a
+W3C signature algorithm. Use `SignContext::new_encapsulation(&recipient_public)`
+with an HMAC builder/template and an explicitly permitting `SigningPolicy`.
+The context fills the KEM ciphertext before canonicalization and reference
+digests, then consumes the resulting 256-bit secret as the HMAC key.
+Verification uses `VerifyContext::decapsulation_key(&recipient_private)` and
+the same explicit algorithm permission. Supplying an ordinary HMAC key cannot
+bypass the mechanism, and conflicting recipient parameter sets are rejected.
+
+**KEM/HMAC does not authenticate the sender:** anyone holding the public key
+can create a new valid message. This path requires explicit
+`VerificationTrustMode::CryptographicOnly` and returns
+`KeyTrustEvidence::NotEstablished`; a trusted-key requirement fails before
+decapsulation. Use a genuine digital signature when sender identity matters.
+
 ## Examples
 
 `examples/sign.rs` builds an enveloped RSA-SHA256 signature with an embedded X.509

@@ -18,6 +18,25 @@ stale or foreign document state is therefore rejected before mutation work begin
 Compiled graph failures are reported as `XmlEncError::OperationPlan`; malformed XMLEnc
 element order or namespaces remain `XmlEncError::InvalidStructure`.
 
+## Experimental ML-KEM
+
+With `experimental-pq`, `EncryptedDataBuilder::encapsulation_key` establishes
+a fresh content key for an explicitly supplied recipient. Grant the exact
+ML-KEM parameter set through the operation's `KeyEstablishmentPolicy`.
+`EncapsulationDecryptor::new` borrows a private recipient handle;
+`EncapsulationDecryptor::provider_key` owns an imported handle.
+`KeyInventory::decryption_resolver_with_provider` selects these keys by their
+actual PKCS#8 identity rather than treating them as RSA transport keys.
+The resolver also supports a mechanism supplying a nested AES Key Wrap KEK.
+
+The serialized mechanism follows libxmlsec1 1.3.13's experimental extension:
+the consuming cipher takes the first 16, 24, or 32 secret octets directly,
+without a KDF. This is not a W3C standardized ML-KEM binding. Ciphertext framing,
+algorithm permission, provider ownership, candidate counts, and cumulative
+key-establishment limits are enforced before cryptographic dispatch.
+KEM establishes recipient confidentiality, not sender identity; use AES-GCM
+for authenticated content and a separate signature for sender authentication.
+
 ## Direct-Key Encryption
 
 `EncryptedDataBuilder` can encrypt opaque bytes, one XML element, an XML content fragment, or a

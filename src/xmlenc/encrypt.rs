@@ -71,6 +71,7 @@ pub struct EncryptedDataBuilder {
 
 #[derive(Clone)]
 enum DirectEncryptionKey {
+    Encapsulation(Arc<dyn crate::provider::KeyEncapsulationKey>),
     Raw(zeroize::Zeroizing<Vec<u8>>),
     Derived {
         method: super::KeyDerivationMethod,
@@ -118,6 +119,10 @@ impl crate::provider::KeyAgreementKey for EphemeralSenderKey {
 }
 
 enum OperationContentKey<'a> {
+    Established {
+        secret: zeroize::Zeroizing<[u8; 32]>,
+        width: usize,
+    },
     Borrowed(&'a [u8]),
     Owned(zeroize::Zeroizing<Vec<u8>>),
 }
@@ -125,6 +130,7 @@ enum OperationContentKey<'a> {
 impl AsRef<[u8]> for OperationContentKey<'_> {
     fn as_ref(&self) -> &[u8] {
         match self {
+            Self::Established { secret, width } => &secret[..*width],
             Self::Borrowed(bytes) => bytes,
             Self::Owned(bytes) => bytes,
         }
@@ -298,6 +304,13 @@ impl EncryptedDataBuilder {
         self.direct_key = Some(DirectEncryptionKey::Raw(zeroize::Zeroizing::new(
             key.into(),
         )));
+        self
+    }
+
+    /// Generate the content key through an experimental KEM recipient handle.
+    /// The final immutable policy must explicitly permit its parameter set.
+    pub fn encapsulation_key(mut self, key: Arc<dyn crate::provider::KeyEncapsulationKey>) -> Self {
+        self.direct_key = Some(DirectEncryptionKey::Encapsulation(key));
         self
     }
 
@@ -645,76 +658,102 @@ impl EncryptedDataBuilder {
             }
         })?;
 
-        let (content_key, encrypted_keys) = operation.run_batch(&plan.keys, || {
-            let content_key = match &self.direct_key {
-                Some(DirectEncryptionKey::Raw(key)) => {
-                    validate_content_key(self.algorithm, key)?;
-                    OperationContentKey::Borrowed(key)
-                }
-                Some(DirectEncryptionKey::Derived { method, secret }) => {
-                    let parameters = method.parameters(self.algorithm.key_len())?;
-                    let key = operation
-                        .budgets()
-                        .key_establishment
-                        .borrow_mut()
-                        .derive_key(
-                            &operation.policy().key_establishment,
-                            self.provider.as_ref(),
-                            &parameters,
-                            secret,
-                        )?;
-                    OperationContentKey::Owned(key)
-                }
-                Some(DirectEncryptionKey::Agreement {
-                    method,
-                    key,
-                    algorithm,
-                    peer_public_key,
-                }) => {
-                    let parameters = method.parameters(self.algorithm.key_len())?;
-                    let agreement = crate::provider::KeyAgreementParameters {
-                        algorithm: algorithm.uri(),
-                        peer_public_key,
-                    };
-                    let content_key = operation
-                        .budgets()
-                        .key_establishment
-                        .borrow_mut()
-                        .agree_and_derive(
-                            &operation.policy().key_establishment,
-                            self.provider.as_ref(),
-                            key.as_ref(),
-                            &agreement,
-                            &parameters,
-                        )?;
-                    OperationContentKey::Owned(content_key)
-                }
-                None => {
-                    let key = random_bytes(self.provider.as_ref(), self.algorithm.key_len())?;
-                    #[cfg(feature = "legacy-algorithms")]
-                    let mut key = key;
-                    #[cfg(feature = "legacy-algorithms")]
-                    if self.algorithm == DataEncryptionAlgorithm::TripleDesCbc {
-                        // RFC 3217 §3.1: generated DES CEKs use odd octet parity.
-                        // Normalize here, not in wrapping, which also accepts AES keys.
-                        // https://www.rfc-editor.org/rfc/rfc3217#section-3.1
-                        for octet in &mut key {
-                            *octet =
-                                (*octet & 0xfe) | (((*octet & 0xfe).count_ones() as u8 & 1) ^ 1);
+        let (content_key, encrypted_keys, encapsulated_ciphertext) =
+            operation.run_batch(&plan.keys, || {
+                let mut encapsulated_ciphertext = None;
+                let content_key = match &self.direct_key {
+                    Some(DirectEncryptionKey::Encapsulation(key)) => {
+                        if self.algorithm.key_len() > 32 {
+                            return Err(
+                                crate::key_establishment::KeyEstablishmentError::Structure(
+                                    "consuming key exceeds KEM secret width",
+                                )
+                                .into(),
+                            );
+                        }
+                        let result = operation
+                            .budgets()
+                            .key_establishment
+                            .borrow_mut()
+                            .encapsulate(
+                                &operation.policy().key_establishment,
+                                self.provider.as_ref(),
+                                key.as_ref(),
+                            )?;
+                        encapsulated_ciphertext = Some(result.ciphertext);
+                        OperationContentKey::Established {
+                            secret: result.shared_secret,
+                            width: self.algorithm.key_len(),
                         }
                     }
-                    OperationContentKey::Owned(zeroize::Zeroizing::new(key))
-                }
-            };
-            let encrypted_keys = self
-                .recipients
-                .iter()
-                .map(|recipient| {
-                    wrap_content_key(self.provider.as_ref(), recipient, content_key.as_ref())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok::<_, XmlEncError>((content_key, encrypted_keys))
-        })?;
+                    Some(DirectEncryptionKey::Raw(key)) => {
+                        validate_content_key(self.algorithm, key)?;
+                        OperationContentKey::Borrowed(key)
+                    }
+                    Some(DirectEncryptionKey::Derived { method, secret }) => {
+                        let parameters = method.parameters(self.algorithm.key_len())?;
+                        let key = operation
+                            .budgets()
+                            .key_establishment
+                            .borrow_mut()
+                            .derive_key(
+                                &operation.policy().key_establishment,
+                                self.provider.as_ref(),
+                                &parameters,
+                                secret,
+                            )?;
+                        OperationContentKey::Owned(key)
+                    }
+                    Some(DirectEncryptionKey::Agreement {
+                        method,
+                        key,
+                        algorithm,
+                        peer_public_key,
+                    }) => {
+                        let parameters = method.parameters(self.algorithm.key_len())?;
+                        let agreement = crate::provider::KeyAgreementParameters {
+                            algorithm: algorithm.uri(),
+                            peer_public_key,
+                        };
+                        let content_key = operation
+                            .budgets()
+                            .key_establishment
+                            .borrow_mut()
+                            .agree_and_derive(
+                                &operation.policy().key_establishment,
+                                self.provider.as_ref(),
+                                key.as_ref(),
+                                &agreement,
+                                &parameters,
+                            )?;
+                        OperationContentKey::Owned(content_key)
+                    }
+                    None => {
+                        let key = random_bytes(self.provider.as_ref(), self.algorithm.key_len())?;
+                        #[cfg(feature = "legacy-algorithms")]
+                        let mut key = key;
+                        #[cfg(feature = "legacy-algorithms")]
+                        if self.algorithm == DataEncryptionAlgorithm::TripleDesCbc {
+                            // RFC 3217 §3.1: generated DES CEKs use odd octet parity.
+                            // Normalize here, not in wrapping, which also accepts AES keys.
+                            // https://www.rfc-editor.org/rfc/rfc3217#section-3.1
+                            for octet in &mut key {
+                                *octet = (*octet & 0xfe)
+                                    | (((*octet & 0xfe).count_ones() as u8 & 1) ^ 1);
+                            }
+                        }
+                        OperationContentKey::Owned(zeroize::Zeroizing::new(key))
+                    }
+                };
+                let encrypted_keys = self
+                    .recipients
+                    .iter()
+                    .map(|recipient| {
+                        wrap_content_key(self.provider.as_ref(), recipient, content_key.as_ref())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok::<_, XmlEncError>((content_key, encrypted_keys, encapsulated_ciphertext))
+            })?;
         let ciphertext = operation.run(plan.crypto, || {
             encrypt_content(
                 self.provider.as_ref(),
@@ -726,6 +765,12 @@ impl EncryptedDataBuilder {
         let (encrypted_data_xml, xml_nodes) = operation.run(plan.evidence, || {
             let encrypted_data_xml = render_encrypted_data(
                 &EncryptionXml {
+                    encapsulation: match (&self.direct_key, encapsulated_ciphertext.as_deref()) {
+                        (Some(DirectEncryptionKey::Encapsulation(key)), Some(ciphertext)) => {
+                            Some((key.algorithm(), ciphertext))
+                        }
+                        _ => None,
+                    },
                     algorithm: self.algorithm,
                     encrypted_type: encrypted_type.as_ref(),
                     id: self.id.as_deref(),
@@ -1251,6 +1296,7 @@ fn wrap_rsa_oaep(
 }
 
 struct EncryptionXml<'a> {
+    encapsulation: Option<(crate::provider::KeyEncapsulationAlgorithm, &'a [u8])>,
     algorithm: DataEncryptionAlgorithm,
     encrypted_type: Option<&'a EncryptedDataType>,
     id: Option<&'a str>,
@@ -1298,6 +1344,7 @@ fn write_encrypted_data<W: Write>(
     output: &EncryptionXml<'_>,
 ) -> Result<(), XmlEncError> {
     let EncryptionXml {
+        encapsulation,
         algorithm,
         encrypted_type,
         id,
@@ -1323,8 +1370,29 @@ fn write_encrypted_data<W: Write>(
     write_start(writer, "xenc:EncryptedData", root_attributes)?;
     write_empty_with_algorithm(writer, "xenc:EncryptionMethod", algorithm.uri())?;
 
-    if direct_key_name.is_some() || !encrypted_keys.is_empty() || derivation_xml.is_some() {
+    if direct_key_name.is_some()
+        || !encrypted_keys.is_empty()
+        || derivation_xml.is_some()
+        || encapsulation.is_some()
+    {
         write_start(writer, "ds:KeyInfo", [])?;
+        if let Some((algorithm, ciphertext)) = encapsulation {
+            write_start(
+                writer,
+                "kem:EncapsulationMechanism",
+                [
+                    ("xmlns:kem", crate::key_establishment::ENCAPSULATION_NS),
+                    ("Algorithm", algorithm.uri()),
+                ],
+            )?;
+            write_start(writer, "ds:KeyInfo", [])?;
+            if let Some(name) = direct_key_name {
+                write_text_element(writer, "ds:KeyName", name)?;
+            }
+            write_end(writer, "ds:KeyInfo")?;
+            write_cipher_data(writer, ciphertext)?;
+            write_end(writer, "kem:EncapsulationMechanism")?;
+        }
         if let Some(key_name) = direct_key_name {
             write_text_element(writer, "ds:KeyName", key_name)?;
         }
@@ -1663,6 +1731,7 @@ mod tests {
         let render = |maximum| {
             render_encrypted_data(
                 &EncryptionXml {
+                    encapsulation: None,
                     algorithm: DataEncryptionAlgorithm::Aes128Gcm,
                     encrypted_type: Some(&EncryptedDataType::Element),
                     id: Some("id&value"),

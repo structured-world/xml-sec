@@ -18,6 +18,7 @@ use super::types::{
 
 #[derive(Clone, Copy)]
 pub(super) struct ParsingPolicy<'a> {
+    key_establishment: &'a crate::policy::KeyEstablishmentPolicy,
     xml: &'a crate::policy::XmlInputPolicy,
     resources: &'a crate::policy::ResourcePolicy,
     uris: Option<&'a crate::policy::UriPolicy>,
@@ -27,6 +28,7 @@ pub(super) struct ParsingPolicy<'a> {
 impl<'a> From<&'a crate::policy::EncryptionPolicy> for ParsingPolicy<'a> {
     fn from(policy: &'a crate::policy::EncryptionPolicy) -> Self {
         Self {
+            key_establishment: &policy.key_establishment,
             xml: &policy.xml,
             resources: &policy.resources,
             uris: None,
@@ -38,6 +40,7 @@ impl<'a> From<&'a crate::policy::EncryptionPolicy> for ParsingPolicy<'a> {
 impl<'a> From<&'a crate::policy::DecryptionPolicy> for ParsingPolicy<'a> {
     fn from(policy: &'a crate::policy::DecryptionPolicy) -> Self {
         Self {
+            key_establishment: &policy.key_establishment,
             xml: &policy.xml,
             resources: &policy.resources,
             uris: Some(&policy.uris),
@@ -47,6 +50,7 @@ impl<'a> From<&'a crate::policy::DecryptionPolicy> for ParsingPolicy<'a> {
 }
 
 struct ParsedKeyInfo {
+    encapsulation_methods: Vec<crate::key_establishment::EncapsulationMechanism>,
     source_nodes: Vec<crate::NodeId>,
     key_name: Option<String>,
     encrypted_keys: Vec<EncryptedKey>,
@@ -396,6 +400,7 @@ pub(super) fn parse_encrypted_data_node_with_origins(
             parse_key_info(key_info, policy, allow_empty_cipher_values, &mut budget, 0)?
         }
         None => ParsedKeyInfo {
+            encapsulation_methods: Vec::new(),
             source_nodes: Vec::new(),
             key_name: None,
             encrypted_keys: Vec::new(),
@@ -413,6 +418,7 @@ pub(super) fn parse_encrypted_data_node_with_origins(
     )?;
 
     let encrypted = EncryptedData {
+        encapsulation_methods: key_info.encapsulation_methods,
         id: bounded_attribute(node, "Id", policy)?,
         encrypted_type: parse_encrypted_data_type(node.attribute("Type")),
         key_name: key_info.key_name,
@@ -422,7 +428,7 @@ pub(super) fn parse_encrypted_data_node_with_origins(
         agreement_methods: key_info.agreement_methods,
         cipher_data,
     };
-    validate_encrypted_data_metadata(&encrypted, policy)?;
+    validate_encrypted_data_metadata_inner(&encrypted, policy, allow_empty_cipher_values)?;
     Ok((encrypted, budget.origins))
 }
 
@@ -458,8 +464,42 @@ fn parse_key_info<'doc>(
     let mut encrypted_keys = Vec::new();
     let mut derived_keys = Vec::new();
     let mut agreement_methods = Vec::new();
+    let mut encapsulation_methods = Vec::new();
     for child in node.children().filter(Node::is_element) {
-        if child.has_tag_name((XMLDSIG_NS, "KeyName")) {
+        if child.has_tag_name((
+            crate::key_establishment::ENCAPSULATION_NS,
+            "EncapsulationMechanism",
+        )) {
+            budget.charge(policy.resources)?;
+            let mechanism =
+                crate::key_establishment::parse_encapsulation(child, allow_empty_cipher_values)?;
+            policy
+                .key_establishment
+                .check_encapsulation(mechanism.algorithm)?;
+            let bytes = mechanism.ciphertext().len().div_ceil(3) * 4;
+            let maximum = policy.resources.max_xml_document_bytes;
+            let used = budget.shared.retained_cipher_bytes;
+            if used > maximum || bytes > maximum - used {
+                return Err(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::AGGREGATE_ENCRYPTION_CIPHER_VALUE_BYTES,
+                    maximum,
+                    actual: used.saturating_add(bytes),
+                }
+                .into());
+            }
+            budget.shared.retained_cipher_bytes += bytes;
+            let info = budget
+                .shared
+                .key_info
+                .parse_with_provider(mechanism.key_info, budget.provider)
+                .map_err(super::agreement::map_key_info_error)?;
+            encapsulation_methods.push(crate::key_establishment::EncapsulationMechanism {
+                algorithm: mechanism.algorithm,
+                key_info: info,
+                ciphertext: mechanism.ciphertext().to_vec(),
+            });
+            source_nodes.push(child.id());
+        } else if child.has_tag_name((XMLDSIG_NS, "KeyName")) {
             if key_name.is_some() {
                 return Err(XmlEncError::InvalidStructure(
                     "KeyInfo contains more than one direct KeyName".into(),
@@ -684,10 +724,12 @@ fn parse_key_info<'doc>(
             source_nodes.extend(info.source_nodes);
             derived_keys.extend(info.derived_keys);
             agreement_methods.extend(info.agreement_methods);
+            encapsulation_methods.extend(info.encapsulation_methods);
         }
     }
     budget.ancestry.pop();
     Ok(ParsedKeyInfo {
+        encapsulation_methods,
         source_nodes,
         key_name,
         encrypted_keys,
@@ -1094,6 +1136,7 @@ fn parse_encrypted_key<'doc>(
         None => None,
     };
     let info = key_info.get_or_insert_with(|| ParsedKeyInfo {
+        encapsulation_methods: Vec::new(),
         source_nodes: Vec::new(),
         key_name: None,
         encrypted_keys: Vec::new(),
@@ -1106,6 +1149,7 @@ fn parse_encrypted_key<'doc>(
         sources: key_info
             .as_mut()
             .map(|info| super::EncryptionKeySources {
+                encapsulation_methods: core::mem::take(&mut info.encapsulation_methods),
                 encrypted_keys: core::mem::take(&mut info.encrypted_keys),
                 derived_keys: core::mem::take(&mut info.derived_keys),
                 agreement_methods: core::mem::take(&mut info.agreement_methods),
@@ -1453,6 +1497,14 @@ pub(super) fn validate_encrypted_data_metadata<'a>(
     policy: impl Into<ParsingPolicy<'a>>,
 ) -> Result<(), XmlEncError> {
     let policy = policy.into();
+    validate_encrypted_data_metadata_inner(encrypted, policy, false)
+}
+
+fn validate_encrypted_data_metadata_inner(
+    encrypted: &EncryptedData,
+    policy: ParsingPolicy<'_>,
+    template: bool,
+) -> Result<(), XmlEncError> {
     let maximum = policy.resources.max_encryption_metadata_bytes;
     let validate = |value: Option<&str>| validate_metadata_len(value.map_or(0, str::len), maximum);
     validate(encrypted.id.as_deref())?;
@@ -1470,29 +1522,55 @@ pub(super) fn validate_encrypted_data_metadata<'a>(
         &encrypted.encrypted_keys,
         &encrypted.derived_keys,
         &encrypted.agreement_methods,
-        policy,
+        &encrypted.encapsulation_methods,
+        KeySourceValidation { policy, template },
         0,
         &mut 0,
     )
+}
+
+#[derive(Clone, Copy)]
+struct KeySourceValidation<'a> {
+    policy: ParsingPolicy<'a>,
+    template: bool,
 }
 
 fn validate_key_sources(
     keys: &[EncryptedKey],
     derived: &[super::DerivedKey],
     agreements: &[super::AgreementMethod],
-    policy: ParsingPolicy<'_>,
+    encapsulations: &[crate::key_establishment::EncapsulationMechanism],
+    validation: KeySourceValidation<'_>,
     depth: usize,
     count: &mut usize,
 ) -> Result<(), XmlEncError> {
+    let KeySourceValidation { policy, template } = validation;
     policy.resources.validate_key_info_reference_depth(depth)?;
     let actual = count
         .saturating_add(keys.len())
         .saturating_add(derived.len())
         .saturating_add(agreements.len());
+    let actual = actual.saturating_add(encapsulations.len());
     policy.resources.validate_key_candidates(actual)?;
     *count = actual;
     let maximum = policy.resources.max_encryption_metadata_bytes;
     let validate = |value: Option<&str>| validate_metadata_len(value.map_or(0, str::len), maximum);
+    for descriptor in encapsulations {
+        policy
+            .key_establishment
+            .check_encapsulation(descriptor.algorithm)?;
+        if descriptor.ciphertext.len() != descriptor.algorithm.ciphertext_len()
+            && !(template && descriptor.ciphertext.is_empty())
+        {
+            return Err(crate::key_establishment::KeyEstablishmentError::Structure(
+                "ciphertext size does not match Algorithm",
+            )
+            .into());
+        }
+        super::agreement::validate_role_metadata(&descriptor.key_info, maximum)?;
+        *count = count.saturating_add(descriptor.key_info.sources.len());
+        policy.resources.validate_key_candidates(*count)?;
+    }
     for descriptor in agreements {
         validate(Some(descriptor.algorithm.uri()))?;
         validate(descriptor.legacy_digest.as_deref())?;
@@ -1532,7 +1610,8 @@ fn validate_key_sources(
             &key.sources.encrypted_keys,
             &key.sources.derived_keys,
             &key.sources.agreement_methods,
-            policy,
+            &key.sources.encapsulation_methods,
+            validation,
             depth + 1,
             count,
         )?;

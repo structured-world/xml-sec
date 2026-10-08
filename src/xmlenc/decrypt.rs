@@ -33,7 +33,7 @@ use super::parse_encrypted_data;
 pub struct KeyCandidateBudget {
     maximum: usize,
     remaining: usize,
-    key_establishment: super::key_establishment_budget::KeyEstablishmentUsage,
+    pub(super) key_establishment: super::key_establishment_budget::KeyEstablishmentUsage,
 }
 
 impl KeyCandidateBudget {
@@ -128,6 +128,8 @@ impl KeyCandidateBudget {
 /// A source resolved for a wrapping algorithm. Its output is never implicitly
 /// treated as a CEK or exported from a non-exportable provider handle.
 pub enum KeyEncryptionKeySource<'a> {
+    /// Experimental KEM producing this operation's wrapping key.
+    Encapsulation(&'a crate::key_establishment::EncapsulationMechanism),
     /// Application-owned key material without transported establishment hints.
     Direct,
     /// A key transporting this operation's wrapping key.
@@ -140,6 +142,18 @@ pub enum KeyEncryptionKeySource<'a> {
 
 /// Supplies keys for an XMLEnc operation under its immutable policy snapshot.
 pub trait DecryptionKeyResolver {
+    /// Resolve an experimental KEM source under the operation snapshot. Raw
+    /// content-key resolvers refuse by default rather than bypassing the KEM.
+    fn resolve_encapsulation_content_keys_with_policy(
+        &self,
+        _provider: &dyn crate::provider::CryptoProvider,
+        _algorithm: DataEncryptionAlgorithm,
+        _descriptor: &crate::key_establishment::EncapsulationMechanism,
+        _policy: &crate::policy::DecryptionPolicy,
+        _budget: &mut KeyCandidateBudget,
+    ) -> Result<Vec<crate::provider::RecoveredContentKey>, XmlEncError> {
+        Err(XmlEncError::KeyNotFound)
+    }
     /// Resolve an actual KEK purpose; default refusal prevents incorrectly
     /// adapting a content algorithm merely because its key width happens to fit.
     fn resolve_key_encryption_keys_with_policy(
@@ -1878,6 +1892,7 @@ fn resolve_content_key_candidates(
     let mut last_error = None;
     let mut candidates = if encrypted.derived_keys.is_empty()
         && encrypted.agreement_methods.is_empty()
+        && encrypted.encapsulation_methods.is_empty()
     {
         match resolve_candidates_with_budget(resolver, provider, algorithm, None, policy, budget) {
             Ok(keys) => keys,
@@ -1889,6 +1904,22 @@ fn resolve_content_key_candidates(
     } else {
         Vec::new()
     };
+    for descriptor in &encrypted.encapsulation_methods {
+        policy
+            .key_establishment
+            .check_encapsulation(descriptor.algorithm)?;
+        let remaining_before = budget.remaining();
+        budget.require_available(1)?;
+        match resolver.resolve_encapsulation_content_keys_with_policy(
+            provider, algorithm, descriptor, policy, budget,
+        ) {
+            Ok(keys) => {
+                budget.account_returned_candidates(remaining_before, keys.len())?;
+                candidates.extend(keys);
+            }
+            Err(error) => record_candidate_source_error_or_fail_operation(error, &mut last_error)?,
+        }
+    }
     for descriptor in &encrypted.agreement_methods {
         let remaining_before = budget.remaining();
         match resolver.resolve_agreement_content_keys_with_policy(
@@ -2042,6 +2073,7 @@ fn resolve_nested_key(
     let mut keys = Vec::new();
     let mut last_error = None;
     let mut resolve_source = |source| -> Result<(), XmlEncError> {
+        budget.require_available(1)?;
         let remaining = budget.remaining();
         match resolver
             .resolve_key_encryption_keys_with_policy(provider, wrap, source, policy, budget)
@@ -2054,6 +2086,9 @@ fn resolve_nested_key(
             Err(error) => record_candidate_source_error_or_fail_operation(error, &mut last_error),
         }
     };
+    for mechanism in &key.sources.encapsulation_methods {
+        resolve_source(KeyEncryptionKeySource::Encapsulation(mechanism))?;
+    }
     for agreement in &key.sources.agreement_methods {
         resolve_source(KeyEncryptionKeySource::Agreement(agreement))?;
     }
@@ -2243,7 +2278,13 @@ fn record_candidate_source_error_or_fail_operation(
     // Candidate-specific failures permit the next ordered key source. The
     // shared work ceiling is operation-wide and must never be recoverable by
     // advancing to another recipient.
-    if matches!(&error, XmlEncError::Policy(_)) {
+    if matches!(
+        &error,
+        XmlEncError::Policy(_)
+            | XmlEncError::KeyEstablishment(
+                crate::key_establishment::KeyEstablishmentError::Policy(_)
+            )
+    ) {
         return Err(error);
     }
     *last_error = Some(error);
@@ -3208,6 +3249,7 @@ mod tests {
         key_name: Option<&str>,
     ) -> EncryptedData {
         EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: Some("target".into()),
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -3535,6 +3577,7 @@ mod tests {
         let mut wire = nonce.to_vec();
         wire.extend_from_slice(&ciphertext);
         let encrypted = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: None,
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -3578,6 +3621,7 @@ mod tests {
             keys: vec![vec![1_u8; 16], vec![2_u8; 16], vec![3_u8; 16]],
         };
         let encrypted = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: None,
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -3636,6 +3680,7 @@ mod tests {
         // CBC padding cannot authenticate which candidate key is correct. A
         // resolver must select one key from trusted metadata before decryption.
         let encrypted = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: None,
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -3684,6 +3729,7 @@ mod tests {
         // that unauthenticated CBC must reject between distinct key identities.
         let key = vec![0x27_u8; 16];
         let encrypted = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: None,
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -3726,6 +3772,7 @@ mod tests {
         // A resolver is caller-controlled; its result cannot multiply one
         // prepared operation beyond the implementation safety ceiling.
         let encrypted = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: None,
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -3767,6 +3814,7 @@ mod tests {
         // A deployment-selected ceiling must reach resolver accounting; the
         // hard implementation ceiling is not the effective runtime policy.
         let encrypted = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: None,
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -3995,6 +4043,7 @@ mod tests {
             .encrypt_data(DataEncryptionAlgorithm::Aes128Cbc, &key, b"payload")
             .expect("test encryption must succeed");
         let encrypted = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: None,
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -4312,6 +4361,7 @@ mod tests {
             };
             let provider = PermissiveUnwrapProvider::default();
             let encrypted = EncryptedData {
+                encapsulation_methods: Vec::new(),
                 id: None,
                 derived_keys: Vec::new(),
                 agreement_methods: Vec::new(),
@@ -4358,6 +4408,7 @@ mod tests {
                 ..PermissiveUnwrapProvider::default()
             };
             let encrypted = EncryptedData {
+                encapsulation_methods: Vec::new(),
                 id: None,
                 derived_keys: Vec::new(),
                 agreement_methods: Vec::new(),
@@ -4609,6 +4660,7 @@ mod tests {
             ))
         ));
         let truncated = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: None,
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -4880,6 +4932,7 @@ mod tests {
             carried_key_name: None,
         };
         let encrypted = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: None,
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -4986,6 +5039,7 @@ mod tests {
             .encrypt_data(DataEncryptionAlgorithm::Aes128Gcm, &[0_u8; 16], b"data")
             .expect("test encryption must succeed");
         let encrypted = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: Some("oversized".into()),
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -5043,6 +5097,7 @@ mod tests {
             .encrypt_data(DataEncryptionAlgorithm::Aes128Gcm, &key, b"data")
             .expect("test encryption must succeed");
         let mut encrypted = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: None,
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -5166,6 +5221,7 @@ mod tests {
             .encrypt_data(DataEncryptionAlgorithm::Aes128Gcm, &key, b"data")
             .expect("test encryption must succeed");
         let encrypted = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: None,
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -5223,6 +5279,7 @@ mod tests {
             .encrypt_data(DataEncryptionAlgorithm::Aes128Gcm, &key, b"data")
             .expect("test encryption must succeed");
         let encrypted = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: None,
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -5279,6 +5336,7 @@ mod tests {
             .encrypt_data(DataEncryptionAlgorithm::Aes128Gcm, &key, b"data")
             .expect("test encryption must succeed");
         let encrypted = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: None,
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -5318,6 +5376,7 @@ mod tests {
             .encrypt_data(DataEncryptionAlgorithm::Aes128Gcm, &key, b"data")
             .expect("test encryption must succeed");
         let encrypted = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: None,
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),

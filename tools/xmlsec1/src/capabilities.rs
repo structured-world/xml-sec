@@ -1,6 +1,12 @@
 use std::{ffi::OsString, io::Write};
 
 pub const TRANSFORMS: &[&str] = &[
+    #[cfg(feature = "experimental-pq")]
+    "ml-kem-512",
+    #[cfg(feature = "experimental-pq")]
+    "ml-kem-768",
+    #[cfg(feature = "experimental-pq")]
+    "ml-kem-1024",
     #[cfg(feature = "legacy-algorithms")]
     "md5",
     #[cfg(feature = "legacy-algorithms")]
@@ -117,6 +123,8 @@ pub const KEY_DATA: &[&str] = &[
     "ml-dsa",
     #[cfg(feature = "experimental-pq")]
     "slh-dsa",
+    #[cfg(feature = "experimental-pq")]
+    "ml-kem",
     "x509",
     "raw-x509-cert",
 ];
@@ -191,6 +199,16 @@ pub fn transform_available(name: &str, provider: &dyn xml_sec::provider::CryptoP
                 || provider.supports(C::Verify(algorithm));
         }
     }
+    for algorithm in [
+        xml_sec::provider::KeyEncapsulationAlgorithm::MlKem512,
+        xml_sec::provider::KeyEncapsulationAlgorithm::MlKem768,
+        xml_sec::provider::KeyEncapsulationAlgorithm::MlKem1024,
+    ] {
+        if algorithm.uri().rsplit('#').next() == Some(name) {
+            return provider.supports(C::Encapsulate(algorithm))
+                || provider.supports(C::Decapsulate(algorithm));
+        }
+    }
     for algorithm in D::ALL {
         if algorithm.uri().rsplit('#').next() == Some(name) {
             return provider.supports(C::Digest(algorithm));
@@ -245,6 +263,11 @@ pub fn key_data_available(name: &str, provider: &dyn xml_sec::provider::CryptoPr
         }
         "ml-dsa" => transform_available("ml-dsa-44", provider),
         "slh-dsa" => transform_available("slh-dsa-sha2-128s", provider),
+        "ml-kem" => {
+            transform_available("ml-kem-512", provider)
+                || transform_available("ml-kem-768", provider)
+                || transform_available("ml-kem-1024", provider)
+        }
         _ => true,
     }
 }
@@ -295,6 +318,26 @@ mod tests {
         assert!(KEY_DATA.contains(&"rsa"));
         assert_eq!(generated_key_len("aes-128"), Some(16));
         assert_eq!(generated_key_len("rsa-1024"), None);
+    }
+
+    #[test]
+    fn kem_capabilities_follow_the_selected_engine() {
+        // XML algorithm recognition never implies that an engine implements it.
+        let provider = xml_sec::provider::RustCryptoProvider;
+        for name in ["ml-kem-512", "ml-kem-768", "ml-kem-1024"] {
+            assert_eq!(
+                transform_available(name, &provider),
+                cfg!(feature = "experimental-pq")
+            );
+            assert_eq!(
+                TRANSFORMS.contains(&name),
+                cfg!(feature = "experimental-pq")
+            );
+        }
+        assert_eq!(
+            key_data_available("ml-kem", &provider),
+            cfg!(feature = "experimental-pq")
+        );
     }
 
     #[test]

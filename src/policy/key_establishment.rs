@@ -75,6 +75,10 @@ impl KeyDerivationAlgorithm {
 /// never select this policy or reset its operation-wide budget.
 #[derive(Debug, Clone)]
 pub struct KeyEstablishmentPolicy {
+    /// Exact experimental KEM permissions. Empty denies all parameter sets.
+    pub encapsulation_algorithms: HashSet<crate::provider::KeyEncapsulationAlgorithm>,
+    /// Cumulative KEM attempts; failed provider calls consume allowance too.
+    pub max_encapsulation_operations: usize,
     /// Exact agreement permissions. None permits ECDH-ES/X25519, not DH.
     pub agreement_algorithms: Option<HashSet<KeyAgreementAlgorithm>>,
     /// Exact KDF permissions. None permits ConcatKDF/HKDF/PBKDF2, not legacy DH.
@@ -103,6 +107,8 @@ pub struct KeyEstablishmentPolicy {
 impl Default for KeyEstablishmentPolicy {
     fn default() -> Self {
         Self {
+            encapsulation_algorithms: HashSet::new(),
+            max_encapsulation_operations: 64,
             agreement_algorithms: None,
             derivation_algorithms: None,
             digest_algorithms: None,
@@ -119,6 +125,11 @@ impl Default for KeyEstablishmentPolicy {
 impl KeyEstablishmentPolicy {
     /// Reject configuration exceeding implementation ceilings before any work.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
+        super::ResourcePolicy::within(
+            "key encapsulation operations",
+            self.max_encapsulation_operations,
+            crate::hard_limits::KEY_ENCAPSULATION_OPERATION_CEILING,
+        )?;
         for (value, minimum, resource) in [
             (
                 self.minimum_dh_modulus_bits,
@@ -172,6 +183,7 @@ impl KeyEstablishmentPolicy {
     }
 
     /// Enforce domain strength at import and again at operation dispatch.
+    #[cfg(feature = "xmlenc")]
     pub(crate) fn check_dh_domain(
         &self,
         p_bits: usize,
@@ -204,6 +216,18 @@ impl KeyEstablishmentPolicy {
             ),
         };
         permission(allowed, "key agreement", algorithm.uri())
+    }
+
+    /// Capability does not grant experimental key-establishment permission.
+    pub fn check_encapsulation(
+        &self,
+        algorithm: crate::provider::KeyEncapsulationAlgorithm,
+    ) -> Result<(), PolicyViolation> {
+        permission(
+            self.encapsulation_algorithms.contains(&algorithm),
+            "key encapsulation",
+            algorithm.uri(),
+        )
     }
 
     /// Check KDF and its underlying digest independently. An HMAC URI does not

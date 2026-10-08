@@ -83,6 +83,7 @@ pub enum KeyMaterialError {
 pub struct SignatureMetadata {
     pub algorithm: SignatureAlgorithm,
     pub key_names: Vec<String>,
+    pub encapsulation: Option<xml_sec::provider::KeyEncapsulationAlgorithm>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +97,7 @@ pub struct SigningTemplateMetadata {
     pub algorithm: SignatureAlgorithm,
     pub key_names: Vec<String>,
     pub key_info: Option<KeyInfo>,
+    pub encapsulation: Option<xml_sec::provider::KeyEncapsulationAlgorithm>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,12 +183,25 @@ pub fn verification_signature_metadata(
     let algorithm = parse_signed_info(signed_info)
         .map(|info| info.signature_method)
         .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
+    let mechanism = signature_key_info(signature)
+        .map(|info| xml_sec::key_establishment::direct_encapsulation(info, false))
+        .transpose()
+        .map_err(|error| KeyMaterialError::Signature(error.to_string()))?
+        .flatten();
+    if let Some(mechanism) = &mechanism {
+        policy
+            .key_establishment
+            .check_encapsulation(mechanism.algorithm)?;
+    }
     let key_info = if key_name_resolution == VerificationKeyNameResolution::IgnoreDocumentKeyInfo {
         None
     } else {
         let mut parsing = xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&policy.resources)
             .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
-        let mut key_info = signature_key_info(signature)
+        let mut key_info = mechanism
+            .as_ref()
+            .map(|mechanism| mechanism.key_info)
+            .or_else(|| signature_key_info(signature))
             .map(|node| parsing.parse_with_provider(node, provider))
             .transpose()
             .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
@@ -206,6 +221,7 @@ pub fn verification_signature_metadata(
     Ok(SignatureMetadata {
         algorithm,
         key_names: key_names(&key_info),
+        encapsulation: mechanism.map(|mechanism| mechanism.algorithm),
     })
 }
 
@@ -237,9 +253,22 @@ pub fn signing_signature_metadata(
     let algorithm = xml_sec::xmldsig::parse::parse_signature_method(method, &policy.resources)
         .map(|(algorithm, _, _)| algorithm)
         .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
+    let mechanism = signature_key_info(signature)
+        .map(|info| xml_sec::key_establishment::direct_encapsulation(info, true))
+        .transpose()
+        .map_err(|error| KeyMaterialError::Signature(error.to_string()))?
+        .flatten();
+    if let Some(mechanism) = &mechanism {
+        policy
+            .key_establishment
+            .check_encapsulation(mechanism.algorithm)?;
+    }
     let mut parsing = xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&policy.resources)
         .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
-    let mut key_info = signature_key_info(signature)
+    let mut key_info = mechanism
+        .as_ref()
+        .map(|mechanism| mechanism.key_info)
+        .or_else(|| signature_key_info(signature))
         .map(|node| parsing.parse_with_provider(node, provider))
         .transpose()
         .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
@@ -252,6 +281,7 @@ pub fn signing_signature_metadata(
         algorithm,
         key_names: key_names(&key_info),
         key_info,
+        encapsulation: mechanism.map(|mechanism| mechanism.algorithm),
     })
 }
 

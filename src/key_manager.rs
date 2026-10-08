@@ -358,6 +358,27 @@ pub struct StoredPrivateKey {
 }
 
 impl StoredPrivateKey {
+    /// Import an explicitly selected recipient into the operation's crypto engine.
+    pub fn decapsulation_key(
+        &self,
+        provider: &dyn crate::provider::CryptoProvider,
+        algorithm: crate::provider::KeyEncapsulationAlgorithm,
+        policy: &crate::policy::KeyEstablishmentPolicy,
+        resources: &ResourcePolicy,
+    ) -> Result<std::sync::Arc<dyn crate::provider::KeyDecapsulationKey>, KeyStoreError> {
+        policy.validate()?;
+        policy.check_encapsulation(algorithm)?;
+        if !self.usages.allows(KeyUsage::Decrypt) {
+            return Err(KeyStoreError::Selection(
+                "key is not authorized for decapsulation",
+            ));
+        }
+        check_operation_material_size(self.pkcs8_der.len(), resources)?;
+        provider
+            .import_decapsulation_key(algorithm, &self.pkcs8_der)
+            .map_err(KeyStoreError::Provider)
+    }
+
     /// Return the chain only when its first certificate matches this private key.
     #[must_use]
     pub fn matching_certificate_chain(&self) -> Option<&[Vec<u8>]> {
@@ -376,6 +397,38 @@ pub struct StoredPublicKey {
 }
 
 impl StoredPublicKey {
+    /// Import one named ML-KEM recipient; document hints never grant permission.
+    pub fn encapsulation_key(
+        &self,
+        provider: &dyn crate::provider::CryptoProvider,
+        algorithm: crate::provider::KeyEncapsulationAlgorithm,
+        policy: &crate::policy::KeyEstablishmentPolicy,
+        resources: &ResourcePolicy,
+    ) -> Result<std::sync::Arc<dyn crate::provider::KeyEncapsulationKey>, KeyStoreError> {
+        policy.validate()?;
+        policy.check_encapsulation(algorithm)?;
+        if !self.usages.allows(KeyUsage::Encrypt) {
+            return Err(KeyStoreError::Selection(
+                "key is not authorized for encapsulation",
+            ));
+        }
+        let der = self
+            .key_info
+            .sources
+            .iter()
+            .find_map(|source| match source {
+                KeyInfoSource::DerEncodedKeyValue(der) => Some(der.as_slice()),
+                _ => None,
+            })
+            .ok_or(KeyStoreError::Selection(
+                "recipient requires an ML-KEM SPKI",
+            ))?;
+        check_operation_material_size(der.len(), resources)?;
+        provider
+            .import_encapsulation_key(algorithm, der)
+            .map_err(KeyStoreError::Provider)
+    }
+
     /// Decode this already-selected RSA recipient without searching the inventory again.
     #[cfg(feature = "xmlenc")]
     pub fn rsa_encryption_key(
@@ -810,6 +863,9 @@ impl crate::xmlenc::DecryptionKeyResolver for InventoryDirectSymmetric {
 #[derive(Debug, thiserror::Error)]
 /// Key-store import errors that never include secret material.
 pub enum KeyStoreError {
+    /// The selected cryptographic engine failed; do not retry another engine.
+    #[error(transparent)]
+    Provider(#[from] crate::provider::ProviderError),
     /// The XML structure or key material was invalid.
     #[error("invalid xmlsec keys.xml: {0}")]
     Invalid(String),
@@ -1110,7 +1166,7 @@ impl KeyInventory {
         Ok(key)
     }
 
-    /// Select a named direct AES key or RSA private-key transport resolver.
+    /// Select a named direct symmetric, RSA transport, or ML-KEM recipient key.
     #[cfg(feature = "xmlenc")]
     pub fn decryption_resolver(
         &self,
@@ -1166,6 +1222,19 @@ impl KeyInventory {
         // permission is not an exemption from the decryption snapshot.
         let info = PrivateKeyInfoRef::try_from(entry.pkcs8_der.as_slice())
             .map_err(|_| KeyStoreError::Selection("incompatible RSA decryption key"))?;
+        if let Some(algorithm) =
+            crate::provider::KeyEncapsulationAlgorithm::from_oid(info.algorithm.oid)
+        {
+            let key = entry.decapsulation_key(
+                provider,
+                algorithm,
+                &policy.key_establishment,
+                &policy.resources,
+            )?;
+            return Ok(Box::new(
+                crate::xmlenc::EncapsulationDecryptor::provider_key(key),
+            ));
+        }
         let components = pkcs1::RsaPrivateKeyRef::from_der(info.private_key.as_bytes())
             .map_err(|_| KeyStoreError::Selection("incompatible RSA decryption key"))?;
         policy.rsa_keys.validate_components(
@@ -1286,6 +1355,33 @@ impl KeyInventory {
             ));
         }
         self.check_material_capacity(named_material_length(&name, der.len(), 2)?, resources)?;
+        #[cfg(feature = "experimental-pq")]
+        if let Ok(spki) = pkcs8::SubjectPublicKeyInfoRef::from_der(&der)
+            && crate::provider::KeyEncapsulationAlgorithm::from_oid(spki.algorithm.oid).is_some()
+        {
+            crate::provider::RustCryptoMlKemPublicKey::from_spki_der(&der)
+                .map_err(|_| KeyStoreError::Selection("invalid ML-KEM public key"))?;
+            let usages = usages.unwrap_or(KeyUsages::ENCRYPT);
+            if usages != KeyUsages::ENCRYPT {
+                return Err(KeyStoreError::Selection(
+                    "ML-KEM public keys establish keys, not signatures",
+                ));
+            }
+            self.reserve_material(named_material_length(&name, der.len(), 2)?, resources)?;
+            self.public_keys.push(StoredPublicKey {
+                key_info: KeyInfo {
+                    sources: vec![
+                        KeyInfoSource::KeyName(name.clone()),
+                        KeyInfoSource::DerEncodedKeyValue(der),
+                    ],
+                    ..KeyInfo::default()
+                },
+                name,
+                usages,
+            });
+            self.entry_count += 1;
+            return Ok(());
+        }
         let material_len = der.len();
         let mut key_info = KeyInfo::default();
         key_info.sources.push(KeyInfoSource::KeyName(name.clone()));
@@ -1574,11 +1670,12 @@ impl KeyInventory {
             ));
         }
         let identity = PrivateKeyIdentity::decode(&der)?;
-        if usages.allows(KeyUsage::Decrypt) && !matches!(identity, PrivateKeyIdentity::Rsa(_)) {
+        if usages.allows(KeyUsage::Decrypt) && !identity.can_decrypt() {
             return Err(KeyStoreError::Selection(
-                "only RSA private keys can be used for decryption",
+                "private key cannot recover encryption keys",
             ));
         }
+        identity.validate_usages(usages)?;
         drop(identity);
         self.reserve_material(
             named_material_length(&name, bytes.len().max(der.len()), 1)?,
@@ -1811,15 +1908,16 @@ impl KeyInventory {
             .ok_or(KeyStoreError::ProtectedContainer)?;
         let mut certificates = contents.certificates;
         let identity = PrivateKeyIdentity::decode(private_key.as_ref())?;
-        if usages.allows(KeyUsage::Decrypt) && !matches!(identity, PrivateKeyIdentity::Rsa(_)) {
+        if usages.allows(KeyUsage::Decrypt) && !identity.can_decrypt() {
             if auto_decrypt {
                 usages = KeyUsages::SIGN;
             } else {
                 return Err(KeyStoreError::Selection(
-                    "only RSA private keys can be used for decryption",
+                    "private key cannot recover encryption keys",
                 ));
             }
         }
+        identity.validate_usages(usages)?;
         let mut matching_leaf = None;
         for certificate in &certificates {
             let (rest, parsed) = X509Certificate::from_der(certificate)
@@ -2415,6 +2513,12 @@ fn named_material_length(
 )]
 enum PrivateKeyIdentity<'a> {
     Rsa(pkcs1::RsaPrivateKeyRef<'a>),
+    #[cfg(feature = "experimental-pq")]
+    Encapsulation {
+        algorithm: pkcs8::AlgorithmIdentifierRef<'a>,
+        public: [u8; 1568],
+        length: usize,
+    },
     Dsa {
         algorithm: pkcs8::AlgorithmIdentifierRef<'a>,
         key: NativeDsaSigningKey,
@@ -2438,9 +2542,47 @@ enum PrivateKeyIdentity<'a> {
 }
 
 impl<'a> PrivateKeyIdentity<'a> {
+    fn can_decrypt(&self) -> bool {
+        match self {
+            Self::Rsa(_) => true,
+            #[cfg(feature = "experimental-pq")]
+            Self::Encapsulation { .. } => true,
+            _ => false,
+        }
+    }
+
+    fn validate_usages(&self, usages: KeyUsages) -> Result<(), KeyStoreError> {
+        #[cfg(feature = "experimental-pq")]
+        if matches!(self, Self::Encapsulation { .. }) && usages.allows(KeyUsage::Sign) {
+            return Err(KeyStoreError::Selection(
+                "ML-KEM private keys decapsulate, not sign",
+            ));
+        }
+        #[cfg(not(feature = "experimental-pq"))]
+        let _ = usages;
+        Ok(())
+    }
+
     fn decode(der: &'a [u8]) -> Result<Self, KeyStoreError> {
         let info = PrivateKeyInfoRef::try_from(der)
             .map_err(|_| KeyStoreError::Selection("unsupported PKCS#12 private key"))?;
+        #[cfg(feature = "experimental-pq")]
+        if crate::provider::KeyEncapsulationAlgorithm::from_oid(info.algorithm.oid).is_some() {
+            let key = crate::provider::RustCryptoMlKemPrivateKey::from_pkcs8_der(der)
+                .map_err(|_| KeyStoreError::Selection("invalid ML-KEM private key"))?;
+            // RFC 9935 sections 4 and 6: bind every private form to the same
+            // raw encapsulation-key identity, with absent ASN.1 parameters.
+            // https://www.rfc-editor.org/rfc/rfc9935.html#section-6
+            let mut public = [0; 1568];
+            let length = key
+                .copy_public(&mut public)
+                .map_err(|_| KeyStoreError::Selection("invalid ML-KEM identity"))?;
+            return Ok(Self::Encapsulation {
+                algorithm: info.algorithm,
+                public,
+                length,
+            });
+        }
         #[cfg(feature = "experimental-pq")]
         if let Some(parameter) = crate::xmldsig::PqAlgorithm::from_oid(info.algorithm.oid) {
             let key = crate::xmldsig::PostQuantumSigningKey::from_pkcs8_der(parameter, der)
@@ -2521,6 +2663,12 @@ impl<'a> PrivateKeyIdentity<'a> {
             return false;
         };
         match self {
+            #[cfg(feature = "experimental-pq")]
+            Self::Encapsulation {
+                algorithm,
+                public,
+                length,
+            } => spki.algorithm == *algorithm && bytes == &public[..*length],
             #[cfg(feature = "experimental-pq")]
             Self::PostQuantum {
                 algorithm,

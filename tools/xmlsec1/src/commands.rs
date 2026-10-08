@@ -59,6 +59,8 @@ const GENERIC_OPTIONS: &[&str] = &[
     "help",
 ];
 const SIGN_OPTIONS: &[&str] = &[
+    "pubkey-pem",
+    "pubkey-der",
     "xml-backend",
     "print-debug",
     "print-xml-debug",
@@ -83,6 +85,11 @@ const SIGN_OPTIONS: &[&str] = &[
     "enable-asn1-signatures-hack",
 ];
 const VERIFY_OPTIONS: &[&str] = &[
+    "privkey-pem",
+    "privkey-der",
+    "pkcs8-pem",
+    "pkcs8-der",
+    "pwd",
     "xml-backend",
     "print-debug",
     "print-xml-debug",
@@ -177,6 +184,8 @@ const PRIMARY_COMMANDS: &[Command] = &[
 
 #[derive(Debug, thiserror::Error)]
 pub enum CommandError {
+    #[error(transparent)]
+    Policy(#[from] xml_sec::policy::PolicyViolation),
     #[error("{0}")]
     Usage(String),
     #[error("unsupported option for this command: --{0}")]
@@ -833,6 +842,32 @@ fn sign_with_policy(
         selected_provider(invocation)?,
     )?;
     let has_key_store = invocation.values("keys-file").next().is_some();
+    if signature.encapsulation.is_some() {
+        if let Some(option) = invocation
+            .ordered_values(&[
+                "hmac-key",
+                "privkey-pem",
+                "privkey-der",
+                "pkcs8-pem",
+                "pkcs8-der",
+                "pkcs12",
+            ])
+            .next()
+        {
+            return Err(CommandError::Usage(format!(
+                "--{} is inapplicable to sign with EncapsulationMechanism; supply a recipient public key",
+                option.name
+            )));
+        }
+    } else if let Some(option) = invocation
+        .ordered_values(&["pubkey-pem", "pubkey-der"])
+        .next()
+    {
+        return Err(CommandError::Usage(format!(
+            "--{} is inapplicable to sign without EncapsulationMechanism",
+            option.name
+        )));
+    }
     if has_key_store
         && invocation
             .ordered_values(&[
@@ -852,77 +887,102 @@ fn sign_with_policy(
     }
     let mut external_budget =
         ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
-    let selected = if has_key_store {
-        if signature.key_names.is_empty() && !invocation.flag("lax-key-search") {
-            return Err(CommandError::Usage(
+    let encapsulated = signature
+        .encapsulation
+        .map(|algorithm| {
+            select_encapsulation_key(
+                invocation,
+                &signature.key_names,
+                algorithm,
+                &policy.key_establishment,
+                &policy,
+                xml_backend,
+                &mut external_budget,
+            )
+        })
+        .transpose()?;
+    let selected = if encapsulated.is_some() {
+        None
+    } else {
+        Some(if has_key_store {
+            if signature.key_names.is_empty() && !invocation.flag("lax-key-search") {
+                return Err(CommandError::Usage(
                 "sign with --keys-file requires a template KeyName unless --lax-key-search is set"
                     .into(),
             ));
-        }
-        let store = load_xml_key_stores(invocation, &policy, xml_backend, &mut external_budget)?;
-        let lax_candidates = invocation.flag("lax-key-search");
-        let candidates = if signature.algorithm.hmac_output_bits().is_some() {
-            select_store_candidates(
-                store.symmetric_keys().iter().filter(|entry| {
-                    entry.kind == SymmetricKeyKind::Hmac
-                        && entry.usages.allows(key_manager::KeyUsage::Sign)
-                }),
-                &signature.key_names,
+            }
+            let store =
+                load_xml_key_stores(invocation, &policy, xml_backend, &mut external_budget)?;
+            let lax_candidates = invocation.flag("lax-key-search");
+            let candidates = if signature.algorithm.hmac_output_bits().is_some() {
+                select_store_candidates(
+                    store.symmetric_keys().iter().filter(|entry| {
+                        entry.kind == SymmetricKeyKind::Hmac
+                            && entry.usages.allows(key_manager::KeyUsage::Sign)
+                    }),
+                    &signature.key_names,
+                    lax_candidates,
+                    policy.resources.max_key_candidates,
+                    |entry| &entry.name,
+                )?
+                .into_iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>()
+            } else {
+                select_store_candidates(
+                    store
+                        .private_keys()
+                        .iter()
+                        .filter(|entry| entry.usages.allows(key_manager::KeyUsage::Sign)),
+                    &signature.key_names,
+                    lax_candidates,
+                    policy.resources.max_key_candidates,
+                    |entry| &entry.name,
+                )?
+                .into_iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>()
+            };
+            select_store_signing_key(
+                &store,
+                candidates,
+                signature.algorithm,
+                signature.key_info.as_ref(),
+                &policy,
                 lax_candidates,
-                policy.resources.max_key_candidates,
-                |entry| &entry.name,
+                selected_provider(invocation)?,
             )?
-            .into_iter()
-            .map(|entry| entry.name.as_str())
-            .collect::<Vec<_>>()
         } else {
-            select_store_candidates(
-                store
-                    .private_keys()
-                    .iter()
-                    .filter(|entry| entry.usages.allows(key_manager::KeyUsage::Sign)),
+            select_signing_key(
+                invocation,
                 &signature.key_names,
-                lax_candidates,
-                policy.resources.max_key_candidates,
-                |entry| &entry.name,
+                signature.algorithm,
+                signature.key_info.as_ref(),
+                &policy,
+                password,
+                &mut external_budget,
             )?
-            .into_iter()
-            .map(|entry| entry.name.as_str())
-            .collect::<Vec<_>>()
-        };
-        select_store_signing_key(
-            &store,
-            candidates,
-            signature.algorithm,
-            signature.key_info.as_ref(),
-            &policy,
-            lax_candidates,
-            selected_provider(invocation)?,
-        )?
-    } else {
-        select_signing_key(
-            invocation,
-            &signature.key_names,
-            signature.algorithm,
-            signature.key_info.as_ref(),
-            &policy,
-            password,
-            &mut external_budget,
-        )?
+        })
     };
     let external_resources =
         load_mapped_reference_resources(invocation, &policy.resources, &mut external_budget)?;
-    let mut context = SignContext::new(selected.key.as_ref())
-        .provider(selected_provider(invocation)?)
-        .policy(policy)
-        .xml_backend(xml_backend)
-        .signature_template_selection(SignatureTemplateSelection::FirstDescendant)
-        .external_resources(&external_resources);
+    let mut context = match (&selected, &encapsulated) {
+        (Some(selected), None) => SignContext::new(selected.key.as_ref()),
+        (None, Some(key)) => SignContext::new_encapsulation(key.as_ref()),
+        _ => return Err(CommandError::Usage("ambiguous signing key request".into())),
+    }
+    .provider(selected_provider(invocation)?)
+    .policy(policy)
+    .xml_backend(xml_backend)
+    .signature_template_selection(SignatureTemplateSelection::FirstDescendant)
+    .external_resources(&external_resources);
     if let Some(id) = start_node_id {
         context = context.start_node_id(id);
     }
     context = context.id_attributes(&id_attributes);
-    if let Some(writer) = &selected.certificate_writer
+    if let Some(writer) = selected
+        .as_ref()
+        .and_then(|selected| selected.certificate_writer.as_ref())
         && signature.key_info.is_some()
     {
         context = context.key_info_writer(writer);
@@ -940,6 +1000,7 @@ fn xmlsec_compatibility_signing_policy(invocation: &Invocation) -> SigningPolicy
     // allowlists opt its sign command into every implemented libxmlsec1 method,
     // including legacy SHA-1, without weakening the core library defaults.
     let mut policy = SigningPolicy {
+        key_establishment: xmlsec_compatibility_key_establishment_policy(),
         parameterized_rsa_pss: xml_sec::policy::RsaPssPermission::AllSupported,
         signature_algorithms: Some(HashSet::from(SignatureAlgorithm::ALL)),
         digest_algorithms: Some(HashSet::from(DigestAlgorithm::ALL)),
@@ -1416,6 +1477,7 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
     // boundary: both CLI signing and verification use the donor interpretation,
     // while the core library retains the XMLDSig binding by default.
     let mut policy = VerificationPolicy {
+        key_establishment: xmlsec_compatibility_key_establishment_policy(),
         parameterized_rsa_pss: xml_sec::policy::RsaPssPermission::AllSupported,
         digest_algorithms: Some(HashSet::from(DigestAlgorithm::ALL)),
         // The compatibility executable explicitly permits every compiled XML
@@ -1527,7 +1589,11 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
             "verify cannot combine --keys-file with explicit key options".into(),
         ));
     }
-    if lax_key_search && explicit_keys.is_empty() && !has_key_store {
+    let has_recipient_key = invocation
+        .ordered_values(&["privkey-pem", "privkey-der", "pkcs8-pem", "pkcs8-der"])
+        .next()
+        .is_some();
+    if lax_key_search && explicit_keys.is_empty() && !has_key_store && !has_recipient_key {
         return Err(CommandError::UnsupportedOption("lax-key-search".into()));
     }
     let policy = xmlsec_compatibility_verification_policy(invocation);
@@ -1552,6 +1618,16 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
         selected_provider(invocation)?,
     )?;
     let algorithm = signature.algorithm;
+    if signature.encapsulation.is_none() && has_recipient_key {
+        let option = invocation
+            .ordered_values(&["privkey-pem", "privkey-der", "pkcs8-pem", "pkcs8-der"])
+            .next()
+            .expect("recipient option exists");
+        return Err(CommandError::Usage(format!(
+            "--{} is inapplicable to verify without EncapsulationMechanism",
+            option.name
+        )));
+    }
     let selected_keys = if explicit_keys.is_empty() {
         Vec::new()
     } else {
@@ -1574,9 +1650,33 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
         selected_keys.is_empty(),
         &mut certificate_budget,
     )?;
-    let stored_keys =
-        load_xml_key_stores(invocation, &policy, xml_backend, &mut certificate_budget)?;
-    let result = if !selected_keys.is_empty() {
+    // Recipient selection owns its inventory import and aggregate budget;
+    // loading the same store here would decode and charge it twice.
+    let stored_keys = if signature.encapsulation.is_some() {
+        KeyInventory::default()
+    } else {
+        load_xml_key_stores(invocation, &policy, xml_backend, &mut certificate_budget)?
+    };
+    let result = if let Some(algorithm) = signature.encapsulation {
+        if !selected_keys.is_empty() {
+            return Err(CommandError::Usage("encapsulation verification requires a recipient private key, not --hmac-key or a signing public key".into()));
+        }
+        let key = select_decapsulation_key(
+            invocation,
+            &signature.key_names,
+            algorithm,
+            &policy.key_establishment,
+            &policy,
+            xml_backend,
+            &mut certificate_budget,
+        )?;
+        verification_context(policy, start_node_id, &id_attributes, xml_backend)
+            .external_resources(&external_resources)
+            .provider(selected_provider(invocation)?)
+            .decapsulation_key(key.as_ref())
+            .verify(&xml)
+            .map_err(|error| CommandError::Signature(error.to_string()))?
+    } else if !selected_keys.is_empty() {
         let mut candidates = Vec::with_capacity(selected_keys.len());
         let mut last_load_error = None;
         for (option, certificate) in selected_keys {
@@ -2472,7 +2572,23 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             "encrypt cannot combine explicit AES and RSA recipient keys".into(),
         ));
     }
-    if metadata
+    if let Some((algorithm, names)) = &metadata.encapsulation {
+        if !aes_keys.is_empty() || metadata.has_encrypted_key_recipient {
+            return Err(CommandError::Usage("direct EncapsulationMechanism cannot be combined with raw symmetric keys or EncryptedKey recipients".into()));
+        }
+        let mut budget =
+            ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
+        let key = select_encapsulation_key(
+            invocation,
+            names,
+            *algorithm,
+            &policy.key_establishment,
+            &policy,
+            xml_backend,
+            &mut budget,
+        )?;
+        builder = builder.encapsulation_key(key);
+    } else if metadata
         .recipients
         .iter()
         .any(|recipient| recipient.wrap.is_some())
@@ -3450,6 +3566,28 @@ fn apply_encryption_template(
     let generated_key_info = direct_child_element(generated_data, XMLDSIG_NS, "KeyInfo");
     match (template_key_info, generated_key_info) {
         (Some(template_key_info), Some(generated_key_info)) => {
+            let template_kem =
+                xml_sec::key_establishment::direct_encapsulation(template_key_info, true)
+                    .map_err(|error| CommandError::Encryption(error.to_string()))?;
+            let generated_kem =
+                xml_sec::key_establishment::direct_encapsulation(generated_key_info, false)
+                    .map_err(|error| CommandError::Encryption(error.to_string()))?;
+            if let (Some(template_kem), Some(generated_kem)) = (&template_kem, &generated_kem) {
+                if template_kem.algorithm != generated_kem.algorithm {
+                    return Err(CommandError::Encryption(
+                        "generated encapsulation parameter set differs from template".into(),
+                    ));
+                }
+                replacements.push(replace_element_text(
+                    template,
+                    template_kem.cipher_value,
+                    generated_kem.cipher_value.text().unwrap_or_default(),
+                )?);
+            } else if template_kem.is_some() {
+                return Err(CommandError::Encryption(
+                    "template encapsulation was not executed".into(),
+                ));
+            }
             if let (Some(template_name), Some(generated_name)) = (
                 direct_child_element(template_key_info, XMLDSIG_NS, "KeyName"),
                 direct_child_element(generated_key_info, XMLDSIG_NS, "KeyName"),
@@ -3809,6 +3947,55 @@ fn direct_encrypted_keys<'a, 'input>(key_info: Node<'a, 'input>) -> Vec<Node<'a,
         .collect()
 }
 
+fn recipient_encapsulation<'a, 'input>(
+    encrypted_data: Node<'a, 'input>,
+    resources: &ResourcePolicy,
+) -> Result<Option<xml_sec::key_establishment::ParsedEncapsulation<'a, 'input>>, CommandError> {
+    let mut selected = None;
+    for node in encrypted_data.descendants().filter(|node| {
+        node.has_tag_name((
+            xml_sec::key_establishment::ENCAPSULATION_NS,
+            "EncapsulationMechanism",
+        ))
+    }) {
+        // Only the selected data's KeyInfo/EncryptedKey source chain can
+        // nominate a recipient. Foreign extension payloads are not key sources.
+        let mut parent = node.parent();
+        let mut depth = 0;
+        let belongs = loop {
+            let Some(info) = parent.filter(|info| info.has_tag_name((XMLDSIG_NS, "KeyInfo")))
+            else {
+                break false;
+            };
+            let Some(owner) = info.parent() else {
+                break false;
+            };
+            if owner == encrypted_data {
+                break true;
+            }
+            if !owner.has_tag_name((XMLENC_NS, "EncryptedKey")) {
+                break false;
+            }
+            depth += 1;
+            resources.validate_key_info_reference_depth(depth)?;
+            parent = owner.parent();
+        };
+        if !belongs {
+            continue;
+        }
+        if selected.is_some() {
+            return Err(CommandError::Usage(
+                "multiple KEM recipients require explicit application key resolution".into(),
+            ));
+        }
+        selected = Some(
+            xml_sec::key_establishment::parse_encapsulation(node, false)
+                .map_err(|error| CommandError::Encryption(error.to_string()))?,
+        );
+    }
+    Ok(selected)
+}
+
 fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
     validate_options(invocation, DECRYPT_OPTIONS)?;
     let xml_backend = selected_xml_backend(invocation)?;
@@ -3870,7 +4057,54 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             "decrypt cannot combine explicit AES and RSA private keys".into(),
         ));
     }
-    let bytes = if !aes_keys.is_empty() {
+    let mechanism = recipient_encapsulation(encrypted_data, &policy.resources)?;
+    let bytes = if let Some(mechanism) = mechanism {
+        policy
+            .key_establishment
+            .check_encapsulation(mechanism.algorithm)?;
+        if !aes_keys.is_empty() {
+            return Err(CommandError::Usage(
+                "EncapsulationMechanism requires a recipient private key, not --aes-key".into(),
+            ));
+        }
+        let mut parsing = xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&policy.resources)
+            .map_err(|error| CommandError::Encryption(error.to_string()))?;
+        let info = parsing
+            .parse_with_provider(mechanism.key_info, selected_provider(invocation)?)
+            .map_err(|error| CommandError::Encryption(error.to_string()))?;
+        let names = info
+            .sources
+            .iter()
+            .filter_map(|source| match source {
+                KeyInfoSource::KeyName(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut budget =
+            ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
+        let key = select_decapsulation_key(
+            invocation,
+            &names,
+            mechanism.algorithm,
+            &policy.key_establishment,
+            &policy,
+            xml_backend,
+            &mut budget,
+        )?;
+        let resolver = xml_sec::xmlenc::EncapsulationDecryptor::provider_key(key);
+        decrypt_input(
+            &resolver,
+            &xml,
+            encrypted_data_id,
+            standalone,
+            policy,
+            &id_attributes,
+            CommandBackends {
+                xml: xml_backend,
+                crypto: selected_provider(invocation)?,
+            },
+        )?
+    } else if !aes_keys.is_empty() {
         let candidates = aes_keys
             .iter()
             .copied()
@@ -4585,6 +4819,7 @@ fn decrypt_input(
 }
 
 struct EncryptionTemplateMetadata {
+    encapsulation: Option<(xml_sec::provider::KeyEncapsulationAlgorithm, Vec<String>)>,
     algorithm: DataEncryptionAlgorithm,
     encrypted_type: EncryptedDataType,
     explicit_xml_type: bool,
@@ -4594,11 +4829,236 @@ struct EncryptionTemplateMetadata {
     recipients: Vec<EncryptionTemplateRecipient>,
 }
 
+fn xmlsec_compatibility_key_establishment_policy() -> xml_sec::policy::KeyEstablishmentPolicy {
+    let policy = xml_sec::policy::KeyEstablishmentPolicy::default();
+    #[cfg(feature = "experimental-pq")]
+    let policy = xml_sec::policy::KeyEstablishmentPolicy {
+        encapsulation_algorithms: [
+            xml_sec::provider::KeyEncapsulationAlgorithm::MlKem512,
+            xml_sec::provider::KeyEncapsulationAlgorithm::MlKem768,
+            xml_sec::provider::KeyEncapsulationAlgorithm::MlKem1024,
+        ]
+        .into(),
+        ..policy
+    };
+    policy
+}
+
+fn select_encapsulation_key<P: xml_sec::document::XmlDocumentPolicy>(
+    invocation: &Invocation,
+    names: &[String],
+    algorithm: xml_sec::provider::KeyEncapsulationAlgorithm,
+    establishment: &xml_sec::policy::KeyEstablishmentPolicy,
+    policy: &P,
+    backend: XmlBackend,
+    budget: &mut ExternalMaterialBudget,
+) -> Result<std::sync::Arc<dyn xml_sec::provider::KeyEncapsulationKey>, CommandError> {
+    establishment.validate()?;
+    establishment.check_encapsulation(algorithm)?;
+    let provider = selected_provider(invocation)?;
+    provider
+        .require_capability(xml_sec::provider::ProviderCapability::Encapsulate(
+            algorithm,
+        ))
+        .map_err(|error| CommandError::Encryption(error.to_string()))?;
+    let resources = policy.resource_policy();
+    let options = invocation
+        .ordered_values(&["pubkey-pem", "pubkey-der"])
+        .map(|option| (option, ()))
+        .collect::<Vec<_>>();
+    if invocation.values("keys-file").next().is_some() {
+        if !options.is_empty() {
+            return Err(CommandError::Usage(
+                "cannot combine --keys-file with explicit recipient keys".into(),
+            ));
+        }
+        let store = load_xml_key_stores(invocation, policy, backend, budget)?;
+        let entries = select_store_candidates(
+            store.public_keys().iter(),
+            names,
+            invocation.flag("lax-key-search"),
+            resources.max_key_candidates,
+            |entry| &entry.name,
+        )?;
+        let mut last = None;
+        for entry in entries {
+            match entry.encapsulation_key(provider, algorithm, establishment, resources) {
+                Ok(key) => return Ok(key),
+                Err(error) => {
+                    let error = CommandError::from(error);
+                    if !invocation.flag("lax-key-search")
+                        || !lax_candidate_error_is_recoverable(&error)
+                    {
+                        return Err(error);
+                    }
+                    last = Some(error);
+                }
+            }
+        }
+        return Err(
+            last.unwrap_or_else(|| CommandError::Usage("no recipient public key found".into()))
+        );
+    }
+    let candidates = named_candidate_search(
+        &options,
+        names,
+        invocation.flag("lax-key-search"),
+        true,
+        "ML-KEM recipient",
+    )?;
+    resources.validate_key_candidates(candidates.len())?;
+    let mut last = None;
+    for (option, ()) in candidates {
+        let attempt = (|| {
+            let bytes = read_key_material_with_budget(
+                Path::new(option.value.as_deref().unwrap_or_default()),
+                budget,
+            )?;
+            let mut store = KeyInventory::default();
+            if option.name == "pubkey-pem" {
+                store.add_public_pem_with_usages(
+                    "recipient".into(),
+                    &bytes,
+                    key_manager::KeyUsages::ENCRYPT,
+                    resources,
+                )?;
+            } else {
+                store.add_public_der_with_usages(
+                    "recipient".into(),
+                    bytes,
+                    key_manager::KeyUsages::ENCRYPT,
+                    resources,
+                )?;
+            }
+            Ok::<_, CommandError>(store.public_keys()[0].encapsulation_key(
+                provider,
+                algorithm,
+                establishment,
+                resources,
+            )?)
+        })();
+        match attempt {
+            Ok(key) => return Ok(key),
+            Err(error)
+                if invocation.flag("lax-key-search")
+                    && lax_candidate_error_is_recoverable(&error) =>
+            {
+                last = Some(error)
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| CommandError::Usage("no ML-KEM public key supplied".into())))
+}
+
+fn select_decapsulation_key<P: xml_sec::document::XmlDocumentPolicy>(
+    invocation: &Invocation,
+    names: &[String],
+    algorithm: xml_sec::provider::KeyEncapsulationAlgorithm,
+    establishment: &xml_sec::policy::KeyEstablishmentPolicy,
+    policy: &P,
+    backend: XmlBackend,
+    budget: &mut ExternalMaterialBudget,
+) -> Result<std::sync::Arc<dyn xml_sec::provider::KeyDecapsulationKey>, CommandError> {
+    establishment.validate()?;
+    establishment.check_encapsulation(algorithm)?;
+    let provider = selected_provider(invocation)?;
+    provider
+        .require_capability(xml_sec::provider::ProviderCapability::Decapsulate(
+            algorithm,
+        ))
+        .map_err(|error| CommandError::Encryption(error.to_string()))?;
+    let resources = policy.resource_policy();
+    let options = invocation
+        .ordered_values(&["privkey-pem", "privkey-der", "pkcs8-pem", "pkcs8-der"])
+        .map(|option| (option, ()))
+        .collect::<Vec<_>>();
+    if invocation.values("keys-file").next().is_some() {
+        if !options.is_empty() {
+            return Err(CommandError::Usage(
+                "cannot combine --keys-file with explicit recipient keys".into(),
+            ));
+        }
+        let store = load_xml_key_stores(invocation, policy, backend, budget)?;
+        let entries = select_store_candidates(
+            store.private_keys().iter(),
+            names,
+            invocation.flag("lax-key-search"),
+            resources.max_key_candidates,
+            |entry| &entry.name,
+        )?;
+        let mut last = None;
+        for entry in entries {
+            match entry.decapsulation_key(provider, algorithm, establishment, resources) {
+                Ok(key) => return Ok(key),
+                Err(error) => {
+                    let error = CommandError::from(error);
+                    if !invocation.flag("lax-key-search")
+                        || !lax_candidate_error_is_recoverable(&error)
+                    {
+                        return Err(error);
+                    }
+                    last = Some(error);
+                }
+            }
+        }
+        return Err(
+            last.unwrap_or_else(|| CommandError::Usage("no recipient private key found".into()))
+        );
+    }
+    let candidates = named_candidate_search(
+        &options,
+        names,
+        invocation.flag("lax-key-search"),
+        true,
+        "ML-KEM recipient",
+    )?;
+    resources.validate_key_candidates(candidates.len())?;
+    let mut last = None;
+    for (option, ()) in candidates {
+        let attempt = budget.with_key_import(resources, |budget, store, resources| {
+            let path = Path::new(option.value.as_deref().unwrap_or_default());
+            let bytes = read_key_material_with_budget(path, budget)?;
+            import_explicit_private_key(
+                store,
+                &bytes,
+                key_material::PrivateKeyImport {
+                    path,
+                    name: "recipient",
+                    format: private_key_format(option),
+                    password: invocation.password_bytes(),
+                    usages: key_manager::KeyUsages::DECRYPT,
+                    resources,
+                },
+                budget,
+            )?;
+            Ok(store.private_keys()[0].decapsulation_key(
+                provider,
+                algorithm,
+                establishment,
+                resources,
+            )?)
+        });
+        match attempt {
+            Ok(key) => return Ok(key),
+            Err(error)
+                if invocation.flag("lax-key-search")
+                    && lax_candidate_error_is_recoverable(&error) =>
+            {
+                last = Some(error)
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| CommandError::Usage("no ML-KEM private key supplied".into())))
+}
+
 fn xmlsec_compatibility_encryption_policy() -> EncryptionPolicy {
     // The compatibility executable is an explicit profile boundary, as for
     // XMLDSig. Library defaults remain restrictive, and provider capability
     // still gates every requested primitive independently of this allowlist.
     EncryptionPolicy {
+        key_establishment: xmlsec_compatibility_key_establishment_policy(),
         #[cfg(feature = "legacy-algorithms")]
         data_algorithms: Some(
             [
@@ -4753,6 +5213,7 @@ fn configure_wrapping_recipients(
 fn xmlsec_compatibility_decryption_policy() -> DecryptionPolicy {
     let compatibility = xmlsec_compatibility_encryption_policy();
     DecryptionPolicy {
+        key_establishment: compatibility.key_establishment,
         data_algorithms: compatibility.data_algorithms,
         key_transport_algorithms: compatibility.key_transport_algorithms,
         key_wrap_algorithms: compatibility.key_wrap_algorithms,
@@ -4806,6 +5267,31 @@ fn encryption_template(
     .map_err(|error| CommandError::Encryption(error.to_string()))?;
     let algorithm = DataEncryptionAlgorithm::from_uri(&parsed.encryption_method.algorithm)
         .map_err(|error| CommandError::Encryption(error.to_string()))?;
+    let encapsulation = match parsed.encapsulation_methods.as_slice() {
+        [] => None,
+        [mechanism] => {
+            policy
+                .key_establishment
+                .check_encapsulation(mechanism.algorithm)?;
+            Some((
+                mechanism.algorithm,
+                mechanism
+                    .key_info
+                    .sources
+                    .iter()
+                    .filter_map(|source| match source {
+                        KeyInfoSource::KeyName(name) => Some(name.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+            ))
+        }
+        _ => {
+            return Err(CommandError::Encryption(
+                "multiple direct template encapsulation mechanisms are ambiguous".into(),
+            ));
+        }
+    };
     let explicit_xml_type = matches!(
         parsed.encrypted_type,
         Some(EncryptedDataType::Element | EncryptedDataType::Content)
@@ -4840,6 +5326,7 @@ fn encryption_template(
         })
         .collect::<Result<Vec<_>, CommandError>>()?;
     Ok(EncryptionTemplateMetadata {
+        encapsulation,
         algorithm,
         encrypted_type,
         explicit_xml_type,

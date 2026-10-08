@@ -16,6 +16,8 @@
 use crate::xml::dom::Node;
 
 mod agreement;
+mod encapsulation;
+pub use encapsulation::EncapsulationDecryptor;
 mod cipher_reference;
 pub use agreement::{AgreementDecryptor, AgreementMethod};
 mod decrypt;
