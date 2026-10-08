@@ -553,8 +553,9 @@ impl<'a> VerifyContext<'a> {
         self.policy.transforms.allowed_algorithms.as_ref()
     }
 
-    fn transform_options(&self) -> TransformOptions {
+    fn transform_options(&self) -> TransformOptions<'_> {
         TransformOptions::default()
+            .id_attributes(self.id_attributes)
             .allow_internal_dtd(self.policy.xml.allow_internal_dtd)
             .xpath_here_semantics(self.policy.transforms.xpath_here_semantics)
             .opc_relationship_edition(self.policy.transforms.opc_relationship_edition)
@@ -1049,7 +1050,7 @@ fn bind_reference_evidence(
 
 struct ReferenceExecutionContext<'a> {
     store_pre_digest: bool,
-    transform_options: TransformOptions,
+    transform_options: TransformOptions<'a>,
     transform_budget: &'a TransformExecutionBudget,
     canonicalized_data_budget: &'a CanonicalizedDataBudget,
     provider: &'a dyn crate::provider::CryptoProvider,

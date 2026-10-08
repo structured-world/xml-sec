@@ -119,6 +119,17 @@ impl Default for NodeSetMaterializationBudget {
 }
 
 impl NodeSetMaterializationBudget {
+    pub(crate) fn reserve_workspace(&self, bytes: usize) -> Result<(), TransformError> {
+        if bytes > self.max_owned_string_bytes {
+            return Err(transform_resource_limit(
+                crate::policy::resource_name::NODE_SET_OWNED_STRING_BYTES,
+                self.max_owned_string_bytes,
+                bytes,
+            ));
+        }
+        self.charge(bytes)
+    }
+
     fn charge(&self, owned_string_bytes: usize) -> Result<(), TransformError> {
         let remaining_before = self.remaining_owned_string_bytes.get();
         let Some(remaining) = self

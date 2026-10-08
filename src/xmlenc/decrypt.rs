@@ -1904,7 +1904,11 @@ fn resolve_content_key_candidates(
     for descriptor in &encrypted.derived_keys {
         if !reference_list_applies_to_target(
             descriptor.reference_list.as_ref(),
-            ReferenceTarget::new(document, encrypted.id.as_deref()),
+            ReferenceTarget::new(
+                document,
+                encrypted.id.as_deref(),
+                policy.transforms.same_document_id_semantics,
+            ),
             ReferenceKind::Data,
         ) {
             continue;
@@ -1928,7 +1932,11 @@ fn resolve_content_key_candidates(
         if !encrypted_key_applies_to_data(
             encrypted_key,
             encrypted,
-            ReferenceTarget::new(document, encrypted.id.as_deref()),
+            ReferenceTarget::new(
+                document,
+                encrypted.id.as_deref(),
+                policy.transforms.same_document_id_semantics,
+            ),
         ) {
             continue;
         }
@@ -2014,7 +2022,11 @@ fn resolve_nested_key(
 ) -> Result<Vec<crate::provider::RecoveredContentKey>, XmlEncError> {
     let key = source.key;
     let mut document = source.document;
-    let target = ReferenceTarget::new(document, key.id.as_deref());
+    let target = ReferenceTarget::new(
+        document,
+        key.id.as_deref(),
+        policy.transforms.same_document_id_semantics,
+    );
     policy.resources.validate_key_info_reference_depth(depth)?;
     validate_encrypted_key_policy(key, policy)?;
     let wrap = KeyWrapAlgorithm::from_uri(&key.encryption_method.algorithm)?;
@@ -2181,17 +2193,24 @@ enum ReferenceTarget<'a, 'doc> {
         references: &'a super::cipher_reference::BoundCipherReferenceContext<'doc, 'doc>,
         node: crate::NodeId,
     },
-    TypedId(Option<&'a str>),
+    TypedId {
+        id: Option<&'a str>,
+        semantics: crate::policy::SameDocumentIdSemantics,
+    },
 }
 
 impl<'a, 'doc> ReferenceTarget<'a, 'doc> {
-    fn new(document: Option<KeySourceDocument<'a, 'doc>>, id: Option<&'a str>) -> Self {
+    fn new(
+        document: Option<KeySourceDocument<'a, 'doc>>,
+        id: Option<&'a str>,
+        semantics: crate::policy::SameDocumentIdSemantics,
+    ) -> Self {
         match document {
             Some(source) => Self::Document {
                 references: source.references,
                 node: source.target,
             },
-            None => Self::TypedId(id),
+            None => Self::TypedId { id, semantics },
         }
     }
 
@@ -2205,7 +2224,9 @@ impl<'a, 'doc> ReferenceTarget<'a, 'doc> {
             Self::Document { references, node } => references
                 .resolver()
                 .same_document_reference_targets(uri, node),
-            Self::TypedId(id) => id.is_some_and(|id| reference_targets_id(uri, id)),
+            Self::TypedId { id, semantics } => {
+                id.is_some_and(|id| reference_targets_id(uri, id, semantics))
+            }
         }
     }
 }
@@ -2297,14 +2318,24 @@ fn reference_list_applies_to_target(
     false
 }
 
-fn reference_targets_id(uri: &str, id: &str) -> bool {
+fn reference_targets_id(
+    uri: &str,
+    id: &str,
+    semantics: crate::policy::SameDocumentIdSemantics,
+) -> bool {
     let Some(fragment) = uri.strip_prefix('#') else {
         return false;
     };
     // Share XMLDSig's XPointer grammar rather than treating every fragment as
     // an ID string; XMLEnc §3.6 uses URI references for both object classes.
     // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-ReferenceList
-    fragment == id || crate::xmldsig::uri::parse_xpointer_id_fragment(fragment) == Some(id)
+    let Ok(fragment) =
+        crate::xmldsig::uri::UriReferenceResolver::normalize_fragment(fragment, None, semantics)
+    else {
+        return false;
+    };
+    crate::xmldsig::uri::UriReferenceResolver::id_fragment(&fragment, semantics)
+        .is_some_and(|(target, _)| target == id)
 }
 
 fn compatible_decryption_key_candidates(
@@ -2707,6 +2738,44 @@ fn map_data_decryption_error(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn typed_reference_association_obeys_id_semantics() {
+        // A typed decryption input must not bypass the URI policy enforced by
+        // the retained-document path, including escaping and Visa3D opt-in.
+        use crate::policy::SameDocumentIdSemantics as Semantics;
+        for semantics in [
+            Semantics::Specification,
+            Semantics::XmlSecBarename,
+            Semantics::XmlSecVisa3d,
+        ] {
+            assert!(!super::reference_targets_id("#", "", semantics));
+        }
+        assert!(super::reference_targets_id(
+            "#tar%67et",
+            "target",
+            Semantics::Specification
+        ));
+        assert!(super::reference_targets_id(
+            "#xpointer(id('target'))",
+            "target",
+            Semantics::Specification
+        ));
+        assert!(!super::reference_targets_id(
+            "#123",
+            "123",
+            Semantics::Specification
+        ));
+        assert!(super::reference_targets_id(
+            "#123",
+            "123",
+            Semantics::XmlSecVisa3d
+        ));
+        assert!(!super::reference_targets_id(
+            "#xpointer(id('a' or 'b'))",
+            "a' or 'b",
+            Semantics::Specification
+        ));
+    }
     #[cfg(feature = "legacy-algorithms")]
     #[test]
     fn legacy_cbc_rejects_ambiguous_candidates_before_decryption() {

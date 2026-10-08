@@ -22,7 +22,7 @@ Just `cargo add xml-sec`.**
 - **Modern signature algorithms**: curve-independent ECDSA with SHA-2/SHA-3, Ed25519/Ed448
   with context/prehash variants, and opt-in experimental ML-DSA/SLH-DSA through `CryptoProvider`.
 - **SAML-ready primitives**: enveloped signatures, encrypted assertions, X.509 keys, XPath,
-  canonicalization, and strict same-document ID handling.
+  canonicalization, same-document XPointer references, DTD/`xml:id` IDs, and namespace-scoped ID registration.
 - **Pure Rust deployment**: RustCrypto, `x509-parser`, and selectable Rust XML backends replace
   the libxml2/OpenSSL-style native dependency stack.
 - **Optional AWS-LC FIPS provider**: select a native cryptographic engine explicitly through

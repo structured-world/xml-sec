@@ -34,7 +34,7 @@ impl XmlBackendImplementation for XmloxideBackend {
         projector.project_children(parsed.root(), root)?;
         projector.positions.finish()?;
         projector.target.finish_subtree(root);
-        Ok(projector.target.finish())
+        Ok(projector.target.finish(preflight))
     }
 }
 
@@ -128,6 +128,7 @@ impl Projector<'_, '_, '_> {
                                         namespace: attribute.namespace.clone(),
                                         prefix: attribute.prefix.clone(),
                                         value: attribute.value.clone(),
+                                        is_id: false,
                                     });
                                 }
                             }

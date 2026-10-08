@@ -106,12 +106,13 @@ pub enum XPathHereSemantics {
     XmlSecLegacy,
 }
 
-/// Execution settings derived from one immutable operation policy snapshot.
+/// Policy-derived execution settings plus borrowed request-scoped ID registrations.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct TransformOptions {
+pub(crate) struct TransformOptions<'r> {
     xpath_here_semantics: XPathHereSemantics,
     allow_internal_dtd: bool,
     opc_relationship_edition: crate::policy::OpcRelationshipEdition,
+    id_attributes: &'r [crate::xml::IdAttributeRegistration],
 }
 
 pub(crate) struct TransformExecutionBudget {
@@ -459,7 +460,14 @@ impl TransformExecutionBudget {
     }
 }
 
-impl TransformOptions {
+impl<'r> TransformOptions<'r> {
+    pub(crate) fn id_attributes(
+        mut self,
+        registrations: &'r [crate::xml::IdAttributeRegistration],
+    ) -> Self {
+        self.id_attributes = registrations;
+        self
+    }
     pub(crate) fn opc_relationship_edition(
         mut self,
         edition: crate::policy::OpcRelationshipEdition,
@@ -555,7 +563,7 @@ impl TransformChainState {
 }
 
 struct TransformExecutionContext<'a> {
-    options: TransformOptions,
+    options: TransformOptions<'a>,
     budget: &'a TransformExecutionBudget,
     state: &'a TransformChainState,
     xml_parse: &'a XmlParseWorkBudget,
@@ -741,7 +749,7 @@ pub(super) fn apply_transform_with_options<'s, 'd>(
     signature_node: Node<'s, 's>,
     transform: &Transform,
     input: TransformData<'d>,
-    options: TransformOptions,
+    options: TransformOptions<'_>,
     budget: &TransformExecutionBudget,
 ) -> Result<TransformData<'d>, TransformError> {
     let state = TransformChainState::default();
@@ -760,7 +768,7 @@ fn apply_transform_with_options_and_state<'s, 'd>(
     signature_node: Node<'s, 's>,
     transform: &Transform,
     input: TransformData<'d>,
-    options: TransformOptions,
+    options: TransformOptions<'_>,
     budget: &TransformExecutionBudget,
     state: &TransformChainState,
     xml_parse: &XmlParseWorkBudget,
@@ -862,7 +870,10 @@ fn apply_transform_with_options_and_state<'s, 'd>(
                 apply_xpath_filter_with_semantics_and_budget(
                     nodes,
                     xpath,
-                    options.here_semantics(),
+                    super::xpath::XPathRequestContext::new(
+                        options.here_semantics(),
+                        options.id_attributes,
+                    ),
                     document_relation,
                     &budget.xpath,
                     &budget.node_filter,
@@ -882,7 +893,10 @@ fn apply_transform_with_options_and_state<'s, 'd>(
                 apply_xpath_filter2_with_semantics_and_budget(
                     nodes,
                     filters,
-                    options.here_semantics(),
+                    super::xpath::XPathRequestContext::new(
+                        options.here_semantics(),
+                        options.id_attributes,
+                    ),
                     document_relation,
                     &budget.xpath,
                     &budget.node_filter,
@@ -1080,7 +1094,7 @@ pub(crate) fn execute_transforms_with_options_and_budget<'a>(
     signature_node: Node<'a, 'a>,
     initial_data: TransformData<'a>,
     transforms: &[Transform],
-    options: TransformOptions,
+    options: TransformOptions<'_>,
     budget: &TransformExecutionBudget,
 ) -> Result<Vec<u8>, TransformError> {
     execute_reference_transforms_with_budget(
@@ -1101,7 +1115,7 @@ pub(crate) fn execute_reference_transforms_with_budget<'a>(
     enveloped_signature: Option<Node<'a, 'a>>,
     initial_data: TransformData<'a>,
     transforms: &[Transform],
-    options: TransformOptions,
+    options: TransformOptions<'_>,
     budget: &TransformExecutionBudget,
     xml_parse: &XmlParseWorkBudget,
 ) -> Result<Vec<u8>, TransformError> {
@@ -1172,7 +1186,7 @@ pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
     signature_node: Node<'a, 'a>,
     initial_data: TransformData<'a>,
     transforms: &[Transform],
-    options: TransformOptions,
+    options: TransformOptions<'_>,
     budget: &TransformExecutionBudget,
     tracked_nodes: Vec<(usize, NodeId)>,
 ) -> Result<TransformDependencyOutput, TransformError> {

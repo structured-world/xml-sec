@@ -2001,6 +2001,7 @@ impl<'a> SignContext<'a> {
             Ok::<_, SigningError>(())
         })?;
         let transform_options = TransformOptions::default()
+            .id_attributes(self.id_attributes)
             .allow_internal_dtd(self.policy.xml.allow_internal_dtd)
             .xpath_here_semantics(self.policy.transforms.xpath_here_semantics)
             .opc_relationship_edition(self.policy.transforms.opc_relationship_edition);
@@ -2472,7 +2473,7 @@ pub fn compute_reference_digest_values(
 
 fn compute_reference_digest_values_with_options(
     xml: &str,
-    transform_options: TransformOptions,
+    transform_options: TransformOptions<'_>,
     policy: Option<&crate::policy::SigningPolicy>,
     provider: &dyn crate::provider::CryptoProvider,
     execution_budget: &TransformExecutionBudget,
@@ -2494,7 +2495,7 @@ fn compute_reference_digest_values_with_options(
 
 fn compute_prepared_reference_digest_values_with_options(
     xml: &str,
-    transform_options: TransformOptions,
+    transform_options: TransformOptions<'_>,
     policy: Option<&crate::policy::SigningPolicy>,
     provider: &dyn crate::provider::CryptoProvider,
     execution_budget: &TransformExecutionBudget,
@@ -2589,7 +2590,7 @@ fn prepare_reference_digest_input<'a>(
 
 fn fill_reference_digest_values_in_dependency_order_with_operation(
     document: &mut XmlDocument,
-    transform_options: TransformOptions,
+    transform_options: TransformOptions<'_>,
     provider: &dyn crate::provider::CryptoProvider,
     operation: &mut OperationExecutionContext<
         crate::policy::SigningPolicy,
@@ -2804,7 +2805,7 @@ fn fill_reference_digest_values_in_dependency_order_with_operation(
 #[cfg(test)]
 fn fill_reference_digest_values_in_dependency_order(
     document: &mut XmlDocument,
-    transform_options: TransformOptions,
+    transform_options: TransformOptions<'_>,
     policy: &crate::policy::SigningPolicy,
     provider: &dyn crate::provider::CryptoProvider,
     budgets: &mut SigningOperationBudgets,
@@ -2842,7 +2843,7 @@ fn reference_dependency_levels(
     doc: &Document<'_>,
     signature: Node<'_, '_>,
     references: &[SigningReference],
-    transform_options: TransformOptions,
+    transform_options: TransformOptions<'_>,
     execution_budget: &TransformExecutionBudget,
     uri_resolution: SigningUriResolution<'_, '_>,
 ) -> Result<SigningDependencyPlan, SigningDigestError> {
@@ -3166,7 +3167,7 @@ fn compute_signing_reference_digests(
     doc: &Document<'_>,
     signature: Node<'_, '_>,
     references: Vec<SigningReference>,
-    transform_options: TransformOptions,
+    transform_options: TransformOptions<'_>,
     provider: &dyn crate::provider::CryptoProvider,
     execution_budget: &TransformExecutionBudget,
     uri_resolution: SigningUriResolution<'_, '_>,
@@ -3232,7 +3233,7 @@ pub fn fill_reference_digest_values(xml: &str) -> Result<String, SigningDigestEr
 
 fn fill_reference_digest_values_with_options(
     xml: &str,
-    transform_options: TransformOptions,
+    transform_options: TransformOptions<'_>,
     policy: Option<&crate::policy::SigningPolicy>,
     provider: &dyn crate::provider::CryptoProvider,
     execution_budget: &TransformExecutionBudget,

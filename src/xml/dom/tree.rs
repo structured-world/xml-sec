@@ -82,6 +82,7 @@ pub(super) struct AttributeData {
     pub(super) namespace: Option<String>,
     pub(super) prefix: Option<String>,
     pub(super) value: String,
+    pub(super) is_id: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -185,7 +186,34 @@ impl<'input> TreeBuilder<'input> {
         }
     }
 
-    pub(super) fn finish(self) -> Document<'input> {
+    pub(super) fn finish(mut self, preflight: &super::LexicalPreflight<'_>) -> Document<'input> {
+        for node in &mut self.nodes {
+            if let NodeKind::Element {
+                name,
+                prefix,
+                attributes,
+                ..
+            } = &mut node.kind
+            {
+                for attribute in attributes {
+                    attribute.is_id = (attribute.namespace.as_deref() == Some(XML_NAMESPACE_URI)
+                        && attribute.name == "id")
+                        || preflight.attribute_type(
+                            prefix.as_deref(),
+                            name,
+                            attribute.prefix.as_deref(),
+                            &attribute.name,
+                        ) == Some(crate::document::DtdAttributeType::Id);
+                    if attribute.is_id {
+                        // xml:id section 4 and XML 1.0 section 3.3.3 require
+                        // ID normalization in the infoset, not just the index.
+                        // https://www.w3.org/TR/2005/REC-xml-id-20050909/#processing
+                        // https://www.w3.org/TR/2008/REC-xml-20081126/#AVNormalize
+                        normalize_id_value(&mut attribute.value);
+                    }
+                }
+            }
+        }
         Document {
             input: self.input,
             nodes: self.nodes,
@@ -195,6 +223,19 @@ impl<'input> TreeBuilder<'input> {
     #[cfg(feature = "xml-backend-roxmltree")]
     pub(super) fn input(&self) -> &'input str {
         self.input
+    }
+}
+
+fn normalize_id_value(value: &mut String) {
+    let mut previous_space = true;
+    value.retain(|character| {
+        let space = character == ' ';
+        let retain = !space || !previous_space;
+        previous_space = space;
+        retain
+    });
+    if value.ends_with(' ') {
+        value.pop();
     }
 }
 
@@ -816,6 +857,10 @@ pub struct Attribute<'a> {
     data: &'a AttributeData,
 }
 impl<'a> Attribute<'a> {
+    /// Whether XML processing assigned the ID type (DTD or xml:id).
+    pub fn is_id(self) -> bool {
+        self.data.is_id
+    }
     /// Returns the local name.
     pub fn name(self) -> &'a str {
         &self.data.name
