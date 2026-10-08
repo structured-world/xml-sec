@@ -73,6 +73,13 @@ Choice or its Fallback. In the 2012 contract, a nested Ignorable declaration res
 inherited ProcessContent for its listed namespaces unless locally overridden
 (Part 3:2012 §10.1.1). The 2021 contract uses Part 3:2015 §9.2 instead: matching
 ProcessContent declarations on any ancestor remain effective.
+The 2012 contract also requires ProcessContent namespaces to appear in Ignorable
+on the same element (§10.1.2), and checks MustUnderstand before ignoring encountered
+elements and on every Choice/Fallback (§§10.1.3, 10.2.1). The 2021 contract permits
+inherited Ignorable for ProcessContent and checks MustUnderstand after ignore and
+branch selection (Part 3:2015 §§7.3, 9.4). Contents of unselected branches are not
+visited in either edition. MCE attributes on direct AlternateContent children are
+validated before any ignore decision, just as on other encountered elements.
 `mc:PreserveElements` and `mc:PreserveAttributes` are
 unknown attributes in both supported vocabularies (Part 3:2012 §10;
 Part 3:2015 §7), not silently ignored preservation requests.

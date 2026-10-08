@@ -16,6 +16,110 @@ const REL: &str = "http://schemas.openxmlformats.org/package/2006/relationships"
 const PARAM: &str = "http://schemas.openxmlformats.org/package/2006/digital-signature";
 const URI: &str = "http://schemas.openxmlformats.org/package/2006/RelationshipTransform";
 
+fn normalize_mce_edition(
+    content: &str,
+    edition: OpcRelationshipEdition,
+) -> Result<Vec<u8>, String> {
+    let input = format!(
+        "<Relationships xmlns=\"{REL}\" xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" xmlns:u=\"urn:ext\" xmlns:v=\"urn:ext\" mc:Ignorable=\"u\">{content}</Relationships>"
+    );
+    let document = Document::parse("<Signature/>").unwrap();
+    let mut policy = VerificationPolicy::default();
+    policy.transforms.opc_relationship_edition = edition;
+    xml_sec::xmldsig::execute_transforms_with_policy(
+        document.root_element(),
+        TransformData::Binary(input.into_bytes()),
+        &[
+            Transform::Relationship(vec![RelationshipSelector::SourceId("x".into())]),
+            Transform::C14n(C14nAlgorithm::new(C14nMode::Inclusive1_0, false)),
+        ],
+        &policy,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[test]
+fn mce_must_understand_checks_follow_selected_edition() {
+    // 2012 §§10.1.3/10.2.1 checks encountered ignored elements and every branch;
+    // 2015 §9.4 excludes ignored elements and unselected branch attributes.
+    for content in [
+        "<u:extension mc:MustUnderstand=\"u\"/>",
+        "<mc:AlternateContent><u:extension mc:MustUnderstand=\"u\"/><mc:Choice Requires=\"u\"/><mc:Fallback/></mc:AlternateContent>",
+        "<mc:AlternateContent><mc:Choice Requires=\"u\" mc:MustUnderstand=\"u\"/><mc:Fallback/></mc:AlternateContent>",
+        "<mc:AlternateContent xmlns:r=\"http://schemas.openxmlformats.org/package/2006/relationships\"><mc:Choice Requires=\"r\"/><mc:Fallback mc:MustUnderstand=\"u\"/></mc:AlternateContent>",
+    ] {
+        let old = normalize_mce_edition(content, OpcRelationshipEdition::Ecma2012);
+        assert!(old.is_err(), "2012: {content}");
+        assert!(
+            normalize_mce_edition(content, OpcRelationshipEdition::Ecma2021).is_ok(),
+            "2021: {content}"
+        );
+    }
+    // Unselected content does not exist semantically in either edition.
+    let hidden = "<mc:AlternateContent><mc:Choice Requires=\"u\"><u:extension mc:MustUnderstand=\"u\"/></mc:Choice><mc:Fallback/></mc:AlternateContent>";
+    for edition in [
+        OpcRelationshipEdition::Ecma2012,
+        OpcRelationshipEdition::Ecma2021,
+    ] {
+        assert!(normalize_mce_edition(hidden, edition).is_ok());
+    }
+}
+
+#[test]
+fn mce_process_content_requires_edition_specific_ignorable_scope() {
+    // 2012 §10.1.2 requires the same element, not a lexical prefix match.
+    for (attribute, old_valid, new_valid) in [
+        ("mc:ProcessContent=\"v:extension\"", false, true),
+        (
+            "mc:Ignorable=\"u\" mc:ProcessContent=\"v:extension\"",
+            true,
+            true,
+        ),
+        (
+            "xmlns:v=\"urn:other\" mc:Ignorable=\"u\" mc:ProcessContent=\"v:extension\"",
+            false,
+            false,
+        ),
+        ("mc:ProcessContent=\"\"", true, true),
+    ] {
+        let content = format!("<u:extension {attribute}/>");
+        assert_eq!(
+            normalize_mce_edition(&content, OpcRelationshipEdition::Ecma2012).is_ok(),
+            old_valid,
+            "2012: {attribute}"
+        );
+        assert_eq!(
+            normalize_mce_edition(&content, OpcRelationshipEdition::Ecma2021).is_ok(),
+            new_valid,
+            "2021: {attribute}"
+        );
+    }
+}
+
+#[test]
+fn mce_alternate_content_validates_ignored_child_attributes() {
+    // Ignoring a foreign child must not hide malformed MCE attributes.
+    for edition in [
+        OpcRelationshipEdition::Ecma2012,
+        OpcRelationshipEdition::Ecma2021,
+    ] {
+        for attribute in [
+            "mc:Future=\"\"",
+            "mc:Ignorable=\"missing\"",
+            "mc:ProcessContent=\"missing:x\"",
+        ] {
+            let content = format!(
+                "<mc:AlternateContent><u:extension {attribute}/><mc:Choice Requires=\"u\"/><mc:Fallback/></mc:AlternateContent>"
+            );
+            assert!(
+                normalize_mce_edition(&content, edition).is_err(),
+                "{edition:?}: {attribute}"
+            );
+        }
+        assert!(normalize_mce_edition("<mc:AlternateContent><u:extension/><mc:Choice Requires=\"u\"/><mc:Fallback/></mc:AlternateContent>", edition).is_ok());
+    }
+}
+
 #[test]
 fn mce_ignorable_reset_follows_selected_edition() {
     // 2012 resets inherited ProcessContent; 2015 explicitly considers any ancestor.

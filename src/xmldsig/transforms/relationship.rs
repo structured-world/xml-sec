@@ -302,14 +302,16 @@ pub(super) fn normalize<'a>(
             continue;
         }
         let tag = node.tag_name();
-        validate_mc_attributes(node, budget)?;
+        validate_mce_entry(node, edition, budget)?;
         if tag.namespace() != Some(REL)
             && tag.namespace() != Some(MC)
             && ignorable(node, tag.namespace(), budget)?
         {
             if process_content(node, edition, budget)? {
                 check_unwrapped(node)?;
-                must_understand(node, budget)?;
+                if edition == OpcRelationshipEdition::Ecma2021 {
+                    must_understand(node, budget)?;
+                }
                 budget.opc_workspace.push(
                     &mut frames,
                     Frame {
@@ -320,16 +322,18 @@ pub(super) fn normalize<'a>(
             }
             continue;
         }
-        must_understand(node, budget)?;
+        if edition == OpcRelationshipEdition::Ecma2021 {
+            must_understand(node, budget)?;
+        }
         if tag.namespace() == Some(MC) {
             if tag.name() != "AlternateContent" {
                 return Err(invalid("MCE Choice/Fallback outside AlternateContent"));
             }
             check_unwrapped(node)?;
             if let Some(branch) = alternate_content(node, edition, budget)? {
-                validate_mc_attributes(branch, budget)?;
-                check_unwrapped(branch)?;
-                must_understand(branch, budget)?;
+                if edition == OpcRelationshipEdition::Ecma2021 {
+                    must_understand(branch, budget)?;
+                }
                 budget.opc_workspace.push(
                     &mut frames,
                     Frame {
@@ -622,14 +626,24 @@ fn ignorable(
     };
     for ancestor in node.ancestors() {
         budget.node_filter.charge(1)?;
-        if let Some(value) = ancestor.attribute((MC, "Ignorable")) {
-            budget
-                .node_filter
-                .charge(value.len().saturating_add(uri.len()))?;
-            for prefix in tokens(value) {
-                if namespace(ancestor, prefix, budget)? == uri {
-                    return Ok(true);
-                }
+        if declares_ignorable(ancestor, uri, budget)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn declares_ignorable(
+    node: Node<'_, '_>,
+    uri: &str,
+    budget: &TransformExecutionBudget,
+) -> Result<bool, TransformError> {
+    if let Some(value) = node.attribute((MC, "Ignorable")) {
+        budget.node_filter.charge(value.len())?;
+        for prefix in tokens(value) {
+            budget.node_filter.charge(uri.len())?;
+            if namespace(node, prefix, budget)? == uri {
+                return Ok(true);
             }
         }
     }
@@ -662,21 +676,35 @@ fn process_content(
         // ancestor's name pair; do not carry the older reset into that edition.
         // https://ecma-international.org/publications-and-standards/standards/ecma-376/
         if edition == OpcRelationshipEdition::Ecma2012
-            && let Some(value) = ancestor.attribute((MC, "Ignorable"))
+            && let Some(uri) = tag.namespace()
+            && declares_ignorable(ancestor, uri, budget)?
         {
-            budget.node_filter.charge(value.len())?;
-            for prefix in tokens(value) {
-                if tag.namespace() == Some(namespace(ancestor, prefix, budget)?) {
-                    return Ok(false);
-                }
-            }
+            return Ok(false);
         }
     }
     Ok(false)
 }
 
+fn validate_mce_entry(
+    node: Node<'_, '_>,
+    edition: OpcRelationshipEdition,
+    budget: &TransformExecutionBudget,
+) -> Result<(), TransformError> {
+    // Part 3:2012 §§10.1, 10.1.3, 10.2.1 checks MCE attributes and
+    // MustUnderstand before ignoring an encountered element, including all
+    // Choice/Fallback attributes. Part 3:2015 §9.4 checks MustUnderstand only
+    // after ignore/selection; descendants of unselected branches are not visited.
+    // https://ecma-international.org/publications-and-standards/standards/ecma-376/
+    validate_mc_attributes(node, edition, budget)?;
+    if edition == OpcRelationshipEdition::Ecma2012 {
+        must_understand(node, budget)?;
+    }
+    Ok(())
+}
+
 fn validate_mc_attributes(
     node: Node<'_, '_>,
+    edition: OpcRelationshipEdition,
     budget: &TransformExecutionBudget,
 ) -> Result<(), TransformError> {
     // ECMA-376 Part 3 (2015) §§7, 9: namespace lists bind at their
@@ -704,7 +732,15 @@ fn validate_mc_attributes(
                         .split_once(':')
                         .ok_or_else(|| invalid("MCE name requires a prefix"))?;
                     let uri = namespace(node, prefix, budget)?;
-                    if (local != "*" && !ncname(local)) || !ignorable(node, Some(uri), budget)? {
+                    // Part 3:2012 §10.1.2 requires Ignorable on the same
+                    // element; Part 3:2015 §7.3 permits ancestor declarations.
+                    // Prefix aliases are compared by their expanded namespace.
+                    // https://ecma-international.org/publications-and-standards/standards/ecma-376/
+                    let declared = match edition {
+                        OpcRelationshipEdition::Ecma2012 => declares_ignorable(node, uri, budget)?,
+                        OpcRelationshipEdition::Ecma2021 => ignorable(node, Some(uri), budget)?,
+                    };
+                    if (local != "*" && !ncname(local)) || !declared {
                         return Err(invalid(
                             "MCE qualified name must belong to an ignorable namespace",
                         ));
@@ -778,6 +814,7 @@ fn alternate_content<'a>(
             continue;
         }
         let tag = child.tag_name();
+        validate_mce_entry(child, edition, budget)?;
         // Part 3 (2015) §9.2 marks ProcessContent matches as unwrapped,
         // not ignored. §9.4(3a) permits only ignored extension children here.
         // https://ecma-international.org/publications-and-standards/standards/ecma-376/
@@ -787,7 +824,6 @@ fn alternate_content<'a>(
         {
             continue;
         }
-        validate_mc_attributes(child, budget)?;
         check_unwrapped(child)?;
         match (tag.namespace(), tag.name()) {
             (Some(MC), "Choice") if fallback.is_none() => {
