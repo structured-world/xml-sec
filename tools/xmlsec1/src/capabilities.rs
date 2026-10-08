@@ -37,6 +37,9 @@ pub const TRANSFORMS: &[&str] = &[
     "exc-c14n-with-comments",
     "xpath",
     "xpath2",
+    // Executable for same-document inputs and explicitly mapped detached
+    // resources; this registry does not claim OPC package validation.
+    "relationship",
     "dsa-sha1",
     "ecdsa-sha256",
     "ecdsa-sha384",

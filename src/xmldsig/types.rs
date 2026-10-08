@@ -921,6 +921,10 @@ pub enum TransformError {
     #[error("XPath transform error: {0}")]
     XPath(String),
 
+    /// OPC relationship parameters, MCE, or part structure are invalid.
+    #[error("OPC relationship transform error: {0}")]
+    Relationship(String),
+
     /// XML octets could not be parsed while adapting binary transform output
     /// to the node-set required by a subsequent transform.
     #[error("XML transform input parse error: {0}")]

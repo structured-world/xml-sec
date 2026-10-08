@@ -37,6 +37,8 @@ assets=(
   "testDSig.sh"
   "testEnc.sh"
   "testKeys.sh"
+  "aleksey-xmldsig-01/enveloping-sha256-rsa-sha256-relationship.tmpl"
+  "aleksey-xmldsig-01/relationship/xml-base-input.xml"
   "phaos-xmldsig-three/signature-rsa-enveloped-bad-digest-val.xml"
   "phaos-xmldsig-three/certs/rsa-ca-cert.der"
   "xmlenc11-interop-2012/xenc11-example-AES128-GCM.xml"

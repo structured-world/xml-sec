@@ -134,3 +134,7 @@ pub(crate) const NODE_SET_ENTRY_CEILING: usize = 524_288;
 pub(crate) const NODE_SET_OWNED_STRING_BYTE_CEILING: usize = 8 * 1024 * 1024;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const NODE_SET_CUMULATIVE_OWNED_STRING_BYTE_CEILING: usize = 64 * 1024 * 1024;
+/// Absolute aggregate OPC selector/projection allocation bound.
+pub(crate) const OPC_WORKSPACE_BYTE_CEILING: usize = 64 * 1024 * 1024;
+/// Absolute retained OPC selector allocation bound across one signature parse.
+pub(crate) const OPC_PARAMETER_BYTE_CEILING: usize = 1024 * 1024;

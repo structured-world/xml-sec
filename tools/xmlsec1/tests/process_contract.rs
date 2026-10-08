@@ -39,6 +39,174 @@ fn binary() -> &'static str {
 }
 
 #[test]
+fn opc_relationship_cli_uses_the_2012_contract() {
+    // The native sign/verify boundary must select case-sensitive 2012 semantics,
+    // not silently inherit the library's ASCII-insensitive 2021 default.
+    use sha2::{Digest as _, Sha256};
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = project_root();
+    let source = root.join("tools/xmlsec1/tests/fixtures/upstream/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256-relationship.tmpl");
+    let namespace = "http://schemas.openxmlformats.org/package/2006/relationships";
+    let template = fs::read_to_string(source)
+        .unwrap()
+        .replace("relationship/xml-base-input.xml", "")
+        .replace("SourceId=\"rId1\"", "SourceId=\"RID1\"")
+        .replace("<Transforms>", &format!("<Transforms><Transform Algorithm=\"http://www.w3.org/TR/1999/REC-xpath-19991116\"><XPath xmlns:r=\"{namespace}\">ancestor-or-self::r:Relationships</XPath></Transform>"))
+        .replace("</Signature>", &format!("<Object><Relationships xmlns=\"{namespace}\"><Relationship Id=\"rId1\" Type=\"urn:t\" Target=\"a\"/></Relationships></Object></Signature>"));
+    fs::write(temp.path().join("template.xml"), template).unwrap();
+    let signed = Command::new(binary())
+        .current_dir(temp.path())
+        .args(["sign", "--lax-key-search", "--privkey-pem"])
+        .arg(root.join("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+        .args(["--output", "signed.xml", "template.xml"])
+        .output()
+        .unwrap();
+    assert!(
+        signed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&signed.stderr)
+    );
+    let empty = format!("<Relationships xmlns=\"{namespace}\"></Relationships>");
+    let digest = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(empty.as_bytes()));
+    assert!(
+        fs::read_to_string(temp.path().join("signed.xml"))
+            .unwrap()
+            .contains(&format!("<DigestValue>{digest}</DigestValue>"))
+    );
+    let verified = Command::new(binary())
+        .current_dir(temp.path())
+        .args(["verify", "--pubkey-pem"])
+        .arg(root.join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"))
+        .arg("signed.xml")
+        .output()
+        .unwrap();
+    assert!(
+        verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+}
+
+#[test]
+fn url_maps_do_not_authorize_external_key_retrieval() {
+    // Reference payload authorization must not grant key-source authorization.
+    // Same-document X509Data retrieval remains a supported metadata path.
+    let directory = tempfile::tempdir().unwrap();
+    let root = project_root();
+    let key = RsaSigningKey::from_pkcs8_pem(
+        &fs::read_to_string(root.join("tests/fixtures/keys/rsa/rsa-2048-key.pem")).unwrap(),
+    )
+    .unwrap();
+    let signed = SignContext::new(&key)
+        .sign_template(signature_template_without_key_info())
+        .unwrap();
+    let certificate =
+        pem::parse(fs::read(root.join("tests/fixtures/keys/rsa/rsa-2048-cert.pem")).unwrap())
+            .unwrap();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(certificate.contents());
+    let mapped = directory.path().join("payload.der");
+    fs::write(&mapped, certificate.contents()).unwrap();
+    for (uri, kind, accepted) in [
+        ("urn:payload", "rawX509Certificate", false),
+        ("#keys", "X509Data", true),
+    ] {
+        let xml = signed
+            .replace("</SignatureValue>", &format!("</SignatureValue><KeyInfo><RetrievalMethod URI=\"{uri}\" Type=\"http://www.w3.org/2000/09/xmldsig#{kind}\"/></KeyInfo>"))
+            .replace("</Signature>", &format!("<Object><X509Data Id=\"keys\"><X509Certificate>{encoded}</X509Certificate></X509Data></Object></Signature>"));
+        let input = directory.path().join("signed.xml");
+        fs::write(&input, xml).unwrap();
+        let output = Command::new(binary())
+            .args(["verify", "--insecure", "--url-map:urn:payload"])
+            .arg(&mapped)
+            .arg(&input)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            accepted,
+            "{uri}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !accepted {
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("retrieval method URI class is not permitted")
+            );
+        }
+    }
+}
+
+#[test]
+fn opc_detached_parts_require_explicit_url_maps() {
+    // Explicit maps must work with the original detached donor template;
+    // no map may fall back to opening a URI-controlled local filename.
+    let temp = tempfile::tempdir().unwrap();
+    let root = project_root();
+    let fixture = root.join("tools/xmlsec1/tests/fixtures/upstream/aleksey-xmldsig-01");
+    let template = fixture.join("enveloping-sha256-rsa-sha256-relationship.tmpl");
+    let part = fixture.join("relationship/xml-base-input.xml");
+    let signed = temp.path().join("signed.xml");
+    let sign = |mapped: bool| {
+        let mut command = Command::new(binary());
+        command
+            .current_dir(&fixture)
+            .args(["sign", "--lax-key-search", "--privkey-pem"])
+            .arg(root.join("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .arg("--output")
+            .arg(&signed);
+        if mapped {
+            command
+                .arg("--url-map:relationship/xml-base-input.xml")
+                .arg(&part);
+        }
+        command.arg(&template).output().unwrap()
+    };
+    assert!(!sign(false).status.success());
+    assert!(!signed.exists());
+    let result = sign(true);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let verify = |mapped: bool| {
+        let mut command = Command::new(binary());
+        command
+            .current_dir(&fixture)
+            .args(["verify", "--pubkey-pem"])
+            .arg(root.join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"));
+        if mapped {
+            command
+                .arg("--url-map:relationship/xml-base-input.xml")
+                .arg(&part);
+        }
+        command.arg(&signed).output().unwrap()
+    };
+    assert!(!verify(false).status.success());
+    let result = verify(true);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let corrupted = fs::read_to_string(&part)
+        .unwrap()
+        .replace("word/document.xml", "word/tampered.xml");
+    let changed = temp.path().join("changed.xml");
+    fs::write(&changed, corrupted).unwrap();
+    let result = Command::new(binary())
+        .args(["verify", "--pubkey-pem"])
+        .arg(root.join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"))
+        .arg("--url-map:relationship/xml-base-input.xml")
+        .arg(changed)
+        .arg(signed)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+}
+
+#[test]
 fn decrypt_nested_wrapping_keys_through_the_cli() {
     // The native process must recover an intermediate KEK, not mistake it for
     // the content key; authentication failure must preserve existing output.

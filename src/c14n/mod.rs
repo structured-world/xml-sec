@@ -23,6 +23,7 @@
 //! ```
 
 mod escape;
+pub(crate) use escape::escape_attr;
 mod ns_common;
 pub(crate) mod ns_exclusive;
 pub(crate) mod ns_inclusive;

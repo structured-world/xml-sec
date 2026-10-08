@@ -197,6 +197,19 @@ depth and key-candidate limits. Referenced `KeyName` and public identity sources
 participate in the same selection and validation as direct children. Missing,
 ambiguous, non-`KeyInfo`, cyclic, over-budget, and external references fail
 closed; the CLI never reads external key metadata implicitly.
+
+For signing and verification references, `--url-map:<URL> <FILE>` explicitly
+supplies a detached resource. Repeat the option for distinct resolved URIs;
+duplicate URLs or missing URL parameters are errors. The map is exact and has
+no filesystem or network fallback. Mapped file capacity is checked before
+allocation against individual and aggregate compiled resource limits, including
+transient reallocation if a file grows during reading. Verification also charges
+mapped bytes against the budget shared with configured certificate/key material.
+This option supplies reference data, not external KeyInfo metadata; verification
+permits only same-document RetrievalMethod and KeyInfoReference URIs. Both commands
+use the 2012 OPC Relationship Transform normalization contract; package-level
+conformance is separate from XMLDSig signature verification.
+
 For RSA, DSA, P-256, P-384, and P-521 signing, `--pwd` decrypts
 password-protected PKCS#8 PEM or DER supplied through the matching private-key
 option. The generic `--privkey-pem` option also accepts OpenSSL traditional

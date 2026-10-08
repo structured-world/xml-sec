@@ -165,7 +165,7 @@ fn complete_surface_categories_are_stable() {
         "https://github.com/lsh123/xmlsec"
     );
     assert_eq!(ledger.generated_by, "xml-sec-capability-ledger/2");
-    assert_eq!(ledger.classifications.len(), 23);
+    assert_eq!(ledger.classifications.len(), 24);
     assert_eq!(ledger.availability.len(), 427);
 
     let counts = ledger
@@ -349,7 +349,7 @@ fn native_algorithm_claims_match_the_rust_api() {
                 )
         })
         .collect();
-    assert_eq!(claims.len(), 73);
+    assert_eq!(claims.len(), 74);
     for item in claims {
         if item.classification == "feature-gated-legacy-uri" {
             // The ledger records the build requirement, not unconditional API
@@ -453,6 +453,16 @@ fn assert_native_uri_support(item: &Item) {
         "xmlSecHrefBase64" | "xmlSecHrefEnveloped" | "xmlSecXPath2Ns" | "xmlSecXPathNs" => {
             assert_transform_uri_parses(uri)
         }
+        "xmlSecHrefRelationship" => {
+            let xml = format!(
+                "<Transforms xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><Transform Algorithm=\"{uri}\"><RelationshipReference xmlns=\"http://schemas.openxmlformats.org/package/2006/digital-signature\" SourceId=\"rId1\"/></Transform><Transform Algorithm=\"http://www.w3.org/TR/2001/REC-xml-c14n-20010315\"/></Transforms>"
+            );
+            let document = roxmltree::Document::parse(&xml).unwrap();
+            let transforms = xml_sec::xmldsig::parse_transforms(document.root_element()).unwrap();
+            assert!(
+                matches!(&transforms[0], xml_sec::xmldsig::Transform::Relationship(selectors) if selectors == &[xml_sec::xmldsig::RelationshipSelector::SourceId("rId1".into())])
+            );
+        }
         "xmlSecHrefDEREncodedKeyValue"
         | "xmlSecHrefDSAKeyValue"
         | "xmlSecHrefECKeyValue"
@@ -553,8 +563,40 @@ fn assert_encrypted_key_uri_parses(uri: &str) {
 
 #[cfg(feature = "xmldsig")]
 #[test]
+fn opc_relationship_contract_executes() {
+    // The ledger's OPC claim proves actual transform execution, not URI
+    // recognition alone; full edition/signature interoperability lives in its
+    // dedicated integration suite.
+    use xml_sec::c14n::{C14nAlgorithm, C14nMode};
+    use xml_sec::xmldsig::{
+        NodeSet, RelationshipSelector, Transform, TransformData, execute_transforms,
+    };
+    assert_eq!(
+        xml_sec::policy::VerificationPolicy::default()
+            .transforms
+            .opc_relationship_edition,
+        xml_sec::policy::OpcRelationshipEdition::Ecma2021
+    );
+    let xml = "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"RID\" Type=\"urn:t\" Target=\"a\"/></Relationships>";
+    let document = xml_sec::Document::parse(xml).unwrap();
+    let chain = [
+        Transform::Relationship(vec![RelationshipSelector::SourceType("URN:T".into())]),
+        Transform::C14n(C14nAlgorithm::new(C14nMode::Inclusive1_0, false)),
+    ];
+    let output = execute_transforms(
+        document.root_element(),
+        TransformData::NodeSet(NodeSet::entire_document_with_comments(&document).unwrap()),
+        &chain,
+    )
+    .unwrap();
+    assert_eq!(output, b"<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"RID\" Target=\"a\" TargetMode=\"Internal\" Type=\"urn:t\"></Relationship></Relationships>");
+}
+
+#[cfg(feature = "xmldsig")]
+#[test]
 fn legacy_algorithm_claims_are_policy_gated() {
-    // Only algorithms independently gated by compiled policy belong here.
+    // Legacy algorithms and the OPC edition contract are independently selected
+    // by compiled policy; OPC compatibility is not a cryptographic downgrade.
     let ledger = ledger();
     let actual: BTreeSet<_> = ledger
         .items
@@ -565,6 +607,7 @@ fn legacy_algorithm_claims_are_policy_gated() {
     assert_eq!(
         actual,
         BTreeSet::from([
+            "xmlSecHrefRelationship",
             "xmlSecHrefDsaSha1",
             "xmlSecHrefEcdsaSha1",
             "xmlSecHrefHmacSha1",

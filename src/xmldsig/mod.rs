@@ -102,9 +102,10 @@ pub use signature::{
     verify_ecdsa_signature_spki_with_encoding, verify_rsa_signature_pem, verify_rsa_signature_spki,
 };
 pub use transforms::{
-    BASE64_TRANSFORM_URI, DEFAULT_IMPLICIT_C14N_URI, ENVELOPED_SIGNATURE_URI, Transform,
-    XPATH_FILTER2_TRANSFORM_URI, XPATH_TRANSFORM_URI, XPathExpression, XPathFilter,
-    XPathFilterOperation, XPathHereSemantics, execute_transforms, parse_transforms,
+    BASE64_TRANSFORM_URI, DEFAULT_IMPLICIT_C14N_URI, ENVELOPED_SIGNATURE_URI,
+    RELATIONSHIP_TRANSFORM_URI, RelationshipSelector, Transform, XPATH_FILTER2_TRANSFORM_URI,
+    XPATH_TRANSFORM_URI, XPathExpression, XPathFilter, XPathFilterOperation, XPathHereSemantics,
+    execute_transforms, execute_transforms_with_policy, parse_transforms,
 };
 pub use trust::{KeyTrustEvidence, ResolvedVerificationKey, TrustedPublicKey, X509TrustEvidence};
 pub use types::{NodeSet, TransformData, TransformError};

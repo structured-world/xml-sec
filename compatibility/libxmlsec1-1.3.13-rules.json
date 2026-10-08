@@ -13,6 +13,10 @@
       "test": "capability_ledger::xpath_claims_record_libxmlsec_here_compatibility",
       "description": "XPath and XPath Filter 2.0 use standards behavior by default; integration tests exercise the explicit libxmlsec1-compatible here() binding."
     },
+    "opc-relationship-tests": {
+      "test": "capability_ledger::opc_relationship_contract_executes",
+      "description": "The public pipeline executes case-insensitive SourceType selection and canonical relationship normalization under the default 2021 contract. Dedicated integration tests exercise typed editions, MCE, budgets, and reciprocal 2012 interoperability."
+    },
     "legacy-policy-tests": {
       "test": "capability_ledger::legacy_algorithm_claims_are_policy_gated",
       "description": "Legacy SHA-1 and optional historical mechanisms require explicit compatibility policy permission; optional methods also require the legacy-algorithms build feature."
@@ -78,6 +82,14 @@
       "outcome": "behavior-compatible",
       "rationale": "The native Rust API parses and executes this standard URI, with unit or interoperability coverage in the repository.",
       "evidence": "native-algorithm-tests"
+    },
+    {
+      "id": "opc-relationship-uri",
+      "kinds": ["algorithm-uri"],
+      "name_regex": "^xmlSecHrefRelationship$",
+      "outcome": "compatibility-profile-only",
+      "rationale": "The complete OPC relationship mechanism uses the 2021 edition by default; the native CLI explicitly selects the 2012 edition required for libxmlsec1 interoperability.",
+      "evidence": "opc-relationship-tests"
     },
     {
       "id": "native-sha1-verification-uri",

@@ -19,6 +19,9 @@ pub enum Error {
     /// An encoding label was not recognized.
     #[error("unsupported XML encoding `{0}`")]
     UnsupportedEncoding(String),
+    /// The consuming XML format disallows the detected or declared encoding.
+    #[error("XML format does not permit encoding `{0}`")]
+    ForbiddenEncoding(String),
     /// Resolver metadata, a byte signature, and the XML declaration disagreed.
     #[error("XML byte encoding conflicts with declared or selected encoding `{0}`")]
     ConflictingEncoding(String),
@@ -226,7 +229,27 @@ pub fn decode_xml_bounded<'a>(
     explicit_encoding: Option<&str>,
     maximum_decoded_bytes: usize,
 ) -> Result<Cow<'a, str>, Error> {
-    decode_xml_bounded_inner(bytes, explicit_encoding, maximum_decoded_bytes, true)
+    decode_xml_bounded_inner(
+        bytes,
+        explicit_encoding,
+        maximum_decoded_bytes,
+        true,
+        |_, _| Ok(()),
+    )
+}
+
+/// Decode XML with a format-specific check of detected and declared encodings.
+///
+/// The guard receives the selected physical decoder name and the declaration
+/// label, when present, as borrowed strings. It runs before transcoding and again
+/// when a non-ASCII declaration becomes readable, before declaration rewriting.
+/// Returning an error prevents parsing; the ordinary decoder remains unrestricted.
+pub fn decode_xml_bounded_with_encoding_guard<'a>(
+    bytes: &'a [u8],
+    maximum_decoded_bytes: usize,
+    guard: impl Fn(&str, Option<&str>) -> Result<(), Error>,
+) -> Result<Cow<'a, str>, Error> {
+    decode_xml_bounded_inner(bytes, None, maximum_decoded_bytes, true, guard)
 }
 
 /// Detect XML-media-type text encoding without changing the included text's declaration.
@@ -238,7 +261,13 @@ pub fn decode_xml_text_bounded<'a>(
     explicit_encoding: Option<&str>,
     maximum_decoded_bytes: usize,
 ) -> Result<Cow<'a, str>, Error> {
-    decode_xml_bounded_inner(bytes, explicit_encoding, maximum_decoded_bytes, false)
+    decode_xml_bounded_inner(
+        bytes,
+        explicit_encoding,
+        maximum_decoded_bytes,
+        false,
+        |_, _| Ok(()),
+    )
 }
 
 fn decode_xml_bounded_inner<'a>(
@@ -246,6 +275,7 @@ fn decode_xml_bounded_inner<'a>(
     explicit_encoding: Option<&str>,
     maximum_decoded_bytes: usize,
     normalize_declaration: bool,
+    encoding_guard: impl Fn(&str, Option<&str>) -> Result<(), Error>,
 ) -> Result<Cow<'a, str>, Error> {
     let physical = physical_encoding(bytes)?;
     let ascii_declaration = if physical.is_none() {
@@ -291,8 +321,18 @@ fn decode_xml_bounded_inner<'a>(
     }
 
     let bom_len = physical.map_or(0, |(_, bom_len)| bom_len);
+    encoding_guard(
+        selected.name(),
+        ascii_declaration.as_ref().map(|(_, label)| *label),
+    )?;
     let mut decoded = decode_selected(&bytes[bom_len..], selected, maximum_decoded_bytes)?;
     let declaration = declaration_from_text(&decoded)?;
+    if physical.is_some() {
+        encoding_guard(
+            selected.name(),
+            declaration.as_ref().map(|range| &decoded[range.clone()]),
+        )?;
+    }
     if explicit_encoding.is_none()
         && declaration.is_none()
         && physical.is_some_and(|(encoding, bom_len)| {
@@ -779,8 +819,28 @@ mod tests {
 
     use super::{
         Error, declaration_from_ascii_bytes, declaration_from_text, decode_text, decode_xml,
-        decode_xml_bounded,
+        decode_xml_bounded, decode_xml_bounded_with_encoding_guard,
     };
+
+    #[test]
+    fn encoding_guard_precedes_conversion_and_preserves_borrowing() {
+        // Format rejection must precede conversion, and accepted UTF-8 needs no copy.
+        let rejected = decode_xml_bounded_with_encoding_guard(
+            b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><root/>",
+            0,
+            |physical, _| Err(Error::ForbiddenEncoding(physical.into())),
+        );
+        assert!(matches!(rejected, Err(Error::ForbiddenEncoding(_))));
+        let source = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><root/>";
+        let accepted =
+            decode_xml_bounded_with_encoding_guard(source, source.len(), |physical, declared| {
+                assert_eq!(physical, "UTF-8");
+                assert_eq!(declared, Some("UTF-8"));
+                Ok(())
+            })
+            .unwrap();
+        assert!(matches!(accepted, Cow::Borrowed(_)));
+    }
 
     fn encode_utf32(source: &str, little_endian: bool) -> Vec<u8> {
         source

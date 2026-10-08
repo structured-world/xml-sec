@@ -95,6 +95,8 @@ pub(crate) mod resource_name {
     pub const XPATH_NAMESPACE_BYTES: &str = "XPath namespace bytes";
     pub const XPATH_FILTERS: &str = "XPath filters";
     pub const NODE_SET_FILTER_WORK: &str = "node-set filter work";
+    pub const OPC_WORKSPACE_BYTES: &str = "OPC workspace bytes";
+    pub const OPC_PARAMETER_BYTES: &str = "OPC parameter bytes";
     pub const NODE_SET_ENTRIES: &str = "node-set entries";
     pub const NODE_SET_OWNED_STRING_BYTES: &str = "node-set owned string bytes";
     pub const NODE_SET_CUMULATIVE_OWNED_STRING_BYTES: &str =
@@ -529,6 +531,10 @@ pub struct ResourcePolicy {
     pub max_node_set_owned_string_bytes: usize,
     /// Maximum cumulative owned node-set string bytes per operation.
     pub max_node_set_cumulative_owned_string_bytes: usize,
+    /// Maximum cumulative OPC parameter allocations retained during signature parsing.
+    pub max_opc_parameter_bytes: usize,
+    /// Maximum cumulative OPC normalization workspace allocations during execution.
+    pub max_opc_workspace_bytes: usize,
 }
 
 impl Default for ResourcePolicy {
@@ -575,6 +581,8 @@ impl Default for ResourcePolicy {
             max_node_set_owned_string_bytes: crate::hard_limits::NODE_SET_OWNED_STRING_BYTE_CEILING,
             max_node_set_cumulative_owned_string_bytes:
                 crate::hard_limits::NODE_SET_CUMULATIVE_OWNED_STRING_BYTE_CEILING,
+            max_opc_workspace_bytes: crate::hard_limits::OPC_WORKSPACE_BYTE_CEILING,
+            max_opc_parameter_bytes: crate::hard_limits::OPC_PARAMETER_BYTE_CEILING,
         }
     }
 }
@@ -766,6 +774,16 @@ impl ResourcePolicy {
         ] {
             Self::within(resource, selected, ceiling)?;
         }
+        Self::within(
+            resource_name::OPC_WORKSPACE_BYTES,
+            self.max_opc_workspace_bytes,
+            crate::hard_limits::OPC_WORKSPACE_BYTE_CEILING,
+        )?;
+        Self::within(
+            resource_name::OPC_PARAMETER_BYTES,
+            self.max_opc_parameter_bytes,
+            crate::hard_limits::OPC_PARAMETER_BYTE_CEILING,
+        )?;
         Ok(())
     }
 
@@ -869,6 +887,19 @@ pub struct XmlInputPolicy {
     pub allow_internal_dtd: bool,
 }
 
+/// Trusted edition of relationship selection and normalization.
+/// This is not an OPC package-conformance profile: signature placement and
+/// package-wide part identity constraints require a package validator.
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OpcRelationshipEdition {
+    /// ECMA-376 Part 2 (2012), including libxmlsec1's case-sensitive selection.
+    Ecma2012,
+    /// ECMA-376 Part 2 (2021) section 10.6, ASCII-insensitive selection.
+    #[default]
+    Ecma2021,
+}
+
 /// XMLDSig transform and canonicalization decisions shared by signing and verification.
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -909,6 +940,8 @@ pub struct TransformPolicy {
     pub xpath_here_semantics: XPathHereSemantics,
     /// Interpretation of bare same-document ID fragments.
     pub same_document_id_semantics: SameDocumentIdSemantics,
+    /// Trusted normalization edition, not package validation; never inferred from XML.
+    pub opc_relationship_edition: OpcRelationshipEdition,
 }
 
 /// URI-class decisions shared by XMLDSig reference and key retrieval processing.
@@ -1725,6 +1758,16 @@ mod tests {
                 |p| &mut p.max_node_set_filter_work,
             ),
             (
+                resource_name::OPC_PARAMETER_BYTES,
+                crate::hard_limits::OPC_PARAMETER_BYTE_CEILING,
+                |p| &mut p.max_opc_parameter_bytes,
+            ),
+            (
+                resource_name::OPC_WORKSPACE_BYTES,
+                crate::hard_limits::OPC_WORKSPACE_BYTE_CEILING,
+                |p| &mut p.max_opc_workspace_bytes,
+            ),
+            (
                 resource_name::NODE_SET_ENTRIES,
                 crate::hard_limits::NODE_SET_ENTRY_CEILING,
                 |p| &mut p.max_node_set_entries,
@@ -1798,6 +1841,8 @@ mod tests {
             max_node_set_entries: 0,
             max_node_set_owned_string_bytes: 0,
             max_node_set_cumulative_owned_string_bytes: 0,
+            max_opc_workspace_bytes: 0,
+            max_opc_parameter_bytes: 0,
         };
 
         assert_eq!(policy.validate(), Ok(()));

@@ -24,6 +24,10 @@
       "test": "capability_ledger::native_cli_claims_match_process_and_upstream_runner_tests",
       "description": "Process tests cover native command parsing, exit statuses, sign/verify and encrypt/decrypt paths; the unmodified upstream DSig, Enc, and Keys runners exercise the same binary and capability registry."
     },
+    "opc-relationship-tests": {
+      "test": "capability_ledger::opc_relationship_contract_executes",
+      "description": "The public pipeline executes case-insensitive SourceType selection and canonical relationship normalization under the default 2021 contract. Dedicated integration tests exercise typed editions, MCE, budgets, and reciprocal 2012 interoperability."
+    },
     "phaos-xmldsig-tests": {
       "test": "capability_ledger::phaos_xmldsig_family_is_exhaustively_classified",
       "description": "The exhaustive Phaos integration suite executes every signature document through the public verification API and asserts exact valid, invalid, or unsupported outcomes without skips."
@@ -118,6 +122,11 @@
       "outcome": "behavior-compatible",
       "rationale": "The native Rust API implements XPath and XPath Filter 2.0 with standards-compliant here() semantics by default; reproducing libxmlsec1's divergent Transform-element binding requires the explicit XmlSecLegacy mode.",
       "evidence": "xpath-compatibility-tests"
+    },
+    "opc-relationship-uri": {
+      "outcome": "compatibility-profile-only",
+      "rationale": "The complete OPC relationship mechanism uses the 2021 edition by default; the native CLI explicitly selects the 2012 edition required for libxmlsec1 interoperability.",
+      "evidence": "opc-relationship-tests"
     },
     "phaos-xmldsig-exhaustive": {
       "outcome": "planned",
@@ -4968,7 +4977,7 @@
       "source": "src/strings.c",
       "line": 920,
       "detail": "http://schemas.openxmlformats.org/package/2006/RelationshipTransform",
-      "classification": "remaining-uri-surface"
+      "classification": "opc-relationship-uri"
     },
     {
       "kind": "algorithm-uri",
