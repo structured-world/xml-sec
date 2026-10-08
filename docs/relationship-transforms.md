@@ -84,6 +84,11 @@ Internal Target syntax must be a relative reference; network-path references
 are permitted by RFC 3986 §4.2. Determining whether they resolve inside the
 same package requires its base pack IRI (2021 §§6.5.2.2-3), which the normalizer
 does not receive. Acceptance by this transform does not assert package membership.
+External Target syntax is validated before selection as well: relative references
+or absolute IRIs are permitted. The 2012 contract also permits format-defined
+fragments on absolute targets (§9.3.2.2); the 2021 contract specifies absolute-IRI
+without a fragment (§6.5.3.4; RFC 3987 §2.2). Relative references may retain fragments
+in either edition. Validation never resolves or fetches the target.
 Relationship simple content is removed in both editions; non-whitespace text
 in the Relationships container and child elements in Relationship remain invalid.
 Selector simple content is permitted and ignored; selection uses only SourceId

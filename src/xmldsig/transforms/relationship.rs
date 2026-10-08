@@ -375,6 +375,8 @@ pub(super) fn normalize<'a>(
                 budget.node_filter.charge(target.len())?;
                 if mode == "Internal" {
                     validate_internal_target_reference_syntax(target)?;
+                } else {
+                    validate_external_target_reference_syntax(target, edition)?;
                 }
                 let index = records.len();
                 budget.opc_workspace.push(
@@ -814,20 +816,56 @@ fn validate_relationship_type_iri(kind: &str) -> Result<(), TransformError> {
     // https://www.rfc-editor.org/rfc/rfc3987#section-2.2
     // Check the collapsed anyURI value without changing its lexical infoset.
     let value = kind.trim_matches(xml_whitespace);
-    if let Some((scheme, remainder)) = value.split_once(':')
-        && scheme
-            .as_bytes()
-            .first()
-            .is_some_and(u8::is_ascii_alphabetic)
-        && scheme
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    if let Some(remainder) = iri_scheme_remainder(value)
         && !remainder.contains('#')
         && valid_iri_reference(remainder, false)
     {
         return Ok(());
     }
     Err(invalid("relationship Type must be an absolute IRI"))
+}
+
+fn iri_scheme_remainder(value: &str) -> Option<&str> {
+    let (scheme, remainder) = value.split_once(':')?;
+    if !scheme
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphabetic)
+    {
+        return None;
+    }
+    for byte in scheme.bytes() {
+        if !byte.is_ascii_alphanumeric() && !matches!(byte, b'+' | b'-' | b'.') {
+            return None;
+        }
+    }
+    Some(remainder)
+}
+
+fn validate_external_target_reference_syntax(
+    target: &str,
+    edition: OpcRelationshipEdition,
+) -> Result<(), TransformError> {
+    // Part 2:2012 §9.3.2.2 permits a URI or relative reference, including
+    // format-defined fragments (O1.6); 2021 §6.5.3.4 instead specifies a
+    // relative reference or absolute-IRI. RFC 3987 §2.2 excludes fragments
+    // from absolute-IRI, but permits them in relative references.
+    // https://ecma-international.org/publications-and-standards/standards/ecma-376/
+    // https://www.rfc-editor.org/rfc/rfc3987#section-2.2
+    let value = target.trim_matches(xml_whitespace);
+    if let Some(remainder) = iri_scheme_remainder(value) {
+        if edition == OpcRelationshipEdition::Ecma2021 && remainder.contains('#') {
+            return Err(invalid(
+                "External relationship Target must be a relative reference or absolute IRI",
+            ));
+        }
+        if valid_iri_reference(remainder, false) {
+            return Ok(());
+        }
+    } else if valid_iri_reference(value, true) {
+        return Ok(());
+    }
+    Err(invalid("invalid External relationship Target reference"))
 }
 
 fn validate_internal_target_reference_syntax(target: &str) -> Result<(), TransformError> {

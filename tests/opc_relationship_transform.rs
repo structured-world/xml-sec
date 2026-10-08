@@ -202,6 +202,74 @@ fn malformed_parameters_and_canonicalization_chains_fail_before_execution() {
 }
 
 #[test]
+fn external_relationship_targets_follow_selected_edition() {
+    // External syntax is mandatory even when the relationship is unselected;
+    // 2012 permits URI fragments, whereas 2021 specifies absolute-IRI.
+    for edition in [
+        OpcRelationshipEdition::Ecma2012,
+        OpcRelationshipEdition::Ecma2021,
+    ] {
+        for selected in [false, true] {
+            for (target, valid) in [
+                ("%ZZ", false),
+                ("https://example.com/%GG", false),
+                ("a b", false),
+                ("//[broken]/x", false),
+                ("https://host:port/x", false),
+                ("1bad:x", false),
+                ("a#b#c", false),
+                ("a%20b", true),
+                ("../a#fragment", true),
+                ("//example.com/a", true),
+                ("https://例え.example/役割", true),
+                ("urn:part:a", true),
+                ("http://[::1]:80/a", true),
+                (
+                    "https://example.com/a#fragment",
+                    edition == OpcRelationshipEdition::Ecma2012,
+                ),
+            ] {
+                let input = format!(
+                    "<Relationships xmlns=\"{REL}\"><Relationship Id=\"x\" Type=\"urn:t\" Target=\"{target}\" TargetMode=\"External\"/></Relationships>"
+                );
+                let document = Document::parse(&input).unwrap();
+                let chain = [
+                    Transform::Relationship(vec![RelationshipSelector::SourceId(
+                        if selected { "x" } else { "absent" }.into(),
+                    )]),
+                    Transform::C14n(C14nAlgorithm::new(C14nMode::Inclusive1_0, false)),
+                ];
+                let mut policy = VerificationPolicy::default();
+                policy.transforms.opc_relationship_edition = edition;
+                let result = xml_sec::xmldsig::execute_transforms_with_policy(
+                    document.root_element(),
+                    TransformData::NodeSet(
+                        NodeSet::entire_document_with_comments(&document).unwrap(),
+                    ),
+                    &chain,
+                    &policy,
+                );
+                assert_eq!(
+                    result.is_ok(),
+                    valid,
+                    "{edition:?} {target} selected={selected}: {result:?}"
+                );
+                if valid {
+                    let expected = if selected {
+                        format!(
+                            "<Relationships xmlns=\"{REL}\"><Relationship Id=\"x\" Target=\"{target}\" TargetMode=\"External\" Type=\"urn:t\"></Relationship></Relationships>"
+                        )
+                    } else {
+                        format!("<Relationships xmlns=\"{REL}\"></Relationships>")
+                    };
+                    assert_eq!(result.unwrap(), expected.as_bytes());
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn internal_relationship_target_syntax_is_not_package_resolution() {
     // ECMA-376 Part 2 §6.5.3.4 requires Internal targets to be relative;
     // selection must not hide invalid unselected relationships.
