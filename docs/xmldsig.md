@@ -134,10 +134,21 @@ equal fragment names in distinct documents remain independent, while reparsing
 an external resource cannot hide a cycle that returns to that resource.
 `IdAttributeRegistration` supplies immutable request context for non-standard ID attributes.
 `SignContext::id_attributes` and `VerifyContext::id_attributes` apply the same global or
-element-scoped registrations to operation start-node selection and every same-document Reference.
+element-scoped registrations to operation start-node selection, every same-document Reference,
+and XPath `id()` in ordinary and Filter 2.0 transforms.
 `scoped_any_namespace` matches one element local name across namespaces, while `scoped` matches
 one exact expanded name and uses `None` for no namespace. The registration is not stored in policy
 and never comes from document content.
+`with_attribute_namespace(Some("urn:trusted"))` restricts the registered attribute to an exact
+namespace URI; `None` restricts it to unqualified attributes. Without this restriction, attribute
+local names match across namespaces, preserving the CLI `--id-attr` contract. Registrations add
+to the built-in `ID`/`Id`/`id` spellings, `xml:id`, and internal-DTD ID declarations; they do not
+remove these defaults. `xml:id` and DTD ID values are normalized in the shared semantic DOM,
+so borrowed and retained-document resolution, XPath, and canonicalization see the same value.
+`Attribute::xml_id_error()` exposes non-fatal invalid-NCName and non-ID-declaration diagnostics.
+As required by [xml:id 1.0 sections 4 and 6](https://www.w3.org/TR/2005/REC-xml-id-20050909/#processing),
+ID assignment is preserved even when a diagnostic is present; callers can inspect it before
+relying on such an attribute. Duplicate values on different elements remain ambiguous.
 `SignContext::sign_template` selects the last descendant `Signature` template by default, preserving
 append-then-sign workflows when a document already contains signatures. Process compatibility
 boundaries that use donor document-order lookup can explicitly select
@@ -263,6 +274,11 @@ while preserving the barename rule that excludes comments. In contrast,
 The native CLI selects the donor barename mode by default and the direct mode for
 `--enable-visa3d-hack`. ID registrations remain request context and duplicate
 IDs fail in every mode.
+The standards mode reverses UTF-8 URI percent escaping before resolving a fragment. Explicit
+`xpointer(/)` and single-literal `xpointer(id('...'))` expressions retain comments, while empty
+URIs and bare fragments remove them. XPointer caret escaping (`^(`, `^)`, `^^`) is processed
+before XPath literal matching. Compound XPath arguments, malformed escaping, and unbalanced
+scheme parentheses are rejected. General XPointer expressions are not evaluated.
 
 Verification separates signature correctness from key authorization.
 `VerificationPolicy::key_trust.mode` defaults to `VerificationTrustMode::RequireTrustedKey`:
@@ -436,10 +452,10 @@ Internal DTD declarations are disabled by default. Verification requires the ope
 `VerifyContext::allow_internal_dtd(true)` convenience method updates that same policy snapshot
 rather than bypassing a separate policy gate. The decision applies consistently to the signed
 document and caller-supplied detached XML parsed by node-set transforms. Direct transform callers
-can set the corresponding option with `TransformOptions::allow_internal_dtd(true)`. Signing uses
+use `execute_transforms_with_policy` with the same `VerificationPolicy::xml` allowance. Signing uses
 `SigningPolicy::xml.allow_internal_dtd` across its complete pipeline. External entity resolution
-remains disabled. Internal-DTD parsing does not import DTD attribute types into the owned Rust ID
-index; attributes outside the built-in XMLDSig spellings and `xml:id` still require an explicit
+remains disabled. Internal-DTD ID declarations are carried into the shared semantic DOM and ID
+index without implicit external DTD loading. Other attribute names require an explicit
 request-scoped ID registration. XSLT is intentionally not executed because transforms operate on
 attacker-controlled documents; an authenticated Manifest reference using unsupported XSLT is
 reported as an invalid per-reference result without changing core `SignedInfo` validity.

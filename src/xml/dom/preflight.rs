@@ -1,6 +1,7 @@
 //! Shared lexical preflight and source-position sidecar for every DOM backend.
 
 use crate::xml_input as xml_sec_xml_input;
+use std::collections::HashMap;
 use std::ops::Range;
 
 use xml_sec_xml_input::lexical::{Event, Scanner};
@@ -22,17 +23,27 @@ struct SourceNode {
     range: Range<usize>,
 }
 
-pub(super) struct LexicalPreflight {
+type DtdAttributeName<'a> = (Option<&'a str>, &'a str, Option<&'a str>, &'a str);
+
+#[derive(Clone, Copy)]
+pub(super) struct DtdAttributeInfo {
+    pub(super) kind: crate::document::DtdAttributeType,
+    pub(super) has_non_id_declaration: bool,
+}
+
+pub(super) struct LexicalPreflight<'input> {
     nodes: Vec<SourceNode>,
+    attributes: HashMap<DtdAttributeName<'input>, DtdAttributeInfo>,
     #[cfg(feature = "xml-backend-roxmltree")]
     doctype: Option<Range<usize>>,
 }
 
-impl LexicalPreflight {
-    pub(super) fn scan(input: &str, allow_dtd: bool) -> Result<Self, ParseError> {
+impl<'input> LexicalPreflight<'input> {
+    pub(super) fn scan(input: &'input str, allow_dtd: bool) -> Result<Self, ParseError> {
         let mut reader = Scanner::new(input);
         let mut nodes: Vec<SourceNode> = Vec::new();
         let mut elements = Vec::new();
+        let mut attributes = HashMap::new();
         #[cfg(feature = "xml-backend-roxmltree")]
         let mut doctype = None;
         while let Some(event) = reader.next_event().map_err(|error| ParseError::Backend {
@@ -88,8 +99,40 @@ impl LexicalPreflight {
                     range,
                 }),
                 Event::DocType { .. } if !allow_dtd => return Err(ParseError::DtdDetected),
-                #[cfg(feature = "xml-backend-roxmltree")]
-                Event::DocType { range, .. } => doctype = Some(range),
+                Event::DocType { range, .. } => {
+                    crate::document::visit_dtd_attributes(
+                        &input[range.clone()],
+                        |element, attribute, kind| {
+                            let (element_prefix, element_local) = split_name(element);
+                            let (attribute_prefix, attribute_local) = split_name(attribute);
+                            // XML 1.0 section 3.3: the first declaration is binding.
+                            // https://www.w3.org/TR/2008/REC-xml-20081126/#attdecls
+                            attributes
+                                .entry((
+                                    element_prefix,
+                                    element_local,
+                                    attribute_prefix,
+                                    attribute_local,
+                                ))
+                                .and_modify(|info: &mut DtdAttributeInfo| {
+                                    // xml:id section 4 constrains ALL declarations,
+                                    // even those shadowed by the first binding.
+                                    // https://www.w3.org/TR/2005/REC-xml-id-20050909/#processing
+                                    info.has_non_id_declaration |=
+                                        kind != crate::document::DtdAttributeType::Id;
+                                })
+                                .or_insert(DtdAttributeInfo {
+                                    kind,
+                                    has_non_id_declaration: kind
+                                        != crate::document::DtdAttributeType::Id,
+                                });
+                        },
+                    );
+                    #[cfg(feature = "xml-backend-roxmltree")]
+                    {
+                        doctype = Some(range);
+                    }
+                }
                 _ => {}
             }
             let actual = nodes.len();
@@ -100,9 +143,27 @@ impl LexicalPreflight {
         }
         Ok(Self {
             nodes,
+            attributes,
             #[cfg(feature = "xml-backend-roxmltree")]
             doctype,
         })
+    }
+
+    pub(super) fn attribute_declaration(
+        &self,
+        element_prefix: Option<&str>,
+        element_local: &str,
+        attribute_prefix: Option<&str>,
+        attribute_local: &str,
+    ) -> Option<DtdAttributeInfo> {
+        self.attributes
+            .get(&(
+                element_prefix,
+                element_local,
+                attribute_prefix,
+                attribute_local,
+            ))
+            .copied()
     }
 
     #[cfg(feature = "xml-backend-roxmltree")]
@@ -141,6 +202,13 @@ impl LexicalPreflight {
             positions: &self.nodes,
             next: 0,
         }
+    }
+}
+
+fn split_name(name: &str) -> (Option<&str>, &str) {
+    match name.split_once(':') {
+        Some((prefix, local)) => (Some(prefix), local),
+        None => (None, name),
     }
 }
 

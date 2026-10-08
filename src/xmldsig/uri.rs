@@ -262,6 +262,9 @@ impl<'a> ResolverIdIndex<'a> {
 }
 
 impl<'a> UriReferenceResolver<'a> {
+    pub(crate) fn id_registrations(&self) -> &[crate::IdAttributeRegistration] {
+        &self.id_registrations
+    }
     /// Build a resolver with default ID attribute names (`ID`, `Id`, `id`).
     pub fn new(doc: &'a Document<'a>) -> Self {
         Self::with_id_attrs(doc, &[])
@@ -517,10 +520,6 @@ impl<'a> UriReferenceResolver<'a> {
             };
             Ok(TransformData::NodeSet(nodes))
         } else if let Some(fragment) = uri.strip_prefix('#') {
-            // Note: we intentionally do NOT percent-decode the fragment.
-            // XMLDSig ID values are XML Name tokens (no spaces/special chars),
-            // and real-world SAML never uses percent-encoded fragments.
-            // xmlsec1 also passes fragments through without decoding.
             self.dereference_fragment(fragment, budget)
         } else {
             self.external_resource(uri)?
@@ -540,12 +539,15 @@ impl<'a> UriReferenceResolver<'a> {
         fragment: &str,
         budget: Option<&NodeSetMaterializationBudget>,
     ) -> Result<TransformData<'a>, TransformError> {
+        let normalized =
+            Self::normalize_fragment(fragment, budget, self.same_document_id_semantics)?;
+        let fragment = normalized.as_ref();
         if fragment.is_empty() {
             // Bare "#" is not a valid same-document reference
             return Err(TransformError::UnsupportedUri("#".to_string()));
         }
 
-        if fragment == "xpointer(/)" {
+        if is_xpointer_root(fragment) {
             // XPointer root: entire document WITH comments (unlike empty URI).
             // Per XMLDSig §4.3.3.3: "the XPointer expression [...] includes
             // comment nodes"
@@ -568,6 +570,16 @@ impl<'a> UriReferenceResolver<'a> {
     }
 
     fn same_document_id_fragment<'uri>(&self, fragment: &'uri str) -> Option<(&'uri str, bool)> {
+        Self::id_fragment(fragment, self.same_document_id_semantics)
+    }
+
+    pub(crate) fn id_fragment(
+        fragment: &str,
+        semantics: SameDocumentIdSemantics,
+    ) -> Option<(&str, bool)> {
+        if fragment.is_empty() {
+            return None;
+        }
         if let Some(id) = parse_xpointer_id_fragment(fragment) {
             // Explicit XPointer dereference retains comments, unlike every
             // barename mode, including libxmlsec1's internal wrapper.
@@ -579,7 +591,7 @@ impl<'a> UriReferenceResolver<'a> {
         if fragment.starts_with("xpointer(") {
             return None;
         }
-        match self.same_document_id_semantics {
+        match semantics {
             SameDocumentIdSemantics::Specification if !is_xml_ncname(fragment) => {
                 return None;
             }
@@ -655,7 +667,13 @@ impl<'a> UriReferenceResolver<'a> {
         let Some(fragment) = uri.strip_prefix('#') else {
             return false;
         };
-        if fragment.is_empty() || fragment == "xpointer(/)" {
+        let Ok(normalized) =
+            Self::normalize_fragment(fragment, None, self.same_document_id_semantics)
+        else {
+            return false;
+        };
+        let fragment = normalized.as_ref();
+        if fragment.is_empty() || is_xpointer_root(fragment) {
             return false;
         }
         let Some((id, _)) = self.same_document_id_fragment(fragment) else {
@@ -670,11 +688,34 @@ impl<'a> UriReferenceResolver<'a> {
         &self,
         uri: &str,
     ) -> Result<Option<NodeId>, TransformError> {
+        let target = self.node_id_for_reference_resource(uri, None)?;
+        if uri.is_empty() || target == Some(self.doc.root().id()) {
+            return Err(TransformError::UnsupportedUri(uri.to_owned()));
+        }
+        Ok(target)
+    }
+
+    /// Classify the resource once using the same normalization as dereference;
+    /// unlike element-only consumers, evidence may bind the document root.
+    pub(crate) fn node_id_for_reference_resource(
+        &self,
+        uri: &str,
+        budget: Option<&NodeSetMaterializationBudget>,
+    ) -> Result<Option<NodeId>, TransformError> {
+        if uri.is_empty() {
+            return Ok(Some(self.doc.root().id()));
+        }
         let fragment = uri
             .strip_prefix('#')
             .ok_or_else(|| TransformError::UnsupportedUri(uri.to_owned()))?;
-        if fragment.is_empty() || fragment == "xpointer(/)" {
+        let normalized =
+            Self::normalize_fragment(fragment, budget, self.same_document_id_semantics)?;
+        let fragment = normalized.as_ref();
+        if fragment.is_empty() {
             return Err(TransformError::UnsupportedUri(uri.to_owned()));
+        }
+        if is_xpointer_root(fragment) {
+            return Ok(Some(self.doc.root().id()));
         }
         let (id, _) = self
             .same_document_id_fragment(fragment)
@@ -690,6 +731,145 @@ impl<'a> UriReferenceResolver<'a> {
     pub fn id_count(&self) -> usize {
         self.id_index.len()
     }
+
+    pub(crate) fn normalize_fragment<'uri>(
+        fragment: &'uri str,
+        budget: Option<&NodeSetMaterializationBudget>,
+        semantics: SameDocumentIdSemantics,
+    ) -> Result<std::borrow::Cow<'uri, str>, TransformError> {
+        use std::borrow::Cow;
+        let invalid = || TransformError::UnsupportedUri("invalid same-document fragment".into());
+        if fragment.len() > crate::hard_limits::XML_DOCUMENT_BYTE_CEILING {
+            return Err(invalid());
+        }
+        let mut result = Cow::Borrowed(fragment);
+        // XPointer Framework sections 3 and 4 reverse URI escaping before
+        // evaluating the pointer. libxmlsec1's barename/Visa3D modes instead
+        // use literal bare ID strings. Explicit pointers still follow the
+        // Framework, independently of the selected barename compatibility mode.
+        // https://www.w3.org/TR/2003/REC-xptr-framework-20030325/#escaping
+        if fragment.contains('%')
+            && (semantics == SameDocumentIdSemantics::Specification
+                || has_encoded_xpointer_prefix(fragment))
+        {
+            if let Some(budget) = budget {
+                budget.reserve_workspace(fragment.len())?;
+            }
+            let mut decoded = Vec::with_capacity(fragment.len());
+            let bytes = fragment.as_bytes();
+            let mut position = 0;
+            while position < bytes.len() {
+                if bytes[position] == b'%' {
+                    let high = bytes
+                        .get(position + 1)
+                        .and_then(|byte| hex_digit(*byte))
+                        .ok_or_else(invalid)?;
+                    let low = bytes
+                        .get(position + 2)
+                        .and_then(|byte| hex_digit(*byte))
+                        .ok_or_else(invalid)?;
+                    decoded.push(high * 16 + low);
+                    position += 3;
+                } else {
+                    decoded.push(bytes[position]);
+                    position += 1;
+                }
+            }
+            result = Cow::Owned(String::from_utf8(decoded).map_err(|_| invalid())?);
+        }
+        if result.starts_with("xpointer(") {
+            // Framework [7] balances parentheses even inside XPath literals;
+            // only ^(, ^), and ^^ are escaping pairs.
+            let bytes = result.as_bytes();
+            let mut depth = 0usize;
+            let mut position = "xpointer".len();
+            while position < bytes.len() {
+                match bytes[position] {
+                    b'^' => {
+                        if !matches!(bytes.get(position + 1), Some(b'(' | b')' | b'^')) {
+                            return Err(invalid());
+                        }
+                        position += 2;
+                        continue;
+                    }
+                    b'(' => depth += 1,
+                    b')' => {
+                        if depth == 0 {
+                            return Err(invalid());
+                        }
+                        depth -= 1;
+                        if depth == 0 && position + 1 != bytes.len() {
+                            return Err(invalid());
+                        }
+                    }
+                    _ => {}
+                }
+                position += 1;
+            }
+            if depth != 0 {
+                return Err(invalid());
+            }
+            if result.contains('^') {
+                if matches!(result, Cow::Borrowed(_))
+                    && let Some(budget) = budget
+                {
+                    budget.reserve_workspace(result.len())?;
+                }
+                let mut escaped = false;
+                result.to_mut().retain(|character| {
+                    if escaped {
+                        escaped = false;
+                        true
+                    } else if character == '^' {
+                        escaped = true;
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
+        Ok(result)
+    }
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn has_encoded_xpointer_prefix(fragment: &str) -> bool {
+    // Recognize URI-escaped scheme syntax without materializing a candidate.
+    let mut bytes = fragment.bytes();
+    for expected in b"xpointer(" {
+        let Some(mut actual) = bytes.next() else {
+            return false;
+        };
+        if actual == b'%' {
+            let Some(high) = bytes.next().and_then(hex_digit) else {
+                return false;
+            };
+            let Some(low) = bytes.next().and_then(hex_digit) else {
+                return false;
+            };
+            actual = high * 16 + low;
+        }
+        if actual != *expected {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_xpointer_root(fragment: &str) -> bool {
+    fragment
+        .strip_prefix("xpointer(")
+        .and_then(|value| value.strip_suffix(')'))
+        .is_some_and(|expression| xml_space_trim(expression) == "/")
 }
 
 fn map_xml_base_resolution_error(error: XmlBaseResolutionError) -> TransformError {
@@ -710,17 +890,35 @@ fn map_xml_base_resolution_error(error: XmlBaseResolutionError) -> TransformErro
 /// Parse `xpointer(id('value'))` or `xpointer(id("value"))` and return the ID value.
 /// Returns `None` if the fragment doesn't match this pattern.
 pub(crate) fn parse_xpointer_id_fragment(fragment: &str) -> Option<&str> {
-    let inner = fragment.strip_prefix("xpointer(id(")?.strip_suffix("))")?;
-
-    // Strip single or double quotes using safe helpers to avoid panics
-    // on malformed input (e.g., `xpointer(id('))` where inner is `'`)
-    if let Some(stripped) = inner.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
-        Some(stripped)
-    } else if let Some(stripped) = inner.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-        Some(stripped)
-    } else {
-        None
+    // XPath 1.0 section 3.7 [29]: a Literal cannot contain its delimiter.
+    // Whitespace may separate tokens, but must not split the function name.
+    // https://www.w3.org/TR/1999/REC-xpath-19991116/#exprlex
+    let expression = fragment.strip_prefix("xpointer(")?.strip_suffix(')')?;
+    let argument = xml_space_trim(expression)
+        .strip_prefix("id")?
+        .trim_start_matches(is_xml_space)
+        .strip_prefix('(')?;
+    let literal = xml_space_trim(argument.strip_suffix(')')?);
+    let quote = literal.as_bytes().first().copied()?;
+    if !matches!(quote, b'\'' | b'"')
+        || literal.len() < 2
+        || literal.as_bytes().last() != Some(&quote)
+    {
+        return None;
     }
+    let value = &literal[1..literal.len() - 1];
+    if value.as_bytes().contains(&quote) {
+        return None;
+    }
+    Some(value)
+}
+
+fn is_xml_space(character: char) -> bool {
+    matches!(character, ' ' | '\t' | '\r' | '\n')
+}
+
+fn xml_space_trim(value: &str) -> &str {
+    value.trim_matches(is_xml_space)
 }
 
 #[cfg(test)]
@@ -728,6 +926,89 @@ pub(crate) fn parse_xpointer_id_fragment(fragment: &str) -> Option<&str> {
 mod tests {
     use super::super::types::NodeSet;
     use super::*;
+
+    #[test]
+    fn escaped_fragments_preserve_target_and_comment_semantics() {
+        // Framework URI/caret escaping must identify the same node; only the
+        // explicit XPointer form retains comments (XMLDSig 4.4.3.3).
+        let document =
+            Document::parse(r#"<root><item ID="café"><!--kept--></item><item ID="a(b)"/></root>"#)
+                .unwrap();
+        let resolver = UriReferenceResolver::new(&document);
+        let plain = resolver
+            .dereference("#caf%C3%A9")
+            .unwrap()
+            .into_node_set()
+            .unwrap();
+        let pointer = resolver
+            .dereference("#xpointer(id('caf%C3%A9'))")
+            .unwrap()
+            .into_node_set()
+            .unwrap();
+        let comment = document
+            .descendants()
+            .find(|node| node.is_comment())
+            .unwrap();
+        assert!(!plain.contains(comment));
+        assert!(pointer.contains(comment));
+        assert!(resolver.dereference("#xpointer(id('a^(b^)'))").is_ok());
+        assert!(resolver.dereference("#xpointer( / )").is_ok());
+        for uri in [
+            "#caf%",
+            "#caf%FF",
+            "#xpointer(id('a^x'))",
+            "#xpointer(id('a(b'))",
+            "#xpointer(id('a') or 'b')",
+        ] {
+            assert!(resolver.dereference(uri).is_err(), "{uri}");
+        }
+    }
+
+    #[test]
+    fn fragment_decoding_reserves_workspace_before_allocation() {
+        // A reference cannot bypass the cumulative projection budget through
+        // its URI-decoding workspace, while a borrowed fragment costs nothing.
+        let budget = NodeSetMaterializationBudget::with_limit(0);
+        assert!(
+            UriReferenceResolver::normalize_fragment(
+                "target",
+                Some(&budget),
+                SameDocumentIdSemantics::Specification
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            UriReferenceResolver::normalize_fragment(
+                "tar%67et",
+                Some(&budget),
+                SameDocumentIdSemantics::Specification
+            ),
+            Err(TransformError::Policy(_))
+        ));
+        assert!(matches!(
+            UriReferenceResolver::normalize_fragment(
+                "xpointer(id('a^(b^)'))",
+                Some(&budget),
+                SameDocumentIdSemantics::Specification
+            ),
+            Err(TransformError::Policy(_))
+        ));
+    }
+
+    #[test]
+    fn xpointer_id_requires_one_complete_literal() {
+        // XPath 1.0 Literal excludes its own delimiter; accepting a compound
+        // expression here incorrectly resolves a different element.
+        assert_eq!(parse_xpointer_id_fragment("xpointer(id('a' or 'b'))"), None);
+        assert_eq!(
+            parse_xpointer_id_fragment("xpointer(id(\"a\" or \"b\"))"),
+            None
+        );
+        assert_eq!(
+            parse_xpointer_id_fragment("xpointer( id ( 'target' ) )"),
+            Some("target")
+        );
+    }
 
     #[test]
     fn empty_same_document_node_reference_selects_the_document_element() {
@@ -1430,6 +1711,26 @@ mod tests {
             resolver.dereference("#visa'3d"),
             Err(TransformError::UnsupportedUri(uri)) if uri == "#visa'3d"
         ));
+    }
+
+    #[test]
+    fn explicit_xpointer_decoding_is_independent_of_barename_mode() {
+        // Compatibility modes change bare IDs, not explicit XPointer escaping.
+        let document = Document::parse("<root><item ID='café'/></root>").unwrap();
+        for semantics in [
+            SameDocumentIdSemantics::Specification,
+            SameDocumentIdSemantics::XmlSecBarename,
+            SameDocumentIdSemantics::XmlSecVisa3d,
+        ] {
+            let resolver =
+                UriReferenceResolver::new(&document).with_same_document_id_semantics(semantics);
+            for uri in [
+                "#xpointer(id('caf%C3%A9'))",
+                "#%78pointer%28id('caf%C3%A9')%29",
+            ] {
+                assert!(resolver.dereference(uri).is_ok(), "{semantics:?}: {uri}");
+            }
+        }
     }
 
     #[test]

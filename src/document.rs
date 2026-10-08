@@ -1809,36 +1809,34 @@ impl<'a> DocumentView<'a> {
         value: &str,
         registrations: &[IdAttributeRegistration],
     ) -> Option<NodeIdentity> {
-        let mut matches = HashSet::new();
-        match self.parsed.indexes.default_ids.get(value) {
-            Some(Some(node)) => {
-                matches.insert(*node);
-            }
+        let mut matched = match self.parsed.indexes.default_ids.get(value) {
+            Some(Some(node)) => Some(*node),
             Some(None) => return None,
-            None => {}
-        }
+            None => None,
+        };
         for registration in registrations {
             let key = (
                 registration.attribute_local_name().to_owned(),
                 value.to_owned(),
             );
             if let Some(nodes) = self.parsed.indexes.attributes_by_value.get(&key) {
-                matches.extend(nodes.iter().copied().filter(|node_id| {
-                    self.parsed
-                        .document
-                        .get_node(*node_id)
-                        .is_some_and(|node| registration.matches_node(node))
-                }));
+                for node_id in nodes {
+                    let recognized = self.parsed.document.get_node(*node_id).is_some_and(|node| {
+                        node.attributes().any(|attribute| {
+                            attribute.value() == value && registration.matches(node, attribute)
+                        })
+                    });
+                    if !recognized {
+                        continue;
+                    }
+                    if matched.is_some_and(|previous| previous != *node_id) {
+                        return None;
+                    }
+                    matched = Some(*node_id);
+                }
             }
         }
-        if matches.len() == 1 {
-            matches
-                .iter()
-                .next()
-                .map(|node| self.node_identity_by_id(*node))
-        } else {
-            None
-        }
+        matched.map(|node| self.node_identity_by_id(node))
     }
 
     #[cfg(feature = "xmldsig")]
@@ -1846,41 +1844,9 @@ impl<'a> DocumentView<'a> {
         self,
         registrations: &[IdAttributeRegistration],
     ) -> HashMap<String, NodeId> {
-        let mut candidates: HashMap<String, HashSet<NodeId>> = HashMap::new();
-        let mut ambiguous = HashSet::new();
-        for (value, node) in &self.parsed.indexes.default_ids {
-            if let Some(node) = node {
-                candidates.entry(value.clone()).or_default().insert(*node);
-            } else {
-                ambiguous.insert(value.clone());
-            }
-        }
-        for ((attribute_name, value), nodes) in &self.parsed.indexes.attributes_by_value {
-            for registration in registrations
-                .iter()
-                .filter(|registration| registration.attribute_local_name() == attribute_name)
-            {
-                candidates
-                    .entry(value.clone())
-                    .or_default()
-                    .extend(nodes.iter().copied().filter(|node_id| {
-                        self.parsed
-                            .document
-                            .get_node(*node_id)
-                            .is_some_and(|node| registration.matches_node(node))
-                    }));
-            }
-        }
-        candidates
-            .into_iter()
-            .filter_map(|(value, nodes)| {
-                if nodes.len() == 1 && !ambiguous.contains(&value) {
-                    nodes.into_iter().next().map(|node| (value, node))
-                } else {
-                    None
-                }
-            })
-            .collect()
+        // The same classification and ambiguity rules govern borrowed and
+        // retained resolvers; retain only the final value-to-node mapping.
+        crate::xml::XmlIdIndex::with_registrations(self.document(), registrations).into_node_ids()
     }
 
     /// Return deterministic document order for a current tree-node identity.
@@ -2949,7 +2915,62 @@ fn observe_preflight_node(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DtdAttributeType {
+    Cdata,
+    Id,
+    Tokenized,
+}
+
 fn collect_internal_dtd(doctype: &str, dtd: &mut InternalDtd) {
+    visit_internal_dtd(doctype, |declaration| {
+        if let Some(declaration) = dtd_declaration_body(declaration, "ENTITY") {
+            if let Some((name, value)) = parse_internal_general_entity(declaration) {
+                dtd.entities
+                    .entry(name.to_owned())
+                    .or_insert_with(|| normalize_internal_entity_value(value));
+            }
+        } else if let Some(declaration) = dtd_declaration_body(declaration, "ATTLIST") {
+            visit_attribute_declarations(declaration, |element, attribute, _, value| {
+                if let Some(value) = value {
+                    dtd.attribute_defaults
+                        .entry(element.to_owned())
+                        .or_default()
+                        .push(InternalAttributeDefault {
+                            attribute_name: attribute.to_owned(),
+                            value: value.to_owned(),
+                        });
+                }
+            });
+        }
+    });
+}
+
+/// Visit actual internal-subset attribute declarations, not declaration-like
+/// strings inside comments, PIs, or quoted entity replacement text.
+pub(crate) fn visit_dtd_attributes<'a>(
+    doctype: &'a str,
+    mut visitor: impl FnMut(&'a str, &'a str, DtdAttributeType),
+) {
+    visit_internal_dtd(doctype, |declaration| {
+        if let Some(declaration) = dtd_declaration_body(declaration, "ATTLIST") {
+            visit_attribute_declarations(declaration, |element, attribute, kind, _| {
+                visitor(element, attribute, kind);
+            });
+        }
+    });
+}
+
+fn dtd_declaration_body<'a>(declaration: &'a str, keyword: &str) -> Option<&'a str> {
+    // XML 1.0 sections 3.3 [52] and 4.2 [70] require S after the keyword.
+    // https://www.w3.org/TR/2008/REC-xml-20081126/#attdecls
+    // https://www.w3.org/TR/2008/REC-xml-20081126/#sec-entity-decl
+    declaration
+        .strip_prefix(keyword)
+        .filter(|body| matches!(body.as_bytes().first(), Some(b' ' | b'\t' | b'\r' | b'\n')))
+}
+
+fn visit_internal_dtd<'a>(doctype: &'a str, mut visitor: impl FnMut(&'a str)) {
     let Some(subset_start) = find_unquoted_byte(doctype.as_bytes(), b'[', 0) else {
         return;
     };
@@ -2970,35 +2991,11 @@ fn collect_internal_dtd(doctype: &str, dtd: &mut InternalDtd) {
                 break;
             };
             offset += 2 + end + 2;
-        } else if bytes[offset..].starts_with(b"<!ENTITY") {
-            let declaration_start = offset + "<!ENTITY".len();
-            let Some(declaration_end) = find_unquoted_byte(bytes, b'>', declaration_start) else {
-                break;
-            };
-            let declaration = &subset[declaration_start..declaration_end];
-            if let Some((name, value)) = parse_internal_general_entity(declaration) {
-                // roxmltree resolves the first declaration with a matching name.
-                dtd.entities
-                    .entry(name.to_owned())
-                    .or_insert_with(|| normalize_internal_entity_value(value));
-            }
-            offset = declaration_end + 1;
-        } else if bytes[offset..].starts_with(b"<!ATTLIST") {
-            let declaration_start = offset + "<!ATTLIST".len();
-            let Some(declaration_end) = find_unquoted_byte(bytes, b'>', declaration_start) else {
-                break;
-            };
-            // Parser-created default values bypass lexical start-tag attributes,
-            // so retain their references for the same iterative work accounting.
-            collect_internal_attribute_defaults(
-                &subset[declaration_start..declaration_end],
-                &mut dtd.attribute_defaults,
-            );
-            offset = declaration_end + 1;
         } else if bytes[offset..].starts_with(b"<!") {
             let Some(declaration_end) = find_unquoted_byte(bytes, b'>', offset + 2) else {
                 break;
             };
+            visitor(&subset[offset + 2..declaration_end]);
             offset = declaration_end + 1;
         } else {
             offset += 1;
@@ -3006,9 +3003,9 @@ fn collect_internal_dtd(doctype: &str, dtd: &mut InternalDtd) {
     }
 }
 
-fn collect_internal_attribute_defaults(
-    declaration: &str,
-    defaults: &mut HashMap<String, Vec<InternalAttributeDefault>>,
+fn visit_attribute_declarations<'a>(
+    declaration: &'a str,
+    mut visitor: impl FnMut(&'a str, &'a str, DtdAttributeType, Option<&'a str>),
 ) {
     let bytes = declaration.as_bytes();
     let mut offset = 0;
@@ -3016,7 +3013,6 @@ fn collect_internal_attribute_defaults(
     let Some(element_name) = consume_dtd_token(declaration, &mut offset) else {
         return;
     };
-    let mut declarations = Vec::new();
     loop {
         skip_dtd_whitespace(bytes, &mut offset);
         if offset == bytes.len() {
@@ -3026,14 +3022,21 @@ fn collect_internal_attribute_defaults(
             break;
         };
         skip_dtd_whitespace(bytes, &mut offset);
+        let type_start = offset;
         if !consume_attribute_type(declaration, &mut offset) {
             break;
         }
+        let kind = match &declaration[type_start..offset] {
+            "CDATA" => DtdAttributeType::Cdata,
+            "ID" => DtdAttributeType::Id,
+            _ => DtdAttributeType::Tokenized,
+        };
         skip_dtd_whitespace(bytes, &mut offset);
 
         if consume_dtd_keyword(declaration, &mut offset, "#REQUIRED")
             || consume_dtd_keyword(declaration, &mut offset, "#IMPLIED")
         {
+            visitor(element_name, attribute_name, kind, None);
             continue;
         }
         if consume_dtd_keyword(declaration, &mut offset, "#FIXED") {
@@ -3042,17 +3045,7 @@ fn collect_internal_attribute_defaults(
         let Some(value) = consume_dtd_quoted_value(declaration, &mut offset) else {
             break;
         };
-        declarations.push(InternalAttributeDefault {
-            attribute_name: attribute_name.to_owned(),
-            value: value.to_owned(),
-        });
-    }
-
-    if !declarations.is_empty() {
-        defaults
-            .entry(element_name.to_owned())
-            .or_default()
-            .extend(declarations);
+        visitor(element_name, attribute_name, kind, Some(value));
     }
 }
 
@@ -3446,7 +3439,7 @@ impl DocumentIndexes {
                     .entry((attribute.name().to_owned(), attribute.value().to_owned()))
                     .or_default()
                     .push(node.id());
-                if !matches!(attribute.name(), "ID" | "Id" | "id")
+                if !crate::xml::is_id_attribute(node, attribute, &[])
                     || duplicate_ids.contains(attribute.value())
                 {
                     continue;
@@ -4048,6 +4041,18 @@ mod tests {
                 })
             ));
         }
+    }
+
+    #[test]
+    fn dtd_attribute_visitor_requires_keyword_boundary() {
+        // XML 1.0 [52] requires S after ATTLIST; a declaration-like token
+        // must not assign ID type even when a non-validating backend skips it.
+        let mut declarations = Vec::new();
+        visit_dtd_attributes(
+            "<!DOCTYPE root [<!ATTLISTitem Token ID #IMPLIED>]>",
+            |element, attribute, kind| declarations.push((element, attribute, kind)),
+        );
+        assert!(declarations.is_empty());
     }
 
     #[test]

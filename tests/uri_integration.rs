@@ -7,6 +7,203 @@ use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize};
 use xml_sec::xmldsig::NodeSet;
 use xml_sec::xmldsig::uri::UriReferenceResolver;
 
+#[test]
+fn xml_id_errors_are_reported_without_losing_id_assignment() {
+    // xml:id sections 4/6 specify non-fatal diagnostics, not parse rejection.
+    for backend in xml_sec::XmlBackend::available() {
+        for (xml, expected) in [
+            (
+                "<root xml:id=' bad value '/>",
+                Some(xml_sec::XmlIdError::InvalidNcName),
+            ),
+            (
+                "<!DOCTYPE root [<!ATTLIST root xml:id CDATA #IMPLIED>]><root xml:id=' bad value '/>",
+                Some(xml_sec::XmlIdError::InvalidNcNameAndDeclaredType),
+            ),
+            (
+                "<!DOCTYPE root [<!ATTLIST root xml:id CDATA #IMPLIED>]><root xml:id='target'/>",
+                Some(xml_sec::XmlIdError::InvalidDeclaredType),
+            ),
+            (
+                "<!DOCTYPE root [<!ATTLIST root xml:id ID #IMPLIED><!ATTLIST root xml:id CDATA #IMPLIED>]><root xml:id='target'/>",
+                Some(xml_sec::XmlIdError::InvalidDeclaredType),
+            ),
+            ("<root xml:id=' valid '/>", None),
+        ] {
+            let document = xml_sec::Document::parse_with_options_and_backend(
+                xml,
+                xml_sec::ParsingOptions {
+                    allow_dtd: true,
+                    ..Default::default()
+                },
+                backend,
+            )
+            .unwrap();
+            let attribute = document.root_element().attributes().next().unwrap();
+            assert!(attribute.is_id());
+            assert_eq!(attribute.xml_id_error(), expected, "{backend:?}: {xml}");
+        }
+    }
+}
+
+#[test]
+fn dtd_ids_and_xml_ids_share_the_normalized_semantic_index() {
+    // Internal DTD ID assignment and xml:id normalization must be identical
+    // across parsers, borrowed resolution and retained document identities.
+    let xml = "<!DOCTYPE root [<!ATTLIST item Token ID #REQUIRED>]><root><item Token='  target  '/><other xml:id='  other  '/></root>";
+    let mut policy = xml_sec::policy::VerificationPolicy::default();
+    policy.xml.allow_internal_dtd = true;
+    let document = xml_sec::XmlDocument::parse_with_policy(xml, &policy).unwrap();
+    document.with_view(|view| {
+        let target = view.node_for_id("target", &[]).unwrap();
+        assert!(view.attribute_identity(target, None, "Token").is_ok());
+        assert!(view.node_for_id("other", &[]).is_some());
+        assert!(view.node_for_id("  target  ", &[]).is_none());
+    });
+    let parsed = xml_sec::Document::parse_with_options(
+        xml,
+        xml_sec::ParsingOptions {
+            allow_dtd: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let resolver = UriReferenceResolver::new(&parsed);
+    let target = resolver.node_for_id("target").unwrap();
+    assert_eq!(target.attribute("Token"), Some("target"));
+    assert!(target.attributes().next().unwrap().is_id());
+    assert!(
+        resolver
+            .node_for_same_document_reference("#target")
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        resolver
+            .node_for_same_document_reference("#xpointer( id ( 'other' ) )")
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn dtd_ids_use_lexical_qnames_and_xml_ids_preserve_character_references() {
+    // DTD names are lexical QNames, not expanded names. XML 1.0 3.3.3
+    // collapses spaces but preserves whitespace introduced by character refs.
+    let xml = "<!DOCTYPE root [<!ATTLIST p:item p:Token ID #IMPLIED>]><root xmlns:p='urn:item' xmlns:q='urn:item'><p:item p:Token=' target '/><q:item q:Token='foreign'/><other xml:id=' a&#9;b '/></root>";
+    let document = xml_sec::Document::parse_with_options(
+        xml,
+        xml_sec::ParsingOptions {
+            allow_dtd: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let resolver = UriReferenceResolver::new(&document);
+    assert!(resolver.has_id("target"));
+    assert!(!resolver.has_id("foreign"));
+    assert!(resolver.has_id("a\tb"));
+    assert!(!resolver.has_id("a b"));
+}
+
+#[test]
+fn unqualified_attribute_registration_and_duplicate_xml_ids() {
+    // An explicit unqualified registration excludes foreign namespaced
+    // attributes; normalized xml:id duplicates remain ambiguous.
+    let source = "<root xmlns:f='urn:foreign'><item Token='target'/><other f:Token='target'/><a xml:id='same'/><b xml:id=' same '/></root>";
+    let document = xml_sec::Document::parse(source).unwrap();
+    let registrations =
+        [xml_sec::IdAttributeRegistration::global("Token").with_attribute_namespace(None)];
+    let resolver = UriReferenceResolver::with_id_registrations(&document, &registrations);
+    assert_eq!(
+        resolver.node_for_id("target").unwrap().tag_name().name(),
+        "item"
+    );
+    assert!(resolver.dereference("#same").is_err());
+    let retained = xml_sec::XmlDocument::parse(source).unwrap();
+    retained.with_view(|view| {
+        assert!(view.node_for_id("target", &registrations).is_some());
+        assert!(view.node_for_id("same", &registrations).is_none());
+    });
+}
+
+#[test]
+fn exact_attribute_namespace_registration_rejects_foreign_collisions() {
+    // A caller's exact namespace registration must not register an attacker
+    // attribute with the same local name, on either resolver path.
+    let xml = "<root xmlns:t='urn:trusted' xmlns:f='urn:foreign'><item t:Token='target'/><item f:Token='target'/></root>";
+    let registrations = [xml_sec::IdAttributeRegistration::global("Token")
+        .with_attribute_namespace(Some("urn:trusted"))];
+    let parsed = xml_sec::Document::parse(xml).unwrap();
+    let resolver = UriReferenceResolver::with_id_registrations(&parsed, &registrations);
+    assert_eq!(
+        resolver
+            .node_for_id("target")
+            .unwrap()
+            .attribute(("urn:trusted", "Token")),
+        Some("target")
+    );
+    let document = xml_sec::XmlDocument::parse(xml).unwrap();
+    document.with_view(|view| {
+        let target = view.node_for_id("target", &registrations).unwrap();
+        assert!(
+            view.attribute_identity(target, Some("urn:trusted"), "Token")
+                .is_ok()
+        );
+        assert!(
+            view.attribute_identity(target, Some("urn:foreign"), "Token")
+                .is_err()
+        );
+    });
+    let broad = [xml_sec::IdAttributeRegistration::global("Token")];
+    assert!(
+        UriReferenceResolver::with_id_registrations(&parsed, &broad)
+            .node_for_id("target")
+            .is_none()
+    );
+    document.with_view(|view| assert!(view.node_for_id("target", &broad).is_none()));
+}
+
+#[test]
+fn dtd_type_assignment_ignores_quoted_and_commented_declarations() {
+    // Declaration-like replacement text must never confer ID type; the first
+    // real declaration wins, and registration remains element-name scoped.
+    let xml = "<!DOCTYPE root [<!-- <!ATTLIST item Token ID #IMPLIED> --><!ENTITY dec '<!ATTLIST item Token ID #IMPLIED>'><!ATTLIST item Token CDATA #IMPLIED><!ATTLIST item Token ID #IMPLIED>]><root><item Token='target'/><other Token='other'/></root>";
+    let parsed = xml_sec::Document::parse_with_options(
+        xml,
+        xml_sec::ParsingOptions {
+            allow_dtd: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let resolver = UriReferenceResolver::new(&parsed);
+    assert!(!resolver.has_id("target"));
+    assert!(!resolver.has_id("other"));
+}
+
+#[test]
+fn dtd_id_generation_is_rebuilt_after_controlled_mutation() {
+    // Changing a DTD-typed ID must retire the old generation and update the
+    // retained ID index, not preserve a stale target from the preceding parse.
+    let mut policy = xml_sec::policy::VerificationPolicy::default();
+    policy.xml.allow_internal_dtd = true;
+    let mut document = xml_sec::XmlDocument::parse_with_policy(
+        "<!DOCTYPE root [<!ATTLIST item Token ID #IMPLIED>]><root><item Token='old'/></root>",
+        &policy,
+    )
+    .unwrap();
+    let old = document.with_view(|view| view.node_for_id("old", &[]).unwrap());
+    document
+        .replace_element(old, "<item Token='new'/>")
+        .unwrap();
+    document.with_view(|view| {
+        assert!(view.document_order(old).is_err());
+        assert!(view.node_for_id("old", &[]).is_none());
+        assert!(view.node_for_id("new", &[]).is_some());
+    });
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 /// Dereference `uri`, build a C14N predicate from the resulting NodeSet,

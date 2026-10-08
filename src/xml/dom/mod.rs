@@ -19,7 +19,7 @@ use self::preflight::LexicalPreflight;
 
 pub use tree::{
     Ancestors, Attribute, Attributes, Children, Descendants, Document, ExpandedName, Namespace,
-    Namespaces, Node, NodeId, NodeType, PI,
+    Namespaces, Node, NodeId, NodeType, PI, XmlIdError,
 };
 
 /// Parser-neutral options used after bounded lexical preflight.

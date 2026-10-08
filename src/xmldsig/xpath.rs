@@ -1328,14 +1328,17 @@ impl function::Function for HereFunction {
 }
 
 /// SXD omits XPath's DTD-aware `id()` function. XMLDSig commonly identifies
-/// elements through `Id`, `ID`, `id`, or `xml:id`, matching this crate's same-
-/// document URI resolver rather than requiring a validating DTD parser.
-struct IdFunction {
+/// elements through `Id`, `ID`, `id`, xml:id, or retained DTD ID type,
+/// matching this crate's semantic DOM without requiring a validating parser.
+struct IdFunction<'s, 'i, 'm, 'r> {
     work_budget: XPathWorkBudget,
     document_scan_cost: usize,
+    source: &'s Document<'i>,
+    elements: &'s HashMap<dom::Element<'m>, NodeId>,
+    registrations: &'r [crate::xml::IdAttributeRegistration],
 }
 
-impl function::Function for IdFunction {
+impl function::Function for IdFunction<'_, '_, '_, '_> {
     fn evaluate<'c, 'd>(
         &self,
         context: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
@@ -1354,39 +1357,49 @@ impl function::Function for IdFunction {
         };
         let identifiers = values
             .iter()
-            .flat_map(|value| value.split_ascii_whitespace())
+            .flat_map(|value| value.split(is_xpath_whitespace).filter(|id| !id.is_empty()))
             .collect::<HashSet<_>>();
         let mut matched = HashMap::new();
         let mut ambiguous = HashSet::new();
-        let mut stack = vec![nodeset::Node::Root(context.node.document().root())];
 
         // The custom id() implementation performs its own full-document scan in
         // addition to the XPath engine's work, so it must consume the same meter.
         self.work_budget.charge_function(self.document_scan_cost)?;
 
+        let mut stack = vec![nodeset::Node::Root(context.node.document().root())];
         while let Some(node) = stack.pop() {
-            stack.extend(node.children());
+            // Indexed children borrow the evaluation document without creating
+            // a fresh child vector for each element in the ID scan.
+            stack.extend((0..node.children_len()).filter_map(|index| node.child_at(index)));
             let Some(element) = node.element() else {
                 continue;
             };
-            for attribute in element.attributes() {
-                let stored_name = attribute.name();
-                let name = sxd_document_no_unsafe::as_qname!(stored_name);
+            let Some(source) = self
+                .elements
+                .get(&element)
+                .and_then(|id| self.source.get_node(*id))
+            else {
+                continue;
+            };
+            for attribute in source.attributes() {
                 // Match the URI resolver's local-name policy: WS-Security's
                 // namespaced wsu:Id and XML's xml:id are ID attributes too.
-                let recognized = matches!(name.local_part(), "Id" | "ID" | "id");
-                let value = sxd_document_no_unsafe::as_str!(attribute.value());
+                // XPath 1.0 section 4.1: ID type comes from the source XML
+                // data model, not the temporary evaluator's untyped DOM.
+                // https://www.w3.org/TR/1999/REC-xpath-19991116/#function-id
+                let recognized = crate::xml::is_id_attribute(source, attribute, self.registrations);
+                let value = attribute.value();
                 if !recognized || !identifiers.contains(&value) || ambiguous.contains(value) {
                     continue;
                 }
-                match matched.entry(value.to_owned()) {
+                match matched.entry(value) {
                     Entry::Vacant(entry) => {
                         entry.insert(element);
                     }
                     Entry::Occupied(entry) if *entry.get() == element => {}
                     Entry::Occupied(entry) => {
                         entry.remove();
-                        ambiguous.insert(value.to_owned());
+                        ambiguous.insert(value);
                     }
                 }
             }
@@ -1483,15 +1496,40 @@ enum XPathEvaluationMode {
     Filter2NodeSetSelection,
 }
 
-fn evaluate_expression<'a>(
+#[derive(Clone, Copy)]
+pub(super) struct XPathRequestContext<'r> {
+    here_semantics: XPathHereSemantics,
+    registrations: &'r [crate::xml::IdAttributeRegistration],
+}
+
+impl<'r> XPathRequestContext<'r> {
+    pub(super) fn new(
+        here_semantics: XPathHereSemantics,
+        registrations: &'r [crate::xml::IdAttributeRegistration],
+    ) -> Self {
+        Self {
+            here_semantics,
+            registrations,
+        }
+    }
+}
+
+impl From<XPathHereSemantics> for XPathRequestContext<'_> {
+    fn from(semantics: XPathHereSemantics) -> Self {
+        Self::new(semantics, &[])
+    }
+}
+
+fn evaluate_expression<'a, 'r>(
     input: &NodeSet<'a>,
     expression: &XPathExpression,
     mode: XPathEvaluationMode,
-    here_semantics: XPathHereSemantics,
+    request: impl Into<XPathRequestContext<'r>>,
     document_relation: XPathDocumentRelation,
     work_budget: &XPathWorkBudget,
     materialization_budget: &NodeSetMaterializationBudget,
 ) -> Result<NodeSet<'a>, TransformError> {
+    let request = request.into();
     let expression_bytes = expression.expression().len();
     if expression_bytes > work_budget.limits.expression_bytes {
         return Err(transform_resource_limit(
@@ -1543,10 +1581,11 @@ fn evaluate_expression<'a>(
         HereFunction {
             context: match document_relation {
                 XPathDocumentRelation::CrossDocument => HereContext::CrossDocument,
-                XPathDocumentRelation::SameDocument => {
-                    here_path(document, expression.here_context_node(here_semantics))
-                        .map_or(HereContext::MissingParameterNode, HereContext::Path)
-                }
+                XPathDocumentRelation::SameDocument => here_path(
+                    document,
+                    expression.here_context_node(request.here_semantics),
+                )
+                .map_or(HereContext::MissingParameterNode, HereContext::Path),
             },
         },
     );
@@ -1555,6 +1594,9 @@ fn evaluate_expression<'a>(
         IdFunction {
             work_budget: work_budget.clone(),
             document_scan_cost: document_size,
+            source: document,
+            elements: &mirror.elements,
+            registrations: request.registrations,
         },
     );
     context.set_function(
@@ -1667,10 +1709,10 @@ pub(super) fn apply_xpath_filter_with_semantics<'a>(
     )
 }
 
-pub(super) fn apply_xpath_filter_with_semantics_and_budget<'a>(
+pub(super) fn apply_xpath_filter_with_semantics_and_budget<'a, 'r>(
     mut input: NodeSet<'a>,
     expression: &XPathExpression,
-    here_semantics: XPathHereSemantics,
+    request: impl Into<XPathRequestContext<'r>>,
     document_relation: XPathDocumentRelation,
     work_budget: &XPathWorkBudget,
     node_filter_budget: &NodeFilterWorkBudget,
@@ -1680,7 +1722,7 @@ pub(super) fn apply_xpath_filter_with_semantics_and_budget<'a>(
         &input,
         expression,
         XPathEvaluationMode::XmlDsigPerNodeFilter,
-        here_semantics,
+        request,
         document_relation,
         work_budget,
         materialization_budget,
@@ -1723,15 +1765,16 @@ pub(super) fn apply_xpath_filter2_with_semantics<'a>(
     )
 }
 
-pub(super) fn apply_xpath_filter2_with_semantics_and_budget<'a>(
+pub(super) fn apply_xpath_filter2_with_semantics_and_budget<'a, 'r>(
     input: NodeSet<'a>,
     filters: &[XPathFilter],
-    here_semantics: XPathHereSemantics,
+    request: impl Into<XPathRequestContext<'r>>,
     document_relation: XPathDocumentRelation,
     work_budget: &XPathWorkBudget,
     node_filter_budget: &NodeFilterWorkBudget,
     materialization_budget: &NodeSetMaterializationBudget,
 ) -> Result<NodeSet<'a>, TransformError> {
+    let request = request.into();
     if filters.is_empty() || filters.len() > work_budget.limits.filters {
         if filters.is_empty() {
             return Err(TransformError::XPath(
@@ -1751,7 +1794,7 @@ pub(super) fn apply_xpath_filter2_with_semantics_and_budget<'a>(
             &input,
             filter.xpath(),
             XPathEvaluationMode::Filter2NodeSetSelection,
-            here_semantics,
+            request,
             document_relation,
             work_budget,
             materialization_budget,
@@ -2743,6 +2786,71 @@ mod tests {
         assert_eq!(
             canonicalize(&result),
             "<scope><keep></keep><restore></restore></scope>"
+        );
+    }
+
+    #[test]
+    fn xpath_id_function_uses_projected_dtd_type() {
+        // XPath 1.0 section 4.1 determines IDs from the XML data model;
+        // projecting into SXD must not erase DTD type assignment.
+        let doc = Document::parse_with_options(
+            "<!DOCTYPE root [<!ATTLIST item Token ID #IMPLIED>]><root><item Token='  target  '>yes</item></root>",
+            crate::ParsingOptions { allow_dtd: true, ..Default::default() },
+        ).unwrap();
+        let result = apply_xpath_filter2(
+            NodeSet::entire_document_with_comments(&doc).unwrap(),
+            &[XPathFilter::new(
+                XPathFilterOperation::Intersect,
+                XPathExpression::new("id('target')"),
+            )],
+        )
+        .unwrap();
+        assert_eq!(canonicalize(&result), "<item Token=\"target\">yes</item>");
+    }
+
+    #[test]
+    fn xpath_id_registration_is_namespace_scoped() {
+        // Filter 2.0 consumes the same request registration as ordinary XPath;
+        // foreign attributes must not create a collision, but broad ones must.
+        let doc = Document::parse(r#"<root xmlns:t="urn:trusted" xmlns:f="urn:foreign"><item t:Token="target">yes</item><other f:Token="target"/></root>"#).unwrap();
+        let filters = [XPathFilter::new(
+            XPathFilterOperation::Intersect,
+            XPathExpression::new("id('target')"),
+        )];
+        let registrations = [crate::xml::IdAttributeRegistration::global("Token")
+            .with_attribute_namespace(Some("urn:trusted"))];
+        let result = apply_xpath_filter2_with_semantics_and_budget(
+            NodeSet::entire_document_with_comments(&doc).unwrap(),
+            &filters,
+            XPathRequestContext::new(XPathHereSemantics::default(), &registrations),
+            XPathDocumentRelation::SameDocument,
+            &XPathWorkBudget::default(),
+            &NodeFilterWorkBudget::default(),
+            &NodeSetMaterializationBudget::default(),
+        )
+        .unwrap();
+        let target = doc
+            .descendants()
+            .find(|node| node.has_tag_name("item"))
+            .unwrap();
+        let other = doc
+            .descendants()
+            .find(|node| node.has_tag_name("other"))
+            .unwrap();
+        assert!(result.contains(target));
+        assert!(!result.contains(other));
+        let broad = [crate::xml::IdAttributeRegistration::global("Token")];
+        assert!(
+            apply_xpath_filter2_with_semantics_and_budget(
+                NodeSet::entire_document_with_comments(&doc).unwrap(),
+                &filters,
+                XPathRequestContext::new(XPathHereSemantics::default(), &broad),
+                XPathDocumentRelation::SameDocument,
+                &XPathWorkBudget::default(),
+                &NodeFilterWorkBudget::default(),
+                &NodeSetMaterializationBudget::default(),
+            )
+            .is_err()
         );
     }
 

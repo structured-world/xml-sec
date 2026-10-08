@@ -121,8 +121,8 @@
         },
         {
           "file": "src/xml.rs",
-          "test": "dtd_id_declarations_do_not_replace_request_registration",
-          "description": "Caller registration indexes a custom attribute even when its ID type is also declared in an allowed internal DTD."
+          "test": "dtd_id_declarations_register_ids_without_request_registration",
+          "description": "Allowed internal-DTD ID declarations register custom attributes independently of caller registration across XML backends."
         }
       ],
       "negative": [
@@ -133,8 +133,8 @@
         },
         {
           "file": "src/xml.rs",
-          "test": "dtd_id_declarations_do_not_replace_request_registration",
-          "description": "Allowing an internal DTD does not implicitly register its custom ID-typed attributes in the owned Rust tree."
+          "test": "id_index_rejects_duplicate_values_but_not_duplicate_attributes_on_one_node",
+          "description": "Duplicate ID values on distinct elements are ambiguous and cannot resolve to a target."
         }
       ]
     },
@@ -348,12 +348,12 @@
     {
       "id": "behavior-006",
       "category": "dtd-xml-id-caller-id",
-      "summary": "Internal-DTD parsing and ID registration are separate controls; DTD declarations do not implicitly register custom ID attributes in the owned Rust tree.",
+      "summary": "Allowed internal-DTD ID declarations, normalized xml:id values and caller registrations share one ID resolution contract across XML backends.",
       "classification": "native",
       "control": {
         "boundary": "typed XML policy plus request-scoped ID registrations",
         "setting": "XmlInputPolicy.allow_internal_dtd and VerifyContext/SignContext id_attributes",
-        "default": "DTD disabled; xml:id and built-in XMLDSig ID spellings indexed; custom attributes require caller registration"
+        "default": "DTD disabled; xml:id and built-in XMLDSig ID spellings indexed; allowed DTD ID declarations indexed; other custom attributes require caller registration"
       },
       "evidence": "id-resolution",
       "donor_anchors": [

@@ -424,6 +424,7 @@ impl<'a> CipherReferenceContext<'a> {
                 input,
                 transforms,
                 TransformOptions::default()
+                    .id_attributes(resolver.id_registrations())
                     .xpath_here_semantics(self.policy.transforms.xpath_here_semantics)
                     .opc_relationship_edition(self.policy.transforms.opc_relationship_edition)
                     .allow_internal_dtd(self.policy.xml.allow_internal_dtd),
@@ -636,6 +637,38 @@ mod tests {
         )
         .expect("context");
         assert_eq!(context.resolve(node).expect("ciphertext"), [1, 2, 3]);
+    }
+
+    #[test]
+    fn cipher_reference_xpath_inherits_custom_id_registration() {
+        // URI lookup and XPath id() must select the same caller-registered ID.
+        let xml = format!(
+            "<root><data Token='cipher'>YWJj</data>{}</root>",
+            reference(
+                "#cipher",
+                &format!(
+                    "<Transforms><ds:Transform Algorithm='http://www.w3.org/TR/1999/REC-xpath-19991116'><ds:XPath>count(id('cipher')) = 1 and count(ancestor-or-self::node() | id('cipher')) = count(ancestor-or-self::node())</ds:XPath></ds:Transform><ds:Transform Algorithm='{BASE64}'/></Transforms>"
+                )
+            )
+        );
+        let document = Document::parse(&xml).expect("custom ID reference XML must parse");
+        let node = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLENC_NS, "CipherReference")))
+            .expect("fixture contains a CipherReference");
+        let policy = crate::policy::DecryptionPolicy::default();
+        let registrations = [crate::IdAttributeRegistration::global("Token")];
+        let context = CipherReferenceContext::new(
+            &policy,
+            None,
+            crate::XmlBackend::default(),
+            &registrations,
+        )
+        .expect("default decryption context must be valid");
+        assert_eq!(
+            context.resolve(node).expect("custom ID must reach XPath"),
+            b"abc"
+        );
     }
 
     #[test]

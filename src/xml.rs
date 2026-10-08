@@ -25,7 +25,14 @@ const DEFAULT_ID_ATTRS: &[&str] = &["ID", "Id", "id"];
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdAttributeRegistration {
     attribute_local_name: String,
+    attribute_namespace: AttributeNamespaceScope,
     element_scope: IdAttributeElementScope,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AttributeNamespaceScope {
+    Any,
+    Exact(Option<String>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,6 +53,7 @@ impl IdAttributeRegistration {
     pub fn global(attribute_local_name: impl Into<String>) -> Self {
         Self {
             attribute_local_name: attribute_local_name.into(),
+            attribute_namespace: AttributeNamespaceScope::Any,
             element_scope: IdAttributeElementScope::AnyElement,
         }
     }
@@ -60,6 +68,7 @@ impl IdAttributeRegistration {
     ) -> Self {
         Self {
             attribute_local_name: attribute_local_name.into(),
+            attribute_namespace: AttributeNamespaceScope::Any,
             element_scope: IdAttributeElementScope::AnyNamespace {
                 local_name: element_local_name.into(),
             },
@@ -78,6 +87,7 @@ impl IdAttributeRegistration {
     ) -> Self {
         Self {
             attribute_local_name: attribute_local_name.into(),
+            attribute_namespace: AttributeNamespaceScope::Any,
             element_scope: IdAttributeElementScope::ExpandedName {
                 local_name: element_local_name.into(),
                 namespace: element_namespace.map(str::to_owned),
@@ -85,9 +95,25 @@ impl IdAttributeRegistration {
         }
     }
 
-    #[cfg(any(feature = "xmldsig", test))]
-    fn matches(&self, node: Node<'_, '_>, attribute_name: &str) -> bool {
-        self.attribute_local_name == attribute_name && self.matches_node(node)
+    /// Restrict this registration to an exact attribute namespace URI.
+    ///
+    /// `None` matches unqualified attributes only. Without this restriction,
+    /// registrations retain xmlsec-style local-name matching in any namespace.
+    #[must_use]
+    pub fn with_attribute_namespace(mut self, namespace: Option<&str>) -> Self {
+        self.attribute_namespace = AttributeNamespaceScope::Exact(namespace.map(str::to_owned));
+        self
+    }
+
+    pub(crate) fn matches(&self, node: Node<'_, '_>, attribute: dom::Attribute<'_>) -> bool {
+        self.attribute_local_name == attribute.name()
+            && match &self.attribute_namespace {
+                AttributeNamespaceScope::Any => true,
+                AttributeNamespaceScope::Exact(namespace) => {
+                    namespace.as_deref() == attribute.namespace()
+                }
+            }
+            && self.matches_node(node)
     }
 
     pub(crate) fn attribute_local_name(&self) -> &str {
@@ -111,6 +137,19 @@ impl IdAttributeRegistration {
     }
 }
 
+/// One ID classification contract for indexes and XPath's projected DOM.
+pub(crate) fn is_id_attribute(
+    node: Node<'_, '_>,
+    attribute: dom::Attribute<'_>,
+    registrations: &[IdAttributeRegistration],
+) -> bool {
+    attribute.is_id()
+        || DEFAULT_ID_ATTRS.contains(&attribute.name())
+        || registrations
+            .iter()
+            .any(|registration| registration.matches(node, attribute))
+}
+
 /// Duplicate-safe index of XML ID attributes in one parsed document.
 #[cfg(any(feature = "xmldsig", test))]
 pub(crate) struct XmlIdIndex<'a> {
@@ -131,12 +170,7 @@ impl<'a> XmlIdIndex<'a> {
             // such as wsu:Id and xml:id participate alongside unqualified Id.
             for value in node
                 .attributes()
-                .filter(|attribute| {
-                    DEFAULT_ID_ATTRS.contains(&attribute.name())
-                        || registrations
-                            .iter()
-                            .any(|registration| registration.matches(node, attribute.name()))
-                })
+                .filter(|attribute| is_id_attribute(node, *attribute, registrations))
                 .map(|attribute| attribute.value())
             {
                 if duplicates.contains(value) {
@@ -175,6 +209,14 @@ impl<'a> XmlIdIndex<'a> {
     pub(crate) fn len(&self) -> usize {
         self.nodes.len()
     }
+
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn into_node_ids(self) -> HashMap<String, NodeId> {
+        self.nodes
+            .into_iter()
+            .map(|(value, node)| (value.to_owned(), node.id()))
+            .collect()
+    }
 }
 
 /// Return whether a Unicode scalar is permitted by XML 1.0 Fifth Edition [2].
@@ -196,14 +238,10 @@ pub(crate) fn is_xml_1_0_character(character: char) -> bool {
 /// Return whether a string is an XML 1.0 NCName.
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) fn is_xml_ncname(value: &str) -> bool {
-    if value.is_empty() || value.contains(':') {
-        return false;
-    }
-
-    // Delegate the complete Unicode Name grammar to the selected backend
-    // instead of maintaining a partial ASCII approximation.
-    dom::Document::parse(&format!("<{value}/>"))
-        .is_ok_and(|document| document.root_element().tag_name().name() == value)
+    // Namespaces in XML 1.0 section 3: NCName is QName without a colon.
+    // Reuse the common lexical grammar without allocating or parsing a DOM.
+    // https://www.w3.org/TR/2009/REC-xml-names-20091208/#ns-qualnames
+    !value.contains(':') && crate::xml_input::lexical::is_qname(value)
 }
 
 #[cfg(test)]
@@ -324,9 +362,9 @@ mod tests {
     }
 
     #[test]
-    fn dtd_id_declarations_do_not_replace_request_registration() {
-        // Internal-DTD policy controls parsing only. The owned Rust tree does
-        // not expose DTD attribute types, so custom IDs remain request context.
+    fn dtd_id_declarations_register_ids_without_request_registration() {
+        // DTD-determined IDs must survive parser projection, independently of
+        // caller registrations, so references see the same target on both backends.
         let document = Document::parse_with_options(
             "<!DOCTYPE root [<!ATTLIST item Token ID #REQUIRED>]><root><item Token=\"target\"/></root>",
             ParsingOptions {
@@ -337,7 +375,10 @@ mod tests {
         .expect("bounded internal DTD fixture must parse");
 
         let implicit = XmlIdIndex::with_registrations(&document, &[]);
-        assert!(implicit.node("target").is_none());
+        assert_eq!(
+            implicit.node("target").map(|node| node.tag_name().name()),
+            Some("item")
+        );
 
         let registered =
             XmlIdIndex::with_registrations(&document, &[IdAttributeRegistration::global("Token")]);

@@ -553,8 +553,9 @@ impl<'a> VerifyContext<'a> {
         self.policy.transforms.allowed_algorithms.as_ref()
     }
 
-    fn transform_options(&self) -> TransformOptions {
+    fn transform_options(&self) -> TransformOptions<'_> {
         TransformOptions::default()
+            .id_attributes(self.id_attributes)
             .allow_internal_dtd(self.policy.xml.allow_internal_dtd)
             .xpath_here_semantics(self.policy.transforms.xpath_here_semantics)
             .opc_relationship_edition(self.policy.transforms.opc_relationship_edition)
@@ -957,7 +958,7 @@ pub fn process_reference(
     let canonicalized_data_budget = CanonicalizedDataBudget::default();
     let execution = ReferenceExecutionContext {
         store_pre_digest,
-        transform_options: TransformOptions::default(),
+        transform_options: TransformOptions::default().id_attributes(resolver.id_registrations()),
         transform_budget: &execution_budget,
         canonicalized_data_budget: &canonicalized_data_budget,
         provider: crate::provider::default_provider(),
@@ -1049,7 +1050,7 @@ fn bind_reference_evidence(
 
 struct ReferenceExecutionContext<'a> {
     store_pre_digest: bool,
-    transform_options: TransformOptions,
+    transform_options: TransformOptions<'a>,
     transform_budget: &'a TransformExecutionBudget,
     canonicalized_data_budget: &'a CanonicalizedDataBudget,
     provider: &'a dyn crate::provider::CryptoProvider,
@@ -1111,18 +1112,12 @@ impl VerificationOperationBudgets {
         let Some(uri) = reference.uri.as_deref() else {
             return OperationResourceIdentity::Generated("omitted-reference", index);
         };
-        if uri.is_empty() || uri == "#xpointer(/)" {
-            // XMLDSig 1.1, Recommendation 11 April 2013, §4.4.3.3
-            // "Same-Document URI-References" (numbering differs in older editions):
-            // URI="" selects the containing document node-set without comments;
-            // #xpointer(/) retains comments. Both bind the document root, not
-            // an ID-resolved element (root XPointer meaning: §4.4.3.2).
-            // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-Same-Document
-            return OperationResourceIdentity::DocumentNode(view.root());
-        }
-        if uri.starts_with('#') {
+        if uri.is_empty() || uri.starts_with('#') {
             return resolver
-                .node_id_for_same_document_reference(uri)
+                .node_id_for_reference_resource(
+                    uri,
+                    Some(self.transforms.node_set_materialization()),
+                )
                 .ok()
                 .flatten()
                 .map(|node| OperationResourceIdentity::DocumentNode(view.node_identity_by_id(node)))
@@ -1420,7 +1415,7 @@ pub fn process_all_references(
     let canonicalized_data_budget = CanonicalizedDataBudget::default();
     let execution = ReferenceExecutionContext {
         store_pre_digest,
-        transform_options: TransformOptions::default(),
+        transform_options: TransformOptions::default().id_attributes(resolver.id_registrations()),
         transform_budget: &execution_budget,
         canonicalized_data_budget: &canonicalized_data_budget,
         provider: crate::provider::default_provider(),
@@ -8647,6 +8642,66 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn public_reference_entries_inherit_custom_id_registration() {
+        // Both public entry points must pass resolver registrations to XPath.
+        let xml = format!(
+            "<root xmlns:ds='{XMLDSIG_NS}'><data Token='target'>YWJj</data><ds:Signature/></root>"
+        );
+        let document = Document::parse(&xml).unwrap();
+        let signature = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "Signature")))
+            .unwrap();
+        let registrations = [crate::IdAttributeRegistration::global("Token")];
+        let resolver = UriReferenceResolver::with_id_registrations(&document, &registrations);
+        let expression = crate::xmldsig::transforms::XPathExpression::new(
+            "count(id('target')) = 1 and count(ancestor-or-self::node() | id('target')) = count(ancestor-or-self::node())",
+        );
+        let reference = make_reference(
+            "#target",
+            vec![Transform::XPath(expression), Transform::Base64Decode],
+            DigestAlgorithm::Sha256,
+            compute_digest(DigestAlgorithm::Sha256, b"abc"),
+        );
+        let one = process_reference(
+            &reference,
+            &resolver,
+            signature,
+            ReferenceSet::SignedInfo,
+            0,
+            true,
+        )
+        .unwrap();
+        assert_eq!(one.status, DsigStatus::Valid);
+        let all = process_all_references(&[reference], &resolver, signature, true).unwrap();
+        assert_eq!(all.results.len(), 1);
+        assert_eq!(all.results[0].status, DsigStatus::Valid);
+        assert!(all.first_failure.is_none());
+    }
+
+    #[test]
+    fn normalized_root_xpointers_bind_document_identity() {
+        // Spelling changes must not discard coverage evidence for the root.
+        let document = XmlDocument::parse("<root><item/></root>").unwrap();
+        let budgets = VerificationOperationBudgets::with_transforms(
+            &crate::policy::VerificationPolicy::default(),
+            TransformExecutionBudget::default(),
+        );
+        document.with_view(|view| {
+            let resolver = UriReferenceResolver::new(view.document());
+            for uri in ["#xpointer(/)", "#xpointer( / )", "#xpointer(%2F)"] {
+                let reference =
+                    make_reference(uri, Vec::new(), DigestAlgorithm::Sha256, vec![0; 32]);
+                assert_eq!(
+                    budgets.resource_identity_for_reference(&reference, 0, &resolver, view, None),
+                    OperationResourceIdentity::DocumentNode(view.root()),
+                    "{uri}"
+                );
+            }
+        });
     }
 
     #[test]

@@ -32,7 +32,7 @@ impl XmlBackendImplementation for RoxmltreeBackend {
             preflight.doctype_range(),
             preflight,
         )?;
-        Ok(target.finish())
+        Ok(target.finish(preflight))
     }
 }
 
@@ -106,6 +106,8 @@ fn project_document<'document, 'input>(
                                 prefix: attribute_prefix(target.input(), &attribute)
                                     .map(str::to_owned),
                                 value: attribute.value().to_owned(),
+                                is_id: false,
+                                xml_id_error: None,
                             })
                             .collect(),
                         namespaces: source

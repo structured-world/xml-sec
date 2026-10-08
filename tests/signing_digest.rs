@@ -29,6 +29,134 @@ use xml_sec::xmldsig::{
 
 const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 
+#[test]
+fn public_xpath_id_uses_request_registration() {
+    // A URI and XPath id() must select the same registered, namespace-scoped
+    // target; an empty XPath selection must not silently authenticate nothing.
+    let key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .unwrap();
+    let registrations = [xml_sec::IdAttributeRegistration::global("Token")
+        .with_attribute_namespace(Some("urn:trusted"))];
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .key_info(true)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#target")
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+    let source = r#"<root xmlns:t="urn:trusted" xmlns:f="urn:foreign"><payload t:Token="target">signed</payload><other f:Token="target"/></root>"#;
+    let signed = SignContext::new(&key)
+        .id_attributes(&registrations)
+        .key_info_writer(&KeyValueInfoWriter)
+        .sign_with_builder(source, &builder)
+        .unwrap();
+    // Prepare a fixed, independently signed XPath input: the signing dependency
+    // analyzer deliberately treats arbitrary XPath value reads conservatively.
+    let signed = signed.replace("<Transforms>",
+        "<Transforms><Transform Algorithm=\"http://www.w3.org/TR/1999/REC-xpath-19991116\"><XPath>count(id('target')) = 1 and count(ancestor-or-self::* | id('target')) = count(ancestor-or-self::*)</XPath></Transform>");
+    assert!(signed.contains("count(id('target'))"));
+    let document = xml_sec::Document::parse(&signed).unwrap();
+    let signed_info = document
+        .descendants()
+        .find(|node| node.has_tag_name((XMLDSIG_NS, "SignedInfo")))
+        .unwrap();
+    let ids = signed_info
+        .descendants()
+        .map(|node| node.id())
+        .collect::<HashSet<_>>();
+    let mut canonical = Vec::new();
+    canonicalize(
+        &document,
+        Some(&|node| ids.contains(&node.id())),
+        &exclusive_c14n(),
+        &mut canonical,
+    )
+    .unwrap();
+    let value = base64::engine::general_purpose::STANDARD
+        .encode(key.sign(SignatureAlgorithm::RsaSha256, &canonical).unwrap());
+    let signed = xml_sec::xmldsig::mutation::fill_signature_value(&signed, &value).unwrap();
+    let resolver = DefaultKeyResolver::default();
+    let mut policy = VerificationPolicy::default();
+    policy.key_trust.mode = xml_sec::policy::VerificationTrustMode::CryptographicOnly;
+    let verify = VerifyContext::new()
+        .policy(policy)
+        .id_attributes(&registrations)
+        .key_resolver(&resolver);
+    assert_eq!(verify.verify(&signed).unwrap().status, DsigStatus::Valid);
+    assert_eq!(
+        verify
+            .verify(&signed.replace(">signed<", ">changed<"))
+            .unwrap()
+            .status,
+        DsigStatus::Invalid(xml_sec::xmldsig::FailureReason::ReferenceDigestMismatch {
+            ref_index: 0
+        })
+    );
+}
+
+#[test]
+fn public_sign_verify_share_dtd_and_namespaced_ids() {
+    // DTD typing and request registrations must survive signing mutations and
+    // resolve exactly the same authenticated subtree during verification.
+    let key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .unwrap();
+    let registrations = [xml_sec::IdAttributeRegistration::global("Token")
+        .with_attribute_namespace(Some("urn:trusted"))];
+    let mut signing = SigningPolicy::default();
+    signing.xml.allow_internal_dtd = true;
+    let mut verification = VerificationPolicy::default();
+    verification.xml.allow_internal_dtd = true;
+    verification.key_trust.mode = xml_sec::policy::VerificationTrustMode::CryptographicOnly;
+    let resolver = DefaultKeyResolver::default();
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .key_info(true)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#target")
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+    for source in [
+        r#"<!DOCTYPE root [<!ATTLIST payload Token ID #REQUIRED>]><root><payload Token="  target  ">signed</payload></root>"#,
+        r#"<root xmlns:t="urn:trusted" xmlns:f="urn:foreign"><payload t:Token="target">signed</payload><other f:Token="target"/></root>"#,
+    ] {
+        let signed = SignContext::new(&key)
+            .policy(signing.clone())
+            .id_attributes(&registrations)
+            .key_info_writer(&KeyValueInfoWriter)
+            .sign_with_builder(source, &builder)
+            .unwrap();
+        let result = VerifyContext::new()
+            .policy(verification.clone())
+            .id_attributes(&registrations)
+            .key_resolver(&resolver)
+            .verify(&signed)
+            .unwrap();
+        assert_eq!(result.status, DsigStatus::Valid);
+        let tampered = VerifyContext::new()
+            .policy(verification.clone())
+            .id_attributes(&registrations)
+            .key_resolver(&resolver)
+            .verify(&signed.replace(">signed<", ">changed<"))
+            .unwrap();
+        assert_eq!(
+            tampered.status,
+            DsigStatus::Invalid(xml_sec::xmldsig::FailureReason::ReferenceDigestMismatch {
+                ref_index: 0
+            })
+        );
+    }
+    let duplicate = r#"<!DOCTYPE root [<!ATTLIST payload Token ID #REQUIRED>]><root><payload Token="target"/><payload Token="target"/></root>"#;
+    assert!(
+        SignContext::new(&key)
+            .policy(signing)
+            .id_attributes(&registrations)
+            .sign_with_builder(duplicate, &builder)
+            .is_err()
+    );
+}
+
 fn exclusive_c14n() -> C14nAlgorithm {
     C14nAlgorithm::new(C14nMode::Exclusive1_0, false)
 }
