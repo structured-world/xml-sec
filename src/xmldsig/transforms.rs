@@ -769,11 +769,35 @@ fn apply_transform_with_options_and_state<'s, 'd>(
         Transform::Relationship(selectors) => {
             let bytes = finalize_transform_data(input, budget)?;
             xml_parse.charge_policy(bytes.len())?;
-            let xml =
-                crate::encoding::decode_xml_octets(&bytes, budget.xml_parse_settings.max_bytes)
-                    .map_err(map_transform_xml_decode_error)?;
+            // Part 2:2012 §9.1.4 / 2021 §6.2.5 constrains Relationships XML
+            // independently of generic XML policy, including declaration labels.
+            // https://ecma-international.org/publications-and-standards/standards/ecma-376/
+            let xml = crate::xml_input_shared::decode_xml_bounded_with_encoding_guard(
+                &bytes,
+                budget.xml_parse_settings.max_bytes,
+                |physical, declaration| {
+                    if !physical.eq_ignore_ascii_case("UTF-8")
+                        && !physical.eq_ignore_ascii_case("UTF-16LE")
+                        && !physical.eq_ignore_ascii_case("UTF-16BE")
+                    {
+                        return Err(crate::encoding::XmlEncodingError::ForbiddenEncoding(
+                            physical.into(),
+                        ));
+                    }
+                    if let Some(label) = declaration
+                        && !label.eq_ignore_ascii_case("UTF-8")
+                        && !label.eq_ignore_ascii_case("UTF-16")
+                    {
+                        return Err(crate::encoding::XmlEncodingError::ForbiddenEncoding(
+                            label.into(),
+                        ));
+                    }
+                    Ok(())
+                },
+            )
+            .map_err(map_transform_xml_decode_error)?;
             let settings = DocumentParseSettings {
-                allow_dtd: options.internal_dtd_allowed(),
+                allow_dtd: false,
                 ..budget.xml_parse_settings
             };
             let document = parse_borrowed_with_settings_and_budget(&xml, settings, Some(xml_parse))

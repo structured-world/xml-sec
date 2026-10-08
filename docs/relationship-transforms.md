@@ -66,10 +66,14 @@ The mapping matches the resolved reference URI exactly. Duplicate mappings and
 missing URL parameters are rejected. Unmapped references never open files or
 fetch URLs; per-file and aggregate operation limits bound mapped bytes.
 
-MCE processing follows ECMA-376 Part 3 §§7 and 9, with only the Relationships
+MCE processing follows the selected edition, with only the Relationships
 application namespace understood. Ignorable and ProcessContent bindings retain
 their declaring namespace scope, AlternateContent selects the first understood
-Choice or its Fallback. `mc:PreserveElements` and `mc:PreserveAttributes` are
+Choice or its Fallback. In the 2012 contract, a nested Ignorable declaration resets
+inherited ProcessContent for its listed namespaces unless locally overridden
+(Part 3:2012 §10.1.1). The 2021 contract uses Part 3:2015 §9.2 instead: matching
+ProcessContent declarations on any ancestor remain effective.
+`mc:PreserveElements` and `mc:PreserveAttributes` are
 unknown attributes in both supported vocabularies (Part 3:2012 §10;
 Part 3:2015 §7), not silently ignored preservation requests.
 Traversal is iterative and charged to operation limits.
@@ -78,7 +82,11 @@ Traversal is iterative and charged to operation limits.
 `max_opc_workspace_bytes` bounds cumulative normalization workspace. Shared XML,
 node-filter work, and canonical output limits also apply. Node-set input respects
 its visibility mask; byte input uses the selected XML backend and shared decoder,
-including UTF-16. This transform is not a complete OPC package validator: package
+including UTF-16. Relationship parts permit only UTF-8 or UTF-16, with declaration
+labels limited to `UTF-8` and `UTF-16`, and reject DTDs even when the operation's
+generic XML policy permits them (Part 2:2012 §9.1.4; Part 2:2021 §6.2.5).
+These restrictions do not narrow other transforms' encoding support.
+This transform is not a complete OPC package validator: package
 part existence, target resolution, and signature packaging rules remain separate.
 Internal Target syntax must be a relative reference; network-path references
 are permitted by RFC 3986 §4.2. Determining whether they resolve inside the

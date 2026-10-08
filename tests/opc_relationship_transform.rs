@@ -17,6 +17,131 @@ const PARAM: &str = "http://schemas.openxmlformats.org/package/2006/digital-sign
 const URI: &str = "http://schemas.openxmlformats.org/package/2006/RelationshipTransform";
 
 #[test]
+fn mce_ignorable_reset_follows_selected_edition() {
+    // 2012 resets inherited ProcessContent; 2015 explicitly considers any ancestor.
+    for edition in [
+        OpcRelationshipEdition::Ecma2012,
+        OpcRelationshipEdition::Ecma2021,
+    ] {
+        for local_override in [false, true] {
+            let input = format!(
+                "<Relationships xmlns=\"{REL}\" xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" xmlns:u=\"urn:ext\" xmlns:v=\"urn:ext\" mc:Ignorable=\"u\" mc:ProcessContent=\"u:wrapper\"><v:wrapper mc:Ignorable=\"v\" {}><Relationship Id=\"x\" Type=\"urn:t\" Target=\"a\"/></v:wrapper></Relationships>",
+                if local_override {
+                    "mc:ProcessContent=\"v:wrapper\""
+                } else {
+                    ""
+                }
+            );
+            let document = Document::parse(&input).unwrap();
+            let chain = [
+                Transform::Relationship(vec![RelationshipSelector::SourceId("x".into())]),
+                Transform::C14n(C14nAlgorithm::new(C14nMode::Inclusive1_0, false)),
+            ];
+            let mut policy = VerificationPolicy::default();
+            policy.transforms.opc_relationship_edition = edition;
+            let output = xml_sec::xmldsig::execute_transforms_with_policy(
+                document.root_element(),
+                TransformData::Binary(input.as_bytes().to_vec()),
+                &chain,
+                &policy,
+            )
+            .unwrap();
+            let expected = if local_override || edition == OpcRelationshipEdition::Ecma2021 {
+                format!(
+                    "<Relationships xmlns=\"{REL}\"><Relationship Id=\"x\" Target=\"a\" TargetMode=\"Internal\" Type=\"urn:t\"></Relationship></Relationships>"
+                )
+            } else {
+                format!("<Relationships xmlns=\"{REL}\"></Relationships>")
+            };
+            assert_eq!(
+                output,
+                expected.as_bytes(),
+                "{edition:?} local_override={local_override}"
+            );
+        }
+    }
+}
+
+#[test]
+fn relationships_reject_dtd_even_under_permissive_xml_policy() {
+    // OPC XML restrictions cannot be widened by generic XML operation allowances.
+    let document = Document::parse("<Signature/>").unwrap();
+    let input = format!(
+        "<!DOCTYPE Relationships [<!ENTITY target 'a'>]><Relationships xmlns=\"{REL}\"><Relationship Id=\"x\" Type=\"urn:t\" Target=\"&target;\"/></Relationships>"
+    );
+    let chain = [
+        Transform::Relationship(vec![RelationshipSelector::SourceId("x".into())]),
+        Transform::C14n(C14nAlgorithm::new(C14nMode::Inclusive1_0, false)),
+    ];
+    let mut policy = VerificationPolicy::default();
+    policy.xml.allow_internal_dtd = true;
+    for edition in [
+        OpcRelationshipEdition::Ecma2012,
+        OpcRelationshipEdition::Ecma2021,
+    ] {
+        policy.transforms.opc_relationship_edition = edition;
+        assert!(
+            xml_sec::xmldsig::execute_transforms_with_policy(
+                document.root_element(),
+                TransformData::Binary(input.as_bytes().to_vec()),
+                &chain,
+                &policy
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn relationships_restrict_physical_and_declared_encodings() {
+    // Both editions require UTF-8/UTF-16 bytes and forbid other declaration labels.
+    let document = Document::parse("<Signature/>").unwrap();
+    let chain = [
+        Transform::Relationship(vec![RelationshipSelector::SourceId("x".into())]),
+        Transform::C14n(C14nAlgorithm::new(C14nMode::Inclusive1_0, false)),
+    ];
+    for edition in [
+        OpcRelationshipEdition::Ecma2012,
+        OpcRelationshipEdition::Ecma2021,
+    ] {
+        let mut policy = VerificationPolicy::default();
+        policy.transforms.opc_relationship_edition = edition;
+        for (label, valid) in [
+            ("UTF-8", true),
+            ("ISO-8859-1", false),
+            ("US-ASCII", false),
+            ("UTF-16", true),
+            ("UTF-16LE", false),
+            ("UTF-32", false),
+        ] {
+            let xml = format!(
+                "<?xml version=\"1.0\" encoding=\"{label}\"?><Relationships xmlns=\"{REL}\"><Relationship Id=\"x\" Type=\"urn:t\" Target=\"a\"/></Relationships>"
+            );
+            let bytes = if label.starts_with("UTF-16") {
+                std::iter::once(0xfeffu16)
+                    .chain(xml.encode_utf16())
+                    .flat_map(u16::to_le_bytes)
+                    .collect()
+            } else if label == "UTF-32" {
+                std::iter::once(0xfeffu32)
+                    .chain(xml.chars().map(u32::from))
+                    .flat_map(u32::to_le_bytes)
+                    .collect()
+            } else {
+                xml.into_bytes()
+            };
+            let result = xml_sec::xmldsig::execute_transforms_with_policy(
+                document.root_element(),
+                TransformData::Binary(bytes),
+                &chain,
+                &policy,
+            );
+            assert_eq!(result.is_ok(), valid, "{edition:?} {label}: {result:?}");
+        }
+    }
+}
+
+#[test]
 fn public_executor_can_select_2012_policy() {
     // The public executor must honor trusted policy rather than hard-code 2021 case folding.
     let xml = format!(

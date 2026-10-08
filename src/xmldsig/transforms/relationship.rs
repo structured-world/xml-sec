@@ -307,7 +307,7 @@ pub(super) fn normalize<'a>(
             && tag.namespace() != Some(MC)
             && ignorable(node, tag.namespace(), budget)?
         {
-            if process_content(node, budget)? {
+            if process_content(node, edition, budget)? {
                 check_unwrapped(node)?;
                 must_understand(node, budget)?;
                 budget.opc_workspace.push(
@@ -326,7 +326,7 @@ pub(super) fn normalize<'a>(
                 return Err(invalid("MCE Choice/Fallback outside AlternateContent"));
             }
             check_unwrapped(node)?;
-            if let Some(branch) = alternate_content(node, budget)? {
+            if let Some(branch) = alternate_content(node, edition, budget)? {
                 validate_mc_attributes(branch, budget)?;
                 check_unwrapped(branch)?;
                 must_understand(branch, budget)?;
@@ -638,6 +638,7 @@ fn ignorable(
 
 fn process_content(
     node: Node<'_, '_>,
+    edition: OpcRelationshipEdition,
     budget: &TransformExecutionBudget,
 ) -> Result<bool, TransformError> {
     let tag = node.tag_name();
@@ -653,6 +654,20 @@ fn process_content(
                     && (local == "*" || local == tag.name())
                 {
                     return Ok(true);
+                }
+            }
+        }
+        // Part 3:2012 §10.1.1 resets this namespace's inherited rules, after
+        // applying local ProcessContent. Part 3:2015 §9.2 instead matches any
+        // ancestor's name pair; do not carry the older reset into that edition.
+        // https://ecma-international.org/publications-and-standards/standards/ecma-376/
+        if edition == OpcRelationshipEdition::Ecma2012
+            && let Some(value) = ancestor.attribute((MC, "Ignorable"))
+        {
+            budget.node_filter.charge(value.len())?;
+            for prefix in tokens(value) {
+                if tag.namespace() == Some(namespace(ancestor, prefix, budget)?) {
+                    return Ok(false);
                 }
             }
         }
@@ -747,6 +762,7 @@ fn validate_attributes(
 
 fn alternate_content<'a>(
     node: Node<'a, 'a>,
+    edition: OpcRelationshipEdition,
     budget: &TransformExecutionBudget,
 ) -> Result<Option<Node<'a, 'a>>, TransformError> {
     validate_attributes(node, &[], budget)?;
@@ -767,7 +783,7 @@ fn alternate_content<'a>(
         // https://ecma-international.org/publications-and-standards/standards/ecma-376/
         if tag.namespace() != Some(MC)
             && ignorable(child, tag.namespace(), budget)?
-            && !process_content(child, budget)?
+            && !process_content(child, edition, budget)?
         {
             continue;
         }
