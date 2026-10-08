@@ -2568,6 +2568,11 @@ fn validate_typed_cipher_values(
     }
 
     let maximum_wrapped_key = projected_decoded_len_for_encoded_len(MAX_CIPHER_VALUE_BASE64_LEN);
+    validate_encapsulation_cipher_values(
+        &encrypted.encapsulation_methods,
+        maximum_cipher_values,
+        &mut aggregate_encoded,
+    )?;
     validate_wrapped_cipher_values(
         &encrypted.encrypted_keys,
         maximum_wrapped_key,
@@ -2594,12 +2599,44 @@ fn validate_wrapped_cipher_values(
             }
             .into());
         }
+        validate_encapsulation_cipher_values(
+            &encrypted_key.sources.encapsulation_methods,
+            maximum_cipher_values,
+            aggregate_encoded,
+        )?;
         validate_wrapped_cipher_values(
             &encrypted_key.sources.encrypted_keys,
             maximum_wrapped_key,
             maximum_cipher_values,
             aggregate_encoded,
         )?;
+    }
+    Ok(())
+}
+
+fn validate_encapsulation_cipher_values(
+    methods: &[crate::key_establishment::EncapsulationMechanism],
+    maximum: usize,
+    aggregate: &mut usize,
+) -> Result<(), XmlEncError> {
+    for method in methods {
+        // Match XML parsing's encoded CipherValue accounting, even though
+        // typed descriptors retain decoded public ciphertext bytes.
+        let encoded = method.ciphertext.len().div_ceil(3).checked_mul(4);
+        let total = encoded.and_then(|encoded| aggregate.checked_add(encoded));
+        let total = total.ok_or(crate::policy::PolicyViolation::ResourceLimitExceeded {
+            resource: crate::policy::resource_name::AGGREGATE_ENCRYPTION_CIPHER_VALUE_BYTES,
+            maximum,
+        })?;
+        if total > maximum {
+            return Err(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::AGGREGATE_ENCRYPTION_CIPHER_VALUE_BYTES,
+                maximum,
+                actual: total,
+            }
+            .into());
+        }
+        *aggregate = total;
     }
     Ok(())
 }
@@ -5210,6 +5247,75 @@ mod tests {
             )) if maximum == aggregate_encoded_len - 1 && actual == aggregate_encoded_len
         ));
         assert_eq!(resolver.candidate_calls.get(), 0);
+    }
+
+    #[cfg(feature = "experimental-pq")]
+    #[test]
+    fn typed_kem_ciphertext_shares_aggregate_cipher_value_budget() {
+        // Typed input must charge the same base64-projected KEM ciphertext as
+        // XML input, including descriptors nested under an EncryptedKey.
+        let xml = include_str!(
+            "../../tests/fixtures/xmlenc/aleksey-xmlenc-01/enc-aes128gcm-em-ml-kem-512.xml"
+        );
+        let document = crate::XmlDomDocument::parse(xml).expect("donor XML parses");
+        let node = document
+            .descendants()
+            .find(|node| node.has_tag_name((crate::xmlenc::types::XMLENC_NS, "EncryptedData")))
+            .expect("donor EncryptedData");
+        let mut policy = crate::policy::DecryptionPolicy::default();
+        policy
+            .key_establishment
+            .encapsulation_algorithms
+            .insert(crate::provider::KeyEncapsulationAlgorithm::MlKem512);
+        let mut encrypted = super::super::parse_encrypted_data_node_with_policy(node, &policy)
+            .expect("permitted donor recipient");
+        let content = cipher_data_storage_len(&encrypted.cipher_data);
+        let kem_encoded = 4 * encrypted.encapsulation_methods[0]
+            .ciphertext
+            .len()
+            .div_ceil(3);
+        assert!(
+            validate_typed_cipher_values(
+                &encrypted,
+                DataEncryptionAlgorithm::Aes128Gcm,
+                usize::MAX / 2,
+                content + kem_encoded
+            )
+            .is_ok()
+        );
+        for nested in [false, true] {
+            if nested {
+                encrypted.encrypted_keys.push(EncryptedKey {
+                    sources: super::super::EncryptionKeySources {
+                        encapsulation_methods: std::mem::take(&mut encrypted.encapsulation_methods),
+                        ..Default::default()
+                    },
+                    id: None,
+                    recipient: None,
+                    key_name: None,
+                    encryption_method: super::super::EncryptionMethod {
+                        algorithm: KeyWrapAlgorithm::AesKw128.uri().into(),
+                        key_size_bits: None,
+                        oaep_digest: None,
+                        mgf_algorithm: None,
+                        oaep_params: None,
+                    },
+                    cipher_data: super::super::CipherData::Bytes(vec![0; 24]),
+                    reference_list: None,
+                    carried_key_name: None,
+                });
+            }
+            let total = content + kem_encoded + if nested { 24 } else { 0 };
+            policy.resources.max_xml_document_bytes = total - 1;
+            let resolver = CountingResolver {
+                candidate_calls: Cell::new(0),
+                key: vec![0; 16],
+            };
+            assert!(
+                matches!(DecryptContext::new(&resolver).policy(policy.clone()).decrypt_data(&encrypted), Err(XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit { resource: crate::policy::resource_name::AGGREGATE_ENCRYPTION_CIPHER_VALUE_BYTES, maximum, actual })) if maximum == total - 1 && actual == total)
+            );
+            assert_eq!(resolver.candidate_calls.get(), 0);
+        }
     }
 
     #[test]

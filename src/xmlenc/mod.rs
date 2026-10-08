@@ -48,8 +48,8 @@ pub use key_derivation::{
     parse_key_derivation_method_with_backend,
 };
 pub use parse::{
-    parse_encrypted_data, parse_encrypted_data_node_with_policy,
-    parse_encrypted_data_node_with_policy_and_backend,
+    parse_encrypted_data, parse_encrypted_data_node_with_context,
+    parse_encrypted_data_node_with_policy, parse_encrypted_data_node_with_policy_and_backend,
     parse_encrypted_data_template_node_with_policy,
     parse_encrypted_data_template_node_with_policy_and_backend,
 };

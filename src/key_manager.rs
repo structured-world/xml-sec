@@ -794,6 +794,7 @@ impl<'a> KeyResolver for InventoryVerificationResolver<'a> {
 enum ParsedMaterial {
     Symmetric(SymmetricKeyKind, Zeroizing<Vec<u8>>),
     Public(KeyValueInfo),
+    PublicDer(Vec<u8>),
     Dsa(KeyValueInfo, Option<Zeroizing<Vec<u8>>>),
     Unsupported,
 }
@@ -1820,8 +1821,9 @@ impl KeyInventory {
         Ok(())
     }
 
-    /// Import a bounded PKCS#12 bundle from caller-owned bytes. The key may
-    /// sign; RSA keys may also decrypt. A bundle with more than one private
+    /// Import a bounded PKCS#12 bundle from caller-owned bytes. Signing keys
+    /// may sign; RSA keys may also decrypt; ML-KEM keys only decapsulate.
+    /// A bundle with more than one private
     /// key is rejected rather than assigning names from iteration order.
     pub fn add_pkcs12(
         &mut self,
@@ -1908,14 +1910,12 @@ impl KeyInventory {
             .ok_or(KeyStoreError::ProtectedContainer)?;
         let mut certificates = contents.certificates;
         let identity = PrivateKeyIdentity::decode(private_key.as_ref())?;
-        if usages.allows(KeyUsage::Decrypt) && !identity.can_decrypt() {
-            if auto_decrypt {
-                usages = KeyUsages::SIGN;
-            } else {
-                return Err(KeyStoreError::Selection(
-                    "private key cannot recover encryption keys",
-                ));
-            }
+        if auto_decrypt {
+            usages = identity.automatic_usages();
+        } else if usages.allows(KeyUsage::Decrypt) && !identity.can_decrypt() {
+            return Err(KeyStoreError::Selection(
+                "private key cannot recover encryption keys",
+            ));
         }
         identity.validate_usages(usages)?;
         let mut matching_leaf = None;
@@ -2274,6 +2274,13 @@ impl KeyInventory {
                     } else {
                         ParsedMaterial::Unsupported
                     });
+                } else if child.has_tag_name((XMLDSIG11_NS, "DEREncodedKeyValue")) {
+                    // XMLDSig 1.1 §4.5.9: this contains base64 DER SPKI, not PKCS#8.
+                    // https://www.w3.org/TR/xmldsig-core1/#sec-DEREncodedKeyValue
+                    if value.is_some() {
+                        return Err(KeyStoreError::Invalid("ambiguous key material".into()));
+                    }
+                    value = Some(ParsedMaterial::PublicDer(decode_xml_base64(child)?));
                 } else {
                     return Err(KeyStoreError::Invalid("unsupported KeyInfo child".into()));
                 }
@@ -2285,6 +2292,15 @@ impl KeyInventory {
                 return Err(KeyStoreError::Invalid("duplicate key name".into()));
             }
             match material {
+                ParsedMaterial::PublicDer(der) => {
+                    store.add_public_der_payload(
+                        name,
+                        der,
+                        None,
+                        resources,
+                        PublicDerFormat::SubjectPublicKeyInfo,
+                    )?;
+                }
                 ParsedMaterial::Symmetric(kind, bytes) => {
                     if bytes.is_empty() {
                         return Err(KeyStoreError::Invalid("empty symmetric key".into()));
@@ -2542,6 +2558,15 @@ enum PrivateKeyIdentity<'a> {
 }
 
 impl<'a> PrivateKeyIdentity<'a> {
+    fn automatic_usages(&self) -> KeyUsages {
+        match self {
+            Self::Rsa(_) => KeyUsages::SIGN.union(KeyUsages::DECRYPT),
+            #[cfg(feature = "experimental-pq")]
+            Self::Encapsulation { .. } => KeyUsages::DECRYPT,
+            _ => KeyUsages::SIGN,
+        }
+    }
+
     fn can_decrypt(&self) -> bool {
         match self {
             Self::Rsa(_) => true,
@@ -3167,6 +3192,9 @@ fn preflight_xml_material(
         .children()
         .find(|child| child.has_tag_name((XMLDSIG_NS, "KeyValue")))
         .and_then(|value| value.children().find(|child| child.is_element()));
+    let has_der = info
+        .children()
+        .any(|child| child.has_tag_name((XMLDSIG11_NS, "DEREncodedKeyValue")));
     let name_copies = match key {
         Some(key) if key.has_tag_name((XMLDSIG_NS, "DSAKeyValue")) => {
             if key
@@ -3184,12 +3212,14 @@ fn preflight_xml_material(
         {
             3
         }
+        _ if has_der => 3,
         _ => 2,
     };
-    let uses_shared_public_parser = key.is_some_and(|key| {
-        key.has_tag_name((XMLDSIG_NS, "RSAKeyValue"))
-            || key.has_tag_name((XMLDSIG11_NS, "ECKeyValue"))
-    });
+    let uses_shared_public_parser = has_der
+        || key.is_some_and(|key| {
+            key.has_tag_name((XMLDSIG_NS, "RSAKeyValue"))
+                || key.has_tag_name((XMLDSIG11_NS, "ECKeyValue"))
+        });
     if uses_shared_public_parser {
         crate::xmldsig::parse::validate_key_info_container(info)
             .map_err(|error| KeyStoreError::Invalid(error.to_string()))?;
@@ -3213,6 +3243,9 @@ fn preflight_xml_material(
             for _ in 0..name_copies {
                 budget.reserve(length)?;
             }
+        } else if child.has_tag_name((XMLDSIG11_NS, "DEREncodedKeyValue")) {
+            let payload = xml_base64_payload(child)?;
+            budget.reserve(payload.decoded_len)?;
         } else if child.has_tag_name((XMLDSIG_NS, "KeyValue")) {
             for key in child.children().filter(|node| node.is_element()) {
                 if key.has_tag_name((XMLSEC_NS, "HMACKeyValue"))
@@ -3952,6 +3985,50 @@ mod tests {
             .expect("identical leaf bags are not ambiguous");
         assert_eq!(inventory.private_keys[0].certificate_chain.len(), 1);
         assert!(inventory.private_keys[0].has_matching_leaf);
+    }
+
+    #[cfg(feature = "experimental-pq")]
+    #[test]
+    fn kem_pkcs12_auto_usage_is_decrypt_only() {
+        // Convenience PKCS#12 import derives usages from the decoded key,
+        // while an explicitly requested signing usage must remain forbidden.
+        let key = crate::provider::RustCryptoMlKemPrivateKey::from_seed(
+            crate::provider::KeyEncapsulationAlgorithm::MlKem512,
+            &[3; 64],
+        )
+        .expect("valid ML-KEM seed");
+        let der = key
+            .to_pkcs8_der(crate::provider::MlKemPrivateKeyEncoding::Seed)
+            .expect("seed PKCS#8 export");
+        let contents = || pkcs12_import::Contents {
+            private_keys: vec![Zeroizing::new(der.as_bytes().to_vec())],
+            certificates: Vec::new(),
+        };
+        let resources = ResourcePolicy::default();
+        let mut inventory = KeyInventory::default();
+        inventory
+            .add_pkcs12_contents(
+                "kem".into(),
+                der.as_bytes().len(),
+                contents(),
+                KeyUsages::SIGN.union(KeyUsages::DECRYPT),
+                &resources,
+                true,
+            )
+            .expect("automatic recipient usages");
+        assert_eq!(inventory.private_keys()[0].usages, KeyUsages::DECRYPT);
+        assert!(
+            KeyInventory::default()
+                .add_pkcs12_contents(
+                    "kem".into(),
+                    der.as_bytes().len(),
+                    contents(),
+                    KeyUsages::SIGN,
+                    &resources,
+                    false
+                )
+                .is_err()
+        );
     }
 
     #[test]

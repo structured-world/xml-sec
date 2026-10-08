@@ -1401,6 +1401,38 @@ mod tests {
         assert_eq!(budget.memory, 0, "denial precedes output allocation");
     }
 
+    #[cfg(feature = "experimental-pq")]
+    #[test]
+    fn kem_key_bag_reaches_public_inventory() {
+        // The full PFX entry point must infer decapsulation-only usage, not
+        // reject a valid ML-KEM bag because it inherited signing usage.
+        let key = crate::provider::RustCryptoMlKemPrivateKey::from_seed(
+            crate::provider::KeyEncapsulationAlgorithm::MlKem512,
+            &[3; 64],
+        )
+        .expect("valid ML-KEM seed");
+        let private = key
+            .to_pkcs8_der(crate::provider::MlKemPrivateKeyEncoding::Seed)
+            .expect("seed PKCS#8 export");
+        let bytes = pfx(&[data(&sequence(&[bag(
+            pkcs12::PKCS_12_KEY_BAG_OID,
+            private.as_bytes(),
+        )]))]);
+        let mut inventory = crate::key_manager::KeyInventory::default();
+        inventory
+            .add_pkcs12(
+                "recipient".into(),
+                &bytes,
+                "secret",
+                &ResourcePolicy::default(),
+            )
+            .expect("ML-KEM PKCS#12 import");
+        assert_eq!(
+            inventory.private_keys()[0].usages,
+            crate::key_manager::KeyUsages::DECRYPT
+        );
+    }
+
     #[test]
     fn ber_key_bag_reaches_public_inventory() {
         // Public import must normalize the actual key, not merely accept BER

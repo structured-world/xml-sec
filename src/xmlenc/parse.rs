@@ -236,26 +236,53 @@ pub fn parse_encrypted_data_node_with_policy_and_backend(
     policy: &crate::policy::DecryptionPolicy,
     backend: crate::XmlBackend,
 ) -> Result<EncryptedData, XmlEncError> {
-    let parse_budget = XmlParseWorkBudget::from_resources(&policy.resources);
-    parse_encrypted_data_node_with_policy_and_budget(node, policy, &parse_budget, backend)
+    parse_encrypted_data_node_with_context(
+        node,
+        policy,
+        backend,
+        crate::provider::default_provider(),
+        &[],
+    )
 }
 
-pub(super) fn parse_encrypted_data_node_with_policy_and_budget(
+/// Inspect a selected node using the same provider and ID registrations as decryption.
+/// Same-document KeyInfo references are resolved before returning recipient metadata.
+pub fn parse_encrypted_data_node_with_context(
+    node: Node<'_, '_>,
+    policy: &crate::policy::DecryptionPolicy,
+    backend: crate::XmlBackend,
+    provider: &dyn crate::provider::CryptoProvider,
+    id_attributes: &[crate::IdAttributeRegistration],
+) -> Result<EncryptedData, XmlEncError> {
+    let parse_budget = XmlParseWorkBudget::from_resources(&policy.resources);
+    parse_encrypted_data_node_with_context_and_budget(
+        node,
+        policy,
+        &parse_budget,
+        backend,
+        provider,
+        id_attributes,
+    )
+}
+
+fn parse_encrypted_data_node_with_context_and_budget(
     node: Node<'_, '_>,
     policy: &crate::policy::DecryptionPolicy,
     parse_budget: &XmlParseWorkBudget,
     backend: crate::XmlBackend,
+    provider: &dyn crate::provider::CryptoProvider,
+    id_attributes: &[crate::IdAttributeRegistration],
 ) -> Result<EncryptedData, XmlEncError> {
     policy.validate()?;
-    let references = super::CipherReferenceContext::new(policy, None, backend, &[])?;
+    let references = super::CipherReferenceContext::new(policy, None, backend, id_attributes)?;
     let policy = ParsingPolicy::from(policy);
     validate_node_document_policy(node, policy, parse_budget, backend)?;
     parse_encrypted_data_node_with_origins(
         node,
         policy,
         false,
-        &[],
-        crate::provider::default_provider(),
+        id_attributes,
+        provider,
         Some(&references),
         Some(parse_budget),
     )
@@ -1809,11 +1836,13 @@ mod tests {
         };
         let budget = XmlParseWorkBudget::from_resources(&resources);
 
-        parse_encrypted_data_node_with_policy_and_budget(
+        parse_encrypted_data_node_with_context_and_budget(
             document.root_element(),
             &policy,
             &budget,
             backend,
+            crate::provider::default_provider(),
+            &[],
         )
         .expect("node revalidation must retain the selected backend");
         assert_eq!(budget.consumed(), expected_work);

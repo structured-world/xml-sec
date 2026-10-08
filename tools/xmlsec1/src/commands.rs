@@ -665,7 +665,7 @@ fn id_attribute_registrations(
 
 fn select_named_candidates<'a, T: Copy>(
     candidates: &[(&'a crate::OptionValue, T)],
-    requested_names: &[String],
+    requested_names: &[impl AsRef<str>],
     allow_unconstrained_named_singleton: bool,
     key_kind: &str,
 ) -> Result<Vec<(&'a crate::OptionValue, T)>, CommandError> {
@@ -682,7 +682,7 @@ fn select_named_candidates<'a, T: Copy>(
             let matching = candidates
                 .iter()
                 .enumerate()
-                .filter(|(_, (key, _))| key.parameter.as_deref() == Some(requested.as_str()))
+                .filter(|(_, (key, _))| key.parameter.as_deref() == Some(requested.as_ref()))
                 .collect::<Vec<_>>();
             match matching.as_slice() {
                 [(index, candidate)] if selected_indices.insert(*index) => {
@@ -729,7 +729,7 @@ fn select_named_candidates<'a, T: Copy>(
 
 fn named_candidate_search<'a, T: Copy>(
     candidates: &[(&'a crate::OptionValue, T)],
-    requested_names: &[String],
+    requested_names: &[impl AsRef<str>],
     lax_key_search: bool,
     allow_unconstrained_named_singleton: bool,
     key_kind: &str,
@@ -768,7 +768,7 @@ fn load_xml_key_stores<P: xml_sec::document::XmlDocumentPolicy>(
 
 fn select_store_candidates<'a, T>(
     entries: impl Iterator<Item = &'a T>,
-    requested_names: &[String],
+    requested_names: &[impl AsRef<str>],
     lax: bool,
     max_candidates: usize,
     name: impl Fn(&T) -> &str,
@@ -790,7 +790,7 @@ fn select_store_candidates<'a, T>(
         if requested_names.is_empty()
             || requested_names
                 .iter()
-                .any(|requested| requested == name(entry))
+                .any(|requested| requested.as_ref() == name(entry))
         {
             named.push(entry);
         } else if lax {
@@ -1601,7 +1601,7 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
     let start_node_id = option_text(invocation, "node-id")?;
     let id_attributes = id_attribute_registrations(invocation)?;
     let key_name_resolution = if lax_key_search
-        || (explicit_keys.is_empty() && !has_key_store)
+        || (explicit_keys.is_empty() && !has_key_store && !has_recipient_key)
         || matches!(explicit_keys.as_slice(), [(key, _)] if key.parameter.is_none())
     {
         key_material::VerificationKeyNameResolution::IgnoreDocumentKeyInfo
@@ -1667,7 +1667,6 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
             algorithm,
             &policy.key_establishment,
             &policy,
-            xml_backend,
             &mut certificate_budget,
         )?;
         verification_context(policy, start_node_id, &id_attributes, xml_backend)
@@ -3947,52 +3946,42 @@ fn direct_encrypted_keys<'a, 'input>(key_info: Node<'a, 'input>) -> Vec<Node<'a,
         .collect()
 }
 
-fn recipient_encapsulation<'a, 'input>(
-    encrypted_data: Node<'a, 'input>,
-    resources: &ResourcePolicy,
-) -> Result<Option<xml_sec::key_establishment::ParsedEncapsulation<'a, 'input>>, CommandError> {
-    let mut selected = None;
-    for node in encrypted_data.descendants().filter(|node| {
-        node.has_tag_name((
-            xml_sec::key_establishment::ENCAPSULATION_NS,
-            "EncapsulationMechanism",
-        ))
-    }) {
-        // Only the selected data's KeyInfo/EncryptedKey source chain can
-        // nominate a recipient. Foreign extension payloads are not key sources.
-        let mut parent = node.parent();
-        let mut depth = 0;
-        let belongs = loop {
-            let Some(info) = parent.filter(|info| info.has_tag_name((XMLDSIG_NS, "KeyInfo")))
-            else {
-                break false;
-            };
-            let Some(owner) = info.parent() else {
-                break false;
-            };
-            if owner == encrypted_data {
-                break true;
+fn recipient_encapsulation(
+    encrypted_data: &xml_sec::xmlenc::EncryptedData,
+) -> Result<Option<&xml_sec::key_establishment::EncapsulationMechanism>, CommandError> {
+    fn visit<'a>(
+        methods: &'a [xml_sec::key_establishment::EncapsulationMechanism],
+        keys: &'a [EncryptedKey],
+        selected: &mut Option<&'a xml_sec::key_establishment::EncapsulationMechanism>,
+    ) -> Result<(), CommandError> {
+        for method in methods {
+            if selected.is_some() {
+                return Err(CommandError::Usage(
+                    "multiple KEM recipients require explicit application key resolution".into(),
+                ));
             }
-            if !owner.has_tag_name((XMLENC_NS, "EncryptedKey")) {
-                break false;
-            }
-            depth += 1;
-            resources.validate_key_info_reference_depth(depth)?;
-            parent = owner.parent();
-        };
-        if !belongs {
-            continue;
+            *selected = Some(method);
         }
-        if selected.is_some() {
-            return Err(CommandError::Usage(
-                "multiple KEM recipients require explicit application key resolution".into(),
-            ));
+        // Core parsing already enforces the non-configurable key-source depth
+        // ceiling, recipient count, and policy before constructing this graph.
+        for key in keys {
+            visit(
+                &key.sources.encapsulation_methods,
+                &key.sources.encrypted_keys,
+                selected,
+            )?;
         }
-        selected = Some(
-            xml_sec::key_establishment::parse_encapsulation(node, false)
-                .map_err(|error| CommandError::Encryption(error.to_string()))?,
-        );
+        Ok(())
     }
+    let mut selected = None;
+    // XMLDSig 1.1 section 4.5.10 resolves KeyInfoReference before interpreting
+    // its sources: lexical descendants are not the resolved recipient graph.
+    // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-KeyInfoReference
+    visit(
+        &encrypted_data.encapsulation_methods,
+        &encrypted_data.encrypted_keys,
+        &mut selected,
+    )?;
     Ok(selected)
 }
 
@@ -4057,7 +4046,33 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             "decrypt cannot combine explicit AES and RSA private keys".into(),
         ));
     }
-    let mechanism = recipient_encapsulation(encrypted_data, &policy.resources)?;
+    // References may nominate a sibling KeyInfo, not only a descendant of the
+    // selected data. With no mechanism anywhere in this same-document-only
+    // source domain, keep ordinary decryption free of extra model construction.
+    let parsed = if document.descendants().any(|node| {
+        node.has_tag_name((
+            xml_sec::key_establishment::ENCAPSULATION_NS,
+            "EncapsulationMechanism",
+        ))
+    }) {
+        Some(
+            xml_sec::xmlenc::parse_encrypted_data_node_with_context(
+                encrypted_data,
+                &policy,
+                xml_backend,
+                selected_provider(invocation)?,
+                &id_attributes,
+            )
+            .map_err(|error| CommandError::Encryption(error.to_string()))?,
+        )
+    } else {
+        None
+    };
+    let mechanism = parsed
+        .as_ref()
+        .map(recipient_encapsulation)
+        .transpose()?
+        .flatten();
     let bytes = if let Some(mechanism) = mechanism {
         policy
             .key_establishment
@@ -4067,16 +4082,12 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                 "EncapsulationMechanism requires a recipient private key, not --aes-key".into(),
             ));
         }
-        let mut parsing = xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&policy.resources)
-            .map_err(|error| CommandError::Encryption(error.to_string()))?;
-        let info = parsing
-            .parse_with_provider(mechanism.key_info, selected_provider(invocation)?)
-            .map_err(|error| CommandError::Encryption(error.to_string()))?;
-        let names = info
+        let names = mechanism
+            .key_info
             .sources
             .iter()
             .filter_map(|source| match source {
-                KeyInfoSource::KeyName(name) => Some(name.clone()),
+                KeyInfoSource::KeyName(name) => Some(name.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -4088,23 +4099,40 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             mechanism.algorithm,
             &policy.key_establishment,
             &policy,
-            xml_backend,
             &mut budget,
         )?;
         let resolver = xml_sec::xmlenc::EncapsulationDecryptor::provider_key(key);
-        decrypt_input(
-            &resolver,
-            &xml,
-            encrypted_data_id,
-            standalone,
-            policy,
-            &id_attributes,
-            CommandBackends {
-                xml: xml_backend,
-                crypto: selected_provider(invocation)?,
-            },
-        )?
+        if standalone {
+            // Reuse the validated descriptor graph for byte output. Re-reading
+            // the XML would decode and allocate every recipient a second time.
+            DecryptContext::new(&resolver)
+                .provider(selected_provider(invocation)?)
+                .policy(policy)
+                .decrypt_data(parsed.as_ref().expect("selected mechanism has parsed data"))
+                .map(|content| match content {
+                    DecryptedContent::Xml(xml) => xml.into_bytes(),
+                    DecryptedContent::Bytes(bytes) => bytes,
+                })
+                .map_err(|error| CommandError::Encryption(error.to_string()))?
+        } else {
+            // Document mutation reparses under its own stable identity. Keep
+            // only the provider key, not a second live recipient graph.
+            drop(parsed);
+            decrypt_input(
+                &resolver,
+                &xml,
+                encrypted_data_id,
+                false,
+                policy,
+                &id_attributes,
+                CommandBackends {
+                    xml: xml_backend,
+                    crypto: selected_provider(invocation)?,
+                },
+            )?
+        }
     } else if !aes_keys.is_empty() {
+        drop(parsed);
         let candidates = aes_keys
             .iter()
             .copied()
@@ -4157,6 +4185,7 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             },
         )?
     } else if has_key_store {
+        drop(parsed);
         let mut budget =
             ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
         let store = load_xml_key_stores(invocation, &policy, xml_backend, &mut budget)?;
@@ -4212,6 +4241,7 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             },
         )?
     } else if !private_keys.is_empty() {
+        drop(parsed);
         let selected = select_recipient_private_keys(
             &private_keys,
             &recipient_key_names,
@@ -4846,7 +4876,7 @@ fn xmlsec_compatibility_key_establishment_policy() -> xml_sec::policy::KeyEstabl
 
 fn select_encapsulation_key<P: xml_sec::document::XmlDocumentPolicy>(
     invocation: &Invocation,
-    names: &[String],
+    names: &[impl AsRef<str>],
     algorithm: xml_sec::provider::KeyEncapsulationAlgorithm,
     establishment: &xml_sec::policy::KeyEstablishmentPolicy,
     policy: &P,
@@ -4874,7 +4904,10 @@ fn select_encapsulation_key<P: xml_sec::document::XmlDocumentPolicy>(
         }
         let store = load_xml_key_stores(invocation, policy, backend, budget)?;
         let entries = select_store_candidates(
-            store.public_keys().iter(),
+            store
+                .public_keys()
+                .iter()
+                .filter(|entry| entry.usages.allows(key_manager::KeyUsage::Encrypt)),
             names,
             invocation.flag("lax-key-search"),
             resources.max_key_candidates,
@@ -4953,11 +4986,10 @@ fn select_encapsulation_key<P: xml_sec::document::XmlDocumentPolicy>(
 
 fn select_decapsulation_key<P: xml_sec::document::XmlDocumentPolicy>(
     invocation: &Invocation,
-    names: &[String],
+    names: &[impl AsRef<str>],
     algorithm: xml_sec::provider::KeyEncapsulationAlgorithm,
     establishment: &xml_sec::policy::KeyEstablishmentPolicy,
     policy: &P,
-    backend: XmlBackend,
     budget: &mut ExternalMaterialBudget,
 ) -> Result<std::sync::Arc<dyn xml_sec::provider::KeyDecapsulationKey>, CommandError> {
     establishment.validate()?;
@@ -4974,37 +5006,12 @@ fn select_decapsulation_key<P: xml_sec::document::XmlDocumentPolicy>(
         .map(|option| (option, ()))
         .collect::<Vec<_>>();
     if invocation.values("keys-file").next().is_some() {
-        if !options.is_empty() {
-            return Err(CommandError::Usage(
-                "cannot combine --keys-file with explicit recipient keys".into(),
-            ));
-        }
-        let store = load_xml_key_stores(invocation, policy, backend, budget)?;
-        let entries = select_store_candidates(
-            store.private_keys().iter(),
-            names,
-            invocation.flag("lax-key-search"),
-            resources.max_key_candidates,
-            |entry| &entry.name,
-        )?;
-        let mut last = None;
-        for entry in entries {
-            match entry.decapsulation_key(provider, algorithm, establishment, resources) {
-                Ok(key) => return Ok(key),
-                Err(error) => {
-                    let error = CommandError::from(error);
-                    if !invocation.flag("lax-key-search")
-                        || !lax_candidate_error_is_recoverable(&error)
-                    {
-                        return Err(error);
-                    }
-                    last = Some(error);
-                }
-            }
-        }
-        return Err(
-            last.unwrap_or_else(|| CommandError::Usage("no recipient private key found".into()))
-        );
+        // XMLDSig 1.1 §4.5.9 carries public SPKI, not private PKCS#8.
+        // https://www.w3.org/TR/xmldsig-core1/#sec-DEREncodedKeyValue
+        return Err(CommandError::Usage(format!(
+            "--keys-file is inapplicable to ML-KEM decapsulation in {}; supply the recipient PKCS#8 using --pkcs8-pem or --pkcs8-der instead",
+            invocation.command
+        )));
     }
     let candidates = named_candidate_search(
         &options,
@@ -5457,7 +5464,7 @@ fn select_recipient_private_keys<'a>(
         return Ok(vec![*candidate]);
     }
     if recipient_names.is_empty() {
-        let requested_names = Vec::new();
+        let requested_names: [&str; 0] = [];
         let wrapped = candidates
             .iter()
             .copied()
