@@ -2130,11 +2130,12 @@ fn verify_signature_node<'a>(
         }
     }
     let signed_info_node = signature_children.signed_info_node;
-    let should_parse_key_info = match (key, ctx.key_resolver) {
-        (Some(_), _) => false,
-        (None, Some(resolver)) => resolver.consumes_document_key_info(),
-        (None, None) => true,
-    };
+    let should_parse_key_info = ctx.decapsulation_key.is_none()
+        && match (key, ctx.key_resolver) {
+            (Some(_), _) => false,
+            (None, Some(resolver)) => resolver.consumes_document_key_info(),
+            (None, None) => true,
+        };
     let mut key_info = if should_parse_key_info {
         signature_children
             .key_info_node
@@ -2260,7 +2261,16 @@ fn verify_signature_node<'a>(
             if let Some(node) = signature_children.key_info_node {
                 // A pinned key ignores lookup hints, not mechanism instructions.
                 // Apply the same bounded reference discovery before key work.
-                if !should_parse_key_info && ctx.decapsulation_key.is_none() {
+                if ctx.decapsulation_key.is_some() {
+                    discover_encapsulation_with_budget(
+                        node,
+                        resolver,
+                        &ctx.policy.resources,
+                        &budgets.transforms,
+                        Some((&ctx.policy, ctx.xml_backend)),
+                        Some(&mut materialization),
+                    )?;
+                } else if !should_parse_key_info {
                     if has_encapsulation_with_budget(
                         node,
                         resolver,
@@ -2773,6 +2783,15 @@ impl KeyInfoMaterializationState {
         else {
             return Ok(());
         };
+        self.record_encapsulation(mechanism, resolver, depth)
+    }
+
+    fn record_encapsulation(
+        &mut self,
+        mechanism: crate::key_establishment::ParsedEncapsulation<'_, '_>,
+        resolver: &UriReferenceResolver<'_>,
+        depth: usize,
+    ) -> Result<(), SignatureVerificationPipelineError> {
         if self.encapsulation.is_some() {
             return Err(SignatureVerificationPipelineError::InvalidStructure {
                 reason: "multiple encapsulation mechanisms in resolved KeyInfo",
@@ -3209,6 +3228,17 @@ fn has_encapsulation_with_budget<P: KeyInfoReferencePolicy>(
     execution: &TransformExecutionBudget,
     external: Option<(&P, crate::XmlBackend)>,
 ) -> Result<bool, DsigError> {
+    discover_encapsulation_with_budget(node, resolver, resources, execution, external, None)
+}
+
+fn discover_encapsulation_with_budget<P: KeyInfoReferencePolicy>(
+    node: Node<'_, '_>,
+    resolver: &UriReferenceResolver<'_>,
+    resources: &crate::policy::ResourcePolicy,
+    execution: &TransformExecutionBudget,
+    external: Option<(&P, crate::XmlBackend)>,
+    materialization: Option<&mut KeyInfoMaterializationState>,
+) -> Result<bool, DsigError> {
     if resolver.node_for_node_id(node.id()) != Some(node) {
         return Err(DsigError::InvalidStructure {
             reason: "KeyInfo and resolver belong to different documents",
@@ -3224,14 +3254,17 @@ fn has_encapsulation_with_budget<P: KeyInfoReferencePolicy>(
         document_base: Option<&'a str>,
         external_path: Option<&'a ExternalProbePath<'a>>,
     }
+    struct DiscoveryState<'a> {
+        path: [Option<(usize, NodeId)>; crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING + 1],
+        work: usize,
+        materialization: Option<&'a mut KeyInfoMaterializationState>,
+    }
     fn visit<P: KeyInfoReferencePolicy>(
         node: Node<'_, '_>,
         resolver: &UriReferenceResolver<'_>,
         context: &ProbeContext<'_, P>,
-        path: &mut [Option<(usize, NodeId)>;
-                 crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING + 1],
+        state: &mut DiscoveryState<'_>,
         depth: usize,
-        work: &mut usize,
         execution: &TransformExecutionBudget,
     ) -> Result<bool, DsigError> {
         let ProbeContext {
@@ -3249,18 +3282,49 @@ fn has_encapsulation_with_budget<P: KeyInfoReferencePolicy>(
         // Every document on the active stack remains alive for this traversal;
         // arena identity distinguishes equal node IDs in different documents.
         let identity = (std::ptr::from_ref(node.document()) as usize, node.id());
-        if path[..depth].contains(&Some(identity)) {
+        if state.path[..depth].contains(&Some(identity)) {
+            if state.materialization.is_some() {
+                return Err(DsigError::InvalidStructure {
+                    reason: "KeyInfoReference cycle detected",
+                });
+            }
             return Ok(false);
         }
-        path[depth] = Some(identity);
+        state.path[depth] = Some(identity);
+        let mut found = false;
         for child in node.children().filter(Node::is_element) {
+            let work = match state.materialization.as_deref_mut() {
+                Some(materialization) => &mut materialization.candidate_work,
+                None => &mut state.work,
+            };
             *work += 1;
             resources.validate_key_candidates(*work)?;
             if child.has_tag_name((
                 crate::key_establishment::ENCAPSULATION_NS,
                 "EncapsulationMechanism",
             )) {
-                return Ok(true);
+                if state.materialization.is_none() {
+                    return Ok(true);
+                }
+                if let Some(materialization) = state.materialization.as_deref_mut() {
+                    let mechanism = crate::key_establishment::parse_encapsulation(
+                        child,
+                        materialization.encapsulation_template,
+                    )
+                    .map_err(|_| DsigError::InvalidStructure {
+                        reason: "invalid encapsulation mechanism in resolved KeyInfo",
+                    })?;
+                    materialization.record_encapsulation(mechanism, resolver, depth)?;
+                    if let (Some(mechanism), Some((policy, _))) =
+                        (&materialization.encapsulation, external)
+                    {
+                        policy
+                            .key_establishment()
+                            .check_encapsulation(mechanism.algorithm)?;
+                    }
+                }
+                found = true;
+                continue;
             }
             if !child.has_tag_name(("http://www.w3.org/2009/xmldsig11#", "KeyInfoReference")) {
                 continue;
@@ -3270,6 +3334,15 @@ fn has_encapsulation_with_budget<P: KeyInfoReferencePolicy>(
             };
             if uri.len() > super::parse::MAX_KEY_NAME_TEXT_LEN {
                 continue;
+            }
+            if state.materialization.is_some()
+                && let Some((policy, _)) = external
+                && !policy.key_info_reference_source_enabled()
+            {
+                return Err(crate::policy::PolicyViolation::KeyTrust {
+                    reason: "KeyInfoReference key sources are disabled",
+                }
+                .into());
             }
             if !uri.is_empty() && !uri.starts_with('#') {
                 let Some((policy, backend)) = external else {
@@ -3291,6 +3364,13 @@ fn has_encapsulation_with_budget<P: KeyInfoReferencePolicy>(
                         )
                     })?;
                 if !policy.key_info_reference_uris().allows(&resolved) {
+                    if state.materialization.is_some() {
+                        return Err(crate::policy::PolicyViolation::Uri {
+                            operation: "KeyInfoReference",
+                            reason: "URI class is disabled",
+                        }
+                        .into());
+                    }
                     continue;
                 }
                 // Resource identity, not a reparsed arena ID, detects external
@@ -3303,6 +3383,11 @@ fn has_encapsulation_with_budget<P: KeyInfoReferencePolicy>(
                     ancestor = entry.parent;
                 }
                 if ancestor.is_some() {
+                    if state.materialization.is_some() {
+                        return Err(DsigError::InvalidStructure {
+                            reason: "KeyInfoReference cycle detected",
+                        });
+                    }
                     continue;
                 }
                 let external_entry = ExternalProbePath {
@@ -3339,7 +3424,7 @@ fn has_encapsulation_with_budget<P: KeyInfoReferencePolicy>(
                     execution.xml_parse_work(),
                 )
                 .map_err(|error| map_document_parse_error(error, settings))?;
-                let found = document.with_view(|view| {
+                let target_found = document.with_view(|view| {
                     let external_resolver = resolver.for_external_document_view(view, resource);
                     let target = match fragment {
                         Some(fragment) if !fragment.is_empty() => external_resolver
@@ -3365,21 +3450,34 @@ fn has_encapsulation_with_budget<P: KeyInfoReferencePolicy>(
                             resources,
                             external,
                         },
-                        path,
+                        state,
                         depth + 1,
-                        work,
                         execution,
                     )
                 })?;
-                if found {
-                    return Ok(true);
+                if target_found {
+                    if state.materialization.is_none() {
+                        return Ok(true);
+                    }
+                    found = true;
                 }
                 continue;
             }
-            // Unconsumed key hints are not validity requirements. Once an
-            // instruction is found, the full resolver enforces XMLDSig 1.1
-            // section 4.5.10 (including the required KeyInfo target type).
+            // Unconsumed key hints are not validity requirements. Mechanism
+            // discovery checks only reachable KeyInfo instructions, not key
+            // candidates that an explicitly supplied recipient never uses.
+            // The target type is defined by XMLDSig 1.1 section 4.5.10.
             // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-KeyInfoReference
+            if state.materialization.is_some()
+                && let Some((policy, _)) = external
+                && !policy.key_info_reference_uris().allows(uri)
+            {
+                return Err(crate::policy::PolicyViolation::Uri {
+                    operation: "KeyInfoReference",
+                    reason: "URI class is disabled",
+                }
+                .into());
+            }
             let target = match resolver.node_for_same_document_reference_with_budget(
                 uri,
                 Some(execution.node_set_materialization()),
@@ -3389,12 +3487,15 @@ fn has_encapsulation_with_budget<P: KeyInfoReferencePolicy>(
                 _ => continue,
             };
             if target.has_tag_name((XMLDSIG_NS, "KeyInfo"))
-                && visit(target, resolver, context, path, depth + 1, work, execution)?
+                && visit(target, resolver, context, state, depth + 1, execution)?
             {
-                return Ok(true);
+                if state.materialization.is_none() {
+                    return Ok(true);
+                }
+                found = true;
             }
         }
-        Ok(false)
+        Ok(found)
     }
     visit(
         node,
@@ -3405,9 +3506,12 @@ fn has_encapsulation_with_budget<P: KeyInfoReferencePolicy>(
             document_base: None,
             external_path: None,
         },
-        &mut [None; crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING + 1],
+        &mut DiscoveryState {
+            path: [None; crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING + 1],
+            work: 0,
+            materialization,
+        },
         0,
-        &mut 0,
         execution,
     )
 }

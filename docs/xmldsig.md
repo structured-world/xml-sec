@@ -51,6 +51,10 @@ Ordinary explicit signing keys (including HMAC) and pinned verification keys ign
 unused key lookup hints, including malformed or unresolved hints. Bounded mechanism
 discovery follows local and policy-permitted external references without decoding
 unrelated key material.
+An explicitly supplied KEM decapsulation key likewise ignores unrelated key candidates:
+verification collects and validates the mechanism graph without importing lookup hints.
+This does not relax mechanism syntax, algorithm permission, reference policy, cycle,
+depth, ambiguity, or aggregate-work checks.
 An actual mechanism, direct or referenced, is an operation instruction and cannot
 be ignored by an ordinary signer or pinned verifier. Signing checks the projected XML size and
 reserves raw ciphertext, encoded ciphertext, and the HMAC secret copy before

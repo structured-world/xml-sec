@@ -393,6 +393,76 @@ fn all_donor_hmac_encapsulation_ciphertexts_verify() {
 }
 
 #[test]
+fn pinned_kem_recipient_ignores_unrelated_key_hints() {
+    // Unsigned lookup hints cannot invalidate verification with a pinned
+    // recipient; the actual encapsulation mechanism must still be validated.
+    let xml = std::fs::read_to_string(fixture_path(
+        "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-em-ml-kem-512.xml",
+    ))
+    .unwrap();
+    let key = RustCryptoMlKemPrivateKey::from_pkcs8_der(&fixture("ml-kem-512-key.der")).unwrap();
+    let document = xml_sec::Document::parse(&xml).unwrap();
+    let info = document
+        .root_element()
+        .children()
+        .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyInfo")))
+        .unwrap();
+    let original = &xml[info.range()];
+    let mut policy = xml_sec::policy::VerificationPolicy::default();
+    policy
+        .key_establishment
+        .encapsulation_algorithms
+        .insert(key.algorithm());
+    policy.key_trust.mode = xml_sec::policy::VerificationTrustMode::CryptographicOnly;
+    for hint in [
+        "<DEREncodedKeyValue xmlns=\"http://www.w3.org/2009/xmldsig11#\">not-base64!</DEREncodedKeyValue>",
+        "<KeyInfoReference xmlns=\"http://www.w3.org/2009/xmldsig11#\" URI=\"#missing\"/>",
+    ] {
+        let input = xml.replacen("<KeyInfo>", &format!("<KeyInfo>{hint}"), 1);
+        let result = xml_sec::xmldsig::VerifyContext::new()
+            .decapsulation_key(&key)
+            .policy(policy.clone())
+            .verify(&input)
+            .expect(hint);
+        assert_eq!(result.status, xml_sec::xmldsig::DsigStatus::Valid);
+        let target = original.replacen(
+            "<KeyInfo>",
+            &format!(
+                "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\" Id=\"recipient\">{hint}"
+            ),
+            1,
+        );
+        for uri in ["#recipient", "https://example.test/recipient.xml"] {
+            let reference = format!(
+                "<KeyInfo><KeyInfoReference xmlns=\"http://www.w3.org/2009/xmldsig11#\" URI=\"{uri}\"/></KeyInfo>"
+            );
+            let signed = xml.replacen(original, &reference, 1);
+            let resources = std::collections::HashMap::from([(
+                "https://example.test/recipient.xml".to_owned(),
+                target.as_bytes().to_vec(),
+            )]);
+            let mut referenced_policy = policy.clone();
+            referenced_policy.uris.key_info_references = xml_sec::xmldsig::UriTypeSet::ALL;
+            let input = if uri.starts_with('#') {
+                format!(
+                    "<root>{}{target}</root>",
+                    signed.trim_start_matches("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
+                )
+            } else {
+                signed
+            };
+            let result = xml_sec::xmldsig::VerifyContext::new()
+                .decapsulation_key(&key)
+                .policy(referenced_policy)
+                .external_resources(&resources)
+                .verify(&input)
+                .expect(hint);
+            assert_eq!(result.status, xml_sec::xmldsig::DsigStatus::Valid, "{uri}");
+        }
+    }
+}
+
+#[test]
 fn hmac_encapsulation_resolves_key_info_references() {
     // Moving unsigned KeyInfo must not alter signature verification; references
     // still obey the existing depth, cycle, source and URI policy gates.
@@ -1178,7 +1248,7 @@ fn multiple_signatures_share_the_encapsulation_allowance() {
     policy.key_establishment.max_encapsulation_operations = 1;
     let evidence = xml_sec::xmldsig::VerifyContext::new()
         .decapsulation_key(&private)
-        .policy(policy)
+        .policy(policy.clone())
         .verify_all(&document)
         .unwrap();
     assert!(!evidence.all_valid());
@@ -1195,6 +1265,31 @@ fn multiple_signatures_share_the_encapsulation_allowance() {
             .to_string()
             .contains("key encapsulation operations")
     );
+    // Mechanism discovery must also share candidate accounting across signatures.
+    policy.key_establishment.max_encapsulation_operations = 2;
+    let parsed = xml_sec::Document::parse(&signed).unwrap();
+    policy.resources.max_key_candidates = parsed
+        .descendants()
+        .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyInfo")))
+        .unwrap()
+        .children()
+        .filter(xml_sec::Node::is_element)
+        .count();
+    let evidence = xml_sec::xmldsig::VerifyContext::new()
+        .decapsulation_key(&private)
+        .policy(policy)
+        .verify_all(&document)
+        .unwrap();
+    assert_eq!(
+        evidence.signatures()[0].result().as_ref().unwrap().status,
+        xml_sec::xmldsig::DsigStatus::Valid
+    );
+    assert!(matches!(
+        evidence.signatures()[1].result(),
+        Err(xml_sec::xmldsig::DsigError::Policy(
+            xml_sec::policy::PolicyViolation::ResourceLimit { .. }
+        ))
+    ));
 }
 
 #[test]
