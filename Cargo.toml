@@ -100,6 +100,7 @@ module-lattice = { version = "0.2.3", default-features = false, features = ["ctu
 shake = { version = "0.1", default-features = false, optional = true }
 const-oid = { version = "0.10", default-features = false, features = ["db"], optional = true }
 slh-dsa = { version = "=0.2.0-rc.5", default-features = false, features = ["alloc", "zeroize"], optional = true }
+ml-kem = { version = "0.3.2", default-features = false, features = ["alloc", "zeroize"], optional = true }
 p256 = { version = "0.14", features = ["ecdsa"], optional = true }
 p384 = { version = "0.14", features = ["ecdsa"], optional = true }
 p521 = { version = "0.14", features = ["ecdsa"], optional = true }
@@ -224,7 +225,7 @@ xmlenc = [             # XML Encryption (encrypt + decrypt)
 ]
 c14n = []              # XML Canonicalization (inclusive + exclusive)
 # Experimental libxmlsec1 algorithm identifiers; build capability is not policy permission.
-experimental-pq = ["xmldsig", "dep:slh-dsa", "dep:common", "dep:ctutils", "dep:hybrid-array", "dep:module-lattice", "dep:shake", "dep:const-oid", "signature/digest", "signature/alloc", "signature/rand_core"]
+experimental-pq = ["xmldsig", "dep:slh-dsa", "dep:ml-kem", "dep:common", "dep:ctutils", "dep:hybrid-array", "dep:module-lattice", "dep:shake", "dep:const-oid", "signature/digest", "signature/alloc", "signature/rand_core"]
 no-unsafe = []
 embedded = []
 

@@ -775,6 +775,8 @@ pub struct EncryptedKey {
 /// Recursion is checked against the operation's depth and candidate allowances.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EncryptionKeySources {
+    /// Experimental KEM sources producing this wrapping key.
+    pub encapsulation_methods: Vec<crate::key_establishment::EncapsulationMechanism>,
     /// Keys transporting the wrapping key, rather than the final content key.
     pub encrypted_keys: Vec<EncryptedKey>,
     /// Derivations producing the wrapping key.
@@ -786,6 +788,7 @@ pub struct EncryptionKeySources {
 impl EncryptionKeySources {
     pub(super) fn is_empty(&self) -> bool {
         self.encrypted_keys.is_empty()
+            && self.encapsulation_methods.is_empty()
             && self.derived_keys.is_empty()
             && self.agreement_methods.is_empty()
     }
@@ -803,6 +806,8 @@ pub struct ReferenceList {
 /// Parsed `EncryptedData` document fragment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncryptedData {
+    /// Experimental KEM sources; never silently treated as raw content keys.
+    pub encapsulation_methods: Vec<crate::key_establishment::EncapsulationMechanism>,
     /// Optional XML identifier.
     pub id: Option<String>,
     /// Optional plaintext representation hint.
@@ -834,6 +839,9 @@ pub enum DecryptedContent {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum XmlEncError {
+    /// Shared key establishment failed before content encryption/decryption.
+    #[error(transparent)]
+    KeyEstablishment(#[from] crate::key_establishment::KeyEstablishmentError),
     /// URI resolution or ciphertext transforms failed.
     #[error("ciphertext reference error: {0}")]
     Transform(#[from] crate::xmldsig::TransformError),

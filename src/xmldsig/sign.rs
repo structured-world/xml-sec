@@ -147,6 +147,9 @@ impl From<OperationPlanError> for SigningDigestError {
 /// Errors returned by the full XMLDSig signing pipeline.
 #[derive(Debug, thiserror::Error)]
 pub enum SigningError {
+    /// Key establishment failed before the consuming HMAC operation.
+    #[error(transparent)]
+    KeyEstablishment(#[from] crate::key_establishment::KeyEstablishmentError),
     /// The compiled signing policy rejected input outside the Reference digest stage.
     #[error("signing policy violation: {0}")]
     Policy(#[from] crate::policy::PolicyViolation),
@@ -1776,7 +1779,8 @@ impl SignatureTemplateSelection {
 
 /// XMLDSig signing context.
 pub struct SignContext<'a> {
-    signing_key: &'a dyn SigningKey,
+    signing_key: Option<&'a dyn SigningKey>,
+    encapsulation_key: Option<&'a dyn crate::provider::KeyEncapsulationKey>,
     key_info_writer: Option<&'a dyn KeyInfoWriter>,
     start_node_id: Option<&'a str>,
     id_attributes: &'a [crate::IdAttributeRegistration],
@@ -1791,7 +1795,26 @@ impl<'a> SignContext<'a> {
     /// Create a signing context using the supplied private key.
     pub fn new(signing_key: &'a dyn SigningKey) -> Self {
         Self {
-            signing_key,
+            signing_key: Some(signing_key),
+            encapsulation_key: None,
+            key_info_writer: None,
+            start_node_id: None,
+            id_attributes: &[],
+            external_resources: None,
+            template_selection: SignatureTemplateSelection::default(),
+            policy: crate::policy::SigningPolicy::default(),
+            provider: crate::provider::default_provider(),
+            xml_backend: crate::XmlBackend::default(),
+        }
+    }
+
+    /// Establish an HMAC key from an explicit recipient public key. The template
+    /// must contain one experimental EncapsulationMechanism; policy must grant
+    /// its exact algorithm. KEM/HMAC alone does not authenticate the sender.
+    pub fn new_encapsulation(key: &'a dyn crate::provider::KeyEncapsulationKey) -> Self {
+        Self {
+            signing_key: None,
+            encapsulation_key: Some(key),
             key_info_writer: None,
             start_node_id: None,
             id_attributes: &[],
@@ -1977,7 +2000,7 @@ impl<'a> SignContext<'a> {
         target_signature: usize,
         budgets: &mut SigningOperationBudgets,
     ) -> Result<(), SigningError> {
-        document.with_view(|view| {
+        let signing_algorithm = document.with_view(|view| {
             let signature = find_signing_signature_node(
                 view.document(),
                 SigningSignatureTarget::Index(target_signature),
@@ -1998,7 +2021,7 @@ impl<'a> SignContext<'a> {
                     .hmac
                     .validate_output(algorithm, output_bits.unwrap_or(full_bits))?;
             }
-            Ok::<_, SigningError>(())
+            Ok::<_, SigningError>(algorithm)
         })?;
         let transform_options = TransformOptions::default()
             .id_attributes(self.id_attributes)
@@ -2019,20 +2042,174 @@ impl<'a> SignContext<'a> {
             None,
         );
         operation.compile()?;
-        let key_info_content = operation.run(key_info, || {
+        let (key_info_content, encapsulated) = operation.run_with_budgets(key_info, |budgets| {
+            let mechanism = document.with_view(|view| {
+                let signature = find_signing_signature_node(
+                    view.document(),
+                    SigningSignatureTarget::Index(target_signature),
+                )?;
+                let children = parse_signature_children(signature)
+                    .map_err(|error| SigningDigestError::InvalidStructure(error.to_string()))?;
+                let metadata_error = |error| match error {
+                    super::DsigError::Policy(violation) => SigningError::Policy(violation),
+                    error => SigningDigestError::InvalidStructure(error.to_string()).into(),
+                };
+                let resolver = external_resources.bind(
+                    view.document(),
+                    self.id_attributes,
+                    self.policy.transforms.same_document_id_semantics,
+                );
+                if self.encapsulation_key.is_none()
+                    && signing_algorithm.hmac_output_bits().is_none()
+                {
+                    if let Some(info) = children.key_info_node
+                        && super::verify::has_signing_encapsulation_with_budget(
+                            info,
+                            &resolver,
+                            &self.policy,
+                            &budgets.transforms,
+                            self.xml_backend,
+                        )
+                        .map_err(metadata_error)?
+                    {
+                        return Err(crate::key_establishment::KeyEstablishmentError::Structure(
+                            "mechanism and explicit recipient key must be supplied together",
+                        )
+                        .into());
+                    }
+                    return Ok(None);
+                }
+                let metadata = children
+                    .key_info_node
+                    .map(|node| {
+                        super::verify::inspect_signing_key_info_with_budgets(
+                            node,
+                            &resolver,
+                            &self.policy,
+                            self.provider,
+                            (&budgets.transforms, &mut budgets.xpath_parse),
+                            self.xml_backend,
+                        )
+                    })
+                    .transpose()
+                    .map_err(metadata_error)?;
+                let mechanism =
+                    metadata.and_then(|metadata| metadata.encapsulation.zip(metadata.cipher_value));
+                if mechanism.is_some() != self.encapsulation_key.is_some() {
+                    return Err(crate::key_establishment::KeyEstablishmentError::Structure(
+                        "mechanism and explicit recipient key must be supplied together",
+                    )
+                    .into());
+                }
+                mechanism
+                    .map(|(algorithm, target)| {
+                        self.policy
+                            .key_establishment
+                            .check_encapsulation(algorithm)?;
+                        if self
+                            .encapsulation_key
+                            .is_some_and(|key| key.algorithm() != algorithm)
+                        {
+                            return Err(
+                                crate::key_establishment::KeyEstablishmentError::Structure(
+                                    "recipient parameter set mismatch",
+                                )
+                                .into(),
+                            );
+                        }
+                        let target = view.document().get_node(target).ok_or(
+                            crate::key_establishment::KeyEstablishmentError::Structure(
+                                "missing ciphertext target",
+                            ),
+                        )?;
+                        Ok::<_, SigningError>(view.node_identity(target))
+                    })
+                    .transpose()
+            })?;
+            if let Some(key) = self.encapsulation_key {
+                if self.key_info_writer.is_some() {
+                    return Err(crate::key_establishment::KeyEstablishmentError::Structure(
+                        "KeyInfo writer cannot overwrite EncapsulationMechanism",
+                    )
+                    .into());
+                }
+                if signing_algorithm.hmac_output_bits().is_none() {
+                    return Err(crate::key_establishment::KeyEstablishmentError::Structure(
+                        "encapsulation requires HMAC",
+                    )
+                    .into());
+                }
+                self.policy.hmac.validate_key_bits(256)?;
+                let target = mechanism.expect("recipient requires mechanism");
+                let encoded_len = key.algorithm().ciphertext_len().div_ceil(3) * 4;
+                // Reserve the consumer's output before executing the primitive;
+                // encapsulate separately reserves its raw ciphertext allocation.
+                self.policy.resources.validate_xml_document_len(
+                    document.projected_content_replacement_len(target, encoded_len)?,
+                )?;
+                budgets.key_establishment.commit_all(
+                    &self.policy.key_establishment,
+                    0,
+                    0,
+                    32 + encoded_len as u128,
+                )?;
+                let result = budgets.key_establishment.encapsulate(
+                    &self.policy.key_establishment,
+                    self.provider,
+                    key,
+                )?;
+                return Ok((None, Some((target, result))));
+            }
             let Some(writer) = self.key_info_writer else {
-                return Ok::<_, SigningError>(None);
+                return Ok::<_, SigningError>((None, None));
             };
-            let key_info_content =
-                writer.write_key_info_with_provider(self.signing_key, self.provider)?;
+            let key_info_content = writer.write_key_info_with_provider(
+                self.signing_key.expect("ordinary signing request"),
+                self.provider,
+            )?;
             // Writer output is a separate untrusted XML input. Bound it before
             // namespace wrapping or parsing, then bound the merged document below.
             self.policy
                 .resources
                 .validate_xml_document_len(key_info_content.len())?;
-            Ok(Some(key_info_content))
+            Ok((Some(key_info_content), None))
         })?;
+        let established_key = if let Some((_, result)) = encapsulated.as_ref() {
+            Some(HmacSigningKey::new(result.shared_secret.to_vec())?)
+        } else {
+            None
+        };
+        let signing_key: &dyn SigningKey = match (&established_key, self.signing_key) {
+            (Some(key), _) => key,
+            (None, Some(key)) => key,
+            _ => {
+                return Err(crate::key_establishment::KeyEstablishmentError::Structure(
+                    "missing signing key",
+                )
+                .into());
+            }
+        };
         operation.extend();
+        let kem_mutation = if let Some((target, result)) = encapsulated {
+            let mutation =
+                operation.add_node(OperationNodeKind::Mutation, OperationStage::Resolve, None);
+            operation.add_dependency(mutation, key_info)?;
+            operation.compile()?;
+            operation.run_document_transition(mutation, document, |document, budgets| {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&result.ciphertext);
+                document
+                    .replace_base64_contents_with_budget(
+                        &[(target, encoded)],
+                        self.document_parse_settings(),
+                        budgets.transforms.xml_parse_work(),
+                    )
+                    .map_err(map_owned_document_mutation_error)
+            })?;
+            operation.extend();
+            Some(mutation)
+        } else {
+            None
+        };
         // Validate reference inputs and build the normalization candidate only after
         // independent key output has passed its own byte boundary. The execution pass
         // revalidates the resulting document defensively after controlled mutations.
@@ -2045,7 +2222,7 @@ impl<'a> SignContext<'a> {
         let normalization = if let Some(candidate) = c14n_candidate {
             let mutation =
                 operation.add_node(OperationNodeKind::Mutation, OperationStage::Resolve, None);
-            operation.add_dependency(mutation, key_info)?;
+            operation.add_dependency(mutation, kem_mutation.unwrap_or(key_info))?;
             operation.compile()?;
             operation.run_document_transition(mutation, document, |document, budgets| {
                 document
@@ -2061,7 +2238,7 @@ impl<'a> SignContext<'a> {
         } else {
             None
         };
-        let setup_gate = normalization.unwrap_or(key_info);
+        let setup_gate = normalization.or(kem_mutation).unwrap_or(key_info);
         let setup_gate = if let Some(key_info_content) = key_info_content {
             let mutation =
                 operation.add_node(OperationNodeKind::Mutation, OperationStage::Resolve, None);
@@ -2120,7 +2297,7 @@ impl<'a> SignContext<'a> {
             })?;
         self.policy.check_signature_algorithm(algorithm)?;
         let expected_signature_len = expected_signature_output_len(
-            self.signing_key,
+            signing_key,
             algorithm,
             &self.policy,
             hmac_output_length_bits,
@@ -2150,7 +2327,7 @@ impl<'a> SignContext<'a> {
                 .require_capability(crate::provider::ProviderCapability::Sign(algorithm))
                 .map_err(SigningKeyError::from)?;
             let mut signature_value = self.provider.sign_with_context(
-                self.signing_key,
+                signing_key,
                 algorithm,
                 &signature_context,
                 &canonical_signed_info,
@@ -2242,15 +2419,21 @@ impl<'a> SignContext<'a> {
         budgets: &mut SigningOperationBudgets,
     ) -> Result<(), SigningError> {
         self.policy.resources.validate_key_candidates(1)?;
-        let expected_signature_len = expected_signature_output_len(
-            self.signing_key,
-            builder.signature_method(),
-            &self.policy,
-            None,
-        )?;
+        let expected_signature_len = if let Some(key) = self.signing_key {
+            expected_signature_output_len(key, builder.signature_method(), &self.policy, None)?
+        } else {
+            self.policy.hmac.validate_key_bits(256)?;
+            builder.signature_method().hmac_output_bits().ok_or(
+                crate::key_establishment::KeyEstablishmentError::Structure(
+                    "encapsulation requires HMAC",
+                ),
+            )? / 8
+        };
         let template = builder.build_template_with_policy_for_signature_output(
             &self.policy,
             expected_signature_len,
+            self.encapsulation_key
+                .map(crate::provider::KeyEncapsulationKey::algorithm),
             &budgets.transforms,
             &mut budgets.xpath_parse,
         )?;
@@ -2407,6 +2590,7 @@ struct SigningReference {
 }
 
 struct SigningOperationBudgets {
+    key_establishment: crate::key_establishment::KeyEstablishmentUsage,
     transforms: TransformExecutionBudget,
     xpath_parse: XPathSignatureParseBudget,
 }
@@ -2427,6 +2611,7 @@ struct SigningPlanNodes {
 impl SigningOperationBudgets {
     fn from_resources(resources: &crate::policy::ResourcePolicy) -> Self {
         Self {
+            key_establishment: Default::default(),
             transforms: TransformExecutionBudget::from_resources(resources),
             xpath_parse: XPathSignatureParseBudget::from_resources(resources),
         }
@@ -2437,6 +2622,7 @@ impl SigningOperationBudgets {
         backend: crate::XmlBackend,
     ) -> Self {
         Self {
+            key_establishment: Default::default(),
             transforms: TransformExecutionBudget::from_resources(resources)
                 .with_xml_backend(backend),
             xpath_parse: XPathSignatureParseBudget::from_resources(resources),

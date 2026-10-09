@@ -10,6 +10,8 @@ use crate::provider::{
 use crate::xmldsig::{DigestAlgorithm, SignatureAlgorithm};
 
 use super::XmlEncError;
+pub(super) use crate::key_establishment::KeyEstablishmentUsage;
+use crate::key_establishment::reserve;
 
 /// Cumulative KDF allowance borrowed from one immutable operation policy.
 ///
@@ -19,15 +21,6 @@ use super::XmlEncError;
 pub struct KeyEstablishmentBudget<'a> {
     policy: &'a KeyEstablishmentPolicy,
     usage: KeyEstablishmentUsage,
-}
-
-/// Counters live with the operation, independently of the borrowed snapshot.
-/// This avoids cloning policy or resetting reservations in nested resolvers.
-#[derive(Debug, Default)]
-pub(super) struct KeyEstablishmentUsage {
-    hash_blocks: usize,
-    owned_bytes: usize,
-    modular_work: usize,
 }
 
 impl<'a> KeyEstablishmentBudget<'a> {
@@ -231,7 +224,7 @@ impl KeyEstablishmentUsage {
         blocks: u128,
         allocations: u128,
     ) -> Result<(), XmlEncError> {
-        self.commit_all(policy, blocks, 0, allocations)
+        Ok(self.commit_all(policy, blocks, 0, allocations)?)
     }
 
     fn commit_dh_reservation(
@@ -240,40 +233,7 @@ impl KeyEstablishmentUsage {
         modular: u128,
         allocations: u128,
     ) -> Result<(), XmlEncError> {
-        self.commit_all(policy, 0, modular, allocations)
-    }
-
-    fn commit_all(
-        &mut self,
-        policy: &KeyEstablishmentPolicy,
-        blocks: u128,
-        modular: u128,
-        allocations: u128,
-    ) -> Result<(), XmlEncError> {
-        let work = reserve(
-            crate::policy::resource_name::KEY_ESTABLISHMENT_HASH_BLOCKS,
-            self.hash_blocks,
-            blocks,
-            policy.max_hash_blocks,
-        )?;
-        let bytes = reserve(
-            crate::policy::resource_name::KEY_ESTABLISHMENT_OWNED_BYTES,
-            self.owned_bytes,
-            allocations,
-            policy.max_owned_bytes,
-        )?;
-        let modular = reserve(
-            crate::policy::resource_name::KEY_ESTABLISHMENT_MODULAR_WORK,
-            self.modular_work,
-            modular,
-            policy.max_modular_work,
-        )?;
-        // Commit both reservations atomically before provider work. No recipient
-        // may recover exhausted operation allowance by moving to another source.
-        self.hash_blocks = work;
-        self.owned_bytes = bytes;
-        self.modular_work = modular;
-        Ok(())
+        Ok(self.commit_all(policy, 0, modular, allocations)?)
     }
 }
 
@@ -286,22 +246,6 @@ fn check_width(bytes: &[u8], expected: usize) -> Result<(), XmlEncError> {
         .into());
     }
     Ok(())
-}
-
-fn reserve(
-    resource: &'static str,
-    used: usize,
-    count: u128,
-    maximum: usize,
-) -> Result<usize, PolicyViolation> {
-    if used > maximum || count > (maximum - used) as u128 {
-        return Err(PolicyViolation::ResourceLimit {
-            resource,
-            maximum,
-            actual: usize::try_from(used as u128 + count).unwrap_or(usize::MAX),
-        });
-    }
-    Ok(used + count as usize)
 }
 
 fn invalid(kind: ProviderInputError) -> XmlEncError {

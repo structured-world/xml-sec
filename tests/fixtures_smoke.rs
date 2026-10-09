@@ -199,9 +199,11 @@ fn fixture_file_count_matches_expected() {
         // two EdDSA, three ML-DSA, and six SLH-DSA parameter sets (121 total).
         // Five DSA inputs cover reciprocal 1024/2048/3072-bit signing.
         // All 17 upstream PSS cases include both signed XML and its template.
-        ("xmldsig", 367),
+        // ML-KEM adds six key formats and two DSig inputs for each of three sets.
+        ("xmldsig", 391),
         ("saml", 2),
-        ("xmlenc", 485),
+        // Six ML-KEM CBC/GCM cases each supply XML, template and plaintext.
+        ("xmlenc", 503),
     ];
 
     for (corpus, expected_count) in expected {

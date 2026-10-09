@@ -44,6 +44,14 @@ public and PKCS#12 keys can be restricted at import with
 `add_pkcs12_with_usages`; the shorter methods authorize only operations
 supported by that key family. An EC/DSA private key may sign but cannot be
 assigned RSA decryption usage. Incompatible or empty usage sets are rejected.
+XML inventories also accept public SPKI in `dsig11:DEREncodedKeyValue`
+([XMLDSig 1.1 §4.5.9](https://www.w3.org/TR/xmldsig-core1/#sec-DEREncodedKeyValue)).
+With `experimental-pq`, ML-KEM SPKI follows RFC 9935 §4 and receives encryption
+usage only. The element never carries private PKCS#8; private ML-KEM material
+uses the existing PEM/DER or PKCS#12 import APIs and RFC 9935 §6 encoding.
+
+With `experimental-pq`, automatic PKCS#12 import gives ML-KEM private keys
+only `Decrypt` usage for decapsulation; explicitly requesting `Sign` is rejected.
 EC and DSA public keys can verify but cannot be authorized as RSA encryption
 recipients, including when imported from `keys.xml`. Imported certificates
 are lookup candidates, **not trust anchors**, unless the caller

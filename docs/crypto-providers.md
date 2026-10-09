@@ -101,6 +101,28 @@ Without it, that selection is an explicit unavailable-provider error.
 
 ## Mechanisms
 
+With `experimental-pq`, RustCrypto provides ML-KEM-512/768/1024 through
+`CryptoProvider::{import_encapsulation_key, import_decapsulation_key,
+encapsulate_key, decapsulate_key}` and opaque recipient handles. Generation and
+encapsulation use the selected provider's CSPRNG; unavailable providers never
+fall back to RustCrypto. AWS-LC FIPS and PKCS#11 do not advertise these KEM paths.
+Private keys and shared secrets use zeroizing storage and redacted diagnostics.
+
+`RustCryptoMlKemPrivateKey` imports all [RFC 9935 section 6](https://www.rfc-editor.org/rfc/rfc9935.html#section-6)
+PKCS#8 forms: seed, expanded, and combined. Combined keys must be consistent;
+expanded-only keys cannot export a seed that was never supplied. SPKI uses the
+exact parameter-set OID, absent parameters, and fixed-width raw public key.
+Malformed framing fails before private-key execution. Valid-width invalid
+ciphertexts retain FIPS 203 implicit rejection: no validity bit is exposed.
+
+Library operation policies deny KEM by default. Add the required parameter set
+to `KeyEstablishmentPolicy::encapsulation_algorithms`; the same typed policy
+also bounds encapsulation attempts and retained bytes. Attempts, including
+provider failures, consume one monotonic operation allowance shared with
+agreement and derivation. Raw provider primitives do not grant XML permission.
+All imported donor key/signature/encryption vectors are exercised offline;
+setting `OPENSSL_BIN` additionally enables reciprocal OpenSSL testing.
+
 With `xmlenc`, RustCrypto exposes X25519 and P-256/P-384/P-521 ECDH through
 `CryptoProvider::agree_key`, using opaque `RustCryptoX25519Key` and
 `RustCryptoEcdhKey` handles. ECDH validates peer points and preserves fixed-width

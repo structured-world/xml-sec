@@ -101,6 +101,7 @@ if (( ${#fixture_paths[@]} == 0 )); then
     "xmldsig/keys/dsa/dsa-1024-pubkey.pem"
     "xmldsig/keys/dsa/dsa-2048-pubkey.pem"
     "xmldsig/keys/dsa/dsa-3072-pubkey.pem"
+    "xmldsig/keys/ml-kem"
     "xmldsig/merlin-xmldsig-twenty-three"
     "xmldsig/phaos-xmldsig-three"
     "xmldsig/xmldsig11-interop-2012"
@@ -121,6 +122,20 @@ if (( ${#fixture_paths[@]} == 0 )); then
       if [[ "$hash" != sha1 ]]; then
         fixture_paths+=("xmldsig/aleksey-xmldsig-01/enveloped-$hash-rsa-pss-$hash.$extension")
       fi
+    done
+  done
+  # Complete ML-KEM families exercised by the upstream DSig/Enc runners.
+  for size in 512 768 1024; do
+    for extension in xml tmpl; do
+      fixture_paths+=("xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-em-ml-kem-$size.$extension")
+    done
+    for extension in xml tmpl data; do
+      fixture_paths+=("xmlenc/aleksey-xmlenc-01/enc-aes256-em-ml-kem-$size.$extension")
+    done
+  done
+  for family in aes128gcm-em-ml-kem-512 aes192gcm-em-ml-kem-768 aes256gcm-em-ml-kem-1024; do
+    for extension in xml tmpl data; do
+      fixture_paths+=("xmlenc/aleksey-xmlenc-01/enc-$family.$extension")
     done
   done
 fi

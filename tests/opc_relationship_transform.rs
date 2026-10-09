@@ -597,6 +597,7 @@ fn relationship_digest_authenticates_selected_rows_only() {
 }
 
 #[test]
+#[cfg(feature = "xmlenc")]
 fn cipher_reference_uses_typed_edition_and_selected_backend_for_encoded_input() {
     // The XMLEnc adapter must share edition policy and octet decoding, not
     // silently use its own default transform configuration.

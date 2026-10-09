@@ -191,7 +191,7 @@ are checked during each attempt rather than only after selecting a key. The CLI
 rejects an oversized candidate ring before opening any private-key source, and
 every successfully read private-key source and certificate companion is also
 charged to one invocation-wide external-material byte budget before decoding.
-Before signing- or verification-key selection, the CLI recursively materializes
+When signing- or verification-key selection consumes document hints, the CLI recursively materializes
 same-document `KeyInfoReference` sources under the operation policy's shared
 depth and key-candidate limits. Referenced `KeyName` and public identity sources therefore
 participate in the same selection and validation as direct children. Missing,
@@ -427,6 +427,31 @@ advertise them in builds without that feature. These experimental XML methods
 are not standardized algorithm URIs; see [XMLDSig details](xmldsig.md).
 The compatibility executable explicitly permits compiled PQ XML methods for both signing
 and verification; core library defaults still require an explicit algorithm allowlist.
+ML-KEM-512/768/1024 also require `experimental-pq`. In such builds,
+`list-key-data` and `check-key-data` expose the
+`encapsulation-mechanism` handler only when the selected crypto engine supports KEM.
+For an `EncapsulationMechanism` template, `sign` and `encrypt` take the recipient
+`--pubkey-pem`/`--pubkey-der`; `verify` and `decrypt` take the recipient
+`--privkey-pem`/`--privkey-der` or `--pkcs8-pem`/`--pkcs8-der`, with `--pwd`
+for protected PKCS#8. For `sign` and `encrypt`, `--keys-file` can select a named
+public ML-KEM key encoded as `dsig11:DEREncodedKeyValue` (Base64 DER SPKI,
+XMLDSig 1.1 §4.5.9 and RFC 9935 §4). This is an extension beyond the donor's
+ML-KEM XML key-store support, not a new key encoding. Private recipient keys
+use PKCS#8 (RFC 9935 §6); `--keys-file` cannot supply them for `verify` or
+`decrypt`, and the diagnostic names the command and the applicable PKCS#8 options.
+Mixing ordinary signing keys with a KEM template is rejected,
+and recipient-only options without a mechanism report which option is
+inapplicable. KEM/HMAC verification needs explicit `--insecure`: it validates
+message integrity but cannot establish sender identity. These are experimental
+libxmlsec1 bindings, not standardized W3C algorithms.
+KEM recipient selection in `sign`, `verify`, and `decrypt` follows the core's resolved source graph,
+including same-document `KeyInfoReference` and caller-declared `--id-attr`
+registrations. Named private options in `verify` retain `KeyName` selection;
+`--lax-key-search` is the explicit opt-out from name matching.
+An explicitly pinned ordinary HMAC key still ignores unused `KeyInfo` hints;
+it does not bypass a direct or same-document referenced encapsulation mechanism.
+Private ML-KEM inventory entries require exactly decryption usage, not verification,
+encryption, signing, or mixed usages.
 Public verification accepts SubjectPublicKeyInfo,
 PKCS#1 RSA public keys, and X.509 certificates. Encryption accepts RSA public
 keys or RSA X.509 recipient certificates in PEM or DER. Explicit verification
