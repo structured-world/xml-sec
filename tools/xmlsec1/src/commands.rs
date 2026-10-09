@@ -34,7 +34,7 @@ use xml_sec::{
         EncryptedDataBuilder, EncryptedDataType, EncryptedKey, EncryptionMethod,
         EncryptionRecipient, KekDecryptor, KeyCandidateBudget, KeyTransportAlgorithm,
         KeyWrapAlgorithm, OaepDigestAlgorithm, PrivateKeyDecryptor, RsaOaepParameters, XmlEncError,
-        parse_encrypted_data_template_node_with_policy_and_backend, validate_rsa_recipient_key,
+        validate_rsa_recipient_key,
     },
 };
 use xml_sec::{
@@ -3540,6 +3540,25 @@ fn apply_encryption_template(
         parse_encryption_document(generated, &policy.xml, &policy.resources, xml_backend)?;
     let template_data = select_encrypted_data(&template_document, start_node_id, id_attributes)?;
     let generated_data = generated_document.root_element();
+    let inspected = if template_document.descendants().any(|node| {
+        node.has_tag_name((
+            xml_sec::key_establishment::ENCAPSULATION_NS,
+            "EncapsulationMechanism",
+        ))
+    }) {
+        Some(
+            xml_sec::xmlenc::inspect_encrypted_data_template_node_with_context(
+                template_data,
+                policy,
+                xml_backend,
+                xml_sec::provider::default_provider(),
+                id_attributes,
+            )
+            .map_err(|error| CommandError::Encryption(error.to_string()))?,
+        )
+    } else {
+        None
+    };
     let template_cipher = required_cipher_value(template_data, "template EncryptedData")?;
     let generated_cipher = required_cipher_value(generated_data, "generated EncryptedData")?;
     let mut replacements = vec![replace_element_text(
@@ -3565,13 +3584,13 @@ fn apply_encryption_template(
     let generated_key_info = direct_child_element(generated_data, XMLDSIG_NS, "KeyInfo");
     match (template_key_info, generated_key_info) {
         (Some(template_key_info), Some(generated_key_info)) => {
-            let template_kem =
-                xml_sec::key_establishment::direct_encapsulation(template_key_info, true)
-                    .map_err(|error| CommandError::Encryption(error.to_string()))?;
             let generated_kem =
                 xml_sec::key_establishment::direct_encapsulation(generated_key_info, false)
                     .map_err(|error| CommandError::Encryption(error.to_string()))?;
-            if let (Some(template_kem), Some(generated_kem)) = (&template_kem, &generated_kem) {
+            let template_kem = inspected.as_ref().map_or(&[][..], |inspected| {
+                inspected.data().encapsulation_methods.as_slice()
+            });
+            if let ([template_kem], Some(generated_kem)) = (template_kem, &generated_kem) {
                 if template_kem.algorithm != generated_kem.algorithm {
                     return Err(CommandError::Encryption(
                         "generated encapsulation parameter set differs from template".into(),
@@ -3579,10 +3598,19 @@ fn apply_encryption_template(
                 }
                 replacements.push(replace_element_text(
                     template,
-                    template_kem.cipher_value,
+                    *inspected
+                        .as_ref()
+                        .expect("selected template mechanism was inspected")
+                        .encapsulation_cipher_values()
+                        .first()
+                        .ok_or_else(|| {
+                            CommandError::Encryption(
+                                "template encapsulation origin is missing".into(),
+                            )
+                        })?,
                     generated_kem.cipher_value.text().unwrap_or_default(),
                 )?);
-            } else if template_kem.is_some() {
+            } else if !template_kem.is_empty() || generated_kem.is_some() {
                 return Err(CommandError::Encryption(
                     "template encapsulation was not executed".into(),
                 ));
@@ -3605,6 +3633,13 @@ fn apply_encryption_template(
             let missing_generated_children = generated_key_info
                 .children()
                 .filter(|node| node.is_element() && !node.has_tag_name((XMLENC_NS, "EncryptedKey")))
+                .filter(|node| {
+                    template_kem.is_empty()
+                        || !node.has_tag_name((
+                            xml_sec::key_establishment::ENCAPSULATION_NS,
+                            "EncapsulationMechanism",
+                        ))
+                })
                 .filter(|generated_child| {
                     !template_key_info.children().any(|template_child| {
                         template_child.is_element()
@@ -3946,45 +3981,6 @@ fn direct_encrypted_keys<'a, 'input>(key_info: Node<'a, 'input>) -> Vec<Node<'a,
         .collect()
 }
 
-fn recipient_encapsulation(
-    encrypted_data: &xml_sec::xmlenc::EncryptedData,
-) -> Result<Option<&xml_sec::key_establishment::EncapsulationMechanism>, CommandError> {
-    fn visit<'a>(
-        methods: &'a [xml_sec::key_establishment::EncapsulationMechanism],
-        keys: &'a [EncryptedKey],
-        selected: &mut Option<&'a xml_sec::key_establishment::EncapsulationMechanism>,
-    ) -> Result<(), CommandError> {
-        for method in methods {
-            if selected.is_some() {
-                return Err(CommandError::Usage(
-                    "multiple KEM recipients require explicit application key resolution".into(),
-                ));
-            }
-            *selected = Some(method);
-        }
-        // Core parsing already enforces the non-configurable key-source depth
-        // ceiling, recipient count, and policy before constructing this graph.
-        for key in keys {
-            visit(
-                &key.sources.encapsulation_methods,
-                &key.sources.encrypted_keys,
-                selected,
-            )?;
-        }
-        Ok(())
-    }
-    let mut selected = None;
-    // XMLDSig 1.1 section 4.5.10 resolves KeyInfoReference before interpreting
-    // its sources: lexical descendants are not the resolved recipient graph.
-    // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-KeyInfoReference
-    visit(
-        &encrypted_data.encapsulation_methods,
-        &encrypted_data.encrypted_keys,
-        &mut selected,
-    )?;
-    Ok(selected)
-}
-
 fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
     validate_options(invocation, DECRYPT_OPTIONS)?;
     let xml_backend = selected_xml_backend(invocation)?;
@@ -4056,7 +4052,7 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         ))
     }) {
         Some(
-            xml_sec::xmlenc::parse_encrypted_data_node_with_context(
+            xml_sec::xmlenc::inspect_encrypted_data_node_with_context(
                 encrypted_data,
                 &policy,
                 xml_backend,
@@ -4070,9 +4066,7 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     };
     let mechanism = parsed
         .as_ref()
-        .map(recipient_encapsulation)
-        .transpose()?
-        .flatten();
+        .and_then(|parsed| parsed.recipient_encapsulation());
     let bytes = if let Some(mechanism) = mechanism {
         policy
             .key_establishment
@@ -4102,27 +4096,38 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             &mut budget,
         )?;
         let resolver = xml_sec::xmlenc::EncapsulationDecryptor::provider_key(key);
-        if standalone {
+        if standalone
+            && !parsed
+                .as_ref()
+                .expect("selected mechanism has parsed data")
+                .requires_document_context()
+        {
             // Reuse the validated descriptor graph for byte output. Re-reading
             // the XML would decode and allocate every recipient a second time.
             DecryptContext::new(&resolver)
                 .provider(selected_provider(invocation)?)
                 .policy(policy)
-                .decrypt_data(parsed.as_ref().expect("selected mechanism has parsed data"))
+                .decrypt_data(
+                    parsed
+                        .as_ref()
+                        .expect("selected mechanism has parsed data")
+                        .data(),
+                )
                 .map(|content| match content {
                     DecryptedContent::Xml(xml) => xml.into_bytes(),
                     DecryptedContent::Bytes(bytes) => bytes,
                 })
                 .map_err(|error| CommandError::Encryption(error.to_string()))?
         } else {
-            // Document mutation reparses under its own stable identity. Keep
-            // only the provider key, not a second live recipient graph.
+            // Associations and CipherReference require the original document's
+            // registered IDs, even for standalone byte output. Keep only the
+            // provider key, not a second live recipient graph.
             drop(parsed);
             decrypt_input(
                 &resolver,
                 &xml,
                 encrypted_data_id,
-                false,
+                standalone,
                 policy,
                 &id_attributes,
                 CommandBackends {
@@ -5266,12 +5271,15 @@ fn encryption_template(
     // Templates preserve every non-cipher field. Parse the selected node through
     // the reciprocal core path first so encryption cannot emit a document that
     // the same policy snapshot would reject during decryption.
-    let parsed = parse_encrypted_data_template_node_with_policy_and_backend(
+    let parsed = xml_sec::xmlenc::inspect_encrypted_data_template_node_with_context(
         encrypted_data,
         policy,
         xml_backend,
+        xml_sec::provider::default_provider(),
+        id_attributes,
     )
-    .map_err(|error| CommandError::Encryption(error.to_string()))?;
+    .map_err(|error| CommandError::Encryption(error.to_string()))?
+    .into_data();
     let algorithm = DataEncryptionAlgorithm::from_uri(&parsed.encryption_method.algorithm)
         .map_err(|error| CommandError::Encryption(error.to_string()))?;
     let encapsulation = match parsed.encapsulation_methods.as_slice() {
@@ -7217,6 +7225,117 @@ mod tests {
             document
                 .descendants()
                 .any(|node| node.has_tag_name(("http://www.w3.org/2009/xmlenc11#", "MGF")))
+        );
+    }
+
+    #[cfg(feature = "experimental-pq")]
+    fn kem_template(mechanism_info: &str, outer_info: &str, sibling: &str) -> String {
+        format!(
+            "<root xmlns:x=\"{XMLENC_NS}\" xmlns:d=\"{XMLDSIG_NS}\" xmlns:i=\"http://www.w3.org/2009/xmldsig11#\" xmlns:k=\"{}\"><x:EncryptedData Id=\"data\"><x:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><d:KeyInfo>{outer_info}</d:KeyInfo><x:CipherData><x:CipherValue/></x:CipherData></x:EncryptedData><d:KeyInfo Id=\"mechanism\"><k:EncapsulationMechanism Algorithm=\"{}\"><d:KeyInfo>{mechanism_info}</d:KeyInfo><x:CipherData><x:CipherValue/></x:CipherData></k:EncapsulationMechanism></d:KeyInfo>{sibling}</root>",
+            xml_sec::key_establishment::ENCAPSULATION_NS,
+            xml_sec::provider::KeyEncapsulationAlgorithm::MlKem512.uri(),
+        )
+    }
+
+    #[test]
+    #[cfg(feature = "experimental-pq")]
+    fn kem_template_resolves_inner_recipient_references() {
+        // A recipient name referenced inside the mechanism must reach selection.
+        let template = kem_template(
+            "<i:KeyInfoReference URI=\"#recipient\"/>",
+            "<i:KeyInfoReference URI=\"#mechanism\"/>",
+            "<d:KeyInfo Id=\"recipient\"><d:KeyName>wanted</d:KeyName></d:KeyInfo>",
+        );
+        let metadata = encryption_template(
+            &template,
+            Some("data"),
+            &[],
+            &xmlsec_compatibility_encryption_policy(),
+            XmlBackend::default(),
+        )
+        .unwrap();
+        assert_eq!(metadata.encapsulation.unwrap().1, ["wanted"]);
+        for invalid in [
+            template.replace("URI=\"#recipient\"", "URI=\"#absent\""),
+            template.replace(
+                "<d:KeyName>wanted</d:KeyName>",
+                "<i:KeyInfoReference URI=\"#mechanism\"/>",
+            ),
+        ] {
+            assert!(
+                encryption_template(
+                    &invalid,
+                    Some("data"),
+                    &[],
+                    &xmlsec_compatibility_encryption_policy(),
+                    XmlBackend::default()
+                )
+                .is_err()
+            );
+        }
+        let custom = template.replace("Id=\"recipient\"", "custom=\"recipient\"");
+        assert!(
+            encryption_template(
+                &custom,
+                Some("data"),
+                &[],
+                &xmlsec_compatibility_encryption_policy(),
+                XmlBackend::default()
+            )
+            .is_err()
+        );
+        let metadata = encryption_template(
+            &custom,
+            Some("data"),
+            &[IdAttributeRegistration::global("custom")],
+            &xmlsec_compatibility_encryption_policy(),
+            XmlBackend::default(),
+        )
+        .unwrap();
+        assert_eq!(metadata.encapsulation.unwrap().1, ["wanted"]);
+    }
+
+    #[test]
+    #[cfg(feature = "experimental-pq")]
+    fn kem_template_updates_referenced_cipher_value() {
+        // Mutate the original referenced mechanism, not a new inline duplicate.
+        use base64::Engine as _;
+        let template = kem_template(
+            "<d:KeyName>wanted</d:KeyName>",
+            "<i:KeyInfoReference URI=\"#mechanism\"/>",
+            "",
+        );
+        let ciphertext = base64::engine::general_purpose::STANDARD.encode([7; 768]);
+        let generated = format!(
+            "<x:EncryptedData xmlns:x=\"{XMLENC_NS}\" xmlns:d=\"{XMLDSIG_NS}\" xmlns:k=\"{}\"><x:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><d:KeyInfo><k:EncapsulationMechanism Algorithm=\"{}\"><d:KeyInfo><d:KeyName>wanted</d:KeyName></d:KeyInfo><x:CipherData><x:CipherValue>{ciphertext}</x:CipherValue></x:CipherData></k:EncapsulationMechanism></d:KeyInfo><x:CipherData><x:CipherValue>AA==</x:CipherValue></x:CipherData></x:EncryptedData>",
+            xml_sec::key_establishment::ENCAPSULATION_NS,
+            xml_sec::provider::KeyEncapsulationAlgorithm::MlKem512.uri(),
+        );
+        let rendered = apply_encryption_template(
+            &template,
+            &generated,
+            Some("data"),
+            &[],
+            &xmlsec_compatibility_encryption_policy(),
+            XmlBackend::default(),
+        )
+        .unwrap();
+        let document = Document::parse(&rendered).unwrap();
+        let mechanisms: Vec<_> = document
+            .descendants()
+            .filter(|node| {
+                node.has_tag_name((
+                    xml_sec::key_establishment::ENCAPSULATION_NS,
+                    "EncapsulationMechanism",
+                ))
+            })
+            .collect();
+        assert_eq!(mechanisms.len(), 1);
+        assert_eq!(
+            required_cipher_value(mechanisms[0], "mechanism")
+                .unwrap()
+                .text(),
+            Some(ciphertext.as_str())
         );
     }
 

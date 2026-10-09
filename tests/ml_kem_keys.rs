@@ -911,6 +911,98 @@ fn all_donor_key_formats_preserve_the_exact_key_pair() {
 
 #[cfg(feature = "xmlenc")]
 #[test]
+fn cli_encrypts_referenced_recipient_metadata() {
+    // Both levels of reference must select the named key and mutate the same
+    // mechanism. A wrong first store entry exposes lost recipient names.
+    use base64::Engine as _;
+    let directory = tempfile::tempdir().unwrap();
+    let algorithm = KeyEncapsulationAlgorithm::MlKem512;
+    let wanted = RustCryptoMlKemPrivateKey::from_seed(algorithm, &[7; 64]).unwrap();
+    let wrong = RustCryptoMlKemPrivateKey::from_seed(algorithm, &[8; 64]).unwrap();
+    let store = directory.path().join("keys.xml");
+    let mut store_xml = String::from("<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\">");
+    for (name, key) in [("wrong", &wrong), ("wanted", &wanted)] {
+        store_xml.push_str(&format!(
+            "<d:KeyInfo xmlns:d=\"http://www.w3.org/2000/09/xmldsig#\"><d:KeyName>{name}</d:KeyName><i:DEREncodedKeyValue xmlns:i=\"http://www.w3.org/2009/xmldsig11#\">{}</i:DEREncodedKeyValue></d:KeyInfo>",
+            base64::engine::general_purpose::STANDARD.encode(key.public_key().to_spki_der().unwrap().as_bytes()),
+        ));
+    }
+    store_xml.push_str("</Keys>");
+    std::fs::write(&store, store_xml).unwrap();
+    let template = directory.path().join("template.xml");
+    let plaintext = directory.path().join("plaintext.xml");
+    let encrypted = directory.path().join("encrypted.xml");
+    let private = directory.path().join("private.der");
+    std::fs::write(
+        &private,
+        wanted
+            .to_pkcs8_der(MlKemPrivateKeyEncoding::Seed)
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    std::fs::write(&plaintext, "<message>referenced recipient</message>").unwrap();
+    std::fs::write(&template, format!(
+        "<root xmlns:x=\"http://www.w3.org/2001/04/xmlenc#\" xmlns:d=\"http://www.w3.org/2000/09/xmldsig#\" xmlns:i=\"http://www.w3.org/2009/xmldsig11#\" xmlns:k=\"{}\"><x:EncryptedData Id=\"data\"><x:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><d:KeyInfo><i:KeyInfoReference URI=\"#mechanism\"/></d:KeyInfo><x:CipherData><x:CipherValue/></x:CipherData></x:EncryptedData><d:KeyInfo Id=\"mechanism\"><k:EncapsulationMechanism Algorithm=\"{}\"><d:KeyInfo><i:KeyInfoReference URI=\"#recipient\"/></d:KeyInfo><x:CipherData><x:CipherValue/></x:CipherData></k:EncapsulationMechanism></d:KeyInfo><d:KeyInfo custom=\"recipient\"><d:KeyName>wanted</d:KeyName></d:KeyInfo></root>",
+        xml_sec::key_establishment::ENCAPSULATION_NS, algorithm.uri(),
+    )).unwrap();
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_xmlsec1"))
+        .args([
+            "encrypt",
+            "--node-id",
+            "data",
+            "--add-id-attr",
+            "custom",
+            "--keys-file",
+        ])
+        .arg(&store)
+        .arg("--xml-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_xmlsec1"))
+        .args([
+            "decrypt",
+            "--node-id",
+            "data",
+            "--add-id-attr",
+            "custom",
+            "--pkcs8-der:wanted",
+        ])
+        .arg(&private)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let output = String::from_utf8(result.stdout).unwrap();
+    let document = xml_sec::XmlDomDocument::parse(&output).unwrap();
+    let message = document
+        .root_element()
+        .children()
+        .find(|node| node.has_tag_name("message"))
+        .unwrap();
+    assert_eq!(message.text(), Some("referenced recipient"));
+    assert!(
+        !document
+            .descendants()
+            .any(|node| node.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "EncryptedData")))
+    );
+}
+
+#[cfg(feature = "xmlenc")]
+#[test]
 fn nested_kem_wrap_recovery_shares_the_operation_budget() {
     // A KEM supplies an AES-KW KEK, not the content key. Nested execution
     // must preserve the same permission and zero-attempt rejection boundary.
@@ -981,8 +1073,8 @@ fn nested_kem_wrap_recovery_shares_the_operation_budget() {
     .unwrap();
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_xmlsec1"))
         .args(["decrypt", "--pkcs8-der"])
-        .arg(key)
-        .arg(input)
+        .arg(&key)
+        .arg(&input)
         .output()
         .unwrap();
     assert!(
@@ -991,6 +1083,98 @@ fn nested_kem_wrap_recovery_shares_the_operation_budget() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.stdout, b"nested KEM plaintext");
+
+    // Unrelated KEM recipients must be excluded before CLI ambiguity checks;
+    // both URI associations and carried content-key names are authoritative.
+    let key_start = xml.find("<x:EncryptedKey>").unwrap();
+    let key_end = xml.find("</x:EncryptedKey>").unwrap() + "</x:EncryptedKey>".len();
+    let key_xml = &xml[key_start..key_end];
+    for (matching, unrelated, content_name, id_attribute) in [
+        (
+            "<x:ReferenceList><x:DataReference URI=\"#target\"/></x:ReferenceList>",
+            "<x:ReferenceList><x:DataReference URI=\"#other\"/></x:ReferenceList>",
+            "",
+            "Id",
+        ),
+        (
+            "<x:CarriedKeyName>session</x:CarriedKeyName>",
+            "<x:CarriedKeyName>other</x:CarriedKeyName>",
+            "<d:KeyName>session</d:KeyName>",
+            "Id",
+        ),
+        (
+            "<x:ReferenceList><x:DataReference URI=\"#target\"/></x:ReferenceList>",
+            "<x:ReferenceList><x:DataReference URI=\"#other\"/></x:ReferenceList>",
+            "",
+            "custom",
+        ),
+    ] {
+        let selected =
+            key_xml.replace("</x:EncryptedKey>", &format!("{matching}</x:EncryptedKey>"));
+        let skipped = key_xml.replace(
+            "</x:EncryptedKey>",
+            &format!("{unrelated}</x:EncryptedKey>"),
+        );
+        let associated = xml
+            .replace(key_xml, &format!("{skipped}{selected}"))
+            .replacen(
+                "<x:EncryptedData ",
+                &format!("<x:EncryptedData {id_attribute}=\"target\" "),
+                1,
+            )
+            .replacen("<d:KeyInfo>", &format!("<d:KeyInfo>{content_name}"), 1);
+        std::fs::write(&input, associated).unwrap();
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_xmlsec1"))
+            .args(["decrypt", "--add-id-attr", "custom", "--pkcs8-der"])
+            .arg(&key)
+            .arg(&input)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"nested KEM plaintext");
+    }
+
+    // Nested KeyReference associations must select only the KEM protecting the
+    // parent key, including a caller-registered ID rather than a typed Id field.
+    let mechanism_start = xml.find("<k:EncapsulationMechanism ").unwrap();
+    let mechanism_end =
+        xml.find("</k:EncapsulationMechanism>").unwrap() + "</k:EncapsulationMechanism>".len();
+    let mechanism = &xml[mechanism_start..mechanism_end];
+    let nested = |target: &str| {
+        format!(
+            "<x:EncryptedKey><x:EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#kw-aes256\"/><d:KeyInfo>{mechanism}</d:KeyInfo><x:CipherData><x:CipherValue>{}</x:CipherValue></x:CipherData><x:ReferenceList><x:KeyReference URI=\"#{target}\"/></x:ReferenceList></x:EncryptedKey>",
+            encode(&wrapped)
+        )
+    };
+    let associated = xml
+        .replace(
+            mechanism,
+            &format!("{}{}", nested("other"), nested("parent")),
+        )
+        .replacen("<x:EncryptedKey>", "<x:EncryptedKey custom=\"parent\">", 1);
+    let mut policy = xml_sec::policy::DecryptionPolicy::default();
+    policy
+        .key_establishment
+        .encapsulation_algorithms
+        .insert(private.algorithm());
+    let document = xml_sec::XmlDomDocument::parse(&associated).unwrap();
+    let inspection = xml_sec::xmlenc::inspect_encrypted_data_node_with_context(
+        document.root_element(),
+        &policy,
+        xml_sec::XmlBackend::default(),
+        &RustCryptoProvider,
+        &[xml_sec::IdAttributeRegistration::global("custom")],
+    )
+    .unwrap();
+    assert_eq!(
+        inspection.recipient_encapsulation().unwrap().algorithm,
+        private.algorithm()
+    );
+    assert!(inspection.requires_document_context());
 }
 
 #[test]

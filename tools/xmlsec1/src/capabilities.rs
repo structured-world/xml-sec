@@ -125,6 +125,8 @@ pub const KEY_DATA: &[&str] = &[
     "slh-dsa",
     #[cfg(feature = "experimental-pq")]
     "ml-kem",
+    #[cfg(feature = "experimental-pq")]
+    "encapsulation-mechanism",
     "x509",
     "raw-x509-cert",
 ];
@@ -263,7 +265,7 @@ pub fn key_data_available(name: &str, provider: &dyn xml_sec::provider::CryptoPr
         }
         "ml-dsa" => transform_available("ml-dsa-44", provider),
         "slh-dsa" => transform_available("slh-dsa-sha2-128s", provider),
-        "ml-kem" => {
+        "ml-kem" | "encapsulation-mechanism" => {
             transform_available("ml-kem-512", provider)
                 || transform_available("ml-kem-768", provider)
                 || transform_available("ml-kem-1024", provider)
@@ -324,6 +326,14 @@ mod tests {
     fn kem_capabilities_follow_the_selected_engine() {
         // XML algorithm recognition never implies that an engine implements it.
         let provider = xml_sec::provider::RustCryptoProvider;
+        assert_eq!(
+            KEY_DATA.contains(&"encapsulation-mechanism"),
+            cfg!(feature = "experimental-pq")
+        );
+        assert_eq!(
+            key_data_available("encapsulation-mechanism", &provider),
+            cfg!(feature = "experimental-pq")
+        );
         for name in ["ml-kem-512", "ml-kem-768", "ml-kem-1024"] {
             assert_eq!(
                 transform_available(name, &provider),

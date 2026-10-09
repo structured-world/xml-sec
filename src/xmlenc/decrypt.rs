@@ -2336,6 +2336,122 @@ fn encrypted_key_applies_to_data(
     true
 }
 
+pub(super) struct EncapsulationRecipient {
+    key_path: [usize; crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING],
+    depth: usize,
+    method: usize,
+}
+
+impl EncapsulationRecipient {
+    pub(super) fn mechanism<'a>(
+        &self,
+        data: &'a EncryptedData,
+    ) -> &'a crate::key_establishment::EncapsulationMechanism {
+        let mut methods = &data.encapsulation_methods;
+        let mut keys = &data.encrypted_keys;
+        for index in &self.key_path[..self.depth] {
+            let sources = &keys[*index].sources;
+            methods = &sources.encapsulation_methods;
+            keys = &sources.encrypted_keys;
+        }
+        &methods[self.method]
+    }
+}
+
+pub(super) fn select_encapsulation_recipient<'doc>(
+    data: &EncryptedData,
+    references: &super::cipher_reference::BoundCipherReferenceContext<'doc, 'doc>,
+    target: crate::NodeId,
+    origins: &[Option<crate::NodeId>],
+    policy: &crate::policy::DecryptionPolicy,
+) -> Result<Option<EncapsulationRecipient>, XmlEncError> {
+    struct Selection<'a> {
+        data: &'a EncryptedData,
+        semantics: crate::policy::SameDocumentIdSemantics,
+        path: [usize; crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING],
+        depth: usize,
+        selected: Option<EncapsulationRecipient>,
+    }
+    fn visit(
+        methods: &[crate::key_establishment::EncapsulationMechanism],
+        keys: &[EncryptedKey],
+        mut document: Option<KeySourceDocument<'_, '_>>,
+        parent: Option<&EncryptedKey>,
+        selection: &mut Selection<'_>,
+    ) -> Result<(), XmlEncError> {
+        for method in 0..methods.len() {
+            if selection.selected.is_some() {
+                return Err(XmlEncError::InvalidStructure(
+                    "multiple KEM recipients require explicit application key resolution".into(),
+                ));
+            }
+            selection.selected = Some(EncapsulationRecipient {
+                key_path: selection.path,
+                depth: selection.depth,
+                method,
+            });
+        }
+        for (index, key) in keys.iter().enumerate() {
+            let source = take_key_document(&mut document, key)?;
+            let target = ReferenceTarget::new(
+                document,
+                match parent {
+                    Some(parent) => parent.id.as_deref(),
+                    None => selection.data.id.as_deref(),
+                },
+                selection.semantics,
+            );
+            // XMLEnc 1.1 §3.6: use the execution predicates for DataReference/CarriedKeyName
+            // at the content-key boundary, KeyReference at wrapping-key boundaries.
+            // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-ReferenceList
+            let applies = match parent {
+                None => encrypted_key_applies_to_data(key, selection.data, target),
+                Some(_) => reference_list_applies_to_target(
+                    key.reference_list.as_ref(),
+                    target,
+                    ReferenceKind::Key,
+                ),
+            };
+            if !applies {
+                continue;
+            }
+            // Parsing bounds every key-indirection path by this absolute
+            // ceiling; selection needs no heap allocation or ciphertext copy.
+            debug_assert!(selection.depth < selection.path.len());
+            selection.path[selection.depth] = index;
+            selection.depth += 1;
+            visit(
+                &key.sources.encapsulation_methods,
+                &key.sources.encrypted_keys,
+                source,
+                Some(key),
+                selection,
+            )?;
+            selection.depth -= 1;
+        }
+        Ok(())
+    }
+    let mut selection = Selection {
+        data,
+        semantics: policy.transforms.same_document_id_semantics,
+        path: [0; crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING],
+        depth: 0,
+        selected: None,
+    };
+    visit(
+        &data.encapsulation_methods,
+        &data.encrypted_keys,
+        Some(KeySourceDocument {
+            references,
+            target,
+            origins,
+        }),
+        None,
+        &mut selection,
+    )?;
+    Ok(selection.selected)
+}
+
 fn reference_list_applies_to_target(
     references: Option<&super::ReferenceList>,
     target: ReferenceTarget<'_, '_>,

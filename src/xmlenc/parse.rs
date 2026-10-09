@@ -92,6 +92,8 @@ struct KeySourceParseBudget<'a, 'doc, 'shared> {
     registrations: &'a [crate::IdAttributeRegistration],
     ancestry: Vec<crate::NodeId>,
     origins: Vec<Option<crate::NodeId>>,
+    encapsulation_values: Vec<Node<'doc, 'doc>>,
+    encrypted_key_depth: usize,
     detached: Option<Vec<crate::NodeId>>,
 }
 
@@ -143,6 +145,8 @@ impl<'a, 'doc, 'shared> KeySourceParseBudget<'a, 'doc, 'shared> {
             registrations,
             ancestry: Vec::new(),
             origins: Vec::new(),
+            encapsulation_values: Vec::new(),
+            encrypted_key_depth: 0,
             detached: None,
         }
     }
@@ -289,6 +293,84 @@ fn parse_encrypted_data_node_with_context_and_budget(
     .map(|(data, _)| data)
 }
 
+/// Immutable descriptor graph with an association-checked recipient location.
+/// No key material is copied to record selection; the private location is bound
+/// to this graph and cannot become stale through caller mutation.
+pub struct EncryptedDataInspection {
+    data: EncryptedData,
+    recipient: Option<super::decrypt::EncapsulationRecipient>,
+}
+
+impl EncryptedDataInspection {
+    /// Validated, fully resolved encrypted-data metadata.
+    pub fn data(&self) -> &EncryptedData {
+        &self.data
+    }
+
+    /// Whether decryption must retain the original document's reference and ID
+    /// semantics rather than use the standalone typed-descriptor API.
+    pub fn requires_document_context(&self) -> bool {
+        fn keys_require_context(keys: &[EncryptedKey]) -> bool {
+            keys.iter().any(|key| {
+                key.reference_list.is_some()
+                    || matches!(key.cipher_data, CipherData::Reference { .. })
+                    || key
+                        .sources
+                        .derived_keys
+                        .iter()
+                        .any(|key| key.reference_list.is_some())
+                    || keys_require_context(&key.sources.encrypted_keys)
+            })
+        }
+        // Parsed graphs have the non-configurable KeyInfo depth ceiling. This
+        // borrowed traversal allocates nothing and cannot recurse past it.
+        matches!(self.data.cipher_data, CipherData::Reference { .. })
+            || self
+                .data
+                .derived_keys
+                .iter()
+                .any(|key| key.reference_list.is_some())
+            || keys_require_context(&self.data.encrypted_keys)
+    }
+
+    /// The sole applicable KEM recipient, after encrypted-key association checks.
+    pub fn recipient_encapsulation(
+        &self,
+    ) -> Option<&crate::key_establishment::EncapsulationMechanism> {
+        self.recipient
+            .as_ref()
+            .map(|recipient| recipient.mechanism(&self.data))
+    }
+}
+
+/// Inspect recipient selection using the same source identities and association
+/// predicates as decryption, before loading any caller-provided private key.
+pub fn inspect_encrypted_data_node_with_context(
+    node: Node<'_, '_>,
+    policy: &crate::policy::DecryptionPolicy,
+    backend: crate::XmlBackend,
+    provider: &dyn crate::provider::CryptoProvider,
+    id_attributes: &[crate::IdAttributeRegistration],
+) -> Result<EncryptedDataInspection, XmlEncError> {
+    let parse_budget = XmlParseWorkBudget::from_resources(&policy.resources);
+    policy.validate()?;
+    let references = super::CipherReferenceContext::new(policy, None, backend, id_attributes)?;
+    validate_node_document_policy(node, policy.into(), &parse_budget, backend)?;
+    let (data, origins) = parse_encrypted_data_node_with_origins(
+        node,
+        policy.into(),
+        false,
+        id_attributes,
+        provider,
+        Some(&references),
+        Some(&parse_budget),
+    )?;
+    let bound = references.bind_document(node.document());
+    let recipient =
+        super::decrypt::select_encapsulation_recipient(&data, &bound, node.id(), &origins, policy)?;
+    Ok(EncryptedDataInspection { data, recipient })
+}
+
 /// Parse an `xenc:EncryptedData` template under an immutable policy snapshot.
 ///
 /// This applies the complete encrypted-data grammar and metadata limits while
@@ -312,11 +394,66 @@ pub fn parse_encrypted_data_template_node_with_policy_and_backend(
     policy: &crate::policy::EncryptionPolicy,
     backend: crate::XmlBackend,
 ) -> Result<EncryptedData, XmlEncError> {
+    inspect_encrypted_data_template_node_with_context(
+        node,
+        policy,
+        backend,
+        crate::provider::default_provider(),
+        &[],
+    )
+    .map(|template| template.data)
+}
+
+/// Validated template metadata and original same-document mutation targets.
+/// The borrowed nodes remain bound to the inspected source DOM; they are never
+/// inferred from a generated document or from a lexical descendant scan.
+pub struct EncryptedDataTemplate<'doc> {
+    data: EncryptedData,
+    encapsulation_values: Vec<Node<'doc, 'doc>>,
+}
+
+impl<'doc> EncryptedDataTemplate<'doc> {
+    /// Fully resolved establishment descriptors, bound to the original targets.
+    pub fn data(&self) -> &EncryptedData {
+        &self.data
+    }
+
+    /// Consume inspection when only the descriptor graph is needed.
+    pub fn into_data(self) -> EncryptedData {
+        self.data
+    }
+
+    /// Original CipherValue placeholders in resolved mechanism order.
+    pub fn encapsulation_cipher_values(&self) -> &[Node<'doc, 'doc>] {
+        &self.encapsulation_values
+    }
+}
+
+/// Inspect a template with the operation's engine and registered XML IDs.
+pub fn inspect_encrypted_data_template_node_with_context<'doc>(
+    node: Node<'doc, 'doc>,
+    policy: &crate::policy::EncryptionPolicy,
+    backend: crate::XmlBackend,
+    provider: &dyn crate::provider::CryptoProvider,
+    id_attributes: &[crate::IdAttributeRegistration],
+) -> Result<EncryptedDataTemplate<'doc>, XmlEncError> {
     let parse_budget = XmlParseWorkBudget::from_resources(&policy.resources);
     policy.validate()?;
     let policy = ParsingPolicy::from(policy);
     validate_node_document_policy(node, policy, &parse_budget, backend)?;
-    parse_encrypted_data_node(node, policy, true)
+    let (data, _, encapsulation_values) = parse_encrypted_data_node_traced(
+        node,
+        policy,
+        true,
+        id_attributes,
+        provider,
+        None,
+        Some(&parse_budget),
+    )?;
+    Ok(EncryptedDataTemplate {
+        data,
+        encapsulation_values,
+    })
 }
 
 fn validate_node_document_policy(
@@ -341,23 +478,6 @@ fn parse_policy_document<'a>(
         .map_err(|error| map_document_error(error, settings))
 }
 
-pub(super) fn parse_encrypted_data_node(
-    node: Node<'_, '_>,
-    policy: ParsingPolicy<'_>,
-    allow_empty_cipher_values: bool,
-) -> Result<EncryptedData, XmlEncError> {
-    parse_encrypted_data_node_with_origins(
-        node,
-        policy,
-        allow_empty_cipher_values,
-        &[],
-        crate::provider::default_provider(),
-        None,
-        None,
-    )
-    .map(|(data, _)| data)
-}
-
 pub(super) fn parse_encrypted_data_node_with_origins(
     node: Node<'_, '_>,
     policy: ParsingPolicy<'_>,
@@ -367,6 +487,33 @@ pub(super) fn parse_encrypted_data_node_with_origins(
     references: Option<&super::CipherReferenceContext<'_>>,
     xml_parse: Option<&XmlParseWorkBudget>,
 ) -> Result<(EncryptedData, Vec<Option<crate::NodeId>>), XmlEncError> {
+    parse_encrypted_data_node_traced(
+        node,
+        policy,
+        allow_empty_cipher_values,
+        registrations,
+        provider,
+        references,
+        xml_parse,
+    )
+    .map(|(data, origins, _)| (data, origins))
+}
+
+type TracedEncryptedData<'doc> = (
+    EncryptedData,
+    Vec<Option<crate::NodeId>>,
+    Vec<Node<'doc, 'doc>>,
+);
+
+fn parse_encrypted_data_node_traced<'doc>(
+    node: Node<'doc, 'doc>,
+    policy: ParsingPolicy<'_>,
+    allow_empty_cipher_values: bool,
+    registrations: &[crate::IdAttributeRegistration],
+    provider: &dyn crate::provider::CryptoProvider,
+    references: Option<&super::CipherReferenceContext<'_>>,
+    xml_parse: Option<&XmlParseWorkBudget>,
+) -> Result<TracedEncryptedData<'doc>, XmlEncError> {
     require_element(node, XMLENC_NS, "EncryptedData")?;
     let mut shared = SharedKeySourceParseBudget::new(policy.resources)?;
     let mut budget = KeySourceParseBudget::new(policy, registrations, provider, &mut shared);
@@ -456,7 +603,7 @@ pub(super) fn parse_encrypted_data_node_with_origins(
         cipher_data,
     };
     validate_encrypted_data_metadata_inner(&encrypted, policy, allow_empty_cipher_values)?;
-    Ok((encrypted, budget.origins))
+    Ok((encrypted, budget.origins, budget.encapsulation_values))
 }
 
 fn parse_key_info<'doc>(
@@ -515,11 +662,10 @@ fn parse_key_info<'doc>(
                 .into());
             }
             budget.shared.retained_cipher_bytes += bytes;
-            let info = budget
-                .shared
-                .key_info
-                .parse_with_provider(mechanism.key_info, budget.provider)
-                .map_err(super::agreement::map_key_info_error)?;
+            let info = parse_encapsulation_key_info(mechanism.key_info, budget, depth + 1)?;
+            if allow_empty_cipher_values && budget.encrypted_key_depth == 0 {
+                budget.encapsulation_values.push(mechanism.cipher_value);
+            }
             encapsulation_methods.push(crate::key_establishment::EncapsulationMechanism {
                 algorithm: mechanism.algorithm,
                 key_info: info,
@@ -763,6 +909,64 @@ fn parse_key_info<'doc>(
         derived_keys,
         agreement_methods,
     })
+}
+
+fn parse_encapsulation_key_info<'doc>(
+    node: Node<'doc, 'doc>,
+    budget: &mut KeySourceParseBudget<'_, 'doc, '_>,
+    depth: usize,
+) -> Result<crate::xmldsig::parse::KeyInfo, XmlEncError> {
+    use crate::xmldsig::parse::KeyInfoSource;
+    budget
+        .policy
+        .resources
+        .validate_key_info_reference_depth(depth)?;
+    if budget.ancestry.contains(&node.id()) {
+        return Err(XmlEncError::InvalidStructure(
+            "cyclic encryption KeyInfo reference".into(),
+        ));
+    }
+    budget.ancestry.push(node.id());
+    let mut info = budget
+        .shared
+        .key_info
+        .parse_with_provider(node, budget.provider)
+        .map_err(super::agreement::map_key_info_error)?;
+    if info
+        .sources
+        .iter()
+        .any(|source| matches!(source, KeyInfoSource::KeyInfoReference { .. }))
+    {
+        let mut sources = Vec::new();
+        for source in std::mem::take(&mut info.sources) {
+            if let KeyInfoSource::KeyInfoReference { uri } = source {
+                // XMLDSig 1.1 §4.5.10 also applies inside the mechanism's KeyInfo.
+                // Resolve before recipient selection, sharing ancestry and work.
+                // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-KeyInfoReference
+                let allowed = budget
+                    .policy
+                    .uris
+                    .map_or(crate::xmldsig::UriTypeSet::SAME_DOCUMENT, |uris| {
+                        uris.key_info_references
+                    });
+                if !allowed.allows(&uri) {
+                    return Err(crate::policy::PolicyViolation::Uri {
+                        operation: "encryption KeyInfoReference",
+                        reason: "URI class is disabled",
+                    }
+                    .into());
+                }
+                budget.charge(budget.policy.resources)?;
+                let target = budget.referenced_node(node, &uri)?;
+                sources.extend(parse_encapsulation_key_info(target, budget, depth + 1)?.sources);
+            } else {
+                sources.push(source);
+            }
+        }
+        info.sources = sources;
+    }
+    budget.ancestry.pop();
+    Ok(info)
 }
 
 enum RetrievedKey {
@@ -1074,6 +1278,7 @@ fn parse_encrypted_key<'doc>(
     }
     budget.ancestry.push(node.id());
     budget.origins.push(Some(node.id()));
+    budget.encrypted_key_depth += 1;
     validate_encrypted_type_attributes(node, policy)?;
     let mut children = element_children(node);
     let encryption_method = parse_encryption_method_with_limit(
@@ -1172,6 +1377,7 @@ fn parse_encrypted_key<'doc>(
     });
     append_detached_keys(node, info, policy, allow_empty_cipher_values, budget, depth)?;
     budget.ancestry.pop();
+    budget.encrypted_key_depth -= 1;
     Ok(EncryptedKey {
         sources: key_info
             .as_mut()
