@@ -564,6 +564,22 @@ fn signing_resolves_referenced_encapsulation_target() {
         .key_establishment
         .encapsulation_algorithms
         .insert(key.algorithm());
+    // An indirect operation instruction is not an ignorable key hint, even
+    // when the caller supplies an ordinary RSA signing key.
+    let ordinary = xml_sec::xmldsig::RsaSigningKey::from_pkcs8_pem(include_str!(
+        "fixtures/keys/rsa/rsa-2048-key.pem"
+    ))
+    .unwrap();
+    let rsa_input = input.replace(
+        "http://www.w3.org/2001/04/xmldsig-more#hmac-sha256",
+        "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+    );
+    assert!(
+        xml_sec::xmldsig::SignContext::new(&ordinary)
+            .policy(policy.clone())
+            .sign_template(&rsa_input)
+            .is_err()
+    );
     let signed = xml_sec::xmldsig::SignContext::new_encapsulation(&public)
         .policy(policy.clone())
         .sign_template(&input)
@@ -667,6 +683,27 @@ fn inventory_accepts_recipient_material_not_signature_keys() {
     // ML-KEM material authorizes key establishment, never signature generation.
     let resources = xml_sec::policy::ResourcePolicy::default();
     for size in [512, 768, 1024] {
+        // Standalone PKCS#8 imports enforce the same exact recipient usage as
+        // PKCS#12 imports, without leaving a partially inserted candidate.
+        for usages in [
+            xml_sec::key_manager::KeyUsages::VERIFY,
+            xml_sec::key_manager::KeyUsages::ENCRYPT,
+            xml_sec::key_manager::KeyUsages::DECRYPT.union(xml_sec::key_manager::KeyUsages::VERIFY),
+        ] {
+            let mut rejected = xml_sec::key_manager::KeyInventory::default();
+            assert!(
+                rejected
+                    .add_private_der(
+                        "recipient".into(),
+                        &fixture(&format!("ml-kem-{size}-key.der")),
+                        None,
+                        usages,
+                        &resources,
+                    )
+                    .is_err()
+            );
+            assert!(rejected.private_keys().is_empty());
+        }
         let mut inventory = xml_sec::key_manager::KeyInventory::default();
         inventory
             .add_private_der(
@@ -776,6 +813,103 @@ fn ordinary_hmac_cannot_ignore_an_encapsulation_template() {
         xml_sec::xmldsig::SignContext::new(&key)
             .sign_template(&template)
             .is_err()
+    );
+}
+
+#[test]
+fn signing_reserves_complete_kem_output_before_crypto() {
+    // Predictable secret-copy, base64 and document-size failures must occur
+    // before the provider invokes the recipient's encapsulation primitive.
+    struct CountedKey {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl xml_sec::provider::KeyEncapsulationKey for CountedKey {
+        fn algorithm(&self) -> KeyEncapsulationAlgorithm {
+            KeyEncapsulationAlgorithm::MlKem512
+        }
+        fn encapsulate_with_provider(
+            &self,
+            _: &dyn CryptoProvider,
+        ) -> Result<xml_sec::provider::EncapsulatedKey, xml_sec::provider::ProviderError> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(xml_sec::provider::ProviderError::Random(
+                "unexpected primitive execution".into(),
+            ))
+        }
+    }
+    let template = std::fs::read_to_string(fixture_path(
+        "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-em-ml-kem-512.tmpl",
+    ))
+    .unwrap();
+    let key = CountedKey {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    };
+    for (owned, document_limit) in [
+        (768, usize::MAX),
+        (800, usize::MAX),
+        (1823, usize::MAX),
+        (1824, template.len()),
+    ] {
+        let mut policy = xml_sec::policy::SigningPolicy::default();
+        policy
+            .key_establishment
+            .encapsulation_algorithms
+            .insert(KeyEncapsulationAlgorithm::MlKem512);
+        policy.key_establishment.max_owned_bytes = owned;
+        if document_limit != usize::MAX {
+            policy.resources.max_xml_document_bytes = document_limit;
+        }
+        assert!(
+            xml_sec::xmldsig::SignContext::new_encapsulation(&key)
+                .policy(policy)
+                .sign_template(&template)
+                .is_err()
+        );
+        assert_eq!(key.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+}
+
+#[test]
+fn mechanism_discovery_bounds_reference_work_without_decoding_hints() {
+    // The presence probe shares URI normalization and rejects exhausted memory
+    // before percent decoding; unused malformed/cyclic hints stay unconsumed.
+    let xml = r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:d="http://www.w3.org/2009/xmldsig11#" xmlns:e="http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#"><ds:KeyInfo Id="entry"><d:DEREncodedKeyValue>not-base64!</d:DEREncodedKeyValue><d:KeyInfoReference URI="#missing"/><d:KeyInfoReference URI="#entry"/><d:KeyInfoReference URI="#%74arget"/></ds:KeyInfo><ds:KeyInfo Id="target"><e:EncapsulationMechanism/></ds:KeyInfo></root>"##;
+    let document = xml_sec::Document::parse(xml).unwrap();
+    let resolver = xml_sec::xmldsig::uri::UriReferenceResolver::new(&document);
+    let entry = resolver.node_for_id("entry").unwrap();
+    let resources = xml_sec::policy::ResourcePolicy::default();
+    assert!(
+        xml_sec::xmldsig::has_same_document_encapsulation(entry, &resolver, &resources).unwrap()
+    );
+    for bounded in [
+        xml_sec::policy::ResourcePolicy {
+            max_key_candidates: 0,
+            ..resources.clone()
+        },
+        xml_sec::policy::ResourcePolicy {
+            max_key_info_reference_depth: 0,
+            ..resources.clone()
+        },
+        xml_sec::policy::ResourcePolicy {
+            max_node_set_cumulative_owned_string_bytes: 0,
+            ..resources.clone()
+        },
+    ] {
+        assert!(
+            xml_sec::xmldsig::has_same_document_encapsulation(entry, &resolver, &bounded).is_err()
+        );
+    }
+    let without_mechanism = xml.replace("<e:EncapsulationMechanism/>", "");
+    let document = xml_sec::Document::parse(&without_mechanism).unwrap();
+    let resolver = xml_sec::xmldsig::uri::UriReferenceResolver::new(&document);
+    assert!(
+        !xml_sec::xmldsig::has_same_document_encapsulation(
+            resolver.node_for_id("entry").unwrap(),
+            &resolver,
+            &resources,
+        )
+        .unwrap()
     );
 }
 

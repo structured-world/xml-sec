@@ -43,6 +43,12 @@ External KEM signing targets are not mutable caller documents and are rejected.
 Verification also resolves mechanisms reached through `KeyInfoReference`, using
 the same source/URI policy, depth, cycle and shared parsing limits as other key
 metadata. Multiple mechanisms in the resolved graph are rejected as ambiguous.
+Pinned ordinary verification keys ignore unused key lookup hints, including malformed or
+unresolved hints; local mechanism discovery does not decode that key material.
+An actual mechanism, direct or referenced, is an operation instruction and cannot
+be ignored by an ordinary signer. Signing checks the projected XML size and
+reserves raw ciphertext, encoded ciphertext, and the HMAC secret copy before
+calling the encapsulation primitive.
 
 **KEM/HMAC does not authenticate the sender:** anyone holding the public key
 can create a new valid message. This path requires explicit

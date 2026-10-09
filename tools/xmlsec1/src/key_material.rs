@@ -183,36 +183,29 @@ pub fn verification_signature_metadata(
     let algorithm = parse_signed_info(signed_info)
         .map(|info| info.signature_method)
         .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
-    // A pinned non-HMAC key does not consume document key hints. KEM/HMAC
-    // metadata is different: its mechanism must still be resolved and checked.
-    let ignore_hints = key_name_resolution == VerificationKeyNameResolution::IgnoreDocumentKeyInfo
-        && algorithm.hmac_output_bits().is_none();
-    let direct = if ignore_hints {
-        signature_key_info(signature)
-            .map(|info| xml_sec::key_establishment::direct_encapsulation(info, false))
-            .transpose()
-            .map_err(|error| KeyMaterialError::Signature(error.to_string()))?
-            .flatten()
-    } else {
-        None
-    };
+    // Pinning a key ignores lookup hints, not operation instructions. Discover
+    // local KEM instructions without parsing unrelated key material first.
+    let ignore_hints = key_name_resolution == VerificationKeyNameResolution::IgnoreDocumentKeyInfo;
     let metadata = signature_key_info(signature)
-        .filter(|_| !ignore_hints)
         .map(|info| {
-            inspect_verification_key_info(
-                info,
-                UriReferenceResolver::with_id_registrations(&document, id_attributes),
-                policy,
-                provider,
-                xml_backend,
-            )
+            let resolver = UriReferenceResolver::with_id_registrations(&document, id_attributes);
+            if ignore_hints {
+                xml_sec::xmldsig::inspect_pinned_verification_key_info(
+                    info,
+                    resolver,
+                    policy,
+                    provider,
+                    xml_backend,
+                )
+            } else {
+                inspect_verification_key_info(info, resolver, policy, provider, xml_backend)
+                    .map(Some)
+            }
         })
         .transpose()
-        .map_err(map_key_info_reference_error)?;
-    let encapsulation = metadata
-        .as_ref()
-        .and_then(|info| info.encapsulation)
-        .or_else(|| direct.map(|mechanism| mechanism.algorithm));
+        .map_err(map_key_info_reference_error)?
+        .flatten();
+    let encapsulation = metadata.as_ref().and_then(|info| info.encapsulation);
     if let Some(algorithm) = encapsulation {
         policy.key_establishment.check_encapsulation(algorithm)?;
     }
@@ -2447,6 +2440,29 @@ mod tests {
 
         assert_eq!(metadata.algorithm, SignatureAlgorithm::RsaSha256);
         assert!(metadata.key_names.is_empty());
+        // Raw HMAC keys are pinned too: neither malformed key bytes nor an
+        // unused unresolved reference may make their metadata inspection fail.
+        let hmac_xml = xml.replace("#rsa-sha256", "#hmac-sha256");
+        for input in [
+            hmac_xml.clone(),
+            hmac_xml.replace(
+                "<dsig11:DEREncodedKeyValue>not-base64!</dsig11:DEREncodedKeyValue>",
+                "<dsig11:KeyInfoReference URI=\"#missing\"/>",
+            ),
+        ] {
+            let metadata = verification_signature_metadata(
+                &input,
+                None,
+                &[],
+                &VerificationPolicy::default(),
+                VerificationKeyNameResolution::IgnoreDocumentKeyInfo,
+                xml_sec::XmlBackend::default(),
+                xml_sec::provider::default_provider(),
+            )
+            .expect("pinned HMAC must ignore unused key hints");
+            assert_eq!(metadata.algorithm, SignatureAlgorithm::HmacSha256);
+            assert!(metadata.key_names.is_empty());
+        }
     }
 
     #[test]

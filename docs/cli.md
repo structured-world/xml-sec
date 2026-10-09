@@ -191,7 +191,7 @@ are checked during each attempt rather than only after selecting a key. The CLI
 rejects an oversized candidate ring before opening any private-key source, and
 every successfully read private-key source and certificate companion is also
 charged to one invocation-wide external-material byte budget before decoding.
-Before signing- or verification-key selection, the CLI recursively materializes
+When signing- or verification-key selection consumes document hints, the CLI recursively materializes
 same-document `KeyInfoReference` sources under the operation policy's shared
 depth and key-candidate limits. Referenced `KeyName` and public identity sources therefore
 participate in the same selection and validation as direct children. Missing,
@@ -448,6 +448,10 @@ KEM recipient selection in `sign`, `verify`, and `decrypt` follows the core's re
 including same-document `KeyInfoReference` and caller-declared `--id-attr`
 registrations. Named private options in `verify` retain `KeyName` selection;
 `--lax-key-search` is the explicit opt-out from name matching.
+An explicitly pinned ordinary HMAC key still ignores unused `KeyInfo` hints;
+it does not bypass a direct or same-document referenced encapsulation mechanism.
+Private ML-KEM inventory entries require exactly decryption usage, not verification,
+encryption, signing, or mixed usages.
 Public verification accepts SubjectPublicKeyInfo,
 PKCS#1 RSA public keys, and X.509 certificates. Encryption accepts RSA public
 keys or RSA X.509 recipient certificates in PEM or DER. Explicit verification

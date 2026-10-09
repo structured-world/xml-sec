@@ -3146,6 +3146,108 @@ pub struct SignatureKeyInfoMetadata {
     pub(crate) cipher_value: Option<NodeId>,
 }
 
+/// Discover operation instructions in local KeyInfo references without consuming
+/// unrelated key hints. A positive result requires full metadata validation.
+pub fn has_same_document_encapsulation(
+    node: Node<'_, '_>,
+    resolver: &UriReferenceResolver<'_>,
+    resources: &crate::policy::ResourcePolicy,
+) -> Result<bool, DsigError> {
+    resources.validate()?;
+    let execution = TransformExecutionBudget::from_resources(resources);
+    has_same_document_encapsulation_with_budget(node, resolver, resources, &execution)
+}
+
+pub(crate) fn has_same_document_encapsulation_with_budget(
+    node: Node<'_, '_>,
+    resolver: &UriReferenceResolver<'_>,
+    resources: &crate::policy::ResourcePolicy,
+    execution: &TransformExecutionBudget,
+) -> Result<bool, DsigError> {
+    if resolver.node_for_node_id(node.id()) != Some(node) {
+        return Err(DsigError::InvalidStructure {
+            reason: "KeyInfo and resolver belong to different documents",
+        });
+    }
+    fn visit(
+        node: Node<'_, '_>,
+        resolver: &UriReferenceResolver<'_>,
+        resources: &crate::policy::ResourcePolicy,
+        path: &mut [Option<NodeId>; crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING + 1],
+        depth: usize,
+        work: &mut usize,
+        execution: &TransformExecutionBudget,
+    ) -> Result<bool, DsigError> {
+        resources.validate_key_info_reference_depth(depth)?;
+        if depth > crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING {
+            return Err(DsigError::InvalidStructure {
+                reason: "KeyInfoReference safety depth exceeded",
+            });
+        }
+        if path[..depth].contains(&Some(node.id())) {
+            return Ok(false);
+        }
+        path[depth] = Some(node.id());
+        for child in node.children().filter(Node::is_element) {
+            *work += 1;
+            resources.validate_key_candidates(*work)?;
+            if child.has_tag_name((
+                crate::key_establishment::ENCAPSULATION_NS,
+                "EncapsulationMechanism",
+            )) {
+                return Ok(true);
+            }
+            if !child.has_tag_name(("http://www.w3.org/2009/xmldsig11#", "KeyInfoReference")) {
+                continue;
+            }
+            let Some(uri) = child.attribute("URI") else {
+                continue;
+            };
+            if uri.len() > super::parse::MAX_KEY_NAME_TEXT_LEN {
+                continue;
+            }
+            if !uri.is_empty() && !uri.starts_with('#') {
+                continue;
+            }
+            // Unconsumed key hints are not validity requirements. Once an
+            // instruction is found, the full resolver enforces XMLDSig 1.1
+            // section 4.5.10 (including the required KeyInfo target type).
+            // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-KeyInfoReference
+            let target = match resolver.node_for_same_document_reference_with_budget(
+                uri,
+                Some(execution.node_set_materialization()),
+            ) {
+                Ok(Some(target)) => target,
+                Err(TransformError::Policy(violation)) => return Err(DsigError::Policy(violation)),
+                _ => continue,
+            };
+            if target.has_tag_name((XMLDSIG_NS, "KeyInfo"))
+                && visit(
+                    target,
+                    resolver,
+                    resources,
+                    path,
+                    depth + 1,
+                    work,
+                    execution,
+                )?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    visit(
+        node,
+        resolver,
+        resources,
+        &mut [None; crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING + 1],
+        0,
+        &mut 0,
+        execution,
+    )
+}
+
 fn inspect_signature_key_info_with_budgets<P: KeyInfoReferencePolicy>(
     node: Node<'_, '_>,
     resolver: &UriReferenceResolver<'_>,
@@ -3321,6 +3423,44 @@ pub fn inspect_verification_key_info(
 ) -> Result<SignatureKeyInfoMetadata, DsigError> {
     policy.validate()?;
     inspect_signature_key_info_for_policy(node, resolver, policy, provider, xml_backend, false)
+}
+
+/// Inspect operation instructions for a caller-pinned key, leaving unrelated
+/// lookup hints unconsumed. Discovery and materialization share one allowance.
+pub fn inspect_pinned_verification_key_info(
+    node: Node<'_, '_>,
+    resolver: UriReferenceResolver<'_>,
+    policy: &crate::policy::VerificationPolicy,
+    provider: &dyn crate::provider::CryptoProvider,
+    xml_backend: crate::XmlBackend,
+) -> Result<Option<SignatureKeyInfoMetadata>, DsigError> {
+    policy.validate()?;
+    let resolver = resolver.with_external_resource_limits(
+        policy.resources.max_external_resource_bytes,
+        policy.resources.max_external_resource_total_bytes,
+    );
+    let execution = TransformExecutionBudget::from_resources(&policy.resources);
+    if !has_same_document_encapsulation_with_budget(node, &resolver, &policy.resources, &execution)?
+    {
+        return Ok(None);
+    }
+    let mut xpath_parse = XPathSignatureParseBudget::from_resources(&policy.resources);
+    inspect_signature_key_info_with_budgets(
+        node,
+        &resolver,
+        policy,
+        provider,
+        &mut RetrievalMaterializationBudgets {
+            xpath_parse: &mut xpath_parse,
+            execution: &execution,
+            resources: &policy.resources,
+            certificate_signature_algorithms: policy.certificate_signature_algorithms(),
+            xml_backend,
+        },
+        false,
+        true,
+    )
+    .map(Some)
 }
 
 fn materialize_key_info_references_for_policy<P: KeyInfoReferencePolicy>(

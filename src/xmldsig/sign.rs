@@ -2050,11 +2050,26 @@ impl<'a> SignContext<'a> {
                 )?;
                 let children = parse_signature_children(signature)
                     .map_err(|error| SigningDigestError::InvalidStructure(error.to_string()))?;
+                let metadata_error = |error| match error {
+                    super::DsigError::Policy(violation) => SigningError::Policy(violation),
+                    error => SigningDigestError::InvalidStructure(error.to_string()).into(),
+                };
+                let resolver = external_resources.bind(
+                    view.document(),
+                    self.id_attributes,
+                    self.policy.transforms.same_document_id_semantics,
+                );
                 if self.encapsulation_key.is_none()
                     && signing_algorithm.hmac_output_bits().is_none()
                 {
                     if let Some(info) = children.key_info_node
-                        && crate::key_establishment::direct_encapsulation(info, true)?.is_some()
+                        && super::verify::has_same_document_encapsulation_with_budget(
+                            info,
+                            &resolver,
+                            &self.policy.resources,
+                            &budgets.transforms,
+                        )
+                        .map_err(metadata_error)?
                     {
                         return Err(crate::key_establishment::KeyEstablishmentError::Structure(
                             "mechanism and explicit recipient key must be supplied together",
@@ -2063,11 +2078,6 @@ impl<'a> SignContext<'a> {
                     }
                     return Ok(None);
                 }
-                let resolver = external_resources.bind(
-                    view.document(),
-                    self.id_attributes,
-                    self.policy.transforms.same_document_id_semantics,
-                );
                 let metadata = children
                     .key_info_node
                     .map(|node| {
@@ -2081,10 +2091,7 @@ impl<'a> SignContext<'a> {
                         )
                     })
                     .transpose()
-                    .map_err(|error| match error {
-                        super::DsigError::Policy(violation) => SigningError::Policy(violation),
-                        error => SigningDigestError::InvalidStructure(error.to_string()).into(),
-                    })?;
+                    .map_err(metadata_error)?;
                 let mechanism =
                     metadata.and_then(|metadata| metadata.encapsulation.zip(metadata.cipher_value));
                 if mechanism.is_some() != self.encapsulation_key.is_some() {
@@ -2132,15 +2139,25 @@ impl<'a> SignContext<'a> {
                     .into());
                 }
                 self.policy.hmac.validate_key_bits(256)?;
+                let target = mechanism.expect("recipient requires mechanism");
+                let encoded_len = key.algorithm().ciphertext_len().div_ceil(3) * 4;
+                // Reserve the consumer's output before executing the primitive;
+                // encapsulate separately reserves its raw ciphertext allocation.
+                self.policy.resources.validate_xml_document_len(
+                    document.projected_content_replacement_len(target, encoded_len)?,
+                )?;
+                budgets.key_establishment.commit_all(
+                    &self.policy.key_establishment,
+                    0,
+                    0,
+                    32 + encoded_len as u128,
+                )?;
                 let result = budgets.key_establishment.encapsulate(
                     &self.policy.key_establishment,
                     self.provider,
                     key,
                 )?;
-                return Ok((
-                    None,
-                    Some((mechanism.expect("recipient requires mechanism"), result)),
-                ));
+                return Ok((None, Some((target, result))));
             }
             let Some(writer) = self.key_info_writer else {
                 return Ok::<_, SigningError>((None, None));
@@ -2157,12 +2174,6 @@ impl<'a> SignContext<'a> {
             Ok((Some(key_info_content), None))
         })?;
         let established_key = if let Some((_, result)) = encapsulated.as_ref() {
-            operation.budgets_mut().key_establishment.commit_all(
-                &self.policy.key_establishment,
-                0,
-                0,
-                32,
-            )?;
             Some(HmacSigningKey::new(result.shared_secret.to_vec())?)
         } else {
             None
@@ -2179,16 +2190,6 @@ impl<'a> SignContext<'a> {
         };
         operation.extend();
         let kem_mutation = if let Some((target, result)) = encapsulated {
-            let encoded_len = result.ciphertext.len().div_ceil(3) * 4;
-            self.policy.resources.validate_xml_document_len(
-                document.projected_content_replacement_len(target, encoded_len)?,
-            )?;
-            operation.budgets_mut().key_establishment.commit_all(
-                &self.policy.key_establishment,
-                0,
-                0,
-                encoded_len as u128,
-            )?;
             let mutation =
                 operation.add_node(OperationNodeKind::Mutation, OperationStage::Resolve, None);
             operation.add_dependency(mutation, key_info)?;

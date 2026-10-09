@@ -2578,9 +2578,9 @@ impl<'a> PrivateKeyIdentity<'a> {
 
     fn validate_usages(&self, usages: KeyUsages) -> Result<(), KeyStoreError> {
         #[cfg(feature = "experimental-pq")]
-        if matches!(self, Self::Encapsulation { .. }) && usages.allows(KeyUsage::Sign) {
+        if matches!(self, Self::Encapsulation { .. }) && usages != KeyUsages::DECRYPT {
             return Err(KeyStoreError::Selection(
-                "ML-KEM private keys decapsulate, not sign",
+                "ML-KEM private keys require DECRYPT-only usage",
             ));
         }
         #[cfg(not(feature = "experimental-pq"))]
@@ -4017,6 +4017,30 @@ mod tests {
             )
             .expect("automatic recipient usages");
         assert_eq!(inventory.private_keys()[0].usages, KeyUsages::DECRYPT);
+        // Explicit imports must never advertise unsupported recipient operations,
+        // including mixed usages that happen to contain DECRYPT.
+        for usages in [
+            KeyUsages::VERIFY,
+            KeyUsages::ENCRYPT,
+            KeyUsages::DECRYPT.union(KeyUsages::VERIFY),
+            KeyUsages::DECRYPT.union(KeyUsages::ENCRYPT),
+            KeyUsages::DECRYPT.union(KeyUsages::SIGN),
+        ] {
+            let mut rejected = KeyInventory::default();
+            assert!(
+                rejected
+                    .add_pkcs12_contents(
+                        "kem".into(),
+                        der.as_bytes().len(),
+                        contents(),
+                        usages,
+                        &resources,
+                        false,
+                    )
+                    .is_err()
+            );
+            assert!(rejected.private_keys().is_empty());
+        }
         assert!(
             KeyInventory::default()
                 .add_pkcs12_contents(
