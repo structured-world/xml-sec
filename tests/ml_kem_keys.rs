@@ -439,6 +439,25 @@ fn hmac_encapsulation_resolves_key_info_references() {
         verify(&same_document, policy.clone()).unwrap().status,
         xml_sec::xmldsig::DsigStatus::Valid
     );
+    // CLI metadata must discover the same referenced mechanism as the core,
+    // and select the recipient's name rather than the outer KeyInfo's hints.
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("referenced.xml");
+    std::fs::write(&input, &same_document).unwrap();
+    let private = fixture_path("xmldsig/keys/ml-kem/ml-kem-512-key.der");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_xmlsec1"))
+        .args(["verify", "--insecure", "--pkcs8-der:unrelated"])
+        .arg(&private)
+        .arg("--pkcs8-der:TestKeyName-ml-kem-512")
+        .arg(&private)
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let mut denied = policy.clone();
     denied.key_sources.key_info_reference = false;
     assert!(verify(&same_document, denied).is_err());
@@ -510,6 +529,107 @@ fn hmac_encapsulation_resolves_key_info_references() {
             .unwrap()
             .status,
         xml_sec::xmldsig::DsigStatus::Valid
+    );
+}
+
+#[test]
+fn signing_resolves_referenced_encapsulation_target() {
+    // Signing must update the original referenced CipherValue before hashing,
+    // not insert a duplicate mechanism into the signature's direct KeyInfo.
+    let xml = std::fs::read_to_string(fixture_path(
+        "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-em-ml-kem-512.xml",
+    ))
+    .unwrap();
+    let document = xml_sec::Document::parse(&xml).unwrap();
+    let info = document
+        .root_element()
+        .children()
+        .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyInfo")))
+        .unwrap();
+    let original = &xml[info.range()];
+    let target = original.replacen(
+        "<KeyInfo>",
+        "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\" Id=\"recipient\">",
+        1,
+    );
+    let referenced = xml.replacen(original, "<KeyInfo><KeyInfoReference xmlns=\"http://www.w3.org/2009/xmldsig11#\" URI=\"#recipient\"/></KeyInfo>", 1);
+    let input = format!(
+        "<root>{}{target}</root>",
+        referenced.trim_start_matches("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
+    );
+    let key = RustCryptoMlKemPrivateKey::from_pkcs8_der(&fixture("ml-kem-512-key.der")).unwrap();
+    let public = key.public_key();
+    let mut policy = xml_sec::policy::SigningPolicy::default();
+    policy
+        .key_establishment
+        .encapsulation_algorithms
+        .insert(key.algorithm());
+    let signed = xml_sec::xmldsig::SignContext::new_encapsulation(&public)
+        .policy(policy.clone())
+        .sign_template(&input)
+        .unwrap();
+    // The shared traversal rejects cycles and competing mechanisms instead of
+    // picking a lexical winner or invoking the provider on ambiguous metadata.
+    let cycle = input.replace(&target,
+        "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\" Id=\"recipient\"><KeyInfoReference xmlns=\"http://www.w3.org/2009/xmldsig11#\" URI=\"#recipient\"/></KeyInfo>");
+    assert!(
+        xml_sec::xmldsig::SignContext::new_encapsulation(&public)
+            .policy(policy.clone())
+            .sign_template(&cycle)
+            .unwrap_err()
+            .to_string()
+            .contains("cycle")
+    );
+    let duplicate = input.replace("</root>", &format!("{}</root>", target.replace("Id=\"recipient\"", "Id=\"other\"")))
+        .replacen("URI=\"#recipient\"/>", "URI=\"#recipient\"/><KeyInfoReference xmlns=\"http://www.w3.org/2009/xmldsig11#\" URI=\"#other\"/>", 1);
+    assert!(
+        xml_sec::xmldsig::SignContext::new_encapsulation(&public)
+            .policy(policy.clone())
+            .sign_template(&duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("multiple encapsulation")
+    );
+    assert_ne!(signed, input);
+    assert!(signed.contains("URI=\"#recipient\""));
+    let mut verification = xml_sec::policy::VerificationPolicy::default();
+    verification
+        .key_establishment
+        .encapsulation_algorithms
+        .insert(key.algorithm());
+    verification.key_trust.mode = xml_sec::policy::VerificationTrustMode::CryptographicOnly;
+    assert_eq!(
+        xml_sec::xmldsig::VerifyContext::new()
+            .decapsulation_key(&key)
+            .policy(verification)
+            .verify(&signed)
+            .unwrap()
+            .status,
+        xml_sec::xmldsig::DsigStatus::Valid
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let template = directory.path().join("template.xml");
+    let output_path = directory.path().join("signed.xml");
+    std::fs::write(&template, &input).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_xmlsec1"))
+        .args(["sign", "--pubkey-pem:TestKeyName-ml-kem-512"])
+        .arg(fixture_path("xmldsig/keys/ml-kem/ml-kem-512-pubkey.pem"))
+        .arg("--output")
+        .arg(&output_path)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    policy.resources.max_key_info_reference_depth = 0;
+    assert!(
+        xml_sec::xmldsig::SignContext::new_encapsulation(&public)
+            .policy(policy)
+            .sign_template(&input)
+            .is_err()
     );
 }
 

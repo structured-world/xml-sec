@@ -112,8 +112,9 @@ pub use types::{NodeSet, TransformData, TransformError};
 pub use verify::{
     CallerTrustedSignatureKey, DsigError, DsigStatus, FailureReason, KeyResolver,
     ReferenceCoverage, ReferenceProcessingError, ReferenceResult, ReferenceSet, ReferencesResult,
-    SignatureEvidence, SignatureRequirement, SignatureSelection, UriTypeSet, VerificationRequest,
-    VerifyContext, VerifyEvidence, VerifyResult, VerifyingKey,
+    SignatureEvidence, SignatureKeyInfoMetadata, SignatureRequirement, SignatureSelection,
+    UriTypeSet, VerificationRequest, VerifyContext, VerifyEvidence, VerifyResult, VerifyingKey,
+    inspect_signing_key_info, inspect_verification_key_info,
     materialize_signing_key_info_references, materialize_verification_key_info_references,
     process_all_references, process_reference, verify_signature_with_pem_key,
 };

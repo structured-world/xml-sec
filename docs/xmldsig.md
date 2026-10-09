@@ -37,6 +37,9 @@ Verification uses `VerifyContext::decapsulation_key(&recipient_private)` and
 the same explicit algorithm permission. Supplying an ordinary HMAC key cannot
 bypass the mechanism, and conflicting recipient parameter sets are rejected.
 
+Signing and CLI preflight resolve same-document mechanisms reached through
+`KeyInfoReference`, retaining the original ciphertext element for atomic mutation.
+External KEM signing targets are not mutable caller documents and are rejected.
 Verification also resolves mechanisms reached through `KeyInfoReference`, using
 the same source/URI policy, depth, cycle and shared parsing limits as other key
 metadata. Multiple mechanisms in the resolved graph are rejected as ambiguous.

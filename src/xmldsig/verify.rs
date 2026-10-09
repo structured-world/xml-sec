@@ -2258,7 +2258,7 @@ fn verify_signature_node<'a>(
             materialization.collect_encapsulation = true;
             materialization.encapsulation = None;
             if let Some(node) = signature_children.key_info_node {
-                materialization.observe_encapsulation(node)?;
+                materialization.observe_encapsulation(node, resolver, 0)?;
             }
             if let Some(info) = key_info.as_mut() {
                 let mut xpath_parse = budgets.xpath_parse.borrow_mut();
@@ -2721,6 +2721,11 @@ struct KeyInfoMaterializationState {
     active: HashSet<(super::uri::TraversalDocumentIdentity, String)>,
     candidate_work: usize,
     collect_encapsulation: bool,
+    encapsulation_template: bool,
+    retain_encapsulation_target: bool,
+    encapsulation_depth: usize,
+    reference_depth_base: usize,
+    encapsulation_target: Option<(super::uri::TraversalDocumentIdentity, NodeId, NodeId)>,
     encapsulation: Option<ResolvedEncapsulation>,
 }
 
@@ -2733,6 +2738,8 @@ impl KeyInfoMaterializationState {
     fn observe_encapsulation(
         &mut self,
         node: Node<'_, '_>,
+        resolver: &UriReferenceResolver<'_>,
+        depth: usize,
     ) -> Result<(), SignatureVerificationPipelineError> {
         if !self.collect_encapsulation {
             return Ok(());
@@ -2742,11 +2749,10 @@ impl KeyInfoMaterializationState {
         // separate unbounded scan; external document nodes cannot escape it.
         // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-KeyInfoReference
         let Some(mechanism) =
-            crate::key_establishment::direct_encapsulation(node, false).map_err(|_| {
-                SignatureVerificationPipelineError::InvalidStructure {
+            crate::key_establishment::direct_encapsulation(node, self.encapsulation_template)
+                .map_err(|_| SignatureVerificationPipelineError::InvalidStructure {
                     reason: "invalid encapsulation mechanism in resolved KeyInfo",
-                }
-            })?
+                })?
         else {
             return Ok(());
         };
@@ -2754,6 +2760,14 @@ impl KeyInfoMaterializationState {
             return Err(SignatureVerificationPipelineError::InvalidStructure {
                 reason: "multiple encapsulation mechanisms in resolved KeyInfo",
             });
+        }
+        if self.retain_encapsulation_target {
+            self.encapsulation_depth = depth;
+            self.encapsulation_target = Some((
+                resolver.traversal_document_identity(),
+                mechanism.cipher_value.id(),
+                mechanism.key_info.id(),
+            ));
         }
         self.encapsulation = Some(ResolvedEncapsulation {
             algorithm: mechanism.algorithm,
@@ -2764,6 +2778,7 @@ impl KeyInfoMaterializationState {
 }
 
 trait KeyInfoReferencePolicy {
+    fn key_establishment(&self) -> &crate::policy::KeyEstablishmentPolicy;
     fn check_digest_algorithm(
         &self,
         algorithm: DigestAlgorithm,
@@ -2780,6 +2795,9 @@ trait KeyInfoReferencePolicy {
 }
 
 impl KeyInfoReferencePolicy for crate::policy::SigningPolicy {
+    fn key_establishment(&self) -> &crate::policy::KeyEstablishmentPolicy {
+        &self.key_establishment
+    }
     fn check_digest_algorithm(
         &self,
         algorithm: DigestAlgorithm,
@@ -2817,6 +2835,9 @@ impl KeyInfoReferencePolicy for crate::policy::SigningPolicy {
 }
 
 impl KeyInfoReferencePolicy for crate::policy::VerificationPolicy {
+    fn key_establishment(&self) -> &crate::policy::KeyEstablishmentPolicy {
+        &self.key_establishment
+    }
     fn check_digest_algorithm(
         &self,
         algorithm: DigestAlgorithm,
@@ -2934,7 +2955,13 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
                         reason: "KeyInfoReference target must be KeyInfo",
                     });
                 }
-                materialization.observe_encapsulation(node)?;
+                materialization.observe_encapsulation(node, resolver, next_depth)?;
+                if let Some(mechanism) = &materialization.encapsulation {
+                    context
+                        .policy
+                        .key_establishment()
+                        .check_encapsulation(mechanism.algorithm)?;
+                }
                 super::parse::validate_x509_digest_policy(node, &|algorithm| {
                     context.policy.check_digest_algorithm(algorithm)
                 })
@@ -3012,7 +3039,17 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
                             reason: "KeyInfoReference external target must be KeyInfo",
                         });
                     }
-                    materialization.observe_encapsulation(target)?;
+                    materialization.observe_encapsulation(
+                        target,
+                        &external_resolver,
+                        next_depth,
+                    )?;
+                    if let Some(mechanism) = &materialization.encapsulation {
+                        context
+                            .policy
+                            .key_establishment()
+                            .check_encapsulation(mechanism.algorithm)?;
+                    }
                     super::parse::validate_x509_digest_policy(target, &|algorithm| {
                         context.policy.check_digest_algorithm(algorithm)
                     })
@@ -3075,7 +3112,8 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
         provider,
         budgets,
     };
-    visit(key_info, resolver, &mut context, materialization, 0)
+    let depth = materialization.reference_depth_base;
+    visit(key_info, resolver, &mut context, materialization, depth)
 }
 
 fn map_key_info_xml_decode_error(
@@ -3095,6 +3133,194 @@ fn map_key_info_xml_decode_error(
             reason: "KeyInfoReference external resource has an invalid XML encoding",
         },
     }
+}
+
+/// Resolved signature hints and experimental recipient mechanism metadata.
+/// No key hint establishes trust or permission. The mutation handle is private
+/// and bound to the original document, never an external document's local ID.
+pub struct SignatureKeyInfoMetadata {
+    /// Materialized recipient hints for KEM, ordinary hints otherwise.
+    pub key_info: KeyInfo,
+    /// Exact KEM parameter set, if the resolved graph contains one mechanism.
+    pub encapsulation: Option<crate::provider::KeyEncapsulationAlgorithm>,
+    pub(crate) cipher_value: Option<NodeId>,
+}
+
+fn inspect_signature_key_info_with_budgets<P: KeyInfoReferencePolicy>(
+    node: Node<'_, '_>,
+    resolver: &UriReferenceResolver<'_>,
+    policy: &P,
+    provider: &dyn crate::provider::CryptoProvider,
+    budgets: &mut RetrievalMaterializationBudgets<'_>,
+    template: bool,
+    retain_recipient_hints: bool,
+) -> Result<SignatureKeyInfoMetadata, DsigError> {
+    if resolver.node_for_node_id(node.id()) != Some(node) {
+        return Err(DsigError::InvalidStructure {
+            reason: "KeyInfo and resolver belong to different documents",
+        });
+    }
+    let mut materialization = KeyInfoMaterializationState {
+        collect_encapsulation: true,
+        encapsulation_template: template,
+        retain_encapsulation_target: true,
+        ..Default::default()
+    };
+    materialization.observe_encapsulation(node, resolver, 0)?;
+    if let Some(mechanism) = &materialization.encapsulation {
+        policy
+            .key_establishment()
+            .check_encapsulation(mechanism.algorithm)?;
+    }
+    let mut key_info = parse_key_info_with_policy_budgets(
+        node,
+        provider,
+        budgets.execution.xml_base_resolution(),
+        policy.resources(),
+        policy.certificate_signature_algorithms(),
+    )
+    .map_err(map_key_info_parse_error)?;
+    materialize_key_info_references_with_budgets(
+        &mut key_info,
+        resolver,
+        policy,
+        provider,
+        budgets,
+        &mut materialization,
+    )?;
+    let encapsulation = materialization
+        .encapsulation
+        .as_ref()
+        .map(|value| value.algorithm);
+    let cipher_value =
+        if let Some((resource, cipher, recipient)) = materialization.encapsulation_target.take() {
+            // Product mutation boundary: immutable external resources cannot be
+            // updated by signing, and foreign node IDs must not address this DOM.
+            if resource != resolver.traversal_document_identity() {
+                return Err(DsigError::InvalidStructure {
+                    reason: "recipient metadata requires its original document context",
+                });
+            }
+            if retain_recipient_hints {
+                let recipient =
+                    resolver
+                        .node_for_node_id(recipient)
+                        .ok_or(DsigError::InvalidStructure {
+                            reason: "recipient KeyInfo target is unavailable",
+                        })?;
+                key_info = parse_key_info_with_policy_budgets(
+                    recipient,
+                    provider,
+                    budgets.execution.xml_base_resolution(),
+                    policy.resources(),
+                    policy.certificate_signature_algorithms(),
+                )
+                .map_err(map_key_info_parse_error)?;
+                // Recipient references use the same cumulative candidate, parse and
+                // external-resource allowances as the containing mechanism graph.
+                materialization.reference_depth_base = materialization.encapsulation_depth;
+                materialize_key_info_references_with_budgets(
+                    &mut key_info,
+                    resolver,
+                    policy,
+                    provider,
+                    budgets,
+                    &mut materialization,
+                )?;
+            }
+            Some(cipher)
+        } else {
+            None
+        };
+    Ok(SignatureKeyInfoMetadata {
+        key_info,
+        encapsulation,
+        cipher_value,
+    })
+}
+
+pub(crate) fn inspect_signing_key_info_with_budgets(
+    node: Node<'_, '_>,
+    resolver: &UriReferenceResolver<'_>,
+    policy: &crate::policy::SigningPolicy,
+    provider: &dyn crate::provider::CryptoProvider,
+    shared_budgets: (&TransformExecutionBudget, &mut XPathSignatureParseBudget),
+    xml_backend: crate::XmlBackend,
+) -> Result<SignatureKeyInfoMetadata, DsigError> {
+    inspect_signature_key_info_with_budgets(
+        node,
+        resolver,
+        policy,
+        provider,
+        &mut RetrievalMaterializationBudgets {
+            xpath_parse: shared_budgets.1,
+            execution: shared_budgets.0,
+            resources: &policy.resources,
+            certificate_signature_algorithms: None,
+            xml_backend,
+        },
+        true,
+        false,
+    )
+}
+
+fn inspect_signature_key_info_for_policy<P: KeyInfoReferencePolicy>(
+    node: Node<'_, '_>,
+    resolver: UriReferenceResolver<'_>,
+    policy: &P,
+    provider: &dyn crate::provider::CryptoProvider,
+    xml_backend: crate::XmlBackend,
+    template: bool,
+) -> Result<SignatureKeyInfoMetadata, DsigError> {
+    let resolver = resolver.with_external_resource_limits(
+        policy.resources().max_external_resource_bytes,
+        policy.resources().max_external_resource_total_bytes,
+    );
+    let mut xpath_parse = XPathSignatureParseBudget::from_resources(policy.resources());
+    let execution = TransformExecutionBudget::from_resources(policy.resources());
+    inspect_signature_key_info_with_budgets(
+        node,
+        &resolver,
+        policy,
+        provider,
+        &mut RetrievalMaterializationBudgets {
+            xpath_parse: &mut xpath_parse,
+            execution: &execution,
+            resources: policy.resources(),
+            certificate_signature_algorithms: policy.certificate_signature_algorithms(),
+            xml_backend,
+        },
+        template,
+        true,
+    )
+}
+
+/// Inspect signing hints and KEM targets through the bounded KeyInfoReference
+/// graph. KEM targets must belong to the document that will be mutated.
+pub fn inspect_signing_key_info(
+    node: Node<'_, '_>,
+    resolver: UriReferenceResolver<'_>,
+    policy: &crate::policy::SigningPolicy,
+    provider: &dyn crate::provider::CryptoProvider,
+    xml_backend: crate::XmlBackend,
+) -> Result<SignatureKeyInfoMetadata, DsigError> {
+    policy.validate()?;
+    inspect_signature_key_info_for_policy(node, resolver, policy, provider, xml_backend, true)
+}
+
+/// Inspect verification hints and KEM metadata with the same source, URI,
+/// candidate, depth and cycle gates as core verification.
+/// This original-document metadata API requires KEM targets in that document;
+/// core verification also supports caller-supplied external KEM resources.
+pub fn inspect_verification_key_info(
+    node: Node<'_, '_>,
+    resolver: UriReferenceResolver<'_>,
+    policy: &crate::policy::VerificationPolicy,
+    provider: &dyn crate::provider::CryptoProvider,
+    xml_backend: crate::XmlBackend,
+) -> Result<SignatureKeyInfoMetadata, DsigError> {
+    policy.validate()?;
+    inspect_signature_key_info_for_policy(node, resolver, policy, provider, xml_backend, false)
 }
 
 fn materialize_key_info_references_for_policy<P: KeyInfoReferencePolicy>(

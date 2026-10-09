@@ -26,8 +26,8 @@ use xml_sec::rsa_encoding::{RsaPrivateKeyEncoding as _, RsaPublicKeyEncoding as 
 use xml_sec::xmldsig::{
     DsaSigningKey, DsigError, EcdsaP256SigningKey, EcdsaP384SigningKey, EcdsaP521SigningKey,
     KeyInfo, ReferenceProcessingError, RsaSigningKey, SignatureAlgorithm, SigningKey,
-    VerificationKey, find_signature_node, materialize_signing_key_info_references,
-    materialize_verification_key_info_references, parse_signed_info, uri::UriReferenceResolver,
+    VerificationKey, find_signature_node, inspect_signing_key_info, inspect_verification_key_info,
+    parse_signed_info, uri::UriReferenceResolver,
 };
 use xml_sec::{
     XmlDomDocument as Document, XmlDomNode as Node, XmlDomParsingOptions as ParsingOptions,
@@ -183,45 +183,48 @@ pub fn verification_signature_metadata(
     let algorithm = parse_signed_info(signed_info)
         .map(|info| info.signature_method)
         .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
-    let mechanism = signature_key_info(signature)
-        .map(|info| xml_sec::key_establishment::direct_encapsulation(info, false))
-        .transpose()
-        .map_err(|error| KeyMaterialError::Signature(error.to_string()))?
-        .flatten();
-    if let Some(mechanism) = &mechanism {
-        policy
-            .key_establishment
-            .check_encapsulation(mechanism.algorithm)?;
-    }
-    let key_info = if key_name_resolution == VerificationKeyNameResolution::IgnoreDocumentKeyInfo {
-        None
-    } else {
-        let mut parsing = xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&policy.resources)
-            .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
-        let mut key_info = mechanism
-            .as_ref()
-            .map(|mechanism| mechanism.key_info)
-            .or_else(|| signature_key_info(signature))
-            .map(|node| parsing.parse_with_provider(node, provider))
+    // A pinned non-HMAC key does not consume document key hints. KEM/HMAC
+    // metadata is different: its mechanism must still be resolved and checked.
+    let ignore_hints = key_name_resolution == VerificationKeyNameResolution::IgnoreDocumentKeyInfo
+        && algorithm.hmac_output_bits().is_none();
+    let direct = if ignore_hints {
+        signature_key_info(signature)
+            .map(|info| xml_sec::key_establishment::direct_encapsulation(info, false))
             .transpose()
-            .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
-        if let Some(key_info) = &mut key_info {
-            let resolver = UriReferenceResolver::with_id_registrations(&document, id_attributes);
-            materialize_verification_key_info_references(
-                key_info,
-                resolver,
+            .map_err(|error| KeyMaterialError::Signature(error.to_string()))?
+            .flatten()
+    } else {
+        None
+    };
+    let metadata = signature_key_info(signature)
+        .filter(|_| !ignore_hints)
+        .map(|info| {
+            inspect_verification_key_info(
+                info,
+                UriReferenceResolver::with_id_registrations(&document, id_attributes),
                 policy,
                 provider,
                 xml_backend,
             )
-            .map_err(map_key_info_reference_error)?;
-        }
-        key_info
+        })
+        .transpose()
+        .map_err(map_key_info_reference_error)?;
+    let encapsulation = metadata
+        .as_ref()
+        .and_then(|info| info.encapsulation)
+        .or_else(|| direct.map(|mechanism| mechanism.algorithm));
+    if let Some(algorithm) = encapsulation {
+        policy.key_establishment.check_encapsulation(algorithm)?;
+    }
+    let key_info = if key_name_resolution == VerificationKeyNameResolution::IgnoreDocumentKeyInfo {
+        None
+    } else {
+        metadata.map(|metadata| metadata.key_info)
     };
     Ok(SignatureMetadata {
         algorithm,
         key_names: key_names(&key_info),
-        encapsulation: mechanism.map(|mechanism| mechanism.algorithm),
+        encapsulation,
     })
 }
 
@@ -253,35 +256,28 @@ pub fn signing_signature_metadata(
     let algorithm = xml_sec::xmldsig::parse::parse_signature_method(method, &policy.resources)
         .map(|(algorithm, _, _)| algorithm)
         .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
-    let mechanism = signature_key_info(signature)
-        .map(|info| xml_sec::key_establishment::direct_encapsulation(info, true))
+    let metadata = signature_key_info(signature)
+        .map(|info| {
+            inspect_signing_key_info(
+                info,
+                UriReferenceResolver::with_id_registrations(&document, id_attributes),
+                policy,
+                provider,
+                xml_backend,
+            )
+        })
         .transpose()
-        .map_err(|error| KeyMaterialError::Signature(error.to_string()))?
-        .flatten();
-    if let Some(mechanism) = &mechanism {
-        policy
-            .key_establishment
-            .check_encapsulation(mechanism.algorithm)?;
+        .map_err(map_key_info_reference_error)?;
+    let encapsulation = metadata.as_ref().and_then(|info| info.encapsulation);
+    if let Some(algorithm) = encapsulation {
+        policy.key_establishment.check_encapsulation(algorithm)?;
     }
-    let mut parsing = xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&policy.resources)
-        .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
-    let mut key_info = mechanism
-        .as_ref()
-        .map(|mechanism| mechanism.key_info)
-        .or_else(|| signature_key_info(signature))
-        .map(|node| parsing.parse_with_provider(node, provider))
-        .transpose()
-        .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
-    if let Some(key_info) = &mut key_info {
-        let resolver = UriReferenceResolver::with_id_registrations(&document, id_attributes);
-        materialize_signing_key_info_references(key_info, resolver, policy, provider, xml_backend)
-            .map_err(map_key_info_reference_error)?;
-    }
+    let key_info = metadata.map(|metadata| metadata.key_info);
     Ok(SigningTemplateMetadata {
         algorithm,
         key_names: key_names(&key_info),
         key_info,
-        encapsulation: mechanism.map(|mechanism| mechanism.algorithm),
+        encapsulation,
     })
 }
 
