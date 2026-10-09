@@ -37,6 +37,10 @@ Verification uses `VerifyContext::decapsulation_key(&recipient_private)` and
 the same explicit algorithm permission. Supplying an ordinary HMAC key cannot
 bypass the mechanism, and conflicting recipient parameter sets are rejected.
 
+Verification also resolves mechanisms reached through `KeyInfoReference`, using
+the same source/URI policy, depth, cycle and shared parsing limits as other key
+metadata. Multiple mechanisms in the resolved graph are rejected as ambiguous.
+
 **KEM/HMAC does not authenticate the sender:** anyone holding the public key
 can create a new valid message. This path requires explicit
 `VerificationTrustMode::CryptographicOnly` and returns

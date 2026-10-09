@@ -363,6 +363,7 @@ impl EncryptedDataBuilder {
     }
 
     /// Emit a direct `KeyName` hint for a caller-managed content key.
+    /// This names the content key, never an encapsulation recipient key.
     pub fn direct_key_name(mut self, key_name: impl Into<String>) -> Self {
         self.direct_key_name = Some(key_name.into());
         self
@@ -1386,9 +1387,9 @@ fn write_encrypted_data<W: Write>(
                 ],
             )?;
             write_start(writer, "ds:KeyInfo", [])?;
-            if let Some(name) = direct_key_name {
-                write_text_element(writer, "ds:KeyName", name)?;
-            }
+            // XMLDSig 1.1 §4.5.1: KeyName identifies the containing KeyInfo's
+            // key. The outer content key and inner recipient key are distinct.
+            // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-KeyName
             write_end(writer, "ds:KeyInfo")?;
             write_cipher_data(writer, ciphertext)?;
             write_end(writer, "kem:EncapsulationMechanism")?;

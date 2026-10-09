@@ -2119,36 +2119,13 @@ fn verify_signature_node<'a>(
     }
     let doc = view.document();
     let signature_children = parse_signature_children(signature_node)?;
-    let encapsulation = signature_children
-        .key_info_node
-        .map(|info| crate::key_establishment::direct_encapsulation(info, false))
-        .transpose()?
-        .flatten();
-    if encapsulation.is_some() != ctx.decapsulation_key.is_some() {
-        return Err(crate::key_establishment::KeyEstablishmentError::Structure(
-            "mechanism and explicit recipient key must be supplied together",
-        )
-        .into());
-    }
-    if let Some(mechanism) = &encapsulation {
+    if ctx.decapsulation_key.is_some() {
         // Public-key encapsulation establishes a recipient secret, not sender
         // identity. Reject an impossible trust requirement before key work.
         if ctx.policy.key_trust.mode != crate::policy::VerificationTrustMode::CryptographicOnly {
             return Err(crate::policy::PolicyViolation::KeyTrust {
                 reason: "KEM/HMAC does not authenticate sender identity",
             }
-            .into());
-        }
-        ctx.policy
-            .key_establishment
-            .check_encapsulation(mechanism.algorithm)?;
-        if ctx
-            .decapsulation_key
-            .is_some_and(|key| key.algorithm() != mechanism.algorithm)
-        {
-            return Err(crate::key_establishment::KeyEstablishmentError::Structure(
-                "recipient parameter set mismatch",
-            )
             .into());
         }
     }
@@ -2276,8 +2253,14 @@ fn verify_signature_node<'a>(
         plan_nodes.key_materialization,
         &observed_key_resources,
         || {
+            let budgets = operation.budgets();
+            let mut materialization = budgets.key_info_materialization.borrow_mut();
+            materialization.collect_encapsulation = true;
+            materialization.encapsulation = None;
+            if let Some(node) = signature_children.key_info_node {
+                materialization.observe_encapsulation(node)?;
+            }
             if let Some(info) = key_info.as_mut() {
-                let budgets = operation.budgets();
                 let mut xpath_parse = budgets.xpath_parse.borrow_mut();
                 let mut retrieval_budgets = RetrievalMaterializationBudgets {
                     xpath_parse: &mut xpath_parse,
@@ -2290,7 +2273,6 @@ fn verify_signature_node<'a>(
                         .as_ref(),
                     xml_backend: ctx.xml_backend,
                 };
-                let mut materialization = budgets.key_info_materialization.borrow_mut();
                 let mut outcome = materialize_key_info_references_with_budgets(
                     info,
                     resolver,
@@ -2313,6 +2295,32 @@ fn verify_signature_node<'a>(
             }
         },
     )?;
+    let encapsulation = operation
+        .budgets()
+        .key_info_materialization
+        .borrow_mut()
+        .encapsulation
+        .take();
+    if encapsulation.is_some() != ctx.decapsulation_key.is_some() {
+        return Err(crate::key_establishment::KeyEstablishmentError::Structure(
+            "mechanism and explicit recipient key must be supplied together",
+        )
+        .into());
+    }
+    if let Some(mechanism) = &encapsulation {
+        ctx.policy
+            .key_establishment
+            .check_encapsulation(mechanism.algorithm)?;
+        if ctx
+            .decapsulation_key
+            .is_some_and(|key| key.algorithm() != mechanism.algorithm)
+        {
+            return Err(crate::key_establishment::KeyEstablishmentError::Structure(
+                "recipient parameter set mismatch",
+            )
+            .into());
+        }
+    }
     let mut reference_results = Vec::with_capacity(signed_info.references.len());
     let mut first_failure = None;
     for (index, (node, reference)) in plan_nodes
@@ -2499,7 +2507,7 @@ fn verify_signature_node<'a>(
                     ctx.provider,
                     recipient,
                     mechanism.algorithm,
-                    mechanism.ciphertext(),
+                    &mechanism.ciphertext[..mechanism.algorithm.ciphertext_len()],
                 )?;
             let hmac = super::HmacVerificationKey::new(secret.to_vec())?;
             return Ok(Some(ResolvedVerifyingKey::Established(hmac)));
@@ -2712,6 +2720,47 @@ struct RetrievalMaterializationBudgets<'a> {
 struct KeyInfoMaterializationState {
     active: HashSet<(super::uri::TraversalDocumentIdentity, String)>,
     candidate_work: usize,
+    collect_encapsulation: bool,
+    encapsulation: Option<ResolvedEncapsulation>,
+}
+
+struct ResolvedEncapsulation {
+    algorithm: crate::provider::KeyEncapsulationAlgorithm,
+    ciphertext: [u8; 1568],
+}
+
+impl KeyInfoMaterializationState {
+    fn observe_encapsulation(
+        &mut self,
+        node: Node<'_, '_>,
+    ) -> Result<(), SignatureVerificationPipelineError> {
+        if !self.collect_encapsulation {
+            return Ok(());
+        }
+        // XMLDSig 1.1 §4.5.10 references KeyInfo, including its extension
+        // children. Collect metadata in the gated reference traversal, not a
+        // separate unbounded scan; external document nodes cannot escape it.
+        // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-KeyInfoReference
+        let Some(mechanism) =
+            crate::key_establishment::direct_encapsulation(node, false).map_err(|_| {
+                SignatureVerificationPipelineError::InvalidStructure {
+                    reason: "invalid encapsulation mechanism in resolved KeyInfo",
+                }
+            })?
+        else {
+            return Ok(());
+        };
+        if self.encapsulation.is_some() {
+            return Err(SignatureVerificationPipelineError::InvalidStructure {
+                reason: "multiple encapsulation mechanisms in resolved KeyInfo",
+            });
+        }
+        self.encapsulation = Some(ResolvedEncapsulation {
+            algorithm: mechanism.algorithm,
+            ciphertext: mechanism.into_ciphertext(),
+        });
+        Ok(())
+    }
 }
 
 trait KeyInfoReferencePolicy {
@@ -2885,6 +2934,7 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
                         reason: "KeyInfoReference target must be KeyInfo",
                     });
                 }
+                materialization.observe_encapsulation(node)?;
                 super::parse::validate_x509_digest_policy(node, &|algorithm| {
                     context.policy.check_digest_algorithm(algorithm)
                 })
@@ -2962,6 +3012,7 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
                             reason: "KeyInfoReference external target must be KeyInfo",
                         });
                     }
+                    materialization.observe_encapsulation(target)?;
                     super::parse::validate_x509_digest_policy(target, &|algorithm| {
                         context.policy.check_digest_algorithm(algorithm)
                     })

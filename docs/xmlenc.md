@@ -23,6 +23,8 @@ element order or namespaces remain `XmlEncError::InvalidStructure`.
 With `experimental-pq`, `EncryptedDataBuilder::encapsulation_key` establishes
 a fresh content key for an explicitly supplied recipient. Grant the exact
 ML-KEM parameter set through the operation's `KeyEstablishmentPolicy`.
+`direct_key_name` names only the outer content key, not the recipient key
+inside `EncapsulationMechanism`; an explicit recipient is supplied by the caller.
 `EncapsulationDecryptor::new` borrows a private recipient handle;
 `EncapsulationDecryptor::provider_key` owns an imported handle.
 `KeyInventory::decryption_resolver_with_provider` selects these keys by their

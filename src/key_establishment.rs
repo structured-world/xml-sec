@@ -56,6 +56,11 @@ impl ParsedEncapsulation<'_, '_> {
     pub fn ciphertext(&self) -> &[u8] {
         &self.ciphertext[..self.ciphertext_len]
     }
+
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn into_ciphertext(self) -> [u8; 1568] {
+        self.ciphertext
+    }
 }
 
 /// Validate the experimental ordered grammar and decode into fixed storage.

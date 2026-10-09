@@ -393,6 +393,127 @@ fn all_donor_hmac_encapsulation_ciphertexts_verify() {
 }
 
 #[test]
+fn hmac_encapsulation_resolves_key_info_references() {
+    // Moving unsigned KeyInfo must not alter signature verification; references
+    // still obey the existing depth, cycle, source and URI policy gates.
+    let xml = std::fs::read_to_string(fixture_path(
+        "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-em-ml-kem-512.xml",
+    ))
+    .unwrap();
+    let document = xml_sec::Document::parse(&xml).unwrap();
+    let info = document
+        .root_element()
+        .children()
+        .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyInfo")))
+        .unwrap();
+    let original = &xml[info.range()];
+    let target = original.replacen(
+        "<KeyInfo>",
+        "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\" Id=\"recipient\">",
+        1,
+    );
+    let reference = |uri: &str| {
+        format!(
+            "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyInfoReference xmlns=\"http://www.w3.org/2009/xmldsig11#\" URI=\"{uri}\"/></KeyInfo>"
+        )
+    };
+    let signed = xml.replacen(original, &reference("#recipient"), 1);
+    let same_document = format!(
+        "<root>{}{target}</root>",
+        signed.trim_start_matches("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
+    );
+    let key = RustCryptoMlKemPrivateKey::from_pkcs8_der(&fixture("ml-kem-512-key.der")).unwrap();
+    let mut policy = xml_sec::policy::VerificationPolicy::default();
+    policy
+        .key_establishment
+        .encapsulation_algorithms
+        .insert(key.algorithm());
+    policy.key_trust.mode = xml_sec::policy::VerificationTrustMode::CryptographicOnly;
+    let verify = |input: &str, policy| {
+        xml_sec::xmldsig::VerifyContext::new()
+            .decapsulation_key(&key)
+            .policy(policy)
+            .verify(input)
+    };
+    assert_eq!(
+        verify(&same_document, policy.clone()).unwrap().status,
+        xml_sec::xmldsig::DsigStatus::Valid
+    );
+    let mut denied = policy.clone();
+    denied.key_sources.key_info_reference = false;
+    assert!(verify(&same_document, denied).is_err());
+    let cyclic = same_document.replacen(
+        &target,
+        &reference("#recipient").replacen("<KeyInfo ", "<KeyInfo Id=\"recipient\" ", 1),
+        1,
+    );
+    assert!(
+        verify(&cyclic, policy.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("cycle")
+    );
+    let two_mechanisms = original.replacen(
+        "</KeyInfo>",
+        "<KeyInfoReference xmlns=\"http://www.w3.org/2009/xmldsig11#\" URI=\"#recipient\"/></KeyInfo>",
+        1,
+    );
+    let ambiguous = format!(
+        "<root>{}{target}</root>",
+        xml.trim_start_matches("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
+            .replacen(original, &two_mechanisms, 1)
+    );
+    assert!(
+        verify(&ambiguous, policy.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("multiple encapsulation")
+    );
+    let intermediate =
+        reference("#recipient").replacen("<KeyInfo ", "<KeyInfo Id=\"intermediate\" ", 1);
+    let nested = same_document
+        .replacen("URI=\"#recipient\"", "URI=\"#intermediate\"", 1)
+        .replace("</root>", &format!("{intermediate}</root>"));
+    assert_eq!(
+        verify(&nested, policy.clone()).unwrap().status,
+        xml_sec::xmldsig::DsigStatus::Valid
+    );
+    let mut shallow = policy.clone();
+    shallow.resources.max_key_info_reference_depth = 1;
+    assert!(verify(&nested, shallow).is_err());
+    let external = xml.replacen(
+        original,
+        &reference("https://example.test/recipient.xml"),
+        1,
+    );
+    let resources = std::collections::HashMap::from([(
+        "https://example.test/recipient.xml".to_owned(),
+        target.into_bytes(),
+    )]);
+    assert!(
+        xml_sec::xmldsig::VerifyContext::new()
+            .decapsulation_key(&key)
+            .external_resources(&resources)
+            .policy(policy.clone())
+            .verify(&external)
+            .unwrap_err()
+            .to_string()
+            .contains("URI class")
+    );
+    policy.uris.key_info_references = xml_sec::xmldsig::UriTypeSet::ALL;
+    assert_eq!(
+        xml_sec::xmldsig::VerifyContext::new()
+            .decapsulation_key(&key)
+            .external_resources(&resources)
+            .policy(policy)
+            .verify(&external)
+            .unwrap()
+            .status,
+        xml_sec::xmldsig::DsigStatus::Valid
+    );
+}
+
+#[test]
 fn cli_verify_selects_named_kem_recipient() {
     // Multiple explicit private keys retain document KeyName selection unless
     // lax search was explicitly requested; private options are still key sources.
@@ -744,6 +865,7 @@ fn encrypted_data_builder_round_trips_all_kem_parameter_sets() {
             xml_sec::xmlenc::DataEncryptionAlgorithm::Aes256Gcm,
         )
         .encapsulation_key(std::sync::Arc::new(private.public_key()))
+        .direct_key_name("content-key")
         .policy(policy.clone())
         .encrypt_binary(b"KEM content")
         .unwrap();
@@ -761,6 +883,50 @@ fn encrypted_data_builder_round_trips_all_kem_parameter_sets() {
             xml_sec::xmlenc::DecryptedContent::Bytes(b"KEM content".to_vec())
         );
         let document = xml_sec::Document::parse(&result.encrypted_data_xml).unwrap();
+        let outer_info = document
+            .root_element()
+            .children()
+            .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyInfo")))
+            .unwrap();
+        assert_eq!(
+            outer_info
+                .children()
+                .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyName")))
+                .unwrap()
+                .text(),
+            Some("content-key")
+        );
+        let mechanism = outer_info
+            .children()
+            .find(|node| node.tag_name().name() == "EncapsulationMechanism")
+            .unwrap();
+        assert!(
+            !mechanism
+                .descendants()
+                .any(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyName")))
+        );
+        // Strict CLI selection must not confuse the content-key hint with the
+        // independently named caller-supplied recipient private key.
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("encrypted.xml");
+        let output = directory.path().join("decrypted.bin");
+        std::fs::write(&input, &result.encrypted_data_xml).unwrap();
+        let command = std::process::Command::new(env!("CARGO_BIN_EXE_xmlsec1"))
+            .args(["decrypt", "--pkcs8-der:recipient-key"])
+            .arg(fixture_path(&format!(
+                "xmldsig/keys/ml-kem/ml-kem-{size}-key.der"
+            )))
+            .arg("--output")
+            .arg(&output)
+            .arg(&input)
+            .output()
+            .unwrap();
+        assert!(
+            command.status.success(),
+            "{}",
+            String::from_utf8_lossy(&command.stderr)
+        );
+        assert_eq!(std::fs::read(output).unwrap(), b"KEM content");
         let value = document
             .descendants()
             .find(|node| node.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "CipherValue")))
