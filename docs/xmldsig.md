@@ -47,10 +47,12 @@ hints do not require decoding their key material.
 Verification also resolves mechanisms reached through `KeyInfoReference`, using
 the same source/URI policy, depth, cycle and shared parsing limits as other key
 metadata. Multiple mechanisms in the resolved graph are rejected as ambiguous.
-Pinned ordinary verification keys ignore unused key lookup hints, including malformed or
-unresolved hints; local mechanism discovery does not decode that key material.
+Ordinary explicit signing keys (including HMAC) and pinned verification keys ignore
+unused key lookup hints, including malformed or unresolved hints. Bounded mechanism
+discovery follows local and policy-permitted external references without decoding
+unrelated key material.
 An actual mechanism, direct or referenced, is an operation instruction and cannot
-be ignored by an ordinary signer. Signing checks the projected XML size and
+be ignored by an ordinary signer or pinned verifier. Signing checks the projected XML size and
 reserves raw ciphertext, encoded ciphertext, and the HMAC secret copy before
 calling the encapsulation primitive.
 

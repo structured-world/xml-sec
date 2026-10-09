@@ -439,6 +439,9 @@ XMLDSig 1.1 §4.5.9 and RFC 9935 §4). This is an extension beyond the donor's
 ML-KEM XML key-store support, not a new key encoding. Private recipient keys
 use PKCS#8 (RFC 9935 §6); `--keys-file` cannot supply them for `verify` or
 `decrypt`, and the diagnostic names the command and the applicable PKCS#8 options.
+Missing recipient inputs are reported directly rather than as KeyName ambiguity.
+Certificate public-key options and `--pkcs12` are not supported by these CLI KEM
+selectors; diagnostics name the option and command before reading key files.
 Mixing ordinary signing keys with a KEM template is rejected,
 and recipient-only options without a mechanism report which option is
 inapplicable. KEM/HMAC verification needs explicit `--insecure`: it validates

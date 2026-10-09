@@ -4897,6 +4897,15 @@ fn select_encapsulation_key<P: xml_sec::document::XmlDocumentPolicy>(
         ))
         .map_err(|error| CommandError::Encryption(error.to_string()))?;
     let resources = policy.resource_policy();
+    if let Some(option) = invocation
+        .ordered_values(&["pubkey-cert-pem", "pubkey-cert-der"])
+        .next()
+    {
+        return Err(CommandError::Usage(format!(
+            "--{} is inapplicable to {} with EncapsulationMechanism; supply --pubkey-pem, --pubkey-der or --keys-file",
+            option.name, invocation.command
+        )));
+    }
     let options = invocation
         .ordered_values(&["pubkey-pem", "pubkey-der"])
         .map(|option| (option, ()))
@@ -4936,6 +4945,12 @@ fn select_encapsulation_key<P: xml_sec::document::XmlDocumentPolicy>(
         return Err(
             last.unwrap_or_else(|| CommandError::Usage("no recipient public key found".into()))
         );
+    }
+    if options.is_empty() {
+        return Err(CommandError::Usage(format!(
+            "{} with EncapsulationMechanism requires a recipient --pubkey-pem, --pubkey-der or --keys-file",
+            invocation.command
+        )));
     }
     let candidates = named_candidate_search(
         &options,
@@ -5006,6 +5021,12 @@ fn select_decapsulation_key<P: xml_sec::document::XmlDocumentPolicy>(
         ))
         .map_err(|error| CommandError::Encryption(error.to_string()))?;
     let resources = policy.resource_policy();
+    if invocation.values("pkcs12").next().is_some() {
+        return Err(CommandError::Usage(format!(
+            "--pkcs12 is inapplicable to {} with EncapsulationMechanism; supply --privkey-pem/der or --pkcs8-pem/der",
+            invocation.command
+        )));
+    }
     let options = invocation
         .ordered_values(&["privkey-pem", "privkey-der", "pkcs8-pem", "pkcs8-der"])
         .map(|option| (option, ()))
@@ -5015,6 +5036,12 @@ fn select_decapsulation_key<P: xml_sec::document::XmlDocumentPolicy>(
         // https://www.w3.org/TR/xmldsig-core1/#sec-DEREncodedKeyValue
         return Err(CommandError::Usage(format!(
             "--keys-file is inapplicable to ML-KEM decapsulation in {}; supply the recipient PKCS#8 using --pkcs8-pem or --pkcs8-der instead",
+            invocation.command
+        )));
+    }
+    if options.is_empty() {
+        return Err(CommandError::Usage(format!(
+            "{} with EncapsulationMechanism requires a recipient --privkey-pem/der or --pkcs8-pem/der",
             invocation.command
         )));
     }
@@ -7252,6 +7279,61 @@ mod tests {
             xml_sec::key_establishment::ENCAPSULATION_NS,
             xml_sec::provider::KeyEncapsulationAlgorithm::MlKem512.uri(),
         )
+    }
+
+    #[test]
+    #[cfg(feature = "experimental-pq")]
+    fn kem_recipient_options_fail_before_key_io() {
+        // Missing or unsupported sources are usage errors, not KeyName ambiguity.
+        for (command, option, expected) in [
+            ("encrypt", None, "requires a recipient"),
+            (
+                "encrypt",
+                Some("pubkey-cert-pem"),
+                "--pubkey-cert-pem is inapplicable",
+            ),
+            ("decrypt", None, "requires a recipient"),
+            ("decrypt", Some("pkcs12"), "--pkcs12 is inapplicable"),
+        ] {
+            let mut args = vec![OsString::from("xmlsec1"), OsString::from(command)];
+            if let Some(option) = option {
+                args.push(OsString::from(format!("--{option}")));
+                args.push(OsString::from("missing-recipient-file"));
+            }
+            let invocation = Invocation::parse(args).unwrap();
+            let policy = xmlsec_compatibility_encryption_policy();
+            let mut budget =
+                ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
+            let names = ["recipient"];
+            let algorithm = xml_sec::provider::KeyEncapsulationAlgorithm::MlKem512;
+            let error = if command == "encrypt" {
+                select_encapsulation_key(
+                    &invocation,
+                    &names,
+                    algorithm,
+                    &policy.key_establishment,
+                    &policy,
+                    XmlBackend::default(),
+                    &mut budget,
+                )
+                .err()
+                .unwrap()
+            } else {
+                select_decapsulation_key(
+                    &invocation,
+                    &names,
+                    algorithm,
+                    &policy.key_establishment,
+                    &policy,
+                    &mut budget,
+                )
+                .err()
+                .unwrap()
+            };
+            assert!(matches!(error, CommandError::Usage(_)), "{error}");
+            assert!(error.to_string().contains(expected), "{error}");
+            assert!(error.to_string().contains(command), "{error}");
+        }
     }
 
     #[test]

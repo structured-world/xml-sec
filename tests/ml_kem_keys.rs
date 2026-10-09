@@ -74,7 +74,7 @@ fn xml_inventory_imports_standard_ml_kem_spki() {
     );
 }
 
-#[cfg(feature = "xmlenc")]
+#[cfg(all(feature = "xmldsig", feature = "xmlenc", feature = "c14n"))]
 #[test]
 fn cli_establishes_keys_for_sign_verify_encrypt_decrypt() {
     // Exercise the real executable and protected-key import, not only core APIs.
@@ -287,7 +287,7 @@ fn cli_establishes_keys_for_sign_verify_encrypt_decrypt() {
     }
 }
 
-#[cfg(feature = "xmlenc")]
+#[cfg(all(feature = "xmldsig", feature = "xmlenc", feature = "c14n"))]
 #[test]
 fn cli_decrypt_resolves_referenced_kem_key_info() {
     // XMLDSig 1.1 section 4.5.10 permits a same-document KeyInfoReference.
@@ -441,23 +441,26 @@ fn hmac_encapsulation_resolves_key_info_references() {
     );
     // CLI metadata must discover the same referenced mechanism as the core,
     // and select the recipient's name rather than the outer KeyInfo's hints.
-    let directory = tempfile::tempdir().unwrap();
-    let input = directory.path().join("referenced.xml");
-    std::fs::write(&input, &same_document).unwrap();
-    let private = fixture_path("xmldsig/keys/ml-kem/ml-kem-512-key.der");
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_xmlsec1"))
-        .args(["verify", "--insecure", "--pkcs8-der:unrelated"])
-        .arg(&private)
-        .arg("--pkcs8-der:TestKeyName-ml-kem-512")
-        .arg(&private)
-        .arg(&input)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    #[cfg(all(feature = "xmldsig", feature = "xmlenc", feature = "c14n"))]
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("referenced.xml");
+        std::fs::write(&input, &same_document).unwrap();
+        let private = fixture_path("xmldsig/keys/ml-kem/ml-kem-512-key.der");
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_xmlsec1"))
+            .args(["verify", "--insecure", "--pkcs8-der:unrelated"])
+            .arg(&private)
+            .arg("--pkcs8-der:TestKeyName-ml-kem-512")
+            .arg(&private)
+            .arg(&input)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     let mut denied = policy.clone();
     denied.key_sources.key_info_reference = false;
     assert!(verify(&same_document, denied).is_err());
@@ -697,23 +700,26 @@ fn signing_resolves_referenced_encapsulation_target() {
             .status,
         xml_sec::xmldsig::DsigStatus::Valid
     );
-    let directory = tempfile::tempdir().unwrap();
-    let template = directory.path().join("template.xml");
-    let output_path = directory.path().join("signed.xml");
-    std::fs::write(&template, &input).unwrap();
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_xmlsec1"))
-        .args(["sign", "--pubkey-pem:TestKeyName-ml-kem-512"])
-        .arg(fixture_path("xmldsig/keys/ml-kem/ml-kem-512-pubkey.pem"))
-        .arg("--output")
-        .arg(&output_path)
-        .arg(&template)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    #[cfg(all(feature = "xmldsig", feature = "xmlenc", feature = "c14n"))]
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let template = directory.path().join("template.xml");
+        let output_path = directory.path().join("signed.xml");
+        std::fs::write(&template, &input).unwrap();
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_xmlsec1"))
+            .args(["sign", "--pubkey-pem:TestKeyName-ml-kem-512"])
+            .arg(fixture_path("xmldsig/keys/ml-kem/ml-kem-512-pubkey.pem"))
+            .arg("--output")
+            .arg(&output_path)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     policy.resources.max_key_info_reference_depth = 0;
     assert!(
         xml_sec::xmldsig::SignContext::new_encapsulation(&public)
@@ -723,6 +729,7 @@ fn signing_resolves_referenced_encapsulation_target() {
     );
 }
 
+#[cfg(all(feature = "xmldsig", feature = "xmlenc", feature = "c14n"))]
 #[test]
 fn cli_verify_selects_named_kem_recipient() {
     // Multiple explicit private keys retain document KeyName selection unless
@@ -891,6 +898,118 @@ fn ordinary_hmac_cannot_ignore_an_encapsulation_template() {
 }
 
 #[test]
+fn pinned_hmac_rejects_referenced_encapsulation() {
+    // Unsigned lookup indirection must not hide an instruction from pinned keys.
+    let template = std::fs::read_to_string(fixture_path(
+        "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-em-ml-kem-512.tmpl",
+    ))
+    .unwrap();
+    let document = xml_sec::Document::parse(&template).unwrap();
+    let info = document
+        .root_element()
+        .children()
+        .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyInfo")))
+        .unwrap();
+    let ordinary = template.replacen(&template[info.range()], "<KeyInfo/>", 1);
+    let key = xml_sec::xmldsig::HmacSigningKey::new(vec![7; 32]).unwrap();
+    let signed = xml_sec::xmldsig::SignContext::new(&key)
+        .sign_template(&ordinary)
+        .unwrap();
+    let verification = xml_sec::policy::VerificationPolicy {
+        key_trust: xml_sec::policy::KeyTrustPolicy {
+            mode: xml_sec::policy::VerificationTrustMode::CryptographicOnly,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let verifying_key = xml_sec::xmldsig::HmacVerificationKey::new(vec![7; 32]).unwrap();
+    assert_eq!(
+        xml_sec::xmldsig::VerifyContext::new()
+            .key(&verifying_key)
+            .policy(verification.clone())
+            .verify(&signed)
+            .unwrap()
+            .status,
+        xml_sec::xmldsig::DsigStatus::Valid
+    );
+    let indirect = signed.replace("<KeyInfo/>", "<KeyInfo><KeyInfoReference xmlns=\"http://www.w3.org/2009/xmldsig11#\" URI=\"#recipient\"/></KeyInfo>");
+    let no_mechanism = format!(
+        "<root>{}<d:KeyInfo xmlns:d=\"http://www.w3.org/2000/09/xmldsig#\" Id=\"recipient\"/></root>",
+        indirect.trim_start_matches("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
+    );
+    assert_eq!(
+        xml_sec::xmldsig::VerifyContext::new()
+            .key(&verifying_key)
+            .policy(verification.clone())
+            .verify(&no_mechanism)
+            .unwrap()
+            .status,
+        xml_sec::xmldsig::DsigStatus::Valid
+    );
+    let indirect = format!(
+        "<root>{}<d:KeyInfo xmlns:d=\"http://www.w3.org/2000/09/xmldsig#\" Id=\"recipient\"><k:EncapsulationMechanism xmlns:k=\"{}\"/></d:KeyInfo></root>",
+        indirect.trim_start_matches("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"),
+        xml_sec::key_establishment::ENCAPSULATION_NS
+    );
+    assert!(
+        xml_sec::xmldsig::VerifyContext::new()
+            .key(&verifying_key)
+            .policy(verification.clone())
+            .verify(&indirect)
+            .is_err(),
+        "a pinned key cannot bypass referenced mechanisms"
+    );
+    // Caller-supplied external resources use the same gate and shared budgets.
+    let external = signed.replace("<KeyInfo/>", "<KeyInfo><KeyInfoReference xmlns=\"http://www.w3.org/2009/xmldsig11#\" URI=\"https://example.test/recipient.xml\"/></KeyInfo>");
+    let resources = std::collections::HashMap::from([(
+        "https://example.test/recipient.xml".to_owned(),
+        format!("<d:KeyInfo xmlns:d=\"http://www.w3.org/2000/09/xmldsig#\"><k:EncapsulationMechanism xmlns:k=\"{}\"/></d:KeyInfo>", xml_sec::key_establishment::ENCAPSULATION_NS).into_bytes(),
+    )]);
+    let mut permitted = verification;
+    permitted.uris.key_info_references = xml_sec::xmldsig::UriTypeSet::ALL;
+    assert!(
+        xml_sec::xmldsig::VerifyContext::new()
+            .key(&verifying_key)
+            .policy(permitted)
+            .external_resources(&resources)
+            .verify(&external)
+            .unwrap_err()
+            .to_string()
+            .contains("must be supplied together")
+    );
+}
+
+#[test]
+fn ordinary_hmac_ignores_unconsumed_key_hints() {
+    // An explicit HMAC key consumes no lookup hints, including malformed DER.
+    let template = std::fs::read_to_string(fixture_path(
+        "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-em-ml-kem-512.tmpl",
+    ))
+    .unwrap();
+    let document = xml_sec::Document::parse(&template).unwrap();
+    let info = document
+        .root_element()
+        .children()
+        .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyInfo")))
+        .unwrap();
+    let key = xml_sec::xmldsig::HmacSigningKey::new(vec![7; 32]).unwrap();
+    for hint in [
+        "<DEREncodedKeyValue xmlns=\"http://www.w3.org/2009/xmldsig11#\">not-base64!</DEREncodedKeyValue>",
+        "<KeyInfoReference xmlns=\"http://www.w3.org/2009/xmldsig11#\" URI=\"#missing\"/>",
+        "<KeyInfoReference xmlns=\"http://www.w3.org/2009/xmldsig11#\" URI=\"https://example.invalid/key.xml\"/>",
+    ] {
+        let ordinary = template.replacen(
+            &template[info.range()],
+            &format!("<KeyInfo>{hint}</KeyInfo>"),
+            1,
+        );
+        xml_sec::xmldsig::SignContext::new(&key)
+            .sign_template(&ordinary)
+            .expect("unused lookup hints cannot abort explicit-key signing");
+    }
+}
+
+#[test]
 fn signing_reserves_complete_kem_output_before_crypto() {
     // Predictable secret-copy, base64 and document-size failures must occur
     // before the provider invokes the recipient's encapsulation primitive.
@@ -987,7 +1106,7 @@ fn mechanism_discovery_bounds_reference_work_without_decoding_hints() {
     );
 }
 
-#[cfg(feature = "xmlenc")]
+#[cfg(all(feature = "xmldsig", feature = "xmlenc", feature = "c14n"))]
 #[test]
 fn cli_rejects_inapplicable_key_options_before_key_io() {
     // A KEM template needs a recipient public key, not a signing private/raw
@@ -1235,26 +1354,29 @@ fn encrypted_data_builder_round_trips_all_kem_parameter_sets() {
         );
         // Strict CLI selection must not confuse the content-key hint with the
         // independently named caller-supplied recipient private key.
-        let directory = tempfile::tempdir().unwrap();
-        let input = directory.path().join("encrypted.xml");
-        let output = directory.path().join("decrypted.bin");
-        std::fs::write(&input, &result.encrypted_data_xml).unwrap();
-        let command = std::process::Command::new(env!("CARGO_BIN_EXE_xmlsec1"))
-            .args(["decrypt", "--pkcs8-der:recipient-key"])
-            .arg(fixture_path(&format!(
-                "xmldsig/keys/ml-kem/ml-kem-{size}-key.der"
-            )))
-            .arg("--output")
-            .arg(&output)
-            .arg(&input)
-            .output()
-            .unwrap();
-        assert!(
-            command.status.success(),
-            "{}",
-            String::from_utf8_lossy(&command.stderr)
-        );
-        assert_eq!(std::fs::read(output).unwrap(), b"KEM content");
+        #[cfg(all(feature = "xmldsig", feature = "xmlenc", feature = "c14n"))]
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let input = directory.path().join("encrypted.xml");
+            let output = directory.path().join("decrypted.bin");
+            std::fs::write(&input, &result.encrypted_data_xml).unwrap();
+            let command = std::process::Command::new(env!("CARGO_BIN_EXE_xmlsec1"))
+                .args(["decrypt", "--pkcs8-der:recipient-key"])
+                .arg(fixture_path(&format!(
+                    "xmldsig/keys/ml-kem/ml-kem-{size}-key.der"
+                )))
+                .arg("--output")
+                .arg(&output)
+                .arg(&input)
+                .output()
+                .unwrap();
+            assert!(
+                command.status.success(),
+                "{}",
+                String::from_utf8_lossy(&command.stderr)
+            );
+            assert_eq!(std::fs::read(output).unwrap(), b"KEM content");
+        }
         let value = document
             .descendants()
             .find(|node| node.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "CipherValue")))
@@ -1403,7 +1525,7 @@ fn all_donor_key_formats_preserve_the_exact_key_pair() {
     }
 }
 
-#[cfg(feature = "xmlenc")]
+#[cfg(all(feature = "xmldsig", feature = "xmlenc", feature = "c14n"))]
 #[test]
 fn cli_encrypts_referenced_recipient_metadata() {
     // Both levels of reference must select the named key and mutate the same
@@ -1553,93 +1675,44 @@ fn nested_kem_wrap_recovery_shares_the_operation_budget() {
     );
     // The executable must select the recipient inside EncryptedKey as well,
     // rather than assuming every private recipient is RSA.
-    let directory = tempfile::tempdir().unwrap();
-    let input = directory.path().join("nested.xml");
-    let key = directory.path().join("recipient.der");
-    std::fs::write(&input, &xml).unwrap();
-    // The CLI must refuse this encryption template before creating output;
-    // an ordinary AES KEK cannot execute its preserved nested mechanism.
-    let aes = directory.path().join("aes.bin");
-    let data = directory.path().join("data.bin");
-    let encrypted = directory.path().join("invalid-output.xml");
-    std::fs::write(&aes, content_key).unwrap();
-    std::fs::write(&data, b"new plaintext").unwrap();
-    let rejected = std::process::Command::new(env!("CARGO_BIN_EXE_xmlsec1"))
-        .args(["encrypt", "--aes-key"])
-        .arg(&aes)
-        .arg("--binary-data")
-        .arg(&data)
-        .arg("--output")
-        .arg(&encrypted)
-        .arg(&input)
-        .output()
-        .unwrap();
-    assert!(!rejected.status.success());
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("nested EncapsulationMechanism"));
-    assert!(!encrypted.exists());
-    std::fs::write(
-        &key,
-        private
-            .to_pkcs8_der(MlKemPrivateKeyEncoding::Seed)
-            .unwrap()
-            .as_bytes(),
-    )
-    .unwrap();
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_xmlsec1"))
-        .args(["decrypt", "--pkcs8-der"])
-        .arg(&key)
-        .arg(&input)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(output.stdout, b"nested KEM plaintext");
-
-    // Unrelated KEM recipients must be excluded before CLI ambiguity checks;
-    // both URI associations and carried content-key names are authoritative.
-    let key_start = xml.find("<x:EncryptedKey>").unwrap();
-    let key_end = xml.find("</x:EncryptedKey>").unwrap() + "</x:EncryptedKey>".len();
-    let key_xml = &xml[key_start..key_end];
-    for (matching, unrelated, content_name, id_attribute) in [
-        (
-            "<x:ReferenceList><x:DataReference URI=\"#target\"/></x:ReferenceList>",
-            "<x:ReferenceList><x:DataReference URI=\"#other\"/></x:ReferenceList>",
-            "",
-            "Id",
-        ),
-        (
-            "<x:CarriedKeyName>session</x:CarriedKeyName>",
-            "<x:CarriedKeyName>other</x:CarriedKeyName>",
-            "<d:KeyName>session</d:KeyName>",
-            "Id",
-        ),
-        (
-            "<x:ReferenceList><x:DataReference URI=\"#target\"/></x:ReferenceList>",
-            "<x:ReferenceList><x:DataReference URI=\"#other\"/></x:ReferenceList>",
-            "",
-            "custom",
-        ),
-    ] {
-        let selected =
-            key_xml.replace("</x:EncryptedKey>", &format!("{matching}</x:EncryptedKey>"));
-        let skipped = key_xml.replace(
-            "</x:EncryptedKey>",
-            &format!("{unrelated}</x:EncryptedKey>"),
+    #[cfg(all(feature = "xmldsig", feature = "xmlenc", feature = "c14n"))]
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("nested.xml");
+        let key = directory.path().join("recipient.der");
+        std::fs::write(&input, &xml).unwrap();
+        // The CLI must refuse this encryption template before creating output;
+        // an ordinary AES KEK cannot execute its preserved nested mechanism.
+        let aes = directory.path().join("aes.bin");
+        let data = directory.path().join("data.bin");
+        let encrypted = directory.path().join("invalid-output.xml");
+        std::fs::write(&aes, content_key).unwrap();
+        std::fs::write(&data, b"new plaintext").unwrap();
+        let rejected = std::process::Command::new(env!("CARGO_BIN_EXE_xmlsec1"))
+            .args(["encrypt", "--aes-key"])
+            .arg(&aes)
+            .arg("--binary-data")
+            .arg(&data)
+            .arg("--output")
+            .arg(&encrypted)
+            .arg(&input)
+            .output()
+            .unwrap();
+        assert!(!rejected.status.success());
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr).contains("nested EncapsulationMechanism")
         );
-        let associated = xml
-            .replace(key_xml, &format!("{skipped}{selected}"))
-            .replacen(
-                "<x:EncryptedData ",
-                &format!("<x:EncryptedData {id_attribute}=\"target\" "),
-                1,
-            )
-            .replacen("<d:KeyInfo>", &format!("<d:KeyInfo>{content_name}"), 1);
-        std::fs::write(&input, associated).unwrap();
+        assert!(!encrypted.exists());
+        std::fs::write(
+            &key,
+            private
+                .to_pkcs8_der(MlKemPrivateKeyEncoding::Seed)
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_xmlsec1"))
-            .args(["decrypt", "--add-id-attr", "custom", "--pkcs8-der"])
+            .args(["decrypt", "--pkcs8-der"])
             .arg(&key)
             .arg(&input)
             .output()
@@ -1650,8 +1723,61 @@ fn nested_kem_wrap_recovery_shares_the_operation_budget() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(output.stdout, b"nested KEM plaintext");
-    }
 
+        // Unrelated KEM recipients must be excluded before CLI ambiguity checks;
+        // both URI associations and carried content-key names are authoritative.
+        let key_start = xml.find("<x:EncryptedKey>").unwrap();
+        let key_end = xml.find("</x:EncryptedKey>").unwrap() + "</x:EncryptedKey>".len();
+        let key_xml = &xml[key_start..key_end];
+        for (matching, unrelated, content_name, id_attribute) in [
+            (
+                "<x:ReferenceList><x:DataReference URI=\"#target\"/></x:ReferenceList>",
+                "<x:ReferenceList><x:DataReference URI=\"#other\"/></x:ReferenceList>",
+                "",
+                "Id",
+            ),
+            (
+                "<x:CarriedKeyName>session</x:CarriedKeyName>",
+                "<x:CarriedKeyName>other</x:CarriedKeyName>",
+                "<d:KeyName>session</d:KeyName>",
+                "Id",
+            ),
+            (
+                "<x:ReferenceList><x:DataReference URI=\"#target\"/></x:ReferenceList>",
+                "<x:ReferenceList><x:DataReference URI=\"#other\"/></x:ReferenceList>",
+                "",
+                "custom",
+            ),
+        ] {
+            let selected =
+                key_xml.replace("</x:EncryptedKey>", &format!("{matching}</x:EncryptedKey>"));
+            let skipped = key_xml.replace(
+                "</x:EncryptedKey>",
+                &format!("{unrelated}</x:EncryptedKey>"),
+            );
+            let associated = xml
+                .replace(key_xml, &format!("{skipped}{selected}"))
+                .replacen(
+                    "<x:EncryptedData ",
+                    &format!("<x:EncryptedData {id_attribute}=\"target\" "),
+                    1,
+                )
+                .replacen("<d:KeyInfo>", &format!("<d:KeyInfo>{content_name}"), 1);
+            std::fs::write(&input, associated).unwrap();
+            let output = std::process::Command::new(env!("CARGO_BIN_EXE_xmlsec1"))
+                .args(["decrypt", "--add-id-attr", "custom", "--pkcs8-der"])
+                .arg(&key)
+                .arg(&input)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout, b"nested KEM plaintext");
+        }
+    }
     // Nested KeyReference associations must select only the KEM protecting the
     // parent key, including a caller-registered ID rather than a typed Id field.
     let mechanism_start = xml.find("<k:EncapsulationMechanism ").unwrap();

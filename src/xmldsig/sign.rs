@@ -2059,9 +2059,7 @@ impl<'a> SignContext<'a> {
                     self.id_attributes,
                     self.policy.transforms.same_document_id_semantics,
                 );
-                if self.encapsulation_key.is_none()
-                    && signing_algorithm.hmac_output_bits().is_none()
-                {
+                if self.encapsulation_key.is_none() {
                     if let Some(info) = children.key_info_node
                         && super::verify::has_signing_encapsulation_with_budget(
                             info,

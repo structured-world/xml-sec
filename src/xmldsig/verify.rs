@@ -2258,7 +2258,24 @@ fn verify_signature_node<'a>(
             materialization.collect_encapsulation = true;
             materialization.encapsulation = None;
             if let Some(node) = signature_children.key_info_node {
-                materialization.observe_encapsulation(node, resolver, 0)?;
+                // A pinned key ignores lookup hints, not mechanism instructions.
+                // Apply the same bounded reference discovery before key work.
+                if !should_parse_key_info && ctx.decapsulation_key.is_none() {
+                    if has_encapsulation_with_budget(
+                        node,
+                        resolver,
+                        &ctx.policy.resources,
+                        &budgets.transforms,
+                        Some((&ctx.policy, ctx.xml_backend)),
+                    )? {
+                        return Err(crate::key_establishment::KeyEstablishmentError::Structure(
+                            "mechanism and explicit recipient key must be supplied together",
+                        )
+                        .into());
+                    }
+                } else {
+                    materialization.observe_encapsulation(node, resolver, 0)?;
+                }
             }
             if let Some(info) = key_info.as_mut() {
                 let mut xpath_parse = budgets.xpath_parse.borrow_mut();
@@ -3164,7 +3181,9 @@ pub(crate) fn has_same_document_encapsulation_with_budget(
     resources: &crate::policy::ResourcePolicy,
     execution: &TransformExecutionBudget,
 ) -> Result<bool, DsigError> {
-    has_encapsulation_with_budget(node, resolver, resources, execution, None)
+    has_encapsulation_with_budget::<crate::policy::SigningPolicy>(
+        node, resolver, resources, execution, None,
+    )
 }
 
 pub(crate) fn has_signing_encapsulation_with_budget(
@@ -3183,12 +3202,12 @@ pub(crate) fn has_signing_encapsulation_with_budget(
     )
 }
 
-fn has_encapsulation_with_budget(
+fn has_encapsulation_with_budget<P: KeyInfoReferencePolicy>(
     node: Node<'_, '_>,
     resolver: &UriReferenceResolver<'_>,
     resources: &crate::policy::ResourcePolicy,
     execution: &TransformExecutionBudget,
-    external: Option<(&crate::policy::SigningPolicy, crate::XmlBackend)>,
+    external: Option<(&P, crate::XmlBackend)>,
 ) -> Result<bool, DsigError> {
     if resolver.node_for_node_id(node.id()) != Some(node) {
         return Err(DsigError::InvalidStructure {
@@ -3199,17 +3218,16 @@ fn has_encapsulation_with_budget(
         uri: &'a str,
         parent: Option<&'a ExternalProbePath<'a>>,
     }
-    #[derive(Clone, Copy)]
-    struct ProbeContext<'a> {
+    struct ProbeContext<'a, P> {
         resources: &'a crate::policy::ResourcePolicy,
-        external: Option<(&'a crate::policy::SigningPolicy, crate::XmlBackend)>,
+        external: Option<(&'a P, crate::XmlBackend)>,
         document_base: Option<&'a str>,
         external_path: Option<&'a ExternalProbePath<'a>>,
     }
-    fn visit(
+    fn visit<P: KeyInfoReferencePolicy>(
         node: Node<'_, '_>,
         resolver: &UriReferenceResolver<'_>,
-        context: ProbeContext<'_>,
+        context: &ProbeContext<'_, P>,
         path: &mut [Option<(usize, NodeId)>;
                  crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING + 1],
         depth: usize,
@@ -3221,7 +3239,7 @@ fn has_encapsulation_with_budget(
             external,
             document_base,
             external_path,
-        } = context;
+        } = *context;
         resources.validate_key_info_reference_depth(depth)?;
         if depth > crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING {
             return Err(DsigError::InvalidStructure {
@@ -3272,7 +3290,7 @@ fn has_encapsulation_with_budget(
                             super::uri::map_xml_base_resolution_error(error),
                         )
                     })?;
-                if !policy.uris.key_info_references.allows(&resolved) {
+                if !policy.key_info_reference_uris().allows(&resolved) {
                     continue;
                 }
                 // Resource identity, not a reparsed arena ID, detects external
@@ -3313,7 +3331,7 @@ fn has_encapsulation_with_budget(
                 let xml =
                     crate::encoding::decode_xml_octets(bytes, resources.max_xml_document_bytes)
                         .map_err(map_key_info_xml_decode_error)?;
-                let settings = DocumentParseSettings::from_policy(&policy.xml, resources)
+                let settings = DocumentParseSettings::from_policy(policy.xml(), resources)
                     .with_backend(backend);
                 let document = XmlDocument::parse_with_settings_and_budget(
                     xml.into_owned(),
@@ -3341,10 +3359,11 @@ fn has_encapsulation_with_budget(
                     visit(
                         target,
                         &external_resolver,
-                        ProbeContext {
+                        &ProbeContext {
                             document_base: Some(resource),
                             external_path: Some(&external_entry),
-                            ..context
+                            resources,
+                            external,
                         },
                         path,
                         depth + 1,
@@ -3380,7 +3399,7 @@ fn has_encapsulation_with_budget(
     visit(
         node,
         resolver,
-        ProbeContext {
+        &ProbeContext {
             resources,
             external,
             document_base: None,
