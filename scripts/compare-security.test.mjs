@@ -5,7 +5,22 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { percentile, resources, heapStats } from './compare-security.mjs';
+import { percentile, resources, heapStats, createEvidenceDirectory } from './compare-security.mjs';
+
+test('fresh nested evidence directories work without overwriting prior results', () => {
+  // Clean CI has no performance directory; only parents may be reused.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'xml-sec-evidence-test-'));
+  const output = path.join(directory, 'target', 'performance', 'comparison');
+  try {
+    createEvidenceDirectory(output);
+    assert.equal(fs.statSync(output).isDirectory(), true);
+    fs.writeFileSync(path.join(output, 'evidence'), 'preserved');
+    assert.throws(() => createEvidenceDirectory(output), { code: 'EEXIST' });
+    assert.equal(fs.readFileSync(path.join(output, 'evidence'), 'utf8'), 'preserved');
+  } finally {
+    fs.rmSync(directory, { recursive: true });
+  }
+});
 
 test('nearest rank sorts independently and rejects missing samples', () => {
   const input = [30, 10, 20];

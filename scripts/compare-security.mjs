@@ -38,6 +38,11 @@ function checked(binary, args, options = {}) {
   return result;
 }
 
+export function createEvidenceDirectory(output) {
+  fs.mkdirSync(path.dirname(path.resolve(output)), { recursive: true });
+  fs.mkdirSync(output); // Refuse to overwrite any existing evidence.
+}
+
 function main() {
   // Keep system-tool reports independent of the caller's locale.
   process.env.LC_ALL = 'C';
@@ -51,7 +56,7 @@ function main() {
     return fs.realpathSync(process.env[name]);
   });
   if (heapMode) checked('valgrind', ['--version']);
-  fs.mkdirSync(output); // Refuse to overwrite any existing evidence.
+  createEvidenceDirectory(output);
   const root = fs.realpathSync(output);
   const corpus = path.join(root, 'corpus');
   checked(binaries[3], ['--export', corpus]);
