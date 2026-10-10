@@ -1,0 +1,55 @@
+name: Comparable CLI measurements
+on:
+  workflow_call:
+    inputs:
+      samples:
+        type: number
+        default: 1
+      publish:
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Locate fresh measurement evidence outside the build cache
+        run: |
+          printf 'COMPARISON_OUTPUT=%s\nSITE_OUTPUT=%s\n' \
+            "$RUNNER_TEMP/benchmark-comparison-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            "$RUNNER_TEMP/benchmark-site-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.92.0"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - uses: Swatinem/rust-cache@v2
+      - name: Install native benchmark tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev perl pkg-config valgrind jq
+      - name: Test metric interpretation
+        run: node --test scripts/compare-security.test.mjs
+      - name: Validate interoperability and compare identical CLI work
+        env:
+          SAMPLES: ${{ inputs.samples }}
+        run: bash scripts/benchmark-compare.sh "$COMPARISON_OUTPUT" "$SAMPLES" --heap
+      - name: Build static dashboard
+        run: node scripts/build-benchmark-dashboard.mjs "$COMPARISON_OUTPUT" "$SITE_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-comparison
+          path: ${{ env.COMPARISON_OUTPUT }}
+          if-no-files-found: error
+      - uses: actions/upload-pages-artifact@v5
+        if: inputs.publish && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        with:
+          path: ${{ env.SITE_OUTPUT }}

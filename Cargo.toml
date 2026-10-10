@@ -21,6 +21,9 @@ include = [
     "/docs/**",
     "/src/**",
     "/examples/**",
+    "/benches/**",
+    "/benchmarks/dashboard/**",
+    "/benchmarks/Dockerfile",
     "/tests/**",
     "/tools/xmlsec1/**",
     "/compatibility/**",
@@ -73,6 +76,15 @@ required-features = ["xmldsig", "xmlenc", "c14n"]
 [[example]]
 name = "encrypt"
 required-features = ["xmlenc"]
+
+[[bench]]
+name = "security"
+harness = false
+required-features = ["benchmark-internals"]
+
+[[example]]
+name = "benchmark_latency"
+required-features = ["benchmark-internals"]
 
 [dependencies]
 # XML parsing
@@ -144,6 +156,7 @@ base64 = "0.23"
 thiserror = "2"
 
 [dev-dependencies]
+divan = "=0.1.21"
 ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc", "pkcs8", "rand_core", "zeroize"] }
 hex-literal = "1"
 roxmltree = { version = "0.21", features = ["positions"] }
@@ -155,6 +168,9 @@ time = "0.3.55"
 tempfile = "3"
 
 [features]
+# Measurement hooks only; no checks are bypassed and no timers run in production.
+benchmark-internals = ["xmldsig", "xmlenc", "c14n", "xml-backends-all"]
+benchmark-alloc = ["benchmark-internals"]
 legacy-algorithms = ["dep:ripemd", "dep:md-5", "dep:des"]
 default = ["std", "xmldsig", "xmlenc", "c14n", "xml-backend-xmloxide"]
 std = ["thiserror/std", "xmlparser/std"]

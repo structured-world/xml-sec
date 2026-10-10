@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="Reproducible XML Security CLI benchmarks: xml-sec, Bergshamra and libxmlsec1. Latency, CPU, RSS and separately profiled allocations.">
+<title>XML Security · Benchmark Observatory</title>
+<link rel="stylesheet" href="style.css">
+<body>
+<header><p class="eyebrow">xml-sec / measured, not assumed</p><h1>Benchmark<br>Observatory.</h1><p>Same documents. Four CLI configurations. Explicit measurement boundaries.</p></header>
+<main>
+<section class="notice"><h2>Read the boundary first</h2><p>Comparisons include fresh process launch, key loading, filesystem I/O and the operation. Caches are warm; processes are not. They are not library-only algorithm timings. Security defaults differ; this corpus uses named caller-supplied keys, locally checked reference digests, RSA-2048/SHA-256 and AES-256-GCM.</p><p>RSS covers the complete process lifetime. Valgrind allocation and heap measurements are separate from latency, include native libraries, and exclude stacks and non-malloc memory mappings. Shared GitHub runners are noisy. Small sample counts do not establish reliable tail latency or superiority.</p></section>
+<p id="status" role="status">Loading validated measurements…</p>
+<section class="controls" aria-label="Measurement filters">
+<label>Operation<select id="operation"><option>verify</option><option>sign</option><option>encrypt</option><option>decrypt</option></select></label>
+<label>Document<select id="shape"><option>saml</option><option>namespaces</option><option>text</option><option>attributes</option><option>adversarial</option></select></label>
+<label>Size<select id="units"><option>16</option><option>256</option></select></label>
+<label>Metric<select id="metric"><option value="p50_ns">p50 latency (ms)</option><option value="p99_ns">p99 latency (ms)</option><option value="cpu_seconds">CPU (ms)</option><option value="rss_bytes">Peak RSS (MiB)</option><option value="allocation_calls">Allocation calls</option><option value="allocated_bytes">Allocated bytes (MiB)</option><option value="peak_heap_bytes">Peak heap (MiB)</option><option value="throughput">Input throughput (MiB/s)</option></select></label>
+</section>
+<section id="chart" aria-label="Comparative measurements"></section>
+<p class="muted">Latency summary: median of three repetition percentiles. CPU: median individual sample. RSS: maximum individual sample. Profiling measurements: one separate process per case. Counts and raw samples are downloadable, not inferred.</p>
+<details><summary>Environment, versions & provenance</summary><pre id="metadata"></pre></details>
+<p><a href="comparison.json">Download raw comparison JSON</a> · <a href="https://github.com/structured-world/xml-sec/actions/workflows/benchmarks.yml">Builds and full measurement artifacts</a> · <a href="https://github.com/structured-world/xml-sec/blob/main/docs/benchmarks.md">Measurement contract</a></p>
+<section><h2>Not comparable in this chart</h2><p>Standalone parse/C14N, retained-DOM operations, semantic projection, operation graph and policy phases remain xml-sec-only measurements. The CLIs do not expose equivalent boundaries. Multi-signature, nested-Manifest and external-reference workloads remain internal benchmarks until equivalent selection, resolver and trust semantics are demonstrated. No unsupported operation is timed as a successful one.</p></section>
+</main><footer>Reproduce before drawing conclusions.</footer>
+<script type="module" src="app.js"></script>
+</body></html>
