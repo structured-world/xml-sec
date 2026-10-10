@@ -40,6 +40,9 @@ compile_error!(
     "compile at least one XML backend: `xml-backend-xmloxide` or `xml-backend-roxmltree`"
 );
 
+#[cfg(feature = "benchmark-internals")]
+#[doc(hidden)]
+pub mod benchmark_support;
 pub mod c14n;
 pub mod document;
 pub mod encoding;

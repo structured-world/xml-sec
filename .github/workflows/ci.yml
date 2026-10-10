@@ -18,6 +18,26 @@ env:
   LD_LIBRARY_PATH: ${{ github.workspace }}/.tools/xmlsec1-1.3.13/lib
 
 jobs:
+  benchmark-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.92.0"
+      - uses: taiki-e/install-action@nextest
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo nextest run --test benchmark_contract --features benchmark-internals
+      - run: cargo clippy --bench security --example benchmark_latency --features benchmark-alloc -- -D warnings
+      - name: Exercise measurement runner (not a performance threshold)
+        run: bash scripts/benchmark-security.sh target/performance/smoke 1
+      - uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-smoke
+          path: target/performance/smoke
+
   pkcs11:
     name: PKCS11 (${{ matrix.backend }})
     runs-on: ubuntu-latest

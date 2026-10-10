@@ -4,6 +4,8 @@
 //! implemented above it, so selecting a backend cannot change C14N, XPath,
 //! XMLDSig, or XMLEnc behavior.
 
+#[cfg(feature = "benchmark-internals")]
+pub(crate) mod benchmark;
 #[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
 mod differential;
 mod preflight;

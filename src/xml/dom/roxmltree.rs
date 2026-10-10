@@ -22,18 +22,26 @@ impl XmlBackendImplementation for RoxmltreeBackend {
             },
         )
         .map_err(map_error)?;
-        let mut target = TreeBuilder::new(
-            input,
-            parsed.descendants().count().max(preflight.node_count()),
-        );
-        project_document(
-            &mut target,
-            parsed.root(),
-            preflight.doctype_range(),
-            preflight,
-        )?;
-        Ok(target.finish(preflight))
+        project(input, &parsed, preflight)
     }
+}
+
+pub(super) fn project<'input>(
+    input: &'input str,
+    parsed: &::roxmltree::Document<'input>,
+    preflight: &LexicalPreflight,
+) -> Result<Document<'input>, ParseError> {
+    let mut target = TreeBuilder::new(
+        input,
+        parsed.descendants().count().max(preflight.node_count()),
+    );
+    project_document(
+        &mut target,
+        parsed.root(),
+        preflight.doctype_range(),
+        preflight,
+    )?;
+    Ok(target.finish(preflight))
 }
 
 fn map_error(error: ::roxmltree::Error) -> ParseError {

@@ -24,21 +24,30 @@ impl XmlBackendImplementation for XmloxideBackend {
                 message: error.to_string(),
             },
         )?;
-        let mut projector = Projector {
-            source: &parsed,
-            target: TreeBuilder::new(input, parsed.node_count()),
-            positions: preflight.positions(),
-            nodes_limit: options.nodes_limit,
-        };
-        let root = projector.target.push(None, NodeKind::Root, 0..input.len());
-        projector.project_children(parsed.root(), root)?;
-        projector.positions.finish()?;
-        projector.target.finish_subtree(root);
-        Ok(projector.target.finish(preflight))
+        project(input, &parsed, options, preflight)
     }
 }
 
-fn backend_options() -> xmloxide::parser::ParseOptions {
+pub(super) fn project<'input>(
+    input: &'input str,
+    parsed: &xmloxide::Document,
+    options: ParsingOptions,
+    preflight: &LexicalPreflight,
+) -> Result<Document<'input>, ParseError> {
+    let mut projector = Projector {
+        source: parsed,
+        target: TreeBuilder::new(input, parsed.node_count()),
+        positions: preflight.positions(),
+        nodes_limit: options.nodes_limit,
+    };
+    let root = projector.target.push(None, NodeKind::Root, 0..input.len());
+    projector.project_children(parsed.root(), root)?;
+    projector.positions.finish()?;
+    projector.target.finish_subtree(root);
+    Ok(projector.target.finish(preflight))
+}
+
+pub(super) fn backend_options() -> xmloxide::parser::ParseOptions {
     // The shared preflight owns the backend-neutral contract. These absolute
     // limits are defense in depth against a backend regression allocating
     // expanded entity data before returning control to the projector.
