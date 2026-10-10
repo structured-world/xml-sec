@@ -18,24 +18,45 @@ env:
   LD_LIBRARY_PATH: ${{ github.workspace }}/.tools/xmlsec1-1.3.13/lib
 
 jobs:
+  benchmark-comparison:
+    uses: ./.github/workflows/benchmark-comparison.yml
+
   benchmark-contract:
+    name: benchmark-contract (${{ matrix.toolchain }}, ${{ matrix.features }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - toolchain: "1.92.0"
+            features: benchmark-internals
+            extra: ""
+          - toolchain: stable
+            features: benchmark-internals
+            extra: ""
+          - toolchain: "1.92.0"
+            features: benchmark-internals,aws-lc-fips
+            extra: aws-lc-fips
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.92.0"
+          toolchain: ${{ matrix.toolchain }}
       - uses: taiki-e/install-action@nextest
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
       - uses: Swatinem/rust-cache@v2
-      - run: cargo nextest run --test benchmark_contract --features benchmark-internals
-      - run: cargo clippy --bench security --example benchmark_latency --features benchmark-alloc -- -D warnings
+      - run: cargo nextest run --test benchmark_contract --example benchmark_latency --features ${{ matrix.features }}
+      - run: cargo clippy --bench security --example benchmark_latency --features ${{ matrix.features }},benchmark-alloc -- -D warnings
+      - run: node --test scripts/compare-security.test.mjs
       - name: Exercise measurement runner (not a performance threshold)
-        run: bash scripts/benchmark-security.sh target/performance/smoke 1
+        run: bash scripts/benchmark-security.sh target/performance/smoke 1 '${{ matrix.extra }}'
       - uses: actions/upload-artifact@v7
         with:
-          name: benchmark-smoke
+          name: benchmark-smoke-${{ matrix.toolchain }}-${{ matrix.extra || 'rustcrypto' }}
           path: target/performance/smoke
 
   pkcs11:
@@ -268,12 +289,14 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
-    needs: [test-matrix, xslt-oracle, pkcs11]
+    needs: [test-matrix, xslt-oracle, pkcs11, benchmark-contract, benchmark-comparison]
     if: ${{ always() }}
     steps:
       - run: test "${{ needs.test-matrix.result }}" = "success"
       - run: test "${{ needs.xslt-oracle.result }}" = "success"
       - run: test "${{ needs.pkcs11.result }}" = "success"
+      - run: test "${{ needs.benchmark-contract.result }}" = "success"
+      - run: test "${{ needs.benchmark-comparison.result }}" = "success"
 
   xslt-oracle:
     name: XSLT oracle (libxslt 1.1.45)

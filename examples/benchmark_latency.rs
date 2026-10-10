@@ -67,6 +67,62 @@ fn measure(
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.len() == 2 && args[0] == "--export" {
+        let directory = std::path::Path::new(&args[1]);
+        std::fs::create_dir(directory)?;
+        std::fs::write(
+            directory.join("private.pem"),
+            include_bytes!("../tests/fixtures/keys/rsa/rsa-2048-key.pem"),
+        )?;
+        std::fs::write(
+            directory.join("public.pem"),
+            include_bytes!("../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"),
+        )?;
+        let aes = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0x42; 32]);
+        std::fs::write(
+            directory.join("keys.xml"),
+            format!(
+                "<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\"><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>bench</KeyName><KeyValue><AESKeyValue xmlns=\"http://www.aleksey.com/xmlsec/2002\">{aes}</AESKeyValue></KeyValue></KeyInfo></Keys>"
+            ),
+        )?;
+        std::fs::write(
+            directory.join("encryption.xml"),
+            "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\"><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes256-gcm\"/><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>bench</KeyName></KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>",
+        )?;
+        let mut cases = Vec::new();
+        for spec in support::specs().filter(|s| {
+            matches!(s.engine, Engine::RustCrypto)
+                && s.backend == XmlBackend::Xmloxide
+                && [0, 1, 2, 3, 7].contains(&s.shape)
+        }) {
+            let fixture = Fixture::new(spec);
+            let name = format!("{}-{}", SHAPES[spec.shape], spec.units);
+            // A named, caller-supplied key avoids differing CLI defaults for
+            // missing KeyInfo; KeyInfo is outside the signed payload/SignedInfo.
+            let key_info = "<ds:KeyInfo><ds:KeyName>bench</ds:KeyName></ds:KeyInfo></ds:Signature>";
+            std::fs::write(
+                directory.join(format!("{name}.template.xml")),
+                fixture.template.replace("</ds:Signature>", key_info),
+            )?;
+            std::fs::write(
+                directory.join(format!("{name}.signed.xml")),
+                fixture.signed.replace("</ds:Signature>", key_info),
+            )?;
+            // All CLIs receive the same octets, not different XML reserializations.
+            std::fs::write(
+                directory.join(format!("{name}.plain.xml")),
+                format!("<?xml version=\"1.0\"?>{}", fixture.unsigned),
+            )?;
+            cases.push(
+                serde_json::json!({"name": name, "shape": SHAPES[spec.shape], "units": spec.units}),
+            );
+        }
+        std::fs::write(
+            directory.join("cases.json"),
+            serde_json::to_vec_pretty(&cases)?,
+        )?;
+        return Ok(());
+    }
     if args == ["--list"] {
         for spec in support::specs() {
             let backend = match spec.backend {

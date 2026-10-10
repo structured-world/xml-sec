@@ -1,0 +1,50 @@
+name: Comparable CLI measurements
+on:
+  workflow_call:
+    inputs:
+      samples:
+        type: number
+        default: 1
+      publish:
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.92.0"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - uses: Swatinem/rust-cache@v2
+      - name: Install native benchmark tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev perl pkg-config valgrind jq
+      - name: Test metric interpretation
+        run: node --test scripts/compare-security.test.mjs
+      - name: Validate interoperability and compare identical CLI work
+        env:
+          SAMPLES: ${{ inputs.samples }}
+        run: bash scripts/benchmark-compare.sh target/performance/comparison "$SAMPLES" --heap
+      - name: Build static dashboard
+        run: node scripts/build-benchmark-dashboard.mjs target/performance/comparison target/performance/site
+      - uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-comparison
+          path: target/performance/comparison
+          if-no-files-found: error
+      - uses: actions/upload-pages-artifact@v5
+        if: inputs.publish && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        with:
+          path: target/performance/site

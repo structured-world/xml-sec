@@ -89,3 +89,66 @@ with a selected Divan filter; allocation profiling remains a separate run.
 The oracle CLI's `--repeat` CPU time excludes parsing and result writing. Do not
 compare it directly with this suite's end-to-end wall time. Comparative native/C/ABI
 measurements require separately matched boundaries and build configurations.
+
+## Comparative CLI Dashboard
+
+```sh
+# External competitor binary only; never a dependency of xml-sec.
+bash scripts/benchmark-compare.sh target/performance/comparison 30
+# Linux: separately profile malloc-family allocations and peak heap, including C.
+bash scripts/benchmark-compare.sh target/performance/comparison-heap 30 --heap
+node scripts/build-benchmark-dashboard.mjs target/performance/comparison target/performance/site
+node --test scripts/compare-security.test.mjs
+```
+
+The runner builds the pinned Bergshamra 0.9.2 source (RustCrypto only) and the
+existing libxmlsec1 1.3.13 oracle, independently of the product dependency graph.
+It compares both xml-sec XML backends against those CLIs: single-reference
+RSA-2048/SHA-256 sign/verify and AES-256-GCM encrypt/decrypt of identical plaintext
+octets, at two sizes for five deterministic document shapes. AES keys use the
+same named XML key store; RSA keys use named PEM imports. Encrypt/decrypt is
+byte-oriented XML payload encryption, not element/content selection parity.
+Before timing, each engine's signature is verified by every engine, each
+ciphertext is decrypted by every engine with exact plaintext equality, and all
+engines must reject a modified signed payload. A crash or timeout is failure,
+not successful rejection. Unsupported work never produces a timing entry.
+
+Every sample includes fresh process launch, key loading, file I/O and operation;
+three interleaved repetitions rotate engine order. File caches are warm. CPU
+and RSS use system `time`; wall time also includes the common measurement wrapper
+and parent launch overhead. No CLI result is compared with retained-DOM or other
+library-only measurements. Sign/encrypt outputs are written to files equally.
+Input throughput and output amplification are derived from those actual files.
+System `time` CPU counters have coarse resolution; very short operations can
+legitimately report zero CPU seconds. They are not high-resolution phase profiles.
+The first build resolves the untracked library lockfile; measurement freezes and
+archives both Rust dependency graphs and source fingerprints.
+
+Optional Linux Valgrind runs record total malloc-family allocation calls/bytes
+with Memcheck and sampled peak live heap plus allocator overhead with Massif.
+These cover Rust and native allocations on the same boundary, include startup
+and teardown, and exclude stacks and non-malloc memory mappings. Massif peaks
+are sampled, not an exact allocation high-water oracle. Their times are never
+used as latency samples; they are not directly comparable to Divan counters.
+The raw logs, commands, source/binary identities, lockfiles and feature graphs
+are retained in CI artifacts. Missing metrics are displayed as not measured.
+
+CI uses the shared comparison workflow to build dashboard artifacts on PRs;
+Benchmark Observatory publishes only validated default-branch results to GitHub Pages. One-sample PR
+runs prove correctness, not performance. Shared runners and 30-sample runs do
+not establish reliable p99 thresholds. The dashboard deliberately makes no
+speed superiority claim. Standalone parse/C14N, multiple signatures, Manifests
+and external resources are not ranked without matching processor boundaries.
+
+References: [Bergshamra CLI](https://github.com/kushaldas/bergshamra/blob/v0.9.2/crates/bergshamra/src/main.rs),
+[Valgrind Massif](https://valgrind.org/docs/manual/ms-manual.html),
+[GitHub Pages workflow](https://docs.github.com/en/pages/getting-started-with-github-pages/using-custom-workflows-with-github-pages).
+
+`benchmarks/Dockerfile` supplies the Linux profiling tools. Mount source read-only
+and a separate writable output/build directory; select it through `CARGO_TARGET_DIR`
+and `XMLSEC1_PREFIX`. Resolve `Cargo.lock` before mounting source read-only
+(`cargo +1.92.0 generate-lockfile`). The competitor checkout must be clean and match the pinned
+revision. Container results describe that container's architecture, not the host.
+Both Rust binaries use Rust 1.92.0 by default (`BENCH_RUST_TOOLCHAIN` selects
+another installed toolchain for both). Keep build artifacts on a Linux-native
+volume when running Docker on macOS; only source and exported reports need bind mounts.

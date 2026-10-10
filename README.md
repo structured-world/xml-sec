@@ -235,6 +235,14 @@ The project tracks stable Rust and supports Rust 1.92 or newer. Detailed contrac
 live in the [XMLDSig guide](docs/xmldsig.md), [XML Encryption guide](docs/xmlenc.md), and
 [CLI guide](docs/cli.md).
 
+## Performance Measurements
+
+The [benchmark dashboard](https://structured-world.github.io/xml-sec/) compares
+XML signature and encryption CLI latency, CPU, RSS and heap allocations against
+Bergshamra and libxmlsec1. Results use cross-verified inputs and matching operation
+boundaries, not algorithm-only claims. See the [benchmark guide](docs/benchmarks.md)
+for reproducible runs, coverage and measurement limitations.
+
 ## License
 
 Apache-2.0
