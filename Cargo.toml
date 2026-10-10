@@ -22,6 +22,8 @@ include = [
     "/src/**",
     "/examples/**",
     "/benches/**",
+    "/benchmarks/dashboard/**",
+    "/benchmarks/Dockerfile",
     "/tests/**",
     "/tools/xmlsec1/**",
     "/compatibility/**",

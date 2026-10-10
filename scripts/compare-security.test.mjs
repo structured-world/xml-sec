@@ -55,14 +55,44 @@ test('latency runner supports empty and nonempty loader arrays under system Bash
   }
 });
 test('published package includes every shared benchmark entry point', () => {
-  // Published examples/tests must retain their path-based support module.
+  // Published tooling must retain support modules and build a standalone dashboard.
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
   const result = spawnSync('cargo', ['package', '--list', '--allow-dirty'],
     { cwd: root, encoding: 'utf8' });
   assert.equal(result.status, 0, result.stderr);
   const files = new Set(result.stdout.trim().split('\n'));
-  for (const file of ['benches/security.rs', 'benches/support/mod.rs', 'examples/benchmark_latency.rs']) {
+  for (const file of [
+    'benches/security.rs', 'benches/support/mod.rs', 'examples/benchmark_latency.rs',
+    'benchmarks/dashboard/index.html', 'benchmarks/dashboard/app.js',
+    'benchmarks/dashboard/style.css', 'benchmarks/Dockerfile',
+    'scripts/build-benchmark-dashboard.mjs',
+  ]) {
     assert.equal(files.has(file), true, `Missing packaged ${file}`);
+  }
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'xml-sec-package-test-'));
+  try {
+    const builder = 'scripts/build-benchmark-dashboard.mjs';
+    const assets = ['index.html', 'app.js', 'style.css'];
+    for (const file of [builder, ...assets.map(file => `benchmarks/dashboard/${file}`)]) {
+      const destination = path.join(directory, file);
+      fs.mkdirSync(path.dirname(destination), { recursive: true });
+      fs.copyFileSync(path.join(root, file), destination);
+    }
+    const report = { schema: 1, results: Array.from({ length: 160 }, () => ({ commands: ['private path'] })) };
+    fs.writeFileSync(path.join(directory, 'comparison.json'), JSON.stringify(report));
+    const output = path.join(directory, 'site');
+    const built = spawnSync(process.execPath, [builder, directory, output],
+      { cwd: directory, encoding: 'utf8' });
+    assert.equal(built.status, 0, built.stderr);
+    for (const file of assets) {
+      assert.deepEqual(fs.readFileSync(path.join(output, file)),
+        fs.readFileSync(path.join(root, 'benchmarks/dashboard', file)));
+    }
+    const published = JSON.parse(fs.readFileSync(path.join(output, 'comparison.json'), 'utf8'));
+    assert.equal(published.results.length, 160);
+    assert.ok(published.results.every(entry => !Object.hasOwn(entry, 'commands')));
+  } finally {
+    fs.rmSync(directory, { recursive: true });
   }
 });
 test('CI benchmark evidence stays outside the restored build cache', () => {
