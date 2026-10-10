@@ -930,7 +930,11 @@ fn parse_encapsulation_key_info<'doc>(
     let mut info = budget
         .shared
         .key_info
-        .parse_with_provider(node, budget.provider)
+        .parse_with_provider_and_document_base(
+            node,
+            budget.provider,
+            budget.document_base.as_deref(),
+        )
         .map_err(super::agreement::map_key_info_error)?;
     if info
         .sources
@@ -957,8 +961,37 @@ fn parse_encapsulation_key_info<'doc>(
                     .into());
                 }
                 budget.charge(budget.policy.resources)?;
-                let target = budget.referenced_node(node, &uri)?;
-                sources.extend(parse_encapsulation_key_info(target, budget, depth + 1)?.sources);
+                budget
+                    .policy
+                    .resources
+                    .validate_key_info_reference_depth(depth + 1)?;
+                let referenced = if uri.is_empty() || uri.starts_with('#') {
+                    let target = budget.referenced_node(node, &uri)?;
+                    parse_encapsulation_key_info(target, budget, depth + 1)?
+                } else {
+                    let resource = uri
+                        .split_once('#')
+                        .map_or(uri.as_str(), |(resource, _)| resource);
+                    let fragment = &uri[resource.len()..];
+                    with_processed_key_reference(
+                        node,
+                        resource,
+                        allowed,
+                        &[],
+                        budget,
+                        |root, child| {
+                            let target = if fragment.is_empty() || fragment == "#" {
+                                root
+                            } else {
+                                child.referenced_node(root, fragment)?
+                            };
+                            // §4.5.10 requires KeyInfo, not arbitrary retrieved key data.
+                            require_element(target, XMLDSIG_NS, "KeyInfo")?;
+                            parse_encapsulation_key_info(target, child, depth + 1)
+                        },
+                    )?
+                };
+                sources.extend(referenced.sources);
             } else {
                 sources.push(source);
             }
@@ -1021,9 +1054,78 @@ fn parse_processed_key_reference(
     budget: &mut KeySourceParseBudget<'_, '_, '_>,
     depth: usize,
 ) -> Result<RetrievedKey, XmlEncError> {
+    budget
+        .policy
+        .resources
+        .validate_key_info_reference_depth(depth)?;
+    let allowed = budget
+        .policy
+        .uris
+        .map_or(crate::xmldsig::UriTypeSet::SAME_DOCUMENT, |uris| {
+            uris.retrieval_methods
+        });
+    with_processed_key_reference(
+        source,
+        uri,
+        allowed,
+        transforms,
+        budget,
+        |target, child_budget| {
+            if let Some(kind) = declared_type {
+                kind.validate_target(target)?;
+            }
+            if target.has_tag_name((XMLENC11_NS, "DerivedKey")) {
+                return Ok(RetrievedKey::Derived(super::derived_key::parse(
+                    target,
+                    child_budget.policy.resources,
+                )?));
+            }
+            let mut key = parse_encrypted_key(
+                target,
+                child_budget.policy,
+                allow_empty,
+                child_budget,
+                depth,
+            )?;
+            let context = child_budget
+                .references
+                .expect("processed reference context");
+            let parse = child_budget
+                .xml_parse
+                .expect("processed reference parse budget");
+            let bound = context
+                .bind_document_with_base(target.document(), child_budget.document_base.as_deref());
+            let mut origins = child_budget.origins.iter();
+            super::decrypt::resolve_nested_cipher_references(
+                core::slice::from_mut(&mut key),
+                target.document(),
+                &mut origins,
+                &bound,
+                parse,
+            )?;
+            if origins.next().is_some() {
+                return Err(XmlEncError::OperationPlan(
+                    "unused processed key origin".into(),
+                ));
+            }
+            Ok(RetrievedKey::Encrypted(key))
+        },
+    )
+}
+
+fn with_processed_key_reference<T>(
+    source: Node<'_, '_>,
+    uri: &str,
+    allowed_uris: crate::xmldsig::UriTypeSet,
+    transforms: &[crate::xmldsig::transforms::Transform],
+    budget: &mut KeySourceParseBudget<'_, '_, '_>,
+    consume: impl for<'doc> FnOnce(
+        Node<'doc, 'doc>,
+        &mut KeySourceParseBudget<'_, 'doc, '_>,
+    ) -> Result<T, XmlEncError>,
+) -> Result<T, XmlEncError> {
     use sha2::Digest as _;
     let policy = budget.policy;
-    policy.resources.validate_key_info_reference_depth(depth)?;
     let context = budget.references.ok_or_else(|| {
         XmlEncError::InvalidStructure(
             "processed key retrieval requires an operation resource context".into(),
@@ -1035,6 +1137,7 @@ fn parse_processed_key_reference(
     let (bytes, base) = context.resolve_key_reference(
         source,
         uri,
+        allowed_uris,
         transforms,
         budget.document_base.as_deref(),
         parse,
@@ -1075,31 +1178,7 @@ fn parse_processed_key_reference(
     child_budget.references = Some(context);
     child_budget.xml_parse = Some(parse);
     child_budget.document_base = base;
-    let target = document.root_element();
-    if let Some(kind) = declared_type {
-        kind.validate_target(target)?;
-    }
-    let result = if target.has_tag_name((XMLENC11_NS, "DerivedKey")) {
-        RetrievedKey::Derived(super::derived_key::parse(target, policy.resources)?)
-    } else {
-        let mut key = parse_encrypted_key(target, policy, allow_empty, &mut child_budget, depth)?;
-        let bound =
-            context.bind_document_with_base(&document, child_budget.document_base.as_deref());
-        let mut origins = child_budget.origins.iter();
-        super::decrypt::resolve_nested_cipher_references(
-            core::slice::from_mut(&mut key),
-            &document,
-            &mut origins,
-            &bound,
-            parse,
-        )?;
-        if origins.next().is_some() {
-            return Err(XmlEncError::OperationPlan(
-                "unused processed key origin".into(),
-            ));
-        }
-        RetrievedKey::Encrypted(key)
-    };
+    let result = consume(document.root_element(), &mut child_budget)?;
     budget
         .origins
         .extend(child_budget.origins.iter().map(|_| None));

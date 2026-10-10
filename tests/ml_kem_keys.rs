@@ -1391,6 +1391,142 @@ fn all_donor_content_encapsulation_ciphertexts_decrypt() {
 
 #[cfg(feature = "xmlenc")]
 #[test]
+fn decrypt_resolves_external_encapsulation_recipient() {
+    // XMLDSig 1.1 §4.5.10: a permitted external reference must resolve to
+    // KeyInfo, with the same resource and depth limits as local recipients.
+    let xml = std::fs::read_to_string(fixture_path(
+        "xmlenc/aleksey-xmlenc-01/enc-aes128gcm-em-ml-kem-512.xml",
+    ))
+    .unwrap();
+    let document = xml_sec::Document::parse(&xml).unwrap();
+    let info = document
+        .descendants()
+        .find(|node| {
+            node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyInfo"))
+                && node.parent().is_some_and(|parent| {
+                    parent.has_tag_name((
+                        xml_sec::key_establishment::ENCAPSULATION_NS,
+                        "EncapsulationMechanism",
+                    ))
+                })
+        })
+        .unwrap();
+    let recipient = &xml[info.range()];
+    let reference = |uri: &str| {
+        format!(
+            "<ds:KeyInfo xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><KeyInfoReference xmlns=\"http://www.w3.org/2009/xmldsig11#\" URI=\"{uri}\"/></ds:KeyInfo>"
+        )
+    };
+    let input = xml.replacen(
+        recipient,
+        &reference("https://example.test/recipient.xml"),
+        1,
+    );
+    let target = recipient.replacen(
+        "<ds:KeyInfo>",
+        "<ds:KeyInfo xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\" Id=\"recipient\">",
+        1,
+    );
+    let private =
+        RustCryptoMlKemPrivateKey::from_pkcs8_der(&fixture("ml-kem-512-key.der")).unwrap();
+    let resolver = xml_sec::xmlenc::EncapsulationDecryptor::new(&private);
+    let mut policy = xml_sec::policy::DecryptionPolicy::default();
+    policy
+        .key_establishment
+        .encapsulation_algorithms
+        .insert(private.algorithm());
+    let expected = xml_sec::xmlenc::DecryptContext::new(&resolver)
+        .policy(policy.clone())
+        .decrypt_document(&xml, Some("ED"))
+        .unwrap();
+    let mut resources = std::collections::HashMap::from([(
+        "https://example.test/recipient.xml".to_owned(),
+        target.into_bytes(),
+    )]);
+    assert!(
+        xml_sec::xmlenc::DecryptContext::new(&resolver)
+            .policy(policy.clone())
+            .external_resources(&resources)
+            .decrypt_document(&input, Some("ED"))
+            .is_err()
+    );
+    policy.uris.key_info_references = xml_sec::xmldsig::UriTypeSet::ALL;
+    // RetrievalMethod permission is independent; it must not gate KeyInfoReference.
+    policy.uris.retrieval_methods = xml_sec::xmldsig::UriTypeSet::SAME_DOCUMENT;
+    let decrypt = |input: &str,
+                   policy: xml_sec::policy::DecryptionPolicy,
+                   resources: &std::collections::HashMap<String, Vec<u8>>| {
+        xml_sec::xmlenc::DecryptContext::new(&resolver)
+            .policy(policy)
+            .external_resources(resources)
+            .decrypt_document(input, Some("ED"))
+    };
+    assert_eq!(
+        decrypt(&input, policy.clone(), &resources).unwrap(),
+        expected
+    );
+    let fragment = input.replace("recipient.xml", "recipient.xml#recipient");
+    assert_eq!(
+        decrypt(&fragment, policy.clone(), &resources).unwrap(),
+        expected
+    );
+    // Select the target, not the external document root; preserve ancestor
+    // context and reject ambiguous IDs before private-key dispatch.
+    let target =
+        String::from_utf8(resources["https://example.test/recipient.xml"].clone()).unwrap();
+    resources.insert(
+        "https://example.test/recipient.xml".to_owned(),
+        format!("<root>{target}</root>").into_bytes(),
+    );
+    assert_eq!(
+        decrypt(&fragment, policy.clone(), &resources).unwrap(),
+        expected
+    );
+    assert!(decrypt(&input, policy.clone(), &resources).is_err());
+    resources.insert(
+        "https://example.test/recipient.xml".to_owned(),
+        format!("<root>{target}{target}</root>").into_bytes(),
+    );
+    assert!(decrypt(&fragment, policy.clone(), &resources).is_err());
+    resources.insert(
+        "https://example.test/recipient.xml".to_owned(),
+        target.into_bytes(),
+    );
+    resources.insert(
+        "https://example.test/entry.xml".to_owned(),
+        reference("recipient.xml#recipient").into_bytes(),
+    );
+    let chained = input.replace("recipient.xml", "entry.xml");
+    assert_eq!(
+        decrypt(&chained, policy.clone(), &resources).unwrap(),
+        expected
+    );
+    let mut bounded = policy.clone();
+    bounded.resources.max_key_info_reference_depth = 1;
+    assert!(decrypt(&chained, bounded, &resources).is_err());
+    let mut bounded = policy.clone();
+    bounded.resources.max_external_resource_bytes = 1;
+    assert!(decrypt(&input, bounded, &resources).is_err());
+    assert!(decrypt(&input, policy.clone(), &std::collections::HashMap::new()).is_err());
+    resources.insert(
+        "https://example.test/recipient.xml".to_owned(),
+        b"<wrong/>".to_vec(),
+    );
+    assert!(decrypt(&input, policy.clone(), &resources).is_err());
+    resources.insert(
+        "https://example.test/recipient.xml".to_owned(),
+        reference("recipient.xml").into_bytes(),
+    );
+    assert!(
+        decrypt(&input, policy, &resources)
+            .unwrap_err()
+            .to_string()
+            .contains("cyclic")
+    );
+}
+
+#[cfg(feature = "xmlenc")]
+#[test]
 fn encrypted_data_builder_round_trips_all_kem_parameter_sets() {
     // Public APIs must establish a CEK, emit a complete mechanism and recover
     // the original bytes, without test-side secret extraction or raw-key fallback.

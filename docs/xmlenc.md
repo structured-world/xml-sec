@@ -39,8 +39,13 @@ and exposes the sole applicable KEM recipient using decryption's `DataReference`
 `requires_document_context()` is false, its `data()` can be reused by `decrypt_data`
 without decoding recipient ciphertexts again. Otherwise decrypt the original XML
 with the same ID registrations to preserve association and CipherReference
-semantics. References inside the mechanism's own `KeyInfo` are expanded before recipient-name selection, with
-the same ID registrations, ancestry checks and operation-wide parsing allowances.
+semantics. References inside the mechanism's own `KeyInfo` are expanded before
+recipient-name selection, with the same ID registrations, ancestry checks and
+operation-wide parsing allowances. Policy-permitted external `KeyInfoReference`
+targets come only from `DecryptContext::external_resources`, including fragments
+and relative chains; no implicit I/O occurs. They use `uris.key_info_references`,
+not `uris.retrieval_methods`, and must resolve to a `ds:KeyInfo` element as required
+by [XMLDSig 1.1 §4.5.10](https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-KeyInfoReference).
 `inspect_encrypted_data_template_node_with_context` additionally retains borrowed
 original `CipherValue` targets, so a frontend can update a referenced mechanism
 without inserting an inline duplicate or replacing the surrounding reference.

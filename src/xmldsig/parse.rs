@@ -1390,12 +1390,21 @@ impl<'a> KeyInfoParsingSession<'a> {
         node: Node,
         provider: &dyn crate::provider::CryptoProvider,
     ) -> Result<KeyInfo, ParseError> {
+        self.parse_with_provider_and_document_base(node, provider, None)
+    }
+
+    pub(crate) fn parse_with_provider_and_document_base(
+        &mut self,
+        node: Node,
+        provider: &dyn crate::provider::CryptoProvider,
+        document_base: Option<&str>,
+    ) -> Result<KeyInfo, ParseError> {
         parse_key_info_in_session(
             node,
             provider,
             &self.xml_base,
             self.resources,
-            None,
+            document_base,
             None,
             &mut self.usage,
         )

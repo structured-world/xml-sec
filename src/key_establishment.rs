@@ -123,6 +123,10 @@ pub fn parse_encapsulation<'a, 'input>(
         }
     }
     let mut ciphertext = [0u8; 1568];
+    // GeneralPurpose checks actual output bytes, including terminal padding,
+    // not decoded_len_estimate (1569 for a padded 1568-byte ciphertext).
+    // Decode directly into retained storage; no staging copy is necessary.
+    // https://docs.rs/base64/0.23.1/src/base64/engine/general_purpose/decode_suffix.rs.html
     let ciphertext_len = base64::engine::general_purpose::STANDARD
         .decode_slice(&encoded[..len], &mut ciphertext)
         .map_err(|_| invalid("invalid ciphertext base64"))?;
@@ -417,6 +421,37 @@ mod tests {
         assert!(
             crate::provider::RustCryptoMlKemPrivateKey::generate(&FailedRandom, algorithm).is_err()
         );
+    }
+
+    #[test]
+    fn maximum_ciphertext_decodes_without_estimate_workspace() {
+        use base64::Engine as _;
+        // The final padded quad needs two bytes, not the three in the
+        // conservative length estimate. Exact-capacity decoding must remain
+        // valid; a 1569-byte ciphertext with the same encoded length must fail.
+        let mechanism = |bytes: &[u8]| {
+            format!(
+                "<e:EncapsulationMechanism xmlns:e=\"{ENCAPSULATION_NS}\" xmlns:d=\"http://www.w3.org/2000/09/xmldsig#\" xmlns:x=\"http://www.w3.org/2001/04/xmlenc#\" Algorithm=\"{}\"><d:KeyInfo/><x:CipherData><x:CipherValue>{}</x:CipherValue></x:CipherData></e:EncapsulationMechanism>",
+                KeyEncapsulationAlgorithm::MlKem1024.uri(),
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            )
+        };
+        let bytes = [7; 1568];
+        let xml = mechanism(&bytes);
+        let document = crate::Document::parse(&xml).expect("maximum ciphertext XML");
+        let parsed = parse_encapsulation(document.root_element(), false).expect("exact capacity");
+        assert_eq!(parsed.ciphertext(), bytes);
+        let spaced = xml.replace("BwcH", "Bw\n cH");
+        let document = crate::Document::parse(&spaced).expect("whitespace ciphertext XML");
+        assert_eq!(
+            parse_encapsulation(document.root_element(), false)
+                .expect("whitespace does not consume ciphertext capacity")
+                .ciphertext(),
+            bytes
+        );
+        let oversized = mechanism(&[7; 1569]);
+        let document = crate::Document::parse(&oversized).expect("oversized ciphertext XML");
+        assert!(parse_encapsulation(document.root_element(), false).is_err());
     }
 
     #[test]
