@@ -4868,6 +4868,10 @@ fn xmlsec_compatibility_key_establishment_policy() -> xml_sec::policy::KeyEstabl
     let policy = xml_sec::policy::KeyEstablishmentPolicy::default();
     #[cfg(feature = "experimental-pq")]
     let policy = xml_sec::policy::KeyEstablishmentPolicy {
+        // The compatibility CLI preserves donor CBC semantics. It cannot
+        // establish external authentication; callers must supply that boundary.
+        kem_content_authentication:
+            xml_sec::policy::KemContentAuthentication::ExternalAuthenticated,
         encapsulation_algorithms: [
             xml_sec::provider::KeyEncapsulationAlgorithm::MlKem512,
             xml_sec::provider::KeyEncapsulationAlgorithm::MlKem768,

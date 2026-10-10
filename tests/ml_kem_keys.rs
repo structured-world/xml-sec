@@ -1419,6 +1419,10 @@ fn all_donor_content_encapsulation_ciphertexts_decrypt() {
         // The AES-192 vector requires explicit product-policy permission;
         // importing a donor document must not grant that permission implicitly.
         policy.data_algorithms = Some([content_algorithm].into_iter().collect());
+        // Donor CBC vectors exercise only compatibility; the caller-owned
+        // authentication permission does not make CBC padding an integrity check.
+        policy.key_establishment.kem_content_authentication =
+            xml_sec::policy::KemContentAuthentication::ExternalAuthenticated;
         let decrypted = xml_sec::xmlenc::DecryptContext::new(&key)
             .policy(policy)
             .decrypt_document(&xml, Some("ED"))
@@ -1430,6 +1434,140 @@ fn all_donor_content_encapsulation_ciphertexts_decrypt() {
             "{name}"
         );
     }
+}
+
+#[cfg(feature = "xmlenc")]
+#[test]
+fn direct_kem_cbc_requires_external_authentication_permission() {
+    // A KEM rejection secret can pass CBC padding. The safe default must
+    // reject this composition even with a correct recipient and ciphertext.
+    let private =
+        RustCryptoMlKemPrivateKey::from_pkcs8_der(&fixture("ml-kem-512-key.der")).unwrap();
+    let resolver = xml_sec::xmlenc::EncapsulationDecryptor::new(&private);
+    let mut policy = xml_sec::policy::DecryptionPolicy::default();
+    policy
+        .key_establishment
+        .encapsulation_algorithms
+        .insert(private.algorithm());
+    let xml = std::fs::read_to_string(fixture_path(
+        "xmlenc/aleksey-xmlenc-01/enc-aes256-em-ml-kem-512.xml",
+    ))
+    .unwrap();
+    assert!(matches!(
+        xml_sec::xmlenc::DecryptContext::new(&resolver)
+            .policy(policy.clone())
+            .decrypt_document(&xml, Some("ED")),
+        Err(xml_sec::xmlenc::XmlEncError::Policy(_))
+    ));
+    use xml_sec::xmlenc::DataEncryptionAlgorithm;
+    for algorithm in [
+        DataEncryptionAlgorithm::Aes128Cbc,
+        DataEncryptionAlgorithm::Aes256Cbc,
+        #[cfg(feature = "legacy-algorithms")]
+        DataEncryptionAlgorithm::Aes192Cbc,
+        #[cfg(feature = "legacy-algorithms")]
+        DataEncryptionAlgorithm::TripleDesCbc,
+    ] {
+        let mut encryption = xml_sec::policy::EncryptionPolicy {
+            data_algorithms: Some([algorithm].into()),
+            key_establishment: xml_sec::policy::KeyEstablishmentPolicy {
+                encapsulation_algorithms: [private.algorithm()].into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let builder = || {
+            xml_sec::xmlenc::EncryptedDataBuilder::new(algorithm)
+                .encapsulation_key(std::sync::Arc::new(private.public_key()))
+        };
+        assert!(matches!(
+            builder()
+                .policy(encryption.clone())
+                .encrypt_binary(b"payload"),
+            Err(xml_sec::xmlenc::XmlEncError::Policy(_))
+        ));
+        encryption.key_establishment.kem_content_authentication =
+            xml_sec::policy::KemContentAuthentication::ExternalAuthenticated;
+        let encrypted = builder()
+            .policy(encryption)
+            .encrypt_binary(b"payload")
+            .unwrap();
+        policy.data_algorithms = Some([algorithm].into());
+        policy.key_establishment.kem_content_authentication =
+            xml_sec::policy::KemContentAuthentication::RequireAuthenticatedCipher;
+        assert!(matches!(
+            xml_sec::xmlenc::DecryptContext::new(&resolver)
+                .policy(policy.clone())
+                .decrypt(&encrypted.encrypted_data_xml),
+            Err(xml_sec::xmlenc::XmlEncError::Policy(_))
+        ));
+        policy.key_establishment.kem_content_authentication =
+            xml_sec::policy::KemContentAuthentication::ExternalAuthenticated;
+        let decrypted = xml_sec::xmlenc::DecryptContext::new(&resolver)
+            .policy(policy.clone())
+            .decrypt(&encrypted.encrypted_data_xml)
+            .unwrap();
+        assert_eq!(
+            decrypted,
+            xml_sec::xmlenc::DecryptedContent::Bytes(b"payload".to_vec())
+        );
+    }
+}
+
+#[cfg(feature = "xmlenc")]
+#[test]
+fn encapsulation_candidate_budget_precedes_nested_der_decode() {
+    // The mechanism and its embedded key share one ingestion allowance.
+    // Malformed base64 proves exhaustion is detected before key decoding.
+    let xml = std::fs::read_to_string(fixture_path(
+        "xmlenc/aleksey-xmlenc-01/enc-aes128gcm-em-ml-kem-512.xml",
+    ))
+    .unwrap()
+    .replace(
+        "<ds:KeyName>TestKeyName-ml-kem-512</ds:KeyName>",
+        "<DEREncodedKeyValue xmlns=\"http://www.w3.org/2009/xmldsig11#\">!</DEREncodedKeyValue>",
+    );
+    let document = xml_sec::Document::parse(&xml).unwrap();
+    let node = document
+        .descendants()
+        .find(|node| node.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "EncryptedData")))
+        .unwrap();
+    let mut policy = xml_sec::policy::DecryptionPolicy::default();
+    policy
+        .key_establishment
+        .encapsulation_algorithms
+        .insert(KeyEncapsulationAlgorithm::MlKem512);
+    policy.resources.max_key_candidates = 1;
+    let error = xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &policy).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            xml_sec::xmlenc::XmlEncError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
+                resource: "key candidates",
+                maximum: 1,
+                actual: 2
+            })
+        ),
+        "{error}"
+    );
+    let key = RustCryptoMlKemPrivateKey::from_seed(KeyEncapsulationAlgorithm::MlKem512, &[7; 64])
+        .unwrap();
+    let spki = key.public_key().to_spki_der().unwrap();
+    use base64::Engine as _;
+    let valid = xml.replace(
+        ">!</DEREncodedKeyValue>",
+        &format!(
+            ">{}</DEREncodedKeyValue>",
+            base64::engine::general_purpose::STANDARD.encode(spki.as_bytes())
+        ),
+    );
+    let document = xml_sec::Document::parse(&valid).unwrap();
+    let node = document
+        .descendants()
+        .find(|node| node.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "EncryptedData")))
+        .unwrap();
+    policy.resources.max_key_candidates = 2;
+    xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &policy).unwrap();
 }
 
 #[cfg(feature = "xmlenc")]

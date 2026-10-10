@@ -447,6 +447,13 @@ and recipient-only options without a mechanism report which option is
 inapplicable. KEM/HMAC verification needs explicit `--insecure`: it validates
 message integrity but cannot establish sender identity. These are experimental
 libxmlsec1 bindings, not standardized W3C algorithms.
+The compatibility CLI explicitly enables direct KEM-to-CBC through
+`KemContentAuthentication::ExternalAuthenticated`; unlike the Rust API's safe
+default, it preserves the donor's CBC behavior. The CLI does not verify an
+external authenticator. Authenticate the complete input before `decrypt` and
+bind external integrity protection of `encrypt` output to its encryption key
+(XMLEnc 1.1 §6.1.1), or use GCM. A successful CBC-padding check
+does not confirm an ML-KEM ciphertext or identify its sender.
 KEM recipient selection in `sign`, `verify`, and `decrypt` follows the core's resolved source graph,
 including same-document `KeyInfoReference` and caller-declared `--id-attr`
 registrations. Named private options in `verify` retain `KeyName` selection;

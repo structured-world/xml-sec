@@ -20,7 +20,7 @@ use crate::xmlenc::{
 mod key_establishment;
 #[cfg(feature = "xmldsig")]
 pub use key_establishment::{
-    KeyAgreementAlgorithm, KeyDerivationAlgorithm, KeyEstablishmentPolicy,
+    KemContentAuthentication, KeyAgreementAlgorithm, KeyDerivationAlgorithm, KeyEstablishmentPolicy,
 };
 
 /// Permission for the unbounded parameterized RSA-PSS family.

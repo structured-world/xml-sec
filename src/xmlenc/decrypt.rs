@@ -3617,6 +3617,20 @@ mod tests {
     }
 
     impl DecryptionKeyResolver for CountingResolver {
+        fn resolve_encapsulation_content_keys_with_policy(
+            &self,
+            _: &dyn crate::provider::CryptoProvider,
+            _: DataEncryptionAlgorithm,
+            _: &crate::key_establishment::EncapsulationMechanism,
+            _: &crate::policy::DecryptionPolicy,
+            _: &mut KeyCandidateBudget,
+        ) -> Result<Vec<crate::provider::RecoveredContentKey>, XmlEncError> {
+            self.candidate_calls.set(self.candidate_calls.get() + 1);
+            Ok(vec![crate::provider::RecoveredContentKey::confirmed(
+                self.key.clone(),
+            )])
+        }
+
         fn resolve_key_candidates_with_policy(
             &self,
             provider: &dyn crate::provider::CryptoProvider,
@@ -5361,6 +5375,94 @@ mod tests {
                     actual,
                 }
             )) if maximum == aggregate_encoded_len - 1 && actual == aggregate_encoded_len
+        ));
+        assert_eq!(resolver.candidate_calls.get(), 0);
+    }
+
+    #[cfg(feature = "experimental-pq")]
+    #[test]
+    fn typed_kem_width_is_checked_before_any_resolver_dispatch() {
+        // Exercise the existing facade preflight with a permissive custom
+        // resolver, including nested KEKs, rather than built-in KEM recovery.
+        let document = crate::XmlDomDocument::parse(include_str!(
+            "../../tests/fixtures/xmlenc/aleksey-xmlenc-01/enc-aes128gcm-em-ml-kem-512.xml"
+        ))
+        .expect("valid donor XML");
+        let node = document
+            .descendants()
+            .find(|node| node.has_tag_name((crate::xmlenc::types::XMLENC_NS, "EncryptedData")))
+            .expect("donor EncryptedData");
+        let mut policy = crate::policy::DecryptionPolicy::default();
+        policy
+            .key_establishment
+            .encapsulation_algorithms
+            .insert(crate::provider::KeyEncapsulationAlgorithm::MlKem512);
+        let data = super::super::parse_encrypted_data_node_with_policy(node, &policy)
+            .expect("valid donor encryption metadata");
+        for width in [0, 767, 769] {
+            for nested in [false, true] {
+                let mut encrypted = data.clone();
+                encrypted.encapsulation_methods[0]
+                    .ciphertext
+                    .resize(width, 0);
+                if nested {
+                    encrypted.encrypted_keys.push(EncryptedKey {
+                        sources: super::super::EncryptionKeySources {
+                            encapsulation_methods: std::mem::take(
+                                &mut encrypted.encapsulation_methods,
+                            ),
+                            ..Default::default()
+                        },
+                        id: None,
+                        recipient: None,
+                        key_name: None,
+                        encryption_method: super::super::EncryptionMethod {
+                            algorithm: KeyWrapAlgorithm::AesKw128.uri().into(),
+                            key_size_bits: None,
+                            oaep_digest: None,
+                            mgf_algorithm: None,
+                            oaep_params: None,
+                        },
+                        cipher_data: super::super::CipherData::Bytes(vec![0; 24]),
+                        reference_list: None,
+                        carried_key_name: None,
+                    });
+                }
+                let resolver = CountingResolver {
+                    candidate_calls: Cell::new(0),
+                    key: vec![0; 16],
+                };
+                let error = DecryptContext::new(&resolver)
+                    .policy(policy.clone())
+                    .decrypt_data(&encrypted)
+                    .expect_err("malformed typed KEM width rejected");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("ciphertext size does not match Algorithm"),
+                    "{error}"
+                );
+                assert_eq!(resolver.candidate_calls.get(), 0);
+            }
+        }
+        // A custom resolver cannot bypass the facade's default KEM/CBC gate.
+        let mut encrypted = data;
+        encrypted.encryption_method.algorithm = DataEncryptionAlgorithm::Aes256Cbc.uri().into();
+        encrypted.cipher_data = super::super::CipherData::Bytes(vec![0; 32]);
+        let resolver = CountingResolver {
+            candidate_calls: Cell::new(0),
+            key: vec![0; 32],
+        };
+        assert!(matches!(
+            DecryptContext::new(&resolver)
+                .policy(policy)
+                .decrypt_data(&encrypted),
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::Algorithm {
+                    operation: "direct KEM content without external authentication",
+                    ..
+                }
+            ))
         ));
         assert_eq!(resolver.candidate_calls.get(), 0);
     }

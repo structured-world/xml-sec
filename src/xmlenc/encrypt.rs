@@ -819,6 +819,9 @@ impl EncryptedDataBuilder {
         policy: &crate::policy::EncryptionPolicy,
     ) -> Result<(), XmlEncError> {
         policy.validate()?;
+        if matches!(self.direct_key, Some(DirectEncryptionKey::Encapsulation(_))) {
+            policy.key_establishment.check_kem_content(self.algorithm)?;
+        }
         let metadata_limit = policy.resources.max_encryption_metadata_bytes;
         if let EncryptedDataType::Other(uri) = &self.encrypted_type {
             validate_metadata("EncryptedData Type", Some(uri), metadata_limit)?;

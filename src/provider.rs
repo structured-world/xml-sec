@@ -50,8 +50,10 @@ impl std::fmt::Debug for RecoveredContentKey {
 impl RecoveredContentKey {
     /// An explicitly supplied key, or one recovered by an integrity-checking
     /// mechanism such as OAEP or key wrap. A KEM real-or-rejection secret also
-    /// has no separate recovery-validity result; content authentication decides
-    /// acceptance. Do not use this for RSA-v1.5 recovery, whose validity must be
+    /// has no separate recovery-validity result; authenticated content decides
+    /// acceptance, or policy explicitly delegates authentication to the caller.
+    /// This constructor itself proves neither ciphertext integrity nor identity.
+    /// Do not use this for RSA-v1.5 recovery, whose validity must be
     /// retained separately with `recovery` until content work completes.
     pub fn confirmed(bytes: Vec<u8>) -> Self {
         Self {

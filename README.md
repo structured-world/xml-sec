@@ -24,6 +24,7 @@ Just `cargo add xml-sec`.**
 - **Experimental post-quantum key establishment**: ML-KEM-512/768/1024 through RustCrypto,
   RFC 9935 key encodings, and libxmlsec1-compatible HMAC/AES encapsulation workflows.
   Recipient encapsulation is not sender authentication; explicit policy permission is required.
+  Direct KEM-to-CBC additionally requires caller-owned external authentication; GCM is the safe default path.
 - **SAML-ready primitives**: enveloped signatures, encrypted assertions, X.509 keys, XPath,
   canonicalization, same-document XPointer references, DTD/`xml:id` IDs, and namespace-scoped ID registration.
 - **Pure Rust deployment**: RustCrypto, `x509-parser`, and selectable Rust XML backends replace

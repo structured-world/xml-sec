@@ -68,6 +68,19 @@ impl KeyDerivationAlgorithm {
     }
 }
 
+/// Authentication boundary for content encrypted directly with a KEM secret.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum KemContentAuthentication {
+    /// Require an authenticated content cipher, such as AES-GCM.
+    #[default]
+    RequireAuthenticatedCipher,
+    /// Compatibility permission: the caller authenticates the complete encrypted
+    /// input before decryption and binds external integrity protection of output
+    /// to its encryption key. CBC padding never proves KEM ciphertext validity
+    /// or sender identity.
+    ExternalAuthenticated,
+}
+
 /// Immutable permission and limits shared by encryption and decryption.
 ///
 /// These are deployment decisions, not specification requirements. Requests
@@ -77,6 +90,8 @@ impl KeyDerivationAlgorithm {
 pub struct KeyEstablishmentPolicy {
     /// Exact experimental KEM permissions. Empty denies all parameter sets.
     pub encapsulation_algorithms: HashSet<crate::provider::KeyEncapsulationAlgorithm>,
+    /// Separate permission for unauthenticated direct KEM content composition.
+    pub kem_content_authentication: KemContentAuthentication,
     /// Cumulative KEM attempts; failed provider calls consume allowance too.
     pub max_encapsulation_operations: usize,
     /// Exact agreement permissions. None permits ECDH-ES/X25519, not DH.
@@ -108,6 +123,7 @@ impl Default for KeyEstablishmentPolicy {
     fn default() -> Self {
         Self {
             encapsulation_algorithms: HashSet::new(),
+            kem_content_authentication: KemContentAuthentication::default(),
             max_encapsulation_operations: 64,
             agreement_algorithms: None,
             derivation_algorithms: None,
@@ -123,6 +139,27 @@ impl Default for KeyEstablishmentPolicy {
 }
 
 impl KeyEstablishmentPolicy {
+    /// Enforce the direct-content boundary independently of KEM capability.
+    #[cfg(feature = "xmlenc")]
+    pub(crate) fn check_kem_content(
+        &self,
+        algorithm: crate::xmlenc::DataEncryptionAlgorithm,
+    ) -> Result<(), PolicyViolation> {
+        // FIPS 203 §6.3 forbids exporting the implicit-rejection flag; CBC
+        // padding therefore cannot confirm a decapsulated key. Requiring an
+        // authenticated cipher by default is product policy, not a FIPS ban
+        // on CBC. The explicit exception requires caller-owned authentication.
+        // https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.203.pdf
+        // XMLEnc 1.1 §6.1.1: https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-edata-attacks
+        permission(
+            algorithm.cbc_block_len().is_none()
+                || self.kem_content_authentication
+                    == KemContentAuthentication::ExternalAuthenticated,
+            "direct KEM content without external authentication",
+            algorithm.uri(),
+        )
+    }
+
     /// Reject configuration exceeding implementation ceilings before any work.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
         super::ResourcePolicy::within(

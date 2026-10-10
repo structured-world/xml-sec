@@ -59,7 +59,6 @@ struct ParsedKeyInfo {
 }
 
 struct SharedKeySourceParseBudget<'a> {
-    count: usize,
     retained_cipher_bytes: usize,
     transforms: crate::xmldsig::transforms::XPathSignatureParseBudget,
     key_info: crate::xmldsig::parse::KeyInfoParsingSession<'a>,
@@ -69,7 +68,6 @@ struct SharedKeySourceParseBudget<'a> {
 impl<'a> SharedKeySourceParseBudget<'a> {
     fn new(resources: &'a crate::policy::ResourcePolicy) -> Result<Self, XmlEncError> {
         Ok(Self {
-            count: 0,
             retained_cipher_bytes: 0,
             transforms: crate::xmldsig::transforms::XPathSignatureParseBudget::from_resources(
                 resources,
@@ -151,10 +149,11 @@ impl<'a, 'doc, 'shared> KeySourceParseBudget<'a, 'doc, 'shared> {
         }
     }
 
-    fn charge(&mut self, resources: &crate::policy::ResourcePolicy) -> Result<(), XmlEncError> {
-        resources.validate_key_candidates(self.shared.count + 1)?;
-        self.shared.count += 1;
-        Ok(())
+    fn charge(&mut self) -> Result<(), XmlEncError> {
+        self.shared
+            .key_info
+            .charge_encryption_source()
+            .map_err(super::agreement::map_key_info_error)
     }
 
     fn charge_recipient(
@@ -170,7 +169,7 @@ impl<'a, 'doc, 'shared> KeySourceParseBudget<'a, 'doc, 'shared> {
             }
             .into());
         }
-        self.charge(resources)
+        self.charge()
     }
 }
 
@@ -644,7 +643,7 @@ fn parse_key_info<'doc>(
             crate::key_establishment::ENCAPSULATION_NS,
             "EncapsulationMechanism",
         )) {
-            budget.charge(policy.resources)?;
+            budget.charge()?;
             let mechanism =
                 crate::key_establishment::parse_encapsulation(child, allow_empty_cipher_values)?;
             policy
@@ -690,33 +689,13 @@ fn parse_key_info<'doc>(
                 depth + 1,
             )?);
         } else if child.has_tag_name((XMLENC11_NS, "DerivedKey")) {
-            budget.charge(policy.resources)?;
+            budget.charge()?;
             source_nodes.push(child.id());
             derived_keys.push(super::derived_key::parse(child, policy.resources)?);
         } else if child.has_tag_name((XMLENC_NS, "AgreementMethod")) {
-            budget.charge(policy.resources)?;
-            for role in child.children().filter(|node| {
-                node.has_tag_name((XMLENC_NS, "OriginatorKeyInfo"))
-                    || node.has_tag_name((XMLENC_NS, "RecipientKeyInfo"))
-            }) {
-                for source in role.children().filter(Node::is_element) {
-                    if source.has_tag_name((XMLDSIG_NS, "KeyValue"))
-                        || source.has_tag_name((
-                            crate::xmldsig::parse::XMLDSIG11_NS,
-                            "DEREncodedKeyValue",
-                        ))
-                    {
-                        budget.charge(policy.resources)?;
-                    } else if source.has_tag_name((XMLDSIG_NS, "X509Data")) {
-                        for _ in source
-                            .children()
-                            .filter(|node| node.has_tag_name((XMLDSIG_NS, "X509Certificate")))
-                        {
-                            budget.charge(policy.resources)?;
-                        }
-                    }
-                }
-            }
+            budget.charge()?;
+            // Role parsing preflights against this same session before binary
+            // metadata inspection, then charges embedded keys exactly once.
             agreement_methods.push(super::agreement::parse(
                 child,
                 policy.resources,
@@ -793,7 +772,7 @@ fn parse_key_info<'doc>(
                 })
                 .transpose()?;
             if !uri.is_empty() && !uri.starts_with('#') || !transforms.is_empty() {
-                budget.charge(policy.resources)?;
+                budget.charge()?;
                 match parse_processed_key_reference(
                     child,
                     uri,
@@ -823,7 +802,7 @@ fn parse_key_info<'doc>(
                 kind.validate_target(target)?;
             }
             if target.has_tag_name((XMLENC11_NS, "DerivedKey")) {
-                budget.charge(policy.resources)?;
+                budget.charge()?;
                 source_nodes.push(target.id());
                 derived_keys.push(super::derived_key::parse(target, policy.resources)?);
                 continue;
@@ -871,7 +850,7 @@ fn parse_key_info<'doc>(
                 }
                 .into());
             }
-            budget.charge(policy.resources)?;
+            budget.charge()?;
             let target = budget.referenced_node(child, uri)?;
             let info =
                 parse_key_info(target, policy, allow_empty_cipher_values, budget, depth + 1)?;
@@ -960,7 +939,7 @@ fn parse_encapsulation_key_info<'doc>(
                     }
                     .into());
                 }
-                budget.charge(budget.policy.resources)?;
+                budget.charge()?;
                 budget
                     .policy
                     .resources
@@ -1319,7 +1298,7 @@ fn append_detached_keys<'doc>(
             continue;
         }
         if derived {
-            budget.charge(policy.resources)?;
+            budget.charge()?;
             info.source_nodes.push(id);
             info.derived_keys
                 .push(super::derived_key::parse(candidate, policy.resources)?);
@@ -1830,6 +1809,13 @@ fn validate_encrypted_data_metadata_inner(
     }
     validate(encrypted.key_name.as_deref())?;
     validate_encryption_method_metadata(&encrypted.encryption_method, maximum)?;
+    if !encrypted.encapsulation_methods.is_empty() {
+        policy
+            .key_establishment
+            .check_kem_content(super::DataEncryptionAlgorithm::from_uri(
+                &encrypted.encryption_method.algorithm,
+            )?)?;
+    }
     validate_key_sources(
         &encrypted.encrypted_keys,
         &encrypted.derived_keys,
@@ -1874,6 +1860,10 @@ fn validate_key_sources(
         if descriptor.ciphertext.len() != descriptor.algorithm.ciphertext_len()
             && !(template && descriptor.ciphertext.is_empty())
         {
+            // RFC 9935 Appendix B fixes ciphertext width per parameter set.
+            // This shared metadata preflight also gates caller-constructed
+            // descriptors before resolver dispatch, not only XML parsing.
+            // https://www.rfc-editor.org/rfc/rfc9935.html#appendix-B
             return Err(crate::key_establishment::KeyEstablishmentError::Structure(
                 "ciphertext size does not match Algorithm",
             )

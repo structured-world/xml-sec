@@ -58,6 +58,18 @@ key-establishment limits are enforced before cryptographic dispatch.
 KEM establishes recipient confidentiality, not sender identity; use AES-GCM
 for authenticated content and a separate signature for sender authentication.
 
+Direct KEM-to-CBC content is denied by default, independently of algorithm
+permission. `key_establishment.kem_content_authentication` must explicitly be
+`KemContentAuthentication::ExternalAuthenticated` to enable compatibility with
+the donor's CBC vectors. The caller must authenticate the complete encrypted
+input before decryption and bind external integrity protection of generated
+ciphertext to its encryption key (XMLEnc 1.1 §6.1.1). This grant
+does not validate that authentication: CBC padding can succeed for an ML-KEM
+implicit-rejection secret and must never be treated as ciphertext validity.
+FIPS 203 §6.3 forbids returning the rejection flag; this default is a product
+security policy, not a normative prohibition of CBC. KEM-to-GCM and nested
+KEM-to-AES-Key-Wrap remain available without this exception.
+
 ## Direct-Key Encryption
 
 `EncryptedDataBuilder` can encrypt opaque bytes, one XML element, an XML content fragment, or a

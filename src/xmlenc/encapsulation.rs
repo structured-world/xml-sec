@@ -73,7 +73,8 @@ impl<'a> EncapsulationDecryptor<'a> {
         // https://github.com/lsh123/xmlsec/blob/xmlsec-1_3_13/src/xmlenc.c
         // FIPS 203 section 7.3 returns the real-or-rejection secret without a
         // validity bit. This candidate does not attest ciphertext validity;
-        // the consuming content cipher/key wrap must still verify integrity.
+        // the consuming content cipher/key wrap must still verify integrity,
+        // unless check_kem_content explicitly delegates it to the caller.
         // https://doi.org/10.6028/NIST.FIPS.203
         Ok(vec![RecoveredContentKey::confirmed(
             secret[..width].to_vec(),
@@ -99,6 +100,7 @@ impl DecryptionKeyResolver for EncapsulationDecryptor<'_> {
         policy: &crate::policy::DecryptionPolicy,
         budget: &mut KeyCandidateBudget,
     ) -> Result<Vec<RecoveredContentKey>, XmlEncError> {
+        policy.key_establishment.check_kem_content(algorithm)?;
         self.recover(provider, algorithm.key_len(), descriptor, policy, budget)
     }
 
