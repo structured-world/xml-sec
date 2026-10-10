@@ -25,6 +25,51 @@ must verify, invalid vectors must return their exact failure class, and vectors
 that depend on an unavailable capability such as XSLT or HMAC-MD5 must fail at
 an explicit typed boundary rather than being skipped.
 
+## Experimental Recipient Encapsulation
+
+`experimental-pq` supports libxmlsec1 1.3.13's experimental
+`EncapsulationMechanism` inside signature `KeyInfo`. It is an extension, not a
+W3C signature algorithm. Use `SignContext::new_encapsulation(&recipient_public)`
+with an HMAC builder/template and an explicitly permitting `SigningPolicy`.
+The context fills the KEM ciphertext before canonicalization and reference
+digests, then consumes the resulting 256-bit secret as the HMAC key.
+Verification uses `VerifyContext::decapsulation_key(&recipient_private)` and
+the same explicit algorithm permission. Supplying an ordinary HMAC key cannot
+bypass the mechanism, and conflicting recipient parameter sets are rejected.
+
+Signing and CLI preflight resolve same-document mechanisms reached through
+`KeyInfoReference`, retaining the original ciphertext element for atomic mutation.
+External KEM signing targets are not mutable caller documents and are rejected.
+This preflight also inspects policy-permitted external KeyInfo references when
+an ordinary signing key is supplied, so it cannot silently preserve a KEM
+instruction. External XML parsing shares the operation budget; unrelated key
+hints do not require decoding their key material.
+Verification also resolves mechanisms reached through `KeyInfoReference`, using
+the same source/URI policy, depth, cycle and shared parsing limits as other key
+metadata. Multiple mechanisms in the resolved graph are rejected as ambiguous.
+Ordinary explicit signing keys (including HMAC) and pinned verification keys ignore
+unused key lookup hints, including malformed or unresolved hints. Bounded mechanism
+discovery follows local and policy-permitted external references without decoding
+unrelated key material.
+The public `inspect_pinned_verification_key_info` preflight follows these references
+too. Its original-document metadata return type cannot retain external DOM handles:
+an external mechanism produces an explicit context error, never an absent-mechanism
+result. Core verification with a decapsulation key supports external mechanisms.
+An explicitly supplied KEM decapsulation key likewise ignores unrelated key candidates:
+verification collects and validates the mechanism graph without importing lookup hints.
+This does not relax mechanism syntax, algorithm permission, reference policy, cycle,
+depth, ambiguity, or aggregate-work checks.
+An actual mechanism, direct or referenced, is an operation instruction and cannot
+be ignored by an ordinary signer or pinned verifier. Signing checks the projected XML size and
+reserves raw ciphertext, encoded ciphertext, and the HMAC secret copy before
+calling the encapsulation primitive.
+
+**KEM/HMAC does not authenticate the sender:** anyone holding the public key
+can create a new valid message. This path requires explicit
+`VerificationTrustMode::CryptographicOnly` and returns
+`KeyTrustEvidence::NotEstablished`; a trusted-key requirement fails before
+decapsulation. Use a genuine digital signature when sender identity matters.
+
 ## Examples
 
 `examples/sign.rs` builds an enveloped RSA-SHA256 signature with an embedded X.509

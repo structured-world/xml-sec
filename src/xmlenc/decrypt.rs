@@ -33,7 +33,7 @@ use super::parse_encrypted_data;
 pub struct KeyCandidateBudget {
     maximum: usize,
     remaining: usize,
-    key_establishment: super::key_establishment_budget::KeyEstablishmentUsage,
+    pub(super) key_establishment: super::key_establishment_budget::KeyEstablishmentUsage,
 }
 
 impl KeyCandidateBudget {
@@ -128,6 +128,8 @@ impl KeyCandidateBudget {
 /// A source resolved for a wrapping algorithm. Its output is never implicitly
 /// treated as a CEK or exported from a non-exportable provider handle.
 pub enum KeyEncryptionKeySource<'a> {
+    /// Experimental KEM producing this operation's wrapping key.
+    Encapsulation(&'a crate::key_establishment::EncapsulationMechanism),
     /// Application-owned key material without transported establishment hints.
     Direct,
     /// A key transporting this operation's wrapping key.
@@ -140,6 +142,18 @@ pub enum KeyEncryptionKeySource<'a> {
 
 /// Supplies keys for an XMLEnc operation under its immutable policy snapshot.
 pub trait DecryptionKeyResolver {
+    /// Resolve an experimental KEM source under the operation snapshot. Raw
+    /// content-key resolvers refuse by default rather than bypassing the KEM.
+    fn resolve_encapsulation_content_keys_with_policy(
+        &self,
+        _provider: &dyn crate::provider::CryptoProvider,
+        _algorithm: DataEncryptionAlgorithm,
+        _descriptor: &crate::key_establishment::EncapsulationMechanism,
+        _policy: &crate::policy::DecryptionPolicy,
+        _budget: &mut KeyCandidateBudget,
+    ) -> Result<Vec<crate::provider::RecoveredContentKey>, XmlEncError> {
+        Err(XmlEncError::KeyNotFound)
+    }
     /// Resolve an actual KEK purpose; default refusal prevents incorrectly
     /// adapting a content algorithm merely because its key width happens to fit.
     fn resolve_key_encryption_keys_with_policy(
@@ -1878,6 +1892,7 @@ fn resolve_content_key_candidates(
     let mut last_error = None;
     let mut candidates = if encrypted.derived_keys.is_empty()
         && encrypted.agreement_methods.is_empty()
+        && encrypted.encapsulation_methods.is_empty()
     {
         match resolve_candidates_with_budget(resolver, provider, algorithm, None, policy, budget) {
             Ok(keys) => keys,
@@ -1889,6 +1904,22 @@ fn resolve_content_key_candidates(
     } else {
         Vec::new()
     };
+    for descriptor in &encrypted.encapsulation_methods {
+        policy
+            .key_establishment
+            .check_encapsulation(descriptor.algorithm)?;
+        let remaining_before = budget.remaining();
+        budget.require_available(1)?;
+        match resolver.resolve_encapsulation_content_keys_with_policy(
+            provider, algorithm, descriptor, policy, budget,
+        ) {
+            Ok(keys) => {
+                budget.account_returned_candidates(remaining_before, keys.len())?;
+                candidates.extend(keys);
+            }
+            Err(error) => record_candidate_source_error_or_fail_operation(error, &mut last_error)?,
+        }
+    }
     for descriptor in &encrypted.agreement_methods {
         let remaining_before = budget.remaining();
         match resolver.resolve_agreement_content_keys_with_policy(
@@ -2042,6 +2073,7 @@ fn resolve_nested_key(
     let mut keys = Vec::new();
     let mut last_error = None;
     let mut resolve_source = |source| -> Result<(), XmlEncError> {
+        budget.require_available(1)?;
         let remaining = budget.remaining();
         match resolver
             .resolve_key_encryption_keys_with_policy(provider, wrap, source, policy, budget)
@@ -2054,6 +2086,9 @@ fn resolve_nested_key(
             Err(error) => record_candidate_source_error_or_fail_operation(error, &mut last_error),
         }
     };
+    for mechanism in &key.sources.encapsulation_methods {
+        resolve_source(KeyEncryptionKeySource::Encapsulation(mechanism))?;
+    }
     for agreement in &key.sources.agreement_methods {
         resolve_source(KeyEncryptionKeySource::Agreement(agreement))?;
     }
@@ -2243,7 +2278,13 @@ fn record_candidate_source_error_or_fail_operation(
     // Candidate-specific failures permit the next ordered key source. The
     // shared work ceiling is operation-wide and must never be recoverable by
     // advancing to another recipient.
-    if matches!(&error, XmlEncError::Policy(_)) {
+    if matches!(
+        &error,
+        XmlEncError::Policy(_)
+            | XmlEncError::KeyEstablishment(
+                crate::key_establishment::KeyEstablishmentError::Policy(_)
+            )
+    ) {
         return Err(error);
     }
     *last_error = Some(error);
@@ -2293,6 +2334,122 @@ fn encrypted_key_applies_to_data(
         return false;
     }
     true
+}
+
+pub(super) struct EncapsulationRecipient {
+    key_path: [usize; crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING],
+    depth: usize,
+    method: usize,
+}
+
+impl EncapsulationRecipient {
+    pub(super) fn mechanism<'a>(
+        &self,
+        data: &'a EncryptedData,
+    ) -> &'a crate::key_establishment::EncapsulationMechanism {
+        let mut methods = &data.encapsulation_methods;
+        let mut keys = &data.encrypted_keys;
+        for index in &self.key_path[..self.depth] {
+            let sources = &keys[*index].sources;
+            methods = &sources.encapsulation_methods;
+            keys = &sources.encrypted_keys;
+        }
+        &methods[self.method]
+    }
+}
+
+pub(super) fn select_encapsulation_recipient<'doc>(
+    data: &EncryptedData,
+    references: &super::cipher_reference::BoundCipherReferenceContext<'doc, 'doc>,
+    target: crate::NodeId,
+    origins: &[Option<crate::NodeId>],
+    policy: &crate::policy::DecryptionPolicy,
+) -> Result<Option<EncapsulationRecipient>, XmlEncError> {
+    struct Selection<'a> {
+        data: &'a EncryptedData,
+        semantics: crate::policy::SameDocumentIdSemantics,
+        path: [usize; crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING],
+        depth: usize,
+        selected: Option<EncapsulationRecipient>,
+    }
+    fn visit(
+        methods: &[crate::key_establishment::EncapsulationMechanism],
+        keys: &[EncryptedKey],
+        mut document: Option<KeySourceDocument<'_, '_>>,
+        parent: Option<&EncryptedKey>,
+        selection: &mut Selection<'_>,
+    ) -> Result<(), XmlEncError> {
+        for method in 0..methods.len() {
+            if selection.selected.is_some() {
+                return Err(XmlEncError::InvalidStructure(
+                    "multiple KEM recipients require explicit application key resolution".into(),
+                ));
+            }
+            selection.selected = Some(EncapsulationRecipient {
+                key_path: selection.path,
+                depth: selection.depth,
+                method,
+            });
+        }
+        for (index, key) in keys.iter().enumerate() {
+            let source = take_key_document(&mut document, key)?;
+            let target = ReferenceTarget::new(
+                document,
+                match parent {
+                    Some(parent) => parent.id.as_deref(),
+                    None => selection.data.id.as_deref(),
+                },
+                selection.semantics,
+            );
+            // XMLEnc 1.1 §3.6: use the execution predicates for DataReference/CarriedKeyName
+            // at the content-key boundary, KeyReference at wrapping-key boundaries.
+            // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-ReferenceList
+            let applies = match parent {
+                None => encrypted_key_applies_to_data(key, selection.data, target),
+                Some(_) => reference_list_applies_to_target(
+                    key.reference_list.as_ref(),
+                    target,
+                    ReferenceKind::Key,
+                ),
+            };
+            if !applies {
+                continue;
+            }
+            // Parsing bounds every key-indirection path by this absolute
+            // ceiling; selection needs no heap allocation or ciphertext copy.
+            debug_assert!(selection.depth < selection.path.len());
+            selection.path[selection.depth] = index;
+            selection.depth += 1;
+            visit(
+                &key.sources.encapsulation_methods,
+                &key.sources.encrypted_keys,
+                source,
+                Some(key),
+                selection,
+            )?;
+            selection.depth -= 1;
+        }
+        Ok(())
+    }
+    let mut selection = Selection {
+        data,
+        semantics: policy.transforms.same_document_id_semantics,
+        path: [0; crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING],
+        depth: 0,
+        selected: None,
+    };
+    visit(
+        &data.encapsulation_methods,
+        &data.encrypted_keys,
+        Some(KeySourceDocument {
+            references,
+            target,
+            origins,
+        }),
+        None,
+        &mut selection,
+    )?;
+    Ok(selection.selected)
 }
 
 fn reference_list_applies_to_target(
@@ -2527,6 +2684,11 @@ fn validate_typed_cipher_values(
     }
 
     let maximum_wrapped_key = projected_decoded_len_for_encoded_len(MAX_CIPHER_VALUE_BASE64_LEN);
+    validate_encapsulation_cipher_values(
+        &encrypted.encapsulation_methods,
+        maximum_cipher_values,
+        &mut aggregate_encoded,
+    )?;
     validate_wrapped_cipher_values(
         &encrypted.encrypted_keys,
         maximum_wrapped_key,
@@ -2553,12 +2715,44 @@ fn validate_wrapped_cipher_values(
             }
             .into());
         }
+        validate_encapsulation_cipher_values(
+            &encrypted_key.sources.encapsulation_methods,
+            maximum_cipher_values,
+            aggregate_encoded,
+        )?;
         validate_wrapped_cipher_values(
             &encrypted_key.sources.encrypted_keys,
             maximum_wrapped_key,
             maximum_cipher_values,
             aggregate_encoded,
         )?;
+    }
+    Ok(())
+}
+
+fn validate_encapsulation_cipher_values(
+    methods: &[crate::key_establishment::EncapsulationMechanism],
+    maximum: usize,
+    aggregate: &mut usize,
+) -> Result<(), XmlEncError> {
+    for method in methods {
+        // Match XML parsing's encoded CipherValue accounting, even though
+        // typed descriptors retain decoded public ciphertext bytes.
+        let encoded = method.ciphertext.len().div_ceil(3).checked_mul(4);
+        let total = encoded.and_then(|encoded| aggregate.checked_add(encoded));
+        let total = total.ok_or(crate::policy::PolicyViolation::ResourceLimitExceeded {
+            resource: crate::policy::resource_name::AGGREGATE_ENCRYPTION_CIPHER_VALUE_BYTES,
+            maximum,
+        })?;
+        if total > maximum {
+            return Err(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::AGGREGATE_ENCRYPTION_CIPHER_VALUE_BYTES,
+                maximum,
+                actual: total,
+            }
+            .into());
+        }
+        *aggregate = total;
     }
     Ok(())
 }
@@ -3208,6 +3402,7 @@ mod tests {
         key_name: Option<&str>,
     ) -> EncryptedData {
         EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: Some("target".into()),
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -3535,6 +3730,7 @@ mod tests {
         let mut wire = nonce.to_vec();
         wire.extend_from_slice(&ciphertext);
         let encrypted = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: None,
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -3578,6 +3774,7 @@ mod tests {
             keys: vec![vec![1_u8; 16], vec![2_u8; 16], vec![3_u8; 16]],
         };
         let encrypted = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: None,
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -3636,6 +3833,7 @@ mod tests {
         // CBC padding cannot authenticate which candidate key is correct. A
         // resolver must select one key from trusted metadata before decryption.
         let encrypted = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: None,
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -3684,6 +3882,7 @@ mod tests {
         // that unauthenticated CBC must reject between distinct key identities.
         let key = vec![0x27_u8; 16];
         let encrypted = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: None,
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -3726,6 +3925,7 @@ mod tests {
         // A resolver is caller-controlled; its result cannot multiply one
         // prepared operation beyond the implementation safety ceiling.
         let encrypted = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: None,
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -3767,6 +3967,7 @@ mod tests {
         // A deployment-selected ceiling must reach resolver accounting; the
         // hard implementation ceiling is not the effective runtime policy.
         let encrypted = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: None,
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -3995,6 +4196,7 @@ mod tests {
             .encrypt_data(DataEncryptionAlgorithm::Aes128Cbc, &key, b"payload")
             .expect("test encryption must succeed");
         let encrypted = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: None,
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -4312,6 +4514,7 @@ mod tests {
             };
             let provider = PermissiveUnwrapProvider::default();
             let encrypted = EncryptedData {
+                encapsulation_methods: Vec::new(),
                 id: None,
                 derived_keys: Vec::new(),
                 agreement_methods: Vec::new(),
@@ -4358,6 +4561,7 @@ mod tests {
                 ..PermissiveUnwrapProvider::default()
             };
             let encrypted = EncryptedData {
+                encapsulation_methods: Vec::new(),
                 id: None,
                 derived_keys: Vec::new(),
                 agreement_methods: Vec::new(),
@@ -4609,6 +4813,7 @@ mod tests {
             ))
         ));
         let truncated = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: None,
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -4880,6 +5085,7 @@ mod tests {
             carried_key_name: None,
         };
         let encrypted = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: None,
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -4986,6 +5192,7 @@ mod tests {
             .encrypt_data(DataEncryptionAlgorithm::Aes128Gcm, &[0_u8; 16], b"data")
             .expect("test encryption must succeed");
         let encrypted = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: Some("oversized".into()),
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -5043,6 +5250,7 @@ mod tests {
             .encrypt_data(DataEncryptionAlgorithm::Aes128Gcm, &key, b"data")
             .expect("test encryption must succeed");
         let mut encrypted = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: None,
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -5157,6 +5365,75 @@ mod tests {
         assert_eq!(resolver.candidate_calls.get(), 0);
     }
 
+    #[cfg(feature = "experimental-pq")]
+    #[test]
+    fn typed_kem_ciphertext_shares_aggregate_cipher_value_budget() {
+        // Typed input must charge the same base64-projected KEM ciphertext as
+        // XML input, including descriptors nested under an EncryptedKey.
+        let xml = include_str!(
+            "../../tests/fixtures/xmlenc/aleksey-xmlenc-01/enc-aes128gcm-em-ml-kem-512.xml"
+        );
+        let document = crate::XmlDomDocument::parse(xml).expect("donor XML parses");
+        let node = document
+            .descendants()
+            .find(|node| node.has_tag_name((crate::xmlenc::types::XMLENC_NS, "EncryptedData")))
+            .expect("donor EncryptedData");
+        let mut policy = crate::policy::DecryptionPolicy::default();
+        policy
+            .key_establishment
+            .encapsulation_algorithms
+            .insert(crate::provider::KeyEncapsulationAlgorithm::MlKem512);
+        let mut encrypted = super::super::parse_encrypted_data_node_with_policy(node, &policy)
+            .expect("permitted donor recipient");
+        let content = cipher_data_storage_len(&encrypted.cipher_data);
+        let kem_encoded = 4 * encrypted.encapsulation_methods[0]
+            .ciphertext
+            .len()
+            .div_ceil(3);
+        assert!(
+            validate_typed_cipher_values(
+                &encrypted,
+                DataEncryptionAlgorithm::Aes128Gcm,
+                usize::MAX / 2,
+                content + kem_encoded
+            )
+            .is_ok()
+        );
+        for nested in [false, true] {
+            if nested {
+                encrypted.encrypted_keys.push(EncryptedKey {
+                    sources: super::super::EncryptionKeySources {
+                        encapsulation_methods: std::mem::take(&mut encrypted.encapsulation_methods),
+                        ..Default::default()
+                    },
+                    id: None,
+                    recipient: None,
+                    key_name: None,
+                    encryption_method: super::super::EncryptionMethod {
+                        algorithm: KeyWrapAlgorithm::AesKw128.uri().into(),
+                        key_size_bits: None,
+                        oaep_digest: None,
+                        mgf_algorithm: None,
+                        oaep_params: None,
+                    },
+                    cipher_data: super::super::CipherData::Bytes(vec![0; 24]),
+                    reference_list: None,
+                    carried_key_name: None,
+                });
+            }
+            let total = content + kem_encoded + if nested { 24 } else { 0 };
+            policy.resources.max_xml_document_bytes = total - 1;
+            let resolver = CountingResolver {
+                candidate_calls: Cell::new(0),
+                key: vec![0; 16],
+            };
+            assert!(
+                matches!(DecryptContext::new(&resolver).policy(policy.clone()).decrypt_data(&encrypted), Err(XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit { resource: crate::policy::resource_name::AGGREGATE_ENCRYPTION_CIPHER_VALUE_BYTES, maximum, actual })) if maximum == total - 1 && actual == total)
+            );
+            assert_eq!(resolver.candidate_calls.get(), 0);
+        }
+    }
+
     #[test]
     fn typed_legacy_oaep_accepts_explicit_mgf() {
         // The legacy URI defaults to MGF1-SHA1 when MGF is absent, but
@@ -5166,6 +5443,7 @@ mod tests {
             .encrypt_data(DataEncryptionAlgorithm::Aes128Gcm, &key, b"data")
             .expect("test encryption must succeed");
         let encrypted = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: None,
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -5223,6 +5501,7 @@ mod tests {
             .encrypt_data(DataEncryptionAlgorithm::Aes128Gcm, &key, b"data")
             .expect("test encryption must succeed");
         let encrypted = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: None,
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -5279,6 +5558,7 @@ mod tests {
             .encrypt_data(DataEncryptionAlgorithm::Aes128Gcm, &key, b"data")
             .expect("test encryption must succeed");
         let encrypted = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: None,
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),
@@ -5318,6 +5598,7 @@ mod tests {
             .encrypt_data(DataEncryptionAlgorithm::Aes128Gcm, &key, b"data")
             .expect("test encryption must succeed");
         let encrypted = EncryptedData {
+            encapsulation_methods: Vec::new(),
             id: None,
             derived_keys: Vec::new(),
             agreement_methods: Vec::new(),

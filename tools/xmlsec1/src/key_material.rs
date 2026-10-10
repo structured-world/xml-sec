@@ -26,8 +26,8 @@ use xml_sec::rsa_encoding::{RsaPrivateKeyEncoding as _, RsaPublicKeyEncoding as 
 use xml_sec::xmldsig::{
     DsaSigningKey, DsigError, EcdsaP256SigningKey, EcdsaP384SigningKey, EcdsaP521SigningKey,
     KeyInfo, ReferenceProcessingError, RsaSigningKey, SignatureAlgorithm, SigningKey,
-    VerificationKey, find_signature_node, materialize_signing_key_info_references,
-    materialize_verification_key_info_references, parse_signed_info, uri::UriReferenceResolver,
+    VerificationKey, find_signature_node, inspect_signing_key_info, inspect_verification_key_info,
+    parse_signed_info, uri::UriReferenceResolver,
 };
 use xml_sec::{
     XmlDomDocument as Document, XmlDomNode as Node, XmlDomParsingOptions as ParsingOptions,
@@ -83,6 +83,7 @@ pub enum KeyMaterialError {
 pub struct SignatureMetadata {
     pub algorithm: SignatureAlgorithm,
     pub key_names: Vec<String>,
+    pub encapsulation: Option<xml_sec::provider::KeyEncapsulationAlgorithm>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +97,7 @@ pub struct SigningTemplateMetadata {
     pub algorithm: SignatureAlgorithm,
     pub key_names: Vec<String>,
     pub key_info: Option<KeyInfo>,
+    pub encapsulation: Option<xml_sec::provider::KeyEncapsulationAlgorithm>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,31 +183,41 @@ pub fn verification_signature_metadata(
     let algorithm = parse_signed_info(signed_info)
         .map(|info| info.signature_method)
         .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
+    // Pinning a key ignores lookup hints, not operation instructions. Discover
+    // local KEM instructions without parsing unrelated key material first.
+    let ignore_hints = key_name_resolution == VerificationKeyNameResolution::IgnoreDocumentKeyInfo;
+    let metadata = signature_key_info(signature)
+        .map(|info| {
+            let resolver = UriReferenceResolver::with_id_registrations(&document, id_attributes);
+            if ignore_hints {
+                xml_sec::xmldsig::inspect_pinned_verification_key_info(
+                    info,
+                    resolver,
+                    policy,
+                    provider,
+                    xml_backend,
+                )
+            } else {
+                inspect_verification_key_info(info, resolver, policy, provider, xml_backend)
+                    .map(Some)
+            }
+        })
+        .transpose()
+        .map_err(map_key_info_reference_error)?
+        .flatten();
+    let encapsulation = metadata.as_ref().and_then(|info| info.encapsulation);
+    if let Some(algorithm) = encapsulation {
+        policy.key_establishment.check_encapsulation(algorithm)?;
+    }
     let key_info = if key_name_resolution == VerificationKeyNameResolution::IgnoreDocumentKeyInfo {
         None
     } else {
-        let mut parsing = xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&policy.resources)
-            .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
-        let mut key_info = signature_key_info(signature)
-            .map(|node| parsing.parse_with_provider(node, provider))
-            .transpose()
-            .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
-        if let Some(key_info) = &mut key_info {
-            let resolver = UriReferenceResolver::with_id_registrations(&document, id_attributes);
-            materialize_verification_key_info_references(
-                key_info,
-                resolver,
-                policy,
-                provider,
-                xml_backend,
-            )
-            .map_err(map_key_info_reference_error)?;
-        }
-        key_info
+        metadata.map(|metadata| metadata.key_info)
     };
     Ok(SignatureMetadata {
         algorithm,
         key_names: key_names(&key_info),
+        encapsulation,
     })
 }
 
@@ -237,21 +249,28 @@ pub fn signing_signature_metadata(
     let algorithm = xml_sec::xmldsig::parse::parse_signature_method(method, &policy.resources)
         .map(|(algorithm, _, _)| algorithm)
         .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
-    let mut parsing = xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&policy.resources)
-        .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
-    let mut key_info = signature_key_info(signature)
-        .map(|node| parsing.parse_with_provider(node, provider))
+    let metadata = signature_key_info(signature)
+        .map(|info| {
+            inspect_signing_key_info(
+                info,
+                UriReferenceResolver::with_id_registrations(&document, id_attributes),
+                policy,
+                provider,
+                xml_backend,
+            )
+        })
         .transpose()
-        .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
-    if let Some(key_info) = &mut key_info {
-        let resolver = UriReferenceResolver::with_id_registrations(&document, id_attributes);
-        materialize_signing_key_info_references(key_info, resolver, policy, provider, xml_backend)
-            .map_err(map_key_info_reference_error)?;
+        .map_err(map_key_info_reference_error)?;
+    let encapsulation = metadata.as_ref().and_then(|info| info.encapsulation);
+    if let Some(algorithm) = encapsulation {
+        policy.key_establishment.check_encapsulation(algorithm)?;
     }
+    let key_info = metadata.map(|metadata| metadata.key_info);
     Ok(SigningTemplateMetadata {
         algorithm,
         key_names: key_names(&key_info),
         key_info,
+        encapsulation,
     })
 }
 
@@ -2421,6 +2440,29 @@ mod tests {
 
         assert_eq!(metadata.algorithm, SignatureAlgorithm::RsaSha256);
         assert!(metadata.key_names.is_empty());
+        // Raw HMAC keys are pinned too: neither malformed key bytes nor an
+        // unused unresolved reference may make their metadata inspection fail.
+        let hmac_xml = xml.replace("#rsa-sha256", "#hmac-sha256");
+        for input in [
+            hmac_xml.clone(),
+            hmac_xml.replace(
+                "<dsig11:DEREncodedKeyValue>not-base64!</dsig11:DEREncodedKeyValue>",
+                "<dsig11:KeyInfoReference URI=\"#missing\"/>",
+            ),
+        ] {
+            let metadata = verification_signature_metadata(
+                &input,
+                None,
+                &[],
+                &VerificationPolicy::default(),
+                VerificationKeyNameResolution::IgnoreDocumentKeyInfo,
+                xml_sec::XmlBackend::default(),
+                xml_sec::provider::default_provider(),
+            )
+            .expect("pinned HMAC must ignore unused key hints");
+            assert_eq!(metadata.algorithm, SignatureAlgorithm::HmacSha256);
+            assert!(metadata.key_names.is_empty());
+        }
     }
 
     #[test]

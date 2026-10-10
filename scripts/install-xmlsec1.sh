@@ -44,7 +44,9 @@ xmlsec_required_capabilities() {
     [[ "$output" == *"\"$transform\""* ]] || return 1
   done
   [[ "$modern_oracle" == 1 ]] || return 0
-  for transform in eddsa-ed25519 eddsa-ed25519ctx eddsa-ed25519ph eddsa-ed448 eddsa-ed448ph; do
+  [[ -x "$prefix/bin/openssl" ]] || return 1
+  [[ "$("$prefix/bin/openssl" version)" == "OpenSSL $ORACLE_OPENSSL_VERSION "* ]] || return 1
+  for transform in eddsa-ed25519 eddsa-ed25519ctx eddsa-ed25519ph eddsa-ed448 eddsa-ed448ph ml-kem-512 ml-kem-768 ml-kem-1024; do
     [[ "$output" == *"\"$transform\""* ]] || return 1
   done
 }
@@ -178,6 +180,10 @@ else
 fi
 
 prepare_modern_openssl
+kem_options=()
+if [[ "$modern_oracle" == 1 ]]; then
+  kem_options+=(--enable-ml-kem)
+fi
 mkdir -p "$build_dir" "$stage_dir"
 OBJ_DIR="$build_dir" "$source_dir/autogen.sh" \
   --prefix="$prefix" \
@@ -186,11 +192,17 @@ OBJ_DIR="$build_dir" "$source_dir/autogen.sh" \
   --without-nss \
   --enable-md5 \
   --enable-ripemd160 \
+  "${kem_options[@]}" \
   "$openssl_option"
 make --directory "$build_dir" --jobs "$build_jobs"
 make --directory "$build_dir" install DESTDIR="$stage_dir"
 
 staged_prefix="$stage_dir$prefix"
+if [[ "$modern_oracle" == 1 ]]; then
+  # Keep the independently built primitive oracle with the transactional
+  # installation, instead of deleting it with its temporary build directory.
+  install -m 755 "$openssl_prefix/bin/openssl" "$staged_prefix/bin/openssl"
+fi
 mkdir -p "$(dirname "$prefix")"
 if [[ -e "$prefix" ]]; then
   mv "$prefix" "$previous_install"
@@ -206,7 +218,7 @@ if ! xmlsec_version_is_expected "$version_output"; then
   exit 1
 fi
 if ! xmlsec_required_capabilities; then
-  printf 'xmlsec1 oracle is missing required compatibility or EdDSA transforms\n' >&2
+  printf 'xmlsec1 oracle is missing required compatibility, EdDSA, or ML-KEM transforms\n' >&2
   exit 1
 fi
 printf '%s\n' "$version_output"

@@ -18,6 +18,46 @@ stale or foreign document state is therefore rejected before mutation work begin
 Compiled graph failures are reported as `XmlEncError::OperationPlan`; malformed XMLEnc
 element order or namespaces remain `XmlEncError::InvalidStructure`.
 
+## Experimental ML-KEM
+
+With `experimental-pq`, `EncryptedDataBuilder::encapsulation_key` establishes
+a fresh content key for an explicitly supplied recipient. Grant the exact
+ML-KEM parameter set through the operation's `KeyEstablishmentPolicy`.
+`direct_key_name` names only the outer content key, not the recipient key
+inside `EncapsulationMechanism`; an explicit recipient is supplied by the caller.
+`EncapsulationDecryptor::new` borrows a private recipient handle;
+`EncapsulationDecryptor::provider_key` owns an imported handle.
+`KeyInventory::decryption_resolver_with_provider` selects these keys by their
+actual PKCS#8 identity rather than treating them as RSA transport keys.
+The resolver also supports a mechanism supplying a nested AES Key Wrap KEK.
+The CLI decrypts this form but rejects nested KEM encryption templates before
+encryption; it must not preserve an unexecuted mechanism while wrapping with an
+ordinary AES key. CLI KEM encryption uses a content-key mechanism instead.
+`inspect_encrypted_data_node_with_context` retains an immutable descriptor graph
+and exposes the sole applicable KEM recipient using decryption's `DataReference`,
+`CarriedKeyName` and nested `KeyReference` predicates. When
+`requires_document_context()` is false, its `data()` can be reused by `decrypt_data`
+without decoding recipient ciphertexts again. Otherwise decrypt the original XML
+with the same ID registrations to preserve association and CipherReference
+semantics. References inside the mechanism's own `KeyInfo` are expanded before
+recipient-name selection, with the same ID registrations, ancestry checks and
+operation-wide parsing allowances. Policy-permitted external `KeyInfoReference`
+targets come only from `DecryptContext::external_resources`, including fragments
+and relative chains; no implicit I/O occurs. They use `uris.key_info_references`,
+not `uris.retrieval_methods`, and must resolve to a `ds:KeyInfo` element as required
+by [XMLDSig 1.1 §4.5.10](https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-KeyInfoReference).
+`inspect_encrypted_data_template_node_with_context` additionally retains borrowed
+original `CipherValue` targets, so a frontend can update a referenced mechanism
+without inserting an inline duplicate or replacing the surrounding reference.
+
+The serialized mechanism follows libxmlsec1 1.3.13's experimental extension:
+the consuming cipher takes the first 16, 24, or 32 secret octets directly,
+without a KDF. This is not a W3C standardized ML-KEM binding. Ciphertext framing,
+algorithm permission, provider ownership, candidate counts, and cumulative
+key-establishment limits are enforced before cryptographic dispatch.
+KEM establishes recipient confidentiality, not sender identity; use AES-GCM
+for authenticated content and a separate signature for sender authentication.
+
 ## Direct-Key Encryption
 
 `EncryptedDataBuilder` can encrypt opaque bytes, one XML element, an XML content fragment, or a

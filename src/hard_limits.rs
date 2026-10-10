@@ -62,15 +62,18 @@ pub(crate) const KEY_IMPORT_KDF_WORK_CEILING: u64 = 10_000_000;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const KEY_IMPORT_KDF_MEMORY_CEILING: usize = 32 * 1024 * 1024;
 /// Bounds hash compression work induced by XML key-establishment parameters.
-#[cfg(feature = "xmlenc")]
+#[cfg(feature = "xmldsig")]
 pub(crate) const KEY_ESTABLISHMENT_HASH_BLOCK_CEILING: usize = 10_000_000;
 /// Bounds cumulative derived-key output reservations.
-#[cfg(feature = "xmlenc")]
+#[cfg(feature = "xmldsig")]
 pub(crate) const KEY_ESTABLISHMENT_BYTE_CEILING: usize = 32 * 1024 * 1024;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const DH_MODULUS_BIT_CEILING: usize = 16_384;
-#[cfg(feature = "xmlenc")]
+#[cfg(feature = "xmldsig")]
 pub(crate) const KEY_ESTABLISHMENT_MODULAR_WORK_CEILING: usize = 1_000_000_000;
+/// Absolute ceiling on operation-wide experimental KEM attempts.
+#[cfg(feature = "xmldsig")]
+pub(crate) const KEY_ENCAPSULATION_OPERATION_CEILING: usize = 4_096;
 /// Stack-safety ceiling for BER construction and nested PKCS#12 safe bags.
 #[cfg(feature = "xmldsig")]
 pub(crate) const PKCS12_NESTING_CEILING: usize = 32;
@@ -135,6 +138,8 @@ pub(crate) const NODE_SET_OWNED_STRING_BYTE_CEILING: usize = 8 * 1024 * 1024;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const NODE_SET_CUMULATIVE_OWNED_STRING_BYTE_CEILING: usize = 64 * 1024 * 1024;
 /// Absolute aggregate OPC selector/projection allocation bound.
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const OPC_WORKSPACE_BYTE_CEILING: usize = 64 * 1024 * 1024;
 /// Absolute retained OPC selector allocation bound across one signature parse.
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const OPC_PARAMETER_BYTE_CEILING: usize = 1024 * 1024;

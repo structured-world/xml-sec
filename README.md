@@ -21,6 +21,9 @@ Just `cargo add xml-sec`.**
 - **End-to-end XML security**: sign, verify, encrypt, and decrypt through public Rust APIs.
 - **Modern signature algorithms**: curve-independent ECDSA with SHA-2/SHA-3, Ed25519/Ed448
   with context/prehash variants, and opt-in experimental ML-DSA/SLH-DSA through `CryptoProvider`.
+- **Experimental post-quantum key establishment**: ML-KEM-512/768/1024 through RustCrypto,
+  RFC 9935 key encodings, and libxmlsec1-compatible HMAC/AES encapsulation workflows.
+  Recipient encapsulation is not sender authentication; explicit policy permission is required.
 - **SAML-ready primitives**: enveloped signatures, encrypted assertions, X.509 keys, XPath,
   canonicalization, same-document XPointer references, DTD/`xml:id` IDs, and namespace-scoped ID registration.
 - **Pure Rust deployment**: RustCrypto, `x509-parser`, and selectable Rust XML backends replace

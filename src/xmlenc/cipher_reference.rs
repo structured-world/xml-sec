@@ -193,11 +193,12 @@ impl<'a> CipherReferenceContext<'a> {
         &self,
         node: Node<'_, '_>,
         uri: &str,
+        allowed_uris: crate::xmldsig::UriTypeSet,
         transforms: &[crate::xmldsig::transforms::Transform],
         document_base: Option<&str>,
         xml_parse: &crate::document::XmlParseWorkBudget,
     ) -> Result<(Vec<u8>, Option<String>), XmlEncError> {
-        if !self.policy.uris.retrieval_methods.allows(uri) {
+        if !allowed_uris.allows(uri) {
             return Err(crate::policy::PolicyViolation::Algorithm {
                 operation: "encryption key retrieval URI",
                 algorithm: uri.into(),
