@@ -649,12 +649,22 @@ impl<'a> UriReferenceResolver<'a> {
         &self,
         uri: &str,
     ) -> Result<Option<Node<'a, 'a>>, TransformError> {
+        self.node_for_same_document_reference_with_budget(uri, None)
+    }
+
+    pub(crate) fn node_for_same_document_reference_with_budget(
+        &self,
+        uri: &str,
+        budget: Option<&NodeSetMaterializationBudget>,
+    ) -> Result<Option<Node<'a, 'a>>, TransformError> {
         if uri.is_empty() {
             return Ok(Some(self.doc.root_element()));
         }
-        Ok(self
-            .node_id_for_same_document_reference(uri)?
-            .and_then(|id| self.doc.get_node(id)))
+        let target = self.node_id_for_reference_resource(uri, budget)?;
+        if target == Some(self.doc.root().id()) {
+            return Err(TransformError::UnsupportedUri(uri.to_owned()));
+        }
+        Ok(target.and_then(|id| self.doc.get_node(id)))
     }
 
     /// Borrowed association prefilter, sharing the normal URI grammar and ID
@@ -872,7 +882,7 @@ fn is_xpointer_root(fragment: &str) -> bool {
         .is_some_and(|expression| xml_space_trim(expression) == "/")
 }
 
-fn map_xml_base_resolution_error(error: XmlBaseResolutionError) -> TransformError {
+pub(crate) fn map_xml_base_resolution_error(error: XmlBaseResolutionError) -> TransformError {
     match error {
         XmlBaseResolutionError::Components { maximum, actual } => transform_resource_limit(
             crate::policy::resource_name::XML_BASE_COMPONENTS,

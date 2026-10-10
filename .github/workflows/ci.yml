@@ -147,6 +147,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - rust: "1.92.0"
+            xml-backend: experimental-pq-xmloxide
+            experimental-pq: true
+            cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-xmloxide,legacy-algorithms,experimental-pq
+          - rust: "1.92.0"
+            xml-backend: experimental-pq-roxmltree
+            experimental-pq: true
+            cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-roxmltree,legacy-algorithms,experimental-pq
+          - rust: "1.92.0"
+            xml-backend: experimental-pq-differential
+            experimental-pq: true
+            cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-differential,legacy-algorithms,experimental-pq
           - rust: stable
             xml-backend: legacy-fat-runtime
             cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backends-all,legacy-algorithms
@@ -218,12 +230,16 @@ jobs:
           sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev perl pkg-config
           scripts/install-xmlsec1.sh
           "$XMLSEC1_BIN" --version
+          echo "OPENSSL_BIN=$XMLSEC1_PREFIX/bin/openssl" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
       - name: Check FIPS provider without encryption
         if: matrix.native-fips
         run: cargo check --no-default-features --features aws-lc-fips,xml-backend-xmloxide
       - name: Lint FIPS provider configuration
         if: matrix.native-fips
+        run: cargo clippy --all-targets ${{ matrix.cargo-args }} -- -D warnings
+      - name: Lint experimental key establishment
+        if: matrix.experimental-pq
         run: cargo clippy --all-targets ${{ matrix.cargo-args }} -- -D warnings
       - run: >-
           cargo nextest run --workspace ${{ matrix.cargo-args }}

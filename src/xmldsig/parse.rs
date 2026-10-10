@@ -1366,6 +1366,37 @@ struct KeyInfoParseUsage {
 }
 
 impl<'a> KeyInfoParsingSession<'a> {
+    /// Count enclosing encryption mechanisms in the same ingestion allowance
+    /// as their embedded keys, before either representation is materialized.
+    #[cfg(feature = "xmlenc")]
+    pub(crate) fn charge_encryption_source(&mut self) -> Result<(), ParseError> {
+        charge_embedded_key_candidate(&mut self.usage.embedded_candidates, self.resources)
+    }
+
+    /// Validate role cardinality before its binary metadata preflight. Parsing
+    /// subsequently charges each candidate exactly once to the session; this
+    /// projection neither resets nor consumes a second allowance.
+    #[cfg(feature = "xmlenc")]
+    pub(crate) fn preflight_agreement_role_candidates(&self, node: Node) -> Result<(), ParseError> {
+        let mut projected = self.usage.embedded_candidates;
+        for child in element_children(node) {
+            match (child.tag_name().namespace(), child.tag_name().name()) {
+                (Some(XMLDSIG_NS), "KeyValue") | (Some(XMLDSIG11_NS), "DEREncodedKeyValue") => {
+                    charge_embedded_key_candidate(&mut projected, self.resources)?;
+                }
+                (Some(XMLDSIG_NS), "X509Data") => {
+                    for _ in element_children(child)
+                        .filter(|node| node.has_tag_name((XMLDSIG_NS, "X509Certificate")))
+                    {
+                        charge_embedded_key_candidate(&mut projected, self.resources)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Start a session using the operation's resource policy.
     pub fn new(resources: &'a crate::policy::ResourcePolicy) -> Result<Self, ParseError> {
         resources.validate()?;
@@ -1390,12 +1421,21 @@ impl<'a> KeyInfoParsingSession<'a> {
         node: Node,
         provider: &dyn crate::provider::CryptoProvider,
     ) -> Result<KeyInfo, ParseError> {
+        self.parse_with_provider_and_document_base(node, provider, None)
+    }
+
+    pub(crate) fn parse_with_provider_and_document_base(
+        &mut self,
+        node: Node,
+        provider: &dyn crate::provider::CryptoProvider,
+        document_base: Option<&str>,
+    ) -> Result<KeyInfo, ParseError> {
         parse_key_info_in_session(
             node,
             provider,
             &self.xml_base,
             self.resources,
-            None,
+            document_base,
             None,
             &mut self.usage,
         )

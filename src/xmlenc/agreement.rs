@@ -146,6 +146,9 @@ pub(super) fn parse(
                 phase = 1;
             }
             (Some(XMLENC_NS), "OriginatorKeyInfo") if phase <= 1 => {
+                key_info
+                    .preflight_agreement_role_candidates(child)
+                    .map_err(map_key_info_error)?;
                 preflight_role_metadata(child, resources.max_encryption_metadata_bytes)?;
                 result.originator = Some(
                     key_info
@@ -155,6 +158,9 @@ pub(super) fn parse(
                 phase = 2;
             }
             (Some(XMLENC_NS), "RecipientKeyInfo") if phase <= 2 => {
+                key_info
+                    .preflight_agreement_role_candidates(child)
+                    .map_err(map_key_info_error)?;
                 preflight_role_metadata(child, resources.max_encryption_metadata_bytes)?;
                 result.recipient = Some(
                     key_info

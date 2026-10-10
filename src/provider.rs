@@ -13,10 +13,20 @@ mod key_establishment;
 pub mod pkcs11;
 #[cfg(feature = "xmlenc")]
 pub use key_establishment::{EcdhCurve, RustCryptoDhKey, RustCryptoEcdhKey, RustCryptoX25519Key};
+#[cfg(feature = "xmldsig")]
+mod key_encapsulation;
 #[cfg(all(feature = "xmlenc", feature = "legacy-algorithms"))]
 mod rsa_pkcs1v15;
 #[cfg(feature = "xmldsig")]
 pub(crate) mod rsa_pss;
+#[cfg(feature = "xmldsig")]
+pub use key_encapsulation::{
+    EncapsulatedKey, KeyDecapsulationKey, KeyEncapsulationAlgorithm, KeyEncapsulationKey,
+};
+#[cfg(feature = "experimental-pq")]
+pub use key_encapsulation::{
+    MlKemPrivateKeyEncoding, RustCryptoMlKemPrivateKey, RustCryptoMlKemPublicKey,
+};
 
 /// Secret candidate whose recovery validity is retained until content work ends.
 /// Debug output never exposes key bytes or padding validity.
@@ -39,7 +49,12 @@ impl std::fmt::Debug for RecoveredContentKey {
 #[cfg(feature = "xmlenc")]
 impl RecoveredContentKey {
     /// An explicitly supplied key, or one recovered by an integrity-checking
-    /// mechanism such as OAEP or key wrap. Not for implicit-rejection output.
+    /// mechanism such as OAEP or key wrap. A KEM real-or-rejection secret also
+    /// has no separate recovery-validity result; authenticated content decides
+    /// acceptance, or policy explicitly delegates authentication to the caller.
+    /// This constructor itself proves neither ciphertext integrity nor identity.
+    /// Do not use this for RSA-v1.5 recovery, whose validity must be
+    /// retained separately with `recovery` until content work completes.
     pub fn confirmed(bytes: Vec<u8>) -> Self {
         Self {
             bytes: zeroize::Zeroizing::new(bytes),
@@ -220,6 +235,10 @@ pub enum ProviderOperation {
     KeyRecovery,
     /// Key agreement.
     KeyAgreement,
+    /// Establish a shared secret with a recipient public key.
+    Encapsulate,
+    /// Recover the shared secret using a recipient private key.
+    Decapsulate,
     /// Key derivation.
     Kdf,
     /// Cryptographically secure random bytes.
@@ -233,6 +252,12 @@ pub enum ProviderOperation {
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub enum ProviderCapability<'a> {
+    /// Exact KEM parameter set, independent of algorithm permission.
+    #[cfg(feature = "xmldsig")]
+    Encapsulate(KeyEncapsulationAlgorithm),
+    /// Exact KEM parameter set for private-key decapsulation.
+    #[cfg(feature = "xmldsig")]
+    Decapsulate(KeyEncapsulationAlgorithm),
     /// Message digest computation for an XMLDSig digest method.
     #[cfg(feature = "xmldsig")]
     Digest(DigestAlgorithm),
@@ -289,6 +314,10 @@ impl ProviderCapability<'_> {
     pub const fn operation(&self) -> ProviderOperation {
         match self {
             #[cfg(feature = "xmldsig")]
+            Self::Encapsulate(_) => ProviderOperation::Encapsulate,
+            #[cfg(feature = "xmldsig")]
+            Self::Decapsulate(_) => ProviderOperation::Decapsulate,
+            #[cfg(feature = "xmldsig")]
             Self::Digest(_) => ProviderOperation::Digest,
             #[cfg(feature = "xmldsig")]
             Self::Sign(_) => ProviderOperation::Sign,
@@ -322,6 +351,8 @@ impl ProviderCapability<'_> {
     #[must_use]
     pub fn algorithm(&self) -> Option<&str> {
         match self {
+            #[cfg(feature = "xmldsig")]
+            Self::Encapsulate(algorithm) | Self::Decapsulate(algorithm) => Some(algorithm.uri()),
             #[cfg(feature = "xmldsig")]
             Self::Digest(algorithm) => Some(algorithm.uri()),
             #[cfg(feature = "xmldsig")]
@@ -473,6 +504,12 @@ impl X509SignatureAlgorithm {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ProviderInputError {
+    /// Invalid ML-KEM key encoding, parameter set or consistency check.
+    #[error("invalid ML-KEM key material")]
+    MlKemKey,
+    /// Invalid public ciphertext framing, never an implicit-rejection signal.
+    #[error("invalid ML-KEM ciphertext length")]
+    MlKemCiphertext,
     /// An EC scalar or peer point is not valid for the selected named curve.
     #[error("invalid ECDH key material")]
     EcdhKey,
@@ -858,8 +895,62 @@ pub trait CryptoProvider: Send + Sync {
     /// algorithm-support check when the operation runs.
     fn supports(&self, capability: ProviderCapability<'_>) -> bool;
 
+    /// Import a recipient SPKI into the selected engine. The caller reserves
+    /// import work and grants permission; unavailable engines never fall back.
+    #[cfg(feature = "xmldsig")]
+    fn import_encapsulation_key(
+        &self,
+        algorithm: KeyEncapsulationAlgorithm,
+        _spki: &[u8],
+    ) -> Result<std::sync::Arc<dyn KeyEncapsulationKey>, ProviderError> {
+        Err(ProviderError::Unsupported {
+            operation: ProviderOperation::Encapsulate,
+            algorithm: Some(algorithm.uri().into()),
+        })
+    }
+
+    /// Import a recipient PKCS#8 into this engine without exporting another
+    /// provider's private handle. The encoded parameter set must match the request.
+    #[cfg(feature = "xmldsig")]
+    fn import_decapsulation_key(
+        &self,
+        algorithm: KeyEncapsulationAlgorithm,
+        _pkcs8: &[u8],
+    ) -> Result<std::sync::Arc<dyn KeyDecapsulationKey>, ProviderError> {
+        Err(ProviderError::Unsupported {
+            operation: ProviderOperation::Decapsulate,
+            algorithm: Some(algorithm.uri().into()),
+        })
+    }
+
     /// Fill caller-owned output with cryptographically secure random bytes.
     fn fill_random(&self, output: &mut [u8]) -> Result<(), ProviderError>;
+
+    /// Encapsulate through this engine; unsupported engines never delegate to RustCrypto.
+    #[cfg(feature = "xmldsig")]
+    fn encapsulate_key(
+        &self,
+        key: &dyn KeyEncapsulationKey,
+    ) -> Result<EncapsulatedKey, ProviderError> {
+        Err(ProviderError::Unsupported {
+            operation: ProviderOperation::Encapsulate,
+            algorithm: Some(key.algorithm().uri().into()),
+        })
+    }
+
+    /// Decapsulate without revealing implicit-rejection validity.
+    #[cfg(feature = "xmldsig")]
+    fn decapsulate_key(
+        &self,
+        key: &dyn KeyDecapsulationKey,
+        ciphertext: &[u8],
+    ) -> Result<zeroize::Zeroizing<[u8; 32]>, ProviderError> {
+        let _ = ciphertext;
+        Err(ProviderError::Unsupported {
+            operation: ProviderOperation::Decapsulate,
+            algorithm: Some(key.algorithm().uri().into()),
+        })
+    }
 
     /// Compute a message digest.
     #[cfg(feature = "xmldsig")]
@@ -1317,6 +1408,35 @@ impl TryRng for ProviderRng<'_> {
 impl TryCryptoRng for ProviderRng<'_> {}
 
 impl CryptoProvider for RustCryptoProvider {
+    #[cfg(feature = "xmldsig")]
+    fn encapsulate_key(
+        &self,
+        key: &dyn KeyEncapsulationKey,
+    ) -> Result<EncapsulatedKey, ProviderError> {
+        self.require_capability(ProviderCapability::Encapsulate(key.algorithm()))?;
+        if key.provider_binding().is_some() {
+            return Err(ProviderError::External(ExternalProviderError::Binding));
+        }
+        key.encapsulate_with_provider(self)
+    }
+
+    #[cfg(feature = "xmldsig")]
+    fn decapsulate_key(
+        &self,
+        key: &dyn KeyDecapsulationKey,
+        ciphertext: &[u8],
+    ) -> Result<zeroize::Zeroizing<[u8; 32]>, ProviderError> {
+        self.require_capability(ProviderCapability::Decapsulate(key.algorithm()))?;
+        if key.provider_binding().is_some() {
+            return Err(ProviderError::External(ExternalProviderError::Binding));
+        }
+        if ciphertext.len() != key.algorithm().ciphertext_len() {
+            return Err(ProviderError::InvalidInput(
+                ProviderInputError::MlKemCiphertext,
+            ));
+        }
+        key.decapsulate(ciphertext)
+    }
     #[cfg(all(feature = "xmlenc", feature = "legacy-algorithms"))]
     fn transport_pkcs1v15(
         &self,
@@ -1339,6 +1459,28 @@ impl CryptoProvider for RustCryptoProvider {
     }
     fn name(&self) -> &'static str {
         "rustcrypto"
+    }
+
+    #[cfg(feature = "experimental-pq")]
+    fn import_encapsulation_key(
+        &self,
+        algorithm: KeyEncapsulationAlgorithm,
+        spki: &[u8],
+    ) -> Result<std::sync::Arc<dyn KeyEncapsulationKey>, ProviderError> {
+        self.require_capability(ProviderCapability::Encapsulate(algorithm))?;
+        let key = RustCryptoMlKemPublicKey::from_spki_der_with_algorithm(spki, Some(algorithm))?;
+        Ok(std::sync::Arc::new(key))
+    }
+
+    #[cfg(feature = "experimental-pq")]
+    fn import_decapsulation_key(
+        &self,
+        algorithm: KeyEncapsulationAlgorithm,
+        pkcs8: &[u8],
+    ) -> Result<std::sync::Arc<dyn KeyDecapsulationKey>, ProviderError> {
+        self.require_capability(ProviderCapability::Decapsulate(algorithm))?;
+        let key = RustCryptoMlKemPrivateKey::from_pkcs8_der_with_algorithm(pkcs8, Some(algorithm))?;
+        Ok(std::sync::Arc::new(key))
     }
 
     #[cfg(feature = "xmlenc")]
@@ -1391,6 +1533,10 @@ impl CryptoProvider for RustCryptoProvider {
 
     fn supports(&self, capability: ProviderCapability<'_>) -> bool {
         match capability {
+            #[cfg(feature = "xmldsig")]
+            ProviderCapability::Encapsulate(_) | ProviderCapability::Decapsulate(_) => {
+                cfg!(feature = "experimental-pq")
+            }
             #[cfg(feature = "xmldsig")]
             ProviderCapability::Digest(_) => true,
             #[cfg(feature = "xmldsig")]

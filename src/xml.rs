@@ -13,7 +13,6 @@ use crate::xml::dom::Node;
 use crate::xml::dom::NodeId;
 
 /// Default ID attribute names shared by XMLDSig and XMLEnc selection.
-#[cfg(any(feature = "xmldsig", test))]
 const DEFAULT_ID_ATTRS: &[&str] = &["ID", "Id", "id"];
 
 /// Caller-declared XML ID attribute registration.
@@ -236,7 +235,6 @@ pub(crate) fn is_xml_1_0_character(character: char) -> bool {
 }
 
 /// Return whether a string is an XML 1.0 NCName.
-#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) fn is_xml_ncname(value: &str) -> bool {
     // Namespaces in XML 1.0 section 3: NCName is QName without a colon.
     // Reuse the common lexical grammar without allocating or parsing a DOM.

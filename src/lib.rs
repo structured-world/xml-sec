@@ -94,6 +94,8 @@ pub(crate) use sxd_xpath::{
     LiteralValue, OwnedPrefixedName, OwnedQName, ParseBudget, Value, axis, context, expression,
     function, node_test, node_to_num_with_context, nodeset, parser, str_to_num, token, tokenizer,
 };
+#[cfg(feature = "xmldsig")]
+pub mod key_establishment;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 mod operation;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
