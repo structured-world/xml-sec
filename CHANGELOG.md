@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.21](https://github.com/structured-world/xml-sec/compare/v0.1.20...v0.1.21) - 2026-10-10
+
+### Added
+
+- *(crypto)* add experimental ML-KEM ([#206](https://github.com/structured-world/xml-sec/pull/206))
+- *(xml)* unify same-document ID resolution ([#200](https://github.com/structured-world/xml-sec/pull/200))
+- support OPC relationship transforms ([#197](https://github.com/structured-world/xml-sec/pull/197))
+
+### Documentation
+
+- *(crypto)* run ML-DSA provider example ([#204](https://github.com/structured-world/xml-sec/pull/204))
+
 ## [0.1.20](https://github.com/structured-world/xml-sec/compare/v0.1.19...v0.1.20) - 2026-10-07
 
 ### Added
