@@ -53,11 +53,11 @@ jobs:
       - run: cargo clippy --bench security --example benchmark_latency --features ${{ matrix.features }},benchmark-alloc -- -D warnings
       - run: node --test scripts/compare-security.test.mjs
       - name: Exercise measurement runner (not a performance threshold)
-        run: bash scripts/benchmark-security.sh target/performance/smoke 1 '${{ matrix.extra }}'
+        run: bash scripts/benchmark-security.sh "$RUNNER_TEMP/benchmark-smoke-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" 1 '${{ matrix.extra }}'
       - uses: actions/upload-artifact@v7
         with:
           name: benchmark-smoke-${{ matrix.toolchain }}-${{ matrix.extra || 'rustcrypto' }}
-          path: target/performance/smoke
+          path: ${{ runner.temp }}/benchmark-smoke-${{ github.run_id }}-${{ github.run_attempt }}
 
   pkcs11:
     name: PKCS11 (${{ matrix.backend }})

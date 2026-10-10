@@ -65,6 +65,21 @@ test('published package includes every shared benchmark entry point', () => {
     assert.equal(files.has(file), true, `Missing packaged ${file}`);
   }
 });
+test('CI benchmark evidence stays outside the restored build cache', () => {
+  // A cache hit must never supply old evidence to a runner that forbids overwrite.
+  const workflow = fs.readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
+  assert.ok(workflow.includes('bash scripts/benchmark-security.sh "$RUNNER_TEMP/benchmark-smoke-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"'));
+  assert.ok(workflow.includes('path: ${{ runner.temp }}/benchmark-smoke-${{ github.run_id }}-${{ github.run_attempt }}'));
+  assert.equal(workflow.includes('target/performance/smoke'), false);
+  const comparison = fs.readFileSync(new URL('../.github/workflows/benchmark-comparison.yml', import.meta.url), 'utf8');
+  assert.ok(comparison.includes('"$RUNNER_TEMP/benchmark-comparison-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"'));
+  assert.ok(comparison.includes('"$RUNNER_TEMP/benchmark-site-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"'));
+  assert.ok(comparison.includes('benchmark-compare.sh "$COMPARISON_OUTPUT"'));
+  assert.ok(comparison.includes('build-benchmark-dashboard.mjs "$COMPARISON_OUTPUT" "$SITE_OUTPUT"'));
+  assert.ok(comparison.includes('path: ${{ env.COMPARISON_OUTPUT }}'));
+  assert.ok(comparison.includes('path: ${{ env.SITE_OUTPUT }}'));
+  assert.equal(comparison.includes('target/performance/'), false);
+});
 test('RSS units differ between GNU time and macOS', () => {
   assert.deepEqual(resources('diagnostic\n__METRICS 1.2 0.3 1024\n', 'linux'), { cpu_seconds: 1.5, rss_bytes: 1048576 });
   assert.deepEqual(resources(' 1.5 real 1.2 user 0.3 sys\n 1024 maximum resident set size', 'darwin'), { cpu_seconds: 1.5, rss_bytes: 1024 });

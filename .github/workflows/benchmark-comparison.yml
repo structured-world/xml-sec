@@ -17,6 +17,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
+      - name: Locate fresh measurement evidence outside the build cache
+        run: |
+          printf 'COMPARISON_OUTPUT=%s\nSITE_OUTPUT=%s\n' \
+            "$RUNNER_TEMP/benchmark-comparison-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            "$RUNNER_TEMP/benchmark-site-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
@@ -36,15 +41,15 @@ jobs:
       - name: Validate interoperability and compare identical CLI work
         env:
           SAMPLES: ${{ inputs.samples }}
-        run: bash scripts/benchmark-compare.sh target/performance/comparison "$SAMPLES" --heap
+        run: bash scripts/benchmark-compare.sh "$COMPARISON_OUTPUT" "$SAMPLES" --heap
       - name: Build static dashboard
-        run: node scripts/build-benchmark-dashboard.mjs target/performance/comparison target/performance/site
+        run: node scripts/build-benchmark-dashboard.mjs "$COMPARISON_OUTPUT" "$SITE_OUTPUT"
       - uses: actions/upload-artifact@v7
         with:
           name: benchmark-comparison
-          path: target/performance/comparison
+          path: ${{ env.COMPARISON_OUTPUT }}
           if-no-files-found: error
       - uses: actions/upload-pages-artifact@v5
         if: inputs.publish && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         with:
-          path: target/performance/site
+          path: ${{ env.SITE_OUTPUT }}
