@@ -29,6 +29,42 @@ test('nearest rank sorts independently and rejects missing samples', () => {
   assert.deepEqual(input, [30, 10, 20]);
   assert.throws(() => percentile([], 99));
 });
+test('latency runner supports empty and nonempty loader arrays under system Bash', () => {
+  // Exercise both actual invocation lines, including macOS Bash 3.2 nounset.
+  const script = fs.readFileSync(new URL('./benchmark-security.sh', import.meta.url), 'utf8');
+  const invocations = script.split('\n').filter(line =>
+    line.includes('"$binary" --list') || line.includes('/usr/bin/time "${time_args[@]}"'));
+  assert.equal(invocations.length, 2);
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'xml-sec-loader-test-'));
+  try {
+    for (const loader of ['()', '(/usr/bin/env BENCH_LOADER_TEST=present)']) {
+      for (const invocation of invocations) {
+        const result = spawnSync('/bin/bash', ['-uc', `
+          loader_env=${loader}
+          time_args=(${process.platform === 'darwin' ? '-l' : '-v'})
+          binary=/usr/bin/true
+          output=$1
+          name=case operation=parse shape=text units=16 backend=xmloxide provider=rustcrypto samples=1
+          ${invocation}
+        `, 'loader-test', directory], { encoding: 'utf8' });
+        assert.equal(result.status, 0, result.stderr);
+      }
+    }
+  } finally {
+    fs.rmSync(directory, { recursive: true });
+  }
+});
+test('published package includes every shared benchmark entry point', () => {
+  // Published examples/tests must retain their path-based support module.
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const result = spawnSync('cargo', ['package', '--list', '--allow-dirty'],
+    { cwd: root, encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+  const files = new Set(result.stdout.trim().split('\n'));
+  for (const file of ['benches/security.rs', 'benches/support/mod.rs', 'examples/benchmark_latency.rs']) {
+    assert.equal(files.has(file), true, `Missing packaged ${file}`);
+  }
+});
 test('RSS units differ between GNU time and macOS', () => {
   assert.deepEqual(resources('diagnostic\n__METRICS 1.2 0.3 1024\n', 'linux'), { cpu_seconds: 1.5, rss_bytes: 1048576 });
   assert.deepEqual(resources(' 1.5 real 1.2 user 0.3 sys\n 1024 maximum resident set size', 'darwin'), { cpu_seconds: 1.5, rss_bytes: 1024 });

@@ -58,10 +58,10 @@ fi
 cp Cargo.lock "$output/Cargo.lock"
 cargo metadata --locked --features "$features" --format-version 1 > "$output/dependencies.json"
 binary=${CARGO_TARGET_DIR:-target}/release/examples/benchmark_latency
-"${loader_env[@]}" "$binary" --list > "$output/cases.txt"
+${loader_env[@]+"${loader_env[@]}"} "$binary" --list > "$output/cases.txt"
 while read -r operation shape units backend provider; do
   name="$operation-$shape-$units-$backend-$provider"
-  /usr/bin/time "${time_args[@]}" "${loader_env[@]}" "$binary" "$operation" "$shape" "$units" "$backend" "$provider" "$samples" > "$output/$name.json" 2> "$output/$name.resources.txt"
+  /usr/bin/time "${time_args[@]}" ${loader_env[@]+"${loader_env[@]}"} "$binary" "$operation" "$shape" "$units" "$backend" "$provider" "$samples" > "$output/$name.json" 2> "$output/$name.resources.txt"
 done < "$output/cases.txt"
 # Allocation counters perturb time. Their timing columns are never the latency baseline.
 cargo bench --locked --bench security --features "$features" -- --sample-count "$samples" --sample-size 1 > "$output/divan-timing.txt"
