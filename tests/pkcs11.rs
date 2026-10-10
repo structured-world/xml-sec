@@ -12,7 +12,7 @@ use std::sync::Arc;
 use xml_sec::provider::pkcs11::{Pkcs11Provider, cryptoki};
 use xml_sec::provider::{
     ContentDecryptionKey, CryptoProvider, ExternalProviderError, KeyAgreementParameters,
-    ProviderError, RustCryptoProvider,
+    ProviderCapability, ProviderError, RustCryptoProvider,
 };
 use xml_sec::xmldsig::{DigestAlgorithm, SignatureAlgorithm};
 use xml_sec::xmlenc::{DataEncryptionAlgorithm, KeyWrapAlgorithm};
@@ -334,6 +334,25 @@ fn isolated_token_operations_and_failures() {
             )
             .is_err()
     );
+    // Sharing the AES key family does not make CBC key encryption an
+    // AES_KEY_WRAP mechanism. Refuse it before inspecting ciphertext or
+    // dispatching to the token, rather than misreporting integrity failure.
+    for cipher in [
+        DataEncryptionAlgorithm::Aes128Cbc,
+        DataEncryptionAlgorithm::Aes256Cbc,
+    ] {
+        let algorithm = KeyWrapAlgorithm::Cbc(cipher);
+        assert!(!provider.supports(ProviderCapability::KeyUnwrap(algorithm)));
+        assert!(matches!(
+            provider.unwrap_content_key(
+                &opaque,
+                algorithm,
+                DataEncryptionAlgorithm::Aes128Gcm,
+                &[],
+            ),
+            Err(ProviderError::Unsupported { .. })
+        ));
+    }
     let wrapped = RustCryptoProvider
         .wrap_key(KeyWrapAlgorithm::AesKw128, &kek, &cek)
         .unwrap();

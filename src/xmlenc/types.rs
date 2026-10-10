@@ -45,12 +45,31 @@ pub enum DataEncryptionAlgorithm {
     Aes128Gcm,
     /// AES-256 in GCM mode.
     Aes256Gcm,
+    /// Camellia CBC with a 128-bit key (RFC 9231 §2.6.2).
+    Camellia128Cbc,
+    /// Camellia CBC with a 192-bit key.
+    Camellia192Cbc,
+    /// Camellia CBC with a 256-bit key.
+    Camellia256Cbc,
+    /// Draft XML-security ChaCha20 profile; unauthenticated and opt-in.
+    ChaCha20,
+    /// ChaCha20-Poly1305 with XML-carried nonce and optional AAD.
+    ChaCha20Poly1305,
 }
 
 impl DataEncryptionAlgorithm {
     /// Key family required independently of the byte length (AES-192 and
     /// three-key Triple DES both use 24 bytes).
     pub const fn key_kind(self) -> crate::key_manager::SymmetricKeyKind {
+        if matches!(self, Self::ChaCha20 | Self::ChaCha20Poly1305) {
+            return crate::key_manager::SymmetricKeyKind::ChaCha20;
+        }
+        if matches!(
+            self,
+            Self::Camellia128Cbc | Self::Camellia192Cbc | Self::Camellia256Cbc
+        ) {
+            return crate::key_manager::SymmetricKeyKind::Camellia;
+        }
         #[cfg(feature = "legacy-algorithms")]
         if matches!(self, Self::TripleDesCbc) {
             return crate::key_manager::SymmetricKeyKind::Des;
@@ -70,6 +89,11 @@ impl DataEncryptionAlgorithm {
             "http://www.w3.org/2001/04/xmlenc#aes256-cbc" => Ok(Self::Aes256Cbc),
             "http://www.w3.org/2009/xmlenc11#aes128-gcm" => Ok(Self::Aes128Gcm),
             "http://www.w3.org/2009/xmlenc11#aes256-gcm" => Ok(Self::Aes256Gcm),
+            "http://www.w3.org/2001/04/xmldsig-more#camellia128-cbc" => Ok(Self::Camellia128Cbc),
+            "http://www.w3.org/2001/04/xmldsig-more#camellia192-cbc" => Ok(Self::Camellia192Cbc),
+            "http://www.w3.org/2001/04/xmldsig-more#camellia256-cbc" => Ok(Self::Camellia256Cbc),
+            "http://www.w3.org/2021/04/xmldsig-more#chacha20" => Ok(Self::ChaCha20),
+            "http://www.w3.org/2021/04/xmldsig-more#chacha20poly1305" => Ok(Self::ChaCha20Poly1305),
             _ => Err(XmlEncError::UnsupportedAlgorithm(uri.to_owned())),
         }
     }
@@ -81,6 +105,10 @@ impl DataEncryptionAlgorithm {
             Self::TripleDesCbc | Self::Aes192Cbc | Self::Aes192Gcm => 24,
             Self::Aes128Cbc | Self::Aes128Gcm => 16,
             Self::Aes256Cbc | Self::Aes256Gcm => 32,
+            Self::Camellia128Cbc => 16,
+            Self::Camellia192Cbc => 24,
+            Self::Camellia256Cbc => 32,
+            Self::ChaCha20 | Self::ChaCha20Poly1305 => 32,
         }
     }
 
@@ -97,11 +125,22 @@ impl DataEncryptionAlgorithm {
             Self::Aes256Cbc => "http://www.w3.org/2001/04/xmlenc#aes256-cbc",
             Self::Aes128Gcm => "http://www.w3.org/2009/xmlenc11#aes128-gcm",
             Self::Aes256Gcm => "http://www.w3.org/2009/xmlenc11#aes256-gcm",
+            Self::Camellia128Cbc => "http://www.w3.org/2001/04/xmldsig-more#camellia128-cbc",
+            Self::Camellia192Cbc => "http://www.w3.org/2001/04/xmldsig-more#camellia192-cbc",
+            Self::Camellia256Cbc => "http://www.w3.org/2001/04/xmldsig-more#camellia256-cbc",
+            Self::ChaCha20 => "http://www.w3.org/2021/04/xmldsig-more#chacha20",
+            Self::ChaCha20Poly1305 => "http://www.w3.org/2021/04/xmldsig-more#chacha20poly1305",
         }
     }
 
     /// Minimum standard wire length for ciphertext produced by this algorithm.
     pub(crate) const fn minimum_ciphertext_len(self) -> usize {
+        if matches!(self, Self::ChaCha20) {
+            return 0;
+        }
+        if matches!(self, Self::ChaCha20Poly1305) {
+            return 16;
+        }
         match self.cbc_block_len() {
             Some(block) => block * 2,
             None => 28,
@@ -112,6 +151,8 @@ impl DataEncryptionAlgorithm {
     /// Whether this capability must be explicitly selected in the operation allowlist.
     pub const fn requires_explicit_permission(self) -> bool {
         match self {
+            Self::Camellia128Cbc | Self::Camellia192Cbc | Self::Camellia256Cbc => true,
+            Self::ChaCha20 | Self::ChaCha20Poly1305 => true,
             #[cfg(feature = "legacy-algorithms")]
             Self::TripleDesCbc | Self::Aes192Cbc | Self::Aes192Gcm => true,
             _ => false,
@@ -124,6 +165,7 @@ impl DataEncryptionAlgorithm {
         // https://www.w3.org/TR/xmlenc-core1/#sec-Block-Encryption
         match self {
             Self::Aes128Cbc | Self::Aes256Cbc => Some(16),
+            Self::Camellia128Cbc | Self::Camellia192Cbc | Self::Camellia256Cbc => Some(16),
             #[cfg(feature = "legacy-algorithms")]
             Self::Aes192Cbc => Some(16),
             #[cfg(feature = "legacy-algorithms")]
@@ -134,6 +176,12 @@ impl DataEncryptionAlgorithm {
 
     /// Exact wire length produced when encrypting the given plaintext length.
     pub(crate) fn ciphertext_len_for_plaintext(self, plaintext_len: usize) -> Option<usize> {
+        if matches!(self, Self::ChaCha20) {
+            return Some(plaintext_len);
+        }
+        if matches!(self, Self::ChaCha20Poly1305) {
+            return plaintext_len.checked_add(16);
+        }
         match self.cbc_block_len() {
             Some(block) => (plaintext_len / block)
                 .checked_add(1)?
@@ -150,10 +198,17 @@ pub(crate) fn validate_ciphertext_framing(
 ) -> Result<(), XmlEncError> {
     let minimum = algorithm.minimum_ciphertext_len();
     if ciphertext_len < minimum {
-        let algorithm_name = match algorithm.cbc_block_len() {
-            Some(8) => "Triple DES CBC",
-            Some(_) => "AES-CBC",
-            None => "AES-GCM",
+        let algorithm_name = match algorithm {
+            DataEncryptionAlgorithm::ChaCha20 => "ChaCha20",
+            DataEncryptionAlgorithm::ChaCha20Poly1305 => "ChaCha20-Poly1305",
+            DataEncryptionAlgorithm::Camellia128Cbc
+            | DataEncryptionAlgorithm::Camellia192Cbc
+            | DataEncryptionAlgorithm::Camellia256Cbc => "Camellia-CBC",
+            _ => match algorithm.cbc_block_len() {
+                Some(8) => "Triple DES CBC",
+                Some(_) => "AES-CBC",
+                None => "AES-GCM",
+            },
         };
         return Err(XmlEncError::DataTooShort {
             algorithm: algorithm_name,
@@ -207,6 +262,15 @@ impl KeyTransportAlgorithm {
 impl KeyWrapAlgorithm {
     /// Family of the wrapping key, not of the wrapped content key.
     pub const fn key_kind(self) -> crate::key_manager::SymmetricKeyKind {
+        if let Self::Cbc(algorithm) = self {
+            return algorithm.key_kind();
+        }
+        if matches!(
+            self,
+            Self::CamelliaKw128 | Self::CamelliaKw192 | Self::CamelliaKw256
+        ) {
+            return crate::key_manager::SymmetricKeyKind::Camellia;
+        }
         #[cfg(feature = "legacy-algorithms")]
         if matches!(self, Self::TripleDes) {
             return crate::key_manager::SymmetricKeyKind::Des;
@@ -222,7 +286,14 @@ impl KeyWrapAlgorithm {
             "http://www.w3.org/2001/04/xmlenc#kw-tripledes" => Ok(Self::TripleDes),
             "http://www.w3.org/2001/04/xmlenc#kw-aes128" => Ok(Self::AesKw128),
             "http://www.w3.org/2001/04/xmlenc#kw-aes256" => Ok(Self::AesKw256),
-            _ => Err(XmlEncError::UnsupportedAlgorithm(uri.to_owned())),
+            "http://www.w3.org/2001/04/xmldsig-more#kw-camellia128" => Ok(Self::CamelliaKw128),
+            "http://www.w3.org/2001/04/xmldsig-more#kw-camellia192" => Ok(Self::CamelliaKw192),
+            "http://www.w3.org/2001/04/xmldsig-more#kw-camellia256" => Ok(Self::CamelliaKw256),
+            _ => DataEncryptionAlgorithm::from_uri(uri)
+                .ok()
+                .filter(|algorithm| algorithm.cbc_block_len().is_some())
+                .map(Self::Cbc)
+                .ok_or_else(|| XmlEncError::UnsupportedAlgorithm(uri.to_owned())),
         }
     }
 
@@ -233,6 +304,10 @@ impl KeyWrapAlgorithm {
             Self::AesKw192 | Self::TripleDes => 24,
             Self::AesKw128 => 16,
             Self::AesKw256 => 32,
+            Self::CamelliaKw128 => 16,
+            Self::CamelliaKw192 => 24,
+            Self::CamelliaKw256 => 32,
+            Self::Cbc(algorithm) => algorithm.key_len(),
         }
     }
 
@@ -245,27 +320,41 @@ impl KeyWrapAlgorithm {
             Self::TripleDes => "http://www.w3.org/2001/04/xmlenc#kw-tripledes",
             Self::AesKw128 => "http://www.w3.org/2001/04/xmlenc#kw-aes128",
             Self::AesKw256 => "http://www.w3.org/2001/04/xmlenc#kw-aes256",
+            Self::CamelliaKw128 => "http://www.w3.org/2001/04/xmldsig-more#kw-camellia128",
+            Self::CamelliaKw192 => "http://www.w3.org/2001/04/xmldsig-more#kw-camellia192",
+            Self::CamelliaKw256 => "http://www.w3.org/2001/04/xmldsig-more#kw-camellia256",
+            Self::Cbc(algorithm) => algorithm.uri(),
         }
     }
 
     /// Whether use requires an explicit compiled-policy allowlist entry.
     pub const fn requires_explicit_permission(self) -> bool {
         match self {
+            Self::CamelliaKw128 | Self::CamelliaKw192 | Self::CamelliaKw256 => true,
+            Self::Cbc(_) => true,
             #[cfg(feature = "legacy-algorithms")]
             Self::AesKw192 | Self::TripleDes => true,
             _ => false,
         }
     }
 
-    pub(crate) const fn overhead(self) -> usize {
+    pub(crate) fn wrapped_len(self, plaintext_len: usize) -> Option<usize> {
         // XMLEnc 1.1 §5.7.1 / RFC 3217 §§2-3: CMS wrapping includes
         // an 8-byte checksum and an 8-byte IV, unlike RFC 3394's A register.
         // https://www.w3.org/TR/xmlenc-core1/#sec-CMS-3DES
-        match self {
+        let overhead = match self {
+            Self::Cbc(algorithm) => {
+                return if algorithm.cbc_block_len().is_some() {
+                    algorithm.ciphertext_len_for_plaintext(plaintext_len)
+                } else {
+                    None
+                };
+            }
             #[cfg(feature = "legacy-algorithms")]
             Self::TripleDes => 16,
             _ => 8,
-        }
+        };
+        plaintext_len.checked_add(overhead)
     }
 }
 
@@ -287,6 +376,10 @@ pub enum KeyTransportAlgorithm {
 /// Supported symmetric key-wrap algorithms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyWrapAlgorithm {
+    /// CBC encryption of key bytes. Unlike RFC 3394 this is not authenticated;
+    /// permission must name this exact algorithm. Only CBC ciphers are valid.
+    /// XMLEnc 1.1 §3.4 permits EncryptedKey's inherited EncryptionMethod.
+    Cbc(DataEncryptionAlgorithm),
     /// AES-192 RFC 3394 key wrap, explicitly permitted by compatibility policy.
     #[cfg(feature = "legacy-algorithms")]
     AesKw192,
@@ -297,30 +390,61 @@ pub enum KeyWrapAlgorithm {
     AesKw128,
     /// RFC 3394 AES key wrap with a 256-bit KEK.
     AesKw256,
+    /// RFC 9231 §2.6.3 Camellia wrapping with a 128-bit KEK.
+    CamelliaKw128,
+    /// Camellia wrapping with a 192-bit KEK.
+    CamelliaKw192,
+    /// Camellia wrapping with a 256-bit KEK.
+    CamelliaKw256,
 }
 
 /// Digest algorithms accepted by RSA-OAEP encryption.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OaepDigestAlgorithm {
+    /// MD5 compatibility digest; requires explicit legacy permission.
+    #[cfg(feature = "legacy-algorithms")]
+    Md5,
+    /// RIPEMD-160 compatibility digest; requires explicit legacy permission.
+    #[cfg(feature = "legacy-algorithms")]
+    Ripemd160,
     /// SHA-1, retained for legacy XMLEnc OAEP interoperability.
     Sha1,
+    /// SHA-224, including the XML Encryption 1.1 MGF1-SHA224 identifier.
+    Sha224,
     /// SHA-256.
     Sha256,
     /// SHA-384.
     Sha384,
     /// SHA-512.
     Sha512,
+    /// SHA3-224.
+    Sha3_224,
+    /// SHA3-256.
+    Sha3_256,
+    /// SHA3-384.
+    Sha3_384,
+    /// SHA3-512.
+    Sha3_512,
 }
 
 impl OaepDigestAlgorithm {
     /// Parse a digest URI accepted by XML Encryption and libxmlsec1.
     pub fn from_uri(uri: &str) -> Option<Self> {
         match uri {
+            #[cfg(feature = "legacy-algorithms")]
+            "http://www.w3.org/2001/04/xmldsig-more#md5" => Some(Self::Md5),
+            #[cfg(feature = "legacy-algorithms")]
+            "http://www.w3.org/2001/04/xmlenc#ripemd160" => Some(Self::Ripemd160),
             "http://www.w3.org/2000/09/xmldsig#sha1" => Some(Self::Sha1),
+            "http://www.w3.org/2001/04/xmldsig-more#sha224" => Some(Self::Sha224),
             "http://www.w3.org/2001/04/xmlenc#sha256" => Some(Self::Sha256),
             "http://www.w3.org/2001/04/xmlenc#sha384"
             | "http://www.w3.org/2001/04/xmldsig-more#sha384" => Some(Self::Sha384),
             "http://www.w3.org/2001/04/xmlenc#sha512" => Some(Self::Sha512),
+            "http://www.w3.org/2007/05/xmldsig-more#sha3-224" => Some(Self::Sha3_224),
+            "http://www.w3.org/2007/05/xmldsig-more#sha3-256" => Some(Self::Sha3_256),
+            "http://www.w3.org/2007/05/xmldsig-more#sha3-384" => Some(Self::Sha3_384),
+            "http://www.w3.org/2007/05/xmldsig-more#sha3-512" => Some(Self::Sha3_512),
             _ => None,
         }
     }
@@ -329,6 +453,7 @@ impl OaepDigestAlgorithm {
     pub fn from_mgf_uri(uri: &str) -> Option<Self> {
         match uri {
             "http://www.w3.org/2009/xmlenc11#mgf1sha1" => Some(Self::Sha1),
+            "http://www.w3.org/2009/xmlenc11#mgf1sha224" => Some(Self::Sha224),
             "http://www.w3.org/2009/xmlenc11#mgf1sha256" => Some(Self::Sha256),
             "http://www.w3.org/2009/xmlenc11#mgf1sha384" => Some(Self::Sha384),
             "http://www.w3.org/2009/xmlenc11#mgf1sha512" => Some(Self::Sha512),
@@ -339,20 +464,44 @@ impl OaepDigestAlgorithm {
     /// Return the standard digest URI.
     pub const fn uri(self) -> &'static str {
         match self {
+            #[cfg(feature = "legacy-algorithms")]
+            Self::Md5 => "http://www.w3.org/2001/04/xmldsig-more#md5",
+            #[cfg(feature = "legacy-algorithms")]
+            Self::Ripemd160 => "http://www.w3.org/2001/04/xmlenc#ripemd160",
             Self::Sha1 => "http://www.w3.org/2000/09/xmldsig#sha1",
+            Self::Sha224 => "http://www.w3.org/2001/04/xmldsig-more#sha224",
             Self::Sha256 => "http://www.w3.org/2001/04/xmlenc#sha256",
             Self::Sha384 => "http://www.w3.org/2001/04/xmlenc#sha384",
             Self::Sha512 => "http://www.w3.org/2001/04/xmlenc#sha512",
+            Self::Sha3_224 => "http://www.w3.org/2007/05/xmldsig-more#sha3-224",
+            Self::Sha3_256 => "http://www.w3.org/2007/05/xmldsig-more#sha3-256",
+            Self::Sha3_384 => "http://www.w3.org/2007/05/xmldsig-more#sha3-384",
+            Self::Sha3_512 => "http://www.w3.org/2007/05/xmldsig-more#sha3-512",
         }
     }
 
-    /// Return the XML Encryption 1.1 MGF URI for this digest.
-    pub const fn mgf_uri(self) -> &'static str {
+    /// Return an XML Encryption 1.1 MGF URI, if one exists for this digest.
+    /// DigestMethod support does not invent additional wire MGF identifiers.
+    pub const fn mgf_uri(self) -> Option<&'static str> {
+        // XML Encryption 1.1 §5.5.2 defines five MGF1 URIs. RFC 8017's
+        // arbitrary Hash parameter does not register further XML identifiers.
+        // https://www.w3.org/TR/xmlenc-core1/#sec-RSA-OAEP
         match self {
-            Self::Sha1 => "http://www.w3.org/2009/xmlenc11#mgf1sha1",
-            Self::Sha256 => "http://www.w3.org/2009/xmlenc11#mgf1sha256",
-            Self::Sha384 => "http://www.w3.org/2009/xmlenc11#mgf1sha384",
-            Self::Sha512 => "http://www.w3.org/2009/xmlenc11#mgf1sha512",
+            Self::Sha1 => Some("http://www.w3.org/2009/xmlenc11#mgf1sha1"),
+            Self::Sha224 => Some("http://www.w3.org/2009/xmlenc11#mgf1sha224"),
+            Self::Sha256 => Some("http://www.w3.org/2009/xmlenc11#mgf1sha256"),
+            Self::Sha384 => Some("http://www.w3.org/2009/xmlenc11#mgf1sha384"),
+            Self::Sha512 => Some("http://www.w3.org/2009/xmlenc11#mgf1sha512"),
+            _ => None,
+        }
+    }
+
+    /// Compatibility digest capability never implicitly permits its use.
+    pub const fn requires_explicit_permission(self) -> bool {
+        match self {
+            #[cfg(feature = "legacy-algorithms")]
+            Self::Md5 | Self::Ripemd160 => true,
+            _ => false,
         }
     }
 }
@@ -386,12 +535,15 @@ mod tests {
     fn oaep_mgf_uris_round_trip() {
         for algorithm in [
             OaepDigestAlgorithm::Sha1,
+            OaepDigestAlgorithm::Sha224,
             OaepDigestAlgorithm::Sha256,
             OaepDigestAlgorithm::Sha384,
             OaepDigestAlgorithm::Sha512,
         ] {
             assert_eq!(
-                OaepDigestAlgorithm::from_mgf_uri(algorithm.mgf_uri()),
+                OaepDigestAlgorithm::from_mgf_uri(
+                    algorithm.mgf_uri().expect("standard MGF1 digest URI")
+                ),
                 Some(algorithm)
             );
         }
@@ -652,6 +804,68 @@ pub struct EncryptionMethod {
     pub mgf_algorithm: Option<String>,
     /// Decoded OAEP label bytes.
     pub oaep_params: Option<Vec<u8>>,
+    /// ChaCha profile parameters, separate from RSA-OAEP labels.
+    pub chacha: Option<ChaChaParameters>,
+}
+
+/// Request/wire data for the draft XML-security ChaCha profiles, not policy.
+/// A missing nonce is only allowed in an encryption template; decryption
+/// requires an explicit nonce, and encryption generates it through its provider.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChaChaParameters {
+    /// 96-bit nonce encoded as hexBinary in EncryptionMethod.
+    pub nonce: Option<[u8; 12]>,
+    /// Raw ChaCha's four little-endian counter bytes; absent for Poly1305.
+    pub counter: Option<[u8; 4]>,
+    /// Poly1305 additional authenticated data: UTF-8 XML text, not base64.
+    pub aad: Option<String>,
+}
+
+impl ChaChaParameters {
+    /// Borrow metadata for cryptographic dispatch and serialization without
+    /// copying AAD when the operation supplies a generated nonce.
+    pub fn borrowed(&self) -> ChaChaParametersRef<'_> {
+        ChaChaParametersRef {
+            nonce: self.nonce.as_ref(),
+            counter: self.counter,
+            aad: self.aad.as_deref(),
+        }
+    }
+    /// Check the selected profile before any resolver or provider work.
+    pub fn validate(&self, algorithm: DataEncryptionAlgorithm) -> Result<(), XmlEncError> {
+        self.borrowed().validate(algorithm)
+    }
+}
+
+/// Borrowed request parameters; no metadata allocation at provider dispatch.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChaChaParametersRef<'a> {
+    /// Explicit or operation-generated nonce.
+    pub nonce: Option<&'a [u8; 12]>,
+    /// Raw ChaCha's encoded initial block counter.
+    pub counter: Option<[u8; 4]>,
+    /// Borrowed UTF-8 additional authenticated data.
+    pub aad: Option<&'a str>,
+}
+
+impl ChaChaParametersRef<'_> {
+    /// Enforce the same profile invariants as owned parsed parameters.
+    pub fn validate(self, algorithm: DataEncryptionAlgorithm) -> Result<(), XmlEncError> {
+        // draft-eastlake-rfc9231bis-xmlsec-uris-06 §§3.6.7–3.6.8 separates
+        // Counter from AAD. These experimental identifiers are not RFC 9231.
+        // https://www.ietf.org/archive/id/draft-eastlake-rfc9231bis-xmlsec-uris-06.html#section-3.6.7
+        let valid = match algorithm {
+            DataEncryptionAlgorithm::ChaCha20 => self.counter.is_some() && self.aad.is_none(),
+            DataEncryptionAlgorithm::ChaCha20Poly1305 => self.counter.is_none(),
+            _ => false,
+        };
+        if !valid {
+            return Err(XmlEncError::InvalidStructure(
+                "invalid ChaCha EncryptionMethod parameters".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl EncryptionMethod {
@@ -660,6 +874,11 @@ impl EncryptionMethod {
     /// Parsed XML and caller-constructed typed values share this check so the
     /// public typed API cannot express wire structures that XML parsing rejects.
     pub(crate) fn validate_structure(&self) -> Result<(), XmlEncError> {
+        if let Some(parameters) = &self.chacha {
+            parameters.validate(DataEncryptionAlgorithm::from_uri(&self.algorithm)?)?;
+        } else if self.algorithm == DataEncryptionAlgorithm::ChaCha20.uri() {
+            return Err(XmlEncError::MissingRequired("ChaCha20 Counter"));
+        }
         if self.key_size_bits == Some(0) {
             return Err(XmlEncError::InvalidStructure(
                 "KeySize must be a positive integer".into(),
@@ -1009,6 +1228,11 @@ impl fmt::Display for DataEncryptionAlgorithm {
             Self::Aes256Cbc => "AES-256-CBC",
             Self::Aes128Gcm => "AES-128-GCM",
             Self::Aes256Gcm => "AES-256-GCM",
+            Self::Camellia128Cbc => "Camellia-128-CBC",
+            Self::Camellia192Cbc => "Camellia-192-CBC",
+            Self::Camellia256Cbc => "Camellia-256-CBC",
+            Self::ChaCha20 => "ChaCha20",
+            Self::ChaCha20Poly1305 => "ChaCha20-Poly1305",
         })
     }
 }

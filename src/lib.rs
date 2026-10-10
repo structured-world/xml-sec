@@ -50,6 +50,9 @@ pub mod error;
 mod hard_limits;
 #[cfg(feature = "xmldsig")]
 pub mod rsa_encoding;
+#[cfg(feature = "xmldsig")]
+#[path = "rustcrypto_sha3/lib.rs"]
+mod rustcrypto_sha3;
 // Checksum-pinned RustCrypto ML-DSA with checked expanded-key import. Keep it
 // inside the published package: Cargo patches do not propagate to consumers.
 #[cfg(feature = "experimental-pq")]

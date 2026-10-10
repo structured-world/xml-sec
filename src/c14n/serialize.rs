@@ -145,7 +145,7 @@ impl<'a> CanonicalOutputOptions<'a> {
         }
     }
 
-    #[cfg(any(feature = "xmldsig", test))]
+    #[cfg(feature = "xmldsig")]
     pub(crate) fn bounded_many(
         tracked_elements: &'a [NodeId],
         max_output_bytes: usize,
@@ -282,7 +282,7 @@ pub(crate) fn serialize_canonical_visible_with_position_bounded(
     Ok(position)
 }
 
-#[cfg(any(feature = "xmldsig", test))]
+#[cfg(feature = "xmldsig")]
 pub(crate) fn serialize_canonical_visible_with_positions_bounded(
     doc: &Document,
     visibility: Option<&dyn NodeVisibility>,

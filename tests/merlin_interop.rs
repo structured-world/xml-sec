@@ -1,5 +1,7 @@
 //! End-to-end coverage for the upstream Merlin XMLDSig interoperability corpus.
 
+#![cfg(feature = "xmldsig")]
+
 use std::{
     collections::HashMap,
     path::PathBuf,

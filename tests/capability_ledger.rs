@@ -2,6 +2,7 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[path = "../tools/xmlsec1/src/args.rs"]
+#[cfg(all(feature = "xmldsig", feature = "xmlenc", feature = "c14n"))]
 mod cli_args;
 
 const LEDGER_JSON: &str = include_str!("../compatibility/libxmlsec1-1.3.13.json");
@@ -238,6 +239,11 @@ fn every_entry_is_unique_sorted_and_evidenced() {
         assert!(!item.source.is_empty(), "{id} has no source");
         assert!(item.line > 0, "{id} has no source line");
         assert!(!item.detail.is_empty(), "{id} has no extracted detail");
+        assert_eq!(
+            item.exit_code.is_some(),
+            item.kind == "cli-exit-status",
+            "{id} has inconsistent exit-status metadata"
+        );
         assert!(
             !classification.rationale.is_empty(),
             "{id} has no rationale"
@@ -447,7 +453,7 @@ fn assert_native_uri_support(item: &Item) {
             assert!(
                 implemented
                     .into_iter()
-                    .any(|algorithm| algorithm.mgf_uri() == uri)
+                    .any(|algorithm| algorithm.mgf_uri() == Some(uri))
             );
         }
         "xmlSecHrefBase64" | "xmlSecHrefEnveloped" | "xmlSecXPath2Ns" | "xmlSecXPathNs" => {
@@ -959,6 +965,7 @@ fn xmldsig_second_edition_family_is_exhaustively_classified() {
 }
 
 #[test]
+#[cfg(all(feature = "xmldsig", feature = "xmlenc", feature = "c14n"))]
 fn native_cli_claims_match_process_and_upstream_runner_tests() {
     // Commands are complete dispatch entries; individual options remain explicit
     // when their format or policy mapping has not been implemented yet.

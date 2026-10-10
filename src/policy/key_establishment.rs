@@ -11,6 +11,8 @@ pub enum KeyAgreementAlgorithm {
     EcdhEs,
     /// RFC 7748 X25519.
     X25519,
+    /// RFC 7748 X448; requires explicit agreement permission.
+    X448,
     /// Finite-field DH-ES with a separate KDF.
     DhEs,
     /// Legacy finite-field DH and its SHA-based derivation.
@@ -23,6 +25,7 @@ impl KeyAgreementAlgorithm {
         match self {
             Self::EcdhEs => "http://www.w3.org/2009/xmlenc11#ECDH-ES",
             Self::X25519 => "http://www.w3.org/2021/04/xmldsig-more#x25519",
+            Self::X448 => "http://www.w3.org/2021/04/xmldsig-more#x448",
             Self::DhEs => "http://www.w3.org/2009/xmlenc11#dh-es",
             Self::LegacyDh => "http://www.w3.org/2001/04/xmlenc#dh",
         }
@@ -30,9 +33,15 @@ impl KeyAgreementAlgorithm {
 
     /// Recognize the exact URI, without normalizing or aliasing algorithms.
     pub fn from_uri(uri: &str) -> Option<Self> {
-        [Self::EcdhEs, Self::X25519, Self::DhEs, Self::LegacyDh]
-            .into_iter()
-            .find(|algorithm| algorithm.uri() == uri)
+        [
+            Self::EcdhEs,
+            Self::X25519,
+            Self::X448,
+            Self::DhEs,
+            Self::LegacyDh,
+        ]
+        .into_iter()
+        .find(|algorithm| algorithm.uri() == uri)
     }
 }
 
@@ -94,7 +103,7 @@ pub struct KeyEstablishmentPolicy {
     pub kem_content_authentication: KemContentAuthentication,
     /// Cumulative KEM attempts; failed provider calls consume allowance too.
     pub max_encapsulation_operations: usize,
-    /// Exact agreement permissions. None permits ECDH-ES/X25519, not DH.
+    /// Exact agreement permissions. None permits only ECDH-ES and X25519.
     pub agreement_algorithms: Option<HashSet<KeyAgreementAlgorithm>>,
     /// Exact KDF permissions. None permits ConcatKDF/HKDF/PBKDF2, not legacy DH.
     pub derivation_algorithms: Option<HashSet<KeyDerivationAlgorithm>>,

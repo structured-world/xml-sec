@@ -40,7 +40,7 @@ use ns_exclusive::ExclusiveNsRenderer;
 use ns_inclusive::InclusiveNsRenderer;
 #[cfg(any(feature = "xmldsig", test))]
 use serialize::CanonicalOutputLimitExceeded;
-#[cfg(any(feature = "xmldsig", test))]
+#[cfg(feature = "xmldsig")]
 use serialize::serialize_canonical_visible_with_positions_bounded;
 use serialize::{
     C14nConfig, CanonicalOutputOptions, serialize_canonical_visible_with_position_bounded,
@@ -260,9 +260,9 @@ pub fn canonicalize(
     )
 }
 
-#[cfg(any(feature = "xmldsig", test))]
 /// Canonicalize through the closure visibility API while enforcing both the
 /// output ceiling and the caller's operation-wide XML Base work budget.
+#[cfg(feature = "xmldsig")]
 pub(crate) fn canonicalize_bounded_with_xml_base_budget(
     doc: &Document,
     node_set: Option<&dyn Fn(Node) -> bool>,
@@ -334,7 +334,7 @@ pub(crate) fn canonicalize_with_visibility_and_position_bounded(
     )
 }
 
-#[cfg(any(feature = "xmldsig", test))]
+#[cfg(feature = "xmldsig")]
 pub(crate) fn canonicalize_with_visibility_and_position_bounded_with_xml_base_budget(
     doc: &Document,
     visibility: Option<&dyn NodeVisibility>,
@@ -355,7 +355,7 @@ pub(crate) fn canonicalize_with_visibility_and_position_bounded_with_xml_base_bu
     )
 }
 
-#[cfg(any(feature = "xmldsig", test))]
+#[cfg(feature = "xmldsig")]
 pub(crate) fn canonicalize_with_visibility_and_positions_bounded_with_xml_base_budget(
     doc: &Document,
     visibility: Option<&dyn NodeVisibility>,

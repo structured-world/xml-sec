@@ -1,5 +1,7 @@
 //! End-to-end XMLDSig Base64 transform coverage.
 
+#![cfg(all(feature = "xmldsig", feature = "c14n"))]
+
 use std::fs;
 
 #[path = "support/cryptographic.rs"]

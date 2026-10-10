@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<PaymentInfo xmlns="http://example.org/paymentv2">
+  <Name>John Smith</Name>
+  <CreditCard Currency="USD" Limit="5,000"><EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" Id="ED" Type="http://www.w3.org/2001/04/xmlenc#Content">
+  <EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes256-cbc"/>
+  <KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+    <EncryptedKey xmlns="http://www.w3.org/2001/04/xmlenc#">
+      <EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#rsa-1_5"> </EncryptionMethod>
+      <KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+        <X509Data>
+          <X509IssuerSerial>
+            <X509IssuerName>emailAddress=xmlsec@aleksey.com,CN=Aleksey Sanin,OU=Second level CA,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509IssuerName>
+            <X509SerialNumber>680572598617295163017172295025714171905498632020</X509SerialNumber>
+          </X509IssuerSerial>
+          <X509IssuerSerial>
+            <X509IssuerName>emailAddress=xmlsec@aleksey.com,CN=Aleksey Sanin,OU=Root CA,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509IssuerName>
+            <X509SerialNumber>680572598617295163017172295025714171905498632015</X509SerialNumber>
+          </X509IssuerSerial>
+          <X509IssuerSerial>
+            <X509IssuerName>emailAddress=xmlsec@aleksey.com,CN=Aleksey Sanin,OU=Root CA,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509IssuerName>
+            <X509SerialNumber>680572598617295163017172295025714171905498632014</X509SerialNumber>
+          </X509IssuerSerial>
+        </X509Data>
+      </KeyInfo>
+      <CipherData>
+        <CipherValue>GrIvzCLQ3ArH6myi9f6vccmnCjahgdxZOXc/+SfXwrHyQCiCqqG5UNHpFCiUSnNj
+vJmbkeLVHawpZzFfLsv67n71HOK6Nca2DyXZwb5SwRms+4q8Ew6qCBiE6MwFvS/u
+irlcfVZC/eZ3puwtE0sB+JNk2Xo59covroNfCzhJH/elb5COCTLM+aS1gAVNHI3y
+Rbi5oHPwkmW6TI3RR6QCkjbnF1Vrvj+V76JoijMYp8pSVyfyi3SASqSnJKl/7iWr
+zeBoo/x83Zzui1+fAxLJVGBi1A0h2epEIlaHXRZFLe9+faUBpnbHrfucgL1wgKXv
+zACaV36+Pa/E6fwS1FpgOad8xhSvPYcRAA39JfLRDKkypkR7dXFNsiYZxKlqx/wJ
+5yuZ3iEUwzlPlqBdFeX0AdEYq5UAyGGRPBr67k8Fnos3UAvM6mfVEdeV17Oc4wQs
+MnQ6bDVWB4iH0jdZSAW9HBJgg7xoyfWN8BiOMOjcI5wRSXQ3L2uvYmpYxhP3Nq+Q
+WgbrZ6OC/RQq1N+Y1cIO2ulyXKv7JV7T9/irn66+nnuoLMlS44NYH+uq3N2yZVDS
+i+TgF6eOtR7T9sZSFLWqWpOrBNojXlNRdUAbl+q2Xd8C5WpniSMDQHAG2cyPTKuz
+ab3SsmnOHT0okcczhjhyW/uiDL5CKIBJQT5n8uD+EfU=</CipherValue>
+      </CipherData>
+    </EncryptedKey>
+  </KeyInfo>
+  <CipherData>
+    <CipherValue>SXVx9JGeZ1uDjodgGiIStMbIBLA+lqdfSXHETN2wPLVMJTdFn0orTTKuUZqesDhD
+/tv5xHG04TAQxmven50ZxItybMuNFNn6/+ElsJZdlfkAbtwl2y+1uTmkyPRmrXby
+dvdqPomVEt25+/BuXxBqq3O3afIk7i4/+aJLMrFBNdPIvg0wRp3+/67nv4F0QC5y</CipherValue>
+  </CipherData>
+</EncryptedData></CreditCard>
+</PaymentInfo>

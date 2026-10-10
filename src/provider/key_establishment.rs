@@ -14,6 +14,7 @@ use super::{
 };
 
 pub(super) const X25519_URI: &str = "http://www.w3.org/2021/04/xmldsig-more#x25519";
+pub(super) const X448_URI: &str = "http://www.w3.org/2021/04/xmldsig-more#x448";
 pub(super) const ECDH_URI: &str = "http://www.w3.org/2009/xmlenc11#ECDH-ES";
 pub(super) const DH_ES_URI: &str = "http://www.w3.org/2009/xmlenc11#dh-es";
 pub(super) const DH_URI: &str = "http://www.w3.org/2001/04/xmlenc#dh";
@@ -164,6 +165,92 @@ impl KeyAgreementKey for RustCryptoX25519Key {
         // from a secret an untrusted low-order peer can force to zero.
         // https://www.rfc-editor.org/rfc/rfc7748.html#section-6.1
         if !secret.was_contributory() {
+            return Err(ProviderError::AuthenticationFailed);
+        }
+        Ok(secret.as_bytes().to_vec())
+    }
+}
+
+/// Opaque RustCrypto X448 private key, zeroized on drop without secret export.
+pub struct RustCryptoX448Key(x448::StaticSecret);
+
+impl core::fmt::Debug for RustCryptoX448Key {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("RustCryptoX448Key")
+            .finish_non_exhaustive()
+    }
+}
+
+impl RustCryptoX448Key {
+    /// Import a 56-byte scalar; clamping follows RFC 7748 section 5.
+    pub fn from_bytes(bytes: [u8; 56]) -> Self {
+        Self(x448::StaticSecret::from(bytes))
+    }
+
+    /// Import RFC 8410 PKCS#8, validating any included public-key identity.
+    /// DER is borrowed; only the fixed-width scalar enters the zeroizing key.
+    pub fn from_pkcs8_der(bytes: &[u8]) -> Result<Self, ProviderError> {
+        use der::{Decode, asn1::OctetStringRef};
+        use pkcs8::{ObjectIdentifier, PrivateKeyInfoRef};
+        use subtle::ConstantTimeEq;
+        let invalid = || ProviderError::InvalidInput(ProviderInputError::EcdhKey);
+        let info = PrivateKeyInfoRef::try_from(bytes).map_err(|_| invalid())?;
+        // RFC 8410 sections 3 and 7: id-X448, absent parameters, and a
+        // CurvePrivateKey OCTET STRING nested inside PKCS#8 privateKey.
+        // https://www.rfc-editor.org/rfc/rfc8410.html#section-7
+        if info.algorithm.oid != ObjectIdentifier::new_unwrap("1.3.101.111")
+            || info.algorithm.parameters.is_some()
+        {
+            return Err(invalid());
+        }
+        let scalar =
+            <&OctetStringRef>::from_der(info.private_key.as_bytes()).map_err(|_| invalid())?;
+        let scalar = zeroize::Zeroizing::new(
+            <[u8; 56]>::try_from(scalar.as_bytes()).map_err(|_| invalid())?,
+        );
+        let key = Self::from_bytes(*scalar);
+        // Section 7 allows carrying the public key. Binding it to the scalar
+        // is our import invariant, not an extra ASN.1 syntax requirement.
+        if let Some(public) = info.public_key {
+            let public = public.as_bytes().ok_or_else(invalid)?;
+            if !bool::from(key.public_key().as_slice().ct_eq(public)) {
+                return Err(invalid());
+            }
+        }
+        Ok(key)
+    }
+
+    /// Return the RFC 7748 section 5 little-endian public u-coordinate.
+    pub fn public_key(&self) -> [u8; 56] {
+        *x448::PublicKey::from(&self.0).as_bytes()
+    }
+}
+
+impl KeyAgreementKey for RustCryptoX448Key {
+    fn agree(&self, parameters: &KeyAgreementParameters<'_>) -> Result<Vec<u8>, ProviderError> {
+        if parameters.algorithm != X448_URI {
+            return Err(ProviderError::Unsupported {
+                operation: ProviderOperation::KeyAgreement,
+                algorithm: Some(parameters.algorithm.to_owned()),
+            });
+        }
+        // RFC 7748 section 5 requires accepting noncanonical u-coordinates.
+        // Decode only the width here; the Montgomery ladder reduces the field
+        // element, and the contributory check below covers low-order aliases.
+        // https://www.rfc-editor.org/rfc/rfc7748.html#section-5
+        let peer = x448::PublicKey::from_bytes_unchecked(parameters.peer_public_key).ok_or(
+            ProviderError::InvalidKeySize {
+                expected: 56,
+                actual: parameters.peer_public_key.len(),
+            },
+        )?;
+        let secret = self.0.diffie_hellman(&peer);
+        // Section 6.2 permits rejecting zero secrets; our agreement contract
+        // requires contributory behavior. Examine every byte before branching.
+        // https://www.rfc-editor.org/rfc/rfc7748.html#section-6.2
+        use subtle::ConstantTimeEq;
+        if bool::from(secret.as_bytes().ct_eq(&[0; 56])) {
             return Err(ProviderError::AuthenticationFailed);
         }
         Ok(secret.as_bytes().to_vec())
@@ -326,14 +413,7 @@ fn context_octets(context: KdfContext<'_>) -> Option<&[u8]> {
 }
 
 fn concat_digest(parameters: &KdfParameters<'_>) -> Option<DigestAlgorithm> {
-    match DigestAlgorithm::from_uri(parameters.digest?)? {
-        algorithm @ (DigestAlgorithm::Sha1
-        | DigestAlgorithm::Sha224
-        | DigestAlgorithm::Sha256
-        | DigestAlgorithm::Sha384
-        | DigestAlgorithm::Sha512) => Some(algorithm),
-        _ => None,
-    }
+    DigestAlgorithm::from_uri(parameters.digest?)
 }
 
 fn derive_concat(parameters: &KdfParameters<'_>, secret: &[u8]) -> Result<Vec<u8>, ProviderError> {

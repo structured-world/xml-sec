@@ -1,7 +1,9 @@
-//! Integration tests for roadmap task P1-021.
+//! Integration tests for the full XMLDSig verification pipeline.
 //!
 //! Verifies full XMLDSig verify pipeline:
 //! reference digest checks + SignedInfo canonicalization + SignatureValue verify.
+
+#![cfg(feature = "xmldsig")]
 
 use std::path::Path;
 

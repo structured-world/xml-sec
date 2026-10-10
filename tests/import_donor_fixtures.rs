@@ -38,6 +38,80 @@ impl Drop for TestDirectory {
     }
 }
 
+#[test]
+fn complete_xmlenc_import_preserves_every_corpus_file() {
+    // Corpus acceptance needs entire snapshots, including nested key material
+    // and binary payloads, rather than a hand-picked list of XML vectors.
+    let root = TestDirectory::new();
+    let scripts = root.path().join("scripts");
+    std::fs::create_dir_all(&scripts).expect("scripts directory");
+    std::fs::copy(
+        "scripts/import-donor-fixtures.sh",
+        scripts.join("import-donor-fixtures.sh"),
+    )
+    .expect("isolated importer");
+    let corpora = [
+        "merlin-xmlenc-five",
+        "01-phaos-xmlenc-3",
+        "aleksey-xmlenc-01",
+        "keys/xdh",
+        "keys/ec",
+        "keys/dhx",
+    ];
+    let payloads: [(&str, &[u8]); 3] = [
+        ("vector.xml", b"<EncryptedData/>"),
+        ("keys/private.der", &[0, 0xff, 1, 0x80]),
+        ("unlisted extra.data", b"not in a curated vector list\r\n"),
+    ];
+    for corpus in corpora {
+        for (name, bytes) in payloads {
+            let path = root.path().join("donor").join(corpus).join(name);
+            std::fs::create_dir_all(path.parent().expect("payload parent"))
+                .expect("donor directory");
+            std::fs::write(path, bytes).expect("donor payload");
+        }
+        let target = root.path().join("tests/fixtures/xmlenc").join(corpus);
+        std::fs::create_dir_all(&target).expect("existing snapshot");
+        std::fs::write(target.join("obsolete.xml"), b"obsolete").expect("stale payload");
+    }
+
+    let output = Command::new("bash")
+        .arg(scripts.join("import-donor-fixtures.sh"))
+        .arg("--xmlenc-corpora")
+        .env("XMLSEC_DONOR_ROOT", root.path().join("donor"))
+        .output()
+        .expect("fixture importer");
+    assert!(
+        output.status.success(),
+        "complete corpus import failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for corpus in corpora {
+        let target = root.path().join("tests/fixtures/xmlenc").join(corpus);
+        for (name, bytes) in payloads {
+            assert_eq!(
+                std::fs::read(target.join(name)).expect("imported payload"),
+                bytes,
+                "{corpus}/{name} must remain byte-for-byte donor data"
+            );
+        }
+        assert!(!target.join("obsolete.xml").exists());
+    }
+    let manifest =
+        std::fs::read_to_string(root.path().join("tests/fixtures/xmlenc/corpora.sha256"))
+            .expect("complete import pins a checksum manifest");
+    assert_eq!(manifest.lines().count(), corpora.len() * payloads.len());
+    for corpus in corpora {
+        for (name, _) in payloads {
+            assert!(
+                manifest
+                    .lines()
+                    .any(|line| line.ends_with(&format!("  xmlenc/{corpus}/{name}")))
+            );
+        }
+    }
+}
+
 /// Verifies that directory imports are snapshots rather than stale overlays.
 #[test]
 fn directory_import_removes_files_deleted_by_the_donor() {

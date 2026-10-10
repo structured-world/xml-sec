@@ -1,3 +1,5 @@
+#![cfg(all(feature = "xmldsig", feature = "c14n"))]
+
 use std::collections::HashSet;
 
 #[path = "support/cryptographic.rs"]

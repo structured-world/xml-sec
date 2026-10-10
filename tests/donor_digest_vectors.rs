@@ -2,8 +2,10 @@
 //!
 //! These tests validate the `<Reference>` processing path end-to-end against
 //! real xmlsec1-generated documents without requiring signature verification.
-//! The coverage target for P1-018a is one donor vector for each currently
+//! The coverage target is one donor vector for each currently
 //! supported digest family: SHA-1, SHA-256, SHA-384, and SHA-512.
+
+#![cfg(feature = "xmldsig")]
 
 use std::fs;
 use std::path::Path;

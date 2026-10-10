@@ -1,3 +1,5 @@
+#![cfg(feature = "xmldsig")]
+
 use std::{
     fs,
     path::Path,

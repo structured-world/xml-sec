@@ -3,6 +3,8 @@
 //! Verifies that dereferencing a URI produces a NodeSet that, when used as
 //! a predicate for C14N, produces the correct canonical output.
 
+#![cfg(all(feature = "xmldsig", feature = "c14n"))]
+
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize};
 use xml_sec::xmldsig::NodeSet;
 use xml_sec::xmldsig::uri::UriReferenceResolver;

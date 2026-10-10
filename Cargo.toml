@@ -77,6 +77,14 @@ required-features = ["xmldsig", "xmlenc", "c14n"]
 name = "encrypt"
 required-features = ["xmlenc"]
 
+[[example]]
+name = "sign"
+required-features = ["xmldsig", "c14n"]
+
+[[example]]
+name = "verify"
+required-features = ["xmldsig"]
+
 [[bench]]
 name = "security"
 harness = false
@@ -102,7 +110,12 @@ aws-lc-rs = { version = "1.18.1", default-features = false, features = ["fips"],
 rsa = { package = "sad-rsa", version = "0.10.2", default-features = false, features = ["sha1", "sha2", "hazmat"], optional = true }
 sha1 = { version = "0.11", features = ["oid", "zeroize"], optional = true }
 sha2 = { version = "0.11", features = ["oid", "zeroize"], optional = true }
-sha3 = { version = "0.12", default-features = false, features = ["oid"], optional = true }
+# Dependencies of the embedded RustCrypto SHA-3 bit-tail adaptation.
+keccak = { version = "0.2", default-features = false, optional = true }
+sponge-cursor = { version = "0.1", default-features = false, features = ["zeroize"], optional = true }
+camellia = { version = "0.2.1", default-features = false, features = ["zeroize"], optional = true }
+chacha20 = { version = "0.10.2", default-features = false, features = ["zeroize"], optional = true }
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc"], optional = true }
 ed448-goldilocks = { version = "=0.14.0-pre.15", default-features = false, features = ["alloc", "signing", "pkcs8"], optional = true }
 # Dependencies of the embedded, patched RustCrypto ML-DSA implementation.
 common = { package = "crypto-common", version = "0.2", default-features = false, features = ["rand_core"], optional = true }
@@ -125,6 +138,7 @@ curve25519-dalek = { version = "5", default-features = false, features = ["alloc
 hmac = { version = "0.13", features = ["zeroize"], optional = true }
 hkdf = { version = "0.13", default-features = false, optional = true }
 x25519-dalek = { version = "3", default-features = false, features = ["static_secrets", "zeroize"], optional = true }
+x448 = { version = "=0.14.0-pre.12", default-features = false, features = ["static_secrets"], optional = true }
 signature = { version = "3", optional = true }
 subtle = { version = "2", optional = true }
 getrandom = { version = "0.4", features = ["sys_rng"], optional = true }
@@ -134,8 +148,8 @@ aes-gcm = { version = "0.11.1", optional = true }
 aes-kw = { version = "0.3.1", optional = true }
 cbc = { version = "0.2.1", optional = true }
 des = { version = "0.9", optional = true }
-md-5 = { version = "0.11", features = ["oid"], optional = true }
-ripemd = { version = "0.2.0", default-features = false, features = ["oid"], optional = true }
+md-5 = { version = "0.11", features = ["oid", "zeroize"], optional = true }
+ripemd = { version = "0.2.0", default-features = false, features = ["oid", "zeroize"], optional = true }
 pem = { version = "4", optional = true }
 pkcs12 = { version = "=0.2.0-pre.0", default-features = false, features = ["kdf"], optional = true }
 pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"], optional = true }
@@ -156,6 +170,7 @@ base64 = "0.23"
 thiserror = "2"
 
 [dev-dependencies]
+sha3 = { version = "0.12", default-features = false, features = ["oid", "zeroize"] }
 divan = "=0.1.21"
 ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc", "pkcs8", "rand_core", "zeroize"] }
 hex-literal = "1"
@@ -210,7 +225,8 @@ xmldsig = [            # XML Digital Signatures (sign + verify)
     "dep:rsa",
     "dep:sha1",
     "dep:sha2",
-    "dep:sha3",
+    "dep:keccak",
+    "dep:sponge-cursor",
     "dep:signature",
     "dep:snafu",
     "dep:subtle",
@@ -228,12 +244,16 @@ xmlenc = [             # XML Encryption (encrypt + decrypt)
     "dep:aes-gcm",
     "dep:aes-kw",
     "dep:cbc",
+    "dep:camellia",
+    "dep:chacha20",
+    "dep:chacha20poly1305",
     "dep:getrandom",
     "dep:rsa",
     "dep:sha1",
     "dep:sha2",
     "dep:hkdf",
     "dep:x25519-dalek",
+    "dep:x448",
     "dep:crypto-primes",
     "p256/ecdh",
     "p384/ecdh",

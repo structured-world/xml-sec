@@ -2545,6 +2545,9 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         })
         .policy(policy.clone())
         .xml_backend(xml_backend);
+    if let Some(parameters) = metadata.chacha {
+        builder = builder.chacha_parameters(parameters);
+    }
     let aes_keys = invocation
         .ordered_values(&["aes-key", "des-key"])
         .collect::<Vec<_>>();
@@ -3442,10 +3445,11 @@ fn template_oaep_parameters(
     // also accepts an explicit XMLEnc 1.1 MGF child under the legacy URI, so
     // template execution must consume the same metadata it preserves.
     let mgf_digest = oaep_mgf_from_uri(
-        method
-            .mgf_algorithm
-            .as_deref()
-            .unwrap_or(OaepDigestAlgorithm::Sha1.mgf_uri()),
+        method.mgf_algorithm.as_deref().unwrap_or(
+            OaepDigestAlgorithm::Sha1
+                .mgf_uri()
+                .expect("XML Encryption defines MGF1-SHA1"),
+        ),
     )?;
     Ok(Some(RsaOaepParameters {
         algorithm: transport,
@@ -3515,15 +3519,8 @@ fn oaep_digest_from_uri(uri: &str) -> Result<OaepDigestAlgorithm, CommandError> 
 }
 
 fn oaep_mgf_from_uri(uri: &str) -> Result<OaepDigestAlgorithm, CommandError> {
-    [
-        OaepDigestAlgorithm::Sha1,
-        OaepDigestAlgorithm::Sha256,
-        OaepDigestAlgorithm::Sha384,
-        OaepDigestAlgorithm::Sha512,
-    ]
-    .into_iter()
-    .find(|digest| digest.mgf_uri() == uri)
-    .ok_or_else(|| CommandError::Encryption(format!("unsupported OAEP MGF: {uri}")))
+    OaepDigestAlgorithm::from_mgf_uri(uri)
+        .ok_or_else(|| CommandError::Encryption(format!("unsupported OAEP MGF: {uri}")))
 }
 
 fn apply_encryption_template(
@@ -3566,6 +3563,50 @@ fn apply_encryption_template(
         template_cipher,
         generated_cipher.text().unwrap_or_default(),
     )?];
+    if let Some(method) = direct_child_element(template_data, XMLENC_NS, "EncryptionMethod")
+        && matches!(
+            method.attribute("Algorithm"),
+            Some(
+                "http://www.w3.org/2021/04/xmldsig-more#chacha20"
+                    | "http://www.w3.org/2021/04/xmldsig-more#chacha20poly1305"
+            )
+        )
+        && direct_child_element(method, "http://www.w3.org/2021/04/xmldsig-more#", "Nonce")
+            .is_none()
+    {
+        let generated_method = direct_child_element(generated_data, XMLENC_NS, "EncryptionMethod")
+            .ok_or_else(|| CommandError::Encryption("generated ChaCha method is absent".into()))?;
+        let nonce = direct_child_element(
+            generated_method,
+            "http://www.w3.org/2021/04/xmldsig-more#",
+            "Nonce",
+        )
+        .ok_or_else(|| CommandError::Encryption("generated ChaCha nonce is absent".into()))?;
+        let fragment = &template[method.range()];
+        let opening = opening_tag_end(fragment).ok_or_else(|| {
+            CommandError::Encryption("ChaCha template method is malformed".into())
+        })?;
+        let original = if fragment[..opening].trim_end().ends_with('/') {
+            ""
+        } else {
+            &fragment[opening + 1..fragment.rfind("</").ok_or_else(|| {
+                CommandError::Encryption("ChaCha template method is malformed".into())
+            })?]
+        };
+        let mut content = String::new();
+        push_plaintext(
+            &mut content,
+            original,
+            policy.resources.max_xml_document_bytes,
+        )?;
+        append_standalone_element(
+            &mut content,
+            generated,
+            nonce,
+            policy.resources.max_xml_document_bytes,
+        )?;
+        replacements.push(replace_element_text(template, method, &content)?);
+    }
     if template_data.attribute("Type").is_none()
         && let Some(generated_type) = generated_data.attribute("Type")
     {
@@ -4856,6 +4897,7 @@ fn decrypt_input(
 struct EncryptionTemplateMetadata {
     encapsulation: Option<(xml_sec::provider::KeyEncapsulationAlgorithm, Vec<String>)>,
     algorithm: DataEncryptionAlgorithm,
+    chacha: Option<xml_sec::xmlenc::ChaChaParameters>,
     encrypted_type: EncryptedDataType,
     explicit_xml_type: bool,
     placement: EncryptionTemplatePlacement,
@@ -5102,16 +5144,23 @@ fn xmlsec_compatibility_encryption_policy() -> EncryptionPolicy {
     // still gates every requested primitive independently of this allowlist.
     EncryptionPolicy {
         key_establishment: xmlsec_compatibility_key_establishment_policy(),
-        #[cfg(feature = "legacy-algorithms")]
         data_algorithms: Some(
             [
+                #[cfg(feature = "legacy-algorithms")]
                 DataEncryptionAlgorithm::TripleDesCbc,
+                #[cfg(feature = "legacy-algorithms")]
                 DataEncryptionAlgorithm::Aes192Cbc,
+                #[cfg(feature = "legacy-algorithms")]
                 DataEncryptionAlgorithm::Aes192Gcm,
                 DataEncryptionAlgorithm::Aes128Cbc,
                 DataEncryptionAlgorithm::Aes256Cbc,
                 DataEncryptionAlgorithm::Aes128Gcm,
                 DataEncryptionAlgorithm::Aes256Gcm,
+                DataEncryptionAlgorithm::Camellia128Cbc,
+                DataEncryptionAlgorithm::Camellia192Cbc,
+                DataEncryptionAlgorithm::Camellia256Cbc,
+                DataEncryptionAlgorithm::ChaCha20,
+                DataEncryptionAlgorithm::ChaCha20Poly1305,
             ]
             .into(),
         ),
@@ -5124,13 +5173,18 @@ fn xmlsec_compatibility_encryption_policy() -> EncryptionPolicy {
             ]
             .into(),
         ),
-        #[cfg(feature = "legacy-algorithms")]
         key_wrap_algorithms: Some(
             [
+                #[cfg(feature = "legacy-algorithms")]
                 xml_sec::xmlenc::KeyWrapAlgorithm::TripleDes,
+                #[cfg(feature = "legacy-algorithms")]
                 xml_sec::xmlenc::KeyWrapAlgorithm::AesKw192,
                 xml_sec::xmlenc::KeyWrapAlgorithm::AesKw128,
                 xml_sec::xmlenc::KeyWrapAlgorithm::AesKw256,
+                xml_sec::xmlenc::KeyWrapAlgorithm::CamelliaKw128,
+                xml_sec::xmlenc::KeyWrapAlgorithm::CamelliaKw192,
+                xml_sec::xmlenc::KeyWrapAlgorithm::CamelliaKw256,
+                xml_sec::xmlenc::KeyWrapAlgorithm::Cbc(DataEncryptionAlgorithm::Camellia256Cbc),
             ]
             .into(),
         ),
@@ -5391,6 +5445,7 @@ fn encryption_template(
     Ok(EncryptionTemplateMetadata {
         encapsulation,
         algorithm,
+        chacha: parsed.encryption_method.chacha,
         encrypted_type,
         explicit_xml_type,
         placement: if encrypted_data == document.root_element() {
@@ -8028,6 +8083,7 @@ mod tests {
             recipient: None,
             key_name: None,
             encryption_method: EncryptionMethod {
+                chacha: None,
                 algorithm: KeyTransportAlgorithm::RsaOaep11.uri().into(),
                 key_size_bits: None,
                 oaep_digest: None,

@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xenc:EncryptedData xmlns:xenc="http://www.w3.org/2001/04/xmlenc#" Type="http://www.w3.org/2001/04/xmlenc#Element">
+  <xenc:EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/>
+  <dsig:KeyInfo xmlns:dsig="http://www.w3.org/2000/09/xmldsig#">
+    <xenc:EncryptedKey xmlns:xenc="http://www.w3.org/2001/04/xmlenc#">
+      <xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#kw-aes256"/>
+      <dsig:KeyInfo xmlns:dsig="http://www.w3.org/2000/09/xmldsig#">
+        <xenc:AgreementMethod Algorithm="http://www.w3.org/2009/xmlenc11#ECDH-ES">
+          <xenc11:KeyDerivationMethod xmlns:xenc11="http://www.w3.org/2009/xmlenc11#" Algorithm="http://www.w3.org/2009/xmlenc11#ConcatKDF">
+            <xenc11:ConcatKDFParams AlgorithmID="00123456" PartyUInfo="00123456" PartyVInfo="00123456">
+              <dsig:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
+            </xenc11:ConcatKDFParams>
+          </xenc11:KeyDerivationMethod>
+          <xenc:OriginatorKeyInfo xmlns:dsig="http://www.w3.org/2000/09/xmldsig#">
+            <dsig:KeyName>originator-key-name</dsig:KeyName>
+          </xenc:OriginatorKeyInfo>
+          <xenc:RecipientKeyInfo xmlns:dsig="http://www.w3.org/2000/09/xmldsig#">
+            <dsig:KeyName>recipient-key-name</dsig:KeyName>
+          </xenc:RecipientKeyInfo>
+        </xenc:AgreementMethod>
+      </dsig:KeyInfo>
+      <xenc:CipherData>
+        <xenc:CipherValue>zTulHSDX3FlUUtZUlMFI2AuuU5YKTIWpS9X1pQVdOFrBhi36msrksQ==</xenc:CipherValue>
+      </xenc:CipherData>
+    </xenc:EncryptedKey>
+  </dsig:KeyInfo>
+  <xenc:CipherData>
+    <xenc:CipherValue>LJX4FRRslNmdLZXJ0qXW4HHqC9fYL04NqM4Rh2nCa7JDTz2FfSjxgHTAr0u5WSk1
+beC2tWJDaD4sPLf40vyM4RE7Ox5arqgAtqtIm9ZMhoWptwcw4ZSRof7jFYGLhGZf
+kvfReVUUa3UR/DEoQeZh4u9jNVyN2xFFvZ2718rxQCkQCgdRwbENet2sZQDanROZ
+m/SeFBT6MqBIN5TU3NwH0jmCwoU+7hlwZBLo8+2e/pyf3yeU8vqqzCa/UEHikUFw
+pVnopDbWrf1/HFQQn2NqgnPzc7XybBxTvM8qTafld9aFEeEn/zQXKNnk8+Auia5t
+qMXcLJyyPC9KPRFFgtsW7Ep3vA8VY2Q7x4m8Jjz4oOcpgFm8tWPq9HxdCGDuVa97
+FLiIr2o=</xenc:CipherValue>
+  </xenc:CipherData>
+</xenc:EncryptedData>

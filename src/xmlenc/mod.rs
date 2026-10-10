@@ -56,10 +56,11 @@ pub use parse::{
     parse_encrypted_data_template_node_with_policy_and_backend,
 };
 pub use types::{
-    CipherData, DataEncryptionAlgorithm, DecryptedContent, DocumentEncryptionOptions,
-    EncryptedData, EncryptedDataType, EncryptedKey, EncryptionKeySources, EncryptionMethod,
-    EncryptionRecipient, EncryptionResult, KeyTransportAlgorithm, KeyWrapAlgorithm,
-    OaepDigestAlgorithm, ReferenceList, ReplacementMode, RsaOaepParameters, XmlEncError,
+    ChaChaParameters, ChaChaParametersRef, CipherData, DataEncryptionAlgorithm, DecryptedContent,
+    DocumentEncryptionOptions, EncryptedData, EncryptedDataType, EncryptedKey,
+    EncryptionKeySources, EncryptionMethod, EncryptionRecipient, EncryptionResult,
+    KeyTransportAlgorithm, KeyWrapAlgorithm, OaepDigestAlgorithm, ReferenceList, ReplacementMode,
+    RsaOaepParameters, XmlEncError,
 };
 
 fn map_document_error(

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<PaymentInfo xmlns="http://example.org/paymentv2">
+  <Name>�</Name>
+  <CreditCard Currency="USD" Limit="5,000"><EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" Type="http://www.w3.org/2001/04/xmlenc#Content">
+<EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes256-cbc"/>
+<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+<EncryptedKey xmlns="http://www.w3.org/2001/04/xmlenc#">
+<EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#rsa-1_5"/>
+<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+<KeyName>TestKeyName-rsa-4096</KeyName>
+</KeyInfo>
+<CipherData>
+<CipherValue>dVurWS7r/3LL2Wg+dxTIa27+usC7NRIoApAR10SdAowKjSbbPeJiYlNaI2/8TzRx
+q4kMWN5tIdHkhE0apvAQbzqgpNO9LWUXkVRXuE+iPEdR52KGKKQXqHXPV5xw8whz
+CHeSweRGLE25vQlZKlzEsCgTdKVifPtjTHpU6NKNscftYGK+wSeeMR7RJtZrWvFC
+edg2IMOVVJEC4xDajYnBhwk2Kzt8Mcd8t+yQQM1TgZaBg4y5LWRG2ocdFV6hd/b6
+1i2OZRyo3MSfVdSukil78Db2UJQq8ExQY+gkpo2xpHhwHe6L4W4rWPdzL6PrGVlT
+h9ir/fpq+x/YY9MsXv9pFRib8iwktDVGRe73U4v8MkgO99eJkuio1gMmhrn3rWuE
+y97THIBn7aIalkQU9k7NZ013D4vWEgfJsxKF7j9OANARkmBzy47mF1rj9Wz1WqZq
+bn8BqPL6CxBymUycYPvLAJtNq4/29AlYD+2pe+hG6UtJGdan0DjlCafIRiruNMKb
+DhB4x4P0qGDjBYoAs9h5lXU814GXmfl5QYXiTZPcsy9ECeH3W2nTYbc+b+SVu9xR
+43sY1RzK5gfZmG4xLETENnJpeg7u19ZPWYc/uj+iO7wTujhXyjQ2y8xeqysCctdz
+XpiGVrLUSYzuoGz7oHtvI8lAQqEXh49ZpJngolsrC6o=</CipherValue>
+</CipherData>
+</EncryptedKey>
+</KeyInfo>
+<CipherData>
+<CipherValue>DbuJ+kMXgkb2s/31EEVg9Scl8u9ZPvi6+NwzFmAoNddAKGxnVtVS9S0wrl13GVDj
+CQZefk3cXPwAq5lICbOCCr9ttx/nVwdoS5eTm9kwKhtg+Q11ZCCSgaJ/59aryEZj
+uZxaKZq3sTCzhgRGh7qPP2d+Qeqwi5eMBujiSQuqvBY=</CipherValue>
+</CipherData>
+</EncryptedData></CreditCard>
+</PaymentInfo>

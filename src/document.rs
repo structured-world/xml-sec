@@ -32,7 +32,7 @@ const VALIDATION_WRAPPER_CLOSE: &str = "</xmlsec_owned_document:wrapper>";
 // both replacement boundaries. The committed candidate uses the real ceiling.
 const VALIDATION_WRAPPER_NODE_OVERHEAD: u32 = 3;
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "xmldsig", feature = "xmlenc")))]
 pub(crate) fn selected_parser_passes() -> usize {
     3
 }
@@ -172,6 +172,7 @@ impl DocumentParseSettings {
         }
     }
 
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     pub(crate) fn from_policy(
         xml: &crate::policy::XmlInputPolicy,
         resources: &crate::policy::ResourcePolicy,
@@ -3715,6 +3716,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     fn node_preflight_rejects_wide_input_before_any_dom_pass() {
         // The allowance covers only the streaming preflight. Reaching either
         // DOM would exhaust parser work before it could report the node bound.
@@ -3733,6 +3735,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     fn namespace_predefined_references_do_not_expand_dtd_declarations() {
         // Predefined/numeric references always yield a character, never an undeclaration.
         // Even a declared predefined entity must not consume DTD expansion work here.
@@ -3752,6 +3755,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     fn namespace_entity_chain_consumes_parse_work_budget() {
         // Namespace normalization expands general entities before testing an undeclaration.
         // That preflight path must share the same sticky parser-work budget as content expansion.
@@ -3925,6 +3929,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     fn namespace_preflight_enforces_compiled_resource_policy() {
         let xml = r#"<root xmlns:first="urn:first" xmlns:second="urn:second"/>"#;
         let resources = crate::policy::ResourcePolicy {
@@ -4087,6 +4092,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     fn entity_preflight_charges_nested_replacement_work() {
         // Repeated nested references must exhaust parser work during the
         // streaming pass, before either DOM parser receives the document.
@@ -4112,6 +4118,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     fn entity_preflight_charges_a_reference_generated_by_a_character_reference() {
         // Declaration-time `&#38;` normalization exposes a general reference
         // which must recurse through the same aggregate parse-work budget.
@@ -4137,6 +4144,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     fn entity_preflight_charges_nested_attribute_replacements() {
         // Attribute values are part of parser expansion work even though their
         // entity references are contained inside one lexical start-tag event.
@@ -4169,6 +4177,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     fn attribute_preflight_exempts_normatively_redeclared_predefined_entities() {
         // XML 1.0 section 4.6 permits predefined entities to be redeclared only with their
         // normative replacement text; they remain predefined references, not expansion work.
@@ -4189,6 +4198,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     fn entity_preflight_streams_dense_attribute_references_in_source_order() {
         // A dense attribute must fail on the first expansion that exhausts the
         // budget. Buffering every reference and popping in reverse both delays
@@ -4217,6 +4227,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     fn entity_preflight_charges_applicable_dtd_attribute_defaults() {
         // Parser-created DTD defaults bypass lexical start-tag attributes when
         // the source element omits that name. Their references must use the same
@@ -4276,6 +4287,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     fn owned_parse_preflights_depth_before_dtd_provenance() {
         // Enabling internal DTD syntax must not move the provenance probe ahead
         // of the allocation-free depth boundary for an ordinary document.
@@ -4923,6 +4935,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     fn parser_work_accounting_follows_the_runtime_backend() {
         // Differential mode validates both implementations against the same
         // per-backend allowance; its diagnostic duplicate is not caller work.

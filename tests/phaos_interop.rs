@@ -1,5 +1,7 @@
 //! Exhaustive public-pipeline coverage for the Phaos XMLDSig 3 corpus.
 
+#![cfg(feature = "xmldsig")]
+
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};

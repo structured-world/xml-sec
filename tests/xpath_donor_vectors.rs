@@ -1,5 +1,7 @@
 //! XPath Filter 2.0 canonicalization vectors derived from Merlin's suite.
 
+#![cfg(feature = "xmldsig")]
+
 use xml_sec::xmldsig::{NodeSet, TransformData, execute_transforms, parse_transforms};
 
 const MERLIN_SIGN_SPEC_SUBSET: &str =

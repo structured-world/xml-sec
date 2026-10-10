@@ -1,5 +1,7 @@
 //! XMLDSig signing interoperability checks against the external xmlsec1 CLI.
 
+#![cfg(all(feature = "xmldsig", feature = "c14n"))]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

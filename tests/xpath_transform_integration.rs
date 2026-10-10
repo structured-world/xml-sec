@@ -1,5 +1,7 @@
 //! End-to-end XMLDSig XPath and XPath Filter 2.0 coverage.
 
+#![cfg(all(feature = "xmldsig", feature = "c14n"))]
+
 use std::fs;
 
 #[path = "support/cryptographic.rs"]

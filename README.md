@@ -68,7 +68,7 @@ xml-sec = { version = "0.1", default-features = false, features = ["xmldsig", "c
 |------|-----------------|
 | Canonicalization | Canonical XML 1.0/1.1, Exclusive C14N, comments, and document subsets |
 | XML signatures | XMLDSig signing and verification, RSA-PSS/PKCS#1, DSA/ECDSA/HMAC, XPath and [OPC Relationship transforms](docs/relationship-transforms.md), `Manifest`, `KeyInfo`, and caller-provided references |
-| XML encryption | AES-CBC/GCM, RSA-OAEP, AES Key Wrap, ECDH/X25519/DH, bounded KDFs, referenced ciphertext, nested recipients, and Element/Content replacement |
+| XML encryption | AES-CBC/GCM, RSA-OAEP, AES Key Wrap, opt-in Camellia-CBC/Key Wrap and experimental ChaCha20/Poly1305 profiles, ECDH/X25519/X448/DH, bounded KDFs, referenced ciphertext, nested recipients, and Element/Content replacement |
 | Optional compatibility algorithms | `legacy-algorithms`: MD5/RIPEMD-160 signatures and digests, AES-192, TripleDES-CBC/CMS wrap, and RSA-1.5 transport; library policy denies these by default |
 | X.509 | Certificate key extraction, chain validation, CRLs, required key authorization by default, and typed trust evidence |
 | Key management | Caller-owned named inventory, usage-restricted keys, xmlsec `keys.xml`, encrypted PKCS#8, and bounded RustCrypto-backed PKCS#12 import |
@@ -124,7 +124,7 @@ keys must explicitly select a lower operation-policy minimum; importing a key do
 
 Decryption supports caller-owned `CipherReference` resources, transformed key retrieval,
 nested/detached `EncryptedKey`, and trusted application bindings for ConcatKDF, HKDF,
-PBKDF2 and ECDH/X25519/DH. No document can trigger implicit filesystem or network access.
+PBKDF2 and ECDH/X25519/X448/DH. No document can trigger implicit filesystem or network access.
 See [XML Encryption](docs/xmlenc.md) and [crypto providers](docs/crypto-providers.md)
 for key establishment, cumulative budgets, interoperability and provider capabilities.
 

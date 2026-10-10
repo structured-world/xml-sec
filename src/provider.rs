@@ -5,14 +5,21 @@
 //! operation-specific handles; this provider owns primitive dispatch and
 //! randomness.
 
+#[cfg(feature = "xmldsig")]
+use crate::rustcrypto_sha3 as sha3;
+
 #[cfg(feature = "aws-lc-fips")]
 mod aws_lc;
+#[cfg(feature = "xmlenc")]
+mod chacha;
 #[cfg(feature = "xmlenc")]
 mod key_establishment;
 #[cfg(feature = "pkcs11")]
 pub mod pkcs11;
 #[cfg(feature = "xmlenc")]
-pub use key_establishment::{EcdhCurve, RustCryptoDhKey, RustCryptoEcdhKey, RustCryptoX25519Key};
+pub use key_establishment::{
+    EcdhCurve, RustCryptoDhKey, RustCryptoEcdhKey, RustCryptoX448Key, RustCryptoX25519Key,
+};
 #[cfg(feature = "xmldsig")]
 mod key_encapsulation;
 #[cfg(all(feature = "xmlenc", feature = "legacy-algorithms"))]
@@ -108,10 +115,20 @@ impl RecoveredContentKey {
         provider: &dyn CryptoProvider,
         algorithm: DataEncryptionAlgorithm,
         ciphertext: &[u8],
+        parameters: Option<crate::xmlenc::ChaChaParametersRef<'_>>,
     ) -> Result<Vec<u8>, ProviderError> {
         match &self.opaque {
+            Some(_) if parameters.is_some() => Err(ProviderError::Unsupported {
+                operation: ProviderOperation::Decrypt,
+                algorithm: Some(algorithm.uri().into()),
+            }),
             Some(key) => provider.decrypt_content_key(algorithm, key.as_ref(), ciphertext),
-            None => provider.decrypt_data(algorithm, &self.bytes, ciphertext),
+            None => provider.decrypt_data_with_parameters(
+                algorithm,
+                &self.bytes,
+                ciphertext,
+                parameters,
+            ),
         }
     }
 
@@ -1054,6 +1071,43 @@ pub trait CryptoProvider: Send + Sync {
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, ProviderError>;
 
+    /// Encrypt while preserving XML-carried cipher parameters. Providers
+    /// must implement the profile explicitly, never discard it or fall back.
+    #[cfg(feature = "xmlenc")]
+    fn encrypt_data_with_parameters(
+        &self,
+        algorithm: DataEncryptionAlgorithm,
+        key: &[u8],
+        plaintext: &[u8],
+        parameters: Option<crate::xmlenc::ChaChaParametersRef<'_>>,
+    ) -> Result<Vec<u8>, ProviderError> {
+        if parameters.is_some() {
+            return Err(ProviderError::Unsupported {
+                operation: ProviderOperation::Encrypt,
+                algorithm: Some(algorithm.uri().into()),
+            });
+        }
+        self.encrypt_data(algorithm, key, plaintext)
+    }
+
+    /// Decrypt with the same explicit parameter contract as encryption.
+    #[cfg(feature = "xmlenc")]
+    fn decrypt_data_with_parameters(
+        &self,
+        algorithm: DataEncryptionAlgorithm,
+        key: &[u8],
+        ciphertext: &[u8],
+        parameters: Option<crate::xmlenc::ChaChaParametersRef<'_>>,
+    ) -> Result<Vec<u8>, ProviderError> {
+        if parameters.is_some() {
+            return Err(ProviderError::Unsupported {
+                operation: ProviderOperation::Decrypt,
+                algorithm: Some(algorithm.uri().into()),
+            });
+        }
+        self.decrypt_data(algorithm, key, ciphertext)
+    }
+
     /// Wrap a content key with RFC 3394 AES Key Wrap.
     ///
     /// Successful output contains the complete RFC 3394 value and is exactly
@@ -1560,9 +1614,15 @@ impl CryptoProvider for RustCryptoProvider {
             #[cfg(feature = "xmlenc")]
             ProviderCapability::Encrypt(_) | ProviderCapability::Decrypt(_) => true,
             #[cfg(feature = "xmlenc")]
-            ProviderCapability::KeyWrap(_) | ProviderCapability::KeyUnwrap(_) => true,
+            ProviderCapability::KeyWrap(algorithm) | ProviderCapability::KeyUnwrap(algorithm) => {
+                algorithm.wrapped_len(16).is_some()
+            }
             #[cfg(feature = "xmlenc")]
-            ProviderCapability::KeyTransport(_) | ProviderCapability::KeyRecovery(_) => true,
+            ProviderCapability::KeyTransport(parameters)
+            | ProviderCapability::KeyRecovery(parameters) => {
+                !parameters.algorithm.requires_explicit_permission()
+                    && parameters.mgf_digest.mgf_uri().is_some()
+            }
             #[cfg(all(feature = "xmlenc", feature = "legacy-algorithms"))]
             ProviderCapability::Pkcs1v15Transport | ProviderCapability::Pkcs1v15Recovery => true,
             ProviderCapability::Random => true,
@@ -1572,6 +1632,7 @@ impl CryptoProvider for RustCryptoProvider {
                     matches!(
                         parameters.algorithm,
                         key_establishment::X25519_URI
+                            | key_establishment::X448_URI
                             | key_establishment::ECDH_URI
                             | key_establishment::DH_ES_URI
                             | key_establishment::DH_URI
@@ -1738,6 +1799,34 @@ impl CryptoProvider for RustCryptoProvider {
         key: &[u8],
     ) -> Result<Vec<u8>, ProviderError> {
         rustcrypto::wrap_key(self, algorithm, kek, key)
+    }
+
+    #[cfg(feature = "xmlenc")]
+    fn encrypt_data_with_parameters(
+        &self,
+        algorithm: DataEncryptionAlgorithm,
+        key: &[u8],
+        plaintext: &[u8],
+        parameters: Option<crate::xmlenc::ChaChaParametersRef<'_>>,
+    ) -> Result<Vec<u8>, ProviderError> {
+        match parameters {
+            Some(parameters) => chacha::encrypt(algorithm, key, plaintext, parameters),
+            None => self.encrypt_data(algorithm, key, plaintext),
+        }
+    }
+
+    #[cfg(feature = "xmlenc")]
+    fn decrypt_data_with_parameters(
+        &self,
+        algorithm: DataEncryptionAlgorithm,
+        key: &[u8],
+        ciphertext: &[u8],
+        parameters: Option<crate::xmlenc::ChaChaParametersRef<'_>>,
+    ) -> Result<Vec<u8>, ProviderError> {
+        match parameters {
+            Some(parameters) => chacha::decrypt(algorithm, key, ciphertext, parameters),
+            None => self.decrypt_data(algorithm, key, ciphertext),
+        }
     }
 
     #[cfg(feature = "xmlenc")]
@@ -2105,6 +2194,7 @@ pub(crate) mod rustcrypto_x509 {
 
 #[cfg(feature = "xmlenc")]
 mod rustcrypto {
+    use crate::rustcrypto_sha3 as sha3;
     #[cfg(feature = "legacy-algorithms")]
     use aes::Aes192;
     use aes::{
@@ -2116,12 +2206,13 @@ mod rustcrypto {
         aead::{AeadInOut, KeyInit},
     };
     use aes_kw::{KwAes128, KwAes256};
+    use camellia::{Camellia128, Camellia192, Camellia256};
     use cbc::{Decryptor, Encryptor};
     #[cfg(feature = "legacy-algorithms")]
     use des::TdesEde3;
     use rsa::{Oaep, traits::PaddingScheme};
     use sha1::Sha1;
-    use sha2::{Sha256, Sha384, Sha512};
+    use sha2::{Sha224, Sha256, Sha384, Sha512};
 
     use super::{CryptoProvider, ProviderError, ProviderInputError};
     use crate::xmlenc::{
@@ -2148,11 +2239,28 @@ mod rustcrypto {
             >(provider, key, plaintext),
             DataEncryptionAlgorithm::Aes128Cbc => encrypt_cbc::<Aes128>(provider, key, plaintext),
             DataEncryptionAlgorithm::Aes256Cbc => encrypt_cbc::<Aes256>(provider, key, plaintext),
+            // RFC 9231 §2.6.2 uses the AES CBC framing and padding with
+            // Camellia substituted as the block cipher.
+            // https://www.rfc-editor.org/rfc/rfc9231.html#section-2.6.2
+            DataEncryptionAlgorithm::Camellia128Cbc => {
+                encrypt_cbc::<Camellia128>(provider, key, plaintext)
+            }
+            DataEncryptionAlgorithm::Camellia192Cbc => {
+                encrypt_cbc::<Camellia192>(provider, key, plaintext)
+            }
+            DataEncryptionAlgorithm::Camellia256Cbc => {
+                encrypt_cbc::<Camellia256>(provider, key, plaintext)
+            }
             DataEncryptionAlgorithm::Aes128Gcm => {
                 encrypt_gcm::<Aes128Gcm>(provider, key, plaintext)
             }
             DataEncryptionAlgorithm::Aes256Gcm => {
                 encrypt_gcm::<Aes256Gcm>(provider, key, plaintext)
+            }
+            DataEncryptionAlgorithm::ChaCha20 | DataEncryptionAlgorithm::ChaCha20Poly1305 => {
+                Err(ProviderError::InvalidInput(
+                    ProviderInputError::PrimitiveInitialization("missing ChaCha parameters"),
+                ))
             }
         }
     }
@@ -2174,8 +2282,16 @@ mod rustcrypto {
             }
             DataEncryptionAlgorithm::Aes128Cbc => decrypt_cbc::<Aes128>(key, ciphertext),
             DataEncryptionAlgorithm::Aes256Cbc => decrypt_cbc::<Aes256>(key, ciphertext),
+            DataEncryptionAlgorithm::Camellia128Cbc => decrypt_cbc::<Camellia128>(key, ciphertext),
+            DataEncryptionAlgorithm::Camellia192Cbc => decrypt_cbc::<Camellia192>(key, ciphertext),
+            DataEncryptionAlgorithm::Camellia256Cbc => decrypt_cbc::<Camellia256>(key, ciphertext),
             DataEncryptionAlgorithm::Aes128Gcm => decrypt_gcm::<Aes128Gcm>(key, ciphertext),
             DataEncryptionAlgorithm::Aes256Gcm => decrypt_gcm::<Aes256Gcm>(key, ciphertext),
+            DataEncryptionAlgorithm::ChaCha20 | DataEncryptionAlgorithm::ChaCha20Poly1305 => {
+                Err(ProviderError::InvalidInput(
+                    ProviderInputError::PrimitiveInitialization("missing ChaCha parameters"),
+                ))
+            }
         }
     }
 
@@ -2329,6 +2445,17 @@ mod rustcrypto {
         key: &[u8],
     ) -> Result<Vec<u8>, ProviderError> {
         check_key(algorithm.key_len(), kek)?;
+        if let KeyWrapAlgorithm::Cbc(cipher) = algorithm {
+            if cipher.cbc_block_len().is_none() {
+                return Err(ProviderError::InvalidInput(
+                    ProviderInputError::AesKeyWrapFraming,
+                ));
+            }
+            // XMLEnc 1.1 §3.4 defines EncryptedKey as EncryptedType; CBC
+            // encrypts key bytes using the same padding/IV contract as data.
+            // https://www.w3.org/TR/xmlenc-core1/#sec-EncryptedKey
+            return encrypt_data(provider, cipher, kek, key);
+        }
         #[cfg(feature = "legacy-algorithms")]
         if algorithm == KeyWrapAlgorithm::TripleDes {
             return wrap_des3(provider, kek, key);
@@ -2344,14 +2471,30 @@ mod rustcrypto {
                 ProviderInputError::AesKeyWrapFraming,
             ));
         }
-        let length =
-            key.len()
-                .checked_add(algorithm.overhead())
-                .ok_or(ProviderError::InvalidInput(
-                    ProviderInputError::AesKeyWrapFraming,
-                ))?;
+        let length = algorithm
+            .wrapped_len(key.len())
+            .ok_or(ProviderError::InvalidInput(
+                ProviderInputError::AesKeyWrapFraming,
+            ))?;
         let mut output = vec![0_u8; length];
+        // RFC 9231 §2.6.3 specifies RFC 3394 with Camellia replacing AES,
+        // including the same A6 integrity register. Reuse its generic engine.
+        // https://www.rfc-editor.org/rfc/rfc9231.html#section-2.6.3
+        macro_rules! camellia_wrap {
+            ($cipher:ty) => {
+                aes_kw::AesKw::<$cipher>::new_from_slice(kek)
+                    .map_err(|_| ProviderError::InvalidKeySize {
+                        expected: algorithm.key_len(),
+                        actual: kek.len(),
+                    })?
+                    .wrap_key(key, &mut output)
+            };
+        }
         match algorithm {
+            KeyWrapAlgorithm::Cbc(_) => unreachable!("CBC wrapping already dispatched"),
+            KeyWrapAlgorithm::CamelliaKw128 => camellia_wrap!(Camellia128),
+            KeyWrapAlgorithm::CamelliaKw192 => camellia_wrap!(Camellia192),
+            KeyWrapAlgorithm::CamelliaKw256 => camellia_wrap!(Camellia256),
             #[cfg(feature = "legacy-algorithms")]
             KeyWrapAlgorithm::AesKw192 => aes_kw::KwAes192::new_from_slice(kek)
                 .map_err(|_| ProviderError::InvalidKeySize {
@@ -2384,6 +2527,14 @@ mod rustcrypto {
         wrapped: &[u8],
     ) -> Result<Vec<u8>, ProviderError> {
         check_key(algorithm.key_len(), kek)?;
+        if let KeyWrapAlgorithm::Cbc(cipher) = algorithm {
+            if cipher.cbc_block_len().is_none() {
+                return Err(ProviderError::InvalidInput(
+                    ProviderInputError::AesKeyWrapFraming,
+                ));
+            }
+            return decrypt_data(cipher, kek, wrapped);
+        }
         #[cfg(feature = "legacy-algorithms")]
         if algorithm == KeyWrapAlgorithm::TripleDes {
             return unwrap_des3(kek, wrapped);
@@ -2394,7 +2545,21 @@ mod rustcrypto {
             ));
         }
         let mut output = zeroize::Zeroizing::new(vec![0_u8; wrapped.len() - 8]);
+        macro_rules! camellia_unwrap {
+            ($cipher:ty) => {
+                aes_kw::AesKw::<$cipher>::new_from_slice(kek)
+                    .map_err(|_| ProviderError::InvalidKeySize {
+                        expected: algorithm.key_len(),
+                        actual: kek.len(),
+                    })?
+                    .unwrap_key(wrapped, &mut output)
+            };
+        }
         match algorithm {
+            KeyWrapAlgorithm::Cbc(_) => unreachable!("CBC unwrapping already dispatched"),
+            KeyWrapAlgorithm::CamelliaKw128 => camellia_unwrap!(Camellia128),
+            KeyWrapAlgorithm::CamelliaKw192 => camellia_unwrap!(Camellia192),
+            KeyWrapAlgorithm::CamelliaKw256 => camellia_unwrap!(Camellia256),
             #[cfg(feature = "legacy-algorithms")]
             KeyWrapAlgorithm::AesKw192 => aes_kw::KwAes192::new_from_slice(kek)
                 .map_err(|_| ProviderError::InvalidKeySize {
@@ -2519,64 +2684,7 @@ mod rustcrypto {
                 ProviderInputError::PrimitiveInitialization("RSA-OAEP algorithm"),
             ));
         }
-        let mut rng = super::ProviderRng(provider);
-        macro_rules! encrypt_with {
-            ($digest:ty, $mgf:ty) => {
-                Oaep::<$digest, $mgf>::new_with_mgf_hash_and_label(parameters.label.clone())
-                    .encrypt(&mut rng, key, plaintext)
-            };
-        }
-        let result = match (parameters.digest, parameters.mgf_digest) {
-            (OaepDigestAlgorithm::Sha1, OaepDigestAlgorithm::Sha1) => {
-                encrypt_with!(Sha1, Sha1)
-            }
-            (OaepDigestAlgorithm::Sha1, OaepDigestAlgorithm::Sha256) => {
-                encrypt_with!(Sha1, Sha256)
-            }
-            (OaepDigestAlgorithm::Sha1, OaepDigestAlgorithm::Sha384) => {
-                encrypt_with!(Sha1, Sha384)
-            }
-            (OaepDigestAlgorithm::Sha1, OaepDigestAlgorithm::Sha512) => {
-                encrypt_with!(Sha1, Sha512)
-            }
-            (OaepDigestAlgorithm::Sha256, OaepDigestAlgorithm::Sha1) => {
-                encrypt_with!(Sha256, Sha1)
-            }
-            (OaepDigestAlgorithm::Sha256, OaepDigestAlgorithm::Sha256) => {
-                encrypt_with!(Sha256, Sha256)
-            }
-            (OaepDigestAlgorithm::Sha256, OaepDigestAlgorithm::Sha384) => {
-                encrypt_with!(Sha256, Sha384)
-            }
-            (OaepDigestAlgorithm::Sha256, OaepDigestAlgorithm::Sha512) => {
-                encrypt_with!(Sha256, Sha512)
-            }
-            (OaepDigestAlgorithm::Sha384, OaepDigestAlgorithm::Sha1) => {
-                encrypt_with!(Sha384, Sha1)
-            }
-            (OaepDigestAlgorithm::Sha384, OaepDigestAlgorithm::Sha256) => {
-                encrypt_with!(Sha384, Sha256)
-            }
-            (OaepDigestAlgorithm::Sha384, OaepDigestAlgorithm::Sha384) => {
-                encrypt_with!(Sha384, Sha384)
-            }
-            (OaepDigestAlgorithm::Sha384, OaepDigestAlgorithm::Sha512) => {
-                encrypt_with!(Sha384, Sha512)
-            }
-            (OaepDigestAlgorithm::Sha512, OaepDigestAlgorithm::Sha1) => {
-                encrypt_with!(Sha512, Sha1)
-            }
-            (OaepDigestAlgorithm::Sha512, OaepDigestAlgorithm::Sha256) => {
-                encrypt_with!(Sha512, Sha256)
-            }
-            (OaepDigestAlgorithm::Sha512, OaepDigestAlgorithm::Sha384) => {
-                encrypt_with!(Sha512, Sha384)
-            }
-            (OaepDigestAlgorithm::Sha512, OaepDigestAlgorithm::Sha512) => {
-                encrypt_with!(Sha512, Sha512)
-            }
-        };
-        result.map_err(map_rsa_error)
+        run_oaep(provider, parameters, OaepOperation::Encrypt(key), plaintext)
     }
 
     pub(super) fn recover_key(
@@ -2590,64 +2698,112 @@ mod rustcrypto {
                 ProviderInputError::PrimitiveInitialization("RSA-OAEP algorithm"),
             ));
         }
-        let mut rng = super::ProviderRng(provider);
-        macro_rules! decrypt_with {
-            ($digest:ty, $mgf:ty) => {
-                Oaep::<$digest, $mgf>::new_with_mgf_hash_and_label(parameters.label.clone())
-                    .decrypt(Some(&mut rng), key, ciphertext)
-            };
+        run_oaep(
+            provider,
+            parameters,
+            OaepOperation::Decrypt(key),
+            ciphertext,
+        )
+    }
+
+    enum OaepOperation<'a> {
+        Encrypt(&'a rsa::RsaPublicKey),
+        Decrypt(&'a rsa::RsaPrivateKey),
+    }
+
+    fn run_oaep(
+        provider: &dyn CryptoProvider,
+        parameters: &RsaOaepParameters,
+        operation: OaepOperation<'_>,
+        input: &[u8],
+    ) -> Result<Vec<u8>, ProviderError> {
+        // RFC 8017 §7.1 selects Hash and MGF1's hash independently. One
+        // dispatch keeps encryption and blinded recovery on the same contract.
+        // https://www.rfc-editor.org/rfc/rfc8017.html#section-7.1
+        match parameters.digest {
+            #[cfg(feature = "legacy-algorithms")]
+            OaepDigestAlgorithm::Md5 => {
+                run_oaep_mgf::<md5::Md5>(provider, parameters, operation, input)
+            }
+            #[cfg(feature = "legacy-algorithms")]
+            OaepDigestAlgorithm::Ripemd160 => {
+                run_oaep_mgf::<ripemd::Ripemd160>(provider, parameters, operation, input)
+            }
+            OaepDigestAlgorithm::Sha3_224 => {
+                run_oaep_mgf::<sha3::Sha3_224>(provider, parameters, operation, input)
+            }
+            OaepDigestAlgorithm::Sha3_256 => {
+                run_oaep_mgf::<sha3::Sha3_256>(provider, parameters, operation, input)
+            }
+            OaepDigestAlgorithm::Sha3_384 => {
+                run_oaep_mgf::<sha3::Sha3_384>(provider, parameters, operation, input)
+            }
+            OaepDigestAlgorithm::Sha3_512 => {
+                run_oaep_mgf::<sha3::Sha3_512>(provider, parameters, operation, input)
+            }
+            OaepDigestAlgorithm::Sha1 => {
+                run_oaep_mgf::<Sha1>(provider, parameters, operation, input)
+            }
+            OaepDigestAlgorithm::Sha224 => {
+                run_oaep_mgf::<Sha224>(provider, parameters, operation, input)
+            }
+            OaepDigestAlgorithm::Sha256 => {
+                run_oaep_mgf::<Sha256>(provider, parameters, operation, input)
+            }
+            OaepDigestAlgorithm::Sha384 => {
+                run_oaep_mgf::<Sha384>(provider, parameters, operation, input)
+            }
+            OaepDigestAlgorithm::Sha512 => {
+                run_oaep_mgf::<Sha512>(provider, parameters, operation, input)
+            }
         }
-        let result = match (parameters.digest, parameters.mgf_digest) {
-            (OaepDigestAlgorithm::Sha1, OaepDigestAlgorithm::Sha1) => {
-                decrypt_with!(Sha1, Sha1)
+    }
+
+    fn run_oaep_mgf<D: sha2::digest::Digest + sha2::digest::FixedOutputReset>(
+        provider: &dyn CryptoProvider,
+        parameters: &RsaOaepParameters,
+        operation: OaepOperation<'_>,
+        input: &[u8],
+    ) -> Result<Vec<u8>, ProviderError> {
+        match parameters.mgf_digest {
+            OaepDigestAlgorithm::Sha1 => {
+                run_oaep_primitive::<D, Sha1>(provider, parameters, operation, input)
             }
-            (OaepDigestAlgorithm::Sha1, OaepDigestAlgorithm::Sha256) => {
-                decrypt_with!(Sha1, Sha256)
+            OaepDigestAlgorithm::Sha224 => {
+                run_oaep_primitive::<D, Sha224>(provider, parameters, operation, input)
             }
-            (OaepDigestAlgorithm::Sha1, OaepDigestAlgorithm::Sha384) => {
-                decrypt_with!(Sha1, Sha384)
+            OaepDigestAlgorithm::Sha256 => {
+                run_oaep_primitive::<D, Sha256>(provider, parameters, operation, input)
             }
-            (OaepDigestAlgorithm::Sha1, OaepDigestAlgorithm::Sha512) => {
-                decrypt_with!(Sha1, Sha512)
+            OaepDigestAlgorithm::Sha384 => {
+                run_oaep_primitive::<D, Sha384>(provider, parameters, operation, input)
             }
-            (OaepDigestAlgorithm::Sha256, OaepDigestAlgorithm::Sha1) => {
-                decrypt_with!(Sha256, Sha1)
+            OaepDigestAlgorithm::Sha512 => {
+                run_oaep_primitive::<D, Sha512>(provider, parameters, operation, input)
             }
-            (OaepDigestAlgorithm::Sha256, OaepDigestAlgorithm::Sha256) => {
-                decrypt_with!(Sha256, Sha256)
-            }
-            (OaepDigestAlgorithm::Sha256, OaepDigestAlgorithm::Sha384) => {
-                decrypt_with!(Sha256, Sha384)
-            }
-            (OaepDigestAlgorithm::Sha256, OaepDigestAlgorithm::Sha512) => {
-                decrypt_with!(Sha256, Sha512)
-            }
-            (OaepDigestAlgorithm::Sha384, OaepDigestAlgorithm::Sha1) => {
-                decrypt_with!(Sha384, Sha1)
-            }
-            (OaepDigestAlgorithm::Sha384, OaepDigestAlgorithm::Sha256) => {
-                decrypt_with!(Sha384, Sha256)
-            }
-            (OaepDigestAlgorithm::Sha384, OaepDigestAlgorithm::Sha384) => {
-                decrypt_with!(Sha384, Sha384)
-            }
-            (OaepDigestAlgorithm::Sha384, OaepDigestAlgorithm::Sha512) => {
-                decrypt_with!(Sha384, Sha512)
-            }
-            (OaepDigestAlgorithm::Sha512, OaepDigestAlgorithm::Sha1) => {
-                decrypt_with!(Sha512, Sha1)
-            }
-            (OaepDigestAlgorithm::Sha512, OaepDigestAlgorithm::Sha256) => {
-                decrypt_with!(Sha512, Sha256)
-            }
-            (OaepDigestAlgorithm::Sha512, OaepDigestAlgorithm::Sha384) => {
-                decrypt_with!(Sha512, Sha384)
-            }
-            (OaepDigestAlgorithm::Sha512, OaepDigestAlgorithm::Sha512) => {
-                decrypt_with!(Sha512, Sha512)
-            }
-        };
-        result.map_err(map_rsa_error)
+            _ => Err(ProviderError::InvalidInput(
+                ProviderInputError::PrimitiveInitialization("unregistered XML OAEP mask digest"),
+            )),
+        }
+    }
+
+    fn run_oaep_primitive<D, M>(
+        provider: &dyn CryptoProvider,
+        parameters: &RsaOaepParameters,
+        operation: OaepOperation<'_>,
+        input: &[u8],
+    ) -> Result<Vec<u8>, ProviderError>
+    where
+        D: sha2::digest::Digest + sha2::digest::FixedOutputReset,
+        M: sha2::digest::Digest + sha2::digest::FixedOutputReset,
+    {
+        let mut rng = super::ProviderRng(provider);
+        let padding = Oaep::<D, M>::new_with_mgf_hash_and_label(parameters.label.clone());
+        match operation {
+            OaepOperation::Encrypt(key) => padding.encrypt(&mut rng, key, input),
+            OaepOperation::Decrypt(key) => padding.decrypt(Some(&mut rng), key, input),
+        }
+        .map_err(map_rsa_error)
     }
 
     pub(super) fn map_rsa_error(error: rsa::Error) -> ProviderError {
@@ -2758,7 +2914,7 @@ mod tests {
                 let mut wrapped = RUST_CRYPTO_PROVIDER
                     .wrap_key(algorithm, &kek, &key)
                     .expect("valid content key must wrap");
-                assert_eq!(wrapped.len(), key.len() + algorithm.overhead());
+                assert_eq!(Some(wrapped.len()), algorithm.wrapped_len(key.len()));
                 assert_eq!(
                     RUST_CRYPTO_PROVIDER
                         .unwrap_key(algorithm, &kek, &wrapped)

@@ -1,8 +1,10 @@
 //! Integration tests for XMLDSig ECDSA signature verification.
 //!
-//! These tests validate roadmap task P1-020: canonicalized `<SignedInfo>` bytes
+//! These tests validate canonicalized `<SignedInfo>` bytes
 //! plus real donor EC public keys must verify against XMLDSig raw `r || s`
 //! `SignatureValue` bytes for the declared `SignatureMethod`.
+
+#![cfg(all(feature = "xmldsig", feature = "c14n"))]
 
 use std::path::Path;
 

@@ -1,8 +1,10 @@
 //! Integration tests for XMLDSig RSA signature verification.
 //!
-//! These tests validate the low-level crypto layer for roadmap task P1-019:
+//! These tests validate the low-level crypto layer:
 //! canonicalized `<SignedInfo>` bytes plus a real RSA public key must verify
 //! against donor `SignatureValue` bytes for the declared `SignatureMethod`.
+
+#![cfg(all(feature = "xmldsig", feature = "c14n"))]
 
 use std::path::Path;
 

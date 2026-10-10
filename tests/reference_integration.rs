@@ -10,6 +10,8 @@
 //! - `compute_digest` + `constant_time_eq` (SHA-family digest comparison)
 //! - `process_reference` / `process_all_references` (full wiring)
 
+#![cfg(feature = "xmldsig")]
+
 use base64::Engine;
 use xml_sec::xmldsig::digest::{DigestAlgorithm, compute_digest};
 use xml_sec::xmldsig::parse::{find_signature_node, parse_signed_info};

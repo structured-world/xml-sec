@@ -550,7 +550,8 @@ fn parse_encrypted_data_node_traced<'doc>(
 
     let cipher_data = parse_cipher_data(
         next_required(&mut children, "CipherData")?,
-        allow_empty_cipher_values,
+        allow_empty_cipher_values
+            || encryption_method.algorithm == super::DataEncryptionAlgorithm::ChaCha20.uri(),
         policy,
         &mut budget.shared.transforms,
         &mut budget.shared.retained_cipher_bytes,
@@ -1599,13 +1600,15 @@ fn parse_encryption_method_with_limit(
     let mut mgf_algorithm = None;
     let mut oaep_params = None;
     let mut key_size_bits = None;
+    let mut chacha = None;
     for child in node.children().filter(Node::is_element) {
         match (child.tag_name().namespace(), child.tag_name().name()) {
             (Some(XMLENC_NS), "KeySize")
                 if key_size_bits.is_none()
                     && oaep_params.is_none()
                     && oaep_digest.is_none()
-                    && mgf_algorithm.is_none() =>
+                    && mgf_algorithm.is_none()
+                    && chacha.is_none() =>
             {
                 key_size_bits = Some(parse_key_size(child, metadata_limit)?);
             }
@@ -1632,6 +1635,33 @@ fn parse_encryption_method_with_limit(
                 validate_metadata_len(mgf.len(), metadata_limit)?;
                 mgf_algorithm = Some(mgf.to_owned());
             }
+            (
+                Some("http://www.w3.org/2021/04/xmldsig-more#"),
+                name @ ("Nonce" | "Counter" | "AAD"),
+            ) => {
+                let parameters = chacha.get_or_insert_with(super::ChaChaParameters::default);
+                match name {
+                    "Nonce" if parameters.nonce.is_none() => {
+                        parameters.nonce = Some(parse_chacha_hex(child, "Nonce", metadata_limit)?);
+                    }
+                    "Counter" if parameters.counter.is_none() => {
+                        parameters.counter =
+                            Some(parse_chacha_hex(child, "Counter", metadata_limit)?);
+                    }
+                    "AAD" if parameters.aad.is_none() => {
+                        parameters.aad = Some(bounded_simple_text_with_limit(
+                            child,
+                            "AAD",
+                            metadata_limit,
+                        )?);
+                    }
+                    _ => {
+                        return Err(XmlEncError::InvalidStructure(format!(
+                            "duplicate ChaCha {name}"
+                        )));
+                    }
+                }
+            }
             _ => {
                 return Err(XmlEncError::InvalidStructure(format!(
                     "unsupported EncryptionMethod child {}",
@@ -1641,15 +1671,50 @@ fn parse_encryption_method_with_limit(
         }
     }
 
+    if chacha.is_none() && algorithm == super::DataEncryptionAlgorithm::ChaCha20Poly1305.uri() {
+        chacha = Some(super::ChaChaParameters::default());
+    }
     let method = EncryptionMethod {
         algorithm,
         key_size_bits,
         oaep_digest,
         mgf_algorithm,
         oaep_params,
+        chacha,
     };
     method.validate_structure()?;
     Ok(method)
+}
+
+fn parse_chacha_hex<const N: usize>(
+    node: Node<'_, '_>,
+    field: &'static str,
+    metadata_limit: usize,
+) -> Result<[u8; N], XmlEncError> {
+    let value = bounded_simple_text_with_limit(node, field, metadata_limit)?;
+    let value = value.trim_matches([' ', '\t', '\r', '\n']);
+    if value.len() != N * 2 {
+        return Err(XmlEncError::InvalidStructure(format!(
+            "ChaCha {field} requires {} hexadecimal digits",
+            N * 2
+        )));
+    }
+    let mut result = [0; N];
+    for (byte, pair) in result.iter_mut().zip(value.as_bytes().as_chunks::<2>().0) {
+        let digit = |value: u8| match value {
+            b'0'..=b'9' => Some(value - b'0'),
+            b'a'..=b'f' => Some(value - b'a' + 10),
+            b'A'..=b'F' => Some(value - b'A' + 10),
+            _ => None,
+        };
+        *byte = digit(pair[0])
+            .zip(digit(pair[1]))
+            .map(|(high, low)| high * 16 + low)
+            .ok_or_else(|| {
+                XmlEncError::InvalidStructure(format!("invalid ChaCha {field} hexBinary"))
+            })?;
+    }
+    Ok(result)
 }
 
 fn parse_key_size(node: Node<'_, '_>, metadata_limit: usize) -> Result<usize, XmlEncError> {
@@ -1966,6 +2031,17 @@ fn validate_encryption_method_metadata(
     if let Some(value) = method.oaep_params.as_deref() {
         validate_metadata_len(value.len(), maximum)?;
     }
+    if let Some(parameters) = &method.chacha {
+        if parameters.nonce.is_some() {
+            validate_metadata_len(12, maximum)?;
+        }
+        if parameters.counter.is_some() {
+            validate_metadata_len(4, maximum)?;
+        }
+        if let Some(aad) = parameters.aad.as_deref() {
+            validate_metadata_len(aad.len(), maximum)?;
+        }
+    }
     Ok(())
 }
 
@@ -2084,6 +2160,82 @@ mod tests {
     use super::*;
 
     const DATA: &str = "<xenc:EncryptedData xmlns:xenc=\"http://www.w3.org/2001/04/xmlenc#\" Type=\"http://www.w3.org/2001/04/xmlenc#Element\"><xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><xenc:CipherData><xenc:CipherValue> YWJj\nZA== </xenc:CipherValue></xenc:CipherData></xenc:EncryptedData>";
+
+    #[test]
+    fn chacha_parameter_syntax_rejects_malformed_and_cross_profile_values() {
+        // Parsing enforces the experimental profile before key resolution:
+        // duplicate fields, malformed hex, nested text and cross-profile
+        // Counter/AAD cannot reach cryptographic dispatch.
+        let nonce = "<c:Nonce>000102030405060708090a0b</c:Nonce>";
+        let counter = "<c:Counter>01000000</c:Counter>";
+        for (algorithm, children) in [
+            ("chacha20", format!("{nonce}{counter}{nonce}")),
+            ("chacha20", format!("{nonce}{counter}{counter}")),
+            ("chacha20", format!("{nonce}{counter}<c:AAD/>")),
+            (
+                "chacha20",
+                format!("{nonce}<c:Counter>0100000z</c:Counter>"),
+            ),
+            ("chacha20", format!("{nonce}<c:Counter>010000</c:Counter>")),
+            (
+                "chacha20",
+                format!("<c:Nonce>000102030405060708090a</c:Nonce>{counter}"),
+            ),
+            (
+                "chacha20",
+                format!("<c:Nonce><c:Nonce/></c:Nonce>{counter}"),
+            ),
+            ("chacha20poly1305", format!("{nonce}{counter}")),
+            ("chacha20poly1305", format!("{nonce}<c:AAD/><c:AAD/>")),
+            (
+                "chacha20poly1305",
+                format!("{nonce}<c:AAD><c:AAD/></c:AAD>"),
+            ),
+        ] {
+            let xml = format!(
+                "<x:EncryptionMethod xmlns:x='{XMLENC_NS}' xmlns:c='http://www.w3.org/2021/04/xmldsig-more#' Algorithm='http://www.w3.org/2021/04/xmldsig-more#{algorithm}'>{children}</x:EncryptionMethod>"
+            );
+            let document = Document::parse(&xml).expect("well-formed malformed-parameter case");
+            assert!(
+                matches!(
+                    parse_encryption_method_with_limit(document.root_element(), 1024),
+                    Err(XmlEncError::InvalidStructure(_))
+                ),
+                "{algorithm}: {children}"
+            );
+        }
+    }
+
+    #[test]
+    fn chacha_metadata_budget_and_xml_text_are_preserved() {
+        // AAD is XML text, including whitespace and decoded entities. Bound
+        // it as metadata rather than silently trimming or base64-decoding it.
+        let aad = "  &lt;payload&gt;\n";
+        let xml = format!(
+            "<x:EncryptionMethod xmlns:x='{XMLENC_NS}' xmlns:c='http://www.w3.org/2021/04/xmldsig-more#' Algorithm='http://www.w3.org/2021/04/xmldsig-more#chacha20poly1305'><c:Nonce> 000102030405060708090a0b </c:Nonce><c:AAD>{aad}</c:AAD></x:EncryptionMethod>"
+        );
+        let document = Document::parse(&xml).expect("AAD XML");
+        let parsed =
+            parse_encryption_method_with_limit(document.root_element(), 128).expect("bounded AAD");
+        let parameters = parsed.chacha.expect("ChaCha metadata");
+        assert_eq!(parameters.aad.as_deref(), Some("  <payload>\n"));
+        assert_eq!(
+            parameters.nonce,
+            Some([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+        );
+        let oversized = xml.replace(aad, &"a".repeat(129));
+        let document = Document::parse(&oversized).expect("oversized AAD XML");
+        assert!(matches!(
+            parse_encryption_method_with_limit(document.root_element(), 128),
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    maximum: 128,
+                    actual: 129,
+                    ..
+                }
+            ))
+        ));
+    }
 
     #[test]
     fn parses_supported_encrypted_data_and_normalizes_cipher_value() {

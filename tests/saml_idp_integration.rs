@@ -4,6 +4,8 @@
 //! Uses a donor SAML 2.0 IdP response fixture to ensure XMLDSig verification
 //! works against non-synthetic assertion payloads.
 
+#![cfg(feature = "xmldsig")]
+
 use xml_sec::xmldsig::{DsigStatus, FailureReason, verify_signature_with_pem_key};
 
 const IDP_RESPONSE_SIGNED_XML: &str =

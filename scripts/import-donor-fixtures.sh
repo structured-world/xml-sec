@@ -89,7 +89,24 @@ normalize_imported_snapshot() {
 }
 
 fixture_paths=("$@")
-if (( ${#fixture_paths[@]} == 0 )); then
+complete_xmlenc_import=false
+if [[ "${1:-}" == "--xmlenc-corpora" ]]; then
+  complete_xmlenc_import=true
+  if (( $# != 1 )); then
+    printf '%s\n' '--xmlenc-corpora accepts no additional paths' >&2
+    exit 1
+  fi
+  # Complete acceptance snapshots include all payloads and nested key material.
+  # Keep the existing staging and replacement path; do not curate XML vectors.
+  fixture_paths=(
+    "xmlenc/merlin-xmlenc-five"
+    "xmlenc/01-phaos-xmlenc-3"
+    "xmlenc/aleksey-xmlenc-01"
+    "xmlenc/keys/xdh"
+    "xmlenc/keys/ec"
+    "xmlenc/keys/dhx"
+  )
+elif (( ${#fixture_paths[@]} == 0 )); then
   fixture_paths=(
     "xmldsig/aleksey-xmldsig-01/enveloping-rsa-x509chain.xml"
     "xmldsig/aleksey-xmldsig-01/enveloped-x509-digest-sha256.xml"
@@ -206,3 +223,17 @@ for relative_path in "${fixture_paths[@]}"; do
     replace_target "$staging" "$target"
   fi
 done
+
+if [[ "$complete_xmlenc_import" == true ]]; then
+  # Pin every imported byte, including credentials/templates/plaintext. Keep
+  # this inventory outside the byte-for-byte donor directory snapshots.
+  checksum_manifest="$(mktemp "$fixture_root/xmlenc/.corpora.sha256.XXXXXX")"
+  if ! (
+    cd "$fixture_root"
+    find "${fixture_paths[@]}" -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256
+  ) > "$checksum_manifest"; then
+    rm -f "$checksum_manifest"
+    exit 1
+  fi
+  replace_target "$checksum_manifest" "$fixture_root/xmlenc/corpora.sha256"
+fi
