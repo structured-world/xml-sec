@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.22](https://github.com/structured-world/xml-sec/compare/v0.1.21...v0.1.22) - 2026-10-10
+
+### Performance
+
+- add reproducible security benchmarks ([#208](https://github.com/structured-world/xml-sec/pull/208))
+
 ## [0.1.21](https://github.com/structured-world/xml-sec/compare/v0.1.20...v0.1.21) - 2026-10-10
 
 ### Added
