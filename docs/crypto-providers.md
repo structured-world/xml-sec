@@ -171,6 +171,8 @@ permission. ChaCha20-Poly1305 provides authenticated decryption. The reader
 accepts both the unqualified parameters in RFC 9231 §§2.6.7-2.6.8 and the
 namespaced draft form; the writer emits the latter for compatibility with
 libxmlsec1 1.3.13, which does not accept the RFC example form.
+CLI encryption preserves a template's nonce in either accepted namespace form
+and adds a generated nonce only when the template does not contain one.
 AWS-LC FIPS and PKCS#11 do not advertise these mechanisms and never fall back
 to RustCrypto. The selected Camellia 0.2.1 implementation uses secret-indexed
 S-box lookups; it is not a constant-time or FIPS-approved implementation.

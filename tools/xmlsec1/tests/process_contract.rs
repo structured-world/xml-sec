@@ -6365,6 +6365,81 @@ fn named_direct_aes_key_extends_extension_only_key_info() {
 }
 
 #[test]
+fn chacha_cli_preserves_nonce_namespace_forms() {
+    // RFC 9231 nonce parameters and the namespaced donor form must survive
+    // template merging without a second nonce; absent nonces are generated.
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let template = temp.path().join("template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let encrypted = temp.path().join("encrypted.xml");
+    let key = temp.path().join("keys.xml");
+    fs::write(&plaintext, b"ChaCha template nonce round trip").expect("plaintext");
+    let encoded = base64::engine::general_purpose::STANDARD.encode([0x37; 32]);
+    fs::write(&key, format!("<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\"><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>content</KeyName><KeyValue><ChaCha20KeyValue xmlns=\"http://www.aleksey.com/xmlsec/2002\">{encoded}</ChaCha20KeyValue></KeyValue></KeyInfo></Keys>"))
+        .expect("key store");
+    for algorithm in ["chacha20", "chacha20poly1305"] {
+        let extra = if algorithm == "chacha20" {
+            "<Counter xmlns=\"\">01000000</Counter>"
+        } else {
+            "<AAD xmlns=\"\">authenticated template data</AAD>"
+        };
+        for nonce in [
+            "<Nonce xmlns=\"\">000102030405060708090a0b</Nonce>",
+            "<more:Nonce xmlns:more=\"http://www.w3.org/2021/04/xmldsig-more#\">000102030405060708090a0b</more:Nonce>",
+            "",
+        ] {
+            fs::write(
+                &template,
+                format!(
+                    "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\"><EncryptionMethod Algorithm=\"http://www.w3.org/2021/04/xmldsig-more#{algorithm}\">{nonce}{extra}</EncryptionMethod><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>content</KeyName></KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"
+                ),
+            )
+            .expect("template");
+            let output = Command::new(binary())
+                .args(["encrypt", "--keys-file"])
+                .arg(&key)
+                .arg("--binary-data")
+                .arg(&plaintext)
+                .arg("--output")
+                .arg(&encrypted)
+                .arg(&template)
+                .output()
+                .expect("encrypt");
+            assert!(
+                output.status.success(),
+                "{algorithm}, {nonce}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let xml = fs::read_to_string(&encrypted).expect("encrypted document");
+            let document = roxmltree::Document::parse(&xml).expect("parse encrypted document");
+            assert_eq!(
+                document
+                    .descendants()
+                    .filter(|node| { node.is_element() && node.tag_name().name() == "Nonce" })
+                    .count(),
+                1,
+                "{algorithm}, {nonce}"
+            );
+            if !nonce.is_empty() {
+                assert!(xml.contains(nonce), "original nonce must remain unchanged");
+            }
+            let output = Command::new(binary())
+                .args(["decrypt", "--keys-file"])
+                .arg(&key)
+                .arg(&encrypted)
+                .output()
+                .expect("decrypt");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout, b"ChaCha template nonce round trip");
+        }
+    }
+}
+
+#[test]
 fn encryption_rejects_invalid_content_encryption_method_structure() {
     // Encrypt must apply the same EncryptionMethod invariants as decrypt;
     // otherwise it can emit ciphertext that its reciprocal parser rejects.

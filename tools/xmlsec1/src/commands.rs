@@ -3571,8 +3571,17 @@ fn apply_encryption_template(
                     | "http://www.w3.org/2021/04/xmldsig-more#chacha20poly1305"
             )
         )
-        && direct_child_element(method, "http://www.w3.org/2021/04/xmldsig-more#", "Nonce")
-            .is_none()
+        // RFC 9231 sections 2.6.7-2.6.8 use unqualified Nonce elements; retain
+        // those and the namespaced donor form accepted by the core parser.
+        // https://www.rfc-editor.org/rfc/rfc9231.html#section-2.6.7
+        && !method.children().any(|child| {
+            child.is_element()
+                && child.tag_name().name() == "Nonce"
+                && matches!(
+                    child.tag_name().namespace(),
+                    None | Some("http://www.w3.org/2021/04/xmldsig-more#")
+                )
+        })
     {
         let generated_method = direct_child_element(generated_data, XMLENC_NS, "EncryptionMethod")
             .ok_or_else(|| CommandError::Encryption("generated ChaCha method is absent".into()))?;
