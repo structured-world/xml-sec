@@ -1181,11 +1181,25 @@ impl<'a> DecryptContext<'a> {
     }
 }
 
-/// Resolver for direct, pre-shared AES content keys.
+/// Resolver for direct, pre-shared AES content keys, zeroized on drop.
 #[derive(Clone)]
 pub struct SymmetricKeyDecryptor {
     key: Vec<u8>,
     kind: crate::key_manager::SymmetricKeyKind,
+}
+
+impl zeroize::Zeroize for SymmetricKeyDecryptor {
+    fn zeroize(&mut self) {
+        self.key.zeroize();
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for SymmetricKeyDecryptor {}
+
+impl Drop for SymmetricKeyDecryptor {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(self);
+    }
 }
 
 impl fmt::Debug for SymmetricKeyDecryptor {
@@ -1254,10 +1268,28 @@ pub struct PrivateKeyDecryptor {
 }
 
 /// Resolver backed by a pre-shared, algorithm-family-bound key-encryption key.
+/// Owned material is zeroized on drop; borrowed material remains caller-owned.
 #[derive(Clone)]
 pub struct KekDecryptor<'a> {
     kek: std::borrow::Cow<'a, [u8]>,
     kind: crate::key_manager::SymmetricKeyKind,
+}
+
+impl zeroize::Zeroize for KekDecryptor<'_> {
+    fn zeroize(&mut self) {
+        // Do not use Cow::to_mut: wiping must neither copy nor modify a borrow.
+        if let std::borrow::Cow::Owned(kek) = &mut self.kek {
+            kek.zeroize();
+        }
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for KekDecryptor<'_> {}
+
+impl Drop for KekDecryptor<'_> {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(self);
+    }
 }
 
 impl fmt::Debug for KekDecryptor<'_> {
@@ -2976,6 +3008,38 @@ fn map_data_decryption_error(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn owned_secret_wipe_reuses_storage_and_preserves_independent_clones() {
+        // Ownership transfer and wiping must not introduce an extra secret copy.
+        use zeroize::Zeroize;
+        let bytes = vec![0x63; 32];
+        let pointer = bytes.as_ptr();
+        let capacity = bytes.capacity();
+        let mut direct = super::SymmetricKeyDecryptor::new(bytes);
+        assert_eq!(direct.key.as_ptr(), pointer);
+        assert_eq!(direct.key.capacity(), capacity);
+        let clone = direct.clone();
+        direct.zeroize();
+        assert!(direct.key.is_empty());
+        assert_eq!(clone.key, [0x63; 32]);
+
+        let bytes = vec![0x74; 32];
+        let pointer = bytes.as_ptr();
+        let mut owned = super::KekDecryptor::new(bytes);
+        assert_eq!(owned.kek.as_ptr(), pointer);
+        let clone = owned.clone();
+        owned.zeroize();
+        assert!(matches!(&owned.kek, std::borrow::Cow::Owned(bytes) if bytes.is_empty()));
+        assert_eq!(clone.kek.as_ref(), &[0x74; 32]);
+
+        let bytes = [0x85; 32];
+        let mut borrowed = super::KekDecryptor::borrowed(&bytes);
+        borrowed.zeroize();
+        assert!(matches!(&borrowed.kek, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(borrowed.kek.as_ptr(), bytes.as_ptr());
+        assert_eq!(borrowed.kek.as_ref(), &bytes);
+    }
+
     #[test]
     fn raw_chacha_cannot_select_keys_or_confirm_kem_decapsulation() {
         // Successful stream decryption is not evidence that a key is correct.

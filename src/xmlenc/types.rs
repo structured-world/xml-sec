@@ -646,7 +646,7 @@ pub enum EncryptionRecipient {
     },
     /// Wrap the content key with a pre-shared AES KEK.
     AesKeyWrap {
-        /// AES key-encryption key.
+        /// AES key-encryption key, zeroized on drop (including cloned owners).
         kek: Vec<u8>,
         /// RFC 3394 key-wrap variant.
         algorithm: KeyWrapAlgorithm,
@@ -655,6 +655,22 @@ pub enum EncryptionRecipient {
         /// Optional key hint inside the encrypted key's `KeyInfo`.
         key_name: Option<String>,
     },
+}
+
+impl zeroize::Zeroize for EncryptionRecipient {
+    fn zeroize(&mut self) {
+        if let Self::AesKeyWrap { kek, .. } = self {
+            kek.zeroize();
+        }
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for EncryptionRecipient {}
+
+impl Drop for EncryptionRecipient {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(self);
+    }
 }
 
 impl fmt::Debug for EncryptionRecipient {

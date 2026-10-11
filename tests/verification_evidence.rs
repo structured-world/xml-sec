@@ -473,6 +473,73 @@ fn duplicate_document_ids_never_become_ambiguous_coverage_proofs() {
     }
 }
 
+#[test]
+fn wrapping_preserves_crypto_validity_but_cannot_authorize_the_decoy() {
+    // XMLDSig 1.1 §8.1.1: only what is signed is secure. Moving the authentic
+    // element under a wrapper must not authenticate a lookalike application
+    // target, even when both use the same element name.
+    // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-Secure
+    let secret = vec![0x38; 32];
+    let signer = HmacSigningKey::new(secret.clone()).unwrap();
+    let verifier = HmacVerificationKey::new(secret).unwrap();
+    let builder = SignatureBuilder::new(
+        C14nAlgorithm::new(C14nMode::Exclusive1_0, false),
+        SignatureAlgorithm::HmacSha256,
+    )
+    .add_reference(
+        ReferenceBuilder::new(DigestAlgorithm::Sha256)
+            .uri("#authentic")
+            .transform(Transform::C14n(C14nAlgorithm::new(
+                C14nMode::Exclusive1_0,
+                false,
+            ))),
+    );
+    let xml = SignContext::new(&signer)
+        .sign_with_builder(
+            "<root><payload ID=\"authentic\">signed</payload></root>",
+            &builder,
+        )
+        .unwrap();
+    let wrapped = xml.replace(
+        "<payload ID=\"authentic\">signed</payload>",
+        "<hidden><payload ID=\"authentic\">signed</payload></hidden><payload ID=\"decoy\">unsigned</payload>",
+    );
+    assert_ne!(wrapped, xml);
+    let backends = [
+        #[cfg(feature = "xml-backend-xmloxide")]
+        xml_sec::XmlBackend::Xmloxide,
+        #[cfg(feature = "xml-backend-roxmltree")]
+        xml_sec::XmlBackend::Roxmltree,
+        #[cfg(all(feature = "xml-backend-xmloxide", feature = "xml-backend-roxmltree"))]
+        xml_sec::XmlBackend::Differential,
+    ];
+    for backend in backends {
+        let document = XmlDocument::parse_with_backend(wrapped.clone(), backend).unwrap();
+        let (authentic, decoy) = document.with_view(|view| {
+            (
+                view.node_for_id("authentic", &[]).unwrap(),
+                view.node_for_id("decoy", &[]).unwrap(),
+            )
+        });
+        let targets = [decoy];
+        let evidence = VerifyContext::new()
+            .xml_backend(backend)
+            .key(&verifier)
+            .verify_request(
+                &document,
+                &VerificationRequest {
+                    expected_targets: &targets,
+                    ..VerificationRequest::default()
+                },
+            )
+            .unwrap();
+        assert!(evidence.all_valid());
+        assert!(evidence.covers_element(&document, authentic).unwrap());
+        assert!(!evidence.covers_element(&document, decoy).unwrap());
+        assert!(!evidence.accepted(&document).unwrap());
+    }
+}
+
 #[cfg(all(feature = "xml-backend-xmloxide", feature = "xml-backend-roxmltree"))]
 #[test]
 fn runtime_backend_matrix_preserves_identity_bound_coverage() {

@@ -103,9 +103,16 @@ impl RecoveredContentKey {
     }
 
     pub(crate) fn same_candidate(&self, other: &Self) -> bool {
+        use subtle::ConstantTimeEq;
+
         match (&self.opaque, &other.opaque) {
             (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
-            (None, None) => self.bytes == other.bytes && self.valid() == other.valid(),
+            // Width is public algorithm metadata; secret bytes and recovery
+            // validity must not select an early-exit comparison path.
+            (None, None) => bool::from(
+                self.bytes.as_slice().ct_eq(other.bytes.as_slice())
+                    & self.valid.unwrap_u8().ct_eq(&other.valid.unwrap_u8()),
+            ),
             _ => false,
         }
     }
@@ -199,6 +206,8 @@ impl RecoveredContentKey {
     }
     /// Consume a completed recovery outside a content operation. Content
     /// operations must retain the candidate until after primitive decryption.
+    /// The returned allocation is caller-owned; the caller is responsible for
+    /// zeroizing it when no longer needed (for example with `Zeroizing`).
     pub fn into_key(mut self) -> Result<Vec<u8>, ProviderError> {
         if self.opaque.is_some() {
             return Err(ProviderError::KeyNotExportable);
@@ -2821,6 +2830,31 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+
+    #[cfg(feature = "xmlenc")]
+    #[test]
+    fn recovered_candidate_equality_includes_every_byte_and_validity() {
+        // Deduplication must retain distinct candidates, including equal real/
+        // rejection bytes with different validity. Timing is ensured by ct_eq,
+        // not by a flaky wall-clock assertion.
+        let reference = RecoveredContentKey::confirmed(vec![0x52; 32]);
+        assert!(reference.same_candidate(&RecoveredContentKey::confirmed(vec![0x52; 32])));
+        for index in 0..32 {
+            let mut bytes = vec![0x52; 32];
+            bytes[index] ^= 1;
+            assert!(!reference.same_candidate(&RecoveredContentKey::confirmed(bytes)));
+        }
+        assert!(!reference.same_candidate(&RecoveredContentKey::confirmed(vec![0x52; 16])));
+        for left in [0, 1] {
+            for right in [0, 1] {
+                let mut a = RecoveredContentKey::confirmed(vec![0x52; 32]);
+                let mut b = RecoveredContentKey::confirmed(vec![0x52; 32]);
+                a.valid = subtle::Choice::from(left);
+                b.valid = subtle::Choice::from(right);
+                assert_eq!(a.same_candidate(&b), left == right);
+            }
+        }
+    }
 
     #[cfg(all(feature = "legacy-algorithms", feature = "xmlenc"))]
     #[test]

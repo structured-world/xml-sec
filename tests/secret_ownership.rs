@@ -17,7 +17,8 @@ fn secret_owners_have_a_drop_wipe_contract() {
 #[test]
 fn recipient_wipes_owned_material_without_wiping_its_clone() {
     // Each explicit clone owns an independent secret and must wipe independently.
-    let mut recipient = EncryptionRecipient::aes_key_wrap(vec![0x73; 32], KeyWrapAlgorithm::AesKw256);
+    let mut recipient =
+        EncryptionRecipient::aes_key_wrap(vec![0x73; 32], KeyWrapAlgorithm::AesKw256);
     let clone = recipient.clone();
     recipient.zeroize();
     let EncryptionRecipient::AesKeyWrap { kek, .. } = &recipient else {
