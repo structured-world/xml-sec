@@ -261,8 +261,10 @@ fn fixture_file_count_matches_expected() {
         ("saml", 2),
         // Complete Merlin, Phaos and Aleksey snapshots, plus shared XDH keys.
         // Agreement recipes additionally need all 66 EC and 12 DHX key files.
+        // Completing the 79-file XML Encryption 1.1 snapshot adds 70 files
+        // to the nine RSA files retained by the earlier subset.
         // The checksum manifest pins every imported file's contents.
-        ("xmlenc", 1002),
+        ("xmlenc", 1072),
     ];
 
     for (corpus, expected_count) in expected {

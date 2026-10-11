@@ -54,6 +54,8 @@ fn complete_xmlenc_import_preserves_every_corpus_file() {
         "merlin-xmlenc-five",
         "01-phaos-xmlenc-3",
         "aleksey-xmlenc-01",
+        "xmlenc11-interop-2012",
+        "nist-aesgcm",
         "keys/xdh",
         "keys/ec",
         "keys/dhx",

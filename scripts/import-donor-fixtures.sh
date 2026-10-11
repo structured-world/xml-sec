@@ -102,6 +102,8 @@ if [[ "${1:-}" == "--xmlenc-corpora" ]]; then
     "xmlenc/merlin-xmlenc-five"
     "xmlenc/01-phaos-xmlenc-3"
     "xmlenc/aleksey-xmlenc-01"
+    "xmlenc/xmlenc11-interop-2012"
+    "xmlenc/nist-aesgcm"
     "xmlenc/keys/xdh"
     "xmlenc/keys/ec"
     "xmlenc/keys/dhx"

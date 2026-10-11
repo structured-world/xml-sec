@@ -106,6 +106,10 @@ name = "cli_upstream_runner"
 path = "tools/xmlsec1/tests/upstream_runner.rs"
 required-features = ["xmldsig", "xmlenc", "c14n"]
 
+[[test]]
+name = "xmlenc11_corpus"
+required-features = ["xmlenc", "c14n", "legacy-algorithms"]
+
 [[example]]
 name = "encrypt"
 required-features = ["xmlenc"]
