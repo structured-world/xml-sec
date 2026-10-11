@@ -59,6 +59,39 @@ path = "tools/xmlsec1/src/main.rs"
 required-features = ["xmldsig", "xmlenc", "c14n"]
 
 [[test]]
+name = "xmlsec1_interop"
+path = "tests/xmlsec1_interop.rs"
+required-features = ["xmldsig", "c14n"]
+
+[[test]]
+name = "signing_digest"
+required-features = ["xmldsig", "c14n"]
+
+[[test]]
+name = "signature_pipeline_integration"
+required-features = ["xmldsig"]
+
+[[test]]
+name = "donor_negative_vectors"
+required-features = ["xmldsig"]
+
+[[test]]
+name = "xpath_transform_integration"
+required-features = ["xmldsig", "c14n"]
+
+[[test]]
+name = "base64_transform_integration"
+required-features = ["xmldsig", "c14n"]
+
+[[test]]
+name = "merlin_interop"
+required-features = ["xmldsig"]
+
+[[test]]
+name = "uri_integration"
+required-features = ["xmldsig", "c14n"]
+
+[[test]]
 name = "cli_import_snapshot"
 path = "tools/xmlsec1/tests/import_snapshot.rs"
 required-features = ["xmldsig", "xmlenc", "c14n"]

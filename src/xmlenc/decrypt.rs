@@ -2567,7 +2567,7 @@ fn validate_decryption_key_candidates(
         }
         .into());
     }
-    if actual > 1 && algorithm.cbc_block_len().is_some() {
+    if actual > 1 && !algorithm.is_authenticated() {
         return Err(XmlEncError::AmbiguousKeyCandidates { algorithm, actual });
     }
     Ok(())
@@ -2945,7 +2945,7 @@ fn map_data_decryption_error(
     use crate::provider::ProviderError;
 
     match error {
-        ProviderError::AuthenticationFailed if algorithm.cbc_block_len().is_none() => {
+        ProviderError::AuthenticationFailed if algorithm.is_authenticated() => {
             XmlEncError::AeadAuthenticationFailed
         }
         ProviderError::InvalidInput(crate::provider::ProviderInputError::AesGcmFraming)
@@ -2976,6 +2976,74 @@ fn map_data_decryption_error(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn raw_chacha_cannot_select_keys_or_confirm_kem_decapsulation() {
+        // Successful stream decryption is not evidence that a key is correct.
+        let algorithm = super::DataEncryptionAlgorithm::ChaCha20;
+        assert!(matches!(
+            super::validate_decryption_key_candidates(algorithm, 2),
+            Err(super::XmlEncError::AmbiguousKeyCandidates { actual: 2, .. })
+        ));
+        assert!(
+            crate::policy::KeyEstablishmentPolicy::default()
+                .check_kem_content(algorithm)
+                .is_err()
+        );
+        let externally_authenticated = crate::policy::KeyEstablishmentPolicy {
+            kem_content_authentication:
+                crate::policy::KemContentAuthentication::ExternalAuthenticated,
+            ..Default::default()
+        };
+        assert!(
+            externally_authenticated
+                .check_kem_content(algorithm)
+                .is_ok()
+        );
+        for authenticated in [
+            super::DataEncryptionAlgorithm::Aes128Gcm,
+            super::DataEncryptionAlgorithm::ChaCha20Poly1305,
+        ] {
+            assert!(super::validate_decryption_key_candidates(authenticated, 2).is_ok());
+            assert!(
+                crate::policy::KeyEstablishmentPolicy::default()
+                    .check_kem_content(authenticated)
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn raw_chacha_public_decryption_rejects_distinct_candidate_keys() {
+        // A wrong key still produces bytes: the public boundary must reject
+        // ambiguity rather than return the first candidate's arbitrary plaintext.
+        let algorithm = DataEncryptionAlgorithm::ChaCha20;
+        let encrypted = super::super::EncryptedDataBuilder::new(algorithm)
+            .policy(crate::policy::EncryptionPolicy {
+                data_algorithms: Some([algorithm].into()),
+                ..Default::default()
+            })
+            .chacha_parameters(super::super::ChaChaParameters {
+                nonce: Some([1; 12]),
+                counter: Some(1_u32.to_le_bytes()),
+                aad: None,
+            })
+            .direct_key([7; 32])
+            .encrypt_binary(b"payload")
+            .expect("explicitly permitted raw ChaCha encryption");
+        let resolver = CandidateResolver {
+            keys: vec![vec![1; 32], vec![7; 32]],
+        };
+        assert!(matches!(
+            DecryptContext::new(&resolver)
+                .policy(crate::policy::DecryptionPolicy {
+                    data_algorithms: Some([algorithm].into()),
+                    ..Default::default()
+                })
+                .decrypt(&encrypted.encrypted_data_xml),
+            Err(XmlEncError::AmbiguousKeyCandidates { actual: 2, .. })
+        ));
+    }
+
     #[test]
     fn typed_reference_association_obeys_id_semantics() {
         // A typed decryption input must not bypass the URI policy enforced by

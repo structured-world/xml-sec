@@ -161,7 +161,7 @@ impl KeyEstablishmentPolicy {
         // https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.203.pdf
         // XMLEnc 1.1 §6.1.1: https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-edata-attacks
         permission(
-            algorithm.cbc_block_len().is_none()
+            algorithm.is_authenticated()
                 || self.kem_content_authentication
                     == KemContentAuthentication::ExternalAuthenticated,
             "direct KEM content without external authentication",

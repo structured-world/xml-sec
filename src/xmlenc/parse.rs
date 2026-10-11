@@ -1636,9 +1636,13 @@ fn parse_encryption_method_with_limit(
                 mgf_algorithm = Some(mgf.to_owned());
             }
             (
-                Some("http://www.w3.org/2021/04/xmldsig-more#"),
+                None | Some("http://www.w3.org/2021/04/xmldsig-more#"),
                 name @ ("Nonce" | "Counter" | "AAD"),
             ) => {
+                // RFC 9231 §§2.6.7-2.6.8 uses unqualified parameters;
+                // libxmlsec1 1.3.13 uses the namespaced draft form. Both share
+                // validation, including duplicate detection across forms.
+                // https://www.rfc-editor.org/rfc/rfc9231.html#section-2.6.7
                 let parameters = chacha.get_or_insert_with(super::ChaChaParameters::default);
                 match name {
                     "Nonce" if parameters.nonce.is_none() => {
@@ -2158,6 +2162,48 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chacha_accepts_rfc9231_parameter_elements() {
+        // RFC 9231 §§2.6.7-2.6.8 examples use unqualified parameter children.
+        for (algorithm, tail) in [
+            ("chacha20", "<Counter>01000000</Counter>"),
+            ("chacha20poly1305", "<AAD>payload</AAD>"),
+        ] {
+            let xml = format!(
+                "<x:EncryptionMethod xmlns:x='{XMLENC_NS}' Algorithm='http://www.w3.org/2021/04/xmldsig-more#{algorithm}'><Nonce>000102030405060708090a0b</Nonce>{tail}</x:EncryptionMethod>"
+            );
+            let document = Document::parse(&xml).expect("RFC parameter XML");
+            let method = parse_encryption_method_with_limit(document.root_element(), 128)
+                .expect("RFC parameter grammar must be accepted");
+            assert_eq!(
+                method
+                    .chacha
+                    .as_ref()
+                    .expect("parsed ChaCha parameters")
+                    .nonce,
+                Some([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+            );
+        }
+    }
+
+    #[test]
+    fn chacha_namespace_aliases_do_not_bypass_duplicate_validation() {
+        // Aliases share one parameter state; foreign namespaces are not aliases.
+        for child in [
+            "<c:Nonce>000102030405060708090a0b</c:Nonce>",
+            "<foreign:AAD xmlns:foreign='urn:foreign'>payload</foreign:AAD>",
+        ] {
+            let xml = format!(
+                "<x:EncryptionMethod xmlns:x='{XMLENC_NS}' xmlns:c='http://www.w3.org/2021/04/xmldsig-more#' Algorithm='http://www.w3.org/2021/04/xmldsig-more#chacha20poly1305'><Nonce>000102030405060708090a0b</Nonce>{child}</x:EncryptionMethod>"
+            );
+            let document = Document::parse(&xml).expect("well-formed namespace regression XML");
+            assert!(matches!(
+                parse_encryption_method_with_limit(document.root_element(), 128),
+                Err(XmlEncError::InvalidStructure(_))
+            ));
+        }
+    }
 
     const DATA: &str = "<xenc:EncryptedData xmlns:xenc=\"http://www.w3.org/2001/04/xmlenc#\" Type=\"http://www.w3.org/2001/04/xmlenc#Element\"><xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><xenc:CipherData><xenc:CipherValue> YWJj\nZA== </xenc:CipherValue></xenc:CipherData></xenc:EncryptedData>";
 

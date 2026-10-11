@@ -1461,6 +1461,10 @@ fn write_encrypted_data<W: Write>(
     .chain(encrypted_type_uri.map(|value| ("Type", value)));
     write_start(writer, "xenc:EncryptedData", root_attributes)?;
     if let Some(parameters) = chacha {
+        // RFC 9231 §§2.6.7-2.6.8 examples have unqualified parameters.
+        // Emit the namespaced draft form for libxmlsec1 1.3.13 compatibility;
+        // our reader accepts both forms without changing their semantics.
+        // https://www.rfc-editor.org/rfc/rfc9231.html#section-2.6.7
         write_start(
             writer,
             "xenc:EncryptionMethod",

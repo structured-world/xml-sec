@@ -5,8 +5,6 @@
 //! metadata, so tests that exercise SignedInfo validation supply a caller key
 //! and deliberately bypass document KeyInfo resolution.
 
-#![cfg(feature = "xmldsig")]
-
 use std::path::Path;
 use std::time::{Duration, UNIX_EPOCH};
 

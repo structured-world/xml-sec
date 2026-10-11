@@ -51,13 +51,32 @@ pub enum DataEncryptionAlgorithm {
     Camellia192Cbc,
     /// Camellia CBC with a 256-bit key.
     Camellia256Cbc,
-    /// Draft XML-security ChaCha20 profile; unauthenticated and opt-in.
+    /// RFC 9231 ChaCha20 profile; unauthenticated and opt-in.
     ChaCha20,
     /// ChaCha20-Poly1305 with XML-carried nonce and optional AAD.
     ChaCha20Poly1305,
 }
 
 impl DataEncryptionAlgorithm {
+    /// Whether successful decryption cryptographically authenticates the key.
+    pub const fn is_authenticated(self) -> bool {
+        // RFC 9231 §§2.6.7-2.6.8 distinguishes the stream cipher from AEAD.
+        // https://www.rfc-editor.org/rfc/rfc9231.html#section-2.6.8
+        match self {
+            Self::Aes128Gcm | Self::Aes256Gcm | Self::ChaCha20Poly1305 => true,
+            #[cfg(feature = "legacy-algorithms")]
+            Self::Aes192Gcm => true,
+            Self::Aes128Cbc
+            | Self::Aes256Cbc
+            | Self::Camellia128Cbc
+            | Self::Camellia192Cbc
+            | Self::Camellia256Cbc
+            | Self::ChaCha20 => false,
+            #[cfg(feature = "legacy-algorithms")]
+            Self::TripleDesCbc | Self::Aes192Cbc => false,
+        }
+    }
+
     /// Key family required independently of the byte length (AES-192 and
     /// three-key Triple DES both use 24 bytes).
     pub const fn key_kind(self) -> crate::key_manager::SymmetricKeyKind {
@@ -808,7 +827,7 @@ pub struct EncryptionMethod {
     pub chacha: Option<ChaChaParameters>,
 }
 
-/// Request/wire data for the draft XML-security ChaCha profiles, not policy.
+/// Request/wire data for the RFC 9231 ChaCha profiles, not policy.
 /// A missing nonce is only allowed in an encryption template; decryption
 /// requires an explicit nonce, and encryption generates it through its provider.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1127,8 +1146,8 @@ pub enum XmlEncError {
     /// ciphertexts or make success/failure safe to expose to an attacker.
     #[error("invalid XMLEnc padding")]
     InvalidPadding,
-    /// GCM authentication failed.
-    #[error("AES-GCM authentication failed")]
+    /// Authenticated content decryption failed (GCM or ChaCha20-Poly1305).
+    #[error("AEAD authentication failed")]
     AeadAuthenticationFailed,
     /// A supplied content key is not the expected size.
     #[error("{algorithm:?} requires a {expected}-byte key, got {actual}")]

@@ -165,6 +165,12 @@ RustCrypto also provides Camellia-CBC and Camellia key wrap at 128/192/256
 bits, and ChaCha20/ChaCha20-Poly1305 with their transported nonce, counter
 and associated-data parameters. These algorithms require explicit typed
 operation-policy permission; they are not additions to the secure defaults.
+Raw ChaCha20 is unauthenticated and cannot select between distinct candidate
+keys. Direct KEM composition requires explicit external-authentication
+permission. ChaCha20-Poly1305 provides authenticated decryption. The reader
+accepts both the unqualified parameters in RFC 9231 §§2.6.7-2.6.8 and the
+namespaced draft form; the writer emits the latter for compatibility with
+libxmlsec1 1.3.13, which does not accept the RFC example form.
 AWS-LC FIPS and PKCS#11 do not advertise these mechanisms and never fall back
 to RustCrypto. The selected Camellia 0.2.1 implementation uses secret-indexed
 S-box lookups; it is not a constant-time or FIPS-approved implementation.

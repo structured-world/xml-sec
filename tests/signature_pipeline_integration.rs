@@ -3,8 +3,6 @@
 //! Verifies full XMLDSig verify pipeline:
 //! reference digest checks + SignedInfo canonicalization + SignatureValue verify.
 
-#![cfg(feature = "xmldsig")]
-
 use std::path::Path;
 
 use xml_sec::xmldsig::{DsigError, DsigStatus, FailureReason, verify_signature_with_pem_key};
