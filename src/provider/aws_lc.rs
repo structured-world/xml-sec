@@ -225,6 +225,13 @@ impl CryptoProvider for AwsLcFipsProvider {
         self.require_capability(ProviderCapability::Encrypt(algorithm))?;
         check_key(algorithm.key_len(), key)?;
         match algorithm {
+            DataEncryptionAlgorithm::Camellia128Cbc
+            | DataEncryptionAlgorithm::Camellia192Cbc
+            | DataEncryptionAlgorithm::Camellia256Cbc
+            | DataEncryptionAlgorithm::ChaCha20
+            | DataEncryptionAlgorithm::ChaCha20Poly1305 => {
+                Err(unsupported(ProviderCapability::Encrypt(algorithm)))
+            }
             #[cfg(feature = "legacy-algorithms")]
             DataEncryptionAlgorithm::TripleDesCbc
             | DataEncryptionAlgorithm::Aes192Cbc
@@ -285,6 +292,13 @@ impl CryptoProvider for AwsLcFipsProvider {
         self.require_capability(ProviderCapability::Decrypt(algorithm))?;
         check_key(algorithm.key_len(), key)?;
         match algorithm {
+            DataEncryptionAlgorithm::Camellia128Cbc
+            | DataEncryptionAlgorithm::Camellia192Cbc
+            | DataEncryptionAlgorithm::Camellia256Cbc
+            | DataEncryptionAlgorithm::ChaCha20
+            | DataEncryptionAlgorithm::ChaCha20Poly1305 => {
+                Err(unsupported(ProviderCapability::Decrypt(algorithm)))
+            }
             #[cfg(feature = "legacy-algorithms")]
             DataEncryptionAlgorithm::TripleDesCbc
             | DataEncryptionAlgorithm::Aes192Cbc
@@ -501,6 +515,12 @@ fn wrapping_key(
     kek: &[u8],
 ) -> Result<key_wrap::KeyEncryptionKey<key_wrap::AesBlockCipher>, ProviderError> {
     let cipher = match algorithm {
+        KeyWrapAlgorithm::CamelliaKw128
+        | KeyWrapAlgorithm::CamelliaKw192
+        | KeyWrapAlgorithm::CamelliaKw256
+        | KeyWrapAlgorithm::Cbc(_) => {
+            return Err(unsupported(ProviderCapability::KeyWrap(algorithm)));
+        }
         #[cfg(feature = "legacy-algorithms")]
         KeyWrapAlgorithm::AesKw192 | KeyWrapAlgorithm::TripleDes => {
             return Err(unsupported(ProviderCapability::KeyWrap(algorithm)));
@@ -846,6 +866,11 @@ fn oaep_algorithm(
         D::Sha256 => &OAEP_SHA256_MGF1SHA256,
         D::Sha384 => &OAEP_SHA384_MGF1SHA384,
         D::Sha512 => &OAEP_SHA512_MGF1SHA512,
+        // The selected native API exposes only these four paired hashes.
+        // Expanded RustCrypto capability must never trigger a software fallback.
+        D::Sha224 | D::Sha3_224 | D::Sha3_256 | D::Sha3_384 | D::Sha3_512 => return None,
+        #[cfg(feature = "legacy-algorithms")]
+        D::Md5 | D::Ripemd160 => return None,
     })
 }
 

@@ -39,6 +39,16 @@ The complete original license notices are preserved and distributed as
 src/rustcrypto_ml_dsa/LICENSE-APACHE and src/rustcrypto_ml_dsa/LICENSE-MIT.
 Local modifications are documented in docs/ml-dsa-patch.md.
 
+RustCrypto sha3 0.12.0 (src/rustcrypto_sha3/)
+--------------------------------------------
+
+Source: https://crates.io/crates/sha3/0.12.0
+License: Apache-2.0 OR MIT
+
+The complete original license notices are preserved and distributed as
+src/rustcrypto_sha3/LICENSE-APACHE and src/rustcrypto_sha3/LICENSE-MIT.
+Local modifications are documented in docs/sha3-patch.md.
+
 sxd-document (src/sxd_document/)
 --------------------------------
 

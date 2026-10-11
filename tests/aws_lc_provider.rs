@@ -5,6 +5,38 @@ use xml_sec::provider::{
 };
 use xml_sec::xmldsig::DigestAlgorithm;
 
+#[cfg(feature = "xmlenc")]
+#[test]
+fn expanded_oaep_digests_remain_explicitly_unavailable_to_aws() {
+    use xml_sec::xmlenc::{OaepDigestAlgorithm as D, RsaOaepParameters};
+    // RustCrypto capability does not extend the selected native provider.
+    // Both transport and recovery must refuse, not downgrade or fall back.
+    for digest in [
+        D::Sha224,
+        D::Sha3_224,
+        D::Sha3_256,
+        D::Sha3_384,
+        D::Sha3_512,
+        #[cfg(feature = "legacy-algorithms")]
+        D::Md5,
+        #[cfg(feature = "legacy-algorithms")]
+        D::Ripemd160,
+    ] {
+        let parameters = RsaOaepParameters::xmlenc11(digest, D::Sha256);
+        for capability in [
+            ProviderCapability::KeyTransport(&parameters),
+            ProviderCapability::KeyRecovery(&parameters),
+        ] {
+            assert!(RustCryptoProvider.supports(capability));
+            assert!(!AwsLcFipsProvider.supports(capability));
+            assert!(matches!(
+                AwsLcFipsProvider.require_capability(capability),
+                Err(xml_sec::provider::ProviderError::Unsupported { .. })
+            ));
+        }
+    }
+}
+
 #[test]
 fn rsa_verifier_size_limit_is_unsupported_not_signature_mismatch() {
     // A caller may allow 1024-bit RSA; native capability limits must still be

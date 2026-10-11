@@ -801,6 +801,71 @@ fn exhausted_unwrap_allowance_prevents_earlier_derivation() {
 }
 
 #[test]
+fn sha3_concat_padding_crossing_is_reserved_before_provider_work() {
+    // FIPS 202 sections 5.1/6.1: at the rate boundary, a partial
+    // octet plus SHA-3 domain/padding can require a second permutation.
+    // The policy must reject before invoking a provider, at all four rates.
+    for (digest, rate) in [
+        (DigestAlgorithm::Sha3_224, 144),
+        (DigestAlgorithm::Sha3_256, 136),
+        (DigestAlgorithm::Sha3_384, 104),
+        (DigestAlgorithm::Sha3_512, 72),
+    ] {
+        let secret = vec![0xa5; rate - 5];
+        let mut params = KdfParameters {
+            algorithm: KeyDerivationAlgorithm::ConcatKdf.uri(),
+            digest: Some(digest.uri()),
+            salt: &[],
+            info: KdfContext::Bits {
+                bytes: &[0xfe],
+                bit_len: 7,
+            },
+            iterations: 0,
+            output_len: 16,
+        };
+        let provider = RecordingProvider::new();
+        let mut policy = KeyEstablishmentPolicy {
+            digest_algorithms: Some(HashSet::from([digest])),
+            max_hash_blocks: 1,
+            ..KeyEstablishmentPolicy::default()
+        };
+        let mut budget = KeyEstablishmentBudget::new(&policy).unwrap();
+        assert!(matches!(
+            budget.derive_key(&provider, &params, &secret),
+            Err(XmlEncError::Policy(
+                xml_sec::policy::PolicyViolation::ResourceLimit {
+                    resource: "key establishment hash blocks",
+                    maximum: 1,
+                    actual: 2
+                }
+            ))
+        ));
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
+        policy.max_hash_blocks = 2;
+        let mut budget = KeyEstablishmentBudget::new(&policy).unwrap();
+        assert_eq!(
+            budget
+                .derive_key(&provider, &params, &secret)
+                .unwrap()
+                .len(),
+            16
+        );
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+        params.info = KdfContext::Octets(&[]);
+        policy.max_hash_blocks = 1;
+        let mut budget = KeyEstablishmentBudget::new(&policy).unwrap();
+        assert_eq!(
+            budget
+                .derive_key(&provider, &params, &secret)
+                .unwrap()
+                .len(),
+            16
+        );
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 2);
+    }
+}
+
+#[test]
 fn nested_resolver_calls_share_derivation_allowance() {
     // A resolver may recurse or retry, but forwarding the candidate budget
     // retains failed KDF reservations instead of silently starting a new budget.
@@ -946,6 +1011,73 @@ fn kdf_permission_gates_provider_work() {
         Err(XmlEncError::Policy(_))
     ));
     assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn x448_permission_and_secret_width_gate_agreement() {
+    use xml_sec::provider::{
+        KeyAgreementKey, KeyAgreementParameters, ProviderError, RustCryptoX448Key,
+    };
+    // An unapproved algorithm or a 55-byte secret reservation must never reach
+    // the private-key callback. X448 needs ZZ(56) plus the consuming key(16).
+    struct CountedX448 {
+        key: RustCryptoX448Key,
+        calls: AtomicUsize,
+    }
+    impl KeyAgreementKey for CountedX448 {
+        fn agree(&self, parameters: &KeyAgreementParameters<'_>) -> Result<Vec<u8>, ProviderError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.key.agree(parameters)
+        }
+    }
+    let private = CountedX448 {
+        key: RustCryptoX448Key::from_bytes([7; 56]),
+        calls: AtomicUsize::new(0),
+    };
+    let peer = RustCryptoX448Key::from_bytes([9; 56]).public_key();
+    let agreement = KeyAgreementParameters {
+        algorithm: KeyAgreementAlgorithm::X448.uri(),
+        peer_public_key: &peer,
+    };
+    let mut policy = xml_sec::policy::DecryptionPolicy::default();
+    let mut budget = xml_sec::xmlenc::KeyCandidateBudget::with_limit(20);
+    assert!(matches!(
+        budget.agree_and_derive(
+            &RUST_CRYPTO_PROVIDER,
+            &policy,
+            &private,
+            &agreement,
+            &parameters()
+        ),
+        Err(XmlEncError::Policy(_))
+    ));
+    assert_eq!(private.calls.load(Ordering::Relaxed), 0);
+    policy.key_establishment.agreement_algorithms =
+        Some(HashSet::from([KeyAgreementAlgorithm::X448]));
+    policy.key_establishment.max_owned_bytes = 71;
+    assert!(matches!(
+        budget.agree_and_derive(
+            &RUST_CRYPTO_PROVIDER,
+            &policy,
+            &private,
+            &agreement,
+            &parameters()
+        ),
+        Err(XmlEncError::Policy(_))
+    ));
+    assert_eq!(private.calls.load(Ordering::Relaxed), 0);
+    policy.key_establishment.max_owned_bytes = 72;
+    let key = budget
+        .agree_and_derive(
+            &RUST_CRYPTO_PROVIDER,
+            &policy,
+            &private,
+            &agreement,
+            &parameters(),
+        )
+        .unwrap();
+    assert_eq!(key.len(), 16);
+    assert_eq!(private.calls.load(Ordering::Relaxed), 1);
 }
 
 #[test]

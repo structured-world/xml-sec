@@ -28,6 +28,60 @@ fn expected() -> AgreementMethod {
 }
 
 #[test]
+fn x448_public_encryption_and_decryption_obey_typed_permission() {
+    use std::collections::HashSet;
+    use xml_sec::provider::RustCryptoX448Key;
+    // The actual XML pipeline must preserve X448 identity, enforce permission
+    // on both operations, and authenticate the result with AES-GCM.
+    let sender = RustCryptoX448Key::from_bytes([3; 56]);
+    let recipient = RustCryptoX448Key::from_bytes([5; 56]);
+    let sender_public = sender.public_key();
+    let mut encryption = xml_sec::policy::EncryptionPolicy::default();
+    encryption.key_establishment.agreement_algorithms =
+        Some(HashSet::from([KeyAgreementAlgorithm::X448]));
+    let wire = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .agreement_key(
+            method(),
+            Box::new(sender),
+            KeyAgreementAlgorithm::X448,
+            recipient.public_key().to_vec(),
+        )
+        .policy(encryption)
+        .encrypt_binary(b"X448 public pipeline")
+        .unwrap();
+    let descriptor = AgreementMethod {
+        algorithm: KeyAgreementAlgorithm::X448,
+        ..expected()
+    };
+    assert_eq!(
+        parse_encrypted_data(&wire.encrypted_data_xml)
+            .unwrap()
+            .agreement_methods,
+        vec![descriptor.clone()]
+    );
+    let resolver = AgreementDecryptor::content(
+        &descriptor,
+        &recipient,
+        &sender_public,
+        DataEncryptionAlgorithm::Aes128Gcm,
+    );
+    assert!(matches!(
+        DecryptContext::new(&resolver).decrypt(&wire.encrypted_data_xml),
+        Err(xml_sec::xmlenc::XmlEncError::Policy(_))
+    ));
+    let mut decryption = DecryptionPolicy::default();
+    decryption.key_establishment.agreement_algorithms =
+        Some(HashSet::from([KeyAgreementAlgorithm::X448]));
+    assert_eq!(
+        DecryptContext::new(&resolver)
+            .policy(decryption)
+            .decrypt(&wire.encrypted_data_xml)
+            .unwrap(),
+        DecryptedContent::Bytes(b"X448 public pipeline".to_vec())
+    );
+}
+
+#[test]
 fn ecdh_sender_is_single_use_across_builder_clones() {
     // A new ciphertext is a new message, even through a cloned builder;
     // XMLEnc ECDH-ES must not reuse its originator private key.

@@ -1,5 +1,7 @@
 //! OPC normalization must use the normative contract, not donor omissions.
 
+#![cfg(all(feature = "xmldsig", feature = "c14n"))]
+
 use xml_sec::Document;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::policy::{

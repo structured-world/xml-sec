@@ -137,6 +137,7 @@ impl KeyEstablishmentUsage {
         policy.check_agreement(mechanism)?;
         let width = match (mechanism, agreement.peer_public_key) {
             (KeyAgreementAlgorithm::X25519, bytes) if bytes.len() == 32 => 32,
+            (KeyAgreementAlgorithm::X448, bytes) if bytes.len() == 56 => 56,
             (KeyAgreementAlgorithm::EcdhEs, [4, tail @ ..])
                 if matches!(tail.len(), 64 | 96 | 132) =>
             {
@@ -293,14 +294,30 @@ fn preflight(
                 | DigestAlgorithm::Sha224
                 | DigestAlgorithm::Sha256
                 | DigestAlgorithm::Sha384
-                | DigestAlgorithm::Sha512),
+                | DigestAlgorithm::Sha512
+                | DigestAlgorithm::Sha3_224
+                | DigestAlgorithm::Sha3_256
+                | DigestAlgorithm::Sha3_384
+                | DigestAlgorithm::Sha3_512),
             ) => value,
+            #[cfg(feature = "legacy-algorithms")]
+            Some(value @ (DigestAlgorithm::Md5 | DigestAlgorithm::Ripemd160)) => value,
             _ => return Err(unsupported(uri)),
         },
     };
     let width = digest.output_len();
-    let block = if width <= 32 { 64u128 } else { 128 };
-    let padding = if width <= 32 { 9u128 } else { 17 };
+    // FIPS 202 §§5.1, 6.1: SHA-3's rate depends on output width, not
+    // SHA-2's 512/1024-bit compression blocks. Round partial octets upward;
+    // one extra octet bounds its domain and pad10*1, including a rate crossing.
+    // https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.202.pdf
+    let (block, padding) = match digest {
+        DigestAlgorithm::Sha3_224 => (144u128, 1u128),
+        DigestAlgorithm::Sha3_256 => (136, 1),
+        DigestAlgorithm::Sha3_384 => (104, 1),
+        DigestAlgorithm::Sha3_512 => (72, 1),
+        _ if width <= 32 => (64, 9),
+        _ => (128, 17),
+    };
     let hash = |bytes: u128| (bytes + padding).div_ceil(block);
     let hmac_key = |bytes: usize| {
         if bytes as u128 > block {

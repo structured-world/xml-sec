@@ -166,6 +166,10 @@ pub enum SymmetricKeyKind {
     Hmac,
     /// AES content-encryption key.
     Aes,
+    /// Camellia content-encryption or wrapping key.
+    Camellia,
+    /// ChaCha20 and ChaCha20-Poly1305 256-bit key material.
+    ChaCha20,
     /// Three-key TDEA key, available with `legacy-algorithms`.
     Des,
 }
@@ -173,18 +177,13 @@ pub enum SymmetricKeyKind {
 impl SymmetricKeyKind {
     /// Whether the compiled mechanism supports this content-key family.
     pub fn is_encryption_key(self) -> bool {
-        self == Self::Aes || (cfg!(feature = "legacy-algorithms") && self == Self::Des)
+        matches!(self, Self::Aes | Self::Camellia | Self::ChaCha20)
+            || (cfg!(feature = "legacy-algorithms") && self == Self::Des)
     }
 
     #[cfg(feature = "xmlenc")]
     fn accepts_algorithm(self, algorithm: crate::xmlenc::DataEncryptionAlgorithm) -> bool {
-        #[cfg(feature = "legacy-algorithms")]
-        if algorithm == crate::xmlenc::DataEncryptionAlgorithm::TripleDesCbc {
-            return self == Self::Des;
-        }
-        #[cfg(not(feature = "legacy-algorithms"))]
-        let _ = algorithm;
-        self == Self::Aes
+        self == algorithm.key_kind()
     }
 }
 
@@ -1273,13 +1272,17 @@ impl KeyInventory {
             ));
         }
         if bytes.is_empty()
-            || (kind == SymmetricKeyKind::Aes && !matches!(bytes.len(), 16 | 24 | 32))
+            || (matches!(kind, SymmetricKeyKind::Aes | SymmetricKeyKind::Camellia)
+                && !matches!(bytes.len(), 16 | 24 | 32))
+            || (kind == SymmetricKeyKind::ChaCha20 && bytes.len() != 32)
         {
             return Err(KeyStoreError::Selection("invalid symmetric key length"));
         }
         let permitted = match kind {
             SymmetricKeyKind::Hmac => KeyUsages::SIGN.union(KeyUsages::VERIFY),
-            SymmetricKeyKind::Aes => KeyUsages::ENCRYPT.union(KeyUsages::DECRYPT),
+            SymmetricKeyKind::Aes | SymmetricKeyKind::Camellia | SymmetricKeyKind::ChaCha20 => {
+                KeyUsages::ENCRYPT.union(KeyUsages::DECRYPT)
+            }
             SymmetricKeyKind::Des => des_key_usages(&bytes)?,
         };
         if usages.0 == 0 || usages.0 & !permitted.0 != 0 {
@@ -2251,6 +2254,10 @@ impl KeyInventory {
                         Some(SymmetricKeyKind::Hmac)
                     } else if key.has_tag_name((XMLSEC_NS, "AESKeyValue")) {
                         Some(SymmetricKeyKind::Aes)
+                    } else if key.has_tag_name((XMLSEC_NS, "CamelliaKeyValue")) {
+                        Some(SymmetricKeyKind::Camellia)
+                    } else if key.has_tag_name((XMLSEC_NS, "ChaCha20KeyValue")) {
+                        Some(SymmetricKeyKind::ChaCha20)
                     } else if key.has_tag_name((XMLSEC_NS, "DESKeyValue")) {
                         Some(SymmetricKeyKind::Des)
                     } else {
@@ -2305,12 +2312,25 @@ impl KeyInventory {
                     if bytes.is_empty() {
                         return Err(KeyStoreError::Invalid("empty symmetric key".into()));
                     }
-                    if kind == SymmetricKeyKind::Aes && !matches!(bytes.len(), 16 | 24 | 32) {
-                        return Err(KeyStoreError::Invalid("invalid AES key length".into()));
+                    if matches!(kind, SymmetricKeyKind::Aes | SymmetricKeyKind::Camellia)
+                        && !matches!(bytes.len(), 16 | 24 | 32)
+                    {
+                        return Err(KeyStoreError::Invalid(
+                            "invalid block-cipher key length".into(),
+                        ));
+                    }
+                    if kind == SymmetricKeyKind::ChaCha20 && bytes.len() != 32 {
+                        return Err(KeyStoreError::Invalid(
+                            "ChaCha20 requires a 256-bit key".into(),
+                        ));
                     }
                     let usages = match kind {
                         SymmetricKeyKind::Hmac => KeyUsages::SIGN.union(KeyUsages::VERIFY),
-                        SymmetricKeyKind::Aes => KeyUsages::ENCRYPT.union(KeyUsages::DECRYPT),
+                        SymmetricKeyKind::Aes
+                        | SymmetricKeyKind::Camellia
+                        | SymmetricKeyKind::ChaCha20 => {
+                            KeyUsages::ENCRYPT.union(KeyUsages::DECRYPT)
+                        }
                         SymmetricKeyKind::Des => des_key_usages(&bytes)?,
                     };
                     store.symmetric_keys.push(StoredSymmetricKey {
@@ -7944,6 +7964,7 @@ mod tests {
             recipient: None,
             key_name: None,
             encryption_method: EncryptionMethod {
+                chacha: None,
                 algorithm: KeyTransportAlgorithm::RsaOaep11.uri().into(),
                 key_size_bits: None,
                 oaep_digest: None,

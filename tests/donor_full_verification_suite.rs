@@ -1,5 +1,7 @@
 //! End-to-end verification for the supported Aleksey donor vectors.
 
+#![cfg(feature = "xmldsig")]
+
 use std::{
     path::{Path, PathBuf},
     time::{Duration, SystemTime},

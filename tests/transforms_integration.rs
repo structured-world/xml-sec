@@ -10,6 +10,8 @@
 //! - `NodeSet::exclude_subtree` (enveloped-signature)
 //! - `c14n::canonicalize` (C14N serializer)
 
+#![cfg(all(feature = "xmldsig", feature = "c14n"))]
+
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::xmldsig::NodeSet;
 use xml_sec::xmldsig::transforms::{Transform, execute_transforms, parse_transforms};

@@ -5,6 +5,7 @@
 //! padding module is adapted here, as with the fixed-width recovery patch.
 
 use crate::rsa_encoding::RsaPublicKeyEncoding as _;
+use crate::rustcrypto_sha3 as sha3;
 use crypto_bigint::BoxedUint;
 use der::{Decode as _, Reader as _, Tagged as _};
 use rsa::{RsaPrivateKey, RsaPublicKey, traits::PublicKeyParts};

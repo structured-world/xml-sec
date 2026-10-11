@@ -339,6 +339,50 @@ fn concat_kdf_rejects_malformed_bit_strings_and_unrelated_parameters() {
     );
 }
 
+#[cfg(feature = "legacy-algorithms")]
+#[test]
+fn legacy_concat_hashes_match_independent_digest_at_block_boundaries() {
+    use sha2::Digest;
+    // Legacy digest permission is separate from primitive support. Compare
+    // complete multi-block output against the byte-oriented RustCrypto API;
+    // boundary lengths catch applying big-endian SHA framing to MD5/RIPEMD.
+    macro_rules! check {
+        ($digest:ty, $uri:expr) => {
+            for length in [0, 1, 45, 46, 47, 53, 54, 55, 56, 63, 64, 129] {
+                let info = vec![0xa5; length];
+                let parameters = KdfParameters {
+                    algorithm: "http://www.w3.org/2009/xmlenc11#ConcatKDF",
+                    digest: Some($uri),
+                    salt: &[],
+                    info: KdfContext::Octets(&info),
+                    iterations: 0,
+                    output_len: 37,
+                };
+                let mut expected = Vec::new();
+                for counter in [1_u32, 2, 3] {
+                    let mut digest = <$digest>::new();
+                    digest.update(counter.to_be_bytes());
+                    digest.update(b"secret");
+                    digest.update(&info);
+                    expected.extend_from_slice(&digest.finalize());
+                }
+                expected.truncate(37);
+                assert_eq!(
+                    RUST_CRYPTO_PROVIDER
+                        .derive_key(&parameters, b"secret")
+                        .unwrap(),
+                    expected
+                );
+            }
+        };
+    }
+    check!(md5::Md5, "http://www.w3.org/2001/04/xmldsig-more#md5");
+    check!(
+        ripemd::Ripemd160,
+        "http://www.w3.org/2001/04/xmlenc#ripemd160"
+    );
+}
+
 #[test]
 fn agreement_primitives_compose_with_xmlenc_key_wrap_and_authenticated_content() {
     use xml_sec::provider::{EcdhCurve, KeyAgreementKey, RustCryptoEcdhKey};
@@ -648,4 +692,146 @@ fn x25519_rejects_noncontributory_and_wrong_width_peers() {
         };
         assert!(RUST_CRYPTO_PROVIDER.agree_key(&key, &parameters).is_err());
     }
+}
+
+#[test]
+fn x448_matches_rfc7748_alice_bob() {
+    use xml_sec::provider::RustCryptoX448Key;
+    // RFC 7748 section 6.2 checks both public encodings and the shared secret.
+    let alice = RustCryptoX448Key::from_bytes(
+        hex(concat!(
+            "9a8f4925d1519f5775cf46b04b5800d4ee9ee8bae8bc5565d498c28d",
+            "d9c9baf574a9419744897391006382a6f127ab1d9ac2d8c0a598726b"
+        ))
+        .try_into()
+        .unwrap(),
+    );
+    let bob = RustCryptoX448Key::from_bytes(
+        hex(concat!(
+            "1c306a7ac2a0e2e0990b294470cba339e6453772b075811d8fad0d1d",
+            "6927c120bb5ee8972b0d3e21374c9c921b09d1b0366f10b65173992d"
+        ))
+        .try_into()
+        .unwrap(),
+    );
+    assert_eq!(
+        alice.public_key().as_slice(),
+        hex(concat!(
+            "9b08f7cc31b7e3e67d22d5aea121074a273bd2b83de09c63faa73d2c",
+            "22c5d9bbc836647241d953d40c5b12da88120d53177f80e532c41fa0"
+        ))
+    );
+    assert_eq!(
+        bob.public_key().as_slice(),
+        hex(concat!(
+            "3eb7a829b0cd20f5bcfc0b599b6feccf6da4627107bdb0d4f345b430",
+            "27d8b972fc3e34fb4232a13ca706dcb57aec3dae07bdc1c67bf33609"
+        ))
+    );
+    let expected = hex(concat!(
+        "07fff4181ac6cc95ec1c16a94a0f74d12da232ce40a77552281d282b",
+        "b60c0b56fd2464c335543936521c24403085d59a449a5037514a879d"
+    ));
+    for (key, peer) in [(&alice, bob.public_key()), (&bob, alice.public_key())] {
+        assert_eq!(
+            RUST_CRYPTO_PROVIDER
+                .agree_key(
+                    key,
+                    &KeyAgreementParameters {
+                        algorithm: "http://www.w3.org/2021/04/xmldsig-more#x448",
+                        peer_public_key: &peer,
+                    }
+                )
+                .unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn x448_reduces_noncanonical_peers_and_rejects_zero_secrets() {
+    use xml_sec::provider::{ProviderError, RustCryptoX448Key};
+    // RFC 7748 section 5: p + 5 and 5 encode the same field element.
+    let key = RustCryptoX448Key::from_bytes([7; 56]);
+    let mut base = [0; 56];
+    base[0] = 5;
+    let mut equivalent = [0; 56];
+    equivalent[0] = 4;
+    equivalent[28..].fill(0xff);
+    let agree = |peer: &[u8]| {
+        RUST_CRYPTO_PROVIDER.agree_key(
+            &key,
+            &KeyAgreementParameters {
+                algorithm: "http://www.w3.org/2021/04/xmldsig-more#x448",
+                peer_public_key: peer,
+            },
+        )
+    };
+    assert_eq!(agree(&base).unwrap(), agree(&equivalent).unwrap());
+    // Contributory agreement is a product requirement, permitted by section 6.2.
+    let mut p = [0xff; 56];
+    p[28] = 0xfe;
+    let mut one = [0; 56];
+    one[0] = 1;
+    for peer in [[0; 56], one, p] {
+        assert!(matches!(
+            agree(&peer),
+            Err(ProviderError::AuthenticationFailed)
+        ));
+    }
+    for peer in [&[0; 55][..], &[0; 57][..]] {
+        assert!(matches!(
+            agree(peer),
+            Err(ProviderError::InvalidKeySize { expected: 56, .. })
+        ));
+    }
+}
+
+#[test]
+fn x448_pkcs8_import_checks_oid_wrapping_and_public_identity() {
+    use der::{
+        Encode,
+        asn1::{BitStringRef, OctetStringRef},
+    };
+    use pkcs8::{AlgorithmIdentifierRef, ObjectIdentifier, PrivateKeyInfoRef};
+    use xml_sec::provider::RustCryptoX448Key;
+    // RFC 8410 sections 3 and 7 require absent parameters and a nested
+    // CurvePrivateKey OCTET STRING. A supplied public key must match the scalar.
+    let scalar = [7; 56];
+    let raw_key = RustCryptoX448Key::from_bytes(scalar);
+    let nested = OctetStringRef::new(&scalar).unwrap().to_der().unwrap();
+    let mut info = PrivateKeyInfoRef::new(
+        AlgorithmIdentifierRef {
+            oid: ObjectIdentifier::new_unwrap("1.3.101.111"),
+            parameters: None,
+        },
+        OctetStringRef::new(&nested).unwrap(),
+    );
+    assert_eq!(
+        RustCryptoX448Key::from_pkcs8_der(&info.to_der().unwrap())
+            .unwrap()
+            .public_key(),
+        raw_key.public_key()
+    );
+    let public = raw_key.public_key();
+    info.public_key = Some(BitStringRef::from_bytes(&public).unwrap());
+    assert_eq!(
+        RustCryptoX448Key::from_pkcs8_der(&info.to_der().unwrap())
+            .unwrap()
+            .public_key(),
+        public
+    );
+    let mut wrong_public = public;
+    wrong_public[0] ^= 1;
+    info.public_key = Some(BitStringRef::from_bytes(&wrong_public).unwrap());
+    assert!(RustCryptoX448Key::from_pkcs8_der(&info.to_der().unwrap()).is_err());
+    info.public_key = None;
+    info.algorithm.parameters = Some(der::asn1::AnyRef::NULL);
+    assert!(RustCryptoX448Key::from_pkcs8_der(&info.to_der().unwrap()).is_err());
+    info.algorithm.parameters = None;
+    info.algorithm.oid = ObjectIdentifier::new_unwrap("1.3.101.110");
+    assert!(RustCryptoX448Key::from_pkcs8_der(&info.to_der().unwrap()).is_err());
+    info.algorithm.oid = ObjectIdentifier::new_unwrap("1.3.101.111");
+    info.private_key = OctetStringRef::new(&scalar).unwrap();
+    assert!(RustCryptoX448Key::from_pkcs8_der(&info.to_der().unwrap()).is_err());
 }

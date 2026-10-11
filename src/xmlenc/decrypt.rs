@@ -619,9 +619,12 @@ impl DecryptionKeyResolver for OpaqueKekDecryptor {
         provider.require_capability(crate::provider::ProviderCapability::KeyUnwrap(wrap))?;
         budget.consume(1)?;
         let wrapped = encrypted_key.cipher_data.octets()?;
-        if wrapped.len() != algorithm.key_len() + wrap.overhead() {
+        let expected = wrap
+            .wrapped_len(algorithm.key_len())
+            .ok_or_else(|| XmlEncError::UnsupportedAlgorithm(wrap.uri().into()))?;
+        if wrapped.len() != expected {
             return Err(XmlEncError::InvalidWrappedKeyLength {
-                expected: algorithm.key_len() + wrap.overhead(),
+                expected,
                 actual: wrapped.len(),
             });
         }
@@ -971,6 +974,18 @@ impl<'a> DecryptContext<'a> {
                 operation.policy().resources.max_encryption_plaintext_bytes,
                 operation.policy().resources.max_xml_document_bytes,
             )?;
+            if matches!(
+                algorithm,
+                DataEncryptionAlgorithm::ChaCha20 | DataEncryptionAlgorithm::ChaCha20Poly1305
+            ) && encrypted
+                .encryption_method
+                .chacha
+                .as_ref()
+                .and_then(|parameters| parameters.nonce)
+                .is_none()
+            {
+                return Err(XmlEncError::MissingRequired("ChaCha Nonce"));
+            }
             let bound_references = source_document
                 .as_ref()
                 .map(|(document, _)| reference_context.bind_document(document));
@@ -1052,7 +1067,16 @@ impl<'a> DecryptContext<'a> {
             for key in keys {
                 let attempt = (|| {
                     validate_content_key_len(algorithm, key.key_len())?;
-                    let result = key.decrypt(self.provider, algorithm, &ciphertext);
+                    let result = key.decrypt(
+                        self.provider,
+                        algorithm,
+                        &ciphertext,
+                        encrypted
+                            .encryption_method
+                            .chacha
+                            .as_ref()
+                            .map(super::ChaChaParameters::borrowed),
+                    );
                     // XMLEnc 1.1 §6.1.2: fallback recovery must still perform
                     // content work. Never release a CBC result merely because
                     // its unauthenticated padding happened to be valid.
@@ -1374,7 +1398,9 @@ impl KekDecryptor<'_> {
                 actual: self.kek.len(),
             });
         }
-        let expected_wrapped_len = output_len + wrap_algorithm.overhead();
+        let expected_wrapped_len = wrap_algorithm
+            .wrapped_len(output_len)
+            .ok_or_else(|| XmlEncError::UnsupportedAlgorithm(wrap_algorithm.uri().into()))?;
         if wrapped.len() != expected_wrapped_len {
             return Err(XmlEncError::InvalidWrappedKeyLength {
                 expected: expected_wrapped_len,
@@ -2063,7 +2089,9 @@ fn resolve_nested_key(
     let wrap = KeyWrapAlgorithm::from_uri(&key.encryption_method.algorithm)?;
     provider.require_capability(crate::provider::ProviderCapability::KeyUnwrap(wrap))?;
     let ciphertext = key.cipher_data.octets()?;
-    let expected = output_len + wrap.overhead();
+    let expected = wrap
+        .wrapped_len(output_len)
+        .ok_or_else(|| XmlEncError::UnsupportedAlgorithm(wrap.uri().into()))?;
     if ciphertext.len() != expected {
         return Err(XmlEncError::InvalidWrappedKeyLength {
             expected,
@@ -2539,7 +2567,7 @@ fn validate_decryption_key_candidates(
         }
         .into());
     }
-    if actual > 1 && algorithm.cbc_block_len().is_some() {
+    if actual > 1 && !algorithm.is_authenticated() {
         return Err(XmlEncError::AmbiguousKeyCandidates { algorithm, actual });
     }
     Ok(())
@@ -2588,10 +2616,26 @@ pub(super) fn validate_key_encryption_method_policy(
                 method
                     .mgf_algorithm
                     .as_deref()
-                    .unwrap_or(mgf_digest.mgf_uri()),
+                    .unwrap_or(mgf_digest.mgf_uri().ok_or_else(|| {
+                        XmlEncError::InvalidStructure(
+                            "OAEP mask digest has no XML Encryption identifier".into(),
+                        )
+                    })?),
             ),
         ];
         for (selected, wire_uri) in selected_algorithms {
+            if selected.requires_explicit_permission()
+                && !policy
+                    .oaep_digests
+                    .as_ref()
+                    .is_some_and(|allowed| allowed.contains(&selected))
+            {
+                return Err(crate::policy::PolicyViolation::Algorithm {
+                    operation: "decryption",
+                    algorithm: wire_uri.to_owned(),
+                }
+                .into());
+            }
             if policy
                 .oaep_digests
                 .as_ref()
@@ -2901,7 +2945,7 @@ fn map_data_decryption_error(
     use crate::provider::ProviderError;
 
     match error {
-        ProviderError::AuthenticationFailed if algorithm.cbc_block_len().is_none() => {
+        ProviderError::AuthenticationFailed if algorithm.is_authenticated() => {
             XmlEncError::AeadAuthenticationFailed
         }
         ProviderError::InvalidInput(crate::provider::ProviderInputError::AesGcmFraming)
@@ -2932,6 +2976,74 @@ fn map_data_decryption_error(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn raw_chacha_cannot_select_keys_or_confirm_kem_decapsulation() {
+        // Successful stream decryption is not evidence that a key is correct.
+        let algorithm = super::DataEncryptionAlgorithm::ChaCha20;
+        assert!(matches!(
+            super::validate_decryption_key_candidates(algorithm, 2),
+            Err(super::XmlEncError::AmbiguousKeyCandidates { actual: 2, .. })
+        ));
+        assert!(
+            crate::policy::KeyEstablishmentPolicy::default()
+                .check_kem_content(algorithm)
+                .is_err()
+        );
+        let externally_authenticated = crate::policy::KeyEstablishmentPolicy {
+            kem_content_authentication:
+                crate::policy::KemContentAuthentication::ExternalAuthenticated,
+            ..Default::default()
+        };
+        assert!(
+            externally_authenticated
+                .check_kem_content(algorithm)
+                .is_ok()
+        );
+        for authenticated in [
+            super::DataEncryptionAlgorithm::Aes128Gcm,
+            super::DataEncryptionAlgorithm::ChaCha20Poly1305,
+        ] {
+            assert!(super::validate_decryption_key_candidates(authenticated, 2).is_ok());
+            assert!(
+                crate::policy::KeyEstablishmentPolicy::default()
+                    .check_kem_content(authenticated)
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn raw_chacha_public_decryption_rejects_distinct_candidate_keys() {
+        // A wrong key still produces bytes: the public boundary must reject
+        // ambiguity rather than return the first candidate's arbitrary plaintext.
+        let algorithm = DataEncryptionAlgorithm::ChaCha20;
+        let encrypted = super::super::EncryptedDataBuilder::new(algorithm)
+            .policy(crate::policy::EncryptionPolicy {
+                data_algorithms: Some([algorithm].into()),
+                ..Default::default()
+            })
+            .chacha_parameters(super::super::ChaChaParameters {
+                nonce: Some([1; 12]),
+                counter: Some(1_u32.to_le_bytes()),
+                aad: None,
+            })
+            .direct_key([7; 32])
+            .encrypt_binary(b"payload")
+            .expect("explicitly permitted raw ChaCha encryption");
+        let resolver = CandidateResolver {
+            keys: vec![vec![1; 32], vec![7; 32]],
+        };
+        assert!(matches!(
+            DecryptContext::new(&resolver)
+                .policy(crate::policy::DecryptionPolicy {
+                    data_algorithms: Some([algorithm].into()),
+                    ..Default::default()
+                })
+                .decrypt(&encrypted.encrypted_data_xml),
+            Err(XmlEncError::AmbiguousKeyCandidates { actual: 2, .. })
+        ));
+    }
+
     #[test]
     fn typed_reference_association_obeys_id_semantics() {
         // A typed decryption input must not bypass the URI policy enforced by
@@ -3379,6 +3491,7 @@ mod tests {
             recipient: None,
             key_name: None,
             encryption_method: EncryptionMethod {
+                chacha: None,
                 algorithm: KeyTransportAlgorithm::RsaOaep11.uri().into(),
                 key_size_bits: None,
                 oaep_digest: None,
@@ -3408,6 +3521,7 @@ mod tests {
             agreement_methods: Vec::new(),
             encrypted_type: None,
             encryption_method: EncryptionMethod {
+                chacha: None,
                 algorithm: DataEncryptionAlgorithm::Aes128Gcm.uri().into(),
                 key_size_bits: None,
                 oaep_digest: None,
@@ -3750,6 +3864,7 @@ mod tests {
             agreement_methods: Vec::new(),
             encrypted_type: None,
             encryption_method: EncryptionMethod {
+                chacha: None,
                 algorithm: DataEncryptionAlgorithm::Aes128Gcm.uri().into(),
                 key_size_bits: None,
                 oaep_digest: None,
@@ -3794,6 +3909,7 @@ mod tests {
             agreement_methods: Vec::new(),
             encrypted_type: None,
             encryption_method: EncryptionMethod {
+                chacha: None,
                 algorithm: DataEncryptionAlgorithm::Aes128Gcm.uri().into(),
                 key_size_bits: None,
                 oaep_digest: None,
@@ -3853,6 +3969,7 @@ mod tests {
             agreement_methods: Vec::new(),
             encrypted_type: None,
             encryption_method: EncryptionMethod {
+                chacha: None,
                 algorithm: DataEncryptionAlgorithm::Aes128Cbc.uri().into(),
                 key_size_bits: None,
                 oaep_digest: None,
@@ -3902,6 +4019,7 @@ mod tests {
             agreement_methods: Vec::new(),
             encrypted_type: None,
             encryption_method: EncryptionMethod {
+                chacha: None,
                 algorithm: DataEncryptionAlgorithm::Aes128Cbc.uri().into(),
                 key_size_bits: None,
                 oaep_digest: None,
@@ -3945,6 +4063,7 @@ mod tests {
             agreement_methods: Vec::new(),
             encrypted_type: None,
             encryption_method: EncryptionMethod {
+                chacha: None,
                 algorithm: DataEncryptionAlgorithm::Aes128Gcm.uri().into(),
                 key_size_bits: None,
                 oaep_digest: None,
@@ -3987,6 +4106,7 @@ mod tests {
             agreement_methods: Vec::new(),
             encrypted_type: None,
             encryption_method: EncryptionMethod {
+                chacha: None,
                 algorithm: DataEncryptionAlgorithm::Aes128Gcm.uri().into(),
                 key_size_bits: None,
                 oaep_digest: None,
@@ -4216,6 +4336,7 @@ mod tests {
             agreement_methods: Vec::new(),
             encrypted_type: None,
             encryption_method: EncryptionMethod {
+                chacha: None,
                 algorithm: DataEncryptionAlgorithm::Aes128Cbc.uri().into(),
                 key_size_bits: None,
                 oaep_digest: None,
@@ -4321,6 +4442,7 @@ mod tests {
             recipient: Some("other-recipient".into()),
             key_name: None,
             encryption_method: super::super::EncryptionMethod {
+                chacha: None,
                 algorithm: "urn:unrelated:key-transport".into(),
                 key_size_bits: None,
                 oaep_digest: None,
@@ -4453,6 +4575,7 @@ mod tests {
             recipient: None,
             key_name: None,
             encryption_method: super::super::EncryptionMethod {
+                chacha: None,
                 algorithm: "http://www.w3.org/2001/04/xmlenc#kw-aes128".into(),
                 key_size_bits: None,
                 oaep_digest: None,
@@ -4485,6 +4608,7 @@ mod tests {
             recipient: None,
             key_name: None,
             encryption_method: super::super::EncryptionMethod {
+                chacha: None,
                 algorithm: KeyWrapAlgorithm::AesKw128.uri().into(),
                 key_size_bits: None,
                 oaep_digest: None,
@@ -4535,6 +4659,7 @@ mod tests {
                 encrypted_type: None,
                 key_name: None,
                 encryption_method: super::super::EncryptionMethod {
+                    chacha: None,
                     algorithm: algorithm.uri().into(),
                     key_size_bits: None,
                     oaep_digest: None,
@@ -4582,6 +4707,7 @@ mod tests {
                 encrypted_type: None,
                 key_name: None,
                 encryption_method: super::super::EncryptionMethod {
+                    chacha: None,
                     algorithm: algorithm.uri().into(),
                     key_size_bits: None,
                     oaep_digest: None,
@@ -4634,6 +4760,7 @@ mod tests {
                 recipient: None,
                 key_name: None,
                 encryption_method: super::super::EncryptionMethod {
+                    chacha: None,
                     algorithm: KeyWrapAlgorithm::AesKw128.uri().into(),
                     key_size_bits: None,
                     oaep_digest: None,
@@ -4786,10 +4913,16 @@ mod tests {
             recipient: None,
             key_name: None,
             encryption_method: super::super::EncryptionMethod {
+                chacha: None,
                 algorithm: KeyTransportAlgorithm::RsaOaep11.uri().into(),
                 key_size_bits: None,
                 oaep_digest: Some(OaepDigestAlgorithm::Sha256.uri().into()),
-                mgf_algorithm: Some(OaepDigestAlgorithm::Sha256.mgf_uri().into()),
+                mgf_algorithm: Some(
+                    OaepDigestAlgorithm::Sha256
+                        .mgf_uri()
+                        .expect("MGF1-SHA256 URI")
+                        .into(),
+                ),
                 oaep_params: None,
             },
             cipher_data: super::super::CipherData::Value {
@@ -4834,6 +4967,7 @@ mod tests {
             encrypted_type: None,
             key_name: None,
             encryption_method: super::super::EncryptionMethod {
+                chacha: None,
                 algorithm: DataEncryptionAlgorithm::Aes128Gcm.uri().into(),
                 key_size_bits: None,
                 oaep_digest: None,
@@ -4859,6 +4993,7 @@ mod tests {
             recipient: None,
             key_name: None,
             encryption_method: super::super::EncryptionMethod {
+                chacha: None,
                 algorithm: "http://www.w3.org/2001/04/xmlenc#kw-aes128".into(),
                 key_size_bits: None,
                 oaep_digest: None,
@@ -4916,6 +5051,7 @@ mod tests {
             recipient: Some("recipient-a".into()),
             key_name: None,
             encryption_method: super::super::EncryptionMethod {
+                chacha: None,
                 algorithm: "http://www.w3.org/2009/xmlenc11#rsa-oaep".into(),
                 key_size_bits: None,
                 oaep_digest: Some("http://www.w3.org/2001/04/xmlenc#sha256".into()),
@@ -4960,6 +5096,7 @@ mod tests {
             recipient: None,
             key_name: None,
             encryption_method: super::super::EncryptionMethod {
+                chacha: None,
                 algorithm: "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p".into(),
                 key_size_bits: None,
                 oaep_digest: Some("http://www.w3.org/2001/04/xmlenc#sha256".into()),
@@ -5014,6 +5151,7 @@ mod tests {
                 recipient: None,
                 key_name: None,
                 encryption_method: super::super::EncryptionMethod {
+                    chacha: None,
                     algorithm: algorithm.into(),
                     key_size_bits: None,
                     oaep_digest: Some(digest.into()),
@@ -5051,6 +5189,7 @@ mod tests {
             recipient: None,
             key_name: None,
             encryption_method: super::super::EncryptionMethod {
+                chacha: None,
                 algorithm: "http://www.w3.org/2009/xmlenc11#rsa-oaep".into(),
                 key_size_bits: None,
                 oaep_digest: Some("urn:unsupported:digest".into()),
@@ -5086,10 +5225,16 @@ mod tests {
             sources: Default::default(),
             key_name: None,
             encryption_method: super::super::EncryptionMethod {
+                chacha: None,
                 algorithm: KeyTransportAlgorithm::RsaOaepMgf1p.uri().into(),
                 key_size_bits: None,
                 oaep_digest: Some(OaepDigestAlgorithm::Sha256.uri().into()),
-                mgf_algorithm: Some(OaepDigestAlgorithm::Sha384.mgf_uri().into()),
+                mgf_algorithm: Some(
+                    OaepDigestAlgorithm::Sha384
+                        .mgf_uri()
+                        .expect("MGF1-SHA384 URI")
+                        .into(),
+                ),
                 oaep_params: None,
             },
             cipher_data: super::super::CipherData::Value {
@@ -5106,6 +5251,7 @@ mod tests {
             encrypted_type: None,
             key_name: None,
             encryption_method: super::super::EncryptionMethod {
+                chacha: None,
                 algorithm: DataEncryptionAlgorithm::Aes128Gcm.uri().into(),
                 key_size_bits: None,
                 oaep_digest: None,
@@ -5132,7 +5278,7 @@ mod tests {
             .decrypt_data(&encrypted),
             Err(XmlEncError::Policy(
                 crate::policy::PolicyViolation::Algorithm { algorithm, .. }
-            )) if algorithm == OaepDigestAlgorithm::Sha384.mgf_uri()
+            )) if algorithm == OaepDigestAlgorithm::Sha384.mgf_uri().expect("MGF1-SHA384 URI")
         ));
 
         let ciphertext = crate::provider::default_provider()
@@ -5170,6 +5316,7 @@ mod tests {
             .expect("test CBC encryption must succeed");
         let bounded_cbc = EncryptedData {
             encryption_method: super::super::EncryptionMethod {
+                chacha: None,
                 algorithm: DataEncryptionAlgorithm::Aes128Cbc.uri().into(),
                 key_size_bits: None,
                 oaep_digest: None,
@@ -5213,6 +5360,7 @@ mod tests {
             encrypted_type: None,
             key_name: None,
             encryption_method: super::super::EncryptionMethod {
+                chacha: None,
                 algorithm: DataEncryptionAlgorithm::Aes128Gcm.uri().into(),
                 key_size_bits: None,
                 oaep_digest: None,
@@ -5271,6 +5419,7 @@ mod tests {
             encrypted_type: None,
             key_name: None,
             encryption_method: super::super::EncryptionMethod {
+                chacha: None,
                 algorithm: DataEncryptionAlgorithm::Aes128Gcm.uri().into(),
                 key_size_bits: None,
                 oaep_digest: None,
@@ -5315,6 +5464,7 @@ mod tests {
             recipient: None,
             key_name: None,
             encryption_method: super::super::EncryptionMethod {
+                chacha: None,
                 algorithm: KeyWrapAlgorithm::AesKw128.uri().into(),
                 key_size_bits: None,
                 oaep_digest: None,
@@ -5417,6 +5567,7 @@ mod tests {
                         recipient: None,
                         key_name: None,
                         encryption_method: super::super::EncryptionMethod {
+                            chacha: None,
                             algorithm: KeyWrapAlgorithm::AesKw128.uri().into(),
                             key_size_bits: None,
                             oaep_digest: None,
@@ -5512,6 +5663,7 @@ mod tests {
                     recipient: None,
                     key_name: None,
                     encryption_method: super::super::EncryptionMethod {
+                        chacha: None,
                         algorithm: KeyWrapAlgorithm::AesKw128.uri().into(),
                         key_size_bits: None,
                         oaep_digest: None,
@@ -5552,6 +5704,7 @@ mod tests {
             encrypted_type: None,
             key_name: None,
             encryption_method: super::super::EncryptionMethod {
+                chacha: None,
                 algorithm: DataEncryptionAlgorithm::Aes128Gcm.uri().into(),
                 key_size_bits: None,
                 oaep_digest: None,
@@ -5564,10 +5717,16 @@ mod tests {
                 recipient: None,
                 key_name: None,
                 encryption_method: super::super::EncryptionMethod {
+                    chacha: None,
                     algorithm: KeyTransportAlgorithm::RsaOaepMgf1p.uri().into(),
                     key_size_bits: None,
                     oaep_digest: Some(OaepDigestAlgorithm::Sha256.uri().into()),
-                    mgf_algorithm: Some(OaepDigestAlgorithm::Sha384.mgf_uri().into()),
+                    mgf_algorithm: Some(
+                        OaepDigestAlgorithm::Sha384
+                            .mgf_uri()
+                            .expect("MGF1-SHA384 URI")
+                            .into(),
+                    ),
                     oaep_params: None,
                 },
                 cipher_data: super::super::CipherData::Value {
@@ -5610,6 +5769,7 @@ mod tests {
             encrypted_type: None,
             key_name: None,
             encryption_method: super::super::EncryptionMethod {
+                chacha: None,
                 algorithm: DataEncryptionAlgorithm::Aes128Gcm.uri().into(),
                 key_size_bits: None,
                 oaep_digest: None,
@@ -5622,10 +5782,16 @@ mod tests {
                 recipient: None,
                 key_name: None,
                 encryption_method: super::super::EncryptionMethod {
+                    chacha: None,
                     algorithm: KeyTransportAlgorithm::RsaOaep11.uri().into(),
                     key_size_bits: Some(0),
                     oaep_digest: Some(OaepDigestAlgorithm::Sha256.uri().into()),
-                    mgf_algorithm: Some(OaepDigestAlgorithm::Sha256.mgf_uri().into()),
+                    mgf_algorithm: Some(
+                        OaepDigestAlgorithm::Sha256
+                            .mgf_uri()
+                            .expect("MGF1-SHA256 URI")
+                            .into(),
+                    ),
                     oaep_params: None,
                 },
                 cipher_data: super::super::CipherData::Value {
@@ -5667,6 +5833,7 @@ mod tests {
             encrypted_type: None,
             key_name: None,
             encryption_method: super::super::EncryptionMethod {
+                chacha: None,
                 algorithm: DataEncryptionAlgorithm::Aes128Gcm.uri().into(),
                 key_size_bits: Some(256),
                 oaep_digest: None,
@@ -5707,6 +5874,7 @@ mod tests {
             encrypted_type: None,
             key_name: None,
             encryption_method: super::super::EncryptionMethod {
+                chacha: None,
                 algorithm: DataEncryptionAlgorithm::Aes128Gcm.uri().into(),
                 key_size_bits: None,
                 oaep_digest: None,
@@ -5719,6 +5887,7 @@ mod tests {
                 sources: Default::default(),
                 key_name: None,
                 encryption_method: super::super::EncryptionMethod {
+                    chacha: None,
                     algorithm: "urn:example:unknown-key-algorithm".into(),
                     key_size_bits: None,
                     oaep_digest: None,

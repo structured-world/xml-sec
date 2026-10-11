@@ -17,13 +17,22 @@
 //! DigestValues embedded in the signed XML (validates subtree C14N
 //! without needing XPath).
 
+#![cfg(feature = "c14n")]
+
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 use std::collections::HashSet;
 use std::fs;
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 use xml_sec::{XmlDomDocument as Document, XmlDomNode as Node};
 
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 use sha1::{Digest, Sha1};
-use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize, canonicalize_xml};
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+use xml_sec::c14n::canonicalize;
+use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize_xml};
+#[cfg(feature = "xmldsig")]
 use xml_sec::xmldsig::uri::UriReferenceResolver;
+#[cfg(feature = "xmldsig")]
 use xml_sec::xmldsig::{
     DsigStatus, ReferenceSet, find_signature_node, parse_reference, process_reference,
 };
@@ -40,6 +49,7 @@ fn fixture_bytes(path: &str) -> Vec<u8> {
     fs::read(&full).unwrap_or_else(|e| panic!("cannot read fixture {full}: {e}"))
 }
 
+#[cfg(feature = "xmldsig")]
 fn canonical_mismatch(label: &str, actual: &[u8], expected: &[u8]) -> String {
     let offset = actual
         .iter()
@@ -56,10 +66,12 @@ fn canonical_mismatch(label: &str, actual: &[u8], expected: &[u8]) -> String {
     )
 }
 
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 fn sha1_base64(data: &[u8]) -> String {
     base64_encode(&Sha1::digest(data))
 }
 
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 fn base64_encode(data: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(data)
@@ -206,6 +218,7 @@ fn c14n11_xml_base_inclusive_c14n11() {
 // This tests subtree exclusive C14N without needing XPath evaluation.
 
 /// Find the element with a given Id attribute value in a roxmltree document.
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 fn find_element_by_id<'a>(doc: &'a Document<'a>, id_value: &str) -> Node<'a, 'a> {
     doc.descendants()
         .find(|n| n.attribute("Id") == Some(id_value))
@@ -213,6 +226,7 @@ fn find_element_by_id<'a>(doc: &'a Document<'a>, id_value: &str) -> Node<'a, 'a>
 }
 
 /// Build a node-set predicate that includes a node and all its descendants.
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 fn subtree_predicate(root: Node) -> impl Fn(Node) -> bool + use<> {
     let mut ids = HashSet::new();
     let mut stack = vec![root];
@@ -226,6 +240,7 @@ fn subtree_predicate(root: Node) -> impl Fn(Node) -> bool + use<> {
 }
 
 /// Canonicalize a subtree identified by Id and return the canonical bytes.
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 fn canonicalize_subtree_by_id(xml_str: &str, id_value: &str, algo: &C14nAlgorithm) -> Vec<u8> {
     let doc = Document::parse(xml_str).expect("parse XML");
     let target = find_element_by_id(&doc, id_value);
@@ -238,6 +253,7 @@ fn canonicalize_subtree_by_id(xml_str: &str, id_value: &str, algo: &C14nAlgorith
 /// Exclusive C14N of <dsig:Object Id="to-be-signed"> without PrefixList.
 /// Expected SHA-1 digest: 7yOTjUu+9oEhShgyIIXDLjQ08aY= (from first Reference)
 #[test]
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 fn exc_c14n_subtree_no_prefix_list() {
     let xml = fixture("merlin-exc-c14n-one/exc-signature.xml");
     let algo = C14nAlgorithm::new(C14nMode::Exclusive1_0, false);
@@ -254,6 +270,7 @@ fn exc_c14n_subtree_no_prefix_list() {
 /// Exclusive C14N of <dsig:Object Id="to-be-signed"> with PrefixList="bar #default".
 /// Expected SHA-1 digest: 09xMy0RTQM1Q91demYe/0F6AGXo= (from second Reference)
 #[test]
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 fn exc_c14n_subtree_with_prefix_list() {
     let xml = fixture("merlin-exc-c14n-one/exc-signature.xml");
     let algo = C14nAlgorithm::new(C14nMode::Exclusive1_0, false).with_prefix_list("bar #default");
@@ -270,6 +287,7 @@ fn exc_c14n_subtree_with_prefix_list() {
 /// Exclusive C14N WithComments of <dsig:Object Id="to-be-signed">.
 /// Expected SHA-1 digest: ZQH+SkCN8c5y0feAr+aRTZDwyvY= (from third Reference)
 #[test]
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 fn exc_c14n_subtree_with_comments() {
     let xml = fixture("merlin-exc-c14n-one/exc-signature.xml");
     let algo = C14nAlgorithm::new(C14nMode::Exclusive1_0, true);
@@ -286,6 +304,7 @@ fn exc_c14n_subtree_with_comments() {
 /// Exclusive C14N WithComments + PrefixList="bar #default".
 /// Expected SHA-1 digest: a1cTqBgbqpUt6bMJN4C6zFtnoyo= (from fourth Reference)
 #[test]
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 fn exc_c14n_subtree_with_comments_and_prefix_list() {
     let xml = fixture("merlin-exc-c14n-one/exc-signature.xml");
     let algo = C14nAlgorithm::new(C14nMode::Exclusive1_0, true).with_prefix_list("bar #default");
@@ -300,6 +319,7 @@ fn exc_c14n_subtree_with_comments_and_prefix_list() {
 }
 
 #[test]
+#[cfg(feature = "xmldsig")]
 fn merlin_xpath_subset_and_signed_info_match_all_28_golden_outputs() {
     // Every reference carries a different XPath predicate and C14N parameter
     // combination. Comparing exact octets catches node-kind, namespace, and

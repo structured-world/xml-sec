@@ -59,6 +59,7 @@ pub fn validate_key_transport_recipient(
 #[derive(Clone)]
 pub struct EncryptedDataBuilder {
     algorithm: DataEncryptionAlgorithm,
+    chacha: Option<super::ChaChaParameters>,
     encrypted_type: EncryptedDataType,
     id: Option<String>,
     direct_key: Option<DirectEncryptionKey>,
@@ -253,6 +254,11 @@ impl EncryptedDataBuilder {
     pub fn new(algorithm: DataEncryptionAlgorithm) -> Self {
         Self {
             algorithm,
+            chacha: if algorithm == DataEncryptionAlgorithm::ChaCha20Poly1305 {
+                Some(super::ChaChaParameters::default())
+            } else {
+                None
+            },
             encrypted_type: EncryptedDataType::Element,
             id: None,
             direct_key: None,
@@ -267,6 +273,14 @@ impl EncryptedDataBuilder {
     /// Replace the complete immutable encryption policy snapshot.
     pub fn policy(mut self, policy: crate::policy::EncryptionPolicy) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// Supply ChaCha wire parameters, not a policy exception. Omit the nonce
+    /// to generate a fresh one through the selected provider. An explicit
+    /// nonce must never be reused with the same key across encryption calls.
+    pub fn chacha_parameters(mut self, parameters: super::ChaChaParameters) -> Self {
+        self.chacha = Some(parameters);
         self
     }
 
@@ -755,12 +769,27 @@ impl EncryptedDataBuilder {
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok::<_, XmlEncError>((content_key, encrypted_keys, encapsulated_ciphertext))
             })?;
+        let mut generated_nonce = [0; 12];
         let ciphertext = operation.run(plan.crypto, || {
+            let parameters = match self.chacha.as_ref() {
+                Some(parameters) => {
+                    let mut parameters = parameters.borrowed();
+                    if parameters.nonce.is_none() {
+                        self.provider
+                            .require_capability(crate::provider::ProviderCapability::Random)?;
+                        self.provider.fill_random(&mut generated_nonce)?;
+                        parameters.nonce = Some(&generated_nonce);
+                    }
+                    Some(parameters)
+                }
+                None => None,
+            };
             encrypt_content(
                 self.provider.as_ref(),
                 self.algorithm,
                 content_key.as_ref(),
                 plaintext,
+                parameters,
             )
         })?;
         let (encrypted_data_xml, xml_nodes) = operation.run(plan.evidence, || {
@@ -773,6 +802,13 @@ impl EncryptedDataBuilder {
                         _ => None,
                     },
                     algorithm: self.algorithm,
+                    chacha: self.chacha.as_ref().map(|parameters| {
+                        let mut parameters = parameters.borrowed();
+                        if parameters.nonce.is_none() {
+                            parameters.nonce = Some(&generated_nonce);
+                        }
+                        parameters
+                    }),
                     encrypted_type: encrypted_type.as_ref(),
                     id: self.id.as_deref(),
                     direct_key_name: self.direct_key_name.as_deref(),
@@ -823,6 +859,15 @@ impl EncryptedDataBuilder {
             policy.key_establishment.check_kem_content(self.algorithm)?;
         }
         let metadata_limit = policy.resources.max_encryption_metadata_bytes;
+        if let Some(parameters) = &self.chacha {
+            parameters.validate(self.algorithm)?;
+            validate_metadata("ChaCha AAD", parameters.aad.as_deref(), metadata_limit)?;
+        } else if matches!(
+            self.algorithm,
+            DataEncryptionAlgorithm::ChaCha20 | DataEncryptionAlgorithm::ChaCha20Poly1305
+        ) {
+            return Err(XmlEncError::MissingRequired("ChaCha parameters"));
+        }
         if let EncryptedDataType::Other(uri) = &self.encrypted_type {
             validate_metadata("EncryptedData Type", Some(uri), metadata_limit)?;
         }
@@ -894,6 +939,11 @@ impl EncryptedDataBuilder {
                             "RSA-OAEP recipient requires an OAEP algorithm".into(),
                         ));
                     }
+                    let mgf_uri = parameters.mgf_digest.mgf_uri().ok_or_else(|| {
+                        XmlEncError::InvalidEncryptionConfig(
+                            "OAEP mask digest has no XML Encryption identifier".into(),
+                        )
+                    })?;
                     validate_key_transport_recipient(public_key.as_ref(), policy)?;
                     if policy
                         .key_transport_algorithms
@@ -906,11 +956,23 @@ impl EncryptedDataBuilder {
                         }
                         .into());
                     }
+                    if parameters.digest.requires_explicit_permission()
+                        && !policy
+                            .oaep_digests
+                            .as_ref()
+                            .is_some_and(|allowed| allowed.contains(&parameters.digest))
+                    {
+                        return Err(crate::policy::PolicyViolation::Algorithm {
+                            operation: "encryption",
+                            algorithm: parameters.digest.uri().to_owned(),
+                        }
+                        .into());
+                    }
                     if let Some(allowed) = &policy.oaep_digests {
                         let rejected_uri = if !allowed.contains(&parameters.digest) {
                             Some(parameters.digest.uri())
                         } else if !allowed.contains(&parameters.mgf_digest) {
-                            Some(parameters.mgf_digest.mgf_uri())
+                            Some(mgf_uri)
                         } else {
                             None
                         };
@@ -1181,9 +1243,11 @@ fn encrypt_content(
     algorithm: DataEncryptionAlgorithm,
     key: &[u8],
     plaintext: &[u8],
+    parameters: Option<super::ChaChaParametersRef<'_>>,
 ) -> Result<Vec<u8>, XmlEncError> {
     provider.require_capability(crate::provider::ProviderCapability::Encrypt(algorithm))?;
-    let ciphertext = provider.encrypt_data(algorithm, key, plaintext)?;
+    let ciphertext =
+        provider.encrypt_data_with_parameters(algorithm, key, plaintext, parameters)?;
     super::types::validate_ciphertext_framing(algorithm, ciphertext.len())?;
     let expected = algorithm
         .ciphertext_len_for_plaintext(plaintext.len())
@@ -1253,7 +1317,9 @@ fn wrap_content_key(
             provider
                 .require_capability(crate::provider::ProviderCapability::KeyWrap(*algorithm))?;
             let wrapped = provider.wrap_key(*algorithm, kek, content_key)?;
-            let expected = content_key.len() + algorithm.overhead();
+            let expected = algorithm
+                .wrapped_len(content_key.len())
+                .ok_or_else(|| XmlEncError::UnsupportedAlgorithm(algorithm.uri().into()))?;
             if wrapped.len() != expected {
                 return Err(XmlEncError::InvalidWrappedKeyLength {
                     expected,
@@ -1302,6 +1368,7 @@ fn wrap_rsa_oaep(
 struct EncryptionXml<'a> {
     encapsulation: Option<(crate::provider::KeyEncapsulationAlgorithm, &'a [u8])>,
     algorithm: DataEncryptionAlgorithm,
+    chacha: Option<super::ChaChaParametersRef<'a>>,
     encrypted_type: Option<&'a EncryptedDataType>,
     id: Option<&'a str>,
     direct_key_name: Option<&'a str>,
@@ -1343,6 +1410,26 @@ impl Write for EncryptionXmlSize {
     }
 }
 
+fn write_hex_element<W: Write>(
+    writer: &mut Writer<W>,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), XmlEncError> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    // Nonce (12 bytes) is the largest hex field. Serialize on the stack in
+    // both counting and output passes; no temporary metadata allocation.
+    let mut text = [0; 24];
+    for (pair, byte) in text.as_chunks_mut::<2>().0.iter_mut().zip(bytes) {
+        pair[0] = HEX[(byte >> 4) as usize];
+        pair[1] = HEX[(byte & 15) as usize];
+    }
+    write_text_element(
+        writer,
+        name,
+        core::str::from_utf8(&text[..bytes.len() * 2]).expect("ASCII hex"),
+    )
+}
+
 fn write_encrypted_data<W: Write>(
     writer: &mut Writer<W>,
     output: &EncryptionXml<'_>,
@@ -1350,6 +1437,7 @@ fn write_encrypted_data<W: Write>(
     let EncryptionXml {
         encapsulation,
         algorithm,
+        chacha,
         encrypted_type,
         id,
         direct_key_name,
@@ -1372,7 +1460,36 @@ fn write_encrypted_data<W: Write>(
     .chain(id.map(|value| ("Id", value)))
     .chain(encrypted_type_uri.map(|value| ("Type", value)));
     write_start(writer, "xenc:EncryptedData", root_attributes)?;
-    write_empty_with_algorithm(writer, "xenc:EncryptionMethod", algorithm.uri())?;
+    if let Some(parameters) = chacha {
+        // RFC 9231 §§2.6.7-2.6.8 examples have unqualified parameters.
+        // Emit the namespaced draft form for libxmlsec1 1.3.13 compatibility;
+        // our reader accepts both forms without changing their semantics.
+        // https://www.rfc-editor.org/rfc/rfc9231.html#section-2.6.7
+        write_start(
+            writer,
+            "xenc:EncryptionMethod",
+            [
+                ("Algorithm", algorithm.uri()),
+                ("xmlns:more", "http://www.w3.org/2021/04/xmldsig-more#"),
+            ],
+        )?;
+        write_hex_element(
+            writer,
+            "more:Nonce",
+            parameters
+                .nonce
+                .ok_or(XmlEncError::MissingRequired("ChaCha Nonce"))?,
+        )?;
+        if let Some(counter) = parameters.counter {
+            write_hex_element(writer, "more:Counter", &counter)?;
+        }
+        if let Some(aad) = parameters.aad {
+            write_text_element(writer, "more:AAD", aad)?;
+        }
+        write_end(writer, "xenc:EncryptionMethod")?;
+    } else {
+        write_empty_with_algorithm(writer, "xenc:EncryptionMethod", algorithm.uri())?;
+    }
 
     if direct_key_name.is_some()
         || !encrypted_keys.is_empty()
@@ -1471,7 +1588,12 @@ fn write_encrypted_key<W: Write>(
         if parameters.algorithm == super::KeyTransportAlgorithm::RsaOaep11
             || parameters.mgf_digest != super::OaepDigestAlgorithm::Sha1
         {
-            write_empty_with_algorithm(writer, "xenc11:MGF", parameters.mgf_digest.mgf_uri())?;
+            let uri = parameters.mgf_digest.mgf_uri().ok_or_else(|| {
+                XmlEncError::InvalidEncryptionConfig(
+                    "OAEP mask digest has no XML Encryption identifier".into(),
+                )
+            })?;
+            write_empty_with_algorithm(writer, "xenc11:MGF", uri)?;
         }
         write_end(writer, "xenc:EncryptionMethod")?;
     } else {
@@ -1736,6 +1858,7 @@ mod tests {
             render_encrypted_data(
                 &EncryptionXml {
                     encapsulation: None,
+                    chacha: None,
                     algorithm: DataEncryptionAlgorithm::Aes128Gcm,
                     encrypted_type: Some(&EncryptedDataType::Element),
                     id: Some("id&value"),
@@ -2118,7 +2241,7 @@ mod tests {
             builder.validate_configuration_with_policy(&builder.policy),
             Err(XmlEncError::Policy(
                 crate::policy::PolicyViolation::Algorithm { algorithm, .. }
-            )) if algorithm == OaepDigestAlgorithm::Sha384.mgf_uri()
+            )) if algorithm == OaepDigestAlgorithm::Sha384.mgf_uri().expect("MGF1-SHA384 URI")
         ));
     }
 

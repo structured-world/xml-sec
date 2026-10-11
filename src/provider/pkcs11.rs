@@ -404,18 +404,25 @@ fn digest_mechanism(algorithm: DigestAlgorithm) -> Option<Mechanism<'static>> {
     }
 }
 
-fn oaep(parameters: &RsaOaepParameters) -> Mechanism<'_> {
+fn oaep<'a>(
+    parameters: &'a RsaOaepParameters,
+    capability: ProviderCapability<'_>,
+) -> Result<Mechanism<'a>, ProviderError> {
     let hash = match parameters.digest {
         OaepDigestAlgorithm::Sha1 => MechanismType::SHA1,
+        OaepDigestAlgorithm::Sha224 => MechanismType::SHA224,
         OaepDigestAlgorithm::Sha256 => MechanismType::SHA256,
         OaepDigestAlgorithm::Sha384 => MechanismType::SHA384,
         OaepDigestAlgorithm::Sha512 => MechanismType::SHA512,
+        _ => return Err(unsupported(capability)),
     };
     let mgf = match parameters.mgf_digest {
         OaepDigestAlgorithm::Sha1 => PkcsMgfType::MGF1_SHA1,
+        OaepDigestAlgorithm::Sha224 => PkcsMgfType::MGF1_SHA224,
         OaepDigestAlgorithm::Sha256 => PkcsMgfType::MGF1_SHA256,
         OaepDigestAlgorithm::Sha384 => PkcsMgfType::MGF1_SHA384,
         OaepDigestAlgorithm::Sha512 => PkcsMgfType::MGF1_SHA512,
+        _ => return Err(unsupported(capability)),
     };
     // PKCS#11 Current Mechanisms v2.40 §2.1.7 requires NULL source data for
     // an empty OAEP label; a non-null zero-length Rust slice is not equivalent.
@@ -425,7 +432,9 @@ fn oaep(parameters: &RsaOaepParameters) -> Mechanism<'_> {
     } else {
         PkcsOaepSource::data_specified(&parameters.label)
     };
-    Mechanism::RsaPkcsOaep(PkcsOaepParams::new(hash, mgf, source))
+    Ok(Mechanism::RsaPkcsOaep(PkcsOaepParams::new(
+        hash, mgf, source,
+    )))
 }
 
 /// Opaque RSA object. Debug deliberately omits object handles, IDs and token identity.
@@ -539,10 +548,11 @@ impl KeyTransportKey for Pkcs11RsaKey {
     ) -> Result<Vec<u8>, ProviderError> {
         self.token.check_binding(provider)?;
         provider.require_capability(ProviderCapability::KeyTransport(parameters))?;
+        let mechanism = oaep(parameters, ProviderCapability::KeyTransport(parameters))?;
         let session = self.token.session()?;
         require_usage(&session, self.object, AttributeType::Encrypt)?;
         session
-            .encrypt(&oaep(parameters), self.object, plaintext)
+            .encrypt(&mechanism, self.object, plaintext)
             .map_err(|error| oaep_error(error, ProviderCapability::KeyTransport(parameters)))
     }
 }
@@ -601,10 +611,11 @@ impl KeyRecoveryKey for Pkcs11RsaKey {
     ) -> Result<Vec<u8>, ProviderError> {
         self.token.check_binding(provider)?;
         provider.require_capability(ProviderCapability::KeyRecovery(parameters))?;
+        let mechanism = oaep(parameters, ProviderCapability::KeyRecovery(parameters))?;
         let session = self.token.session()?;
         require_usage(&session, self.object, AttributeType::Decrypt)?;
         session
-            .decrypt(&oaep(parameters), self.object, ciphertext)
+            .decrypt(&mechanism, self.object, ciphertext)
             .map_err(|error| oaep_error(error, ProviderCapability::KeyRecovery(parameters)))
     }
 }
@@ -643,13 +654,16 @@ impl CryptoProvider for Pkcs11Provider {
             ProviderCapability::Sign(algorithm) | ProviderCapability::Verify(algorithm) => {
                 signature_mechanism(algorithm).map(|m| m.mechanism_type())
             }
-            ProviderCapability::KeyTransport(_) | ProviderCapability::KeyRecovery(_) => {
-                Some(MechanismType::RSA_PKCS_OAEP)
-            }
+            ProviderCapability::KeyTransport(parameters)
+            | ProviderCapability::KeyRecovery(parameters) => oaep(parameters, capability)
+                .ok()
+                .map(|mechanism| mechanism.mechanism_type()),
             ProviderCapability::Decrypt(algorithm) => content_mechanism(algorithm),
-            ProviderCapability::KeyUnwrap(algorithm)
-                if algorithm.key_kind() == crate::key_manager::SymmetricKeyKind::Aes =>
-            {
+            ProviderCapability::KeyUnwrap(
+                KeyWrapAlgorithm::AesKw128 | KeyWrapAlgorithm::AesKw256,
+            ) => Some(MechanismType::AES_KEY_WRAP),
+            #[cfg(feature = "legacy-algorithms")]
+            ProviderCapability::KeyUnwrap(KeyWrapAlgorithm::AesKw192) => {
                 Some(MechanismType::AES_KEY_WRAP)
             }
             ProviderCapability::KeyAgreement(parameters)
@@ -850,6 +864,11 @@ fn content_mechanism(algorithm: DataEncryptionAlgorithm) -> Option<MechanismType
         DataEncryptionAlgorithm::Aes192Gcm => Some(MechanismType::AES_GCM),
         #[cfg(feature = "legacy-algorithms")]
         DataEncryptionAlgorithm::TripleDesCbc => None,
+        DataEncryptionAlgorithm::Camellia128Cbc
+        | DataEncryptionAlgorithm::Camellia192Cbc
+        | DataEncryptionAlgorithm::Camellia256Cbc
+        | DataEncryptionAlgorithm::ChaCha20
+        | DataEncryptionAlgorithm::ChaCha20Poly1305 => None,
     }
 }
 

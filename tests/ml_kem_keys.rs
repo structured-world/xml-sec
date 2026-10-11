@@ -1377,63 +1377,15 @@ fn hmac_builder_establishes_a_recipient_key() {
 }
 
 #[cfg(all(feature = "xmlenc", feature = "legacy-algorithms"))]
+#[path = "common/xmlenc_ml_kem_corpus.rs"]
+mod content_corpus;
+
+#[cfg(all(feature = "xmlenc", feature = "legacy-algorithms"))]
 #[test]
 fn all_donor_content_encapsulation_ciphertexts_decrypt() {
-    // Independently produced CBC/GCM documents cover all KEM parameter sets
-    // and every AES consumer width. Compare complete canonicalized documents.
-    use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize_xml};
-    for (name, size, width) in [
-        ("enc-aes256-em-ml-kem-512", 512, 32),
-        ("enc-aes256-em-ml-kem-768", 768, 32),
-        ("enc-aes256-em-ml-kem-1024", 1024, 32),
-        ("enc-aes128gcm-em-ml-kem-512", 512, 16),
-        ("enc-aes192gcm-em-ml-kem-768", 768, 24),
-        ("enc-aes256gcm-em-ml-kem-1024", 1024, 32),
-    ] {
-        let path = format!("xmlenc/aleksey-xmlenc-01/{name}");
-        let xml = std::fs::read_to_string(fixture_path(&format!("{path}.xml")))
-            .expect("encrypted donor XML");
-        let expected =
-            std::fs::read(fixture_path(&format!("{path}.data"))).expect("donor plaintext");
-        let private =
-            RustCryptoMlKemPrivateKey::from_pkcs8_der(&fixture(&format!("ml-kem-{size}-key.der")))
-                .unwrap();
-        let key = xml_sec::xmlenc::EncapsulationDecryptor::new(&private);
-        let mut policy = xml_sec::policy::DecryptionPolicy::default();
-        policy
-            .key_establishment
-            .encapsulation_algorithms
-            .insert(private.algorithm());
-        let document = xml_sec::Document::parse(&xml).expect("donor XML");
-        let method = document
-            .descendants()
-            .find(|node| {
-                node.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "EncryptionMethod"))
-            })
-            .expect("content method");
-        let content_algorithm = xml_sec::xmlenc::DataEncryptionAlgorithm::from_uri(
-            method.attribute("Algorithm").expect("content URI"),
-        )
-        .expect("content algorithm");
-        assert_eq!(content_algorithm.key_len(), width);
-        // The AES-192 vector requires explicit product-policy permission;
-        // importing a donor document must not grant that permission implicitly.
-        policy.data_algorithms = Some([content_algorithm].into_iter().collect());
-        // Donor CBC vectors exercise only compatibility; the caller-owned
-        // authentication permission does not make CBC padding an integrity check.
-        policy.key_establishment.kem_content_authentication =
-            xml_sec::policy::KemContentAuthentication::ExternalAuthenticated;
-        let decrypted = xml_sec::xmlenc::DecryptContext::new(&key)
-            .policy(policy)
-            .decrypt_document(&xml, Some("ED"))
-            .expect("donor content decryption");
-        let algorithm = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
-        assert_eq!(
-            canonicalize_xml(decrypted.as_bytes(), &algorithm).expect("actual C14N"),
-            canonicalize_xml(&expected, &algorithm).expect("expected C14N"),
-            "{name}"
-        );
-    }
+    // The same runner feeds the complete XMLEnc inventory; retaining one
+    // implementation prevents coverage and policy wiring from diverging.
+    assert_eq!(content_corpus::execute().len(), 6);
 }
 
 #[cfg(feature = "xmlenc")]

@@ -1,3 +1,5 @@
+#![cfg(all(feature = "xmldsig", feature = "c14n"))]
+
 use std::collections::HashSet;
 
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize};

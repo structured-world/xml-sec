@@ -5,9 +5,66 @@
 use std::fs;
 use std::path::Path;
 
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+#[path = "common/xmlenc_snapshot.rs"]
+mod xmlenc_snapshot;
+
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+#[test]
+fn complete_xmlenc_snapshot_has_exact_hash_inventory() {
+    // Names alone cannot detect changed algorithms, keys or plaintext. Hash
+    // every imported byte and reject added, removed and mutated payloads.
+    xmlenc_snapshot::verify();
+}
+
 /// Base path for all test fixtures.
 fn fixtures_dir() -> &'static Path {
     Path::new("tests/fixtures")
+}
+
+#[cfg(feature = "xmlenc")]
+#[test]
+fn merlin_original_credentials_preserve_published_archive_bytes() {
+    // The complete W3C archive is a second, explicit provenance source, not a
+    // license to silently repair the separately pinned donor's truncated keys.
+    use hex_literal::hex;
+    use sha2::Digest as _;
+    let expected = [
+        (
+            "Readme.txt",
+            hex!("86d78044ce4efd8f89de8e3224cb6f6746a10f1ddb3b0404cdbd37997974cd4c"),
+        ),
+        (
+            "dh0.p8",
+            hex!("308db48973e654f6d468fa8dd36c18d17d5ca5bda51c2c4d2a4efc32f96ebb9a"),
+        ),
+        (
+            "dh1.p8",
+            hex!("68d2eb744dd49ef481f7709e29244827dce98dd7ca31b4648b1bb9accd15f11d"),
+        ),
+        (
+            "dsa.p8",
+            hex!("c8c9c44c3371a080dd6dc7ecc915c2ed1ef43674f79ba4a73ca2d6f5216c135f"),
+        ),
+        (
+            "ids.p12",
+            hex!("542cc21d96b42f92ba3f8069763ce5e75d7979140401bc20a3452bfec77bfa49"),
+        ),
+        (
+            "plaintext.txt",
+            hex!("4d99fe60a858c300bb6ae144224449dd1f5b78d82a794a55703e2cac7a056a85"),
+        ),
+        (
+            "rsa.p8",
+            hex!("73d6cd69705d0e9aa38804ae08450a181efbe98704d539e935522309d1da1376"),
+        ),
+    ];
+    let directory = fixtures_dir().join("xmlenc/merlin-original-keys");
+    assert_eq!(fs::read_dir(&directory).unwrap().count(), expected.len());
+    for (name, digest) in expected {
+        let bytes = fs::read(directory.join(name)).unwrap();
+        assert_eq!(sha2::Sha256::digest(&bytes).as_slice(), digest, "{name}");
+    }
 }
 
 // ─── Key fixtures ───────────────────────────────────────────────────────────
@@ -202,8 +259,10 @@ fn fixture_file_count_matches_expected() {
         // ML-KEM adds six key formats and two DSig inputs for each of three sets.
         ("xmldsig", 391),
         ("saml", 2),
-        // Six ML-KEM CBC/GCM cases each supply XML, template and plaintext.
-        ("xmlenc", 503),
+        // Complete Merlin, Phaos and Aleksey snapshots, plus shared XDH keys.
+        // Agreement recipes additionally need all 66 EC and 12 DHX key files.
+        // The checksum manifest pins every imported file's contents.
+        ("xmlenc", 1002),
     ];
 
     for (corpus, expected_count) in expected {
