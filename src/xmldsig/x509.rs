@@ -201,7 +201,12 @@ pub fn verify_x509_certificate_chain(
     info: &X509DataInfo,
     options: &X509ChainOptions<'_>,
 ) -> Result<(), X509ChainError> {
-    verify_x509_certificate_chain_with_provider(info, options, crate::provider::default_provider())
+    verify_x509_certificate_chain_with_resources(
+        info,
+        options,
+        &crate::policy::ResourcePolicy::default(),
+        crate::provider::default_provider(),
+    )
 }
 
 /// Validate supplied evidence under explicit borrowed resource limits.
@@ -260,25 +265,6 @@ pub fn verify_x509_certificate_chain_with_resources(
         remaining -= bytes.len();
     }
     verify_x509_certificate_chain_in_session(info, options, provider, &[], &session).map(|_| ())
-}
-
-pub(crate) fn verify_x509_certificate_chain_with_provider(
-    info: &X509DataInfo,
-    options: &X509ChainOptions<'_>,
-    provider: &dyn crate::provider::CryptoProvider,
-) -> Result<(), X509ChainError> {
-    verify_x509_certificate_chain_with_provider_and_crls(info, options, provider, &[])
-}
-
-pub(crate) fn verify_x509_certificate_chain_with_provider_and_crls(
-    info: &X509DataInfo,
-    options: &X509ChainOptions<'_>,
-    provider: &dyn crate::provider::CryptoProvider,
-    additional_crls: &[Vec<u8>],
-) -> Result<(), X509ChainError> {
-    let session = super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
-    verify_x509_certificate_chain_in_session(info, options, provider, additional_crls, &session)
-        .map(|_| ())
 }
 
 pub(crate) fn verify_x509_certificate_chain_in_session(

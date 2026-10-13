@@ -23,6 +23,53 @@ use xml_sec::xmldsig::{
 const VERIFICATION_TIME: u64 = 1_773_964_800; // 2026-03-20T00:00:00Z
 
 #[test]
+fn default_path_validation_preflights_every_evidence_source() {
+    // The convenience API must enforce the same admission as its explicit
+    // overload, including unused malformed evidence before path processing.
+    let limits = xml_sec::policy::ResourcePolicy::default();
+    for source in 0..3 {
+        let mut info = X509DataInfo::default();
+        let mut anchors = Vec::new();
+        let bytes = vec![0; limits.max_external_resource_bytes + 1];
+        match source {
+            0 => info.certificates.push(bytes),
+            1 => info.crls.push(bytes),
+            _ => anchors.push(bytes),
+        }
+        let result = verify_x509_certificate_chain(&info, &options(&anchors, false));
+        assert!(
+            matches!(result, Err(X509ChainError::Policy(
+            xml_sec::policy::PolicyViolation::ResourceLimitExceeded {
+                resource: "external resource bytes", maximum
+            }
+        )) if maximum == limits.max_external_resource_bytes),
+            "source {source}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn default_path_validation_counts_combined_evidence_bytes() {
+    // Each item fits, but all inputs must share the default aggregate ceiling.
+    let limits = xml_sec::policy::ResourcePolicy::default();
+    let mut info = X509DataInfo::default();
+    let count = limits.max_external_resource_total_bytes / limits.max_external_resource_bytes;
+    for _ in 0..count {
+        info.crls.push(vec![0; limits.max_external_resource_bytes]);
+    }
+    let anchors = [vec![0; 1]];
+    let result = verify_x509_certificate_chain(&info, &options(&anchors, false));
+    assert!(
+        matches!(result, Err(X509ChainError::Policy(
+        xml_sec::policy::PolicyViolation::ResourceLimitExceeded {
+            resource: "aggregate external resource bytes", maximum
+        }
+    )) if maximum == limits.max_external_resource_total_bytes),
+        "{result:?}"
+    );
+}
+
+#[test]
 fn direct_path_validation_preflights_every_evidence_source() {
     // Oversized borrowed DER must fail admission even if the path is empty or
     // CRL checking is disabled; malformed DER must never hide that refusal.

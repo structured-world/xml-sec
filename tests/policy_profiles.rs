@@ -163,6 +163,9 @@ impl CryptoProvider for ProfileTestProvider {
         panic!("compile must not execute crypto")
     }
     fn supports(&self, capability: ProviderCapability<'_>) -> bool {
+        if matches!(capability, ProviderCapability::VerifyCertificate(_)) {
+            return false;
+        }
         if self.inbound_only {
             match capability {
                 ProviderCapability::Encrypt(_)
@@ -186,6 +189,60 @@ impl CryptoProvider for ProfileTestProvider {
             _ => RustCryptoProvider.supports(capability),
         }
     }
+}
+
+#[cfg(feature = "xmlenc")]
+#[test]
+fn compiler_rejects_unavailable_certificate_allowlist() {
+    // An XML-capable provider need not implement certificate verification.
+    // Reject this contradiction at compile time, before any provider work.
+    let provider = ProfileTestProvider { inbound_only: true };
+    let initial = PolicyCompiler::new(PolicyProfile::Modern, &provider, None).unwrap();
+    let mut layer = initial.policies().clone();
+    layer.signing = None;
+    layer.encryption = None;
+    let trust = &mut layer.verification.as_mut().unwrap().key_trust;
+    trust.verify_x509_chains = true;
+    trust.certificate_signature_algorithms =
+        Some(xml_sec::policy::CertificateSignatureAlgorithms::Allowlist(
+            HashSet::from([xml_sec::provider::X509SignatureAlgorithm::RsaPkcs1v15(
+                xml_sec::xmldsig::DigestAlgorithm::Sha256,
+            )]),
+        ));
+    assert!(matches!(
+        initial.restrict(&layer).unwrap().compile(&context()),
+        Err(PolicyViolation::Configuration { .. })
+    ));
+}
+
+#[test]
+fn denying_certificate_signatures_keeps_trusted_preset_keys_usable() {
+    // Chain checking governs certificate-backed resolution, not preset keys.
+    // Denying certificate signatures must not disable a trusted HMAC request.
+    let initial = compiler(PolicyProfile::Modern);
+    let mut layer = initial.policies().clone();
+    let trust = &mut layer.verification.as_mut().unwrap().key_trust;
+    trust.verify_x509_chains = true;
+    trust.certificate_signature_algorithms = Some(
+        xml_sec::policy::CertificateSignatureAlgorithms::Allowlist(HashSet::new()),
+    );
+    let compiled = initial
+        .restrict(&layer)
+        .unwrap()
+        .compile(&context())
+        .unwrap();
+    let key = HmacSigningKey::new(vec![0x53; 32]).unwrap();
+    let verifier = HmacVerificationKey::new(vec![0x53; 32]).unwrap();
+    let xml = SignContext::new(&key)
+        .policy(compiled.signing().unwrap().clone())
+        .sign_template(&template("urn:test", "root"))
+        .unwrap();
+    let result = VerifyContext::new()
+        .key(&verifier)
+        .policy(compiled.verification().unwrap().clone())
+        .verify(&xml)
+        .unwrap();
+    assert_eq!(result.status, xml_sec::xmldsig::DsigStatus::Valid);
 }
 
 #[cfg(feature = "xmlenc")]
@@ -516,6 +573,84 @@ fn compiler_rejects_impossible_hmac_and_missing_request_contracts() {
 }
 
 #[test]
+fn compiler_requires_a_usable_canonicalization_method() {
+    // Reference-only transforms cannot canonicalize SignedInfo. Empty and
+    // unknown URI sets must fail compilation for either enabled operation.
+    for signing in [false, true] {
+        for methods in [
+            HashSet::new(),
+            HashSet::from([
+                "http://www.w3.org/2000/09/xmldsig#enveloped-signature".to_owned(),
+                "urn:unknown:c14n".to_owned(),
+            ]),
+        ] {
+            let initial = compiler(PolicyProfile::Modern);
+            let mut layer = initial.policies().clone();
+            if signing {
+                layer.verification = None;
+                layer
+                    .signing
+                    .as_mut()
+                    .unwrap()
+                    .transforms
+                    .allowed_algorithms = Some(methods);
+            } else {
+                layer.signing = None;
+                layer
+                    .verification
+                    .as_mut()
+                    .unwrap()
+                    .transforms
+                    .allowed_algorithms = Some(methods);
+            }
+            assert!(matches!(
+                initial.restrict(&layer).unwrap().compile(&context()),
+                Err(PolicyViolation::Configuration { .. })
+            ));
+        }
+    }
+    let initial = compiler(PolicyProfile::Modern);
+    let mut layer = initial.policies().clone();
+    layer
+        .verification
+        .as_mut()
+        .unwrap()
+        .transforms
+        .allowed_algorithms = Some(HashSet::from([
+        "http://www.w3.org/2001/10/xml-exc-c14n#".into()
+    ]));
+    initial
+        .restrict(&layer)
+        .unwrap()
+        .compile(&context())
+        .unwrap();
+}
+
+#[test]
+fn saml_compiler_requires_its_enveloped_transform() {
+    // A canonicalization-only layer still makes every SAML operation
+    // impossible because its enclosing Signature must be removed from input.
+    for signing in [false, true] {
+        let initial = compiler(PolicyProfile::SecureSaml);
+        let mut layer = initial.policies().clone();
+        let transforms = if signing {
+            layer.verification = None;
+            &mut layer.signing.as_mut().unwrap().transforms
+        } else {
+            layer.signing = None;
+            &mut layer.verification.as_mut().unwrap().transforms
+        };
+        transforms.allowed_algorithms = Some(HashSet::from([
+            "http://www.w3.org/2001/10/xml-exc-c14n#".into(),
+        ]));
+        assert!(matches!(
+            initial.restrict(&layer).unwrap().compile(&context()),
+            Err(PolicyViolation::Configuration { .. })
+        ));
+    }
+}
+
+#[test]
 fn relaxation_requires_valid_grant_and_preserves_earlier_expiration() {
     // A trusted explicit grant can relax; ordinary composition cannot. Its
     // exclusive expiration remains enforced on the cached operation snapshot.
@@ -618,6 +753,151 @@ fn saml_profile_signs_and_authenticates_explicit_parent_target() {
             ..
         })
     ));
+}
+
+#[test]
+fn saml_profile_rejects_non_message_roots() {
+    // Namespace membership cannot authorize signing a Subject, Status or an
+    // invented element as though it were an assertion/protocol message root.
+    let compiled = compiler(PolicyProfile::SecureSaml)
+        .compile(&context())
+        .unwrap();
+    let key = HmacSigningKey::new(vec![0x53; 32]).unwrap();
+    for (namespace, name) in [
+        ("urn:oasis:names:tc:SAML:2.0:assertion", "Subject"),
+        ("urn:oasis:names:tc:SAML:2.0:protocol", "Status"),
+        ("urn:oasis:names:tc:SAML:2.0:protocol", "Assertion"),
+        ("urn:oasis:names:tc:SAML:2.0:assertion", "Response"),
+    ] {
+        let xml = template(namespace, "root").replace("Assertion", name);
+        assert!(matches!(
+            SignContext::new(&key)
+                .policy(compiled.signing().unwrap().clone())
+                .sign_template(&xml),
+            Err(xml_sec::xmldsig::SigningError::Policy(
+                PolicyViolation::SignatureProfile {
+                    profile: SignatureConstraints::Saml,
+                    ..
+                }
+            ))
+        ));
+    }
+}
+
+#[test]
+fn saml_profile_accepts_defined_protocol_roots() {
+    // Every concrete protocol message root has the same XML signature binding;
+    // this does not claim to validate its application-specific payload schema.
+    let compiled = compiler(PolicyProfile::SecureSaml)
+        .compile(&context())
+        .unwrap();
+    let key = HmacSigningKey::new(vec![0x53; 32]).unwrap();
+    for name in [
+        "AssertionIDRequest",
+        "AuthnQuery",
+        "AttributeQuery",
+        "AuthzDecisionQuery",
+        "AuthnRequest",
+        "Response",
+        "ArtifactResolve",
+        "ArtifactResponse",
+        "ManageNameIDRequest",
+        "ManageNameIDResponse",
+        "LogoutRequest",
+        "LogoutResponse",
+        "NameIDMappingRequest",
+        "NameIDMappingResponse",
+    ] {
+        let xml =
+            template("urn:oasis:names:tc:SAML:2.0:protocol", "root").replace("Assertion", name);
+        SignContext::new(&key)
+            .policy(compiled.signing().unwrap().clone())
+            .sign_template(&xml)
+            .unwrap();
+    }
+    // SubjectQuery's abstract base is extensible; the application validates the
+    // derived type rather than this binding gate rejecting the extension root.
+    let xml = template("urn:oasis:names:tc:SAML:2.0:protocol", "root")
+        .replace("Assertion", "SubjectQuery")
+        .replace(" ID=", " xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:q=\"urn:query\" xsi:type=\"q:QueryType\" ID=");
+    SignContext::new(&key)
+        .policy(compiled.signing().unwrap().clone())
+        .sign_template(&xml)
+        .unwrap();
+}
+
+fn xades_template(properties: &str) -> String {
+    template("urn:test", "root")
+        .replace("<ds:Signature ", "<ds:Signature Id=\"sig\" ")
+        .replace("</ds:SignedInfo>", r##"<ds:Reference URI="#properties" Type="http://uri.etsi.org/01903#SignedProperties"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo>"##)
+        .replace("</ds:Signature>", &format!(r##"<ds:Object><x:QualifyingProperties xmlns:x="http://uri.etsi.org/01903/v1.3.2#" Target="#sig"><x:SignedProperties Id="properties">{properties}</x:SignedProperties></x:QualifyingProperties></ds:Object></ds:Signature>"##))
+}
+
+#[test]
+fn xades_profile_rejects_empty_or_foreign_properties_containers() {
+    // An authenticated reference to an empty/foreign-only container does not
+    // establish the structural SignedProperties binding required by ETSI.
+    let compiled = compiler(PolicyProfile::Xades).compile(&context()).unwrap();
+    let key = HmacSigningKey::new(vec![0x53; 32]).unwrap();
+    for properties in [
+        "",
+        " \n<!-- none --><?none?>",
+        "<foreign xmlns=\"urn:other\"/>",
+    ] {
+        assert!(matches!(
+            SignContext::new(&key)
+                .policy(compiled.signing().unwrap().clone())
+                .sign_template(&xades_template(properties)),
+            Err(xml_sec::xmldsig::SigningError::Policy(
+                PolicyViolation::SignatureProfile {
+                    profile: SignatureConstraints::Xades,
+                    ..
+                }
+            ))
+        ));
+    }
+}
+
+#[test]
+fn xades_profile_authenticates_nonempty_ordered_properties() {
+    // Binding authenticates the entire properties container, not a loose
+    // child; detailed qualifying-property semantics belong to the XAdES layer.
+    let compiled = compiler(PolicyProfile::Xades).compile(&context()).unwrap();
+    let key = HmacSigningKey::new(vec![0x53; 32]).unwrap();
+    let verifier = HmacVerificationKey::new(vec![0x53; 32]).unwrap();
+    let properties = "<x:SignedSignatureProperties><x:SigningTime>2026-10-14T00:00:00Z</x:SigningTime></x:SignedSignatureProperties>";
+    let xml = SignContext::new(&key)
+        .policy(compiled.signing().unwrap().clone())
+        .sign_template(&xades_template(properties))
+        .unwrap();
+    let document = XmlDocument::parse(xml).unwrap();
+    let targets = document.with_view(|view| [view.root_element()]);
+    let evidence = VerifyContext::new()
+        .key(&verifier)
+        .policy(compiled.verification().unwrap().clone())
+        .verify_request(
+            &document,
+            &VerificationRequest {
+                expected_targets: &targets,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(evidence.accepted(&document).unwrap());
+    for invalid in [
+        "<x:SignedDataObjectProperties/><x:SignedSignatureProperties/>",
+        "<x:SignedSignatureProperties/><x:SignedSignatureProperties/>",
+        "text<x:SignedSignatureProperties/>",
+    ] {
+        assert!(matches!(
+            SignContext::new(&key)
+                .policy(compiled.signing().unwrap().clone())
+                .sign_template(&xades_template(invalid)),
+            Err(xml_sec::xmldsig::SigningError::Policy(
+                PolicyViolation::SignatureProfile { .. }
+            ))
+        ));
+    }
 }
 
 #[test]

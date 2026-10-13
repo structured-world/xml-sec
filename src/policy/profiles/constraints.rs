@@ -17,6 +17,8 @@ impl PolicySet {
                 |algorithm| policy.check_signature_algorithm(algorithm),
             )?;
             digest_methods(policy.digest_algorithms.as_ref(), provider)?;
+            signature_transforms(&policy.transforms, policy.signature_constraints)?;
+            certificate_methods(&policy.key_trust, provider)?;
             uri_contract(policy.uris, context)?;
             if policy.signature_constraints != SignatureConstraints::General
                 && !context.target_evidence
@@ -36,6 +38,7 @@ impl PolicySet {
                 |algorithm| policy.check_signature_algorithm(algorithm),
             )?;
             digest_methods(policy.digest_algorithms.as_ref(), provider)?;
+            signature_transforms(&policy.transforms, policy.signature_constraints)?;
             uri_contract(policy.uris, context)?;
         }
         #[cfg(feature = "xmlenc")]
@@ -138,6 +141,62 @@ fn digest_methods(
     Ok(())
 }
 
+fn certificate_methods(
+    trust: &KeyTrustPolicy,
+    provider: &dyn CryptoProvider,
+) -> Result<(), PolicyViolation> {
+    if !trust.verify_x509_chains {
+        return Ok(());
+    }
+    if let Some(CertificateSignatureAlgorithms::Allowlist(methods)) =
+        &trust.certificate_signature_algorithms
+    {
+        for &algorithm in methods {
+            if !provider.supports(ProviderCapability::VerifyCertificate(algorithm)) {
+                return Err(configuration(
+                    "selected provider does not support a permitted certificate/CRL method",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn signature_transforms(
+    transforms: &TransformPolicy,
+    constraints: SignatureConstraints,
+) -> Result<(), PolicyViolation> {
+    // XMLDSig 1.1 §4.4.1 requires CanonicalizationMethod in SignedInfo.
+    // This is configuration viability, not rejection of an untrusted document.
+    // https://www.w3.org/TR/xmldsig-core1/#sec-CanonicalizationMethod
+    if let Some(methods) = &transforms.allowed_algorithms {
+        // SAML Core §§5.4.3–5.4.4 requires enveloped processing; exclusive
+        // C14N is the existing profile's stricter choice of the SHOULD.
+        // https://docs.oasis-open.org/security/saml/v2.0/saml-core-2.0-os.pdf
+        if constraints == SignatureConstraints::Saml
+            && !methods.contains("http://www.w3.org/2000/09/xmldsig#enveloped-signature")
+        {
+            return Err(configuration(
+                "SAML profile has no permitted enveloped-signature transform",
+            ));
+        }
+        for uri in methods {
+            let Some(algorithm) = crate::c14n::C14nAlgorithm::from_uri(uri) else {
+                continue;
+            };
+            if constraints != SignatureConstraints::Saml
+                || algorithm.mode() == crate::c14n::C14nMode::Exclusive1_0
+            {
+                return Ok(());
+            }
+        }
+        return Err(configuration(
+            "enabled signature operation has no permitted canonicalization method",
+        ));
+    }
+    Ok(())
+}
+
 fn uri_contract(uris: UriPolicy, context: &PolicyCompileContext) -> Result<(), PolicyViolation> {
     if !context.external_resources
         && [
@@ -230,7 +289,7 @@ impl SignatureConstraints {
             Self::General => Ok(()),
             Self::Saml => saml(signature),
             Self::WsSecurity => ws_security(signature),
-            Self::Xades => xades(signature),
+            Self::Xades => xades(signature, budget),
         }
         .map_err(|error| match error {
             PolicyViolation::Configuration { reason } => PolicyViolation::SignatureProfile {
@@ -330,12 +389,35 @@ fn saml(signature: Node<'_, '_>) -> Result<(), PolicyViolation> {
     let parent = signature.parent().ok_or(configuration(
         "SAML Signature requires an enclosing element",
     ))?;
-    if !parent.is_element()
-        || !matches!(
-            parent.tag_name().namespace(),
-            Some("urn:oasis:names:tc:SAML:2.0:assertion" | "urn:oasis:names:tc:SAML:2.0:protocol")
-        )
-    {
+    // Core §§2.3.3, 3.2 and 5.4.2: the ID names the assertion/message
+    // root, not an arbitrary element sharing its namespace. The protocol schema
+    // defines these request/response roots. SubjectQuery is an extension point
+    // with an abstract base type (§3.3.2.1); derived schema validation stays
+    // with the application, as does payload-schema validation for other roots.
+    // https://docs.oasis-open.org/security/saml/v2.0/saml-schema-protocol-2.0.xsd
+    let signable = match parent.tag_name().namespace() {
+        Some("urn:oasis:names:tc:SAML:2.0:assertion") => parent.tag_name().name() == "Assertion",
+        Some("urn:oasis:names:tc:SAML:2.0:protocol") => matches!(
+            parent.tag_name().name(),
+            "AssertionIDRequest"
+                | "SubjectQuery"
+                | "AuthnQuery"
+                | "AttributeQuery"
+                | "AuthzDecisionQuery"
+                | "AuthnRequest"
+                | "Response"
+                | "ArtifactResolve"
+                | "ArtifactResponse"
+                | "ManageNameIDRequest"
+                | "ManageNameIDResponse"
+                | "LogoutRequest"
+                | "LogoutResponse"
+                | "NameIDMappingRequest"
+                | "NameIDMappingResponse"
+        ),
+        _ => false,
+    };
+    if !parent.is_element() || !signable {
         return Err(configuration(
             "SAML Signature must belong to a SAML assertion or message",
         ));
@@ -437,7 +519,10 @@ fn ws_security(signature: Node<'_, '_>) -> Result<(), PolicyViolation> {
     Ok(())
 }
 
-fn xades(signature: Node<'_, '_>) -> Result<(), PolicyViolation> {
+fn xades(
+    signature: Node<'_, '_>,
+    budget: &crate::xmldsig::transforms::TransformExecutionBudget,
+) -> Result<(), PolicyViolation> {
     // ETSI EN 319 132-1 V1.3.1 §4.4.2: SignedProperties is protected by
     // a Reference with the assigned Type. This checks XML-security binding,
     // not the complete signature profile or its timestamp/certificate claims.
@@ -480,6 +565,46 @@ fn xades(signature: Node<'_, '_>) -> Result<(), PolicyViolation> {
         .attribute("Id")
         .filter(|id| !id.is_empty())
         .ok_or(configuration("SignedProperties requires Id"))?;
+    // ETSI EN 319 132-1 V1.3.1 §4.3.2 forbids empty SignedProperties and
+    // defines this sequence of optional containers, not arbitrary children.
+    // https://www.etsi.org/deliver/etsi_en/319100_319199/31913201/01.03.01_60/en_31913201v010301p.pdf
+    let mut last = 0;
+    for node in properties.children() {
+        if node.is_element() {
+            let position = if named(node, XADES, "SignedSignatureProperties") {
+                1
+            } else if named(node, XADES, "SignedDataObjectProperties") {
+                2
+            } else {
+                return Err(configuration("invalid SignedProperties child"));
+            };
+            if position <= last {
+                return Err(configuration(
+                    "invalid SignedProperties container order or duplicate",
+                ));
+            }
+            last = position;
+        } else if let Some(text) = node.text().filter(|_| node.is_text()) {
+            budget
+                .charge_node_filter_work(text.len())
+                .map_err(|error| match error {
+                    crate::xmldsig::TransformError::Policy(error) => error,
+                    _ => configuration("signature profile inspection budget failed"),
+                })?;
+            for byte in text.bytes() {
+                if !matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
+                    return Err(configuration(
+                        "SignedProperties cannot contain character data",
+                    ));
+                }
+            }
+        }
+    }
+    if last == 0 {
+        return Err(configuration(
+            "SignedProperties requires a qualifying-property container",
+        ));
+    }
     let info = child(signature, DS, "SignedInfo").ok_or(configuration("missing SignedInfo"))?;
     let mut count = 0;
     for reference in info.children().filter(|node| named(*node, DS, "Reference")) {
@@ -496,11 +621,15 @@ fn xades(signature: Node<'_, '_>) -> Result<(), PolicyViolation> {
             count += 1;
             if let Some(transforms) = child(reference, DS, "Transforms") {
                 for transform in transforms.children().filter(|node| node.is_element()) {
-                    if !named(transform, DS, "Transform")
-                        || !transform
-                            .attribute("Algorithm")
-                            .is_some_and(|uri| crate::c14n::C14nAlgorithm::from_uri(uri).is_some())
-                    {
+                    if !named(transform, DS, "Transform") {
+                        return Err(configuration("invalid SignedProperties transform element"));
+                    }
+                    let Some(uri) = transform.attribute("Algorithm") else {
+                        return Err(configuration(
+                            "SignedProperties transform requires Algorithm",
+                        ));
+                    };
+                    if crate::c14n::C14nAlgorithm::from_uri(uri).is_none() {
                         return Err(configuration(
                             "SignedProperties protection permits only canonicalization transforms",
                         ));

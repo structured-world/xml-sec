@@ -1609,7 +1609,9 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
         return Err(CommandError::UnsupportedOption("lax-key-search".into()));
     }
     let policy = xmlsec_compatibility_verification_policy(invocation);
-    let utc_facts = UtcFacts::load(invocation, &policy.resources)?;
+    let mut certificate_budget =
+        ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
+    let utc_facts = UtcFacts::load(invocation, &policy.resources, &mut certificate_budget)?;
     let utc_table = utc_facts.as_ref().map(UtcFacts::table).transpose()?;
     let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
     let start_node_id = option_text(invocation, "node-id")?;
@@ -1655,8 +1657,6 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
     };
     validate_verification_candidate_count(selected_keys.len(), &policy)
         .map_err(|error| CommandError::Signature(error.to_string()))?;
-    let mut certificate_budget =
-        ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
     let external_resources =
         load_mapped_reference_resources(invocation, &policy.resources, &mut certificate_budget)?;
     let configured_certificates = load_configured_certificates(
@@ -1853,7 +1853,7 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
     Ok(())
 }
 
-struct ExternalMaterialBudget {
+pub(super) struct ExternalMaterialBudget {
     total_bytes: usize,
     maximum_bytes: usize,
     kdf_work: usize,
@@ -2018,7 +2018,7 @@ fn load_configured_certificates(
 }
 
 impl ExternalMaterialBudget {
-    fn new(maximum_bytes: usize) -> Self {
+    pub(super) fn new(maximum_bytes: usize) -> Self {
         Self {
             total_bytes: 0,
             maximum_bytes,
@@ -2026,7 +2026,7 @@ impl ExternalMaterialBudget {
         }
     }
 
-    fn charge(&mut self, bytes: usize) -> Result<(), CommandError> {
+    pub(super) fn charge(&mut self, bytes: usize) -> Result<(), CommandError> {
         self.total_bytes = self
             .total_bytes
             .checked_add(bytes)
@@ -2037,8 +2037,12 @@ impl ExternalMaterialBudget {
         Ok(())
     }
 
-    fn remaining(&self) -> usize {
+    pub(super) fn remaining(&self) -> usize {
         self.maximum_bytes - self.total_bytes
+    }
+
+    pub(super) fn maximum(&self) -> usize {
+        self.maximum_bytes
     }
 
     fn with_key_import<T>(
