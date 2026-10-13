@@ -181,6 +181,8 @@ jobs:
           cargo +1.92.0 check -p xml-sec-xml-input --no-default-features
           --target thumbv7em-none-eabihf
       - run: bash scripts/check-shared-pkix.sh
+        env:
+          RUSTUP_TOOLCHAIN: "1.92.0"
 
   test-matrix:
     name: test-matrix (${{ matrix.rust }}, ${{ matrix.xml-backend }})
