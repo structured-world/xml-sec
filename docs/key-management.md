@@ -98,6 +98,36 @@ the original configured certificates/enabled CRLs and their simultaneously live
 copies, including document CRLs attached to a selected named certificate.
 Embedded certificates and CRLs share one aggregate byte allowance with the
 configured certificates and enabled CRLs before chain parsing or assembly.
+
+Certificate paths, distinguished names and CRLs use the published
+`structured-asn1` / `structured-pkix` mechanisms. Original DER and signed
+ranges remain borrowed; one operation account covers ingestion, recursive
+key lookup, path search, static validation and revocation. Displayed names or
+phase-local metadata never establish certificate identity. Effective inherited
+issuer parameters are projected from the authenticated path without rewriting
+certificates or repeating their signature checks.
+
+When CRL checking is enabled, supply authenticated UTC history with
+`VerifyContext::utc_facts(LeapTable)` or `X509ChainOptions::utc_facts` for direct
+chain validation. Standalone budget-aware resolvers accept the same fact through
+`InspectedKeyCandidateBudget::new_with_utc_facts`. The core does not obtain a
+table from the host, network or a built-in default. Missing facts return
+`MissingUtcFacts`; insufficient or contradictory coverage returns
+`CrlTimeUncertain`, never non-revocation. Cached complete CRLs permit the exact
+`nextUpdate` boundary, but even one nanosecond later fails freshness. Revocation
+dates are checked against the same lossless operation time. Unsupported critical
+demands, entry conflicts and unpaired delta CRLs cannot authorize a key.
+Applicable partial lists must collectively cover all revocation reasons;
+otherwise `IncompleteCrlCoverage` is returned. This checks supplied evidence,
+not an implicit online revocation fetch or a requirement to supply a CRL for
+every path certificate.
+
+The CLI accepts `verify --verify-crls --utc-facts leap-seconds.list` using the
+published IERS/IANA NTP-timestamp and TAI-UTC-offset format. The first entry
+starts coverage and `#@` ends it; offsets become relative corrections. The
+caller must establish the file's authenticity and completeness. Loading it
+does not authenticate its source, download updates or extend expired coverage.
+
 RSA decryption selection checks borrowed public components before bigint
 decoding. `DecryptionPolicy::rsa_keys` defaults to a 2048-bit minimum; the same
 snapshot is enforced again before provider recovery, including opaque keys.
@@ -179,6 +209,21 @@ another candidate resolved. Custom bag attributes accept BER high-tag-number
 identifiers (X.690 section 8.1.2.4) without retaining their values.
 Shared XMLDSig candidate accounting is constructed from the operation's
 `VerificationPolicy`, not a separate caller-supplied numeric limit.
+Core verification retains one `InspectedKeyCandidateBudget` across signatures,
+including unsuccessful key attempts. `DefaultKeyResolver` and inventory-backed
+resolvers use `KeyResolver::resolve_for_verification_with_budget`; their
+certificate execution account is shared with direct and recursive KeyInfo
+ingestion. Custom resolvers override that hook to charge each actual inspection
+and use `budget.execution()` for common certificate mechanisms. The default
+hook accounts for one custom-resolver dispatch; the application remains
+responsible for any additional work its callback performs.
+Certificate name selectors and supplied-path validation use the shared PKIX
+mechanisms. Discovery compares original ASN.1 Names, not subject/issuer display
+strings. Unknown name equality syntax is reported as unsupported rather than
+guessed from its bytes. Display metadata is not a certificate identity.
+When a validated path inherits public-key parameters (RFC 5280 section 6.1.4(e)),
+the effective key reaches the XML signature verifier without rewriting the
+certificate's signed bytes. Verification still uses the selected `CryptoProvider`.
 For multiple XML stores, use `XmlKeyStoreImporter::new(&policy, backend)`, call
 `import(bytes)` for each source, then `finish()` to obtain the inventory. The CLI
 uses this session for repeated `--keys-file`: candidate inspections and XML parsing

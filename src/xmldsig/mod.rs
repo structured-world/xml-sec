@@ -64,6 +64,7 @@ pub use post_quantum::PostQuantumSigningKey;
 pub use pq_algorithm::PqAlgorithm;
 pub mod mutation;
 pub mod parse;
+pub(crate) mod pkix;
 pub mod sign;
 pub mod signature;
 pub mod transforms;

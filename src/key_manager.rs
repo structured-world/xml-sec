@@ -24,7 +24,10 @@ use pkcs12_import::Limits as Pkcs12Limits;
 use rsa::RsaPrivateKey;
 #[cfg(feature = "xmlenc")]
 use rsa::RsaPublicKey;
-use x509_parser::prelude::{FromDer as _, X509Certificate};
+#[cfg(test)]
+use x509_parser::prelude::FromDer as _;
+#[cfg(test)]
+use x509_parser::prelude::X509Certificate;
 use zeroize::Zeroizing;
 
 #[cfg(feature = "xmlenc")]
@@ -447,20 +450,24 @@ impl StoredPublicKey {
                 }
                 KeyInfoSource::DerEncodedKeyValue(der) => {
                     check_encryption_material_size(der.len(), &policy.resources)?;
-                    let (rest, spki) = x509_parser::x509::SubjectPublicKeyInfo::from_der(der)
+                    let spki = pkcs8::SubjectPublicKeyInfoRef::from_der(der)
                         .map_err(|_| KeyStoreError::Selection("invalid RSA encryption key"))?;
-                    if !rest.is_empty() {
-                        return Err(KeyStoreError::Selection("invalid RSA encryption key"));
-                    }
-                    let x509_parser::public_key::PublicKey::RSA(raw) = spki
-                        .parsed()
-                        .map_err(|_| KeyStoreError::Selection("invalid RSA encryption key"))?
-                    else {
+                    if spki.algorithm.oid != pkcs1::ALGORITHM_OID {
                         return Err(KeyStoreError::Selection(
                             "named key is not an RSA public key",
                         ));
-                    };
-                    rsa_recipient_preflight(raw.modulus, raw.exponent, policy)?;
+                    }
+                    let octets = spki
+                        .subject_public_key
+                        .as_bytes()
+                        .ok_or(KeyStoreError::Selection("invalid RSA encryption key"))?;
+                    let raw = pkcs1::RsaPublicKeyRef::from_der(octets)
+                        .map_err(|_| KeyStoreError::Selection("invalid RSA encryption key"))?;
+                    rsa_recipient_preflight(
+                        raw.modulus.as_bytes(),
+                        raw.public_exponent.as_bytes(),
+                        policy,
+                    )?;
                     RsaPublicKey::from_public_key_der(der)
                         .map_err(|_| KeyStoreError::Selection("invalid RSA encryption key"))
                 }
@@ -535,13 +542,31 @@ impl<'a> KeyResolver for InventoryVerificationResolver<'a> {
         policy: &crate::policy::VerificationPolicy,
         provider: &dyn crate::provider::CryptoProvider,
     ) -> Result<Option<crate::xmldsig::ResolvedVerificationKey<'k>>, DsigError> {
+        let mut budget = InspectedKeyCandidateBudget::new(policy);
+        self.resolve_for_verification_with_budget(
+            key_info,
+            algorithm,
+            policy,
+            provider,
+            &mut budget,
+        )
+    }
+
+    fn resolve_for_verification_with_budget<'k>(
+        &'k self,
+        key_info: Option<&KeyInfo>,
+        algorithm: SignatureAlgorithm,
+        policy: &crate::policy::VerificationPolicy,
+        provider: &dyn crate::provider::CryptoProvider,
+        inspected_candidates: &mut InspectedKeyCandidateBudget,
+    ) -> Result<Option<crate::xmldsig::ResolvedVerificationKey<'k>>, DsigError> {
         policy.validate()?;
+        inspected_candidates.bind_policy(policy)?;
         if let Some(info) = key_info {
             crate::xmldsig::keys::validate_key_info_source_permissions(info, policy.key_sources)?;
         }
         let mut candidate: Option<&StoredPublicKey> = None;
         let mut secret_candidate: Option<&StoredSymmetricKey> = None;
-        let mut inspected_candidates = InspectedKeyCandidateBudget::new(policy);
         for name in key_info
             .into_iter()
             .flat_map(|info| &info.sources)
@@ -665,7 +690,7 @@ impl<'a> KeyResolver for InventoryVerificationResolver<'a> {
                 algorithm,
                 policy,
                 provider,
-                &mut inspected_candidates,
+                inspected_candidates,
                 if candidate.is_some() {
                     crate::xmldsig::keys::ResolutionScope::TrustedPrefix(first_x509)
                 } else {
@@ -751,7 +776,7 @@ impl<'a> KeyResolver for InventoryVerificationResolver<'a> {
                 algorithm,
                 policy,
                 provider,
-                &mut inspected_candidates,
+                inspected_candidates,
                 if candidate.is_some() {
                     crate::xmldsig::keys::ResolutionScope::TrustedSuffix(first_x509)
                 } else {
@@ -773,7 +798,7 @@ impl<'a> KeyResolver for InventoryVerificationResolver<'a> {
                 algorithm,
                 policy,
                 provider,
-                &mut inspected_candidates,
+                inspected_candidates,
             );
         }
         fallback.resolve_with_candidate_budget(
@@ -781,7 +806,7 @@ impl<'a> KeyResolver for InventoryVerificationResolver<'a> {
             algorithm,
             policy,
             provider,
-            &mut inspected_candidates,
+            inspected_candidates,
         )
     }
 
@@ -1389,11 +1414,7 @@ impl KeyInventory {
         let material_len = der.len();
         let mut key_info = KeyInfo::default();
         key_info.sources.push(KeyInfoSource::KeyName(name.clone()));
-        let is_rsa = if let Ok((rest, spki)) =
-            x509_parser::x509::SubjectPublicKeyInfo::from_der(&der)
-            && rest.is_empty()
-            && spki.raw == der
-        {
+        let is_rsa = if let Ok(spki) = pkcs8::SubjectPublicKeyInfoRef::from_der(&der) {
             let is_rsa = crate::xmldsig::keys::supported_parsed_spki_is_rsa(&spki, &der)
                 .map_err(|_| KeyStoreError::Selection("unsupported public key algorithm"))?;
             key_info
@@ -1409,18 +1430,19 @@ impl KeyInventory {
                 // https://www.rfc-editor.org/rfc/rfc7468#section-2
                 return Err(KeyStoreError::Selection("invalid PUBLIC KEY payload"));
             }
-            let (rest, certificate) = X509Certificate::from_der(&der)
-                .map_err(|_| KeyStoreError::Selection("invalid public key or X.509 certificate"))?;
-            if !rest.is_empty() {
-                return Err(KeyStoreError::Selection("invalid X.509 certificate"));
-            }
-            let parsed = crate::xmldsig::parse::parse_x509_certificate(&der)
+            let session = crate::xmldsig::pkix::CertificateSession::new(resources);
+            let certificate = session.read(&der).map_err(certificate_import_error)?;
+            let parsed = crate::xmldsig::parse::certificate_metadata(&certificate, &session)
+                .map_err(|error| match error {
+                    crate::xmldsig::ParseError::Policy(error) => KeyStoreError::Policy(error),
+                    _ => KeyStoreError::Selection("unsupported X.509 certificate key"),
+                })?;
+            let spki_der = certificate.tbs().public_key().as_bytes();
+            let spki = pkcs8::SubjectPublicKeyInfoRef::from_der(spki_der)
                 .map_err(|_| KeyStoreError::Selection("unsupported X.509 certificate key"))?;
-            let is_rsa = crate::xmldsig::keys::supported_parsed_spki_is_rsa(
-                certificate.public_key(),
-                certificate.public_key().raw,
-            )
-            .map_err(|_| KeyStoreError::Selection("unsupported X.509 certificate key"))?;
+            let is_rsa = crate::xmldsig::keys::supported_parsed_spki_is_rsa(&spki, spki_der)
+                .map_err(|_| KeyStoreError::Selection("unsupported X.509 certificate key"))?;
+            drop(certificate);
             key_info.sources.push(KeyInfoSource::X509Data(X509DataInfo {
                 certificates: vec![der],
                 parsed_certificates: vec![parsed],
@@ -1922,13 +1944,12 @@ impl KeyInventory {
         }
         identity.validate_usages(usages)?;
         let mut matching_leaf = None;
+        let session = crate::xmldsig::pkix::CertificateSession::new(resources);
         for certificate in &certificates {
-            let (rest, parsed) = X509Certificate::from_der(certificate)
-                .map_err(|_| KeyStoreError::Selection("invalid certificate in PKCS#12"))?;
-            if !rest.is_empty() {
-                return Err(KeyStoreError::Selection("invalid certificate in PKCS#12"));
-            }
-            if identity.matches_spki(parsed.public_key().raw) {
+            let parsed = session
+                .read(certificate)
+                .map_err(certificate_import_error)?;
+            if identity.matches_spki(parsed.tbs().public_key().as_bytes()) {
                 if matching_leaf.is_some_and(|leaf: &[u8]| leaf != certificate.as_slice()) {
                     return Err(KeyStoreError::Selection(
                         "ambiguous certificate for PKCS#12 private key",
@@ -2099,11 +2120,8 @@ impl KeyInventory {
         resources: &ResourcePolicy,
     ) -> Result<(), KeyStoreError> {
         let material_bytes = self.preflight_x509_import(&der, resources)?;
-        let (rest, _) = X509Certificate::from_der(&der)
-            .map_err(|_| KeyStoreError::Selection("invalid X.509 certificate"))?;
-        if !rest.is_empty() {
-            return Err(KeyStoreError::Selection("invalid X.509 certificate"));
-        }
+        let session = crate::xmldsig::pkix::CertificateSession::new(resources);
+        drop(session.read(&der).map_err(certificate_import_error)?);
         self.material_bytes = material_bytes;
         if trusted_anchor {
             self.trusted_certificates.push(der);
@@ -2121,11 +2139,11 @@ impl KeyInventory {
         resources: &ResourcePolicy,
     ) -> Result<(), KeyStoreError> {
         let material_bytes = self.preflight_x509_import(&der, resources)?;
-        let (rest, _) = x509_parser::revocation_list::CertificateRevocationList::from_der(&der)
-            .map_err(|_| KeyStoreError::Selection("invalid X.509 CRL"))?;
-        if !rest.is_empty() {
-            return Err(KeyStoreError::Selection("invalid X.509 CRL"));
-        }
+        let session = crate::xmldsig::pkix::CertificateSession::new(resources);
+        drop(session.read_crl(&der).map_err(|error| match error {
+            crate::xmldsig::X509ChainError::Policy(error) => KeyStoreError::Policy(error),
+            _ => KeyStoreError::Selection("invalid X.509 CRL"),
+        })?);
         self.material_bytes = material_bytes;
         self.crls.push(der);
         self.entry_count += 1;
@@ -2405,6 +2423,13 @@ impl KeyInventory {
             ));
         }
         Ok(store)
+    }
+}
+
+fn certificate_import_error(error: crate::xmldsig::X509ChainError) -> KeyStoreError {
+    match error {
+        crate::xmldsig::X509ChainError::Policy(error) => KeyStoreError::Policy(error),
+        _ => KeyStoreError::Selection("invalid X.509 certificate"),
     }
 }
 
@@ -6691,12 +6716,17 @@ mod tests {
             crls: vec![crl.der().to_vec()],
             ..X509DataInfo::default()
         }));
+        let mut candidate_budget = InspectedKeyCandidateBudget::new_with_utc_facts(
+            &policy,
+            crate::xmldsig::pkix::test_utc_facts(),
+        );
         let error = resolver
-            .resolve_with_policy_and_provider(
+            .resolve_for_verification_with_budget(
                 Some(&info),
                 SignatureAlgorithm::EcdsaSha256,
                 &policy,
                 crate::provider::default_provider(),
+                &mut candidate_budget,
             )
             .err()
             .expect("document CRL revokes leaf");

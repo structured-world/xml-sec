@@ -1045,7 +1045,7 @@ fn native_cli_claims_match_process_and_upstream_runner_tests() {
     // Native extensions are intentionally absent from the donor inventory.
     // Keep the list explicit so adding an option cannot silently weaken the
     // libxmlsec1 compatibility classification below.
-    let native_extension_options = BTreeSet::from(["xml-backend"]);
+    let native_extension_options = BTreeSet::from(["xml-backend", "utc-facts"]);
     assert!(native_extension_options.is_subset(&runtime_options));
     assert!(native_extension_options.iter().all(|option| {
         !ledger

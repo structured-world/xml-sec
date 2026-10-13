@@ -9375,6 +9375,16 @@ fn explicit_certificate_verification_reports_revoked_leaf() {
     );
     fs::write(&with_crl, signed_xml).unwrap();
 
+    // Synthetic caller facts cover exactly this generated test window. The
+    // CLI neither downloads UTC facts nor assumes future corrections absent.
+    let utc_path = temp.path().join("leap-seconds.list");
+    let ntp_now = verification_window.unix_timestamp() + 2_208_988_800;
+    fs::write(
+        &utc_path,
+        format!("#@ {}\n{} 37\n", ntp_now + 172_800, ntp_now - 172_800),
+    )
+    .unwrap();
+
     let checked = Command::new(binary())
         .args(["verify", "--verify-crls", "--pubkey-cert-pem"])
         .arg(&leaf_path)
@@ -9382,6 +9392,8 @@ fn explicit_certificate_verification_reports_revoked_leaf() {
         .arg(&root_path)
         .arg("--untrusted-pem")
         .arg(&issuer_path)
+        .arg("--utc-facts")
+        .arg(&utc_path)
         .arg(&with_crl)
         .output()
         .unwrap();

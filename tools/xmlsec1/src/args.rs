@@ -232,6 +232,7 @@ pub(crate) const OPTION_SPECS: &[OptionSpec] = &[
     option_spec!("lax-key-search", [], FLAG, false, SINGLE),
     option_spec!("verify-keys", [], FLAG, false, SINGLE),
     option_spec!("verify-crls", [], FLAG, false, SINGLE),
+    option_spec!("utc-facts", [], VALUE, false, SINGLE),
     option_spec!("X509-skip-time-checks", [], FLAG, false, SINGLE),
     option_spec!("X509-skip-strict-checks", [], FLAG, false, SINGLE),
     option_spec!("insecure", [], FLAG, false, SINGLE),

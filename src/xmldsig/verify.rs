@@ -37,8 +37,7 @@ use super::parse::{
     RetrievalMethodTransforms, SignatureAlgorithm, XMLDSIG_NS,
 };
 use super::parse::{
-    parse_key_info_with_policy_budgets, parse_key_info_with_policy_budgets_and_document_base,
-    parse_reference_with_xpath_budget, parse_signed_info_with_xpath_budget, parse_x509_certificate,
+    parse_reference_with_xpath_budget, parse_signed_info_with_xpath_budget,
     parse_x509_data_dispatch_with_budget_and_provider, reference_digest_method,
 };
 use super::signature::{
@@ -181,6 +180,23 @@ pub trait VerifyingKey {
 /// This trait intentionally has no `Send + Sync` supertraits; callers that need
 /// cross-thread sharing can wrap resolvers/keys in their own thread-safe types.
 pub trait KeyResolver {
+    /// Resolve using the core operation's cumulative candidate and certificate account.
+    /// The default charges one custom-resolver dispatch. Implementations searching
+    /// multiple candidates override this method, charging each inspection through
+    /// `budget` and using its execution account for certificate mechanism work.
+    fn resolve_for_verification_with_budget<'a>(
+        &'a self,
+        key_info: Option<&KeyInfo>,
+        algorithm: SignatureAlgorithm,
+        policy: &crate::policy::VerificationPolicy,
+        provider: &dyn crate::provider::CryptoProvider,
+        budget: &mut super::InspectedKeyCandidateBudget,
+    ) -> Result<Option<super::ResolvedVerificationKey<'a>>, DsigError> {
+        budget.bind_policy(policy)?;
+        budget.charge()?;
+        self.resolve_for_verification(key_info, algorithm, policy, provider)
+    }
+
     /// Discover and explicitly authorize a key for an end-to-end operation.
     /// The default preserves discovery only: applications that authorize keys
     /// themselves return `ResolvedVerificationKey::CallerTrusted` explicitly.
@@ -338,6 +354,7 @@ pub enum SignatureSelection<'a> {
 #[must_use = "configure the context and call verify(), or store it for reuse"]
 #[derive(Clone)]
 pub struct VerifyContext<'a> {
+    utc_facts: Option<structured_pkix::temporal::LeapTable<'a>>,
     decapsulation_key: Option<&'a dyn crate::provider::KeyDecapsulationKey>,
     key: Option<&'a dyn VerifyingKey>,
     key_resolver: Option<&'a dyn KeyResolver>,
@@ -361,6 +378,7 @@ impl<'a> VerifyContext<'a> {
     /// - pre-digest buffers not stored
     pub fn new() -> Self {
         Self {
+            utc_facts: None,
             decapsulation_key: None,
             key: None,
             key_resolver: None,
@@ -372,6 +390,13 @@ impl<'a> VerifyContext<'a> {
             signature_selection: SignatureSelection::UniqueDocumentSignature,
             id_attributes: &[],
         }
+    }
+
+    /// Supply application-owned UTC history for certificate evidence. The
+    /// context borrows the table; it neither copies it nor discovers updates.
+    pub fn utc_facts(mut self, facts: structured_pkix::temporal::LeapTable<'a>) -> Self {
+        self.utc_facts = Some(facts);
+        self
     }
 
     /// Set a pre-resolved verification key.
@@ -1071,7 +1096,9 @@ struct CanonicalizedDataBudget {
     max_bytes: usize,
 }
 
-struct VerificationOperationBudgets {
+struct VerificationOperationBudgets<'a> {
+    key_info_parse: RefCell<super::parse::KeyInfoParseUsage>,
+    key_candidates: RefCell<super::InspectedKeyCandidateBudget<'a>>,
     key_establishment: RefCell<crate::key_establishment::KeyEstablishmentUsage>,
     transforms: TransformExecutionBudget,
     canonicalized: CanonicalizedDataBudget,
@@ -1082,12 +1109,21 @@ struct VerificationOperationBudgets {
     external_resource_set_identity: RefCell<Option<OperationResourceIdentity>>,
 }
 
-impl VerificationOperationBudgets {
+impl<'a> VerificationOperationBudgets<'a> {
     fn with_transforms(
         policy: &crate::policy::VerificationPolicy,
         transforms: TransformExecutionBudget,
+        utc_facts: Option<structured_pkix::temporal::LeapTable<'a>>,
     ) -> Self {
+        let key_info_parse = super::parse::KeyInfoParseUsage::new(&policy.resources);
+        let key_candidates = super::InspectedKeyCandidateBudget::with_ingestion(
+            policy,
+            &key_info_parse.certificates,
+            utc_facts,
+        );
         Self {
+            key_info_parse: RefCell::new(key_info_parse),
+            key_candidates: RefCell::new(key_candidates),
             key_establishment: Default::default(),
             transforms,
             canonicalized: CanonicalizedDataBudget::with_limit(
@@ -1764,6 +1800,7 @@ fn verify_signature_with_context(
     ctx: &VerifyContext<'_>,
 ) -> Result<VerifyResult, SignatureVerificationPipelineError> {
     ctx.policy.validate()?;
+    ctx.policy.signature_constraints.require_targets(false)?;
     ctx.policy.resources.validate_xml_document_len(xml.len())?;
     let execution_budget = TransformExecutionBudget::from_resources(&ctx.policy.resources)
         .with_xml_backend(ctx.xml_backend);
@@ -1853,6 +1890,9 @@ fn verify_all_document(
 ) -> Result<VerifyEvidence, DsigError> {
     ctx.policy.validate()?;
     document.validate_operation_policy(&ctx.policy.xml, &ctx.policy.resources)?;
+    ctx.policy
+        .signature_constraints
+        .require_targets(!request.expected_targets.is_empty())?;
     if request.external_resources.is_some() && ctx.external_resources.is_some() {
         return Err(DsigError::InvalidRequest {
             reason: "external resources configured in both context and request",
@@ -1883,6 +1923,7 @@ fn verify_all_document(
         &ctx.policy,
         TransformExecutionBudget::from_resources(&ctx.policy.resources)
             .with_xml_backend(ctx.xml_backend),
+        ctx.utc_facts,
     );
     document.with_view(|view| {
         match request.signatures {
@@ -2026,7 +2067,8 @@ fn verify_signature_document_with_context_and_transforms(
     } else {
         ctx
     };
-    let budgets = VerificationOperationBudgets::with_transforms(&ctx.policy, transforms);
+    let budgets =
+        VerificationOperationBudgets::with_transforms(&ctx.policy, transforms, ctx.utc_facts);
     let mut operation = OperationExecutionContext::new(
         &ctx.policy,
         &budgets,
@@ -2044,6 +2086,7 @@ fn verify_signature_view<'a>(
     >,
 ) -> Result<VerifyResult, SignatureVerificationPipelineError> {
     ctx.policy.validate()?;
+    ctx.policy.signature_constraints.require_targets(false)?;
     let doc = view.document();
     let resolver = UriReferenceResolver::with_document_view(view, ctx.id_attributes)
         .with_same_document_id_semantics(ctx.policy.transforms.same_document_id_semantics)
@@ -2119,6 +2162,9 @@ fn verify_signature_node<'a>(
     }
     let doc = view.document();
     let signature_children = parse_signature_children(signature_node)?;
+    ctx.policy
+        .signature_constraints
+        .check(signature_node, &operation.budgets().transforms)?;
     if ctx.decapsulation_key.is_some() {
         // Public-key encapsulation establishes a recipient secret, not sender
         // identity. Reject an impossible trust requirement before key work.
@@ -2143,15 +2189,17 @@ fn verify_signature_node<'a>(
                 super::parse::validate_x509_digest_policy(node, &|algorithm| {
                     ctx.policy.check_digest_algorithm(algorithm)
                 })?;
-                parse_key_info_with_policy_budgets(
+                super::parse::parse_key_info_in_session(
                     node,
                     ctx.provider,
                     operation.budgets().transforms.xml_base_resolution(),
                     &ctx.policy.resources,
+                    None,
                     ctx.policy
                         .key_trust
                         .certificate_signature_algorithms
                         .as_ref(),
+                    &mut operation.budgets().key_info_parse.borrow_mut(),
                 )
             })
             .transpose()
@@ -2290,6 +2338,7 @@ fn verify_signature_node<'a>(
             if let Some(info) = key_info.as_mut() {
                 let mut xpath_parse = budgets.xpath_parse.borrow_mut();
                 let mut retrieval_budgets = RetrievalMaterializationBudgets {
+                    key_info_parse: &budgets.key_info_parse,
                     xpath_parse: &mut xpath_parse,
                     execution: &budgets.transforms,
                     resources: &ctx.policy.resources,
@@ -2520,6 +2569,7 @@ fn verify_signature_node<'a>(
             let mechanism = encapsulation.as_ref().ok_or(
                 crate::key_establishment::KeyEstablishmentError::Structure("missing mechanism"),
             )?;
+            operation.budgets().key_candidates.borrow_mut().charge()?;
             operation
                 .budgets()
                 .key_establishment
@@ -2539,7 +2589,13 @@ fn verify_signature_node<'a>(
             let hmac = super::HmacVerificationKey::new(secret.to_vec())?;
             return Ok(Some(ResolvedVerifyingKey::Established(hmac)));
         }
-        resolve_verifying_key(ctx, key, key_info.as_ref(), signed_info.signature_method)
+        resolve_verifying_key(
+            ctx,
+            key,
+            key_info.as_ref(),
+            signed_info.signature_method,
+            &mut operation.budgets().key_candidates.borrow_mut(),
+        )
     })?;
     let Some(resolved_key) = resolved_key else {
         operation.set_outcome(
@@ -2736,6 +2792,7 @@ impl RetrievalMaterialization {
 }
 
 struct RetrievalMaterializationBudgets<'a> {
+    key_info_parse: &'a RefCell<super::parse::KeyInfoParseUsage>,
     certificate_signature_algorithms: Option<&'a crate::policy::CertificateSignatureAlgorithms>,
     xpath_parse: &'a mut XPathSignatureParseBudget,
     execution: &'a TransformExecutionBudget,
@@ -3003,12 +3060,14 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
                 })
                 .map_err(map_key_info_parse_error)?;
                 (
-                    parse_key_info_with_policy_budgets(
+                    super::parse::parse_key_info_in_session(
                         node,
                         context.provider,
                         context.budgets.execution.xml_base_resolution(),
                         context.policy.resources(),
+                        None,
                         context.policy.certificate_signature_algorithms(),
+                        &mut context.budgets.key_info_parse.borrow_mut(),
                     )
                     .map_err(map_key_info_parse_error)?,
                     RetrievalMaterialization::default(),
@@ -3090,13 +3149,14 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
                         context.policy.check_digest_algorithm(algorithm)
                     })
                     .map_err(map_key_info_parse_error)?;
-                    let mut referenced = parse_key_info_with_policy_budgets_and_document_base(
+                    let mut referenced = super::parse::parse_key_info_in_session(
                         target,
                         context.provider,
                         context.budgets.execution.xml_base_resolution(),
                         context.policy.resources(),
                         Some(resource_uri),
                         context.policy.certificate_signature_algorithms(),
+                        &mut context.budgets.key_info_parse.borrow_mut(),
                     )
                     .map_err(map_key_info_parse_error)?;
                     let mut nested_outcome = visit(
@@ -3542,12 +3602,14 @@ fn inspect_signature_key_info_with_budgets<P: KeyInfoReferencePolicy>(
             .key_establishment()
             .check_encapsulation(mechanism.algorithm)?;
     }
-    let mut key_info = parse_key_info_with_policy_budgets(
+    let mut key_info = super::parse::parse_key_info_in_session(
         node,
         provider,
         budgets.execution.xml_base_resolution(),
         policy.resources(),
+        None,
         policy.certificate_signature_algorithms(),
+        &mut budgets.key_info_parse.borrow_mut(),
     )
     .map_err(map_key_info_parse_error)?;
     materialize_key_info_references_with_budgets(
@@ -3578,12 +3640,14 @@ fn inspect_signature_key_info_with_budgets<P: KeyInfoReferencePolicy>(
                         .ok_or(DsigError::InvalidStructure {
                             reason: "recipient KeyInfo target is unavailable",
                         })?;
-                key_info = parse_key_info_with_policy_budgets(
+                key_info = super::parse::parse_key_info_in_session(
                     recipient,
                     provider,
                     budgets.execution.xml_base_resolution(),
                     policy.resources(),
+                    None,
                     policy.certificate_signature_algorithms(),
+                    &mut budgets.key_info_parse.borrow_mut(),
                 )
                 .map_err(map_key_info_parse_error)?;
                 // Recipient references use the same cumulative candidate, parse and
@@ -3623,6 +3687,7 @@ pub(crate) fn inspect_signing_key_info_with_budgets(
         policy,
         provider,
         &mut RetrievalMaterializationBudgets {
+            key_info_parse: &RefCell::new(super::parse::KeyInfoParseUsage::new(&policy.resources)),
             xpath_parse: shared_budgets.1,
             execution: shared_budgets.0,
             resources: &policy.resources,
@@ -3654,6 +3719,7 @@ fn inspect_signature_key_info_for_policy<P: KeyInfoReferencePolicy>(
         policy,
         provider,
         &mut RetrievalMaterializationBudgets {
+            key_info_parse: &RefCell::new(super::parse::KeyInfoParseUsage::new(policy.resources())),
             xpath_parse: &mut xpath_parse,
             execution: &execution,
             resources: policy.resources(),
@@ -3727,6 +3793,7 @@ pub fn inspect_pinned_verification_key_info(
         policy,
         provider,
         &mut RetrievalMaterializationBudgets {
+            key_info_parse: &RefCell::new(super::parse::KeyInfoParseUsage::new(&policy.resources)),
             xpath_parse: &mut xpath_parse,
             execution: &execution,
             resources: &policy.resources,
@@ -3753,6 +3820,7 @@ fn materialize_key_info_references_for_policy<P: KeyInfoReferencePolicy>(
     let mut xpath_parse_budget = XPathSignatureParseBudget::from_resources(policy.resources());
     let execution_budget = TransformExecutionBudget::from_resources(policy.resources());
     let mut budgets = RetrievalMaterializationBudgets {
+        key_info_parse: &RefCell::new(super::parse::KeyInfoParseUsage::new(policy.resources())),
         xpath_parse: &mut xpath_parse_budget,
         execution: &execution_budget,
         resources: policy.resources(),
@@ -3912,7 +3980,10 @@ fn materialize_retrieval_methods_with_budgets<P: KeyInfoReferencePolicy>(
                 });
             }
             add_retrieval_binary_usage(&mut total_binary_len, certificate.len())?;
-            let parsed = match parse_x509_certificate(certificate) {
+            let parsed = match super::parse::parse_x509_certificate_in(
+                certificate,
+                &budgets.key_info_parse.borrow().certificates,
+            ) {
                 Ok(parsed) => parsed,
                 Err(error) => {
                     let error = map_key_info_parse_error(error);
@@ -4003,6 +4074,7 @@ fn materialize_retrieval_methods_with_budgets<P: KeyInfoReferencePolicy>(
                 provider,
                 budgets.resources,
                 budgets.certificate_signature_algorithms,
+                &budgets.key_info_parse.borrow().certificates,
             )
             .map_err(map_key_info_parse_error)?;
             materialized.push(super::parse::KeyInfoSource::X509Data(data));
@@ -4072,6 +4144,7 @@ fn materialize_retrieval_methods(
     let execution_budget = TransformExecutionBudget::default();
     let resources = crate::policy::ResourcePolicy::default();
     let mut budgets = RetrievalMaterializationBudgets {
+        key_info_parse: &RefCell::new(super::parse::KeyInfoParseUsage::new(&resources)),
         xpath_parse: &mut xpath_parse_budget,
         execution: &execution_budget,
         resources: &resources,
@@ -4615,6 +4688,7 @@ fn resolve_verifying_key<'k>(
     key: Option<&'k dyn VerifyingKey>,
     key_info: Option<&KeyInfo>,
     algorithm: SignatureAlgorithm,
+    budget: &mut super::InspectedKeyCandidateBudget,
 ) -> Result<Option<ResolvedVerifyingKey<'k>>, SignatureVerificationPipelineError> {
     if let Some(key) = key {
         if !ctx.policy.key_sources.preset_key {
@@ -4624,12 +4698,18 @@ fn resolve_verifying_key<'k>(
             .into());
         }
         require_verifying_key_candidate_capacity(&ctx.policy)?;
+        budget.charge()?;
         return Ok(Some(ResolvedVerifyingKey::Borrowed(key)));
     }
     if let Some(resolver) = ctx.key_resolver {
         require_verifying_key_candidate_capacity(&ctx.policy)?;
-        let resolved =
-            resolver.resolve_for_verification(key_info, algorithm, &ctx.policy, ctx.provider)?;
+        let resolved = resolver.resolve_for_verification_with_budget(
+            key_info,
+            algorithm,
+            &ctx.policy,
+            ctx.provider,
+            budget,
+        )?;
         if let Some(key) = &resolved {
             key.authorize(&ctx.policy)?;
         }
@@ -5118,6 +5198,57 @@ mod tests {
     }
 
     #[test]
+    fn operation_borrows_caller_utc_facts_without_policy_rebinding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Synthetic caller facts test transport, not real-world UTC history.
+        // Operation capture shares the original slice and never infers facts
+        // from a different policy or creates a replacement timeline.
+        let transitions = [structured_pkix::temporal::Transition::new(2_678_400, 1)];
+        let facts = structured_pkix::temporal::LeapTable::new(0, 6_000_000, &transitions)
+            .expect("valid synthetic UTC facts");
+        let ctx = VerifyContext::new().utc_facts(facts);
+        let budgets = VerificationOperationBudgets::with_transforms(
+            &ctx.policy,
+            TransformExecutionBudget::from_resources(&ctx.policy.resources),
+            ctx.utc_facts,
+        );
+        let mut budget = budgets.key_candidates.borrow_mut();
+        assert_eq!(
+            budget
+                .utc_facts()
+                .ok_or("operation UTC facts")?
+                .transitions()
+                .as_ptr(),
+            transitions.as_ptr()
+        );
+        budget.bind_policy(&ctx.policy)?;
+        assert_eq!(
+            budget
+                .utc_facts()
+                .ok_or("retained UTC facts")?
+                .transitions()
+                .as_ptr(),
+            transitions.as_ptr()
+        );
+        let standalone =
+            super::super::InspectedKeyCandidateBudget::new_with_utc_facts(&ctx.policy, facts);
+        assert_eq!(
+            standalone
+                .utc_facts()
+                .ok_or("standalone UTC facts")?
+                .transitions()
+                .as_ptr(),
+            transitions.as_ptr()
+        );
+        assert!(
+            super::super::InspectedKeyCandidateBudget::new(&ctx.policy)
+                .utc_facts()
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn reference_resolution_uses_each_elements_effective_xml_base() {
         // Equal lexical URIs under different xml:base values identify distinct
         // caller-owned resources and must not collide in the resolver.
@@ -5553,8 +5684,11 @@ mod tests {
                     .expect("test signature must contain Object");
                 let resolver = UriReferenceResolver::with_document_view(view, &[])
                     .with_external_resources(&resources);
-                let budgets =
-                    VerificationOperationBudgets::with_transforms(&ctx.policy, transform_budget);
+                let budgets = VerificationOperationBudgets::with_transforms(
+                    &ctx.policy,
+                    transform_budget,
+                    ctx.utc_facts,
+                );
                 let mut operation = OperationExecutionContext::new(
                     &ctx.policy,
                     &budgets,
@@ -7316,6 +7450,7 @@ mod tests {
             let budgets = VerificationOperationBudgets::with_transforms(
                 &policy,
                 TransformExecutionBudget::from_resources(&policy.resources),
+                None,
             );
             let operation = OperationExecutionContext::new(
                 &policy,
@@ -7365,6 +7500,7 @@ mod tests {
             let budgets = VerificationOperationBudgets::with_transforms(
                 &policy,
                 TransformExecutionBudget::from_resources(&policy.resources),
+                None,
             );
             let operation = OperationExecutionContext::new(
                 &policy,
@@ -8078,6 +8214,9 @@ mod tests {
         let mut xpath_parse_budget = XPathSignatureParseBudget::default();
         let execution_budget = TransformExecutionBudget::from_resources(&policy.resources);
         let mut budgets = RetrievalMaterializationBudgets {
+            key_info_parse: &RefCell::new(super::super::parse::KeyInfoParseUsage::new(
+                &policy.resources,
+            )),
             xpath_parse: &mut xpath_parse_budget,
             execution: &execution_budget,
             resources: &policy.resources,
@@ -8110,6 +8249,65 @@ mod tests {
     }
 
     #[test]
+    fn raw_certificate_retrieval_retains_spent_operation_work() {
+        // Raw DER retrieval must not bypass the account used by XML KeyInfo parsing.
+        let pair = rcgen::KeyPair::generate().expect("test key generation");
+        let cert = rcgen::CertificateParams::new(Vec::<String>::new())
+            .expect("empty SAN list")
+            .self_signed(&pair)
+            .expect("test certificate signing");
+        let external = HashMap::from([("urn:cert".to_owned(), cert.der().to_vec())]);
+        let document = Document::parse("<root/>").expect("test XML");
+        let resolver = UriReferenceResolver::new(&document).with_external_resources(&external);
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_x509_work = 1;
+        policy.uris.retrieval_methods = UriTypeSet::ALL;
+        let usage = RefCell::new(super::super::parse::KeyInfoParseUsage::new(
+            &policy.resources,
+        ));
+        usage
+            .borrow()
+            .certificates
+            .memory()
+            .charge_work(1)
+            .expect("spend allowance");
+        let mut xpath = XPathSignatureParseBudget::from_resources(&policy.resources);
+        let execution = TransformExecutionBudget::from_resources(&policy.resources);
+        let mut budgets = RetrievalMaterializationBudgets {
+            key_info_parse: &usage,
+            xpath_parse: &mut xpath,
+            execution: &execution,
+            resources: &policy.resources,
+            certificate_signature_algorithms: None,
+            xml_backend: crate::XmlBackend::default(),
+        };
+        let mut info = KeyInfo {
+            sources: vec![super::super::parse::KeyInfoSource::RetrievalMethod {
+                uri: "urn:cert".into(),
+                resource_type: Some("http://www.w3.org/2000/09/xmldsig#rawX509Certificate".into()),
+                transforms: RetrievalMethodTransforms::None,
+            }],
+        };
+        let result = materialize_retrieval_methods_with_budgets(
+            &mut info,
+            &resolver,
+            &policy,
+            crate::provider::default_provider(),
+            &mut budgets,
+            &mut 0,
+        );
+        assert!(matches!(
+            result,
+            Err(SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::ResourceLimitExceeded {
+                    resource: crate::policy::resource_name::X509_WORK,
+                    maximum: 1,
+                }
+            ))
+        ));
+    }
+
+    #[test]
     fn empty_key_info_reference_participates_in_cycle_detection() {
         // Empty URI resolves to the owning document's root KeyInfo. It must
         // recurse through the same traversal state rather than leave the
@@ -8128,6 +8326,9 @@ mod tests {
         let mut xpath_parse_budget = XPathSignatureParseBudget::default();
         let execution_budget = TransformExecutionBudget::from_resources(&policy.resources);
         let mut budgets = RetrievalMaterializationBudgets {
+            key_info_parse: &RefCell::new(super::super::parse::KeyInfoParseUsage::new(
+                &policy.resources,
+            )),
             xpath_parse: &mut xpath_parse_budget,
             execution: &execution_budget,
             resources: &policy.resources,
@@ -8186,6 +8387,9 @@ mod tests {
         let mut xpath_parse_budget = XPathSignatureParseBudget::default();
         let execution_budget = TransformExecutionBudget::from_resources(&policy.resources);
         let mut budgets = RetrievalMaterializationBudgets {
+            key_info_parse: &RefCell::new(super::super::parse::KeyInfoParseUsage::new(
+                &policy.resources,
+            )),
             xpath_parse: &mut xpath_parse_budget,
             execution: &execution_budget,
             resources: &policy.resources,
@@ -8463,6 +8667,9 @@ mod tests {
         let mut xpath_parse_budget = XPathSignatureParseBudget::default();
         let execution_budget = TransformExecutionBudget::from_resources(&policy.resources);
         let mut budgets = RetrievalMaterializationBudgets {
+            key_info_parse: &RefCell::new(super::super::parse::KeyInfoParseUsage::new(
+                &policy.resources,
+            )),
             xpath_parse: &mut xpath_parse_budget,
             execution: &execution_budget,
             resources: &policy.resources,
@@ -8508,6 +8715,9 @@ mod tests {
         let mut xpath_parse_budget = XPathSignatureParseBudget::default();
         let execution_budget = TransformExecutionBudget::from_resources(&policy.resources);
         let mut budgets = RetrievalMaterializationBudgets {
+            key_info_parse: &RefCell::new(super::super::parse::KeyInfoParseUsage::new(
+                &policy.resources,
+            )),
             xpath_parse: &mut xpath_parse_budget,
             execution: &execution_budget,
             resources: &policy.resources,
@@ -8691,6 +8901,9 @@ mod tests {
             ..crate::policy::ResourcePolicy::default()
         };
         let mut budgets = RetrievalMaterializationBudgets {
+            key_info_parse: &RefCell::new(super::super::parse::KeyInfoParseUsage::new(
+                &resource_policy,
+            )),
             xpath_parse: &mut xpath_parse_budget,
             execution: &execution_budget,
             resources: &resource_policy,
@@ -8994,6 +9207,94 @@ mod tests {
                 }
             )
         ));
+    }
+
+    #[test]
+    fn verification_candidate_account_is_not_reset_for_each_signature() {
+        // A rejected signature still spends its candidate allowance in verify_all.
+        let xml = signature_with_target_reference("AQ==");
+        let start = xml
+            .find("<ds:Signature>")
+            .expect("generated signature start");
+        let end = xml
+            .find("</ds:Signature>")
+            .expect("generated signature end")
+            + "</ds:Signature>".len();
+        let document =
+            XmlDocument::parse(xml.replace("</root>", &format!("{}</root>", &xml[start..end])))
+                .expect("two signatures");
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_key_candidates = 1;
+        let evidence = VerifyContext::new()
+            .key(&RejectingKey)
+            .policy(policy)
+            .verify_all(&document)
+            .expect("signature-local failure report");
+        assert_eq!(evidence.signatures().len(), 2);
+        assert!(evidence.signatures()[0].result().is_ok());
+        assert!(matches!(
+            evidence.signatures()[1].result(),
+            Err(DsigError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::KEY_CANDIDATES,
+                    maximum: 1,
+                    actual: 2,
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn resolver_receives_the_certificate_account_spent_by_ingestion() {
+        // The public resolver hook receives prior parsing work, not a fresh allowance.
+        struct ProbeResolver {
+            called: Cell<bool>,
+        }
+        impl KeyResolver for ProbeResolver {
+            fn resolve<'a>(
+                &'a self,
+                _info: Option<&KeyInfo>,
+                _algorithm: SignatureAlgorithm,
+            ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
+                panic!("core must dispatch through the budget-aware hook");
+            }
+            fn resolve_for_verification_with_budget<'a>(
+                &'a self,
+                _info: Option<&KeyInfo>,
+                _algorithm: SignatureAlgorithm,
+                _policy: &crate::policy::VerificationPolicy,
+                _provider: &dyn crate::provider::CryptoProvider,
+                budget: &mut super::super::InspectedKeyCandidateBudget,
+            ) -> Result<Option<super::super::ResolvedVerificationKey<'a>>, DsigError> {
+                assert!(budget.execution().work_used() > 0);
+                budget.charge()?;
+                self.called.set(true);
+                Ok(Some(super::super::ResolvedVerificationKey::CallerTrusted(
+                    Box::new(AcceptingKey),
+                )))
+            }
+            fn consumes_document_key_info(&self) -> bool {
+                true
+            }
+        }
+        let pair = rcgen::KeyPair::generate().expect("test key generation");
+        let certificate = rcgen::CertificateParams::new(Vec::<String>::new())
+            .expect("empty SAN list")
+            .self_signed(&pair)
+            .expect("test certificate");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(certificate.der());
+        let xml = signature_with_target_reference("AQ==").replace("</ds:Signature>", &format!(
+            "<ds:KeyInfo><ds:X509Data><ds:X509Certificate>{encoded}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature>",
+        ));
+        let resolver = ProbeResolver {
+            called: Cell::new(false),
+        };
+        let result = VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(&xml)
+            .expect("shared-account resolver dispatch");
+        assert!(matches!(result.status, DsigStatus::Valid));
+        assert!(resolver.called.get());
     }
 
     #[test]
@@ -9481,6 +9782,7 @@ mod tests {
         let budgets = VerificationOperationBudgets::with_transforms(
             &crate::policy::VerificationPolicy::default(),
             TransformExecutionBudget::default(),
+            None,
         );
         document.with_view(|view| {
             let resolver = UriReferenceResolver::new(view.document());
@@ -9511,6 +9813,7 @@ mod tests {
         let budgets = VerificationOperationBudgets::with_transforms(
             &crate::policy::VerificationPolicy::default(),
             TransformExecutionBudget::default(),
+            None,
         );
 
         document.with_view(|view| {

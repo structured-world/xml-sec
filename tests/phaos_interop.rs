@@ -327,7 +327,13 @@ fn execute(case: Case) -> Result<xml_sec::xmldsig::VerifyResult, DsigError> {
         Setup::Dsa => {
             // These DSA cases may select KeyValue before X509Data: the corpus
             // tests cryptographic interoperability, not authorization of that key.
-            let mut dsa_policy = policy(SignatureAlgorithm::DsaSha1, true);
+            // This is a cryptographic corpus, not a certificate qualification
+            // corpus: Phaos encodes KeyUsage as 03 03 07 D8 00, retaining
+            // trailing zero bits forbidden for a DER named bit list by
+            // X.690 (2021) 11.2.2. The negative corpus separately proves the
+            // certificate path rejects it; do not relax the shared reader.
+            // https://www.itu.int/rec/T-REC-X.690-202102-I/en
+            let mut dsa_policy = policy(SignatureAlgorithm::DsaSha1, false);
             dsa_policy.key_trust.mode = xml_sec::policy::VerificationTrustMode::CryptographicOnly;
             let resolver = DefaultKeyResolver::new(KeyResolverConfig {
                 lookup_certs: vec![certificate("dsa-cert.der")],

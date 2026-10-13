@@ -98,6 +98,8 @@ X.509 validation. See [XML Digital Signatures](docs/xmldsig.md) for algorithms, 
 key resolution, failure handling, and current interoperability boundaries.
 See [Key management](docs/key-management.md) for inventory ownership, format import,
 password handling, and CLI key-store behavior.
+See [policy profiles](docs/policy-profiles.md) for trusted presets, restrictive
+composition and expiring compatibility authorization.
 
 ## XML Encryption
 

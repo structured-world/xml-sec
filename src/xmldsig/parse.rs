@@ -17,21 +17,13 @@
 //! ```
 
 use crate::xml::dom::{Document, Node};
-use der::{
-    Decode,
-    asn1::{Ia5StringRef, ObjectIdentifier},
-};
+use der::{Decode, asn1::ObjectIdentifier};
 use std::collections::BTreeMap;
-use x509_cert::ext::pkix::name::DirectoryString;
-use x509_cert::name::Name;
-use x509_parser::extensions::ParsedExtension;
-use x509_parser::prelude::FromDer;
-use x509_parser::public_key::PublicKey;
-use x509_parser::x509::X509Name;
 
 #[cfg(test)]
 use super::digest::compute_digest;
 use super::digest::{DigestAlgorithm, compute_digest_with_provider, constant_time_eq};
+use super::pkix::X509DataSource;
 use super::transforms::{self, Transform};
 use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_text};
 use super::x509::certificate_signature_matches_with_provider;
@@ -817,6 +809,9 @@ pub enum X509PublicKeyInfo {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ParseError {
+    /// Located processing failure from the shared certificate decoder.
+    #[error("X509Certificate is not valid DER X.509: {0}")]
+    Certificate(#[source] structured_pkix::Error),
     /// The default low-level parsing policy rejected bounded input.
     #[error("XMLDSig policy violation: {0}")]
     Policy(#[from] crate::policy::PolicyViolation),
@@ -1359,13 +1354,58 @@ pub struct KeyInfoParsingSession<'a> {
     usage: KeyInfoParseUsage,
 }
 
-#[derive(Default)]
-struct KeyInfoParseUsage {
+pub(crate) struct KeyInfoParseUsage {
     embedded_candidates: usize,
     x509_binary_bytes: usize,
+    pub(crate) certificates: super::pkix::CertificateSession,
+}
+
+impl KeyInfoParseUsage {
+    pub(crate) fn new(resources: &crate::policy::ResourcePolicy) -> Self {
+        Self {
+            embedded_candidates: 0,
+            x509_binary_bytes: 0,
+            certificates: super::pkix::CertificateSession::new(resources),
+        }
+    }
 }
 
 impl<'a> KeyInfoParsingSession<'a> {
+    /// Inspect original certificate SPKI without constructing display metadata
+    /// or starting another certificate budget. Parsing does not establish trust.
+    /// The callback owns any further key conversion and its accounting.
+    pub fn with_certificate_public_key<R>(
+        &mut self,
+        der: &[u8],
+        inspect: impl FnOnce(&[u8]) -> R,
+    ) -> Result<R, ParseError> {
+        charge_embedded_key_candidate(&mut self.usage.embedded_candidates, self.resources)?;
+        if der.len() > self.resources.max_external_resource_bytes {
+            return Err(ParseError::Policy(
+                crate::policy::PolicyViolation::ResourceLimitExceeded {
+                    resource: crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
+                    maximum: self.resources.max_external_resource_bytes,
+                },
+            ));
+        }
+        let total = self.usage.x509_binary_bytes.checked_add(der.len());
+        if total.is_none_or(|bytes| bytes > self.resources.max_external_resource_total_bytes) {
+            return Err(ParseError::Policy(
+                crate::policy::PolicyViolation::ResourceLimitExceeded {
+                    resource: crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                    maximum: self.resources.max_external_resource_total_bytes,
+                },
+            ));
+        }
+        self.usage.x509_binary_bytes = total.expect("admitted checked sum");
+        let certificate = self
+            .usage
+            .certificates
+            .read(der)
+            .map_err(|error| self.usage.certificates.parse_error(error))?;
+        Ok(inspect(certificate.tbs().public_key().as_bytes()))
+    }
+
     /// Count enclosing encryption mechanisms in the same ingestion allowance
     /// as their embedded keys, before either representation is materialized.
     #[cfg(feature = "xmlenc")]
@@ -1406,7 +1446,7 @@ impl<'a> KeyInfoParsingSession<'a> {
                 resources.effective_xml_base_components(),
                 resources.effective_xml_base_resolution_bytes(),
             ),
-            usage: KeyInfoParseUsage::default(),
+            usage: KeyInfoParseUsage::new(resources),
         })
     }
 
@@ -1491,36 +1531,18 @@ pub(crate) fn parse_key_info_with_policy_budgets(
     resources: &crate::policy::ResourcePolicy,
     allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<KeyInfo, ParseError> {
-    parse_key_info_with_policy_budgets_and_document_base(
+    parse_key_info_in_session(
         key_info_node,
         provider,
         xml_base_budget,
         resources,
         None,
         allowed,
+        &mut KeyInfoParseUsage::new(resources),
     )
 }
 
-pub(crate) fn parse_key_info_with_policy_budgets_and_document_base(
-    key_info_node: Node,
-    provider: &dyn crate::provider::CryptoProvider,
-    xml_base_budget: &XmlBaseResolutionBudget,
-    resources: &crate::policy::ResourcePolicy,
-    document_base: Option<&str>,
-    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
-) -> Result<KeyInfo, ParseError> {
-    parse_key_info_in_session(
-        key_info_node,
-        provider,
-        xml_base_budget,
-        resources,
-        document_base,
-        allowed,
-        &mut KeyInfoParseUsage::default(),
-    )
-}
-
-fn parse_key_info_in_session(
+pub(crate) fn parse_key_info_in_session(
     key_info_node: Node,
     provider: &dyn crate::provider::CryptoProvider,
     xml_base_budget: &XmlBaseResolutionBudget,
@@ -1574,13 +1596,14 @@ fn parse_key_info_contents_in_session(
                 sources.push(KeyInfoSource::KeyValue(key_value));
             }
             (Some(XMLDSIG_NS), "X509Data") => {
-                let x509 = parse_x509_data_dispatch_with_budget_and_provider(
+                let x509 = parse_x509_data_in_session(
                     child,
                     &mut usage.x509_binary_bytes,
                     &mut usage.embedded_candidates,
                     provider,
                     resources,
                     allowed,
+                    &usage.certificates,
                 )?;
                 sources.push(KeyInfoSource::X509Data(x509));
             }
@@ -2124,6 +2147,27 @@ pub(crate) fn parse_x509_data_dispatch_with_budget_and_provider(
     provider: &dyn crate::provider::CryptoProvider,
     resources: &crate::policy::ResourcePolicy,
     allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
+    certificates: &super::pkix::CertificateSession,
+) -> Result<X509DataInfo, ParseError> {
+    parse_x509_data_in_session(
+        node,
+        total_binary_len,
+        embedded_key_candidates,
+        provider,
+        resources,
+        allowed,
+        certificates,
+    )
+}
+
+fn parse_x509_data_in_session(
+    node: Node,
+    total_binary_len: &mut usize,
+    embedded_key_candidates: &mut usize,
+    provider: &dyn crate::provider::CryptoProvider,
+    resources: &crate::policy::ResourcePolicy,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
+    certificates: &super::pkix::CertificateSession,
 ) -> Result<X509DataInfo, ParseError> {
     verify_ds_element(node, "X509Data")?;
     ensure_no_non_whitespace_text(node, "X509Data")?;
@@ -2137,7 +2181,7 @@ pub(crate) fn parse_x509_data_dispatch_with_budget_and_provider(
                 ensure_x509_data_entry_budget(&info)?;
                 let cert =
                     decode_x509_base64(child, "X509Certificate", total_binary_len, resources)?;
-                let parsed_cert = parse_x509_certificate(cert.as_slice())?;
+                let parsed_cert = parse_x509_certificate_in(cert.as_slice(), certificates)?;
                 info.parsed_certificates.push(parsed_cert);
                 info.certificates.push(cert);
             }
@@ -2184,7 +2228,7 @@ pub(crate) fn parse_x509_data_dispatch_with_budget_and_provider(
         }
     }
 
-    info.certificate_chain = build_x509_certificate_chain(&info, provider, allowed)?;
+    info.certificate_chain = build_x509_certificate_chain(&info, provider, allowed, certificates)?;
     Ok(info)
 }
 
@@ -2226,18 +2270,20 @@ fn build_x509_certificate_chain(
     info: &X509DataInfo,
     provider: &dyn crate::provider::CryptoProvider,
     allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
+    certificates: &super::pkix::CertificateSession,
 ) -> Result<Vec<usize>, ParseError> {
     if info.parsed_certificates.is_empty() {
         return Ok(Vec::new());
     }
 
-    let signing_idx = select_x509_signing_certificate(info, provider)?;
-    build_x509_certificate_chain_from(info, signing_idx, provider, allowed)
+    let signing_idx = select_x509_signing_certificate(info, provider, certificates)?;
+    build_x509_certificate_chain_from(info, signing_idx, provider, allowed, certificates)
         .map_err(ParseError::from)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum X509ChainBuildError {
+    Certificate(super::X509ChainError),
     Policy(crate::policy::PolicyViolation),
     InconsistentMetadata,
     DepthExceeded,
@@ -2248,9 +2294,26 @@ pub(crate) enum X509ChainBuildError {
     Provider(crate::provider::ProviderError),
 }
 
+impl From<super::X509ChainError> for X509ChainBuildError {
+    fn from(error: super::X509ChainError) -> Self {
+        match error {
+            super::X509ChainError::Policy(error) => Self::Policy(error),
+            super::X509ChainError::Provider(error) => Self::Provider(error),
+            error => Self::Certificate(error),
+        }
+    }
+}
+
 impl From<X509ChainBuildError> for ParseError {
     fn from(error: X509ChainBuildError) -> Self {
         let reason = match error {
+            X509ChainBuildError::Certificate(error) => {
+                return match error {
+                    super::X509ChainError::Policy(error) => Self::Policy(error),
+                    super::X509ChainError::Processing(error) => Self::Certificate(error),
+                    error => Self::InvalidStructure(error.to_string()),
+                };
+            }
             X509ChainBuildError::InconsistentMetadata => {
                 "X509Data certificate metadata is inconsistent"
             }
@@ -2282,6 +2345,7 @@ pub(crate) fn build_x509_certificate_chain_from(
     signing_idx: usize,
     provider: &dyn crate::provider::CryptoProvider,
     allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
+    certificates: &super::pkix::CertificateSession,
 ) -> Result<Vec<usize>, X509ChainBuildError> {
     if signing_idx >= info.parsed_certificates.len()
         || info.parsed_certificates.len() != info.certificates.len()
@@ -2289,26 +2353,32 @@ pub(crate) fn build_x509_certificate_chain_from(
         return Err(X509ChainBuildError::InconsistentMetadata);
     }
     let mut chain = vec![signing_idx];
+    let source = certificates
+        .read_pool(&info.certificates)
+        .map_err(X509ChainBuildError::from)?;
 
     loop {
         let current_idx = *chain
             .last()
             .expect("chain starts with signing certificate index");
-        let current = &info.parsed_certificates[current_idx];
-        if distinguished_names_equal(&current.subject_dn, &current.issuer_dn) {
+        let current = &source[current_idx];
+        if certificates
+            .source_names_equal(current.tbs().subject(), current.tbs().issuer())
+            .map_err(X509ChainBuildError::from)?
+        {
             break;
         }
 
-        let candidates = info
-            .parsed_certificates
-            .iter()
-            .enumerate()
-            .filter(|(idx, cert)| {
-                *idx != current_idx
-                    && distinguished_names_equal(&cert.subject_dn, &current.issuer_dn)
-            })
-            .map(|(idx, _)| idx)
-            .collect::<Vec<_>>();
+        let mut candidates = Vec::new();
+        for (idx, cert) in source.iter().enumerate() {
+            if idx != current_idx
+                && certificates
+                    .source_names_equal(cert.tbs().subject(), current.tbs().issuer())
+                    .map_err(X509ChainBuildError::from)?
+            {
+                candidates.push(idx);
+            }
+        }
 
         let issuer_idx = match candidates.as_slice() {
             [] => break,
@@ -2322,6 +2392,7 @@ pub(crate) fn build_x509_certificate_chain_from(
                         &info.certificates[issuer_idx],
                         provider,
                         allowed,
+                        certificates,
                     ) {
                         Ok(true) => verified.push(issuer_idx),
                         Ok(false) => {}
@@ -2373,15 +2444,15 @@ pub(crate) fn build_x509_certificate_chain_from(
 /// in the trusted prefix. Trust and certificate policy are intentionally not
 /// assigned here; callers must fully validate every returned candidate.
 pub(crate) fn build_x509_certificate_paths_to_trusted_prefix(
-    info: &X509DataInfo,
+    info: &impl X509DataSource,
     signing_idx: usize,
     trusted_prefix_len: usize,
-    max_depth: usize,
-    max_candidate_paths: usize,
+    bounds: X509PathBounds,
     provider: &dyn crate::provider::CryptoProvider,
     allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
-) -> Result<Vec<Vec<usize>>, X509ChainBuildError> {
-    if trusted_prefix_len > info.certificates.len() {
+    certificates: &super::pkix::CertificateSession,
+) -> Result<X509CandidatePaths, X509ChainBuildError> {
+    if trusted_prefix_len > info.certificate_count() {
         return Err(X509ChainBuildError::InconsistentMetadata);
     }
     build_x509_certificate_paths(
@@ -2389,12 +2460,9 @@ pub(crate) fn build_x509_certificate_paths_to_trusted_prefix(
         signing_idx,
         |index| index < trusted_prefix_len,
         false,
-        X509PathBounds {
-            max_depth,
-            max_candidate_paths,
-        },
-        provider,
-        allowed,
+        bounds,
+        super::pkix::ProviderVerifier { provider, allowed },
+        certificates,
     )
 }
 
@@ -2402,17 +2470,17 @@ pub(crate) fn build_x509_certificate_paths_to_trusted_prefix(
 /// A matching intermediate is retained as a candidate and traversal continues
 /// so callers can test selector categories against every longer path as well.
 pub(crate) fn build_x509_certificate_paths_to_selector_targets(
-    info: &X509DataInfo,
+    info: &impl X509DataSource,
     signing_idx: usize,
     targets: &[usize],
-    max_depth: usize,
-    max_candidate_paths: usize,
+    bounds: X509PathBounds,
     provider: &dyn crate::provider::CryptoProvider,
     allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
-) -> Result<Vec<Vec<usize>>, X509ChainBuildError> {
+    certificates: &super::pkix::CertificateSession,
+) -> Result<X509CandidatePaths, X509ChainBuildError> {
     if targets
         .iter()
-        .any(|index| *index >= info.certificates.len())
+        .any(|index| *index >= info.certificate_count())
     {
         return Err(X509ChainBuildError::InconsistentMetadata);
     }
@@ -2421,79 +2489,118 @@ pub(crate) fn build_x509_certificate_paths_to_selector_targets(
         signing_idx,
         |index| targets.contains(&index),
         true,
-        X509PathBounds {
-            max_depth,
-            max_candidate_paths,
-        },
-        provider,
-        allowed,
+        bounds,
+        super::pkix::ProviderVerifier { provider, allowed },
+        certificates,
     )
 }
 
-struct X509PathBounds {
-    max_depth: usize,
-    max_candidate_paths: usize,
+pub(crate) struct X509PathBounds {
+    pub(crate) max_depth: usize,
+    pub(crate) max_candidate_paths: usize,
 }
 
+type X509CandidatePaths =
+    structured_asn1::memory::OwnedVec<structured_asn1::memory::OwnedVec<usize>>;
+
 fn build_x509_certificate_paths(
-    info: &X509DataInfo,
+    info: &impl X509DataSource,
     signing_idx: usize,
     is_terminal: impl Fn(usize) -> bool,
     continue_after_terminal: bool,
     bounds: X509PathBounds,
-    provider: &dyn crate::provider::CryptoProvider,
-    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
-) -> Result<Vec<Vec<usize>>, X509ChainBuildError> {
+    verifier: super::pkix::ProviderVerifier<'_>,
+    certificates: &super::pkix::CertificateSession,
+) -> Result<X509CandidatePaths, X509ChainBuildError> {
     let X509PathBounds {
         max_depth,
         max_candidate_paths,
     } = bounds;
-    if signing_idx >= info.parsed_certificates.len()
-        || info.parsed_certificates.len() != info.certificates.len()
-    {
+    if signing_idx >= info.certificate_count() {
         return Err(X509ChainBuildError::InconsistentMetadata);
     }
     if max_candidate_paths == 0 {
         return Err(X509ChainBuildError::AmbiguousIssuer);
     }
+    let source = certificates
+        .read_sources(info.encoded_certificates())
+        .map_err(X509ChainBuildError::from)?;
 
-    let mut pending = vec![vec![signing_idx]];
-    let mut completed = Vec::new();
+    let memory = certificates.memory();
+    let allocation_error = |reason| {
+        X509ChainBuildError::from(certificates.error(structured_pkix::Error::resource(
+            reason,
+            "certificate.paths",
+            0,
+        )))
+    };
+    let mut initial = memory.vector();
+    initial.try_push(signing_idx).map_err(allocation_error)?;
+    let mut pending = memory.vector();
+    pending.try_push(initial).map_err(allocation_error)?;
+    let mut completed = memory.vector();
     let mut generated_paths = 1usize;
     let mut depth_exceeded = false;
     let mut unsupported_oid = None;
     let mut policy_rejection = None;
-    let mut issuer_cache = vec![None; info.parsed_certificates.len()];
+    let mut issuer_cache = memory.vector();
+    issuer_cache
+        .try_reserve_exact(info.certificate_count())
+        .map_err(allocation_error)?;
+    for _ in 0..info.certificate_count() {
+        issuer_cache.try_push(None).map_err(allocation_error)?;
+    }
     while let Some(path) = pending.pop() {
+        memory
+            .charge_work(info.certificate_count() as u64)
+            .map_err(allocation_error)?;
         let current_idx = *path
             .last()
             .expect("candidate path starts with signing certificate index");
         if is_terminal(current_idx) {
-            completed.push(path.clone());
             if !continue_after_terminal {
+                completed.try_push(path).map_err(allocation_error)?;
                 continue;
             }
+            memory
+                .charge_work(path.len() as u64)
+                .map_err(allocation_error)?;
+            completed
+                .try_push(path.try_copy().map_err(allocation_error)?)
+                .map_err(allocation_error)?;
         }
         if path.len() == max_depth {
             depth_exceeded = true;
             continue;
         }
 
-        let current = &info.parsed_certificates[current_idx];
+        let current = &source[current_idx];
         if issuer_cache[current_idx].is_none() {
-            let mut verified = Vec::new();
-            for (issuer_idx, issuer) in info.parsed_certificates.iter().enumerate() {
-                if !distinguished_names_equal(&issuer.subject_dn, &current.issuer_dn) {
+            let mut verified = memory.vector();
+            for (issuer_idx, issuer) in source.iter().enumerate() {
+                if !certificates
+                    .source_names_equal(issuer.tbs().subject(), current.tbs().issuer())
+                    .map_err(X509ChainBuildError::from)?
+                {
                     continue;
                 }
-                match certificate_signature_matches_with_provider(
-                    &info.certificates[current_idx],
-                    &info.certificates[issuer_idx],
-                    provider,
-                    allowed,
+                match super::x509::shared_certificate_signature_outcome(
+                    current,
+                    issuer,
+                    verifier.provider,
+                    verifier.allowed,
+                    certificates,
                 ) {
-                    Ok(true) => verified.push(issuer_idx),
-                    Ok(false) => {}
+                    Ok(
+                        structured_pkix::path::Verified::Yes
+                        | structured_pkix::path::Verified::Unsupported,
+                    ) => {
+                        // An isolated edge with inherited parameters cannot prove
+                        // rejection. Only complete supplied-path validation grants trust.
+                        verified.try_push(issuer_idx).map_err(allocation_error)?;
+                    }
+                    Ok(structured_pkix::path::Verified::No) => {}
+                    Ok(_) => return Err(X509ChainBuildError::IssuerSignatureMismatch),
                     Err(super::X509ChainError::Provider(
                         crate::provider::ProviderError::Unsupported {
                             operation: crate::provider::ProviderOperation::VerifyCertificate,
@@ -2515,6 +2622,13 @@ fn build_x509_certificate_paths(
                         break;
                     }
                     Err(super::X509ChainError::Policy(error)) => {
+                        if matches!(
+                            error,
+                            crate::policy::PolicyViolation::ResourceLimit { .. }
+                                | crate::policy::PolicyViolation::ResourceLimitExceeded { .. }
+                        ) {
+                            return Err(X509ChainBuildError::Policy(error));
+                        }
                         // Certificate permission belongs to this child's
                         // parent edge, not to other cross-certified paths.
                         // RFC 5280 section 6.1 validates a prospective path;
@@ -2531,19 +2645,29 @@ fn build_x509_certificate_paths(
         let issuers = issuer_cache[current_idx]
             .as_ref()
             .expect("issuer cache entry was initialized");
-        let issuers = issuers
-            .iter()
-            .copied()
-            .filter(|issuer_idx| !path.contains(issuer_idx))
-            .collect::<Vec<_>>();
-        if generated_paths.saturating_add(issuers.len()) > max_candidate_paths {
-            return Err(X509ChainBuildError::AmbiguousIssuer);
-        }
-        generated_paths += issuers.len();
-        for issuer_idx in issuers {
-            let mut candidate = path.clone();
-            candidate.push(issuer_idx);
-            pending.push(candidate);
+        for &issuer_idx in issuers {
+            memory
+                .charge_work(path.len() as u64 + 1)
+                .map_err(allocation_error)?;
+            if path.contains(&issuer_idx) {
+                continue;
+            }
+            if generated_paths == max_candidate_paths {
+                return Err(X509ChainBuildError::AmbiguousIssuer);
+            }
+            generated_paths += 1;
+            memory
+                .charge_work(path.len() as u64 + 1)
+                .map_err(allocation_error)?;
+            let mut candidate = memory.vector();
+            candidate
+                .try_reserve_exact(path.len() + 1)
+                .map_err(allocation_error)?;
+            candidate
+                .try_extend_from_slice(&path)
+                .map_err(allocation_error)?;
+            candidate.try_push(issuer_idx).map_err(allocation_error)?;
+            pending.try_push(candidate).map_err(allocation_error)?;
         }
     }
 
@@ -2564,21 +2688,17 @@ fn build_x509_certificate_paths(
 fn select_x509_signing_certificate(
     info: &X509DataInfo,
     provider: &dyn crate::provider::CryptoProvider,
+    certificates: &super::pkix::CertificateSession,
 ) -> Result<usize, ParseError> {
     let has_lookup_identifiers = x509_data_has_lookup_identifiers(info);
     let mut candidates = Vec::new();
     if has_lookup_identifiers {
-        for (idx, (parsed, der)) in info
-            .parsed_certificates
-            .iter()
-            .zip(&info.certificates)
-            .enumerate()
-        {
-            if x509_certificate_matches_any_selector(info, parsed, der, provider)? {
+        for (idx, der) in info.certificates.iter().enumerate() {
+            if x509_certificate_matches_any_selector(info, der, provider, certificates)? {
                 candidates.push(idx);
             }
         }
-        if !x509_selector_categories_match_chain(info, provider)? {
+        if !x509_selector_categories_match_chain(info, provider, certificates)? {
             return Err(ParseError::InvalidStructure(
                 "X509Data lookup identifiers do not match the embedded certificate chain".into(),
             ));
@@ -2596,19 +2716,31 @@ fn select_x509_signing_certificate(
         _ => {}
     }
 
-    let leaf_candidates = info
-        .parsed_certificates
-        .iter()
-        .enumerate()
-        .filter(|(_, cert)| {
-            !distinguished_names_equal(&cert.subject_dn, &cert.issuer_dn)
-                && !info
-                    .parsed_certificates
-                    .iter()
-                    .any(|other| distinguished_names_equal(&other.issuer_dn, &cert.subject_dn))
-        })
-        .map(|(idx, _)| idx)
-        .collect::<Vec<_>>();
+    let source = certificates
+        .read_pool(&info.certificates)
+        .map_err(|error| certificates.parse_error(error))?;
+    let mut leaf_candidates = Vec::new();
+    for (idx, cert) in source.iter().enumerate() {
+        if certificates
+            .source_names_equal(cert.tbs().subject(), cert.tbs().issuer())
+            .map_err(|error| certificates.parse_error(error))?
+        {
+            continue;
+        }
+        let mut issuer = false;
+        for other in &source {
+            if certificates
+                .source_names_equal(other.tbs().issuer(), cert.tbs().subject())
+                .map_err(|error| certificates.parse_error(error))?
+            {
+                issuer = true;
+                break;
+            }
+        }
+        if !issuer {
+            leaf_candidates.push(idx);
+        }
+    }
 
     let selected_leaves = leaf_candidates
         .iter()
@@ -2643,28 +2775,37 @@ pub(crate) fn x509_data_has_lookup_identifiers(info: &X509DataInfo) -> bool {
 
 pub(crate) fn x509_certificate_matches_any_selector(
     info: &X509DataInfo,
-    certificate: &ParsedX509Certificate,
     certificate_der: &[u8],
     provider: &dyn crate::provider::CryptoProvider,
+    certificates: &super::pkix::CertificateSession,
 ) -> Result<bool, ParseError> {
-    let subject_match = info
-        .subject_names
-        .iter()
-        .any(|subject| distinguished_names_equal(subject, &certificate.subject_dn));
+    let decoded = certificates
+        .read(certificate_der)
+        .map_err(|error| certificates.parse_error(error))?;
+    let mut subject_match = false;
+    for subject in &info.subject_names {
+        let selector = certificates
+            .selector(subject)
+            .map_err(|error| certificates.parse_error(error))?;
+        subject_match |= selector
+            .matches_name(decoded.tbs().subject(), certificates.memory())
+            .map_err(|error| certificates.parse_error(certificates.error(error)))?;
+    }
     let mut issuer_serial_match = false;
     for (issuer, serial) in &info.issuer_serials {
-        let serial_hex = x509_serial_decimal_to_hex(serial).ok_or_else(|| {
-            ParseError::InvalidStructure(
-                "X509Data lookup identifiers contain an invalid serial number".into(),
-            )
-        })?;
-        issuer_serial_match |= distinguished_names_equal(issuer, &certificate.issuer_dn)
-            && serial_hex == certificate.serial_number_hex;
+        let serial = selector_serial(serial, certificates)?;
+        let selector = certificates
+            .selector(issuer)
+            .map_err(|error| certificates.parse_error(error))?;
+        issuer_serial_match |= selector
+            .matches_name(decoded.tbs().issuer(), certificates.memory())
+            .map_err(|error| certificates.parse_error(certificates.error(error)))?
+            && source_serial_matches(&serial, &decoded, certificates)?;
     }
-    let ski_match = certificate
-        .subject_key_identifier
-        .as_ref()
-        .is_some_and(|certificate_ski| info.skis.iter().any(|ski| ski == certificate_ski));
+    let mut ski_match = false;
+    for ski in &info.skis {
+        ski_match |= source_ski_matches(ski, &decoded, certificates)?;
+    }
     let mut digest_match = false;
     for (algorithm_uri, expected) in &info.digests {
         let algorithm = DigestAlgorithm::from_uri(algorithm_uri).ok_or_else(|| {
@@ -2672,10 +2813,8 @@ pub(crate) fn x509_certificate_matches_any_selector(
                 uri: algorithm_uri.clone(),
             }
         })?;
-        digest_match |= constant_time_eq(
-            &compute_digest_with_provider(provider, algorithm, certificate_der)?,
-            expected,
-        );
+        digest_match |=
+            source_digest_matches(provider, algorithm, certificate_der, expected, certificates)?;
     }
     Ok(subject_match || issuer_serial_match || ski_match || digest_match)
 }
@@ -2690,44 +2829,97 @@ pub fn x509_certificate_matches_selectors(
     certificate_der: &[u8],
     provider: &dyn crate::provider::CryptoProvider,
 ) -> Result<bool, ParseError> {
-    let mut candidate = info.clone();
-    candidate.certificates = vec![certificate_der.to_vec()];
-    candidate.parsed_certificates = vec![parse_x509_certificate(certificate_der)?];
-    candidate.certificate_chain = vec![0];
-    x509_selector_categories_match_chain(&candidate, provider)
+    let certificates =
+        super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
+    x509_selector_categories_match_candidates(
+        info,
+        core::iter::once(certificate_der),
+        provider,
+        &certificates,
+    )
 }
 
 pub(crate) fn x509_selector_categories_match_chain(
     info: &X509DataInfo,
     provider: &dyn crate::provider::CryptoProvider,
+    certificates: &super::pkix::CertificateSession,
 ) -> Result<bool, ParseError> {
-    let subject_match = info.subject_names.iter().all(|subject| {
-        info.parsed_certificates
-            .iter()
-            .any(|certificate| distinguished_names_equal(subject, &certificate.subject_dn))
-    });
+    x509_selector_categories_match_candidates(
+        info,
+        info.certificates.iter().map(Vec::as_slice),
+        provider,
+        certificates,
+    )
+}
+
+pub(crate) fn x509_selector_categories_match_candidates<'a>(
+    info: &X509DataInfo,
+    candidates: impl Iterator<Item = &'a [u8]>,
+    provider: &dyn crate::provider::CryptoProvider,
+    certificates: &super::pkix::CertificateSession,
+) -> Result<bool, ParseError> {
+    let mut decoded = certificates.memory().vector();
+    for der in candidates {
+        let certificate = certificates
+            .read(der)
+            .map_err(|error| certificates.parse_error(error))?;
+        decoded.try_push(certificate).map_err(|reason| {
+            certificates.parse_error(certificates.error(structured_pkix::Error::resource(
+                reason,
+                "name.candidates",
+                0,
+            )))
+        })?;
+    }
+    let mut subject_match = true;
+    for subject in &info.subject_names {
+        let selector = certificates
+            .selector(subject)
+            .map_err(|error| certificates.parse_error(error))?;
+        let mut matched = false;
+        for certificate in &decoded {
+            if selector
+                .matches_name(certificate.tbs().subject(), certificates.memory())
+                .map_err(|error| certificates.parse_error(certificates.error(error)))?
+            {
+                matched = true;
+                break;
+            }
+        }
+        subject_match &= matched;
+    }
 
     let mut issuer_serial_match = true;
     for (issuer, serial) in &info.issuer_serials {
-        let serial_hex = x509_serial_decimal_to_hex(serial).ok_or_else(|| {
-            ParseError::InvalidStructure(
-                "X509Data lookup identifiers contain an invalid serial number".into(),
-            )
-        })?;
-        issuer_serial_match &= info.parsed_certificates.iter().any(|certificate| {
-            distinguished_names_equal(issuer, &certificate.issuer_dn)
-                && serial_hex == certificate.serial_number_hex
-        });
+        let serial = selector_serial(serial, certificates)?;
+        let selector = certificates
+            .selector(issuer)
+            .map_err(|error| certificates.parse_error(error))?;
+        let mut matched = false;
+        for certificate in &decoded {
+            if source_serial_matches(&serial, certificate, certificates)?
+                && selector
+                    .matches_name(certificate.tbs().issuer(), certificates.memory())
+                    .map_err(|error| certificates.parse_error(certificates.error(error)))?
+            {
+                matched = true;
+                break;
+            }
+        }
+        issuer_serial_match &= matched;
     }
 
-    let ski_match = info.skis.iter().all(|ski| {
-        info.parsed_certificates.iter().any(|certificate| {
-            certificate
-                .subject_key_identifier
-                .as_ref()
-                .is_some_and(|certificate_ski| ski == certificate_ski)
-        })
-    });
+    let mut ski_match = true;
+    for ski in &info.skis {
+        let mut matched = false;
+        for certificate in &decoded {
+            if source_ski_matches(ski, certificate, certificates)? {
+                matched = true;
+                break;
+            }
+        }
+        ski_match &= matched;
+    }
 
     let mut digest_match = true;
     for (algorithm_uri, expected) in &info.digests {
@@ -2737,11 +2929,14 @@ pub(crate) fn x509_selector_categories_match_chain(
             }
         })?;
         let mut category_match = false;
-        for certificate in &info.certificates {
-            category_match |= constant_time_eq(
-                &compute_digest_with_provider(provider, algorithm, certificate)?,
+        for certificate in &decoded {
+            category_match |= source_digest_matches(
+                provider,
+                algorithm,
+                certificate.as_bytes(),
                 expected,
-            );
+                certificates,
+            )?;
         }
         digest_match &= category_match;
     }
@@ -2749,174 +2944,138 @@ pub(crate) fn x509_selector_categories_match_chain(
     Ok(subject_match && issuer_serial_match && ski_match && digest_match)
 }
 
-fn x509_attribute_values_equal(
-    left: &x509_cert::attr::AttributeTypeAndValue,
-    right: &x509_cert::attr::AttributeTypeAndValue,
-) -> bool {
-    if left.oid != right.oid {
-        return false;
-    }
-    const EMAIL_ADDRESS: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.1");
-    const DOMAIN_COMPONENT: ObjectIdentifier =
-        ObjectIdentifier::new_unwrap("0.9.2342.19200300.100.1.25");
-    if left.oid == EMAIL_ADDRESS {
-        let (Ok(left), Ok(right)) = (
-            Ia5StringRef::try_from(&left.value),
-            Ia5StringRef::try_from(&right.value),
-        ) else {
-            return false;
-        };
-        let (Some((left_local, left_domain)), Some((right_local, right_domain))) = (
-            left.as_str().rsplit_once('@'),
-            right.as_str().rsplit_once('@'),
-        ) else {
-            return false;
-        };
-        return left_local == right_local && left_domain.eq_ignore_ascii_case(right_domain);
-    }
-    if left.oid == DOMAIN_COMPONENT {
-        let (Ok(left), Ok(right)) = (
-            Ia5StringRef::try_from(&left.value),
-            Ia5StringRef::try_from(&right.value),
-        ) else {
-            return false;
-        };
-        return left.as_str().eq_ignore_ascii_case(right.as_str());
-    }
-    match (
-        DirectoryString::try_from(&left.value),
-        DirectoryString::try_from(&right.value),
-    ) {
-        (Ok(left), Ok(right)) => {
-            // RFC 5280 section 7.1 requires caseIgnoreMatch with LDAP/X.520
-            // string preparation for PrintableString and UTF8String names.
-            let Ok(left) =
-                x520_stringprep::x520_stringprep_to_case_ignore_string(left.value().as_ref())
-            else {
-                return false;
-            };
-            let Ok(right) =
-                x520_stringprep::x520_stringprep_to_case_ignore_string(right.value().as_ref())
-            else {
-                return false;
-            };
-            left.trim_matches(' ') == right.trim_matches(' ')
-        }
-        _ => left.value == right.value,
-    }
+#[cfg(test)]
+fn distinguished_names_equal(left: &str, right: &str) -> bool {
+    super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default())
+        .names_equal(left, right)
+        .expect("supported test names")
 }
 
-fn x509_rdns_equal(
-    left: &x509_cert::name::RelativeDistinguishedName,
-    right: &x509_cert::name::RelativeDistinguishedName,
-) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    // A DN is an ordered RDN sequence, but each individual RDN is a set.
-    let right = right.iter().collect::<Vec<_>>();
-    let mut matched = vec![false; right.len()];
-    left.iter().all(|left_attribute| {
-        right
-            .iter()
-            .enumerate()
-            .find(|(index, right_attribute)| {
-                !matched[*index] && x509_attribute_values_equal(left_attribute, right_attribute)
-            })
-            .is_some_and(|(index, _)| {
-                matched[index] = true;
-                true
-            })
+fn selector_serial(
+    serial: &str,
+    session: &super::pkix::CertificateSession,
+) -> Result<[u8; MAX_X509_SERIAL_NUMBER_BYTES], ParseError> {
+    let work = (serial.len() as u64)
+        .checked_mul(3)
+        .and_then(|work| {
+            work.checked_add(
+                (MAX_X509_SERIAL_NUMBER_BYTES * MAX_X509_SERIAL_NUMBER_VALUE_DIGITS) as u64,
+            )
+        })
+        .ok_or_else(|| {
+            session.parse_error(session.error(structured_pkix::Error::resource(
+                structured_asn1::memory::MemoryError::WorkExceeded,
+                "certificate.serial_selector",
+                0,
+            )))
+        })?;
+    session.memory().charge_work(work).map_err(|reason| {
+        session.parse_error(session.error(structured_pkix::Error::resource(
+            reason,
+            "certificate.serial_selector",
+            0,
+        )))
+    })?;
+    x509_serial_decimal_bytes(serial).ok_or_else(|| {
+        ParseError::InvalidStructure(
+            "X509Data lookup identifiers contain an invalid serial number".into(),
+        )
     })
 }
 
-fn trailing_whitespace_is_escaped(value: &str) -> bool {
-    let Some((&last, prefix)) = value.as_bytes().split_last() else {
-        return false;
+fn source_serial_matches(
+    expected: &[u8; MAX_X509_SERIAL_NUMBER_BYTES],
+    certificate: &structured_pkix::Certificate<'_>,
+    session: &super::pkix::CertificateSession,
+) -> Result<bool, ParseError> {
+    let bytes = certificate.tbs().serial().as_bytes();
+    if bytes.first().is_none_or(|first| first & 0x80 != 0) {
+        return Ok(false);
+    }
+    let bytes = bytes.strip_prefix(&[0]).unwrap_or(bytes);
+    if bytes.len() > expected.len() {
+        return Ok(false);
+    }
+    session
+        .memory()
+        .charge_work(expected.len() as u64 + bytes.len() as u64)
+        .map_err(|reason| {
+            session.parse_error(session.error(structured_pkix::Error::resource(
+                reason,
+                "certificate.serial_selector",
+                certificate.span().start,
+            )))
+        })?;
+    let padding = expected.len() - bytes.len();
+    Ok(expected[..padding].iter().all(|byte| *byte == 0) && expected[padding..] == *bytes)
+}
+
+fn source_ski_matches(
+    expected: &[u8],
+    certificate: &structured_pkix::Certificate<'_>,
+    session: &super::pkix::CertificateSession,
+) -> Result<bool, ParseError> {
+    let Some(ski) = certificate
+        .tbs()
+        .extensions()
+        .subject_key_identifier(session.memory())
+        .map_err(|error| session.parse_error(session.error(error)))?
+    else {
+        return Ok(false);
     };
-    if !matches!(last, b' ' | b'\t' | b'\r' | b'\n') {
-        return false;
+    if ski.as_bytes().len() != expected.len() {
+        return Ok(false);
     }
-    prefix
-        .iter()
-        .rev()
-        .take_while(|byte| **byte == b'\\')
-        .count()
-        % 2
-        == 1
+    session
+        .memory()
+        .charge_work(expected.len() as u64)
+        .map_err(|reason| {
+            session.parse_error(session.error(structured_pkix::Error::resource(
+                reason,
+                "certificate.ski_selector",
+                certificate.span().start,
+            )))
+        })?;
+    Ok(ski.as_bytes() == expected)
 }
 
-fn parse_distinguished_name(value: &str) -> Option<Name> {
-    let mut normalized = String::with_capacity(value.len());
-    let mut chars = value
-        .trim_start_matches([' ', '\t', '\r', '\n'])
-        .chars()
-        .peekable();
-    let mut escaped = false;
-
-    while let Some(ch) = chars.next() {
-        if escaped {
-            normalized.push(ch);
-            escaped = false;
-            continue;
-        }
-        if ch == '\\' {
-            normalized.push(ch);
-            escaped = true;
-            continue;
-        }
-        if matches!(ch, ',' | '+') {
-            while normalized
-                .chars()
-                .next_back()
-                .is_some_and(|last| matches!(last, ' ' | '\t' | '\r' | '\n'))
-                && !trailing_whitespace_is_escaped(&normalized)
-            {
-                normalized.pop();
-            }
-            normalized.push(ch);
-            while chars
-                .next_if(|next| matches!(next, ' ' | '\t' | '\r' | '\n'))
-                .is_some()
-            {}
-            continue;
-        }
-        normalized.push(ch);
+fn source_digest_matches(
+    provider: &dyn crate::provider::CryptoProvider,
+    algorithm: DigestAlgorithm,
+    source: &[u8],
+    expected: &[u8],
+    session: &super::pkix::CertificateSession,
+) -> Result<bool, ParseError> {
+    if !provider.supports(crate::provider::ProviderCapability::Digest(algorithm)) {
+        return Err(ParseError::Provider(
+            crate::provider::ProviderError::Unsupported {
+                operation: crate::provider::ProviderOperation::Digest,
+                algorithm: Some(algorithm.uri().into()),
+            },
+        ));
     }
-
-    while normalized
-        .chars()
-        .next_back()
-        .is_some_and(|last| matches!(last, ' ' | '\t' | '\r' | '\n'))
-        && !trailing_whitespace_is_escaped(&normalized)
-    {
-        normalized.pop();
+    if expected.len() != algorithm.output_len() {
+        return Ok(false);
     }
-    normalized.parse().ok()
-}
-
-pub(crate) fn distinguished_names_equal(left: &str, right: &str) -> bool {
-    parse_distinguished_name(left)
-        .zip(parse_distinguished_name(right))
-        .is_some_and(|(left, right)| {
-            left.len() == right.len()
-                && left
-                    .iter_rdn()
-                    .zip(right.iter_rdn())
-                    .all(|(left, right)| x509_rdns_equal(left, right))
-        })
-}
-
-pub(crate) fn distinguished_name_within_subtree(name: &str, subtree: &str) -> bool {
-    parse_distinguished_name(name)
-        .zip(parse_distinguished_name(subtree))
-        .is_some_and(|(name, subtree)| {
-            subtree.len() <= name.len()
-                && name
-                    .iter_rdn()
-                    .zip(subtree.iter_rdn())
-                    .all(|(name, subtree)| x509_rdns_equal(name, subtree))
-        })
+    let resource = |reason| {
+        session.parse_error(session.error(structured_pkix::Error::resource(
+            reason,
+            "certificate.digest_selector",
+            0,
+        )))
+    };
+    session
+        .memory()
+        .charge_work(source.len() as u64 + expected.len() as u64)
+        .map_err(resource)?;
+    let _output = session
+        .memory()
+        .reserve(algorithm.output_len())
+        .map_err(resource)?;
+    // Built-in providers return the fixed-width digest; opaque custom-provider
+    // internals remain that provider's admitted-work responsibility.
+    let actual = compute_digest_with_provider(provider, algorithm, source)?;
+    Ok(constant_time_eq(&actual, expected))
 }
 
 fn ensure_x509_data_entry_budget(info: &X509DataInfo) -> Result<(), ParseError> {
@@ -3011,68 +3170,88 @@ fn xml_base64_payload_error(element: &str, reason: &'static str) -> ParseError {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn parse_x509_certificate(cert_der: &[u8]) -> Result<ParsedX509Certificate, ParseError> {
-    let (rest, cert) =
-        x509_parser::certificate::X509Certificate::from_der(cert_der).map_err(|err| {
-            ParseError::InvalidStructure(format!("X509Certificate is not valid DER X.509: {err}"))
-        })?;
-    if !rest.is_empty() {
-        return Err(ParseError::InvalidStructure(
-            "X509Certificate contains trailing bytes after DER certificate".into(),
-        ));
-    }
+    let session = super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
+    parse_x509_certificate_in(cert_der, &session)
+}
 
-    // x509-parser displays the DER RDN sequence in storage order, while
-    // XMLDSig names follow RFC 4514 and serialize that sequence in reverse.
-    // Normalize at the certificate boundary so matching remains ordered and
-    // cannot confuse a DN with another hierarchy containing reversed RDNs.
-    let subject_dn = x509_name_to_rfc4514(cert.subject())?;
-    let issuer_dn = x509_name_to_rfc4514(cert.issuer())?;
-    let serial_number = cert.tbs_certificate.raw_serial().to_vec();
+pub(crate) fn parse_x509_certificate_in(
+    cert_der: &[u8],
+    session: &super::pkix::CertificateSession,
+) -> Result<ParsedX509Certificate, ParseError> {
+    let cert = session
+        .read(cert_der)
+        .map_err(|error| session.parse_error(error))?;
+    certificate_metadata(&cert, session)
+}
+
+pub(crate) fn certificate_metadata(
+    cert: &structured_pkix::Certificate<'_>,
+    session: &super::pkix::CertificateSession,
+) -> Result<ParsedX509Certificate, ParseError> {
+    // RFC 4514 section 2.1 serializes the RDN sequence in reverse order.
+    // The shared whole-Name formatter preserves unknown values as #BER and
+    // never uses the display-oriented, potentially truncated Attribute::text.
+    // https://www.rfc-editor.org/rfc/rfc4514.html#section-2.1
+    let subject_dn = shared_name_text(cert.tbs().subject(), session)?;
+    let issuer_dn = shared_name_text(cert.tbs().issuer(), session)?;
+    let serial_number = cert.tbs().serial().as_bytes().to_vec();
     let serial_number_hex = format_x509_serial_value_hex(&serial_number);
 
-    let subject_key_identifier = cert.extensions().iter().find_map(|ext| {
-        if let ParsedExtension::SubjectKeyIdentifier(ski) = ext.parsed_extension() {
-            Some(ski.0.to_vec())
-        } else {
-            None
-        }
-    });
+    let subject_key_identifier = cert
+        .tbs()
+        .extensions()
+        .subject_key_identifier(session.memory())
+        .map_err(|error| session.parse_error(session.error(error)))?
+        .map(|ski| ski.as_bytes().to_vec());
 
-    let spki = cert.public_key();
-    let public_key = match spki.parsed().map_err(|err| {
-        ParseError::InvalidStructure(format!("X509Certificate public key parse error: {err}"))
-    })? {
-        PublicKey::RSA(rsa) => {
-            let modulus = trim_leading_zeroes(rsa.modulus);
-            let exponent = trim_leading_zeroes(rsa.exponent);
-            if modulus.is_empty() || exponent.is_empty() {
-                return Err(ParseError::InvalidStructure(
-                    "X509Certificate RSA key contains empty modulus or exponent".into(),
-                ));
-            }
-            X509PublicKeyInfo::Rsa { modulus, exponent }
+    let spki = cert.tbs().public_key();
+    // RFC 5280 4.1.2.7 delegates key encoding to the identified algorithm.
+    // Unknown keys retain Unsupported rather than inheriting RSA/EC rules.
+    // https://www.rfc-editor.org/rfc/rfc5280.html#section-4.1.2.7
+    let public_key = if spki.algorithm().algorithm() == structured_pkix::oid::RSA_ENCRYPTION {
+        let key_octets = spki.key_octets().ok_or_else(|| {
+            ParseError::InvalidStructure(
+                "X509Certificate RSA public key is not octet-aligned".into(),
+            )
+        })?;
+        let rsa = pkcs1::RsaPublicKeyRef::from_der(key_octets).map_err(|error| {
+            ParseError::InvalidStructure(format!("X509Certificate RSA key: {error}"))
+        })?;
+        let modulus = trim_leading_zeroes(rsa.modulus.as_bytes());
+        let exponent = trim_leading_zeroes(rsa.public_exponent.as_bytes());
+        if modulus.is_empty() || exponent.is_empty() {
+            return Err(ParseError::InvalidStructure(
+                "X509Certificate RSA key contains empty modulus or exponent".into(),
+            ));
         }
-        PublicKey::EC(ec_point) => {
-            let Some(params) = spki.algorithm.parameters.as_ref() else {
-                return Err(ParseError::InvalidStructure(
-                    "X509Certificate EC key is missing curve parameters".into(),
-                ));
-            };
+        X509PublicKeyInfo::Rsa { modulus, exponent }
+    } else if spki.algorithm().algorithm() == structured_pkix::oid::EC_PUBLIC_KEY {
+        let key_octets = spki.key_octets().ok_or_else(|| {
+            ParseError::InvalidStructure(
+                "X509Certificate EC public key is not octet-aligned".into(),
+            )
+        })?;
+        let Some(params) = spki.algorithm().parameters() else {
+            return Err(ParseError::InvalidStructure(
+                "X509Certificate EC key is missing curve parameters".into(),
+            ));
+        };
 
-            match params.as_oid() {
-                Ok(oid) => X509PublicKeyInfo::Ec {
-                    curve_oid: oid.to_id_string(),
-                    public_key: ec_point.data().to_vec(),
-                },
-                Err(_) => X509PublicKeyInfo::Unsupported {
-                    algorithm_oid: spki.algorithm.algorithm.to_id_string(),
-                },
-            }
+        match <ObjectIdentifier>::from_der(params) {
+            Ok(oid) => X509PublicKeyInfo::Ec {
+                curve_oid: oid.to_string(),
+                public_key: key_octets.to_vec(),
+            },
+            Err(_) => X509PublicKeyInfo::Unsupported {
+                algorithm_oid: shared_oid_text(spki.algorithm().algorithm(), session)?,
+            },
         }
-        _ => X509PublicKeyInfo::Unsupported {
-            algorithm_oid: spki.algorithm.algorithm.to_id_string(),
-        },
+    } else {
+        X509PublicKeyInfo::Unsupported {
+            algorithm_oid: shared_oid_text(spki.algorithm().algorithm(), session)?,
+        }
     };
 
     Ok(ParsedX509Certificate {
@@ -3085,13 +3264,36 @@ pub(crate) fn parse_x509_certificate(cert_der: &[u8]) -> Result<ParsedX509Certif
     })
 }
 
-pub(crate) fn x509_name_to_rfc4514(name: &X509Name<'_>) -> Result<String, ParseError> {
-    let name = Name::from_der(name.as_raw()).map_err(|error| {
-        ParseError::InvalidStructure(format!(
-            "X509Certificate distinguished name is invalid DER: {error}"
-        ))
+fn shared_name_text(
+    name: &structured_pkix::name::Name<'_>,
+    session: &super::pkix::CertificateSession,
+) -> Result<String, ParseError> {
+    let text = name
+        .rfc4514_readable(session.memory())
+        .map_err(|error| session.parse_error(session.error(error)))?;
+    text.as_str(session.memory())
+        .map(str::to_owned)
+        .map_err(|reason| {
+            session.parse_error(session.error(structured_pkix::Error::resource(reason, "name", 0)))
+        })
+}
+
+fn shared_oid_text(
+    oid: structured_asn1::Oid<'_>,
+    session: &super::pkix::CertificateSession,
+) -> Result<String, ParseError> {
+    let text = oid.text(session.memory()).map_err(|error| {
+        session.parse_error(session.error(structured_pkix::Error::resource(error, "algorithm", 0)))
     })?;
-    Ok(name.to_string())
+    text.as_str(session.memory())
+        .map(str::to_owned)
+        .map_err(|error| {
+            session.parse_error(session.error(structured_pkix::Error::resource(
+                error,
+                "algorithm",
+                0,
+            )))
+        })
 }
 
 fn format_x509_serial_hex(serial: &[u8]) -> String {
@@ -3114,7 +3316,7 @@ fn format_x509_serial_value_hex(serial: &[u8]) -> String {
     format_x509_serial_hex(canonical)
 }
 
-fn x509_serial_decimal_to_hex(serial: &str) -> Option<String> {
+fn x509_serial_decimal_bytes(serial: &str) -> Option<[u8; MAX_X509_SERIAL_NUMBER_BYTES]> {
     let serial = serial.trim();
     let serial = serial.strip_prefix('+').unwrap_or(serial);
     let serial = serial.trim_start_matches('0');
@@ -3142,7 +3344,12 @@ fn x509_serial_decimal_to_hex(serial: &str) -> Option<String> {
         return None;
     }
 
-    Some(format_x509_serial_value_hex(&bytes))
+    Some(bytes)
+}
+
+#[cfg(test)]
+fn x509_serial_decimal_to_hex(serial: &str) -> Option<String> {
+    x509_serial_decimal_bytes(serial).map(|bytes| format_x509_serial_value_hex(&bytes))
 }
 
 fn trim_leading_zeroes(bytes: &[u8]) -> Vec<u8> {
@@ -3387,7 +3594,7 @@ fn collect_x509_serial_number(node: Node<'_, '_>) -> Result<String, ParseError> 
     if serial.is_empty() {
         serial.push('0');
     }
-    if x509_serial_decimal_to_hex(&serial).is_none() {
+    if x509_serial_decimal_bytes(&serial).is_none() {
         return Err(ParseError::InvalidStructure(
             "invalid X509SerialNumber decimal value or RFC 5280 range".into(),
         ));
@@ -3421,6 +3628,39 @@ fn ensure_no_non_whitespace_text(node: Node<'_, '_>, element_name: &str) -> Resu
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests use trusted XML fixtures")]
 mod tests {
+    #[test]
+    fn certificate_spki_inspection_borrows_source_and_retains_ingestion_budget() {
+        // CLI key matching must inspect original SPKI without a second codec,
+        // display projection, or reset of the retained parsing allowance.
+        let der = pem::parse(include_bytes!(
+            "../../tests/fixtures/keys/rsa/rsa-2048-cert.pem"
+        ))
+        .expect("public certificate PEM")
+        .into_contents();
+        let resources = crate::policy::ResourcePolicy {
+            max_key_candidates: 1,
+            ..crate::policy::ResourcePolicy::default()
+        };
+        let mut session = super::KeyInfoParsingSession::new(&resources).expect("resource policy");
+        session
+            .with_certificate_public_key(&der, |spki| {
+                assert!(!spki.is_empty());
+                assert!(spki.as_ptr() >= der.as_ptr());
+                assert!(spki.as_ptr() as usize + spki.len() <= der.as_ptr() as usize + der.len());
+            })
+            .expect("borrowed SPKI");
+        assert!(matches!(
+            session.with_certificate_public_key(&der, |_| panic!("unadmitted inspection")),
+            Err(super::ParseError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::KEY_CANDIDATES,
+                    maximum: 1,
+                    actual: 2
+                }
+            ))
+        ));
+    }
+
     use super::*;
     use crate::xmldsig::TransformError;
     use base64::Engine;
@@ -3601,7 +3841,7 @@ mod tests {
         let mut session = KeyInfoParsingSession::new(&resources).unwrap();
         assert!(matches!(
             session.parse(invalid.root_element()),
-            Err(ParseError::InvalidStructure(_))
+            Err(ParseError::Certificate(error)) if !error.is_resource()
         ));
         assert!(matches!(
             session.parse(valid.root_element()),
@@ -4204,6 +4444,7 @@ BA== </Modulus>
 
     #[test]
     fn parse_key_info_rejects_x509_certificate_with_invalid_der() {
+        // The common decoder reports the malformed input with its source field.
         let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
             <X509Data>
                 <X509Certificate>AQID</X509Certificate>
@@ -4212,11 +4453,14 @@ BA== </Modulus>
         let doc = Document::parse(xml).unwrap();
 
         let err = parse_key_info(doc.root_element()).unwrap_err();
-        assert!(matches!(err, ParseError::InvalidStructure(_)));
+        assert!(
+            matches!(err, ParseError::Certificate(error) if !error.is_resource() && error.field() == "certificate")
+        );
     }
 
     #[test]
     fn parse_key_info_rejects_x509_certificate_with_trailing_der_bytes() {
+        // Trailing bytes remain a structural refusal, with a precise shared error code.
         let mut cert = base64::engine::general_purpose::STANDARD
             .decode(fixture_rsa_cert_base64())
             .unwrap();
@@ -4232,7 +4476,9 @@ BA== </Modulus>
         let doc = Document::parse(&xml).unwrap();
 
         let err = parse_key_info(doc.root_element()).unwrap_err();
-        assert!(matches!(err, ParseError::InvalidStructure(_)));
+        assert!(
+            matches!(err, ParseError::Certificate(error) if error.code() == structured_pkix::ErrorCode::TrailingData)
+        );
     }
 
     #[test]
@@ -4294,6 +4540,161 @@ BA== </Modulus>
     }
 
     #[test]
+    fn certificate_metadata_preserves_opaque_nonaligned_public_keys()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // RFC 5280 4.1.2.7: key encodings are algorithm-specific. Metadata
+        // must preserve unsupported capability, not invent an EC/RSA defect.
+        // https://www.rfc-editor.org/rfc/rfc5280.html#section-4.1.2.7
+        let key = rcgen::KeyPair::generate()?;
+        let certificate = rcgen::CertificateParams::new(Vec::<String>::new())?.self_signed(&key)?;
+        let mut bytes = certificate.der().to_vec();
+        let session =
+            super::super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
+        let (start, length) = {
+            let decoded = session.read(&bytes)?;
+            let octets = decoded
+                .tbs()
+                .public_key()
+                .key_octets()
+                .ok_or("EC key octets")?;
+            (
+                octets.as_ptr() as usize - bytes.as_ptr() as usize,
+                octets.len(),
+            )
+        };
+        let ec_oid = [0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+        let oid_start = bytes
+            .windows(ec_oid.len())
+            .position(|value| value == ec_oid)
+            .ok_or("EC algorithm identifier")?;
+        bytes[oid_start + ec_oid.len() - 1] = 99;
+        bytes[start - 1] = 1;
+        bytes[start + length - 1] &= 0xfe;
+        let metadata = parse_x509_certificate_in(&bytes, &session)?;
+        assert!(
+            matches!(metadata.public_key, X509PublicKeyInfo::Unsupported { algorithm_oid }
+            if algorithm_oid == "1.2.840.10045.2.99")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn certificate_digest_selector_reserves_work_and_output_before_hashing() {
+        // The digest comparison is only a gate: its selected-provider output
+        // must not bypass either the shared CPU or live-workspace allowance.
+        let source = b"certificate identity bytes";
+        let expected = super::super::compute_digest(DigestAlgorithm::Sha256, source);
+        for (work, bytes, resource) in [
+            (0, usize::MAX, crate::policy::resource_name::X509_WORK),
+            (
+                usize::MAX,
+                expected.len() - 1,
+                crate::policy::resource_name::X509_WORKSPACE_BYTES,
+            ),
+        ] {
+            let resources = crate::policy::ResourcePolicy {
+                max_x509_work: work,
+                max_x509_workspace_bytes: bytes,
+                ..Default::default()
+            };
+            let session = super::super::pkix::CertificateSession::new(&resources);
+            assert!(
+                matches!(source_digest_matches(crate::provider::default_provider(), DigestAlgorithm::Sha256, source, &expected, &session),
+                Err(ParseError::Policy(crate::policy::PolicyViolation::ResourceLimitExceeded { resource: actual, .. })) if actual == resource)
+            );
+            assert_eq!(
+                session.memory().used(),
+                0,
+                "failed admission retains no output"
+            );
+        }
+    }
+
+    #[test]
+    fn certificate_selectors_ignore_rewritten_display_metadata() {
+        // Serial/SKI discovery must consult the source certificate, not a
+        // stale or edited projection supplied alongside its unchanged DER.
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(fixture_cert_base64(
+                "../../tests/fixtures/keys/rsa/rsa-2048-cert.pem",
+            ))
+            .unwrap();
+        let mut metadata = parse_x509_certificate(&der).unwrap();
+        let session =
+            super::super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
+        let mut serial = X509DataInfo {
+            issuer_serials: vec![(metadata.issuer_dn.clone(), "1".into())],
+            certificates: vec![der.clone()],
+            ..Default::default()
+        };
+        metadata.serial_number_hex = "01".into();
+        serial.parsed_certificates.push(metadata.clone());
+        assert!(
+            !x509_selector_categories_match_chain(
+                &serial,
+                crate::provider::default_provider(),
+                &session
+            )
+            .unwrap()
+        );
+        let mut ski = X509DataInfo {
+            skis: vec![vec![0x12, 0x34]],
+            certificates: vec![der],
+            ..Default::default()
+        };
+        metadata.subject_key_identifier = Some(vec![0x12, 0x34]);
+        ski.parsed_certificates.push(metadata);
+        assert!(
+            !x509_selector_categories_match_chain(
+                &ski,
+                crate::provider::default_provider(),
+                &session
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn chain_discovery_uses_source_names_not_display_metadata() {
+        // Display text is not certificate identity: edited metadata must not
+        // truncate a real DER issuer chain or create a new issuer edge.
+        let certificates = [
+            fixture_cert_base64("../../tests/fixtures/keys/rsa/rsa-2048-cert.pem"),
+            fixture_cert_base64("../../tests/fixtures/keys/ca2cert.pem"),
+            fixture_cert_base64("../../tests/fixtures/keys/cacert.pem"),
+        ]
+        .map(|encoded| {
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap()
+        })
+        .to_vec();
+        let mut parsed_certificates = certificates
+            .iter()
+            .map(|certificate| parse_x509_certificate(certificate).unwrap())
+            .collect::<Vec<_>>();
+        parsed_certificates[0].subject_dn = parsed_certificates[0].issuer_dn.clone();
+        let info = X509DataInfo {
+            certificates,
+            parsed_certificates,
+            ..Default::default()
+        };
+        let session =
+            super::super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
+        assert_eq!(
+            build_x509_certificate_chain_from(
+                &info,
+                0,
+                crate::provider::default_provider(),
+                None,
+                &session
+            )
+            .unwrap(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
     fn chain_builder_matches_x509_equivalent_distinguished_names() {
         // RFC 5280 name chaining uses X.501 matching rather than the lexical
         // RFC 4514 rendering. Case differences in DirectoryString values must
@@ -4322,12 +4723,27 @@ BA== </Modulus>
         };
 
         assert_eq!(
-            select_x509_signing_certificate(&info, crate::provider::default_provider()).unwrap(),
+            select_x509_signing_certificate(
+                &info,
+                crate::provider::default_provider(),
+                &super::super::pkix::CertificateSession::new(
+                    &crate::policy::ResourcePolicy::default()
+                )
+            )
+            .unwrap(),
             0
         );
         assert_eq!(
-            build_x509_certificate_chain_from(&info, 0, crate::provider::default_provider(), None)
-                .unwrap(),
+            build_x509_certificate_chain_from(
+                &info,
+                0,
+                crate::provider::default_provider(),
+                None,
+                &super::super::pkix::CertificateSession::new(
+                    &crate::policy::ResourcePolicy::default()
+                ),
+            )
+            .unwrap(),
             vec![0, 1, 2]
         );
     }
@@ -4617,31 +5033,51 @@ BA== </Modulus>
 
     #[test]
     fn build_x509_certificate_chain_rejects_chain_exceeding_max_depth() {
-        let parsed_certificates: Vec<ParsedX509Certificate> = (0..=MAX_X509_CHAIN_DEPTH)
-            .map(|idx| ParsedX509Certificate {
-                subject_dn: format!("CN=cert-{idx}"),
-                issuer_dn: if idx == MAX_X509_CHAIN_DEPTH {
-                    format!("CN=cert-{idx}")
-                } else {
-                    format!("CN=cert-{}", idx + 1)
-                },
-                serial_number: vec![u8::try_from(idx).unwrap()],
-                serial_number_hex: format!("{idx:02X}"),
-                subject_key_identifier: None,
-                public_key: X509PublicKeyInfo::Unsupported {
-                    algorithm_oid: "1.2.3.4".into(),
-                },
+        // Exercise the real source-identity path, not invented display
+        // metadata beside empty DER. Every edge is a well-formed certificate.
+        let parameters = (0..=MAX_X509_CHAIN_DEPTH)
+            .map(|index| {
+                let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+                params
+                    .distinguished_name
+                    .push(rcgen::DnType::CommonName, format!("cert-{index}"));
+                params
             })
+            .collect::<Vec<_>>();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificates = parameters
+            .iter()
+            .enumerate()
+            .map(|(index, params)| {
+                let issuer = rcgen::Issuer::from_params(
+                    &parameters[(index + 1).min(MAX_X509_CHAIN_DEPTH)],
+                    &key,
+                );
+                params
+                    .clone()
+                    .signed_by(&key, &issuer)
+                    .unwrap()
+                    .der()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        let parsed_certificates = certificates
+            .iter()
+            .map(|certificate| parse_x509_certificate(certificate).unwrap())
             .collect();
-        let certificates = vec![Vec::new(); parsed_certificates.len()];
         let info = X509DataInfo {
             certificates,
             parsed_certificates,
             ..X509DataInfo::default()
         };
 
-        let err = build_x509_certificate_chain(&info, crate::provider::default_provider(), None)
-            .unwrap_err();
+        let err = build_x509_certificate_chain(
+            &info,
+            crate::provider::default_provider(),
+            None,
+            &super::super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default()),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, ParseError::InvalidStructure(message) if message.contains("maximum depth"))
         );
@@ -4735,27 +5171,40 @@ BA== </Modulus>
         // Selector decimal text represents the unsigned magnitude; the DER
         // sign-padding octet must not make the same certificate unmatchable.
         let serial_hex = "8000000000000000000000000000000000000000";
+        let mut magnitude = [0; 20];
+        magnitude[0] = 0x80;
+        let mut parameters = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        parameters
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "issuer");
+        parameters.serial_number = Some(rcgen::SerialNumber::from_slice(&magnitude));
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificate = parameters.self_signed(&key).unwrap();
+        let metadata = parse_x509_certificate(certificate.der()).unwrap();
+        assert_eq!(
+            metadata.serial_number,
+            [vec![0], magnitude.to_vec()].concat()
+        );
+        assert_eq!(metadata.serial_number_hex, serial_hex);
         let info = X509DataInfo {
             issuer_serials: vec![(
                 "CN=issuer".into(),
                 "730750818665451459101842416358141509827966271488".into(),
             )],
-            parsed_certificates: vec![ParsedX509Certificate {
-                subject_dn: "CN=leaf".into(),
-                issuer_dn: "CN=issuer".into(),
-                serial_number: [vec![0, 0x80], vec![0; 19]].concat(),
-                serial_number_hex: serial_hex.into(),
-                subject_key_identifier: None,
-                public_key: X509PublicKeyInfo::Unsupported {
-                    algorithm_oid: "1.2.3.4".into(),
-                },
-            }],
+            certificates: vec![certificate.der().to_vec()],
+            parsed_certificates: vec![metadata],
             ..X509DataInfo::default()
         };
 
         assert!(
-            x509_selector_categories_match_chain(&info, crate::provider::default_provider())
-                .unwrap()
+            x509_selector_categories_match_chain(
+                &info,
+                crate::provider::default_provider(),
+                &super::super::pkix::CertificateSession::new(
+                    &crate::policy::ResourcePolicy::default()
+                )
+            )
+            .unwrap()
         );
     }
 
@@ -4797,13 +5246,14 @@ BA== </Modulus>
 
     #[test]
     fn distinguished_name_matching_applies_ia5_matching_rules() {
-        // RFC 5280 emailAddress matching preserves the local part while the
-        // domain is case-insensitive; domainComponent is case-insensitive too.
+        // DN emailAddress uses whole-value caseIgnoreMatch, unlike GeneralName
+        // rfc822Name: RFC 2985 5.2.1 and 6.1, RFC 5280 7.5 respectively.
+        // https://www.rfc-editor.org/rfc/rfc2985.html#section-5.2.1
         assert!(distinguished_names_equal(
             "EMAIL=ops@EXAMPLE.COM,DC=EXAMPLE,DC=COM",
             "EMAIL=ops@example.com,DC=example,DC=com"
         ));
-        assert!(!distinguished_names_equal(
+        assert!(distinguished_names_equal(
             "EMAIL=OPS@example.com,DC=example,DC=com",
             "EMAIL=ops@example.com,DC=example,DC=com"
         ));
@@ -4824,7 +5274,7 @@ BA== </Modulus>
 
         assert_eq!(
             parsed.subject_dn,
-            r"CN=\ leading\,plus\+equals=slash\\trailing\ "
+            r"CN=\ leading\,plus\+equals\=slash\\trailing\ "
         );
         assert!(distinguished_names_equal(
             r"CN=\ leading\,plus\+equals=slash\\trailing\ ",
@@ -4841,12 +5291,26 @@ BA== </Modulus>
         // The normalizer strips all four XML whitespace characters, so escape
         // detection must preserve each one consistently at RDN boundaries.
         for whitespace in [' ', '\t', '\r', '\n'] {
-            assert!(trailing_whitespace_is_escaped(&format!(
-                "CN=value\\{whitespace}"
-            )));
-            assert!(!trailing_whitespace_is_escaped(&format!(
-                "CN=value{whitespace}"
-            )));
+            let session = super::super::pkix::CertificateSession::new(
+                &crate::policy::ResourcePolicy::default(),
+            );
+            // RFC 4514 3 allows a literal escaped SPACE, but controls need
+            // hexpair escapes; backslash followed by a raw control is invalid.
+            // https://www.rfc-editor.org/rfc/rfc4514.html#section-3
+            let escaped = format!("CN=value\\{whitespace}");
+            if whitespace == ' ' {
+                assert!(session.names_equal(&escaped, &escaped).unwrap());
+            } else {
+                assert!(
+                    matches!(session.selector(&escaped), Err(super::super::X509ChainError::Processing(error))
+                    if error.code() == structured_pkix::ErrorCode::MalformedValue)
+                );
+            }
+            assert!(
+                session
+                    .names_equal(&format!("CN=value{whitespace}"), "CN=value")
+                    .unwrap()
+            );
         }
     }
 

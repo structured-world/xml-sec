@@ -215,6 +215,7 @@ fn phaos_certificate_chain_is_expired_at_a_modern_verification_time() {
     let options = X509ChainOptions {
         trusted_certs: &trusted,
         verification_time: UNIX_EPOCH + Duration::from_secs(1_767_225_600),
+        utc_facts: None,
         max_chain_depth: 2,
         check_crls: false,
         allowed_extended_key_usages: None,
@@ -233,11 +234,33 @@ fn phaos_certificate_chain_is_expired_at_a_modern_verification_time() {
 fn x509_path_enforces_configured_issuer_rsa_minimum() {
     // Cryptographic providers authenticate signatures; deployment key strength
     // belongs to the compiled path policy and must reject this historical CA.
-    let info = phaos_x509_data();
-    let trusted = vec![PHAOS_RSA_CA_CERTIFICATE.to_vec()];
-    let options = X509ChainOptions {
+    // Isolate strength from Phaos's non-DER KeyUsage, which the shared decoder
+    // correctly rejects before the issuer signature callback can run.
+    let issuer_key = rcgen::KeyPair::from_pem(include_str!("fixtures/keys/rsa/rsa-2048-key.pem"))
+        .expect("RSA issuer key fixture");
+    let mut issuer_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    issuer_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "RSA strength authority");
+    issuer_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    issuer_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+    let issuer = rcgen::CertifiedIssuer::self_signed(issuer_params, issuer_key).unwrap();
+    let mut leaf_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    leaf_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "RSA strength signer");
+    leaf_params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+    let leaf = leaf_params
+        .signed_by(&rcgen::KeyPair::generate().unwrap(), &issuer)
+        .unwrap();
+    let trusted = vec![issuer.der().to_vec()];
+    let mut info = X509DataInfo::default();
+    info.certificates = vec![leaf.der().to_vec(), issuer.der().to_vec()];
+    info.certificate_chain = vec![0, 1];
+    let mut options = X509ChainOptions {
+        utc_facts: None,
         trusted_certs: &trusted,
-        verification_time: UNIX_EPOCH + Duration::from_secs(1_104_580_800),
+        verification_time: std::time::SystemTime::now(),
         max_chain_depth: 2,
         check_crls: false,
         allowed_extended_key_usages: None,
@@ -246,15 +269,49 @@ fn x509_path_enforces_configured_issuer_rsa_minimum() {
         certificate_signature_algorithms: None,
     };
 
+    verify_x509_certificate_chain(&info, &options).expect("canonical chain meets default minimum");
+    options.rsa_keys.minimum_modulus_bits = 3072;
+
     assert!(matches!(
         verify_x509_certificate_chain(&info, &options),
         Err(X509ChainError::KeyPolicy {
             position: 1,
             source: PolicyViolation::KeySize {
                 key_type: "RSA",
-                minimum_bits: 2048,
+                minimum_bits: 3072,
+                actual_bits: 2048,
                 ..
             }
         })
     ));
+}
+
+#[test]
+fn phaos_non_der_key_usage_cannot_establish_certificate_trust() {
+    // X.690 (2021) 11.2.2 removes every trailing zero from a named bit list;
+    // Phaos's 03 03 07 D8 00 is not DER. Cryptographic XML corpus success
+    // must never be interpreted as acceptance of this certificate path.
+    // https://www.itu.int/rec/T-REC-X.690-202102-I/en
+    let info = phaos_x509_data();
+    let trusted = vec![PHAOS_RSA_CA_CERTIFICATE.to_vec()];
+    let options = X509ChainOptions {
+        trusted_certs: &trusted,
+        verification_time: UNIX_EPOCH + Duration::from_secs(1_104_580_800),
+        utc_facts: None,
+        max_chain_depth: 2,
+        check_crls: false,
+        allowed_extended_key_usages: None,
+        rsa_keys: xml_sec::policy::RsaKeyPolicy {
+            minimum_modulus_bits: 1024,
+        },
+        dsa_keys: xml_sec::policy::DsaKeyPolicy::default(),
+        certificate_signature_algorithms: None,
+    };
+    assert_eq!(
+        verify_x509_certificate_chain(&info, &options),
+        Err(X509ChainError::UnsupportedCriticalExtension {
+            position: 0,
+            oid: "2.5.29.15".into()
+        })
+    );
 }

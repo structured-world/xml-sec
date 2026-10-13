@@ -279,6 +279,11 @@ pub struct Document<'input> {
 }
 
 impl<'input> Document<'input> {
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
     /// Parses XML with default backend-neutral options.
     pub fn parse(input: &'input str) -> Result<Self, ParseError> {
         Self::parse_with_options(input, ParsingOptions::default())

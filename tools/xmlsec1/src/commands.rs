@@ -8,7 +8,6 @@ use std::{
 };
 
 use rsa::{RsaPublicKey, traits::PublicKeyParts as _};
-use x509_parser::prelude::FromDer as _;
 use xml_sec::rsa_encoding::RsaPublicKeyEncoding as _;
 use xml_sec::xml_input as xml_sec_xml_input;
 use xml_sec::{
@@ -47,6 +46,7 @@ use crate::{
     args::{Arity, HelpTarget, OPTION_SPECS},
     capabilities::{self, KEY_DATA, TRANSFORMS},
     key_material,
+    utc_facts::UtcFacts,
 };
 
 const GENERIC_OPTIONS: &[&str] = &[
@@ -108,6 +108,7 @@ const VERIFY_OPTIONS: &[&str] = &[
     "ignore-manifests",
     "lax-key-search",
     "verify-crls",
+    "utc-facts",
     "X509-skip-time-checks",
     "X509-skip-strict-checks",
     "insecure",
@@ -1081,7 +1082,7 @@ fn select_store_signing_key<'a>(
                     certificate_writer: None,
                     leaf_certificate_der: None,
                 };
-                validate_signing_key_info(key_info, &candidate, provider)?;
+                validate_signing_key_info(key_info, &candidate, provider, &policy.resources)?;
                 Ok(candidate)
             });
         match attempt {
@@ -1150,7 +1151,12 @@ fn select_signing_key(
             selected_provider(invocation)?,
         )
         .and_then(|candidate| {
-            validate_signing_key_info(key_info, &candidate, selected_provider(invocation)?)?;
+            validate_signing_key_info(
+                key_info,
+                &candidate,
+                selected_provider(invocation)?,
+                &policy.resources,
+            )?;
             Ok(candidate)
         });
         match attempt {
@@ -1324,6 +1330,7 @@ fn validate_signing_key_info(
     key_info: Option<&KeyInfo>,
     selected: &SigningKeyCandidate,
     provider: &dyn CryptoProvider,
+    resources: &ResourcePolicy,
 ) -> Result<(), CommandError> {
     let Some(key_info) = key_info else {
         return Ok(());
@@ -1380,10 +1387,9 @@ fn validate_signing_key_info(
                     let certificate = data.certificates.get(index).ok_or_else(|| {
                         signing_key_info_error("X509Data certificate chain is inconsistent")
                     })?;
-                    let (_, certificate) =
-                        x509_parser::certificate::X509Certificate::from_der(certificate)
-                            .map_err(|_| signing_key_info_error("X509Certificate is invalid"))?;
-                    Some(certificate.public_key().raw) == public.spki_der()
+                    certificate_public_key(certificate, resources, |spki| {
+                        Some(spki) == public.spki_der()
+                    })?
                 } else {
                     let certificate =
                         selected.leaf_certificate_der.as_deref().ok_or_else(|| {
@@ -1597,6 +1603,8 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
         return Err(CommandError::UnsupportedOption("lax-key-search".into()));
     }
     let policy = xmlsec_compatibility_verification_policy(invocation);
+    let utc_facts = UtcFacts::load(invocation, &policy.resources)?;
+    let utc_table = utc_facts.as_ref().map(UtcFacts::table).transpose()?;
     let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
     let start_node_id = option_text(invocation, "node-id")?;
     let id_attributes = id_attribute_registrations(invocation)?;
@@ -1669,12 +1677,18 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
             &policy,
             &mut certificate_budget,
         )?;
-        verification_context(policy, start_node_id, &id_attributes, xml_backend)
-            .external_resources(&external_resources)
-            .provider(selected_provider(invocation)?)
-            .decapsulation_key(key.as_ref())
-            .verify(&xml)
-            .map_err(|error| CommandError::Signature(error.to_string()))?
+        verification_context(
+            policy,
+            start_node_id,
+            &id_attributes,
+            xml_backend,
+            utc_table,
+        )
+        .external_resources(&external_resources)
+        .provider(selected_provider(invocation)?)
+        .decapsulation_key(key.as_ref())
+        .verify(&xml)
+        .map_err(|error| CommandError::Signature(error.to_string()))?
     } else if !selected_keys.is_empty() {
         let mut candidates = Vec::with_capacity(selected_keys.len());
         let mut last_load_error = None;
@@ -1723,12 +1737,18 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
             lax_key_search,
             policy.key_trust.check_crls,
         );
-        verification_context(policy, start_node_id, &id_attributes, xml_backend)
-            .external_resources(&external_resources)
-            .provider(selected_provider(invocation)?)
-            .key_resolver(&resolver)
-            .verify(&xml)
-            .map_err(|error| CommandError::Signature(error.to_string()))?
+        verification_context(
+            policy,
+            start_node_id,
+            &id_attributes,
+            xml_backend,
+            utc_table,
+        )
+        .external_resources(&external_resources)
+        .provider(selected_provider(invocation)?)
+        .key_resolver(&resolver)
+        .verify(&xml)
+        .map_err(|error| CommandError::Signature(error.to_string()))?
     } else if has_key_store && algorithm.hmac_output_bits().is_some() {
         let selected = select_store_candidates(
             stored_keys.symmetric_keys().iter().filter(|entry| {
@@ -1757,12 +1777,18 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
             lax_key_search,
             policy.key_trust.check_crls,
         );
-        verification_context(policy, start_node_id, &id_attributes, xml_backend)
-            .external_resources(&external_resources)
-            .provider(selected_provider(invocation)?)
-            .key_resolver(&resolver)
-            .verify(&xml)
-            .map_err(|error| CommandError::Signature(error.to_string()))?
+        verification_context(
+            policy,
+            start_node_id,
+            &id_attributes,
+            xml_backend,
+            utc_table,
+        )
+        .external_resources(&external_resources)
+        .provider(selected_provider(invocation)?)
+        .key_resolver(&resolver)
+        .verify(&xml)
+        .map_err(|error| CommandError::Signature(error.to_string()))?
     } else if has_key_store {
         let selected = select_store_candidates(
             stored_keys
@@ -1786,21 +1812,33 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
             lax_key_search,
             policy.key_trust.check_crls,
         );
-        verification_context(policy, start_node_id, &id_attributes, xml_backend)
-            .external_resources(&external_resources)
-            .provider(selected_provider(invocation)?)
-            .key_resolver(&resolver)
-            .verify(&xml)
-            .map_err(|error| CommandError::Signature(error.to_string()))?
+        verification_context(
+            policy,
+            start_node_id,
+            &id_attributes,
+            xml_backend,
+            utc_table,
+        )
+        .external_resources(&external_resources)
+        .provider(selected_provider(invocation)?)
+        .key_resolver(&resolver)
+        .verify(&xml)
+        .map_err(|error| CommandError::Signature(error.to_string()))?
     } else {
         let config = configured_certificates.into_resolver_config();
         let resolver = DefaultKeyResolver::new(config);
-        verification_context(policy, start_node_id, &id_attributes, xml_backend)
-            .external_resources(&external_resources)
-            .provider(selected_provider(invocation)?)
-            .key_resolver(&resolver)
-            .verify(&xml)
-            .map_err(|error| CommandError::Signature(error.to_string()))?
+        verification_context(
+            policy,
+            start_node_id,
+            &id_attributes,
+            xml_backend,
+            utc_table,
+        )
+        .external_resources(&external_resources)
+        .provider(selected_provider(invocation)?)
+        .key_resolver(&resolver)
+        .verify(&xml)
+        .map_err(|error| CommandError::Signature(error.to_string()))?
     };
     write_verification_diagnostics(invocation, &result, stdout)?;
     if aggregate_verification_status(&result) != DsigStatus::Valid {
@@ -2202,11 +2240,16 @@ fn verification_context<'a>(
     start_node_id: Option<&'a str>,
     id_attributes: &'a [IdAttributeRegistration],
     xml_backend: XmlBackend,
+    utc_facts: Option<structured_pkix::temporal::LeapTable<'a>>,
 ) -> VerifyContext<'a> {
     let context = VerifyContext::new()
         .policy(policy)
         .xml_backend(xml_backend)
         .id_attributes(id_attributes);
+    let context = match utc_facts {
+        Some(facts) => context.utc_facts(facts),
+        None => context,
+    };
     match start_node_id {
         Some(id) => context.start_node_id(id),
         None => context.first_document_signature(),
@@ -2261,30 +2304,17 @@ fn validate_verification_candidate_count(
     Ok(())
 }
 
-impl KeyResolver for CandidateVerificationResolver {
-    fn resolve<'a>(
-        &'a self,
-        key_info: Option<&KeyInfo>,
-        algorithm: SignatureAlgorithm,
-    ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
-        self.resolve_with_policy_and_provider(
-            key_info,
-            algorithm,
-            &VerificationPolicy::default(),
-            default_provider(),
-        )
-    }
-
-    fn resolve_with_policy_and_provider<'a>(
+impl CandidateVerificationResolver {
+    fn resolve_candidates<'a>(
         &'a self,
         key_info: Option<&KeyInfo>,
         algorithm: SignatureAlgorithm,
         policy: &VerificationPolicy,
         provider: &dyn CryptoProvider,
+        candidate_budget: &mut InspectedKeyCandidateBudget<'_>,
     ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
         validate_verification_candidate_count(self.candidates.len(), policy)?;
         policy.validate()?;
-        let mut candidate_budget = InspectedKeyCandidateBudget::new(policy);
         let document_crls = key_info
             .into_iter()
             .flat_map(|info| &info.sources)
@@ -2334,7 +2364,7 @@ impl KeyResolver for CandidateVerificationResolver {
                         algorithm,
                         &certificate_policy,
                         provider,
-                        &mut candidate_budget,
+                        candidate_budget,
                     ) {
                         Ok(key) => key.map(xml_sec::xmldsig::ResolvedVerificationKey::into_key),
                         Err(error)
@@ -2366,6 +2396,51 @@ impl KeyResolver for CandidateVerificationResolver {
         Ok(Some(Box::new(CandidateVerifyingKey {
             candidates: resolved,
         })))
+    }
+}
+
+impl KeyResolver for CandidateVerificationResolver {
+    fn resolve<'a>(
+        &'a self,
+        key_info: Option<&KeyInfo>,
+        algorithm: SignatureAlgorithm,
+    ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
+        self.resolve_with_policy_and_provider(
+            key_info,
+            algorithm,
+            &VerificationPolicy::default(),
+            default_provider(),
+        )
+    }
+
+    fn resolve_with_policy_and_provider<'a>(
+        &'a self,
+        key_info: Option<&KeyInfo>,
+        algorithm: SignatureAlgorithm,
+        policy: &VerificationPolicy,
+        provider: &dyn CryptoProvider,
+    ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
+        self.resolve_candidates(
+            key_info,
+            algorithm,
+            policy,
+            provider,
+            &mut InspectedKeyCandidateBudget::new(policy),
+        )
+    }
+
+    fn resolve_for_verification_with_budget<'a>(
+        &'a self,
+        key_info: Option<&KeyInfo>,
+        algorithm: SignatureAlgorithm,
+        policy: &VerificationPolicy,
+        provider: &dyn CryptoProvider,
+        budget: &mut InspectedKeyCandidateBudget<'_>,
+    ) -> Result<Option<xml_sec::xmldsig::ResolvedVerificationKey<'a>>, DsigError> {
+        // Carry the operation's UTC facts and account into explicit candidates,
+        // rather than restarting a certificate execution domain in this adapter.
+        self.resolve_candidates(key_info, algorithm, policy, provider, budget)
+            .map(|key| key.map(xml_sec::xmldsig::ResolvedVerificationKey::CallerTrusted))
     }
 
     fn consumes_document_key_info(&self) -> bool {
@@ -2772,8 +2847,13 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                             }
                         }
                         reserved = available.loaded.as_ref().is_some_and(|candidate| {
-                            validate_recipient_key_metadata(metadata.as_ref(), candidate, provider)
-                                .is_ok()
+                            validate_recipient_key_metadata(
+                                metadata.as_ref(),
+                                candidate,
+                                provider,
+                                &policy.resources,
+                            )
+                            .is_ok()
                         });
                     } else {
                         reserved = true;
@@ -2856,6 +2936,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                             metadata.as_ref(),
                             &candidate,
                             selected_provider(invocation)?,
+                            &policy.resources,
                         )?;
                     }
                     Ok(candidate)
@@ -2950,6 +3031,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                         metadata.as_ref(),
                         &key,
                         selected_provider(invocation)?,
+                        &policy.resources,
                     )?;
                     Ok(key)
                 }) {
@@ -3320,6 +3402,7 @@ fn validate_recipient_key_metadata(
     metadata: Option<&ParsedRecipientKeyMetadata>,
     selected_key: &RecipientPublicKeyCandidate,
     provider: &dyn CryptoProvider,
+    resources: &ResourcePolicy,
 ) -> Result<(), CommandError> {
     if let Some(metadata) = metadata {
         for source in &metadata.0.sources {
@@ -3354,18 +3437,13 @@ fn validate_recipient_key_metadata(
                                     "X509Data certificate chain is inconsistent",
                                 )
                             })?;
-                        let (_, certificate) =
-                            x509_parser::certificate::X509Certificate::from_der(certificate)
-                                .map_err(|_| {
-                                    recipient_metadata_error("X509Certificate is invalid")
-                                })?;
-                        let public_key =
-                            RsaPublicKey::from_public_key_der(certificate.public_key().raw)
-                                .map_err(|_| {
-                                    recipient_metadata_error(
-                                        "X509Certificate does not contain an RSA key",
-                                    )
-                                })?;
+                        let public_key = certificate_public_key(certificate, resources, |spki| {
+                            RsaPublicKey::from_public_key_der(spki).map_err(|_| {
+                                recipient_metadata_error(
+                                    "X509Certificate does not contain an RSA key",
+                                )
+                            })
+                        })??;
                         rsa_public_keys_match(&selected_key.public_key, &public_key)
                     } else {
                         let certificate =
@@ -4390,7 +4468,11 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                                     "recovery key exposes no public identity".into(),
                                 )
                             })?;
-                            ensure_leaf_certificate_matches_spki(&certificates[0], spki)?;
+                            ensure_leaf_certificate_matches_spki(
+                                &certificates[0],
+                                spki,
+                                resources,
+                            )?;
                         }
                         return Ok(RecipientPrivateKey {
                             inner: PrivateKeyDecryptor::provider_key(key),
@@ -4420,7 +4502,11 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                             encoding,
                             certificate_budget,
                         )?;
-                        ensure_leaf_certificate_matches_rsa_key(&certificates[0], &private_key)?;
+                        ensure_leaf_certificate_matches_rsa_key(
+                            &certificates[0],
+                            &private_key,
+                            resources,
+                        )?;
                     }
                     Ok::<_, CommandError>(RecipientPrivateKey {
                         inner: PrivateKeyDecryptor::new(private_key),
@@ -5471,31 +5557,38 @@ fn encryption_template(
 fn ensure_leaf_certificate_matches_rsa_key(
     certificate_der: &[u8],
     private_key: &rsa::RsaPrivateKey,
+    resources: &ResourcePolicy,
 ) -> Result<(), CommandError> {
     let public_key = RsaPublicKey::from(private_key)
         .to_public_key_der()
         .map_err(|error| CommandError::Encryption(error.to_string()))?;
-    ensure_leaf_certificate_matches_spki(certificate_der, public_key.as_bytes())
+    ensure_leaf_certificate_matches_spki(certificate_der, public_key.as_bytes(), resources)
 }
 
 fn ensure_leaf_certificate_matches_spki(
     certificate_der: &[u8],
     public_spki: &[u8],
+    resources: &ResourcePolicy,
 ) -> Result<(), CommandError> {
-    let (rest, certificate) = x509_parser::certificate::X509Certificate::from_der(certificate_der)
-        .map_err(|_| CommandError::Encryption("invalid X.509 certificate".into()))?;
-    if !rest.is_empty() {
-        return Err(CommandError::Encryption("invalid X.509 certificate".into()));
-    }
     // RFC 5280 §4.1.2.7: SPKI includes AlgorithmIdentifier and its parameters,
     // not just key bits. The companion must match this complete key identity.
     // https://www.rfc-editor.org/rfc/rfc5280#section-4.1.2.7
-    if certificate.public_key().raw != public_spki {
+    if !certificate_public_key(certificate_der, resources, |spki| spki == public_spki)? {
         return Err(CommandError::Encryption(
             "X.509 certificate public key does not match private key".into(),
         ));
     }
     Ok(())
+}
+
+fn certificate_public_key<R>(
+    certificate: &[u8],
+    resources: &ResourcePolicy,
+    inspect: impl FnOnce(&[u8]) -> R,
+) -> Result<R, CommandError> {
+    xml_sec::xmldsig::parse::KeyInfoParsingSession::new(resources)
+        .and_then(|mut session| session.with_certificate_public_key(certificate, inspect))
+        .map_err(|error| CommandError::Encryption(error.to_string()))
 }
 
 fn encrypted_data_key_name(encrypted_data: Node<'_, '_>) -> Result<Option<String>, CommandError> {

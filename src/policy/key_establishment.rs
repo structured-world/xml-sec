@@ -288,6 +288,11 @@ impl KeyEstablishmentPolicy {
             None => algorithm != KeyDerivationAlgorithm::LegacyDh,
         };
         permission(allowed, "key derivation", algorithm.uri())?;
+        self.check_derivation_digest(digest)
+    }
+
+    /// Digest permission is independent of the selected derivation mechanism.
+    pub fn check_derivation_digest(&self, digest: DigestAlgorithm) -> Result<(), PolicyViolation> {
         let allowed = match &self.digest_algorithms {
             Some(allowed) => allowed.contains(&digest),
             None => matches!(

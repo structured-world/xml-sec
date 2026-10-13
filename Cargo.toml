@@ -192,9 +192,10 @@ pkcs12 = { version = "=0.2.0-pre.0", default-features = false, features = ["kdf"
 pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"], optional = true }
 
 # X.509 certificates
-x509-parser = { version = "0.18", features = ["verify"], optional = true }
+x509-parser = { version = "0.18", optional = true }
 x509-cert = { version = "0.3", default-features = false, optional = true }
-x520-stringprep = { version = "1", features = ["alloc"], optional = true }
+structured-asn1 = { version = "0.1.4", default-features = false, features = ["alloc"], optional = true }
+structured-pkix = { version = "0.1.4", default-features = false, features = ["alloc"], optional = true }
 tinyvec = { version = "1.13", optional = true }
 der = { version = "0.8", optional = true }
 crypto-bigint = { version = "0.7", features = ["zeroize"], optional = true }
@@ -225,7 +226,7 @@ benchmark-internals = ["xmldsig", "xmlenc", "c14n", "xml-backends-all"]
 benchmark-alloc = ["benchmark-internals"]
 legacy-algorithms = ["dep:ripemd", "dep:md-5", "dep:des"]
 default = ["std", "xmldsig", "xmlenc", "c14n", "xml-backend-xmloxide"]
-std = ["thiserror/std", "xmlparser/std"]
+std = ["thiserror/std", "xmlparser/std", "structured-asn1?/std", "structured-pkix?/std"]
 aws-lc-fips = ["std", "xmldsig", "dep:aws-lc-rs"]
 pkcs11 = ["std", "xmlenc", "dep:cryptoki"]
 xml-backend-xmloxide = ["dep:xmloxide"]
@@ -269,7 +270,8 @@ xmldsig = [            # XML Digital Signatures (sign + verify)
     "dep:subtle",
     "dep:x509-parser",
     "dep:x509-cert",
-    "dep:x520-stringprep",
+    "dep:structured-asn1",
+    "dep:structured-pkix",
     "dep:tinyvec",
     "dep:zeroize",
 ]

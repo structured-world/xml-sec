@@ -23,6 +23,14 @@ pub use key_establishment::{
     KemContentAuthentication, KeyAgreementAlgorithm, KeyDerivationAlgorithm, KeyEstablishmentPolicy,
 };
 
+#[cfg(feature = "xmldsig")]
+mod profiles;
+#[cfg(feature = "xmldsig")]
+pub use profiles::{
+    CompiledPolicies, PolicyCompileContext, PolicyCompiler, PolicyProfile, PolicySet,
+    PolicyValidity, SignatureConstraints,
+};
+
 /// Permission for the unbounded parameterized RSA-PSS family.
 /// Exact permissions continue to use the signature algorithm allowlist.
 #[cfg(feature = "xmldsig")]
@@ -31,6 +39,8 @@ pub enum RsaPssPermission {
     /// No additional family grant; existing allowlists and secure defaults apply.
     #[default]
     ExactOnly,
+    /// Permit supported parameterized tuples using non-legacy hashes only.
+    SecureSupported,
     /// Permit every supported tuple; capability and key restrictions still apply.
     AllSupported,
 }
@@ -38,7 +48,9 @@ pub enum RsaPssPermission {
 #[cfg(feature = "xmldsig")]
 impl RsaPssPermission {
     fn permits(self, algorithm: SignatureAlgorithm) -> bool {
-        self == Self::AllSupported && matches!(algorithm, SignatureAlgorithm::RsaPss(_))
+        matches!(algorithm, SignatureAlgorithm::RsaPss(_))
+            && (self == Self::AllSupported
+                || (self == Self::SecureSupported && algorithm.signing_allowed()))
     }
 }
 
@@ -71,6 +83,8 @@ pub(crate) mod resource_name {
     pub const KEY_CANDIDATES: &str = "key candidates";
     pub const KEY_IMPORT_KDF_WORK: &str = "key import KDF work";
     pub const KEY_IMPORT_KDF_MEMORY: &str = "key import KDF memory bytes";
+    pub const X509_WORK: &str = "X.509 work";
+    pub const X509_WORKSPACE_BYTES: &str = "X.509 workspace bytes";
     #[cfg(feature = "xmldsig")]
     pub const KEY_ESTABLISHMENT_HASH_BLOCKS: &str = "key establishment hash blocks";
     #[cfg(feature = "xmldsig")]
@@ -107,6 +121,15 @@ pub(crate) mod resource_name {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum PolicyViolation {
+    /// Contradictory policy layers or an unavailable compiled requirement.
+    #[error("policy compilation failed: {reason}")]
+    Configuration {
+        /// Stable, non-secret diagnostic.
+        reason: &'static str,
+    },
+    /// An explicitly authorized exception is not valid at operation time.
+    #[error("policy authorization is outside its validity interval")]
+    AuthorizationExpired,
     /// An algorithm is outside the operation allowlist.
     #[error("{operation} policy rejects algorithm {algorithm}")]
     Algorithm {
@@ -491,6 +514,12 @@ pub struct ResourcePolicy {
     /// Maximum key-source expansion work and concrete key or certificate
     /// candidates inspected by one operation stage.
     pub max_key_candidates: usize,
+    /// Maximum cumulative work charged by the shared certificate mechanism
+    /// in a processing session, across its candidates and nested decodes.
+    pub max_x509_work: usize,
+    /// Maximum live allocation capacity retained by the shared certificate
+    /// mechanism, including path search, Name processing and CRL evaluation.
+    pub max_x509_workspace_bytes: usize,
     /// Maximum aggregate PBKDF2/PKCS#12 hash rounds or conservative scrypt work
     /// during key import, including PKCS#8 password-hashing work units.
     pub max_key_import_kdf_work: usize,
@@ -558,6 +587,8 @@ impl Default for ResourcePolicy {
             max_encryption_recipients: crate::hard_limits::ENCRYPTION_RECIPIENT_CEILING,
             max_encryption_metadata_bytes: crate::hard_limits::ENCRYPTION_METADATA_BYTE_CEILING,
             max_key_candidates: crate::hard_limits::KEY_CANDIDATE_CEILING,
+            max_x509_work: crate::hard_limits::X509_WORK_CEILING,
+            max_x509_workspace_bytes: crate::hard_limits::X509_WORKSPACE_BYTE_CEILING,
             max_key_import_kdf_work: crate::hard_limits::KEY_IMPORT_KDF_WORK_CEILING as usize,
             max_key_import_kdf_memory_bytes: crate::hard_limits::KEY_IMPORT_KDF_MEMORY_CEILING,
             max_key_info_reference_depth: crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING,
@@ -671,6 +702,16 @@ impl ResourcePolicy {
             crate::hard_limits::ENCRYPTION_METADATA_BYTE_CEILING,
         )?;
         for (resource, selected, ceiling) in [
+            (
+                resource_name::X509_WORK,
+                self.max_x509_work,
+                crate::hard_limits::X509_WORK_CEILING,
+            ),
+            (
+                resource_name::X509_WORKSPACE_BYTES,
+                self.max_x509_workspace_bytes,
+                crate::hard_limits::X509_WORKSPACE_BYTE_CEILING,
+            ),
             (
                 resource_name::KEY_CANDIDATES,
                 self.max_key_candidates,
@@ -1180,6 +1221,10 @@ pub enum ManifestProcessing {
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Default)]
 pub struct VerificationPolicy {
+    /// Explicitly authorized lifetime; checked again at operation entry.
+    pub validity: Option<PolicyValidity>,
+    /// XML Security requirements, not application protocol validation.
+    pub signature_constraints: SignatureConstraints,
     /// Shared key-establishment permissions and cumulative operation limits.
     pub key_establishment: KeyEstablishmentPolicy,
     /// Family permission selected by the caller, never derived from document input.
@@ -1234,6 +1279,16 @@ impl VerificationPolicy {
     }
     /// Validate the complete snapshot against implementation hard ceilings.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
+        if let Some(validity) = &self.validity {
+            validity.validate_at(SystemTime::now())?;
+        }
+        if self.signature_constraints != SignatureConstraints::General
+            && self.key_trust.mode == VerificationTrustMode::CryptographicOnly
+        {
+            return Err(PolicyViolation::Configuration {
+                reason: "target coverage requires trusted-key verification",
+            });
+        }
         self.resources.validate()?;
         self.key_establishment.validate()?;
         self.key_trust.validate()?;
@@ -1295,6 +1350,10 @@ impl VerificationPolicy {
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Default)]
 pub struct SigningPolicy {
+    /// Explicitly authorized lifetime; checked again at operation entry.
+    pub validity: Option<PolicyValidity>,
+    /// XML Security requirements, not application protocol validation.
+    pub signature_constraints: SignatureConstraints,
     /// Shared key-establishment permissions and cumulative operation limits.
     pub key_establishment: KeyEstablishmentPolicy,
     /// Explicit parameterized RSA-PSS family permission, including legacy hashes.
@@ -1329,6 +1388,9 @@ pub struct SigningPolicy {
 impl SigningPolicy {
     /// Validate the complete snapshot before signing work begins.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
+        if let Some(validity) = &self.validity {
+            validity.validate_at(SystemTime::now())?;
+        }
         self.resources.validate()?;
         self.key_establishment.validate()?;
         self.rsa_keys.validate()?;
@@ -1404,6 +1466,8 @@ pub(crate) fn check_content_algorithm(
 #[cfg(feature = "xmlenc")]
 #[derive(Debug, Clone, Default)]
 pub struct EncryptionPolicy {
+    /// Explicitly authorized lifetime; checked again at operation entry.
+    pub validity: Option<PolicyValidity>,
     /// Allowed content-encryption algorithms.
     pub data_algorithms: Option<HashSet<DataEncryptionAlgorithm>>,
     /// Allowed RSA key-transport algorithms.
@@ -1426,6 +1490,9 @@ pub struct EncryptionPolicy {
 impl EncryptionPolicy {
     /// Validate the complete snapshot before outbound encryption work begins.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
+        if let Some(validity) = &self.validity {
+            validity.validate_at(SystemTime::now())?;
+        }
         self.resources.validate()?;
         self.key_establishment.validate()?;
         self.rsa_keys.validate()
@@ -1436,6 +1503,8 @@ impl EncryptionPolicy {
 #[cfg(feature = "xmlenc")]
 #[derive(Debug, Clone, Default)]
 pub struct DecryptionPolicy {
+    /// Explicitly authorized lifetime; checked again at operation entry.
+    pub validity: Option<PolicyValidity>,
     /// URI-class permissions for ciphertext and indirect key references.
     pub uris: UriPolicy,
     /// Shared transform permissions and same-document reference semantics.
@@ -1463,6 +1532,9 @@ pub struct DecryptionPolicy {
 impl DecryptionPolicy {
     /// Validate the complete snapshot before inbound decryption work begins.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
+        if let Some(validity) = &self.validity {
+            validity.validate_at(SystemTime::now())?;
+        }
         self.resources.validate()?;
         self.key_establishment.validate()?;
         self.rsa_keys.validate()
@@ -1598,6 +1670,16 @@ mod tests {
         // also catch a field accidentally paired with another field's ceiling.
         type Case = (&'static str, usize, fn(&mut ResourcePolicy) -> &mut usize);
         let cases: &[Case] = &[
+            (
+                resource_name::X509_WORK,
+                crate::hard_limits::X509_WORK_CEILING,
+                |p| &mut p.max_x509_work,
+            ),
+            (
+                resource_name::X509_WORKSPACE_BYTES,
+                crate::hard_limits::X509_WORKSPACE_BYTE_CEILING,
+                |p| &mut p.max_x509_workspace_bytes,
+            ),
             (
                 resource_name::XML_NODES,
                 crate::hard_limits::XML_DOCUMENT_NODE_CEILING as usize,
@@ -1828,6 +1910,8 @@ mod tests {
             max_encryption_recipients: 0,
             max_encryption_metadata_bytes: 0,
             max_key_candidates: 0,
+            max_x509_work: 0,
+            max_x509_workspace_bytes: 0,
             max_key_import_kdf_work: 0,
             max_key_import_kdf_memory_bytes: 0,
             max_key_info_reference_depth: 0,

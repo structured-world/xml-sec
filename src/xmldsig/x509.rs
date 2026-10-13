@@ -1,23 +1,16 @@
 //! X.509 certificate path and revocation validation.
 
-use std::{
-    collections::HashSet,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{collections::HashSet, time::SystemTime};
 
+use x509_parser::x509::AlgorithmIdentifier;
+#[cfg(test)]
 use x509_parser::{
-    certificate::X509Certificate,
-    extensions::{GeneralName, NameConstraints, ParsedExtension},
-    prelude::FromDer,
-    revocation_list::CertificateRevocationList,
+    certificate::X509Certificate, prelude::FromDer, revocation_list::CertificateRevocationList,
     time::ASN1Time,
-    x509::AlgorithmIdentifier,
 };
 
-use super::{
-    X509DataInfo,
-    parse::{distinguished_name_within_subtree, distinguished_names_equal, x509_name_to_rfc4514},
-};
+use super::X509DataInfo;
+use super::pkix::X509DataSource;
 use crate::{
     policy::{DsaKeyPolicy, ExtendedKeyPurpose, RsaKeyPolicy},
     provider::X509SignatureAlgorithm,
@@ -26,6 +19,9 @@ use crate::{
 /// Inputs controlling X.509 certificate-chain validation.
 #[derive(Debug, Clone)]
 pub struct X509ChainOptions<'a> {
+    /// Caller-owned UTC history for evaluating supplied certificate evidence.
+    /// This is a request fact; the core does not discover or update the table.
+    pub utc_facts: Option<structured_pkix::temporal::LeapTable<'a>>,
     /// DER-encoded certificates accepted as trust anchors.
     pub trusted_certs: &'a [Vec<u8>],
     /// Time used for certificate, CRL, and revocation checks.
@@ -50,12 +46,18 @@ pub struct X509ChainOptions<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum X509ChainError {
+    /// A located error from the common certificate mechanism.
+    #[error("X.509 processing failed: {0}")]
+    Processing(#[source] structured_pkix::Error),
     /// The operation does not permit this certificate or CRL signature method.
     #[error("X.509 signature policy rejected authentication: {0}")]
     Policy(#[from] crate::policy::PolicyViolation),
     /// The selected cryptographic provider rejected path authentication.
     #[error("cryptographic provider rejected X.509 authentication: {0}")]
     Provider(#[from] crate::provider::ProviderError),
+    /// The provider cannot answer for this path's algorithm/key/parameters.
+    #[error("certificate signature at chain position {0} is unsupported")]
+    UnsupportedSignature(usize),
     /// The configured path limit cannot contain a certificate.
     #[error("maximum certificate chain depth must be greater than zero")]
     InvalidDepth,
@@ -81,6 +83,12 @@ pub enum X509ChainError {
     /// The path contains more certificates than allowed.
     #[error("certificate chain exceeds maximum depth of {0}")]
     DepthExceeded(usize),
+    /// Static checking stopped without producing an accepted path.
+    #[error("certificate path checking stopped at {0:?}")]
+    PathIncomplete(structured_pkix::path::Truncation),
+    /// The path's certificate policies do not permit the requested operation.
+    #[error("certificate path policy constraints are not satisfied")]
+    CertificatePolicies,
     /// A certificate is outside its validity period.
     #[error("certificate at chain position {0} is expired or not yet valid")]
     CertificateNotValid(usize),
@@ -147,9 +155,44 @@ pub enum X509ChainError {
     /// A CRL is not valid for the selected verification time or issuer.
     #[error("CRL {0} is invalid or cannot be authenticated")]
     InvalidCrl(usize),
+    /// Applicable authenticated lists do not cover every revocation reason.
+    #[error("CRL evidence has incomplete reason coverage at chain position {0}")]
+    IncompleteCrlCoverage(usize),
+    /// Revocation-time qualification requires caller-supplied UTC evidence.
+    #[error("CRL validation requires caller-supplied UTC facts")]
+    MissingUtcFacts,
+    /// The caller's UTC evidence cannot establish a CRL temporal fact.
+    #[error("UTC evidence cannot establish CRL {index} time: {reason:?}")]
+    CrlTimeUncertain {
+        /// Original embedded/inventory source index.
+        index: usize,
+        /// Lossless reason supplied by the common temporal mechanism.
+        reason: structured_pkix::temporal::Uncertainty,
+    },
     /// A path certificate was revoked by an applicable CRL.
     #[error("certificate at chain position {0} is revoked")]
     Revoked(usize),
+}
+
+impl X509ChainError {
+    pub(crate) fn is_execution_failure(&self) -> bool {
+        match self {
+            Self::Processing(error) => error.is_resource(),
+            Self::Policy(
+                crate::policy::PolicyViolation::ResourceLimit { .. }
+                | crate::policy::PolicyViolation::ResourceLimitExceeded { .. },
+            ) => true,
+            Self::Provider(crate::provider::ProviderError::Unsupported { .. }) => false,
+            Self::Provider(_) => true,
+            Self::PathIncomplete(reason) => !matches!(
+                reason,
+                structured_pkix::path::Truncation::Depth
+                    | structured_pkix::path::Truncation::Paths
+                    | structured_pkix::path::Truncation::Policies
+            ),
+            _ => false,
+        }
+    }
 }
 
 /// Verify the ordered certificate path parsed from one `<X509Data>` element.
@@ -174,75 +217,104 @@ pub(crate) fn verify_x509_certificate_chain_with_provider_and_crls(
     provider: &dyn crate::provider::CryptoProvider,
     additional_crls: &[Vec<u8>],
 ) -> Result<(), X509ChainError> {
+    let session = super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
+    verify_x509_certificate_chain_in_session(info, options, provider, additional_crls, &session)
+        .map(|_| ())
+}
+
+pub(crate) fn verify_x509_certificate_chain_in_session(
+    info: &impl X509DataSource,
+    options: &X509ChainOptions<'_>,
+    provider: &dyn crate::provider::CryptoProvider,
+    additional_crls: &[Vec<u8>],
+    session: &super::pkix::CertificateSession,
+) -> Result<super::pkix::ValidatedX509Key, X509ChainError> {
     if options.max_chain_depth == 0 {
         return Err(X509ChainError::InvalidDepth);
     }
-    if info.certificate_chain.is_empty() {
+    if info.chain().is_empty() {
         return Err(X509ChainError::UntrustedRoot);
     }
 
-    let path_der = info
-        .certificate_chain
-        .iter()
-        .map(|&idx| {
-            info.certificates
-                .get(idx)
-                .map(Vec::as_slice)
-                .ok_or(X509ChainError::UntrustedRoot)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let storage_error = |reason| {
+        session.error(structured_pkix::Error::resource(
+            reason,
+            "certificate.path",
+            0,
+        ))
+    };
+    let mut path_der = session.memory().vector();
+    path_der
+        .try_reserve_exact(info.chain().len())
+        .map_err(storage_error)?;
+    for &index in info.chain() {
+        let bytes = info
+            .certificate(index)
+            .ok_or(X509ChainError::UntrustedRoot)?;
+        path_der.try_push(bytes).map_err(storage_error)?;
+    }
 
-    let last = parse_certificate(
+    let last = session.read(
         path_der
             .last()
             .copied()
             .ok_or(X509ChainError::UntrustedRoot)?,
     )?;
-    let trusted_anchors = options
-        .trusted_certs
+    let trusted_anchors =
+        session
+            .read_pool(options.trusted_certs)
+            .map_err(|error| match error {
+                X509ChainError::Processing(error) if !error.is_resource() => {
+                    X509ChainError::InvalidDer {
+                        kind: "certificate",
+                        message: error.to_string(),
+                    }
+                }
+                error => error,
+            })?;
+    let embedded_anchor = trusted_anchors
         .iter()
-        .map(|der| parse_certificate(der).map(|cert| (der.as_slice(), cert)))
-        .collect::<Result<Vec<_>, _>>()?;
-    let verification_time = system_time_to_asn1(options.verification_time)?;
-    let embedded_anchor = trusted_anchors.iter().any(|(der, _)| *der == last.as_raw());
+        .any(|cert| cert.as_bytes() == last.as_bytes());
     if embedded_anchor {
         return validate_path(
             &path_der,
             info,
             options,
-            verification_time,
-            provider,
+            (provider, session),
             additional_crls,
         );
     }
 
-    // Use the path-edge verifier here too: x509-parser does not verify legacy
-    // DSA-SHA1 roots, while our fallback must recognize them for rollover.
+    // Root replacement requires a proved self-signature and child signature;
+    // a merely prospective edge cannot authorize discarding a certificate.
     let replace_untrusted_root = if path_der.len() > 1
-        && certificate_names_equal(last.subject(), last.issuer())
-        && verify_certificate_signature_with_provider(
+        && session.source_names_equal(last.tbs().subject(), last.tbs().issuer())?
+        && shared_certificate_signature_outcome(
             &last,
             &last,
             provider,
             options.certificate_signature_algorithms,
-        )? {
-        let child = parse_certificate(path_der[path_der.len() - 2])?;
-        certificate_names_equal(child.issuer(), last.subject())
-            && verify_certificate_signature_with_provider(
+            session,
+        )? == structured_pkix::path::Verified::Yes
+    {
+        let child = session.read(path_der[path_der.len() - 2])?;
+        session.source_names_equal(child.tbs().issuer(), last.tbs().subject())?
+            && shared_certificate_signature_outcome(
                 &child,
                 &last,
                 provider,
                 options.certificate_signature_algorithms,
-            )?
+                session,
+            )? == structured_pkix::path::Verified::Yes
     } else {
         false
     };
     let candidate_base = if replace_untrusted_root {
         &path_der[..path_der.len() - 1]
     } else {
-        path_der.as_slice()
+        &path_der[..]
     };
-    let candidate_child = parse_certificate(
+    let candidate_child = session.read(
         candidate_base
             .last()
             .copied()
@@ -250,28 +322,37 @@ pub(crate) fn verify_x509_certificate_chain_with_provider_and_crls(
     )?;
 
     let mut first_validation_error = None;
-    for (anchor_der, cert) in &trusted_anchors {
-        if !certificate_names_equal(cert.subject(), candidate_child.issuer())
-            || !verify_certificate_signature_with_provider(
-                &candidate_child,
-                cert,
-                provider,
-                options.certificate_signature_algorithms,
-            )?
-        {
+    for cert in &trusted_anchors {
+        if !session.source_names_equal(cert.tbs().subject(), candidate_child.tbs().issuer())? {
             continue;
         }
-        let mut candidate_path = candidate_base.to_vec();
-        candidate_path.push(anchor_der);
+        match shared_certificate_signature_outcome(
+            &candidate_child,
+            cert,
+            provider,
+            options.certificate_signature_algorithms,
+            session,
+        )? {
+            structured_pkix::path::Verified::Yes | structured_pkix::path::Verified::Unsupported => {
+            }
+            _ => continue,
+        }
+        let mut candidate_path = session.memory().vector();
+        candidate_path
+            .try_extend_from_slice(candidate_base)
+            .map_err(storage_error)?;
+        candidate_path
+            .try_push(cert.as_bytes())
+            .map_err(storage_error)?;
         match validate_path(
             &candidate_path,
             info,
             options,
-            verification_time,
-            provider,
+            (provider, session),
             additional_crls,
         ) {
-            Ok(()) => return Ok(()),
+            Ok(key) => return Ok(key),
+            Err(error) if error.is_execution_failure() => return Err(error),
             Err(error) => first_validation_error.get_or_insert(error),
         };
     }
@@ -281,84 +362,503 @@ pub(crate) fn verify_x509_certificate_chain_with_provider_and_crls(
 
 fn validate_path(
     path_der: &[&[u8]],
-    info: &X509DataInfo,
+    info: &impl X509DataSource,
     options: &X509ChainOptions<'_>,
-    verification_time: ASN1Time,
-    provider: &dyn crate::provider::CryptoProvider,
+    execution: (
+        &dyn crate::provider::CryptoProvider,
+        &super::pkix::CertificateSession,
+    ),
     additional_crls: &[Vec<u8>],
-) -> Result<(), X509ChainError> {
+) -> Result<super::pkix::ValidatedX509Key, X509ChainError> {
+    let (provider, session) = execution;
     if path_der.len() > options.max_chain_depth {
         return Err(X509ChainError::DepthExceeded(options.max_chain_depth));
     }
 
-    let path = path_der
-        .iter()
-        .map(|der| parse_certificate(der))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut effective_extended_key_usages = options.allowed_extended_key_usages.cloned();
+    let mut decoded = session.memory().vector();
+    for der in path_der {
+        let certificate = session.read(der)?;
+        if decoded.is_empty() {
+            // Fail the target's time gate before examining issuer permissions,
+            // as shared path discovery also does before entering its pool.
+            let at = super::pkix::verification_instant(options.verification_time)?;
+            let validity = certificate.tbs().validity();
+            if at < validity.not_before().instant() || at > validity.not_after().instant() {
+                return Err(X509ChainError::CertificateNotValid(0));
+            }
+        }
+        decoded.try_push(certificate).map_err(|reason| {
+            X509ChainError::Processing(structured_pkix::Error::resource(
+                reason,
+                "certificate.path",
+                0,
+            ))
+        })?;
+    }
 
-    for (position, cert) in path.iter().enumerate() {
-        validate_certificate_serial(cert)?;
-        validate_unique_extensions(cert, position)?;
-        if !cert.validity().is_valid_at(verification_time) {
+    let mut effective_extended_key_usages = session.memory().vector();
+    if let Some(purposes) = options.allowed_extended_key_usages {
+        for purpose in purposes {
+            effective_extended_key_usages
+                .try_push(purpose)
+                .map_err(|reason| {
+                    session.error(structured_pkix::Error::resource(
+                        reason,
+                        "certificate.extended_key_usage",
+                        0,
+                    ))
+                })?;
+        }
+    }
+    let mut anchor_limit = None;
+    let at = super::pkix::verification_instant(options.verification_time)?;
+    for (position, cert) in decoded.iter().enumerate() {
+        validate_positive_serial_bytes(
+            cert.tbs().serial().as_bytes(),
+            "certificate serial number",
+        )?;
+        if position == decoded.len() - 1
+            && (at < cert.tbs().validity().not_before().instant()
+                || at > cert.tbs().validity().not_after().instant())
+        {
             return Err(X509ChainError::CertificateNotValid(position));
         }
+        let extensions = cert.tbs().extensions();
         if position == 0 {
-            validate_leaf_key_usage(cert)?;
-        } else {
-            validate_ca_constraints(cert, position)?;
+            if let Some(usage) = shared_key_usage(cert, position, session)?
+                && !usage.digital_signature()
+                && !usage.content_commitment()
+            {
+                return Err(X509ChainError::InvalidKeyUsage {
+                    position,
+                    required: "digitalSignature or nonRepudiation",
+                });
+            }
+        } else if position == decoded.len() - 1 {
+            // RFC 5280 4.2.1.9 requires critical cA BasicConstraints of issuers;
+            // 6.1.4(k) requires the assertion, not an extra criticality gate.
+            // This certificate-anchor profile likewise does not invent one.
+            // https://www.rfc-editor.org/rfc/rfc5280.html#section-4.2.1.9
+            // https://www.rfc-editor.org/rfc/rfc5280.html#section-6.1.4
+            let basic = extensions
+                .basic_constraints(session.memory())
+                .map_err(|error| session.error(error))?
+                .filter(|basic| basic.is_authority())
+                .ok_or(X509ChainError::IssuerNotCa(position))?;
+            anchor_limit = basic.path_length().and_then(|limit| limit.certificates());
+            if let Some(usage) = shared_key_usage(cert, position, session)?
+                && !usage.key_cert_sign()
+            {
+                return Err(X509ChainError::InvalidKeyUsage {
+                    position,
+                    required: "keyCertSign",
+                });
+            }
         }
-        validate_extended_key_usage(cert, position, &mut effective_extended_key_usages)?;
-        validate_subject_identity(cert)?;
-        validate_critical_extensions(cert, position)?;
-    }
-    validate_path_length_constraints(&path)?;
-    validate_name_constraints(&path)?;
-
-    for (position, pair) in path.windows(2).enumerate() {
-        let [child, issuer] = pair else {
-            unreachable!()
-        };
-        validate_issuer_key_policy(issuer, position + 1, options.rsa_keys, options.dsa_keys)?;
-        if !certificate_names_equal(child.issuer(), issuer.subject())
-            || !verify_certificate_signature_with_provider(
-                child,
-                issuer,
-                provider,
-                options.certificate_signature_algorithms,
-            )?
+        validate_shared_extended_key_usage(
+            cert,
+            position,
+            &mut effective_extended_key_usages,
+            session,
+        )?;
+        validate_shared_subject_identity(cert, session)?;
+        if position == decoded.len() - 1 {
+            validate_shared_anchor_extensions(cert, position, session)?;
+        }
+        // This strict issuance-profile rule is XML security policy, not an
+        // additional RFC 5280 6.1 processor mandate. The common processor
+        // handles the actual name constraints and their provenance.
+        if let Some(extension) = extensions
+            .get(structured_pkix::oid::NAME_CONSTRAINTS, session.memory())
+            .map_err(|error| session.error(error))?
+            && (position == 0 || !extension.is_critical())
         {
-            return Err(X509ChainError::InvalidSignature(position));
+            return Err(X509ChainError::InvalidNameConstraints { position });
         }
+    }
+    let mut effective_key = super::pkix::ValidatedX509Key {
+        effective_spki: None,
+    };
+    if path_der.len() > 1 {
+        let anchor = decoded.last().expect("nonempty path");
+        let mut chain = session.memory().vector();
+        for certificate in &decoded[..decoded.len() - 1] {
+            chain.try_push(certificate).map_err(|reason| {
+                X509ChainError::Processing(structured_pkix::Error::resource(
+                    reason,
+                    "certificate.path",
+                    0,
+                ))
+            })?;
+        }
+        let facts =
+            super::pkix::validate_supplied_path(&chain, anchor, options, provider, session)?;
+        // The anchor is a caller input, excluded by RFC 5280 6.1. Our existing
+        // certificate-anchor profile additionally honors its pathLenConstraint.
+        // https://www.rfc-editor.org/rfc/rfc5280.html#section-6.1
+        if let Some(limit) = anchor_limit
+            && facts.non_self_issued_intermediates > limit
+        {
+            return Err(X509ChainError::PathLengthExceeded {
+                position: decoded.len() - 1,
+                limit,
+            });
+        }
+        // RFC 5280 6.1.4(e): keep the target's authenticated working key for
+        // subsequent data verification; never rewrite the certificate's TBS.
+        // https://www.rfc-editor.org/rfc/rfc5280.html#section-6.1.4
+        effective_key = super::pkix::effective_target_spki(facts.key, session.memory())?;
     }
 
     if options.check_crls {
-        verify_crls(
-            &path,
-            &info.crls,
+        super::pkix::verify_crls(
+            &decoded,
+            info.crls(),
             additional_crls,
-            verification_time,
+            options,
             provider,
-            options.certificate_signature_algorithms,
+            session,
         )?;
+    }
+    Ok(effective_key)
+}
+
+fn shared_key_usage<'a>(
+    certificate: &structured_pkix::Certificate<'a>,
+    position: usize,
+    session: &super::pkix::CertificateSession,
+) -> Result<Option<structured_pkix::usage::KeyUsage<'a>>, X509ChainError> {
+    let Some(extension) = certificate
+        .tbs()
+        .extensions()
+        .get(structured_pkix::oid::KEY_USAGE, session.memory())
+        .map_err(|error| session.error(error))?
+    else {
+        return Ok(None);
+    };
+    structured_pkix::usage::KeyUsage::read(extension, session.memory())
+        .map(Some)
+        .map_err(|error| {
+            if error.is_resource() {
+                session.error(error)
+            } else if extension.is_critical() {
+                X509ChainError::UnsupportedCriticalExtension {
+                    position,
+                    oid: "2.5.29.15".into(),
+                }
+            } else {
+                session.error(error)
+            }
+        })
+}
+
+fn validate_shared_extended_key_usage(
+    certificate: &structured_pkix::Certificate<'_>,
+    position: usize,
+    effective: &mut structured_asn1::memory::OwnedVec<&ExtendedKeyPurpose>,
+    session: &super::pkix::CertificateSession,
+) -> Result<(), X509ChainError> {
+    let Some(usage) = certificate
+        .tbs()
+        .extensions()
+        .extended_key_usage(session.memory())
+        .map_err(|error| session.error(error))?
+    else {
+        return Ok(());
+    };
+    if usage
+        .has(
+            structured_pkix::oid::ANY_EXTENDED_KEY_USAGE,
+            session.memory(),
+        )
+        .map_err(|error| session.error(error))?
+    {
+        return Ok(());
+    }
+    let mut kept = 0;
+    for index in 0..effective.len() {
+        if shared_usage_contains(&usage, effective[index], session)? {
+            effective[kept] = effective[index];
+            kept += 1;
+        }
+    }
+    while effective.len() > kept {
+        effective.pop();
+    }
+    if kept == 0 {
+        return Err(X509ChainError::InvalidKeyUsage {
+            position,
+            required: "an approved extended key usage",
+        });
     }
     Ok(())
 }
 
-fn validate_issuer_key_policy(
-    issuer: &X509Certificate<'_>,
+fn shared_usage_contains(
+    usage: &structured_pkix::usage::ExtendedKeyUsage<'_>,
+    purpose: &ExtendedKeyPurpose,
+    session: &super::pkix::CertificateSession,
+) -> Result<bool, X509ChainError> {
+    use structured_pkix::oid;
+    let kind = match purpose {
+        ExtendedKeyPurpose::ServerAuth => oid::SERVER_AUTH,
+        ExtendedKeyPurpose::ClientAuth => oid::CLIENT_AUTH,
+        ExtendedKeyPurpose::CodeSigning => oid::CODE_SIGNING,
+        ExtendedKeyPurpose::EmailProtection => oid::EMAIL_PROTECTION,
+        ExtendedKeyPurpose::TimeStamping => oid::TIME_STAMPING,
+        ExtendedKeyPurpose::OcspSigning => oid::OCSP_SIGNING,
+        ExtendedKeyPurpose::Other(expected) => {
+            for kind in usage.purposes() {
+                session
+                    .memory()
+                    .charge_work(kind.as_bytes().len() as u64 + expected.len() as u64 + 1)
+                    .map_err(|reason| {
+                        session.error(structured_pkix::Error::resource(
+                            reason,
+                            "certificate.extended_key_usage",
+                            0,
+                        ))
+                    })?;
+                let mut arcs = kind.arcs();
+                let mut matches = true;
+                for &expected in expected {
+                    if arcs.next().and_then(|arc| arc.as_u64()) != Some(expected) {
+                        matches = false;
+                        break;
+                    }
+                }
+                if matches && arcs.next().is_none() {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
+    };
+    usage
+        .has(kind, session.memory())
+        .map_err(|error| session.error(error))
+}
+
+fn validate_shared_subject_identity(
+    certificate: &structured_pkix::Certificate<'_>,
+    session: &super::pkix::CertificateSession,
+) -> Result<(), X509ChainError> {
+    let subject = certificate.tbs().subject();
+    for attribute in subject.attributes_of(structured_pkix::oid::EMAIL_ADDRESS, session.memory()) {
+        let attribute = attribute.map_err(|error| session.error(error))?;
+        let text = attribute
+            .text(session.memory())
+            .map_err(|error| session.error(error))?
+            .ok_or_else(|| invalid_subject_identity("subject emailAddress is not text"))?;
+        let text = text.as_str(session.memory()).map_err(|reason| {
+            session.error(structured_pkix::Error::resource(
+                reason,
+                "certificate.subject",
+                0,
+            ))
+        })?;
+        session
+            .memory()
+            .charge_work(text.len() as u64)
+            .map_err(|reason| {
+                session.error(structured_pkix::Error::resource(
+                    reason,
+                    "certificate.subject",
+                    0,
+                ))
+            })?;
+        if !mailbox_has_valid_syntax(text) {
+            return Err(invalid_subject_identity(
+                "invalid subject emailAddress syntax",
+            ));
+        }
+    }
+    let extensions = certificate.tbs().extensions();
+    let extension = extensions
+        .get(structured_pkix::oid::SUBJECT_ALT_NAME, session.memory())
+        .map_err(|error| session.error(error))?;
+    let Some(extension) = extension else {
+        return if subject.is_empty() {
+            Err(invalid_subject_identity(
+                "an empty subject requires a critical SubjectAlternativeName",
+            ))
+        } else {
+            Ok(())
+        };
+    };
+    // RFC 5280 4.1.2.6 / 4.2.1.6: empty subjects need a critical SAN;
+    // the common decoder owns its schema, syntax and non-empty-list checks.
+    // https://www.rfc-editor.org/rfc/rfc5280.html#section-4.2.1.6
+    if let Err(error) = structured_pkix::general_name::read_alternative(extension, session.memory())
+    {
+        return Err(shared_san_error(extension, error, session)?);
+    }
+    if subject.is_empty() && !extension.is_critical() {
+        return Err(invalid_subject_identity(
+            "an empty subject requires a critical SubjectAlternativeName",
+        ));
+    }
+    Ok(())
+}
+
+fn shared_san_error(
+    extension: &structured_pkix::extension::Extension<'_>,
+    error: structured_pkix::Error,
+    session: &super::pkix::CertificateSession,
+) -> Result<X509ChainError, X509ChainError> {
+    if error.is_resource() {
+        return Ok(session.error(error));
+    }
+    let decode_error = |error: structured_asn1::Error| {
+        let error = structured_pkix::Error::new(
+            structured_pkix::ErrorCode::Encoding(error.code()),
+            "certificate.subjectAltName",
+            error.offset(),
+        );
+        if error.is_resource() {
+            session.error(error)
+        } else {
+            invalid_subject_identity("invalid SubjectAlternativeName")
+        }
+    };
+    // Decode only on a semantic failure to preserve the existing distinction
+    // between malformed IA5 encoding and a well-encoded invalid DNS name.
+    // This is the producing parser/account, not a fresh diagnostic allowance.
+    let mut reader = extension.reader(session.memory()).map_err(decode_error)?;
+    let sequence = reader
+        .expect(structured_asn1::Tag::constructed(
+            structured_asn1::universal::SEQUENCE,
+        ))
+        .map_err(decode_error)?;
+    let mut inside = reader.enter(&sequence).map_err(decode_error)?;
+    while let Some(element) = inside.next_element().map_err(decode_error)? {
+        if element.span().start != error.offset() {
+            continue;
+        }
+        if element.tag() == structured_asn1::Tag::context(false, 2) {
+            inside
+                .charge(element.contents().len() as u64)
+                .map_err(|error| {
+                    session.error(structured_pkix::Error::new(
+                        structured_pkix::ErrorCode::Encoding(error.code()),
+                        "certificate.subjectAltName",
+                        error.offset(),
+                    ))
+                })?;
+            if element.contents().is_ascii() {
+                return Ok(X509ChainError::InvalidDer {
+                    kind: "certificate DNS name",
+                    message: "invalid SubjectAlternativeName dNSName".into(),
+                });
+            }
+        }
+        break;
+    }
+    Ok(invalid_subject_identity("invalid SubjectAlternativeName"))
+}
+
+fn validate_shared_anchor_extensions(
+    certificate: &structured_pkix::Certificate<'_>,
+    position: usize,
+    session: &super::pkix::CertificateSession,
+) -> Result<(), X509ChainError> {
+    use structured_pkix::{error::CallbackError, oid};
+    let extensions = certificate.tbs().extensions();
+    for extension in extensions.criticals(session.memory()) {
+        let extension = extension.map_err(|error| session.error(error))?;
+        let kind = extension.kind();
+        let accepted = matches!(
+            kind,
+            oid::KEY_USAGE
+                | oid::SUBJECT_ALT_NAME
+                | oid::BASIC_CONSTRAINTS
+                | oid::NAME_CONSTRAINTS
+                | oid::EXT_KEY_USAGE
+        );
+        let understood = if accepted {
+            match extensions.understands(extension, &(), session.memory()) {
+                Ok(value) => value,
+                Err(CallbackError::Processing(error)) => return Err(session.error(error)),
+                Err(CallbackError::Callback(error)) => match error {},
+            }
+        } else {
+            false
+        };
+        if !understood {
+            if kind == oid::NAME_CONSTRAINTS {
+                return Err(X509ChainError::InvalidNameConstraints { position });
+            }
+            let oid = kind.text(session.memory()).map_err(|reason| {
+                session.error(structured_pkix::Error::resource(
+                    reason,
+                    "certificate.anchor",
+                    extension.span().start,
+                ))
+            })?;
+            let oid = oid.as_str(session.memory()).map_err(|reason| {
+                session.error(structured_pkix::Error::resource(
+                    reason,
+                    "certificate.anchor",
+                    extension.span().start,
+                ))
+            })?;
+            return Err(X509ChainError::UnsupportedCriticalExtension {
+                position,
+                oid: oid.into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_issuer_spki_policy(
+    encoded: &[u8],
     position: usize,
     rsa_keys: RsaKeyPolicy,
     dsa_keys: DsaKeyPolicy,
 ) -> Result<(), X509ChainError> {
-    match issuer.public_key().parsed() {
-        Ok(x509_parser::public_key::PublicKey::RSA(key)) => rsa_keys
-            .validate_components("X.509 issuer verification", key.modulus, key.exponent)
-            .map(|_| ())
-            .map_err(|source| X509ChainError::KeyPolicy { position, source }),
-        Ok(x509_parser::public_key::PublicKey::DSA(_)) => {
+    use der::Decode as _;
+    let key = pkcs8::SubjectPublicKeyInfoRef::from_der(encoded).map_err(|error| {
+        X509ChainError::InvalidDer {
+            kind: "issuer SubjectPublicKeyInfo",
+            message: error.to_string(),
+        }
+    })?;
+    // RFC 5280 4.1.2.7 makes key encoding algorithm-specific. An opaque
+    // algorithm's BIT STRING must not acquire RSA's octet-alignment rule.
+    // https://www.rfc-editor.org/rfc/rfc5280.html#section-4.1.2.7
+    match key.algorithm.oid {
+        // RFC 4055 1.2/3.1: rsaEncryption and id-RSASSA-PSS identify RSA
+        // public-key material. PSS restrictions never bypass the RSA minimum.
+        // https://www.rfc-editor.org/rfc/rfc4055.html#section-1.2
+        oid if oid == pkcs1::ALGORITHM_OID
+            || oid.as_bytes() == structured_pkix::oid::RSASSA_PSS.as_bytes() =>
+        {
+            let octets =
+                key.subject_public_key
+                    .as_bytes()
+                    .ok_or_else(|| X509ChainError::InvalidDer {
+                        kind: "issuer SubjectPublicKeyInfo",
+                        message: "RSA public key is not octet-aligned".into(),
+                    })?;
+            let key = pkcs1::RsaPublicKeyRef::from_der(octets).map_err(|error| {
+                X509ChainError::InvalidDer {
+                    kind: "RSA issuer SubjectPublicKeyInfo",
+                    message: error.to_string(),
+                }
+            })?;
+            rsa_keys
+                .validate_components(
+                    "X.509 issuer verification",
+                    key.modulus.as_bytes(),
+                    key.public_exponent.as_bytes(),
+                )
+                .map(|_| ())
+                .map_err(|source| X509ChainError::KeyPolicy { position, source })
+        }
+        dsa::OID => {
             match super::signature::validate_dsa_signature_spki_with_minimum(
-                issuer.public_key().raw,
+                encoded,
                 dsa_keys.minimum_modulus_bits,
             ) {
                 Ok(()) => Ok(()),
@@ -371,19 +871,14 @@ fn validate_issuer_key_policy(
                 }),
             }
         }
-        Ok(_) => Ok(()),
-        Err(error) => Err(X509ChainError::InvalidDer {
-            kind: "issuer SubjectPublicKeyInfo",
-            message: error.to_string(),
-        }),
+        _ => Ok(()),
     }
 }
 
-fn validate_certificate_serial(cert: &X509Certificate<'_>) -> Result<(), X509ChainError> {
-    validate_positive_serial_bytes(cert.raw_serial(), "certificate serial number")
-}
-
-fn validate_positive_serial_bytes(serial: &[u8], kind: &'static str) -> Result<(), X509ChainError> {
+pub(crate) fn validate_positive_serial_bytes(
+    serial: &[u8],
+    kind: &'static str,
+) -> Result<(), X509ChainError> {
     let magnitude = serial.strip_prefix(&[0]).unwrap_or(serial);
     if serial.is_empty()
         || serial[0] & 0x80 != 0
@@ -395,102 +890,6 @@ fn validate_positive_serial_bytes(serial: &[u8], kind: &'static str) -> Result<(
             kind,
             message: "RFC 5280 requires a positive, non-zero value of at most 20 octets".into(),
         });
-    }
-    Ok(())
-}
-
-fn validate_unique_extensions(
-    cert: &X509Certificate<'_>,
-    position: usize,
-) -> Result<(), X509ChainError> {
-    let mut seen = std::collections::HashSet::with_capacity(cert.extensions().len());
-    for extension in cert.extensions() {
-        let oid = extension.oid.to_id_string();
-        if !seen.insert(oid.clone()) {
-            return Err(X509ChainError::DuplicateExtension { position, oid });
-        }
-    }
-    Ok(())
-}
-
-fn validate_subject_identity(cert: &X509Certificate<'_>) -> Result<(), X509ChainError> {
-    for attribute in cert.subject().iter_email() {
-        let email = attribute
-            .as_str()
-            .map_err(|error| X509ChainError::InvalidDer {
-                kind: "certificate subject emailAddress",
-                message: error.to_string(),
-            })?;
-        if !mailbox_has_valid_syntax(email) {
-            return Err(X509ChainError::InvalidDer {
-                kind: "certificate subject emailAddress",
-                message: format!("invalid RFC 5280 mailbox syntax: {email:?}"),
-            });
-        }
-    }
-
-    let subject_is_empty = cert.subject().iter().next().is_none();
-    let mut san_extensions = cert
-        .extensions()
-        .iter()
-        .filter(|extension| extension.oid.to_id_string() == "2.5.29.17");
-    let Some(extension) = san_extensions.next() else {
-        return if subject_is_empty {
-            Err(invalid_subject_identity(
-                "an empty subject requires a critical SubjectAlternativeName",
-            ))
-        } else {
-            Ok(())
-        };
-    };
-    if san_extensions.next().is_some() {
-        return Err(invalid_subject_identity(
-            "an empty subject must not contain duplicate SubjectAlternativeName extensions",
-        ));
-    }
-    let ParsedExtension::SubjectAlternativeName(names) = extension.parsed_extension() else {
-        return Err(invalid_subject_identity(
-            "SubjectAlternativeName could not be parsed",
-        ));
-    };
-    for name in &names.general_names {
-        validate_subject_alternative_name(name)?;
-    }
-    if subject_is_empty && (!extension.critical || names.general_names.is_empty()) {
-        return Err(invalid_subject_identity(
-            "an empty subject requires a critical, non-empty SubjectAlternativeName",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_subject_alternative_name(name: &GeneralName<'_>) -> Result<(), X509ChainError> {
-    match name {
-        GeneralName::RFC822Name(value) => validate_rfc5280_mailbox(value),
-        GeneralName::DNSName(value) => {
-            // RFC 5280 section 4.2.1.6 requires RFC 1034/1123 preferred-name
-            // syntax here. RFC 9525 wildcard matching is an application-level
-            // TLS identity rule, not certificate-path profile validation.
-            validate_rfc5280_dns_name(value)
-        }
-        GeneralName::URI(value) => validate_rfc5280_uri(value),
-        GeneralName::IPAddress(value) if !matches!(value.len(), 4 | 16) => {
-            Err(invalid_subject_identity(
-                "SubjectAlternativeName iPAddress must contain 4 or 16 octets",
-            ))
-        }
-        GeneralName::Invalid(..) => Err(invalid_subject_identity(
-            "SubjectAlternativeName contains a malformed GeneralName",
-        )),
-        _ => Ok(()),
-    }
-}
-
-fn validate_rfc5280_mailbox(value: &str) -> Result<(), X509ChainError> {
-    if !mailbox_has_valid_syntax(value) {
-        return Err(invalid_subject_identity(
-            "SubjectAlternativeName rfc822Name has invalid RFC 5280 mailbox syntax",
-        ));
     }
     Ok(())
 }
@@ -571,182 +970,6 @@ fn mailbox_local_part_has_valid_syntax(local: &str) -> bool {
     })
 }
 
-fn validate_rfc5280_uri(value: &str) -> Result<(), X509ChainError> {
-    let Some((scheme, scheme_specific)) = value.split_once(':') else {
-        return Err(invalid_subject_identity(
-            "SubjectAlternativeName URI must be absolute",
-        ));
-    };
-    if scheme.is_empty()
-        || !scheme.as_bytes()[0].is_ascii_alphabetic()
-        || !scheme
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
-        || scheme_specific.is_empty()
-        || !uri_scheme_specific_part_has_valid_syntax(scheme_specific)
-    {
-        return Err(invalid_subject_identity(
-            "SubjectAlternativeName URI has invalid RFC 3986 syntax",
-        ));
-    }
-
-    if let Some(authority_and_path) = scheme_specific.strip_prefix("//") {
-        let authority = authority_and_path
-            .split(['/', '?', '#'])
-            .next()
-            .unwrap_or_default();
-        if !uri_authority_has_rfc5280_host(authority) {
-            return Err(invalid_subject_identity(
-                "SubjectAlternativeName URI authority requires a fully qualified host",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn uri_scheme_specific_part_has_valid_syntax(value: &str) -> bool {
-    if value.bytes().any(|byte| {
-        !byte.is_ascii()
-            || byte.is_ascii_control()
-            || byte == b' '
-            || !matches!(
-                byte,
-                b'A'..=b'Z'
-                    | b'a'..=b'z'
-                    | b'0'..=b'9'
-                    | b'-'
-                    | b'.'
-                    | b'_'
-                    | b'~'
-                    | b':'
-                    | b'/'
-                    | b'?'
-                    | b'#'
-                    | b'['
-                    | b']'
-                    | b'@'
-                    | b'!'
-                    | b'$'
-                    | b'&'
-                    | b'\''
-                    | b'('
-                    | b')'
-                    | b'*'
-                    | b'+'
-                    | b','
-                    | b';'
-                    | b'='
-                    | b'%'
-            )
-    }) || value.matches('#').count() > 1
-    {
-        return false;
-    }
-
-    let bytes = value.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%'
-            && (index + 2 >= bytes.len()
-                || !bytes[index + 1].is_ascii_hexdigit()
-                || !bytes[index + 2].is_ascii_hexdigit())
-        {
-            return false;
-        }
-        index += if bytes[index] == b'%' { 3 } else { 1 };
-    }
-    true
-}
-
-fn uri_authority_has_rfc5280_host(authority: &str) -> bool {
-    parse_uri_authority_host(authority).is_some()
-}
-
-#[derive(Clone, Copy)]
-enum UriAuthorityHost<'a> {
-    Dns(&'a str),
-    Ip,
-}
-
-fn parse_uri_authority_host(authority: &str) -> Option<UriAuthorityHost<'_>> {
-    let host_port = match authority.split_once('@') {
-        Some((userinfo, host_port))
-            if !host_port.contains('@') && uri_userinfo_has_valid_syntax(userinfo) =>
-        {
-            host_port
-        }
-        Some(_) => return None,
-        None => authority,
-    };
-    if let Some(bracketed) = host_port.strip_prefix('[') {
-        let (host, port) = bracketed.split_once(']')?;
-        return (host.parse::<std::net::Ipv6Addr>().is_ok() && uri_port_has_valid_syntax(port))
-            .then_some(UriAuthorityHost::Ip);
-    }
-    let (host, port) = host_port
-        .split_once(':')
-        .map_or((host_port, None), |(host, port)| (host, Some(port)));
-    if port.is_some_and(|port| port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit())) {
-        return None;
-    }
-    if host.parse::<std::net::Ipv4Addr>().is_ok() {
-        Some(UriAuthorityHost::Ip)
-    } else if dns_name_has_valid_syntax(host, false) {
-        Some(UriAuthorityHost::Dns(host))
-    } else {
-        None
-    }
-}
-
-fn uri_port_has_valid_syntax(suffix: &str) -> bool {
-    suffix.is_empty()
-        || suffix
-            .strip_prefix(':')
-            .is_some_and(|port| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
-}
-
-fn uri_userinfo_has_valid_syntax(userinfo: &str) -> bool {
-    let bytes = userinfo.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if byte == b'%' {
-            if index + 2 >= bytes.len()
-                || !bytes[index + 1].is_ascii_hexdigit()
-                || !bytes[index + 2].is_ascii_hexdigit()
-            {
-                return false;
-            }
-            index += 3;
-            continue;
-        }
-        if !(byte.is_ascii_alphanumeric()
-            || matches!(
-                byte,
-                b'-' | b'.'
-                    | b'_'
-                    | b'~'
-                    | b'!'
-                    | b'$'
-                    | b'&'
-                    | b'\''
-                    | b'('
-                    | b')'
-                    | b'*'
-                    | b'+'
-                    | b','
-                    | b';'
-                    | b'='
-                    | b':'
-            ))
-        {
-            return false;
-        }
-        index += 1;
-    }
-    true
-}
-
 fn invalid_subject_identity(message: &str) -> X509ChainError {
     X509ChainError::InvalidDer {
         kind: "certificate subject identity",
@@ -768,6 +991,7 @@ fn verify_certificate_signature(
     .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn verify_certificate_signature_with_provider(
     certificate: &X509Certificate<'_>,
     issuer: &X509Certificate<'_>,
@@ -799,6 +1023,7 @@ pub(crate) fn certificate_signature_matches(certificate_der: &[u8], issuer_der: 
         issuer_der,
         crate::provider::default_provider(),
         None,
+        &super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default()),
     )
     .unwrap_or(false)
 }
@@ -808,24 +1033,59 @@ pub(crate) fn certificate_signature_matches_with_provider(
     issuer_der: &[u8],
     provider: &dyn crate::provider::CryptoProvider,
     allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
+    session: &super::pkix::CertificateSession,
 ) -> Result<bool, X509ChainError> {
-    let (Ok(certificate), Ok(issuer)) = (
-        parse_certificate(certificate_der),
-        parse_certificate(issuer_der),
-    ) else {
-        return Ok(false);
-    };
-    verify_certificate_signature_with_provider(&certificate, &issuer, provider, allowed)
+    match certificate_signature_outcome_with_provider(
+        certificate_der,
+        issuer_der,
+        provider,
+        allowed,
+        session,
+    )? {
+        structured_pkix::path::Verified::Yes => Ok(true),
+        structured_pkix::path::Verified::No => Ok(false),
+        _ => Err(X509ChainError::Provider(
+            crate::provider::ProviderError::Unsupported {
+                operation: crate::provider::ProviderOperation::VerifyCertificate,
+                algorithm: None,
+            },
+        )),
+    }
 }
 
-fn certificate_names_equal(
-    left: &x509_parser::x509::X509Name<'_>,
-    right: &x509_parser::x509::X509Name<'_>,
-) -> bool {
-    let (Ok(left), Ok(right)) = (x509_name_to_rfc4514(left), x509_name_to_rfc4514(right)) else {
-        return false;
-    };
-    distinguished_names_equal(&left, &right)
+pub(crate) fn certificate_signature_outcome_with_provider(
+    certificate_der: &[u8],
+    issuer_der: &[u8],
+    provider: &dyn crate::provider::CryptoProvider,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
+    session: &super::pkix::CertificateSession,
+) -> Result<structured_pkix::path::Verified, X509ChainError> {
+    let certificate = session.read(certificate_der)?;
+    let issuer = session.read(issuer_der)?;
+    shared_certificate_signature_outcome(&certificate, &issuer, provider, allowed, session)
+}
+
+pub(crate) fn shared_certificate_signature_outcome(
+    certificate: &structured_pkix::Certificate<'_>,
+    issuer: &structured_pkix::Certificate<'_>,
+    provider: &dyn crate::provider::CryptoProvider,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
+    session: &super::pkix::CertificateSession,
+) -> Result<structured_pkix::path::Verified, X509ChainError> {
+    use structured_pkix::path::{Verify as _, WorkingKey};
+    let verifier = super::pkix::ProviderVerifier { provider, allowed };
+    verifier
+        .verify(
+            &certificate.tbs().signature(),
+            WorkingKey::standing(issuer.tbs().public_key()),
+            certificate.signed_bytes(),
+            certificate.signature(),
+            session.memory(),
+        )
+        .map_err(|error| match error {
+            X509ChainError::Processing(error) => session.error(error),
+            error => error,
+        })
 }
 
 #[cfg(test)]
@@ -834,6 +1094,7 @@ fn verify_crl_signature(crl: &CertificateRevocationList<'_>, issuer: &X509Certif
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn verify_crl_signature_with_provider(
     crl: &CertificateRevocationList<'_>,
     issuer: &X509Certificate<'_>,
@@ -853,6 +1114,7 @@ fn verify_crl_signature_with_provider(
     )
 }
 
+#[cfg(test)]
 fn verify_x509_signed_object_with_provider(
     outer_algorithm: &AlgorithmIdentifier<'_>,
     signed_algorithm: &AlgorithmIdentifier<'_>,
@@ -875,7 +1137,8 @@ fn verify_x509_signed_object_with_provider(
     )
 }
 
-fn verify_x509_signature_with_provider(
+#[cfg(test)]
+pub(crate) fn verify_x509_signature_with_provider(
     algorithm_identifier: &AlgorithmIdentifier<'_>,
     signature_der: &[u8],
     signed_data: &[u8],
@@ -883,6 +1146,17 @@ fn verify_x509_signature_with_provider(
     provider: &dyn crate::provider::CryptoProvider,
     allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
 ) -> Result<bool, X509ChainError> {
+    let algorithm = authorize_x509_signature_algorithm(algorithm_identifier, provider, allowed)?;
+    provider
+        .verify_x509_signature(algorithm, signed_data, signature_der, issuer_spki_der)
+        .map_err(Into::into)
+}
+
+pub(crate) fn authorize_x509_signature_algorithm(
+    algorithm_identifier: &AlgorithmIdentifier<'_>,
+    provider: &dyn crate::provider::CryptoProvider,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
+) -> Result<X509SignatureAlgorithm, X509ChainError> {
     let algorithm = x509_signature_algorithm(algorithm_identifier)?;
     crate::policy::KeyTrustPolicy::check_certificate_signature_algorithm(algorithm, allowed)?;
     provider
@@ -890,9 +1164,7 @@ fn verify_x509_signature_with_provider(
             algorithm,
         ))
         .map_err(X509ChainError::from)?;
-    provider
-        .verify_x509_signature(algorithm, signed_data, signature_der, issuer_spki_der)
-        .map_err(Into::into)
+    Ok(algorithm)
 }
 
 fn x509_signature_algorithm(
@@ -1069,75 +1341,7 @@ fn x509_digest_algorithm(oid: &str) -> Result<super::DigestAlgorithm, X509ChainE
     }
 }
 
-fn validate_leaf_key_usage(cert: &X509Certificate<'_>) -> Result<(), X509ChainError> {
-    // RFC 5280 section 4.2.1.3 restricts key purpose only when KeyUsage is present.
-    if cert
-        .key_usage()
-        .map_err(|error| X509ChainError::InvalidDer {
-            kind: "certificate KeyUsage",
-            message: error.to_string(),
-        })?
-        .is_some_and(|usage| !usage.value.digital_signature() && !usage.value.non_repudiation())
-    {
-        return Err(X509ChainError::InvalidKeyUsage {
-            position: 0,
-            required: "digitalSignature or nonRepudiation",
-        });
-    }
-    Ok(())
-}
-
-fn validate_extended_key_usage(
-    cert: &X509Certificate<'_>,
-    position: usize,
-    effective_extended_key_usages: &mut Option<HashSet<ExtendedKeyPurpose>>,
-) -> Result<(), X509ChainError> {
-    let Some(usage) = cert
-        .extended_key_usage()
-        .map_err(|error| X509ChainError::InvalidDer {
-            kind: "certificate ExtendedKeyUsage",
-            message: error.to_string(),
-        })?
-    else {
-        return Ok(());
-    };
-    if usage.value.any {
-        return Ok(());
-    }
-    if let Some(effective) = effective_extended_key_usages {
-        effective.retain(|purpose| extended_key_usage_contains(usage.value, purpose));
-        if !effective.is_empty() {
-            return Ok(());
-        }
-    }
-    Err(X509ChainError::InvalidKeyUsage {
-        position,
-        required: "an approved extended key usage",
-    })
-}
-
-fn extended_key_usage_contains(
-    usage: &x509_parser::extensions::ExtendedKeyUsage<'_>,
-    purpose: &ExtendedKeyPurpose,
-) -> bool {
-    match purpose {
-        ExtendedKeyPurpose::ServerAuth => usage.server_auth,
-        ExtendedKeyPurpose::ClientAuth => usage.client_auth,
-        ExtendedKeyPurpose::CodeSigning => usage.code_signing,
-        ExtendedKeyPurpose::EmailProtection => usage.email_protection,
-        ExtendedKeyPurpose::TimeStamping => usage.time_stamping,
-        ExtendedKeyPurpose::OcspSigning => usage.ocsp_signing,
-        ExtendedKeyPurpose::Other(arcs) => usage.other.iter().any(|oid| {
-            let oid = oid.to_id_string();
-            arcs.iter()
-                .map(u64::to_string)
-                .collect::<Vec<_>>()
-                .join(".")
-                == oid
-        }),
-    }
-}
-
+#[cfg(test)]
 fn parse_certificate(der: &[u8]) -> Result<X509Certificate<'_>, X509ChainError> {
     let (rest, cert) =
         X509Certificate::from_der(der).map_err(|error| X509ChainError::InvalidDer {
@@ -1153,259 +1357,26 @@ fn parse_certificate(der: &[u8]) -> Result<X509Certificate<'_>, X509ChainError> 
     Ok(cert)
 }
 
+#[cfg(test)]
 fn system_time_to_asn1(time: SystemTime) -> Result<ASN1Time, X509ChainError> {
-    let seconds = time
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| X509ChainError::CertificateNotValid(0))?
-        .as_secs();
-    let timestamp = i64::try_from(seconds).map_err(|_| X509ChainError::CertificateNotValid(0))?;
-    ASN1Time::from_timestamp(timestamp).map_err(|error| X509ChainError::InvalidDer {
-        kind: "verification time",
-        message: error.to_string(),
-    })
-}
-
-fn validate_ca_constraints(
-    cert: &X509Certificate<'_>,
-    position: usize,
-) -> Result<(), X509ChainError> {
-    let extension = cert
-        .extensions()
-        .iter()
-        .find(|extension| {
-            matches!(
-                extension.parsed_extension(),
-                ParsedExtension::BasicConstraints(_)
-            )
-        })
-        .ok_or(X509ChainError::IssuerNotCa(position))?;
-    let ParsedExtension::BasicConstraints(constraints) = extension.parsed_extension() else {
-        unreachable!("extension was selected by parsed type")
-    };
-    if !constraints.ca {
-        return Err(X509ChainError::IssuerNotCa(position));
-    }
-    // RFC 5280 section 4.2.1.9 requires conforming issuers to mark CA
-    // BasicConstraints critical, but the path-validation algorithm requires
-    // the cA assertion and does not turn issuer non-conformance into a path
-    // failure. OpenSSL/xmlsec1 accepts historical non-critical CA extensions.
-
-    if cert
-        .key_usage()
-        .map_err(|error| X509ChainError::InvalidDer {
-            kind: "certificate KeyUsage",
+    let instant = super::pkix::verification_instant(time)?;
+    // RFC 5280 6.1.3(a)(2) compares the actual validation time, not its
+    // whole-second truncation. Keep the same instant for CRL freshness.
+    // https://www.rfc-editor.org/rfc/rfc5280.html#section-6.1.3
+    let whole = ASN1Time::from_timestamp(instant.seconds()).map_err(|error| {
+        X509ChainError::InvalidDer {
+            kind: "verification time",
             message: error.to_string(),
-        })?
-        .is_some_and(|usage| !usage.value.key_cert_sign())
-    {
-        return Err(X509ChainError::InvalidKeyUsage {
-            position,
-            required: "keyCertSign",
-        });
-    }
-
-    Ok(())
-}
-
-fn basic_constraints(
-    cert: &X509Certificate<'_>,
-) -> Option<x509_parser::extensions::BasicConstraints> {
-    cert.extensions()
-        .iter()
-        .find_map(|extension| match extension.parsed_extension() {
-            ParsedExtension::BasicConstraints(value) => Some(value.clone()),
-            _ => None,
+        }
+    })?;
+    whole
+        .to_datetime()
+        .replace_nanosecond(instant.nanos())
+        .map(ASN1Time::new)
+        .map_err(|error| X509ChainError::InvalidDer {
+            kind: "verification time",
+            message: error.to_string(),
         })
-}
-
-fn validate_path_length_constraints(path: &[X509Certificate<'_>]) -> Result<(), X509ChainError> {
-    for (position, cert) in path.iter().enumerate().skip(1) {
-        let Some(limit) = basic_constraints(cert).and_then(|value| value.path_len_constraint)
-        else {
-            continue;
-        };
-        let subordinate_ca_count = path[1..position]
-            .iter()
-            .filter(|subordinate| {
-                basic_constraints(subordinate).is_some_and(|value| value.ca)
-                    && !certificate_names_equal(subordinate.subject(), subordinate.issuer())
-            })
-            .count();
-        if subordinate_ca_count > limit as usize {
-            return Err(X509ChainError::PathLengthExceeded { position, limit });
-        }
-    }
-    Ok(())
-}
-
-fn validate_critical_extensions(
-    cert: &X509Certificate<'_>,
-    position: usize,
-) -> Result<(), X509ChainError> {
-    for extension in cert
-        .extensions()
-        .iter()
-        .filter(|extension| extension.critical)
-    {
-        let oid = extension.oid.to_id_string();
-        if !matches!(
-            oid.as_str(),
-            "2.5.29.15" | "2.5.29.17" | "2.5.29.19" | "2.5.29.30" | "2.5.29.37"
-        ) {
-            return Err(X509ChainError::UnsupportedCriticalExtension { position, oid });
-        }
-        if matches!(
-            extension.parsed_extension(),
-            ParsedExtension::UnsupportedExtension { .. }
-                | ParsedExtension::ParseError { .. }
-                | ParsedExtension::Unparsed
-        ) {
-            return Err(X509ChainError::UnsupportedCriticalExtension { position, oid });
-        }
-    }
-    Ok(())
-}
-
-fn validate_name_constraints(path: &[X509Certificate<'_>]) -> Result<(), X509ChainError> {
-    for (position, certificate) in path.iter().enumerate() {
-        if let Some(extension) = certificate
-            .extensions()
-            .iter()
-            .find(|extension| extension.oid.to_id_string() == "2.5.29.30")
-            && (position == 0 || !extension.critical)
-        {
-            return Err(X509ChainError::InvalidNameConstraints { position });
-        }
-    }
-    for (constraining_position, issuer) in path.iter().enumerate().skip(1) {
-        let Some(extension) = issuer
-            .extensions()
-            .iter()
-            .find(|extension| extension.oid.to_id_string() == "2.5.29.30")
-        else {
-            continue;
-        };
-        let ParsedExtension::NameConstraints(constraints) = extension.parsed_extension() else {
-            continue;
-        };
-        validate_name_constraints_der(extension.value, constraining_position)?;
-        ensure_supported_name_constraints(constraints, constraining_position)?;
-        for (position, subordinate) in path[..constraining_position].iter().enumerate() {
-            // The target certificate is always checked. Self-issued CA rollover
-            // certificates between it and the constraint issuer are exempt.
-            if position != 0 && certificate_names_equal(subordinate.subject(), subordinate.issuer())
-            {
-                continue;
-            }
-            validate_certificate_names(subordinate, constraints, position, constraining_position)?;
-        }
-    }
-    Ok(())
-}
-
-fn validate_name_constraints_der(
-    extension_der: &[u8],
-    position: usize,
-) -> Result<(), X509ChainError> {
-    use der::Decode as _;
-
-    // x509-parser intentionally omits GeneralSubtree distance fields from its
-    // public model. Decode the raw extension as well so they cannot silently
-    // acquire the zero-minimum, unbounded semantics implemented below.
-    let constraints =
-        x509_cert::ext::pkix::NameConstraints::from_der(extension_der).map_err(|error| {
-            X509ChainError::InvalidDer {
-                kind: "NameConstraints",
-                message: error.to_string(),
-            }
-        })?;
-    if constraints.permitted_subtrees.is_none() && constraints.excluded_subtrees.is_none()
-        || constraints
-            .permitted_subtrees
-            .as_ref()
-            .is_some_and(Vec::is_empty)
-        || constraints
-            .excluded_subtrees
-            .as_ref()
-            .is_some_and(Vec::is_empty)
-    {
-        return Err(X509ChainError::InvalidNameConstraints { position });
-    }
-    let unsupported = constraints
-        .permitted_subtrees
-        .iter()
-        .flatten()
-        .chain(constraints.excluded_subtrees.iter().flatten())
-        .any(|subtree| subtree.minimum != 0 || subtree.maximum.is_some());
-    if unsupported {
-        return Err(X509ChainError::InvalidNameConstraints { position });
-    }
-    Ok(())
-}
-
-fn ensure_supported_name_constraints(
-    constraints: &NameConstraints<'_>,
-    position: usize,
-) -> Result<(), X509ChainError> {
-    for subtree in constraints
-        .permitted_subtrees
-        .iter()
-        .flatten()
-        .chain(constraints.excluded_subtrees.iter().flatten())
-    {
-        match &subtree.base {
-            GeneralName::DNSName(value) | GeneralName::URI(value) => {
-                validate_dns_name_constraint(value)?;
-            }
-            GeneralName::RFC822Name(value) => validate_email_name_constraint(value)?,
-            GeneralName::IPAddress(bytes) => {
-                validate_ip_name_constraint(bytes)?;
-            }
-            _ => {}
-        }
-        if matches!(
-            subtree.base,
-            GeneralName::OtherName(..)
-                | GeneralName::X400Address(..)
-                | GeneralName::EDIPartyName(..)
-                | GeneralName::RegisteredID(..)
-                | GeneralName::Invalid(..)
-        ) {
-            return Err(X509ChainError::UnsupportedCriticalExtension {
-                position,
-                oid: "2.5.29.30".into(),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn validate_email_name_constraint(value: &str) -> Result<(), X509ChainError> {
-    if value.contains('@') {
-        if !mailbox_has_valid_syntax(value) {
-            return Err(invalid_string_name_constraint(value));
-        }
-        Ok(())
-    } else {
-        validate_dns_name_constraint(value)
-    }
-}
-
-fn validate_dns_name_constraint(value: &str) -> Result<(), X509ChainError> {
-    if !dns_name_has_valid_syntax(value, true) {
-        return Err(invalid_string_name_constraint(value));
-    }
-    Ok(())
-}
-
-fn validate_rfc5280_dns_name(value: &str) -> Result<(), X509ChainError> {
-    if !dns_name_has_valid_syntax(value, false) {
-        return Err(X509ChainError::InvalidDer {
-            kind: "certificate DNS name",
-            message: format!("invalid RFC 5280 dNSName: {value:?}"),
-        });
-    }
-    Ok(())
 }
 
 fn dns_name_has_valid_syntax(value: &str, allow_leading_dot: bool) -> bool {
@@ -1437,443 +1408,6 @@ fn dns_name_has_valid_syntax(value: &str, allow_leading_dot: bool) -> bool {
     true
 }
 
-fn invalid_string_name_constraint(value: &str) -> X509ChainError {
-    X509ChainError::InvalidDer {
-        kind: "string name constraint",
-        message: format!("invalid RFC 5280 string name constraint: {value:?}"),
-    }
-}
-
-fn validate_certificate_names(
-    certificate: &X509Certificate<'_>,
-    constraints: &NameConstraints<'_>,
-    position: usize,
-    constraining_position: usize,
-) -> Result<(), X509ChainError> {
-    if certificate.subject().iter().next().is_some() {
-        let subject = GeneralName::DirectoryName(certificate.subject().clone());
-        validate_general_name(&subject, constraints, position, constraining_position)?;
-    }
-    for attribute in certificate.subject().iter_email() {
-        let email = attribute
-            .as_str()
-            .map_err(|error| X509ChainError::InvalidDer {
-                kind: "certificate subject emailAddress",
-                message: error.to_string(),
-            })?;
-        validate_general_name(
-            &GeneralName::RFC822Name(email),
-            constraints,
-            position,
-            constraining_position,
-        )?;
-    }
-    if let Some(names) =
-        certificate
-            .extensions()
-            .iter()
-            .find_map(|extension| match extension.parsed_extension() {
-                ParsedExtension::SubjectAlternativeName(value) => Some(&value.general_names),
-                _ => None,
-            })
-    {
-        for name in names {
-            validate_general_name(name, constraints, position, constraining_position)?;
-        }
-    }
-    Ok(())
-}
-
-fn validate_general_name(
-    name: &GeneralName<'_>,
-    constraints: &NameConstraints<'_>,
-    position: usize,
-    constraining_position: usize,
-) -> Result<(), X509ChainError> {
-    let permitted = constraints
-        .permitted_subtrees
-        .iter()
-        .flatten()
-        .filter(|subtree| general_names_have_same_form(name, &subtree.base));
-    let mut has_permitted_form = false;
-    let mut matches_permitted = false;
-    for subtree in permitted {
-        has_permitted_form = true;
-        matches_permitted |=
-            general_name_within_subtree(name, &subtree.base)? == NameConstraintMatch::Match;
-    }
-    let excluded = constraints
-        .excluded_subtrees
-        .iter()
-        .flatten()
-        .filter(|subtree| general_names_have_same_form(name, &subtree.base))
-        .try_fold(false, |rejected, subtree| {
-            general_name_within_subtree(name, &subtree.base)
-                .map(|current| rejected || current != NameConstraintMatch::NoMatch)
-        })?;
-    if excluded || (has_permitted_form && !matches_permitted) {
-        return Err(X509ChainError::NameConstraintViolation {
-            position,
-            constraining_position,
-        });
-    }
-    Ok(())
-}
-
-fn general_names_have_same_form(left: &GeneralName<'_>, right: &GeneralName<'_>) -> bool {
-    matches!(
-        (left, right),
-        (GeneralName::RFC822Name(_), GeneralName::RFC822Name(_))
-            | (GeneralName::DNSName(_), GeneralName::DNSName(_))
-            | (GeneralName::DirectoryName(_), GeneralName::DirectoryName(_))
-            | (GeneralName::URI(_), GeneralName::URI(_))
-            | (GeneralName::IPAddress(_), GeneralName::IPAddress(_))
-    )
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NameConstraintMatch {
-    Match,
-    NoMatch,
-    Unevaluable,
-}
-
-impl From<bool> for NameConstraintMatch {
-    fn from(matched: bool) -> Self {
-        if matched { Self::Match } else { Self::NoMatch }
-    }
-}
-
-fn general_name_within_subtree(
-    name: &GeneralName<'_>,
-    subtree: &GeneralName<'_>,
-) -> Result<NameConstraintMatch, X509ChainError> {
-    Ok(match (name, subtree) {
-        (GeneralName::DNSName(name), GeneralName::DNSName(subtree)) => {
-            dns_name_within_subtree(name, subtree, true).into()
-        }
-        (GeneralName::RFC822Name(name), GeneralName::RFC822Name(subtree)) => {
-            email_within_subtree(name, subtree).into()
-        }
-        (GeneralName::DirectoryName(name), GeneralName::DirectoryName(subtree)) => {
-            let name = x509_name_to_rfc4514(name).map_err(|error| X509ChainError::InvalidDer {
-                kind: "certificate name constraint",
-                message: error.to_string(),
-            })?;
-            let subtree =
-                x509_name_to_rfc4514(subtree).map_err(|error| X509ChainError::InvalidDer {
-                    kind: "certificate name constraint",
-                    message: error.to_string(),
-                })?;
-            distinguished_name_within_subtree(&name, &subtree).into()
-        }
-        (GeneralName::URI(name), GeneralName::URI(subtree)) => uri_host(name)
-            .map_or(NameConstraintMatch::Unevaluable, |host| {
-                dns_name_within_subtree(host, subtree, false).into()
-            }),
-        (GeneralName::IPAddress(name), GeneralName::IPAddress(subtree)) => {
-            ip_address_within_subtree(name, subtree)?.into()
-        }
-        _ => NameConstraintMatch::NoMatch,
-    })
-}
-
-fn dns_name_within_subtree(name: &str, subtree: &str, include_subdomains: bool) -> bool {
-    let name = name.trim_end_matches('.');
-    let subtree = subtree.trim_end_matches('.');
-    if let Some(domain) = subtree.strip_prefix('.') {
-        return name.len() > domain.len()
-            && name.as_bytes()[name.len() - domain.len() - 1] == b'.'
-            && name[name.len() - domain.len()..].eq_ignore_ascii_case(domain);
-    }
-    name.eq_ignore_ascii_case(subtree)
-        || (include_subdomains
-            && name.len() > subtree.len()
-            && name.as_bytes()[name.len() - subtree.len() - 1] == b'.'
-            && name[name.len() - subtree.len()..].eq_ignore_ascii_case(subtree))
-}
-
-fn email_within_subtree(name: &str, subtree: &str) -> bool {
-    let Some((local, domain)) = name.rsplit_once('@') else {
-        return false;
-    };
-    if let Some((expected_local, expected_domain)) = subtree.rsplit_once('@') {
-        return local == expected_local && domain.eq_ignore_ascii_case(expected_domain);
-    }
-    dns_name_within_subtree(domain, subtree, false)
-}
-
-fn uri_host(uri: &str) -> Option<&str> {
-    let authority = uri.split_once("://")?.1;
-    let authority = authority.split(['/', '?', '#']).next()?;
-    match parse_uri_authority_host(authority)? {
-        UriAuthorityHost::Dns(host) => Some(host),
-        UriAuthorityHost::Ip => None,
-    }
-}
-
-fn ip_address_within_subtree(address: &[u8], subtree: &[u8]) -> Result<bool, X509ChainError> {
-    if !matches!(address.len(), 4 | 16) {
-        return Err(X509ChainError::InvalidDer {
-            kind: "IP subject alternative name",
-            message: format!("expected 4 or 16 octets, got {}", address.len()),
-        });
-    }
-    let (network, mask) = validate_ip_name_constraint(subtree)?;
-    if network.len() != address.len() {
-        return Ok(false);
-    }
-    Ok(address
-        .iter()
-        .zip(network)
-        .zip(mask)
-        .all(|((address, network), mask)| address & mask == network & mask))
-}
-
-fn validate_ip_name_constraint(subtree: &[u8]) -> Result<(&[u8], &[u8]), X509ChainError> {
-    if !matches!(subtree.len(), 8 | 32) {
-        return Err(X509ChainError::InvalidDer {
-            kind: "IP name constraint",
-            message: format!("expected 8 or 32 octets, got {}", subtree.len()),
-        });
-    }
-    let (network, mask) = subtree.split_at(subtree.len() / 2);
-    if !ip_mask_is_contiguous(mask) {
-        return Err(X509ChainError::InvalidDer {
-            kind: "IP name constraint",
-            message: "network mask is not contiguous".into(),
-        });
-    }
-    Ok((network, mask))
-}
-
-fn ip_mask_is_contiguous(mask: &[u8]) -> bool {
-    let mut zero_seen = false;
-    for byte in mask {
-        for bit in (0..8).rev() {
-            let set = byte & (1 << bit) != 0;
-            if zero_seen && set {
-                return false;
-            }
-            zero_seen |= !set;
-        }
-    }
-    true
-}
-
-fn certificate_subject_key_identifier<'a>(
-    certificate: &'a X509Certificate<'a>,
-) -> Option<&'a [u8]> {
-    certificate
-        .extensions()
-        .iter()
-        .find_map(|extension| match extension.parsed_extension() {
-            ParsedExtension::SubjectKeyIdentifier(identifier) => Some(identifier.0),
-            _ => None,
-        })
-}
-
-fn crl_authority_key_matches(
-    crl: &CertificateRevocationList<'_>,
-    issuer: &X509Certificate<'_>,
-) -> Result<Option<bool>, X509ChainError> {
-    let authority_key = crl
-        .extensions()
-        .iter()
-        .find(|extension| extension.oid.to_id_string() == "2.5.29.35")
-        .map(|extension| match extension.parsed_extension() {
-            ParsedExtension::AuthorityKeyIdentifier(identifier) => {
-                Ok(identifier.key_identifier.as_ref().map(|key| key.0))
-            }
-            _ => Err(X509ChainError::InvalidDer {
-                kind: "CRL AuthorityKeyIdentifier",
-                message: "extension could not be decoded".into(),
-            }),
-        })
-        .transpose()?
-        .flatten();
-    Ok(authority_key
-        .zip(certificate_subject_key_identifier(issuer))
-        .map(|(authority, subject)| authority == subject))
-}
-
-fn validate_crl_extensions(
-    crl: &CertificateRevocationList<'_>,
-    crl_index: usize,
-) -> Result<(), X509ChainError> {
-    validate_crl_extension_uniqueness(crl, crl_index)?;
-    validate_crl_extension_semantics(crl, crl_index)
-}
-
-fn validate_crl_extension_uniqueness(
-    crl: &CertificateRevocationList<'_>,
-    crl_index: usize,
-) -> Result<(), X509ChainError> {
-    crl.tbs_cert_list
-        .extensions_map()
-        .map_err(|_| X509ChainError::InvalidCrl(crl_index))?;
-    for revoked in crl.iter_revoked_certificates() {
-        validate_positive_serial_bytes(revoked.raw_serial(), "CRL revoked certificate serial")
-            .map_err(|_| X509ChainError::InvalidCrl(crl_index))?;
-        revoked
-            .extensions_map()
-            .map_err(|_| X509ChainError::InvalidCrl(crl_index))?;
-    }
-    Ok(())
-}
-
-fn validate_crl_extension_semantics(
-    crl: &CertificateRevocationList<'_>,
-    crl_index: usize,
-) -> Result<(), X509ChainError> {
-    for extension in crl.extensions() {
-        let oid = extension.oid.to_id_string();
-        // IssuingDistributionPoint changes which certificates and issuers a CRL
-        // covers. Delta CRLs also cannot be treated as complete CRLs: in particular,
-        // removeFromCRL has the opposite meaning from a complete-list revocation.
-        if matches!(oid.as_str(), "2.5.29.27" | "2.5.29.28")
-            || (extension.critical && oid != "2.5.29.35")
-        {
-            return Err(X509ChainError::InvalidCrl(crl_index));
-        }
-        if oid == "2.5.29.35"
-            && !matches!(
-                extension.parsed_extension(),
-                ParsedExtension::AuthorityKeyIdentifier(_)
-            )
-        {
-            return Err(X509ChainError::InvalidCrl(crl_index));
-        }
-    }
-    for revoked in crl.iter_revoked_certificates() {
-        for extension in revoked.extensions() {
-            let oid = extension.oid.to_id_string();
-            // certificateIssuer carries the issuer identity for indirect CRLs.
-            // removeFromCRL is meaningful only in a delta CRL, which this
-            // complete-CRL validator rejects above.
-            let invalid_reason = oid == "2.5.29.21"
-                && !matches!(
-                    extension.parsed_extension(),
-                    ParsedExtension::ReasonCode(code)
-                        if *code != x509_parser::x509::ReasonCode::RemoveFromCRL
-                );
-            if oid == "2.5.29.29" || extension.critical || invalid_reason {
-                return Err(X509ChainError::InvalidCrl(crl_index));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn verify_crls(
-    path: &[X509Certificate<'_>],
-    crl_der: &[Vec<u8>],
-    additional_crls: &[Vec<u8>],
-    verification_time: ASN1Time,
-    provider: &dyn crate::provider::CryptoProvider,
-    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
-) -> Result<(), X509ChainError> {
-    let crls = crl_der
-        .iter()
-        .chain(additional_crls)
-        .enumerate()
-        .map(|(idx, der)| {
-            let (rest, crl) = CertificateRevocationList::from_der(der).map_err(|error| {
-                X509ChainError::InvalidDer {
-                    kind: "CRL",
-                    message: error.to_string(),
-                }
-            })?;
-            if !rest.is_empty() {
-                return Err(X509ChainError::InvalidDer {
-                    kind: "CRL",
-                    message: "trailing data".into(),
-                });
-            }
-            Ok((idx, crl))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    for (position, cert) in path.iter().enumerate().take(path.len().saturating_sub(1)) {
-        let issuer = &path[position + 1];
-        for (crl_index, crl) in crls
-            .iter()
-            .filter(|(_, crl)| certificate_names_equal(crl.issuer(), cert.issuer()))
-        {
-            // Duplicate OIDs make first-match AKI filtering ambiguous, so this
-            // structural invariant must hold before key applicability is tested.
-            validate_crl_extension_uniqueness(crl, *crl_index)?;
-            let authority_key_match = crl_authority_key_matches(crl, issuer)?;
-            if authority_key_match == Some(false) {
-                continue;
-            }
-            if !verify_crl_signature_with_provider(crl, issuer, provider, allowed)? {
-                if authority_key_match == Some(true) {
-                    return Err(X509ChainError::InvalidCrl(*crl_index));
-                }
-                continue;
-            }
-            // Extension semantics can reject an applicable CRL, but unrelated
-            // untrusted CRL material must not influence the selected path.
-            validate_crl_extensions(crl, *crl_index)?;
-            validate_crl_issuer_key_usage(issuer, position + 1)?;
-            // RFC 5280 requires conforming CRL issuers to provide nextUpdate;
-            // without it this verifier cannot establish a bounded freshness window.
-            let time_valid = crl.next_update().is_some_and(|next| {
-                crl.last_update() <= verification_time && verification_time <= next
-            });
-            if !time_valid {
-                return Err(X509ChainError::InvalidCrl(*crl_index));
-            }
-            if crl.iter_revoked_certificates().any(|revoked| {
-                revoked.raw_serial() == cert.raw_serial()
-                    && revoked.revocation_date <= verification_time
-            }) {
-                return Err(X509ChainError::Revoked(position));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Enforce the certificate-version-specific authorization for an authenticated CRL.
-fn validate_crl_issuer_key_usage(
-    issuer: &X509Certificate<'_>,
-    position: usize,
-) -> Result<(), X509ChainError> {
-    // RFC 10007 section 4 updates RFC 5280 6.3.3(f): v3 requires both
-    // KeyUsage and cRLSign; v1/v2 have no extensions field and are exempt.
-    // https://www.rfc-editor.org/rfc/rfc10007.html#section-4
-    let usage = issuer
-        .key_usage()
-        .map_err(|error| X509ChainError::InvalidDer {
-            kind: "certificate KeyUsage",
-            message: error.to_string(),
-        })?;
-    let authorized = match issuer.version() {
-        x509_parser::x509::X509Version::V1 | x509_parser::x509::X509Version::V2 => {
-            usage.is_none_or(|usage| usage.value.crl_sign())
-        }
-        x509_parser::x509::X509Version::V3 => usage.is_some_and(|usage| usage.value.crl_sign()),
-        version => {
-            // RFC 5280 section 4.1.2.1 defines only v1, v2, and v3. An unknown value cannot
-            // inherit RFC 10007 section 4's narrowly defined v1/v2 KeyUsage exemption.
-            // https://www.rfc-editor.org/rfc/rfc5280.html#section-4.1.2.1
-            return Err(X509ChainError::InvalidDer {
-                kind: "certificate version",
-                message: format!("unsupported X.509 version value {}", version.0),
-            });
-        }
-    };
-    if !authorized {
-        return Err(X509ChainError::InvalidKeyUsage {
-            position,
-            required: "cRLSign",
-        });
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::str::FromStr as _;
@@ -1884,42 +1418,243 @@ mod tests {
     use p256::pkcs8::EncodePublicKey;
     use sha2::{Digest, Sha256, Sha384};
     use signature::hazmat::PrehashSigner;
-    use std::time::Duration;
+    use std::time::{Duration, UNIX_EPOCH};
     use x509_parser::oid_registry::{OID_SIG_ECDSA_WITH_SHA256, OID_SIG_ECDSA_WITH_SHA384, Oid};
 
     #[test]
+    fn issuer_spki_preflight_checks_borrowed_components_and_exact_der()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Strength and exact framing are enforced before bigint decoding or
+        // signature work; the reported position stays attached to the issuer.
+        use der::Encode as _;
+        let modulus = [0xff; 32];
+        let exponent = [1, 0, 1];
+        let public = pkcs1::RsaPublicKeyRef {
+            modulus: der::asn1::UintRef::new(&modulus)?,
+            public_exponent: der::asn1::UintRef::new(&exponent)?,
+        }
+        .to_der()?;
+        let encoded = pkcs8::SubjectPublicKeyInfoRef {
+            algorithm: pkcs1::ALGORITHM_ID,
+            subject_public_key: der::asn1::BitStringRef::from_bytes(&public)?,
+        }
+        .to_der()?;
+        assert!(matches!(
+            validate_issuer_spki_policy(
+                &encoded,
+                7,
+                RsaKeyPolicy::default(),
+                DsaKeyPolicy::default()
+            ),
+            Err(X509ChainError::KeyPolicy { position: 7, .. }),
+        ));
+        // RFC 4055 3.1 permits absent parameters for PSS SPKI, but its key
+        // material is still RSA and must obey the same strength policy.
+        // https://www.rfc-editor.org/rfc/rfc4055.html#section-3.1
+        let pss = pkcs8::SubjectPublicKeyInfoRef {
+            algorithm: pkcs8::AlgorithmIdentifierRef {
+                oid: der::asn1::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.10"),
+                parameters: None,
+            },
+            subject_public_key: der::asn1::BitStringRef::from_bytes(&public)?,
+        }
+        .to_der()?;
+        assert!(matches!(
+            validate_issuer_spki_policy(&pss, 7, RsaKeyPolicy::default(), DsaKeyPolicy::default()),
+            Err(X509ChainError::KeyPolicy { position: 7, .. }),
+        ));
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(matches!(
+            validate_issuer_spki_policy(
+                &trailing,
+                7,
+                RsaKeyPolicy::default(),
+                DsaKeyPolicy::default()
+            ),
+            Err(X509ChainError::InvalidDer {
+                kind: "issuer SubjectPublicKeyInfo",
+                ..
+            }),
+        ));
+        let unaligned = pkcs8::SubjectPublicKeyInfoRef {
+            algorithm: pkcs1::ALGORITHM_ID,
+            subject_public_key: der::asn1::BitStringRef::new(1, &[0])?,
+        }
+        .to_der()?;
+        assert!(matches!(
+            validate_issuer_spki_policy(
+                &unaligned,
+                7,
+                RsaKeyPolicy::default(),
+                DsaKeyPolicy::default()
+            ),
+            Err(X509ChainError::InvalidDer {
+                kind: "issuer SubjectPublicKeyInfo",
+                ..
+            }),
+        ));
+        // A generic SPKI BIT STRING does not require octet alignment. Unknown
+        // algorithms have no RSA/DSA strength contract to guess here.
+        let opaque = pkcs8::SubjectPublicKeyInfoRef {
+            algorithm: pkcs8::AlgorithmIdentifierRef {
+                oid: der::asn1::ObjectIdentifier::new_unwrap("1.2.3.4"),
+                parameters: None,
+            },
+            subject_public_key: der::asn1::BitStringRef::new(1, &[0])?,
+        }
+        .to_der()?;
+        validate_issuer_spki_policy(&opaque, 7, RsaKeyPolicy::default(), DsaKeyPolicy::default())?;
+        Ok(())
+    }
+
+    #[test]
+    fn verification_time_retains_subseconds_on_both_sides_of_epoch() {
+        // A fractional instant must not extend notAfter or shift a pre-epoch
+        // validation request forward to the next second.
+        for (input, seconds, nanos) in [
+            (UNIX_EPOCH + Duration::new(1, 123), 1, 123),
+            (UNIX_EPOCH - Duration::new(1, 123), -2, 999_999_877),
+        ] {
+            let actual = system_time_to_asn1(input).expect("representable validation time");
+            assert_eq!(actual.timestamp(), seconds);
+            assert_eq!(actual.to_datetime().nanosecond(), nanos);
+        }
+    }
+
+    #[test]
+    fn exact_certificate_pin_does_not_bypass_execution_budget() {
+        // Caller trust skips path construction, not certificate decoding/accounting.
+        let certificate = generated_certificate_params("pinned signer", false)
+            .self_signed(&rcgen::KeyPair::generate().expect("test key"))
+            .expect("test certificate");
+        let anchors = vec![certificate.der().to_vec()];
+        let info = X509DataInfo {
+            certificates: anchors.clone(),
+            certificate_chain: vec![0],
+            ..X509DataInfo::default()
+        };
+        let options = X509ChainOptions {
+            trusted_certs: &anchors,
+            verification_time: SystemTime::now(),
+            max_chain_depth: 1,
+            utc_facts: None,
+            check_crls: false,
+            allowed_extended_key_usages: None,
+            rsa_keys: RsaKeyPolicy::default(),
+            dsa_keys: DsaKeyPolicy::default(),
+            certificate_signature_algorithms: None,
+        };
+        let session = super::super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy {
+            max_x509_work: 0,
+            ..crate::policy::ResourcePolicy::default()
+        });
+        assert!(matches!(
+            verify_x509_certificate_chain_in_session(
+                &info,
+                &options,
+                crate::provider::default_provider(),
+                &[],
+                &session,
+            ),
+            Err(X509ChainError::Policy(
+                crate::policy::PolicyViolation::ResourceLimitExceeded {
+                    resource: crate::policy::resource_name::X509_WORK,
+                    maximum: 0,
+                }
+            ))
+        ));
+    }
+
+    #[test]
     fn crl_key_usage_absence_depends_on_certificate_version() {
-        // Isolate RFC 10007's v1/v2 exemption from the chain's separate CA constraints.
-        let params = rcgen::CertificateParams::new(Vec::new()).expect("empty SANs are valid");
+        // RFC 10007's v1/v2 exemption is checked on original DER by the shared
+        // authentication API, not a mutated phase-local parser projection.
+        use der::{Decode as _, Encode as _};
+        let mut params = rcgen::CertificateParams::new(Vec::new()).expect("empty SANs are valid");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "CRL issuer");
         let certificate = params
             .self_signed(&rcgen::KeyPair::generate().expect("test key generation"))
             .expect("test certificate signing");
-        let (_, mut parsed) =
-            X509Certificate::from_der(certificate.der()).expect("generated certificate DER");
-        assert!(parsed.key_usage().expect("generated extensions").is_none());
+        let encoded =
+            x509_cert::Certificate::from_der(certificate.der()).expect("generated issuer DER");
+        let mut crl: x509_cert::crl::CertificateList =
+            x509_cert::crl::CertificateList::from_der(&merlin_crl_der()).expect("Merlin CRL DER");
+        crl.tbs_cert_list.issuer = encoded.tbs_certificate().subject().clone();
+        let crl_bytes = crl.to_der().expect("modified CRL encoding");
         for version in [
-            x509_parser::x509::X509Version::V1,
-            x509_parser::x509::X509Version::V2,
+            x509_cert::Version::V1,
+            x509_cert::Version::V2,
+            x509_cert::Version::V3,
         ] {
-            parsed.tbs_certificate.version = version;
-            assert_eq!(validate_crl_issuer_key_usage(&parsed, 1), Ok(()));
+            use der::Tagged as _;
+            let mut fields = Vec::<der::asn1::Any>::from_der(
+                &encoded
+                    .tbs_certificate()
+                    .to_der()
+                    .expect("issuer TBS encoding"),
+            )
+            .expect("issuer TBS fields");
+            fields.remove(0); // Replace the explicitly encoded v3 version.
+            fields.retain(|field| {
+                field.tag()
+                    != der::Tag::ContextSpecific {
+                        constructed: true,
+                        number: der::TagNumber(3),
+                    }
+            });
+            if version != x509_cert::Version::V1 {
+                fields.insert(
+                    0,
+                    der::asn1::Any::from_der(&[0xa0, 3, 2, 1, version as u8])
+                        .expect("version encoding"),
+                );
+            }
+            let sequence = vec![
+                der::asn1::Any::from_der(&fields.to_der().expect("modified TBS encoding"))
+                    .expect("modified TBS sequence"),
+                der::asn1::Any::from_der(
+                    &encoded
+                        .signature_algorithm()
+                        .to_der()
+                        .expect("signature algorithm encoding"),
+                )
+                .expect("signature algorithm sequence"),
+                der::asn1::Any::from_der(
+                    &encoded.signature().to_der().expect("signature encoding"),
+                )
+                .expect("signature BIT STRING"),
+            ];
+            let bytes = sequence.to_der().expect("modified issuer encoding");
+            let session = super::super::pkix::CertificateSession::new(
+                &crate::policy::ResourcePolicy::default(),
+            );
+            let issuer = session.read(&bytes).expect("modified issuer parses");
+            let crl = session.read_crl(&crl_bytes).expect("modified CRL parses");
+            let outcome = crl
+                .authenticate(
+                    &issuer,
+                    structured_pkix::path::WorkingKey::standing(issuer.tbs().public_key()),
+                    &FormatOnly,
+                    session.memory(),
+                )
+                .expect("format-only authentication returns an outcome");
+            if version == x509_cert::Version::V3 {
+                assert!(matches!(
+                    outcome,
+                    structured_pkix::crl::Authentication::Rejected(
+                        structured_pkix::crl::AuthenticationFailure::KeyUsage
+                    )
+                ));
+            } else {
+                assert!(matches!(
+                    outcome,
+                    structured_pkix::crl::Authentication::Authenticated(_)
+                ));
+            }
         }
-        parsed.tbs_certificate.version = x509_parser::x509::X509Version::V3;
-        assert_eq!(
-            validate_crl_issuer_key_usage(&parsed, 1),
-            Err(X509ChainError::InvalidKeyUsage {
-                position: 1,
-                required: "cRLSign"
-            })
-        );
-        parsed.tbs_certificate.version = x509_parser::x509::X509Version(3);
-        assert!(matches!(
-            validate_crl_issuer_key_usage(&parsed, 1),
-            Err(X509ChainError::InvalidDer {
-                kind: "certificate version",
-                ..
-            })
-        ));
     }
 
     fn generated_certificate_params(common_name: &str, is_ca: bool) -> rcgen::CertificateParams {
@@ -1957,6 +1692,7 @@ mod tests {
             &info,
             &X509ChainOptions {
                 trusted_certs: &anchors,
+                utc_facts: None,
                 verification_time: SystemTime::now(),
                 max_chain_depth: info.certificate_chain.len(),
                 check_crls: false,
@@ -1966,6 +1702,61 @@ mod tests {
                 certificate_signature_algorithms: None,
             },
         )
+    }
+
+    fn verify_generated_constraints(
+        constraints: x509_cert::ext::pkix::NameConstraints,
+        name: x509_cert::ext::pkix::name::GeneralName,
+    ) -> Result<(), X509ChainError> {
+        use der::Encode as _;
+        let mut root_params = generated_certificate_params("constraint authority", true);
+        let mut constraint_extension = rcgen::CustomExtension::from_oid_content(
+            &[2, 5, 29, 30],
+            constraints.to_der().expect("constraint fixture DER"),
+        );
+        constraint_extension.set_criticality(true);
+        root_params.custom_extensions.push(constraint_extension);
+        let root = rcgen::CertifiedIssuer::self_signed(
+            root_params,
+            rcgen::KeyPair::generate().expect("constraint root key"),
+        )
+        .expect("constraint root");
+        let mut leaf_params = generated_certificate_params("constraint signer", false);
+        let mut san = rcgen::CustomExtension::from_oid_content(
+            &[2, 5, 29, 17],
+            vec![name].to_der().expect("SAN fixture DER"),
+        );
+        san.set_criticality(true);
+        leaf_params.custom_extensions.push(san);
+        let leaf = leaf_params
+            .signed_by(
+                &rcgen::KeyPair::generate().expect("constraint leaf key"),
+                &root,
+            )
+            .expect("constraint leaf");
+        let session =
+            super::super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
+        let leaf = session.read(leaf.der())?;
+        let root = session.read(root.der())?;
+        let options = X509ChainOptions {
+            trusted_certs: &[],
+            utc_facts: None,
+            verification_time: SystemTime::now(),
+            max_chain_depth: 2,
+            check_crls: false,
+            allowed_extended_key_usages: None,
+            rsa_keys: RsaKeyPolicy::default(),
+            dsa_keys: DsaKeyPolicy::default(),
+            certificate_signature_algorithms: None,
+        };
+        super::super::pkix::validate_supplied_path(
+            &[&leaf],
+            &root,
+            &options,
+            crate::provider::default_provider(),
+            &session,
+        )
+        .map(|_| ())
     }
 
     #[test]
@@ -1980,12 +1771,20 @@ mod tests {
                 &[2, 5, 29, 19],
                 vec![0x30, 0x03, 0x01, 0x01, 0xff],
             ));
+        let key = rcgen::KeyPair::generate().expect("CA key generation should succeed");
+        let issuer = rcgen::Issuer::from_params(&params, &key);
         let certificate = params
-            .self_signed(&rcgen::KeyPair::generate().expect("CA key generation should succeed"))
+            .clone()
+            .self_signed(&key)
             .expect("test CA should be self-signable");
-        let parsed = parse_certificate(certificate.der()).expect("test CA DER should parse");
-
-        assert_eq!(validate_ca_constraints(&parsed, 1), Ok(()));
+        let leaf = generated_certificate_params("noncritical CA target", false)
+            .signed_by(&rcgen::KeyPair::generate().expect("target key"), &issuer)
+            .expect("target certificate");
+        verify_generated_path(
+            vec![leaf.der().to_vec(), certificate.der().to_vec()],
+            certificate.der().to_vec(),
+        )
+        .expect("the actual common path accepts noncritical cA");
     }
 
     #[test]
@@ -2626,6 +2425,7 @@ mod tests {
             dsa_keys: DsaKeyPolicy {
                 minimum_modulus_bits: 1024,
             },
+            utc_facts: None,
             certificate_signature_algorithms: None,
         };
 
@@ -2656,6 +2456,7 @@ mod tests {
             allowed_extended_key_usages: None,
             rsa_keys: RsaKeyPolicy::default(),
             dsa_keys: DsaKeyPolicy::default(),
+            utc_facts: None,
             certificate_signature_algorithms: None,
         };
 
@@ -2781,136 +2582,251 @@ mod tests {
             )
             .expect("root should sign malformed-DNS leaf");
 
-        assert!(matches!(
-            verify_generated_path(
-                vec![leaf.der().to_vec(), root.der().to_vec()],
-                root.der().to_vec(),
+        let outcome = verify_generated_path(
+            vec![leaf.der().to_vec(), root.der().to_vec()],
+            root.der().to_vec(),
+        );
+        assert!(
+            matches!(
+                outcome,
+                Err(X509ChainError::InvalidDer {
+                    kind: "certificate DNS name",
+                    ..
+                })
             ),
-            Err(X509ChainError::InvalidDer {
-                kind: "certificate DNS name",
-                ..
-            })
-        ));
+            "{outcome:?}"
+        );
 
         for dns_name in ["*.example.com", "_signing.example.com"] {
-            assert!(validate_rfc5280_dns_name(dns_name).is_err(), "{dns_name}");
+            let mut params = generated_certificate_params("invalid DNS target", false);
+            let mut san = vec![
+                0x30,
+                u8::try_from(dns_name.len() + 2).expect("SAN length"),
+                0x82,
+                u8::try_from(dns_name.len()).expect("DNS length"),
+            ];
+            san.extend_from_slice(dns_name.as_bytes());
+            params
+                .custom_extensions
+                .push(rcgen::CustomExtension::from_oid_content(
+                    &[2, 5, 29, 17],
+                    san,
+                ));
+            let leaf = params
+                .signed_by(&rcgen::KeyPair::generate().expect("target key"), &root)
+                .expect("target certificate");
+            assert!(
+                matches!(
+                    verify_generated_path(
+                        vec![leaf.der().to_vec(), root.der().to_vec()],
+                        root.der().to_vec()
+                    ),
+                    Err(X509ChainError::InvalidDer {
+                        kind: "certificate DNS name",
+                        ..
+                    })
+                ),
+                "{dns_name}"
+            );
         }
     }
 
     #[test]
     fn name_constraint_matchers_cover_email_uri_and_ip_forms() {
-        // RFC 5280 gives each GeneralName form distinct subtree semantics;
-        // exercise those rules directly so a DNS-only implementation cannot pass.
-        assert!(email_within_subtree("ops@example.com", "example.com"));
-        assert!(email_within_subtree("ops@example.com", "ops@example.com"));
-        assert!(!email_within_subtree(
-            "other@example.com",
-            "ops@example.com"
-        ));
-        assert_eq!(
-            uri_host("https://user@api.example.com:8443/path"),
-            Some("api.example.com")
+        use der::asn1::{Ia5String, OctetString};
+        use x509_cert::ext::pkix::{
+            NameConstraints as Constraints, constraints::name::GeneralSubtree,
+            name::GeneralName as Name,
+        };
+        // Exercise the actual shared processor, not the retired local matchers.
+        // RFC 5280 4.2.1.10 gives each form distinct subtree semantics.
+        let email = |value: &str| Name::Rfc822Name(Ia5String::new(value).expect("email fixture"));
+        let uri = |value: &str| {
+            Name::UniformResourceIdentifier(Ia5String::new(value).expect("URI fixture"))
+        };
+        let ip = |value: &[u8]| Name::IpAddress(OctetString::new(value).expect("IP fixture"));
+        for (name, base, accepted) in [
+            (email("ops@example.com"), email("example.com"), true),
+            (email("ops@example.com"), email("ops@example.com"), true),
+            (email("other@example.com"), email("ops@example.com"), false),
+            (
+                uri("https://user@api.example.com:8443/path"),
+                uri(".example.com"),
+                true,
+            ),
+            (
+                uri("https://api.example.com/path"),
+                uri(".example.com"),
+                true,
+            ),
+            (
+                ip(&[192, 0, 2, 42]),
+                ip(&[192, 0, 2, 0, 255, 255, 255, 0]),
+                true,
+            ),
+            (
+                ip(&[192, 0, 3, 42]),
+                ip(&[192, 0, 2, 0, 255, 255, 255, 0]),
+                false,
+            ),
+        ] {
+            let result = verify_generated_constraints(
+                Constraints {
+                    permitted_subtrees: Some(vec![GeneralSubtree {
+                        base,
+                        minimum: 0,
+                        maximum: None,
+                    }]),
+                    excluded_subtrees: None,
+                },
+                name,
+            );
+            if accepted {
+                result.expect("matching name must be accepted");
+            } else {
+                assert_eq!(
+                    result,
+                    Err(X509ChainError::NameConstraintViolation {
+                        position: 0,
+                        constraining_position: 1,
+                    })
+                );
+            }
+        }
+        let result = verify_generated_constraints(
+            Constraints {
+                permitted_subtrees: Some(vec![GeneralSubtree {
+                    base: uri(".example.com"),
+                    minimum: 0,
+                    maximum: None,
+                }]),
+                excluded_subtrees: None,
+            },
+            uri("https://user@other@example.com/path"),
         );
         assert_eq!(
-            uri_host("https://user@other@example.com/path"),
-            None,
+            result,
+            Err(X509ChainError::UnsupportedCriticalExtension {
+                position: 0,
+                oid: "2.5.29.17".into(),
+            }),
             "a second userinfo delimiter must not expose a constraint-matchable host"
         );
-        assert!(dns_name_within_subtree(
-            uri_host("https://api.example.com/path").expect("URI must expose a DNS host"),
-            ".example.com",
-            false,
-        ));
-        assert!(
-            ip_address_within_subtree(&[192, 0, 2, 42], &[192, 0, 2, 0, 255, 255, 255, 0],)
-                .expect("valid IPv4 constraint must evaluate")
+        let result = verify_generated_constraints(
+            Constraints {
+                permitted_subtrees: Some(vec![GeneralSubtree {
+                    base: ip(&[192, 0, 2, 0, 255, 0, 255, 0]),
+                    minimum: 0,
+                    maximum: None,
+                }]),
+                excluded_subtrees: None,
+            },
+            ip(&[192, 0, 2, 42]),
         );
-        assert!(
-            !ip_address_within_subtree(&[192, 0, 3, 42], &[192, 0, 2, 0, 255, 255, 255, 0],)
-                .expect("valid non-matching IPv4 constraint must evaluate")
+        assert_eq!(
+            result,
+            Err(X509ChainError::InvalidNameConstraints { position: 1 })
         );
-        assert!(matches!(
-            ip_address_within_subtree(&[192, 0, 2, 42], &[192, 0, 2, 0, 255, 0, 255, 0],),
-            Err(X509ChainError::InvalidDer {
-                kind: "IP name constraint",
-                ..
-            })
-        ));
     }
 
     #[test]
     fn malformed_ip_name_constraints_fail_before_matching() {
-        use x509_parser::extensions::GeneralSubtree;
-
-        let name = GeneralName::IPAddress(&[192, 0, 2, 42]);
+        use der::asn1::OctetString;
+        use x509_cert::ext::pkix::{
+            NameConstraints as Constraints, constraints::name::GeneralSubtree,
+            name::GeneralName as Name,
+        };
+        // Both permitted/excluded constraints must reject malformed masks
+        // through the production common processor before any name can match.
         for malformed in [
             &[192, 0, 2, 0, 255, 255, 255][..],
             &[192, 0, 2, 0, 255, 0, 255, 0][..],
         ] {
             for permitted in [true, false] {
                 let subtree = GeneralSubtree {
-                    base: GeneralName::IPAddress(malformed),
+                    base: Name::IpAddress(
+                        OctetString::new(malformed).expect("IP constraint fixture"),
+                    ),
+                    minimum: 0,
+                    maximum: None,
                 };
-                let constraints = NameConstraints {
+                let constraints = Constraints {
                     permitted_subtrees: permitted.then(|| vec![subtree.clone()]),
                     excluded_subtrees: (!permitted).then(|| vec![subtree]),
                 };
-                assert!(matches!(
-                    validate_general_name(&name, &constraints, 0, 1),
-                    Err(X509ChainError::InvalidDer {
-                        kind: "IP name constraint",
-                        ..
-                    })
-                ));
+                assert_eq!(
+                    verify_generated_constraints(
+                        constraints,
+                        Name::IpAddress(OctetString::new([192, 0, 2, 42]).expect("IP SAN fixture")),
+                    ),
+                    Err(X509ChainError::InvalidNameConstraints { position: 1 })
+                );
             }
         }
     }
 
     #[test]
     fn malformed_string_name_constraints_fail_before_matching() {
-        use x509_parser::extensions::GeneralSubtree;
+        use der::asn1::Ia5String;
+        use x509_cert::ext::pkix::{
+            NameConstraints as Constraints, constraints::name::GeneralSubtree,
+            name::GeneralName as Name,
+        };
+        let dns =
+            |value: &str| Name::DnsName(Ia5String::new(value).expect("DNS constraint fixture"));
+        let email = |value: &str| {
+            Name::Rfc822Name(Ia5String::new(value).expect("email constraint fixture"))
+        };
+        let uri = |value: &str| {
+            Name::UniformResourceIdentifier(Ia5String::new(value).expect("URI constraint fixture"))
+        };
 
         // Matchers assume admitted string constraints have RFC 5280 syntax.
         // Invalid values must not degrade into ordinary non-matches.
         for malformed in [
-            GeneralName::DNSName(""),
-            GeneralName::DNSName("example..com"),
-            GeneralName::RFC822Name("@example.com"),
-            GeneralName::RFC822Name("bad..local@example.com"),
-            GeneralName::URI("https://example.com"),
+            dns(""),
+            dns("example..com"),
+            email("@example.com"),
+            email("bad..local@example.com"),
+            uri("https://example.com"),
         ] {
-            let constraints = NameConstraints {
+            let constraints = Constraints {
                 permitted_subtrees: None,
-                excluded_subtrees: Some(vec![GeneralSubtree { base: malformed }]),
+                excluded_subtrees: Some(vec![GeneralSubtree {
+                    base: malformed,
+                    minimum: 0,
+                    maximum: None,
+                }]),
             };
-            assert!(matches!(
-                ensure_supported_name_constraints(&constraints, 1),
-                Err(X509ChainError::InvalidDer {
-                    kind: "string name constraint",
-                    ..
-                })
-            ));
+            assert_eq!(
+                verify_generated_constraints(constraints, dns("www.example.com")),
+                Err(X509ChainError::InvalidNameConstraints { position: 1 })
+            );
         }
 
         for valid in [
-            GeneralName::DNSName("example.com"),
-            GeneralName::DNSName(".example.com"),
-            GeneralName::RFC822Name("ops@example.com"),
-            GeneralName::RFC822Name("example.com"),
-            GeneralName::URI(".example.com"),
+            dns("example.com"),
+            dns(".example.com"),
+            email("ops@example.com"),
+            email("example.com"),
+            uri(".example.com"),
         ] {
-            let constraints = NameConstraints {
-                permitted_subtrees: Some(vec![GeneralSubtree { base: valid }]),
+            let constraints = Constraints {
+                permitted_subtrees: Some(vec![GeneralSubtree {
+                    base: valid,
+                    minimum: 0,
+                    maximum: None,
+                }]),
                 excluded_subtrees: None,
             };
-            ensure_supported_name_constraints(&constraints, 1)
+            verify_generated_constraints(constraints, dns("www.example.com"))
                 .expect("valid string constraints must remain supported");
         }
     }
 
     #[test]
     fn empty_name_constraint_collections_are_rejected() {
-        use der::Encode as _;
+        use der::asn1::Ia5String;
         use x509_cert::ext::pkix::NameConstraints as EncodedNameConstraints;
 
         // RFC 5280 requires at least one subtree overall and at least one entry
@@ -2929,13 +2845,15 @@ mod tests {
                 excluded_subtrees: Some(Vec::new()),
             },
         ] {
-            let der = constraints
-                .to_der()
-                .expect("malformed NameConstraints test input must encode");
-            assert!(matches!(
-                validate_name_constraints_der(&der, 1),
+            assert_eq!(
+                verify_generated_constraints(
+                    constraints,
+                    x509_cert::ext::pkix::name::GeneralName::DnsName(
+                        Ia5String::new("www.example.com").expect("DNS SAN fixture")
+                    ),
+                ),
                 Err(X509ChainError::InvalidNameConstraints { position: 1 })
-            ));
+            );
         }
     }
 
@@ -2996,13 +2914,17 @@ mod tests {
                 )
                 .expect("root should sign leaf certificate");
 
-            assert!(matches!(
-                verify_generated_path(
-                    vec![leaf.der().to_vec(), root.der().to_vec()],
-                    root.der().to_vec(),
+            let outcome = verify_generated_path(
+                vec![leaf.der().to_vec(), root.der().to_vec()],
+                root.der().to_vec(),
+            );
+            assert!(
+                matches!(
+                    outcome,
+                    Err(X509ChainError::InvalidNameConstraints { position: 1 })
                 ),
-                Err(X509ChainError::InvalidNameConstraints { position: 1 })
-            ));
+                "{outcome:?}"
+            );
         }
     }
 
@@ -3104,16 +3026,19 @@ mod tests {
             .expect("test issuer should sign a non-critical-SAN certificate");
 
         for leaf in [missing_san, noncritical_san] {
-            assert!(matches!(
-                verify_generated_path(
-                    vec![leaf.der().to_vec(), root.der().to_vec()],
-                    root.der().to_vec(),
-                ),
-                Err(X509ChainError::InvalidDer {
-                    kind: "certificate subject identity",
-                    ..
-                })
-            ));
+            // The shared reader now reports the original subject range rather
+            // than the legacy projection's unlocated subject-identity message.
+            let error = verify_generated_path(
+                vec![leaf.der().to_vec(), root.der().to_vec()],
+                root.der().to_vec(),
+            )
+            .expect_err("an empty subject without critical SAN must fail");
+            let X509ChainError::Processing(error) = error else {
+                panic!("expected located subject rejection: {error:?}");
+            };
+            assert_eq!(error.code(), structured_pkix::ErrorCode::MissingField);
+            assert_eq!(error.field(), "certificate.tbsCertificate.subject");
+            assert!(error.offset() > 0 && error.offset() < leaf.der().len() as u64);
         }
     }
 
@@ -3281,7 +3206,11 @@ mod tests {
                 vec![leaf.der().to_vec(), root.der().to_vec()],
                 root.der().to_vec(),
             )
-            .expect("valid typed SAN identity must satisfy an empty subject");
+            .unwrap_or_else(|error| {
+                panic!(
+                    "valid typed SAN {tag:#x} {value:?} must satisfy an empty subject: {error:?}"
+                )
+            });
         }
     }
 
@@ -3291,7 +3220,7 @@ mod tests {
             .1
     }
 
-    fn merlin_crl_der() -> Vec<u8> {
+    fn merlin_crl_fixture() -> X509DataInfo {
         let xml = include_str!(
             "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-x509-crt-crl.xml"
         );
@@ -3304,7 +3233,114 @@ mod tests {
         let KeyInfoSource::X509Data(info) = &key_info.sources[0] else {
             panic!("expected X509Data")
         };
-        info.crls[0].clone()
+        info.clone()
+    }
+
+    fn merlin_crl_der() -> Vec<u8> {
+        merlin_crl_fixture().crls[0].clone()
+    }
+
+    struct FormatOnly;
+    impl structured_pkix::path::Verify for FormatOnly {
+        type Error = std::convert::Infallible;
+        fn verify(
+            &self,
+            _: &structured_pkix::algorithm::AlgorithmIdentifier<'_>,
+            _: structured_pkix::path::WorkingKey<'_>,
+            _: &[u8],
+            _: structured_asn1::BitString<'_>,
+            _: &structured_asn1::memory::Memory,
+        ) -> Result<structured_pkix::path::Verified, Self::Error> {
+            Ok(structured_pkix::path::Verified::Yes)
+        }
+    }
+
+    fn validate_crl_extensions(bytes: &[u8], index: usize) -> Result<(), X509ChainError> {
+        // Isolate format/entry semantics for deliberately re-encoded test
+        // inputs. Signature authentication is exercised by the public-path tests.
+        let session =
+            super::super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
+        let crl = session
+            .read_crl(bytes)
+            .map_err(|_| X509ChainError::InvalidCrl(index))?;
+        let memory = session.memory();
+        for entry in crl.tbs().revoked_certificates() {
+            validate_positive_serial_bytes(
+                entry.serial().as_bytes(),
+                "CRL revoked certificate serial",
+            )
+            .map_err(|_| X509ChainError::InvalidCrl(index))?;
+        }
+        if crl
+            .tbs()
+            .extensions()
+            .get(structured_pkix::oid::DELTA_CRL_INDICATOR, memory)
+            .map_err(|_| X509ChainError::InvalidCrl(index))?
+            .is_some()
+        {
+            return Err(X509ChainError::InvalidCrl(index));
+        }
+        let mut fixture = merlin_crl_fixture();
+        fixture.certificates.push(
+            pem::parse(include_bytes!(
+                "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/certs/ca.pem"
+            ))
+            .expect("public Merlin issuer PEM")
+            .into_contents(),
+        );
+        for encoded in &fixture.certificates {
+            // Strip extensions/version in this format-only fixture so a
+            // deliberately unrelated KeyUsage cannot mask entry semantics.
+            use der::{Decode as _, Encode as _, Tagged as _};
+            let mut envelope =
+                Vec::<der::asn1::Any>::from_der(encoded).expect("fixture certificate fields");
+            let mut fields = Vec::<der::asn1::Any>::from_der(
+                &envelope[0].to_der().expect("fixture TBS encoding"),
+            )
+            .expect("fixture TBS fields");
+            fields.retain(|field| {
+                !matches!(
+                    field.tag(),
+                    der::Tag::ContextSpecific {
+                        number: der::TagNumber(0 | 3),
+                        ..
+                    }
+                )
+            });
+            envelope[0] =
+                der::asn1::Any::from_der(&fields.to_der().expect("versionless TBS encoding"))
+                    .expect("versionless TBS sequence");
+            let bytes = envelope.to_der().expect("versionless issuer encoding");
+            let issuer = session.read(&bytes)?;
+            if !crl
+                .tbs()
+                .issuer()
+                .matches(issuer.tbs().subject(), memory)
+                .map_err(|_| X509ChainError::InvalidCrl(index))?
+            {
+                continue;
+            }
+            let proof = crl
+                .authenticate(
+                    &issuer,
+                    structured_pkix::path::WorkingKey::standing(issuer.tbs().public_key()),
+                    &FormatOnly,
+                    memory,
+                )
+                .map_err(|_| X509ChainError::InvalidCrl(index))?;
+            let structured_pkix::crl::Authentication::Authenticated(proof) = proof else {
+                return Err(X509ChainError::InvalidCrl(index));
+            };
+            return match proof
+                .entry(&issuer, memory)
+                .map_err(|_| X509ChainError::InvalidCrl(index))?
+            {
+                structured_pkix::crl::EntryLookup::Absent
+                | structured_pkix::crl::EntryLookup::Found(_) => Ok(()),
+                _ => Err(X509ChainError::InvalidCrl(index)),
+            };
+        }
+        Err(X509ChainError::InvalidCrl(index))
     }
 
     #[test]
@@ -3325,7 +3361,7 @@ mod tests {
             .to_der()
             .expect("duplicate CRL extension test vector must encode");
         assert_eq!(
-            validate_crl_extensions(&parsed_merlin_crl(&duplicate_crl), 0),
+            validate_crl_extensions(&duplicate_crl, 0),
             Err(X509ChainError::InvalidCrl(0))
         );
 
@@ -3349,7 +3385,7 @@ mod tests {
             .to_der()
             .expect("duplicate entry extension test vector must encode");
         assert_eq!(
-            validate_crl_extensions(&parsed_merlin_crl(&duplicate_entry), 0),
+            validate_crl_extensions(&duplicate_entry, 0),
             Err(X509ChainError::InvalidCrl(0))
         );
     }
@@ -3384,7 +3420,7 @@ mod tests {
             let mut malformed = original.clone();
             malformed[offsets[0]..offsets[0] + serial.len()].copy_from_slice(&replacement);
             assert_eq!(
-                validate_crl_extensions(&parsed_merlin_crl(&malformed), 0),
+                validate_crl_extensions(&malformed, 0),
                 Err(X509ChainError::InvalidCrl(0))
             );
         }
@@ -3413,7 +3449,7 @@ mod tests {
                 .to_der()
                 .expect("delta CRL indicator test vector must encode");
             assert_eq!(
-                validate_crl_extensions(&parsed_merlin_crl(&encoded), 0),
+                validate_crl_extensions(&encoded, 0),
                 Err(X509ChainError::InvalidCrl(0)),
                 "delta CRL indicator criticality must not change unsupported semantics"
             );
@@ -3429,6 +3465,9 @@ mod tests {
         for (reason, accepted) in [(1_u8, true), (8_u8, false)] {
             let mut encoded: CertificateList =
                 CertificateList::from_der(&original).expect("tracked Merlin CRL must decode");
+            // This vector isolates entry reason semantics, not the historical
+            // fixture's issuer-hint profile. Absence of CRL extensions is legal.
+            encoded.tbs_cert_list.crl_extensions = None;
             let revoked = encoded
                 .tbs_cert_list
                 .revoked_certificates
@@ -3447,7 +3486,7 @@ mod tests {
             let encoded = encoded
                 .to_der()
                 .expect("reason-code CRL test vector must encode");
-            let result = validate_crl_extensions(&parsed_merlin_crl(&encoded), 0);
+            let result = validate_crl_extensions(&encoded, 0);
             if accepted {
                 assert_eq!(result, Ok(()), "ordinary revocation reasons remain valid");
             } else {
@@ -3458,27 +3497,44 @@ mod tests {
 
     #[test]
     fn unevaluable_uri_names_fail_closed_for_both_constraint_forms() {
-        use x509_parser::extensions::GeneralSubtree;
+        use der::asn1::Ia5String;
+        use x509_cert::ext::pkix::{
+            NameConstraints as Constraints, constraints::name::GeneralSubtree,
+            name::GeneralName as Name,
+        };
 
         // A URI without a DNS host is not a non-match: treating it that way
         // would bypass excluded URI subtrees while rejecting permitted ones.
-        let uri = GeneralName::URI("urn:example:opaque");
+        let uri = || {
+            Name::UniformResourceIdentifier(
+                Ia5String::new("urn:example:opaque").expect("URI SAN fixture"),
+            )
+        };
+        let base = || {
+            Name::UniformResourceIdentifier(
+                Ia5String::new(".example.com").expect("URI constraint fixture"),
+            )
+        };
         for constraints in [
-            NameConstraints {
+            Constraints {
                 permitted_subtrees: Some(vec![GeneralSubtree {
-                    base: GeneralName::URI(".example.com"),
+                    base: base(),
+                    minimum: 0,
+                    maximum: None,
                 }]),
                 excluded_subtrees: None,
             },
-            NameConstraints {
+            Constraints {
                 permitted_subtrees: None,
                 excluded_subtrees: Some(vec![GeneralSubtree {
-                    base: GeneralName::URI(".example.com"),
+                    base: base(),
+                    minimum: 0,
+                    maximum: None,
                 }]),
             },
         ] {
             assert_eq!(
-                validate_general_name(&uri, &constraints, 0, 1),
+                verify_generated_constraints(constraints, uri()),
                 Err(X509ChainError::NameConstraintViolation {
                     position: 0,
                     constraining_position: 1,
@@ -3543,16 +3599,19 @@ mod tests {
             )
             .expect("root should sign leaf certificate");
 
-        assert_eq!(
-            verify_generated_path(
-                vec![leaf.der().to_vec(), root.der().to_vec()],
-                root.der().to_vec(),
-            ),
-            Err(X509ChainError::DuplicateExtension {
-                position: 0,
-                oid: "1.2.3.4".into(),
-            })
-        );
+        // Duplicate-extension identity now comes from the common decoder's
+        // located structural failure, without reparsing solely for a display OID.
+        let error = verify_generated_path(
+            vec![leaf.der().to_vec(), root.der().to_vec()],
+            root.der().to_vec(),
+        )
+        .expect_err("duplicate extension must fail");
+        let X509ChainError::Processing(error) = error else {
+            panic!("expected located duplicate-extension rejection: {error:?}");
+        };
+        assert_eq!(error.code(), structured_pkix::ErrorCode::DuplicateExtension);
+        assert_eq!(error.field(), "certificate.tbsCertificate.extensions");
+        assert!(error.offset() > 0 && error.offset() < leaf.der().len() as u64);
     }
 
     #[test]

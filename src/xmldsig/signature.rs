@@ -16,6 +16,7 @@ use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
 use p384::ecdsa::{Signature as P384Signature, VerifyingKey as P384VerifyingKey};
 use p521::ecdsa::{Signature as P521Signature, VerifyingKey as P521VerifyingKey};
 use pkcs8::DecodePublicKey as _;
+use pkcs8::SubjectPublicKeyInfoRef;
 use rsa::signature::hazmat::PrehashVerifier;
 use rsa::{
     pkcs1v15::{Signature as RsaPkcs1v15Signature, VerifyingKey as RsaVerifyingKey},
@@ -24,9 +25,6 @@ use rsa::{
 use sha1::Sha1;
 use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
 use signature::Verifier;
-use x509_parser::prelude::FromDer;
-use x509_parser::public_key::{ECPoint, PublicKey};
-use x509_parser::x509::SubjectPublicKeyInfo;
 
 use super::parse::SignatureAlgorithm;
 use crate::policy::EcdsaSignatureValueEncoding;
@@ -184,20 +182,10 @@ pub(crate) fn signature_value_matches_spki_with_encoding(
         let bits = modulus.len() * 8 - first.leading_zeros() as usize;
         return Ok(parameters.fits_modulus_bits(bits) && signature_value.len() == modulus.len());
     }
-    let (rest, spki) = SubjectPublicKeyInfo::from_der(public_key_spki_der)
+    let spki = SubjectPublicKeyInfoRef::from_der(public_key_spki_der)
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
-    if !rest.is_empty() {
-        return Err(SignatureVerificationError::InvalidKeyDer);
-    }
-    let public_key = spki
-        .parsed()
-        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
-
-    match (algorithm, public_key) {
-        (
-            algorithm @ (SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256),
-            PublicKey::DSA(_),
-        ) => {
+    match (algorithm, spki.algorithm.oid) {
+        (algorithm @ (SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256), dsa::OID) => {
             let key = decode_dsa_verifying_key(public_key_spki_der)?;
             let component_len = usize::try_from(key.components().q().bits_vartime())
                 .map_err(|_| SignatureVerificationError::InvalidKeyDer)?
@@ -205,14 +193,15 @@ pub(crate) fn signature_value_matches_spki_with_encoding(
             Ok(algorithm.dsa_component_len() == Some(component_len)
                 && signature_value.len() == component_len * 2)
         }
-        (method, PublicKey::RSA(_)) if method.is_rsa() => {
+        (method, pkcs1::ALGORITHM_OID) if method.is_rsa() => {
             let key = rsa::RsaPublicKey::from_public_key_der(public_key_spki_der)
                 .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
             Ok(signature_value.len() == key.size())
         }
-        (method, PublicKey::EC(ec)) if method.ecdsa_digest().is_some() => {
-            validate_ec_public_key_encoding(&ec, &spki.subject_public_key.data)?;
-            let (_, component_len) = ecdsa_curve_and_component_len(&spki, &ec)?;
+        (method, oid)
+            if method.ecdsa_digest().is_some() && oid == p256::elliptic_curve::ALGORITHM_OID =>
+        {
+            let (_, component_len) = ecdsa_curve_and_component_len(&spki)?;
             match encoding {
                 EcdsaSignatureValueEncoding::XmlDsig
                     if signature_value.len() == component_len * 2 => {}
@@ -421,16 +410,18 @@ pub(crate) fn validate_rsa_signature_spki_with_minimum(
             })
         };
     }
-    let (rest, spki) = SubjectPublicKeyInfo::from_der(public_key_spki_der)
+    let spki = SubjectPublicKeyInfoRef::from_der(public_key_spki_der)
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
-    if !rest.is_empty() {
-        return Err(SignatureVerificationError::InvalidKeyDer);
-    }
-    match spki
-        .parsed()
-        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?
-    {
-        PublicKey::RSA(rsa) => validate_rsa_public_key(&rsa, algorithm, minimum_modulus_bits),
+    match spki.algorithm.oid {
+        pkcs1::ALGORITHM_OID => {
+            let octets = spki
+                .subject_public_key
+                .as_bytes()
+                .ok_or(SignatureVerificationError::InvalidKeyDer)?;
+            let key = pkcs1::RsaPublicKeyRef::from_der(octets)
+                .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+            validate_rsa_public_key(&key, algorithm, minimum_modulus_bits)
+        }
         _ => Err(SignatureVerificationError::KeyAlgorithmMismatch {
             uri: algorithm.uri().to_string(),
         }),
@@ -650,19 +641,15 @@ pub fn verify_ecdsa_signature_spki_with_encoding(
         }
     })?;
 
-    let (rest, spki) = SubjectPublicKeyInfo::from_der(public_key_spki_der)
+    let spki = SubjectPublicKeyInfoRef::from_der(public_key_spki_der)
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
-    if !rest.is_empty() {
-        return Err(SignatureVerificationError::InvalidKeyDer);
-    }
-    let public_key = spki
-        .parsed()
-        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
-
-    match public_key {
-        PublicKey::EC(ec) => {
-            validate_ec_public_key_encoding(&ec, &spki.subject_public_key.data)?;
-            let (curve, component_len) = ecdsa_curve_and_component_len(&spki, &ec)?;
+    match spki.algorithm.oid {
+        oid if oid == p256::elliptic_curve::ALGORITHM_OID => {
+            let public_key = spki
+                .subject_public_key
+                .as_bytes()
+                .ok_or(SignatureVerificationError::InvalidKeyDer)?;
+            let (curve, component_len) = ecdsa_curve_and_component_len(&spki)?;
             let signature_encoding = match encoding {
                 EcdsaSignatureValueEncoding::XmlDsig => {
                     if signature_value.len() != component_len * 2 {
@@ -681,24 +668,15 @@ pub fn verify_ecdsa_signature_spki_with_encoding(
             };
             let prehash = super::compute_digest(digest_algorithm, signed_data);
             match curve {
-                EcCurve::P256 => verify_ecdsa_p256(
-                    &spki.subject_public_key.data,
-                    &prehash,
-                    signature_value,
-                    signature_encoding,
-                ),
-                EcCurve::P384 => verify_ecdsa_p384(
-                    &spki.subject_public_key.data,
-                    &prehash,
-                    signature_value,
-                    signature_encoding,
-                ),
-                EcCurve::P521 => verify_ecdsa_p521(
-                    &spki.subject_public_key.data,
-                    &prehash,
-                    signature_value,
-                    signature_encoding,
-                ),
+                EcCurve::P256 => {
+                    verify_ecdsa_p256(public_key, &prehash, signature_value, signature_encoding)
+                }
+                EcCurve::P384 => {
+                    verify_ecdsa_p384(public_key, &prehash, signature_value, signature_encoding)
+                }
+                EcCurve::P521 => {
+                    verify_ecdsa_p521(public_key, &prehash, signature_value, signature_encoding)
+                }
             }
         }
         _ => Err(SignatureVerificationError::KeyAlgorithmMismatch {
@@ -728,18 +706,23 @@ pub(crate) fn verify_ecdsa_signature_spki_asn1_der(
 }
 
 fn validate_rsa_public_key(
-    rsa: &x509_parser::public_key::RSAPublicKey<'_>,
+    rsa: &pkcs1::RsaPublicKeyRef<'_>,
     algorithm: SignatureAlgorithm,
     minimum_modulus_bits: usize,
 ) -> Result<(), SignatureVerificationError> {
     ensure_rsa_signature_algorithm(algorithm)?;
-    validate_rsa_key_components(rsa.modulus, rsa.exponent, minimum_modulus_bits)?;
+    validate_rsa_key_components(
+        rsa.modulus.as_bytes(),
+        rsa.public_exponent.as_bytes(),
+        minimum_modulus_bits,
+    )?;
     if let Some(parameters) = algorithm.rsa_pss_parameters() {
         let modulus = rsa
             .modulus
+            .as_bytes()
             .iter()
             .position(|byte| *byte != 0)
-            .map(|start| &rsa.modulus[start..])
+            .map(|start| &rsa.modulus.as_bytes()[start..])
             .ok_or(SignatureVerificationError::InvalidKeyDer)?;
         let bits = modulus.len() * 8 - modulus[0].leading_zeros() as usize;
         if !parameters.fits_modulus_bits(bits) {
@@ -778,32 +761,57 @@ fn ensure_rsa_signature_algorithm(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EcCurve {
+pub(crate) enum EcCurve {
     P256,
     P384,
     P521,
 }
 
-fn ecdsa_curve_and_component_len(
-    spki: &SubjectPublicKeyInfo<'_>,
-    ec: &ECPoint<'_>,
+impl EcCurve {
+    pub(crate) fn from_oid(oid: der::asn1::ObjectIdentifier) -> Option<Self> {
+        use pkcs8::AssociatedOid as _;
+        match oid {
+            p256::NistP256::OID => Some(Self::P256),
+            p384::NistP384::OID => Some(Self::P384),
+            p521::NistP521::OID => Some(Self::P521),
+            _ => None,
+        }
+    }
+
+    fn component_len(self) -> usize {
+        match self {
+            Self::P256 => 32,
+            Self::P384 => 48,
+            Self::P521 => 66,
+        }
+    }
+
+    pub(crate) fn validate_point(self, point: &[u8]) -> Result<(), SignatureVerificationError> {
+        // RFC 5480 2.2 permits but does not mandate compressed points. This
+        // product's uncompressed profile is shared by import and verification.
+        // https://www.rfc-editor.org/rfc/rfc5480.html#section-2.2
+        if point.len() != self.component_len() * 2 + 1 || point.first() != Some(&4) {
+            return Err(SignatureVerificationError::InvalidKeyDer);
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn ecdsa_curve_and_component_len(
+    spki: &SubjectPublicKeyInfoRef<'_>,
 ) -> Result<(EcCurve, usize), SignatureVerificationError> {
     let curve_oid = spki
         .algorithm
         .parameters
-        .as_ref()
-        .and_then(|params| params.as_oid().ok())
+        .and_then(|params| params.decode_as::<der::asn1::ObjectIdentifier>().ok())
         .ok_or(SignatureVerificationError::InvalidKeyDer)?;
-    let point_len = ec.key_size();
-
-    let curve_oid = curve_oid.to_id_string();
-    match (curve_oid.as_str(), point_len) {
-        ("1.2.840.10045.3.1.7", 256) => Ok((EcCurve::P256, 32)),
-        ("1.3.132.0.34", 384) => Ok((EcCurve::P384, 48)),
-        // x509-parser reports the byte-aligned SEC1 point size for P-521.
-        ("1.3.132.0.35", 528) => Ok((EcCurve::P521, 66)),
-        _ => Err(SignatureVerificationError::InvalidKeyDer),
-    }
+    let curve = EcCurve::from_oid(curve_oid).ok_or(SignatureVerificationError::InvalidKeyDer)?;
+    let point = spki
+        .subject_public_key
+        .as_bytes()
+        .ok_or(SignatureVerificationError::InvalidKeyDer)?;
+    curve.validate_point(point)?;
+    Ok((curve, curve.component_len()))
 }
 
 fn verify_ecdsa_p256(
@@ -1088,28 +1096,7 @@ fn parse_der_length(input: &[u8]) -> Option<Result<(usize, &[u8]), ()>> {
     Some(Ok((declared_len, remainder)))
 }
 
-pub(crate) fn validate_ec_public_key_encoding(
-    ec: &ECPoint<'_>,
-    public_key_bytes: &[u8],
-) -> Result<(), SignatureVerificationError> {
-    let coordinate_len = ec_coordinate_len_bytes(ec.key_size())?;
-    let expected_len = coordinate_len
-        .checked_mul(2)
-        .and_then(|len| len.checked_add(1))
-        .ok_or(SignatureVerificationError::InvalidKeyDer)?;
-
-    // RFC 5480 §2.2 permits, but does not require, compressed points:
-    // https://www.rfc-editor.org/rfc/rfc5480.html#section-2.2 . This implementation
-    // uses the uncompressed profile consistently for import and verification.
-    let is_uncompressed_sec1 =
-        public_key_bytes.len() == expected_len && public_key_bytes.first() == Some(&0x04);
-    if !is_uncompressed_sec1 {
-        return Err(SignatureVerificationError::InvalidKeyDer);
-    }
-
-    Ok(())
-}
-
+#[cfg(test)]
 fn ec_coordinate_len_bytes(key_bits: usize) -> Result<usize, SignatureVerificationError> {
     key_bits
         .checked_add(7)

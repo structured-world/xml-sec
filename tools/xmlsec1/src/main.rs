@@ -2,6 +2,7 @@ mod args;
 mod capabilities;
 mod commands;
 mod key_material;
+mod utc_facts;
 
 use std::{ffi::OsString, io::Write, process::ExitCode};
 

@@ -32,7 +32,6 @@ use std::{
     collections::{HashMap, HashSet},
     ops::Range,
 };
-use x509_parser::prelude::FromDer;
 use zeroize::Zeroizing;
 
 use crate::c14n::canonicalize_bounded_with_xml_base_budget;
@@ -582,6 +581,9 @@ pub trait KeyInfoWriter {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum KeyInfoWriteError {
+    /// Certificate processing exceeded the operation's resource allowance.
+    #[error("certificate processing rejected by policy: {0}")]
+    Policy(#[from] crate::policy::PolicyViolation),
     /// The selected provider could not produce cryptographic key metadata.
     #[error("cryptographic provider error: {0}")]
     Provider(#[from] crate::provider::ProviderError),
@@ -721,23 +723,29 @@ impl X509CertificateKeyInfoWriter {
         I: IntoIterator<Item = B>,
         B: AsRef<[u8]>,
     {
+        let session =
+            super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
         let certificates_der = certificates_der
             .into_iter()
             .map(|certificate_der| {
                 let certificate_der = certificate_der.as_ref();
-                let (rest, _) =
-                    x509_parser::certificate::X509Certificate::from_der(certificate_der)
-                        .map_err(|_| KeyInfoWriteError::InvalidCertificateDer)?;
-                if !rest.is_empty() {
-                    return Err(KeyInfoWriteError::InvalidCertificateDer);
-                }
-                Ok(certificate_der.to_vec())
+                session
+                    .read(certificate_der)
+                    .map_err(certificate_write_error)?;
+                Ok::<_, KeyInfoWriteError>(certificate_der.to_vec())
             })
             .collect::<Result<Vec<_>, _>>()?;
         if certificates_der.is_empty() {
             return Err(KeyInfoWriteError::EmptyCertificateChain);
         }
         Ok(Self { certificates_der })
+    }
+}
+
+fn certificate_write_error(error: super::X509ChainError) -> KeyInfoWriteError {
+    match error {
+        super::X509ChainError::Policy(error) => KeyInfoWriteError::Policy(error),
+        _ => KeyInfoWriteError::InvalidCertificateDer,
     }
 }
 
@@ -756,13 +764,11 @@ fn parse_certificate_pem(certificate_pem: &str) -> Result<Vec<u8>, KeyInfoWriteE
 impl KeyInfoWriter for X509CertificateKeyInfoWriter {
     fn write_key_info(&self, signing_key: &dyn SigningKey) -> Result<String, KeyInfoWriteError> {
         let leaf_der = &self.certificates_der[0];
-        let (rest, certificate) = x509_parser::certificate::X509Certificate::from_der(leaf_der)
-            .map_err(|_| KeyInfoWriteError::InvalidCertificateDer)?;
-        if !rest.is_empty() {
-            return Err(KeyInfoWriteError::InvalidCertificateDer);
-        }
+        let session =
+            super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
+        let certificate = session.read(leaf_der).map_err(certificate_write_error)?;
         let signing_public_key = signing_key.public_key_info()?;
-        if signing_public_key.spki_der() != Some(certificate.public_key().raw) {
+        if signing_public_key.spki_der() != Some(certificate.tbs().public_key().as_bytes()) {
             return Err(KeyInfoWriteError::CertificateKeyMismatch);
         }
 
@@ -791,15 +797,14 @@ impl X509DigestKeyInfoWriter {
         certificate_der: &[u8],
         digest_algorithm: DigestAlgorithm,
     ) -> Result<Self, KeyInfoWriteError> {
-        let (rest, certificate) =
-            x509_parser::certificate::X509Certificate::from_der(certificate_der)
-                .map_err(|_| KeyInfoWriteError::InvalidCertificateDer)?;
-        if !rest.is_empty() {
-            return Err(KeyInfoWriteError::InvalidCertificateDer);
-        }
+        let session =
+            super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
+        let certificate = session
+            .read(certificate_der)
+            .map_err(certificate_write_error)?;
         Ok(Self {
             certificate_der: certificate_der.to_vec(),
-            certificate_spki_der: certificate.public_key().raw.to_vec(),
+            certificate_spki_der: certificate.tbs().public_key().as_bytes().to_vec(),
             digest_algorithm,
         })
     }
@@ -2007,6 +2012,9 @@ impl<'a> SignContext<'a> {
             )?;
             parse_signature_children(signature)
                 .map_err(|error| SigningDigestError::InvalidStructure(error.to_string()))?;
+            self.policy
+                .signature_constraints
+                .check(signature, &budgets.transforms)?;
             let (algorithm, output_bits) =
                 validate_signing_signed_info_methods(signature, &self.policy)?;
             self.policy.check_signature_algorithm(algorithm)?;

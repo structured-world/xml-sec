@@ -56,6 +56,15 @@ pub(crate) const ENCRYPTION_RECIPIENT_CEILING: usize = 64;
 /// Maximum symmetric keys attempted by one prepared decryption operation.
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const KEY_CANDIDATE_CEILING: usize = 64;
+/// Maximum cumulative shared-mechanism work across a session's certificate candidates.
+#[cfg(feature = "xmldsig")]
+pub(crate) const X509_WORK_CEILING: usize = 256 * 1024 * 1024;
+/// Maximum live allocation capacity retained by shared certificate decoding.
+#[cfg(feature = "xmldsig")]
+pub(crate) const X509_WORKSPACE_BYTE_CEILING: usize = 32 * 1024 * 1024;
+/// Absolute ASN.1 nesting bound; operational budgets may only tighten it.
+#[cfg(feature = "xmldsig")]
+pub(crate) const ASN1_DEPTH_CEILING: u32 = 64;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const KEY_IMPORT_KDF_WORK_CEILING: u64 = 10_000_000;
 /// Maximum workspace reserved by one imported password key derivation.
