@@ -23,6 +23,82 @@ use xml_sec::xmldsig::{
 const VERIFICATION_TIME: u64 = 1_773_964_800; // 2026-03-20T00:00:00Z
 
 #[test]
+fn direct_path_validation_preflights_every_evidence_source() {
+    // Oversized borrowed DER must fail admission even if the path is empty or
+    // CRL checking is disabled; malformed DER must never hide that refusal.
+    for source in 0..3 {
+        let mut info = X509DataInfo::default();
+        let mut anchors = Vec::new();
+        match source {
+            0 => info.certificates.push(vec![0; 2]),
+            1 => info.crls.push(vec![0; 2]),
+            _ => anchors.push(vec![0; 2]),
+        }
+        let resources = xml_sec::policy::ResourcePolicy {
+            max_external_resource_bytes: 1,
+            ..Default::default()
+        };
+        let result = xml_sec::xmldsig::verify_x509_certificate_chain_with_resources(
+            &info,
+            &options(&anchors, false),
+            &resources,
+            xml_sec::provider::default_provider(),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(X509ChainError::Policy(
+                    xml_sec::policy::PolicyViolation::ResourceLimitExceeded {
+                        resource: "external resource bytes",
+                        maximum: 1
+                    }
+                ))
+            ),
+            "source {source}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn direct_path_validation_counts_combined_evidence_bytes() {
+    // Certificate, CRL and anchor inputs share one total, not three independent
+    // allowances. Exact admission still proceeds to the ordinary path error.
+    let mut info = X509DataInfo::default();
+    info.certificates.push(vec![0]);
+    info.crls.push(vec![0]);
+    let anchors = [vec![0]];
+    for maximum in [2, 3] {
+        let resources = xml_sec::policy::ResourcePolicy {
+            max_external_resource_bytes: 1,
+            max_external_resource_total_bytes: maximum,
+            ..Default::default()
+        };
+        let result = xml_sec::xmldsig::verify_x509_certificate_chain_with_resources(
+            &info,
+            &options(&anchors, false),
+            &resources,
+            xml_sec::provider::default_provider(),
+        );
+        if maximum == 2 {
+            assert!(
+                matches!(
+                    result,
+                    Err(X509ChainError::Policy(
+                        xml_sec::policy::PolicyViolation::ResourceLimitExceeded {
+                            resource: "aggregate external resource bytes",
+                            maximum: 2
+                        }
+                    ))
+                ),
+                "{result:?}"
+            );
+        } else {
+            assert_eq!(result, Err(X509ChainError::UntrustedRoot));
+        }
+    }
+}
+
+#[test]
 fn direct_path_validation_uses_explicit_policy_limits() {
     // The direct API must not restore default work/workspace allowances.
     let info = parsed_chain("rsa/rsa-2048-cert.pem", None);

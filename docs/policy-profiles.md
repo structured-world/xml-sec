@@ -37,6 +37,11 @@ let verifier = VerifyContext::new().provider(provider).policy(verification);
 Compilation checks provider capabilities and contradictions before XML work.
 The compiler borrows the engine supplied to `new` for its entire lifecycle;
 compile context cannot silently substitute another engine.
+Content and key-wrap permissions are filtered by the operation's direction:
+decryption uses `Decrypt`/`KeyUnwrap`, never outbound capability sets.
+Compatibility explicitly grants supported inbound CBC, legacy and extended
+methods; it does not turn an absent allowlist into permission or relax outbound
+modern permissions.
 Explicit RSA-OAEP permissions are checked for every allowed digest/MGF tuple.
 Modern signing and verification retain supported secure parameterized RSA-PSS;
 compatibility verification additionally permits supported legacy PSS tuples.
@@ -62,7 +67,11 @@ profile default; see [key management](key-management.md).
 
 Standalone certificate-path validation accepts explicit resource limits through
 `verify_x509_certificate_chain_with_resources`; its convenience counterpart uses
-the documented default allowance. Built-in certificate and `X509Digest` writers
+the documented default allowance. The resource-bound entry point admits every
+supplied certificate, CRL and trust anchor against the per-input and shared total
+byte limits before parsing, including unused evidence; preflight traversal also
+consumes the operation's X.509 work allowance.
+Built-in certificate and `X509Digest` writers
 share the signing operation's certificate account through
 `KeyInfoWriter::write_key_info_in_session`, including multi-signature work.
 For bounded ingestion before signing, use `from_der_chain_in_session` or

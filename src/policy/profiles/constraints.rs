@@ -280,13 +280,7 @@ fn transport_methods(
             }) {
                 continue;
             }
-            for mgf in [
-                OaepDigestAlgorithm::Sha1,
-                OaepDigestAlgorithm::Sha224,
-                OaepDigestAlgorithm::Sha256,
-                OaepDigestAlgorithm::Sha384,
-                OaepDigestAlgorithm::Sha512,
-            ] {
+            for mgf in OAEP_MGF_DIGESTS {
                 if digests.is_some_and(|set| !set.contains(&mgf)) {
                     continue;
                 }

@@ -215,6 +215,50 @@ pub fn verify_x509_certificate_chain_with_resources(
 ) -> Result<(), X509ChainError> {
     resources.validate()?;
     let session = super::pkix::CertificateSession::new(resources);
+    // Borrowed DER still consumes the supplied source-byte allowance. Admit
+    // all evidence, including unused CRLs/anchors, before path storage/parsing.
+    let count = info
+        .certificates
+        .len()
+        .checked_add(info.crls.len())
+        .and_then(|count| count.checked_add(options.trusted_certs.len()))
+        .ok_or(crate::policy::PolicyViolation::ResourceLimitExceeded {
+            resource: crate::policy::resource_name::X509_WORK,
+            maximum: resources.max_x509_work,
+        })?;
+    session
+        .memory()
+        .charge_work(count as u64)
+        .map_err(|reason| {
+            session.error(structured_pkix::Error::resource(
+                reason,
+                "certificate.evidence",
+                0,
+            ))
+        })?;
+    let mut remaining = resources.max_external_resource_total_bytes;
+    for bytes in info
+        .certificates
+        .iter()
+        .chain(&info.crls)
+        .chain(options.trusted_certs)
+    {
+        if bytes.len() > resources.max_external_resource_bytes {
+            return Err(crate::policy::PolicyViolation::ResourceLimitExceeded {
+                resource: crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
+                maximum: resources.max_external_resource_bytes,
+            }
+            .into());
+        }
+        if bytes.len() > remaining {
+            return Err(crate::policy::PolicyViolation::ResourceLimitExceeded {
+                resource: crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                maximum: resources.max_external_resource_total_bytes,
+            }
+            .into());
+        }
+        remaining -= bytes.len();
+    }
     verify_x509_certificate_chain_in_session(info, options, provider, &[], &session).map(|_| ())
 }
 

@@ -11,6 +11,8 @@ use xml_sec::policy::{
     PolicyViolation, SignatureConstraints,
 };
 use xml_sec::provider::RustCryptoProvider;
+#[cfg(feature = "xmlenc")]
+use xml_sec::provider::{CryptoProvider, ProviderCapability};
 use xml_sec::xmldsig::{
     HmacSigningKey, HmacVerificationKey, SignContext, SignatureAlgorithm, VerificationRequest,
     VerifyContext,
@@ -67,117 +69,140 @@ fn profiles_keep_parameterized_pss_permissions() {
 }
 
 #[cfg(feature = "xmlenc")]
+struct ProfileTestProvider {
+    inbound_only: bool,
+}
+
+#[cfg(feature = "xmlenc")]
+impl CryptoProvider for ProfileTestProvider {
+    fn name(&self) -> &'static str {
+        "restricted-test"
+    }
+    fn fill_random(&self, _: &mut [u8]) -> Result<(), xml_sec::provider::ProviderError> {
+        panic!("compile must not execute crypto")
+    }
+    fn digest(
+        &self,
+        _: xml_sec::xmldsig::DigestAlgorithm,
+        _: &[u8],
+    ) -> Result<Vec<u8>, xml_sec::provider::ProviderError> {
+        panic!("compile must not execute crypto")
+    }
+    fn sign(
+        &self,
+        _: &dyn xml_sec::xmldsig::SigningKey,
+        _: SignatureAlgorithm,
+        _: &[u8],
+    ) -> Result<Vec<u8>, xml_sec::xmldsig::SigningKeyError> {
+        panic!("compile must not execute crypto")
+    }
+    fn verify(
+        &self,
+        _: &dyn xml_sec::xmldsig::VerifyingKey,
+        _: SignatureAlgorithm,
+        _: &[u8],
+        _: &[u8],
+    ) -> Result<bool, xml_sec::xmldsig::DsigError> {
+        panic!("compile must not execute crypto")
+    }
+    fn encrypt_data(
+        &self,
+        _: xml_sec::xmlenc::DataEncryptionAlgorithm,
+        _: &[u8],
+        _: &[u8],
+    ) -> Result<Vec<u8>, xml_sec::provider::ProviderError> {
+        panic!("compile must not execute crypto")
+    }
+    fn decrypt_data(
+        &self,
+        algorithm: xml_sec::xmlenc::DataEncryptionAlgorithm,
+        key: &[u8],
+        bytes: &[u8],
+    ) -> Result<Vec<u8>, xml_sec::provider::ProviderError> {
+        assert!(self.inbound_only, "compile must not execute crypto");
+        self.require_capability(ProviderCapability::Decrypt(algorithm))?;
+        RustCryptoProvider.decrypt_data(algorithm, key, bytes)
+    }
+    fn wrap_key(
+        &self,
+        _: xml_sec::xmlenc::KeyWrapAlgorithm,
+        _: &[u8],
+        _: &[u8],
+    ) -> Result<Vec<u8>, xml_sec::provider::ProviderError> {
+        panic!("compile must not execute crypto")
+    }
+    fn unwrap_key(
+        &self,
+        _: xml_sec::xmlenc::KeyWrapAlgorithm,
+        _: &[u8],
+        _: &[u8],
+    ) -> Result<Vec<u8>, xml_sec::provider::ProviderError> {
+        panic!("compile must not execute crypto")
+    }
+    fn transport_key(
+        &self,
+        _: &dyn xml_sec::provider::KeyTransportKey,
+        _: &xml_sec::xmlenc::RsaOaepParameters,
+        _: &[u8],
+    ) -> Result<Vec<u8>, xml_sec::provider::ProviderError> {
+        panic!("compile must not execute crypto")
+    }
+    fn recover_key(
+        &self,
+        _: &dyn xml_sec::provider::KeyRecoveryKey,
+        _: &xml_sec::xmlenc::RsaOaepParameters,
+        _: &[u8],
+    ) -> Result<Vec<u8>, xml_sec::provider::ProviderError> {
+        panic!("compile must not execute crypto")
+    }
+    fn derive_key(
+        &self,
+        _: &xml_sec::provider::KdfParameters<'_>,
+        _: &[u8],
+    ) -> Result<Vec<u8>, xml_sec::provider::ProviderError> {
+        panic!("compile must not execute crypto")
+    }
+    fn supports(&self, capability: ProviderCapability<'_>) -> bool {
+        if self.inbound_only {
+            match capability {
+                ProviderCapability::Encrypt(_)
+                | ProviderCapability::KeyWrap(_)
+                | ProviderCapability::KeyTransport(_) => return false,
+                ProviderCapability::Decrypt(algorithm) => {
+                    return algorithm == xml_sec::xmlenc::DataEncryptionAlgorithm::Aes128Gcm;
+                }
+                ProviderCapability::KeyUnwrap(algorithm) => {
+                    return algorithm == xml_sec::xmlenc::KeyWrapAlgorithm::AesKw128;
+                }
+                _ => return RustCryptoProvider.supports(capability),
+            }
+        }
+        match capability {
+            ProviderCapability::KeyTransport(p) | ProviderCapability::KeyRecovery(p)
+                if p.mgf_digest == xml_sec::xmlenc::OaepDigestAlgorithm::Sha384 =>
+            {
+                false
+            }
+            _ => RustCryptoProvider.supports(capability),
+        }
+    }
+}
+
+#[cfg(feature = "xmlenc")]
 #[test]
 fn compiler_checks_every_permitted_oaep_tuple() {
     // Capabilities can differ by digest/MGF even when content ciphers work.
-    use xml_sec::provider::{CryptoProvider, ProviderCapability};
-    use xml_sec::xmlenc::OaepDigestAlgorithm;
-    struct Restricted;
-    impl CryptoProvider for Restricted {
-        fn name(&self) -> &'static str {
-            "restricted-test"
-        }
-        fn fill_random(&self, _: &mut [u8]) -> Result<(), xml_sec::provider::ProviderError> {
-            panic!("compile must not execute crypto")
-        }
-        fn digest(
-            &self,
-            _: xml_sec::xmldsig::DigestAlgorithm,
-            _: &[u8],
-        ) -> Result<Vec<u8>, xml_sec::provider::ProviderError> {
-            panic!("compile must not execute crypto")
-        }
-        fn sign(
-            &self,
-            _: &dyn xml_sec::xmldsig::SigningKey,
-            _: SignatureAlgorithm,
-            _: &[u8],
-        ) -> Result<Vec<u8>, xml_sec::xmldsig::SigningKeyError> {
-            panic!("compile must not execute crypto")
-        }
-        fn verify(
-            &self,
-            _: &dyn xml_sec::xmldsig::VerifyingKey,
-            _: SignatureAlgorithm,
-            _: &[u8],
-            _: &[u8],
-        ) -> Result<bool, xml_sec::xmldsig::DsigError> {
-            panic!("compile must not execute crypto")
-        }
-        fn encrypt_data(
-            &self,
-            _: xml_sec::xmlenc::DataEncryptionAlgorithm,
-            _: &[u8],
-            _: &[u8],
-        ) -> Result<Vec<u8>, xml_sec::provider::ProviderError> {
-            panic!("compile must not execute crypto")
-        }
-        fn decrypt_data(
-            &self,
-            _: xml_sec::xmlenc::DataEncryptionAlgorithm,
-            _: &[u8],
-            _: &[u8],
-        ) -> Result<Vec<u8>, xml_sec::provider::ProviderError> {
-            panic!("compile must not execute crypto")
-        }
-        fn wrap_key(
-            &self,
-            _: xml_sec::xmlenc::KeyWrapAlgorithm,
-            _: &[u8],
-            _: &[u8],
-        ) -> Result<Vec<u8>, xml_sec::provider::ProviderError> {
-            panic!("compile must not execute crypto")
-        }
-        fn unwrap_key(
-            &self,
-            _: xml_sec::xmlenc::KeyWrapAlgorithm,
-            _: &[u8],
-            _: &[u8],
-        ) -> Result<Vec<u8>, xml_sec::provider::ProviderError> {
-            panic!("compile must not execute crypto")
-        }
-        fn transport_key(
-            &self,
-            _: &dyn xml_sec::provider::KeyTransportKey,
-            _: &xml_sec::xmlenc::RsaOaepParameters,
-            _: &[u8],
-        ) -> Result<Vec<u8>, xml_sec::provider::ProviderError> {
-            panic!("compile must not execute crypto")
-        }
-        fn recover_key(
-            &self,
-            _: &dyn xml_sec::provider::KeyRecoveryKey,
-            _: &xml_sec::xmlenc::RsaOaepParameters,
-            _: &[u8],
-        ) -> Result<Vec<u8>, xml_sec::provider::ProviderError> {
-            panic!("compile must not execute crypto")
-        }
-        fn derive_key(
-            &self,
-            _: &xml_sec::provider::KdfParameters<'_>,
-            _: &[u8],
-        ) -> Result<Vec<u8>, xml_sec::provider::ProviderError> {
-            panic!("compile must not execute crypto")
-        }
-        fn supports(&self, capability: ProviderCapability<'_>) -> bool {
-            match capability {
-                ProviderCapability::KeyTransport(p) | ProviderCapability::KeyRecovery(p)
-                    if p.mgf_digest == OaepDigestAlgorithm::Sha384 =>
-                {
-                    false
-                }
-                _ => RustCryptoProvider.supports(capability),
-            }
-        }
-    }
+    let restricted = ProfileTestProvider {
+        inbound_only: false,
+    };
     // Preset filtering and final capability checks must use the same engine.
     assert!(matches!(
-        PolicyCompiler::new(PolicyProfile::Modern, &Restricted, None)
+        PolicyCompiler::new(PolicyProfile::Modern, &restricted, None)
             .unwrap()
             .compile(&context()),
         Err(PolicyViolation::Configuration { .. })
     ));
-    let initial = PolicyCompiler::new(PolicyProfile::Modern, &Restricted, None).unwrap();
+    let initial = PolicyCompiler::new(PolicyProfile::Modern, &restricted, None).unwrap();
     let mut recovery_only = initial.policies().clone();
     recovery_only.encryption = None;
     assert!(matches!(
@@ -187,6 +212,165 @@ fn compiler_checks_every_permitted_oaep_tuple() {
             .compile(&context()),
         Err(PolicyViolation::Configuration { .. })
     ));
+}
+
+#[cfg(feature = "xmlenc")]
+#[test]
+fn decryption_profile_uses_only_inbound_provider_capabilities() {
+    // Disabling outbound work must leave an inbound-only provider usable,
+    // including the retained cipher/unwrap permissions and public operation.
+    use xml_sec::xmlenc::{
+        DataEncryptionAlgorithm, DecryptContext, EncryptedDataBuilder, KeyWrapAlgorithm,
+        SymmetricKeyDecryptor,
+    };
+    let provider = ProfileTestProvider { inbound_only: true };
+    for profile in [PolicyProfile::Modern, PolicyProfile::XmlSecCompatible] {
+        let initial = PolicyCompiler::new(profile, &provider, None).unwrap();
+        let mut layer = initial.policies().clone();
+        layer.encryption = None;
+        let compiled = initial
+            .restrict(&layer)
+            .unwrap()
+            .compile(&context())
+            .unwrap();
+        let policy = compiled.decryption().unwrap();
+        assert_eq!(
+            policy.data_algorithms.as_ref().unwrap(),
+            &HashSet::from([DataEncryptionAlgorithm::Aes128Gcm])
+        );
+        assert_eq!(
+            policy.key_wrap_algorithms.as_ref().unwrap(),
+            &HashSet::from([KeyWrapAlgorithm::AesKw128])
+        );
+        let key = [0x31; 16];
+        let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .direct_key(key)
+            .encrypt_binary(b"inbound-only")
+            .unwrap();
+        let resolver = SymmetricKeyDecryptor::new(key);
+        let decrypted = DecryptContext::new(&resolver)
+            .provider(&provider)
+            .policy(policy.clone())
+            .decrypt(&encrypted.encrypted_data_xml)
+            .unwrap();
+        assert_eq!(
+            decrypted,
+            xml_sec::xmlenc::DecryptedContent::Bytes(b"inbound-only".to_vec())
+        );
+    }
+}
+
+#[cfg(feature = "xmlenc")]
+#[test]
+fn compatibility_decryption_permissions_are_explicit_and_operation_local() {
+    // A named compatibility profile grants compiled inbound mechanisms, not
+    // implicit defaults, and never relaxes the modern outbound profile.
+    use xml_sec::policy::EncryptionPolicy;
+    use xml_sec::xmlenc::{
+        DataEncryptionAlgorithm as Data, DecryptContext, EncryptedDataBuilder,
+        KeyTransportAlgorithm as Transport, KeyWrapAlgorithm as Wrap, SymmetricKeyDecryptor,
+    };
+    let compiled = compiler(PolicyProfile::XmlSecCompatible)
+        .compile(&context())
+        .unwrap();
+    let inbound = compiled.decryption().unwrap();
+    let outbound = compiled.encryption().unwrap();
+    let ciphers = [
+        Data::Aes128Cbc,
+        Data::Camellia128Cbc,
+        Data::ChaCha20,
+        Data::ChaCha20Poly1305,
+        #[cfg(feature = "legacy-algorithms")]
+        Data::TripleDesCbc,
+        #[cfg(feature = "legacy-algorithms")]
+        Data::Aes192Cbc,
+        #[cfg(feature = "legacy-algorithms")]
+        Data::Aes192Gcm,
+    ];
+    let wraps = [
+        Wrap::CamelliaKw128,
+        Wrap::Cbc(Data::Aes128Cbc),
+        #[cfg(feature = "legacy-algorithms")]
+        Wrap::TripleDes,
+        #[cfg(feature = "legacy-algorithms")]
+        Wrap::AesKw192,
+    ];
+    let transports = [
+        Transport::RsaOaepMgf1p,
+        Transport::RsaOaep11,
+        #[cfg(feature = "legacy-algorithms")]
+        Transport::RsaPkcs1v15,
+    ];
+    for algorithm in ciphers {
+        assert!(
+            inbound
+                .data_algorithms
+                .as_ref()
+                .unwrap()
+                .contains(&algorithm)
+        );
+        if algorithm != Data::ChaCha20Poly1305 {
+            assert!(
+                !outbound
+                    .data_algorithms
+                    .as_ref()
+                    .unwrap()
+                    .contains(&algorithm)
+            );
+        }
+        let key = vec![0x31; algorithm.key_len()];
+        let mut builder = EncryptedDataBuilder::new(algorithm)
+            .direct_key(key.as_slice())
+            .policy(EncryptionPolicy {
+                data_algorithms: Some(HashSet::from([algorithm])),
+                ..Default::default()
+            });
+        if matches!(algorithm, Data::ChaCha20 | Data::ChaCha20Poly1305) {
+            builder = builder.chacha_parameters(xml_sec::xmlenc::ChaChaParameters {
+                counter: if algorithm == Data::ChaCha20 {
+                    Some([0; 4])
+                } else {
+                    None
+                },
+                ..Default::default()
+            });
+        }
+        let encrypted = builder.encrypt_binary(b"compatibility profile").unwrap();
+        let resolver = SymmetricKeyDecryptor::with_kind(key, algorithm.key_kind());
+        let result = DecryptContext::new(&resolver)
+            .policy(inbound.clone())
+            .decrypt(&encrypted.encrypted_data_xml)
+            .unwrap();
+        assert_eq!(
+            result,
+            xml_sec::xmlenc::DecryptedContent::Bytes(b"compatibility profile".to_vec())
+        );
+    }
+    for algorithm in wraps {
+        assert!(
+            inbound
+                .key_wrap_algorithms
+                .as_ref()
+                .unwrap()
+                .contains(&algorithm)
+        );
+        assert!(
+            !outbound
+                .key_wrap_algorithms
+                .as_ref()
+                .unwrap()
+                .contains(&algorithm)
+        );
+    }
+    for algorithm in transports {
+        assert!(
+            inbound
+                .key_transport_algorithms
+                .as_ref()
+                .unwrap()
+                .contains(&algorithm)
+        );
+    }
 }
 
 #[cfg(feature = "xmlenc")]

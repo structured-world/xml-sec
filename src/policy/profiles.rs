@@ -349,6 +349,68 @@ fn profile_policies(
 }
 
 #[cfg(feature = "xmlenc")]
+const MODERN_CONTENT_METHODS: [DataEncryptionAlgorithm; 3] = [
+    DataEncryptionAlgorithm::Aes128Gcm,
+    DataEncryptionAlgorithm::Aes256Gcm,
+    DataEncryptionAlgorithm::ChaCha20Poly1305,
+];
+#[cfg(feature = "xmlenc")]
+const MODERN_WRAP_METHODS: [KeyWrapAlgorithm; 2] =
+    [KeyWrapAlgorithm::AesKw128, KeyWrapAlgorithm::AesKw256];
+#[cfg(feature = "xmlenc")]
+const MODERN_OAEP_DIGESTS: [OaepDigestAlgorithm; 3] = [
+    OaepDigestAlgorithm::Sha256,
+    OaepDigestAlgorithm::Sha384,
+    OaepDigestAlgorithm::Sha512,
+];
+
+#[cfg(feature = "xmlenc")]
+const COMPATIBLE_CONTENT_METHODS: &[DataEncryptionAlgorithm] = &[
+    DataEncryptionAlgorithm::Aes128Cbc,
+    DataEncryptionAlgorithm::Aes256Cbc,
+    DataEncryptionAlgorithm::Aes128Gcm,
+    DataEncryptionAlgorithm::Aes256Gcm,
+    DataEncryptionAlgorithm::Camellia128Cbc,
+    DataEncryptionAlgorithm::Camellia192Cbc,
+    DataEncryptionAlgorithm::Camellia256Cbc,
+    DataEncryptionAlgorithm::ChaCha20,
+    DataEncryptionAlgorithm::ChaCha20Poly1305,
+    #[cfg(feature = "legacy-algorithms")]
+    DataEncryptionAlgorithm::TripleDesCbc,
+    #[cfg(feature = "legacy-algorithms")]
+    DataEncryptionAlgorithm::Aes192Cbc,
+    #[cfg(feature = "legacy-algorithms")]
+    DataEncryptionAlgorithm::Aes192Gcm,
+];
+#[cfg(feature = "xmlenc")]
+const COMPATIBLE_WRAP_METHODS: &[KeyWrapAlgorithm] = &[
+    KeyWrapAlgorithm::AesKw128,
+    KeyWrapAlgorithm::AesKw256,
+    KeyWrapAlgorithm::CamelliaKw128,
+    KeyWrapAlgorithm::CamelliaKw192,
+    KeyWrapAlgorithm::CamelliaKw256,
+    #[cfg(feature = "legacy-algorithms")]
+    KeyWrapAlgorithm::TripleDes,
+    #[cfg(feature = "legacy-algorithms")]
+    KeyWrapAlgorithm::AesKw192,
+];
+#[cfg(feature = "xmlenc")]
+const COMPATIBLE_TRANSPORT_METHODS: &[KeyTransportAlgorithm] = &[
+    KeyTransportAlgorithm::RsaOaepMgf1p,
+    KeyTransportAlgorithm::RsaOaep11,
+    #[cfg(feature = "legacy-algorithms")]
+    KeyTransportAlgorithm::RsaPkcs1v15,
+];
+#[cfg(feature = "xmlenc")]
+const OAEP_MGF_DIGESTS: [OaepDigestAlgorithm; 5] = [
+    OaepDigestAlgorithm::Sha1,
+    OaepDigestAlgorithm::Sha224,
+    OaepDigestAlgorithm::Sha256,
+    OaepDigestAlgorithm::Sha384,
+    OaepDigestAlgorithm::Sha512,
+];
+
+#[cfg(feature = "xmlenc")]
 fn encryption_profile(
     provider: &dyn CryptoProvider,
     validity: Option<PolicyValidity>,
@@ -356,27 +418,19 @@ fn encryption_profile(
     EncryptionPolicy {
         validity,
         data_algorithms: Some(
-            [
-                DataEncryptionAlgorithm::Aes128Gcm,
-                DataEncryptionAlgorithm::Aes256Gcm,
-                DataEncryptionAlgorithm::ChaCha20Poly1305,
-            ]
-            .into_iter()
-            .filter(|a| provider.supports(ProviderCapability::Encrypt(*a)))
-            .collect(),
+            MODERN_CONTENT_METHODS
+                .into_iter()
+                .filter(|a| provider.supports(ProviderCapability::Encrypt(*a)))
+                .collect(),
         ),
         key_transport_algorithms: Some(HashSet::from([KeyTransportAlgorithm::RsaOaep11])),
         key_wrap_algorithms: Some(
-            [KeyWrapAlgorithm::AesKw128, KeyWrapAlgorithm::AesKw256]
+            MODERN_WRAP_METHODS
                 .into_iter()
                 .filter(|a| provider.supports(ProviderCapability::KeyWrap(*a)))
                 .collect(),
         ),
-        oaep_digests: Some(HashSet::from([
-            OaepDigestAlgorithm::Sha256,
-            OaepDigestAlgorithm::Sha384,
-            OaepDigestAlgorithm::Sha512,
-        ])),
+        oaep_digests: Some(HashSet::from(MODERN_OAEP_DIGESTS)),
         ..EncryptionPolicy::default()
     }
 }
@@ -387,20 +441,91 @@ fn decryption_profile(
     compatibility: bool,
     validity: Option<PolicyValidity>,
 ) -> DecryptionPolicy {
-    let outbound = encryption_profile(provider, validity);
-    let mut policy = DecryptionPolicy {
-        validity: outbound.validity,
-        data_algorithms: outbound.data_algorithms,
-        key_transport_algorithms: outbound.key_transport_algorithms,
-        key_wrap_algorithms: outbound.key_wrap_algorithms,
-        oaep_digests: outbound.oaep_digests,
-        ..DecryptionPolicy::default()
+    let content = if compatibility {
+        COMPATIBLE_CONTENT_METHODS
+    } else {
+        &MODERN_CONTENT_METHODS
     };
-    if compatibility {
-        policy.data_algorithms = None;
-        policy.key_transport_algorithms = None;
-        policy.key_wrap_algorithms = None;
-        policy.oaep_digests = None;
+    let wraps = if compatibility {
+        COMPATIBLE_WRAP_METHODS
+    } else {
+        &MODERN_WRAP_METHODS
+    };
+    let cbc_methods = if compatibility {
+        COMPATIBLE_CONTENT_METHODS
+    } else {
+        &[]
+    };
+    let oaep_digests = if compatibility {
+        DigestAlgorithm::ALL
+            .into_iter()
+            .filter(|digest| provider.supports(ProviderCapability::Digest(*digest)))
+            .filter_map(|digest| OaepDigestAlgorithm::from_uri(digest.uri()))
+            .collect()
+    } else {
+        HashSet::from(MODERN_OAEP_DIGESTS)
+    };
+    let transports = if compatibility {
+        COMPATIBLE_TRANSPORT_METHODS
+            .iter()
+            .copied()
+            .filter(|method| recovery_method_available(provider, *method, &oaep_digests))
+            .collect()
+    } else {
+        HashSet::from([KeyTransportAlgorithm::RsaOaep11])
+    };
+    DecryptionPolicy {
+        validity,
+        data_algorithms: Some(
+            content
+                .iter()
+                .copied()
+                .filter(|algorithm| provider.supports(ProviderCapability::Decrypt(*algorithm)))
+                .collect(),
+        ),
+        key_transport_algorithms: Some(transports),
+        key_wrap_algorithms: Some(
+            wraps
+                .iter()
+                .copied()
+                .chain(
+                    cbc_methods
+                        .iter()
+                        .copied()
+                        .filter(|algorithm| algorithm.cbc_block_len().is_some())
+                        .map(KeyWrapAlgorithm::Cbc),
+                )
+                .filter(|algorithm| provider.supports(ProviderCapability::KeyUnwrap(*algorithm)))
+                .collect(),
+        ),
+        oaep_digests: Some(oaep_digests),
+        ..DecryptionPolicy::default()
     }
-    policy
+}
+
+#[cfg(feature = "xmlenc")]
+fn recovery_method_available(
+    provider: &dyn CryptoProvider,
+    method: KeyTransportAlgorithm,
+    digests: &HashSet<OaepDigestAlgorithm>,
+) -> bool {
+    #[cfg(feature = "legacy-algorithms")]
+    if method == KeyTransportAlgorithm::RsaPkcs1v15 {
+        return provider.supports(ProviderCapability::Pkcs1v15Recovery);
+    }
+    // Admission here identifies an available mechanism; compilation still
+    // checks every permitted digest/MGF tuple, never silently dropping a tuple.
+    digests.iter().any(|&digest| {
+        OAEP_MGF_DIGESTS.into_iter().any(|mgf| {
+            digests.contains(&mgf)
+                && provider.supports(ProviderCapability::KeyRecovery(
+                    &crate::xmlenc::RsaOaepParameters {
+                        algorithm: method,
+                        digest,
+                        mgf_digest: mgf,
+                        label: Vec::new(),
+                    },
+                ))
+        })
+    })
 }
