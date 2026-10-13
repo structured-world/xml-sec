@@ -30,6 +30,70 @@ use xml_sec::xmldsig::{
 const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 
 #[test]
+fn certificate_writer_ingestion_obeys_explicit_resource_snapshot() {
+    // Neither constructor may replace an application's admission account.
+    let der = pem::parse(read_fixture("tests/fixtures/keys/rsa/rsa-2048-cert.pem"))
+        .unwrap()
+        .into_contents();
+    let resources = xml_sec::policy::ResourcePolicy {
+        max_x509_work: 1,
+        ..Default::default()
+    };
+    let mut parsing = xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&resources).unwrap();
+    assert!(matches!(
+        X509CertificateKeyInfoWriter::from_der_chain_in_session([&der], &mut parsing),
+        Err(xml_sec::xmldsig::KeyInfoWriteError::Policy(_))
+    ));
+    let mut parsing = xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&resources).unwrap();
+    assert!(matches!(
+        xml_sec::xmldsig::X509DigestKeyInfoWriter::from_der_in_session(
+            &der,
+            DigestAlgorithm::Sha256,
+            &mut parsing
+        ),
+        Err(xml_sec::xmldsig::KeyInfoWriteError::Policy(_))
+    ));
+}
+
+#[test]
+fn certificate_writer_obeys_signing_resource_snapshot() {
+    // Retained metadata must not restore default parsing limits during signing.
+    let key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .unwrap();
+    let writer = X509CertificateKeyInfoWriter::from_pem(&read_fixture(
+        "tests/fixtures/keys/rsa/rsa-2048-cert.pem",
+    ))
+    .unwrap();
+    let digest_writer = xml_sec::xmldsig::X509DigestKeyInfoWriter::from_pem(
+        &read_fixture("tests/fixtures/keys/rsa/rsa-2048-cert.pem"),
+        DigestAlgorithm::Sha256,
+    )
+    .unwrap();
+    for writer in [
+        &writer as &dyn KeyInfoWriter,
+        &digest_writer as &dyn KeyInfoWriter,
+    ] {
+        for memory in [false, true] {
+            let mut policy = SigningPolicy::default();
+            if memory {
+                policy.resources.max_x509_workspace_bytes = 1;
+            } else {
+                policy.resources.max_x509_work = 1;
+            }
+            let result = SignContext::new(&key)
+                .policy(policy)
+                .key_info_writer(writer)
+                .sign_with_builder(
+                    "<root><payload Id=\"payload\">signed</payload></root>",
+                    &namespace_dense_signature_builder(),
+                );
+            assert!(matches!(result, Err(SigningError::Policy(_))), "{result:?}");
+        }
+    }
+}
+
+#[test]
 fn public_xpath_id_uses_request_registration() {
     // A URI and XPath id() must select the same registered, namespace-scoped
     // target; an empty XPath selection must not silently authenticate nothing.

@@ -575,6 +575,19 @@ pub trait KeyInfoWriter {
         let _ = provider;
         self.write_key_info(signing_key)
     }
+
+    /// Write with the operation's retained certificate admission account.
+    /// Certificate-processing writers override this hook; other writers retain
+    /// their provider-aware serialization contract without creating a parser.
+    fn write_key_info_in_session(
+        &self,
+        signing_key: &dyn SigningKey,
+        provider: &dyn crate::provider::CryptoProvider,
+        parsing: &mut super::parse::KeyInfoParsingSession<'_>,
+    ) -> Result<String, KeyInfoWriteError> {
+        let _ = parsing;
+        self.write_key_info_with_provider(signing_key, provider)
+    }
 }
 
 /// Errors while preparing XMLDSig signing `<KeyInfo>` output.
@@ -723,15 +736,29 @@ impl X509CertificateKeyInfoWriter {
         I: IntoIterator<Item = B>,
         B: AsRef<[u8]>,
     {
-        let session =
-            super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
+        let resources = crate::policy::ResourcePolicy::default();
+        let mut parsing = super::parse::KeyInfoParsingSession::new(&resources)
+            .map_err(certificate_parse_write_error)?;
+        Self::from_der_chain_in_session(certificates_der, &mut parsing)
+    }
+
+    /// Validate and retain certificates in the caller's bounded ingestion account.
+    /// Unlike the default standalone constructor, this does not restore defaults.
+    pub fn from_der_chain_in_session<I, B>(
+        certificates_der: I,
+        parsing: &mut super::parse::KeyInfoParsingSession<'_>,
+    ) -> Result<Self, KeyInfoWriteError>
+    where
+        I: IntoIterator<Item = B>,
+        B: AsRef<[u8]>,
+    {
         let certificates_der = certificates_der
             .into_iter()
             .map(|certificate_der| {
                 let certificate_der = certificate_der.as_ref();
-                session
-                    .read(certificate_der)
-                    .map_err(certificate_write_error)?;
+                parsing
+                    .with_certificate_public_key(certificate_der, |_| ())
+                    .map_err(certificate_parse_write_error)?;
                 Ok::<_, KeyInfoWriteError>(certificate_der.to_vec())
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -742,9 +769,9 @@ impl X509CertificateKeyInfoWriter {
     }
 }
 
-fn certificate_write_error(error: super::X509ChainError) -> KeyInfoWriteError {
+fn certificate_parse_write_error(error: super::parse::ParseError) -> KeyInfoWriteError {
     match error {
-        super::X509ChainError::Policy(error) => KeyInfoWriteError::Policy(error),
+        super::parse::ParseError::Policy(error) => KeyInfoWriteError::Policy(error),
         _ => KeyInfoWriteError::InvalidCertificateDer,
     }
 }
@@ -763,20 +790,51 @@ fn parse_certificate_pem(certificate_pem: &str) -> Result<Vec<u8>, KeyInfoWriteE
 
 impl KeyInfoWriter for X509CertificateKeyInfoWriter {
     fn write_key_info(&self, signing_key: &dyn SigningKey) -> Result<String, KeyInfoWriteError> {
-        let leaf_der = &self.certificates_der[0];
-        let session =
-            super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
-        let certificate = session.read(leaf_der).map_err(certificate_write_error)?;
-        let signing_public_key = signing_key.public_key_info()?;
-        if signing_public_key.spki_der() != Some(certificate.tbs().public_key().as_bytes()) {
-            return Err(KeyInfoWriteError::CertificateKeyMismatch);
-        }
+        let resources = crate::policy::ResourcePolicy::default();
+        let mut parsing = super::parse::KeyInfoParsingSession::new(&resources)
+            .map_err(certificate_parse_write_error)?;
+        self.write_key_info_in_session(
+            signing_key,
+            crate::provider::default_provider(),
+            &mut parsing,
+        )
+    }
 
-        let mut xml = format!("<X509Data xmlns=\"{XMLDSIG_NS}\">");
+    fn write_key_info_in_session(
+        &self,
+        signing_key: &dyn SigningKey,
+        _provider: &dyn crate::provider::CryptoProvider,
+        parsing: &mut super::parse::KeyInfoParsingSession<'_>,
+    ) -> Result<String, KeyInfoWriteError> {
+        for (index, der) in self.certificates_der.iter().enumerate() {
+            parsing
+                .with_certificate_public_key(der, |spki| {
+                    if index == 0 && signing_key.public_key_info()?.spki_der() != Some(spki) {
+                        return Err(KeyInfoWriteError::CertificateKeyMismatch);
+                    }
+                    Ok(())
+                })
+                .map_err(certificate_parse_write_error)??;
+        }
+        let start = "<X509Data xmlns=\"http://www.w3.org/2000/09/xmldsig#\">";
+        let mut length = start.len() + "</X509Data>".len();
+        for der in &self.certificates_der {
+            length = length
+                .checked_add(
+                    der.len()
+                        .div_ceil(3)
+                        .checked_mul(4)
+                        .ok_or(KeyInfoWriteError::InvalidCertificateDer)?
+                        + "<X509Certificate></X509Certificate>".len(),
+                )
+                .ok_or(KeyInfoWriteError::InvalidCertificateDer)?;
+        }
+        parsing.resources().validate_xml_document_len(length)?;
+        let mut xml = String::with_capacity(length);
+        xml.push_str(start);
         for certificate_der in &self.certificates_der {
-            let certificate_b64 = base64::engine::general_purpose::STANDARD.encode(certificate_der);
             xml.push_str("<X509Certificate>");
-            xml.push_str(&certificate_b64);
+            base64::engine::general_purpose::STANDARD.encode_string(certificate_der, &mut xml);
             xml.push_str("</X509Certificate>");
         }
         xml.push_str("</X509Data>");
@@ -787,7 +845,6 @@ impl KeyInfoWriter for X509CertificateKeyInfoWriter {
 /// Writes an XMLDSig 1.1 `X509Digest` selector for the signing certificate.
 pub struct X509DigestKeyInfoWriter {
     certificate_der: Vec<u8>,
-    certificate_spki_der: Vec<u8>,
     digest_algorithm: DigestAlgorithm,
 }
 
@@ -797,14 +854,23 @@ impl X509DigestKeyInfoWriter {
         certificate_der: &[u8],
         digest_algorithm: DigestAlgorithm,
     ) -> Result<Self, KeyInfoWriteError> {
-        let session =
-            super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
-        let certificate = session
-            .read(certificate_der)
-            .map_err(certificate_write_error)?;
+        let resources = crate::policy::ResourcePolicy::default();
+        let mut parsing = super::parse::KeyInfoParsingSession::new(&resources)
+            .map_err(certificate_parse_write_error)?;
+        Self::from_der_in_session(certificate_der, digest_algorithm, &mut parsing)
+    }
+
+    /// Validate and retain a certificate in the caller's bounded ingestion account.
+    pub fn from_der_in_session(
+        certificate_der: &[u8],
+        digest_algorithm: DigestAlgorithm,
+        parsing: &mut super::parse::KeyInfoParsingSession<'_>,
+    ) -> Result<Self, KeyInfoWriteError> {
+        parsing
+            .with_certificate_public_key(certificate_der, |_| ())
+            .map_err(certificate_parse_write_error)?;
         Ok(Self {
             certificate_der: certificate_der.to_vec(),
-            certificate_spki_der: certificate.tbs().public_key().as_bytes().to_vec(),
             digest_algorithm,
         })
     }
@@ -828,19 +894,46 @@ impl KeyInfoWriter for X509DigestKeyInfoWriter {
         signing_key: &dyn SigningKey,
         provider: &dyn crate::provider::CryptoProvider,
     ) -> Result<String, KeyInfoWriteError> {
-        if signing_key.public_key_info()?.spki_der() != Some(self.certificate_spki_der.as_slice()) {
-            return Err(KeyInfoWriteError::CertificateKeyMismatch);
-        }
+        let resources = crate::policy::ResourcePolicy::default();
+        let mut parsing = super::parse::KeyInfoParsingSession::new(&resources)
+            .map_err(certificate_parse_write_error)?;
+        self.write_key_info_in_session(signing_key, provider, &mut parsing)
+    }
+
+    fn write_key_info_in_session(
+        &self,
+        signing_key: &dyn SigningKey,
+        provider: &dyn crate::provider::CryptoProvider,
+        parsing: &mut super::parse::KeyInfoParsingSession<'_>,
+    ) -> Result<String, KeyInfoWriteError> {
+        parsing
+            .with_certificate_public_key(&self.certificate_der, |spki| {
+                if signing_key.public_key_info()?.spki_der() != Some(spki) {
+                    return Err(KeyInfoWriteError::CertificateKeyMismatch);
+                }
+                Ok(())
+            })
+            .map_err(certificate_parse_write_error)??;
         let digest = super::compute_digest_with_provider(
             provider,
             self.digest_algorithm,
             &self.certificate_der,
         )?;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(digest);
-        Ok(format!(
-            "<ds:X509Data xmlns:ds=\"{XMLDSIG_NS}\"><dsig11:X509Digest xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\" Algorithm=\"{}\">{encoded}</dsig11:X509Digest></ds:X509Data>",
-            self.digest_algorithm.uri()
-        ))
+        let start = "<ds:X509Data xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><dsig11:X509Digest xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\" Algorithm=\"";
+        let end = "</dsig11:X509Digest></ds:X509Data>";
+        let length = start.len()
+            + self.digest_algorithm.uri().len()
+            + "\">".len()
+            + digest.len().div_ceil(3) * 4
+            + end.len();
+        parsing.resources().validate_xml_document_len(length)?;
+        let mut xml = String::with_capacity(length);
+        xml.push_str(start);
+        xml.push_str(self.digest_algorithm.uri());
+        xml.push_str("\">");
+        base64::engine::general_purpose::STANDARD.encode_string(digest, &mut xml);
+        xml.push_str(end);
+        Ok(xml)
     }
 }
 
@@ -2169,10 +2262,24 @@ impl<'a> SignContext<'a> {
             let Some(writer) = self.key_info_writer else {
                 return Ok::<_, SigningError>((None, None));
             };
-            let key_info_content = writer.write_key_info_with_provider(
-                self.signing_key.expect("ordinary signing request"),
-                self.provider,
-            )?;
+            let certificates = budgets.certificates.get_or_insert_with(|| {
+                super::pkix::CertificateSession::new(&self.policy.resources)
+            });
+            let mut parsing = super::parse::KeyInfoParsingSession::with_certificate_account(
+                &self.policy.resources,
+                certificates,
+            )
+            .map_err(SigningError::from)?;
+            let key_info_content = writer
+                .write_key_info_in_session(
+                    self.signing_key.expect("ordinary signing request"),
+                    self.provider,
+                    &mut parsing,
+                )
+                .map_err(|error| match error {
+                    KeyInfoWriteError::Policy(error) => SigningError::Policy(error),
+                    error => SigningError::KeyInfo(error),
+                })?;
             // Writer output is a separate untrusted XML input. Bound it before
             // namespace wrapping or parsing, then bound the merged document below.
             self.policy
@@ -2596,6 +2703,7 @@ struct SigningReference {
 }
 
 struct SigningOperationBudgets {
+    certificates: Option<super::pkix::CertificateSession>,
     key_establishment: crate::key_establishment::KeyEstablishmentUsage,
     transforms: TransformExecutionBudget,
     xpath_parse: XPathSignatureParseBudget,
@@ -2617,6 +2725,7 @@ struct SigningPlanNodes {
 impl SigningOperationBudgets {
     fn from_resources(resources: &crate::policy::ResourcePolicy) -> Self {
         Self {
+            certificates: None,
             key_establishment: Default::default(),
             transforms: TransformExecutionBudget::from_resources(resources),
             xpath_parse: XPathSignatureParseBudget::from_resources(resources),
@@ -2628,6 +2737,7 @@ impl SigningOperationBudgets {
         backend: crate::XmlBackend,
     ) -> Self {
         Self {
+            certificates: None,
             key_establishment: Default::default(),
             transforms: TransformExecutionBudget::from_resources(resources)
                 .with_xml_backend(backend),

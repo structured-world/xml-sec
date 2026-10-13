@@ -4,18 +4,19 @@ use crate::xml::dom::Node;
 impl PolicySet {
     pub(super) fn validate(
         &self,
-        context: &PolicyCompileContext<'_>,
+        context: &PolicyCompileContext,
+        provider: &dyn CryptoProvider,
     ) -> Result<(), PolicyViolation> {
         if let Some(policy) = &self.verification {
             policy.validate()?;
             signature_methods(
                 policy.signature_algorithms.as_ref(),
                 policy.hmac,
-                context.provider,
+                provider,
                 false,
                 |algorithm| policy.check_signature_algorithm(algorithm),
             )?;
-            digest_methods(policy.digest_algorithms.as_ref(), context.provider)?;
+            digest_methods(policy.digest_algorithms.as_ref(), provider)?;
             uri_contract(policy.uris, context)?;
             if policy.signature_constraints != SignatureConstraints::General
                 && !context.target_evidence
@@ -30,11 +31,11 @@ impl PolicySet {
             signature_methods(
                 policy.signature_algorithms.as_ref(),
                 policy.hmac,
-                context.provider,
+                provider,
                 true,
                 |algorithm| policy.check_signature_algorithm(algorithm),
             )?;
-            digest_methods(policy.digest_algorithms.as_ref(), context.provider)?;
+            digest_methods(policy.digest_algorithms.as_ref(), provider)?;
             uri_contract(policy.uris, context)?;
         }
         #[cfg(feature = "xmlenc")]
@@ -44,13 +45,13 @@ impl PolicySet {
                 cipher_methods(
                     policy.data_algorithms.as_ref(),
                     policy.key_wrap_algorithms.as_ref(),
-                    context.provider,
+                    provider,
                     true,
                 )?;
                 transport_methods(
                     policy.key_transport_algorithms.as_ref(),
                     policy.oaep_digests.as_ref(),
-                    context.provider,
+                    provider,
                     true,
                 )?;
             }
@@ -59,13 +60,13 @@ impl PolicySet {
                 cipher_methods(
                     policy.data_algorithms.as_ref(),
                     policy.key_wrap_algorithms.as_ref(),
-                    context.provider,
+                    provider,
                     false,
                 )?;
                 transport_methods(
                     policy.key_transport_algorithms.as_ref(),
                     policy.oaep_digests.as_ref(),
-                    context.provider,
+                    provider,
                     false,
                 )?;
                 uri_contract(policy.uris, context)?;
@@ -137,10 +138,7 @@ fn digest_methods(
     Ok(())
 }
 
-fn uri_contract(
-    uris: UriPolicy,
-    context: &PolicyCompileContext<'_>,
-) -> Result<(), PolicyViolation> {
+fn uri_contract(uris: UriPolicy, context: &PolicyCompileContext) -> Result<(), PolicyViolation> {
     if !context.external_resources
         && [
             uris.references,

@@ -1371,6 +1371,27 @@ impl KeyInfoParseUsage {
 }
 
 impl<'a> KeyInfoParsingSession<'a> {
+    pub(crate) fn resources(&self) -> &crate::policy::ResourcePolicy {
+        self.resources
+    }
+    pub(crate) fn with_certificate_account(
+        resources: &'a crate::policy::ResourcePolicy,
+        certificates: &super::pkix::CertificateSession,
+    ) -> Result<Self, ParseError> {
+        certificates.require_resources(resources)?;
+        Ok(Self {
+            resources,
+            xml_base: XmlBaseResolutionBudget::with_limits(
+                resources.effective_xml_base_components(),
+                resources.effective_xml_base_resolution_bytes(),
+            ),
+            usage: KeyInfoParseUsage {
+                embedded_candidates: 0,
+                x509_binary_bytes: 0,
+                certificates: certificates.share(),
+            },
+        })
+    }
     /// Inspect original certificate SPKI without constructing display metadata
     /// or starting another certificate budget. Parsing does not establish trust.
     /// The callback owns any further key conversion and its accounting.

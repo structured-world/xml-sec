@@ -16,14 +16,13 @@ use xml_sec::xmldsig::{
     VerifyContext,
 };
 
-fn context() -> PolicyCompileContext<'static> {
+fn context() -> PolicyCompileContext {
     PolicyCompileContext {
-        provider: &RustCryptoProvider,
         external_resources: false,
         target_evidence: true,
     }
 }
-fn compiler(profile: PolicyProfile) -> PolicyCompiler {
+fn compiler(profile: PolicyProfile) -> PolicyCompiler<'static> {
     PolicyCompiler::new(profile, &RustCryptoProvider, None).unwrap()
 }
 fn grant() -> PolicyValidity {
@@ -171,20 +170,21 @@ fn compiler_checks_every_permitted_oaep_tuple() {
             }
         }
     }
-    let mut restricted = context();
-    restricted.provider = &Restricted;
+    // Preset filtering and final capability checks must use the same engine.
     assert!(matches!(
-        compiler(PolicyProfile::Modern).compile(&restricted),
+        PolicyCompiler::new(PolicyProfile::Modern, &Restricted, None)
+            .unwrap()
+            .compile(&context()),
         Err(PolicyViolation::Configuration { .. })
     ));
-    let initial = compiler(PolicyProfile::Modern);
+    let initial = PolicyCompiler::new(PolicyProfile::Modern, &Restricted, None).unwrap();
     let mut recovery_only = initial.policies().clone();
     recovery_only.encryption = None;
     assert!(matches!(
         initial
             .restrict(&recovery_only)
             .unwrap()
-            .compile(&restricted),
+            .compile(&context()),
         Err(PolicyViolation::Configuration { .. })
     ));
 }

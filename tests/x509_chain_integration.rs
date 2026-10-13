@@ -22,6 +22,31 @@ use xml_sec::xmldsig::{
 
 const VERIFICATION_TIME: u64 = 1_773_964_800; // 2026-03-20T00:00:00Z
 
+#[test]
+fn direct_path_validation_uses_explicit_policy_limits() {
+    // The direct API must not restore default work/workspace allowances.
+    let info = parsed_chain("rsa/rsa-2048-cert.pem", None);
+    let anchors = [info.certificates.last().unwrap().clone()];
+    for memory in [false, true] {
+        let mut policy = xml_sec::policy::VerificationPolicy::default();
+        if memory {
+            policy.resources.max_x509_workspace_bytes = 1;
+        } else {
+            policy.resources.max_x509_work = 1;
+        }
+        let result = xml_sec::xmldsig::verify_x509_certificate_chain_with_resources(
+            &info,
+            &options(&anchors, false),
+            &policy.resources,
+            xml_sec::provider::default_provider(),
+        );
+        assert!(
+            matches!(result, Err(X509ChainError::Policy(_))),
+            "{result:?}"
+        );
+    }
+}
+
 fn pem_der(path: impl AsRef<Path>) -> Vec<u8> {
     let pem = fs::read_to_string(path).expect("fixture PEM should be readable");
     let mut inside_pem = false;

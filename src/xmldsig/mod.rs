@@ -120,4 +120,7 @@ pub use verify::{
     materialize_signing_key_info_references, materialize_verification_key_info_references,
     process_all_references, process_reference, verify_signature_with_pem_key,
 };
-pub use x509::{X509ChainError, X509ChainOptions, verify_x509_certificate_chain};
+pub use x509::{
+    X509ChainError, X509ChainOptions, verify_x509_certificate_chain,
+    verify_x509_certificate_chain_with_resources,
+};

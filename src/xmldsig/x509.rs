@@ -195,12 +195,27 @@ impl X509ChainError {
     }
 }
 
-/// Verify the ordered certificate path parsed from one `<X509Data>` element.
+/// Verify a path with the default standalone resource allowance.
+/// Use [`verify_x509_certificate_chain_with_resources`] with the operation's resource snapshot.
 pub fn verify_x509_certificate_chain(
     info: &X509DataInfo,
     options: &X509ChainOptions<'_>,
 ) -> Result<(), X509ChainError> {
     verify_x509_certificate_chain_with_provider(info, options, crate::provider::default_provider())
+}
+
+/// Validate supplied evidence under explicit borrowed resource limits.
+/// XML operations pass their immutable policy's `resources` snapshot; other
+/// path constraints, trust anchors, time and UTC history come from `options`.
+pub fn verify_x509_certificate_chain_with_resources(
+    info: &X509DataInfo,
+    options: &X509ChainOptions<'_>,
+    resources: &crate::policy::ResourcePolicy,
+    provider: &dyn crate::provider::CryptoProvider,
+) -> Result<(), X509ChainError> {
+    resources.validate()?;
+    let session = super::pkix::CertificateSession::new(resources);
+    verify_x509_certificate_chain_in_session(info, options, provider, &[], &session).map(|_| ())
 }
 
 pub(crate) fn verify_x509_certificate_chain_with_provider(

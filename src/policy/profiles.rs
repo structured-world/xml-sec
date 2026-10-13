@@ -93,9 +93,7 @@ pub struct PolicySet {
 /// Caller-owned capabilities promised to operations using the compiled policy.
 /// This is a contract, not permission to discover resources. Actual resource
 /// maps and target identities must still be supplied to each operation.
-pub struct PolicyCompileContext<'a> {
-    /// Exactly one selected engine; compilation never selects a fallback.
-    pub provider: &'a dyn CryptoProvider,
+pub struct PolicyCompileContext {
     /// Caller guarantees an explicit external-resource map on applicable calls.
     pub external_resources: bool,
     /// Caller uses `verify_request` with nonempty expected target identities.
@@ -137,17 +135,18 @@ impl CompiledPolicies {
 
 /// Compose layers in system → application → tenant order. Every ordinary layer
 /// intersects the previous snapshot; only `authorize_replacement` can relax it.
-pub struct PolicyCompiler {
+pub struct PolicyCompiler<'a> {
+    provider: &'a dyn CryptoProvider,
     profile: PolicyProfile,
     policies: PolicySet,
 }
 
-impl PolicyCompiler {
+impl<'a> PolicyCompiler<'a> {
     /// Construct a named profile using this engine's advertised capabilities.
     /// LegacyVerify requires a valid authorization even before compilation.
     pub fn new(
         profile: PolicyProfile,
-        provider: &dyn CryptoProvider,
+        provider: &'a dyn CryptoProvider,
         authorization: Option<PolicyValidity>,
     ) -> Result<Self, PolicyViolation> {
         if profile == PolicyProfile::LegacyVerify && authorization.is_none() {
@@ -159,7 +158,11 @@ impl PolicyCompiler {
             validity.validate_at(SystemTime::now())?;
         }
         let policies = profile_policies(profile, provider, authorization);
-        Ok(Self { profile, policies })
+        Ok(Self {
+            provider,
+            profile,
+            policies,
+        })
     }
 
     /// Intersect another complete layer without granting any new permission.
@@ -186,9 +189,9 @@ impl PolicyCompiler {
     /// Compile contradictions before parsing, resolver calls or cryptography.
     pub fn compile(
         self,
-        context: &PolicyCompileContext<'_>,
+        context: &PolicyCompileContext,
     ) -> Result<CompiledPolicies, PolicyViolation> {
-        self.policies.validate(context)?;
+        self.policies.validate(context, self.provider)?;
         Ok(CompiledPolicies {
             profile: self.profile,
             policies: self.policies,

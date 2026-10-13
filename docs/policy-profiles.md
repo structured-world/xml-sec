@@ -27,7 +27,6 @@ use xml_sec::xmldsig::VerifyContext;
 let provider = default_provider();
 let policies = PolicyCompiler::new(PolicyProfile::Modern, provider, None)?
     .compile(&PolicyCompileContext {
-        provider,
         external_resources: false,
         target_evidence: false,
     })?;
@@ -36,6 +35,8 @@ let verifier = VerifyContext::new().provider(provider).policy(verification);
 ```
 
 Compilation checks provider capabilities and contradictions before XML work.
+The compiler borrows the engine supplied to `new` for its entire lifecycle;
+compile context cannot silently substitute another engine.
 Explicit RSA-OAEP permissions are checked for every allowed digest/MGF tuple.
 Modern signing and verification retain supported secure parameterized RSA-PSS;
 compatibility verification additionally permits supported legacy PSS tuples.
@@ -58,3 +59,11 @@ is performed.
 Certificate and CRL processing uses the same immutable resource/trust policy
 and selected provider. Caller-supplied UTC facts are request evidence, not a
 profile default; see [key management](key-management.md).
+
+Standalone certificate-path validation accepts explicit resource limits through
+`verify_x509_certificate_chain_with_resources`; its convenience counterpart uses
+the documented default allowance. Built-in certificate and `X509Digest` writers
+share the signing operation's certificate account through
+`KeyInfoWriter::write_key_info_in_session`, including multi-signature work.
+For bounded ingestion before signing, use `from_der_chain_in_session` or
+`X509DigestKeyInfoWriter::from_der_in_session` with a caller-owned parsing session.

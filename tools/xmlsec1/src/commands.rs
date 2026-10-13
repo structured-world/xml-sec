@@ -1067,7 +1067,7 @@ fn select_store_signing_key<'a>(
     let mut last_error = None;
     let mut lookup_budget = key_manager::SigningLookupBudget::default();
     let mut parsing = xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&policy.resources)
-        .map_err(certificate_command_error)?;
+        .map_err(certificate_signing_error)?;
     for name in candidates {
         let attempt = store
             .signing_key_with_provider_and_budget(
@@ -1144,7 +1144,7 @@ fn select_signing_key(
     let lax_key_search = invocation.flag("lax-key-search");
     let mut last_error: Option<CommandError> = None;
     let mut parsing = xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&policy.resources)
-        .map_err(certificate_command_error)?;
+        .map_err(certificate_signing_error)?;
     for (option, ()) in candidates {
         let attempt = prepare_signing_key_candidate(
             option,
@@ -1393,7 +1393,8 @@ fn validate_signing_key_info(
                     })?;
                     certificate_public_key(certificate, parsing, |spki| {
                         Some(spki) == public.spki_der()
-                    })?
+                    })
+                    .map_err(certificate_signing_error)?
                 } else {
                     let certificate =
                         selected.leaf_certificate_der.as_deref().ok_or_else(|| {
@@ -1403,7 +1404,7 @@ fn validate_signing_key_info(
                         })?;
                     parsing
                         .certificate_matches_selectors(data, certificate, provider)
-                        .map_err(certificate_command_error)?
+                        .map_err(certificate_signing_error)?
                 }
             }
             _ => {
@@ -3462,7 +3463,8 @@ fn validate_recipient_key_metadata(
                                     "X509Certificate does not contain an RSA key",
                                 )
                             })
-                        })??;
+                        })
+                        .map_err(certificate_command_error)??;
                         rsa_public_keys_match(&selected_key.public_key, &public_key)
                     } else {
                         let certificate =
@@ -5596,7 +5598,9 @@ fn ensure_leaf_certificate_matches_spki(
     // RFC 5280 §4.1.2.7: SPKI includes AlgorithmIdentifier and its parameters,
     // not just key bits. The companion must match this complete key identity.
     // https://www.rfc-editor.org/rfc/rfc5280#section-4.1.2.7
-    if !certificate_public_key(certificate_der, parsing, |spki| spki == public_spki)? {
+    if !certificate_public_key(certificate_der, parsing, |spki| spki == public_spki)
+        .map_err(certificate_command_error)?
+    {
         return Err(CommandError::Encryption(
             "X.509 certificate public key does not match private key".into(),
         ));
@@ -5608,16 +5612,25 @@ fn certificate_public_key<R>(
     certificate: &[u8],
     parsing: &mut xml_sec::xmldsig::parse::KeyInfoParsingSession<'_>,
     inspect: impl FnOnce(&[u8]) -> R,
-) -> Result<R, CommandError> {
-    parsing
-        .with_certificate_public_key(certificate, inspect)
-        .map_err(certificate_command_error)
+) -> Result<R, xml_sec::xmldsig::ParseError> {
+    parsing.with_certificate_public_key(certificate, inspect)
 }
 
 fn certificate_command_error(error: xml_sec::xmldsig::ParseError) -> CommandError {
+    certificate_operation_error(error, CommandError::Encryption)
+}
+
+fn certificate_signing_error(error: xml_sec::xmldsig::ParseError) -> CommandError {
+    certificate_operation_error(error, CommandError::Signature)
+}
+
+fn certificate_operation_error(
+    error: xml_sec::xmldsig::ParseError,
+    diagnostic: fn(String) -> CommandError,
+) -> CommandError {
     match error {
         xml_sec::xmldsig::ParseError::Policy(error) => CommandError::Policy(error),
-        error => CommandError::Encryption(error.to_string()),
+        error => diagnostic(error.to_string()),
     }
 }
 
@@ -5914,6 +5927,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn signing_certificate_failure_has_signature_category() {
+        // A malformed embedded certificate is a signing-input failure, not encryption.
+        let key = xml_sec::xmldsig::RsaSigningKey::from_pkcs8_pem(include_str!(
+            "../../../tests/fixtures/keys/rsa/rsa-2048-key.pem"
+        ))
+        .unwrap();
+        let candidate = SigningKeyCandidate {
+            key: Box::new(key),
+            certificate_writer: None,
+            leaf_certificate_der: None,
+        };
+        let mut info = KeyInfo::default();
+        let mut data = xml_sec::xmldsig::X509DataInfo::default();
+        data.certificates.push(vec![0]);
+        info.sources.push(KeyInfoSource::X509Data(data));
+        let resources = ResourcePolicy::default();
+        let mut parsing = xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&resources).unwrap();
+        let error =
+            validate_signing_key_info(Some(&info), &candidate, default_provider(), &mut parsing)
+                .unwrap_err();
+        assert!(matches!(error, CommandError::Signature(_)));
+    }
+
+    #[test]
     fn certificate_work_refusal_is_terminal_for_lax_search() {
         // A certificate account failure must not be downgraded to candidate mismatch.
         let der = pem::parse(include_bytes!(
@@ -5926,45 +5963,51 @@ mod tests {
             ..Default::default()
         };
         let mut parsing = xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&resources).unwrap();
-        let error = certificate_public_key(&der, &mut parsing, |_| ()).unwrap_err();
+        let error = certificate_public_key(&der, &mut parsing, |_| ())
+            .map_err(certificate_command_error)
+            .unwrap_err();
         assert!(matches!(error, CommandError::Policy(_)));
         assert!(!lax_candidate_error_is_recoverable(&error));
     }
 
     #[test]
     fn certificate_candidate_matching_retains_spent_work() {
-        // Find the one-decode ceiling, then prove a second candidate cannot reset it.
+        // Hash-table equality work can vary across independent accounts.
+        // Test one retained account until its exact work resource refuses admission.
         let der = pem::parse(include_bytes!(
             "../../../tests/fixtures/keys/rsa/rsa-2048-cert.pem"
         ))
         .unwrap()
         .into_contents();
-        let mut low = 1;
-        let mut high = ResourcePolicy::default().max_x509_work;
-        while low < high {
-            let middle = low + (high - low) / 2;
-            let resources = ResourcePolicy {
-                max_x509_work: middle,
-                ..Default::default()
-            };
-            let mut parsing =
-                xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&resources).unwrap();
-            if certificate_public_key(&der, &mut parsing, |_| ()).is_ok() {
-                high = middle;
-            } else {
-                low = middle + 1;
-            }
-        }
         let resources = ResourcePolicy {
-            max_x509_work: low,
+            max_x509_work: 50_000,
+            max_key_candidates: 32,
             ..Default::default()
         };
         let mut parsing = xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&resources).unwrap();
-        certificate_public_key(&der, &mut parsing, |_| ()).unwrap();
-        let error = certificate_public_key(&der, &mut parsing, |_| panic!("unadmitted candidate"))
-            .unwrap_err();
-        assert!(matches!(error, CommandError::Policy(_)));
-        assert!(!lax_candidate_error_is_recoverable(&error));
+        let mut successful = 0;
+        for _ in 0..resources.max_key_candidates {
+            match certificate_public_key(&der, &mut parsing, |_| ())
+                .map_err(certificate_command_error)
+            {
+                Ok(()) => successful += 1,
+                Err(error) => {
+                    assert!(successful > 0);
+                    assert!(matches!(
+                        error,
+                        CommandError::Policy(
+                            xml_sec::policy::PolicyViolation::ResourceLimitExceeded {
+                                resource: "X.509 work",
+                                maximum: 50_000
+                            }
+                        )
+                    ));
+                    assert!(!lax_candidate_error_is_recoverable(&error));
+                    return;
+                }
+            }
+        }
+        panic!("certificate work was reset between candidates");
     }
 
     fn invocation(arguments: &[&str]) -> Invocation {
