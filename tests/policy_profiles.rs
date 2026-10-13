@@ -35,6 +35,172 @@ fn grant() -> PolicyValidity {
         expires_at: SystemTime::now() + Duration::from_secs(3600),
     }
 }
+
+#[test]
+fn profiles_keep_parameterized_pss_permissions() {
+    // An explicit preset allowlist must not erase its supported PSS family.
+    use xml_sec::policy::RsaPssPermission;
+    for (profile, permission) in [
+        (PolicyProfile::Modern, RsaPssPermission::SecureSupported),
+        (
+            PolicyProfile::XmlSecCompatible,
+            RsaPssPermission::AllSupported,
+        ),
+    ] {
+        let compiled = compiler(profile).compile(&context()).unwrap();
+        assert_eq!(
+            compiled.verification().unwrap().parameterized_rsa_pss,
+            permission
+        );
+        assert_eq!(
+            compiled
+                .verification()
+                .unwrap()
+                .key_trust
+                .parameterized_rsa_pss,
+            permission
+        );
+        assert_eq!(
+            compiled.signing().unwrap().parameterized_rsa_pss,
+            RsaPssPermission::SecureSupported
+        );
+    }
+}
+
+#[cfg(feature = "xmlenc")]
+#[test]
+fn compiler_checks_every_permitted_oaep_tuple() {
+    // Capabilities can differ by digest/MGF even when content ciphers work.
+    use xml_sec::provider::{CryptoProvider, ProviderCapability};
+    use xml_sec::xmlenc::OaepDigestAlgorithm;
+    struct Restricted;
+    impl CryptoProvider for Restricted {
+        fn name(&self) -> &'static str {
+            "restricted-test"
+        }
+        fn fill_random(&self, _: &mut [u8]) -> Result<(), xml_sec::provider::ProviderError> {
+            panic!("compile must not execute crypto")
+        }
+        fn digest(
+            &self,
+            _: xml_sec::xmldsig::DigestAlgorithm,
+            _: &[u8],
+        ) -> Result<Vec<u8>, xml_sec::provider::ProviderError> {
+            panic!("compile must not execute crypto")
+        }
+        fn sign(
+            &self,
+            _: &dyn xml_sec::xmldsig::SigningKey,
+            _: SignatureAlgorithm,
+            _: &[u8],
+        ) -> Result<Vec<u8>, xml_sec::xmldsig::SigningKeyError> {
+            panic!("compile must not execute crypto")
+        }
+        fn verify(
+            &self,
+            _: &dyn xml_sec::xmldsig::VerifyingKey,
+            _: SignatureAlgorithm,
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<bool, xml_sec::xmldsig::DsigError> {
+            panic!("compile must not execute crypto")
+        }
+        fn encrypt_data(
+            &self,
+            _: xml_sec::xmlenc::DataEncryptionAlgorithm,
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<Vec<u8>, xml_sec::provider::ProviderError> {
+            panic!("compile must not execute crypto")
+        }
+        fn decrypt_data(
+            &self,
+            _: xml_sec::xmlenc::DataEncryptionAlgorithm,
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<Vec<u8>, xml_sec::provider::ProviderError> {
+            panic!("compile must not execute crypto")
+        }
+        fn wrap_key(
+            &self,
+            _: xml_sec::xmlenc::KeyWrapAlgorithm,
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<Vec<u8>, xml_sec::provider::ProviderError> {
+            panic!("compile must not execute crypto")
+        }
+        fn unwrap_key(
+            &self,
+            _: xml_sec::xmlenc::KeyWrapAlgorithm,
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<Vec<u8>, xml_sec::provider::ProviderError> {
+            panic!("compile must not execute crypto")
+        }
+        fn transport_key(
+            &self,
+            _: &dyn xml_sec::provider::KeyTransportKey,
+            _: &xml_sec::xmlenc::RsaOaepParameters,
+            _: &[u8],
+        ) -> Result<Vec<u8>, xml_sec::provider::ProviderError> {
+            panic!("compile must not execute crypto")
+        }
+        fn recover_key(
+            &self,
+            _: &dyn xml_sec::provider::KeyRecoveryKey,
+            _: &xml_sec::xmlenc::RsaOaepParameters,
+            _: &[u8],
+        ) -> Result<Vec<u8>, xml_sec::provider::ProviderError> {
+            panic!("compile must not execute crypto")
+        }
+        fn derive_key(
+            &self,
+            _: &xml_sec::provider::KdfParameters<'_>,
+            _: &[u8],
+        ) -> Result<Vec<u8>, xml_sec::provider::ProviderError> {
+            panic!("compile must not execute crypto")
+        }
+        fn supports(&self, capability: ProviderCapability<'_>) -> bool {
+            match capability {
+                ProviderCapability::KeyTransport(p) | ProviderCapability::KeyRecovery(p)
+                    if p.mgf_digest == OaepDigestAlgorithm::Sha384 =>
+                {
+                    false
+                }
+                _ => RustCryptoProvider.supports(capability),
+            }
+        }
+    }
+    let mut restricted = context();
+    restricted.provider = &Restricted;
+    assert!(matches!(
+        compiler(PolicyProfile::Modern).compile(&restricted),
+        Err(PolicyViolation::Configuration { .. })
+    ));
+    let initial = compiler(PolicyProfile::Modern);
+    let mut recovery_only = initial.policies().clone();
+    recovery_only.encryption = None;
+    assert!(matches!(
+        initial
+            .restrict(&recovery_only)
+            .unwrap()
+            .compile(&restricted),
+        Err(PolicyViolation::Configuration { .. })
+    ));
+}
+
+#[cfg(feature = "xmlenc")]
+#[test]
+fn permitted_oaep_method_requires_a_usable_parameter_tuple() {
+    // An empty digest set cannot silently leave a permitted transport unusable.
+    let initial = compiler(PolicyProfile::Modern);
+    let mut layer = initial.policies().clone();
+    layer.encryption.as_mut().unwrap().oaep_digests = Some(HashSet::new());
+    assert!(matches!(
+        initial.restrict(&layer).unwrap().compile(&context()),
+        Err(PolicyViolation::Configuration { .. })
+    ));
+}
 fn template(namespace: &str, id: &str) -> String {
     format!(
         r##"<Assertion xmlns="{namespace}" ID="{id}"><payload>protected</payload><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"/><ds:Reference URI="#{id}"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></Assertion>"##
@@ -82,6 +248,7 @@ fn layers_intersect_permissions_minima_and_resource_caps() {
         SignatureAlgorithm::HmacSha256,
         SignatureAlgorithm::HmacSha1,
     ]));
+    policy.parameterized_rsa_pss = xml_sec::policy::RsaPssPermission::ExactOnly;
     policy
         .key_trust
         .allowed_legacy_signature_algorithms
@@ -255,12 +422,18 @@ fn saml_profile_signs_and_authenticates_explicit_parent_target() {
     );
     assert!(context.verify_document(&document).is_err());
     let wrong = template("urn:wrong", "assertion");
-    assert!(
-        SignContext::new(&signer)
-            .policy(compiled.signing().unwrap().clone())
-            .sign_template(&wrong)
-            .is_err()
-    );
+    let error = SignContext::new(&signer)
+        .policy(compiled.signing().unwrap().clone())
+        .sign_template(&wrong)
+        .unwrap_err();
+    // Untrusted profile input is not a trusted-policy compilation defect.
+    assert!(matches!(
+        error,
+        xml_sec::xmldsig::SigningError::Policy(PolicyViolation::SignatureProfile {
+            profile: SignatureConstraints::Saml,
+            ..
+        })
+    ));
 }
 
 #[test]

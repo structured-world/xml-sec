@@ -26,7 +26,7 @@ use xml_sec::{
         SignatureAlgorithm, SignatureTemplateSelection, SigningKey, SigningPublicKeyInfo,
         UriTypeSet, VerificationKey, VerifyContext, VerifyResult, VerifyingKey,
         X509CertificateKeyInfoWriter, XPathHereSemantics, parse_key_info,
-        uri::UriReferenceResolver, validate_signing_key, x509_certificate_matches_selectors,
+        uri::UriReferenceResolver, validate_signing_key,
     },
     xmlenc::{
         DataEncryptionAlgorithm, DecryptContext, DecryptedContent, DecryptionKeyResolver,
@@ -1066,6 +1066,8 @@ fn select_store_signing_key<'a>(
 ) -> Result<SigningKeyCandidate, CommandError> {
     let mut last_error = None;
     let mut lookup_budget = key_manager::SigningLookupBudget::default();
+    let mut parsing = xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&policy.resources)
+        .map_err(certificate_command_error)?;
     for name in candidates {
         let attempt = store
             .signing_key_with_provider_and_budget(
@@ -1082,7 +1084,7 @@ fn select_store_signing_key<'a>(
                     certificate_writer: None,
                     leaf_certificate_der: None,
                 };
-                validate_signing_key_info(key_info, &candidate, provider, &policy.resources)?;
+                validate_signing_key_info(key_info, &candidate, provider, &mut parsing)?;
                 Ok(candidate)
             });
         match attempt {
@@ -1141,6 +1143,8 @@ fn select_signing_key(
         .map_err(|error| CommandError::Signature(error.to_string()))?;
     let lax_key_search = invocation.flag("lax-key-search");
     let mut last_error: Option<CommandError> = None;
+    let mut parsing = xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&policy.resources)
+        .map_err(certificate_command_error)?;
     for (option, ()) in candidates {
         let attempt = prepare_signing_key_candidate(
             option,
@@ -1155,7 +1159,7 @@ fn select_signing_key(
                 key_info,
                 &candidate,
                 selected_provider(invocation)?,
-                &policy.resources,
+                &mut parsing,
             )?;
             Ok(candidate)
         });
@@ -1330,7 +1334,7 @@ fn validate_signing_key_info(
     key_info: Option<&KeyInfo>,
     selected: &SigningKeyCandidate,
     provider: &dyn CryptoProvider,
-    resources: &ResourcePolicy,
+    parsing: &mut xml_sec::xmldsig::parse::KeyInfoParsingSession<'_>,
 ) -> Result<(), CommandError> {
     let Some(key_info) = key_info else {
         return Ok(());
@@ -1387,7 +1391,7 @@ fn validate_signing_key_info(
                     let certificate = data.certificates.get(index).ok_or_else(|| {
                         signing_key_info_error("X509Data certificate chain is inconsistent")
                     })?;
-                    certificate_public_key(certificate, resources, |spki| {
+                    certificate_public_key(certificate, parsing, |spki| {
                         Some(spki) == public.spki_der()
                     })?
                 } else {
@@ -1397,8 +1401,9 @@ fn validate_signing_key_info(
                                 "X509Data selectors require a signing certificate companion",
                             )
                         })?;
-                    x509_certificate_matches_selectors(data, certificate, provider)
-                        .map_err(|error| CommandError::Signature(error.to_string()))?
+                    parsing
+                        .certificate_matches_selectors(data, certificate, provider)
+                        .map_err(certificate_command_error)?
                 }
             }
             _ => {
@@ -2124,7 +2129,8 @@ fn lax_candidate_error_is_recoverable(error: &CommandError) -> bool {
     // resource failure or a failed protected-container authentication.
     !matches!(
         error,
-        CommandError::ExternalMaterialTooLarge { .. }
+        CommandError::Policy(_)
+            | CommandError::ExternalMaterialTooLarge { .. }
             | CommandError::KeyStore(key_manager::KeyStoreError::ProtectedContainer)
             | CommandError::KeyStore(key_manager::KeyStoreError::Policy(_))
             | CommandError::Key(key_material::KeyMaterialError::ProtectedContainer)
@@ -2770,6 +2776,9 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         let mut budget =
             ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
         let store = load_xml_key_stores(invocation, &policy, xml_backend, &mut budget)?;
+        let mut recipient_parsing =
+            xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&policy.resources)
+                .map_err(certificate_command_error)?;
         let template_recipients = if metadata.recipients.is_empty() {
             vec![EncryptionTemplateRecipient {
                 key_name: None,
@@ -2789,8 +2798,11 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             &id_attributes,
             &policy,
             template_recipients.len(),
-            xml_backend,
-            selected_provider(invocation)?,
+            CommandBackends {
+                xml: xml_backend,
+                crypto: selected_provider(invocation)?,
+            },
+            &mut recipient_parsing,
         )?;
         let mut store_candidate_budget =
             KeyCandidateBudget::with_limit(policy.resources.max_key_candidates);
@@ -2846,15 +2858,18 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                                 Err(_) => {}
                             }
                         }
-                        reserved = available.loaded.as_ref().is_some_and(|candidate| {
-                            validate_recipient_key_metadata(
+                        if let Some(candidate) = available.loaded.as_ref() {
+                            reserved = match validate_recipient_key_metadata(
                                 metadata.as_ref(),
                                 candidate,
                                 provider,
-                                &policy.resources,
-                            )
-                            .is_ok()
-                        });
+                                &mut recipient_parsing,
+                            ) {
+                                Ok(()) => true,
+                                Err(error) if lax_candidate_error_is_recoverable(&error) => false,
+                                Err(error) => return Err(error),
+                            };
+                        }
                     } else {
                         reserved = true;
                     }
@@ -2936,7 +2951,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                             metadata.as_ref(),
                             &candidate,
                             selected_provider(invocation)?,
-                            &policy.resources,
+                            &mut recipient_parsing,
                         )?;
                     }
                     Ok(candidate)
@@ -2946,7 +2961,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                         selected = Some((entry, candidate));
                         break;
                     }
-                    Err(error @ CommandError::KeyStore(key_manager::KeyStoreError::Policy(_))) => {
+                    Err(error) if !lax_candidate_error_is_recoverable(&error) => {
                         return Err(error);
                     }
                     Err(error) => last_error = Some(error),
@@ -2971,6 +2986,9 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             builder = builder.add_recipient(configured);
         }
     } else if !public_keys.is_empty() {
+        let mut recipient_parsing =
+            xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&policy.resources)
+                .map_err(certificate_command_error)?;
         let template_recipients = if metadata.recipients.is_empty() {
             vec![EncryptionTemplateRecipient {
                 key_name: None,
@@ -2998,8 +3016,11 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             &id_attributes,
             &policy,
             template_recipients.len(),
-            xml_backend,
-            selected_provider(invocation)?,
+            CommandBackends {
+                xml: xml_backend,
+                crypto: selected_provider(invocation)?,
+            },
+            &mut recipient_parsing,
         )?;
         for (template_recipient, metadata) in
             template_recipients.into_iter().zip(recipient_metadata)
@@ -3031,7 +3052,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                         metadata.as_ref(),
                         &key,
                         selected_provider(invocation)?,
-                        &policy.resources,
+                        &mut recipient_parsing,
                     )?;
                     Ok(key)
                 }) {
@@ -3039,7 +3060,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                         selected = Some((option, certificate, key.public_key));
                         break;
                     }
-                    Err(error @ CommandError::ExternalMaterialTooLarge { .. }) => {
+                    Err(error) if !lax_candidate_error_is_recoverable(&error) => {
                         return Err(error);
                     }
                     Err(error) => last_error = Some(error),
@@ -3361,11 +3382,11 @@ fn recipient_key_metadata(
     id_attributes: &[IdAttributeRegistration],
     policy: &EncryptionPolicy,
     expected_recipients: usize,
-    xml_backend: XmlBackend,
-    provider: &dyn CryptoProvider,
+    backends: CommandBackends<'_>,
+    parsing: &mut xml_sec::xmldsig::parse::KeyInfoParsingSession<'_>,
 ) -> Result<Vec<Option<ParsedRecipientKeyMetadata>>, CommandError> {
     let document =
-        parse_encryption_document(template, &policy.xml, &policy.resources, xml_backend)?;
+        parse_encryption_document(template, &policy.xml, &policy.resources, backends.xml)?;
     let encrypted_data = select_encrypted_data(&document, start_node_id, id_attributes)?;
     let encrypted_keys = direct_child_element(encrypted_data, XMLDSIG_NS, "KeyInfo")
         .into_iter()
@@ -3381,19 +3402,17 @@ fn recipient_key_metadata(
         ));
     }
 
-    let mut parsing = xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&policy.resources)
-        .map_err(|error| CommandError::Encryption(error.to_string()))?;
     encrypted_keys
         .into_iter()
         .map(|encrypted_key| {
             direct_child_element(encrypted_key, XMLDSIG_NS, "KeyInfo")
                 .map(|node| {
                     parsing
-                        .parse_with_provider(node, provider)
+                        .parse_with_provider(node, backends.crypto)
                         .map(ParsedRecipientKeyMetadata)
                 })
                 .transpose()
-                .map_err(|error| CommandError::Encryption(error.to_string()))
+                .map_err(certificate_command_error)
         })
         .collect()
 }
@@ -3402,7 +3421,7 @@ fn validate_recipient_key_metadata(
     metadata: Option<&ParsedRecipientKeyMetadata>,
     selected_key: &RecipientPublicKeyCandidate,
     provider: &dyn CryptoProvider,
-    resources: &ResourcePolicy,
+    parsing: &mut xml_sec::xmldsig::parse::KeyInfoParsingSession<'_>,
 ) -> Result<(), CommandError> {
     if let Some(metadata) = metadata {
         for source in &metadata.0.sources {
@@ -3437,7 +3456,7 @@ fn validate_recipient_key_metadata(
                                     "X509Data certificate chain is inconsistent",
                                 )
                             })?;
-                        let public_key = certificate_public_key(certificate, resources, |spki| {
+                        let public_key = certificate_public_key(certificate, parsing, |spki| {
                             RsaPublicKey::from_public_key_der(spki).map_err(|_| {
                                 recipient_metadata_error(
                                     "X509Certificate does not contain an RSA key",
@@ -3452,8 +3471,9 @@ fn validate_recipient_key_metadata(
                                     "X509Data selectors require a selected RSA certificate",
                                 )
                             })?;
-                        x509_certificate_matches_selectors(data, certificate, provider)
-                            .map_err(|error| CommandError::Encryption(error.to_string()))?
+                        parsing
+                            .certificate_matches_selectors(data, certificate, provider)
+                            .map_err(certificate_command_error)?
                     }
                 }
                 KeyInfoSource::DerEncodedKeyValue(der) => {
@@ -4388,6 +4408,9 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         let mut last_load_error = None;
         let mut certificate_budget =
             ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
+        let mut certificate_parsing =
+            xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&policy.resources)
+                .map_err(certificate_command_error)?;
         for option in selected {
             let loaded = certificate_budget.with_key_import(
                 &policy.resources,
@@ -4471,7 +4494,7 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                             ensure_leaf_certificate_matches_spki(
                                 &certificates[0],
                                 spki,
-                                resources,
+                                &mut certificate_parsing,
                             )?;
                         }
                         return Ok(RecipientPrivateKey {
@@ -4505,7 +4528,7 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                         ensure_leaf_certificate_matches_rsa_key(
                             &certificates[0],
                             &private_key,
-                            resources,
+                            &mut certificate_parsing,
                         )?;
                     }
                     Ok::<_, CommandError>(RecipientPrivateKey {
@@ -5557,23 +5580,23 @@ fn encryption_template(
 fn ensure_leaf_certificate_matches_rsa_key(
     certificate_der: &[u8],
     private_key: &rsa::RsaPrivateKey,
-    resources: &ResourcePolicy,
+    parsing: &mut xml_sec::xmldsig::parse::KeyInfoParsingSession<'_>,
 ) -> Result<(), CommandError> {
     let public_key = RsaPublicKey::from(private_key)
         .to_public_key_der()
         .map_err(|error| CommandError::Encryption(error.to_string()))?;
-    ensure_leaf_certificate_matches_spki(certificate_der, public_key.as_bytes(), resources)
+    ensure_leaf_certificate_matches_spki(certificate_der, public_key.as_bytes(), parsing)
 }
 
 fn ensure_leaf_certificate_matches_spki(
     certificate_der: &[u8],
     public_spki: &[u8],
-    resources: &ResourcePolicy,
+    parsing: &mut xml_sec::xmldsig::parse::KeyInfoParsingSession<'_>,
 ) -> Result<(), CommandError> {
     // RFC 5280 §4.1.2.7: SPKI includes AlgorithmIdentifier and its parameters,
     // not just key bits. The companion must match this complete key identity.
     // https://www.rfc-editor.org/rfc/rfc5280#section-4.1.2.7
-    if !certificate_public_key(certificate_der, resources, |spki| spki == public_spki)? {
+    if !certificate_public_key(certificate_der, parsing, |spki| spki == public_spki)? {
         return Err(CommandError::Encryption(
             "X.509 certificate public key does not match private key".into(),
         ));
@@ -5583,12 +5606,19 @@ fn ensure_leaf_certificate_matches_spki(
 
 fn certificate_public_key<R>(
     certificate: &[u8],
-    resources: &ResourcePolicy,
+    parsing: &mut xml_sec::xmldsig::parse::KeyInfoParsingSession<'_>,
     inspect: impl FnOnce(&[u8]) -> R,
 ) -> Result<R, CommandError> {
-    xml_sec::xmldsig::parse::KeyInfoParsingSession::new(resources)
-        .and_then(|mut session| session.with_certificate_public_key(certificate, inspect))
-        .map_err(|error| CommandError::Encryption(error.to_string()))
+    parsing
+        .with_certificate_public_key(certificate, inspect)
+        .map_err(certificate_command_error)
+}
+
+fn certificate_command_error(error: xml_sec::xmldsig::ParseError) -> CommandError {
+    match error {
+        xml_sec::xmldsig::ParseError::Policy(error) => CommandError::Policy(error),
+        error => CommandError::Encryption(error.to_string()),
+    }
 }
 
 fn encrypted_data_key_name(encrypted_data: Node<'_, '_>) -> Result<Option<String>, CommandError> {
@@ -5883,6 +5913,60 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn certificate_work_refusal_is_terminal_for_lax_search() {
+        // A certificate account failure must not be downgraded to candidate mismatch.
+        let der = pem::parse(include_bytes!(
+            "../../../tests/fixtures/keys/rsa/rsa-2048-cert.pem"
+        ))
+        .unwrap()
+        .into_contents();
+        let resources = ResourcePolicy {
+            max_x509_work: 1,
+            ..Default::default()
+        };
+        let mut parsing = xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&resources).unwrap();
+        let error = certificate_public_key(&der, &mut parsing, |_| ()).unwrap_err();
+        assert!(matches!(error, CommandError::Policy(_)));
+        assert!(!lax_candidate_error_is_recoverable(&error));
+    }
+
+    #[test]
+    fn certificate_candidate_matching_retains_spent_work() {
+        // Find the one-decode ceiling, then prove a second candidate cannot reset it.
+        let der = pem::parse(include_bytes!(
+            "../../../tests/fixtures/keys/rsa/rsa-2048-cert.pem"
+        ))
+        .unwrap()
+        .into_contents();
+        let mut low = 1;
+        let mut high = ResourcePolicy::default().max_x509_work;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let resources = ResourcePolicy {
+                max_x509_work: middle,
+                ..Default::default()
+            };
+            let mut parsing =
+                xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&resources).unwrap();
+            if certificate_public_key(&der, &mut parsing, |_| ()).is_ok() {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        let resources = ResourcePolicy {
+            max_x509_work: low,
+            ..Default::default()
+        };
+        let mut parsing = xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&resources).unwrap();
+        certificate_public_key(&der, &mut parsing, |_| ()).unwrap();
+        let error = certificate_public_key(&der, &mut parsing, |_| panic!("unadmitted candidate"))
+            .unwrap_err();
+        assert!(matches!(error, CommandError::Policy(_)));
+        assert!(!lax_candidate_error_is_recoverable(&error));
+    }
+
     fn invocation(arguments: &[&str]) -> Invocation {
         Invocation::parse(arguments.iter().map(OsString::from)).unwrap()
     }
@@ -6043,22 +6127,34 @@ mod tests {
         };
         let mut policy = EncryptionPolicy::default();
         policy.resources.max_key_candidates = 2;
+        let mut parsing =
+            xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&policy.resources).unwrap();
         let error = recipient_key_metadata(
             &template(""),
             None,
             &[],
             &policy,
             3,
-            XmlBackend::default(),
-            default_provider(),
+            CommandBackends {
+                xml: XmlBackend::default(),
+                crypto: default_provider(),
+            },
+            &mut parsing,
         )
         .err()
         .expect("aggregate candidate limit");
-        assert_eq!(
-            error.to_string(),
-            "XML encryption operation failed: XMLDSig policy violation: key candidates exceeds policy maximum 2: got 3"
-        );
+        assert!(matches!(
+            error,
+            CommandError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
+                maximum: 2,
+                actual: 3,
+                ..
+            })
+        ));
+        drop(parsing);
         policy.resources.max_key_candidates = 3;
+        let mut parsing =
+            xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&policy.resources).unwrap();
         assert!(
             recipient_key_metadata(
                 &template("<Unknown/>"),
@@ -6066,8 +6162,11 @@ mod tests {
                 &[],
                 &policy,
                 3,
-                XmlBackend::default(),
-                default_provider(),
+                CommandBackends {
+                    xml: XmlBackend::default(),
+                    crypto: default_provider()
+                },
+                &mut parsing,
             )
             .is_ok()
         );

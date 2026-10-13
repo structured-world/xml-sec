@@ -36,6 +36,12 @@ let verifier = VerifyContext::new().provider(provider).policy(verification);
 ```
 
 Compilation checks provider capabilities and contradictions before XML work.
+Explicit RSA-OAEP permissions are checked for every allowed digest/MGF tuple.
+Modern signing and verification retain supported secure parameterized RSA-PSS;
+compatibility verification additionally permits supported legacy PSS tuples.
+Restrictive layers can narrow that family permission independently of exact methods.
+Untrusted XML profile failures return `PolicyViolation::SignatureProfile`, not
+the `Configuration` error used for trusted policy compilation.
 Compile-context promises do not supply actual resources or target identities:
 operations still need caller-provided resource maps, trusted key material and,
 for protocol profiles, nonempty expected targets through `verify_request`.

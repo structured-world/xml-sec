@@ -809,8 +809,8 @@ pub enum X509PublicKeyInfo {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ParseError {
-    /// Located processing failure from the shared certificate decoder.
-    #[error("X509Certificate is not valid DER X.509: {0}")]
+    /// Located certificate or name-selector processing failure.
+    #[error("X.509 processing failed: {0}")]
     Certificate(#[source] structured_pkix::Error),
     /// The default low-level parsing policy rejected bounded input.
     #[error("XMLDSig policy violation: {0}")]
@@ -1379,6 +1379,32 @@ impl<'a> KeyInfoParsingSession<'a> {
         der: &[u8],
         inspect: impl FnOnce(&[u8]) -> R,
     ) -> Result<R, ParseError> {
+        self.admit_certificate(der)?;
+        let certificate = self
+            .usage
+            .certificates
+            .read(der)
+            .map_err(|error| self.usage.certificates.parse_error(error))?;
+        Ok(inspect(certificate.tbs().public_key().as_bytes()))
+    }
+
+    /// Match a candidate's selectors in this operation's retained account.
+    pub fn certificate_matches_selectors(
+        &mut self,
+        info: &X509DataInfo,
+        der: &[u8],
+        provider: &dyn crate::provider::CryptoProvider,
+    ) -> Result<bool, ParseError> {
+        self.admit_certificate(der)?;
+        x509_selector_categories_match_candidates(
+            info,
+            core::iter::once(der),
+            provider,
+            &self.usage.certificates,
+        )
+    }
+
+    fn admit_certificate(&mut self, der: &[u8]) -> Result<(), ParseError> {
         charge_embedded_key_candidate(&mut self.usage.embedded_candidates, self.resources)?;
         if der.len() > self.resources.max_external_resource_bytes {
             return Err(ParseError::Policy(
@@ -1398,12 +1424,7 @@ impl<'a> KeyInfoParsingSession<'a> {
             ));
         }
         self.usage.x509_binary_bytes = total.expect("admitted checked sum");
-        let certificate = self
-            .usage
-            .certificates
-            .read(der)
-            .map_err(|error| self.usage.certificates.parse_error(error))?;
-        Ok(inspect(certificate.tbs().public_key().as_bytes()))
+        Ok(())
     }
 
     /// Count enclosing encryption mechanisms in the same ingestion allowance
@@ -3628,6 +3649,16 @@ fn ensure_no_non_whitespace_text(node: Node<'_, '_>, element_name: &str) -> Resu
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests use trusted XML fixtures")]
 mod tests {
+    #[test]
+    fn certificate_processing_diagnostic_does_not_blame_der_for_selector() {
+        // DN selector syntax is not certificate DER, but retains the located source.
+        let error = super::ParseError::Certificate(structured_pkix::Error::new(
+            structured_pkix::ErrorCode::UnsupportedNameSyntax,
+            "name.selector",
+            0,
+        ));
+        assert!(error.to_string().starts_with("X.509 processing failed:"));
+    }
     #[test]
     fn certificate_spki_inspection_borrows_source_and_retains_ingestion_budget() {
         // CLI key matching must inspect original SPKI without a second codec,

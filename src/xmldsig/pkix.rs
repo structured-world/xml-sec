@@ -1079,6 +1079,56 @@ mod tests {
     use structured_pkix::path::{Verified, Verify as _, WorkingKey};
 
     #[test]
+    fn shared_general_name_queries_keep_semantics_and_work_limits() {
+        // GeneralName equality is not raw text equality or mailbox local-part folding.
+        use structured_pkix::general_name::{self, GeneralName};
+        let session = CertificateSession::new(&ResourcePolicy::default());
+        for (left, right, expected) in [
+            (
+                GeneralName::Dns("EXAMPLE.test"),
+                GeneralName::Dns("example.TEST"),
+                true,
+            ),
+            (
+                GeneralName::Email("User@example.test"),
+                GeneralName::Email("user@example.test"),
+                false,
+            ),
+            (
+                GeneralName::Uri("HTTP://Example.test:80/a/../%7e"),
+                GeneralName::Uri("http://example.test/~"),
+                true,
+            ),
+        ] {
+            assert_eq!(
+                left.matches(&right, session.memory())
+                    .expect("funded GeneralName comparison"),
+                expected
+            );
+        }
+        let resources = ResourcePolicy {
+            max_x509_work: 1,
+            ..Default::default()
+        };
+        let limited = CertificateSession::new(&resources);
+        let reader = limited
+            .parser
+            .read(&[], 500)
+            .expect("empty producing reader");
+        let error = general_name::matches(
+            &reader,
+            &GeneralName::Dns("example.test"),
+            &GeneralName::Dns("EXAMPLE.test"),
+            777,
+            "certificate.generalName",
+        )
+        .expect_err("GeneralName work must be denied");
+        assert!(error.is_resource());
+        assert_eq!(error.offset(), 777);
+        assert!(matches!(limited.error(error), X509ChainError::Policy(_)));
+    }
+
+    #[test]
     fn xml_name_adapter_preserves_escaped_delimiters_and_spaces() {
         // XML formatting tolerance must not erase escaped DN value bytes.
         let session = CertificateSession::new(&ResourcePolicy::default());

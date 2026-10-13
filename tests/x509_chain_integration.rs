@@ -879,6 +879,62 @@ fn ignores_authenticated_crl_outside_the_targets_distribution_scope() {
 }
 
 #[test]
+fn explicit_crl_distribution_names_keep_encoded_identity() {
+    // RFC 5280 §5.2.5 requires identical encoding for explicit DP/IDP names;
+    // general URI host normalization must not make a different encoding applicable.
+    // https://www.rfc-editor.org/rfc/rfc5280#section-5.2.5
+    let mut root_params = CertificateParams::new(Vec::new()).unwrap();
+    root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    root_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let root =
+        rcgen::CertifiedIssuer::self_signed(root_params, KeyPair::generate().unwrap()).unwrap();
+    let mut leaf_params = CertificateParams::new(Vec::new()).unwrap();
+    leaf_params.serial_number = Some(SerialNumber::from(42_u64));
+    leaf_params.crl_distribution_points = vec![CrlDistributionPoint {
+        uris: vec!["https://example.test/root.crl".into()],
+    }];
+    let leaf = leaf_params
+        .signed_by(&KeyPair::generate().unwrap(), &root)
+        .unwrap();
+    let anchors = [root.der().to_vec()];
+    for (uri, expected) in [
+        (
+            "https://example.test/root.crl",
+            Err(X509ChainError::Revoked(0)),
+        ),
+        ("https://EXAMPLE.test/root.crl", Ok(())),
+    ] {
+        let crl = CertificateRevocationListParams {
+            this_update: date_time_ymd(2026, 3, 15),
+            next_update: date_time_ymd(2026, 4, 15),
+            crl_number: SerialNumber::from(1_u64),
+            issuing_distribution_point: Some(CrlIssuingDistributionPoint {
+                distribution_point: CrlDistributionPoint {
+                    uris: vec![uri.into()],
+                },
+                scope: Some(CrlScope::UserCertsOnly),
+            }),
+            revoked_certs: vec![RevokedCertParams {
+                serial_number: SerialNumber::from(42_u64),
+                revocation_time: date_time_ymd(2026, 3, 16),
+                reason_code: None,
+                invalidity_date: None,
+            }],
+            key_identifier_method: KeyIdMethod::Sha256,
+        }
+        .signed_by(&root)
+        .unwrap();
+        let mut info = generated_info(vec![leaf.der().to_vec(), root.der().to_vec()]);
+        info.crls.push(crl.der().to_vec());
+        assert_eq!(
+            verify_x509_certificate_chain(&info, &options(&anchors, true)),
+            expected,
+            "{uri}"
+        );
+    }
+}
+
+#[test]
 fn partial_crl_absence_requires_complete_authenticated_reason_coverage() {
     // RFC 5280 §6.3.3(d),(l): absence is qualified only for covered reasons;
     // complementary authenticated complete lists may establish all reasons.

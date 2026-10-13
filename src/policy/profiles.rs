@@ -259,10 +259,16 @@ fn profile_policies(
         validity: validity.clone(),
         signature_constraints: constraints,
         signature_algorithms: Some(signatures),
+        parameterized_rsa_pss: if compatibility {
+            RsaPssPermission::AllSupported
+        } else {
+            RsaPssPermission::SecureSupported
+        },
         digest_algorithms: Some(digests),
         transforms: transforms.clone(),
         ..VerificationPolicy::default()
     };
+    verification.key_trust.parameterized_rsa_pss = verification.parameterized_rsa_pss;
     if compatibility {
         verification.key_trust.allowed_legacy_signature_algorithms = verification
             .signature_algorithms
@@ -300,6 +306,7 @@ fn profile_policies(
     let signing = SigningPolicy {
         validity: validity.clone(),
         signature_constraints: constraints,
+        parameterized_rsa_pss: RsaPssPermission::SecureSupported,
         signature_algorithms: Some(
             SignatureAlgorithm::ALL
                 .into_iter()

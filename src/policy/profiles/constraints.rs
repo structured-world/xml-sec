@@ -47,12 +47,24 @@ impl PolicySet {
                     context.provider,
                     true,
                 )?;
+                transport_methods(
+                    policy.key_transport_algorithms.as_ref(),
+                    policy.oaep_digests.as_ref(),
+                    context.provider,
+                    true,
+                )?;
             }
             if let Some(policy) = &self.decryption {
                 policy.validate()?;
                 cipher_methods(
                     policy.data_algorithms.as_ref(),
                     policy.key_wrap_algorithms.as_ref(),
+                    context.provider,
+                    false,
+                )?;
+                transport_methods(
+                    policy.key_transport_algorithms.as_ref(),
+                    policy.oaep_digests.as_ref(),
                     context.provider,
                     false,
                 )?;
@@ -222,7 +234,90 @@ impl SignatureConstraints {
             Self::WsSecurity => ws_security(signature),
             Self::Xades => xades(signature),
         }
+        .map_err(|error| match error {
+            PolicyViolation::Configuration { reason } => PolicyViolation::SignatureProfile {
+                profile: self,
+                reason,
+            },
+            error => error,
+        })
     }
+}
+
+#[cfg(feature = "xmlenc")]
+fn transport_methods(
+    methods: Option<&HashSet<KeyTransportAlgorithm>>,
+    digests: Option<&HashSet<OaepDigestAlgorithm>>,
+    provider: &dyn CryptoProvider,
+    encrypt: bool,
+) -> Result<(), PolicyViolation> {
+    let Some(methods) = methods else {
+        return Ok(());
+    };
+    for &algorithm in methods {
+        #[cfg(feature = "legacy-algorithms")]
+        if algorithm == KeyTransportAlgorithm::RsaPkcs1v15 {
+            let capability = if encrypt {
+                ProviderCapability::Pkcs1v15Transport
+            } else {
+                ProviderCapability::Pkcs1v15Recovery
+            };
+            if !provider.supports(capability) {
+                return Err(configuration(
+                    "selected provider does not support a permitted key-transport method",
+                ));
+            }
+            continue;
+        }
+        // Both DigestMethod and MGF must satisfy the same compiled allowlist.
+        // Only five wire MGF identifiers exist: XMLEnc 1.1 §5.5.2.
+        // https://www.w3.org/TR/xmlenc-core1/#sec-RSA-OAEP
+        let mut permitted_tuple = false;
+        for digest in DigestAlgorithm::ALL
+            .into_iter()
+            .filter_map(|value| OaepDigestAlgorithm::from_uri(value.uri()))
+        {
+            if !digests.map_or(!digest.requires_explicit_permission(), |set| {
+                set.contains(&digest)
+            }) {
+                continue;
+            }
+            for mgf in [
+                OaepDigestAlgorithm::Sha1,
+                OaepDigestAlgorithm::Sha224,
+                OaepDigestAlgorithm::Sha256,
+                OaepDigestAlgorithm::Sha384,
+                OaepDigestAlgorithm::Sha512,
+            ] {
+                if digests.is_some_and(|set| !set.contains(&mgf)) {
+                    continue;
+                }
+                permitted_tuple = true;
+                let parameters = crate::xmlenc::RsaOaepParameters {
+                    algorithm,
+                    digest,
+                    mgf_digest: mgf,
+                    label: Vec::new(),
+                };
+                let capability = if encrypt {
+                    ProviderCapability::KeyTransport(&parameters)
+                } else {
+                    ProviderCapability::KeyRecovery(&parameters)
+                };
+                if !provider.supports(capability) {
+                    return Err(configuration(
+                        "selected provider does not support a permitted RSA-OAEP tuple",
+                    ));
+                }
+            }
+        }
+        if !permitted_tuple {
+            return Err(configuration(
+                "permitted RSA-OAEP method has no usable digest/MGF tuple",
+            ));
+        }
+    }
+    Ok(())
 }
 
 const DS: &str = "http://www.w3.org/2000/09/xmldsig#";

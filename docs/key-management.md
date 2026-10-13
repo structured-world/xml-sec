@@ -106,6 +106,10 @@ key lookup, path search, static validation and revocation. Displayed names or
 phase-local metadata never establish certificate identity. Effective inherited
 issuer parameters are projected from the authenticated path without rewriting
 certificates or repeating their signature checks.
+GeneralName comparisons use the shared semantic core, including its accounting;
+explicit CRL distribution-point and issuer fields retain the encoded-identity
+rules required by RFC 5280 sections 5.2.5 and 4.2.1.13. Semantic URI/DNS
+normalization does not override those encoded-identity requirements.
 
 When CRL checking is enabled, supply authenticated UTC history with
 `VerifyContext::utc_facts(LeapTable)` or `X509ChainOptions::utc_facts` for direct

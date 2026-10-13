@@ -127,6 +127,15 @@ pub enum PolicyViolation {
         /// Stable, non-secret diagnostic.
         reason: &'static str,
     },
+    /// Untrusted XML does not satisfy the selected signature profile.
+    #[cfg(feature = "xmldsig")]
+    #[error("{profile:?} signature profile rejects document: {reason}")]
+    SignatureProfile {
+        /// Compiled protocol constraint being enforced.
+        profile: SignatureConstraints,
+        /// Stable, non-secret explanation of the document defect.
+        reason: &'static str,
+    },
     /// An explicitly authorized exception is not valid at operation time.
     #[error("policy authorization is outside its validity interval")]
     AuthorizationExpired,
