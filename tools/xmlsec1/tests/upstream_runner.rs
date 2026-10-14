@@ -1,7 +1,12 @@
 use std::{fs, path::Path, process::Command};
 
 fn run_upstream(script: &str, selected_test: &str) -> String {
-    let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/xmlsec1/tests/fixtures/upstream");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let tests = root.join("tools/xmlsec1/tests/fixtures/upstream");
     let run_root = tempfile::tempdir().expect("the upstream runner needs a private log directory");
     // The upstream runner uses Bash-only `source` and `[[` despite its `/bin/sh`
     // shebang. Invoke its actual language explicitly on platforms where `sh` is dash.

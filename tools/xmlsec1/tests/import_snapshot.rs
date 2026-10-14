@@ -2,6 +2,10 @@ use std::{fs, path::Path, process::Command};
 
 fn project_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
 }
 
 fn donor_tests() -> std::path::PathBuf {

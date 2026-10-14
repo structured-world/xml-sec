@@ -36,6 +36,8 @@ members = [
     "crates/xml-sec-xml-input",
     "crates/xml-sec-xslt",
     "tools/capability-ledger",
+    "crates/xml-sec-config",
+    "tools/xmlsec1",
     "vendor/sxd-document-no-unsafe",
     "vendor/sxd-xpath-no-unsafe",
 ]
@@ -52,11 +54,6 @@ opt-level = 2
 
 [profile.dev.package.xml-sec-sxd-xpath]
 opt-level = 2
-
-[[bin]]
-name = "xmlsec1"
-path = "tools/xmlsec1/src/main.rs"
-required-features = ["xmldsig", "xmlenc", "c14n"]
 
 [[test]]
 name = "xmlsec1_interop"
@@ -90,21 +87,6 @@ required-features = ["xmldsig"]
 [[test]]
 name = "uri_integration"
 required-features = ["xmldsig", "c14n"]
-
-[[test]]
-name = "cli_import_snapshot"
-path = "tools/xmlsec1/tests/import_snapshot.rs"
-required-features = ["xmldsig", "xmlenc", "c14n"]
-
-[[test]]
-name = "cli_process_contract"
-path = "tools/xmlsec1/tests/process_contract.rs"
-required-features = ["xmldsig", "xmlenc", "c14n"]
-
-[[test]]
-name = "cli_upstream_runner"
-path = "tools/xmlsec1/tests/upstream_runner.rs"
-required-features = ["xmldsig", "xmlenc", "c14n"]
 
 [[test]]
 name = "xmlenc11_corpus"

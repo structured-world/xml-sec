@@ -3,9 +3,9 @@
 use std::{collections::BTreeSet, path::Path};
 use xml_sec::provider::{KeyDecapsulationKey as _, RustCryptoMlKemPrivateKey};
 
-pub fn execute() -> BTreeSet<String> {
+pub fn execute(project_root: &Path) -> BTreeSet<String> {
     use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize_xml};
-    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let fixtures = project_root.join("tests/fixtures");
     let mut completed = BTreeSet::new();
     // Independently produced CBC/GCM documents cover all parameter sets and
     // consumer widths. An entry is recorded only after whole-document parity.

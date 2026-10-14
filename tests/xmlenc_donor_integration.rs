@@ -3046,7 +3046,7 @@ fn complete_corpora_execute_every_vector_exactly_once() {
     decrypts_iso_latin1_element_and_content_donor_documents();
     decrypts_rsa15_documents_with_certificate_selector_metadata();
     legacy_oaep_donor_hashes_require_permission_then_decrypt();
-    for name in ml_kem_corpus::execute() {
+    for name in ml_kem_corpus::execute(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))) {
         completed_vector(VECTOR_DIR, &name, CorpusOutcome::Decrypted);
     }
     decrypts_merlin_direct_and_wrapped_document_shapes();

@@ -1,0 +1,95 @@
+[package]
+name = "xml-sec-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "Apache-2.0 AND MIT"
+publish = false
+description = "Native xmlsec1-compatible XML Security CLI"
+
+[[bin]]
+name = "xmlsec1"
+path = "src/main.rs"
+required-features = ["xmldsig", "xmlenc", "c14n"]
+
+[[test]]
+name = "cli_process_contract"
+path = "tests/process_contract.rs"
+required-features = ["xmldsig", "xmlenc", "c14n"]
+
+[[test]]
+name = "cli_import_snapshot"
+path = "tests/import_snapshot.rs"
+required-features = ["xmldsig", "xmlenc", "c14n"]
+
+[[test]]
+name = "cli_upstream_runner"
+path = "tests/upstream_runner.rs"
+required-features = ["xmldsig", "xmlenc", "c14n"]
+
+[[test]]
+name = "policy_commands"
+required-features = ["xmldsig", "xmlenc", "c14n"]
+
+[[test]]
+name = "ml_kem_keys"
+required-features = ["experimental-pq", "xmlenc", "c14n"]
+
+[[test]]
+name = "xmlenc_encrypt_xmlsec1"
+required-features = ["xmldsig", "xmlenc", "c14n"]
+
+[dependencies]
+xml-sec = { path = "../..", default-features = false }
+xml-sec-config = { path = "../../crates/xml-sec-config", default-features = false }
+rsa = { package = "sad-rsa", version = "0.10.2", default-features = false, features = ["sha1", "sha2", "hazmat"] }
+aes = "0.9.2"
+cbc = "0.2.1"
+crypto-bigint = { version = "0.7", features = ["zeroize"] }
+der = "0.8"
+dsa = { version = "0.7", features = ["hazmat"] }
+md-5 = { version = "0.11", features = ["oid", "zeroize"] }
+pkcs8 = { version = "0.11", features = ["encryption", "pem"] }
+x509-parser = "0.18"
+structured-asn1 = { version = "0.1.6", default-features = false, features = ["alloc", "std"] }
+structured-pkix = { version = "0.1.6", default-features = false, features = ["alloc", "std"] }
+zeroize = "1"
+base64 = "0.23"
+thiserror = "2"
+p256 = { version = "0.14", features = ["ecdsa"] }
+p384 = { version = "0.14", features = ["ecdsa"] }
+p521 = { version = "0.14", features = ["ecdsa"] }
+des = "0.9"
+pem = "4"
+pkcs1 = { version = "0.8.0-rc.5", default-features = false, features = ["alloc", "pem"] }
+
+[features]
+default = ["std", "xmldsig", "xmlenc", "c14n", "xml-backend-xmloxide"]
+std = ["xml-sec/std"]
+xmldsig = ["xml-sec/xmldsig"]
+xmlenc = ["xmldsig", "xml-sec/xmlenc", "xml-sec-config/xmlenc"]
+c14n = ["xml-sec/c14n"]
+xml-backend-xmloxide = ["xml-sec/xml-backend-xmloxide", "xml-sec-config/xml-backend-xmloxide"]
+xml-backend-roxmltree = ["xml-sec/xml-backend-roxmltree", "xml-sec-config/xml-backend-roxmltree"]
+xml-backends-all = ["xml-sec/xml-backends-all", "xml-sec-config/xml-backends-all"]
+xml-backend-differential = ["xml-sec/xml-backend-differential", "xml-sec-config/xml-backend-differential"]
+legacy-algorithms = ["xml-sec/legacy-algorithms"]
+experimental-pq = ["xmldsig", "xml-sec/experimental-pq"]
+aws-lc-fips = ["std", "xmldsig", "xml-sec/aws-lc-fips"]
+pkcs11 = ["std", "xmlenc", "xml-sec/pkcs11"]
+benchmark-internals = ["xml-sec/benchmark-internals"]
+benchmark-alloc = ["xml-sec/benchmark-alloc"]
+no-unsafe = ["xml-sec/no-unsafe"]
+embedded = ["xml-sec/embedded"]
+
+[dev-dependencies]
+rand_chacha = "0.10"
+rcgen = "0.14.6"
+time = "0.3.55"
+tempfile = "3"
+sha2 = { version = "0.11", features = ["oid", "zeroize"] }
+sha3 = { version = "0.12", default-features = false, features = ["oid", "zeroize"] }
+hex-literal = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+roxmltree = { version = "0.21", features = ["positions"] }

@@ -9,7 +9,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-#[path = "common/xmlsec1.rs"]
+#[path = "../../../tests/common/xmlsec1.rs"]
 mod xmlsec1;
 
 use rsa::RsaPublicKey;
@@ -21,6 +21,12 @@ use xml_sec::xmlenc::{
 use xml_sec::{key_manager::KeyInventory, policy::ResourcePolicy};
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+macro_rules! fixture_name {
+    ($path:literal) => {
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../", $path)
+    };
+}
 
 fn require_key_establishment_oracle() {
     // These acceptance tests intentionally require independent execution;
@@ -110,8 +116,12 @@ fn merlin_templates_execute_reciprocally_with_xml_replacement() {
     use xml_sec::xmlenc::{DecryptContext, KekDecryptor, SymmetricKeyDecryptor};
 
     require_key_establishment_oracle();
-    let directory =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/xmlenc/merlin-xmlenc-five");
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("tests/fixtures/xmlenc/merlin-xmlenc-five");
     let cases = [
         ("encrypt-data-aes128-cbc", "job", false),
         ("encrypt-content-aes256-cbc-prop", "jed", false),
@@ -237,7 +247,7 @@ fn merlin_templates_execute_reciprocally_with_xml_replacement() {
                 // CLI's RSA minimum for historical 1024-bit sample keys.
                 command
                     .arg("--pubkey-pem:merlin-rsa-key")
-                    .arg("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+                    .arg(fixture_name!("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"));
             } else if native {
                 // The complete original key store contains DES. A build
                 // without that capability correctly rejects the store; pass
@@ -350,7 +360,7 @@ fn merlin_templates_execute_reciprocally_with_xml_replacement() {
                 if rsa {
                     command
                         .arg("--privkey-pem:merlin-rsa-key")
-                        .arg("tests/fixtures/keys/rsa/rsa-2048-key.pem");
+                        .arg(fixture_name!("tests/fixtures/keys/rsa/rsa-2048-key.pem"));
                 } else {
                     command.arg("--keys-file").arg(directory.join("keys.xml"));
                 }
@@ -381,8 +391,10 @@ fn merlin_templates_execute_reciprocally_with_xml_replacement() {
                 let private = if rsa {
                     Some(xml_sec::xmlenc::PrivateKeyDecryptor::new(
                         rsa::RsaPrivateKey::from_pkcs8_pem(
-                            &fs::read_to_string("tests/fixtures/keys/rsa/rsa-2048-key.pem")
-                                .unwrap(),
+                            &fs::read_to_string(fixture_name!(
+                                "tests/fixtures/keys/rsa/rsa-2048-key.pem"
+                            ))
+                            .unwrap(),
                         )
                         .unwrap(),
                     ))
@@ -529,7 +541,7 @@ fn extended_oaep_hashes_have_reciprocal_oracle_coverage() {
     require_key_establishment_oracle();
     use xml_sec::policy::EncryptionPolicy;
     use xml_sec::xmlenc::KeyTransportAlgorithm;
-    let path = Path::new("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let path = Path::new(fixture_name!("tests/fixtures/keys/rsa/rsa-4096-key.pem"));
     let private = rsa::RsaPrivateKey::from_pkcs8_pem(&fs::read_to_string(path).unwrap()).unwrap();
     let public = RsaPublicKey::from(&private);
     let hashes = [
@@ -1076,7 +1088,8 @@ fn xmlsec1_decrypts_all_optional_content_and_transport_methods() {
         );
     }
     let public = RsaPublicKey::from_public_key_pem(
-        &fs::read_to_string("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem").expect("public key"),
+        &fs::read_to_string(fixture_name!("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"))
+            .expect("public key"),
     )
     .expect("RSA SPKI");
     let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
@@ -1091,7 +1104,7 @@ fn xmlsec1_decrypts_all_optional_content_and_transport_methods() {
         decrypt_with_xmlsec1(
             &encrypted.encrypted_data_xml,
             "--privkey-pem:interop-rsa",
-            Path::new("tests/fixtures/keys/rsa/rsa-2048-key.pem")
+            Path::new(fixture_name!("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
         ),
         plaintext
     );
@@ -1105,8 +1118,8 @@ fn xmlsec1_decrypts_rsa_oaep_wrapped_aes_cbc_from_xml_sec() {
         eprintln!("{}", xmlsec1::skip_reason());
         return;
     }
-    let public_key_path = Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
-    let private_key_path = Path::new("tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    let public_key_path = Path::new(fixture_name!("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"));
+    let private_key_path = Path::new(fixture_name!("tests/fixtures/keys/rsa/rsa-2048-key.pem"));
     let public_key = RsaPublicKey::from_public_key_pem(
         &fs::read_to_string(public_key_path).expect("RSA public-key fixture must load"),
     )
@@ -1145,8 +1158,8 @@ fn xmlsec1_decrypts_rsa_recipient_imported_by_key_inventory() {
         eprintln!("{}", xmlsec1::skip_reason());
         return;
     }
-    let public_path = Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
-    let private_path = Path::new("tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    let public_path = Path::new(fixture_name!("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"));
+    let private_path = Path::new(fixture_name!("tests/fixtures/keys/rsa/rsa-2048-key.pem"));
     let public_pem = fs::read(public_path).expect("public-key fixture must load");
     let mut keys = KeyInventory::default();
     keys.add_public_pem(

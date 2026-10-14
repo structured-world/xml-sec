@@ -6,11 +6,32 @@ Security operations to the same `xml-sec` policy and provider pipelines as the
 library; it does not bind to libxml2, OpenSSL, or the libxmlsec1 C ABI.
 
 ```sh
-cargo install xml-sec
+cargo install --git https://github.com/structured-world/xml-sec xml-sec-cli
 xmlsec1 version
 xmlsec1 list-transforms
 xmlsec1 list-key-data
 ```
+
+For a local checkout use `cargo install --path tools/xmlsec1` or
+`cargo run -p xml-sec-cli --bin xmlsec1 -- version`. The core package no longer
+contains the binary; the command name and donor operation grammar are unchanged.
+
+## Explicit Policy Configuration
+
+The native extension `xmlsec1 policy` compiles trusted, caller-selected TOML
+without discovering files, loading keys or selecting a profile from XML:
+
+```sh
+xmlsec1 policy check --file policy.toml --profile tenant
+xmlsec1 policy show-effective --file policy.toml --profile tenant
+xmlsec1 policy diff --file old.toml --profile tenant \
+  --other-file new.toml --other-profile tenant
+```
+
+`--crypto` selects the same engine used for capability admission. The flags
+`--external-resources` and `--target-evidence` assert application integration
+contracts, not resource discovery or trust. See [the schema](policy-configuration.md).
+These operator commands do not implicitly change subsequent sign/verify commands.
 
 ## Commands
 

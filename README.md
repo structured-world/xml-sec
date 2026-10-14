@@ -49,10 +49,11 @@ cargo add xml-sec
 ```
 
 Default features provide C14N, XMLDSig, XMLEnc, and the `xmloxide` XML backend. Adding the crate as
-a dependency builds the library; install the command-line tool from the same package:
+a dependency builds the library. The native CLI is a separate workspace package,
+so TOML configuration dependencies never enter the core library:
 
 ```sh
-cargo install xml-sec
+cargo install --git https://github.com/structured-world/xml-sec xml-sec-cli
 xmlsec1 version
 ```
 

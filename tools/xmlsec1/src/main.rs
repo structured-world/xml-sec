@@ -2,6 +2,7 @@ mod args;
 mod capabilities;
 mod commands;
 mod key_material;
+mod policy_commands;
 mod utc_facts;
 
 use std::{ffi::OsString, io::Write, process::ExitCode};
@@ -13,7 +14,21 @@ fn run(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> ExitCode {
-    let invocation = match args::Invocation::parse(args) {
+    let mut args = args.into_iter();
+    let program = args.next();
+    let command = args.next();
+    if command.as_deref() == Some(std::ffi::OsStr::new("policy")) {
+        return match policy_commands::execute(args, stdout)
+            .and_then(|()| stdout.flush().map_err(|e| e.to_string()))
+        {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                let _ = writeln!(stderr, "Error: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    let invocation = match args::Invocation::parse(program.into_iter().chain(command).chain(args)) {
         Ok(invocation) => invocation,
         Err(error) => {
             let _ = writeln!(stderr, "Error: {error}");

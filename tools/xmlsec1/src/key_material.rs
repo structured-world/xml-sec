@@ -430,9 +430,14 @@ mod modern_import_tests {
             (SignatureAlgorithm::Ed448, "ed448"),
             (SignatureAlgorithm::Ed448Ph, "ed448"),
         ] {
-            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
-                "tests/fixtures/xmldsig/keys/eddsa/eddsa-{stem}-key.der"
-            ));
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join(format!(
+                    "tests/fixtures/xmldsig/keys/eddsa/eddsa-{stem}-key.der"
+                ));
             let bytes = std::fs::read(&path).unwrap();
             assert!(
                 decode_signing_key(&path, &bytes, PrivateKeyFormat::Pkcs8Der, algorithm, None)

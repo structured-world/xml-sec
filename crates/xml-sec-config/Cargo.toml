@@ -1,0 +1,34 @@
+[package]
+name = "xml-sec-config"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "Apache-2.0 AND MIT"
+publish = false
+description = "Explicit versioned configuration for XML Security policy"
+
+[dependencies]
+xml-sec = { path = "../..", default-features = false, features = ["xmldsig", "c14n"] }
+toml = { version = "1.1.8", default-features = false, features = ["parse", "serde", "display"] }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+thiserror = "2"
+
+[features]
+default = ["xmlenc", "xml-backend-xmloxide"]
+xmlenc = ["xml-sec/xmlenc"]
+xml-backend-xmloxide = ["xml-sec/xml-backend-xmloxide"]
+xml-backend-roxmltree = ["xml-sec/xml-backend-roxmltree"]
+xml-backends-all = ["xml-sec/xml-backends-all"]
+xml-backend-differential = ["xml-sec/xml-backend-differential"]
+experimental-pq = ["xml-sec/experimental-pq"]
+legacy-algorithms = ["xml-sec/legacy-algorithms"]
+aws-lc-fips = ["xml-sec/aws-lc-fips"]
+pkcs11 = ["xml-sec/pkcs11"]
+
+[dev-dependencies]
+tempfile = "3"
+divan = "=0.1.21"
+
+[[bench]]
+name = "configuration"
+harness = false

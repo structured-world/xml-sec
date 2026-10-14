@@ -9,6 +9,10 @@ use xml_sec::provider::{
 fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("tests/fixtures/xmldsig/keys/ml-kem")
             .join(name),
     )
@@ -17,6 +21,10 @@ fn fixture(name: &str) -> Vec<u8> {
 
 fn fixture_path(path: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
         .join("tests/fixtures")
         .join(path)
 }
@@ -683,7 +691,7 @@ fn signing_resolves_referenced_encapsulation_target() {
     // An indirect operation instruction is not an ignorable key hint, even
     // when the caller supplies an ordinary RSA signing key.
     let ordinary = xml_sec::xmldsig::RsaSigningKey::from_pkcs8_pem(include_str!(
-        "fixtures/keys/rsa/rsa-2048-key.pem"
+        "../../../tests/fixtures/keys/rsa/rsa-2048-key.pem"
     ))
     .unwrap();
     let rsa_input = input.replace(
@@ -1377,7 +1385,7 @@ fn hmac_builder_establishes_a_recipient_key() {
 }
 
 #[cfg(all(feature = "xmlenc", feature = "legacy-algorithms"))]
-#[path = "common/xmlenc_ml_kem_corpus.rs"]
+#[path = "../../../tests/common/xmlenc_ml_kem_corpus.rs"]
 mod content_corpus;
 
 #[cfg(all(feature = "xmlenc", feature = "legacy-algorithms"))]
@@ -1385,7 +1393,12 @@ mod content_corpus;
 fn all_donor_content_encapsulation_ciphertexts_decrypt() {
     // The same runner feeds the complete XMLEnc inventory; retaining one
     // implementation prevents coverage and policy wiring from diverging.
-    assert_eq!(content_corpus::execute().len(), 6);
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    assert_eq!(content_corpus::execute(root).len(), 6);
 }
 
 #[cfg(feature = "xmlenc")]

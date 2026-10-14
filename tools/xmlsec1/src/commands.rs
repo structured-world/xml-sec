@@ -402,7 +402,11 @@ fn validate_provider(invocation: &Invocation) -> Result<(), CommandError> {
 }
 
 fn selected_provider(invocation: &Invocation) -> Result<&'static dyn CryptoProvider, CommandError> {
-    match option_text(invocation, "crypto")?.unwrap_or("default") {
+    provider_by_name(option_text(invocation, "crypto")?.unwrap_or("default"))
+}
+
+pub(crate) fn provider_by_name(name: &str) -> Result<&'static dyn CryptoProvider, CommandError> {
+    match name {
         "rustcrypto" | "default" => Ok(default_provider()),
         #[cfg(feature = "aws-lc-fips")]
         "aws-lc-fips" => Ok(&xml_sec::provider::AwsLcFipsProvider),
@@ -5930,6 +5934,14 @@ mod tests {
 
     use super::*;
 
+    fn project_root() -> &'static Path {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+    }
+
     #[test]
     fn signing_certificate_failure_has_signature_category() {
         // A malformed embedded certificate is a signing-input failure, not encryption.
@@ -6604,9 +6616,7 @@ mod tests {
     }
 
     fn testdata(name: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tools/xmlsec1/testdata")
-            .join(name)
+        project_root().join("tools/xmlsec1/testdata").join(name)
     }
 
     #[test]
@@ -6731,7 +6741,7 @@ mod tests {
         let encrypted = directory.path().join("encrypted.xml");
         fs::write(&input, b"RSA15 CLI plaintext").expect("plaintext");
         fs::write(&template, "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#rsa-1_5\"/><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>").expect("template");
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = project_root();
         let public = root.join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
         let private = root.join("tests/fixtures/keys/rsa/rsa-2048-key.pem");
         let args = [
@@ -6788,15 +6798,14 @@ mod tests {
         let temp = tempfile::tempdir().expect("temporary test directory");
         let template_path = temp.path().join("template.xml");
         let input_path = temp.path().join("input.bin");
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let fixture = project_root()
             .join("tests/fixtures/xmlenc/aleksey-xmlenc-01/enc-aes128gcm-keyname.tmpl");
         let template = fs::read_to_string(fixture)
             .expect("encryption template fixture")
             .replace("test-aes128", "absent");
         fs::write(&template_path, template).expect("write encryption template");
         fs::write(&input_path, b"lax fallback payload").expect("write plaintext");
-        let store =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keys/xmlsec/mixed-keys.xml");
+        let store = project_root().join("tests/fixtures/keys/xmlsec/mixed-keys.xml");
         let args = [
             "xmlsec1",
             "encrypt",
@@ -6822,17 +6831,16 @@ mod tests {
         let template_path = temp.path().join("template.xml");
         let input_path = temp.path().join("input.bin");
         let store_path = temp.path().join("keys.xml");
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let fixture = project_root()
             .join("tests/fixtures/xmlenc/aleksey-xmlenc-01/enc-aes128gcm-keyname.tmpl");
         let template = fs::read_to_string(fixture)
             .expect("encryption template fixture")
             .replace("test-aes128", "absent");
         fs::write(&template_path, template).expect("write encryption template");
         fs::write(&input_path, b"lax fallback payload").expect("write plaintext");
-        let source = fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keys/xmlsec/mixed-keys.xml"),
-        )
-        .expect("key store fixture");
+        let source =
+            fs::read_to_string(project_root().join("tests/fixtures/keys/xmlsec/mixed-keys.xml"))
+                .expect("key store fixture");
         let extra = "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>wrong-aes192</KeyName><KeyValue><AESKeyValue xmlns=\"http://www.aleksey.com/xmlsec/2002\">AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA</AESKeyValue></KeyValue></KeyInfo>";
         fs::write(
             &store_path,
@@ -6863,7 +6871,7 @@ mod tests {
         let template_path = temp.path().join("template.xml");
         let input_path = temp.path().join("input.bin");
         let store_path = temp.path().join("keys.xml");
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join(
+        let fixture = project_root().join(
             "tests/fixtures/xmlenc/aleksey-xmlenc-01/enc-aes256-kt-rsa_oaep_sha1_mgf1_sha512.tmpl",
         );
         let template = fs::read_to_string(fixture)
@@ -6871,11 +6879,9 @@ mod tests {
             .replace("TestKeyName-rsa-4096", "absent");
         fs::write(&template_path, template).expect("write encryption template");
         fs::write(&input_path, b"<root>lax RSA fallback payload</root>").expect("write plaintext");
-        let pem = fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"),
-        )
-        .expect("public key fixture");
+        let pem =
+            fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"))
+                .expect("public key fixture");
         let public_key = RsaPublicKey::from_public_key_pem(&pem).expect("RSA public key");
         let encode = |bytes: Vec<u8>| base64::engine::general_purpose::STANDARD.encode(bytes);
         let extra = format!(
@@ -6883,10 +6889,9 @@ mod tests {
             encode(public_key.n().to_be_bytes_trimmed_vartime().into_vec()),
             encode(public_key.e().to_be_bytes_trimmed_vartime().into_vec())
         );
-        let source = fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keys/xmlsec/mixed-keys.xml"),
-        )
-        .expect("key store fixture");
+        let source =
+            fs::read_to_string(project_root().join("tests/fixtures/keys/xmlsec/mixed-keys.xml"))
+                .expect("key store fixture");
         fs::write(
             &store_path,
             source.replacen("</Keys>", &format!("{extra}</Keys>"), 1),
@@ -6926,8 +6931,7 @@ mod tests {
         assert!(String::from_utf8_lossy(&output).contains("CipherValue"));
         let encrypted = temp.path().join("encrypted.xml");
         fs::write(&encrypted, &output).expect("write encrypted output");
-        let private =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keys/rsa/rsa-2048-key.pem");
+        let private = project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem");
         let decrypt_args = [
             "xmlsec1",
             "decrypt",
@@ -6946,14 +6950,10 @@ mod tests {
         // An algorithm-compatible key is not a valid match for embedded KeyInfo.
         let mut inventory = KeyInventory::default();
         let policy = SigningPolicy::default();
-        let wrong = std::fs::read(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keys/rsa/rsa-2048-key.pem"),
-        )
-        .unwrap();
-        let right = std::fs::read(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keys/rsa/rsa-4096-key.pem"),
-        )
-        .unwrap();
+        let wrong =
+            std::fs::read(project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem")).unwrap();
+        let right =
+            std::fs::read(project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem")).unwrap();
         for (name, pem) in [("wrong", wrong), ("right", right)] {
             inventory
                 .add_private_pem(
@@ -7007,14 +7007,10 @@ mod tests {
         // Three independent scans cost 1 + 2 + 3 inspections, not three.
         let mut inventory = KeyInventory::default();
         let mut policy = SigningPolicy::default();
-        let wrong = fs::read(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keys/rsa/rsa-2048-key.pem"),
-        )
-        .unwrap();
-        let right = fs::read(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keys/rsa/rsa-4096-key.pem"),
-        )
-        .unwrap();
+        let wrong =
+            fs::read(project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem")).unwrap();
+        let right =
+            fs::read(project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem")).unwrap();
         for (name, pem) in [("wrong-a", &wrong), ("wrong-b", &wrong), ("right", &right)] {
             inventory
                 .add_private_pem(

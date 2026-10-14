@@ -37,7 +37,8 @@ source_identity() {
 before=$(source_identity)
 # The library repository does not track Cargo.lock. Resolve once, then freeze
 # the resulting graph for measurement and retain it with the evidence.
-cargo build --release --bin xmlsec1 --example benchmark_latency --features benchmark-internals
+cargo build --release -p xml-sec-cli --bin xmlsec1 --features benchmark-internals
+cargo build --release -p xml-sec --example benchmark_latency --features benchmark-internals
 cargo build --release --locked --manifest-path "$source/Cargo.toml" -p bergshamra --no-default-features --features rustcrypto --target-dir "$target/competitors/bergshamra"
 [[ $before == "$(source_identity)" ]] || { printf 'Source changed during build; discard binaries\n' >&2; exit 3; }
 locks_before=$(shasum -a 256 Cargo.lock "$source/Cargo.lock")
