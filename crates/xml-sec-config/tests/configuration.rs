@@ -159,6 +159,81 @@ fn bounded_readers_and_paths_admit_bytes_before_parsing() {
 }
 
 #[test]
+fn certificate_default_to_classical_allowlist_is_restrictive() {
+    // The default admits classical methods, not PQ. Narrowing to one classical
+    // method must not be reported as permission growth merely due to TOML types.
+    let old = effective(&config(""), "team");
+    let new = effective(
+        &config(
+            "[profiles.team.verification.key_trust]\ncertificate_signature_algorithms=[{kind='Ed25519'}]",
+        ),
+        "team",
+    );
+    let field = "verification.key_trust.certificate_signature_algorithms";
+    assert_eq!(
+        old.diff(&new)
+            .iter()
+            .find(|c| c.field == field)
+            .unwrap()
+            .direction,
+        Direction::Restrictive
+    );
+    assert_eq!(
+        new.diff(&old)
+            .iter()
+            .find(|c| c.field == field)
+            .unwrap()
+            .direction,
+        Direction::Relaxing
+    );
+}
+
+#[cfg(feature = "xmlenc")]
+#[test]
+fn configured_snapshots_enforce_real_encrypt_and_decrypt_limits() {
+    // Exercise the config-to-public-context boundary with actual authenticated
+    // encryption, then prove each configured resource limit refuses work.
+    use xml_sec::xmlenc::{
+        DataEncryptionAlgorithm, DecryptContext, DecryptedContent, EncryptedDataBuilder,
+        SymmetricKeyDecryptor, XmlEncError,
+    };
+    let policies = effective(&config(""), "team");
+    let key = vec![7; 16];
+    let resolver = SymmetricKeyDecryptor::new(key.clone());
+    let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .direct_key(key.clone())
+        .policy(policies.compiled().encryption().unwrap().clone())
+        .encrypt_binary(b"protected")
+        .unwrap();
+    assert_eq!(
+        DecryptContext::new(&resolver)
+            .policy(policies.compiled().decryption().unwrap().clone())
+            .decrypt(&encrypted.encrypted_data_xml)
+            .unwrap(),
+        DecryptedContent::Bytes(b"protected".to_vec())
+    );
+    let restricted = effective(
+        &config(
+            "[profiles.team.encryption.resources]\nmax_encryption_plaintext_bytes=0\n[profiles.team.decryption.resources]\nmax_xml_nodes=0",
+        ),
+        "team",
+    );
+    assert!(matches!(
+        EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .direct_key(key)
+            .policy(restricted.compiled().encryption().unwrap().clone())
+            .encrypt_binary(b"protected"),
+        Err(XmlEncError::Policy(_))
+    ));
+    assert!(matches!(
+        DecryptContext::new(&resolver)
+            .policy(restricted.compiled().decryption().unwrap().clone())
+            .decrypt(&encrypted.encrypted_data_xml),
+        Err(XmlEncError::Policy(_))
+    ));
+}
+
+#[test]
 fn disabling_operation_has_only_restrictive_effective_changes() {
     // Removing an operation's subordinate settings is not a relaxation: they
     // are unreachable once enabled=false. The reverse enables all those paths.

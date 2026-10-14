@@ -848,6 +848,20 @@ fn dsa_snapshot(p: DsaKeyPolicy) -> Value {
     )]))
 }
 fn trust_snapshot(p: &KeyTrustPolicy) -> Result<Value, Error> {
+    let KeyTrustPolicy {
+        mode: _,
+        verify_x509_chains: _,
+        max_x509_chain_depth: _,
+        max_x509_candidate_paths: _,
+        allowed_legacy_signature_algorithms: _,
+        parameterized_rsa_pss: _,
+        certificate_signature_algorithms: _,
+        rsa_keys: _,
+        dsa_keys: _,
+        allowed_extended_key_usages: _,
+        check_crls: _,
+        verification_time: _,
+    } = p;
     let purpose = |v: &ExtendedKeyPurpose| match v {
         ExtendedKeyPurpose::Other(arcs) => {
             Value::Array(arcs.iter().map(|v| text(v.to_string())).collect())
@@ -908,6 +922,14 @@ fn trust_snapshot(p: &KeyTrustPolicy) -> Result<Value, Error> {
     ])))
 }
 fn source_snapshot(p: KeySourcePolicy) -> Value {
+    let KeySourcePolicy {
+        preset_key: _,
+        key_name: _,
+        key_value: _,
+        der_encoded_key_value: _,
+        x509_data: _,
+        key_info_reference: _,
+    } = p;
     Value::Table(Table::from_iter([
         ("preset_key".into(), Value::Boolean(p.preset_key)),
         ("key_name".into(), Value::Boolean(p.key_name)),
@@ -1016,6 +1038,23 @@ pub(super) fn snapshot(p: &CompiledPolicies) -> Result<Table, Error> {
         match p.verification() {
             None => disabled(),
             Some(p) => {
+                let VerificationPolicy {
+                    validity: _,
+                    signature_constraints: _,
+                    key_establishment: _,
+                    parameterized_rsa_pss: _,
+                    signature_algorithms: _,
+                    digest_algorithms: _,
+                    hmac: _,
+                    ecdsa_signature_value_encoding: _,
+                    key_trust: _,
+                    key_sources: _,
+                    uris: _,
+                    transforms: _,
+                    manifest_processing: _,
+                    xml: _,
+                    resources: _,
+                } = p;
                 let mut t = signature_snapshot!(p);
                 t.insert("key_trust".into(), trust_snapshot(&p.key_trust)?);
                 t.insert("key_sources".into(), source_snapshot(p.key_sources));
@@ -1028,6 +1067,23 @@ pub(super) fn snapshot(p: &CompiledPolicies) -> Result<Table, Error> {
         match p.signing() {
             None => disabled(),
             Some(p) => {
+                let SigningPolicy {
+                    validity: _,
+                    signature_constraints: _,
+                    key_establishment: _,
+                    parameterized_rsa_pss: _,
+                    signature_algorithms: _,
+                    digest_algorithms: _,
+                    hmac: _,
+                    ecdsa_signature_value_encoding: _,
+                    rsa_keys: _,
+                    dsa_keys: _,
+                    uris: _,
+                    transforms: _,
+                    manifest_processing: _,
+                    xml: _,
+                    resources: _,
+                } = p;
                 let mut t = signature_snapshot!(p);
                 t.insert("rsa_keys".into(), rsa_snapshot(p.rsa_keys));
                 t.insert("dsa_keys".into(), dsa_snapshot(p.dsa_keys));
@@ -1041,7 +1097,20 @@ pub(super) fn snapshot(p: &CompiledPolicies) -> Result<Table, Error> {
             "encryption".into(),
             match p.encryption() {
                 None => disabled(),
-                Some(p) => Value::Table(encryption_snapshot!(p)),
+                Some(p) => {
+                    let EncryptionPolicy {
+                        validity: _,
+                        data_algorithms: _,
+                        key_transport_algorithms: _,
+                        key_wrap_algorithms: _,
+                        oaep_digests: _,
+                        rsa_keys: _,
+                        key_establishment: _,
+                        xml: _,
+                        resources: _,
+                    } = p;
+                    Value::Table(encryption_snapshot!(p))
+                }
             },
         );
         output.insert(
@@ -1049,6 +1118,19 @@ pub(super) fn snapshot(p: &CompiledPolicies) -> Result<Table, Error> {
             match p.decryption() {
                 None => disabled(),
                 Some(p) => {
+                    let DecryptionPolicy {
+                        validity: _,
+                        data_algorithms: _,
+                        key_transport_algorithms: _,
+                        key_wrap_algorithms: _,
+                        oaep_digests: _,
+                        rsa_keys: _,
+                        key_establishment: _,
+                        xml: _,
+                        resources: _,
+                        uris: _,
+                        transforms: _,
+                    } = p;
                     let mut t = encryption_snapshot!(p);
                     t.insert("uris".into(), uri_snapshot(p.uris));
                     t.insert("transforms".into(), transform_snapshot(&p.transforms));
@@ -1095,6 +1177,21 @@ fn direction(field: &str, old: Option<&Value>, new: Option<&Value>) -> Direction
         };
     }
     let last = field.rsplit('.').next().unwrap_or(field);
+    if last == "certificate_signature_algorithms" {
+        // This is the core's deployment-permission ordering, not PKIX syntax:
+        // default admits classical algorithms only; AllSupported also admits PQ.
+        if old.and_then(Value::as_str) == Some("AllSupported") {
+            return Restrictive;
+        }
+        if old.and_then(Value::as_str) == Some("default")
+            && let Some(Value::Array(algorithms)) = new
+            && algorithms.iter().all(|v| {
+                matches!(certificate(v), Ok(a) if !matches!(a, X509SignatureAlgorithm::PostQuantum(_)))
+            })
+        {
+            return Restrictive;
+        }
+    }
     if matches!(last, "not_before" | "expires_at")
         && let (Some(a), Some(b)) = (old, new)
         && let (Ok(a), Ok(b)) = (timestamp(a, last), timestamp(b, last))
@@ -1230,6 +1327,45 @@ mod tests {
         assert_eq!(
             purpose(&value).unwrap(),
             ExtendedKeyPurpose::Other(vec![2, u64::MAX, 1])
+        );
+    }
+
+    #[test]
+    fn certificate_permission_diff_preserves_default_pq_boundary() {
+        // Default excludes PQ, while AllSupported includes it. Exact classical
+        // and mixed sets therefore have different directions from default.
+        let field = "verification.key_trust.certificate_signature_algorithms";
+        let default = text("default");
+        let all = text("AllSupported");
+        let classical = Value::Array(vec![
+            certificate_value(X509SignatureAlgorithm::Ed25519).unwrap(),
+        ]);
+        let mixed = Value::Array(vec![
+            certificate_value(X509SignatureAlgorithm::Ed25519).unwrap(),
+            certificate_value(X509SignatureAlgorithm::PostQuantum(
+                xml_sec::xmldsig::PqAlgorithm::MlDsa44,
+            ))
+            .unwrap(),
+        ]);
+        assert_eq!(
+            direction(field, Some(&all), Some(&default)),
+            Direction::Restrictive
+        );
+        assert_eq!(
+            direction(field, Some(&all), Some(&mixed)),
+            Direction::Restrictive
+        );
+        assert_eq!(
+            direction(field, Some(&default), Some(&classical)),
+            Direction::Restrictive
+        );
+        assert_eq!(
+            direction(field, Some(&default), Some(&mixed)),
+            Direction::Relaxing
+        );
+        assert_eq!(
+            direction(field, Some(&classical), Some(&default)),
+            Direction::Relaxing
         );
     }
 }
