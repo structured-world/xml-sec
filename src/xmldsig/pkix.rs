@@ -1079,6 +1079,36 @@ mod tests {
     use structured_pkix::path::{Verified, Verify as _, WorkingKey};
 
     #[test]
+    fn algorithm_inspection_faults_never_become_strict_crypto_identifiers() {
+        // The released inspection API preserves diagnostic bytes and offsets;
+        // our Certificate/CRL crypto path must still require strict identifiers.
+        let session = CertificateSession::new(&ResourcePolicy::default());
+        let bytes = [0x30, 0x05, 0x06, 0x01, 0x2a, 0x25, 0x00];
+        let mut reader = session
+            .parser
+            .read(&bytes, 500)
+            .expect("funded source reader");
+        let element = reader
+            .next_element()
+            .expect("structural sequence")
+            .expect("one algorithm element");
+        let reading = structured_pkix::algorithm::read_inspection(&reader, &element, "algorithm")
+            .expect("recoverable parameter fault");
+        assert!(reading.fault().is_some());
+        assert!(reading.identifier().is_none());
+        assert_eq!(reading.parameters(), Some(&bytes[5..]));
+        assert_eq!(
+            reading
+                .parameters_span()
+                .expect("original parameter range")
+                .start,
+            505
+        );
+        assert!(std::ptr::eq(reading.as_bytes().as_ptr(), bytes.as_ptr()));
+        assert!(structured_pkix::algorithm::read(&reader, &element, "algorithm").is_err());
+    }
+
+    #[test]
     fn shared_general_name_queries_keep_semantics_and_work_limits() {
         // GeneralName equality is not raw text equality or mailbox local-part folding.
         use structured_pkix::general_name::{self, GeneralName};

@@ -1164,6 +1164,73 @@ fn flatten<'a>(table: &'a Table, prefix: &str, output: &mut BTreeMap<String, &'a
         }
     }
 }
+fn default_admits(field: &str, value: &Value) -> bool {
+    let last = field.rsplit('.').next().unwrap_or(field);
+    let uri = value.as_str();
+    // Interpret the core field's None contract, not a universal "allow all".
+    // This is reporting only; permission enforcement remains in the compiler
+    // and operation policies. Keep parsing borrowed and fail conservatively.
+    match last {
+        "allowed_algorithms" => uri.is_some(),
+        "certificate_signature_algorithms" => {
+            matches!(certificate(value), Ok(a) if !matches!(a, X509SignatureAlgorithm::PostQuantum(_)))
+        }
+        "agreement_algorithms" => matches!(
+            uri.and_then(KeyAgreementAlgorithm::from_uri),
+            Some(KeyAgreementAlgorithm::EcdhEs | KeyAgreementAlgorithm::X25519)
+        ),
+        "derivation_algorithms" => matches!(
+            uri.and_then(KeyDerivationAlgorithm::from_uri),
+            Some(
+                KeyDerivationAlgorithm::ConcatKdf
+                    | KeyDerivationAlgorithm::Hkdf
+                    | KeyDerivationAlgorithm::Pbkdf2
+            )
+        ),
+        "digest_algorithms" if field.contains(".key_establishment.") => matches!(
+            uri.and_then(DigestAlgorithm::from_uri),
+            Some(
+                DigestAlgorithm::Sha224
+                    | DigestAlgorithm::Sha256
+                    | DigestAlgorithm::Sha384
+                    | DigestAlgorithm::Sha512
+            )
+        ),
+        "digest_algorithms" => uri.and_then(DigestAlgorithm::from_uri).is_some_and(|a| {
+            if field.starts_with("signing.") {
+                a.signing_allowed()
+            } else {
+                !a.requires_explicit_permission()
+            }
+        }),
+        "signature_algorithms" => signature(value).is_ok_and(|a| {
+            if field.starts_with("signing.") {
+                a.signing_allowed()
+            } else {
+                !a.requires_explicit_permission()
+                    && !matches!(a, SignatureAlgorithm::PostQuantum(_))
+            }
+        }),
+        #[cfg(feature = "xmlenc")]
+        "data_algorithms" => uri.is_some_and(|uri| {
+            DataEncryptionAlgorithm::from_uri(uri).is_ok_and(|a| !a.requires_explicit_permission())
+        }),
+        #[cfg(feature = "xmlenc")]
+        "key_transport_algorithms" => uri.is_some_and(|uri| {
+            KeyTransportAlgorithm::from_uri(uri).is_ok_and(|a| !a.requires_explicit_permission())
+        }),
+        #[cfg(feature = "xmlenc")]
+        "key_wrap_algorithms" => uri.is_some_and(|uri| {
+            KeyWrapAlgorithm::from_uri(uri).is_ok_and(|a| !a.requires_explicit_permission())
+        }),
+        #[cfg(feature = "xmlenc")]
+        "oaep_digests" => uri
+            .and_then(OaepDigestAlgorithm::from_uri)
+            .is_some_and(|a| !a.requires_explicit_permission()),
+        _ => false,
+    }
+}
+
 fn direction(field: &str, old: Option<&Value>, new: Option<&Value>) -> Direction {
     use Direction::{Neutral, Relaxing, Restrictive};
     if field == "base" {
@@ -1183,14 +1250,12 @@ fn direction(field: &str, old: Option<&Value>, new: Option<&Value>) -> Direction
         if old.and_then(Value::as_str) == Some("AllSupported") {
             return Restrictive;
         }
-        if old.and_then(Value::as_str) == Some("default")
-            && let Some(Value::Array(algorithms)) = new
-            && algorithms.iter().all(|v| {
-                matches!(certificate(v), Ok(a) if !matches!(a, X509SignatureAlgorithm::PostQuantum(_)))
-            })
-        {
-            return Restrictive;
-        }
+    }
+    if old.and_then(Value::as_str) == Some("default")
+        && let Some(Value::Array(algorithms)) = new
+        && algorithms.iter().all(|v| default_admits(field, v))
+    {
+        return Restrictive;
     }
     if matches!(last, "not_before" | "expires_at")
         && let (Some(a), Some(b)) = (old, new)
@@ -1275,6 +1340,67 @@ pub(super) fn diff(old: &Table, new: &Table) -> Vec<Change> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reported_key_establishment_defaults_match_core_permission_checks() {
+        // Explicit-only algorithms cannot be classified as safe narrowing of
+        // None. Cross-check the report's model against actual core enforcement.
+        let policy = KeyEstablishmentPolicy::default();
+        let default = text("default");
+        for algorithm in [
+            KeyAgreementAlgorithm::EcdhEs,
+            KeyAgreementAlgorithm::X25519,
+            KeyAgreementAlgorithm::X448,
+            KeyAgreementAlgorithm::DhEs,
+            KeyAgreementAlgorithm::LegacyDh,
+        ] {
+            let field = "verification.key_establishment.agreement_algorithms";
+            let value = text(algorithm.uri());
+            let admitted = policy.check_agreement(algorithm).is_ok();
+            assert_eq!(default_admits(field, &value), admitted);
+            let set = Value::Array(vec![value]);
+            assert_eq!(
+                direction(field, Some(&default), Some(&set)),
+                if admitted {
+                    Direction::Restrictive
+                } else {
+                    Direction::Relaxing
+                }
+            );
+        }
+        for algorithm in [
+            KeyDerivationAlgorithm::ConcatKdf,
+            KeyDerivationAlgorithm::Hkdf,
+            KeyDerivationAlgorithm::Pbkdf2,
+            KeyDerivationAlgorithm::LegacyDh,
+        ] {
+            assert_eq!(
+                default_admits(
+                    "verification.key_establishment.derivation_algorithms",
+                    &text(algorithm.uri())
+                ),
+                policy
+                    .check_derivation(algorithm, DigestAlgorithm::Sha256)
+                    .is_ok()
+            );
+        }
+        for algorithm in [
+            DigestAlgorithm::Sha1,
+            DigestAlgorithm::Sha224,
+            DigestAlgorithm::Sha256,
+            DigestAlgorithm::Sha384,
+            DigestAlgorithm::Sha512,
+            DigestAlgorithm::Sha3_256,
+        ] {
+            assert_eq!(
+                default_admits(
+                    "verification.key_establishment.digest_algorithms",
+                    &text(algorithm.uri())
+                ),
+                policy.check_derivation_digest(algorithm).is_ok()
+            );
+        }
+    }
 
     #[test]
     fn exact_timestamp_codec_handles_both_sides_of_epoch() {

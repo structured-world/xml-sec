@@ -1,15 +1,17 @@
 # xmlsec1 command-line target
 
-This directory contains the `xmlsec1` binary target shipped by the `xml-sec`
-package; it is not a separately published crate. The command is backed by the
+This directory contains the `xmlsec1` binary target in the `xml-sec-cli`
+workspace package, which is not published to crates.io. The command is backed by the
 [`xml-sec`](https://crates.io/crates/xml-sec) XMLDSig, XMLEnc, policy, and
 cryptographic-provider pipelines.
 
 ```sh
-cargo install xml-sec
+cargo install --git https://github.com/structured-world/xml-sec xml-sec-cli
 xmlsec1 version
 xmlsec1 list-transforms
 ```
+
+From a checkout, use `cargo install --path tools/xmlsec1` at the repository root.
 
 See the repository's [CLI compatibility guide](https://github.com/structured-world/xml-sec/blob/main/docs/cli.md) for command
 examples, supported key formats, fail-closed behavior, and upstream runner

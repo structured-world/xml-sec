@@ -188,6 +188,51 @@ fn certificate_default_to_classical_allowlist_is_restrictive() {
     );
 }
 
+#[test]
+fn default_transform_and_agreement_permissions_narrow_to_allowlists() {
+    // None is field-specific, not an empty set: transforms permit implemented
+    // methods, while agreement defaults permit ECDH-ES/X25519 but not X448.
+    let load = |extra: &str| {
+        Configuration::from_str(
+            &format!("schema_version=1\n[profiles.team]\nbase='XmlSecCompatible'\n{extra}"),
+            LoadLimits::default(),
+        )
+        .unwrap()
+    };
+    let old = effective(&load(""), "team");
+    let new = effective(
+        &load(
+            "[profiles.team.verification.transforms]\nallowed_algorithms=['http://www.w3.org/TR/2001/REC-xml-c14n-20010315']\n[profiles.team.verification.key_establishment]\nagreement_algorithms=['http://www.w3.org/2009/xmlenc11#ECDH-ES']\nderivation_algorithms=['http://www.w3.org/2009/xmlenc11#ConcatKDF']\ndigest_algorithms=['http://www.w3.org/2001/04/xmlenc#sha256']",
+        ),
+        "team",
+    );
+    for field in [
+        "verification.transforms.allowed_algorithms",
+        "verification.key_establishment.agreement_algorithms",
+        "verification.key_establishment.derivation_algorithms",
+        "verification.key_establishment.digest_algorithms",
+    ] {
+        assert_eq!(
+            old.diff(&new)
+                .iter()
+                .find(|change| change.field == field)
+                .unwrap()
+                .direction,
+            Direction::Restrictive,
+            "{field}"
+        );
+        assert_eq!(
+            new.diff(&old)
+                .iter()
+                .find(|change| change.field == field)
+                .unwrap()
+                .direction,
+            Direction::Relaxing,
+            "{field}"
+        );
+    }
+}
+
 #[cfg(feature = "xmlenc")]
 #[test]
 fn configured_snapshots_enforce_real_encrypt_and_decrypt_limits() {

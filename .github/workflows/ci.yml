@@ -140,7 +140,7 @@ jobs:
             cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backends-all
           - rust: stable
             xml-backend: xmlenc-inventory
-            cargo-args: --no-default-features --features xmlenc,xml-backend-xmloxide
+            cargo-args: --package xml-sec --no-default-features --features xmlenc,xml-backend-xmloxide
           - rust: "1.92.0"
             xml-backend: xmloxide
             cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-xmloxide
@@ -155,7 +155,11 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --workspace ${{ matrix.cargo-args }}
+      - name: Build without enriching the inventory feature graph
+        run: >-
+          cargo build
+          ${{ matrix.xml-backend != 'xmlenc-inventory' && '--workspace' || '' }}
+          ${{ matrix.cargo-args }}
 
   build:
     runs-on: ubuntu-latest
