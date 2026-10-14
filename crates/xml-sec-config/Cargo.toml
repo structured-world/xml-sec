@@ -23,7 +23,7 @@ xml-backend-differential = ["xml-sec/xml-backend-differential"]
 experimental-pq = ["xml-sec/experimental-pq"]
 legacy-algorithms = ["xml-sec/legacy-algorithms"]
 aws-lc-fips = ["xml-sec/aws-lc-fips"]
-pkcs11 = ["xml-sec/pkcs11"]
+pkcs11 = ["xmlenc", "xml-sec/pkcs11"]
 
 [dev-dependencies]
 tempfile = "3"

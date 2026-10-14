@@ -368,7 +368,7 @@ failure, not a successful skipped check. Install it with
 installation's `bin/xmlsec1`. Set `DYLD_LIBRARY_PATH` (macOS) or
 `LD_LIBRARY_PATH` (Linux) to that installation's `lib` directory when required
 by the dynamic loader. CI provisions the same oracle. Run with
-`cargo nextest run -p xml-sec --test xmlenc_encrypt_xmlsec1`.
+`cargo nextest run -p xml-sec-cli --test xmlenc_encrypt_xmlsec1`.
 
 `parse_hkdf_agreement_method` separately adapts the
 [RFC 9231 section 2.8.1](https://www.rfc-editor.org/rfc/rfc9231.html#section-2.8.1)

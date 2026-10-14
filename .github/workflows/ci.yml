@@ -81,6 +81,8 @@ jobs:
         run: cargo clippy --no-default-features --features pkcs11,c14n,xml-backend-${{ matrix.backend }} --all-targets -- -D warnings
       - name: Check provider and policy contracts
         run: cargo nextest run --lib --no-default-features --features pkcs11,c14n,xml-backend-${{ matrix.backend }}
+      - name: Check configuration with only the token provider enabled
+        run: cargo nextest run -p xml-sec-config --no-default-features --features pkcs11,xml-backend-${{ matrix.backend }}
       - name: Exercise token operations with disposable storage
         run: bash scripts/test-pkcs11.sh /usr/lib/softhsm/libsofthsm2.so --no-default-features --features c14n,xml-backend-${{ matrix.backend }}
 

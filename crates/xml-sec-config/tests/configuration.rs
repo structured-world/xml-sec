@@ -47,6 +47,32 @@ fn all_ordinary_profiles_round_trip_effective_policy() {
     }
 }
 
+#[cfg(feature = "pkcs11")]
+#[test]
+fn pkcs11_configuration_retains_encryption_policies() {
+    // PKCS#11 enables encryption in the core; configuration must admit and
+    // retain the same policy sections even without its default features.
+    let policy = effective(
+        &config(
+            "[profiles.team.encryption]\nenabled=true\n[profiles.team.decryption]\nenabled=true",
+        ),
+        "team",
+    );
+    assert!(policy.compiled().encryption().is_some());
+    assert!(policy.compiled().decryption().is_some());
+    let output = policy.to_toml().expect("effective output");
+    assert!(output.contains("[profiles.effective.encryption]"));
+    assert!(output.contains("[profiles.effective.decryption]"));
+    let restored =
+        Configuration::from_str(&output, LoadLimits::default()).expect("effective configuration");
+    assert_eq!(
+        output,
+        effective(&restored, "effective")
+            .to_toml()
+            .expect("round trip")
+    );
+}
+
 #[test]
 fn strict_schema_rejects_typos_versions_cycles_and_irrelevant_fields() {
     // No unknown setting can be ignored and accidentally inherit permission.

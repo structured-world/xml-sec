@@ -106,7 +106,7 @@ key lookup, path search, static validation and revocation. Displayed names or
 phase-local metadata never establish certificate identity. Effective inherited
 issuer parameters are projected from the authenticated path without rewriting
 certificates or repeating their signature checks.
-Both the core and native CLI use the published 0.2 API family (minimum 0.2.1).
+Both the core and native CLI use the published 0.2 API family (minimum 0.2.2).
 Applications supplying public PKIX types such as `LeapTable` must use the same
 compatible family; a type from the older 0.1 package is not interchangeable.
 GeneralName comparisons use the shared semantic core, including its accounting;
