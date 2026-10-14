@@ -23,6 +23,27 @@ fn effective(config: &Configuration, name: &str) -> xml_sec_config::EffectivePol
 }
 
 #[test]
+#[cfg(unix)]
+fn earliest_signed_verification_time_round_trips_effective_policy() {
+    // Schema-admitted lower-bound instants must compile and survive effective
+    // output, not fail only when the snapshot serializes their unsigned span.
+    for nanoseconds in [0, 1, 999_999_999] {
+        let original = effective(
+            &config(&format!(
+                "[profiles.team.verification.key_trust]\nverification_time={{seconds={},nanoseconds={nanoseconds}}}",
+                i64::MIN
+            )),
+            "team",
+        );
+        let output = original.to_toml().unwrap();
+        let restored = Configuration::from_str(&output, LoadLimits::default()).unwrap();
+        let restored = effective(&restored, "effective");
+        assert_eq!(output, restored.to_toml().unwrap());
+        assert!(original.diff(&restored).is_empty());
+    }
+}
+
+#[test]
 fn all_ordinary_profiles_round_trip_effective_policy() {
     // Every exposed setting must survive canonical output and re-compilation,
     // independent of HashSet order or profile-specific restrictions.

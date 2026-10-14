@@ -68,17 +68,16 @@ fn timestamp_value(time: std::time::SystemTime) -> Result<Value, Error> {
         ),
         Err(e) => {
             let d = e.duration();
-            let secs = i64::try_from(d.as_secs()).map_err(|_| invalid("timestamp range"))?;
-            if d.subsec_nanos() == 0 {
-                (-secs, 0)
+            let secs = -i128::from(d.as_secs());
+            let (seconds, nanoseconds) = if d.subsec_nanos() == 0 {
+                (secs, 0)
             } else {
-                (
-                    secs.checked_add(1)
-                        .and_then(i64::checked_neg)
-                        .ok_or_else(|| invalid("timestamp range"))?,
-                    1_000_000_000 - d.subsec_nanos(),
-                )
-            }
+                (secs - 1, 1_000_000_000 - d.subsec_nanos())
+            };
+            (
+                i64::try_from(seconds).map_err(|_| invalid("timestamp range"))?,
+                nanoseconds,
+            )
         }
     };
     Ok(Value::Table(Table::from_iter([
@@ -1436,6 +1435,27 @@ mod tests {
                 policy.check_derivation_digest(algorithm).is_ok()
             );
         }
+    }
+
+    #[test]
+    fn exact_timestamp_codec_preserves_signed_lower_boundary() {
+        // Accepted signed seconds must survive snapshot conversion, including
+        // fractional instants whose floor is i64::MIN rather than truncation.
+        for seconds in [i64::MIN, i64::MIN + 1, -1, 0, i64::MAX] {
+            for nanoseconds in [0, 1, 999_999_999] {
+                let value = Value::Table(Table::from_iter([
+                    ("seconds".into(), Value::Integer(seconds)),
+                    ("nanoseconds".into(), Value::Integer(nanoseconds)),
+                ]));
+                // SystemTime's supported range is platform-dependent. Every
+                // instant admitted on this platform must round-trip exactly.
+                if let Ok(time) = timestamp(&value, "time") {
+                    assert_eq!(timestamp_value(time).unwrap(), value);
+                }
+            }
+        }
+        #[cfg(unix)]
+        assert!(timestamp(&Value::Integer(i64::MIN), "time").is_ok());
     }
 
     #[test]
