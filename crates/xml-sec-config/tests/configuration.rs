@@ -185,6 +185,87 @@ fn bounded_readers_and_paths_admit_bytes_before_parsing() {
 }
 
 #[test]
+fn signature_constraint_diff_matches_typed_composition() {
+    // General is the identity of constraint intersection. Different specialized
+    // constraints are incomparable, not progressively stricter protocol levels.
+    use xml_sec::policy::{PolicyCompiler, PolicyProfile, SignatureConstraints};
+    let variants = [
+        SignatureConstraints::General,
+        SignatureConstraints::Saml,
+        SignatureConstraints::WsSecurity,
+        SignatureConstraints::Xades,
+    ];
+    let load = |constraints| {
+        effective(
+            &config(&format!(
+                "[profiles.team.verification]\nsignature_constraints='{constraints:?}'\n[profiles.team.verification.key_trust]\nmode='RequireTrustedKey'\n[profiles.team.signing]\nsignature_constraints='{constraints:?}'"
+            )),
+            "team",
+        )
+    };
+    for before in variants {
+        let old = load(before);
+        for after in variants {
+            let new = load(after);
+            let compiler = PolicyCompiler::new(PolicyProfile::Modern, default_provider(), None)
+                .expect("base compiler");
+            let mut layer = compiler.policies().clone();
+            layer
+                .verification
+                .as_mut()
+                .expect("verification")
+                .signature_constraints = before;
+            layer
+                .signing
+                .as_mut()
+                .expect("signing")
+                .signature_constraints = before;
+            let compiler = compiler.restrict(&layer).expect("initial restriction");
+            let mut layer = compiler.policies().clone();
+            layer
+                .verification
+                .as_mut()
+                .expect("verification")
+                .signature_constraints = after;
+            layer
+                .signing
+                .as_mut()
+                .expect("signing")
+                .signature_constraints = after;
+            let intersection = compiler.restrict(&layer);
+            let expected = if before == after {
+                Direction::Neutral
+            } else if intersection.as_ref().is_ok_and(|c| {
+                c.policies()
+                    .verification
+                    .as_ref()
+                    .expect("verification")
+                    .signature_constraints
+                    == after
+            }) {
+                Direction::Restrictive
+            } else {
+                Direction::Relaxing
+            };
+            for operation in ["verification", "signing"] {
+                let field = format!("{operation}.signature_constraints");
+                let changes = old.diff(&new);
+                let change = changes.iter().find(|c| c.field == field);
+                if expected == Direction::Neutral {
+                    assert!(change.is_none(), "{operation}: {before:?} -> {after:?}");
+                } else {
+                    assert_eq!(
+                        change.expect("constraint change").direction,
+                        expected,
+                        "{operation}: {before:?} -> {after:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn certificate_default_to_classical_allowlist_is_restrictive() {
     // The default admits classical methods, not PQ. Narrowing to one classical
     // method must not be reported as permission growth merely due to TOML types.

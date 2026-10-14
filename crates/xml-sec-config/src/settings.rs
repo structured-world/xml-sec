@@ -182,6 +182,17 @@ macro_rules! choice {
     }};
 }
 
+fn signature_constraints(value: &Value) -> Result<SignatureConstraints, Error> {
+    Ok(choice!(
+        value,
+        "signature_constraints",
+        SignatureConstraints::General,
+        SignatureConstraints::Saml,
+        SignatureConstraints::WsSecurity,
+        SignatureConstraints::Xades
+    ))
+}
+
 macro_rules! resource_fields {
     ($apply:ident $(, $arg:expr)*) => { $apply!($($arg,)*
         max_xml_nodes, max_xml_depth, max_xml_namespace_bindings, max_references, max_signatures,
@@ -458,16 +469,7 @@ macro_rules! signature_fields {
     ($p:expr, $key:expr, $value:expr) => {
         match $key.as_str() {
             "validity" => validity(&mut $p.validity, $value)?,
-            "signature_constraints" => {
-                $p.signature_constraints = choice!(
-                    $value,
-                    $key,
-                    SignatureConstraints::General,
-                    SignatureConstraints::Saml,
-                    SignatureConstraints::WsSecurity,
-                    SignatureConstraints::Xades
-                )
-            }
+            "signature_constraints" => $p.signature_constraints = signature_constraints($value)?,
             "signature_algorithms" => $p.signature_algorithms = optional($value, $key, signature)?,
             "digest_algorithms" => $p.digest_algorithms = optional($value, $key, digest)?,
             "parameterized_rsa_pss" => {
@@ -1244,6 +1246,18 @@ fn direction(field: &str, old: Option<&Value>, new: Option<&Value>) -> Direction
         };
     }
     let last = field.rsplit('.').next().unwrap_or(field);
+    if last == "signature_constraints" {
+        // General is the identity of typed constraint intersection. Specialized
+        // protocol constraints are incomparable, not ordered security levels.
+        return match (
+            old.map(signature_constraints).transpose(),
+            new.map(signature_constraints).transpose(),
+        ) {
+            (Ok(Some(a)), Ok(Some(b))) if a == b => Neutral,
+            (Ok(Some(SignatureConstraints::General)), Ok(Some(_))) => Restrictive,
+            _ => Relaxing,
+        };
+    }
     if last == "certificate_signature_algorithms" {
         // This is the core's deployment-permission ordering, not PKIX syntax:
         // default admits classical algorithms only; AllSupported also admits PQ.
