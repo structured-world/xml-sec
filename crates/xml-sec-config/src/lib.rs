@@ -320,7 +320,8 @@ impl EffectivePolicy {
         };
         Ok(toml::to_string(&document)?)
     }
-    /// Classify every effective leaf change. Non-ordered interpretation changes
+    /// Classify every effective leaf change, with validity presence transitions
+    /// reported as one constraint change. Non-ordered interpretation changes
     /// are conservatively relaxing and require operator review, never a silent
     /// claim that two different processing models are equally restrictive.
     pub fn diff(&self, next: &Self) -> Vec<Change> {
@@ -337,7 +338,8 @@ pub enum Direction {
     Relaxing,
 }
 
-/// A changed effective leaf; secret/key/request data cannot enter this snapshot.
+/// A changed effective setting; validity presence is reported atomically.
+/// Secret/key/request data cannot enter this snapshot.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Change {
     /// Fully qualified operation/setting.

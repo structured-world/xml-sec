@@ -1144,13 +1144,29 @@ pub(super) fn snapshot(p: &CompiledPolicies) -> Result<Table, Error> {
     Ok(output)
 }
 
-fn flatten<'a>(table: &'a Table, prefix: &str, output: &mut BTreeMap<String, &'a Value>) {
+fn flatten<'a>(
+    table: &'a Table,
+    peer: Option<&Table>,
+    prefix: &str,
+    output: &mut BTreeMap<String, &'a Value>,
+) {
     for (key, value) in table {
         let field = if prefix.is_empty() {
             key.clone()
         } else {
             format!("{prefix}.{key}")
         };
+        let other = if matches!(value, Value::Table(_)) {
+            peer.and_then(|table| table.get(key))
+        } else {
+            None
+        };
+        // Presence changes are one validity constraint, not removal of a
+        // sentinel plus unrelated additions of its interval and audit fields.
+        if key == "validity" && other.and_then(Value::as_str) == Some("none") {
+            output.insert(field, value);
+            continue;
+        }
         match value {
             Value::Table(t)
                 if !matches!(
@@ -1158,7 +1174,7 @@ fn flatten<'a>(table: &'a Table, prefix: &str, output: &mut BTreeMap<String, &'a
                     "not_before" | "expires_at" | "verification_time"
                 ) =>
             {
-                flatten(t, &field, output)
+                flatten(t, other.and_then(Value::as_table), &field, output)
             }
             _ => {
                 output.insert(field, value);
@@ -1246,6 +1262,12 @@ fn direction(field: &str, old: Option<&Value>, new: Option<&Value>) -> Direction
         };
     }
     let last = field.rsplit('.').next().unwrap_or(field);
+    if last == "validity" {
+        return match (old, new) {
+            (Some(Value::String(value)), Some(Value::Table(_))) if value == "none" => Restrictive,
+            _ => Relaxing,
+        };
+    }
     if last == "signature_constraints" {
         // General is the identity of typed constraint intersection. Specialized
         // protocol constraints are incomparable, not ordered security levels.
@@ -1315,8 +1337,8 @@ fn direction(field: &str, old: Option<&Value>, new: Option<&Value>) -> Direction
 pub(super) fn diff(old: &Table, new: &Table) -> Vec<Change> {
     let mut a = BTreeMap::new();
     let mut b = BTreeMap::new();
-    flatten(old, "", &mut a);
-    flatten(new, "", &mut b);
+    flatten(old, Some(new), "", &mut a);
+    flatten(new, Some(old), "", &mut b);
     a.keys()
         .chain(b.keys())
         .collect::<BTreeSet<_>>()

@@ -440,6 +440,81 @@ fn effective_time_preserves_fractional_and_negative_unix_time() {
 }
 
 #[test]
+fn validity_presence_diff_is_one_directional_change_per_operation() {
+    // Binding a grant narrows every operation to its time window; removing it
+    // widens permission. Audit metadata must not split this into false relaxations.
+    use std::time::{Duration, SystemTime};
+    use xml_sec::policy::PolicyValidity;
+    let configuration = config("");
+    let ordinary = effective(&configuration, "team");
+    let now = SystemTime::now();
+    let grant = PolicyValidity {
+        authorization_id: "test-grant".into(),
+        authority: "test-application".into(),
+        reason: "bounded operation".into(),
+        not_before: now - Duration::from_secs(60),
+        expires_at: now + Duration::from_secs(3600),
+    };
+    let bounded = configuration
+        .compile(
+            "team",
+            default_provider(),
+            &PolicyCompileContext {
+                external_resources: false,
+                target_evidence: true,
+            },
+            Some(grant.clone()),
+        )
+        .unwrap();
+    let mut operations = vec!["verification", "signing"];
+    if cfg!(feature = "xmlenc") {
+        operations.extend(["encryption", "decryption"]);
+    }
+    for (before, after, expected) in [
+        (&ordinary, &bounded, Direction::Restrictive),
+        (&bounded, &ordinary, Direction::Relaxing),
+    ] {
+        let changes = before.diff(after);
+        assert_eq!(changes.len(), operations.len(), "{changes:?}");
+        for operation in &operations {
+            let field = format!("{operation}.validity");
+            let change = changes.iter().find(|change| change.field == field).unwrap();
+            assert_eq!(change.direction, expected, "{field}");
+        }
+    }
+    let narrower = configuration
+        .compile(
+            "team",
+            default_provider(),
+            &PolicyCompileContext {
+                external_resources: false,
+                target_evidence: true,
+            },
+            Some(PolicyValidity {
+                not_before: grant.not_before + Duration::from_nanos(1),
+                expires_at: grant.expires_at - Duration::from_nanos(1),
+                ..grant
+            }),
+        )
+        .unwrap();
+    // Existing windows retain exact leaf-level comparisons, including nanos.
+    for (before, after, expected) in [
+        (&bounded, &narrower, Direction::Restrictive),
+        (&narrower, &bounded, Direction::Relaxing),
+    ] {
+        let changes = before.diff(after);
+        assert_eq!(changes.len(), operations.len() * 2);
+        for change in changes {
+            assert!(
+                change.field.ends_with(".validity.not_before")
+                    || change.field.ends_with(".validity.expires_at")
+            );
+            assert_eq!(change.direction, expected, "{}", change.field);
+        }
+    }
+}
+
+#[test]
 fn legacy_authority_must_come_from_caller_and_retains_exact_interval() {
     // A TOML audit record is not proof of authority. A supplied authenticated
     // grant is retained exactly, including fractional expiry, on round trip.

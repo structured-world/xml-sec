@@ -106,6 +106,8 @@ merely because both inputs are valid. Mixed array changes include a relaxation.
 For `signature_constraints`, `General` is the composition identity: selecting
 `Saml`, `WsSecurity` or `Xades` narrows it, while returning to `General` relaxes it.
 Different specialized constraints are incomparable, not successive security levels.
+Adding a validity window is one restrictive change; removing it is relaxing.
+When both policies have a window, its boundaries remain individually classified.
 The CLI prints all changes and exits successfully when both inputs compile;
 operators must inspect classifications rather than equating exit zero with a
 safe rollout. Store/reload atomicity and policy audit identity are separate APIs.
