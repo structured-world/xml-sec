@@ -66,12 +66,19 @@ pub(crate) fn execute(
                 .to_owned())
         };
         let time = |key| -> Result<std::time::SystemTime, String> {
-            let seconds = text(key)?
-                .parse::<u64>()
-                .map_err(|_| format!("{key} requires Unix seconds"))?;
-            UNIX_EPOCH
-                .checked_add(Duration::from_secs(seconds))
-                .ok_or_else(|| format!("{key} overflows SystemTime"))
+            let seconds = utf8(key)?
+                .ok_or_else(|| format!("{key} is required"))?
+                .parse::<i64>()
+                .map_err(|_| format!("{key} requires signed Unix seconds"))?;
+            // Match the configuration's signed epoch model; unsigned_abs also
+            // handles i64::MIN without a signed negation overflow.
+            let duration = Duration::from_secs(seconds.unsigned_abs());
+            let time = if seconds < 0 {
+                UNIX_EPOCH.checked_sub(duration)
+            } else {
+                UNIX_EPOCH.checked_add(duration)
+            };
+            time.ok_or_else(|| format!("{key} overflows SystemTime"))
         };
         Some(PolicyValidity {
             authorization_id: text("--authorization-id")?,

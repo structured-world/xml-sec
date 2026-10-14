@@ -73,7 +73,8 @@ core compiler after policy composition, never interpreted as permission.
 Legacy grants must arrive as authenticated `PolicyValidity` from the application.
 A file cannot manufacture one. A `validity` table can match its audit metadata
 and restrict its interval; `"none"` is valid only without an inherited grant.
-The CLI offers explicit authorization metadata and Unix-second interval flags;
+The CLI offers explicit authorization metadata and signed Unix-second interval flags
+(`--not-before -1` means one second before epoch);
 the operator/application is responsible for authenticating the authority.
 Time settings accept signed Unix seconds or `{ seconds = -1, nanoseconds = 0 }`;
 effective output uses the exact seconds/nanoseconds form, including dates before

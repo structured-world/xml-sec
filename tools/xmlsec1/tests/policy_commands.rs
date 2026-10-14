@@ -55,6 +55,122 @@ fn policy_commands_validate_print_and_compare_actual_files() {
 }
 
 #[test]
+fn policy_commands_accept_pre_epoch_authorization() {
+    // The native boundary must accept a currently valid grant whose lower
+    // bound precedes epoch, preserve it exactly, and still reject expired grants.
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use xml_sec::{
+        policy::{PolicyCompileContext, PolicyValidity},
+        provider::default_provider,
+    };
+    use xml_sec_config::{Configuration, LoadLimits};
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("policy.toml");
+    std::fs::write(&file, "schema_version=1\n[profiles.team]\nbase='Modern'").unwrap();
+    let expires = (SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600)
+        .to_string();
+    let run = |action: &str, not_before: &str, expires: &str| {
+        let mut command = cli();
+        command.args(["policy", action, "--file"]).arg(&file).args([
+            "--profile",
+            "team",
+            "--authorization-id",
+            "test-grant",
+            "--authority",
+            "test-application",
+            "--reason",
+            "historical start",
+            "--not-before",
+            not_before,
+            "--expires-at",
+            expires,
+        ]);
+        command
+    };
+    let check = run("check", "-1", &expires).output().unwrap();
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    assert_eq!(check.stdout, b"policy team: valid\n");
+    let shown = run("show-effective", "-1", &expires).output().unwrap();
+    assert!(
+        shown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    let output = String::from_utf8(shown.stdout).unwrap();
+    let grant = PolicyValidity {
+        authorization_id: "test-grant".into(),
+        authority: "test-application".into(),
+        reason: "historical start".into(),
+        not_before: UNIX_EPOCH - Duration::from_secs(1),
+        expires_at: UNIX_EPOCH + Duration::from_secs(expires.parse().unwrap()),
+    };
+    let restored = Configuration::from_str(&output, LoadLimits::default())
+        .unwrap()
+        .compile(
+            "effective",
+            default_provider(),
+            &PolicyCompileContext {
+                external_resources: false,
+                target_evidence: false,
+            },
+            Some(grant.clone()),
+        )
+        .unwrap();
+    assert_eq!(
+        restored
+            .compiled()
+            .verification()
+            .unwrap()
+            .validity
+            .as_ref(),
+        Some(&grant)
+    );
+    let diff = run("diff", "-1", &expires)
+        .arg("--other-file")
+        .arg(&file)
+        .args(["--other-profile", "team"])
+        .output()
+        .unwrap();
+    assert!(
+        diff.status.success(),
+        "{}",
+        String::from_utf8_lossy(&diff.stderr)
+    );
+    assert_eq!(diff.stdout, b"neutral: effective policies are identical\n");
+    let expired = run("check", "-2", "-1").output().unwrap();
+    assert!(!expired.status.success());
+    assert!(expired.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&expired.stderr)
+            .contains("policy authorization is outside its validity interval")
+    );
+    // Neither malformed text nor an out-of-i64-range value can wrap into a
+    // valid interval. Both timestamp flags use the same parsing boundary.
+    for value in ["not-a-time", "9223372036854775808", "-9223372036854775809"] {
+        for (start, end, field) in [
+            (value, expires.as_str(), "--not-before"),
+            ("-1", value, "--expires-at"),
+        ] {
+            let rejected = run("check", start, end).output().unwrap();
+            assert!(!rejected.status.success());
+            assert!(rejected.stdout.is_empty());
+            assert!(
+                String::from_utf8_lossy(&rejected.stderr)
+                    .contains(&format!("{field} requires signed Unix seconds"))
+            );
+        }
+    }
+}
+
+#[test]
 fn malformed_cli_configuration_fails_without_stdout_or_xml_work() {
     // Unknown fields/options, incomplete authorization and unreadable paths
     // cannot become successful operator checks.
