@@ -48,7 +48,14 @@ where
     F: Fn(&dyn VerifyingKey) -> Result<bool, DsigError>,
     O: FnMut(KeyVerificationEvent<'_>) -> Result<(), DsigError> + ?Sized,
 {
-    observed_at_depth(key, observer, verify_leaf, 0)
+    let mut admitted = 0;
+    let result = observed_at_depth(key, observer, verify_leaf, 0, &mut admitted);
+    // A composite may recover from a visitor error, but cannot recover capacity
+    // after a terminal hard refusal and report an unchecked later success.
+    if admitted > crate::hard_limits::KEY_CANDIDATE_CEILING {
+        return Err(MemoryError::WorkExceeded.into());
+    }
+    result
 }
 
 fn observed_at_depth<F, O>(
@@ -56,17 +63,22 @@ fn observed_at_depth<F, O>(
     observer: &mut O,
     verify_leaf: &F,
     depth: usize,
+    admitted: &mut usize,
 ) -> Result<bool, DsigError>
 where
     F: Fn(&dyn VerifyingKey) -> Result<bool, DsigError>,
     O: FnMut(KeyVerificationEvent<'_>) -> Result<(), DsigError> + ?Sized,
 {
-    observer(KeyVerificationEvent::BeforeCandidate { depth })?;
-    if depth == crate::hard_limits::KEY_CANDIDATE_CEILING {
+    if depth == crate::hard_limits::KEY_CANDIDATE_CEILING
+        || *admitted >= crate::hard_limits::KEY_CANDIDATE_CEILING
+    {
+        *admitted = crate::hard_limits::KEY_CANDIDATE_CEILING + 1;
         return Err(MemoryError::WorkExceeded.into());
     }
+    *admitted += 1;
+    observer(KeyVerificationEvent::BeforeCandidate { depth })?;
     if let Some(result) = key.verify_candidate_keys(&mut |candidate| {
-        observed_at_depth(candidate, observer, verify_leaf, depth + 1)
+        observed_at_depth(candidate, observer, verify_leaf, depth + 1, admitted)
     })? {
         return Ok(result);
     }

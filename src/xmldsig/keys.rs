@@ -831,13 +831,19 @@ impl<'a> InspectedKeyCandidateBudget<'a> {
     }
 
     pub(crate) fn charge_many(&mut self, count: usize) -> Result<(), DsigError> {
+        self.charge_policy(count).map_err(Into::into)
+    }
+
+    pub(crate) fn charge_policy(
+        &mut self,
+        count: usize,
+    ) -> Result<(), crate::policy::PolicyViolation> {
         if self.attempted > self.maximum || count > self.maximum - self.attempted {
             return Err(crate::policy::PolicyViolation::ResourceLimit {
                 resource: crate::policy::resource_name::KEY_CANDIDATES,
                 maximum: self.maximum,
                 actual: self.attempted.saturating_add(count),
-            }
-            .into());
+            });
         }
         debug_assert!(self.attempted <= self.maximum);
         self.attempted += count;

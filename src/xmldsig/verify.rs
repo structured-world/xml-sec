@@ -2867,11 +2867,14 @@ fn verify_signature_node<'a, C: VerificationCapture>(
             .require_capability(crate::provider::ProviderCapability::Verify(
                 signed_info.signature_method,
             ))?;
+        let candidate_refusal = RefCell::new(None);
         let policy_verifier = PolicyVerifyingKey {
             key: verifier,
             policy: &ctx.policy,
+            candidates: &operation.budgets().key_candidates,
+            candidate_refusal: &candidate_refusal,
         };
-        capture.verify(
+        let result = capture.verify(
             ctx.provider,
             &policy_verifier,
             crate::provider::SignatureVerificationInput {
@@ -2880,7 +2883,11 @@ fn verify_signature_node<'a, C: VerificationCapture>(
                 data: &canonical_signed_info,
                 signature: &signature_value,
             },
-        )
+        );
+        if let Some(error) = candidate_refusal.into_inner() {
+            return Err(error.into());
+        }
+        result
     })?;
 
     if !signature_valid {
@@ -2952,12 +2959,14 @@ fn verify_signature_node<'a, C: VerificationCapture>(
     })
 }
 
-struct PolicyVerifyingKey<'a> {
+struct PolicyVerifyingKey<'a, 'inputs> {
     key: &'a dyn VerifyingKey,
     policy: &'a crate::policy::VerificationPolicy,
+    candidates: &'a RefCell<super::InspectedKeyCandidateBudget<'inputs>>,
+    candidate_refusal: &'a RefCell<Option<crate::policy::PolicyViolation>>,
 }
 
-impl VerifyingKey for PolicyVerifyingKey<'_> {
+impl VerifyingKey for PolicyVerifyingKey<'_, '_> {
     fn association_spki(&self, algorithm: SignatureAlgorithm) -> Option<&[u8]> {
         self.key.association_spki(algorithm)
     }
@@ -2969,10 +2978,21 @@ impl VerifyingKey for PolicyVerifyingKey<'_> {
         verify: &mut dyn FnMut(&dyn VerifyingKey) -> Result<bool, DsigError>,
     ) -> Result<Option<bool>, DsigError> {
         self.key.verify_candidate_keys(&mut |key| {
+            if let Some(error) = self.candidate_refusal.borrow().as_ref() {
+                return Err(error.clone().into());
+            }
+            // The resolver already admitted this handle. Every child exposed
+            // by it is another attempt in that same operation-wide budget.
+            if let Err(error) = self.candidates.borrow_mut().charge_policy(1) {
+                *self.candidate_refusal.borrow_mut() = Some(error.clone());
+                return Err(error.into());
+            }
             key.validate_policy(self.policy)?;
             verify(&PolicyVerifyingKey {
                 key,
                 policy: self.policy,
+                candidates: self.candidates,
+                candidate_refusal: self.candidate_refusal,
             })
         })
     }

@@ -771,6 +771,11 @@ capacity; query Work pays later comparisons. Receipt admission failure cannot
 be swallowed by candidate recovery. Ordinary and scoped RustCrypto verification
 share the same bounded candidate traversal and leaf verifier; observing a
 successful leaf does not change which candidates are tried.
+Resolution and every exposed sibling/nested candidate share the original
+`ResourcePolicy::max_key_candidates` allowance. Admission precedes candidate
+policy and crypto work; a composite cannot recover from that terminal refusal.
+The primitive provider boundary also bounds total fan-out and nesting by its
+absolute candidate ceiling.
 
 ## RSA-PSS Parameters
 

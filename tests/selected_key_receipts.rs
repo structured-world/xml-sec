@@ -278,11 +278,18 @@ fn recursive_composites_stop_before_a_leaf_or_stack_overflow() {
         &account(),
         |session| {
             let identity = session.evidence().signatures()[0].identity();
+            let maximum = xml_sec::policy::VerificationPolicy::default()
+                .resources
+                .max_key_candidates;
+            assert!(matches!(
+                session.evidence().signatures()[0].result(),
+                Err(DsigError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
+                    maximum: limit, actual, ..
+                })) if *limit == maximum && *actual == maximum + 1
+            ));
             assert!(matches!(
                 session.select_signature(identity),
-                Err(DsigError::SharedExecution(
-                    structured_asn1::memory::MemoryError::WorkExceeded
-                ))
+                Err(DsigError::InvalidRequest { .. })
             ));
             Ok(())
         },
@@ -599,6 +606,184 @@ impl VerifyingKey for Candidates<'_> {
     fn verify(&self, _: SignatureAlgorithm, _: &[u8], _: &[u8]) -> Result<bool, DsigError> {
         panic!("a composite is not a successful leaf")
     }
+}
+
+#[test]
+fn composite_trials_share_the_original_candidate_policy_budget() {
+    // Resolver admission already spends one candidate. Every exposed child
+    // must spend the same aggregate before its policy/crypto work, in both APIs.
+    let document = signed();
+    for nested in [false, true] {
+        let required = if nested { 4 } else { 3 };
+        for maximum in 1..=required {
+            let wrong = ObservedKey {
+                key: public_key(include_str!("fixtures/keys/rsa/rsa-expired-pubkey.pem")),
+                calls: Cell::new(0),
+                disclose: true,
+            };
+            let right = ObservedKey {
+                key: public_key(include_str!("fixtures/keys/rsa/rsa-2048-pubkey.pem")),
+                calls: Cell::new(0),
+                disclose: true,
+            };
+            let keys = Candidates([&wrong, &right]);
+            let outer = Candidates([&keys, &right]);
+            let selected: &dyn VerifyingKey = if nested { &outer } else { &keys };
+            let mut policy = xml_sec::policy::VerificationPolicy::default();
+            policy.resources.max_key_candidates = maximum;
+            let context = VerifyContext::new().key(selected).policy(policy);
+            let result = context.verify_document(&document);
+            if maximum == required {
+                assert_eq!(result.unwrap().status, DsigStatus::Valid);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(DsigError::Policy(
+                        xml_sec::policy::PolicyViolation::ResourceLimit { .. }
+                    ))
+                ));
+            }
+            assert_eq!(wrong.calls.get(), usize::from(maximum >= required - 1));
+            assert_eq!(right.calls.get(), usize::from(maximum >= required));
+            wrong.calls.set(0);
+            right.calls.set(0);
+            with_verified_request(
+                &document,
+                &context,
+                &VerificationRequest::default(),
+                &account(),
+                |session| {
+                    let identity = session.evidence().signatures()[0].identity();
+                    if maximum == required {
+                        session.select_signature(identity)?;
+                    } else {
+                        assert!(matches!(
+                            session.evidence().signatures()[0].result(),
+                            Err(DsigError::Policy(
+                                xml_sec::policy::PolicyViolation::ResourceLimit { .. }
+                            ))
+                        ));
+                        assert!(session.select_signature(identity).is_err());
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(wrong.calls.get(), usize::from(maximum >= required - 1));
+            assert_eq!(right.calls.get(), usize::from(maximum >= required));
+        }
+    }
+}
+
+#[test]
+fn a_composite_cannot_recover_from_candidate_policy_refusal() {
+    // A custom container swallowing the callback error cannot forge a usable
+    // signature decision after the operation refused another candidate.
+    struct Recover<'a>(&'a dyn VerifyingKey);
+    impl VerifyingKey for Recover<'_> {
+        fn verify_candidate_keys(
+            &self,
+            visitor: &mut dyn FnMut(&dyn VerifyingKey) -> Result<bool, DsigError>,
+        ) -> Result<Option<bool>, DsigError> {
+            let _ = visitor(self.0);
+            let _ = visitor(self.0);
+            Ok(Some(true))
+        }
+        fn verify(&self, _: SignatureAlgorithm, _: &[u8], _: &[u8]) -> Result<bool, DsigError> {
+            panic!("composite is not a leaf")
+        }
+    }
+    let key = ObservedKey {
+        key: public_key(include_str!("fixtures/keys/rsa/rsa-2048-pubkey.pem")),
+        calls: Cell::new(0),
+        disclose: true,
+    };
+    let recover = Recover(&key);
+    let mut policy = xml_sec::policy::VerificationPolicy::default();
+    policy.resources.max_key_candidates = 1;
+    let context = VerifyContext::new().key(&recover).policy(policy);
+    let document = signed();
+    assert!(matches!(
+        context.verify_document(&document),
+        Err(DsigError::Policy(
+            xml_sec::policy::PolicyViolation::ResourceLimit {
+                maximum: 1,
+                actual: 2,
+                ..
+            }
+        ))
+    ));
+    with_verified_request(
+        &document,
+        &context,
+        &VerificationRequest::default(),
+        &account(),
+        |session| {
+            assert!(matches!(
+                session.evidence().signatures()[0].result(),
+                Err(DsigError::Policy(
+                    xml_sec::policy::PolicyViolation::ResourceLimit {
+                        maximum: 1,
+                        actual: 2,
+                        ..
+                    }
+                ))
+            ));
+            assert!(
+                session
+                    .select_signature(session.evidence().signatures()[0].identity())
+                    .is_err()
+            );
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(key.calls.get(), 0);
+}
+
+#[test]
+fn provider_hard_candidate_ceiling_bounds_flat_recovering_containers() {
+    // The primitive provider boundary also caps flat fan-out without an XML
+    // policy wrapper. Swallowing visitor errors must not turn refusal into true.
+    use xml_sec::provider::CryptoProvider as _;
+    struct Leaf(Cell<usize>);
+    impl VerifyingKey for Leaf {
+        fn verify(&self, _: SignatureAlgorithm, _: &[u8], _: &[u8]) -> Result<bool, DsigError> {
+            self.0.set(self.0.get() + 1);
+            Ok(false)
+        }
+    }
+    struct Flat<'a>(&'a Leaf);
+    impl VerifyingKey for Flat<'_> {
+        fn verify_candidate_keys(
+            &self,
+            visitor: &mut dyn FnMut(&dyn VerifyingKey) -> Result<bool, DsigError>,
+        ) -> Result<Option<bool>, DsigError> {
+            for _ in 0..128 {
+                let _ = visitor(self.0);
+            }
+            Ok(Some(true))
+        }
+        fn verify(&self, _: SignatureAlgorithm, _: &[u8], _: &[u8]) -> Result<bool, DsigError> {
+            panic!("not a leaf")
+        }
+    }
+    let leaf = Leaf(Cell::new(0));
+    let error = xml_sec::provider::RUST_CRYPTO_PROVIDER
+        .verify(&Flat(&leaf), SignatureAlgorithm::RsaSha256, &[], &[])
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        DsigError::SharedExecution(structured_asn1::memory::MemoryError::WorkExceeded)
+    ));
+    let maximum = xml_sec::policy::VerificationPolicy::default()
+        .resources
+        .max_key_candidates;
+    assert_eq!(
+        leaf.0.get(),
+        maximum - 1,
+        "the container occupies one admitted candidate"
+    );
 }
 
 #[test]
