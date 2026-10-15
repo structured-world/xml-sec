@@ -127,6 +127,8 @@ pub fn visit_in_scope_namespaces<W: Work, E>(
 pub enum ScalarType<'a> {
     /// XML Schema 1.0 boolean.
     Boolean,
+    /// XML Schema 1.0 integer validity, without finite-width conversion.
+    Integer,
     /// XML Schema 1.0 dateTime, not RFC 3339 or XSD 1.1.
     DateTime,
     /// XML Schema 1.0 ID lexical facts, without registering an ID.
@@ -172,6 +174,9 @@ pub struct DateTimeLexical<'a> {
 pub enum ScalarValue<'a> {
     /// Explicit schema boolean.
     Boolean(bool),
+    /// Valid arbitrary-precision integer spelling; not a numeric value or a
+    /// claim about derived types such as int, nonNegativeInteger or totalDigits.
+    Integer,
     /// Exact dateTime lexical components, not canonicalized value fields.
     DateTime(DateTimeLexical<'a>),
     /// Collapsed NCName; no ID registration, uniqueness or authentication claim.
@@ -334,7 +339,7 @@ pub fn with_scalar<W: Work, R, E>(
     };
     let lexical = value.view();
     let collapsed = match datatype {
-        ScalarType::Other { .. } => Text::Borrowed(lexical),
+        ScalarType::Other { .. } | ScalarType::Integer => Text::Borrowed(lexical),
         _ => collapse(lexical, work).map_err(InspectionError::Processing)?,
     };
     let text = collapsed.view();
@@ -345,6 +350,13 @@ pub fn with_scalar<W: Work, R, E>(
             "false" | "0" => ScalarFact::Value(ScalarValue::Boolean(false)),
             _ => ScalarFact::Malformed,
         },
+        ScalarType::Integer => {
+            if valid_integer(text) {
+                ScalarFact::Value(ScalarValue::Integer)
+            } else {
+                ScalarFact::Malformed
+            }
+        }
         ScalarType::DateTime => parse_date_time(text)
             .map(|value| ScalarFact::Value(ScalarValue::DateTime(value)))
             .unwrap_or(ScalarFact::Malformed),
@@ -375,6 +387,29 @@ pub fn with_scalar<W: Work, R, E>(
 
 fn whitespace(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
+}
+
+fn valid_integer(text: &str) -> bool {
+    // XSD 1.0 §§3.3.13.1,4.3.6: optional sign and one or more ASCII digits
+    // after collapse. Internal whitespace always invalidates this grammar, so
+    // trimming XML whitespace is equivalent without allocating a collapsed copy.
+    // Canonical-form rules (§3.3.13.2) do not restrict lexical validity.
+    // https://www.w3.org/TR/2004/REC-xmlschema-2-20041028/#integer
+    // https://www.w3.org/TR/2004/REC-xmlschema-2-20041028/#rf-whiteSpace
+    let text = text.trim_matches([' ', '\t', '\r', '\n']);
+    let digits = match text.as_bytes().first() {
+        Some(b'+' | b'-') => &text.as_bytes()[1..],
+        _ => text.as_bytes(),
+    };
+    if digits.is_empty() {
+        return false;
+    }
+    for digit in digits {
+        if !digit.is_ascii_digit() {
+            return false;
+        }
+    }
+    true
 }
 
 fn collapse<'a, W: Work>(input: &'a str, work: &W) -> Result<Text<'a, W>, ScalarError> {

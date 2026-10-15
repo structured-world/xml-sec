@@ -682,7 +682,14 @@ The known linear-pass bound is admitted before joining fragments. If both Work
 and join capacity are insufficient, Work refusal precedes the allocation request;
 OwnedVec independently admits the actual copying and retained capacity.
 
-Supported base types are XSD 1.0 `boolean`, `dateTime`, `ID` and `anyURI`.
+Supported base types are XSD 1.0 `boolean`, `integer`, `dateTime`, `ID` and `anyURI`.
+`ScalarType::Integer` returns the marker `ScalarValue::Integer` for a valid
+optional sign followed by one or more ASCII digits, with schema XML whitespace
+handling. Arbitrarily long values, leading zeros and signed zero remain valid;
+no machine-number conversion, canonicalization or normalized string is produced.
+Contiguous validation, even of malformed internal whitespace, needs no owned
+capacity. This is base `integer` validity, not derived-type range/facet validation
+(for example `int` or `nonNegativeInteger`), authentication or profile acceptance.
 `DateTimeLexical` preserves arbitrary year/fraction digits and absent timezone;
 it describes lexical components, including hour 24 and XSD 1.0's second 60,
 not normalized UTC fields or proof that a UTC leap second occurred. Unlike
