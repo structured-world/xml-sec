@@ -576,6 +576,15 @@ fn valid_any_uri(input: &str) -> bool {
                 return false;
             }
             if !rest.starts_with('/') {
+                // RFC 2396 §3 / Appendix A: opaque_part begins with
+                // uric_no_slash, not uric. RFC 2732 §3 expands reserved/uric
+                // with brackets but does not add them to uric_no_slash.
+                // Escaped brackets and brackets after the first token remain legal.
+                // https://www.rfc-editor.org/rfc/rfc2396#section-3
+                // https://www.rfc-editor.org/rfc/rfc2732#section-3
+                if matches!(rest.as_bytes()[0], b'[' | b']') {
+                    return false;
+                }
                 return uri_chars(rest, b";/?:@&=+$,[]");
             }
             path = &path[colon + 1..];
