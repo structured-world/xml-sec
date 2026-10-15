@@ -57,6 +57,9 @@ use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_bytes};
 
 mod session;
 pub use session::*;
+mod capture;
+pub use capture::SelectedSignatureMethod;
+use capture::{CapturedOperation, ScopedCapture, VerificationCapture};
 
 const MAX_SIGNATURE_VALUE_LEN: usize = 8192;
 const MAX_RETRIEVAL_METHOD_COUNT: usize = 64;
@@ -992,6 +995,7 @@ pub fn process_reference(
         transform_budget: &execution_budget,
         canonicalized_data_budget: &canonicalized_data_budget,
         provider: crate::provider::default_provider(),
+        capture: &(),
     };
     process_reference_with_options(
         reference,
@@ -1078,12 +1082,13 @@ fn bind_reference_evidence(
     }
 }
 
-struct ReferenceExecutionContext<'a> {
+struct ReferenceExecutionContext<'a, C = ()> {
     store_pre_digest: bool,
     transform_options: TransformOptions<'a>,
     transform_budget: &'a TransformExecutionBudget,
     canonicalized_data_budget: &'a CanonicalizedDataBudget,
     provider: &'a dyn crate::provider::CryptoProvider,
+    capture: &'a C,
 }
 
 struct CanonicalizedDataBudget {
@@ -1354,15 +1359,19 @@ impl CanonicalizedDataBudget {
     }
 }
 
-fn process_reference_with_options(
+fn process_reference_with_options<C: VerificationCapture>(
     reference: &Reference,
     resolver: &UriReferenceResolver<'_>,
     signature_node: Node<'_, '_>,
     reference_set: ReferenceSet,
     reference_index: usize,
     reference_node: Option<Node<'_, '_>>,
-    execution: &ReferenceExecutionContext<'_>,
+    execution: &ReferenceExecutionContext<'_, C>,
 ) -> Result<ReferenceResult, ReferenceProcessingError> {
+    execution.capture.admit_digest(
+        reference_node.map(|node| node.id()),
+        reference.digest_method,
+    )?;
     // 1. Dereference URI. Omitted URI is distinct from URI="" in XMLDSig and
     // must be rejected until caller-provided external object resolution exists.
     let uri = reference
@@ -1412,6 +1421,9 @@ fn process_reference_with_options(
         reference.digest_method,
         &pre_digest_bytes,
     )?;
+    execution
+        .capture
+        .computed_digest(reference_node.map(|node| node.id()))?;
 
     // 4. Compare with stored DigestValue (constant-time)
     let status = if constant_time_eq(&computed_digest, &reference.digest_value) {
@@ -1470,6 +1482,7 @@ pub fn process_all_references(
         transform_budget: &execution_budget,
         canonicalized_data_budget: &canonicalized_data_budget,
         provider: crate::provider::default_provider(),
+        capture: &(),
     };
     process_all_references_with_options(references, resolver, signature_node, &execution)
 }
@@ -1515,6 +1528,9 @@ fn process_all_references_with_options(
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ReferenceProcessingError {
+    /// The current shared execution refused original digest-receipt retention.
+    #[error("shared reference execution: {0}")]
+    SharedExecution(#[from] structured_asn1::memory::MemoryError),
     /// The immutable verification policy rejected reference processing.
     #[error("verification policy violation: {0}")]
     Policy(#[from] crate::policy::PolicyViolation),
@@ -1918,39 +1934,45 @@ impl<W: structured_asn1::memory::Work> SignatureBuffer
     }
 }
 
-trait OperationRetention<P, B> {
+trait OperationRetention<P, B, C> {
     fn retain(
         &mut self,
         operation: OperationExecutionContext<P, B>,
+        capture: C,
     ) -> Result<(), structured_asn1::memory::MemoryError>;
 }
 
-impl<P, B> OperationRetention<P, B> for () {
+impl<P, B, C> OperationRetention<P, B, C> for () {
     fn retain(
         &mut self,
         operation: OperationExecutionContext<P, B>,
+        _capture: C,
     ) -> Result<(), structured_asn1::memory::MemoryError> {
         drop(operation);
         Ok(())
     }
 }
 
-impl<P, B, W: structured_asn1::memory::Work> OperationRetention<P, B>
-    for structured_asn1::memory::OwnedVec<OperationExecutionContext<P, B>, W>
+impl<P, B, C, W: structured_asn1::memory::Work> OperationRetention<P, B, C>
+    for structured_asn1::memory::OwnedVec<CapturedOperation<P, B, C>, W>
 {
     fn retain(
         &mut self,
         operation: OperationExecutionContext<P, B>,
+        capture: C,
     ) -> Result<(), structured_asn1::memory::MemoryError> {
-        self.try_push(operation)
+        self.try_push(CapturedOperation { operation, capture })
     }
 }
 
 trait RequestStorage {
     type Signatures: SignatureBuffer;
+    type Capture: VerificationCapture;
     // Actual reference types preserve their lifetimes without the implied
     // 'static bound of a lifetime-GAT projection under the scoped callback.
-    type Operations<P, B>: OperationRetention<P, B>;
+    type Operations<P, B>: OperationRetention<P, B, Self::Capture>;
+
+    fn capture(&self) -> Self::Capture;
 
     fn admit_request(
         &self,
@@ -1970,7 +1992,10 @@ struct CollectedRequestStorage;
 
 impl RequestStorage for CollectedRequestStorage {
     type Signatures = Vec<SignatureEvidence>;
+    type Capture = ();
     type Operations<P, B> = ();
+
+    fn capture(&self) {}
 
     fn admit_request(
         &self,
@@ -1994,9 +2019,15 @@ impl RequestStorage for CollectedRequestStorage {
 
 struct ScopedRequestStorage<'work, W: structured_asn1::memory::Work>(&'work W);
 
-impl<W: structured_asn1::memory::Work> RequestStorage for ScopedRequestStorage<'_, W> {
+impl<'work, W: structured_asn1::memory::Work> RequestStorage for ScopedRequestStorage<'work, W> {
     type Signatures = structured_asn1::memory::OwnedVec<SignatureEvidence, W>;
-    type Operations<P, B> = structured_asn1::memory::OwnedVec<OperationExecutionContext<P, B>, W>;
+    type Capture = ScopedCapture<'work, W>;
+    type Operations<P, B> =
+        structured_asn1::memory::OwnedVec<CapturedOperation<P, B, ScopedCapture<'work, W>>, W>;
+
+    fn capture(&self) -> Self::Capture {
+        ScopedCapture::new(self.0)
+    }
 
     fn admit_request(
         &self,
@@ -2180,13 +2211,21 @@ fn with_verified_document<'inputs, R, S: RequestStorage>(
                 .find(|entry| entry.signature == signature_identity)
                 .map(|entry| entry.key)
                 .or(ctx.key);
-            let result =
-                verify_signature_node(view, ctx, key, &mut operation, &resolver, signature);
+            let capture = storage.capture();
+            let result = verify_signature_node(
+                view,
+                ctx,
+                key,
+                &mut operation,
+                &resolver,
+                signature,
+                &capture,
+            );
             signatures.push_signature(SignatureEvidence {
                 identity: view.node_identity(signature),
                 result,
             })?;
-            operations.retain(operation)?;
+            operations.retain(operation, capture)?;
         }
         let mut evidence = VerifyEvidence {
             document: view.root(),
@@ -2314,10 +2353,18 @@ fn verify_signature_view<'a>(
         }
     };
 
-    verify_signature_node(view, ctx, ctx.key, operation, &resolver, signature_node)
+    verify_signature_node(
+        view,
+        ctx,
+        ctx.key,
+        operation,
+        &resolver,
+        signature_node,
+        &(),
+    )
 }
 
-fn verify_signature_node<'a>(
+fn verify_signature_node<'a, C: VerificationCapture>(
     view: DocumentView<'a>,
     ctx: &VerifyContext<'_>,
     key: Option<&dyn VerifyingKey>,
@@ -2327,6 +2374,7 @@ fn verify_signature_node<'a>(
     >,
     resolver: &UriReferenceResolver<'a>,
     signature_node: Node<'a, 'a>,
+    capture: &C,
 ) -> Result<VerifyResult, DsigError> {
     if ctx.policy.resources.max_signatures == 0 {
         return Err(crate::policy::PolicyViolation::ResourceLimit {
@@ -2389,6 +2437,7 @@ fn verify_signature_node<'a>(
         &mut operation.budgets().xpath_parse.borrow_mut(),
         &ctx.policy.resources,
     )?;
+    capture.method(view, signed_info_node, signed_info.signature_method)?;
     if signed_info.references.len() > ctx.policy.resources.max_references {
         return Err(crate::policy::PolicyViolation::ResourceLimit {
             resource: crate::policy::resource_name::SIGNATURE_REFERENCES,
@@ -2597,6 +2646,7 @@ fn verify_signature_node<'a>(
                 transform_budget: &budgets.transforms,
                 canonicalized_data_budget: &budgets.canonicalized,
                 provider: ctx.provider,
+                capture,
             };
             process_reference_with_options(
                 reference,
@@ -2855,7 +2905,10 @@ fn verify_signature_node<'a>(
                 view,
                 signature_node,
                 resolver,
-                ctx,
+                ManifestVerification {
+                    context: ctx,
+                    capture,
+                },
                 remaining_reference_capacity,
                 plan_nodes.crypto,
             )?
@@ -4420,7 +4473,12 @@ impl ScheduledManifestReference {
     }
 }
 
-fn process_authenticated_manifest_references(
+struct ManifestVerification<'context, 'inputs, C> {
+    context: &'context VerifyContext<'inputs>,
+    capture: &'context C,
+}
+
+fn process_authenticated_manifest_references<C: VerificationCapture>(
     operation: &mut OperationExecutionContext<
         &crate::policy::VerificationPolicy,
         &VerificationOperationBudgets,
@@ -4428,10 +4486,12 @@ fn process_authenticated_manifest_references(
     view: DocumentView<'_>,
     signature_node: Node<'_, '_>,
     resolver: &UriReferenceResolver<'_>,
-    ctx: &VerifyContext<'_>,
+    verification: ManifestVerification<'_, '_, C>,
     mut remaining_reference_capacity: usize,
     crypto: OperationNodeId,
 ) -> Result<(Vec<ReferenceResult>, Vec<OperationNodeId>), SignatureVerificationPipelineError> {
+    let ctx = verification.context;
+    let capture = verification.capture;
     let mut processed_manifests = HashSet::new();
     let mut next_reference_index = 0usize;
     let mut frontier_index = 0usize;
@@ -4546,6 +4606,7 @@ fn process_authenticated_manifest_references(
                             transform_budget: &budgets.transforms,
                             canonicalized_data_budget: &budgets.canonicalized,
                             provider: ctx.provider,
+                            capture,
                         };
                         let mut result = if execution.transform_budget.remaining_c14n_output() == 0
                             || super::transforms::validate_relationship_chain(
@@ -5890,7 +5951,10 @@ mod tests {
                     view,
                     signature,
                     &resolver,
-                    &ctx,
+                    ManifestVerification {
+                        context: &ctx,
+                        capture: &(),
+                    },
                     2,
                     crypto,
                 )
@@ -6320,8 +6384,8 @@ mod tests {
                 assert_eq!(evidence.signatures().len(), 1);
                 assert_eq!(operations.len(), 1);
                 let target = view.node_for_id("target", &[]).unwrap();
-                assert!(operations[0].is_authenticated(target));
-                assert!(std::ptr::eq(*operations[0].budgets(), budgets));
+                assert!(operations[0].operation.is_authenticated(target));
+                assert!(std::ptr::eq(*operations[0].operation.budgets(), budgets));
                 assert!(budgets.canonicalized.remaining() < budgets.canonicalized.max_bytes);
                 Ok(())
             },
@@ -10239,6 +10303,7 @@ mod tests {
             transform_budget: &transform_budget,
             canonicalized_data_budget: &canonicalized_data_budget,
             provider: crate::provider::default_provider(),
+            capture: &(),
         };
 
         let error = process_all_references_with_options(
@@ -10781,6 +10846,7 @@ mod tests {
             transform_budget: &budget,
             canonicalized_data_budget: &canonicalized_data_budget,
             provider: crate::provider::default_provider(),
+            capture: &(),
         };
 
         let error = process_all_references_with_options(
@@ -10828,6 +10894,7 @@ mod tests {
             transform_budget: &budget,
             canonicalized_data_budget: &canonicalized_data_budget,
             provider: crate::provider::default_provider(),
+            capture: &(),
         };
 
         let error = process_all_references_with_options(

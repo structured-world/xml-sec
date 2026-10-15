@@ -1289,33 +1289,93 @@ pub(crate) fn parse_reference_with_xpath_budget(
 pub(crate) fn reference_layout<'a>(
     node: Node<'a, 'a>,
 ) -> Result<(Option<Node<'a, 'a>>, Node<'a, 'a>, Node<'a, 'a>), ParseError> {
-    verify_ds_element(node, "Reference")?;
-    ensure_no_non_whitespace_text(node, "Reference")?;
+    inspect_reference_layout(node).map_err(ReferenceLayoutFault::diagnostic)
+}
+
+#[derive(Debug)]
+pub(crate) enum ReferenceLayoutFault<'a, 'input> {
+    Missing(&'static str),
+    WrongElement(Node<'a, 'input>, &'static str),
+    MixedContent,
+    TrailingElement(Node<'a, 'input>),
+}
+
+impl ReferenceLayoutFault<'_, '_> {
+    fn diagnostic(self) -> ParseError {
+        match self {
+            Self::Missing(element) => ParseError::MissingElement { element },
+            Self::WrongElement(node, expected) => verify_ds_element(node, expected)
+                .expect_err("layout fault records a failed element check"),
+            Self::MixedContent => ParseError::InvalidStructure(
+                "Reference must not contain non-whitespace mixed content".into(),
+            ),
+            Self::TrailingElement(node) => ParseError::InvalidStructure(format!(
+                "unexpected element <{}> after <DigestValue> in <Reference>",
+                node.tag_name().name()
+            )),
+        }
+    }
+}
+
+fn layout_element<'a, 'input>(
+    node: Node<'a, 'input>,
+    expected: &'static str,
+) -> Result<(), ReferenceLayoutFault<'a, 'input>> {
+    if node.has_tag_name((XMLDSIG_NS, expected)) {
+        Ok(())
+    } else {
+        Err(ReferenceLayoutFault::WrongElement(node, expected))
+    }
+}
+
+/// Structural inspection borrows faults without constructing diagnostic strings.
+pub(crate) fn inspect_reference_layout<'a>(
+    node: Node<'a, 'a>,
+) -> Result<(Option<Node<'a, 'a>>, Node<'a, 'a>, Node<'a, 'a>), ReferenceLayoutFault<'a, 'a>> {
+    layout_element(node, "Reference")?;
+    for child in node.children() {
+        if child.is_text()
+            && child
+                .text()
+                .is_some_and(|text| !is_xml_whitespace_only(text))
+        {
+            return Err(ReferenceLayoutFault::MixedContent);
+        }
+    }
     let mut children = element_children(node);
-    let (transforms, method) = reference_transforms_and_digest_method(&mut children)?;
-    let value = reference_digest_value_node(&mut children)?;
-    finish_reference_children(&mut children)?;
+    let (transforms, method) = layout_transforms_and_digest_method(&mut children)?;
+    let value = layout_digest_value(&mut children)?;
+    layout_finish(&mut children)?;
     Ok((transforms, method, value))
 }
 
 fn reference_digest_value_node<'a>(
     children: &mut impl Iterator<Item = Node<'a, 'a>>,
 ) -> Result<Node<'a, 'a>, ParseError> {
-    let value = children.next().ok_or(ParseError::MissingElement {
-        element: "DigestValue",
-    })?;
-    verify_ds_element(value, "DigestValue")?;
+    layout_digest_value(children).map_err(ReferenceLayoutFault::diagnostic)
+}
+
+fn layout_digest_value<'a, 'input>(
+    children: &mut impl Iterator<Item = Node<'a, 'input>>,
+) -> Result<Node<'a, 'input>, ReferenceLayoutFault<'a, 'input>> {
+    let value = children
+        .next()
+        .ok_or(ReferenceLayoutFault::Missing("DigestValue"))?;
+    layout_element(value, "DigestValue")?;
     Ok(value)
 }
 
 fn finish_reference_children<'a>(
     children: &mut impl Iterator<Item = Node<'a, 'a>>,
 ) -> Result<(), ParseError> {
+    layout_finish(children).map_err(ReferenceLayoutFault::diagnostic)
+}
+
+fn layout_finish<'a, 'input>(
+    children: &mut impl Iterator<Item = Node<'a, 'input>>,
+) -> Result<(), ReferenceLayoutFault<'a, 'input>> {
     if let Some(unexpected) = children.next() {
-        return Err(ParseError::InvalidStructure(format!(
-            "unexpected element <{}> after <DigestValue> in <Reference>",
-            unexpected.tag_name().name()
-        )));
+        return Err(ReferenceLayoutFault::TrailingElement(unexpected));
     }
     Ok(())
 }
@@ -1350,18 +1410,24 @@ pub(crate) fn reference_digest_method(
 fn reference_transforms_and_digest_method<'a, 'input>(
     children: &mut impl Iterator<Item = Node<'a, 'input>>,
 ) -> Result<(Option<Node<'a, 'input>>, Node<'a, 'input>), ParseError> {
-    let first = children.next().ok_or(ParseError::MissingElement {
-        element: "DigestMethod",
-    })?;
+    layout_transforms_and_digest_method(children).map_err(ReferenceLayoutFault::diagnostic)
+}
+
+fn layout_transforms_and_digest_method<'a, 'input>(
+    children: &mut impl Iterator<Item = Node<'a, 'input>>,
+) -> Result<(Option<Node<'a, 'input>>, Node<'a, 'input>), ReferenceLayoutFault<'a, 'input>> {
+    let first = children
+        .next()
+        .ok_or(ReferenceLayoutFault::Missing("DigestMethod"))?;
     let transforms_node = is_ds_element(first, "Transforms").then_some(first);
     let digest_method_node = if transforms_node.is_some() {
-        children.next().ok_or(ParseError::MissingElement {
-            element: "DigestMethod",
-        })?
+        children
+            .next()
+            .ok_or(ReferenceLayoutFault::Missing("DigestMethod"))?
     } else {
         first
     };
-    verify_ds_element(digest_method_node, "DigestMethod")?;
+    layout_element(digest_method_node, "DigestMethod")?;
     Ok((transforms_node, digest_method_node))
 }
 
@@ -3741,6 +3807,21 @@ fn ensure_no_non_whitespace_text(node: Node<'_, '_>, element_name: &str) -> Resu
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests use trusted XML fixtures")]
 mod tests {
+    #[test]
+    fn inspected_reference_layout_errors_do_not_own_diagnostics() {
+        // Metadata classification borrows its original malformed source and
+        // must not retain/construct an owned parser diagnostic on that path.
+        let doc = crate::xml::dom::Document::parse(
+            "<Reference xmlns='http://www.w3.org/2000/09/xmldsig#'><wrong/></Reference>",
+        )
+        .unwrap();
+        let fault = super::inspect_reference_layout(doc.root_element()).unwrap_err();
+        fn owns_storage<T>(_: &T) -> bool {
+            std::mem::needs_drop::<T>()
+        }
+        assert!(!owns_storage(&fault));
+    }
+
     #[test]
     fn certificate_processing_diagnostic_does_not_blame_der_for_selector() {
         // DN selector syntax is not certificate DER, but retains the located source.

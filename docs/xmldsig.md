@@ -697,6 +697,32 @@ The incorporated historical RFC 2732/2373 IPv6 grammar permits decimal IPv4
 tail octets with leading zeroes; modern address-parser restrictions do not
 silently replace that XSD 1.0 lexical contract.
 
+## Original Signature Hash Uses
+
+Inside `with_verified_request`, `SelectedSignature::signature_method` returns
+the original method identity and the typed algorithm captured during the first
+verification parse. `visit_hash_uses` visits signature-message, RSA-PSS MGF1 and
+authenticated direct/nested Manifest Reference roles with original method,
+instruction, Signature and parent identities. These are selected algorithm roles,
+not a count of internal primitive invocations or a signer-trust verdict.
+
+Each fact separates its declared algorithm from `Complete`, `Unsupported` or
+`Unprocessed` execution state. Digest computation remains recorded even when a
+later Manifest error prevents a final `VerifyResult`. An unsupported historical
+URI or ignored/fail-fast instruction does not disappear into an empty successful
+catalogue. The overall completeness result supplements, rather than replaces,
+individual facts and existing verification evidence.
+
+RSA-PSS retains independent message/MGF1 hashes and its original salt length.
+Pure EdDSA and pure post-quantum methods report an intrinsic suite, not a fabricated
+external digest. Ed25519ph reports SHA-512; Ed448ph reports SHAKE256 with its
+64-byte output, never SHA3-512 or an identity guessed from output length.
+
+Inspection uses current Work and typed terminal visitor/resource errors. It
+neither parses SignedInfo/PSS again nor resolves a key or verifies a signature
+again. Ordinary collecting verification uses a monomorphized no-op capture;
+scoped receipts retain only accounted metadata, without copying XML or payloads.
+
 ## RSA-PSS Parameters
 
 The nine fixed RSA-PSS methods use MGF1 with the signature digest and a salt of that digest's

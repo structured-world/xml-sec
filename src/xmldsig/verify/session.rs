@@ -3,9 +3,13 @@
 use super::*;
 use structured_asn1::memory::{MemoryError, OwnedMap, OwnedVec, Work};
 
-type RetainedOperation<'scope, 'inputs> = OperationExecutionContext<
+mod hash_uses;
+pub use hash_uses::*;
+
+type RetainedOperation<'scope, 'inputs, W> = CapturedOperation<
     &'scope crate::policy::VerificationPolicy,
     &'scope VerificationOperationBudgets<'inputs>,
+    ScopedCapture<'scope, W>,
 >;
 
 /// A verified request's scoped continuation. No document, policy, resolver or
@@ -15,7 +19,7 @@ pub struct VerifiedSession<'view, 'scope, 'inputs, W: Work> {
     context: &'scope VerifyContext<'inputs>,
     budgets: &'scope VerificationOperationBudgets<'inputs>,
     evidence: VerifyEvidence<OwnedVec<SignatureEvidence, W>>,
-    operations: OwnedVec<RetainedOperation<'scope, 'inputs>, W>,
+    operations: OwnedVec<RetainedOperation<'scope, 'inputs, W>, W>,
     resolver: UriReferenceResolver<'view>,
     work: &'scope W,
     replays: RefCell<OwnedVec<ReplayRecord, W>>,
@@ -113,6 +117,16 @@ pub enum CatalogueError<E> {
     Visitor(E),
 }
 
+fn flatten_catalogue<T, E>(
+    result: Result<T, CatalogueError<CatalogueError<E>>>,
+) -> Result<T, CatalogueError<E>> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(CatalogueError::Processing(error)) => Err(CatalogueError::Processing(error)),
+        Err(CatalogueError::Visitor(error)) => Err(error),
+    }
+}
+
 /// Where the original property supplies its URI. Attribute lookup uses an
 /// expanded name; simple content joins only direct text/CDATA in source order.
 #[derive(Clone, Copy, Debug)]
@@ -201,7 +215,11 @@ impl<'view, 'scope, 'inputs, W: Work> VerifiedSession<'view, 'scope, 'inputs, W>
             if entry.identity != identity {
                 continue;
             }
-            let operation = &self.operations[index];
+            let retained = &self.operations[index];
+            if let Some(error) = retained.capture.failure.get() {
+                return Err(error.into());
+            }
+            let operation = &retained.operation;
             operation.validate_document_view(self.view)?;
             self.work.charge_work(
                 u64::try_from(operation.decision_count()).map_err(|_| MemoryError::WorkExceeded)?,
@@ -244,8 +262,13 @@ impl<'view, 'scope, 'inputs, W: Work> VerifiedSession<'view, 'scope, 'inputs, W>
 impl<'session, 'view, 'scope, 'inputs, W: Work>
     SelectedSignature<'session, 'view, 'scope, 'inputs, W>
 {
-    fn operation(&self) -> &RetainedOperation<'scope, 'inputs> {
-        &self.session.operations[self.index]
+    fn operation(
+        &self,
+    ) -> &OperationExecutionContext<
+        &'scope crate::policy::VerificationPolicy,
+        &'scope VerificationOperationBudgets<'inputs>,
+    > {
+        &self.session.operations[self.index].operation
     }
     fn signature(&self) -> Result<Node<'_, '_>, DsigError> {
         Ok(self
@@ -432,6 +455,15 @@ impl<'session, 'view, 'scope, 'inputs, W: Work>
         let Some(parent) = self.parent(node)? else {
             return Ok(None);
         };
+        self.descriptor_in_parent(node, parent).map(Some)
+    }
+
+    fn descriptor_in_parent<'a>(
+        &'a self,
+        node: Node<'a, 'a>,
+        parent: ReferenceParent,
+    ) -> Result<AuthenticatedReference<'a>, DsigError> {
+        let reference = self.session.view.node_identity(node);
         let result = match self.results.get(&reference, self.session.work)? {
             Some((set, index)) => self.session.evidence.signatures()[self.index]
                 .result
@@ -443,7 +475,12 @@ impl<'session, 'view, 'scope, 'inputs, W: Work>
                 }),
             None => None,
         };
-        Ok(Some(AuthenticatedReference {
+        // Admit both URI/Type attribute lookups before performing them. Their
+        // fixed names bound each comparison; values themselves remain borrowed.
+        for _ in node.attributes() {
+            self.session.work.charge_work(9)?;
+        }
+        Ok(AuthenticatedReference {
             identity: reference,
             parent,
             uri: node.attribute("URI"),
@@ -468,7 +505,7 @@ impl<'session, 'view, 'scope, 'inputs, W: Work>
                     _ => ReferenceLocation::Unchecked,
                 }
             },
-        }))
+        })
     }
 
     /// Paid, single-pass original catalogue. No repeated ordinal rescanning;
@@ -476,6 +513,22 @@ impl<'session, 'view, 'scope, 'inputs, W: Work>
     pub fn visit_authenticated_references<E>(
         &self,
         mut visitor: impl for<'a> FnMut(AuthenticatedReference<'a>) -> Result<(), E>,
+    ) -> Result<CatalogueCompleteness, CatalogueError<E>> {
+        flatten_catalogue(self.visit_reference_instructions(|node, parent, _| {
+            let reference = self
+                .descriptor_in_parent(node, parent)
+                .map_err(CatalogueError::Processing)?;
+            visitor(reference).map_err(CatalogueError::Visitor)
+        }))
+    }
+
+    fn visit_reference_instructions<E>(
+        &self,
+        mut visitor: impl for<'a> FnMut(
+            Node<'a, 'a>,
+            ReferenceParent,
+            Option<Node<'a, 'a>>,
+        ) -> Result<(), E>,
     ) -> Result<CatalogueCompleteness, CatalogueError<E>> {
         let mut completeness = CatalogueCompleteness::Complete;
         let mut references = 0;
@@ -525,12 +578,10 @@ impl<'session, 'view, 'scope, 'inputs, W: Work>
             if !node.has_tag_name((XMLDSIG_NS, "Reference")) {
                 continue;
             }
-            let Some(reference) = self
-                .descriptor(self.session.view.node_identity(node))
-                .map_err(CatalogueError::Processing)?
-            else {
+            let Some(parent) = self.parent(node).map_err(CatalogueError::Processing)? else {
                 continue;
             };
+            let identity = self.session.view.node_identity(node);
             if references == maximum {
                 return Err(CatalogueError::Processing(
                     crate::policy::PolicyViolation::ResourceLimit {
@@ -542,18 +593,36 @@ impl<'session, 'view, 'scope, 'inputs, W: Work>
                 ));
             }
             references += 1;
-            if super::super::parse::reference_layout(node).is_err() {
+            self.session
+                .work
+                .charge_work(128)
+                .map_err(|error| CatalogueError::Processing(error.into()))?;
+            for child in node.children() {
+                let text = child.text().filter(|_| child.is_text()).map_or(0, str::len);
+                let cost = u64::try_from(text)
+                    .ok()
+                    .and_then(|length| length.checked_add(128))
+                    .ok_or_else(|| CatalogueError::Processing(MemoryError::WorkExceeded.into()))?;
+                self.session
+                    .work
+                    .charge_work(cost)
+                    .map_err(|error| CatalogueError::Processing(error.into()))?;
+            }
+            let method = super::super::parse::inspect_reference_layout(node)
+                .ok()
+                .map(|(_, method, _)| method);
+            if method.is_none() {
                 if !matches!(completeness, CatalogueCompleteness::Incomplete(_)) {
-                    completeness = CatalogueCompleteness::Incomplete(reference.identity);
+                    completeness = CatalogueCompleteness::Incomplete(identity);
                 }
-            } else if let ReferenceParent::Manifest(parent) = reference.parent
+            } else if let ReferenceParent::Manifest(parent) = parent
                 && matches!(completeness, CatalogueCompleteness::Complete)
                 && self.session.context.policy.manifest_processing
                     == crate::policy::ManifestProcessing::Ignore
             {
                 completeness = CatalogueCompleteness::Unchecked(parent);
             }
-            visitor(reference).map_err(CatalogueError::Visitor)?;
+            visitor(node, parent, method).map_err(CatalogueError::Visitor)?;
         }
         Ok(completeness)
     }
