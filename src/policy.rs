@@ -127,6 +127,10 @@ pub enum PolicyViolation {
         /// Stable, non-secret diagnostic.
         reason: &'static str,
     },
+    /// The immutable operation policy forbids executing Manifest references.
+    #[cfg(feature = "xmldsig")]
+    #[error("Manifest reference processing is disabled by policy")]
+    ManifestProcessingDisabled,
     /// Untrusted XML does not satisfy the selected signature profile.
     #[cfg(feature = "xmldsig")]
     #[error("{profile:?} signature profile rejects document: {reason}")]

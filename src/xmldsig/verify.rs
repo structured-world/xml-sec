@@ -1202,24 +1202,18 @@ impl<'a> VerificationOperationBudgets<'a> {
             }
             return identity;
         }
-        let identity = resolver.external_resource_identity(uri).unwrap_or_else(|| {
-            OperationResourceIdentity::MissingExternal {
-                uri: uri.to_owned(),
-            }
-        });
-        if matches!(
-            identity,
-            OperationResourceIdentity::External { .. }
-                | OperationResourceIdentity::MissingExternal { .. }
-        ) {
+        let identity = resolver
+            .external_resource_identity(uri)
+            .unwrap_or(OperationResourceIdentity::MissingExternal);
+        if matches!(identity, OperationResourceIdentity::External { .. }) {
             self.external_resource_identities
                 .borrow_mut()
                 .insert(uri.to_owned(), identity.clone());
-            if let Some(origin) = origin {
-                self.resolved_reference_resources
-                    .borrow_mut()
-                    .insert(origin.id(), identity.clone());
-            }
+        }
+        if let Some(origin) = origin {
+            self.resolved_reference_resources
+                .borrow_mut()
+                .insert(origin.id(), identity.clone());
         }
         identity
     }
@@ -4687,13 +4681,24 @@ fn parse_manifest_references(
     // authentication state; another Signature's successes cannot admit it.
     // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-Manifest
     let document = signature_node.document();
-    for manifest_node in document
-        .descendants()
-        .filter(|node| node.has_tag_name((XMLDSIG_NS, "Manifest")))
-    {
-        let manifest_is_signed = manifest_node
-            .ancestors()
-            .any(|ancestor| operation.is_authenticated(view.node_identity(ancestor)));
+    let scan = &operation.budgets().transforms;
+    for manifest_node in document.descendants() {
+        scan.charge_node_filter_work(1)
+            .map_err(ReferenceProcessingError::Transform)?;
+        if !manifest_node.has_tag_name((XMLDSIG_NS, "Manifest"))
+            || state.processed.contains(&manifest_node.id())
+        {
+            continue;
+        }
+        let mut manifest_is_signed = false;
+        for ancestor in manifest_node.ancestors() {
+            scan.charge_node_filter_work(1)
+                .map_err(ReferenceProcessingError::Transform)?;
+            if operation.is_authenticated(view.node_identity(ancestor)) {
+                manifest_is_signed = true;
+                break;
+            }
+        }
         // Leave unauthenticated Manifests unmarked so a verified outer
         // Manifest can make them eligible on the next discovery pass.
         if !manifest_is_signed {
@@ -7953,6 +7958,46 @@ mod tests {
     }
 
     #[test]
+    fn unsigned_manifest_discovery_cannot_bypass_the_filter_work_budget() {
+        // Unsigned appended nodes still cost discovery work after Signature
+        // authentication. Even an all-unsigned frontier must admit its scan.
+        let document = XmlDocument::parse(format!(
+            "<ds:Signature xmlns:ds=\"{XMLDSIG_NS}\"><ds:Object><ds:Manifest/></ds:Object></ds:Signature>"
+        )).unwrap();
+        document.with_view(|view| {
+            let mut policy = crate::policy::VerificationPolicy::default();
+            policy.resources.max_node_set_filter_work = 0;
+            let budgets = VerificationOperationBudgets::with_transforms(
+                &policy,
+                TransformExecutionBudget::from_resources(&policy.resources),
+                None,
+            );
+            let operation = OperationExecutionContext::new(
+                &policy,
+                &budgets,
+                Some((view.identity(), view.generation())),
+            );
+            let mut processed = HashSet::new();
+            let mut remaining = 1;
+            let mut index = 0;
+            let mut xpath = XPathSignatureParseBudget::default();
+            let result = parse_manifest_references(
+                view.document().root_element(),
+                &operation,
+                view,
+                &mut ManifestDiscoveryState {
+                    processed: &mut processed,
+                    remaining_capacity: &mut remaining,
+                    next_reference_index: &mut index,
+                    xpath_parse: &mut xpath,
+                },
+                None,
+            );
+            assert!(result.is_err(), "unsigned scans are not free");
+        });
+    }
+
+    #[test]
     fn unsigned_manifest_remains_eligible_after_trust_expands() {
         // The second Object is not authenticated during the first discovery
         // pass. It must remain unprocessed so a valid reference from the first
@@ -10266,6 +10311,26 @@ mod tests {
                     "{uri}"
                 );
             }
+        });
+    }
+
+    #[test]
+    fn missing_external_identity_does_not_retain_uri_cache_copies() {
+        // No bytes exist to fingerprint or reuse. The graph's Reference node
+        // already carries provenance, so a missing URI must not enter the
+        // available-resource memoization cache or be cloned with every decision.
+        let document = XmlDocument::parse("<root/>").unwrap();
+        let uri = format!("urn:missing:{}", "x".repeat(16384));
+        let reference = make_reference(&uri, Vec::new(), DigestAlgorithm::Sha256, vec![0; 32]);
+        let budgets = VerificationOperationBudgets::with_transforms(
+            &crate::policy::VerificationPolicy::default(),
+            TransformExecutionBudget::default(),
+            None,
+        );
+        document.with_view(|view| {
+            let resolver = UriReferenceResolver::new(view.document());
+            let _ = budgets.resource_identity_for_reference(&reference, 0, &resolver, view, None);
+            assert!(budgets.external_resource_identities.borrow().is_empty());
         });
     }
 

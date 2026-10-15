@@ -567,6 +567,9 @@ struct TransformExecutionContext<'a> {
     budget: &'a TransformExecutionBudget,
     state: &'a TransformChainState,
     xml_parse: &'a XmlParseWorkBudget,
+    // Original XML context survives loss/remapping of the Signature in a
+    // later parsed transform result; absence in those two trees is not equal.
+    source_has_signature: bool,
 }
 
 /// An XPath 1.0 expression and the namespace bindings in scope where it was declared.
@@ -1133,6 +1136,7 @@ pub(crate) fn execute_reference_transforms_with_budget<'a>(
         budget,
         state: &budget.state,
         xml_parse,
+        source_has_signature: enveloped_signature.is_some(),
     };
     execute_transform_chain::<false, _, _, _>(
         source_node,
@@ -1151,7 +1155,7 @@ pub(crate) fn execute_reference_transforms_with_budget<'a>(
 /// verification. Only the final node-set coercion differs for timestamp input.
 pub(crate) fn replay_reference_transforms<'a, E, F>(
     source: Node<'a, 'a>,
-    signature: Node<'a, 'a>,
+    signature: Option<Node<'a, 'a>>,
     initial: TransformData<'a>,
     transforms: &[Transform],
     options: TransformOptions<'_>,
@@ -1174,16 +1178,10 @@ where
         budget,
         state: &budget.state,
         xml_parse: budget.xml_parse_work(),
+        source_has_signature: signature.is_some(),
     };
     execute_transform_chain::<true, _, _, _>(
-        source,
-        Some(signature),
-        initial,
-        transforms,
-        None,
-        None,
-        &context,
-        terminal,
+        source, signature, initial, transforms, None, None, &context, terminal,
     )
     .map(|_| ())
 }
@@ -1279,6 +1277,7 @@ pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
         budget,
         state: &budget.state,
         xml_parse: budget.xml_parse_work(),
+        source_has_signature: true,
     };
     let output = execute_transform_chain::<false, _, _, _>(
         signature_node,
@@ -1551,6 +1550,21 @@ where
 
     if matches!(transform, Transform::Enveloped) {
         let Some(signature) = enveloped_signature else {
+            // XMLDSig 1.1 §6.6.4 requires the specified XPath's exact effect.
+            // With no source containing Signature, its union adds no node:
+            // the predicate is false everywhere. A Signature lost only in a
+            // later transform result is different: its source still exists.
+            // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-EnvelopedSignature
+            let data = if !context.source_has_signature {
+                match data {
+                    TransformData::NodeSet(nodes) => {
+                        TransformData::NodeSet(super::types::NodeSet::empty(nodes.document()))
+                    }
+                    _ => unreachable!("node-set transforms adapt binary input before execution"),
+                }
+            } else {
+                data
+            };
             return execute_transform_chain::<STREAM_FINAL_C14N, _, _, _>(
                 source_signature,
                 None,
@@ -2473,6 +2487,7 @@ mod tests {
             budget: &budget,
             state: &budget.state,
             xml_parse: budget.xml_parse_work(),
+            source_has_signature: true,
         };
         let algorithm = C14nAlgorithm::new(C14nMode::Exclusive1_0, false);
         let result: Result<TransformChainOutput<()>, TerminalError> =

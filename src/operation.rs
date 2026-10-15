@@ -79,9 +79,9 @@ pub(crate) enum OperationResourceIdentity {
         fingerprint: [u8; 32],
     },
     #[cfg(feature = "xmldsig")]
-    MissingExternal {
-        uri: String,
-    },
+    // Absence has no bytes to cache. The originating graph Reference retains
+    // provenance; cloning absence must not clone an unaccounted URI string.
+    MissingExternal,
     #[cfg(feature = "xmldsig")]
     Generated(&'static str, usize),
 }

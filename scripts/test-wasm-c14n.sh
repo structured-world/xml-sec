@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Run the actual existing WASM C14N path rather than treating compilation as execution.
 set -euo pipefail
-readonly root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly root
 readonly manifest="$root/tests/wasm-smoke/Cargo.toml"
 cargo build --manifest-path "$manifest" --target-dir "$root/target/wasm-smoke" \
   --target wasm32-unknown-unknown

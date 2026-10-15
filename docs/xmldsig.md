@@ -624,13 +624,25 @@ Absent, malformed, unsupported, detached, unresolved, wrong-target and
 unauthenticated dispositions are separate from terminal processing/resource errors.
 
 `replay_reference` streams transform output to a fallible receiver without
-rechecking the historical digest algorithm. `ReferenceOutput` uses XMLDSig's
+rechecking the historical digest algorithm. The original policy's transform
+count/permissions still apply before execution; Manifest instructions require
+`ManifestProcessing::Process`, otherwise processing returns
+`PolicyViolation::ManifestProcessingDisabled`. An authenticated unchecked
+catalogue entry does not grant permission to execute it.
+`ReferenceOutput` uses XMLDSig's
 implicit C14N 1.0 for a final node set. `Timestamp(original_method)` instead uses
 that original CanonicalizationMethod and PrefixList. An explicit final C14N
 transform or other final octets always takes precedence: octets are not parsed
 or canonicalized merely because timestamp mode was selected. Missing admitted
 external bytes return `Unavailable`, not successful empty output. Empty supplied
 bytes are valid input. No network/filesystem acquisition is implicit.
+
+Enveloped transforms use their actual containing Signature, not necessarily the
+Signature selected by the continuation. With no containing Signature in the source,
+the mandated XPath selects no nodes, as specified by
+[XMLDSig 1.1 section 6.6.4](https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-EnvelopedSignature).
+This source fact stays distinct from a Signature disappearing only from an
+intermediate transform result.
 
 Receiver refusal remains `ReplayError::Receiver(E)`; XML/policy/resource refusal
 is `Processing`. Both stop output immediately. Repeated replay spends remaining

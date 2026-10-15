@@ -462,7 +462,7 @@ impl<'session, 'view, 'scope, 'inputs, W: Work>
                     Some(OperationResourceIdentity::External { fingerprint, .. }) => {
                         ReferenceLocation::Detached(Some(*fingerprint))
                     }
-                    Some(OperationResourceIdentity::MissingExternal { .. }) => {
+                    Some(OperationResourceIdentity::MissingExternal) => {
                         ReferenceLocation::Detached(None)
                     }
                     _ => ReferenceLocation::Unchecked,
@@ -716,6 +716,14 @@ impl<W: Work> SelectedSignature<'_, '_, '_, '_, W> {
                     reason: "Reference instruction is not authenticated by selected Signature",
                 })
             })?;
+        if matches!(descriptor.parent, ReferenceParent::Manifest(_))
+            && self.session.context.policy.manifest_processing
+                == crate::policy::ManifestProcessing::Ignore
+        {
+            return Err(processing(
+                crate::policy::PolicyViolation::ManifestProcessingDisabled.into(),
+            ));
+        }
         if self.session.replay_active.get() {
             return Err(processing(DsigError::InvalidRequest {
                 reason: "reentrant replay would reset the active transform chain",
@@ -780,6 +788,13 @@ impl<W: Work> SelectedSignature<'_, '_, '_, '_, W> {
             .transforms
             .allowed_algorithms
             .as_ref();
+        let maximum = self
+            .session
+            .context
+            .policy
+            .resources
+            .max_transforms_per_reference;
+        let mut transform_count = 0;
         for transforms in node
             .children()
             .filter(|child| child.has_tag_name((XMLDSIG_NS, "Transforms")))
@@ -789,6 +804,17 @@ impl<W: Work> SelectedSignature<'_, '_, '_, '_, W> {
                     .work
                     .charge_work(1)
                     .map_err(|error| processing(error.into()))?;
+                transform_count += 1;
+                if transform_count > maximum {
+                    return Err(processing(
+                        crate::policy::PolicyViolation::ResourceLimit {
+                            resource: crate::policy::resource_name::REFERENCE_TRANSFORMS,
+                            maximum,
+                            actual: transform_count,
+                        }
+                        .into(),
+                    ));
+                }
                 if let Some(algorithm) = transform.attribute("Algorithm") {
                     self.session
                         .work
@@ -852,9 +878,20 @@ impl<W: Work> SelectedSignature<'_, '_, '_, '_, W> {
                 reference: descriptor.identity,
             }));
         };
+        let mut enveloped_signature = None;
+        for ancestor in node.ancestors() {
+            self.session
+                .work
+                .charge_work(1)
+                .map_err(|error| processing(error.into()))?;
+            if ancestor.has_tag_name((XMLDSIG_NS, "Signature")) {
+                enveloped_signature = Some(ancestor);
+                break;
+            }
+        }
         super::super::transforms::replay_reference_transforms(
             node,
-            self.signature().map_err(processing)?,
+            enveloped_signature,
             data,
             &transforms,
             self.session.context.transform_options(),

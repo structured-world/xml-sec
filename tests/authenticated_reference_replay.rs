@@ -17,6 +17,201 @@ fn account() -> Memory {
 }
 
 #[test]
+fn replay_enforces_the_compiled_transform_count_before_output() {
+    // A valid Signature authenticates even a Manifest instruction whose
+    // execution exceeded policy. Replay must not turn that into permission.
+    let transforms = r#"<ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms>"#;
+    let (xml, key) = signed_manifest(
+        "#target",
+        "http://www.w3.org/2001/04/xmlenc#sha256",
+        transforms,
+    );
+    let document = XmlDocument::parse(xml).unwrap();
+    let mut policy = xml_sec::policy::VerificationPolicy::default();
+    policy.manifest_processing = xml_sec::policy::ManifestProcessing::Process;
+    policy.resources.max_transforms_per_reference = 1;
+    let context = VerifyContext::new().key(&key).policy(policy);
+    with_verified_request(
+        &document,
+        &context,
+        &VerificationRequest::default(),
+        &account(),
+        |session| {
+            let selected =
+                session.select_signature(session.evidence().signatures()[0].identity())?;
+            let mut calls = 0;
+            let result = selected.replay_reference(
+                session.view().node_for_id("inside", &[]).unwrap(),
+                ReplayMode::ReferenceOutput,
+                &mut |_: &[u8]| {
+                    calls += 1;
+                    Ok::<_, ()>(())
+                },
+            );
+            assert!(matches!(
+                result,
+                Err(ReplayError::Processing(DsigError::Policy(
+                    xml_sec::policy::PolicyViolation::ResourceLimit {
+                        maximum: 1,
+                        actual: 2,
+                        ..
+                    }
+                )))
+            ));
+            assert_eq!(calls, 0);
+            Ok(())
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn ignored_manifest_instructions_cannot_be_replayed() {
+    // Historical unchecked catalogue entries are not permission to do Manifest
+    // work under the immutable Ignore policy, even when their parent is signed.
+    let (xml, key) = signed_manifest("#target", "http://www.w3.org/2001/04/xmlenc#sha256", "");
+    let document = XmlDocument::parse(xml).unwrap();
+    let context = VerifyContext::new().key(&key);
+    with_verified_request(
+        &document,
+        &context,
+        &VerificationRequest::default(),
+        &account(),
+        |session| {
+            let selected =
+                session.select_signature(session.evidence().signatures()[0].identity())?;
+            let mut calls = 0;
+            let result = selected.replay_reference(
+                session.view().node_for_id("inside", &[]).unwrap(),
+                ReplayMode::ReferenceOutput,
+                &mut |_: &[u8]| {
+                    calls += 1;
+                    Ok::<_, ()>(())
+                },
+            );
+            assert!(matches!(
+                result,
+                Err(ReplayError::Processing(DsigError::Policy(_)))
+            ));
+            assert_eq!(calls, 0);
+            Ok(())
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn outside_manifest_enveloped_replay_has_no_invented_signature_context() {
+    // XMLDSig 1.1 §6.6.4's mandated XPath is false for every node when
+    // here()/ancestor::Signature[1] is empty; no unrelated Signature is removed.
+    // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-EnvelopedSignature
+    let secret = vec![0x61; 32];
+    let signer = HmacSigningKey::new(secret.clone()).unwrap();
+    let key = HmacVerificationKey::new(secret).unwrap();
+    let transforms = r#"<ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/></ds:Transforms>"#;
+    let template = manifest_template(
+        "#target",
+        "http://www.w3.org/2001/04/xmlenc#sha256",
+        transforms,
+    )
+    .replace("<ds:Object>", "</ds:Signature>")
+    .replace("</ds:Object></ds:Signature>", "");
+    let document =
+        XmlDocument::parse(SignContext::new(&signer).sign_template(&template).unwrap()).unwrap();
+    let context = VerifyContext::new().key(&key).process_manifests(true);
+    with_verified_request(
+        &document,
+        &context,
+        &VerificationRequest::default(),
+        &account(),
+        |session| {
+            let selected =
+                session.select_signature(session.evidence().signatures()[0].identity())?;
+            let mut bytes = Vec::new();
+            assert!(matches!(
+                selected
+                    .replay_reference(
+                        session.view().node_for_id("inside", &[]).unwrap(),
+                        ReplayMode::ReferenceOutput,
+                        &mut |chunk: &[u8]| {
+                            bytes.extend_from_slice(chunk);
+                            Ok::<_, ()>(())
+                        }
+                    )
+                    .unwrap(),
+                ReplayOutcome::Complete
+            ));
+            assert!(
+                bytes.is_empty(),
+                "absent containing Signature yields an empty node-set"
+            );
+            Ok(())
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn replay_excludes_the_actual_containing_signature_not_the_selected_one() {
+    // An authenticated Manifest may live inside another Signature. Enveloped
+    // removes that actual ancestor while retaining the selected verifier's one.
+    let secret = vec![0x61; 32];
+    let signer = HmacSigningKey::new(secret.clone()).unwrap();
+    let key = HmacVerificationKey::new(secret).unwrap();
+    let transforms = r#"<ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/></ds:Transforms>"#;
+    let other = r##"</ds:Signature><ds:Signature Id="other"><ds:SignedInfo>
+<ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+<ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"/>
+<ds:Reference URI="#target"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference>
+</ds:SignedInfo><ds:SignatureValue/><ds:Object>"##;
+    let template = manifest_template("", "http://www.w3.org/2001/04/xmlenc#sha256", transforms)
+        .replace("<ds:Object>", other);
+    let document = XmlDocument::parse(
+        SignContext::new(&signer)
+            .signature_template_selection(
+                xml_sec::xmldsig::SignatureTemplateSelection::FirstDescendant,
+            )
+            .sign_template(&template)
+            .unwrap(),
+    )
+    .unwrap();
+    let context = VerifyContext::new().key(&key).process_manifests(true);
+    with_verified_request(
+        &document,
+        &context,
+        &VerificationRequest::default(),
+        &account(),
+        |session| {
+            let selected =
+                session.select_signature(session.evidence().signatures()[0].identity())?;
+            let mut bytes = Vec::new();
+            selected
+                .replay_reference(
+                    session.view().node_for_id("inside", &[]).unwrap(),
+                    ReplayMode::ReferenceOutput,
+                    &mut |chunk: &[u8]| {
+                        bytes.extend_from_slice(chunk);
+                        Ok::<_, ()>(())
+                    },
+                )
+                .unwrap();
+            let output = String::from_utf8(bytes).unwrap();
+            assert!(
+                output.contains("<ds:Signature>"),
+                "selected Signature remains"
+            );
+            assert!(output.contains("<ds:SignatureValue>"));
+            assert!(
+                !output.contains("Id=\"other\""),
+                "actual containing Signature is excluded"
+            );
+            Ok(())
+        },
+    )
+    .unwrap();
+}
+
+#[test]
 fn terminal_replay_memory_does_not_scale_with_output_length() {
     // Increasing final canonical text by 16x must not retain a final-output
     // allocation. Only document shape and accounted serializer scratch matter.
