@@ -35,6 +35,10 @@ Just `cargo add xml-sec`.**
   transforms, external resources, and cumulative operation budgets.
 - **Identity-bound verification evidence**: bounded multi-signature reports, explicit trusted-key
   requests, and expected-element coverage checks resist signature wrapping and stale-document reuse.
+- **Scoped authenticated reference replay**: inspect original SignedInfo/Manifest instructions
+  and stream transform output with the original timestamp canonicalization parameters,
+  without conflating instruction authentication, historical digest validity and signer trust.
+  See [scoped reference replay](docs/xmldsig.md#scoped-authenticated-reference-replay).
 - **xmlsec1 interoperability**: a native `xmlsec1` CLI surface plus deterministic offline
   compatibility corpora and generated parity ledgers.
 - **Encoding-aware XML input**: strict bounded decoding for UTF-8, UTF-16, UTF-32, and supported

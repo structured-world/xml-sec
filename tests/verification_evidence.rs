@@ -165,6 +165,61 @@ fn distinct_authorized_keys_bind_each_signature_and_expected_element() {
 }
 
 #[test]
+fn scoped_replay_cannot_substitute_another_selected_signatures_reference() {
+    // Distinct real HMAC signatures are verified together, but one signature's
+    // authenticated catalogue does not authorize another signature's instruction.
+    use structured_asn1::memory::{Memory, MemoryAccount};
+    use xml_sec::xmldsig::{ReplayError, ReplayMode, with_verified_request};
+    let (document, first, second) = signed_pair();
+    let signatures = VerifyContext::new()
+        .signature_identities(&document)
+        .unwrap();
+    let keys = [
+        CallerTrustedSignatureKey {
+            signature: signatures[0],
+            key: &first,
+        },
+        CallerTrustedSignatureKey {
+            signature: signatures[1],
+            key: &second,
+        },
+    ];
+    let request = VerificationRequest {
+        trusted_keys: &keys,
+        ..VerificationRequest::default()
+    };
+    let work = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 24)));
+    with_verified_request(
+        &document,
+        &VerifyContext::new(),
+        &request,
+        &work,
+        |session| {
+            assert!(session.evidence().all_valid());
+            let first = session.select_signature(signatures[0])?;
+            let second = session.select_signature(signatures[1])?;
+            second
+                .visit_authenticated_references(|reference| {
+                    assert!(matches!(
+                        first.replay_reference(
+                            reference.identity,
+                            ReplayMode::ReferenceOutput,
+                            &mut |_: &[u8]| -> Result<(), ()> {
+                                panic!("cross-signature replay must refuse before output");
+                            }
+                        ),
+                        Err(ReplayError::Processing(_))
+                    ));
+                    Ok::<_, ()>(())
+                })
+                .unwrap();
+            Ok(())
+        },
+    )
+    .unwrap();
+}
+
+#[test]
 fn partial_success_requires_explicit_request_and_cannot_cover_failed_target() {
     // A correct digest under an invalid SignatureValue is not authentication.
     let (document, first, _) = signed_pair();

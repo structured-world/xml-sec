@@ -903,7 +903,7 @@ pub(crate) fn parse_signed_info_with_xpath_budget(
         })?;
     if let Some(prefix_list) = parse_inclusive_prefixes(c14n_node)? {
         if c14n_method.mode() == crate::c14n::C14nMode::Exclusive1_0 {
-            c14n_method = c14n_method.with_prefix_list(&prefix_list);
+            c14n_method = c14n_method.with_prefix_list(prefix_list);
         } else {
             return Err(ParseError::UnsupportedAlgorithm {
                 uri: c14n_uri.to_string(),
@@ -1243,11 +1243,10 @@ pub(crate) fn parse_reference_with_xpath_budget(
     let id = reference_node.attribute("Id").map(String::from);
     let ref_type = reference_node.attribute("Type").map(String::from);
 
-    let mut children = element_children(reference_node);
-
     // Optional <Transforms>
     let mut transforms = Vec::new();
     let mut transform_error = None;
+    let mut children = element_children(reference_node);
     let (transforms_node, digest_method_node) =
         reference_transforms_and_digest_method(&mut children)?;
 
@@ -1266,19 +1265,9 @@ pub(crate) fn parse_reference_with_xpath_budget(
         })?;
 
     // Required <DigestValue>
-    let digest_value_node = children.next().ok_or(ParseError::MissingElement {
-        element: "DigestValue",
-    })?;
-    verify_ds_element(digest_value_node, "DigestValue")?;
+    let digest_value_node = reference_digest_value_node(&mut children)?;
     let digest_value = decode_digest_value_children(digest_value_node, digest_method)?;
-
-    // No more children expected
-    if let Some(unexpected) = children.next() {
-        return Err(ParseError::InvalidStructure(format!(
-            "unexpected element <{}> after <DigestValue> in <Reference>",
-            unexpected.tag_name().name()
-        )));
-    }
+    finish_reference_children(&mut children)?;
 
     // Validate the complete Reference before reporting an unsupported transform.
     // This prevents malformed DigestMethod/DigestValue content from being
@@ -1295,6 +1284,55 @@ pub(crate) fn parse_reference_with_xpath_budget(
         digest_method,
         digest_value,
     })
+}
+
+pub(crate) fn reference_layout<'a>(
+    node: Node<'a, 'a>,
+) -> Result<(Option<Node<'a, 'a>>, Node<'a, 'a>, Node<'a, 'a>), ParseError> {
+    verify_ds_element(node, "Reference")?;
+    ensure_no_non_whitespace_text(node, "Reference")?;
+    let mut children = element_children(node);
+    let (transforms, method) = reference_transforms_and_digest_method(&mut children)?;
+    let value = reference_digest_value_node(&mut children)?;
+    finish_reference_children(&mut children)?;
+    Ok((transforms, method, value))
+}
+
+fn reference_digest_value_node<'a>(
+    children: &mut impl Iterator<Item = Node<'a, 'a>>,
+) -> Result<Node<'a, 'a>, ParseError> {
+    let value = children.next().ok_or(ParseError::MissingElement {
+        element: "DigestValue",
+    })?;
+    verify_ds_element(value, "DigestValue")?;
+    Ok(value)
+}
+
+fn finish_reference_children<'a>(
+    children: &mut impl Iterator<Item = Node<'a, 'a>>,
+) -> Result<(), ParseError> {
+    if let Some(unexpected) = children.next() {
+        return Err(ParseError::InvalidStructure(format!(
+            "unexpected element <{}> after <DigestValue> in <Reference>",
+            unexpected.tag_name().name()
+        )));
+    }
+    Ok(())
+}
+
+/// Replay processes the original instruction but does not compute or select
+/// its historical digest algorithm (EN 319 132-1 V1.3.1 §5.5.3 Note 2).
+/// Layout validation is shared with ordinary Reference parsing.
+pub(crate) fn parse_replay_transforms(
+    node: Node<'_, '_>,
+    budget: &mut transforms::XPathSignatureParseBudget,
+) -> Result<Vec<transforms::Transform>, ParseError> {
+    let (transforms, method, _) = reference_layout(node)?;
+    required_algorithm_attr(method, "DigestMethod")?;
+    transforms.map_or_else(
+        || Ok(Vec::new()),
+        |node| transforms::parse_transforms_with_budget(node, budget).map_err(Into::into),
+    )
 }
 
 pub(crate) fn reference_digest_method(
@@ -1861,7 +1899,7 @@ fn required_algorithm_attr<'a>(
 ///
 /// This mirrors transform parsing for Exclusive C14N and keeps SignedInfo
 /// canonicalization parameters lossless.
-fn parse_inclusive_prefixes(node: Node) -> Result<Option<String>, ParseError> {
+fn parse_inclusive_prefixes<'a>(node: Node<'a, '_>) -> Result<Option<&'a str>, ParseError> {
     const EXCLUSIVE_C14N_NS_URI: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
 
     for child in node.children() {
@@ -1871,7 +1909,6 @@ fn parse_inclusive_prefixes(node: Node) -> Result<Option<String>, ParseError> {
             {
                 return child
                     .attribute("PrefixList")
-                    .map(str::to_string)
                     .ok_or_else(|| {
                         ParseError::InvalidStructure(
                             "missing PrefixList attribute on <InclusiveNamespaces>".into(),
@@ -1883,6 +1920,40 @@ fn parse_inclusive_prefixes(node: Node) -> Result<Option<String>, ParseError> {
     }
 
     Ok(None)
+}
+
+/// Read the original timestamp method, not a caller-supplied algorithm hint.
+pub(crate) fn parse_replay_canonicalization_method<'a>(
+    node: Node<'a, '_>,
+) -> Result<(C14nAlgorithm, Option<&'a str>), ParseError> {
+    verify_ds_element(node, "CanonicalizationMethod")?;
+    ensure_no_non_whitespace_text(node, "CanonicalizationMethod")?;
+    let uri = required_algorithm_attr(node, "CanonicalizationMethod")?;
+    let algorithm =
+        C14nAlgorithm::from_uri(uri).ok_or_else(|| ParseError::UnsupportedAlgorithm {
+            uri: uri.to_string(),
+        })?;
+    let mut parameter_seen = false;
+    for child in element_children(node) {
+        // Exclusive C14N §4 defines one empty InclusiveNamespaces parameter;
+        // other known algorithms here have no parameter grammar.
+        // https://www.w3.org/TR/2002/REC-xml-exc-c14n-20020718/#def-InclusiveNamespaces-PrefixList
+        if parameter_seen
+            || algorithm.mode() != crate::c14n::C14nMode::Exclusive1_0
+            || !child.has_tag_name((
+                "http://www.w3.org/2001/10/xml-exc-c14n#",
+                "InclusiveNamespaces",
+            ))
+        {
+            return Err(ParseError::InvalidStructure(
+                "invalid canonicalization parameter".into(),
+            ));
+        }
+        ensure_no_element_children(child, "InclusiveNamespaces")?;
+        ensure_no_non_whitespace_text(child, "InclusiveNamespaces")?;
+        parameter_seen = true;
+    }
+    Ok((algorithm, parse_inclusive_prefixes(node)?))
 }
 
 pub(crate) fn parse_key_value_dispatch(node: Node) -> Result<KeyValueInfo, ParseError> {

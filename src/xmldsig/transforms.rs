@@ -926,6 +926,9 @@ fn apply_transform_with_options_and_state<'s, 'd>(
                 TransformData::Binary(bytes) => {
                     append_normalized_base64(&bytes, &mut normalized, &budget.base64)?;
                 }
+                TransformData::BorrowedBinary(bytes) => {
+                    append_normalized_base64(bytes, &mut normalized, &budget.base64)?;
+                }
                 TransformData::NodeSet(nodes) => {
                     for node in nodes.document().descendants() {
                         if nodes.contains(node) && node.is_text() {
@@ -1071,7 +1074,10 @@ pub fn execute_transforms_with_policy<'a>(
         }
     }
     validate_transform_policy(
-        matches!(&initial_data, TransformData::Binary(_)),
+        matches!(
+            &initial_data,
+            TransformData::Binary(_) | TransformData::BorrowedBinary(_)
+        ),
         transforms,
         policy.transforms.allowed_algorithms.as_ref(),
         "transform execution",
@@ -1128,7 +1134,7 @@ pub(crate) fn execute_reference_transforms_with_budget<'a>(
         state: &budget.state,
         xml_parse,
     };
-    execute_transform_chain(
+    execute_transform_chain::<false, _, _, _>(
         source_node,
         enveloped_signature,
         initial_data,
@@ -1136,8 +1142,61 @@ pub(crate) fn execute_reference_transforms_with_budget<'a>(
         None,
         None,
         &context,
+        |data, _, budget| finalize_transform_data(data, budget),
     )
-    .map(|output| output.bytes)
+    .map(|output| output.output)
+}
+
+/// The replay terminal shares every transform and type adapter with reference
+/// verification. Only the final node-set coercion differs for timestamp input.
+pub(crate) fn replay_reference_transforms<'a, E, F>(
+    source: Node<'a, 'a>,
+    signature: Node<'a, 'a>,
+    initial: TransformData<'a>,
+    transforms: &[Transform],
+    options: TransformOptions<'_>,
+    budget: &TransformExecutionBudget,
+    terminal: F,
+) -> Result<(), E>
+where
+    E: From<TransformError>,
+    F: for<'data> FnOnce(
+        TransformData<'data>,
+        Option<&C14nAlgorithm>,
+        &TransformExecutionBudget,
+    ) -> Result<(), E>,
+{
+    ensure_transform_count(transforms.len())?;
+    relationship::validate_edition(transforms, options.opc_relationship_edition)?;
+    budget.state.begin_chain();
+    let context = TransformExecutionContext {
+        options,
+        budget,
+        state: &budget.state,
+        xml_parse: budget.xml_parse_work(),
+    };
+    execute_transform_chain::<true, _, _, _>(
+        source,
+        Some(signature),
+        initial,
+        transforms,
+        None,
+        None,
+        &context,
+        terminal,
+    )
+    .map(|_| ())
+}
+
+pub(crate) fn replay_output_limit(budget: &TransformExecutionBudget) -> usize {
+    budget.c14n.remaining()
+}
+
+pub(crate) fn charge_replay_output(
+    budget: &TransformExecutionBudget,
+    bytes: usize,
+) -> Result<(), TransformError> {
+    budget.c14n.charge(bytes).map_err(Into::into)
 }
 
 /// Mutable signing fields that can affect a transform output.
@@ -1145,8 +1204,8 @@ pub(crate) struct TransformDependencyOutput {
     pub(crate) dependencies: HashSet<usize>,
 }
 
-struct TransformChainOutput {
-    bytes: Vec<u8>,
+struct TransformChainOutput<T> {
+    output: T,
     dependencies: HashSet<usize>,
 }
 
@@ -1200,7 +1259,7 @@ pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
         if let Some(node) = signature_node.document().get_node(node_id) {
             let belongs_to_input = match &initial_data {
                 TransformData::NodeSet(nodes) => nodes.contains(node),
-                TransformData::Binary(_) => false,
+                TransformData::Binary(_) | TransformData::BorrowedBinary(_) => false,
             };
             if belongs_to_input {
                 active_nodes.push(TrackedDependencyNode {
@@ -1221,7 +1280,7 @@ pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
         state: &budget.state,
         xml_parse: budget.xml_parse_work(),
     };
-    let output = execute_transform_chain(
+    let output = execute_transform_chain::<false, _, _, _>(
         signature_node,
         Some(signature_node),
         initial_data,
@@ -1234,6 +1293,7 @@ pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
             canonical_positions: None,
         }),
         &context,
+        |data, _, budget| finalize_transform_data(data, budget),
     )?;
     Ok(TransformDependencyOutput {
         dependencies: output.dependencies,
@@ -1251,7 +1311,10 @@ fn ensure_transform_count(count: usize) -> Result<(), TransformError> {
     Ok(())
 }
 
-fn execute_transform_chain<'s, 'e, 'd>(
+// Terminal strategy is monomorphized: collecting callers retain their existing
+// position/remapping path, while streaming consumers may intercept final C14N.
+#[allow(clippy::too_many_arguments)]
+fn execute_transform_chain<'s, 'e, 'd, const STREAM_FINAL_C14N: bool, T, E, F>(
     source_signature: Node<'s, 's>,
     enveloped_signature: Option<Node<'e, 'e>>,
     data: TransformData<'d>,
@@ -1259,7 +1322,16 @@ fn execute_transform_chain<'s, 'e, 'd>(
     canonical_signature_position: Option<Option<usize>>,
     mut dependency_tracking: Option<DependencyTracking>,
     context: &TransformExecutionContext<'_>,
-) -> Result<TransformChainOutput, TransformError> {
+    finalize: F,
+) -> Result<TransformChainOutput<T>, E>
+where
+    E: From<TransformError>,
+    F: for<'data> FnOnce(
+        TransformData<'data>,
+        Option<&C14nAlgorithm>,
+        &TransformExecutionBudget,
+    ) -> Result<T, E>,
+{
     let Some((transform, remaining)) = transforms.split_first() else {
         if let (TransformData::NodeSet(nodes), Some(tracking)) = (&data, &mut dependency_tracking) {
             tracking.active_nodes.retain(|tracked| {
@@ -1269,16 +1341,23 @@ fn execute_transform_chain<'s, 'e, 'd>(
                     .is_some_and(|node| nodes.contains(node))
             });
         }
-        let bytes = finalize_transform_data(data, context.budget)?;
+        let output = finalize(data, None, context.budget)?;
         return Ok(TransformChainOutput {
-            bytes,
+            output,
             dependencies: dependency_indexes(dependency_tracking),
         });
     };
 
-    if transform_requires_node_set(transform)
-        && let TransformData::Binary(bytes) = data
-    {
+    let binary = if transform_requires_node_set(transform) {
+        match &data {
+            TransformData::Binary(bytes) => Some(bytes.as_slice()),
+            TransformData::BorrowedBinary(bytes) => Some(*bytes),
+            TransformData::NodeSet(_) => None,
+        }
+    } else {
+        None
+    };
+    if let Some(bytes) = binary {
         // The parsed document must outlive every remaining node-set transform.
         // Recursive execution keeps all borrows scoped to this stack frame and
         // returns only owned digest bytes. Every C14N output is charged before
@@ -1286,9 +1365,12 @@ fn execute_transform_chain<'s, 'e, 'd>(
         // signature-wide canonicalization work budget.
         // Decoding is a separate input pass, including malformed-input failures. Reserve it
         // before any transcoding; the subsequent parser charges its own decoded-byte passes.
-        context.xml_parse.charge_policy(bytes.len())?;
+        context
+            .xml_parse
+            .charge_policy(bytes.len())
+            .map_err(TransformError::from)?;
         let xml =
-            crate::encoding::decode_xml_octets(&bytes, context.budget.xml_parse_settings.max_bytes)
+            crate::encoding::decode_xml_octets(bytes, context.budget.xml_parse_settings.max_bytes)
                 .map_err(map_transform_xml_decode_error)?;
         let settings = DocumentParseSettings {
             allow_dtd: context.options.internal_dtd_allowed(),
@@ -1333,7 +1415,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
                             .is_some_and(|source| node.tag_name() == source.tag_name())
                     })
                     .ok_or(TransformError::CrossDocumentSignatureNode)?;
-                execute_transform_chain(
+                execute_transform_chain::<STREAM_FINAL_C14N, _, _, _>(
                     source_signature,
                     Some(remapped),
                     TransformData::NodeSet(nodes),
@@ -1341,9 +1423,10 @@ fn execute_transform_chain<'s, 'e, 'd>(
                     None,
                     dependency_tracking,
                     context,
+                    finalize,
                 )
             }
-            Some(None) => execute_transform_chain(
+            Some(None) => execute_transform_chain::<STREAM_FINAL_C14N, _, _, _>(
                 source_signature,
                 None,
                 TransformData::NodeSet(nodes),
@@ -1351,8 +1434,9 @@ fn execute_transform_chain<'s, 'e, 'd>(
                 None,
                 dependency_tracking,
                 context,
+                finalize,
             ),
-            None => execute_transform_chain(
+            None => execute_transform_chain::<STREAM_FINAL_C14N, _, _, _>(
                 source_signature,
                 // Binary input not produced by tracked canonicalization is a
                 // different document. Keep source_signature for XPath here()
@@ -1363,6 +1447,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
                 None,
                 dependency_tracking,
                 context,
+                finalize,
             ),
         };
     }
@@ -1370,11 +1455,6 @@ fn execute_transform_chain<'s, 'e, 'd>(
     if let Transform::C14n(algo) = transform
         && let TransformData::NodeSet(nodes) = &data
     {
-        let tracked_element = enveloped_signature
-            .filter(|signature| std::ptr::eq(signature.document(), nodes.document()))
-            .filter(|signature| nodes.contains(*signature))
-            .map(|signature| signature.id());
-        let mut output = Vec::new();
         if let Some(tracking) = &mut dependency_tracking {
             tracking.active_nodes.retain(|tracked| {
                 nodes
@@ -1384,6 +1464,18 @@ fn execute_transform_chain<'s, 'e, 'd>(
             });
             tracking.dormant_indexes.clear();
         }
+        if STREAM_FINAL_C14N && remaining.is_empty() {
+            let output = finalize(data, Some(algo), context.budget)?;
+            return Ok(TransformChainOutput {
+                output,
+                dependencies: dependency_indexes(dependency_tracking),
+            });
+        }
+        let tracked_element = enveloped_signature
+            .filter(|signature| std::ptr::eq(signature.document(), nodes.document()))
+            .filter(|signature| nodes.contains(*signature))
+            .map(|signature| signature.id());
+        let mut output = Vec::new();
         let position = if let Some(tracking) = &mut dependency_tracking {
             let mut tracked_ids = tracking
                 .active_nodes
@@ -1440,8 +1532,12 @@ fn execute_transform_chain<'s, 'e, 'd>(
             )
             .map_err(|error| map_c14n_limit_error(error, &context.budget.c14n))?
         };
-        context.budget.c14n.charge(output.len())?;
-        return execute_transform_chain(
+        context
+            .budget
+            .c14n
+            .charge(output.len())
+            .map_err(TransformError::from)?;
+        return execute_transform_chain::<STREAM_FINAL_C14N, _, _, _>(
             source_signature,
             enveloped_signature,
             TransformData::Binary(output),
@@ -1449,12 +1545,13 @@ fn execute_transform_chain<'s, 'e, 'd>(
             Some(position),
             dependency_tracking,
             context,
+            finalize,
         );
     }
 
     if matches!(transform, Transform::Enveloped) {
         let Some(signature) = enveloped_signature else {
-            return execute_transform_chain(
+            return execute_transform_chain::<STREAM_FINAL_C14N, _, _, _>(
                 source_signature,
                 None,
                 data,
@@ -1462,6 +1559,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
                 None,
                 dependency_tracking,
                 context,
+                finalize,
             );
         };
         let data = apply_transform_with_options_and_state(
@@ -1473,7 +1571,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
             context.state,
             context.xml_parse,
         )?;
-        return execute_transform_chain(
+        return execute_transform_chain::<STREAM_FINAL_C14N, _, _, _>(
             source_signature,
             Some(signature),
             data,
@@ -1481,6 +1579,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
             None,
             dependency_tracking,
             context,
+            finalize,
         );
     }
 
@@ -1531,7 +1630,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
                 }
                 tracking.active_nodes = active_nodes;
             }
-            TransformData::Binary(_) => {
+            TransformData::Binary(_) | TransformData::BorrowedBinary(_) => {
                 tracking
                     .opaque_dependencies
                     .extend(tracking.active_nodes.drain(..).map(|tracked| tracked.index));
@@ -1540,7 +1639,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
             }
         }
     }
-    execute_transform_chain(
+    execute_transform_chain::<STREAM_FINAL_C14N, _, _, _>(
         source_signature,
         enveloped_signature,
         data,
@@ -1548,6 +1647,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
         None,
         dependency_tracking,
         context,
+        finalize,
     )
 }
 
@@ -1601,6 +1701,7 @@ fn finalize_transform_data(
     // default inclusive C14N 1.0 per XMLDSig spec §4.3.3.2.
     match data {
         TransformData::Binary(bytes) => Ok(bytes),
+        TransformData::BorrowedBinary(bytes) => Ok(bytes.to_vec()),
         TransformData::NodeSet(nodes) => {
             #[expect(clippy::expect_used, reason = "hardcoded URI is a known constant")]
             let algo = C14nAlgorithm::from_uri(DEFAULT_IMPLICIT_C14N_URI)
@@ -2349,6 +2450,53 @@ fn parse_inclusive_prefixes(transform_node: Node) -> Result<Option<String>, Tran
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests use trusted XML fixtures")]
 mod tests {
+    #[test]
+    fn terminal_callback_receives_final_nodes_before_c14n_materialization() {
+        use crate::c14n::C14nMode;
+        // A final explicit C14N transform must reach the terminal consumer as
+        // nodes plus its actual algorithm, without first producing a whole Vec.
+        // A consumer error is preserved rather than converted to a digest result.
+        #[derive(Debug)]
+        enum TerminalError {
+            Processing(TransformError),
+            Refused(&'static str),
+        }
+        impl From<TransformError> for TerminalError {
+            fn from(error: TransformError) -> Self {
+                Self::Processing(error)
+            }
+        }
+        let document = Document::parse("<root/>").unwrap();
+        let budget = TransformExecutionBudget::default();
+        let context = TransformExecutionContext {
+            options: TransformOptions::default(),
+            budget: &budget,
+            state: &budget.state,
+            xml_parse: budget.xml_parse_work(),
+        };
+        let algorithm = C14nAlgorithm::new(C14nMode::Exclusive1_0, false);
+        let result: Result<TransformChainOutput<()>, TerminalError> =
+            execute_transform_chain::<true, _, _, _>(
+                document.root_element(),
+                Some(document.root_element()),
+                TransformData::NodeSet(NodeSet::entire_document_with_comments(&document).unwrap()),
+                &[Transform::C14n(algorithm)],
+                None,
+                None,
+                &context,
+                |data, explicit, _budget| {
+                    assert!(matches!(data, TransformData::NodeSet(_)));
+                    assert_eq!(explicit.unwrap().mode(), C14nMode::Exclusive1_0);
+                    Err(TerminalError::Refused("original terminal cause"))
+                },
+            );
+        match result {
+            Err(TerminalError::Refused(cause)) => assert_eq!(cause, "original terminal cause"),
+            Err(TerminalError::Processing(error)) => panic!("unexpected processing error: {error}"),
+            Ok(_) => panic!("terminal refusal was ignored"),
+        }
+    }
+
     use super::*;
     use crate::xml::dom::Document;
     use crate::xmldsig::NodeSet;

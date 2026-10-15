@@ -3,20 +3,16 @@
 //! In exclusive mode, only **visibly utilized** namespace prefixes are emitted
 //! on each element (plus any prefixes forced by the InclusiveNamespaces PrefixList).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use crate::xml::dom::Node;
 
+use super::C14nError;
 use super::NodeVisibility;
 use super::ns_common::collect_ns_declarations;
 use super::prefix::{attribute_prefix, element_prefix};
+use super::scratch::{List, NamespaceMap, NamespaceRendering, Scratch};
 use super::serialize::NsRenderer;
-
-const MISSING_NAMESPACE_NODE: &str = "\0";
-
-fn nearest_utilizer_key(prefix: &str) -> String {
-    format!("\0exclusive-nearest-utilizer:{prefix}")
-}
 
 /// Exclusive C14N namespace renderer.
 ///
@@ -24,23 +20,69 @@ fn nearest_utilizer_key(prefix: &str) -> String {
 /// by the element's tag name or attributes, plus any forced prefixes from
 /// the `InclusiveNamespaces PrefixList`.
 pub(crate) struct ExclusiveNsRenderer<'a> {
-    inclusive_prefixes: &'a HashSet<String>,
+    inclusive_prefixes: Prefixes<'a>,
+}
+
+enum Prefixes<'a> {
+    Stored(&'a HashSet<String>),
+    #[cfg(feature = "xmldsig")]
+    Lexical(&'a str),
+}
+impl Prefixes<'_> {
+    fn contains(&self, prefix: &str) -> bool {
+        match self {
+            Self::Stored(prefixes) => prefixes.contains(prefix),
+            #[cfg(feature = "xmldsig")]
+            Self::Lexical(list) => list
+                .split([' ', '\t', '\r', '\n'])
+                .filter(|p| !p.is_empty())
+                .any(|p| p == prefix || (prefix.is_empty() && p == "#default")),
+        }
+    }
+    fn work(&self, prefix: &str) -> usize {
+        let probes = match self {
+            Self::Stored(set) => set.capacity(),
+            #[cfg(feature = "xmldsig")]
+            Self::Lexical(list) => list.len(),
+        };
+        // Includes token scanning/hash computation and every possible equality
+        // comparison. Four lookups per namespace cover both rendering passes.
+        probes
+            .saturating_add(2)
+            .saturating_mul(prefix.len().saturating_add(1))
+            .saturating_mul(4)
+    }
 }
 
 impl<'a> ExclusiveNsRenderer<'a> {
     pub(crate) fn new(inclusive_prefixes: &'a HashSet<String>) -> Self {
-        Self { inclusive_prefixes }
+        Self {
+            inclusive_prefixes: Prefixes::Stored(inclusive_prefixes),
+        }
+    }
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn from_prefix_list(list: &'a str) -> Self {
+        Self {
+            inclusive_prefixes: Prefixes::Lexical(list),
+        }
     }
 }
 
-impl NsRenderer for ExclusiveNsRenderer<'_> {
+impl<S: Scratch> NsRenderer<S> for ExclusiveNsRenderer<'_> {
     fn render_namespaces<'n>(
         &self,
         node: Node<'n, '_>,
-        parent_rendered: &HashMap<String, String>,
+        parent_rendered: &S::Namespaces<'n>,
         visibility: Option<&dyn NodeVisibility>,
-    ) -> (Vec<(String, String)>, HashMap<String, String>) {
-        let utilized = visibly_utilized_prefixes(node, visibility);
+        scratch: &S,
+    ) -> Result<NamespaceRendering<'n, S>, C14nError> {
+        let utilized = visibly_utilized_prefixes(node, visibility, scratch)?;
+        // Admit probing of the borrowed, immutable PrefixList before either
+        // predicate uses it. No owned prefix strings are copied into scratch.
+        for ns in node.namespaces() {
+            let prefix = ns.name().unwrap_or("");
+            scratch.charge(self.inclusive_prefixes.work(prefix))?;
+        }
         // Exclusive mode: only visibly-utilized prefixes and forced prefixes
         // from InclusiveNamespaces PrefixList are candidates.
         // Missing namespace nodes suppress a declaration but do not erase a
@@ -50,8 +92,12 @@ impl NsRenderer for ExclusiveNsRenderer<'_> {
             parent_rendered,
             visibility,
             |prefix| self.inclusive_prefixes.contains(prefix),
-            |prefix, _| utilized.contains(prefix) || self.inclusive_prefixes.contains(prefix),
-        );
+            |prefix, _| {
+                Ok(utilized.get(prefix, false)?.is_some()
+                    || self.inclusive_prefixes.contains(prefix))
+            },
+            scratch,
+        )?;
 
         if let (Some(visibility), Some(parent)) = (visibility, node.parent())
             && parent.is_element()
@@ -59,45 +105,40 @@ impl NsRenderer for ExclusiveNsRenderer<'_> {
             for namespace in node.namespaces() {
                 let prefix = namespace.name().unwrap_or("");
                 let uri = namespace.uri();
+                scratch.charge(prefix.len().saturating_add(uri.len()).saturating_add(1))?;
                 let selected_here = visibility.contains_namespace(node, prefix, uri);
-                let declaration_suppressed = parent_rendered.get(prefix).map(String::as_str)
+                let declaration_suppressed = parent_rendered.get(prefix, false)?.flatten()
                     == Some(uri)
                     && !declarations
                         .iter()
-                        .any(|(declared_prefix, _)| declared_prefix == prefix);
-                let utilizer_key = nearest_utilizer_key(prefix);
-                let nearest_utilizer_omitted_namespace = parent_rendered
-                    .get(&utilizer_key)
-                    .is_some_and(|selected_uri| selected_uri == MISSING_NAMESPACE_NODE);
-                let uses_exclusive_rendering =
-                    utilized.contains(prefix) && !self.inclusive_prefixes.contains(prefix);
+                        .any(|(declared_prefix, _)| *declared_prefix == prefix);
+                let nearest_utilizer_omitted_namespace =
+                    parent_rendered.get(prefix, true)? == Some(None);
+                let uses_exclusive_rendering = utilized.get(prefix, false)?.is_some()
+                    && !self.inclusive_prefixes.contains(prefix);
 
                 if uses_exclusive_rendering
                     && selected_here
                     && declaration_suppressed
                     && nearest_utilizer_omitted_namespace
                 {
-                    declarations.push((prefix.to_owned(), uri.to_owned()));
-                    declarations.sort_by(|left, right| left.0.cmp(&right.0));
+                    declarations.push((prefix, uri))?;
+                    declarations.sort(|left, right| {
+                        scratch.charge(left.0.len().min(right.0.len()))?;
+                        Ok(left.0.cmp(right.0))
+                    })?;
                 }
 
                 // Exclusive C14N section 3 compares a namespace node with the
                 // nearest output ancestor that visibly utilized its prefix,
                 // not merely with the physically effective output binding.
                 if uses_exclusive_rendering {
-                    rendered.insert(
-                        utilizer_key,
-                        if selected_here {
-                            uri.to_owned()
-                        } else {
-                            MISSING_NAMESPACE_NODE.to_owned()
-                        },
-                    );
+                    rendered.insert(prefix, true, selected_here.then_some(uri))?;
                 }
             }
         }
 
-        (declarations, rendered)
+        Ok((declarations, rendered))
     }
 
     fn renders_selected_namespace_of_omitted_element(&self, prefix: &str) -> bool {
@@ -113,26 +154,28 @@ impl NsRenderer for ExclusiveNsRenderer<'_> {
 ///
 /// Uses lexical prefixes extracted from source XML byte positions,
 /// avoiding ambiguity when multiple prefixes bind the same namespace URI.
-fn visibly_utilized_prefixes<'a>(
+fn visibly_utilized_prefixes<'a, S: Scratch>(
     node: Node<'a, '_>,
     visibility: Option<&dyn NodeVisibility>,
-) -> HashSet<&'a str> {
-    let mut utilized = HashSet::new();
+    scratch: &S,
+) -> Result<S::Namespaces<'a>, C14nError> {
+    let mut utilized = scratch.namespaces();
 
     // Element's own lexical prefix from source XML.
     let el_prefix = element_prefix(node);
     if !el_prefix.is_empty() {
-        utilized.insert(el_prefix);
+        utilized.insert(el_prefix, false, None)?;
     } else {
         // Unprefixed element relies on the current default-namespace binding
         // (including xmlns="" undeclaration), so the default namespace is
         // visibly utilized. This ensures xmlns="" is emitted when needed
         // to undeclare an inherited default namespace in exclusive C14N.
-        utilized.insert("");
+        utilized.insert("", false, None)?;
     }
 
     // Attribute lexical prefixes from source XML.
     for attr in node.attributes() {
+        scratch.charge(attr.name().len().saturating_add(1))?;
         if visibility
             .is_some_and(|set| !set.contains_attribute(node, attr.namespace(), attr.name()))
         {
@@ -140,11 +183,11 @@ fn visibly_utilized_prefixes<'a>(
         }
         let attr_prefix = attribute_prefix(node, &attr);
         if !attr_prefix.is_empty() {
-            utilized.insert(attr_prefix);
+            utilized.insert(attr_prefix, false, None)?;
         }
     }
 
-    utilized
+    Ok(utilized)
 }
 
 #[cfg(test)]

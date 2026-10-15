@@ -3,8 +3,8 @@
 //! Walks an XML document tree in document order, emitting canonical bytes.
 //! Namespace rendering is delegated to the caller via [`NsRenderer`] trait.
 
-use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::collections::HashSet;
 use std::io::{self, Write};
 
 use crate::xml::dom::{Document, Node, NodeId, NodeType};
@@ -13,31 +13,14 @@ use crate::xml::dom::{Document, Node, NodeId, NodeType};
 use super::ClosureVisibility;
 use super::escape::{escape_attr, escape_cr, escape_text};
 use super::prefix::{attribute_prefix, element_prefix};
+use super::scratch::{List, NamespaceMap, NamespaceRendering, Native, Scratch, Text};
 use super::xml_base::{
-    XmlBaseResolutionBudget, XmlBaseResolutionError, compute_effective_xml_base_with_budget,
-    preserves_xml_base_context, resolve_uri_with_budget,
+    XmlBaseResolutionBudget, XmlBaseResolutionError, preserves_xml_base_context,
 };
-use super::{C14nError, NodeVisibility};
-
-#[derive(Debug)]
-pub(super) struct CanonicalOutputLimitExceeded {
-    max_bytes: usize,
-}
-
-impl std::fmt::Display for CanonicalOutputLimitExceeded {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "canonical output exceeds maximum of {} bytes",
-            self.max_bytes
-        )
-    }
-}
-
-impl std::error::Error for CanonicalOutputLimitExceeded {}
+use super::{C14nError, C14nMode, NodeVisibility};
 
 fn output_limit_error(max_bytes: usize) -> C14nError {
-    C14nError::Io(io::Error::other(CanonicalOutputLimitExceeded { max_bytes }))
+    C14nError::OutputLimitExceeded { max_bytes }
 }
 
 /// The XML namespace URI.
@@ -49,28 +32,41 @@ const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
 type TrackedPositions = Vec<(NodeId, usize)>;
 
-struct CanonicalOutput<'a> {
-    bytes: &'a mut Vec<u8>,
-    max_len: Option<usize>,
+struct CanonicalOutput<'a, W: Write + ?Sized, S: Scratch = Native> {
+    writer: &'a mut W,
+    position: usize,
+    max_len: usize,
     limit_exceeded: bool,
     tracked_element: Option<NodeId>,
     tracked_position: Option<usize>,
     tracked_elements: Option<&'a [NodeId]>,
     tracked_positions: Vec<(NodeId, usize)>,
     xml_base_resolution: &'a XmlBaseResolutionBudget,
+    scratch: &'a S,
 }
 
-impl Write for CanonicalOutput<'_> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let next_len = self.bytes.len().checked_add(bytes.len());
-        if self
-            .max_len
-            .is_some_and(|max_len| next_len.is_none_or(|next_len| next_len > max_len))
-        {
-            self.limit_exceeded = true;
-            return Err(io::Error::other("canonical output limit exceeded"));
+enum AttributeValue<'a, T: Text> {
+    Borrowed(&'a str),
+    Owned(T),
+}
+impl<T: Text> AttributeValue<'_, T> {
+    fn view(&self) -> Result<&str, C14nError> {
+        match self {
+            Self::Borrowed(text) => Ok(text),
+            Self::Owned(text) => text.view(),
         }
-        self.bytes.extend_from_slice(bytes);
+    }
+}
+
+impl<W: Write + ?Sized, S: Scratch> Write for CanonicalOutput<'_, W, S> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        debug_assert!(self.position <= self.max_len);
+        if bytes.len() > self.max_len - self.position {
+            self.limit_exceeded = true;
+            return Err(io::ErrorKind::OutOfMemory.into());
+        }
+        self.writer.write_all(bytes)?;
+        self.position += bytes.len();
         Ok(bytes.len())
     }
 
@@ -79,16 +75,16 @@ impl Write for CanonicalOutput<'_> {
     }
 }
 
-impl CanonicalOutput<'_> {
+impl<W: Write + ?Sized, S: Scratch> CanonicalOutput<'_, W, S> {
     fn track(&mut self, node: Node<'_, '_>) {
         if self.tracked_element == Some(node.id()) {
-            self.tracked_position = Some(self.bytes.len());
+            self.tracked_position = Some(self.position);
         }
         if self
             .tracked_elements
             .is_some_and(|tracked| tracked.contains(&node.id()))
         {
-            self.tracked_positions.push((node.id(), self.bytes.len()));
+            self.tracked_positions.push((node.id(), self.position));
         }
     }
 }
@@ -109,6 +105,19 @@ pub(crate) struct C14nConfig {
     pub inherit_xml_attrs: bool,
     /// Resolve relative xml:base URIs via RFC 3986 (C14N 1.1 only).
     pub fixup_xml_base: bool,
+}
+
+impl C14nConfig {
+    pub(crate) fn for_mode(mode: C14nMode) -> Self {
+        // C14N 1.0/1.1 §2.4 inherits xml:*; Exclusive C14N §3 does not.
+        // Only C14N 1.1 applies XML Base fixup. All output paths share this rule.
+        // https://www.w3.org/TR/2008/REC-xml-c14n11-20080502/#DocSubsets
+        // https://www.w3.org/TR/2002/REC-xml-exc-c14n-20020718/#sec-Specification
+        Self {
+            inherit_xml_attrs: !matches!(mode, C14nMode::Exclusive1_0),
+            fixup_xml_base: matches!(mode, C14nMode::Inclusive1_1),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -161,7 +170,7 @@ impl<'a> CanonicalOutputOptions<'a> {
 }
 
 /// Trait for namespace rendering strategies (inclusive vs exclusive).
-pub(crate) trait NsRenderer {
+pub(crate) trait NsRenderer<S: Scratch = Native> {
     /// Compute namespace declarations to emit for this element.
     /// Returns (sorted_ns_decls, updated_rendered_map).
     ///
@@ -170,9 +179,10 @@ pub(crate) trait NsRenderer {
     fn render_namespaces<'a>(
         &self,
         node: Node<'a, '_>,
-        parent_rendered: &HashMap<String, String>,
+        parent_rendered: &S::Namespaces<'a>,
         visibility: Option<&dyn NodeVisibility>,
-    ) -> (Vec<(String, String)>, HashMap<String, String>);
+        scratch: &S,
+    ) -> Result<NamespaceRendering<'a, S>, C14nError>;
 
     fn renders_selected_namespace_of_omitted_element(&self, prefix: &str) -> bool;
 }
@@ -270,6 +280,7 @@ pub(crate) fn serialize_canonical_visible_with_position_bounded(
     options: CanonicalOutputOptions<'_>,
     output: &mut Vec<u8>,
 ) -> Result<Option<usize>, C14nError> {
+    let initial_offset = output.len();
     let (position, _) = serialize_canonical_visible_with_positions_bounded_impl(
         doc,
         visibility,
@@ -278,6 +289,7 @@ pub(crate) fn serialize_canonical_visible_with_position_bounded(
         config,
         options,
         output,
+        initial_offset,
     )?;
     Ok(position)
 }
@@ -292,6 +304,7 @@ pub(crate) fn serialize_canonical_visible_with_positions_bounded(
     options: CanonicalOutputOptions<'_>,
     output: &mut Vec<u8>,
 ) -> Result<TrackedPositions, C14nError> {
+    let initial_offset = output.len();
     let (_, positions) = serialize_canonical_visible_with_positions_bounded_impl(
         doc,
         visibility,
@@ -300,31 +313,59 @@ pub(crate) fn serialize_canonical_visible_with_positions_bounded(
         config,
         options,
         output,
+        initial_offset,
     )?;
     Ok(positions)
 }
 
-fn serialize_canonical_visible_with_positions_bounded_impl(
+// The explicit initial offset preserves collecting callers' absolute tracked
+// positions while a terminal writer starts at zero, on the same traversal.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn serialize_canonical_visible_with_positions_bounded_impl<W: Write + ?Sized>(
     doc: &Document,
     visibility: Option<&dyn NodeVisibility>,
     with_comments: bool,
     ns_renderer: &dyn NsRenderer,
     config: C14nConfig,
     options: CanonicalOutputOptions<'_>,
-    output: &mut Vec<u8>,
+    output: &mut W,
+    initial_offset: usize,
+) -> Result<(Option<usize>, TrackedPositions), C14nError> {
+    serialize_with_scratch(
+        doc,
+        visibility,
+        with_comments,
+        ns_renderer,
+        config,
+        options,
+        output,
+        initial_offset,
+        &Native,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn serialize_with_scratch<W: Write + ?Sized, S: Scratch>(
+    doc: &Document,
+    visibility: Option<&dyn NodeVisibility>,
+    with_comments: bool,
+    ns_renderer: &dyn NsRenderer<S>,
+    config: C14nConfig,
+    options: CanonicalOutputOptions<'_>,
+    output: &mut W,
+    initial_offset: usize,
+    scratch: &S,
 ) -> Result<(Option<usize>, TrackedPositions), C14nError> {
     let root = doc.root();
     let max_len = match options.max_output_bytes {
-        Some(limit) => Some(
-            output
-                .len()
-                .checked_add(limit)
-                .ok_or_else(|| output_limit_error(limit))?,
-        ),
-        None => None,
+        Some(limit) => initial_offset
+            .checked_add(limit)
+            .ok_or_else(|| output_limit_error(limit))?,
+        None => usize::MAX,
     };
     let mut output = CanonicalOutput {
-        bytes: output,
+        writer: output,
+        position: initial_offset,
         max_len,
         limit_exceeded: false,
         tracked_element: options.tracked_element,
@@ -332,6 +373,7 @@ fn serialize_canonical_visible_with_positions_bounded_impl(
         tracked_elements: options.tracked_elements,
         tracked_positions: Vec::new(),
         xml_base_resolution: options.xml_base_resolution,
+        scratch,
     };
     let result = serialize_children(
         root,
@@ -339,7 +381,7 @@ fn serialize_canonical_visible_with_positions_bounded_impl(
         with_comments,
         ns_renderer,
         config,
-        &HashMap::new(),
+        &scratch.namespaces(),
         &mut output,
     );
     if output.limit_exceeded {
@@ -352,18 +394,19 @@ fn serialize_canonical_visible_with_positions_bounded_impl(
 }
 
 /// Serialize children of a node in document order.
-fn serialize_children(
-    parent: Node,
+fn serialize_children<'n, W: Write + ?Sized, S: Scratch>(
+    parent: Node<'n, '_>,
     visibility: Option<&dyn NodeVisibility>,
     with_comments: bool,
-    ns_renderer: &dyn NsRenderer,
+    ns_renderer: &dyn NsRenderer<S>,
     config: C14nConfig,
-    parent_rendered: &HashMap<String, String>,
-    output: &mut CanonicalOutput<'_>,
+    parent_rendered: &S::Namespaces<'n>,
+    output: &mut CanonicalOutput<'_, W, S>,
 ) -> Result<(), C14nError> {
     let is_doc_root = parent.node_type() == NodeType::Root;
 
     for child in parent.children() {
+        output.scratch.charge(1)?;
         // Node-set filtering: skip nodes not in the set.
         let in_set = visibility.is_none_or(|set| set.contains_node(child));
 
@@ -409,6 +452,7 @@ fn serialize_children(
                     // Document-level text nodes are ignored by C14N.
                     // Only text inside elements is serialized.
                     if !is_doc_root && let Some(text) = child.text() {
+                        output.scratch.charge(text.len())?;
                         output.track(child);
                         escape_text(text, output)?;
                     }
@@ -421,6 +465,7 @@ fn serialize_children(
                     write_doc_level_prefix(is_doc_root, follows_document_element, output)?;
                     output.write_all(b"<!--")?;
                     if let Some(text) = child.text() {
+                        output.scratch.charge(text.len())?;
                         // C14N spec: \r in comments must be escaped to &#xD;
                         escape_cr(text, output)?;
                     }
@@ -436,6 +481,7 @@ fn serialize_children(
                     output.write_all(b"<?")?;
                     output.write_all(pi.target.as_bytes())?;
                     if let Some(value) = pi.value {
+                        output.scratch.charge(value.len())?;
                         output.write_all(b" ")?;
                         // C14N spec: \r in PI content must be escaped to &#xD;
                         escape_cr(value, output)?;
@@ -452,30 +498,39 @@ fn serialize_children(
     Ok(())
 }
 
-fn serialize_selected_axes_of_omitted_element(
-    owner: Node,
+fn serialize_selected_axes_of_omitted_element<'n, W: Write + ?Sized, S: Scratch>(
+    owner: Node<'n, '_>,
     visibility: Option<&dyn NodeVisibility>,
-    ns_renderer: &dyn NsRenderer,
-    parent_rendered: &HashMap<String, String>,
-    output: &mut CanonicalOutput<'_>,
+    ns_renderer: &dyn NsRenderer<S>,
+    parent_rendered: &S::Namespaces<'n>,
+    output: &mut CanonicalOutput<'_, W, S>,
 ) -> Result<(), C14nError> {
     let Some(visibility) = visibility else {
         return Ok(());
     };
 
-    let mut namespaces = owner
-        .namespaces()
-        .filter_map(|namespace| {
-            let prefix = namespace.name().unwrap_or("");
-            (prefix != "xml"
-                && ns_renderer.renders_selected_namespace_of_omitted_element(prefix)
-                && visibility.contains_namespace(owner, prefix, namespace.uri())
-                && parent_rendered.get(prefix).map(String::as_str) != Some(namespace.uri()))
-            .then_some((prefix, namespace.uri()))
-        })
-        .collect::<Vec<_>>();
-    namespaces.sort_by_key(|(prefix, _)| *prefix);
-    for (prefix, uri) in namespaces {
+    let mut namespaces = output.scratch.values();
+    for namespace in owner.namespaces() {
+        let prefix = namespace.name().unwrap_or("");
+        output.scratch.charge(
+            prefix
+                .len()
+                .saturating_add(namespace.uri().len())
+                .saturating_add(1),
+        )?;
+        if prefix != "xml"
+            && ns_renderer.renders_selected_namespace_of_omitted_element(prefix)
+            && visibility.contains_namespace(owner, prefix, namespace.uri())
+            && parent_rendered.get(prefix, false)?.flatten() != Some(namespace.uri())
+        {
+            namespaces.push((prefix, namespace.uri()))?;
+        }
+    }
+    namespaces.sort(|left, right| {
+        output.scratch.charge(left.0.len().min(right.0.len()))?;
+        Ok(left.0.cmp(right.0))
+    })?;
+    for &(prefix, uri) in namespaces.iter() {
         if prefix.is_empty() {
             output.write_all(b" xmlns=\"")?;
         } else {
@@ -487,25 +542,37 @@ fn serialize_selected_axes_of_omitted_element(
         output.write_all(b"\"")?;
     }
 
-    let mut attributes = owner
-        .attributes()
-        .filter(|attribute| {
-            visibility.contains_attribute(owner, attribute.namespace(), attribute.name())
-        })
-        .collect::<Vec<_>>();
-    attributes.sort_by(|left, right| {
-        (left.namespace().unwrap_or(""), left.name())
-            .cmp(&(right.namespace().unwrap_or(""), right.name()))
-    });
-    for attribute in attributes {
+    let mut attributes = output.scratch.values();
+    for attribute in owner.attributes() {
+        output
+            .scratch
+            .charge(attribute.name().len().saturating_add(1))?;
+        if visibility.contains_attribute(owner, attribute.namespace(), attribute.name()) {
+            attributes.push(attribute)?;
+        }
+    }
+    attributes.sort(|left, right| {
+        output.scratch.charge(
+            left.namespace()
+                .unwrap_or("")
+                .len()
+                .saturating_add(left.name().len())
+                .saturating_add(right.namespace().unwrap_or("").len())
+                .saturating_add(right.name().len()),
+        )?;
+        Ok((left.namespace().unwrap_or(""), left.name())
+            .cmp(&(right.namespace().unwrap_or(""), right.name())))
+    })?;
+    for attribute in attributes.iter() {
         output.write_all(b" ")?;
-        let prefix = attribute_prefix(owner, &attribute);
+        let prefix = attribute_prefix(owner, attribute);
         if !prefix.is_empty() {
             output.write_all(prefix.as_bytes())?;
             output.write_all(b":")?;
         }
         output.write_all(attribute.name().as_bytes())?;
         output.write_all(b"=\"")?;
+        output.scratch.charge(attribute.value().len())?;
         escape_attr(attribute.value(), output)?;
         output.write_all(b"\"")?;
     }
@@ -513,16 +580,17 @@ fn serialize_selected_axes_of_omitted_element(
 }
 
 /// Serialize a single element node (start tag + children + end tag).
-fn serialize_element(
-    node: Node,
+fn serialize_element<'n, W: Write + ?Sized, S: Scratch>(
+    node: Node<'n, '_>,
     visibility: Option<&dyn NodeVisibility>,
     with_comments: bool,
-    ns_renderer: &dyn NsRenderer,
+    ns_renderer: &dyn NsRenderer<S>,
     config: C14nConfig,
-    parent_rendered: &HashMap<String, String>,
-    output: &mut CanonicalOutput<'_>,
+    parent_rendered: &S::Namespaces<'n>,
+    output: &mut CanonicalOutput<'_, W, S>,
 ) -> Result<(), C14nError> {
-    let (ns_decls, rendered) = ns_renderer.render_namespaces(node, parent_rendered, visibility);
+    let (ns_decls, rendered) =
+        ns_renderer.render_namespaces(node, parent_rendered, visibility, output.scratch)?;
 
     // Start tag: <prefix:localname
     output.track(node);
@@ -530,7 +598,7 @@ fn serialize_element(
     write_qualified_name(node, output)?;
 
     // Namespace declarations (already sorted by prefix).
-    for (prefix, uri) in &ns_decls {
+    for &(prefix, uri) in ns_decls.iter() {
         if prefix.is_empty() {
             output.write_all(b" xmlns=\"")?;
         } else {
@@ -538,6 +606,7 @@ fn serialize_element(
             output.write_all(prefix.as_bytes())?;
             output.write_all(b"=\"")?;
         }
+        output.scratch.charge(uri.len())?;
         escape_attr(uri, output)?;
         output.write_all(b"\"")?;
     }
@@ -554,9 +623,9 @@ fn serialize_element(
     // For C14N 1.1 (fixup_xml_base=true): xml:base values are additionally
     // resolved to effective URIs per RFC 3986.
     let inherited_xml = if config.inherit_xml_attrs {
-        collect_inherited_xml_attrs(node, visibility, config.fixup_xml_base)
+        collect_inherited_xml_attrs(node, visibility, config.fixup_xml_base, output.scratch)?
     } else {
-        Vec::new()
+        output.scratch.values()
     };
 
     // Compute effective parent xml:base for C14N 1.1 fixup. Needed when:
@@ -573,12 +642,12 @@ fn serialize_element(
     };
     let effective_parent_base = if config.fixup_xml_base && parent_not_in_set {
         match node.parent() {
-            Some(parent) => compute_effective_xml_base_with_budget(
+            Some(parent) => super::xml_base::compute_effective_xml_base_in(
                 parent,
                 visibility,
                 output.xml_base_resolution,
-            )
-            .map_err(map_xml_base_error)?,
+                output.scratch,
+            )?,
             None => None,
         }
     } else {
@@ -587,55 +656,66 @@ fn serialize_element(
 
     // Build unified list: (ns_uri, local_name, prefix, value)
     // Using Cow to avoid allocations when no fixup is needed.
-    let mut all_attrs: Vec<(&str, &str, &str, Cow<'_, str>)> = Vec::new();
+    let mut all_attrs = output.scratch.values();
     for attr in node.attributes() {
+        output.scratch.charge(attr.name().len().saturating_add(1))?;
         if visibility
             .is_some_and(|set| !set.contains_attribute(node, attr.namespace(), attr.name()))
         {
             continue;
         }
-        let value = if let Some(base) = effective_parent_base.as_deref() {
+        let value = if let Some(base) = effective_parent_base.as_ref() {
             if attr.namespace() == Some(XML_NS) && attr.name() == "base" {
                 // C14N 1.1: resolve the element's xml:base against the
                 // parent's effective base when non-empty. For xml:base="",
                 // emit the attribute value unchanged (do not resolve it).
                 let raw = attr.value();
                 if raw.is_empty() {
-                    Cow::Borrowed(raw)
+                    AttributeValue::Borrowed(raw)
                 } else {
-                    Cow::Owned(
-                        resolve_uri_with_budget(base, raw, output.xml_base_resolution)
-                            .map_err(map_xml_base_error)?,
-                    )
+                    AttributeValue::Owned(super::xml_base::resolve_uri_with_budget_in(
+                        base.view()?,
+                        raw,
+                        output.xml_base_resolution,
+                        output.scratch,
+                    )?)
                 }
             } else {
-                Cow::Borrowed(attr.value())
+                AttributeValue::Borrowed(attr.value())
             }
         } else {
-            Cow::Borrowed(attr.value())
+            AttributeValue::Borrowed(attr.value())
         };
         all_attrs.push((
             attr.namespace().unwrap_or(""),
             attr.name(),
             attribute_prefix(node, &attr),
             value,
-        ));
+        ))?;
     }
-    for &(name, value) in &inherited_xml {
+    for &(name, value) in inherited_xml.iter() {
         let resolved_value = if config.fixup_xml_base && name == "base" {
             // C14N 1.1: inherited xml:base uses the resolved effective value
             match effective_parent_base.as_ref() {
-                Some(base) => Cow::Owned(base.clone()),
-                None => Cow::Borrowed(value),
+                Some(base) => AttributeValue::Borrowed(base.view()?),
+                None => AttributeValue::Borrowed(value),
             }
         } else {
-            Cow::Borrowed(value)
+            AttributeValue::Borrowed(value)
         };
-        all_attrs.push((XML_NS, name, "xml", resolved_value));
+        all_attrs.push((XML_NS, name, "xml", resolved_value))?;
     }
-    all_attrs.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    all_attrs.sort(|a, b| {
+        output.scratch.charge(
+            a.0.len()
+                .saturating_add(a.1.len())
+                .saturating_add(b.0.len())
+                .saturating_add(b.1.len()),
+        )?;
+        Ok((a.0, a.1).cmp(&(b.0, b.1)))
+    })?;
 
-    for (_, local_name, prefix, value) in &all_attrs {
+    for (_, local_name, prefix, value) in all_attrs.iter() {
         output.write_all(b" ")?;
         if !prefix.is_empty() {
             output.write_all(prefix.as_bytes())?;
@@ -643,6 +723,8 @@ fn serialize_element(
         }
         output.write_all(local_name.as_bytes())?;
         output.write_all(b"=\"")?;
+        let value = value.view()?;
+        output.scratch.charge(value.len())?;
         escape_attr(value, output)?;
         output.write_all(b"\"")?;
     }
@@ -668,7 +750,7 @@ fn serialize_element(
     Ok(())
 }
 
-fn map_xml_base_error(error: XmlBaseResolutionError) -> C14nError {
+pub(super) fn map_xml_base_error(error: XmlBaseResolutionError) -> C14nError {
     match error {
         XmlBaseResolutionError::Components { maximum, actual } => {
             C14nError::XmlBaseComponentsTooLarge {
@@ -684,10 +766,10 @@ fn map_xml_base_error(error: XmlBaseResolutionError) -> C14nError {
 }
 
 /// Emit the separator preceding a document-level comment or PI.
-fn write_doc_level_prefix(
+fn write_doc_level_prefix<W: Write + ?Sized, S: Scratch>(
     is_doc_root: bool,
     follows_document_element: bool,
-    output: &mut CanonicalOutput<'_>,
+    output: &mut CanonicalOutput<'_, W, S>,
 ) -> io::Result<()> {
     if is_doc_root && follows_document_element {
         output.write_all(b"\n")?;
@@ -696,10 +778,10 @@ fn write_doc_level_prefix(
 }
 
 /// Emit the separator following a document-level comment or PI.
-fn write_doc_level_suffix(
+fn write_doc_level_suffix<W: Write + ?Sized, S: Scratch>(
     is_doc_root: bool,
     follows_document_element: bool,
-    output: &mut CanonicalOutput<'_>,
+    output: &mut CanonicalOutput<'_, W, S>,
 ) -> io::Result<()> {
     if is_doc_root && !follows_document_element {
         output.write_all(b"\n")?;
@@ -731,14 +813,15 @@ fn has_preceding_element_sibling(node: &Node) -> bool {
 ///
 /// Returns `(local_name, value)` pairs. Closer ancestors take precedence.
 /// Attributes already present on the element itself are excluded.
-fn collect_inherited_xml_attrs<'a>(
+fn collect_inherited_xml_attrs<'a, S: Scratch>(
     node: Node<'a, '_>,
     visibility: Option<&dyn NodeVisibility>,
     fixup_xml_base: bool,
-) -> Vec<(&'a str, &'a str)> {
+    scratch: &S,
+) -> Result<S::Values<(&'a str, &'a str)>, C14nError> {
     let set = match visibility {
         Some(p) => p,
-        None => return Vec::new(), // Full document — no inheritance needed
+        None => return Ok(scratch.values()), // Full document — no inheritance needed
     };
 
     // If parent element is in the node set, no inheritance needed — the parent
@@ -747,7 +830,7 @@ fn collect_inherited_xml_attrs<'a>(
         && parent.is_element()
         && set.contains_node(parent)
     {
-        return Vec::new();
+        return Ok(scratch.values());
     }
 
     // C14N 1.1 is the only inclusive mode with xml:base fixup, and it is also
@@ -756,12 +839,13 @@ fn collect_inherited_xml_attrs<'a>(
 
     // Collect inheritable xml:* attr names already on this element (own attrs
     // take precedence). Non-inheritable xml:* attrs are ignored.
-    let mut seen: HashSet<&str> = HashSet::new();
+    let mut seen = scratch.namespaces();
     for attr in node.attributes() {
+        scratch.charge(attr.name().len().saturating_add(1))?;
         if attr.namespace() == Some(XML_NS) {
             let local = attr.name();
             if is_inheritable_xml_attr(local, inherit_xml_id) {
-                seen.insert(local);
+                seen.insert(local, false, None)?;
             }
         }
     }
@@ -771,16 +855,18 @@ fn collect_inherited_xml_attrs<'a>(
     // The direct source parent is absent from the node set at this point, so
     // Canonical XML treats this element as an apex even if a more distant
     // ancestor is also in the output. Search the complete source ancestry.
-    let mut inherited = Vec::new();
+    let mut inherited = scratch.values();
     let mut xml_base_boundary_reached = false;
     let mut ancestor = node.parent();
     while let Some(anc) = ancestor {
+        scratch.charge(1)?;
         if anc.is_element() {
             // C14N 1.1 resolves xml:base only across the contiguous omitted
             // chain. An included ancestor already renders its own base, but
             // remains the resolution seed for bases on omitted descendants.
             xml_base_boundary_reached |= fixup_xml_base && preserves_xml_base_context(anc, set);
             for attr in anc.attributes() {
+                scratch.charge(attr.name().len().saturating_add(1))?;
                 if attr.namespace() == Some(XML_NS) {
                     let local = attr.name();
                     if local == "base" && xml_base_boundary_reached {
@@ -795,8 +881,11 @@ fn collect_inherited_xml_attrs<'a>(
                     // whether or not their attribute nodes are in the input
                     // node-set. Filtering here would change inherited XML
                     // semantics at an apex element.
-                    if is_inheritable_xml_attr(local, inherit_xml_id) && seen.insert(local) {
-                        inherited.push((attr.name(), attr.value()));
+                    if is_inheritable_xml_attr(local, inherit_xml_id)
+                        && seen.get(local, false)?.is_none()
+                    {
+                        seen.insert(local, false, None)?;
+                        inherited.push((attr.name(), attr.value()))?;
                     }
                 }
             }
@@ -804,14 +893,17 @@ fn collect_inherited_xml_attrs<'a>(
         ancestor = anc.parent();
     }
 
-    inherited
+    Ok(inherited)
 }
 
 /// Write the qualified name (prefix:localname or just localname) of an element.
 ///
 /// Extracts the lexical prefix from the source XML via byte-range positions,
 /// avoiding ambiguity when multiple prefixes bind the same namespace URI.
-fn write_qualified_name(node: Node, output: &mut CanonicalOutput<'_>) -> io::Result<()> {
+fn write_qualified_name<W: Write + ?Sized, S: Scratch>(
+    node: Node,
+    output: &mut CanonicalOutput<'_, W, S>,
+) -> io::Result<()> {
     let prefix = element_prefix(node);
     if !prefix.is_empty() {
         output.write_all(prefix.as_bytes())?;
@@ -827,6 +919,176 @@ mod tests {
     use super::super::ns_inclusive::InclusiveNsRenderer;
     use super::*;
     use crate::xml::dom::NodeId;
+
+    #[test]
+    fn terminal_writer_matches_golden_bytes_without_output_storage() {
+        // The streaming path must use the same serializer, including escaping
+        // and document-level comments, without requiring a terminal Vec.
+        struct ExactSink<'a> {
+            expected: &'a [u8],
+            position: usize,
+        }
+        impl Write for ExactSink<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let count = bytes.len().min(2);
+                assert_eq!(
+                    &bytes[..count],
+                    &self.expected[self.position..self.position + count]
+                );
+                self.position += count;
+                Ok(count)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let document =
+            Document::parse("<!--before--><root a=\"&quot;\">x&amp;y<empty/></root><!--after-->")
+                .unwrap();
+        let expected =
+            b"<!--before-->\n<root a=\"&quot;\">x&amp;y<empty></empty></root>\n<!--after-->";
+        let mut sink = ExactSink {
+            expected,
+            position: 0,
+        };
+        let xml_base = XmlBaseResolutionBudget::default();
+        let (position, tracked) = serialize_canonical_visible_with_positions_bounded_impl(
+            &document,
+            None,
+            true,
+            &InclusiveNsRenderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: false,
+            },
+            CanonicalOutputOptions::bounded(None, expected.len(), &xml_base),
+            &mut sink,
+            0,
+        )
+        .unwrap();
+        assert_eq!(sink.position, expected.len());
+        assert_eq!(position, None);
+        assert!(tracked.is_empty());
+        #[cfg(feature = "xmldsig")]
+        {
+            // Mode/PrefixList selection enters that same serializer. The sink
+            // compares golden bytes incrementally, including short writes.
+            let document =
+                Document::parse("<r xmlns:p=\"urn:p\" xmlns:q=\"urn:q\"><p:c q:a=\"v\"/></r>")
+                    .unwrap();
+            for (mode, force_q, expected) in [
+                (
+                    C14nMode::Inclusive1_0,
+                    false,
+                    &b"<r xmlns:p=\"urn:p\" xmlns:q=\"urn:q\"><p:c q:a=\"v\"></p:c></r>"[..],
+                ),
+                (
+                    C14nMode::Inclusive1_1,
+                    false,
+                    &b"<r xmlns:p=\"urn:p\" xmlns:q=\"urn:q\"><p:c q:a=\"v\"></p:c></r>"[..],
+                ),
+                (
+                    C14nMode::Exclusive1_0,
+                    false,
+                    &b"<r><p:c xmlns:p=\"urn:p\" xmlns:q=\"urn:q\" q:a=\"v\"></p:c></r>"[..],
+                ),
+                (
+                    C14nMode::Exclusive1_0,
+                    true,
+                    &b"<r xmlns:q=\"urn:q\"><p:c xmlns:p=\"urn:p\" q:a=\"v\"></p:c></r>"[..],
+                ),
+            ] {
+                let mut algorithm = super::super::C14nAlgorithm::new(mode, false);
+                if force_q {
+                    algorithm.inclusive_prefixes.insert("q".into());
+                }
+                let mut sink = ExactSink {
+                    expected,
+                    position: 0,
+                };
+                super::super::canonicalize_visible_to_writer_bounded(
+                    &document,
+                    None,
+                    &algorithm,
+                    expected.len(),
+                    &xml_base,
+                    &mut sink,
+                    0,
+                )
+                .unwrap();
+                assert_eq!(sink.position, expected.len());
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_writer_limit_is_typed_without_an_io_error_box() {
+        // Exhausting output allowance must not allocate an error or invoke the
+        // sink with a chunk that exceeds the remaining allowance.
+        struct NeverWrite;
+        impl Write for NeverWrite {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                panic!("output was not admitted");
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let document = Document::parse("<root/>").unwrap();
+        let xml_base = XmlBaseResolutionBudget::default();
+        let error = serialize_canonical_visible_with_positions_bounded_impl(
+            &document,
+            None,
+            false,
+            &InclusiveNsRenderer,
+            C14nConfig::for_mode(C14nMode::Inclusive1_0),
+            CanonicalOutputOptions::bounded(None, 0, &xml_base),
+            &mut NeverWrite,
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            C14nError::OutputLimitExceeded { max_bytes: 0 }
+        ));
+    }
+
+    #[test]
+    fn terminal_writer_stops_at_first_io_refusal() {
+        // A downstream refusal stops traversal immediately; the serializer must
+        // neither buffer the remaining output nor call the sink again.
+        struct RefusingSink {
+            calls: usize,
+        }
+        impl Write for RefusingSink {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                self.calls += 1;
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let document = Document::parse("<root><a/><b/></root>").unwrap();
+        let xml_base = XmlBaseResolutionBudget::default();
+        let mut sink = RefusingSink { calls: 0 };
+        let error = serialize_canonical_visible_with_positions_bounded_impl(
+            &document,
+            None,
+            false,
+            &InclusiveNsRenderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: false,
+            },
+            CanonicalOutputOptions::bounded(None, 1024, &xml_base),
+            &mut sink,
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(error, C14nError::Io(error) if error.kind() == io::ErrorKind::BrokenPipe));
+        assert_eq!(sink.calls, 1);
+    }
 
     #[test]
     fn empty_element_expanded() {

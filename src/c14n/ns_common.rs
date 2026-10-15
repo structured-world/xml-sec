@@ -5,12 +5,12 @@
 //! sort by prefix → update rendered map. The only difference is the predicate
 //! that decides which namespace bindings are candidates for emission.
 
-use std::collections::HashMap;
-
 use crate::xml::dom::Node;
 
+use super::C14nError;
 use super::NodeVisibility;
 use super::prefix::has_in_scope_default_namespace;
+use super::scratch::{List, NamespaceMap, NamespaceRendering, Scratch};
 
 /// Collect, filter, and sort namespace declarations for a single element.
 ///
@@ -33,19 +33,25 @@ use super::prefix::has_in_scope_default_namespace;
 ///
 /// `(sorted_ns_decls, updated_rendered_map)` — the declarations to emit and
 /// the binding map to pass to child elements.
-pub(crate) fn collect_ns_declarations(
-    node: Node<'_, '_>,
-    parent_rendered: &HashMap<String, String>,
+pub(super) fn collect_ns_declarations<'a, S: Scratch>(
+    node: Node<'a, '_>,
+    parent_rendered: &S::Namespaces<'a>,
     visibility: Option<&dyn NodeVisibility>,
     reset_invisible_binding: impl Fn(&str) -> bool,
-    include_prefix: impl Fn(&str, &str) -> bool,
-) -> (Vec<(String, String)>, HashMap<String, String>) {
-    let mut rendered = parent_rendered.clone();
-    let mut decls: Vec<(String, String)> = Vec::new();
+    include_prefix: impl Fn(&str, &str) -> Result<bool, C14nError>,
+    scratch: &S,
+) -> Result<NamespaceRendering<'a, S>, C14nError> {
+    let mut rendered = parent_rendered.copy()?;
+    let mut decls = scratch.values();
 
     for ns in node.namespaces() {
         let prefix = ns.name().unwrap_or(""); // None = default namespace
         let uri = ns.uri();
+        scratch.charge(prefix.len().checked_add(uri.len()).ok_or(
+            C14nError::OutputLimitExceeded {
+                max_bytes: usize::MAX,
+            },
+        )?)?;
 
         if visibility.is_some_and(|set| !set.contains_namespace(node, prefix, uri)) {
             // Canonical XML subset state tracks namespace nodes present on the
@@ -55,12 +61,13 @@ pub(crate) fn collect_ns_declarations(
             if reset_invisible_binding(prefix) {
                 if prefix.is_empty()
                     && parent_rendered
-                        .get("")
-                        .is_some_and(|parent_uri| !parent_uri.is_empty())
+                        .get("", false)?
+                        .flatten()
+                        .is_some_and(|uri| !uri.is_empty())
                 {
-                    decls.push((String::new(), String::new()));
+                    decls.push(("", ""))?;
                 }
-                rendered.remove(prefix);
+                rendered.remove(prefix)?;
             }
             continue;
         }
@@ -72,13 +79,13 @@ pub(crate) fn collect_ns_declarations(
 
         // Mode-specific filter: inclusive accepts all, exclusive accepts
         // only visibly-utilized and forced prefixes.
-        if !include_prefix(prefix, uri) {
+        if !include_prefix(prefix, uri)? {
             continue;
         }
 
         // Suppress redundant: skip if the nearest output ancestor already
         // rendered the same prefix→URI binding.
-        if parent_rendered.get(prefix).map(|u| u.as_str()) == Some(uri) {
+        if parent_rendered.get(prefix, false)?.flatten() == Some(uri) {
             continue;
         }
 
@@ -86,32 +93,71 @@ pub(crate) fn collect_ns_declarations(
         // in scope. Check the source tree (not just parent_rendered) to handle
         // document subsets where output ancestors may be absent.
         if prefix.is_empty() && uri.is_empty() {
-            let has_rendered_default = parent_rendered.contains_key("");
+            let has_rendered_default = parent_rendered.get("", false)?.is_some();
             let has_in_scope_default = has_in_scope_default_namespace(node);
             if !has_rendered_default && !has_in_scope_default {
                 continue;
             }
         }
 
-        decls.push((prefix.to_string(), uri.to_string()));
+        decls.push((prefix, uri))?;
     }
 
     // Sort namespace declarations by prefix (lexicographic, "" sorts first).
-    decls.sort_by(|a, b| a.0.cmp(&b.0));
+    decls.sort(|a, b| {
+        scratch.charge(a.0.len().min(b.0.len()))?;
+        Ok(a.0.cmp(b.0))
+    })?;
 
     // Update the rendered map for child elements.
-    for (prefix, uri) in &decls {
-        rendered.insert(prefix.clone(), uri.clone());
+    for &(prefix, uri) in decls.iter() {
+        rendered.insert(prefix, false, Some(uri))?;
     }
 
-    (decls, rendered)
+    Ok((decls, rendered))
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use super::super::scratch::{Native, Scratch};
     use super::*;
     use crate::xml::dom::Document;
+    use std::collections::HashMap;
+
+    // Preserve the original golden fixture interface while the production
+    // pipeline borrows names instead of allocating String copies per node.
+    fn collect_ns_declarations(
+        node: Node<'_, '_>,
+        parent: &HashMap<String, String>,
+        visibility: Option<&dyn NodeVisibility>,
+        reset: impl Fn(&str) -> bool,
+        include: impl Fn(&str, &str) -> bool,
+    ) -> (Vec<(String, String)>, HashMap<String, String>) {
+        let mut namespaces = Native.namespaces();
+        for (prefix, uri) in parent {
+            namespaces.insert(prefix, false, Some(uri)).unwrap();
+        }
+        let (declarations, rendered) = super::collect_ns_declarations(
+            node,
+            &namespaces,
+            visibility,
+            reset,
+            |p, u| Ok(include(p, u)),
+            &Native,
+        )
+        .unwrap();
+        (
+            declarations
+                .into_iter()
+                .map(|(p, u)| (p.to_owned(), u.to_owned()))
+                .collect(),
+            rendered
+                .into_pairs()
+                .map(|(p, u)| (p.to_owned(), u.to_owned()))
+                .collect(),
+        )
+    }
 
     /// Helper: run the pipeline with an accept-all predicate (inclusive behavior).
     fn collect_all(xml: &str) -> Vec<(String, String)> {

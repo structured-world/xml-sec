@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use structured_asn1::memory::{Memory, MemoryAccount, MemoryError, OwnedVec};
+use structured_asn1::memory::{Memory, MemoryAccount, MemoryError, OwnedVec, Work};
 use structured_asn1::{Encoding, Limits, Parser};
 use structured_pkix::Certificate;
 
@@ -651,10 +651,10 @@ pub(crate) fn validate_supplied_path<'a>(
     }
 }
 
-fn with_effective_spki<T>(
+fn with_effective_spki<T, W: Work>(
     encoded: &[u8],
     parameters: Option<&[u8]>,
-    execution: &Memory,
+    execution: &W,
     verify: impl FnOnce(&[u8]) -> Result<T, X509ChainError>,
 ) -> Result<T, X509ChainError> {
     let Some(parameters) = parameters else {
@@ -695,11 +695,11 @@ pub(crate) fn effective_target_spki(
     }
 }
 
-fn encode_effective_spki(
+fn encode_effective_spki<W: Work>(
     encoded: &[u8],
     parameters: &[u8],
-    execution: &Memory,
-) -> Result<OwnedVec<u8>, X509ChainError> {
+    execution: &W,
+) -> Result<OwnedVec<u8, W>, X509ChainError> {
     use der::{Decode as _, Encode as _};
     execution
         .charge_work(encoded.len() as u64)
@@ -770,12 +770,12 @@ fn encode_effective_spki(
     Ok(writer.bytes)
 }
 
-struct AccountedDerWriter {
-    bytes: OwnedVec<u8>,
+struct AccountedDerWriter<W: Work> {
+    bytes: OwnedVec<u8, W>,
     failure: Option<MemoryError>,
 }
 
-impl der::Writer for AccountedDerWriter {
+impl<W: Work> der::Writer for AccountedDerWriter<W> {
     fn write(&mut self, bytes: &[u8]) -> der::Result<()> {
         self.bytes.try_extend_from_slice(bytes).map_err(|error| {
             self.failure = Some(error);
@@ -790,7 +790,7 @@ pub(crate) struct ProviderVerifier<'a> {
     pub(crate) allowed: Option<&'a crate::policy::CertificateSignatureAlgorithms>,
 }
 
-impl structured_pkix::path::Verify for ProviderVerifier<'_> {
+impl<W: Work> structured_pkix::path::Verify<W> for ProviderVerifier<'_> {
     type Error = X509ChainError;
 
     fn verify(
@@ -799,20 +799,20 @@ impl structured_pkix::path::Verify for ProviderVerifier<'_> {
         key: structured_pkix::path::WorkingKey<'_>,
         signed: &[u8],
         signature: structured_asn1::BitString<'_>,
-        execution: &Memory,
+        execution: &W,
     ) -> Result<structured_pkix::path::Verified, Self::Error> {
         self.verify_with_key_check(algorithm, key, signed, signature, execution, |_| Ok(()))
     }
 }
 
 impl ProviderVerifier<'_> {
-    fn verify_with_key_check(
+    fn verify_with_key_check<W: Work>(
         &self,
         algorithm: &structured_pkix::algorithm::AlgorithmIdentifier<'_>,
         key: structured_pkix::path::WorkingKey<'_>,
         signed: &[u8],
         signature: structured_asn1::BitString<'_>,
-        execution: &Memory,
+        execution: &W,
         check: impl FnOnce(&[u8]) -> Result<(), X509ChainError>,
     ) -> Result<structured_pkix::path::Verified, X509ChainError> {
         use x509_parser::prelude::FromDer as _;
@@ -894,7 +894,7 @@ struct PathVerifier<'a, 'p> {
     options: &'p super::x509::X509ChainOptions<'p>,
 }
 
-impl structured_pkix::path::Verify for PathVerifier<'_, '_> {
+impl<W: Work> structured_pkix::path::Verify<W> for PathVerifier<'_, '_> {
     type Error = X509ChainError;
 
     fn verify(
@@ -903,7 +903,7 @@ impl structured_pkix::path::Verify for PathVerifier<'_, '_> {
         key: structured_pkix::path::WorkingKey<'_>,
         signed: &[u8],
         signature: structured_asn1::BitString<'_>,
-        execution: &Memory,
+        execution: &W,
     ) -> Result<structured_pkix::path::Verified, Self::Error> {
         let raw = key.key().as_bytes();
         execution
@@ -1492,6 +1492,51 @@ mod tests {
                 .expect("corrupt signature execution succeeds"),
             Verified::No
         );
+    }
+
+    #[test]
+    fn published_scoped_verifier_preserves_both_current_work_ceilings() {
+        // Actual registry Verify<Execution>, not Verify<Memory>: either the
+        // caller's local ceiling or aggregate account can refuse before crypto.
+        let pair = rcgen::KeyPair::generate().expect("generate scoped verifier test key");
+        let certificate = rcgen::CertificateParams::new(Vec::<String>::new())
+            .expect("valid scoped verifier certificate parameters")
+            .self_signed(&pair)
+            .expect("sign scoped verifier test certificate");
+        let source = CertificateSession::new(&ResourcePolicy::default());
+        let certificate = source
+            .read(certificate.der())
+            .expect("read original certificate");
+        let verifier = ProviderVerifier {
+            provider: crate::provider::default_provider(),
+            allowed: None,
+        };
+        for (local, aggregate) in [(0, 100000), (100000, 0), (100000, 100000)] {
+            let memory = Memory::new(Arc::new(MemoryAccount::new(1 << 20, aggregate)));
+            let operation = Parser::new(
+                Encoding::Der,
+                Limits {
+                    max_work: local,
+                    ..Limits::default()
+                },
+                memory,
+            );
+            let reader = operation.read(&[], 0).expect("create current execution");
+            let result = verifier.verify(
+                &certificate.tbs().signature(),
+                WorkingKey::standing(certificate.tbs().public_key()),
+                certificate.signed_bytes(),
+                certificate.signature(),
+                &reader.execution(),
+            );
+            if local == 0 || aggregate == 0 {
+                assert!(
+                    matches!(result, Err(X509ChainError::Processing(error)) if error == structured_pkix::Error::resource(MemoryError::WorkExceeded, "certificate.signature", 0))
+                );
+            } else {
+                assert_eq!(result.expect("funded verification succeeds"), Verified::Yes);
+            }
+        }
     }
 
     #[test]

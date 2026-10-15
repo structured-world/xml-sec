@@ -23,6 +23,7 @@
 //! ```
 
 mod escape;
+mod scratch;
 #[cfg(feature = "xmldsig")]
 pub(crate) use escape::escape_attr;
 mod ns_common;
@@ -38,8 +39,6 @@ use crate::xml::dom::{Document, Node, NodeId};
 
 use ns_exclusive::ExclusiveNsRenderer;
 use ns_inclusive::InclusiveNsRenderer;
-#[cfg(any(feature = "xmldsig", test))]
-use serialize::CanonicalOutputLimitExceeded;
 #[cfg(feature = "xmldsig")]
 use serialize::serialize_canonical_visible_with_positions_bounded;
 use serialize::{
@@ -153,6 +152,10 @@ impl C14nAlgorithm {
 /// Error type for C14N operations.
 #[derive(Debug, thiserror::Error)]
 pub enum C14nError {
+    /// Current scoped execution refused work or scratch storage.
+    #[cfg(feature = "xmldsig")]
+    #[error("canonicalization shared execution: {0}")]
+    SharedExecution(#[from] structured_asn1::memory::MemoryError),
     /// XML parsing error.
     #[error("XML parse error: {0}")]
     Parse(String),
@@ -178,6 +181,12 @@ pub enum C14nError {
         /// Minimum cumulative byte count that exceeded the maximum.
         actual: usize,
     },
+    /// Canonical output was refused before exceeding its admitted byte bound.
+    #[error("canonical output exceeds maximum of {max_bytes} bytes")]
+    OutputLimitExceeded {
+        /// Maximum bytes admitted for this serialization, excluding any prefix.
+        max_bytes: usize,
+    },
     /// I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -185,13 +194,7 @@ pub enum C14nError {
 
 #[cfg(any(feature = "xmldsig", test))]
 pub(crate) fn is_output_limit_error(error: &C14nError) -> bool {
-    matches!(
-        error,
-        C14nError::Io(error)
-            if error
-                .get_ref()
-                .is_some_and(|source| source.is::<CanonicalOutputLimitExceeded>())
-    )
+    matches!(error, C14nError::OutputLimitExceeded { .. })
 }
 
 /// Visibility contract for canonicalizing a precise XPath node-set.
@@ -272,16 +275,106 @@ pub(crate) fn canonicalize_bounded_with_xml_base_budget(
     output: &mut Vec<u8>,
 ) -> Result<(), C14nError> {
     let visibility = node_set.map(|predicate| ClosureVisibility { predicate });
-    canonicalize_with_visibility_and_position_bounded_with_xml_base_budget(
+    let initial_offset = output.len();
+    canonicalize_visible_to_writer_bounded(
         doc,
         visibility
             .as_ref()
             .map(|visibility| visibility as &dyn NodeVisibility),
         algo,
-        None,
         max_output_bytes,
         xml_base_resolution,
         output,
+        initial_offset,
+    )?;
+    Ok(())
+}
+
+/// Same bounded serializer for terminal streams and retained collecting output.
+/// The supplied initial offset preserves absolute positions for append callers.
+#[cfg(feature = "xmldsig")]
+pub(crate) fn canonicalize_visible_to_writer_bounded<W: std::io::Write + ?Sized>(
+    doc: &Document,
+    visibility: Option<&dyn NodeVisibility>,
+    algo: &C14nAlgorithm,
+    max_output_bytes: usize,
+    xml_base_resolution: &xml_base::XmlBaseResolutionBudget,
+    output: &mut W,
+    initial_offset: usize,
+) -> Result<(), C14nError> {
+    canonicalize_writer_with_scratch(
+        doc,
+        visibility,
+        algo,
+        max_output_bytes,
+        xml_base_resolution,
+        output,
+        initial_offset,
+        &scratch::Native,
+        None,
+    )
+}
+
+#[cfg(feature = "xmldsig")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn canonicalize_visible_to_writer_accounted<
+    W: std::io::Write + ?Sized,
+    E: structured_asn1::memory::Work,
+>(
+    doc: &Document,
+    visibility: Option<&dyn NodeVisibility>,
+    algo: &C14nAlgorithm,
+    max_output_bytes: usize,
+    xml_base_resolution: &xml_base::XmlBaseResolutionBudget,
+    output: &mut W,
+    work: &E,
+    prefix_list: Option<&str>,
+) -> Result<(), C14nError> {
+    canonicalize_writer_with_scratch(
+        doc,
+        visibility,
+        algo,
+        max_output_bytes,
+        xml_base_resolution,
+        output,
+        0,
+        &scratch::Accounted(work),
+        prefix_list,
+    )
+}
+
+#[cfg(feature = "xmldsig")]
+#[allow(clippy::too_many_arguments)]
+fn canonicalize_writer_with_scratch<W: std::io::Write + ?Sized, S: scratch::Scratch>(
+    doc: &Document,
+    visibility: Option<&dyn NodeVisibility>,
+    algo: &C14nAlgorithm,
+    max_output_bytes: usize,
+    xml_base_resolution: &xml_base::XmlBaseResolutionBudget,
+    output: &mut W,
+    initial_offset: usize,
+    scratch: &S,
+    prefix_list: Option<&str>,
+) -> Result<(), C14nError> {
+    let inclusive = InclusiveNsRenderer;
+    let exclusive = match prefix_list {
+        Some(list) => ExclusiveNsRenderer::from_prefix_list(list),
+        None => ExclusiveNsRenderer::new(&algo.inclusive_prefixes),
+    };
+    let renderer: &dyn serialize::NsRenderer<S> = match algo.mode {
+        C14nMode::Inclusive1_0 | C14nMode::Inclusive1_1 => &inclusive,
+        C14nMode::Exclusive1_0 => &exclusive,
+    };
+    serialize::serialize_with_scratch(
+        doc,
+        visibility,
+        algo.with_comments,
+        renderer,
+        C14nConfig::for_mode(algo.mode),
+        CanonicalOutputOptions::bounded(None, max_output_bytes, xml_base_resolution),
+        output,
+        initial_offset,
+        scratch,
     )?;
     Ok(())
 }
@@ -365,10 +458,7 @@ pub(crate) fn canonicalize_with_visibility_and_positions_bounded_with_xml_base_b
     xml_base_resolution: &xml_base::XmlBaseResolutionBudget,
     output: &mut Vec<u8>,
 ) -> Result<Vec<(NodeId, usize)>, C14nError> {
-    let config = C14nConfig {
-        inherit_xml_attrs: !matches!(algo.mode, C14nMode::Exclusive1_0),
-        fixup_xml_base: matches!(algo.mode, C14nMode::Inclusive1_1),
-    };
+    let config = C14nConfig::for_mode(algo.mode);
     let inclusive = InclusiveNsRenderer;
     let exclusive = ExclusiveNsRenderer::new(&algo.inclusive_prefixes);
     let renderer: &dyn serialize::NsRenderer = match algo.mode {
@@ -407,10 +497,7 @@ fn canonicalize_with_visibility_and_position_impl(
     match algo.mode {
         C14nMode::Inclusive1_0 => {
             let renderer = InclusiveNsRenderer;
-            let config = C14nConfig {
-                inherit_xml_attrs: true,
-                fixup_xml_base: false,
-            };
+            let config = C14nConfig::for_mode(algo.mode);
             serialize_canonical_visible_with_position_dispatch(
                 doc,
                 visibility,
@@ -425,10 +512,7 @@ fn canonicalize_with_visibility_and_position_impl(
         }
         C14nMode::Inclusive1_1 => {
             let renderer = InclusiveNsRenderer;
-            let config = C14nConfig {
-                inherit_xml_attrs: true,
-                fixup_xml_base: true,
-            };
+            let config = C14nConfig::for_mode(algo.mode);
             serialize_canonical_visible_with_position_dispatch(
                 doc,
                 visibility,
@@ -443,10 +527,7 @@ fn canonicalize_with_visibility_and_position_impl(
         }
         C14nMode::Exclusive1_0 => {
             let renderer = ExclusiveNsRenderer::new(&algo.inclusive_prefixes);
-            let config = C14nConfig {
-                inherit_xml_attrs: false,
-                fixup_xml_base: false,
-            };
+            let config = C14nConfig::for_mode(algo.mode);
             serialize_canonical_visible_with_position_dispatch(
                 doc,
                 visibility,

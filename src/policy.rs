@@ -1215,7 +1215,8 @@ impl KeyTrustPolicy {
     }
 }
 
-/// Whether an XMLDSig operation evaluates direct `<Object>/<Manifest>` references.
+/// Whether an XMLDSig operation evaluates Manifest references. Verification
+/// requires original authenticated coverage; signing populates direct Object/Manifest digests.
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ManifestProcessing {

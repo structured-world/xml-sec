@@ -79,6 +79,10 @@ pub(crate) enum OperationResourceIdentity {
         fingerprint: [u8; 32],
     },
     #[cfg(feature = "xmldsig")]
+    MissingExternal {
+        uri: String,
+    },
+    #[cfg(feature = "xmldsig")]
     Generated(&'static str, usize),
 }
 
@@ -712,6 +716,45 @@ impl<P, B> OperationExecutionContext<P, B> {
     #[cfg(feature = "xmldsig")]
     pub(crate) fn is_authenticated(&self, node: NodeIdentity) -> bool {
         self.authenticated_nodes.borrow().contains(&node)
+    }
+
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn decision_count(&self) -> usize {
+        self.decisions.borrow().len()
+    }
+
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn accepted_signature(&self) -> Option<OperationNodeId> {
+        self.decisions.borrow().iter().find_map(|decision| {
+            (decision.accepted && decision.reason == OperationDecisionReason::SignatureVerified)
+                .then_some(decision.node)
+        })
+    }
+
+    /// Gate a scoped replay on the original graph's accepted crypto dependency.
+    /// The scoped caller records each invocation in its accounted continuation
+    /// storage; the completed original digest node is never executed twice.
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn run_reference_replay<T, E>(
+        &self,
+        view: DocumentView<'_>,
+        reference: NodeIdentity,
+        action: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<OperationPlanError>,
+    {
+        self.validate_document_view(view).map_err(E::from)?;
+        let requires = self
+            .accepted_signature()
+            .ok_or(OperationPlanError::UnknownNode)
+            .map_err(E::from)?;
+        if !self.is_executed(requires) {
+            return Err(E::from(OperationPlanError::UnknownNode));
+        }
+        view.resolve_node(reference)
+            .map_err(|_| E::from(OperationPlanError::StaleResourceIdentity))?;
+        action()
     }
 
     #[cfg(feature = "xmldsig")]

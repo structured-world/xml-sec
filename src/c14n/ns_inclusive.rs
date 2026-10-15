@@ -6,12 +6,12 @@
 //! namespaces are rendered even if not visibly used by the element's tag or
 //! attributes.
 
-use std::collections::HashMap;
-
 use crate::xml::dom::Node;
 
+use super::C14nError;
 use super::NodeVisibility;
 use super::ns_common::collect_ns_declarations;
+use super::scratch::{NamespaceRendering, Scratch};
 use super::serialize::NsRenderer;
 
 /// Inclusive C14N namespace renderer.
@@ -20,15 +20,23 @@ use super::serialize::NsRenderer;
 /// output ancestor already rendered.
 pub(crate) struct InclusiveNsRenderer;
 
-impl NsRenderer for InclusiveNsRenderer {
+impl<S: Scratch> NsRenderer<S> for InclusiveNsRenderer {
     fn render_namespaces<'a>(
         &self,
         node: Node<'a, '_>,
-        parent_rendered: &HashMap<String, String>,
+        parent_rendered: &S::Namespaces<'a>,
         visibility: Option<&dyn NodeVisibility>,
-    ) -> (Vec<(String, String)>, HashMap<String, String>) {
+        scratch: &S,
+    ) -> Result<NamespaceRendering<'a, S>, C14nError> {
         // Inclusive mode: all in-scope namespace bindings are candidates.
-        collect_ns_declarations(node, parent_rendered, visibility, |_| true, |_, _| true)
+        collect_ns_declarations(
+            node,
+            parent_rendered,
+            visibility,
+            |_| true,
+            |_, _| Ok(true),
+            scratch,
+        )
     }
 
     fn renders_selected_namespace_of_omitted_element(&self, _prefix: &str) -> bool {

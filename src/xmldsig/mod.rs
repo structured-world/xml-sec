@@ -54,6 +54,7 @@
 
 pub mod builder;
 pub mod digest;
+pub mod extension;
 pub mod keys;
 mod modern;
 #[cfg(feature = "experimental-pq")]
@@ -111,14 +112,17 @@ pub use transforms::{
 pub use trust::{KeyTrustEvidence, ResolvedVerificationKey, TrustedPublicKey, X509TrustEvidence};
 pub use types::{NodeSet, TransformData, TransformError};
 pub use verify::{
-    CallerTrustedSignatureKey, DsigError, DsigStatus, FailureReason, KeyResolver,
-    ReferenceCoverage, ReferenceProcessingError, ReferenceResult, ReferenceSet, ReferencesResult,
-    SignatureEvidence, SignatureKeyInfoMetadata, SignatureRequirement, SignatureSelection,
-    UriTypeSet, VerificationRequest, VerifyContext, VerifyEvidence, VerifyResult, VerifyingKey,
-    has_same_document_encapsulation, inspect_pinned_verification_key_info,
-    inspect_signing_key_info, inspect_verification_key_info,
+    AuthenticatedReference, CallerTrustedSignatureKey, CatalogueCompleteness, CatalogueError,
+    DsigError, DsigStatus, ExternalResourceUnavailable, FailureReason, KeyResolver, LexicalSource,
+    ReferenceCoverage, ReferenceLocation, ReferenceParent, ReferenceProcessingError,
+    ReferenceResolution, ReferenceResult, ReferenceSet, ReferencesResult, ReplayError, ReplayMode,
+    ReplayOutcome, SelectedSignature, SignatureEvidence, SignatureKeyInfoMetadata,
+    SignatureRequirement, SignatureSelection, UriTypeSet, VerificationRequest, VerifiedSession,
+    VerifyContext, VerifyEvidence, VerifyResult, VerifyingKey, has_same_document_encapsulation,
+    inspect_pinned_verification_key_info, inspect_signing_key_info, inspect_verification_key_info,
     materialize_signing_key_info_references, materialize_verification_key_info_references,
     process_all_references, process_reference, verify_signature_with_pem_key,
+    with_verified_request,
 };
 pub use x509::{
     X509ChainError, X509ChainOptions, verify_x509_certificate_chain,

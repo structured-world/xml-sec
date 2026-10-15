@@ -32,6 +32,8 @@ pub enum TransformData<'a> {
     NodeSet(NodeSet<'a>),
     /// Raw bytes (e.g., after canonicalization).
     Binary(Vec<u8>),
+    /// Original caller-supplied bytes, borrowed for a scoped transform chain.
+    BorrowedBinary(&'a [u8]),
 }
 
 impl std::fmt::Debug for TransformData<'_> {
@@ -39,6 +41,7 @@ impl std::fmt::Debug for TransformData<'_> {
         match self {
             Self::NodeSet(_) => f.debug_tuple("NodeSet").field(&"...").finish(),
             Self::Binary(b) => f.debug_tuple("Binary").field(&b.len()).finish(),
+            Self::BorrowedBinary(b) => f.debug_tuple("BorrowedBinary").field(&b.len()).finish(),
         }
     }
 }
@@ -48,7 +51,7 @@ impl<'a> TransformData<'a> {
     pub fn into_node_set(self) -> Result<NodeSet<'a>, TransformError> {
         match self {
             Self::NodeSet(ns) => Ok(ns),
-            Self::Binary(_) => Err(TransformError::TypeMismatch {
+            Self::Binary(_) | Self::BorrowedBinary(_) => Err(TransformError::TypeMismatch {
                 expected: "NodeSet",
                 got: "Binary",
             }),
@@ -59,6 +62,7 @@ impl<'a> TransformData<'a> {
     pub fn into_binary(self) -> Result<Vec<u8>, TransformError> {
         match self {
             Self::Binary(b) => Ok(b),
+            Self::BorrowedBinary(b) => Ok(b.to_vec()),
             Self::NodeSet(_) => Err(TransformError::TypeMismatch {
                 expected: "Binary",
                 got: "NodeSet",

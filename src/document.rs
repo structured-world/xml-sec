@@ -49,6 +49,21 @@ pub struct NodeIdentity {
     semantic_id: SemanticNodeId,
 }
 
+#[cfg(feature = "xmldsig")]
+impl structured_asn1::memory::HashWork for NodeIdentity {
+    fn hash_work(&self) -> Result<u64, structured_asn1::memory::MemoryError> {
+        let Self {
+            document: _,
+            generation: _,
+            semantic_id: _,
+        } = self;
+        // Derived Hash/Eq traverse two u64 fields and one u32 field, never
+        // padding or source XML. Admit their bytes and one operation per field.
+        // Exhaustive destructuring and the counting-Hasher test guard growth.
+        Ok((2 * core::mem::size_of::<u64>() + core::mem::size_of::<u32>() + 3) as u64)
+    }
+}
+
 /// Identity of one XPath attribute node and its owning element.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AttributeIdentity {

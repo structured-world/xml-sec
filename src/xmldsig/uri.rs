@@ -500,6 +500,24 @@ impl<'a> UriReferenceResolver<'a> {
         self.dereference_with_budget(&resolved, budget)
     }
 
+    /// Preserve an admitted external lookup's absence. Unsupported fragment
+    /// syntax, ambiguous IDs and resource failures are never recast as absence.
+    pub(crate) fn replay_input_from_with_budget(
+        &self,
+        uri: &str,
+        origin: Node<'_, '_>,
+        budget: &NodeSetMaterializationBudget,
+        xml_base_budget: &XmlBaseResolutionBudget,
+    ) -> Result<Option<TransformData<'a>>, TransformError> {
+        if uri.is_empty() || uri.starts_with('#') {
+            return self.dereference_with_budget(uri, budget).map(Some);
+        }
+        let resolved = resolve_uri_from_node_with_budget(origin, uri, xml_base_budget)
+            .map_err(map_xml_base_resolution_error)?;
+        self.external_resource(&resolved)
+            .map(|bytes| bytes.map(TransformData::BorrowedBinary))
+    }
+
     fn dereference_with_optional_budget(
         &self,
         uri: &str,

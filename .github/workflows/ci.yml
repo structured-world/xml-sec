@@ -189,6 +189,12 @@ jobs:
       - run: bash scripts/check-shared-pkix.sh
         env:
           RUSTUP_TOOLCHAIN: "1.92.0"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - run: bash scripts/test-wasm-c14n.sh
+        env:
+          RUSTUP_TOOLCHAIN: "1.92.0"
 
   test-matrix:
     name: test-matrix (${{ matrix.rust }}, ${{ matrix.xml-backend }})

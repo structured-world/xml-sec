@@ -56,6 +56,9 @@ use super::types::{NodeSet, TransformError, subtree_node_id_range};
 use super::uri::{ExternalResourceMapError, UriReferenceResolver, validate_external_resource_map};
 use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_bytes};
 
+mod session;
+pub use session::*;
+
 const MAX_SIGNATURE_VALUE_LEN: usize = 8192;
 const MAX_RETRIEVAL_METHOD_COUNT: usize = 64;
 /// Cryptographic verifier used by [`VerifyContext`].
@@ -444,24 +447,17 @@ impl<'a> VerifyContext<'a> {
 
     /// Enable or disable `<Manifest>` processing.
     ///
-    /// When enabled, references in `<ds:Manifest>` elements that are direct
-    /// element children of `<ds:Object>` are processed only when the direct-child
-    /// `<ds:Object>` or `<ds:Manifest>` itself is referenced from `<SignedInfo>`
-    /// by an ID-based same-document fragment URI such as `#id` or
-    /// `#xpointer(id('id'))`, and that reference uses only canonicalization
-    /// transforms (or implicit canonicalization). Filtering or binary transforms
-    /// do not prove that the complete Manifest structure was authenticated.
-    /// Only those signed Manifest references are returned in
-    /// `VerifyResult::manifest_references`.
-    /// Manifest parsing begins only after every `<SignedInfo>` reference digest
-    /// validates; a failure returns immediately with no Manifest results.
-    /// Nested `<ds:Manifest>` descendants under `<ds:Object>` are not
-    /// processed.
-    /// Direct-child unsigned/unreferenced Manifests are skipped and do not
-    /// appear in `VerifyResult::manifest_references`.
+    /// Process references only when this Signature authenticated the original
+    /// Manifest or an ancestor through an ID-based same-document reference
+    /// using only canonicalization transforms (or implicit canonicalization).
+    /// Such Manifests may be nested or outside Signature; physical ancestry
+    /// alone never authenticates them. Authenticated Manifest references can
+    /// establish the next discovery frontier through the same operation state.
+    /// Filtering or binary transforms do not prove complete original structure.
+    /// Unsigned/unreferenced Manifests are skipped.
     /// Whole-document same-document references such as `URI=""` or
-    /// `URI="#xpointer(/)"` do not mark a specific direct-child
-    /// `<ds:Object>`/`<ds:Manifest>` as signed for this option.
+    /// `URI="#xpointer(/)"` do not establish an element-specific Manifest
+    /// authentication proof for this option.
     ///
     /// Manifests are parsed and processed only after the SignedInfo references
     /// and SignatureValue both validate. Their digest mismatches, policy
@@ -722,14 +718,14 @@ impl SignatureEvidence {
 /// Bounded outcomes for all signatures in one document generation.
 #[derive(Debug)]
 #[must_use = "inspect the individual outcomes before accepting the document"]
-pub struct VerifyEvidence {
+pub struct VerifyEvidence<V = Vec<SignatureEvidence>> {
     document: NodeIdentity,
-    signatures: Vec<SignatureEvidence>,
+    signatures: V,
     accepted: bool,
     correlation: Option<[u8; 16]>,
 }
 
-impl VerifyEvidence {
+impl<V: std::ops::Deref<Target = [SignatureEvidence]>> VerifyEvidence<V> {
     /// Whether the explicit request requirements hold for this document.
     /// Foreign documents or any mutation after verification invalidate acceptance.
     pub fn accepted(&self, document: &XmlDocument) -> Result<bool, DsigError> {
@@ -766,7 +762,7 @@ impl VerifyEvidence {
                 });
             }
             let target_id = target_node.id().get();
-            for signature in &self.signatures {
+            for signature in self.signatures() {
                 let Ok(result) = &signature.result else {
                     continue;
                 };
@@ -876,7 +872,7 @@ pub struct ReferenceResult {
 ///
 /// XMLDSig 1.1 §8.1.1 protects only transformed data. Unknown projection is
 /// deliberately not promoted to complete original-element coverage.
-/// https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-Signed
+/// <https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-Signed>
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ReferenceCoverage {
@@ -1206,10 +1202,16 @@ impl<'a> VerificationOperationBudgets<'a> {
             }
             return identity;
         }
-        let identity = resolver.external_resource_identity(uri).unwrap_or(
-            OperationResourceIdentity::Generated("missing-external-reference", index),
-        );
-        if matches!(identity, OperationResourceIdentity::External { .. }) {
+        let identity = resolver.external_resource_identity(uri).unwrap_or_else(|| {
+            OperationResourceIdentity::MissingExternal {
+                uri: uri.to_owned(),
+            }
+        });
+        if matches!(
+            identity,
+            OperationResourceIdentity::External { .. }
+                | OperationResourceIdentity::MissingExternal { .. }
+        ) {
             self.external_resource_identities
                 .borrow_mut()
                 .insert(uri.to_owned(), identity.clone());
@@ -1563,11 +1565,12 @@ pub struct VerifyResult {
     /// `<Manifest>` reference results.
     /// Populated only when `VerifyContext::process_manifests(true)` is enabled
     /// and core signature validation succeeds.
-    /// Includes only references from signed direct-child `<ds:Object>/<ds:Manifest>`
-    /// blocks that are referenced from `<SignedInfo>`.
+    /// Includes references whose original Manifest or ancestor is authenticated
+    /// by this Signature's structure-preserving references. Manifests may be
+    /// nested or outside Signature; DOM ancestry alone never authenticates them.
     /// Each entry has an independent status that does not alter [`Self::status`].
     /// Callers must inspect every entry before accepting Manifest-backed data.
-    /// Unsigned/unreferenced direct-child Manifest blocks are skipped, so an
+    /// Unsigned/unreferenced Manifest blocks are skipped, so an
     /// empty list does not imply that no Manifest elements existed in `verify()` input.
     pub manifest_references: Vec<ReferenceResult>,
     /// Canonicalized `<SignedInfo>` bytes when `store_pre_digest` is enabled
@@ -1579,6 +1582,9 @@ pub struct VerifyResult {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum DsigError {
+    /// The current shared execution refused work or storage admission.
+    #[error("shared verification execution: {0}")]
+    SharedExecution(#[from] structured_asn1::memory::MemoryError),
     /// Key establishment failed before the consuming MAC.
     #[error(transparent)]
     KeyEstablishment(#[from] crate::key_establishment::KeyEstablishmentError),
@@ -1883,11 +1889,178 @@ fn count_signature_nodes(view: DocumentView<'_>, maximum: usize) -> Result<usize
     Ok(count)
 }
 
+trait SignatureBuffer: std::ops::Deref<Target = [SignatureEvidence]> {
+    fn push_signature(
+        &mut self,
+        evidence: SignatureEvidence,
+    ) -> Result<(), structured_asn1::memory::MemoryError>;
+}
+
+impl SignatureBuffer for Vec<SignatureEvidence> {
+    fn push_signature(
+        &mut self,
+        evidence: SignatureEvidence,
+    ) -> Result<(), structured_asn1::memory::MemoryError> {
+        self.push(evidence);
+        Ok(())
+    }
+}
+
+impl<W: structured_asn1::memory::Work> SignatureBuffer
+    for structured_asn1::memory::OwnedVec<SignatureEvidence, W>
+{
+    fn push_signature(
+        &mut self,
+        evidence: SignatureEvidence,
+    ) -> Result<(), structured_asn1::memory::MemoryError> {
+        self.try_push(evidence)
+    }
+}
+
+trait OperationRetention<P, B> {
+    fn retain(
+        &mut self,
+        operation: OperationExecutionContext<P, B>,
+    ) -> Result<(), structured_asn1::memory::MemoryError>;
+}
+
+impl<P, B> OperationRetention<P, B> for () {
+    fn retain(
+        &mut self,
+        operation: OperationExecutionContext<P, B>,
+    ) -> Result<(), structured_asn1::memory::MemoryError> {
+        drop(operation);
+        Ok(())
+    }
+}
+
+impl<P, B, W: structured_asn1::memory::Work> OperationRetention<P, B>
+    for structured_asn1::memory::OwnedVec<OperationExecutionContext<P, B>, W>
+{
+    fn retain(
+        &mut self,
+        operation: OperationExecutionContext<P, B>,
+    ) -> Result<(), structured_asn1::memory::MemoryError> {
+        self.try_push(operation)
+    }
+}
+
+trait RequestStorage {
+    type Signatures: SignatureBuffer;
+    // Actual reference types preserve their lifetimes without the implied
+    // 'static bound of a lifetime-GAT projection under the scoped callback.
+    type Operations<P, B>: OperationRetention<P, B>;
+
+    fn admit_request(
+        &self,
+        document: &XmlDocument,
+    ) -> Result<(), structured_asn1::memory::MemoryError>;
+    fn signatures(
+        &self,
+        count: usize,
+    ) -> Result<Self::Signatures, structured_asn1::memory::MemoryError>;
+    fn operations<P, B>(
+        &self,
+        count: usize,
+    ) -> Result<Self::Operations<P, B>, structured_asn1::memory::MemoryError>;
+}
+
+struct CollectedRequestStorage;
+
+impl RequestStorage for CollectedRequestStorage {
+    type Signatures = Vec<SignatureEvidence>;
+    type Operations<P, B> = ();
+
+    fn admit_request(
+        &self,
+        _document: &XmlDocument,
+    ) -> Result<(), structured_asn1::memory::MemoryError> {
+        Ok(())
+    }
+    fn signatures(
+        &self,
+        count: usize,
+    ) -> Result<Self::Signatures, structured_asn1::memory::MemoryError> {
+        Ok(Vec::with_capacity(count))
+    }
+    fn operations<P, B>(
+        &self,
+        _count: usize,
+    ) -> Result<Self::Operations<P, B>, structured_asn1::memory::MemoryError> {
+        Ok(())
+    }
+}
+
+struct ScopedRequestStorage<'work, W: structured_asn1::memory::Work>(&'work W);
+
+impl<W: structured_asn1::memory::Work> RequestStorage for ScopedRequestStorage<'_, W> {
+    type Signatures = structured_asn1::memory::OwnedVec<SignatureEvidence, W>;
+    type Operations<P, B> = structured_asn1::memory::OwnedVec<OperationExecutionContext<P, B>, W>;
+
+    fn admit_request(
+        &self,
+        document: &XmlDocument,
+    ) -> Result<(), structured_asn1::memory::MemoryError> {
+        let units = document
+            .with_view(|view| {
+                u64::try_from(view.node_count())
+                    .ok()
+                    .and_then(|count| count.checked_mul(2))
+                    .and_then(|count| count.checked_add(1))
+            })
+            .ok_or(structured_asn1::memory::MemoryError::WorkExceeded)?;
+        self.0.charge_work(units)
+    }
+    fn signatures(
+        &self,
+        count: usize,
+    ) -> Result<Self::Signatures, structured_asn1::memory::MemoryError> {
+        let mut values = self.0.vector();
+        values.try_reserve_exact(count)?;
+        Ok(values)
+    }
+    fn operations<P, B>(
+        &self,
+        count: usize,
+    ) -> Result<Self::Operations<P, B>, structured_asn1::memory::MemoryError> {
+        let mut values = self.0.vector();
+        values.try_reserve_exact(count)?;
+        Ok(values)
+    }
+}
+
 fn verify_all_document(
     document: &XmlDocument,
     ctx: &VerifyContext<'_>,
     request: &VerificationRequest<'_>,
 ) -> Result<VerifyEvidence, DsigError> {
+    with_verified_document(
+        document,
+        ctx,
+        request,
+        CollectedRequestStorage,
+        |_, _, _, evidence, (), _| Ok(evidence),
+    )
+}
+
+fn with_verified_document<'inputs, R, S: RequestStorage>(
+    document: &XmlDocument,
+    ctx: &VerifyContext<'inputs>,
+    request: &VerificationRequest<'inputs>,
+    storage: S,
+    continuation: impl for<'view, 'scope> FnOnce(
+        DocumentView<'view>,
+        &'scope VerifyContext<'inputs>,
+        &'scope VerificationOperationBudgets<'inputs>,
+        VerifyEvidence<S::Signatures>,
+        S::Operations<
+            &'scope crate::policy::VerificationPolicy,
+            &'scope VerificationOperationBudgets<'inputs>,
+        >,
+        UriReferenceResolver<'view>,
+    ) -> Result<R, DsigError>,
+) -> Result<R, DsigError> {
+    storage.admit_request(document)?;
     ctx.policy.validate()?;
     document.validate_operation_policy(&ctx.policy.xml, &ctx.policy.resources)?;
     ctx.policy
@@ -1978,7 +2151,8 @@ fn verify_all_document(
         let count = count_signature_nodes(view, ctx.policy.resources.max_signatures)?;
         // Cardinality is checked before allocating the report or calling a
         // resolver. No Vec of backend handles or cloned XML is needed.
-        let mut signatures = Vec::with_capacity(count);
+        let mut signatures = storage.signatures(count)?;
+        let mut operations = storage.operations(count)?;
         let resolver = UriReferenceResolver::with_document_view(view, ctx.id_attributes)
             .with_same_document_id_semantics(ctx.policy.transforms.same_document_id_semantics)
             .with_external_resource_limits(
@@ -2007,10 +2181,11 @@ fn verify_all_document(
                 .or(ctx.key);
             let result =
                 verify_signature_node(view, ctx, key, &mut operation, &resolver, signature);
-            signatures.push(SignatureEvidence {
+            signatures.push_signature(SignatureEvidence {
                 identity: view.node_identity(signature),
                 result,
-            });
+            })?;
+            operations.retain(operation)?;
         }
         let mut evidence = VerifyEvidence {
             document: view.root(),
@@ -2042,7 +2217,7 @@ fn verify_all_document(
                 break;
             }
         }
-        Ok(evidence)
+        continuation(view, ctx, &budgets, evidence, operations, resolver)
     })
 }
 
@@ -4507,100 +4682,97 @@ fn parse_manifest_references(
 ) -> Result<ParsedManifestReferences, SignatureVerificationPipelineError> {
     let mut references = Vec::new();
     let mut invalid = Vec::new();
-    for object_node in signature_node.children().filter(|node| {
-        node.is_element()
-            && node.tag_name().namespace() == Some(XMLDSIG_NS)
-            && node.tag_name().name() == "Object"
-    }) {
-        let object_is_signed = operation.is_authenticated(view.node_identity(object_node));
-        for manifest_node in object_node.children().filter(|node| {
-            node.is_element()
-                && node.tag_name().namespace() == Some(XMLDSIG_NS)
-                && node.tag_name().name() == "Manifest"
-        }) {
-            let manifest_is_signed = operation.is_authenticated(view.node_identity(manifest_node));
-            // Leave unauthenticated Manifests unmarked so a verified outer
-            // Manifest can make them eligible on the next discovery pass.
-            if !object_is_signed && !manifest_is_signed {
-                continue;
-            }
-            if !state.processed.insert(manifest_node.id()) {
-                continue;
-            }
-            let mut manifest_children = Vec::new();
-            for child in manifest_node.children() {
-                if child.is_text()
-                    && child.text().is_some_and(|text| {
-                        text.chars().any(|c| !matches!(c, ' ' | '\t' | '\n' | '\r'))
-                    })
-                {
-                    return Err(SignatureVerificationPipelineError::InvalidStructure {
-                        reason: "Manifest contains non-whitespace mixed content",
-                    });
-                }
-                if child.is_element() {
-                    manifest_children.push(child);
-                }
-            }
-            if manifest_children.is_empty() {
+    // XMLDSig 1.1 §5.1 binds a Manifest through references, independently of
+    // physical Signature/Object ancestry. Use only this operation's existing
+    // authentication state; another Signature's successes cannot admit it.
+    // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-Manifest
+    let document = signature_node.document();
+    for manifest_node in document
+        .descendants()
+        .filter(|node| node.has_tag_name((XMLDSIG_NS, "Manifest")))
+    {
+        let manifest_is_signed = manifest_node
+            .ancestors()
+            .any(|ancestor| operation.is_authenticated(view.node_identity(ancestor)));
+        // Leave unauthenticated Manifests unmarked so a verified outer
+        // Manifest can make them eligible on the next discovery pass.
+        if !manifest_is_signed {
+            continue;
+        }
+        if !state.processed.insert(manifest_node.id()) {
+            continue;
+        }
+        let mut manifest_children = Vec::new();
+        for child in manifest_node.children() {
+            if child.is_text()
+                && child.text().is_some_and(|text| {
+                    text.chars().any(|c| !matches!(c, ' ' | '\t' | '\n' | '\r'))
+                })
+            {
                 return Err(SignatureVerificationPipelineError::InvalidStructure {
-                    reason: "Manifest must contain at least one ds:Reference element child",
+                    reason: "Manifest contains non-whitespace mixed content",
                 });
             }
-            for child in manifest_children {
-                if child.tag_name().namespace() != Some(XMLDSIG_NS)
-                    || child.tag_name().name() != "Reference"
-                {
-                    return Err(SignatureVerificationPipelineError::InvalidStructure {
-                        reason: "Manifest must contain only ds:Reference element children",
+            if child.is_element() {
+                manifest_children.push(child);
+            }
+        }
+        if manifest_children.is_empty() {
+            return Err(SignatureVerificationPipelineError::InvalidStructure {
+                reason: "Manifest must contain at least one ds:Reference element child",
+            });
+        }
+        for child in manifest_children {
+            if child.tag_name().namespace() != Some(XMLDSIG_NS)
+                || child.tag_name().name() != "Reference"
+            {
+                return Err(SignatureVerificationPipelineError::InvalidStructure {
+                    reason: "Manifest must contain only ds:Reference element children",
+                });
+            }
+            if *state.remaining_capacity == 0 {
+                return Err(SignatureVerificationPipelineError::InvalidStructure {
+                    reason: "signed Manifests exceed the per-signature Reference limit",
+                });
+            }
+            *state.remaining_capacity -= 1;
+            let reference_index = *state.next_reference_index;
+            *state.next_reference_index += 1;
+            match parse_reference_with_xpath_budget(child, state.xpath_parse) {
+                Ok(reference) => references.push(CompiledManifestReference {
+                    index: reference_index,
+                    reference,
+                    reference_node_id: child.id(),
+                }),
+                Err(ParseError::Transform(super::TransformError::UnsupportedTransform(uri))) => {
+                    let digest_algorithm =
+                        reference_digest_method(child).map_err(map_manifest_parse_error)?;
+                    let reason =
+                        if allowed_transforms.is_some_and(|allowed| !allowed.contains(&uri)) {
+                            FailureReason::ReferencePolicyViolation {
+                                ref_index: reference_index,
+                            }
+                        } else {
+                            FailureReason::ReferenceProcessingFailure {
+                                ref_index: reference_index,
+                            }
+                        };
+                    invalid.push(CompiledManifestInvalid {
+                        result: ReferenceResult {
+                            reference_identity: Some(view.node_identity(child)),
+                            target_identity: None,
+                            external_resource_fingerprint: None,
+                            coverage: ReferenceCoverage::TransformedData,
+                            reference_set: ReferenceSet::Manifest,
+                            reference_index,
+                            uri: child.attribute("URI").unwrap_or("<omitted>").to_owned(),
+                            digest_algorithm,
+                            status: DsigStatus::Invalid(reason),
+                            pre_digest_data: None,
+                        },
                     });
                 }
-                if *state.remaining_capacity == 0 {
-                    return Err(SignatureVerificationPipelineError::InvalidStructure {
-                        reason: "signed Manifests exceed the per-signature Reference limit",
-                    });
-                }
-                *state.remaining_capacity -= 1;
-                let reference_index = *state.next_reference_index;
-                *state.next_reference_index += 1;
-                match parse_reference_with_xpath_budget(child, state.xpath_parse) {
-                    Ok(reference) => references.push(CompiledManifestReference {
-                        index: reference_index,
-                        reference,
-                        reference_node_id: child.id(),
-                    }),
-                    Err(ParseError::Transform(super::TransformError::UnsupportedTransform(
-                        uri,
-                    ))) => {
-                        let digest_algorithm =
-                            reference_digest_method(child).map_err(map_manifest_parse_error)?;
-                        let reason =
-                            if allowed_transforms.is_some_and(|allowed| !allowed.contains(&uri)) {
-                                FailureReason::ReferencePolicyViolation {
-                                    ref_index: reference_index,
-                                }
-                            } else {
-                                FailureReason::ReferenceProcessingFailure {
-                                    ref_index: reference_index,
-                                }
-                            };
-                        invalid.push(CompiledManifestInvalid {
-                            result: ReferenceResult {
-                                reference_identity: Some(view.node_identity(child)),
-                                target_identity: None,
-                                external_resource_fingerprint: None,
-                                coverage: ReferenceCoverage::TransformedData,
-                                reference_set: ReferenceSet::Manifest,
-                                reference_index,
-                                uri: child.attribute("URI").unwrap_or("<omitted>").to_owned(),
-                                digest_algorithm,
-                                status: DsigStatus::Invalid(reason),
-                                pre_digest_data: None,
-                            },
-                        });
-                    }
-                    Err(error) => return Err(map_manifest_parse_error(error)),
-                }
+                Err(error) => return Err(map_manifest_parse_error(error)),
             }
         }
     }
@@ -6120,6 +6292,299 @@ mod tests {
     }
 
     #[test]
+    fn retained_verification_preserves_original_authenticated_operation() {
+        // Keep the original per-Signature graph/authentication state, not a new
+        // set reconstructed from detached digest-result booleans.
+        use structured_asn1::memory::{Memory, MemoryAccount};
+        let work = Memory::new(std::sync::Arc::new(MemoryAccount::new(16384, 100000)));
+        let document = XmlDocument::parse(signature_with_target_reference("AQ==")).unwrap();
+        let context = VerifyContext::new().key(&AcceptingKey);
+        with_verified_document(
+            &document,
+            &context,
+            &VerificationRequest::default(),
+            ScopedRequestStorage(&work),
+            |view, _, budgets, evidence, operations, _| {
+                assert_eq!(evidence.signatures().len(), 1);
+                assert_eq!(operations.len(), 1);
+                let target = view.node_for_id("target", &[]).unwrap();
+                assert!(operations[0].is_authenticated(target));
+                assert!(std::ptr::eq(*operations[0].budgets(), budgets));
+                assert!(budgets.canonicalized.remaining() < budgets.canonicalized.max_bytes);
+                Ok(())
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn retained_verification_accepts_borrowed_keys_and_admits_storage_first() {
+        // The scoped storage projection must not impose 'static on request
+        // keys. Refused report/state storage cannot reach the provider.
+        use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
+        struct BorrowedKey<'a>(&'a Cell<usize>);
+        impl VerifyingKey for BorrowedKey<'_> {
+            fn validate_signature_value(
+                &self,
+                _: SignatureAlgorithm,
+                _: &[u8],
+            ) -> Result<bool, DsigError> {
+                Ok(true)
+            }
+            fn verify(&self, _: SignatureAlgorithm, _: &[u8], _: &[u8]) -> Result<bool, DsigError> {
+                self.0.set(self.0.get() + 1);
+                Ok(true)
+            }
+        }
+        let calls = Cell::new(0);
+        let key = BorrowedKey(&calls);
+        let context = VerifyContext::new().key(&key);
+        let document = XmlDocument::parse(signature_with_target_reference("AQ==")).unwrap();
+        let denied = Memory::new(std::sync::Arc::new(MemoryAccount::new(0, 100000)));
+        let result: Result<(), DsigError> = with_verified_document(
+            &document,
+            &context,
+            &VerificationRequest::default(),
+            ScopedRequestStorage(&denied),
+            |_, _, _, _, _, _| panic!("refused storage must not reach the continuation"),
+        );
+        assert!(matches!(
+            result,
+            Err(DsigError::SharedExecution(MemoryError::LimitExceeded))
+        ));
+        assert_eq!(calls.get(), 0);
+        let admitted = Memory::new(std::sync::Arc::new(MemoryAccount::new(16384, 100000)));
+        with_verified_document(
+            &document,
+            &context,
+            &VerificationRequest::default(),
+            ScopedRequestStorage(&admitted),
+            |_, _, _, evidence, operations, _| {
+                assert!(evidence.all_valid());
+                assert_eq!(operations.len(), 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn verified_continuation_keeps_the_consumed_operation_budget() {
+        // Extension work continues after core verification with the very same
+        // canonicalization allowance, not a fresh budget built from policy.
+        let document = XmlDocument::parse(signature_with_target_reference("AQ==")).unwrap();
+        let context = VerifyContext::new().key(&AcceptingKey);
+        let called = Cell::new(false);
+        let evidence = with_verified_document(
+            &document,
+            &context,
+            &VerificationRequest::default(),
+            CollectedRequestStorage,
+            |view, _captured_context, budgets, evidence, (), _| {
+                called.set(true);
+                assert_eq!(view.root(), evidence.document);
+                assert!(evidence.signatures()[0].result().is_ok());
+                let remaining = budgets.canonicalized.remaining();
+                assert!(remaining < budgets.canonicalized.max_bytes);
+                budgets.canonicalized.charge(remaining).unwrap();
+                assert!(budgets.canonicalized.charge(1).is_err());
+                Ok(evidence)
+            },
+        )
+        .unwrap();
+        assert!(called.get());
+        assert_eq!(evidence.signatures().len(), 1);
+    }
+
+    #[test]
+    fn public_session_catalogue_replays_the_original_reference() {
+        // The public continuation must retain the selected operation, expose
+        // original Reference/parent identities, and stream the verified bytes.
+        use structured_asn1::memory::{Memory, MemoryAccount};
+        let document = XmlDocument::parse(signature_with_target_reference("AQ==")).unwrap();
+        let context = VerifyContext::new().key(&AcceptingKey);
+        let work = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 24)));
+        with_verified_request(
+            &document,
+            &context,
+            &VerificationRequest::default(),
+            &work,
+            |session| {
+                let signature = session.evidence().signatures()[0].identity();
+                let selected = session.select_signature(signature)?;
+                let mut count = 0;
+                let completeness = selected
+                    .visit_authenticated_references(|reference| {
+                        count += 1;
+                        assert!(matches!(reference.parent, ReferenceParent::SignedInfo(_)));
+                        assert_eq!(reference.uri, Some("#target"));
+                        let mut bytes = Vec::new();
+                        let outcome = selected
+                            .replay_reference(
+                                reference.identity,
+                                ReplayMode::ReferenceOutput,
+                                &mut |chunk: &[u8]| {
+                                    bytes.extend_from_slice(chunk);
+                                    Ok::<_, ()>(())
+                                },
+                            )
+                            .unwrap();
+                        assert_eq!(outcome, ReplayOutcome::Complete);
+                        assert_eq!(bytes, b"<target ID=\"target\">payload</target>");
+                        Ok::<_, ()>(())
+                    })
+                    .unwrap();
+                assert_eq!(completeness, CatalogueCompleteness::Complete);
+                assert_eq!(count, 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn public_session_resolves_original_attribute_and_fragmented_simple_content() {
+        // Both schema lexical sources must resolve through the same original
+        // ID index. Fragmented text must not drop text after comments or CDATA.
+        use structured_asn1::memory::{Memory, MemoryAccount};
+        let document = XmlDocument::parse(signature_with_target_content(
+            "AQ==",
+            "<property URI=\"#ref\"/><content>#r<!--split--><![CDATA[ef]]></content>",
+        ))
+        .unwrap();
+        let context = VerifyContext::new().key(&AcceptingKey);
+        let work = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 24)));
+        with_verified_request(
+            &document,
+            &context,
+            &VerificationRequest::default(),
+            &work,
+            |session| {
+                let selected =
+                    session.select_signature(session.evidence().signatures()[0].identity())?;
+                for (name, source) in [
+                    (
+                        "property",
+                        LexicalSource::Attribute {
+                            namespace: None,
+                            local_name: "URI",
+                        },
+                    ),
+                    ("content", LexicalSource::SimpleContent),
+                ] {
+                    let node = session
+                        .view()
+                        .document()
+                        .descendants()
+                        .find(|node| node.has_tag_name(name))
+                        .unwrap();
+                    let ReferenceResolution::Reference(reference) =
+                        selected.resolve_reference(session.view().node_identity(node), source)?
+                    else {
+                        panic!("original Reference must resolve");
+                    };
+                    assert_eq!(reference.uri, Some("#target"));
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn public_session_manifest_instruction_survives_old_digest_mismatch() {
+        // Renewal covers the authenticated instruction with a new digest. It
+        // must not require the old target digest to match first (EN §5.5.3).
+        use structured_asn1::memory::{Memory, MemoryAccount};
+        let document = XmlDocument::parse(signature_with_manifest_xml(false)).unwrap();
+        let context = VerifyContext::new()
+            .key(&AcceptingKey)
+            .process_manifests(true);
+        let work = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 24)));
+        with_verified_request(
+            &document,
+            &context,
+            &VerificationRequest::default(),
+            &work,
+            |session| {
+                let selected =
+                    session.select_signature(session.evidence().signatures()[0].identity())?;
+                let mut manifests = 0;
+                let completeness = selected
+                    .visit_authenticated_references(|reference| {
+                        if let ReferenceParent::Manifest(_) = reference.parent {
+                            manifests += 1;
+                            assert!(matches!(
+                                reference.result.unwrap().status,
+                                DsigStatus::Invalid(_)
+                            ));
+                            let mut calls = 0;
+                            let outcome = selected
+                                .replay_reference(
+                                    reference.identity,
+                                    ReplayMode::ReferenceOutput,
+                                    &mut |_: &[u8]| {
+                                        calls += 1;
+                                        Ok::<_, ()>(())
+                                    },
+                                )
+                                .unwrap();
+                            assert_eq!(outcome, ReplayOutcome::Complete);
+                            assert!(calls > 0);
+                        }
+                        Ok::<_, ()>(())
+                    })
+                    .unwrap();
+                assert_eq!(manifests, 1);
+                assert_eq!(completeness, CatalogueCompleteness::Complete);
+                Ok(())
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn public_session_replay_keeps_original_receiver_failure_sticky() {
+        // No later C14N fragment may overwrite a typed caller refusal or invoke
+        // the receiver a second time after the first error.
+        use structured_asn1::memory::{Memory, MemoryAccount};
+        #[derive(Debug, PartialEq)]
+        struct Refusal(u32);
+        let document = XmlDocument::parse(signature_with_target_reference("AQ==")).unwrap();
+        let context = VerifyContext::new().key(&AcceptingKey);
+        let work = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 24)));
+        with_verified_request(
+            &document,
+            &context,
+            &VerificationRequest::default(),
+            &work,
+            |session| {
+                let selected =
+                    session.select_signature(session.evidence().signatures()[0].identity())?;
+                selected
+                    .visit_authenticated_references(|reference| {
+                        let mut calls = 0;
+                        let result = selected.replay_reference(
+                            reference.identity,
+                            ReplayMode::ReferenceOutput,
+                            &mut |_: &[u8]| {
+                                calls += 1;
+                                Err(Refusal(7))
+                            },
+                        );
+                        assert!(matches!(result, Err(ReplayError::Receiver(Refusal(7)))));
+                        assert_eq!(calls, 1);
+                        Ok::<_, ()>(())
+                    })
+                    .unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn verify_all_retains_each_signature_without_vacuous_success() {
         // Malformed signatures remain individually visible; an empty document
         // never satisfies a request merely because there were no failures.
@@ -6358,13 +6823,18 @@ mod tests {
     }
 
     fn signature_with_target_reference(signature_value_b64: &str) -> String {
+        signature_with_target_content(signature_value_b64, "payload")
+            .replace("<ds:Reference Id=\"ref\"", "<ds:Reference")
+    }
+
+    fn signature_with_target_content(signature_value_b64: &str, content: &str) -> String {
         let xml_template = r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
   <target ID="target">payload</target>
   <ds:Signature>
     <ds:SignedInfo>
       <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
       <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
-      <ds:Reference URI="#target">
+      <ds:Reference Id="ref" URI="#target">
         <ds:Transforms>
           <ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
         </ds:Transforms>
@@ -6374,9 +6844,10 @@ mod tests {
     </ds:SignedInfo>
     <ds:SignatureValue>SIGNATURE_VALUE_PLACEHOLDER</ds:SignatureValue>
   </ds:Signature>
-</root>"##;
+</root>"##
+            .replace(">payload</target>", &format!(">{content}</target>"));
 
-        let doc = Document::parse(xml_template).unwrap();
+        let doc = Document::parse(&xml_template).unwrap();
         let sig_node = doc
             .descendants()
             .find(|node| node.is_element() && node.tag_name().name() == "Signature")
@@ -7336,9 +7807,10 @@ mod tests {
     }
 
     #[test]
-    fn verify_context_ignores_nested_manifests_in_object() {
-        // A digest-valid Manifest below a wrapper is outside the strict direct-
-        // child processing profile and must not appear in diagnostics.
+    fn verify_context_processes_authenticated_nested_manifests_in_object() {
+        // XMLDSig §5.1 does not impose a direct Object-child restriction.
+        // The original Reference authenticates this exact wrapped Manifest.
+        // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-Manifest
         let xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
             xml.replacen(
                 "<ds:Manifest ID=\"manifest\">",
@@ -7352,11 +7824,10 @@ mod tests {
             .key(&AcceptingKey)
             .process_manifests(true)
             .verify(&xml)
-            .expect("nested Manifest nodes are ignored in strict mode");
-        assert!(
-            result.manifest_references.is_empty(),
-            "only direct ds:Manifest children of ds:Object must be processed"
-        );
+            .expect("authenticated nested Manifest is processed");
+        assert_eq!(result.manifest_references.len(), 1);
+        assert_eq!(result.manifest_references[0].uri, "#target");
+        assert_eq!(result.manifest_references[0].status, DsigStatus::Valid);
         assert!(matches!(result.status, DsigStatus::Valid));
     }
 

@@ -13,7 +13,11 @@ use std::cell::Cell;
 
 use crate::xml::dom::Node;
 
+use super::C14nError;
 use super::NodeVisibility;
+#[cfg(any(feature = "xmldsig", test))]
+use super::scratch::Native;
+use super::scratch::{List, Scratch, Text};
 
 /// The XML namespace URI.
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
@@ -105,15 +109,29 @@ pub(crate) fn compute_effective_xml_base(
 }
 
 /// Budgeted form used for attacker-controlled XMLDSig URI resolution.
+#[cfg(any(feature = "xmldsig", test))]
 pub(crate) fn compute_effective_xml_base_with_budget(
     start: Node<'_, '_>,
     visibility: Option<&dyn NodeVisibility>,
     budget: &XmlBaseResolutionBudget,
 ) -> Result<Option<String>, XmlBaseResolutionError> {
-    let mut bases: Vec<&str> = Vec::new();
+    compute_effective_xml_base_in(start, visibility, budget, &Native).map_err(native_policy_error)
+}
+
+pub(super) fn compute_effective_xml_base_in<S: Scratch>(
+    start: Node<'_, '_>,
+    visibility: Option<&dyn NodeVisibility>,
+    budget: &XmlBaseResolutionBudget,
+    scratch: &S,
+) -> Result<Option<S::Text>, C14nError> {
+    let mut bases = scratch.values();
     let mut current = Some(start);
     while let Some(node) = current {
+        scratch.charge(1)?;
         if node.is_element() {
+            for attribute in node.attributes() {
+                scratch.charge(attribute.name().len().saturating_add(1))?;
+            }
             let base = xml_base_value(node);
             if let Some(set) = visibility
                 && preserves_xml_base_context(node, set)
@@ -122,9 +140,13 @@ pub(crate) fn compute_effective_xml_base_with_budget(
             }
             if let Some(base) = base {
                 let component_count = bases.len().saturating_add(1);
-                budget.check_components(component_count)?;
-                budget.charge_bytes(base.len())?;
-                bases.push(base);
+                budget
+                    .check_components(component_count)
+                    .map_err(super::serialize::map_xml_base_error)?;
+                budget
+                    .charge_bytes(base.len())
+                    .map_err(super::serialize::map_xml_base_error)?;
+                bases.push(base)?;
             }
         }
         current = node.parent();
@@ -133,31 +155,70 @@ pub(crate) fn compute_effective_xml_base_with_budget(
     let Some(first) = bases.pop() else {
         return Ok(None);
     };
-    budget.charge_bytes(first.len())?;
-    let mut effective = first.to_owned();
-    for relative in bases.into_iter().rev() {
-        effective = resolve_uri_with_budget(&effective, relative, budget)?;
+    budget
+        .charge_bytes(first.len())
+        .map_err(super::serialize::map_xml_base_error)?;
+    let mut effective = scratch.text(&[first])?;
+    for relative in bases.iter().rev() {
+        effective = resolve_uri_with_budget_in(effective.view()?, relative, budget, scratch)?;
     }
     Ok(Some(effective))
 }
 
+#[cfg(feature = "xmldsig")]
 pub(crate) fn resolve_uri_with_budget(
     base: &str,
     reference: &str,
     budget: &XmlBaseResolutionBudget,
 ) -> Result<String, XmlBaseResolutionError> {
+    resolve_uri_with_budget_in(base, reference, budget, &Native).map_err(native_policy_error)
+}
+
+pub(super) fn resolve_uri_with_budget_in<S: Scratch>(
+    base: &str,
+    reference: &str,
+    budget: &XmlBaseResolutionBudget,
+    scratch: &S,
+) -> Result<S::Text, C14nError> {
     let input_bytes = base
         .len()
         .checked_add(reference.len())
         .and_then(|bytes| bytes.checked_add(1))
-        .ok_or(XmlBaseResolutionError::Bytes {
-            maximum: budget.max_bytes,
-            actual: usize::MAX,
+        .ok_or_else(|| {
+            super::serialize::map_xml_base_error(XmlBaseResolutionError::Bytes {
+                maximum: budget.max_bytes,
+                actual: usize::MAX,
+            })
         })?;
-    budget.charge_bytes(input_bytes)?;
-    let resolved = resolve_uri(base, reference);
-    budget.charge_bytes(resolved.len())?;
+    budget
+        .charge_bytes(input_bytes)
+        .map_err(super::serialize::map_xml_base_error)?;
+    let resolved = resolve_uri_in(base, reference, scratch)?;
+    budget
+        .charge_bytes(resolved.view()?.len())
+        .map_err(super::serialize::map_xml_base_error)?;
     Ok(resolved)
+}
+
+#[cfg(any(feature = "xmldsig", test))]
+fn native_policy_error(error: C14nError) -> XmlBaseResolutionError {
+    // Native scratch cannot refuse execution/storage; the shared kernel can
+    // return only these two policy failures for the legacy native entry points.
+    match error {
+        C14nError::XmlBaseComponentsTooLarge { max, actual } => {
+            XmlBaseResolutionError::Components {
+                maximum: max,
+                actual,
+            }
+        }
+        C14nError::XmlBaseResolutionTooLarge { max_bytes, actual } => {
+            XmlBaseResolutionError::Bytes {
+                maximum: max_bytes,
+                actual,
+            }
+        }
+        _ => unreachable!("native scratch has no fallible resource domain"),
+    }
 }
 
 /// Resolve a reference against inherited XML Base without traversing ancestors
@@ -235,62 +296,84 @@ fn xml_base_value<'a>(node: Node<'a, '_>) -> Option<&'a str> {
 /// resolution is not possible, but path-merge and dot-segment removal are
 /// still performed so that chained relative `xml:base` values collapse
 /// correctly (e.g. `a/b/` + `c/` → `a/b/c/`). The result remains relative.
+#[cfg(test)]
 pub(crate) fn resolve_uri(base: &str, reference: &str) -> String {
+    resolve_uri_in(base, reference, &Native).expect("native URI storage is unmetered")
+}
+
+fn resolve_uri_in<S: Scratch>(
+    base: &str,
+    reference: &str,
+    scratch: &S,
+) -> Result<S::Text, C14nError> {
     // Empty reference → base URI
     if reference.is_empty() {
-        return base.to_string();
+        return scratch.text(&[base]);
     }
 
     // A scheme-bearing reference supplies every target component, but RFC 3986
     // section 5.2.2 still requires dot-segment removal from its path.
+    // has_scheme performs find(':') and a bounded scheme-byte scan.
+    scratch.charge(reference.len().saturating_mul(2))?;
     if has_scheme(reference) {
+        scratch.charge(reference.len())?;
         let (absolute, suffix) = split_path_suffix(reference);
+        // parse_base: has_scheme (two scans), find(':') and at most three
+        // delimiter searches in the authority. Admit before those scans.
+        scratch.charge(absolute.len().saturating_mul(6))?;
         let parts = parse_base(absolute).expect("has_scheme accepted the absolute reference");
-        let path = remove_dot_segments_from_absolute_reference(parts.path);
-        let mut result = recompose(parts.scheme, parts.authority, &path);
-        result.push_str(suffix);
-        return result;
+        let path = remove_dot_segments_in(parts.path, false, scratch)?;
+        let mut result = recompose_in(parts.scheme, parts.authority, path.view()?, scratch)?;
+        result.append(suffix)?;
+        return Ok(result);
     }
 
     // Query- and fragment-only references preserve the complete base path for
     // both absolute and relative bases (RFC 3986 section 5.2.2).
     if reference.starts_with('?') {
-        return format!("{}{reference}", strip_query_fragment(base));
+        scratch.charge(base.len().saturating_mul(2))?;
+        return scratch.text(&[strip_query_fragment(base), reference]);
     }
     if reference.starts_with('#') {
-        return format!("{}{reference}", base.split('#').next().unwrap_or(base));
+        scratch.charge(base.len())?;
+        return scratch.text(&[base.split('#').next().unwrap_or(base), reference]);
     }
 
     // Parse base URI components
+    scratch.charge(base.len().saturating_mul(6))?;
     let base_parts = match parse_base(base) {
         Some(parts) => parts,
         None => {
             // Schemeless bases include both ordinary relative paths and
             // network-path references. Preserve the latter's authority while
             // applying the same RFC 3986 path merge and normalization rules.
+            scratch.charge(reference.len().saturating_mul(2))?;
             let (ref_path, ref_suffix) = split_path_suffix(reference);
             if let Some((authority, path)) = parse_network_path(ref_path) {
-                let path = remove_dot_segments(path);
-                return format!("//{authority}{path}{ref_suffix}");
+                let path = remove_dot_segments_in(path, true, scratch)?;
+                return scratch.text(&["//", authority, path.view()?, ref_suffix]);
             }
+            scratch.charge(base.len().saturating_mul(2))?;
             let (base_path_with_authority, _) = split_path_suffix(base);
             let network_base = parse_network_path(base_path_with_authority);
             if ref_path.starts_with('/') {
-                let path = remove_dot_segments(ref_path);
+                let path = remove_dot_segments_in(ref_path, true, scratch)?;
                 return match network_base {
-                    Some((authority, _)) => format!("//{authority}{path}{ref_suffix}"),
-                    None => format!("{path}{ref_suffix}"),
+                    Some((authority, _)) => {
+                        scratch.text(&["//", authority, path.view()?, ref_suffix])
+                    }
+                    None => scratch.text(&[path.view()?, ref_suffix]),
                 };
             }
             let (base_path, authority) = match network_base {
                 Some((authority, path)) => (path, Some(authority)),
                 None => (base_path_with_authority, None),
             };
-            let merged = merge_paths(base_path, ref_path, authority.is_some());
-            let cleaned = remove_dot_segments(&merged);
+            let merged = merge_paths_in(base_path, ref_path, authority.is_some(), scratch)?;
+            let cleaned = remove_dot_segments_in(merged.view()?, true, scratch)?;
             return match authority {
-                Some(authority) => format!("//{authority}{cleaned}{ref_suffix}"),
-                None => format!("{cleaned}{ref_suffix}"),
+                Some(authority) => scratch.text(&["//", authority, cleaned.view()?, ref_suffix]),
+                None => scratch.text(&[cleaned.view()?, ref_suffix]),
             };
         }
     };
@@ -301,11 +384,13 @@ pub(crate) fn resolve_uri(base: &str, reference: &str) -> String {
     // Split reference into path and query/fragment suffix. We apply
     // remove_dot_segments only to the path portion, then reattach the
     // query/fragment to the result.
+    scratch.charge(reference.len())?;
     let (ref_path, ref_suffix) = split_path_suffix(reference);
 
     // Reference starts with // → authority override (RFC 3986 §5.2.2:
     // the path component must still be normalized).
     if let Some(rest) = ref_path.strip_prefix("//") {
+        scratch.charge(rest.len().saturating_mul(3))?;
         let mut auth_end = rest.len();
         for ch in ['/', '?', '#'] {
             if let Some(pos) = rest.find(ch)
@@ -315,28 +400,29 @@ pub(crate) fn resolve_uri(base: &str, reference: &str) -> String {
             }
         }
         let new_authority = &rest[..auth_end];
-        let new_path = remove_dot_segments(&rest[auth_end..]);
-        let mut result = recompose(scheme, Some(new_authority), &new_path);
-        result.push_str(ref_suffix);
-        return result;
+        let new_path = remove_dot_segments_in(&rest[auth_end..], true, scratch)?;
+        let mut result = recompose_in(scheme, Some(new_authority), new_path.view()?, scratch)?;
+        result.append(ref_suffix)?;
+        return Ok(result);
     }
 
     // Reference starts with / → absolute path
     if ref_path.starts_with('/') {
-        let cleaned = remove_dot_segments(ref_path);
-        let mut result = recompose(scheme, authority, &cleaned);
-        result.push_str(ref_suffix);
-        return result;
+        let cleaned = remove_dot_segments_in(ref_path, true, scratch)?;
+        let mut result = recompose_in(scheme, authority, cleaned.view()?, scratch)?;
+        result.append(ref_suffix)?;
+        return Ok(result);
     }
 
     // Relative path — merge with base path (strip query/fragment from
     // base_path first, since merge operates on the path component only).
+    scratch.charge(base_path.len().saturating_mul(2))?;
     let clean_base_path = strip_query_fragment(base_path);
-    let merged = merge_paths(clean_base_path, ref_path, authority.is_some());
-    let cleaned = remove_dot_segments(&merged);
-    let mut result = recompose(scheme, authority, &cleaned);
-    result.push_str(ref_suffix);
-    result
+    let merged = merge_paths_in(clean_base_path, ref_path, authority.is_some(), scratch)?;
+    let cleaned = remove_dot_segments_in(merged.view()?, true, scratch)?;
+    let mut result = recompose_in(scheme, authority, cleaned.view()?, scratch)?;
+    result.append(ref_suffix)?;
+    Ok(result)
 }
 
 /// Check if a URI string has a scheme (e.g., `http:`, `urn:`).
@@ -415,10 +501,15 @@ fn parse_network_path(reference: &str) -> Option<(&str, &str)> {
 ///
 /// `authority = Some("")` → `scheme:///path` (empty authority, e.g. `file:///`).
 /// `authority = None` → `scheme:path` (no authority, e.g. `urn:foo:bar`).
-fn recompose(scheme: &str, authority: Option<&str>, path: &str) -> String {
+fn recompose_in<S: Scratch>(
+    scheme: &str,
+    authority: Option<&str>,
+    path: &str,
+    scratch: &S,
+) -> Result<S::Text, C14nError> {
     match authority {
-        Some(auth) => format!("{scheme}://{auth}{path}"),
-        None => format!("{scheme}:{path}"),
+        Some(auth) => scratch.text(&[scheme, "://", auth, path]),
+        None => scratch.text(&[scheme, ":", path]),
     }
 }
 
@@ -452,17 +543,28 @@ fn strip_query_fragment(s: &str) -> &str {
 /// An authority with an empty path contributes the leading `/`; an empty
 /// schemeless base does not. Keeping that distinction explicit prevents a
 /// relative XML Base from changing the reference kind.
+#[cfg(test)]
 fn merge_paths(base_path: &str, reference: &str, base_has_authority: bool) -> String {
+    merge_paths_in(base_path, reference, base_has_authority, &Native).expect("native storage")
+}
+
+fn merge_paths_in<S: Scratch>(
+    base_path: &str,
+    reference: &str,
+    base_has_authority: bool,
+    scratch: &S,
+) -> Result<S::Text, C14nError> {
     if base_has_authority && base_path.is_empty() {
-        format!("/{reference}")
+        scratch.text(&["/", reference])
     } else {
         // Remove everything after the last segment of base path.
         // If there is no '/' in the base path (non-hierarchical path,
         // e.g. opaque URIs like `urn:foo:bar`), return the reference
         // unchanged per RFC 3986 §5.2.3.
+        scratch.charge(base_path.len())?;
         match base_path.rfind('/') {
-            Some(pos) => format!("{}{reference}", &base_path[..=pos]),
-            None => reference.to_string(),
+            Some(pos) => scratch.text(&[&base_path[..=pos], reference]),
+            None => scratch.text(&[reference]),
         }
     }
 }
@@ -482,25 +584,25 @@ mod merge_tests {
 ///
 /// For absolute paths (starting with `/`), `..` at the root is a no-op.
 /// For relative paths, unresolved leading `..` segments are preserved.
+#[cfg(test)]
 fn remove_dot_segments(path: &str) -> String {
-    remove_dot_segments_with_unmatched_parents(path, true)
+    remove_dot_segments_in(path, true, &Native).expect("native storage")
 }
 
 /// Apply RFC 3986 section 5.2.4 to a reference that already supplied a scheme.
 /// Such a reference is the final target, so unresolved leading parents are
 /// discarded rather than retained for a later base-path merge.
-fn remove_dot_segments_from_absolute_reference(path: &str) -> String {
-    remove_dot_segments_with_unmatched_parents(path, false)
-}
-
-fn remove_dot_segments_with_unmatched_parents(
+fn remove_dot_segments_in<S: Scratch>(
     path: &str,
     preserve_unmatched_parents: bool,
-) -> String {
+    scratch: &S,
+) -> Result<S::Text, C14nError> {
+    scratch.charge(path.len())?;
     let is_absolute = path.starts_with('/');
-    let mut segments: Vec<&str> = Vec::new();
+    let mut segments = scratch.values();
 
     for segment in path.split('/') {
+        scratch.charge(4)?;
         match segment {
             "." => {
                 // Current directory — skip
@@ -516,21 +618,37 @@ fn remove_dot_segments_with_unmatched_parents(
                 if can_pop {
                     segments.pop();
                 } else if !is_absolute && preserve_unmatched_parents {
-                    segments.push("..");
+                    segments.push("..")?;
                 }
             }
-            s => segments.push(s),
+            s => segments.push(s)?,
         }
     }
 
-    let mut result = segments.join("/");
-
-    // If the input path ended with /. or /.., ensure trailing slash
-    if (path.ends_with("/.") || path.ends_with("/..")) && !result.ends_with('/') {
-        result.push('/');
+    scratch.charge(segments.len())?;
+    let capacity = segments
+        .iter()
+        .try_fold(0usize, |n, segment| {
+            n.checked_add(segment.len()).and_then(|n| n.checked_add(1))
+        })
+        .ok_or(C14nError::OutputLimitExceeded {
+            max_bytes: usize::MAX,
+        })?;
+    let mut result = scratch.text(&[])?;
+    result.reserve(capacity)?;
+    for (index, segment) in segments.iter().enumerate() {
+        if index != 0 {
+            result.append("/")?;
+        }
+        result.append(segment)?;
     }
 
-    result
+    // If the input path ended with /. or /.., ensure trailing slash
+    if (path.ends_with("/.") || path.ends_with("/..")) && !result.view()?.ends_with('/') {
+        result.append("/")?;
+    }
+
+    Ok(result)
 }
 
 #[cfg(test)]
