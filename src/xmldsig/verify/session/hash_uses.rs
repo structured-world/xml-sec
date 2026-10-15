@@ -163,15 +163,8 @@ impl<W: Work, F> ReferenceHashVisitor<'_, W, F> {
 impl<W: Work> SelectedSignature<'_, '_, '_, '_, W> {
     /// Original typed method captured during the first successful verification.
     pub fn signature_method(&self) -> Result<SelectedSignatureMethod, DsigError> {
-        self.session.work.charge_work(1)?;
-        self.operation().validate_document_view(self.session.view)?;
-        let capture = &self.session.operations[self.index].capture;
-        if let Some(error) = capture.failure.get() {
-            return Err(error.into());
-        }
-        capture.method.get().ok_or(DsigError::InvalidRequest {
-            reason: "selected Signature has no original method receipt",
-        })
+        self.session
+            .signature_method_in(self.index, self.session.work)
     }
 
     /// Visit declared original roles and their actual original completion state.

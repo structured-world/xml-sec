@@ -210,10 +210,44 @@ impl<'view, 'scope, 'inputs, W: Work> VerifiedSession<'view, 'scope, 'inputs, W>
         &self,
         identity: NodeIdentity,
     ) -> Result<SelectedSignature<'_, 'view, 'scope, 'inputs, W>, DsigError> {
-        self.work.charge_work(1)?;
+        let index = self.authenticated_signature_in(identity, self.work)?;
+        let entry = &self.evidence.signatures()[index];
+        let mut results = self.work.map();
+        if let Ok(result) = &entry.result {
+            for (set, entries) in [
+                (ReferenceSet::SignedInfo, &result.signed_info_references),
+                (ReferenceSet::Manifest, &result.manifest_references),
+            ] {
+                for (ordinal, reference) in entries.iter().enumerate() {
+                    self.work.charge_work(1)?;
+                    if let Some(node) = reference.reference_identity
+                        && results.try_insert(node, (set, ordinal))?.is_some()
+                    {
+                        return Err(DsigError::InvalidRequest {
+                            reason: "ambiguous original Reference evidence",
+                        });
+                    }
+                }
+            }
+        }
+        Ok(SelectedSignature {
+            session: self,
+            index,
+            results,
+        })
+    }
+
+    // Key-only queries reuse authentication without allocating a Reference
+    // index or charging the completed verification's producer-local execution.
+    fn authenticated_signature_in<Q: Work>(
+        &self,
+        identity: NodeIdentity,
+        work: &Q,
+    ) -> Result<usize, DsigError> {
+        work.charge_work(1)?;
         self.view.resolve_node(identity)?;
         for (index, entry) in self.evidence.signatures().iter().enumerate() {
-            self.work.charge_work(1)?;
+            work.charge_work(1)?;
             if entry.identity != identity {
                 continue;
             }
@@ -223,7 +257,7 @@ impl<'view, 'scope, 'inputs, W: Work> VerifiedSession<'view, 'scope, 'inputs, W>
             }
             let operation = &retained.operation;
             operation.validate_document_view(self.view)?;
-            self.work.charge_work(
+            work.charge_work(
                 u64::try_from(operation.decision_count()).map_err(|_| MemoryError::WorkExceeded)?,
             )?;
             if operation.accepted_signature().is_none() {
@@ -231,33 +265,31 @@ impl<'view, 'scope, 'inputs, W: Work> VerifiedSession<'view, 'scope, 'inputs, W>
                     reason: "selected Signature is not authenticated",
                 });
             }
-            let mut results = self.work.map();
-            if let Ok(result) = &entry.result {
-                for (set, entries) in [
-                    (ReferenceSet::SignedInfo, &result.signed_info_references),
-                    (ReferenceSet::Manifest, &result.manifest_references),
-                ] {
-                    for (ordinal, reference) in entries.iter().enumerate() {
-                        self.work.charge_work(1)?;
-                        if let Some(node) = reference.reference_identity
-                            && results.try_insert(node, (set, ordinal))?.is_some()
-                        {
-                            return Err(DsigError::InvalidRequest {
-                                reason: "ambiguous original Reference evidence",
-                            });
-                        }
-                    }
-                }
-            }
-            return Ok(SelectedSignature {
-                session: self,
-                index,
-                results,
-            });
+            return Ok(index);
         }
         Err(DsigError::InvalidRequest {
             reason: "Signature is not part of this request",
         })
+    }
+
+    fn signature_method_in<Q: Work>(
+        &self,
+        index: usize,
+        work: &Q,
+    ) -> Result<SelectedSignatureMethod, DsigError> {
+        work.charge_work(1)?;
+        let retained = &self.operations[index];
+        retained.operation.validate_document_view(self.view)?;
+        if let Some(error) = retained.capture.failure.get() {
+            return Err(error.into());
+        }
+        retained
+            .capture
+            .method
+            .get()
+            .ok_or(DsigError::InvalidRequest {
+                reason: "selected Signature has no original method receipt",
+            })
     }
 }
 

@@ -725,6 +725,17 @@ scoped receipts retain only accounted metadata, without copying XML or payloads.
 
 ## Actual Selected-Key Receipts
 
+`VerifiedSession::with_key_association_in(signature, expected, work, visitor)`
+selects an original authenticated Signature and compares its successful key in
+one read-only query. Every selection, authentication/receipt gate, provider-domain
+check, comparison and callback admission uses the supplied current `Work`, which
+may be a different or narrower execution than the producer's. The producer's
+completed local work is not replayed; the sealed current Work charges its local
+ceilings and aggregate once. No Reference index is built for this key-only query.
+Retained receipt storage keeps its original lifetime charge, and a new query
+cannot erase the original capture failure or change its policy, generation or
+provider. Processing and caller visitor errors remain distinct typed causes.
+
 `SelectedSignature::with_key_receipt` borrows an unforgeable receipt from the
 original successful verification. Built-in providers report the actual successful
 leaf of a composite key, not the first key or certificate advertised by a resolver.
@@ -735,6 +746,10 @@ secrets and private/token key attributes are never copied into receipts.
 including its effective parameters. It rejects another operation, Signature,
 document generation or provider before comparison/callbacks. Results are `Same`,
 `Mismatch`, or `Unproven`; none establishes certificate authorization or trust.
+These two selected-handle methods use their session's original Work. Do not call
+`select_signature` first when funding a later query through a new execution: use
+the single-entry session query above instead. Reference catalogue, resolution
+and replay APIs remain session-funded; this key query does not change them.
 No resolver, signature verification, fingerprint comparison, or SPKI re-encoding
 is performed to manufacture the association.
 
@@ -751,9 +766,11 @@ Custom providers may implement `verify_with_key_receipt` and
 unproven association. A custom leaf exposes only its own successful public material
 through `VerifyingKey::association_spki`; this does not enable native verification
 of an otherwise opaque handle. An ambiguous composite that reports multiple
-successes yields no arbitrary winning-key proof. Current Work pays every retained
-capacity and later comparison; receipt admission failure cannot be swallowed by
-candidate recovery.
+successes yields no arbitrary winning-key proof. Producer Work pays retained
+capacity; query Work pays later comparisons. Receipt admission failure cannot
+be swallowed by candidate recovery. Ordinary and scoped RustCrypto verification
+share the same bounded candidate traversal and leaf verifier; observing a
+successful leaf does not change which candidates are tried.
 
 ## RSA-PSS Parameters
 

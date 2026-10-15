@@ -1,6 +1,5 @@
 //! Selected-provider evidence, separate from key authorization and trust.
 
-use super::CryptoProvider;
 use crate::xmldsig::{DsigError, SignatureAlgorithm, SignatureContext, VerifyingKey};
 use structured_asn1::memory::MemoryError;
 use structured_pkix::path::WorkingKey;
@@ -40,42 +39,27 @@ pub enum KeyVerificationEvent<'a> {
     Verified(&'a dyn VerifyingKey),
 }
 
-pub(super) fn observed<P: CryptoProvider + ?Sized>(
-    provider: &P,
+pub(super) fn observed_leaf<F, O>(
     key: &dyn VerifyingKey,
-    input: SignatureVerificationInput<'_>,
-    observer: &mut dyn FnMut(KeyVerificationEvent<'_>) -> Result<(), DsigError>,
-) -> Result<bool, DsigError> {
-    observed_leaf(key, observer, &|key| {
-        provider.verify_with_context(
-            key,
-            input.algorithm,
-            input.context,
-            input.data,
-            input.signature,
-        )
-    })
-}
-
-pub(super) fn observed_leaf<F>(
-    key: &dyn VerifyingKey,
-    observer: &mut dyn FnMut(KeyVerificationEvent<'_>) -> Result<(), DsigError>,
+    observer: &mut O,
     verify_leaf: &F,
 ) -> Result<bool, DsigError>
 where
     F: Fn(&dyn VerifyingKey) -> Result<bool, DsigError>,
+    O: FnMut(KeyVerificationEvent<'_>) -> Result<(), DsigError> + ?Sized,
 {
     observed_at_depth(key, observer, verify_leaf, 0)
 }
 
-fn observed_at_depth<F>(
+fn observed_at_depth<F, O>(
     key: &dyn VerifyingKey,
-    observer: &mut dyn FnMut(KeyVerificationEvent<'_>) -> Result<(), DsigError>,
+    observer: &mut O,
     verify_leaf: &F,
     depth: usize,
 ) -> Result<bool, DsigError>
 where
     F: Fn(&dyn VerifyingKey) -> Result<bool, DsigError>,
+    O: FnMut(KeyVerificationEvent<'_>) -> Result<(), DsigError> + ?Sized,
 {
     observer(KeyVerificationEvent::BeforeCandidate { depth })?;
     if depth == crate::hard_limits::KEY_CANDIDATE_CEILING {

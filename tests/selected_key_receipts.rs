@@ -209,6 +209,26 @@ fn receipt_storage_refusal_cannot_be_swallowed_by_candidate_recovery() {
                     structured_asn1::memory::MemoryError::LimitExceeded
                 ))
             ));
+            // A fresh query execution cannot erase the original terminal
+            // capture failure, even though it has its own available allowance.
+            with_expected(&key.key.public_key_bytes, |expected| {
+                let called = Cell::new(false);
+                assert!(matches!(
+                    session.with_key_association_in(
+                        signature.identity(),
+                        expected,
+                        &account(),
+                        |_| {
+                            called.set(true);
+                            Ok::<_, ()>(())
+                        }
+                    ),
+                    Err(CatalogueError::Processing(DsigError::SharedExecution(
+                        structured_asn1::memory::MemoryError::LimitExceeded
+                    )))
+                ));
+                assert!(!called.get());
+            });
             let rejection = session.select_signature(signature.identity());
             selected = rejection.is_ok();
             match rejection {
@@ -619,6 +639,17 @@ fn receipt_is_the_real_successful_candidate_and_does_not_verify_again() {
                             (&right.key, KeyAssociation::Same),
                         ] {
                             with_expected(&key.public_key_bytes, |key| {
+                                session
+                                    .with_key_association_in(
+                                        receipt.signature(),
+                                        key,
+                                        &account(),
+                                        |actual| {
+                                            assert_eq!(actual, expected);
+                                            Ok::<_, ()>(())
+                                        },
+                                    )
+                                    .unwrap();
                                 selected
                                     .associate_key(&receipt, key, |actual| {
                                         assert_eq!(actual, expected);
@@ -637,6 +668,14 @@ fn receipt_is_the_real_successful_candidate_and_does_not_verify_again() {
         },
     )
     .unwrap();
+    // Observation must not change which keys the collecting API tries. In
+    // particular, a composite's leaf-only verify hook must never be invoked.
+    assert_eq!(
+        context.verify_document(&document).unwrap().status,
+        DsigStatus::Valid
+    );
+    assert_eq!(wrong.calls.get(), 2);
+    assert_eq!(right.calls.get(), 2);
 }
 
 #[test]
@@ -663,6 +702,26 @@ fn opaque_keys_are_unproven_only_when_public_receipt_evidence_is_absent() {
                     .with_key_receipt(|receipt| {
                         assert_eq!(receipt.has_public_evidence(), disclose);
                         with_expected(&key.key.public_key_bytes, |expected| {
+                            // The single-entry query preserves exactly the same
+                            // proven/unproven opaque-key semantics under a new Work.
+                            session
+                                .with_key_association_in(
+                                    receipt.signature(),
+                                    expected,
+                                    &account(),
+                                    |result| {
+                                        assert_eq!(
+                                            result,
+                                            if disclose {
+                                                KeyAssociation::Same
+                                            } else {
+                                                KeyAssociation::Unproven
+                                            }
+                                        );
+                                        Ok::<_, ()>(())
+                                    },
+                                )
+                                .unwrap();
                             selected
                                 .associate_key(&receipt, expected, |result| {
                                     assert_eq!(
@@ -702,6 +761,211 @@ fn current_work_and_typed_visitor_refusal_are_preserved() {
     );
     let reader = parser.read(&[], 0).unwrap();
     exhausted_receipt(&reader.execution());
+}
+
+#[test]
+fn current_query_is_independent_of_completed_producer_work() {
+    // A shared aggregate is not a shared local execution: finishing the
+    // producer's allowance must not disable a separately admitted query.
+    let memory = account();
+    let producer = Parser::new(
+        Encoding::Der,
+        Limits {
+            max_work: 1 << 20,
+            ..Default::default()
+        },
+        memory.clone(),
+    );
+    let producer_reader = producer.read(&[], 0).unwrap();
+    let producer_work = producer_reader.execution();
+    let query = Parser::new(Encoding::Der, Limits::default(), memory.clone());
+    let query_reader = query.read(&[], 0).unwrap();
+    let query_work = query_reader.execution();
+    let key = ObservedKey {
+        key: public_key(include_str!("fixtures/keys/rsa/rsa-2048-pubkey.pem")),
+        calls: Cell::new(0),
+        disclose: true,
+    };
+    let document = signed();
+    let context = VerifyContext::new().key(&key);
+    with_expected(&key.key.public_key_bytes, |expected| {
+        with_verified_request(
+            &document,
+            &context,
+            &VerificationRequest::default(),
+            &producer_work,
+            |session| {
+                let identity = session.evidence().signatures()[0].identity();
+                for shift in (0..=20).rev() {
+                    while producer_work.charge_work(1 << shift).is_ok() {}
+                }
+                assert!(session.select_signature(identity).is_err());
+                let storage = memory.used();
+                let aggregate_before = memory.work_used();
+                session
+                    .with_key_association_in(identity, expected, &query_work, |association| {
+                        assert_eq!(association, KeyAssociation::Same);
+                        Ok::<_, ()>(())
+                    })
+                    .unwrap();
+                let cost = memory.work_used() - aggregate_before;
+                assert!(cost > 1);
+                assert!(producer_work.charge_work(1).is_err());
+                assert_eq!(memory.used(), storage, "no Reference index or key copies");
+
+                // A different Work type has exactly the same single-aggregate
+                // cost; no pointer/account-equality shortcut pays for the query.
+                let before = memory.work_used();
+                let refusal = session.with_key_association_in(identity, expected, &memory, |_| {
+                    Err::<(), _>("original visitor cause")
+                });
+                assert!(matches!(
+                    refusal,
+                    Err(CatalogueError::Visitor("original visitor cause"))
+                ));
+                assert_eq!(memory.work_used() - before, cost);
+                assert_eq!(key.calls.get(), 1, "no resolver or signature retry");
+
+                // Exact current-local boundary succeeds; one less refuses
+                // before the callback, even though the aggregate has capacity.
+                for (limit, succeeds) in [(cost, true), (cost - 1, false), (0, false)] {
+                    let narrowed = Parser::new(
+                        Encoding::Der,
+                        Limits {
+                            max_work: u64::try_from(limit).unwrap(),
+                            ..Default::default()
+                        },
+                        memory.clone(),
+                    );
+                    let reader = narrowed.read(&[], 0).unwrap();
+                    let called = Cell::new(false);
+                    let outcome = session.with_key_association_in(
+                        identity,
+                        expected,
+                        &reader.execution(),
+                        |_| {
+                            called.set(true);
+                            Ok::<_, ()>(())
+                        },
+                    );
+                    assert_eq!(called.get(), succeeds);
+                    if succeeds {
+                        outcome.unwrap();
+                    } else {
+                        assert!(matches!(
+                            outcome,
+                            Err(CatalogueError::Processing(DsigError::SharedExecution(_)))
+                        ));
+                    }
+                }
+                assert!(producer_work.charge_work(1).is_err());
+                assert_eq!(key.calls.get(), 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+    });
+    assert_eq!(
+        memory.used(),
+        0,
+        "original receipt storage is released with session"
+    );
+}
+
+#[test]
+fn current_query_rejects_foreign_identity_and_aggregate_refusal() {
+    // A new query budget cannot mint authentication or accept another source
+    // generation, and a generous local execution cannot bypass its aggregate.
+    let memory = account();
+    let key = public_key(include_str!("fixtures/keys/rsa/rsa-2048-pubkey.pem"));
+    let mut document = XmlDocument::parse(signed_named("query")).unwrap();
+    let stale = document.with_view(|view| view.node_for_id("signature-query", &[]).unwrap());
+    let payload = document.with_view(|view| view.node_for_id("payload-query", &[]).unwrap());
+    document.replace_content(payload, "value").unwrap();
+    let foreign = signed();
+    let foreign_identity = VerifyContext::new().signature_identities(&foreign).unwrap()[0];
+    let context = VerifyContext::new().key(&key);
+    with_expected(&key.public_key_bytes, |expected| {
+        with_verified_request(
+            &document,
+            &context,
+            &VerificationRequest::default(),
+            &memory,
+            |session| {
+                let query = Parser::new(Encoding::Der, Limits::default(), memory.clone());
+                let reader = query.read(&[], 0).unwrap();
+                let work = reader.execution();
+                for identity in [stale, foreign_identity, payload] {
+                    let called = Cell::new(false);
+                    assert!(
+                        session
+                            .with_key_association_in(identity, expected, &work, |_| {
+                                called.set(true);
+                                Ok::<_, ()>(())
+                            })
+                            .is_err()
+                    );
+                    assert!(!called.get());
+                }
+                for shift in (0..=28).rev() {
+                    while memory.charge_work(1 << shift).is_ok() {}
+                }
+                let called = Cell::new(false);
+                assert!(matches!(
+                    session.with_key_association_in(
+                        session.evidence().signatures()[0].identity(),
+                        expected,
+                        &work,
+                        |_| {
+                            called.set(true);
+                            Ok::<_, ()>(())
+                        }
+                    ),
+                    Err(CatalogueError::Processing(DsigError::SharedExecution(_)))
+                ));
+                assert!(!called.get());
+                Ok(())
+            },
+        )
+        .unwrap();
+    });
+}
+
+#[test]
+fn current_query_cannot_authenticate_an_unsuccessful_signature() {
+    // Fresh funding is not a fresh verification: the original wrong key's
+    // failed cryptographic decision must reject before association callbacks.
+    let wrong = public_key(include_str!("fixtures/keys/rsa/rsa-expired-pubkey.pem"));
+    let right = public_key(include_str!("fixtures/keys/rsa/rsa-2048-pubkey.pem"));
+    let document = signed();
+    let context = VerifyContext::new().key(&wrong);
+    with_expected(&right.public_key_bytes, |expected| {
+        with_verified_request(
+            &document,
+            &context,
+            &VerificationRequest::default(),
+            &account(),
+            |session| {
+                let called = Cell::new(false);
+                let outcome = session.with_key_association_in(
+                    session.evidence().signatures()[0].identity(),
+                    expected,
+                    &account(),
+                    |_| {
+                        called.set(true);
+                        Ok::<_, ()>(())
+                    },
+                );
+                assert!(matches!(
+                    outcome,
+                    Err(CatalogueError::Processing(DsigError::InvalidRequest { .. }))
+                ));
+                assert!(!called.get());
+                Ok(())
+            },
+        )
+        .unwrap();
+    });
 }
 
 fn exhausted_receipt(work: &impl Work) {

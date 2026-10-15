@@ -1506,6 +1506,22 @@ impl TryRng for ProviderRng<'_> {
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 impl TryCryptoRng for ProviderRng<'_> {}
 
+#[cfg(feature = "xmldsig")]
+impl RustCryptoProvider {
+    fn verify_context_leaf(
+        key: &dyn crate::xmldsig::VerifyingKey,
+        algorithm: crate::xmldsig::SignatureAlgorithm,
+        context: &crate::xmldsig::SignatureContext,
+        data: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, crate::xmldsig::DsigError> {
+        if key.provider_binding().is_some() {
+            return Err(ProviderError::External(ExternalProviderError::Binding).into());
+        }
+        key.verify_with_context(algorithm, context, data, signature)
+    }
+}
+
 impl CryptoProvider for RustCryptoProvider {
     #[cfg(feature = "xmldsig")]
     fn verify_with_key_receipt(
@@ -1514,7 +1530,16 @@ impl CryptoProvider for RustCryptoProvider {
         input: SignatureVerificationInput<'_>,
         observer: &mut dyn FnMut(KeyVerificationEvent<'_>) -> Result<(), crate::xmldsig::DsigError>,
     ) -> Result<bool, crate::xmldsig::DsigError> {
-        key_association::observed(self, key, input, observer)
+        self.require_capability(ProviderCapability::Verify(input.algorithm))?;
+        key_association::observed_leaf(key, observer, &|key| {
+            Self::verify_context_leaf(
+                key,
+                input.algorithm,
+                input.context,
+                input.data,
+                input.signature,
+            )
+        })
     }
 
     #[cfg(feature = "xmldsig")]
@@ -1803,10 +1828,9 @@ impl CryptoProvider for RustCryptoProvider {
         signature: &[u8],
     ) -> Result<bool, crate::xmldsig::DsigError> {
         self.require_capability(ProviderCapability::Verify(algorithm))?;
-        if key.provider_binding().is_some() {
-            return Err(ProviderError::External(ExternalProviderError::Binding).into());
-        }
-        key.verify_with_context(algorithm, context, data, signature)
+        key_association::observed_leaf(key, &mut |_| Ok(()), &|key| {
+            Self::verify_context_leaf(key, algorithm, context, data, signature)
+        })
     }
 
     #[cfg(feature = "xmldsig")]
@@ -1818,10 +1842,12 @@ impl CryptoProvider for RustCryptoProvider {
         signature: &[u8],
     ) -> Result<bool, crate::xmldsig::DsigError> {
         self.require_capability(ProviderCapability::Verify(algorithm))?;
-        if key.provider_binding().is_some() {
-            return Err(ProviderError::External(ExternalProviderError::Binding).into());
-        }
-        key.verify(algorithm, data, signature)
+        key_association::observed_leaf(key, &mut |_| Ok(()), &|key| {
+            if key.provider_binding().is_some() {
+                return Err(ProviderError::External(ExternalProviderError::Binding).into());
+            }
+            key.verify(algorithm, data, signature)
+        })
     }
 
     #[cfg(feature = "xmldsig")]
