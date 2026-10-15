@@ -49,8 +49,7 @@ use super::transforms::BASE64_TRANSFORM_URI;
 use super::transforms::{
     DEFAULT_IMPLICIT_C14N_URI, Transform, TransformExecutionBudget, TransformOptions,
     XPATH_TRANSFORM_URI, XPathHereSemantics, XPathSignatureParseBudget,
-    execute_transforms_with_options_and_budget, map_c14n_resource_policy_violation,
-    transform_chain_produces_binary,
+    map_c14n_resource_policy_violation, transform_chain_produces_binary,
 };
 use super::types::{NodeSet, TransformError, subtree_node_id_range};
 use super::uri::{ExternalResourceMapError, UriReferenceResolver, validate_external_resource_map};
@@ -1390,12 +1389,20 @@ fn process_reference_with_options(
         .map_err(ReferenceProcessingError::UriDereference)?;
 
     // 2. Apply transform chain
-    let pre_digest_bytes = execute_transforms_with_options_and_budget(
-        signature_node,
+    let source = reference_node.unwrap_or(signature_node);
+    let containing_signature =
+        super::transforms::enveloped_signature_for_reference(source, &reference.transforms, || {
+            execution.transform_budget.charge_node_filter_work(1)
+        })
+        .map_err(ReferenceProcessingError::Transform)?;
+    let pre_digest_bytes = super::transforms::execute_reference_transforms_with_budget(
+        source,
+        containing_signature,
         initial_data,
         &reference.transforms,
         execution.transform_options,
         execution.transform_budget,
+        execution.transform_budget.xml_parse_work(),
     )
     .map_err(ReferenceProcessingError::Transform)?;
 

@@ -1197,6 +1197,38 @@ pub(crate) fn charge_replay_output(
     budget.c14n.charge(bytes).map_err(Into::into)
 }
 
+pub(crate) fn replay_c14n_error(
+    error: c14n::C14nError,
+    budget: &TransformExecutionBudget,
+) -> TransformError {
+    map_c14n_limit_error(error, &budget.c14n)
+}
+
+pub(crate) fn enveloped_signature_for_reference<'a, E>(
+    source: Node<'a, 'a>,
+    transforms: &[Transform],
+    mut admit: impl FnMut() -> Result<(), E>,
+) -> Result<Option<Node<'a, 'a>>, E> {
+    let mut needed = false;
+    for transform in transforms {
+        admit()?;
+        if matches!(transform, Transform::Enveloped) {
+            needed = true;
+            break;
+        }
+    }
+    if !needed {
+        return Ok(None);
+    }
+    for ancestor in source.ancestors() {
+        admit()?;
+        if ancestor.has_tag_name((XMLDSIG_NS, "Signature")) {
+            return Ok(Some(ancestor));
+        }
+    }
+    Ok(None)
+}
+
 /// Mutable signing fields that can affect a transform output.
 pub(crate) struct TransformDependencyOutput {
     pub(crate) dependencies: HashSet<usize>,
@@ -1357,6 +1389,16 @@ where
         None
     };
     if let Some(bytes) = binary {
+        // XMLDSig 1.1 §6.6.4: Enveloped is restricted to its parent document.
+        // Tracked C14N can preserve its identity through serialization; external
+        // or decoded octets cannot acquire that provenance from equal bytes.
+        // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-EnvelopedSignature
+        if canonical_signature_position.is_none() {
+            context.budget.node_filter.charge(transforms.len())?;
+            if transforms.iter().any(|t| matches!(t, Transform::Enveloped)) {
+                return Err(TransformError::CrossDocumentSignatureNode.into());
+            }
+        }
         // The parsed document must outlive every remaining node-set transform.
         // Recursive execution keeps all borrows scoped to this stack frame and
         // returns only owned digest bytes. Every C14N output is charged before
@@ -3773,10 +3815,11 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_enveloped_ignores_signature_absent_after_base64_adaptation() {
+    fn pipeline_enveloped_rejects_foreign_base64_document() {
         // A binary-producing transform may replace the source document rather
         // than serialize it. The enveloped transform must not carry the source
-        // Signature identity into that unrelated decoded document.
+        // Signature identity into that unrelated decoded document; §6.6.4
+        // forbids applying Enveloped to it, rather than returning a no-op.
         let source = Document::parse(
             r#"<root><Signature xmlns="http://www.w3.org/2000/09/xmldsig#"/></root>"#,
         )
@@ -3792,14 +3835,16 @@ mod tests {
             Transform::Enveloped,
         ];
 
-        let output = execute_transforms(
+        let result = execute_transforms(
             signature,
             TransformData::Binary(encoded.into()),
             &transforms,
-        )
-        .unwrap();
+        );
 
-        assert_eq!(output, b"<payload>ok</payload>");
+        assert!(matches!(
+            result,
+            Err(TransformError::CrossDocumentSignatureNode)
+        ));
     }
 
     #[test]

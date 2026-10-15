@@ -115,7 +115,11 @@ fn outside_manifest_enveloped_replay_has_no_invented_signature_context() {
         transforms,
     )
     .replace("<ds:Object>", "</ds:Signature>")
-    .replace("</ds:Object></ds:Signature>", "");
+    .replace("</ds:Object></ds:Signature>", "")
+    .replace(
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+    );
     let document =
         XmlDocument::parse(SignContext::new(&signer).sign_template(&template).unwrap()).unwrap();
     let context = VerifyContext::new().key(&key).process_manifests(true);
@@ -125,6 +129,18 @@ fn outside_manifest_enveloped_replay_has_no_invented_signature_context() {
         &VerificationRequest::default(),
         &account(),
         |session| {
+            assert!(
+                matches!(
+                    session.evidence().signatures()[0]
+                        .result()
+                        .as_ref()
+                        .unwrap()
+                        .manifest_references[0]
+                        .status,
+                    DsigStatus::Valid
+                ),
+                "historical verification must hash the same empty bytes as replay"
+            );
             let selected =
                 session.select_signature(session.evidence().signatures()[0].identity())?;
             let mut bytes = Vec::new();
@@ -578,11 +594,14 @@ fn final_octets_are_borrowed_and_not_timestamp_recanonicalized() {
     // because a timestamp method was supplied. Pointer identity proves no copy.
     let uri = "https://example.test/binary";
     let (xml, key) = signed_manifest(uri, "http://www.w3.org/2001/04/xmlenc#sha256", "");
-    for bytes in [vec![], vec![0xff, 0, 0x80, 1]] {
+    for bytes in [vec![], vec![0xff, 0, 0x80, 1], vec![0xff; 16384]] {
         let resources = HashMap::from([(uri.to_owned(), bytes)]);
         let expected = resources.get(uri).unwrap();
         let document = XmlDocument::parse(xml.clone()).unwrap();
+        let mut policy = xml_sec::policy::VerificationPolicy::default();
+        policy.resources.max_canonicalized_bytes = 8192;
         let context = VerifyContext::new()
+            .policy(policy)
             .key(&key)
             .allowed_uri_types(UriTypeSet::ALL)
             .process_manifests(true);
@@ -612,6 +631,182 @@ fn final_octets_are_borrowed_and_not_timestamp_recanonicalized() {
             assert_eq!(calls, usize::from(!expected.is_empty()));
             Ok(())
         })
+        .unwrap();
+    }
+}
+
+#[test]
+fn external_enveloped_replay_refuses_a_foreign_document() {
+    // XMLDSig 1.1 §6.6.4 limits Enveloped to its parent XML document,
+    // even when the original instruction has no Signature ancestor.
+    let uri = "https://example.test/other.xml";
+    let transforms = r#"<ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/></ds:Transforms>"#;
+    let template = manifest_template(uri, "http://www.w3.org/2001/04/xmlenc#sha256", transforms)
+        .replace("<ds:Object>", "</ds:Signature>")
+        .replace("</ds:Object></ds:Signature>", "");
+    let signer = HmacSigningKey::new(vec![0x61; 32]).unwrap();
+    let key = HmacVerificationKey::new(vec![0x61; 32]).unwrap();
+    let document =
+        XmlDocument::parse(SignContext::new(&signer).sign_template(&template).unwrap()).unwrap();
+    let resources = HashMap::from([(uri.to_owned(), b"<payload/>".to_vec())]);
+    let context = VerifyContext::new()
+        .key(&key)
+        .allowed_uri_types(UriTypeSet::ALL)
+        .process_manifests(true);
+    let request = VerificationRequest {
+        external_resources: Some(&resources),
+        ..VerificationRequest::default()
+    };
+    with_verified_request(&document, &context, &request, &account(), |session| {
+        let selected = session.select_signature(session.evidence().signatures()[0].identity())?;
+        let result = selected.replay_reference(
+            session.view().node_for_id("inside", &[]).unwrap(),
+            ReplayMode::ReferenceOutput,
+            &mut |_: &[u8]| -> Result<(), ()> {
+                panic!("foreign Enveloped input must not reach receiver")
+            },
+        );
+        assert!(
+            result.is_err(),
+            "foreign input must not become authenticated empty output"
+        );
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn terminal_c14n_refusal_is_typed_and_exhausts_remaining_output() {
+    // Partial streaming output spends the original allowance; subsequent
+    // attempts cannot spend it again and retain the exact policy resource.
+    let (xml, key) = signed_manifest("#target", "http://www.w3.org/2001/04/xmlenc#sha256", "");
+    let document = XmlDocument::parse(xml).unwrap();
+    let mut policy = xml_sec::policy::VerificationPolicy::default();
+    policy.resources.max_canonicalized_bytes = 4096;
+    let context = VerifyContext::new()
+        .key(&key)
+        .policy(policy)
+        .process_manifests(true);
+    with_verified_request(
+        &document,
+        &context,
+        &VerificationRequest::default(),
+        &account(),
+        |session| {
+            let selected =
+                session.select_signature(session.evidence().signatures()[0].identity())?;
+            let reference = session.view().node_for_id("inside", &[]).unwrap();
+            let mut refused = false;
+            for _ in 0..100 {
+                if let Err(error) = selected.replay_reference(
+                    reference,
+                    ReplayMode::ReferenceOutput,
+                    &mut |_: &[u8]| Ok::<_, ()>(()),
+                ) {
+                    assert!(
+                        matches!(
+                            error,
+                            ReplayError::Processing(DsigError::Policy(
+                                xml_sec::policy::PolicyViolation::ResourceLimit {
+                                    resource: "canonicalized bytes",
+                                    maximum: 4096,
+                                    ..
+                                }
+                            ))
+                        ),
+                        "{error:?}"
+                    );
+                    refused = true;
+                    break;
+                }
+            }
+            assert!(refused);
+            let mut bytes = 0;
+            let result = selected.replay_reference(
+                reference,
+                ReplayMode::ReferenceOutput,
+                &mut |chunk: &[u8]| {
+                    bytes += chunk.len();
+                    Ok::<_, ()>(())
+                },
+            );
+            assert!(matches!(
+                result,
+                Err(ReplayError::Processing(DsigError::Policy(_)))
+            ));
+            assert_eq!(bytes, 0);
+            Ok(())
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn terminal_c14n_xml_base_refusals_keep_their_policy_resources() {
+    // Timestamp C14N 1.1 fixup uses the same typed component/byte refusals
+    // as collecting C14N, rather than losing them in Canonicalization errors.
+    let secret = vec![0x61; 32];
+    let signer = HmacSigningKey::new(secret.clone()).unwrap();
+    let key = HmacVerificationKey::new(secret).unwrap();
+    let template = manifest_template("#target", "http://www.w3.org/2001/04/xmlenc#sha256", "")
+        .replacen(
+            "<root xmlns:ds=",
+            "<root xml:base=\"https://example.test/a/b/\" xmlns:ds=",
+            1,
+        )
+        .replacen(
+            "<target Id=",
+            "<group xml:base=\"nested/\"><target xml:base=\"../c/\" Id=",
+            1,
+        )
+        .replacen("</target>", "</target></group>", 1)
+        .replace(
+            "Id=\"timestamp-method\" Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"",
+            "Id=\"timestamp-method\" Algorithm=\"http://www.w3.org/2006/12/xml-c14n11\"",
+        );
+    let document =
+        XmlDocument::parse(SignContext::new(&signer).sign_template(&template).unwrap()).unwrap();
+    for components in [true, false] {
+        let mut policy = xml_sec::policy::VerificationPolicy::default();
+        let expected = if components {
+            policy.resources.max_xml_base_components = 1;
+            "XML Base components"
+        } else {
+            policy.resources.max_xml_base_resolution_bytes = 1;
+            "XML Base resolution bytes"
+        };
+        let context = VerifyContext::new()
+            .key(&key)
+            .policy(policy)
+            .process_manifests(true);
+        with_verified_request(
+            &document,
+            &context,
+            &VerificationRequest::default(),
+            &account(),
+            |session| {
+                let selected =
+                    session.select_signature(session.evidence().signatures()[0].identity())?;
+                let reference = session.view().node_for_id("inside", &[]).unwrap();
+                let method = session.view().node_for_id("timestamp-method", &[]).unwrap();
+                let result = selected.replay_reference(
+                    reference,
+                    ReplayMode::Timestamp(method),
+                    &mut |_: &[u8]| Ok::<_, ()>(()),
+                );
+                match result {
+                    Err(ReplayError::Processing(DsigError::Policy(
+                        xml_sec::policy::PolicyViolation::ResourceLimit {
+                            resource,
+                            maximum: 1,
+                            ..
+                        },
+                    ))) => assert_eq!(resource, expected),
+                    other => panic!("expected {expected} policy refusal, got {other:?}"),
+                }
+                Ok(())
+            },
+        )
         .unwrap();
     }
 }

@@ -643,6 +643,14 @@ the mandated XPath selects no nodes, as specified by
 [XMLDSig 1.1 section 6.6.4](https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-EnvelopedSignature).
 This source fact stays distinct from a Signature disappearing only from an
 intermediate transform result.
+Historical Manifest digest verification uses this same original Reference
+context. Enveloped cannot run on an unrelated external or base64-decoded XML
+document; only tracked canonicalization preserves identity across serialization.
+
+Raw final octets consume receiver work, not canonicalization output allowance.
+Actual C14N output consumes the remaining aggregate canonicalization budget;
+output and XML Base limits retain typed policy violations, and a partial output
+limit failure exhausts the spent allowance before a later replay.
 
 Receiver refusal remains `ReplayError::Receiver(E)`; XML/policy/resource refusal
 is `Processing`. Both stop output immediately. Repeated replay spends remaining

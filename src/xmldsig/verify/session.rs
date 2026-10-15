@@ -596,9 +596,7 @@ pub enum ReplayError<E> {
 }
 impl<E> From<TransformError> for ReplayError<E> {
     fn from(error: TransformError) -> Self {
-        Self::Processing(DsigError::Reference(ReferenceProcessingError::Transform(
-            error,
-        )))
+        Self::Processing(ReferenceProcessingError::Transform(error).into())
     }
 }
 impl<E> From<OperationPlanError> for ReplayError<E> {
@@ -610,6 +608,7 @@ impl<E> From<OperationPlanError> for ReplayError<E> {
 struct ReplayWriter<'a, W: Work, E, F> {
     work: &'a W,
     budget: &'a TransformExecutionBudget,
+    canonicalizing: bool,
     receiver: &'a mut F,
     failure: Option<ReplayError<E>>,
 }
@@ -661,7 +660,9 @@ impl<W: Work, E, F: FnMut(&[u8]) -> Result<(), E>> std::io::Write for ReplayWrit
             self.work
                 .charge_work(units)
                 .map_err(|error| ReplayError::Processing(error.into()))?;
-            super::super::transforms::charge_replay_output(self.budget, bytes.len())?;
+            if self.canonicalizing {
+                super::super::transforms::charge_replay_output(self.budget, bytes.len())?;
+            }
             (self.receiver)(bytes).map_err(ReplayError::Receiver)
         })();
         match result {
@@ -878,17 +879,13 @@ impl<W: Work> SelectedSignature<'_, '_, '_, '_, W> {
                 reference: descriptor.identity,
             }));
         };
-        let mut enveloped_signature = None;
-        for ancestor in node.ancestors() {
-            self.session
-                .work
-                .charge_work(1)
-                .map_err(|error| processing(error.into()))?;
-            if ancestor.has_tag_name((XMLDSIG_NS, "Signature")) {
-                enveloped_signature = Some(ancestor);
-                break;
-            }
-        }
+        let enveloped_signature =
+            super::super::transforms::enveloped_signature_for_reference(node, &transforms, || {
+                self.session
+                    .work
+                    .charge_work(1)
+                    .map_err(|error| processing(error.into()))
+            })?;
         super::super::transforms::replay_reference_transforms(
             node,
             enveloped_signature,
@@ -900,6 +897,7 @@ impl<W: Work> SelectedSignature<'_, '_, '_, '_, W> {
                 let mut output = ReplayWriter {
                     work: self.session.work,
                     budget,
+                    canonicalizing: matches!(&data, super::super::TransformData::NodeSet(_)),
                     receiver,
                     failure: None,
                 };
@@ -939,11 +937,9 @@ impl<W: Work> SelectedSignature<'_, '_, '_, '_, W> {
                 if let Some(error) = output.failure {
                     return Err(error);
                 }
-                result.map_err(|error| {
-                    processing(match error {
-                        crate::c14n::C14nError::SharedExecution(error) => error.into(),
-                        error => error.into(),
-                    })
+                result.map_err(|error| match error {
+                    crate::c14n::C14nError::SharedExecution(error) => processing(error.into()),
+                    error => super::super::transforms::replay_c14n_error(error, budget).into(),
                 })
             },
         )?;
