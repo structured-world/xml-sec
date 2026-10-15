@@ -211,12 +211,6 @@ enum Text<'a, W: Work> {
     Joined(OwnedVec<u8, W>),
 }
 impl<W: Work> Text<'_, W> {
-    fn len(&self) -> usize {
-        match self {
-            Self::Borrowed(text) => text.len(),
-            Self::Joined(bytes) => bytes.len(),
-        }
-    }
     fn view(&self) -> &str {
         match self {
             Self::Borrowed(text) => text,
@@ -250,6 +244,7 @@ pub fn with_scalar<W: Work, R, E>(
                     charge_bytes(work, attribute.name().len())?;
                     charge_bytes(work, attribute.namespace().map_or(0, str::len))?;
                     if attribute.name() == local_name && attribute.namespace() == namespace {
+                        admit_scalar_passes(work, attribute.value().len())?;
                         return Ok(Ok(Some(Text::Borrowed(attribute.value()))));
                     }
                 }
@@ -258,12 +253,25 @@ pub fn with_scalar<W: Work, R, E>(
             LexicalSource::SimpleContent => {
                 // Validate structure before creating any joined prefix. A malformed
                 // simple-content source must not allocate only to discard the text.
+                let mut text_bytes = 0usize;
                 for child in node.children() {
                     charge_bytes(work, 1)?;
                     if child.is_element() {
                         return Ok(Err(()));
                     }
+                    if child.is_text() {
+                        let text = child.text().expect("text node has a text value");
+                        text_bytes =
+                            text_bytes
+                                .checked_add(text.len())
+                                .ok_or(ScalarError::Resource(
+                                    structured_asn1::memory::MemoryError::WorkExceeded,
+                                ))?;
+                    }
                 }
+                // Copies have their own OwnedVec work charge, but admit every
+                // subsequent linear pass before constructing a doomed join.
+                admit_scalar_passes(work, text_bytes)?;
                 let mut value = Text::Borrowed("");
                 for child in node.children() {
                     charge_bytes(work, 1)?;
@@ -278,6 +286,9 @@ pub fn with_scalar<W: Work, R, E>(
                         Text::Borrowed(first) if first.is_empty() => *first = text,
                         Text::Borrowed(first) => {
                             let mut bytes = work.vector();
+                            bytes
+                                .try_reserve_exact(text_bytes)
+                                .map_err(ScalarError::Resource)?;
                             bytes
                                 .try_extend_from_slice(first.as_bytes())
                                 .map_err(ScalarError::Resource)?;
@@ -315,15 +326,6 @@ pub fn with_scalar<W: Work, R, E>(
         }
         Ok(Some(value)) => value,
     };
-    // Pre-admit every linear pass: UTF-8 validation, trim/collapse detection,
-    // construction and base-datatype parsing. OwnedVec separately admits copies.
-    let scan_bound = value
-        .len()
-        .checked_mul(12)
-        .ok_or(InspectionError::Processing(ScalarError::Resource(
-            structured_asn1::memory::MemoryError::WorkExceeded,
-        )))?;
-    charge_bytes(work, scan_bound).map_err(InspectionError::Processing)?;
     let lexical = value.view();
     let collapsed = match datatype {
         ScalarType::Other { .. } => Text::Borrowed(lexical),
@@ -542,6 +544,15 @@ fn uri_chars(input: &str, extra: &[u8]) -> bool {
     }
     true
 }
+fn admit_scalar_passes(work: &impl Work, bytes: usize) -> Result<(), ScalarError> {
+    // UTF-8 validation, whitespace handling and base datatype parsing. OwnedVec
+    // separately admits copying; no owned intermediate precedes this bound.
+    let bound = bytes.checked_mul(12).ok_or(ScalarError::Resource(
+        structured_asn1::memory::MemoryError::WorkExceeded,
+    ))?;
+    charge_bytes(work, bound)
+}
+
 fn valid_any_uri(input: &str) -> bool {
     // XSD 1.0 §3.2.17.1 incorporates RFC 2396 + RFC 2732, not URL scheme
     // validation or implicit XML Base. XLink 1.0 §5.4 escapes spaces/non-ASCII
@@ -608,7 +619,7 @@ fn valid_any_uri(input: &str) -> bool {
             let Some((address, port)) = server.split_once(']') else {
                 return false;
             };
-            if address.parse::<std::net::Ipv6Addr>().is_err() {
+            if !valid_ipv6_reference(address) {
                 return false;
             }
             if !port.is_empty()
@@ -624,4 +635,69 @@ fn valid_any_uri(input: &str) -> bool {
         path = suffix;
     }
     uri_chars(path, b"/;:@&=+$,")
+}
+
+fn valid_ipv6_reference(address: &str) -> bool {
+    // XSD 1.0 §3.2.17.1 incorporates RFC 2732 §3 and RFC 2373 Appendix B:
+    // embedded IPv4 octets are 1*3DIGIT, including leading zeroes. RFC 2373
+    // §2.2(3) still requires 8-bit decimal values, not arbitrary three digits.
+    // https://www.rfc-editor.org/rfc/rfc2732#section-3
+    // https://www.rfc-editor.org/rfc/rfc2373#appendix-B
+    if let Some((left, right)) = address.split_once("::") {
+        let Some(left) = ipv6_units(left, false) else {
+            return false;
+        };
+        let Some(right) = ipv6_units(right, true) else {
+            return false;
+        };
+        left + right < 8
+    } else {
+        ipv6_units(address, true) == Some(8)
+    }
+}
+
+fn ipv6_units(part: &str, allow_ipv4_tail: bool) -> Option<usize> {
+    if part.is_empty() {
+        return Some(0);
+    }
+    let mut units = 0;
+    let mut groups = part.split(':').peekable();
+    while let Some(group) = groups.next() {
+        if group.contains('.') {
+            if !allow_ipv4_tail || groups.peek().is_some() {
+                return None;
+            }
+            let mut count = 0;
+            for octet in group.split('.') {
+                if octet.is_empty() || octet.len() > 3 {
+                    return None;
+                }
+                let mut value = 0u16;
+                for byte in octet.bytes() {
+                    if !byte.is_ascii_digit() {
+                        return None;
+                    }
+                    value = value * 10 + u16::from(byte - b'0');
+                }
+                if value > 255 {
+                    return None;
+                }
+                count += 1;
+            }
+            if count != 4 {
+                return None;
+            }
+            units += 2;
+        } else {
+            if group.is_empty() || group.len() > 4 || !group.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return None;
+            }
+            units += 1;
+        }
+        if units > 8 {
+            return None;
+        }
+    }
+    Some(units)
 }

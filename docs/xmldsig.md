@@ -678,6 +678,9 @@ complex content, malformed base-type syntax and unsupported schema types are
 distinct from document/resource failures and the callback's own typed error.
 Temporary joining and XSD whitespace collapse use accounted storage only when
 borrowing cannot suffice, and release it on success or refusal.
+The known linear-pass bound is admitted before joining fragments. If both Work
+and join capacity are insufficient, Work refusal precedes the allocation request;
+OwnedVec independently admits the actual copying and retained capacity.
 
 Supported base types are XSD 1.0 `boolean`, `dateTime`, `ID` and `anyURI`.
 `DateTimeLexical` preserves arbitrary year/fraction digits and absent timezone;
@@ -690,6 +693,9 @@ changes existing duplicate-ID handling. URI inspection applies XSD escaping and
 generic URI-reference semantics, not a URL/scheme policy; it does not resolve
 XML Base, fetch a resource or authenticate its owner. XAdES/profile requirements
 and trust decisions remain with the consumer.
+The incorporated historical RFC 2732/2373 IPv6 grammar permits decimal IPv4
+tail octets with leading zeroes; modern address-parser restrictions do not
+silently replace that XSD 1.0 lexical contract.
 
 ## RSA-PSS Parameters
 

@@ -334,6 +334,17 @@ fn anyuri_applies_schema_escaping_not_url_policy() {
         ("urn:?a", true),
         ("urn:&#xE9;", true),
         ("https://[::1]:443/a?b#c", true),
+        ("http://[::192.009.005.005]/", true),
+        ("http://[0:0:0:0:0:ffff:192.000.002.001]/", true),
+        ("http://[::192.999.005.005]/", false),
+        ("http://[::192.0009.005.005]/", false),
+        ("http://[192.009.005.005::]/", false),
+        ("http://[::000.000.000.000]/", true),
+        ("http://[1:2:3:4:5:6:7:8]/", true),
+        ("http://[1:2:3:4:5:6:7]/", false),
+        ("http://[1::2::3]/", false),
+        ("http://[:::]/", false),
+        ("http://[1:2:3:4:5:6::192.9.5.5]/", false),
         ("a%20b", true),
         ("a%", false),
         ("a%xx", false),
@@ -398,6 +409,39 @@ fn scalar_refuses_both_live_work_ceilings_and_join_memory_before_callback() {
             ));
         });
     }
+}
+
+#[test]
+fn scalar_join_admits_byte_work_before_requesting_capacity() {
+    // Even with no allocation allowance, insufficient byte work must be the
+    // first refusal: an input-sized join cannot precede its work admission.
+    let document = XmlDocument::parse(format!(
+        "<r Id='r'>{}<!--split-->{}</r>",
+        "a".repeat(2048),
+        "b".repeat(2048)
+    ))
+    .unwrap();
+    let memory = Memory::new(Arc::new(MemoryAccount::new(0, 8192)));
+    document.with_view(|view| {
+        let result = with_scalar(
+            view,
+            view.node_for_id("r", &[]).unwrap(),
+            LexicalSource::SimpleContent,
+            ScalarType::AnyUri,
+            &memory,
+            |_| Ok::<_, ()>(()),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(InspectionError::Processing(ScalarError::Resource(
+                    MemoryError::WorkExceeded
+                )))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(memory.used(), 0);
+    });
 }
 
 #[test]
