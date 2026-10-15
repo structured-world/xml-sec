@@ -96,6 +96,16 @@ impl<'work, W: Work> ScopedCapture<'work, W> {
         }
         result
     }
+
+    fn copy_public_evidence(&self, public: &[u8]) -> Result<OwnedVec<u8, W>, MemoryError> {
+        let mut bytes = self.work.vector();
+        // OwnedVec admits public.len() copy work before reserving capacity;
+        // its allocator separately admits allocation work before allocation.
+        // A separate byte charge here would bill the same copy twice; retain
+        // its original refusal so candidate recovery cannot erase it.
+        self.retain_failure(bytes.try_extend_from_slice(public))?;
+        Ok(bytes)
+    }
 }
 
 impl<W: Work> VerificationCapture for ScopedCapture<'_, W> {
@@ -131,9 +141,7 @@ impl<W: Work> VerificationCapture for ScopedCapture<'_, W> {
             }
             retained.observations = 1;
             if let Some(public) = key.association_spki(input.algorithm) {
-                let mut bytes = self.work.vector();
-                self.retain_failure(bytes.try_extend_from_slice(public))?;
-                retained.public = Some(bytes);
+                retained.public = Some(self.copy_public_evidence(public)?);
             }
             retained.binding = key.provider_binding().cloned();
             Ok(())
@@ -207,6 +215,35 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use structured_asn1::memory::{Memory, MemoryAccount};
+
+    #[test]
+    fn receipt_copy_charges_exact_byte_work_before_capacity_and_stays_terminal() {
+        // The bounded vector, not merely its observer event, pays every copied
+        // byte exactly once. An insufficient budget must leave no retained copy.
+        let public = vec![0x42; 128 * 1024];
+        let exact = public.len() * 2; // One byte-copy pass plus one allocation.
+        for allowance in [public.len() - 1, exact - 1, exact] {
+            let work = Memory::new(Arc::new(MemoryAccount::new(public.len() * 2, allowance)));
+            let capture = ScopedCapture::new(&work);
+            let result = capture.copy_public_evidence(&public);
+            if allowance < exact {
+                assert!(matches!(result, Err(MemoryError::WorkExceeded)));
+                assert_eq!(work.used(), 0);
+                assert_eq!(capture.failure.get(), Some(MemoryError::WorkExceeded));
+                let _ = capture.retain_failure(Err::<(), _>(MemoryError::LimitExceeded));
+                assert_eq!(capture.failure.get(), Some(MemoryError::WorkExceeded));
+            } else {
+                let copied = match result {
+                    Ok(copied) => copied,
+                    Err(error) => panic!("exact admitted copy failed: {error:?}"),
+                };
+                assert_eq!(&*copied, public.as_slice());
+                assert_eq!(work.work_used(), exact);
+                drop(copied);
+                assert_eq!(work.used(), 0);
+            }
+        }
+    }
 
     #[test]
     fn first_receipt_resource_failure_stays_terminal() {

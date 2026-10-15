@@ -754,8 +754,14 @@ No resolver, signature verification, fingerprint comparison, or SPKI re-encoding
 is performed to manufacture the association.
 
 DSA needs the complete effective y/p/q/g; absent parameters remain unproven.
-PSS restrictions must be established equal, not merely compatible with the
-particular signature method. Different encodings alone are not a mismatch.
+RSA n/e differences establish Mismatch before comparing PSS restrictions.
+Equal components need equal effective restrictions for Same, not merely
+compatibility with the signature method; otherwise they remain Unproven.
+Different encodings alone are not a mismatch.
+The selected RustCrypto provider decodes RFC 8410 Ed25519/Ed448 public keys
+with absent parameters and canonical RFC 8032 point encodings. Different valid
+keys establish Mismatch; invalid encodings remain Unproven. This adds no
+native-to-software fallback and does not re-encode a SubjectPublicKeyInfo.
 RustCrypto can compare compressed/uncompressed forms on the supported NIST
 curves through its own point decoder. The official AWS safe API cannot establish
 those aliases, so that case remains explicitly unproven without software fallback.
@@ -767,7 +773,8 @@ unproven association. A custom leaf exposes only its own successful public mater
 through `VerifyingKey::association_spki`; this does not enable native verification
 of an otherwise opaque handle. An ambiguous composite that reports multiple
 successes yields no arbitrary winning-key proof. Producer Work pays retained
-capacity; query Work pays later comparisons. Receipt admission failure cannot
+capacity and each copied public-key byte once through OwnedVec; query Work
+pays later comparisons. Receipt admission failure cannot
 be swallowed by candidate recovery. Ordinary and scoped RustCrypto verification
 share the same bounded candidate traversal and leaf verifier; observing a
 successful leaf does not change which candidates are tried.

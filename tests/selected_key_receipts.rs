@@ -17,6 +17,151 @@ fn account() -> Memory {
     Memory::new(Arc::new(MemoryAccount::new(1 << 22, 1 << 28)))
 }
 
+#[test]
+fn fixed_format_eddsa_keys_report_proven_mismatch() {
+    // RFC 8410 §§3–4: absent parameters and decoded public key octets
+    // identify the key. Two real successful signing-key families exercise
+    // Same versus Mismatch without repeating signature verification.
+    use der::{Decode as _, Encode as _};
+    use pkcs8::EncodePrivateKey as _;
+    use xml_sec::provider::CryptoProvider as _;
+    for algorithm in [SignatureAlgorithm::Ed25519, SignatureAlgorithm::Ed448] {
+        let make = |seed: u8| {
+            let der = if algorithm == SignatureAlgorithm::Ed25519 {
+                ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+                    .to_pkcs8_der()
+                    .unwrap()
+            } else {
+                ed448_goldilocks::SigningKey::try_from(&[seed; 57][..])
+                    .unwrap()
+                    .to_pkcs8_der()
+                    .unwrap()
+            };
+            EdDsaSigningKey::from_pkcs8_der(algorithm, der.as_bytes()).unwrap()
+        };
+        let signer = make(0x42);
+        let other = make(0x43);
+        let public = signer
+            .public_key_info()
+            .unwrap()
+            .spki_der()
+            .unwrap()
+            .to_vec();
+        let different = other
+            .public_key_info()
+            .unwrap()
+            .spki_der()
+            .unwrap()
+            .to_vec();
+        let original = pkcs8::SubjectPublicKeyInfoRef::from_der(&public).unwrap();
+        let invalid_bits = vec![0xff; original.subject_public_key.as_bytes().unwrap().len()];
+        let invalid_point = pkcs8::SubjectPublicKeyInfoRef {
+            algorithm: original.algorithm,
+            subject_public_key: der::asn1::BitStringRef::from_bytes(&invalid_bits).unwrap(),
+        }
+        .to_der()
+        .unwrap();
+        let invalid_parameters = pkcs8::SubjectPublicKeyInfoRef {
+            algorithm: pkcs8::AlgorithmIdentifierRef {
+                parameters: Some(der::asn1::AnyRef::NULL),
+                ..original.algorithm
+            },
+            subject_public_key: original.subject_public_key,
+        }
+        .to_der()
+        .unwrap();
+        for malformed in [&invalid_point, &invalid_parameters] {
+            with_expected(&public, |expected| {
+                let work = account();
+                assert_eq!(
+                    xml_sec::provider::RustCryptoProvider
+                        .associate_verification_key(malformed, expected, &|units| work
+                            .charge_work(units))
+                        .unwrap(),
+                    KeyAssociation::Unproven
+                );
+            });
+        }
+        with_expected(&invalid_point, |expected| {
+            let work = account();
+            assert_eq!(
+                xml_sec::provider::RustCryptoProvider
+                    .associate_verification_key(&invalid_point, expected, &|units| work
+                        .charge_work(units))
+                    .unwrap(),
+                KeyAssociation::Unproven,
+                "identical invalid encodings are not validated keys"
+            );
+        });
+        with_expected(&public, |expected| {
+            let small = Memory::new(Arc::new(MemoryAccount::new(0, 4096)));
+            assert!(
+                matches!(
+                    xml_sec::provider::RustCryptoProvider.associate_verification_key(
+                        &public,
+                        expected,
+                        &|units| small.charge_work(units)
+                    ),
+                    Err(DsigError::SharedExecution(
+                        structured_asn1::memory::MemoryError::WorkExceeded
+                    ))
+                ),
+                "point validation must be admitted before arithmetic"
+            );
+        });
+        let builder =
+            SignatureBuilder::new(C14nAlgorithm::new(C14nMode::Exclusive1_0, false), algorithm)
+                .add_reference(
+                    ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                        .uri("")
+                        .transform(Transform::Enveloped),
+                );
+        let document = XmlDocument::parse(
+            SignContext::new(&signer)
+                .sign_with_builder("<root/>", &builder)
+                .unwrap(),
+        )
+        .unwrap();
+        let key = VerificationKey {
+            algorithm,
+            public_key_bytes: public.clone(),
+            certificate_der: None,
+            name: None,
+        };
+        let context = VerifyContext::new().key(&key);
+        with_verified_request(
+            &document,
+            &context,
+            &VerificationRequest::default(),
+            &account(),
+            |session| {
+                let selected =
+                    session.select_signature(session.evidence().signatures()[0].identity())?;
+                selected
+                    .with_key_receipt(|receipt| {
+                        for (bytes, expected_outcome) in [
+                            (&public, KeyAssociation::Same),
+                            (&different, KeyAssociation::Mismatch),
+                        ] {
+                            with_expected(bytes, |expected| {
+                                selected
+                                    .associate_key(&receipt, expected, |actual| {
+                                        assert_eq!(actual, expected_outcome);
+                                        Ok::<_, ()>(())
+                                    })
+                                    .unwrap()
+                            });
+                        }
+                        Ok::<_, ()>(())
+                    })
+                    .unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+    }
+}
+
 fn public_key(pem: &str) -> VerificationKey {
     VerificationKey {
         algorithm: SignatureAlgorithm::RsaSha256,
@@ -513,6 +658,9 @@ fn pss_method_compatibility_does_not_erase_effective_key_restrictions() {
     let unrestricted = public(&key.public_key_bytes, None);
     let minimum20 = public(&key.public_key_bytes, Some(20));
     let minimum32 = public(&key.public_key_bytes, Some(32));
+    let different_key = public_key(include_str!("fixtures/keys/rsa/rsa-expired-pubkey.pem"));
+    let different_restricted = public(&different_key.public_key_bytes, Some(32));
+    let different_unrestricted = public(&different_key.public_key_bytes, None);
     let signer =
         RsaSigningKey::from_pkcs8_pem(include_str!("fixtures/keys/rsa/rsa-2048-key.pem")).unwrap();
     let builder = SignatureBuilder::new(
@@ -551,6 +699,8 @@ fn pss_method_compatibility_does_not_erase_effective_key_restrictions() {
                         (&minimum20, KeyAssociation::Same),
                         (&minimum32, KeyAssociation::Unproven),
                         (&unrestricted, KeyAssociation::Unproven),
+                        (&different_restricted, KeyAssociation::Mismatch),
+                        (&different_unrestricted, KeyAssociation::Mismatch),
                     ] {
                         with_expected(bytes, |expected| {
                             selected

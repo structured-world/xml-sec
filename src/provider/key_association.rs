@@ -189,6 +189,88 @@ fn compare_with_points(
             },
         );
     }
+    if actual.algorithm.oid == der::asn1::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.10") {
+        let components = rsa_components(bits, expected_bits);
+        // PSS restrictions cannot make different n/e the same public key.
+        // Equal components alone do not establish equal effective restrictions
+        // (RFC 4055 §3.3); this distinction is association reporting, not trust.
+        // https://www.rfc-editor.org/rfc/rfc4055#section-3.3
+        return Ok(
+            if components == KeyAssociation::Same && actual.algorithm.parameters != parameters {
+                KeyAssociation::Unproven
+            } else {
+                components
+            },
+        );
+    }
+    if rustcrypto_points
+        && (actual.algorithm.oid == ed25519_dalek::pkcs8::ALGORITHM_OID
+            || actual.algorithm.oid == ed448_goldilocks::ALGORITHM_OID)
+    {
+        // RFC 8410 §§3–4 requires absent parameters and encoded public-key
+        // octets; RFC 8032 §§5.1.3/5.2.3 defines their point encoding. Decode
+        // only inside the selected RustCrypto provider, never as native fallback.
+        // https://www.rfc-editor.org/rfc/rfc8410#section-4
+        // https://www.rfc-editor.org/rfc/rfc8032#section-5.1.3
+        if actual.algorithm.parameters.is_some() || parameters.is_some() {
+            return Ok(KeyAssociation::Unproven);
+        }
+        macro_rules! compare_edwards {
+            ($key:ty, $length:expr, $width:expr, $point:ident, $encoded:expr) => {{
+                let (Ok(left), Ok(right)) = (
+                    <&[u8; $length]>::try_from(bits),
+                    <&[u8; $length]>::try_from(expected_bits),
+                ) else {
+                    return Ok(KeyAssociation::Unproven);
+                };
+                charge($width * $width * 8)?;
+                let Ok(left) = <$key>::from_bytes(left) else {
+                    return Ok(KeyAssociation::Unproven);
+                };
+                let $point = left.to_edwards();
+                let left = $encoded;
+                // Point decoders may accept noncanonical encodings. Such wire
+                // aliases are not validated RFC 8032 public-key encodings.
+                if left.as_slice() != bits {
+                    KeyAssociation::Unproven
+                } else if bits == expected_bits {
+                    // Reuse the first decoded point for identical input.
+                    KeyAssociation::Same
+                } else {
+                    charge($width * $width * 8)?;
+                    let Ok(right) = <$key>::from_bytes(right) else {
+                        return Ok(KeyAssociation::Unproven);
+                    };
+                    let $point = right.to_edwards();
+                    let right = $encoded;
+                    if right.as_slice() != expected_bits {
+                        KeyAssociation::Unproven
+                    } else {
+                        KeyAssociation::Mismatch
+                    }
+                }
+            }};
+        }
+        return Ok(
+            if actual.algorithm.oid == ed25519_dalek::pkcs8::ALGORITHM_OID {
+                compare_edwards!(
+                    ed25519_dalek::VerifyingKey,
+                    32,
+                    256,
+                    point,
+                    point.compress().to_bytes()
+                )
+            } else {
+                compare_edwards!(
+                    ed448_goldilocks::VerifyingKey,
+                    57,
+                    448,
+                    point,
+                    point.to_affine().compress().0
+                )
+            },
+        );
+    }
     if actual.algorithm.parameters != parameters {
         // RFC 5280 §6.1.3 preserves effective working parameters. Method
         // compatibility alone does not prove equal PSS restrictions or groups.
@@ -199,9 +281,6 @@ fn compare_with_points(
     // association without re-encoding, fingerprints or another signature check.
     if bits == expected_bits {
         return Ok(KeyAssociation::Same);
-    }
-    if actual.algorithm.oid == der::asn1::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.10") {
-        return Ok(rsa_components(bits, expected_bits));
     }
     if rustcrypto_points && actual.algorithm.oid == p256::elliptic_curve::ALGORITHM_OID {
         let Some(curve) =
