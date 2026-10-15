@@ -68,6 +68,14 @@ const MAX_RETRIEVAL_METHOD_COUNT: usize = 64;
 /// This trait intentionally has no `Send + Sync` supertraits so lightweight
 /// single-threaded verifiers can be used without additional bounds.
 pub trait VerifyingKey {
+    /// Borrow public SPKI describing this exact key after successful verification.
+    /// This is evidence only, never authorization for native verification or
+    /// private-key export. Composite handles expose their leaves instead. This
+    /// hook only borrows cached public metadata; it must not allocate, parse,
+    /// perform I/O or manufacture a different key after the decision.
+    fn association_spki(&self, _algorithm: SignatureAlgorithm) -> Option<&[u8]> {
+        None
+    }
     /// Exact external execution domain; a key cannot be moved between token sessions.
     fn provider_binding(&self) -> Option<&crate::provider::ProviderBinding> {
         None
@@ -2863,12 +2871,15 @@ fn verify_signature_node<'a, C: VerificationCapture>(
             key: verifier,
             policy: &ctx.policy,
         };
-        ctx.provider.verify_with_context(
+        capture.verify(
+            ctx.provider,
             &policy_verifier,
-            signed_info.signature_method,
-            &signed_info.signature_context,
-            &canonical_signed_info,
-            &signature_value,
+            crate::provider::SignatureVerificationInput {
+                algorithm: signed_info.signature_method,
+                context: &signed_info.signature_context,
+                data: &canonical_signed_info,
+                signature: &signature_value,
+            },
         )
     })?;
 
@@ -2947,6 +2958,9 @@ struct PolicyVerifyingKey<'a> {
 }
 
 impl VerifyingKey for PolicyVerifyingKey<'_> {
+    fn association_spki(&self, algorithm: SignatureAlgorithm) -> Option<&[u8]> {
+        self.key.association_spki(algorithm)
+    }
     fn provider_binding(&self) -> Option<&crate::provider::ProviderBinding> {
         self.key.provider_binding()
     }

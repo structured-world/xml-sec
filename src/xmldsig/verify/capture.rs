@@ -1,7 +1,7 @@
 //! Original execution facts retained only by scoped verification.
 
 use super::*;
-use structured_asn1::memory::{MemoryError, OwnedMap, Work};
+use structured_asn1::memory::{MemoryError, OwnedMap, OwnedVec, Work};
 
 /// Original parsed method, not a reconstruction from an algorithm URI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -13,6 +13,20 @@ pub struct SelectedSignatureMethod {
 }
 
 pub(super) trait VerificationCapture {
+    fn verify(
+        &self,
+        provider: &dyn crate::provider::CryptoProvider,
+        key: &dyn VerifyingKey,
+        input: crate::provider::SignatureVerificationInput<'_>,
+    ) -> Result<bool, DsigError> {
+        provider.verify_with_context(
+            key,
+            input.algorithm,
+            input.context,
+            input.data,
+            input.signature,
+        )
+    }
     fn method(
         &self,
         _view: DocumentView<'_>,
@@ -42,6 +56,8 @@ pub(super) struct CapturedDigest {
 }
 
 pub(super) struct ScopedCapture<'work, W: Work> {
+    pub(super) seal: [u8; 1],
+    pub(super) key: RefCell<CapturedKey<W>>,
     pub(super) method: Cell<Option<SelectedSignatureMethod>>,
     // Arena ordinals are private to the retained original operation, never
     // compared across parses or exposed as public provenance.
@@ -50,9 +66,21 @@ pub(super) struct ScopedCapture<'work, W: Work> {
     work: &'work W,
 }
 
+pub(super) struct CapturedKey<W: Work> {
+    pub(super) public: Option<OwnedVec<u8, W>>,
+    pub(super) binding: Option<crate::provider::ProviderBinding>,
+    observations: u8,
+}
+
 impl<'work, W: Work> ScopedCapture<'work, W> {
     pub(super) fn new(work: &'work W) -> Self {
         Self {
+            seal: [0],
+            key: RefCell::new(CapturedKey {
+                public: None,
+                binding: None,
+                observations: 0,
+            }),
             method: Cell::new(None),
             digests: RefCell::new(work.map()),
             failure: Cell::new(None),
@@ -71,6 +99,50 @@ impl<'work, W: Work> ScopedCapture<'work, W> {
 }
 
 impl<W: Work> VerificationCapture for ScopedCapture<'_, W> {
+    fn verify(
+        &self,
+        provider: &dyn crate::provider::CryptoProvider,
+        key: &dyn VerifyingKey,
+        input: crate::provider::SignatureVerificationInput<'_>,
+    ) -> Result<bool, DsigError> {
+        let result = provider.verify_with_key_receipt(key, input, &mut |event| {
+            if let Some(error) = self.failure.get() {
+                return Err(error.into());
+            }
+            if matches!(event, crate::provider::KeyVerificationEvent::BeforeCandidate { depth }
+                if depth == crate::hard_limits::KEY_CANDIDATE_CEILING)
+            {
+                return self
+                    .retain_failure(Err(MemoryError::WorkExceeded))
+                    .map_err(Into::into);
+            }
+            self.retain_failure(self.work.charge_work(1))?;
+            let crate::provider::KeyVerificationEvent::Verified(key) = event else {
+                return Ok(());
+            };
+            let mut retained = self.key.borrow_mut();
+            if retained.observations != 0 {
+                // A custom composite that continues after success supplies no
+                // unique winning leaf. Never pick an arbitrary success for it.
+                retained.observations = 2;
+                retained.public = None;
+                retained.binding = None;
+                return Ok(());
+            }
+            retained.observations = 1;
+            if let Some(public) = key.association_spki(input.algorithm) {
+                let mut bytes = self.work.vector();
+                self.retain_failure(bytes.try_extend_from_slice(public))?;
+                retained.public = Some(bytes);
+            }
+            retained.binding = key.provider_binding().cloned();
+            Ok(())
+        });
+        if let Some(error) = self.failure.get() {
+            return Err(error.into());
+        }
+        result
+    }
     fn method(
         &self,
         view: DocumentView<'_>,

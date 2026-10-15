@@ -14,7 +14,7 @@ use xml_sec::provider::{
     ContentDecryptionKey, CryptoProvider, ExternalProviderError, KeyAgreementParameters,
     ProviderCapability, ProviderError, RustCryptoProvider,
 };
-use xml_sec::xmldsig::{DigestAlgorithm, SignatureAlgorithm};
+use xml_sec::xmldsig::{DigestAlgorithm, SignatureAlgorithm, VerifyingKey as _};
 use xml_sec::xmlenc::{DataEncryptionAlgorithm, KeyWrapAlgorithm};
 
 #[test]
@@ -185,6 +185,63 @@ fn isolated_token_operations_and_failures() {
             .status
             == xml_sec::xmldsig::DsigStatus::Valid
     );
+    // The token never exports private material or a native-verification SPKI.
+    // Its cached public attributes still prove the actual successful key.
+    {
+        use structured_asn1::{
+            Encoding, Limits, Parser,
+            memory::{Memory, MemoryAccount},
+        };
+        let work = Memory::new(Arc::new(MemoryAccount::new(1 << 22, 1 << 28)));
+        assert!(
+            public
+                .verification_spki(SignatureAlgorithm::RsaSha256)
+                .unwrap()
+                .is_none()
+        );
+        let bytes = public
+            .association_spki(SignatureAlgorithm::RsaSha256)
+            .unwrap();
+        let parser = Parser::new(Encoding::Der, Limits::default(), work.clone());
+        let mut reader = parser.read(bytes, 0).unwrap();
+        let element = reader.next_element().unwrap().unwrap();
+        let expected = structured_pkix::path::WorkingKey::standing(
+            structured_pkix::key::PublicKeyInfo::read_element(
+                &reader,
+                &element,
+                "token expected key",
+            )
+            .unwrap(),
+        );
+        let document = xml_sec::XmlDocument::parse(signed.clone()).unwrap();
+        let context = xml_sec::xmldsig::VerifyContext::new()
+            .key(&public)
+            .provider(&provider);
+        xml_sec::xmldsig::with_verified_request(
+            &document,
+            &context,
+            &xml_sec::xmldsig::VerificationRequest::default(),
+            &work,
+            |session| {
+                let selected =
+                    session.select_signature(session.evidence().signatures()[0].identity())?;
+                selected
+                    .with_key_receipt(|receipt| {
+                        assert!(receipt.has_public_evidence());
+                        selected
+                            .associate_key(&receipt, expected, |outcome| {
+                                assert_eq!(outcome, xml_sec::provider::KeyAssociation::Same);
+                                Ok::<_, ()>(())
+                            })
+                            .unwrap();
+                        Ok::<_, ()>(())
+                    })
+                    .unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+    }
     assert!(
         xml_sec::xmldsig::VerifyContext::new()
             .key(&public)

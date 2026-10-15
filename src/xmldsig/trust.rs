@@ -114,6 +114,9 @@ impl TrustedPublicKey {
 }
 
 impl VerifyingKey for TrustedPublicKey {
+    fn association_spki(&self, algorithm: SignatureAlgorithm) -> Option<&[u8]> {
+        self.key.association_spki(algorithm)
+    }
     fn verification_spki(&self, algorithm: SignatureAlgorithm) -> Result<Option<&[u8]>, DsigError> {
         self.key.verification_spki(algorithm)
     }

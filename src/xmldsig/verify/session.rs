@@ -5,6 +5,8 @@ use structured_asn1::memory::{MemoryError, OwnedMap, OwnedVec, Work};
 
 mod hash_uses;
 pub use hash_uses::*;
+mod key_receipt;
+pub use key_receipt::*;
 
 type RetainedOperation<'scope, 'inputs, W> = CapturedOperation<
     &'scope crate::policy::VerificationPolicy,

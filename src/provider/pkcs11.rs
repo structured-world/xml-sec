@@ -494,6 +494,10 @@ impl SigningKey for Pkcs11RsaKey {
 }
 
 impl VerifyingKey for Pkcs11RsaKey {
+    fn association_spki(&self, _algorithm: SignatureAlgorithm) -> Option<&[u8]> {
+        // Cached public CKA_MODULUS/CKA_PUBLIC_EXPONENT, not private attributes.
+        Some(&self.spki)
+    }
     fn provider_binding(&self) -> Option<&ProviderBinding> {
         Some(&self.token.binding)
     }
@@ -627,7 +631,53 @@ fn unsupported(capability: ProviderCapability<'_>) -> ProviderError {
     }
 }
 
+impl Pkcs11Provider {
+    fn verify_leaf(
+        &self,
+        key: &dyn VerifyingKey,
+        algorithm: SignatureAlgorithm,
+        data: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, DsigError> {
+        if !key
+            .provider_binding()
+            .is_some_and(|binding| binding.matches(&self.0.binding))
+        {
+            return Err(external(ExternalProviderError::Binding).into());
+        }
+        key.verify(algorithm, data, signature)
+    }
+}
+
 impl CryptoProvider for Pkcs11Provider {
+    fn verify_with_key_receipt(
+        &self,
+        key: &dyn VerifyingKey,
+        input: super::SignatureVerificationInput<'_>,
+        observer: &mut dyn FnMut(super::KeyVerificationEvent<'_>) -> Result<(), DsigError>,
+    ) -> Result<bool, DsigError> {
+        if !input.context.as_bytes().is_empty() {
+            return Err(
+                crate::xmldsig::SignatureVerificationError::UnsupportedAlgorithm {
+                    uri: input.algorithm.uri().to_owned(),
+                }
+                .into(),
+            );
+        }
+        self.require_capability(ProviderCapability::Verify(input.algorithm))?;
+        super::key_association::observed_leaf(key, observer, &|key| {
+            self.verify_leaf(key, input.algorithm, input.data, input.signature)
+        })
+    }
+
+    fn associate_verification_key(
+        &self,
+        actual: &[u8],
+        expected: structured_pkix::path::WorkingKey<'_>,
+        charge: &dyn Fn(u64) -> Result<(), structured_asn1::memory::MemoryError>,
+    ) -> Result<super::KeyAssociation, DsigError> {
+        super::key_association::compare(actual, expected, charge)
+    }
     fn recover_content_key(
         &self,
         key: &dyn KeyRecoveryKey,
@@ -717,13 +767,7 @@ impl CryptoProvider for Pkcs11Provider {
         })? {
             return Ok(result);
         }
-        if !key
-            .provider_binding()
-            .is_some_and(|binding| binding.matches(&self.0.binding))
-        {
-            return Err(external(ExternalProviderError::Binding).into());
-        }
-        key.verify(algorithm, data, signature)
+        self.verify_leaf(key, algorithm, data, signature)
     }
     fn verify_x509_signature(
         &self,

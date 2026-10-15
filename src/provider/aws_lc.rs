@@ -67,7 +67,57 @@ fn initialization(primitive: &'static str) -> ProviderError {
     ProviderError::InvalidInput(ProviderInputError::PrimitiveInitialization(primitive))
 }
 
+fn verify_leaf(
+    key: &dyn VerifyingKey,
+    algorithm: SignatureAlgorithm,
+    data: &[u8],
+    signature_value: &[u8],
+) -> Result<bool, DsigError> {
+    let spki = key
+        .verification_spki(algorithm)?
+        .ok_or_else(|| verification_unsupported(algorithm))?;
+    if !key.validate_signature_value(algorithm, signature_value)? {
+        return Ok(false);
+    }
+    let native = verification_algorithm(algorithm, spki, key.ecdsa_encoding())?;
+    if let Some(parameters) = algorithm.rsa_pss_parameters() {
+        let encoded = super::rsa_pss::encoded_public_key(spki, parameters)
+            .ok_or(crate::xmldsig::SignatureVerificationError::InvalidKeyDer)?;
+        return Ok(signature::UnparsedPublicKey::new(native, encoded)
+            .verify(data, signature_value)
+            .is_ok());
+    }
+    let public = signature::ParsedPublicKey::new(native, spki)
+        .map_err(|_| crate::xmldsig::SignatureVerificationError::InvalidKeyDer)?;
+    Ok(public.verify_sig(data, signature_value).is_ok())
+}
+
 impl CryptoProvider for AwsLcFipsProvider {
+    fn verify_with_key_receipt(
+        &self,
+        key: &dyn VerifyingKey,
+        input: super::SignatureVerificationInput<'_>,
+        observer: &mut dyn FnMut(super::KeyVerificationEvent<'_>) -> Result<(), DsigError>,
+    ) -> Result<bool, DsigError> {
+        if !input.context.as_bytes().is_empty() {
+            return Err(verification_unsupported(input.algorithm).into());
+        }
+        self.require_capability(ProviderCapability::Verify(input.algorithm))?;
+        super::key_association::observed_leaf(key, observer, &|key| {
+            verify_leaf(key, input.algorithm, input.data, input.signature)
+        })
+    }
+
+    fn associate_verification_key(
+        &self,
+        actual: &[u8],
+        expected: structured_pkix::path::WorkingKey<'_>,
+        charge: &dyn Fn(u64) -> Result<(), structured_asn1::memory::MemoryError>,
+    ) -> Result<super::KeyAssociation, DsigError> {
+        // The official safe AWS API does not expose general parsed-point
+        // equality. Unsupported aliases stay Unproven, without software fallback.
+        super::key_association::compare(actual, expected, charge)
+    }
     fn name(&self) -> &'static str {
         "aws-lc-fips"
     }
@@ -165,23 +215,7 @@ impl CryptoProvider for AwsLcFipsProvider {
         })? {
             return Ok(result);
         }
-        let spki = key
-            .verification_spki(algorithm)?
-            .ok_or_else(|| verification_unsupported(algorithm))?;
-        if !key.validate_signature_value(algorithm, signature)? {
-            return Ok(false);
-        }
-        let native = verification_algorithm(algorithm, spki, key.ecdsa_encoding())?;
-        if let Some(parameters) = algorithm.rsa_pss_parameters() {
-            let encoded = super::rsa_pss::encoded_public_key(spki, parameters)
-                .ok_or(crate::xmldsig::SignatureVerificationError::InvalidKeyDer)?;
-            return Ok(signature::UnparsedPublicKey::new(native, encoded)
-                .verify(data, signature)
-                .is_ok());
-        }
-        let public = signature::ParsedPublicKey::new(native, spki)
-            .map_err(|_| crate::xmldsig::SignatureVerificationError::InvalidKeyDer)?;
-        Ok(public.verify_sig(data, signature).is_ok())
+        verify_leaf(key, algorithm, data, signature)
     }
 
     fn verify_x509_signature(

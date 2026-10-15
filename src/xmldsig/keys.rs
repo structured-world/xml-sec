@@ -256,6 +256,13 @@ pub struct VerificationKey {
 }
 
 impl VerifyingKey for VerificationKey {
+    fn association_spki(&self, algorithm: SignatureAlgorithm) -> Option<&[u8]> {
+        if algorithm == self.algorithm {
+            Some(&self.public_key_bytes)
+        } else {
+            None
+        }
+    }
     fn verification_spki(&self, algorithm: SignatureAlgorithm) -> Result<Option<&[u8]>, DsigError> {
         if algorithm != self.algorithm {
             return Err(KeyResolutionError::AlgorithmMismatch.into());
@@ -564,6 +571,9 @@ impl VerificationKeyStorage {
 }
 
 impl VerifyingKey for PolicyBoundVerificationKey {
+    fn association_spki(&self, algorithm: SignatureAlgorithm) -> Option<&[u8]> {
+        self.key.association_spki(algorithm)
+    }
     fn verification_spki(&self, algorithm: SignatureAlgorithm) -> Result<Option<&[u8]>, DsigError> {
         // Preserve strength checks carried by this resolver-produced handle.
         if algorithm.is_rsa() {
@@ -2513,6 +2523,58 @@ mod tests {
             source.tbs().public_key().algorithm().parameters().is_none(),
             "source certificate is not rewritten"
         );
+        // Receipt association consumes the same effective PKIX state. The
+        // identical original leaf has insufficient standing parameters but
+        // becomes provable after the existing authenticated DSA transition.
+        let root_source = original.read(&resolver.config.trusted_certs[0])?;
+        let standing = structured_pkix::path::WorkingKey::standing(source.tbs().public_key());
+        let inherited = structured_pkix::path::WorkingKey::standing(root_source.tbs().public_key())
+            .subject(&source, original.memory())?;
+        let verification_key = VerificationKey {
+            algorithm: SignatureAlgorithm::DsaSha256,
+            public_key_bytes: effective.to_vec(),
+            certificate_der: None,
+            name: None,
+        };
+        let builder = super::super::SignatureBuilder::new(
+            crate::c14n::C14nAlgorithm::new(crate::c14n::C14nMode::Exclusive1_0, false),
+            SignatureAlgorithm::DsaSha256,
+        )
+        .add_reference(
+            super::super::ReferenceBuilder::new(super::super::DigestAlgorithm::Sha256)
+                .uri("")
+                .transform(super::super::Transform::Enveloped),
+        );
+        let xml = super::super::SignContext::new(&signer).sign_with_builder("<root/>", &builder)?;
+        let document = crate::XmlDocument::parse(xml)?;
+        let context = super::super::VerifyContext::new().key(&verification_key);
+        super::super::with_verified_request(
+            &document,
+            &context,
+            &super::super::VerificationRequest::default(),
+            original.memory(),
+            |session| {
+                let selected =
+                    session.select_signature(session.evidence().signatures()[0].identity())?;
+                selected
+                    .with_key_receipt(|receipt| {
+                        for (expected, outcome) in [
+                            (standing, crate::provider::KeyAssociation::Unproven),
+                            (inherited, crate::provider::KeyAssociation::Same),
+                        ] {
+                            selected
+                                .associate_key(&receipt, expected, |actual| {
+                                    assert_eq!(actual, outcome);
+                                    Ok::<_, ()>(())
+                                })
+                                .expect("inherited DSA key association");
+                        }
+                        Ok::<_, ()>(())
+                    })
+                    .expect("original successful DSA receipt");
+                Ok(())
+            },
+        )?;
         Ok(())
     }
 

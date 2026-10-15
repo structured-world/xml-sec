@@ -723,6 +723,38 @@ neither parses SignedInfo/PSS again nor resolves a key or verifies a signature
 again. Ordinary collecting verification uses a monomorphized no-op capture;
 scoped receipts retain only accounted metadata, without copying XML or payloads.
 
+## Actual Selected-Key Receipts
+
+`SelectedSignature::with_key_receipt` borrows an unforgeable receipt from the
+original successful verification. Built-in providers report the actual successful
+leaf of a composite key, not the first key or certificate advertised by a resolver.
+Only public key material is retained, under the current execution account. HMAC
+secrets and private/token key attributes are never copied into receipts.
+
+`associate_key` accepts that receipt and the caller's published PKIX `WorkingKey`,
+including its effective parameters. It rejects another operation, Signature,
+document generation or provider before comparison/callbacks. Results are `Same`,
+`Mismatch`, or `Unproven`; none establishes certificate authorization or trust.
+No resolver, signature verification, fingerprint comparison, or SPKI re-encoding
+is performed to manufacture the association.
+
+DSA needs the complete effective y/p/q/g; absent parameters remain unproven.
+PSS restrictions must be established equal, not merely compatible with the
+particular signature method. Different encodings alone are not a mismatch.
+RustCrypto can compare compressed/uncompressed forms on the supported NIST
+curves through its own point decoder. The official AWS safe API cannot establish
+those aliases, so that case remains explicitly unproven without software fallback.
+PKCS11 RSA uses its actual cached public token attributes, without private export.
+
+Custom providers may implement `verify_with_key_receipt` and
+`associate_verification_key`. Their defaults preserve verification but return
+unproven association. A custom leaf exposes only its own successful public material
+through `VerifyingKey::association_spki`; this does not enable native verification
+of an otherwise opaque handle. An ambiguous composite that reports multiple
+successes yields no arbitrary winning-key proof. Current Work pays every retained
+capacity and later comparison; receipt admission failure cannot be swallowed by
+candidate recovery.
+
 ## RSA-PSS Parameters
 
 The nine fixed RSA-PSS methods use MGF1 with the signature digest and a salt of that digest's
