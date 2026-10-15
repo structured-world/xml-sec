@@ -508,14 +508,20 @@ fn node_kinds_semantically_equivalent(left: &NodeKind, right: &NodeKind) -> bool
 
 #[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
 fn namespace_axes_equivalent(left: &[NamespaceData], right: &[NamespaceData]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
+    // Namespaces in XML 1.0 §3: xml is predefined, whether or not explicitly
+    // declared. Backends may omit that redundant declaration from their axis.
+    // https://www.w3.org/TR/2009/REC-xml-names-20091208/#ns-decl
     let mut remaining = HashMap::with_capacity(left.len());
     for item in left {
+        if item.prefix.as_deref() == Some("xml") {
+            continue;
+        }
         *remaining.entry(item).or_insert(0_usize) += 1;
     }
-    right.iter().all(|item| {
+    let matched = right.iter().all(|item| {
+        if item.prefix.as_deref() == Some("xml") {
+            return true;
+        }
         remaining.get_mut(item).is_some_and(|count| {
             if *count == 0 {
                 return false;
@@ -523,7 +529,8 @@ fn namespace_axes_equivalent(left: &[NamespaceData], right: &[NamespaceData]) ->
             *count -= 1;
             true
         })
-    })
+    });
+    matched && remaining.values().all(|count| *count == 0)
 }
 
 #[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]

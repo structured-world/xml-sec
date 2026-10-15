@@ -6,6 +6,9 @@
 use crate::document::{DocumentView, NodeIdentity, XmlDocumentError};
 use structured_asn1::memory::{MemoryError, Work};
 
+mod scalar;
+pub use scalar::*;
+
 /// Schema boolean attribute without an invented default for an absent value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BooleanAttribute {
@@ -31,7 +34,7 @@ pub enum ScalarError {
     Resource(MemoryError),
 }
 
-fn charge_bytes<W: Work>(work: &W, bytes: usize) -> Result<(), ScalarError> {
+pub(super) fn charge_bytes<W: Work>(work: &W, bytes: usize) -> Result<(), ScalarError> {
     let bytes =
         u64::try_from(bytes).map_err(|_| ScalarError::Resource(MemoryError::WorkExceeded))?;
     work.charge_work(bytes).map_err(ScalarError::Resource)

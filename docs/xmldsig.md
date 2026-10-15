@@ -663,6 +663,34 @@ requirements and acceptance decisions.
 allocation and preserves absence separately from explicit false/malformed values.
 It does not authenticate the owner or supply application-profile defaults.
 
+## Exact Scoped XML Inspection
+
+The `xmldsig::extension` module exposes paid inspection of the original semantic
+document without another XML parser. `visit_direct_attributes` visits every
+non-namespace attribute once, preserving its owner identity, expanded name and
+XML-normalized value. `visit_in_scope_namespaces` exposes bindings separately;
+these are the in-scope namespace axis, not evidence of direct declarations.
+
+`with_scalar` reads an original `LexicalSource::Attribute` or `SimpleContent`
+under the current generic `Work`. Its scoped callback receives the original
+XML-normalized lexical text independently of the schema outcome. Absent,
+complex content, malformed base-type syntax and unsupported schema types are
+distinct from document/resource failures and the callback's own typed error.
+Temporary joining and XSD whitespace collapse use accounted storage only when
+borrowing cannot suffice, and release it on success or refusal.
+
+Supported base types are XSD 1.0 `boolean`, `dateTime`, `ID` and `anyURI`.
+`DateTimeLexical` preserves arbitrary year/fraction digits and absent timezone;
+it describes lexical components, including hour 24 and XSD 1.0's second 60,
+not normalized UTC fields or proof that a UTC leap second occurred. Unlike
+libxml2's narrower acceptance, XSD 1.0 Appendix D.1 permits second 60.
+It does not convert through RFC 3339, floating point or finite-width years.
+ID inspection proves only lexical validity and never registers an attribute or
+changes existing duplicate-ID handling. URI inspection applies XSD escaping and
+generic URI-reference semantics, not a URL/scheme policy; it does not resolve
+XML Base, fetch a resource or authenticate its owner. XAdES/profile requirements
+and trust decisions remain with the consumer.
+
 ## RSA-PSS Parameters
 
 The nine fixed RSA-PSS methods use MGF1 with the signature digest and a salt of that digest's
