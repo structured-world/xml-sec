@@ -445,6 +445,49 @@ fn scalar_join_admits_byte_work_before_requesting_capacity() {
 }
 
 #[test]
+fn scalar_join_admits_trailing_child_visits_before_requesting_capacity() {
+    // Comments after two text fragments still require a second traversal.
+    // Its known work must refuse before a join can request unavailable memory.
+    let document = XmlDocument::parse(format!(
+        "<r Id='r'>a<!--split-->b{}</r>",
+        "<!--tail-->".repeat(64)
+    ))
+    .unwrap();
+    for (local, aggregate) in [(100, 100000), (100000, 100)] {
+        let memory = Memory::new(Arc::new(MemoryAccount::new(0, aggregate)));
+        let parser = Parser::new(
+            Encoding::Der,
+            Limits {
+                max_work: local,
+                ..Limits::default()
+            },
+            memory.clone(),
+        );
+        let reader = parser.read(&[], 0).unwrap();
+        document.with_view(|view| {
+            let result = with_scalar(
+                view,
+                view.node_for_id("r", &[]).unwrap(),
+                LexicalSource::SimpleContent,
+                ScalarType::AnyUri,
+                &reader.execution(),
+                |_| panic!("work refusal must precede callback"),
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err::<(), InspectionError<()>>(InspectionError::Processing(
+                        ScalarError::Resource(MemoryError::WorkExceeded)
+                    ))
+                ),
+                "{result:?}"
+            );
+            assert_eq!(memory.used(), 0);
+        });
+    }
+}
+
+#[test]
 fn xsd10_leap_second_lexical_components_are_not_posix_time() {
     // XSD 1.0 Appendix D.1 permits 60, unlike XSD 1.1 and libxml2.
     // This lexical receipt neither certifies a UTC adjustment nor normalizes it.

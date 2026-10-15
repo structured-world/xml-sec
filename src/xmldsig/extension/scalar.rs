@@ -254,8 +254,12 @@ pub fn with_scalar<W: Work, R, E>(
                 // Validate structure before creating any joined prefix. A malformed
                 // simple-content source must not allocate only to discard the text.
                 let mut text_bytes = 0usize;
+                let mut child_visits = 0usize;
                 for child in node.children() {
                     charge_bytes(work, 1)?;
+                    child_visits = child_visits.checked_add(1).ok_or(ScalarError::Resource(
+                        structured_asn1::memory::MemoryError::WorkExceeded,
+                    ))?;
                     if child.is_element() {
                         return Ok(Err(()));
                     }
@@ -272,9 +276,11 @@ pub fn with_scalar<W: Work, R, E>(
                 // Copies have their own OwnedVec work charge, but admit every
                 // subsequent linear pass before constructing a doomed join.
                 admit_scalar_passes(work, text_bytes)?;
+                // The second traversal also visits comments and PIs, even when
+                // no text remains. Admit those visits before the first join.
+                charge_bytes(work, child_visits)?;
                 let mut value = Text::Borrowed("");
                 for child in node.children() {
-                    charge_bytes(work, 1)?;
                     if child.is_element() {
                         return Ok(Err(()));
                     }
