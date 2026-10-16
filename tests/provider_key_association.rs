@@ -32,6 +32,68 @@ fn ordinary_rustcrypto_candidate_traversal_is_bounded() {
     candidate_limits::assert_provider_candidate_limits(&RustCryptoProvider);
 }
 
+#[test]
+fn receipt_observer_work_refusal_is_terminal() {
+    // Recovering composites must not erase a refused admission or receipt,
+    // nor dispatch another leaf after either observer event refuses work.
+    use std::cell::Cell;
+    use xml_sec::provider::{KeyVerificationEvent, SignatureVerificationInput};
+    use xml_sec::xmldsig::{DsigError, SignatureAlgorithm, SignatureContext, VerifyingKey};
+    struct Leaf<'a>(&'a Cell<usize>);
+    impl VerifyingKey for Leaf<'_> {
+        fn verify(&self, _: SignatureAlgorithm, _: &[u8], _: &[u8]) -> Result<bool, DsigError> {
+            self.0.set(self.0.get() + 1);
+            Ok(true)
+        }
+    }
+    struct Recover<'a>(&'a Cell<usize>);
+    impl VerifyingKey for Recover<'_> {
+        fn verify_candidate_keys(
+            &self,
+            visitor: &mut dyn FnMut(&dyn VerifyingKey) -> Result<bool, DsigError>,
+        ) -> Result<Option<bool>, DsigError> {
+            let _ = visitor(&Leaf(self.0));
+            let _ = visitor(&Leaf(self.0));
+            Ok(Some(true))
+        }
+        fn verify(&self, _: SignatureAlgorithm, _: &[u8], _: &[u8]) -> Result<bool, DsigError> {
+            panic!("container is not a leaf")
+        }
+    }
+    for refuse_verified in [false, true] {
+        let leaves = Cell::new(0);
+        let mut events = 0;
+        let mut refused = false;
+        let result = RustCryptoProvider.verify_with_key_receipt(
+            &Recover(&leaves),
+            SignatureVerificationInput {
+                algorithm: SignatureAlgorithm::RsaSha256,
+                context: &SignatureContext::default(),
+                data: &[],
+                signature: &[],
+            },
+            &mut |event| {
+                assert!(!refused, "observer called after terminal refusal");
+                events += 1;
+                if matches!(event, KeyVerificationEvent::Verified(_)) == refuse_verified
+                    && events > 1
+                {
+                    refused = true;
+                    return Err(structured_asn1::memory::MemoryError::WorkExceeded.into());
+                }
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(DsigError::SharedExecution(
+                structured_asn1::memory::MemoryError::WorkExceeded
+            ))
+        ));
+        assert_eq!(leaves.get(), usize::from(refuse_verified));
+    }
+}
+
 #[cfg(feature = "aws-lc-fips")]
 #[test]
 fn ordinary_aws_candidate_traversal_is_bounded() {

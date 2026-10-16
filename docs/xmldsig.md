@@ -790,7 +790,9 @@ Resolution and every exposed sibling/nested candidate share the original
 `ResourcePolicy::max_key_candidates` allowance. Admission precedes candidate
 policy and crypto work; a composite cannot recover from that terminal refusal.
 The primitive provider boundary also bounds total fan-out and nesting by its
-absolute candidate ceiling.
+absolute candidate ceiling. Direct `verify_with_key_receipt` calls preserve an
+observer's `WorkExceeded` from either event as terminal, even when a composite
+swallows it: no later leaf or observer callback runs and no success is returned.
 
 ## RSA-PSS Parameters
 

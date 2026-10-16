@@ -49,10 +49,29 @@ where
     O: FnMut(KeyVerificationEvent<'_>) -> Result<(), DsigError> + ?Sized,
 {
     let mut admitted = 0;
-    let result = observed_at_depth(key, observer, verify_leaf, 0, &mut admitted);
+    let mut observer_refused = false;
+    let result = observed_at_depth(
+        key,
+        &mut |event| {
+            if observer_refused {
+                return Err(MemoryError::WorkExceeded.into());
+            }
+            let result = observer(event);
+            if matches!(
+                result,
+                Err(DsigError::SharedExecution(MemoryError::WorkExceeded))
+            ) {
+                observer_refused = true;
+            }
+            result
+        },
+        verify_leaf,
+        0,
+        &mut admitted,
+    );
     // A composite may recover from a visitor error, but cannot recover capacity
     // after a terminal hard refusal and report an unchecked later success.
-    if admitted > crate::hard_limits::KEY_CANDIDATE_CEILING {
+    if observer_refused || admitted > crate::hard_limits::KEY_CANDIDATE_CEILING {
         return Err(MemoryError::WorkExceeded.into());
     }
     result
