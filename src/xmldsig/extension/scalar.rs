@@ -129,6 +129,8 @@ pub enum ScalarType<'a> {
     Boolean,
     /// XML Schema 1.0 integer validity, without finite-width conversion.
     Integer,
+    /// XML Schema 1.0 QName, expanded in the original owner's namespace scope.
+    QName,
     /// XML Schema 1.0 dateTime, not RFC 3339 or XSD 1.1.
     DateTime,
     /// XML Schema 1.0 ID lexical facts, without registering an ID.
@@ -169,6 +171,15 @@ pub struct DateTimeLexical<'a> {
     pub timezone_minutes: Option<i16>,
 }
 
+/// Expanded QName value, not an element/attribute name or a resolved schema type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QNameValue<'a> {
+    /// Original in-scope namespace URI, or None when no default binding exists.
+    pub namespace: Option<&'a str>,
+    /// Validated original local component, without a prefix or whitespace.
+    pub local_name: &'a str,
+}
+
 /// A supported schema value, preserving exact lexical data when required.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarValue<'a> {
@@ -177,6 +188,8 @@ pub enum ScalarValue<'a> {
     /// Valid arbitrary-precision integer spelling; not a numeric value or a
     /// claim about derived types such as int, nonNegativeInteger or totalDigits.
     Integer,
+    /// Expanded original QName, without type-definition lookup or schema loading.
+    QName(QNameValue<'a>),
     /// Exact dateTime lexical components, not canonicalized value fields.
     DateTime(DateTimeLexical<'a>),
     /// Collapsed NCName; no ID registration, uniqueness or authentication claim.
@@ -194,6 +207,9 @@ pub enum ScalarFact<'a> {
     ComplexContent,
     /// A present lexical value is outside the requested base datatype.
     Malformed,
+    /// A syntactically valid QName uses this prefix without an in-scope binding.
+    /// This is a value-interpretation fact, not a terminal processing failure.
+    UnboundPrefix(&'a str),
     /// The requested datatype has no implemented semantics.
     Unsupported,
     /// A supported base-datatype value.
@@ -339,7 +355,9 @@ pub fn with_scalar<W: Work, R, E>(
     };
     let lexical = value.view();
     let collapsed = match datatype {
-        ScalarType::Other { .. } | ScalarType::Integer => Text::Borrowed(lexical),
+        ScalarType::Other { .. } | ScalarType::Integer | ScalarType::QName => {
+            Text::Borrowed(lexical)
+        }
         _ => collapse(lexical, work).map_err(InspectionError::Processing)?,
     };
     let text = collapsed.view();
@@ -356,6 +374,9 @@ pub fn with_scalar<W: Work, R, E>(
             } else {
                 ScalarFact::Malformed
             }
+        }
+        ScalarType::QName => {
+            inspect_qname(node, text, work).map_err(InspectionError::Processing)?
         }
         ScalarType::DateTime => parse_date_time(text)
             .map(|value| ScalarFact::Value(ScalarValue::DateTime(value)))
@@ -387,6 +408,71 @@ pub fn with_scalar<W: Work, R, E>(
 
 fn whitespace(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
+}
+
+fn inspect_qname<'a>(
+    node: crate::xml::dom::Node<'a, 'a>,
+    text: &'a str,
+    work: &impl Work,
+) -> Result<ScalarFact<'a>, ScalarError> {
+    // XSD 1.0 Part 2 §§3.2.18,4.3.6: a QName contains no internal whitespace,
+    // so trimming XML whitespace is collapse-equivalent without a new buffer.
+    // Namespaces in XML 1.0 §3 supplies the shared NCName grammar.
+    // https://www.w3.org/TR/2004/REC-xmlschema-2-20041028/#QName
+    // https://www.w3.org/TR/2009/REC-xml-names-20091208/#ns-qualnames
+    let text = text.trim_matches([' ', '\t', '\r', '\n']);
+    let (prefix, local_name) = match text.split_once(':') {
+        Some((prefix, local_name)) => {
+            if !crate::xml::is_xml_ncname(prefix) {
+                return Ok(ScalarFact::Malformed);
+            }
+            (Some(prefix), local_name)
+        }
+        None => (None, text),
+    };
+    if !crate::xml::is_xml_ncname(local_name) {
+        return Ok(ScalarFact::Malformed);
+    }
+    // XSD 1.0 Part 1 §3.15.3: QName *values*, including xsi:type (§2.6.1),
+    // use the containing element's bindings, including the default namespace.
+    // This differs from the namespace rule for unprefixed attribute *names*.
+    // A binding does not resolve the value to any schema declaration (§3.15.4).
+    // https://www.w3.org/TR/2004/REC-xmlschema-1-20041028/#src-qname
+    let mut namespace = None;
+    if prefix == Some("xml") {
+        // Namespaces in XML 1.0 §3: xml is bound even without a declaration.
+        // https://www.w3.org/TR/2009/REC-xml-names-20091208/#ns-decl
+        const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
+        charge_bytes(work, 1 + 3 + XML_NAMESPACE.len())?;
+        namespace = Some(XML_NAMESPACE);
+    } else {
+        for binding in node.namespaces() {
+            charge_bytes(work, 1)?;
+            if let Some(name) = binding.name() {
+                charge_bytes(work, name.len())?;
+            }
+            if binding.name() != prefix {
+                continue;
+            }
+            charge_bytes(work, binding.uri().len())?;
+            // An empty default declaration removes the binding (§6.2);
+            // it is not a namespace whose name is the empty string.
+            // https://www.w3.org/TR/2009/REC-xml-names-20091208/#defaulting
+            if !binding.uri().is_empty() {
+                namespace = Some(binding.uri());
+            }
+            break;
+        }
+    }
+    if let Some(prefix) = prefix
+        && namespace.is_none()
+    {
+        return Ok(ScalarFact::UnboundPrefix(prefix));
+    }
+    Ok(ScalarFact::Value(ScalarValue::QName(QNameValue {
+        namespace,
+        local_name,
+    })))
 }
 
 fn valid_integer(text: &str) -> bool {

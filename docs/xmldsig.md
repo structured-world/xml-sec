@@ -682,7 +682,7 @@ The known linear-pass bound is admitted before joining fragments. If both Work
 and join capacity are insufficient, Work refusal precedes the allocation request;
 OwnedVec independently admits the actual copying and retained capacity.
 
-Supported base types are XSD 1.0 `boolean`, `integer`, `dateTime`, `ID` and `anyURI`.
+Supported base types are XSD 1.0 `boolean`, `integer`, `QName`, `dateTime`, `ID` and `anyURI`.
 `ScalarType::Integer` returns the marker `ScalarValue::Integer` for a valid
 optional sign followed by one or more ASCII digits, with schema XML whitespace
 handling. Arbitrarily long values, leading zeros and signed zero remain valid;
@@ -690,6 +690,24 @@ no machine-number conversion, canonicalization or normalized string is produced.
 Contiguous validation, even of malformed internal whitespace, needs no owned
 capacity. This is base `integer` validity, not derived-type range/facet validation
 (for example `int` or `nonNegativeInteger`), authentication or profile acceptance.
+`ScalarType::QName` returns `ScalarValue::QName(QNameValue { namespace,
+local_name })`, borrowing the expanded value from the original owner's namespace
+context and the scoped lexical text. Namespace absence is `None`; an empty default
+declaration removes that binding. Prefixes are case-sensitive, are not Unicode
+normalized, and may be inherited or rebound. The `xml` prefix is implicitly bound.
+The default namespace applies to unprefixed QName **values**, including `xsi:type`,
+even though it does not apply to unprefixed attribute **names**. This follows
+[XSD 1.0 Structures section 3.15.3](https://www.w3.org/TR/2004/REC-xmlschema-1-20041028/#src-qname).
+Malformed QName syntax is `Malformed`; valid syntax with an undeclared prefix is
+`UnboundPrefix(prefix)`. Neither is a processing exception or a type declaration.
+Contiguous input needs no normalization allocation; split lexical input uses the
+existing accounted join. Namespace lookup is paid through current Work before
+binding comparison or returning its URI. Select `xsi:type` as an attribute with
+namespace `http://www.w3.org/2001/XMLSchema-instance` and local name `type`.
+Existing direct-attribute/boolean inspection handles other original xsi values;
+declaration lookup, derivation/nillability, hints and profile acceptance remain
+consumer responsibilities. No schema fetch, schema engine or `SchemaValid` claim
+is introduced.
 `DateTimeLexical` preserves arbitrary year/fraction digits and absent timezone;
 it describes lexical components, including hour 24 and XSD 1.0's second 60,
 not normalized UTC fields or proof that a UTC leap second occurred. Unlike
