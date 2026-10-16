@@ -112,7 +112,7 @@ fn compare_with_points(
     charge: &dyn Fn(u64) -> Result<(), MemoryError>,
     rustcrypto_points: bool,
 ) -> Result<KeyAssociation, DsigError> {
-    use der::Decode as _;
+    use der::{Decode as _, Tagged as _};
     // Borrowed DER decoding and comparisons are linear in the supplied source;
     // admit their complete byte scans before entering either codec.
     let size = actual
@@ -134,29 +134,69 @@ fn compare_with_points(
         return Ok(KeyAssociation::Unproven);
     };
     let algorithm = expected.key().algorithm();
-    if actual.algorithm.oid.as_bytes() != algorithm.algorithm().as_bytes() {
-        return Ok(KeyAssociation::Unproven);
-    }
-    let parameters = match expected.parameters() {
+    let rsa_pss = der::asn1::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.10");
+    // RFC 4055 §3.1: PSS parameters are absent or RSASSA-PSS-params, never
+    // NULL. PSS does not inherit parameters; retain the original field rather
+    // than the generic WorkingKey projection which treats NULL as absent.
+    // https://www.rfc-editor.org/rfc/rfc4055#section-3.1
+    let effective_parameters = if algorithm.algorithm().as_bytes() == rsa_pss.as_bytes() {
+        algorithm.parameters()
+    } else {
+        expected.parameters()
+    };
+    let parameters = match effective_parameters {
         Some(bytes) => match der::asn1::AnyRef::from_der(bytes) {
             Ok(value) => Some(value),
             Err(_) => return Ok(KeyAssociation::Unproven),
         },
         None => None,
     };
-    if actual.algorithm.oid == pkcs1::ALGORITHM_OID {
+    let expected_oid = algorithm.algorithm().as_bytes();
+    let actual_rsa =
+        actual.algorithm.oid == pkcs1::ALGORITHM_OID || actual.algorithm.oid == rsa_pss;
+    let expected_rsa =
+        expected_oid == pkcs1::ALGORITHM_OID.as_bytes() || expected_oid == rsa_pss.as_bytes();
+    if actual_rsa && expected_rsa {
         // RFC 3279 §2.3.1: RSA key identity consists of n and e. Omitted
         // versus NULL parameters are tolerated by the existing RSA codec.
         // https://www.rfc-editor.org/rfc/rfc3279#section-2.3.1
-        if actual
-            .algorithm
-            .parameters
-            .is_some_and(|value| !value.is_null())
-            || parameters.is_some_and(|value| !value.is_null())
+        if (actual.algorithm.oid == pkcs1::ALGORITHM_OID
+            && actual
+                .algorithm
+                .parameters
+                .is_some_and(|value| !value.is_null()))
+            || (expected_oid == pkcs1::ALGORITHM_OID.as_bytes()
+                && parameters.is_some_and(|value| !value.is_null()))
+            || (actual.algorithm.oid == rsa_pss
+                && actual
+                    .algorithm
+                    .parameters
+                    .is_some_and(|value| value.tag() != der::Tag::Sequence))
+            || (expected_oid == rsa_pss.as_bytes()
+                && parameters.is_some_and(|value| value.tag() != der::Tag::Sequence))
         {
             return Ok(KeyAssociation::Unproven);
         }
-        return Ok(rsa_components(bits, expected_bits));
+        let components = rsa_components(bits, expected_bits);
+        // RFC 4055 §3.3 constrains PSS use independently of n/e. Comparing
+        // components across rsaEncryption/PSS can prove a different key, but
+        // equal components do not prove equal effective algorithm restrictions.
+        // This Same/Mismatch/Unproven classification is product reporting.
+        // https://www.rfc-editor.org/rfc/rfc4055#section-3.3
+        return Ok(
+            if components == KeyAssociation::Same
+                && (actual.algorithm.oid.as_bytes() != expected_oid
+                    || (actual.algorithm.oid == rsa_pss
+                        && actual.algorithm.parameters != parameters))
+            {
+                KeyAssociation::Unproven
+            } else {
+                components
+            },
+        );
+    }
+    if actual.algorithm.oid.as_bytes() != expected_oid {
+        return Ok(KeyAssociation::Unproven);
     }
     let dsa = der::asn1::ObjectIdentifier::new_unwrap("1.2.840.10040.4.1");
     if actual.algorithm.oid == dsa {
@@ -189,17 +229,27 @@ fn compare_with_points(
             },
         );
     }
-    if actual.algorithm.oid == der::asn1::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.10") {
-        let components = rsa_components(bits, expected_bits);
-        // PSS restrictions cannot make different n/e the same public key.
-        // Equal components alone do not establish equal effective restrictions
-        // (RFC 4055 §3.3); this distinction is association reporting, not trust.
-        // https://www.rfc-editor.org/rfc/rfc4055#section-3.3
+    #[cfg(feature = "experimental-pq")]
+    if rustcrypto_points
+        && let Some(algorithm) = crate::xmldsig::PqAlgorithm::from_oid(actual.algorithm.oid)
+    {
+        // RFC 9881 §§2,4 / RFC 9909 §§3,5 require absent parameters and
+        // fixed-width raw public encodings. Validate both before byte equality;
+        // identical malformed encodings do not establish key association.
+        // https://www.rfc-editor.org/rfc/rfc9881.html#section-4
+        // https://www.rfc-editor.org/rfc/rfc9909.html#section-5
         return Ok(
-            if components == KeyAssociation::Same && actual.algorithm.parameters != parameters {
+            if actual.algorithm.parameters.is_some()
+                || expected.key().algorithm().parameters().is_some()
+                || parameters.is_some()
+                || !valid_pq_public_encoding(algorithm, bits)
+                || !valid_pq_public_encoding(algorithm, expected_bits)
+            {
                 KeyAssociation::Unproven
+            } else if bits == expected_bits {
+                KeyAssociation::Same
             } else {
-                components
+                KeyAssociation::Mismatch
             },
         );
     }
@@ -212,7 +262,13 @@ fn compare_with_points(
         // only inside the selected RustCrypto provider, never as native fallback.
         // https://www.rfc-editor.org/rfc/rfc8410#section-4
         // https://www.rfc-editor.org/rfc/rfc8032#section-5.1.3
-        if actual.algorithm.parameters.is_some() || parameters.is_some() {
+        // WorkingKey's generic effective projection treats NULL as absent;
+        // the original encoding is still governed by RFC 8410 §3.
+        // https://www.rfc-editor.org/rfc/rfc8410#section-3
+        if actual.algorithm.parameters.is_some()
+            || expected.key().algorithm().parameters().is_some()
+            || parameters.is_some()
+        {
             return Ok(KeyAssociation::Unproven);
         }
         macro_rules! compare_edwards {
@@ -324,6 +380,37 @@ fn compare_with_points(
         );
     }
     Ok(KeyAssociation::Unproven)
+}
+
+#[cfg(feature = "experimental-pq")]
+fn valid_pq_public_encoding(algorithm: crate::xmldsig::PqAlgorithm, bytes: &[u8]) -> bool {
+    use crate::rustcrypto_ml_dsa as ml_dsa;
+    use crate::xmldsig::PqAlgorithm;
+    // FIPS 204 §7.2 Algorithms 22–23: pkDecode is a bijection over the
+    // fixed-size rho/t1 encoding (every packed 10-bit coefficient is valid).
+    // Admission uses the selected backend's borrowed encoded-key type, not
+    // matrix expansion, key cloning or a second signature verification.
+    // https://doi.org/10.6028/NIST.FIPS.204
+    fn ml<P: ml_dsa::MlDsaParams>(bytes: &[u8]) -> bool {
+        <&ml_dsa::EncodedVerifyingKey<P>>::try_from(bytes).is_ok()
+    }
+    // FIPS 205 §9.1 / RFC 9909 §5: every seed||root of width 2*n is a
+    // public encoding; backend-associated width validation needs no copy.
+    // https://www.rfc-editor.org/rfc/rfc9909.html#section-5
+    fn slh<P: slh_dsa::ParameterSet>(bytes: &[u8]) -> bool {
+        <&hybrid_array::Array<u8, P::VkLen>>::try_from(bytes).is_ok()
+    }
+    match algorithm {
+        PqAlgorithm::MlDsa44 => ml::<ml_dsa::MlDsa44>(bytes),
+        PqAlgorithm::MlDsa65 => ml::<ml_dsa::MlDsa65>(bytes),
+        PqAlgorithm::MlDsa87 => ml::<ml_dsa::MlDsa87>(bytes),
+        PqAlgorithm::SlhDsaSha2_128f => slh::<slh_dsa::Sha2_128f>(bytes),
+        PqAlgorithm::SlhDsaSha2_128s => slh::<slh_dsa::Sha2_128s>(bytes),
+        PqAlgorithm::SlhDsaSha2_192f => slh::<slh_dsa::Sha2_192f>(bytes),
+        PqAlgorithm::SlhDsaSha2_192s => slh::<slh_dsa::Sha2_192s>(bytes),
+        PqAlgorithm::SlhDsaSha2_256f => slh::<slh_dsa::Sha2_256f>(bytes),
+        PqAlgorithm::SlhDsaSha2_256s => slh::<slh_dsa::Sha2_256s>(bytes),
+    }
 }
 
 fn rsa_components(actual: &[u8], expected: &[u8]) -> KeyAssociation {

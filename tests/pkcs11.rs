@@ -17,6 +17,9 @@ use xml_sec::provider::{
 use xml_sec::xmldsig::{DigestAlgorithm, SignatureAlgorithm, VerifyingKey as _};
 use xml_sec::xmlenc::{DataEncryptionAlgorithm, KeyWrapAlgorithm};
 
+#[path = "support/provider_candidate_limits.rs"]
+mod candidate_limits;
+
 #[test]
 fn isolated_token_operations_and_failures() {
     // Refuse initialization unless the maintained harness supplies a disposable store.
@@ -56,6 +59,7 @@ fn isolated_token_operations_and_failures() {
         session.init_pin(&pin).unwrap();
     }
     let provider = Pkcs11Provider::new(module, slot).unwrap();
+    candidate_limits::assert_provider_candidate_limits(&provider);
     // PKCS#11 Base 2.40 §5.6: the provider must not require token-write access.
     // A live R/O session prevents SO login, proving the mode without exposing
     // the provider's private session or modifying a real token's protection flags.

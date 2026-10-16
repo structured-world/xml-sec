@@ -210,12 +210,9 @@ impl CryptoProvider for AwsLcFipsProvider {
         if !self.supports(ProviderCapability::Verify(algorithm)) {
             return Err(verification_unsupported(algorithm).into());
         }
-        if let Some(result) = key.verify_candidate_keys(&mut |candidate| {
-            self.verify(candidate, algorithm, data, signature)
-        })? {
-            return Ok(result);
-        }
-        verify_leaf(key, algorithm, data, signature)
+        super::key_association::observed_leaf(key, &mut |_| Ok(()), &|key| {
+            verify_leaf(key, algorithm, data, signature)
+        })
     }
 
     fn verify_x509_signature(
