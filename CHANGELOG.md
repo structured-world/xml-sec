@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.23](https://github.com/structured-world/xml-sec/compare/v0.1.22...v0.1.23) - 2026-10-17
+
+### Added
+
+- *(dsig)* fund scoped reference queries ([#235](https://github.com/structured-world/xml-sec/pull/235))
+- *(xml)* inspect original expanded QNames ([#234](https://github.com/structured-world/xml-sec/pull/234))
+- *(xml)* inspect scoped XSD integers ([#232](https://github.com/structured-world/xml-sec/pull/232))
+- *(dsig)* retain selected-key receipts ([#229](https://github.com/structured-world/xml-sec/pull/229))
+- *(dsig)* expose original hash uses ([#228](https://github.com/structured-world/xml-sec/pull/228))
+- *(xml)* add scoped scalar inspection ([#226](https://github.com/structured-world/xml-sec/pull/226))
+- add authenticated reference replay ([#225](https://github.com/structured-world/xml-sec/pull/225))
+- *(config)* add explicit policy configuration ([#220](https://github.com/structured-world/xml-sec/pull/220))
+- *(policy)* add profiles and shared PKIX ([#218](https://github.com/structured-world/xml-sec/pull/218))
+
+### Fixed
+
+- *(security)* protect owned encryption secrets ([#214](https://github.com/structured-world/xml-sec/pull/214))
+
 ## [0.1.22](https://github.com/structured-world/xml-sec/compare/v0.1.21...v0.1.22) - 2026-10-11
 
 ### Added
