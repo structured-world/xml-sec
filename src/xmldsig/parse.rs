@@ -842,6 +842,13 @@ pub enum ParseError {
         uri: String,
     },
 
+    /// Unsupported algorithm whose URI retains its current-query capacity charge.
+    #[error("unsupported algorithm: {uri}")]
+    AccountedUnsupportedAlgorithm {
+        /// The unrecognized algorithm URI.
+        uri: structured_asn1::memory::OwnedText,
+    },
+
     /// Base64 decode error.
     #[error("base64 decode error: {0}")]
     Base64(String),
@@ -2049,37 +2056,53 @@ fn parse_inclusive_prefixes<'a>(node: Node<'a, '_>) -> Result<Option<&'a str>, P
 }
 
 /// Read the original timestamp method, not a caller-supplied algorithm hint.
-pub(crate) fn parse_replay_canonicalization_method<'a>(
+/// The current query pays for every inspected node and owns each diagnostic.
+pub(crate) fn parse_replay_canonicalization_method<'a, 's, S: transforms::ParseStorage<'s>>(
     node: Node<'a, '_>,
+    scratch: &S,
 ) -> Result<(C14nAlgorithm, Option<&'a str>), ParseError> {
-    verify_ds_element(node, "CanonicalizationMethod")?;
-    ensure_no_non_whitespace_text(node, "CanonicalizationMethod")?;
-    let uri = required_algorithm_attr(node, "CanonicalizationMethod")?;
+    element_mismatch(node, "CanonicalizationMethod", XMLDSIG_NS, "ds", scratch)?;
+    ensure_charged_whitespace_text(node, "CanonicalizationMethod", scratch)?;
+    scratch
+        .charge(node.attributes().len())
+        .map_err(super::types::TransformError::from)?;
+    let uri = node.attribute("Algorithm").ok_or_else(|| {
+        scratch.structure(format_args!(
+            "missing Algorithm attribute on <CanonicalizationMethod>"
+        ))
+    })?;
     let algorithm =
-        C14nAlgorithm::from_uri(uri).ok_or_else(|| ParseError::UnsupportedAlgorithm {
-            uri: uri.to_string(),
-        })?;
-    let mut parameter_seen = false;
+        C14nAlgorithm::from_uri(uri).ok_or_else(|| scratch.unsupported_algorithm(uri))?;
+    let mut prefixes = None;
     for child in element_children(node) {
         // Exclusive C14N §4 defines one empty InclusiveNamespaces parameter;
         // other known algorithms here have no parameter grammar.
         // https://www.w3.org/TR/2002/REC-xml-exc-c14n-20020718/#def-InclusiveNamespaces-PrefixList
-        if parameter_seen
+        if prefixes.is_some()
             || algorithm.mode() != crate::c14n::C14nMode::Exclusive1_0
             || !child.has_tag_name((
                 "http://www.w3.org/2001/10/xml-exc-c14n#",
                 "InclusiveNamespaces",
             ))
         {
-            return Err(ParseError::InvalidStructure(
-                "invalid canonicalization parameter".into(),
-            ));
+            return Err(scratch.structure(format_args!("invalid canonicalization parameter")));
         }
-        ensure_no_element_children(child, "InclusiveNamespaces")?;
-        ensure_no_non_whitespace_text(child, "InclusiveNamespaces")?;
-        parameter_seen = true;
+        ensure_charged_whitespace_text(child, "InclusiveNamespaces", scratch)?;
+        if child.children().any(|child| child.is_element()) {
+            return Err(scratch.structure(format_args!(
+                "InclusiveNamespaces must not contain child elements"
+            )));
+        }
+        scratch
+            .charge(child.attributes().len())
+            .map_err(super::types::TransformError::from)?;
+        prefixes = Some(child.attribute("PrefixList").ok_or_else(|| {
+            scratch.structure(format_args!(
+                "missing PrefixList attribute on <InclusiveNamespaces>"
+            ))
+        })?);
     }
-    Ok((algorithm, parse_inclusive_prefixes(node)?))
+    Ok((algorithm, prefixes))
 }
 
 pub(crate) fn parse_key_value_dispatch(node: Node) -> Result<KeyValueInfo, ParseError> {
@@ -3852,13 +3875,28 @@ fn ensure_no_element_children(node: Node<'_, '_>, element_name: &str) -> Result<
 }
 
 fn ensure_no_non_whitespace_text(node: Node<'_, '_>, element_name: &str) -> Result<(), ParseError> {
-    for child in node.children().filter(|child| child.is_text()) {
-        if let Some(text) = child.text()
-            && !is_xml_whitespace_only(text)
-        {
-            return Err(ParseError::InvalidStructure(format!(
-                "{element_name} must not contain non-whitespace mixed content"
-            )));
+    ensure_charged_whitespace_text(node, element_name, &crate::c14n::scratch::Native)
+}
+
+/// Charges the child count and each text node's length before scanning it.
+fn ensure_charged_whitespace_text<'s, S: transforms::ParseStorage<'s>>(
+    node: Node<'_, '_>,
+    element_name: &str,
+    storage: &S,
+) -> Result<(), ParseError> {
+    storage
+        .charge(node.children().len())
+        .map_err(super::types::TransformError::from)?;
+    for child in node.children() {
+        if let Some(text) = child.text().filter(|_| child.is_text()) {
+            storage
+                .charge(text.len())
+                .map_err(super::types::TransformError::from)?;
+            if !is_xml_whitespace_only(text) {
+                return Err(storage.structure(format_args!(
+                    "{element_name} must not contain non-whitespace mixed content"
+                )));
+            }
         }
     }
     Ok(())

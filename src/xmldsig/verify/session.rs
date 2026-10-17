@@ -1027,21 +1027,23 @@ impl<W: Work, Q: Work> SelectedSignature<'_, '_, '_, '_, W, Q> {
                     self.work
                         .charge_work(algorithm.len() as u64)
                         .map_err(|error| processing(error.into()))?;
-                    enforce_transform_allowed(allowed, algorithm).map_err(processing)?;
+                    enforce_current_transform_allowed(allowed, algorithm, self.work)
+                        .map_err(processing)?;
                 }
             }
         }
+        let parse_failure = |error| match error {
+            super::super::parse::ParseError::Transform(TransformError::C14n(
+                crate::c14n::C14nError::SharedExecution(error),
+            )) => processing(error.into()),
+            error => processing(DsigError::ParseManifestReference(error)),
+        };
         let transforms = super::super::parse::parse_replay_transforms(
             node,
             &mut self.session.budgets.xpath_parse.borrow_mut(),
             &crate::c14n::scratch::Accounted(self.work),
         )
-        .map_err(|error| match error {
-            super::super::parse::ParseError::Transform(TransformError::C14n(
-                crate::c14n::C14nError::SharedExecution(error),
-            )) => processing(error.into()),
-            error => processing(DsigError::ParseManifestReference(error)),
-        })?;
+        .map_err(parse_failure)?;
         if matches!(mode, ReplayMode::ReferenceOutput)
             && !transform_chain_produces_binary(
                 classify_uri(uri) == UriClass::External,
@@ -1063,19 +1065,15 @@ impl<W: Work, Q: Work> SelectedSignature<'_, '_, '_, '_, W, Q> {
                         reason: "timestamp method has no Algorithm",
                     })
                 })?;
-                enforce_transform_allowed(
-                    self.session
-                        .context
-                        .policy
-                        .transforms
-                        .allowed_algorithms
-                        .as_ref(),
-                    uri,
+                self.work
+                    .charge_work(uri.len() as u64)
+                    .map_err(|error| processing(error.into()))?;
+                enforce_current_transform_allowed(allowed, uri, self.work).map_err(processing)?;
+                let algorithm = super::super::parse::parse_replay_canonicalization_method(
+                    method,
+                    &crate::c14n::scratch::Accounted(self.work),
                 )
-                .map_err(processing)?;
-                let algorithm =
-                    super::super::parse::parse_replay_canonicalization_method(method)
-                        .map_err(|error| processing(DsigError::ParseManifestReference(error)))?;
+                .map_err(parse_failure)?;
                 Some(algorithm)
             }
         };

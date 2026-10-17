@@ -112,11 +112,17 @@ impl<S: Scratch, D: DomStorage> NsRenderer<S, D> for ExclusiveNsRenderer<'_> {
                 let uri = namespace.uri();
                 scratch.charge(prefix.len().saturating_add(uri.len()).saturating_add(1))?;
                 let selected_here = visibility.contains_namespace_at(node, ordinal, namespace)?;
-                let declaration_suppressed = parent_rendered.get(prefix, false)?.flatten()
-                    == Some(uri)
-                    && !declarations
-                        .iter()
-                        .any(|(declared_prefix, _)| *declared_prefix == prefix);
+                // No search of `declarations` is needed: the shared pipeline
+                // declares a selected prefix only when its parent binding
+                // differs, and its one invisible-default entry is never selected
+                // here; prefixes pushed below are unique namespace nodes.
+                let declaration_suppressed =
+                    parent_rendered.get(prefix, false)?.flatten() == Some(uri);
+                debug_assert!(
+                    !(selected_here
+                        && declaration_suppressed
+                        && declarations.iter().any(|(declared, _)| *declared == prefix))
+                );
                 let nearest_utilizer_omitted_namespace =
                     parent_rendered.get(prefix, true)? == Some(None);
                 let uses_exclusive_rendering = utilized.get(prefix, false)?.is_some()

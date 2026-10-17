@@ -1208,6 +1208,132 @@ fn replay_layout_diagnostic_retains_current_capacity_until_error_drop() {
     .unwrap();
 }
 
+/// Replays `inside` in one funded query that must fail, and checks that the
+/// escaping diagnostic names `text` and keeps its charge until it is dropped.
+fn assert_query_diagnostic_retained(
+    document: &XmlDocument,
+    context: &VerifyContext<'_>,
+    timestamp: bool,
+    text: &str,
+) {
+    with_verified_request(
+        document,
+        context,
+        &VerificationRequest::default(),
+        &account(),
+        |session| {
+            let mode = if timestamp {
+                ReplayMode::Timestamp(session.view().node_for_id("timestamp-method", &[]).unwrap())
+            } else {
+                ReplayMode::ReferenceOutput
+            };
+            let current = account();
+            let error = session
+                .with_query(
+                    session.evidence().signatures()[0].identity(),
+                    &current,
+                    |selected| {
+                        selected.replay_reference(
+                            session.view().node_for_id("inside", &[]).unwrap(),
+                            mode,
+                            &mut |_: &[u8]| -> Result<(), ()> {
+                                panic!("rejected instruction cannot produce bytes")
+                            },
+                        )
+                    },
+                )
+                .unwrap_err();
+            assert!(format!("{error:?}").contains(text));
+            assert!(
+                current.used() >= text.len(),
+                "escaping diagnostic retains its capacity charge"
+            );
+            drop(error);
+            assert_eq!(current.used(), 0);
+            Ok(())
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn replay_transform_policy_diagnostic_retains_current_capacity_until_error_drop() {
+    // An authenticated transform outside the allowlist names an attacker-sized
+    // URI; the escaping policy rejection must stay funded by the query.
+    let algorithm = format!("urn:example:{}", "x".repeat(65536));
+    let (xml, key) = signed_manifest(
+        "#target",
+        "http://www.w3.org/2001/04/xmlenc#sha256",
+        &format!(r#"<ds:Transforms><ds:Transform Algorithm="{algorithm}"/></ds:Transforms>"#),
+    );
+    let document = XmlDocument::parse(xml).unwrap();
+    let mut policy = xml_sec::policy::VerificationPolicy::default();
+    policy.manifest_processing = xml_sec::policy::ManifestProcessing::Process;
+    policy.transforms.allowed_algorithms =
+        Some(["http://www.w3.org/2001/10/xml-exc-c14n#".to_owned()].into());
+    let context = VerifyContext::new().key(&key).policy(policy);
+    assert_query_diagnostic_retained(&document, &context, false, &algorithm);
+}
+
+const TIMESTAMP_METHOD: &str = r#"<ds:CanonicalizationMethod Id="timestamp-method" Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#;
+
+#[test]
+fn timestamp_method_whitespace_is_charged_by_length() {
+    // The timestamp method is parsed by the current query, so legal whitespace
+    // inside it must cost its bytes rather than run on unfunded work.
+    let work = |whitespace: usize| {
+        let (xml, key) = signed_manifest("#target", "http://www.w3.org/2001/04/xmlenc#sha256", "");
+        let method = TIMESTAMP_METHOD.replace(
+            "/>",
+            &format!(">{}</ds:CanonicalizationMethod>", " ".repeat(whitespace)),
+        );
+        let document = XmlDocument::parse(xml.replace(TIMESTAMP_METHOD, &method)).unwrap();
+        let context = VerifyContext::new().key(&key).process_manifests(true);
+        let current = account();
+        with_verified_request(
+            &document,
+            &context,
+            &VerificationRequest::default(),
+            &account(),
+            |session| {
+                let method = session.view().node_for_id("timestamp-method", &[]).unwrap();
+                session
+                    .with_query(
+                        session.evidence().signatures()[0].identity(),
+                        &current,
+                        |selected| {
+                            selected.replay_reference(
+                                session.view().node_for_id("inside", &[]).unwrap(),
+                                ReplayMode::Timestamp(method),
+                                &mut |_: &[u8]| Ok::<_, ()>(()),
+                            )
+                        },
+                    )
+                    .unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        current.work_used()
+    };
+    // Same randomized ID-table slack as the Reference layout check.
+    let length = 1 << 20;
+    let slack = 1024;
+    assert!(work(length) + slack >= work(1) + length);
+}
+
+#[test]
+fn timestamp_method_diagnostic_retains_current_capacity_until_error_drop() {
+    // An unsupported timestamp method URI is attacker-sized; its diagnostic
+    // must be built in the query's storage, not copied outside it.
+    let algorithm = format!("urn:example:{}", "x".repeat(65536));
+    let (xml, key) = signed_manifest("#target", "http://www.w3.org/2001/04/xmlenc#sha256", "");
+    let method = TIMESTAMP_METHOD.replace("http://www.w3.org/2001/10/xml-exc-c14n#", &algorithm);
+    let document = XmlDocument::parse(xml.replace(TIMESTAMP_METHOD, &method)).unwrap();
+    let context = VerifyContext::new().key(&key).process_manifests(true);
+    assert_query_diagnostic_retained(&document, &context, true, &algorithm);
+}
+
 #[test]
 fn final_octets_are_borrowed_and_not_timestamp_recanonicalized() {
     // Final binary, including empty/non-XML input, is not XML-decoded merely

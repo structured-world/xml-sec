@@ -618,11 +618,14 @@ current execution's local ceiling and aggregate account. Retained session
 allocations keep their original charge; a new query does not reset the original
 compiled policy allowances or change the provider/document identity. Borrowed
 query capabilities cannot escape the callback; independently owned output may.
-Owned URI and replayed Reference layout diagnostics also retain their
-current-query capacity charge until the error is dropped. If that storage cannot
-be admitted, the result is the original typed resource failure rather than an
-unaccounted copy of the URI, missing ID or element name. Replay charges every
-Reference text node by its byte length before checking it for mixed content.
+Owned URI, replayed Reference layout, transform-policy and timestamp-method
+diagnostics also retain their current-query capacity charge until the error is
+dropped; a rejected transform URI is reported as
+`DsigError::AccountedPolicyAlgorithm`. If that storage cannot be admitted, the
+result is the original typed resource failure rather than an unaccounted copy
+of the URI, missing ID, algorithm or element name. Replay charges every
+Reference and timestamp-method text node by its byte length before checking it
+for mixed content.
 All implemented transform branches,
 parser/DOM construction, XPath workspaces, binary/XML transitions and terminal
 C14N admit their work and actual capacity before allocation or receiver effects.

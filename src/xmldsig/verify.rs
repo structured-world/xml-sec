@@ -1623,6 +1623,15 @@ pub enum DsigError {
     #[error("verification policy violation: {0}")]
     Policy(#[from] crate::policy::PolicyViolation),
 
+    /// A query-funded algorithm rejection; the URI retains its charge until drop.
+    #[error("verification policy violation: {operation} policy rejects algorithm {algorithm}")]
+    AccountedPolicyAlgorithm {
+        /// Operation evaluating the algorithm.
+        operation: &'static str,
+        /// Rejected algorithm URI, owned by the current query's account.
+        algorithm: structured_asn1::memory::OwnedText,
+    },
+
     /// The selected provider cannot execute the requested operation.
     #[error("cryptographic provider error: {0}")]
     Provider(#[from] crate::provider::ProviderError),
@@ -5058,6 +5067,28 @@ fn enforce_transform_allowed(
             algorithm: algorithm.to_owned(),
         }
         .into());
+    }
+    Ok(())
+}
+
+/// Query-funded form: the attacker-sized URI is copied into `work`'s storage.
+fn enforce_current_transform_allowed<W: structured_asn1::memory::Work>(
+    allowed_transforms: Option<&HashSet<String>>,
+    algorithm: &str,
+    work: &W,
+) -> Result<(), SignatureVerificationPipelineError> {
+    use crate::xml::dom::storage::Storage as _;
+    if allowed_transforms.is_some_and(|allowed| !allowed.contains(algorithm)) {
+        return Err(
+            match crate::xml::dom::storage::Accounted(work).formatted(format_args!("{algorithm}")) {
+                Ok(algorithm) => DsigError::AccountedPolicyAlgorithm {
+                    operation: "verification transform",
+                    algorithm: algorithm.into_owned(),
+                },
+                Err(crate::xml::dom::ParseError::SharedExecution(cause)) => cause.into(),
+                Err(cause) => cause.into(),
+            },
+        );
     }
     Ok(())
 }

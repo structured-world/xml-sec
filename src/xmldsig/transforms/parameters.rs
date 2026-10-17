@@ -160,6 +160,8 @@ pub(crate) trait ParseStorage<'a>: Scratch {
     fn diagnostic(&self, kind: Diagnostic, arguments: std::fmt::Arguments<'_>) -> TransformError;
     /// Structural diagnostic owned by this storage, as transform diagnostics are.
     fn structure(&self, arguments: std::fmt::Arguments<'_>) -> ParseError;
+    /// Unsupported-algorithm diagnostic owned by this storage.
+    fn unsupported_algorithm(&self, uri: &str) -> ParseError;
     fn unsupported(&self, arguments: std::fmt::Arguments<'_>) -> TransformError {
         self.diagnostic(Diagnostic::Unsupported, arguments)
     }
@@ -204,6 +206,12 @@ impl<'a> ParseStorage<'a> for Native {
 
     fn structure(&self, arguments: std::fmt::Arguments<'_>) -> ParseError {
         ParseError::InvalidStructure(std::fmt::format(arguments))
+    }
+
+    fn unsupported_algorithm(&self, uri: &str) -> ParseError {
+        ParseError::UnsupportedAlgorithm {
+            uri: uri.to_owned(),
+        }
     }
 
     fn validate_xpath(
@@ -369,6 +377,12 @@ impl<'a, W: Work> ParseStorage<'a> for Accounted<'_, W> {
     fn structure(&self, arguments: std::fmt::Arguments<'_>) -> ParseError {
         current_text(arguments, self.0)
             .map_or_else(ParseError::Transform, ParseError::AccountedInvalidStructure)
+    }
+
+    fn unsupported_algorithm(&self, uri: &str) -> ParseError {
+        current_text(format_args!("{uri}"), self.0).map_or_else(ParseError::Transform, |uri| {
+            ParseError::AccountedUnsupportedAlgorithm { uri }
+        })
     }
 
     fn validate_xpath(
