@@ -3942,9 +3942,12 @@ mod tests {
             (result, memory)
         }
 
+        // No lookup below misses against a non-empty dictionary: such a miss
+        // compares keys only on a randomly seeded tag collision, so two runs'
+        // exact work would differ.
         for source in [
             "<r xmlns:p='urn:outer'><c xmlns:p='urn:inner'/><c/></r>",
-            "<!DOCTYPE r [<!ENTITY x 'value'><!ATTLIST c a CDATA '&x;'>]><r><c/><c a='literal'/></r>",
+            "<!DOCTYPE c [<!ENTITY x 'value'><!ATTLIST c a CDATA '&x;'>]><c><c/><c a='literal'/></c>",
             "<!DOCTYPE r [<!ENTITY x '<c xmlns:p=\"urn:p\"/>'>]><r>&x;</r>",
         ] {
             let expected = preflight_document_limits(

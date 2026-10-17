@@ -807,16 +807,24 @@ fn is_xpath_value_scanning_function(name: &str) -> bool {
 /// Composed scanning steps gain one document-size factor, while independent
 /// expression branches add their traversal costs. Predicate scans inherit the
 /// enclosing path depth and gain another factor per predicate level. Saturation
-/// deliberately turns arithmetic overflow into a budget rejection.
-fn xpath_evaluation_work(source: &str, document_size: usize, mode: XPathEvaluationMode) -> usize {
+/// deliberately turns arithmetic overflow into a budget rejection. `scratch`
+/// pays for the source scan and owns the per-predicate state.
+fn xpath_evaluation_work<S: crate::c14n::scratch::Scratch>(
+    source: &str,
+    document_size: usize,
+    mode: XPathEvaluationMode,
+    scratch: &S,
+) -> Result<usize, crate::c14n::C14nError> {
+    use crate::c14n::scratch::List as _;
+    scratch.charge(source.len())?;
     let bytes = source.as_bytes();
     let mut work = document_size;
     let mut predicate_depth = 0_usize;
     let mut top_level_path_scans = 0_usize;
     let mut top_level_path_started = false;
     let mut top_level_path_branches = 0_usize;
-    let mut predicate_path_scans = Vec::new();
-    let mut predicate_path_started = Vec::new();
+    let mut predicate_path_scans = scratch.values();
+    let mut predicate_path_started = scratch.values();
     let mut parent_steps = 0_usize;
     let mut quote = None;
     let mut index = 0_usize;
@@ -851,8 +859,8 @@ fn xpath_evaluation_work(source: &str, document_size: usize, mode: XPathEvaluati
         match byte {
             b'[' => {
                 predicate_depth = predicate_depth.saturating_add(1);
-                predicate_path_scans.push(0);
-                predicate_path_started.push(false);
+                predicate_path_scans.push(0)?;
+                predicate_path_started.push(false)?;
             }
             b']' => {
                 predicate_depth = predicate_depth.saturating_sub(1);
@@ -946,7 +954,7 @@ fn xpath_evaluation_work(source: &str, document_size: usize, mode: XPathEvaluati
     };
     work = work.saturating_add(parent_step_contexts.saturating_mul(parent_steps));
 
-    work
+    Ok(work)
 }
 
 fn charge_xpath_path_branch(
@@ -2041,7 +2049,7 @@ fn evaluate_expression<'a, 'r, K: Keys, D: crate::xml::dom::storage::Storage>(
     work_budget: &XPathWorkBudget,
     materialization_budget: &NodeSetMaterializationBudget,
 ) -> Result<Projection<'a, K, D>, TransformError> {
-    use crate::c14n::scratch::List as _;
+    use crate::c14n::scratch::{List as _, Scratch as _};
     let request = request.into();
     let expression_bytes = expression.expression().len();
     if expression_bytes > work_budget.limits.expression_bytes {
@@ -2139,7 +2147,10 @@ fn evaluate_expression<'a, 'r, K: Keys, D: crate::xml::dom::storage::Storage>(
     context.set_namespace_lookup(&resolve_namespace);
     context.set_function_view(&functions);
 
-    let evaluation_work = xpath_evaluation_work(expression.expression(), document_size, mode);
+    let evaluation_work =
+        xpath_evaluation_work(expression.expression(), document_size, mode, &scratch)?;
+    // One more full pass over the source, paid like the estimate above.
+    scratch.charge(expression_bytes)?;
     let string_scans = xpath_string_scan_count(expression.expression()).max(1);
 
     if matches!(mode, XPathEvaluationMode::XmlDsigPerNodeFilter) {
@@ -3373,6 +3384,10 @@ mod tests {
     fn xpath_work_profile_tracks_nested_paths_but_ignores_literals() {
         // The preflight meter must recognize both abbreviated paths and named
         // axes without treating XPath punctuation inside quoted data as work.
+        fn xpath_evaluation_work(source: &str, size: usize, mode: XPathEvaluationMode) -> usize {
+            super::xpath_evaluation_work(source, size, mode, &crate::c14n::scratch::Native)
+                .expect("native estimate state is infallible")
+        }
         let filter2 = XPathEvaluationMode::Filter2NodeSetSelection;
         assert_eq!(
             xpath_evaluation_work("//*[count(//*) > 0]", 10, filter2),
@@ -3711,6 +3726,36 @@ mod tests {
             XPathWorkBudget::with_limit(0).charge_function(1),
             Err(function::Error::ProcessingStopped)
         ));
+    }
+
+    #[test]
+    fn current_evaluation_estimate_pays_its_scan_and_predicate_state() {
+        // The estimate runs before the non-interruptible evaluator; a query
+        // must pay its full source scan and own the per-predicate stacks.
+        use std::sync::Arc;
+        use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
+        let mode = XPathEvaluationMode::XmlDsigPerNodeFilter;
+        let source = format!("{}self::node()", " ".repeat(4096));
+        let memory = Memory::new(Arc::new(MemoryAccount::new(4096, 1 << 20)));
+        xpath_evaluation_work(&source, 10, mode, &crate::c14n::scratch::Accounted(&memory))
+            .unwrap();
+        assert!(memory.work_used() >= source.len());
+        assert_eq!(memory.used(), 0);
+
+        let nested = format!("{}self::node(){}", "a[".repeat(64), "]".repeat(64));
+        let refused = Memory::new(Arc::new(MemoryAccount::new(0, 1 << 20)));
+        assert!(matches!(
+            xpath_evaluation_work(
+                &nested,
+                10,
+                mode,
+                &crate::c14n::scratch::Accounted(&refused)
+            ),
+            Err(crate::c14n::C14nError::SharedExecution(
+                MemoryError::LimitExceeded
+            ))
+        ));
+        assert_eq!(refused.used(), 0);
     }
 
     #[test]
