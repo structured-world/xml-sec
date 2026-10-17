@@ -26,7 +26,7 @@ use super::transforms::{
 use super::transforms::{XPathExpression, XPathFilter};
 #[cfg(test)]
 use super::types::NodeSet;
-use super::types::projection::{Keys, NativeKeys, Projection, RetainKeys};
+use super::types::projection::{Keys, NativeKeys, Projection};
 use super::types::{NodeSetMaterializationBudget, TransformError, transform_resource_limit};
 use crate::c14n::prefix::{attribute_prefix, element_prefix};
 
@@ -2279,7 +2279,7 @@ pub(super) fn apply_xpath_filter_with_semantics_and_budget<'a, 'r>(
 pub(super) fn apply_xpath_projection_with_budget<
     'a,
     'r,
-    K: RetainKeys,
+    K: Keys,
     D: crate::xml::dom::storage::Storage,
 >(
     mut input: Projection<'a, K, D>,
@@ -2362,7 +2362,7 @@ pub(super) fn apply_xpath_filter2_with_semantics_and_budget<'a, 'r>(
 pub(super) fn apply_xpath_projection2_with_budget<
     'a,
     'r,
-    K: RetainKeys,
+    K: Keys,
     D: crate::xml::dom::storage::Storage,
 >(
     input: Projection<'a, K, D>,
