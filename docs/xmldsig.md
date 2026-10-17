@@ -618,6 +618,9 @@ current execution's local ceiling and aggregate account. Retained session
 allocations keep their original charge; a new query does not reset the original
 compiled policy allowances or change the provider/document identity. Borrowed
 query capabilities cannot escape the callback; independently owned output may.
+Owned URI diagnostics also retain their current-query capacity charge until the
+error is dropped. If that storage cannot be admitted, the result is the original
+typed resource failure rather than an unaccounted copy of the URI or missing ID.
 All implemented transform branches,
 parser/DOM construction, XPath workspaces, binary/XML transitions and terminal
 C14N admit their work and actual capacity before allocation or receiver effects.

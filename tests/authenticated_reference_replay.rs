@@ -395,6 +395,8 @@ fn current_query_admits_external_uri_scratch_before_lookup_output() {
 fn current_query_base64_charges_local_and_aggregate_once() {
     // Memory and a narrower Execution must pay the same aggregate cost.
     // Exact local work succeeds; one less refuses before receiver effects.
+    // One original Reference makes the table's comparison count deterministic:
+    // independently seeded tables with two keys can require different probes.
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use structured_asn1::{Encoding, Limits, Parser};
     let uri = "https://example.test/base64-work";
@@ -403,7 +405,25 @@ fn current_query_base64_charges_local_and_aggregate_once() {
     let encoded = STANDARD.encode(&expected).into_bytes();
     let input_length = encoded.len();
     let resources = HashMap::from([(uri.to_owned(), encoded)]);
-    let (xml, key) = signed_manifest(uri, "http://www.w3.org/2001/04/xmlenc#sha256", transforms);
+    let secret = vec![0x61; 32];
+    let signer = HmacSigningKey::new(secret.clone()).unwrap();
+    let key = HmacVerificationKey::new(secret).unwrap();
+    let template = format!(
+        r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+<ds:SignedInfo>
+<ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+<ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"/>
+<ds:Reference Id="inside" URI="{uri}">{transforms}
+<ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/>
+</ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature>"#
+    );
+    let mut signing_policy = xml_sec::policy::SigningPolicy::default();
+    signing_policy.uris.references = UriTypeSet::ALL;
+    let xml = SignContext::new(&signer)
+        .policy(signing_policy)
+        .external_resources(&resources)
+        .sign_template(&template)
+        .unwrap();
     let document = XmlDocument::parse(xml).unwrap();
     let request = VerificationRequest {
         external_resources: Some(&resources),
@@ -1042,6 +1062,53 @@ fn only_admitted_missing_external_data_is_unavailable() {
             Ok(())
         }).unwrap();
     }
+}
+
+#[test]
+fn missing_id_replay_retains_diagnostic_capacity_until_error_drop() {
+    // A signed Manifest authenticates its instruction even when its ID is
+    // absent. The returned error must retain only admitted query storage.
+    let id = "x".repeat(65536);
+    let (xml, key) = signed_manifest(
+        &format!("#{id}"),
+        "http://www.w3.org/2001/04/xmlenc#sha256",
+        "",
+    );
+    let document = XmlDocument::parse(xml).unwrap();
+    let context = VerifyContext::new().key(&key).process_manifests(true);
+    with_verified_request(
+        &document,
+        &context,
+        &VerificationRequest::default(),
+        &account(),
+        |session| {
+            let current = account();
+            let error = session
+                .with_query(
+                    session.evidence().signatures()[0].identity(),
+                    &current,
+                    |selected| {
+                        selected.replay_reference(
+                            session.view().node_for_id("inside", &[]).unwrap(),
+                            ReplayMode::ReferenceOutput,
+                            &mut |_: &[u8]| -> Result<(), ()> {
+                                panic!("missing ID cannot produce bytes")
+                            },
+                        )
+                    },
+                )
+                .unwrap_err();
+            assert!(
+                current.used() >= id.len(),
+                "escaping diagnostic retains its capacity charge"
+            );
+            assert!(format!("{error:?}").contains(&id));
+            drop(error);
+            assert_eq!(current.used(), 0);
+            Ok(())
+        },
+    )
+    .unwrap();
 }
 
 #[test]

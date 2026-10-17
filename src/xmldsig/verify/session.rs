@@ -459,7 +459,11 @@ impl<'session, 'view, 'scope, 'inputs, W: Work, Q: Work>
         );
         let target = match target {
             Ok(target) => target,
-            Err(TransformError::UnsupportedUri(_)) => return Ok(ReferenceResolution::Unsupported),
+            Err(
+                TransformError::UnsupportedUri(_)
+                | TransformError::AccountedUnsupportedUri(_)
+                | TransformError::InvalidFragment,
+            ) => return Ok(ReferenceResolution::Unsupported),
             Err(error) => {
                 return Err(DsigError::Reference(
                     ReferenceProcessingError::UriDereference(error),

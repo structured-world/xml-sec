@@ -406,9 +406,21 @@ pub enum TransformError {
     #[error("element not found by ID: {0}")]
     ElementNotFound(String),
 
+    /// Missing ID whose diagnostic retains its current-query capacity charge.
+    #[error("element not found by ID: {0}")]
+    AccountedElementNotFound(structured_asn1::memory::OwnedText),
+
     /// Unsupported URI scheme or format.
     #[error("unsupported URI: {0}")]
     UnsupportedUri(String),
+
+    /// Rejected URI whose diagnostic retains its current-query capacity charge.
+    #[error("unsupported URI: {0}")]
+    AccountedUnsupportedUri(structured_asn1::memory::OwnedText),
+
+    /// Malformed same-document syntax, requiring no diagnostic allocation.
+    #[error("unsupported URI: invalid same-document fragment")]
+    InvalidFragment,
 
     /// Unsupported transform algorithm.
     #[error("unsupported transform: {0}")]

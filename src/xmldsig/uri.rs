@@ -12,7 +12,7 @@
 //! External URI bytes are resolved only from an explicit caller-owned map; this
 //! module never performs network or filesystem I/O.
 
-use crate::c14n::scratch::{Bytes as _, Native, Scratch, Text as _};
+use crate::c14n::scratch::{Accounted, Bytes as _, Native, Scratch, Text as _};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -56,7 +56,57 @@ impl<B: std::ops::Deref<Target = [u8]>> NormalizedFragment<'_, B> {
 }
 
 fn invalid_fragment() -> TransformError {
-    TransformError::UnsupportedUri("invalid same-document fragment".into())
+    TransformError::InvalidFragment
+}
+
+pub(crate) enum UriFailureKind {
+    MissingId,
+    Unsupported,
+}
+
+pub(crate) trait UriScratch: Scratch {
+    fn diagnostic(&self, kind: UriFailureKind, parts: &[&str]) -> TransformError;
+}
+
+impl UriScratch for Native {
+    fn diagnostic(&self, kind: UriFailureKind, parts: &[&str]) -> TransformError {
+        match kind {
+            UriFailureKind::MissingId => TransformError::ElementNotFound(parts.concat()),
+            UriFailureKind::Unsupported => TransformError::UnsupportedUri(parts.concat()),
+        }
+    }
+}
+
+impl<W: structured_asn1::memory::Work> UriScratch for Accounted<'_, W> {
+    fn diagnostic(&self, kind: UriFailureKind, parts: &[&str]) -> TransformError {
+        match self.text(parts) {
+            Ok(text) => match kind {
+                UriFailureKind::MissingId => {
+                    TransformError::AccountedElementNotFound(text.into_owned())
+                }
+                UriFailureKind::Unsupported => {
+                    TransformError::AccountedUnsupportedUri(text.into_owned())
+                }
+            },
+            Err(cause) => cause.into(),
+        }
+    }
+}
+
+enum FragmentFailure<'uri> {
+    MissingId(&'uri str),
+    Unsupported(&'uri str),
+}
+
+impl FragmentFailure<'_> {
+    fn diagnostic(self, scratch: &impl UriScratch) -> TransformError {
+        match self {
+            Self::MissingId(id) => scratch.diagnostic(UriFailureKind::MissingId, &[id]),
+            Self::Unsupported(fragment) => {
+                scratch.diagnostic(UriFailureKind::Unsupported, &["#", fragment])
+            }
+        }
+    }
 }
 
 /// Validate signing URI policy independently of request-scoped resource bytes.
@@ -533,7 +583,7 @@ impl<'a> UriReferenceResolver<'a> {
 
     /// Preserve an admitted external lookup's absence. Unsupported fragment
     /// syntax, ambiguous IDs and resource failures are never recast as absence.
-    pub(crate) fn replay_input_from_with_budget<S: Scratch>(
+    pub(crate) fn replay_input_from_with_budget<S: UriScratch>(
         &self,
         uri: &str,
         origin: Node<'_, '_>,
@@ -556,7 +606,10 @@ impl<'a> UriReferenceResolver<'a> {
             )?;
             let fragment = normalized.view(scratch)?;
             scratch.charge(fragment.len())?;
-            return self.normalized_fragment_input(fragment).map(Some);
+            return self
+                .normalized_fragment_input(fragment)
+                .map(Some)
+                .map_err(|cause| cause.diagnostic(scratch));
         }
         let resolved = crate::c14n::xml_base::resolve_uri_from_node_in(
             origin,
@@ -627,20 +680,22 @@ impl<'a> UriReferenceResolver<'a> {
         let ReferenceInput::Xml {
             root,
             with_comments,
-        } = self.normalized_fragment_input(fragment)?
+        } = self
+            .normalized_fragment_input(fragment)
+            .map_err(|cause| cause.diagnostic(&Native))?
         else {
             unreachable!("a same-document fragment resolves to XML");
         };
         NodeSet::projected(root, with_comments, budget).map(TransformData::NodeSet)
     }
 
-    fn normalized_fragment_input(
+    fn normalized_fragment_input<'uri>(
         &self,
-        fragment: &str,
-    ) -> Result<ReferenceInput<'a>, TransformError> {
+        fragment: &'uri str,
+    ) -> Result<ReferenceInput<'a>, FragmentFailure<'uri>> {
         if fragment.is_empty() {
             // Bare "#" is not a valid same-document reference
-            return Err(TransformError::UnsupportedUri("#".to_string()));
+            return Err(FragmentFailure::Unsupported(fragment));
         }
 
         if is_xpointer_root(fragment) {
@@ -654,14 +709,14 @@ impl<'a> UriReferenceResolver<'a> {
         } else {
             let (id, with_comments) = self
                 .same_document_id_fragment(fragment)
-                .ok_or_else(|| TransformError::UnsupportedUri(format!("#{fragment}")))?;
+                .ok_or(FragmentFailure::Unsupported(fragment))?;
             self.id_index
                 .node(self.doc, id)
                 .map(|root| ReferenceInput::Xml {
                     root,
                     with_comments,
                 })
-                .ok_or_else(|| TransformError::ElementNotFound(id.to_string()))
+                .ok_or(FragmentFailure::MissingId(id))
         }
     }
 
@@ -735,14 +790,14 @@ impl<'a> UriReferenceResolver<'a> {
         &self,
         uri: &str,
         budget: Option<&NodeSetMaterializationBudget>,
-        scratch: &impl Scratch,
+        scratch: &impl UriScratch,
     ) -> Result<Option<Node<'a, 'a>>, TransformError> {
         if uri.is_empty() {
             return Ok(Some(self.doc.root_element()));
         }
         let target = self.node_id_for_reference_resource_in(uri, budget, scratch)?;
         if target == Some(self.doc.root().id()) {
-            return Err(TransformError::UnsupportedUri(uri.to_owned()));
+            return Err(scratch.diagnostic(UriFailureKind::Unsupported, &[uri]));
         }
         Ok(target.and_then(|id| self.doc.get_node(id)))
     }
@@ -799,14 +854,14 @@ impl<'a> UriReferenceResolver<'a> {
         &self,
         uri: &str,
         budget: Option<&NodeSetMaterializationBudget>,
-        scratch: &impl Scratch,
+        scratch: &impl UriScratch,
     ) -> Result<Option<NodeId>, TransformError> {
         if uri.is_empty() {
             return Ok(Some(self.doc.root().id()));
         }
         let fragment = uri
             .strip_prefix('#')
-            .ok_or_else(|| TransformError::UnsupportedUri(uri.to_owned()))?;
+            .ok_or_else(|| scratch.diagnostic(UriFailureKind::Unsupported, &[uri]))?;
         let normalized = Self::normalize_fragment_in(
             fragment,
             budget,
@@ -816,14 +871,14 @@ impl<'a> UriReferenceResolver<'a> {
         let fragment = normalized.view(scratch)?;
         scratch.charge(fragment.len())?;
         if fragment.is_empty() {
-            return Err(TransformError::UnsupportedUri(uri.to_owned()));
+            return Err(scratch.diagnostic(UriFailureKind::Unsupported, &[uri]));
         }
         if is_xpointer_root(fragment) {
             return Ok(Some(self.doc.root().id()));
         }
         let (id, _) = self
             .same_document_id_fragment(fragment)
-            .ok_or_else(|| TransformError::UnsupportedUri(uri.to_owned()))?;
+            .ok_or_else(|| scratch.diagnostic(UriFailureKind::Unsupported, &[uri]))?;
         Ok(self.id_index.node_id(id))
     }
 
@@ -1405,6 +1460,69 @@ mod tests {
             TransformError::ElementNotFound(id) => assert_eq!(id, "nonexistent"),
             other => panic!("expected ElementNotFound, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn missing_fragment_diagnostic_obeys_current_capacity() {
+        // An unresolved attacker-controlled ID must not escape as an uncharged
+        // String when the query cannot retain its diagnostic.
+        use crate::c14n::scratch::Accounted;
+        use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
+
+        let doc = Document::parse("<root/>").unwrap();
+        let resolver = UriReferenceResolver::new(&doc);
+        let uri = format!("#{}", "x".repeat(65536));
+        let work = Memory::new(std::sync::Arc::new(MemoryAccount::new(1024, 1 << 22)));
+        let result = resolver.replay_input_from_with_budget(
+            &uri,
+            doc.root_element(),
+            &NodeSetMaterializationBudget::default(),
+            &XmlBaseResolutionBudget::default(),
+            &Accounted(&work),
+        );
+        assert!(matches!(
+            result,
+            Err(TransformError::C14n(
+                crate::c14n::C14nError::SharedExecution(MemoryError::LimitExceeded)
+            ))
+        ));
+        assert_eq!(work.used(), 0);
+    }
+
+    #[test]
+    fn rejected_fragment_diagnostics_obey_current_capacity() {
+        // Unsupported parsed pointers also carry attacker-controlled text;
+        // malformed normalization itself needs no owned diagnostic at all.
+        use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
+        let doc = Document::parse("<root/>").unwrap();
+        let resolver = UriReferenceResolver::new(&doc);
+        let uri = format!("#xpointer('{}')", "x".repeat(65536));
+        let work = Memory::new(std::sync::Arc::new(MemoryAccount::new(1024, 1 << 22)));
+        assert!(matches!(
+            resolver.replay_input_from_with_budget(
+                &uri,
+                doc.root_element(),
+                &NodeSetMaterializationBudget::default(),
+                &XmlBaseResolutionBudget::default(),
+                &Accounted(&work),
+            ),
+            Err(TransformError::C14n(
+                crate::c14n::C14nError::SharedExecution(MemoryError::LimitExceeded)
+            ))
+        ));
+        assert_eq!(work.used(), 0);
+        let work = Memory::new(std::sync::Arc::new(MemoryAccount::new(0, 1024)));
+        assert!(matches!(
+            resolver.replay_input_from_with_budget(
+                "#xpointer(^)",
+                doc.root_element(),
+                &NodeSetMaterializationBudget::default(),
+                &XmlBaseResolutionBudget::default(),
+                &Accounted(&work),
+            ),
+            Err(TransformError::InvalidFragment)
+        ));
+        assert_eq!(work.used(), 0);
     }
 
     #[test]
