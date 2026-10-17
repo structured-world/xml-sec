@@ -9516,17 +9516,17 @@ fn normalize_space_fast_path_preflights_its_output_allocation() {
 
 #[test]
 fn translate_preflights_all_transient_workspace() {
-    // The canonical XPath implementation must reserve its source conversion, replacement index,
-    // and worst-case UTF-8 result before any attacker-sized workspace is allocated.
+    // Actual source/index/output storage is admitted before allocation, including the
+    // old and new output blocks during growth. Unused worst-case UTF-8 space is not charged.
     let payload = "a".repeat(128 * 1024);
     let source_xml = format!("<source><value>{payload}</value></source>");
-    let stylesheet = compile(
-        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:param name="from" select="'a'"/><xsl:param name="to" select="'b'"/><xsl:template match="source"><xsl:value-of select="translate(value, $from, $to)"/></xsl:template></xsl:stylesheet>"#,
-    );
-    let mut budget = execution_budget(source_xml.len());
-    budget.owned_bytes = 1024 * 1024;
-    assert!(matches!(
-        stylesheet.execute(
+    for replacement in ["b", "&#x1f600;"] {
+        let stylesheet = compile(&format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:param name="from" select="'a'"/><xsl:param name="to" select="'{replacement}'"/><xsl:template match="source"><xsl:value-of select="translate(value, $from, $to)"/></xsl:template></xsl:stylesheet>"#,
+        ));
+        let mut budget = execution_budget(source_xml.len());
+        budget.owned_bytes = 1024 * 1024;
+        let result = stylesheet.execute(
             &Document::parse(&source_xml, None).expect("source parses"),
             &Parameters::new(),
             Arc::new(NoResolver),
@@ -9535,12 +9535,22 @@ fn translate_preflights_all_transient_workspace() {
                 initial_mode: None,
                 initial_template: None,
             },
-        ),
-        Err(Error::Budget {
-            kind: BudgetKind::OwnedBytes,
-            ..
-        })
-    ));
+        );
+        if replacement == "b" {
+            assert_eq!(
+                result.expect("ASCII output fits").serialized.bytes,
+                b"b".repeat(payload.len())
+            );
+        } else {
+            assert!(matches!(
+                result,
+                Err(Error::Budget {
+                    kind: BudgetKind::OwnedBytes,
+                    ..
+                })
+            ));
+        }
+    }
 }
 
 #[test]

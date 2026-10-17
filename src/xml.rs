@@ -104,7 +104,11 @@ impl IdAttributeRegistration {
         self
     }
 
-    pub(crate) fn matches(&self, node: Node<'_, '_>, attribute: dom::Attribute<'_>) -> bool {
+    pub(crate) fn matches<S: dom::storage::Storage>(
+        &self,
+        node: Node<'_, '_, S>,
+        attribute: dom::Attribute<'_, S>,
+    ) -> bool {
         self.attribute_local_name == attribute.name()
             && match &self.attribute_namespace {
                 AttributeNamespaceScope::Any => true,
@@ -119,7 +123,7 @@ impl IdAttributeRegistration {
         &self.attribute_local_name
     }
 
-    pub(crate) fn matches_node(&self, node: Node<'_, '_>) -> bool {
+    pub(crate) fn matches_node<S: dom::storage::Storage>(&self, node: Node<'_, '_, S>) -> bool {
         match &self.element_scope {
             IdAttributeElementScope::AnyElement => true,
             IdAttributeElementScope::AnyNamespace { local_name } => {
@@ -137,9 +141,9 @@ impl IdAttributeRegistration {
 }
 
 /// One ID classification contract for indexes and XPath's projected DOM.
-pub(crate) fn is_id_attribute(
-    node: Node<'_, '_>,
-    attribute: dom::Attribute<'_>,
+pub(crate) fn is_id_attribute<S: dom::storage::Storage>(
+    node: Node<'_, '_, S>,
+    attribute: dom::Attribute<'_, S>,
     registrations: &[IdAttributeRegistration],
 ) -> bool {
     attribute.is_id()

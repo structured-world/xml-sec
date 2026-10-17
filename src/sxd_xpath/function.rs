@@ -3,13 +3,28 @@
 #[cfg(feature = "embedded")]
 use crate::sxd_document as sxd_document_no_unsafe;
 use snafu::Snafu;
-use std::borrow::ToOwned;
 use std::ops::Index;
-use sxd_document_no_unsafe::XmlChar;
 
+use crate::Value;
 use crate::context;
 use crate::nodeset::Nodeset;
-use crate::{Value, node_to_num_with_context};
+
+#[path = "function/core.rs"]
+pub(crate) mod core;
+
+pub(crate) enum Resolved<'a> {
+    Core(core::Core),
+    Extension(&'a dyn Function),
+}
+
+impl<'a> Resolved<'a> {
+    pub(crate) fn native(self) -> &'a dyn Function {
+        match self {
+            Self::Core(core) => core.native(),
+            Self::Extension(function) => function,
+        }
+    }
+}
 
 /// Types that can be used as XPath functions.
 pub trait Function {
@@ -18,8 +33,19 @@ pub trait Function {
     fn evaluate<'c, 'd>(
         &self,
         context: &context::Evaluation<'c, 'd>,
-        args: Vec<Value<'d>>,
-    ) -> Result<Value<'d>, Error>;
+        mut args: Vec<Value<'d>>,
+    ) -> Result<Value<'d>, Error> {
+        self.evaluate_borrowed(context, &mut args)
+    }
+
+    /// Borrow admitted slots without copying them into a native Vec.
+    fn evaluate_borrowed<'c, 'd>(
+        &self,
+        _context: &context::Evaluation<'c, 'd>,
+        _args: &mut [Value<'d>],
+    ) -> Result<Value<'d>, Error> {
+        Err(Error::BorrowedArgumentsUnsupported)
+    }
 }
 
 /// Represents the kind of an XPath value without carrying a value.
@@ -38,6 +64,8 @@ impl<'a> From<&'a Value<'a>> for ArgumentType {
             Value::Boolean(..) => ArgumentType::Boolean,
             Value::Number(..) => ArgumentType::Number,
             Value::String(..) => ArgumentType::String,
+            #[cfg(feature = "embedded")]
+            Value::AccountedString(..) => ArgumentType::String,
             Value::ResultTreeFragment(..) => ArgumentType::ResultTreeFragment,
             Value::Nodeset(..) => ArgumentType::Nodeset,
         }
@@ -56,8 +84,16 @@ pub enum Error {
     ArgumentMissing,
     #[snafu(display("argument was expected to be a nodeset but was a {:?}", actual))]
     ArgumentNotANodeset { actual: ArgumentType },
+    /// The embedding callback stopped processing; it retains the typed cause.
+    #[snafu(display("processing stopped by the embedding callback"))]
+    ProcessingStopped,
+    #[snafu(display("extension does not support borrowed argument storage"))]
+    BorrowedArgumentsUnsupported,
     #[snafu(display("could not evaluate function: {}", what))]
     Other { what: String },
+    /// A fixed diagnostic has no allocation to admit or retain.
+    #[snafu(display("could not evaluate function: {}", what))]
+    Static { what: &'static str },
 }
 
 impl Error {
@@ -70,9 +106,38 @@ impl Error {
 
 /// Provides common utility functions for dealing with function
 /// argument lists.
-pub struct Args<'d>(pub Vec<Value<'d>>);
+pub trait ArgumentList<'d>: std::ops::Deref<Target = [Value<'d>]> + std::ops::DerefMut {
+    fn pop(&mut self) -> Option<Value<'d>>;
+}
 
-impl<'d> Args<'d> {
+impl<'d> ArgumentList<'d> for Vec<Value<'d>> {
+    fn pop(&mut self) -> Option<Value<'d>> {
+        Vec::pop(self)
+    }
+}
+
+impl<'d> ArgumentList<'d> for &mut [Value<'d>] {
+    fn pop(&mut self) -> Option<Value<'d>> {
+        let slots = std::mem::take(self);
+        let (last, rest) = slots.split_last_mut()?;
+        *self = rest;
+        // Vacated slots remain initialized until the caller drops its buffer.
+        // Moving a value neither clones it nor frees the admitted capacity.
+        Some(std::mem::replace(last, Value::Boolean(false)))
+    }
+}
+
+pub struct Args<'d, A = Vec<Value<'d>>>(pub A, std::marker::PhantomData<&'d ()>);
+
+impl<'d, A: ArgumentList<'d>> Args<'d, A> {
+    pub fn new(values: A) -> Self {
+        Self(values, std::marker::PhantomData)
+    }
+
+    pub fn pop_value(&mut self) -> Result<Value<'d>, Error> {
+        self.0.pop().ok_or(Error::ArgumentMissing)
+    }
+
     pub fn len(&self) -> usize {
         self.0.len()
     }
@@ -137,6 +202,12 @@ impl<'d> Args<'d> {
     pub fn pop_string(&mut self, context: &context::Evaluation<'_, '_>) -> Result<String, Error> {
         match self.0.pop().ok_or(Error::ArgumentMissing)? {
             Value::String(value) => Ok(value),
+            #[cfg(feature = "embedded")]
+            Value::AccountedString(value) => {
+                context.charge_work(value.len())?;
+                context.reserve_string_allocation(value.len())?;
+                Ok(value.as_str().to_owned())
+            }
             Value::ResultTreeFragment(_, value) => match std::sync::Arc::try_unwrap(value) {
                 Ok(value) => Ok(value),
                 Err(value) => {
@@ -166,47 +237,9 @@ impl<'d> Args<'d> {
             a => Err(Error::not_a_nodeset(&a)),
         }
     }
-
-    /// Removes the **last** argument. If no argument is present, the
-    /// context node is returned as a nodeset.
-    fn pop_value_or_context_node<'c>(
-        &mut self,
-        context: &context::Evaluation<'c, 'd>,
-    ) -> Value<'d> {
-        self.0
-            .pop()
-            .unwrap_or_else(|| Value::Nodeset(nodeset![context.node.clone()]))
-    }
-
-    /// Removes the **last** argument if it is a string. If no
-    /// argument is present, the context node is converted to a string
-    /// and returned. If there is an argument but it is not a string,
-    /// it is converted to one.
-    fn pop_string_value_or_context_node(
-        &mut self,
-        context: &context::Evaluation<'_, '_>,
-    ) -> Result<String, Error> {
-        if self.0.is_empty() {
-            context.node.string_value_with_context(context)
-        } else {
-            self.pop_string(context)
-        }
-    }
-
-    /// Select the first argument node, or the context identity without a singleton allocation.
-    fn pop_first_node_or_context<'c>(
-        &mut self,
-        context: &context::Evaluation<'c, 'd>,
-    ) -> Result<Option<crate::nodeset::Node<'d>>, Error> {
-        match self.0.pop() {
-            Some(Value::Nodeset(ns)) => ns.document_order_first_with_context(context),
-            Some(arg) => Err(Error::not_a_nodeset(&arg)),
-            None => context.node.clone_with_context(context).map(Some),
-        }
-    }
 }
 
-impl<'d> Index<usize> for Args<'d> {
+impl<'d, A: ArgumentList<'d>> Index<usize> for Args<'d, A> {
     type Output = Value<'d>;
 
     fn index(&self, index: usize) -> &Value<'d> {
@@ -214,200 +247,41 @@ impl<'d> Index<usize> for Args<'d> {
     }
 }
 
-struct Last;
-
-impl Function for Last {
-    fn evaluate<'c, 'd>(
+impl Function for core::Core {
+    fn evaluate_borrowed<'c, 'd>(
         &self,
         context: &context::Evaluation<'c, 'd>,
-        args: Vec<Value<'d>>,
+        args: &mut [Value<'d>],
     ) -> Result<Value<'d>, Error> {
-        let args = Args(args);
-        args.exactly(0)?;
-        Ok(Value::Number(context.size as f64))
+        self.evaluate_in(context, args, crate::runtime::Native)
     }
 }
 
-struct Position;
-
-impl Function for Position {
-    fn evaluate<'c, 'd>(
-        &self,
-        context: &context::Evaluation<'c, 'd>,
-        args: Vec<Value<'d>>,
-    ) -> Result<Value<'d>, Error> {
-        let args = Args(args);
-        args.exactly(0)?;
-        Ok(Value::Number(context.position as f64))
-    }
-}
-
-struct Count;
-
-impl Function for Count {
-    fn evaluate<'c, 'd>(
-        &self,
-        _context: &context::Evaluation<'c, 'd>,
-        args: Vec<Value<'d>>,
-    ) -> Result<Value<'d>, Error> {
-        let mut args = Args(args);
-        args.exactly(1)?;
-        let arg = args.pop_nodeset()?;
-        Ok(Value::Number(arg.size() as f64))
-    }
-}
-
-struct LocalName;
-
-impl Function for LocalName {
-    fn evaluate<'c, 'd>(
-        &self,
-        context: &context::Evaluation<'c, 'd>,
-        args: Vec<Value<'d>>,
-    ) -> Result<Value<'d>, Error> {
-        let mut args = Args(args);
-        args.at_most(1)?;
-        let name = args
-            .pop_first_node_or_context(context)?
-            .map(|node| node.name_with_context(crate::nodeset::NamePart::Local, context))
-            .transpose()?
-            .unwrap_or_default();
-        Ok(Value::String(name))
-    }
-}
-
-struct NamespaceUri;
-
-impl Function for NamespaceUri {
-    fn evaluate<'c, 'd>(
-        &self,
-        context: &context::Evaluation<'c, 'd>,
-        args: Vec<Value<'d>>,
-    ) -> Result<Value<'d>, Error> {
-        let mut args = Args(args);
-        args.at_most(1)?;
-        let name = args
-            .pop_first_node_or_context(context)?
-            .map(|node| node.name_with_context(crate::nodeset::NamePart::Namespace, context))
-            .transpose()?
-            .unwrap_or_default();
-        Ok(Value::String(name))
-    }
-}
-
-struct Name;
-
-impl Function for Name {
-    fn evaluate<'c, 'd>(
-        &self,
-        context: &context::Evaluation<'c, 'd>,
-        args: Vec<Value<'d>>,
-    ) -> Result<Value<'d>, Error> {
-        let mut args = Args(args);
-        args.at_most(1)?;
-        let name = args
-            .pop_first_node_or_context(context)?
-            .map(|node| node.name_with_context(crate::nodeset::NamePart::Qualified, context))
-            .transpose()?
-            .unwrap_or_default();
-        Ok(Value::String(name))
-    }
-}
-
-struct StringFn;
-
-impl Function for StringFn {
-    fn evaluate<'c, 'd>(
-        &self,
-        context: &context::Evaluation<'c, 'd>,
-        args: Vec<Value<'d>>,
-    ) -> Result<Value<'d>, Error> {
-        let mut args = Args(args);
-        args.at_most(1)?;
-        Ok(Value::String(
-            args.pop_string_value_or_context_node(context)?,
-        ))
-    }
-}
-
-struct Concat;
-
-impl Function for Concat {
-    fn evaluate<'c, 'd>(
-        &self,
-        context: &context::Evaluation<'c, 'd>,
-        args: Vec<Value<'d>>,
-    ) -> Result<Value<'d>, Error> {
-        let args = Args(args);
-        args.at_least(2)?;
-        let mut output = String::new();
-        for value in args.0 {
-            match value {
-                Value::String(text) => {
-                    append_metered_string(&mut output, &text, context)?;
-                }
-                Value::ResultTreeFragment(_, text) => {
-                    append_metered_string(&mut output, &text, context)?;
-                }
-                Value::Nodeset(nodes) => {
-                    if let Some(node) = nodes.document_order_first_with_context(context)? {
-                        node.visit_string_value_with_context(context, |text| {
-                            append_metered_string(&mut output, text, context)?;
-                            Ok(true)
-                        })?;
-                    }
-                }
-                value => {
-                    context.reserve_temporary_allocation(value.string_len())?;
-                    append_metered_string(&mut output, &value.into_string(), context)?;
-                }
-            }
-        }
-        Ok(Value::String(output))
-    }
-}
-
-fn append_metered_string(
+pub(crate) fn append_metered_string(
     output: &mut String,
     text: &str,
     context: &context::Evaluation<'_, '_>,
 ) -> Result<(), Error> {
     context.charge_work(text.len())?;
-    let required = output
-        .len()
-        .checked_add(text.len())
-        .ok_or_else(|| Error::Other {
-            what: "XPath string size overflow".into(),
-        })?;
+    let required = output.len().checked_add(text.len()).ok_or(Error::Static {
+        what: "XPath string size overflow",
+    })?;
     if required > output.capacity() {
-        let capacity = required.max(output.capacity().saturating_mul(2));
-        context.reserve_string_allocation(capacity - output.capacity())?;
-        output
-            .try_reserve_exact(capacity - output.len())
-            .map_err(|_| Error::Other {
-                what: "XPath string allocation failed".into(),
-            })?;
+        let old_capacity = output.capacity();
+        let capacity = required.max(old_capacity.saturating_mul(2));
+        context.charge_work(output.len())?;
+        // A relocating allocator can retain the old block until the copy completes.
+        context.reserve_string_allocation(capacity)?;
+        if output.try_reserve_exact(capacity - output.len()).is_err() {
+            context.release_temporary_allocation(capacity)?;
+            return Err(Error::Static {
+                what: "XPath string allocation failed",
+            });
+        }
+        context.release_temporary_allocation(old_capacity)?;
     }
     output.push_str(text);
     Ok(())
-}
-
-struct TwoStringPredicate(fn(&str, &str) -> bool);
-
-impl Function for TwoStringPredicate {
-    fn evaluate<'c, 'd>(
-        &self,
-        context: &context::Evaluation<'c, 'd>,
-        args: Vec<Value<'d>>,
-    ) -> Result<Value<'d>, Error> {
-        let args = Args(args);
-        args.exactly(2)?;
-        let second = string_argument_view(&args[1], context)?;
-        let first = string_argument_view(&args[0], context)?;
-        context.charge_work(first.len().saturating_add(second.len()))?;
-        let v = self.0(&first, &second);
-        Ok(Value::Boolean(v))
-    }
 }
 
 /// Borrow existing string values or coerce under the evaluation's traversal and memory limits.
@@ -419,6 +293,8 @@ pub fn string_argument_view<'a>(
     use std::borrow::Cow;
     match value {
         Value::String(text) => Ok(Cow::Borrowed(text)),
+        #[cfg(feature = "embedded")]
+        Value::AccountedString(text) => Ok(Cow::Borrowed(text)),
         Value::ResultTreeFragment(_, text) => Ok(Cow::Borrowed(text)),
         Value::Nodeset(nodes) => match nodes.document_order_first_with_context(context)? {
             Some(node) => node.string_value_with_context(context).map(Cow::Owned),
@@ -429,324 +305,6 @@ pub fn string_argument_view<'a>(
             Ok(Cow::Owned(value.string()))
         }
     }
-}
-
-fn starts_with() -> TwoStringPredicate {
-    fn imp(a: &str, b: &str) -> bool {
-        str::starts_with(a, b)
-    }
-    TwoStringPredicate(imp)
-}
-fn contains() -> TwoStringPredicate {
-    fn imp(a: &str, b: &str) -> bool {
-        str::contains(a, b)
-    }
-    TwoStringPredicate(imp)
-}
-
-struct SubstringCommon(for<'s> fn(&'s str, &'s str) -> &'s str);
-
-impl Function for SubstringCommon {
-    fn evaluate<'c, 'd>(
-        &self,
-        context: &context::Evaluation<'c, 'd>,
-        args: Vec<Value<'d>>,
-    ) -> Result<Value<'d>, Error> {
-        let mut args = Args(args);
-        args.exactly(2)?;
-        let second = args.pop_string(context)?;
-        let first = args.pop_string(context)?;
-        context.charge_work(first.len().saturating_mul(2).saturating_add(second.len()))?;
-        let s = self.0(&first, &second);
-        context.reserve_string_allocation(s.len())?;
-        Ok(Value::String(s.to_owned()))
-    }
-}
-
-fn substring_before() -> SubstringCommon {
-    fn inner<'a>(haystack: &'a str, needle: &'a str) -> &'a str {
-        match haystack.find(needle) {
-            Some(pos) => &haystack[..pos],
-            None => "",
-        }
-    }
-    SubstringCommon(inner)
-}
-
-fn substring_after() -> SubstringCommon {
-    fn inner<'a>(haystack: &'a str, needle: &'a str) -> &'a str {
-        match haystack.find(needle) {
-            Some(pos) => &haystack[pos + needle.len()..],
-            None => "",
-        }
-    }
-    SubstringCommon(inner)
-}
-
-struct Substring;
-
-impl Function for Substring {
-    fn evaluate<'c, 'd>(
-        &self,
-        context: &context::Evaluation<'c, 'd>,
-        args: Vec<Value<'d>>,
-    ) -> Result<Value<'d>, Error> {
-        let mut args = Args(args);
-        args.at_least(2)?;
-        args.at_most(3)?;
-
-        let len = if args.len() == 3 {
-            let len = args.pop_number(context)?;
-            Some(round_ties_to_positive_infinity(len))
-        } else {
-            None
-        };
-
-        let start = args.pop_number(context)?;
-        let start = round_ties_to_positive_infinity(start);
-        let s = args.pop_string(context)?;
-        context.charge_work(s.len().saturating_mul(2))?;
-        context.reserve_string_allocation(s.len())?;
-
-        let mut selected_chars = String::with_capacity(s.len());
-        selected_chars.extend(s.chars().enumerate().filter_map(|(p, s)| {
-            let p = (p + 1) as f64; // 1-based indexing
-            if p >= start && len.is_none_or(|len| p < start + len) {
-                Some(s)
-            } else {
-                None
-            }
-        }));
-
-        Ok(Value::String(selected_chars))
-    }
-}
-
-struct StringLength;
-
-impl Function for StringLength {
-    fn evaluate<'c, 'd>(
-        &self,
-        context: &context::Evaluation<'c, 'd>,
-        args: Vec<Value<'d>>,
-    ) -> Result<Value<'d>, Error> {
-        let mut args = Args(args);
-        args.at_most(1)?;
-        let length = match args.0.pop() {
-            None => context.node.string_value_char_len_with_context(context)?,
-            Some(Value::Nodeset(nodes)) => {
-                match nodes.document_order_first_with_context(context)? {
-                    Some(node) => node.string_value_char_len_with_context(context)?,
-                    None => 0,
-                }
-            }
-            Some(value) => {
-                context.charge_work(value.string_len())?;
-                value.string_char_len()
-            }
-        };
-        Ok(Value::Number(length as f64))
-    }
-}
-
-struct NormalizeSpace;
-
-impl Function for NormalizeSpace {
-    fn evaluate<'c, 'd>(
-        &self,
-        context: &context::Evaluation<'c, 'd>,
-        args: Vec<Value<'d>>,
-    ) -> Result<Value<'d>, Error> {
-        let mut args = Args(args);
-        args.at_most(1)?;
-        let arg = args.pop_string_value_or_context_node(context)?;
-        context.charge_work(arg.len().saturating_mul(2))?;
-        let length = arg
-            .split(XmlChar::is_space_char)
-            .filter(|part| !part.is_empty())
-            .try_fold((0usize, false), |(length, has_part), part| {
-                length
-                    .checked_add(usize::from(has_part))
-                    .and_then(|length| length.checked_add(part.len()))
-                    .map(|length| (length, true))
-            })
-            .map(|(length, _)| length)
-            .unwrap_or(usize::MAX);
-        context.reserve_string_allocation(length)?;
-        let mut normalized = String::with_capacity(length);
-        for part in arg
-            .split(XmlChar::is_space_char)
-            .filter(|part| !part.is_empty())
-        {
-            if !normalized.is_empty() {
-                normalized.push(' ');
-            }
-            normalized.push_str(part);
-        }
-        Ok(Value::String(normalized))
-    }
-}
-
-struct Translate;
-
-impl Function for Translate {
-    fn evaluate<'c, 'd>(
-        &self,
-        context: &context::Evaluation<'c, 'd>,
-        args: Vec<Value<'d>>,
-    ) -> Result<Value<'d>, Error> {
-        let mut args = Args(args);
-        args.exactly(3)?;
-
-        let to = args.pop_string(context)?;
-        let from = args.pop_string(context)?;
-        let s = args.pop_string(context)?;
-        let source_bytes = s.len();
-        let map_capacity = from.len();
-        let map_bytes =
-            map_capacity.saturating_mul(std::mem::size_of::<(char, usize, Option<char>)>());
-        let result_bytes = source_bytes.saturating_mul(char::MAX.len_utf8());
-        context.reserve_string_allocation(map_bytes.saturating_add(result_bytes))?;
-
-        // Sorting and per-character binary lookup are O((map + input) log(map)).
-        // Byte lengths bound Unicode scalar counts without an uncharged counting pass.
-        let levels = (usize::BITS - from.len().leading_zeros()) as usize + 1;
-        context.charge_work(
-            from.len()
-                .saturating_add(s.len())
-                .saturating_mul(levels.saturating_mul(2))
-                .saturating_add(to.len()),
-        )?;
-        let mut replacements = Vec::with_capacity(from.chars().count());
-        let mut to = to.chars();
-        replacements.extend(
-            from.chars()
-                .enumerate()
-                .map(|(index, from)| (from, index, to.next())),
-        );
-        replacements.sort_unstable_by_key(|&(from, index, _)| (from, index));
-        replacements.dedup_by_key(|replacement| replacement.0);
-
-        let s = s
-            .chars()
-            .filter_map(|c| {
-                replacements
-                    .binary_search_by_key(&c, |replacement| replacement.0)
-                    .map_or(Some(c), |index| replacements[index].2)
-            })
-            .collect();
-
-        Ok(Value::String(s))
-    }
-}
-
-struct BooleanFn;
-
-impl Function for BooleanFn {
-    fn evaluate<'c, 'd>(
-        &self,
-        _context: &context::Evaluation<'c, 'd>,
-        args: Vec<Value<'d>>,
-    ) -> Result<Value<'d>, Error> {
-        let args = Args(args);
-        args.exactly(1)?;
-        Ok(Value::Boolean(args[0].boolean()))
-    }
-}
-
-struct Not;
-
-impl Function for Not {
-    fn evaluate<'c, 'd>(
-        &self,
-        _context: &context::Evaluation<'c, 'd>,
-        args: Vec<Value<'d>>,
-    ) -> Result<Value<'d>, Error> {
-        let mut args = Args(args);
-        args.exactly(1)?;
-        let arg = args.pop_boolean()?;
-        Ok(Value::Boolean(!arg))
-    }
-}
-
-struct BooleanLiteral(bool);
-
-impl Function for BooleanLiteral {
-    fn evaluate<'c, 'd>(
-        &self,
-        _context: &context::Evaluation<'c, 'd>,
-        args: Vec<Value<'d>>,
-    ) -> Result<Value<'d>, Error> {
-        let args = Args(args);
-        args.exactly(0)?;
-        Ok(Value::Boolean(self.0))
-    }
-}
-
-fn true_fn() -> BooleanLiteral {
-    BooleanLiteral(true)
-}
-fn false_fn() -> BooleanLiteral {
-    BooleanLiteral(false)
-}
-
-struct NumberFn;
-
-impl Function for NumberFn {
-    fn evaluate<'c, 'd>(
-        &self,
-        context: &context::Evaluation<'c, 'd>,
-        args: Vec<Value<'d>>,
-    ) -> Result<Value<'d>, Error> {
-        let mut args = Args(args);
-        args.at_most(1)?;
-        let arg = args.pop_value_or_context_node(context);
-        Ok(Value::Number(arg.number(context)?))
-    }
-}
-
-struct Sum;
-
-impl Function for Sum {
-    fn evaluate<'c, 'd>(
-        &self,
-        context: &context::Evaluation<'c, 'd>,
-        args: Vec<Value<'d>>,
-    ) -> Result<Value<'d>, Error> {
-        let mut args = Args(args);
-        args.exactly(1)?;
-        let arg = args.pop_nodeset()?;
-        let mut r = 0.0;
-        // A node-set has no iteration order; floating-point addition is order-sensitive.
-        // Use document order so sum() is deterministic for the same XPath input.
-        arg.visit_document_order_with_context(context, |node| {
-            r += node_to_num_with_context(context, node)?;
-            Ok(())
-        })?;
-        Ok(Value::Number(r))
-    }
-}
-
-struct NumberConvert(fn(f64) -> f64);
-
-impl Function for NumberConvert {
-    fn evaluate<'c, 'd>(
-        &self,
-        context: &context::Evaluation<'c, 'd>,
-        args: Vec<Value<'d>>,
-    ) -> Result<Value<'d>, Error> {
-        let mut args = Args(args);
-        args.exactly(1)?;
-        let arg = args.pop_number(context)?;
-        Ok(Value::Number(self.0(arg)))
-    }
-}
-
-fn floor() -> NumberConvert {
-    NumberConvert(f64::floor)
-}
-fn ceiling() -> NumberConvert {
-    NumberConvert(f64::ceil)
 }
 
 // https://stackoverflow.com/a/28124775/155423
@@ -765,39 +323,27 @@ fn round_ties_to_positive_infinity(x: f64) -> f64 {
     }
 }
 
-fn round() -> NumberConvert {
-    NumberConvert(round_ties_to_positive_infinity)
-}
+pub(super) use core::CORE_NAMES;
+pub use core::register_core_functions;
 
-/// Adds the [XPath 1.0 core function library][corelib].
-///
-/// [corelib]: https://www.w3.org/TR/xpath/#corelib
-pub fn register_core_functions(context: &mut context::ScopedContext<'_, '_>) {
-    context.set_function("last", Last);
-    context.set_function("position", Position);
-    context.set_function("count", Count);
-    context.set_function("local-name", LocalName);
-    context.set_function("namespace-uri", NamespaceUri);
-    context.set_function("name", Name);
-    context.set_function("string", StringFn);
-    context.set_function("concat", Concat);
-    context.set_function("starts-with", starts_with());
-    context.set_function("contains", contains());
-    context.set_function("substring-before", substring_before());
-    context.set_function("substring-after", substring_after());
-    context.set_function("substring", Substring);
-    context.set_function("string-length", StringLength);
-    context.set_function("normalize-space", NormalizeSpace);
-    context.set_function("translate", Translate);
-    context.set_function("boolean", BooleanFn);
-    context.set_function("not", Not);
-    context.set_function("true", true_fn());
-    context.set_function("false", false_fn());
-    context.set_function("number", NumberFn);
-    context.set_function("sum", Sum);
-    context.set_function("floor", floor());
-    context.set_function("ceiling", ceiling());
-    context.set_function("round", round());
+#[cfg(test)]
+use core::Core::{
+    Boolean as BooleanFn, Concat, Count, Last, LocalName, Name, NamespaceUri,
+    Normalize as NormalizeSpace, Number as NumberFn, Position, String as StringFn, StringLength,
+    Substring, Sum, Translate,
+};
+
+#[cfg(test)]
+macro_rules! test_function {
+    ($($name:ident => $kind:ident),* $(,)?) => {
+        $(const fn $name() -> core::Core { core::Core::$kind })*
+    };
+}
+#[cfg(test)]
+test_function! {
+    starts_with => StartsWith, contains => Contains, substring_before => Before,
+    substring_after => After,
+    floor => Floor, ceiling => Ceiling, round => Round,
 }
 
 #[cfg(test)]
@@ -818,6 +364,23 @@ mod test {
         NormalizeSpace, NumberFn, Position, StringFn, StringLength, Substring, Sum, Translate,
         ceiling, contains, floor, round, starts_with, substring_after, substring_before,
     };
+
+    #[test]
+    fn native_text_growth_admits_the_old_and_new_allocation() {
+        // A reallocating builder may hold both blocks during relocation;
+        // reserving only the capacity delta would let the live peak escape.
+        let package = Package::new();
+        let mut context = context::Context::new();
+        context.set_string_allocation_limit(64);
+        let evaluation = context::Evaluation::new(&context, package.as_document().root().into());
+        let mut text = String::new();
+        super::append_metered_string(&mut text, &"a".repeat(32), &evaluation).unwrap();
+        let error = super::append_metered_string(&mut text, "b", &evaluation)
+            .expect_err("32 old plus 64 new does not fit 64");
+        assert!(error.to_string().contains("allocation budget"));
+        assert_eq!(text, "a".repeat(32));
+        assert_eq!(context.string_allocation_exceeded(), Some(96));
+    }
 
     /// Converts each argument into a `Value` and packs them into a
     /// vector.
@@ -1297,7 +860,7 @@ mod test {
         let mut setup = Setup::new();
         setup.context.set_evaluation_work_limit(0);
         let evaluation = context::Evaluation::new(&setup.context, document.root().into());
-        let mut args = super::Args(vec![Value::Nodeset(nodeset![root])]);
+        let mut args = super::Args::new(vec![Value::Nodeset(nodeset![root])]);
         assert!(
             args.pop_string(&evaluation).is_err(),
             "coercion must reject before traversing"
@@ -1334,8 +897,9 @@ mod test {
     #[test]
     fn translate_charges_one_character_replacement_storage() {
         // Derive the target-dependent tuple layout from the production representation instead of
-        // assuming a 64-bit ABI.
-        let required = std::mem::size_of::<(char, usize, Option<char>)>() + char::MAX.len_utf8();
+        // assuming a 64-bit ABI. The UTF-8 scratch is on the stack; the heap
+        // owns one replacement tuple and the actual one-byte output.
+        let required = std::mem::size_of::<(char, usize, Option<char>)>() + "b".len();
         let package = Package::new();
         let document = package.as_document();
         let mut setup = Setup::new();

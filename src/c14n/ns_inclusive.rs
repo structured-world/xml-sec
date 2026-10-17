@@ -7,6 +7,7 @@
 //! attributes.
 
 use crate::xml::dom::Node;
+use crate::xml::dom::storage::Storage as DomStorage;
 
 use super::C14nError;
 use super::NodeVisibility;
@@ -20,12 +21,12 @@ use super::serialize::NsRenderer;
 /// output ancestor already rendered.
 pub(crate) struct InclusiveNsRenderer;
 
-impl<S: Scratch> NsRenderer<S> for InclusiveNsRenderer {
+impl<S: Scratch, D: DomStorage> NsRenderer<S, D> for InclusiveNsRenderer {
     fn render_namespaces<'a>(
         &self,
-        node: Node<'a, '_>,
+        node: Node<'a, '_, D>,
         parent_rendered: &S::Namespaces<'a>,
-        visibility: Option<&dyn NodeVisibility>,
+        visibility: Option<&dyn NodeVisibility<D>>,
         scratch: &S,
     ) -> Result<NamespaceRendering<'a, S>, C14nError> {
         // Inclusive mode: all in-scope namespace bindings are candidates.

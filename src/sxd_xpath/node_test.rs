@@ -6,18 +6,30 @@ use sxd_document_no_unsafe::QName;
 
 use crate::context;
 use crate::expression::Error;
-use crate::nodeset::{self, OrderedNodes};
+use crate::nodeset;
+#[cfg(test)]
+use crate::nodeset::OrderedNodes;
 
 pub trait NodeTest: fmt::Debug {
     fn validate(&self, _context: &context::Evaluation<'_, '_>) -> Result<(), Error> {
         Ok(())
     }
 
+    fn matches(&self, context: &context::Evaluation<'_, '_>) -> Result<bool, Error>;
+
+    #[cfg(test)]
     fn test<'c, 'd>(
         &self,
         context: &context::Evaluation<'c, 'd>,
         result: &mut OrderedNodes<'d>,
-    ) -> Result<(), Error>;
+    ) -> Result<(), Error> {
+        if self.matches(context)? {
+            result
+                .add_metered(context, context.node.clone())
+                .map_err(|source| Error::FunctionEvaluation { source })?;
+        }
+        Ok(())
+    }
 }
 
 impl<T: ?Sized> NodeTest for Box<T>
@@ -28,30 +40,83 @@ where
         (**self).validate(context)
     }
 
-    fn test<'c, 'd>(
-        &self,
-        context: &context::Evaluation<'c, 'd>,
-        result: &mut OrderedNodes<'d>,
-    ) -> Result<(), Error> {
-        (**self).test(context, result)
+    fn matches(&self, context: &context::Evaluation<'_, '_>) -> Result<bool, Error> {
+        (**self).matches(context)
     }
 }
 
-pub type SubNodeTest = Box<dyn NodeTest + 'static>;
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct NameTest {
-    pub prefix: Option<String>,
-    pub local_part: String,
+// XPath 1.0 §2.3 defines a closed set of node tests. Store that grammar
+// directly in each path step rather than allocating a trait object per step.
+// https://www.w3.org/TR/1999/REC-xpath-19991116/#node-tests
+#[derive(Debug)]
+pub enum SubNodeTest<T = String> {
+    Node,
+    Text,
+    Comment,
+    ProcessingInstruction(ProcessingInstruction<T>),
+    Attribute(Attribute<T>),
+    Element(Element<T>),
+    Namespace(Namespace<T>),
 }
 
-impl NameTest {
+impl<T> From<super::grammar::Test<T>> for SubNodeTest<T> {
+    fn from(test: super::grammar::Test<T>) -> Self {
+        use super::grammar::Test;
+        use crate::axis::PrincipalNodeType;
+        use crate::token::NodeTestName;
+        match test {
+            Test::Kind(NodeTestName::Node) => Self::Node,
+            Test::Kind(NodeTestName::Text) => Self::Text,
+            Test::Kind(NodeTestName::Comment) => Self::Comment,
+            Test::Kind(NodeTestName::ProcessingInstruction(target)) => {
+                Self::ProcessingInstruction(ProcessingInstruction::for_target(target))
+            }
+            Test::Name(PrincipalNodeType::Attribute, name) => Self::Attribute(Attribute::new(name)),
+            Test::Name(PrincipalNodeType::Element, name) => Self::Element(Element::new(name)),
+            Test::Name(PrincipalNodeType::Namespace, name) => Self::Namespace(Namespace::new(name)),
+        }
+    }
+}
+
+impl<T: AsRef<str> + std::fmt::Debug> NodeTest for SubNodeTest<T> {
+    fn validate(&self, context: &context::Evaluation<'_, '_>) -> Result<(), Error> {
+        match self {
+            Self::Attribute(test) => test.validate(context),
+            Self::Element(test) => test.validate(context),
+            Self::Namespace(test) => test.validate(context),
+            Self::Node | Self::Text | Self::Comment | Self::ProcessingInstruction(_) => Ok(()),
+        }
+    }
+
+    fn matches(&self, context: &context::Evaluation<'_, '_>) -> Result<bool, Error> {
+        match self {
+            Self::Node => Node.matches(context),
+            Self::Text => Text.matches(context),
+            Self::Comment => Comment.matches(context),
+            Self::ProcessingInstruction(test) => test.matches(context),
+            Self::Attribute(test) => test.matches(context),
+            Self::Element(test) => test.matches(context),
+            Self::Namespace(test) => test.matches(context),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NameTest<T = String> {
+    pub prefix: Option<T>,
+    pub local_part: T,
+}
+
+impl<T: AsRef<str>> NameTest<T> {
     fn validate(&self, context: &context::Evaluation<'_, '_>) -> Result<(), Error> {
         if let Some(prefix) = &self.prefix
-            && context.namespace_for(prefix).is_none()
+            && context
+                .namespace_for(prefix.as_ref())
+                .map_err(|source| Error::FunctionEvaluation { source })?
+                .is_none()
         {
             return Err(Error::UnknownNamespace {
-                prefix: prefix.clone(),
+                prefix: prefix.as_ref().to_owned(),
             });
         }
         Ok(())
@@ -62,16 +127,17 @@ impl NameTest {
         context: &context::Evaluation<'_, '_>,
         node_name: QName<'_>,
     ) -> Result<bool, Error> {
-        let is_wildcard = self.local_part == "*";
+        let is_wildcard = self.local_part.as_ref() == "*";
 
         let test_uri = self
             .prefix
             .as_ref()
             .map(|prefix| {
                 context
-                    .namespace_for(prefix)
+                    .namespace_for(prefix.as_ref())
+                    .map_err(|source| Error::FunctionEvaluation { source })?
                     .ok_or_else(|| Error::UnknownNamespace {
-                        prefix: prefix.clone(),
+                        prefix: prefix.as_ref().to_owned(),
                     })
             })
             .transpose()?;
@@ -79,108 +145,87 @@ impl NameTest {
         Ok(match (is_wildcard, test_uri) {
             (true, None) => true,
             (true, Some(..)) => test_uri == node_name.namespace_uri(),
-            _ => test_uri == node_name.namespace_uri() && self.local_part == node_name.local_part(),
+            _ => {
+                test_uri == node_name.namespace_uri()
+                    && self.local_part.as_ref() == node_name.local_part()
+            }
         })
     }
 }
 
 #[derive(Debug)]
-pub struct Attribute {
-    name_test: NameTest,
+pub struct Attribute<T = String> {
+    name_test: NameTest<T>,
 }
 
-impl Attribute {
-    pub fn new(name: NameTest) -> Attribute {
+impl<T> Attribute<T> {
+    pub fn new(name: NameTest<T>) -> Self {
         Attribute { name_test: name }
     }
 }
 
-impl NodeTest for Attribute {
+impl<T: AsRef<str> + std::fmt::Debug> NodeTest for Attribute<T> {
     fn validate(&self, context: &context::Evaluation<'_, '_>) -> Result<(), Error> {
         self.name_test.validate(context)
     }
 
-    fn test<'c, 'd>(
-        &self,
-        context: &context::Evaluation<'c, 'd>,
-        result: &mut OrderedNodes<'d>,
-    ) -> Result<(), Error> {
-        if let nodeset::Node::Attribute(ref a) = context.node
-            && self
+    fn matches(&self, context: &context::Evaluation<'_, '_>) -> Result<bool, Error> {
+        if let nodeset::Node::Attribute(ref a) = context.node {
+            return self
                 .name_test
-                .matches(context, sxd_document_no_unsafe::as_qname!(a.name()))?
-        {
-            result
-                .add_metered(context, context.node.clone())
-                .map_err(|source| Error::FunctionEvaluation { source })?;
+                .matches(context, sxd_document_no_unsafe::as_qname!(a.name()));
         }
-        Ok(())
+        Ok(false)
     }
 }
 
 #[derive(Debug)]
-pub struct Namespace {
-    name_test: NameTest,
+pub struct Namespace<T = String> {
+    name_test: NameTest<T>,
 }
 
-impl Namespace {
-    pub fn new(name: NameTest) -> Namespace {
+impl<T> Namespace<T> {
+    pub fn new(name: NameTest<T>) -> Self {
         Namespace { name_test: name }
     }
 }
 
-impl NodeTest for Namespace {
+impl<T: AsRef<str> + std::fmt::Debug> NodeTest for Namespace<T> {
     fn validate(&self, context: &context::Evaluation<'_, '_>) -> Result<(), Error> {
         self.name_test.validate(context)
     }
 
-    fn test<'c, 'd>(
-        &self,
-        context: &context::Evaluation<'c, 'd>,
-        result: &mut OrderedNodes<'d>,
-    ) -> Result<(), Error> {
-        if let nodeset::Node::Namespace(ref ns) = context.node
-            && self.name_test.matches(context, QName::new(ns.prefix()))?
-        {
-            result
-                .add_metered(context, context.node.clone())
-                .map_err(|source| Error::FunctionEvaluation { source })?;
+    fn matches(&self, context: &context::Evaluation<'_, '_>) -> Result<bool, Error> {
+        if let nodeset::Node::Namespace(ref ns) = context.node {
+            return self.name_test.matches(context, QName::new(ns.prefix()));
         }
-        Ok(())
+        Ok(false)
     }
 }
 
 #[derive(Debug)]
-pub struct Element {
-    name_test: NameTest,
+pub struct Element<T = String> {
+    name_test: NameTest<T>,
 }
 
-impl Element {
-    pub fn new(name: NameTest) -> Element {
+impl<T> Element<T> {
+    pub fn new(name: NameTest<T>) -> Self {
         Element { name_test: name }
     }
 }
 
-impl NodeTest for Element {
+impl<T: AsRef<str> + std::fmt::Debug> NodeTest for Element<T> {
     fn validate(&self, context: &context::Evaluation<'_, '_>) -> Result<(), Error> {
         self.name_test.validate(context)
     }
 
-    fn test<'c, 'd>(
-        &self,
-        context: &context::Evaluation<'c, 'd>,
-        result: &mut OrderedNodes<'d>,
-    ) -> Result<(), Error> {
-        if let nodeset::Node::Element(ref e) = context.node
-            && self
+    fn matches(&self, context: &context::Evaluation<'_, '_>) -> Result<bool, Error> {
+        if let nodeset::Node::Element(ref e) = context.node {
+            return self
                 .name_test
-                .matches(context, sxd_document_no_unsafe::as_qname!(e.name()))?
-        {
-            result
-                .add_metered(context, context.node.clone())
-                .map_err(|source| Error::FunctionEvaluation { source })?;
+                .matches(context, sxd_document_no_unsafe::as_qname!(e.name()));
         }
-        Ok(())
+        Ok(false)
     }
 }
 
@@ -189,15 +234,8 @@ impl NodeTest for Element {
 pub struct Node;
 
 impl NodeTest for Node {
-    fn test<'c, 'd>(
-        &self,
-        context: &context::Evaluation<'c, 'd>,
-        result: &mut OrderedNodes<'d>,
-    ) -> Result<(), Error> {
-        result
-            .add_metered(context, context.node.clone())
-            .map_err(|source| Error::FunctionEvaluation { source })?;
-        Ok(())
+    fn matches(&self, _: &context::Evaluation<'_, '_>) -> Result<bool, Error> {
+        Ok(true)
     }
 }
 
@@ -206,17 +244,8 @@ impl NodeTest for Node {
 pub struct Text;
 
 impl NodeTest for Text {
-    fn test<'c, 'd>(
-        &self,
-        context: &context::Evaluation<'c, 'd>,
-        result: &mut OrderedNodes<'d>,
-    ) -> Result<(), Error> {
-        if let nodeset::Node::Text(_) = context.node {
-            result
-                .add_metered(context, context.node.clone())
-                .map_err(|source| Error::FunctionEvaluation { source })?;
-        }
-        Ok(())
+    fn matches(&self, context: &context::Evaluation<'_, '_>) -> Result<bool, Error> {
+        Ok(matches!(context.node, nodeset::Node::Text(_)))
     }
 }
 
@@ -225,49 +254,31 @@ impl NodeTest for Text {
 pub struct Comment;
 
 impl NodeTest for Comment {
-    fn test<'c, 'd>(
-        &self,
-        context: &context::Evaluation<'c, 'd>,
-        result: &mut OrderedNodes<'d>,
-    ) -> Result<(), Error> {
-        if let nodeset::Node::Comment(_) = context.node {
-            result
-                .add_metered(context, context.node.clone())
-                .map_err(|source| Error::FunctionEvaluation { source })?;
-        }
-        Ok(())
+    fn matches(&self, context: &context::Evaluation<'_, '_>) -> Result<bool, Error> {
+        Ok(matches!(context.node, nodeset::Node::Comment(_)))
     }
 }
 
 #[derive(Debug)]
-pub struct ProcessingInstruction {
-    target: Option<String>,
+pub struct ProcessingInstruction<T = String> {
+    target: Option<T>,
 }
 
-impl ProcessingInstruction {
-    pub fn new(target: Option<String>) -> ProcessingInstruction {
+impl<T> ProcessingInstruction<T> {
+    fn for_target(target: Option<T>) -> Self {
         ProcessingInstruction { target }
     }
 }
 
-impl NodeTest for ProcessingInstruction {
-    fn test<'c, 'd>(
-        &self,
-        context: &context::Evaluation<'c, 'd>,
-        result: &mut OrderedNodes<'d>,
-    ) -> Result<(), Error> {
+impl<T: AsRef<str> + std::fmt::Debug> NodeTest for ProcessingInstruction<T> {
+    fn matches(&self, context: &context::Evaluation<'_, '_>) -> Result<bool, Error> {
         if let nodeset::Node::ProcessingInstruction(pi) = &context.node {
-            match self.target {
-                Some(ref name) if name == sxd_document_no_unsafe::as_str!(pi.target()) => result
-                    .add_metered(context, context.node.clone())
-                    .map_err(|source| Error::FunctionEvaluation { source })?,
-                Some(_) => {}
-                None => result
-                    .add_metered(context, context.node.clone())
-                    .map_err(|source| Error::FunctionEvaluation { source })?,
-            }
+            return Ok(self
+                .target
+                .as_ref()
+                .is_none_or(|name| name.as_ref() == sxd_document_no_unsafe::as_str!(pi.target())));
         }
-        Ok(())
+        Ok(false)
     }
 }
 
@@ -301,10 +312,10 @@ mod test {
         }
 
         fn context_for_attribute<'n, N>(
-            &'d self,
+            &self,
             name: N,
             val: &str,
-        ) -> (dom::Attribute<'d>, context::Evaluation<'d, 'd>)
+        ) -> (dom::Attribute<'d>, context::Evaluation<'_, 'd>)
         where
             N: Into<QName<'n>>,
         {
@@ -315,20 +326,20 @@ mod test {
         }
 
         fn context_for_ns_attribute(
-            &'d mut self,
+            &mut self,
             prefix: &str,
             nsuri: &str,
             local: &str,
             value: &str,
-        ) -> (dom::Attribute<'d>, context::Evaluation<'d, 'd>) {
+        ) -> (dom::Attribute<'d>, context::Evaluation<'_, 'd>) {
             self.register_prefix(prefix, nsuri);
             self.context_for_attribute((nsuri, local), value)
         }
 
         fn context_for_element<'n, N>(
-            &'d self,
+            &self,
             name: N,
-        ) -> (dom::Element<'d>, context::Evaluation<'d, 'd>)
+        ) -> (dom::Element<'d>, context::Evaluation<'_, 'd>)
         where
             N: Into<QName<'n>>,
         {
@@ -338,18 +349,18 @@ mod test {
         }
 
         fn context_for_ns_element(
-            &'d mut self,
+            &mut self,
             prefix: &str,
             nsuri: &str,
             local: &str,
-        ) -> (dom::Element<'d>, context::Evaluation<'d, 'd>) {
+        ) -> (dom::Element<'d>, context::Evaluation<'_, 'd>) {
             self.register_prefix(prefix, nsuri);
             self.context_for_element((nsuri, local))
         }
     }
 
     fn run_attribute<'d>(
-        context: &context::Evaluation<'d, 'd>,
+        context: &context::Evaluation<'_, 'd>,
         prefix: Option<&str>,
         local: &str,
     ) -> OrderedNodes<'d> {
@@ -449,7 +460,7 @@ mod test {
     }
 
     fn run_element<'d>(
-        context: &context::Evaluation<'d, 'd>,
+        context: &context::Evaluation<'_, 'd>,
         prefix: Option<&str>,
         local: &str,
     ) -> OrderedNodes<'d> {

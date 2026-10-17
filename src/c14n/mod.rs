@@ -23,7 +23,7 @@
 //! ```
 
 mod escape;
-mod scratch;
+pub(crate) mod scratch;
 #[cfg(feature = "xmldsig")]
 pub(crate) use escape::escape_attr;
 mod ns_common;
@@ -35,6 +35,7 @@ pub(crate) mod xml_base;
 
 use std::collections::HashSet;
 
+use crate::xml::dom::storage::{Native as NativeDom, Storage as DomStorage};
 use crate::xml::dom::{Document, Node, NodeId};
 
 use ns_exclusive::ExclusiveNsRenderer;
@@ -121,8 +122,7 @@ impl C14nAlgorithm {
     /// Only meaningful for [`C14nMode::Exclusive1_0`]. For inclusive modes,
     /// the prefix list is ignored during canonicalization.
     pub fn with_prefix_list(mut self, prefix_list: &str) -> Self {
-        self.inclusive_prefixes = prefix_list
-            .split_whitespace()
+        self.inclusive_prefixes = prefix::inclusive_tokens(prefix_list)
             .map(|p| {
                 if p == "#default" {
                     String::new()
@@ -203,17 +203,39 @@ pub(crate) fn is_output_limit_error(error: &C14nError) -> bool {
 /// owner element. The public closure API predates that requirement and treats
 /// both categories as visible whenever their owner is visible; XMLDSig uses
 /// this richer crate-private contract for standards-compliant subsets.
-pub(crate) trait NodeVisibility {
-    fn contains_node(&self, node: Node<'_, '_>) -> bool;
+pub(crate) trait NodeVisibility<D: DomStorage = NativeDom> {
+    fn contains_node(&self, node: Node<'_, '_, D>) -> Result<bool, C14nError>;
 
     fn contains_attribute(
         &self,
-        owner: Node<'_, '_>,
+        owner: Node<'_, '_, D>,
         namespace: Option<&str>,
         local_name: &str,
-    ) -> bool;
+    ) -> Result<bool, C14nError>;
 
-    fn contains_namespace(&self, owner: Node<'_, '_>, prefix: &str, uri: &str) -> bool;
+    fn contains_namespace(
+        &self,
+        owner: Node<'_, '_, D>,
+        prefix: &str,
+        uri: &str,
+    ) -> Result<bool, C14nError>;
+
+    fn contains_attribute_at(
+        &self,
+        owner: Node<'_, '_, D>,
+        _ordinal: usize,
+        attribute: crate::xml::dom::Attribute<'_, D>,
+    ) -> Result<bool, C14nError> {
+        self.contains_attribute(owner, attribute.namespace(), attribute.name())
+    }
+    fn contains_namespace_at(
+        &self,
+        owner: Node<'_, '_, D>,
+        _ordinal: usize,
+        namespace: crate::xml::dom::Namespace<'_, D>,
+    ) -> Result<bool, C14nError> {
+        self.contains_namespace(owner, namespace.name().unwrap_or(""), namespace.uri())
+    }
 }
 
 struct ClosureVisibility<'a> {
@@ -221,8 +243,8 @@ struct ClosureVisibility<'a> {
 }
 
 impl NodeVisibility for ClosureVisibility<'_> {
-    fn contains_node(&self, node: Node<'_, '_>) -> bool {
-        (self.predicate)(node)
+    fn contains_node(&self, node: Node<'_, '_>) -> Result<bool, C14nError> {
+        Ok((self.predicate)(node))
     }
 
     fn contains_attribute(
@@ -230,12 +252,17 @@ impl NodeVisibility for ClosureVisibility<'_> {
         owner: Node<'_, '_>,
         _namespace: Option<&str>,
         _local_name: &str,
-    ) -> bool {
-        (self.predicate)(owner)
+    ) -> Result<bool, C14nError> {
+        Ok((self.predicate)(owner))
     }
 
-    fn contains_namespace(&self, owner: Node<'_, '_>, _prefix: &str, _uri: &str) -> bool {
-        (self.predicate)(owner)
+    fn contains_namespace(
+        &self,
+        owner: Node<'_, '_>,
+        _prefix: &str,
+        _uri: &str,
+    ) -> Result<bool, C14nError> {
+        Ok((self.predicate)(owner))
     }
 }
 
@@ -312,7 +339,9 @@ pub(crate) fn canonicalize_visible_to_writer_bounded<W: std::io::Write + ?Sized>
         initial_offset,
         &scratch::Native,
         None,
+        None,
     )
+    .map(|_| ())
 }
 
 #[cfg(feature = "xmldsig")]
@@ -320,9 +349,10 @@ pub(crate) fn canonicalize_visible_to_writer_bounded<W: std::io::Write + ?Sized>
 pub(crate) fn canonicalize_visible_to_writer_accounted<
     W: std::io::Write + ?Sized,
     E: structured_asn1::memory::Work,
+    D: DomStorage,
 >(
-    doc: &Document,
-    visibility: Option<&dyn NodeVisibility>,
+    doc: &Document<'_, D>,
+    visibility: Option<&dyn NodeVisibility<D>>,
     algo: &C14nAlgorithm,
     max_output_bytes: usize,
     xml_base_resolution: &xml_base::XmlBaseResolutionBudget,
@@ -340,14 +370,73 @@ pub(crate) fn canonicalize_visible_to_writer_accounted<
         0,
         &scratch::Accounted(work),
         prefix_list,
+        None,
     )
+    .map(|_| ())
+}
+
+/// Materialize only when another transform requires bytes, with the same
+/// serializer, storage admission and position provenance as terminal output.
+#[cfg(feature = "xmldsig")]
+pub(crate) fn canonicalize_buffer_in<S: scratch::Scratch, D: DomStorage>(
+    doc: &Document<'_, D>,
+    visibility: &dyn NodeVisibility<D>,
+    (algo, prefix_list): (&C14nAlgorithm, Option<&str>),
+    tracked: Option<NodeId>,
+    max_output_bytes: usize,
+    xml_base_resolution: &xml_base::XmlBaseResolutionBudget,
+    scratch: &S,
+) -> Result<(S::Bytes, Option<usize>), C14nError> {
+    struct Buffer<B> {
+        bytes: B,
+        failure: Option<C14nError>,
+    }
+    impl<B: scratch::Bytes> std::io::Write for Buffer<B> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.failure.is_some() {
+                return Err(std::io::ErrorKind::OutOfMemory.into());
+            }
+            if let Err(error) = self.bytes.append(bytes) {
+                self.failure = Some(error);
+                return Err(std::io::ErrorKind::OutOfMemory.into());
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut buffer = Buffer {
+        bytes: scratch.bytes(),
+        failure: None,
+    };
+    let result = canonicalize_writer_with_scratch(
+        doc,
+        Some(visibility),
+        algo,
+        max_output_bytes,
+        xml_base_resolution,
+        &mut buffer,
+        0,
+        scratch,
+        prefix_list,
+        tracked,
+    );
+    if let Some(error) = buffer.failure {
+        return Err(error);
+    }
+    Ok((buffer.bytes, result?))
 }
 
 #[cfg(feature = "xmldsig")]
 #[allow(clippy::too_many_arguments)]
-fn canonicalize_writer_with_scratch<W: std::io::Write + ?Sized, S: scratch::Scratch>(
-    doc: &Document,
-    visibility: Option<&dyn NodeVisibility>,
+fn canonicalize_writer_with_scratch<
+    W: std::io::Write + ?Sized,
+    S: scratch::Scratch,
+    D: DomStorage,
+>(
+    doc: &Document<'_, D>,
+    visibility: Option<&dyn NodeVisibility<D>>,
     algo: &C14nAlgorithm,
     max_output_bytes: usize,
     xml_base_resolution: &xml_base::XmlBaseResolutionBudget,
@@ -355,28 +444,29 @@ fn canonicalize_writer_with_scratch<W: std::io::Write + ?Sized, S: scratch::Scra
     initial_offset: usize,
     scratch: &S,
     prefix_list: Option<&str>,
-) -> Result<(), C14nError> {
+    tracked: Option<NodeId>,
+) -> Result<Option<usize>, C14nError> {
     let inclusive = InclusiveNsRenderer;
     let exclusive = match prefix_list {
         Some(list) => ExclusiveNsRenderer::from_prefix_list(list),
         None => ExclusiveNsRenderer::new(&algo.inclusive_prefixes),
     };
-    let renderer: &dyn serialize::NsRenderer<S> = match algo.mode {
+    let renderer: &dyn serialize::NsRenderer<S, D> = match algo.mode {
         C14nMode::Inclusive1_0 | C14nMode::Inclusive1_1 => &inclusive,
         C14nMode::Exclusive1_0 => &exclusive,
     };
-    serialize::serialize_with_scratch(
+    let (position, _) = serialize::serialize_with_scratch(
         doc,
         visibility,
         algo.with_comments,
         renderer,
         C14nConfig::for_mode(algo.mode),
-        CanonicalOutputOptions::bounded(None, max_output_bytes, xml_base_resolution),
+        CanonicalOutputOptions::bounded(tracked, max_output_bytes, xml_base_resolution),
         output,
         initial_offset,
         scratch,
     )?;
-    Ok(())
+    Ok(position)
 }
 
 pub(crate) fn canonicalize_with_visibility(
@@ -428,9 +518,11 @@ pub(crate) fn canonicalize_with_visibility_and_position_bounded(
 }
 
 #[cfg(feature = "xmldsig")]
-pub(crate) fn canonicalize_with_visibility_and_position_bounded_with_xml_base_budget(
-    doc: &Document,
-    visibility: Option<&dyn NodeVisibility>,
+pub(crate) fn canonicalize_with_visibility_and_position_bounded_with_xml_base_budget<
+    D: DomStorage,
+>(
+    doc: &Document<'_, D>,
+    visibility: Option<&dyn NodeVisibility<D>>,
     algo: &C14nAlgorithm,
     tracked_element: Option<NodeId>,
     max_output_bytes: usize,
@@ -449,9 +541,11 @@ pub(crate) fn canonicalize_with_visibility_and_position_bounded_with_xml_base_bu
 }
 
 #[cfg(feature = "xmldsig")]
-pub(crate) fn canonicalize_with_visibility_and_positions_bounded_with_xml_base_budget(
-    doc: &Document,
-    visibility: Option<&dyn NodeVisibility>,
+pub(crate) fn canonicalize_with_visibility_and_positions_bounded_with_xml_base_budget<
+    D: DomStorage,
+>(
+    doc: &Document<'_, D>,
+    visibility: Option<&dyn NodeVisibility<D>>,
     algo: &C14nAlgorithm,
     tracked_elements: &[NodeId],
     max_output_bytes: usize,
@@ -461,7 +555,7 @@ pub(crate) fn canonicalize_with_visibility_and_positions_bounded_with_xml_base_b
     let config = C14nConfig::for_mode(algo.mode);
     let inclusive = InclusiveNsRenderer;
     let exclusive = ExclusiveNsRenderer::new(&algo.inclusive_prefixes);
-    let renderer: &dyn serialize::NsRenderer = match algo.mode {
+    let renderer: &dyn serialize::NsRenderer<scratch::Native, D> = match algo.mode {
         C14nMode::Inclusive1_0 | C14nMode::Inclusive1_1 => &inclusive,
         C14nMode::Exclusive1_0 => &exclusive,
     };
@@ -480,9 +574,9 @@ pub(crate) fn canonicalize_with_visibility_and_positions_bounded_with_xml_base_b
     )
 }
 
-fn canonicalize_with_visibility_and_position_impl(
-    doc: &Document,
-    visibility: Option<&dyn NodeVisibility>,
+fn canonicalize_with_visibility_and_position_impl<D: DomStorage>(
+    doc: &Document<'_, D>,
+    visibility: Option<&dyn NodeVisibility<D>>,
     algo: &C14nAlgorithm,
     tracked_element: Option<NodeId>,
     max_output_bytes: Option<usize>,
@@ -544,11 +638,11 @@ fn canonicalize_with_visibility_and_position_impl(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn serialize_canonical_visible_with_position_dispatch(
-    doc: &Document,
-    visibility: Option<&dyn NodeVisibility>,
+fn serialize_canonical_visible_with_position_dispatch<D: DomStorage>(
+    doc: &Document<'_, D>,
+    visibility: Option<&dyn NodeVisibility<D>>,
     with_comments: bool,
-    renderer: &dyn serialize::NsRenderer,
+    renderer: &dyn serialize::NsRenderer<scratch::Native, D>,
     config: C14nConfig,
     tracked_element: Option<NodeId>,
     max_output_bytes: Option<usize>,

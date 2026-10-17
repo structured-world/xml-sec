@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 use std::io::{self, Write};
 
+use crate::xml::dom::storage::{Native as NativeDom, Storage as DomStorage};
 use crate::xml::dom::{Document, Node, NodeId, NodeType};
 
 #[cfg(test)]
@@ -76,7 +77,7 @@ impl<W: Write + ?Sized, S: Scratch> Write for CanonicalOutput<'_, W, S> {
 }
 
 impl<W: Write + ?Sized, S: Scratch> CanonicalOutput<'_, W, S> {
-    fn track(&mut self, node: Node<'_, '_>) {
+    fn track<D: DomStorage>(&mut self, node: Node<'_, '_, D>) {
         if self.tracked_element == Some(node.id()) {
             self.tracked_position = Some(self.position);
         }
@@ -170,7 +171,7 @@ impl<'a> CanonicalOutputOptions<'a> {
 }
 
 /// Trait for namespace rendering strategies (inclusive vs exclusive).
-pub(crate) trait NsRenderer<S: Scratch = Native> {
+pub(crate) trait NsRenderer<S: Scratch = Native, D: DomStorage = NativeDom> {
     /// Compute namespace declarations to emit for this element.
     /// Returns (sorted_ns_decls, updated_rendered_map).
     ///
@@ -178,9 +179,9 @@ pub(crate) trait NsRenderer<S: Scratch = Native> {
     /// already declared in the canonical form.
     fn render_namespaces<'a>(
         &self,
-        node: Node<'a, '_>,
+        node: Node<'a, '_, D>,
         parent_rendered: &S::Namespaces<'a>,
-        visibility: Option<&dyn NodeVisibility>,
+        visibility: Option<&dyn NodeVisibility<D>>,
         scratch: &S,
     ) -> Result<NamespaceRendering<'a, S>, C14nError>;
 
@@ -250,11 +251,11 @@ pub(crate) fn serialize_canonical_visible_with_position(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn serialize_canonical_visible_with_position_with_xml_base_budget(
-    doc: &Document,
-    visibility: Option<&dyn NodeVisibility>,
+pub(crate) fn serialize_canonical_visible_with_position_with_xml_base_budget<D: DomStorage>(
+    doc: &Document<'_, D>,
+    visibility: Option<&dyn NodeVisibility<D>>,
     with_comments: bool,
-    ns_renderer: &dyn NsRenderer,
+    ns_renderer: &dyn NsRenderer<Native, D>,
     config: C14nConfig,
     tracked_element: Option<NodeId>,
     xml_base_resolution: &XmlBaseResolutionBudget,
@@ -271,11 +272,11 @@ pub(crate) fn serialize_canonical_visible_with_position_with_xml_base_budget(
     )
 }
 
-pub(crate) fn serialize_canonical_visible_with_position_bounded(
-    doc: &Document,
-    visibility: Option<&dyn NodeVisibility>,
+pub(crate) fn serialize_canonical_visible_with_position_bounded<D: DomStorage>(
+    doc: &Document<'_, D>,
+    visibility: Option<&dyn NodeVisibility<D>>,
     with_comments: bool,
-    ns_renderer: &dyn NsRenderer,
+    ns_renderer: &dyn NsRenderer<Native, D>,
     config: C14nConfig,
     options: CanonicalOutputOptions<'_>,
     output: &mut Vec<u8>,
@@ -295,11 +296,11 @@ pub(crate) fn serialize_canonical_visible_with_position_bounded(
 }
 
 #[cfg(feature = "xmldsig")]
-pub(crate) fn serialize_canonical_visible_with_positions_bounded(
-    doc: &Document,
-    visibility: Option<&dyn NodeVisibility>,
+pub(crate) fn serialize_canonical_visible_with_positions_bounded<D: DomStorage>(
+    doc: &Document<'_, D>,
+    visibility: Option<&dyn NodeVisibility<D>>,
     with_comments: bool,
-    ns_renderer: &dyn NsRenderer,
+    ns_renderer: &dyn NsRenderer<Native, D>,
     config: C14nConfig,
     options: CanonicalOutputOptions<'_>,
     output: &mut Vec<u8>,
@@ -321,11 +322,14 @@ pub(crate) fn serialize_canonical_visible_with_positions_bounded(
 // The explicit initial offset preserves collecting callers' absolute tracked
 // positions while a terminal writer starts at zero, on the same traversal.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn serialize_canonical_visible_with_positions_bounded_impl<W: Write + ?Sized>(
-    doc: &Document,
-    visibility: Option<&dyn NodeVisibility>,
+pub(crate) fn serialize_canonical_visible_with_positions_bounded_impl<
+    W: Write + ?Sized,
+    D: DomStorage,
+>(
+    doc: &Document<'_, D>,
+    visibility: Option<&dyn NodeVisibility<D>>,
     with_comments: bool,
-    ns_renderer: &dyn NsRenderer,
+    ns_renderer: &dyn NsRenderer<Native, D>,
     config: C14nConfig,
     options: CanonicalOutputOptions<'_>,
     output: &mut W,
@@ -345,11 +349,11 @@ pub(crate) fn serialize_canonical_visible_with_positions_bounded_impl<W: Write +
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn serialize_with_scratch<W: Write + ?Sized, S: Scratch>(
-    doc: &Document,
-    visibility: Option<&dyn NodeVisibility>,
+pub(super) fn serialize_with_scratch<W: Write + ?Sized, S: Scratch, D: DomStorage>(
+    doc: &Document<'_, D>,
+    visibility: Option<&dyn NodeVisibility<D>>,
     with_comments: bool,
-    ns_renderer: &dyn NsRenderer<S>,
+    ns_renderer: &dyn NsRenderer<S, D>,
     config: C14nConfig,
     options: CanonicalOutputOptions<'_>,
     output: &mut W,
@@ -394,11 +398,11 @@ pub(super) fn serialize_with_scratch<W: Write + ?Sized, S: Scratch>(
 }
 
 /// Serialize children of a node in document order.
-fn serialize_children<'n, W: Write + ?Sized, S: Scratch>(
-    parent: Node<'n, '_>,
-    visibility: Option<&dyn NodeVisibility>,
+fn serialize_children<'n, W: Write + ?Sized, S: Scratch, D: DomStorage>(
+    parent: Node<'n, '_, D>,
+    visibility: Option<&dyn NodeVisibility<D>>,
     with_comments: bool,
-    ns_renderer: &dyn NsRenderer<S>,
+    ns_renderer: &dyn NsRenderer<S, D>,
     config: C14nConfig,
     parent_rendered: &S::Namespaces<'n>,
     output: &mut CanonicalOutput<'_, W, S>,
@@ -408,7 +412,10 @@ fn serialize_children<'n, W: Write + ?Sized, S: Scratch>(
     for child in parent.children() {
         output.scratch.charge(1)?;
         // Node-set filtering: skip nodes not in the set.
-        let in_set = visibility.is_none_or(|set| set.contains_node(child));
+        let in_set = match visibility {
+            Some(set) => set.contains_node(child)?,
+            None => true,
+        };
 
         match child.node_type() {
             NodeType::Element => {
@@ -498,10 +505,10 @@ fn serialize_children<'n, W: Write + ?Sized, S: Scratch>(
     Ok(())
 }
 
-fn serialize_selected_axes_of_omitted_element<'n, W: Write + ?Sized, S: Scratch>(
-    owner: Node<'n, '_>,
-    visibility: Option<&dyn NodeVisibility>,
-    ns_renderer: &dyn NsRenderer<S>,
+fn serialize_selected_axes_of_omitted_element<'n, W: Write + ?Sized, S: Scratch, D: DomStorage>(
+    owner: Node<'n, '_, D>,
+    visibility: Option<&dyn NodeVisibility<D>>,
+    ns_renderer: &dyn NsRenderer<S, D>,
     parent_rendered: &S::Namespaces<'n>,
     output: &mut CanonicalOutput<'_, W, S>,
 ) -> Result<(), C14nError> {
@@ -510,7 +517,7 @@ fn serialize_selected_axes_of_omitted_element<'n, W: Write + ?Sized, S: Scratch>
     };
 
     let mut namespaces = output.scratch.values();
-    for namespace in owner.namespaces() {
+    for (ordinal, namespace) in owner.namespaces().enumerate() {
         let prefix = namespace.name().unwrap_or("");
         output.scratch.charge(
             prefix
@@ -520,7 +527,7 @@ fn serialize_selected_axes_of_omitted_element<'n, W: Write + ?Sized, S: Scratch>
         )?;
         if prefix != "xml"
             && ns_renderer.renders_selected_namespace_of_omitted_element(prefix)
-            && visibility.contains_namespace(owner, prefix, namespace.uri())
+            && visibility.contains_namespace_at(owner, ordinal, namespace)?
             && parent_rendered.get(prefix, false)?.flatten() != Some(namespace.uri())
         {
             namespaces.push((prefix, namespace.uri()))?;
@@ -543,11 +550,11 @@ fn serialize_selected_axes_of_omitted_element<'n, W: Write + ?Sized, S: Scratch>
     }
 
     let mut attributes = output.scratch.values();
-    for attribute in owner.attributes() {
+    for (ordinal, attribute) in owner.attributes().enumerate() {
         output
             .scratch
             .charge(attribute.name().len().saturating_add(1))?;
-        if visibility.contains_attribute(owner, attribute.namespace(), attribute.name()) {
+        if visibility.contains_attribute_at(owner, ordinal, attribute)? {
             attributes.push(attribute)?;
         }
     }
@@ -580,11 +587,11 @@ fn serialize_selected_axes_of_omitted_element<'n, W: Write + ?Sized, S: Scratch>
 }
 
 /// Serialize a single element node (start tag + children + end tag).
-fn serialize_element<'n, W: Write + ?Sized, S: Scratch>(
-    node: Node<'n, '_>,
-    visibility: Option<&dyn NodeVisibility>,
+fn serialize_element<'n, W: Write + ?Sized, S: Scratch, D: DomStorage>(
+    node: Node<'n, '_, D>,
+    visibility: Option<&dyn NodeVisibility<D>>,
     with_comments: bool,
-    ns_renderer: &dyn NsRenderer<S>,
+    ns_renderer: &dyn NsRenderer<S, D>,
     config: C14nConfig,
     parent_rendered: &S::Namespaces<'n>,
     output: &mut CanonicalOutput<'_, W, S>,
@@ -634,9 +641,10 @@ fn serialize_element<'n, W: Write + ?Sized, S: Scratch>(
     // The effective base is used for both inherited xml:base values and
     // resolving the element's own xml:base against the ancestor chain.
     let parent_not_in_set = if let Some(set) = visibility {
-        !node
-            .parent()
-            .is_some_and(|p| p.is_element() && set.contains_node(p))
+        match node.parent().filter(|p| p.is_element()) {
+            Some(parent) => !set.contains_node(parent)?,
+            None => true,
+        }
     } else {
         false
     };
@@ -657,10 +665,10 @@ fn serialize_element<'n, W: Write + ?Sized, S: Scratch>(
     // Build unified list: (ns_uri, local_name, prefix, value)
     // Using Cow to avoid allocations when no fixup is needed.
     let mut all_attrs = output.scratch.values();
-    for attr in node.attributes() {
+    for (ordinal, attr) in node.attributes().enumerate() {
         output.scratch.charge(attr.name().len().saturating_add(1))?;
-        if visibility
-            .is_some_and(|set| !set.contains_attribute(node, attr.namespace(), attr.name()))
+        if let Some(set) = visibility
+            && !set.contains_attribute_at(node, ordinal, attr)?
         {
             continue;
         }
@@ -790,7 +798,7 @@ fn write_doc_level_suffix<W: Write + ?Sized, S: Scratch>(
 }
 
 /// Check if a node has a preceding sibling that is an element.
-fn has_preceding_element_sibling(node: &Node) -> bool {
+fn has_preceding_element_sibling<D: DomStorage>(node: &Node<'_, '_, D>) -> bool {
     let mut prev = node.prev_sibling();
     while let Some(p) = prev {
         if p.is_element() {
@@ -813,9 +821,9 @@ fn has_preceding_element_sibling(node: &Node) -> bool {
 ///
 /// Returns `(local_name, value)` pairs. Closer ancestors take precedence.
 /// Attributes already present on the element itself are excluded.
-fn collect_inherited_xml_attrs<'a, S: Scratch>(
-    node: Node<'a, '_>,
-    visibility: Option<&dyn NodeVisibility>,
+fn collect_inherited_xml_attrs<'a, S: Scratch, D: DomStorage>(
+    node: Node<'a, '_, D>,
+    visibility: Option<&dyn NodeVisibility<D>>,
     fixup_xml_base: bool,
     scratch: &S,
 ) -> Result<S::Values<(&'a str, &'a str)>, C14nError> {
@@ -828,7 +836,7 @@ fn collect_inherited_xml_attrs<'a, S: Scratch>(
     // will render its own xml:* attributes, and the element inherits normally.
     if let Some(parent) = node.parent()
         && parent.is_element()
-        && set.contains_node(parent)
+        && set.contains_node(parent)?
     {
         return Ok(scratch.values());
     }
@@ -864,7 +872,7 @@ fn collect_inherited_xml_attrs<'a, S: Scratch>(
             // C14N 1.1 resolves xml:base only across the contiguous omitted
             // chain. An included ancestor already renders its own base, but
             // remains the resolution seed for bases on omitted descendants.
-            xml_base_boundary_reached |= fixup_xml_base && preserves_xml_base_context(anc, set);
+            xml_base_boundary_reached |= fixup_xml_base && preserves_xml_base_context(anc, set)?;
             for attr in anc.attributes() {
                 scratch.charge(attr.name().len().saturating_add(1))?;
                 if attr.namespace() == Some(XML_NS) {
@@ -900,8 +908,8 @@ fn collect_inherited_xml_attrs<'a, S: Scratch>(
 ///
 /// Extracts the lexical prefix from the source XML via byte-range positions,
 /// avoiding ambiguity when multiple prefixes bind the same namespace URI.
-fn write_qualified_name<W: Write + ?Sized, S: Scratch>(
-    node: Node,
+fn write_qualified_name<W: Write + ?Sized, S: Scratch, D: DomStorage>(
+    node: Node<'_, '_, D>,
     output: &mut CanonicalOutput<'_, W, S>,
 ) -> io::Result<()> {
     let prefix = element_prefix(node);
@@ -919,6 +927,52 @@ mod tests {
     use super::super::ns_inclusive::InclusiveNsRenderer;
     use super::*;
     use crate::xml::dom::NodeId;
+
+    #[test]
+    fn visibility_refusal_precedes_output_and_preserves_cause() {
+        // A paid node-set lookup may refuse before reading a key. The
+        // serializer must propagate that refusal, not treat it as exclusion.
+        struct Refused;
+        impl NodeVisibility for Refused {
+            fn contains_node(&self, _: Node<'_, '_>) -> Result<bool, C14nError> {
+                Err(C14nError::OutputLimitExceeded { max_bytes: 7 })
+            }
+            fn contains_attribute(
+                &self,
+                _: Node<'_, '_>,
+                _: Option<&str>,
+                _: &str,
+            ) -> Result<bool, C14nError> {
+                unreachable!("node lookup must refuse before axes are inspected")
+            }
+            fn contains_namespace(
+                &self,
+                _: Node<'_, '_>,
+                _: &str,
+                _: &str,
+            ) -> Result<bool, C14nError> {
+                unreachable!("node lookup must refuse before axes are inspected")
+            }
+        }
+        let document = Document::parse("<root/>").unwrap();
+        let mut output = Vec::new();
+        let algorithm = super::super::C14nAlgorithm::from_uri(
+            "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+        )
+        .unwrap();
+        let error = super::super::canonicalize_with_visibility(
+            &document,
+            Some(&Refused),
+            &algorithm,
+            &mut output,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            C14nError::OutputLimitExceeded { max_bytes: 7 }
+        ));
+        assert!(output.is_empty());
+    }
 
     #[test]
     fn terminal_writer_matches_golden_bytes_without_output_storage() {
@@ -1349,8 +1403,8 @@ mod tests {
     }
 
     impl NodeVisibility for SelectedAxesOnly {
-        fn contains_node(&self, _node: Node<'_, '_>) -> bool {
-            false
+        fn contains_node(&self, _node: Node<'_, '_>) -> Result<bool, C14nError> {
+            Ok(false)
         }
 
         fn contains_attribute(
@@ -1358,12 +1412,17 @@ mod tests {
             owner: Node<'_, '_>,
             namespace: Option<&str>,
             local_name: &str,
-        ) -> bool {
-            owner.id() == self.owner && namespace.is_none() && local_name == "a"
+        ) -> Result<bool, C14nError> {
+            Ok(owner.id() == self.owner && namespace.is_none() && local_name == "a")
         }
 
-        fn contains_namespace(&self, owner: Node<'_, '_>, prefix: &str, uri: &str) -> bool {
-            owner.id() == self.owner && prefix == "p" && uri == "urn:p"
+        fn contains_namespace(
+            &self,
+            owner: Node<'_, '_>,
+            prefix: &str,
+            uri: &str,
+        ) -> Result<bool, C14nError> {
+            Ok(owner.id() == self.owner && prefix == "p" && uri == "urn:p")
         }
     }
 
@@ -1767,8 +1826,8 @@ mod tests {
     }
 
     impl NodeVisibility for HiddenXmlBaseVisibility {
-        fn contains_node(&self, node: Node<'_, '_>) -> bool {
-            self.included.contains(&node.id())
+        fn contains_node(&self, node: Node<'_, '_>) -> Result<bool, C14nError> {
+            Ok(self.included.contains(&node.id()))
         }
 
         fn contains_attribute(
@@ -1776,15 +1835,20 @@ mod tests {
             owner: Node<'_, '_>,
             namespace: Option<&str>,
             local_name: &str,
-        ) -> bool {
-            self.included.contains(&owner.id())
+        ) -> Result<bool, C14nError> {
+            Ok(self.included.contains(&owner.id())
                 && !(owner.id() == self.hidden_base_owner
                     && namespace == Some(XML_NS)
-                    && local_name == "base")
+                    && local_name == "base"))
         }
 
-        fn contains_namespace(&self, owner: Node<'_, '_>, _prefix: &str, _uri: &str) -> bool {
-            self.included.contains(&owner.id())
+        fn contains_namespace(
+            &self,
+            owner: Node<'_, '_>,
+            _prefix: &str,
+            _uri: &str,
+        ) -> Result<bool, C14nError> {
+            Ok(self.included.contains(&owner.id()))
         }
     }
 

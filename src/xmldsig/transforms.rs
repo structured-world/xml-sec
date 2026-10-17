@@ -4,9 +4,9 @@
 //! each `<Reference>` specifies a chain of transforms applied sequentially to
 //! produce bytes for digest computation.
 //!
-//! The pipeline is a simple `Vec<Transform>` iterated front-to-back — a dramatic
-//! simplification of xmlsec1's bidirectional push/pop doubly-linked list with
-//! auto-inserted type adapters.
+//! Template-owned and original/current-query parameters expose borrowed
+//! instruction views to one execution state machine, including its binary/XML
+//! adapters and terminal canonicalization.
 //!
 //! ## Supported transforms
 //!
@@ -19,27 +19,37 @@
 //! | XPath 1.0 | NodeSet → NodeSet | P1 |
 //! | XPath Filter 2.0 | NodeSet → NodeSet | P1 |
 
+use crate::xml_input_shared::DecodeStorage as _;
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
 
+mod parameters;
 mod relationship;
+mod source;
+pub(crate) use parameters::ParseStorage;
+pub(super) use parameters::{Diagnostic, current_diagnostic};
+pub(super) use parameters::{Expression as ExpressionParameter, Filter as FilterParameter};
+use parameters::{Instruction, View as InstructionView};
 pub(crate) use relationship::validate_edition as validate_relationship_chain;
 pub use relationship::{RELATIONSHIP_TRANSFORM_URI, RelationshipSelector};
 
+use crate::xml::dom::storage::names::NameStorage;
+use crate::xml::dom::storage::{Native as NativeDom, Storage as DomStorage};
 use crate::xml::dom::{Document, Node, NodeId, NodeType};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use sha2::{Digest as _, Sha256};
 
 use super::parse::XMLDSIG_NS;
+use super::types::projection::{NativeKeys, PaidKeys, Projection, RetainKeys};
 use super::types::{
     NodeSetMaterializationBudget, TransformData, TransformError, transform_resource_limit,
 };
 use super::whitespace::is_xml_whitespace_only;
 use super::xpath::{
-    XPathDocumentRelation, XPathWorkBudget, apply_xpath_filter_with_semantics_and_budget,
-    apply_xpath_filter2_with_semantics_and_budget, is_xpath_whitespace,
+    XPathDocumentRelation, XPathWorkBudget, is_xpath_whitespace,
     xpath_may_read_mutable_character_data,
 };
+use crate::c14n::scratch::{Bytes as _, List as _, Native, Scratch};
 use crate::c14n::xml_base::XmlBaseResolutionBudget;
 use crate::c14n::{self, C14nAlgorithm};
 use crate::document::{
@@ -500,17 +510,17 @@ impl<'r> TransformOptions<'r> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct XPathHereNodes {
+pub(crate) struct XPathHereNodes {
     specification_xpath_element: NodeId,
     xmlsec_legacy_transform_element: NodeId,
     document: XPathDocumentIdentity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct XPathDocumentIdentity([u8; 32]);
+pub(crate) struct XPathDocumentIdentity([u8; 32]);
 
 impl XPathDocumentIdentity {
-    fn from_document(document: &Document<'_>) -> Self {
+    fn from_document<D: DomStorage>(document: &Document<'_, D>) -> Self {
         #[cfg(test)]
         XPATH_DOCUMENT_IDENTITY_COMPUTATIONS.with(|count| count.set(count.get() + 1));
         Self(Sha256::digest(document.input_text().as_bytes()).into())
@@ -541,7 +551,10 @@ impl TransformChainState {
         self.xpath_document_identity.set(None);
     }
 
-    fn xpath_document_identity(&self, document: &Document<'_>) -> XPathDocumentIdentity {
+    fn xpath_document_identity<D: DomStorage>(
+        &self,
+        document: &Document<'_, D>,
+    ) -> XPathDocumentIdentity {
         let document_key = std::ptr::from_ref(document).cast::<()>();
         if let Some(cached) = self.xpath_document_identity.get()
             && cached.document == document_key
@@ -562,7 +575,8 @@ impl TransformChainState {
     }
 }
 
-struct TransformExecutionContext<'a> {
+struct TransformExecutionContext<'a, S: Scratch = Native> {
+    scratch: &'a S,
     options: TransformOptions<'a>,
     budget: &'a TransformExecutionBudget,
     state: &'a TransformChainState,
@@ -710,14 +724,7 @@ pub enum Transform {
 
 impl Transform {
     pub(crate) fn algorithm_uri(&self) -> &'static str {
-        match self {
-            Self::Enveloped => ENVELOPED_SIGNATURE_URI,
-            Self::XpathExcludeAllSignatures | Self::XPath(_) => XPATH_TRANSFORM_URI,
-            Self::XPathFilter2(_) => XPATH_FILTER2_TRANSFORM_URI,
-            Self::C14n(algorithm) => algorithm.uri(),
-            Self::Base64Decode => BASE64_TRANSFORM_URI,
-            Self::Relationship(_) => RELATIONSHIP_TRANSFORM_URI,
-        }
+        Instruction::algorithm_uri(self)
     }
 }
 
@@ -767,6 +774,7 @@ pub(super) fn apply_transform_with_options<'s, 'd>(
     )
 }
 
+#[cfg(test)]
 fn apply_transform_with_options_and_state<'s, 'd>(
     signature_node: Node<'s, 's>,
     transform: &Transform,
@@ -776,54 +784,107 @@ fn apply_transform_with_options_and_state<'s, 'd>(
     state: &TransformChainState,
     xml_parse: &XmlParseWorkBudget,
 ) -> Result<TransformData<'d>, TransformError> {
-    match transform {
-        Transform::Relationship(selectors) => {
-            let bytes = finalize_transform_data(input, budget)?;
+    let context = TransformExecutionContext {
+        scratch: &Native,
+        options,
+        budget,
+        state,
+        xml_parse,
+        source_has_signature: true,
+    };
+    apply_transform_with_context(signature_node, transform, input.into(), &context)
+        .map(ExecutionData::into_native)
+}
+
+fn apply_transform_with_context<
+    's,
+    'd,
+    S: TransformScratch,
+    D: DomStorage,
+    G: DomStorage,
+    I: Instruction,
+>(
+    signature_node: Node<'s, 's, G>,
+    transform: &I,
+    input: ExecutionData<'d, S, D>,
+    context: &TransformExecutionContext<'_, S>,
+) -> Result<ExecutionData<'d, S, D>, TransformError> {
+    let options = context.options;
+    let budget = context.budget;
+    let state = context.state;
+    let xml_parse = context.xml_parse;
+    match transform.view() {
+        InstructionView::Relationship(selectors) => {
+            let collected;
+            let bytes = if let Some(bytes) = input.binary() {
+                bytes
+            } else {
+                let nodes = input.nodes().expect("nodes or bytes");
+                let algorithm =
+                    C14nAlgorithm::from_uri(DEFAULT_IMPLICIT_C14N_URI).expect("constant URI");
+                let (bytes, _) = c14n::canonicalize_buffer_in(
+                    nodes.document(),
+                    nodes,
+                    (&algorithm, None),
+                    None,
+                    budget.c14n.remaining(),
+                    budget.xml_base_resolution(),
+                    context.scratch,
+                )
+                .map_err(|error| map_c14n_limit_error(error, &budget.c14n))?;
+                budget.c14n.charge(bytes.len())?;
+                collected = bytes;
+                &collected
+            };
             xml_parse.charge_policy(bytes.len())?;
             // Part 2:2012 §9.1.4 / 2021 §6.2.5 constrains Relationships XML
             // independently of generic XML policy, including declaration labels.
             // https://ecma-international.org/publications-and-standards/standards/ecma-376/
-            let xml = crate::xml_input_shared::decode_xml_bounded_with_encoding_guard(
-                &bytes,
+            let decoder = context.scratch.decoder();
+            let xml = crate::xml_input_shared::decode_xml_in(
+                bytes,
                 budget.xml_parse_settings.max_bytes,
                 |physical, declaration| {
                     if !physical.eq_ignore_ascii_case("UTF-8")
                         && !physical.eq_ignore_ascii_case("UTF-16LE")
                         && !physical.eq_ignore_ascii_case("UTF-16BE")
                     {
-                        return Err(crate::encoding::XmlEncodingError::ForbiddenEncoding(
-                            physical.into(),
+                        return Err(decoder.label_error(
+                            crate::xml_input_shared::LabelError::Forbidden,
+                            physical,
                         ));
                     }
                     if let Some(label) = declaration
                         && !label.eq_ignore_ascii_case("UTF-8")
                         && !label.eq_ignore_ascii_case("UTF-16")
                     {
-                        return Err(crate::encoding::XmlEncodingError::ForbiddenEncoding(
-                            label.into(),
-                        ));
+                        return Err(decoder
+                            .label_error(crate::xml_input_shared::LabelError::Forbidden, label));
                     }
                     Ok(())
                 },
+                &decoder,
             )
-            .map_err(map_transform_xml_decode_error)?;
+            .map_err(S::decode_error)?;
             let settings = DocumentParseSettings {
                 allow_dtd: false,
                 ..budget.xml_parse_settings
             };
-            let document = parse_borrowed_with_settings_and_budget(&xml, settings, Some(xml_parse))
-                .map_err(|error| map_transform_xml_parse_error(error, settings))?;
+            let document = context
+                .scratch
+                .parse_xml(xml.as_ref(), settings, xml_parse)?;
             state.document_reparsed();
-            relationship::normalize(
+            relationship::normalize_in(
                 &document,
                 selectors,
                 options.opc_relationship_edition,
                 budget,
+                context.scratch,
             )
-            .map(TransformData::Binary)
+            .map(ExecutionData::Accounted)
         }
-        Transform::Enveloped => {
-            let mut nodes = input.into_node_set()?;
+        InstructionView::Enveloped => {
+            let mut nodes = input.into_nodes()?;
             // Exclude the Signature element and all its descendants from
             // the node set. This is the core mechanism of the enveloped
             // signature transform: the digest is computed as if the
@@ -832,15 +893,22 @@ fn apply_transform_with_options_and_state<'s, 'd>(
             // xmlsec1 equivalent:
             //   xmlSecNodeSetGetChildren(doc, signatureNode, 1, 1)  // inverted tree
             //   xmlSecNodeSetAdd(inNodes, children, Intersection)   // intersect = subtract
-            if !std::ptr::eq(signature_node.document(), nodes.document()) {
+            if !std::ptr::eq(
+                std::ptr::from_ref(signature_node.document()).cast::<()>(),
+                std::ptr::from_ref(nodes.document()).cast::<()>(),
+            ) {
                 return Err(TransformError::CrossDocumentSignatureNode);
             }
             budget.node_filter.charge(nodes.len())?;
-            nodes.exclude_subtree(signature_node);
-            Ok(TransformData::NodeSet(nodes))
+            let signature = nodes
+                .document()
+                .get_node(signature_node.id())
+                .ok_or(TransformError::CrossDocumentSignatureNode)?;
+            nodes.exclude_subtree(signature)?;
+            Ok(ExecutionData::Nodes(nodes))
         }
-        Transform::XpathExcludeAllSignatures => {
-            let mut nodes = input.into_node_set()?;
+        InstructionView::ExcludeSignatures => {
+            let mut nodes = input.into_nodes()?;
             let doc = nodes.document();
 
             // This variant is an optimized execution of a concrete wire-level
@@ -848,7 +916,9 @@ fn apply_transform_with_options_and_state<'s, 'd>(
             // the expression's policy accounting for every input context and
             // the node-set filtering pass.
             budget.xpath.validate_context_evaluations(nodes.len())?;
-            budget.xpath.charge(doc.descendants().count())?;
+            let source_nodes = doc.descendants().len();
+            budget.xpath.charge(source_nodes)?;
+            context.scratch.charge(source_nodes)?;
 
             for node in doc.descendants().filter(|node| {
                 node.is_element()
@@ -856,21 +926,21 @@ fn apply_transform_with_options_and_state<'s, 'd>(
                     && node.tag_name().namespace() == Some(XMLDSIG_NS)
             }) {
                 budget.node_filter.charge(nodes.len())?;
-                nodes.exclude_subtree(node);
+                nodes.exclude_subtree(node)?;
             }
 
-            Ok(TransformData::NodeSet(nodes))
+            Ok(ExecutionData::Nodes(nodes))
         }
-        Transform::XPath(xpath) => {
-            let nodes = input.into_node_set()?;
+        InstructionView::XPath(xpath) => {
+            let nodes = input.into_nodes()?;
             let document_relation = xpath_document_relation(
                 signature_node.document(),
                 nodes.document(),
                 std::iter::once(xpath),
                 state,
             );
-            Ok(TransformData::NodeSet(
-                apply_xpath_filter_with_semantics_and_budget(
+            Ok(ExecutionData::Nodes(
+                super::xpath::apply_xpath_projection_with_budget(
                     nodes,
                     xpath,
                     super::xpath::XPathRequestContext::new(
@@ -884,16 +954,16 @@ fn apply_transform_with_options_and_state<'s, 'd>(
                 )?,
             ))
         }
-        Transform::XPathFilter2(filters) => {
-            let nodes = input.into_node_set()?;
+        InstructionView::Filter2(filters) => {
+            let nodes = input.into_nodes()?;
             let document_relation = xpath_document_relation(
                 signature_node.document(),
                 nodes.document(),
-                filters.iter().map(XPathFilter::xpath),
+                filters.iter().map(FilterParameter::xpath),
                 state,
             );
-            Ok(TransformData::NodeSet(
-                apply_xpath_filter2_with_semantics_and_budget(
+            Ok(ExecutionData::Nodes(
+                super::xpath::apply_xpath_projection2_with_budget(
                     nodes,
                     filters,
                     super::xpath::XPathRequestContext::new(
@@ -907,55 +977,32 @@ fn apply_transform_with_options_and_state<'s, 'd>(
                 )?,
             ))
         }
-        Transform::C14n(algo) => {
-            let nodes = input.into_node_set()?;
-            let mut output = Vec::new();
-            c14n::canonicalize_with_visibility_and_position_bounded_with_xml_base_budget(
+        InstructionView::C14n(algo, prefixes) => {
+            let nodes = input.into_nodes()?;
+            let (output, _) = c14n::canonicalize_buffer_in(
                 nodes.document(),
-                Some(&nodes),
-                algo,
+                &nodes,
+                (algo, prefixes),
                 None,
                 budget.c14n.remaining(),
                 budget.xml_base_resolution(),
-                &mut output,
+                context.scratch,
             )
             .map_err(|error| map_c14n_limit_error(error, &budget.c14n))?;
             budget.c14n.charge(output.len())?;
-            Ok(TransformData::Binary(output))
+            Ok(ExecutionData::Accounted(output))
         }
-        Transform::Base64Decode => {
-            let mut normalized = Vec::new();
-            match input {
-                TransformData::Binary(bytes) => {
-                    append_normalized_base64(&bytes, &mut normalized, &budget.base64)?;
-                }
-                TransformData::BorrowedBinary(bytes) => {
-                    append_normalized_base64(bytes, &mut normalized, &budget.base64)?;
-                }
-                TransformData::NodeSet(nodes) => {
-                    for node in nodes.document().descendants() {
-                        if nodes.contains(node) && node.is_text() {
-                            append_normalized_base64(
-                                node.text().unwrap_or_default().as_bytes(),
-                                &mut normalized,
-                                &budget.base64,
-                            )?;
-                        }
-                    }
-                }
-            }
-            Ok(TransformData::Binary(decode_base64_transform(
-                &normalized,
-                &budget.base64,
-            )?))
+        InstructionView::Base64 => {
+            base64_projection(input.binary(), input.nodes(), budget, context.scratch)
+                .map(ExecutionData::Accounted)
         }
     }
 }
 
-fn xpath_document_relation<'a>(
-    signature_document: &Document<'_>,
-    input_document: &Document<'_>,
-    expressions: impl IntoIterator<Item = &'a XPathExpression>,
+fn xpath_document_relation<'a, L: DomStorage, R: DomStorage, X: ExpressionParameter + 'a>(
+    signature_document: &Document<'_, L>,
+    input_document: &Document<'_, R>,
+    expressions: impl IntoIterator<Item = &'a X>,
     state: &TransformChainState,
 ) -> XPathDocumentRelation {
     if matches!(
@@ -967,7 +1014,7 @@ fn xpath_document_relation<'a>(
 
     let mut parsed_identities = expressions
         .into_iter()
-        .filter_map(XPathExpression::parsed_document_identity);
+        .filter_map(ExpressionParameter::parsed_document_identity);
     let Some(first) = parsed_identities.next() else {
         return XPathDocumentRelation::SameDocument;
     };
@@ -984,24 +1031,21 @@ fn xpath_document_relation<'a>(
 /// RFC 2045 section 6.8 requires decoders to ignore every byte outside the
 /// alphabet. The raw-input budget is charged before filtering so ignored data
 /// cannot be used to force unbounded scanning or allocation.
-fn append_normalized_base64(
+fn append_normalized_base64<S: Scratch>(
     encoded: &[u8],
-    normalized: &mut Vec<u8>,
+    normalized: &mut S::Bytes,
     budget: &Base64WorkBudget,
+    scratch: &S,
 ) -> Result<(), TransformError> {
     budget.charge_input(encoded.len())?;
-
+    scratch.charge(encoded.len())?;
     let additional = encoded
         .iter()
         .filter(|byte| is_rfc2045_base64_byte(**byte))
         .count();
-    normalized.reserve(additional);
-    normalized.extend(
-        encoded
-            .iter()
-            .copied()
-            .filter(|byte| is_rfc2045_base64_byte(*byte)),
-    );
+    normalized.reserve(additional)?;
+    scratch.charge(encoded.len())?;
+    normalized.append_filtered(encoded, is_rfc2045_base64_byte)?;
     Ok(())
 }
 
@@ -1009,10 +1053,12 @@ fn is_rfc2045_base64_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')
 }
 
-fn decode_base64_transform(
+fn decode_base64_transform<S: Scratch>(
     normalized: &[u8],
     budget: &Base64WorkBudget,
-) -> Result<Vec<u8>, TransformError> {
+    scratch: &S,
+) -> Result<S::Bytes, TransformError> {
+    scratch.charge(normalized.len())?;
     let padding = normalized
         .iter()
         .rev()
@@ -1021,13 +1067,44 @@ fn decode_base64_transform(
     let decoded_len = base64::decoded_len_estimate(normalized.len()).saturating_sub(padding);
     budget.ensure_output_capacity(decoded_len)?;
 
-    let mut decoded = vec![0_u8; decoded_len];
+    let mut decoded = scratch.bytes();
+    decoded.zeros(decoded_len)?;
+    scratch.charge(normalized.len())?;
     let written = STANDARD
         .decode_slice(normalized, &mut decoded)
-        .map_err(|error| TransformError::Base64(error.to_string()))?;
+        .map_err(TransformError::Base64)?;
     budget.charge_output(written)?;
     decoded.truncate(written);
     Ok(decoded)
+}
+
+fn base64_projection<S: Scratch, K: super::types::projection::Keys, D: DomStorage>(
+    binary: Option<&[u8]>,
+    nodes: Option<&Projection<'_, K, D>>,
+    budget: &TransformExecutionBudget,
+    scratch: &S,
+) -> Result<S::Bytes, TransformError> {
+    let mut normalized = scratch.bytes();
+    match (binary, nodes) {
+        (Some(bytes), _) => {
+            append_normalized_base64(bytes, &mut normalized, &budget.base64, scratch)?
+        }
+        (None, Some(nodes)) => {
+            for node in nodes.document().descendants() {
+                scratch.charge(1)?;
+                if nodes.contains_tree(node)? && node.is_text() {
+                    append_normalized_base64(
+                        node.text().unwrap_or_default().as_bytes(),
+                        &mut normalized,
+                        &budget.base64,
+                        scratch,
+                    )?;
+                }
+            }
+        }
+        (None, None) => unreachable!("execution data has either nodes or bytes"),
+    }
+    decode_base64_transform(&normalized, &budget.base64, scratch)
 }
 
 /// Execute a chain of transforms for a single `<Reference>`.
@@ -1132,55 +1209,83 @@ pub(crate) fn execute_reference_transforms_with_budget<'a>(
     relationship::validate_edition(transforms, options.opc_relationship_edition)?;
     budget.state.begin_chain();
     let context = TransformExecutionContext {
+        scratch: &Native,
         options,
         budget,
         state: &budget.state,
         xml_parse,
         source_has_signature: enveloped_signature.is_some(),
     };
-    execute_transform_chain::<false, _, _, _>(
+    execute_transform_chain::<false, _, _, _, _, _, _>(
         source_node,
         enveloped_signature,
-        initial_data,
+        initial_data.into(),
         transforms,
         None,
         None,
         &context,
-        |data, _, budget| finalize_transform_data(data, budget),
+        CollectTerminal,
     )
     .map(|output| output.output)
 }
 
 /// The replay terminal shares every transform and type adapter with reference
 /// verification. Only the final node-set coercion differs for timestamp input.
-pub(crate) fn replay_reference_transforms<'a, E, F>(
+pub(crate) struct ReplayExecution<'a, Q: structured_asn1::memory::Work> {
+    pub(crate) options: TransformOptions<'a>,
+    pub(crate) budget: &'a TransformExecutionBudget,
+    pub(crate) work: &'a Q,
+}
+
+pub(crate) fn replay_reference_transforms<
+    'a,
+    'w,
+    E,
+    F,
+    Q: structured_asn1::memory::Work,
+    I: Instruction,
+>(
     source: Node<'a, 'a>,
     signature: Option<Node<'a, 'a>>,
-    initial: TransformData<'a>,
-    transforms: &[Transform],
-    options: TransformOptions<'_>,
-    budget: &TransformExecutionBudget,
+    initial: super::uri::ReferenceInput<'a>,
+    transforms: &[I],
+    execution: ReplayExecution<'w, Q>,
     terminal: F,
 ) -> Result<(), E>
 where
     E: From<TransformError>,
-    F: for<'data> FnOnce(
-        TransformData<'data>,
-        Option<&C14nAlgorithm>,
-        &TransformExecutionBudget,
-    ) -> Result<(), E>,
+    F: TransformTerminal<crate::c14n::scratch::Accounted<'w, Q>, Output = (), Error = E>,
 {
+    let ReplayExecution {
+        options,
+        budget,
+        work,
+    } = execution;
     ensure_transform_count(transforms.len())?;
     relationship::validate_edition(transforms, options.opc_relationship_edition)?;
     budget.state.begin_chain();
+    let scratch = crate::c14n::scratch::Accounted(work);
+    let initial = match initial {
+        super::uri::ReferenceInput::Xml {
+            root,
+            with_comments,
+        } => ExecutionData::Nodes(Projection::subtree(
+            root,
+            with_comments,
+            &budget.node_set_materialization,
+            scratch.node_keys(),
+        )?),
+        super::uri::ReferenceInput::Binary(bytes) => ExecutionData::BorrowedBinary(bytes),
+    };
     let context = TransformExecutionContext {
+        scratch: &scratch,
         options,
         budget,
         state: &budget.state,
         xml_parse: budget.xml_parse_work(),
         source_has_signature: signature.is_some(),
     };
-    execute_transform_chain::<true, _, _, _>(
+    execute_transform_chain::<true, _, _, _, _, _, _>(
         source, signature, initial, transforms, None, None, &context, terminal,
     )
     .map(|_| ())
@@ -1204,15 +1309,15 @@ pub(crate) fn replay_c14n_error(
     map_c14n_limit_error(error, &budget.c14n)
 }
 
-pub(crate) fn enveloped_signature_for_reference<'a, E>(
+pub(crate) fn enveloped_signature_for_reference<'a, E, I: Instruction>(
     source: Node<'a, 'a>,
-    transforms: &[Transform],
+    transforms: &[I],
     mut admit: impl FnMut() -> Result<(), E>,
 ) -> Result<Option<Node<'a, 'a>>, E> {
     let mut needed = false;
     for transform in transforms {
         admit()?;
-        if matches!(transform, Transform::Enveloped) {
+        if matches!(transform.view(), InstructionView::Enveloped) {
             needed = true;
             break;
         }
@@ -1237,6 +1342,205 @@ pub(crate) struct TransformDependencyOutput {
 struct TransformChainOutput<T> {
     output: T,
     dependencies: HashSet<usize>,
+}
+
+fn retain_visible_dependencies<K: super::types::projection::Keys, D: DomStorage>(
+    nodes: &Projection<'_, K, D>,
+    tracking: &mut DependencyTracking,
+) -> Result<(), TransformError> {
+    let mut failure = None;
+    tracking.active_nodes.retain(|tracked| {
+        if failure.is_some() {
+            return true;
+        }
+        let Some(node) = nodes.document().get_node(tracked.node_id) else {
+            return false;
+        };
+        match nodes.contains_tree(node) {
+            Ok(visible) => visible,
+            Err(error) => {
+                failure = Some(error);
+                true
+            }
+        }
+    });
+    failure.map_or(Ok(()), |error| Err(error.into()))
+}
+
+pub(crate) trait TransformScratch: Scratch {
+    type NodeKeys: RetainKeys;
+    type Decoder: crate::xml_input_shared::DecodeStorage;
+    type Dom: NameStorage;
+    fn parse_xml<'input>(
+        &self,
+        xml: &'input str,
+        settings: DocumentParseSettings,
+        budget: &XmlParseWorkBudget,
+    ) -> Result<Document<'input, Self::Dom>, TransformError>;
+    fn node_keys(&self) -> Self::NodeKeys;
+    fn decoder(&self) -> Self::Decoder;
+    fn decode_error(
+        error: <Self::Decoder as crate::xml_input_shared::DecodeStorage>::Error,
+    ) -> TransformError;
+}
+
+impl TransformScratch for Native {
+    type NodeKeys = NativeKeys;
+    type Decoder = crate::xml_input_shared::NativeStorage;
+    type Dom = NativeDom;
+    fn parse_xml<'input>(
+        &self,
+        xml: &'input str,
+        settings: DocumentParseSettings,
+        budget: &XmlParseWorkBudget,
+    ) -> Result<Document<'input>, TransformError> {
+        parse_borrowed_with_settings_and_budget(xml, settings, Some(budget))
+            .map_err(|error| map_transform_xml_parse_error(error, settings))
+    }
+    fn decoder(&self) -> Self::Decoder {
+        crate::xml_input_shared::NativeStorage
+    }
+    fn decode_error(error: crate::encoding::XmlEncodingError) -> TransformError {
+        map_transform_xml_decode_error(error)
+    }
+    fn node_keys(&self) -> NativeKeys {
+        NativeKeys::default()
+    }
+}
+
+impl<'w, W: structured_asn1::memory::Work> TransformScratch
+    for crate::c14n::scratch::Accounted<'w, W>
+{
+    type NodeKeys = PaidKeys<'w, W>;
+    type Decoder = crate::encoding::AccountedDecoder<'w, W>;
+    type Dom = crate::xml::dom::storage::Accounted<'w, W>;
+    fn parse_xml<'input>(
+        &self,
+        xml: &'input str,
+        settings: DocumentParseSettings,
+        budget: &XmlParseWorkBudget,
+    ) -> Result<Document<'input, Self::Dom>, TransformError> {
+        crate::document::parse_borrowed_in(
+            xml,
+            settings,
+            Some(budget),
+            crate::xml::dom::storage::Accounted(self.0),
+        )
+        .map_err(|error| map_transform_xml_parse_error(error, settings))
+    }
+    fn decoder(&self) -> Self::Decoder {
+        crate::encoding::AccountedDecoder(self.0)
+    }
+    fn decode_error(error: crate::encoding::DecodeError) -> TransformError {
+        match error {
+            crate::encoding::DecodeError::Encoding(error) => map_transform_xml_decode_error(error),
+            crate::encoding::DecodeError::Label(error) => {
+                TransformError::AccountedXmlEncoding(error)
+            }
+            crate::encoding::DecodeError::Execution(error) => error.into(),
+        }
+    }
+    fn node_keys(&self) -> Self::NodeKeys {
+        PaidKeys::new(self.0)
+    }
+}
+
+pub(crate) enum ExecutionData<'a, S: TransformScratch, D: DomStorage = NativeDom> {
+    Nodes(Projection<'a, S::NodeKeys, D>),
+    NativeBinary(Vec<u8>),
+    BorrowedBinary(&'a [u8]),
+    Accounted(S::Bytes),
+}
+
+impl<'a> From<TransformData<'a>> for ExecutionData<'a, Native> {
+    fn from(value: TransformData<'a>) -> Self {
+        match value {
+            TransformData::NodeSet(nodes) => Self::Nodes(nodes.projection),
+            TransformData::Binary(bytes) => Self::NativeBinary(bytes),
+            TransformData::BorrowedBinary(bytes) => Self::BorrowedBinary(bytes),
+        }
+    }
+}
+
+impl<'a, S: TransformScratch, D: DomStorage> ExecutionData<'a, S, D> {
+    pub(crate) fn nodes(&self) -> Option<&Projection<'a, S::NodeKeys, D>> {
+        match self {
+            Self::Nodes(nodes) => Some(nodes),
+            _ => None,
+        }
+    }
+    pub(crate) fn binary(&self) -> Option<&[u8]> {
+        match self {
+            Self::NativeBinary(bytes) => Some(bytes),
+            Self::BorrowedBinary(bytes) => Some(bytes),
+            Self::Accounted(bytes) => Some(bytes),
+            Self::Nodes(_) => None,
+        }
+    }
+    fn into_nodes(self) -> Result<Projection<'a, S::NodeKeys, D>, TransformError> {
+        match self {
+            Self::Nodes(nodes) => Ok(nodes),
+            _ => Err(TransformError::TypeMismatch {
+                expected: "NodeSet",
+                got: "Binary",
+            }),
+        }
+    }
+}
+
+pub(crate) trait TransformTerminal<S: TransformScratch> {
+    type Output;
+    type Error: From<TransformError>;
+    fn finish<D: DomStorage>(
+        self,
+        data: ExecutionData<'_, S, D>,
+        explicit: Option<(&C14nAlgorithm, Option<&str>)>,
+        budget: &TransformExecutionBudget,
+    ) -> Result<Self::Output, Self::Error>;
+}
+
+struct CollectTerminal;
+impl TransformTerminal<Native> for CollectTerminal {
+    type Output = Vec<u8>;
+    type Error = TransformError;
+    fn finish<D: DomStorage>(
+        self,
+        data: ExecutionData<'_, Native, D>,
+        _: Option<(&C14nAlgorithm, Option<&str>)>,
+        budget: &TransformExecutionBudget,
+    ) -> Result<Vec<u8>, TransformError> {
+        match data {
+            ExecutionData::NativeBinary(bytes) | ExecutionData::Accounted(bytes) => Ok(bytes),
+            ExecutionData::BorrowedBinary(bytes) => Ok(bytes.to_vec()),
+            ExecutionData::Nodes(nodes) => {
+                let algorithm =
+                    C14nAlgorithm::from_uri(DEFAULT_IMPLICIT_C14N_URI).expect("constant C14N URI");
+                let (output, _) = c14n::canonicalize_buffer_in(
+                    nodes.document(),
+                    &nodes,
+                    (&algorithm, None),
+                    None,
+                    budget.c14n.remaining(),
+                    budget.xml_base_resolution(),
+                    &Native,
+                )
+                .map_err(|error| map_c14n_limit_error(error, &budget.c14n))?;
+                budget.c14n.charge(output.len())?;
+                Ok(output)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl<'a> ExecutionData<'a, Native> {
+    fn into_native(self) -> TransformData<'a> {
+        match self {
+            Self::Nodes(projection) => TransformData::NodeSet(super::types::NodeSet { projection }),
+            Self::NativeBinary(bytes) | Self::Accounted(bytes) => TransformData::Binary(bytes),
+            Self::BorrowedBinary(bytes) => TransformData::BorrowedBinary(bytes),
+        }
+    }
 }
 
 struct DependencyTracking {
@@ -1305,16 +1609,17 @@ pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
         }
     }
     let context = TransformExecutionContext {
+        scratch: &Native,
         options,
         budget,
         state: &budget.state,
         xml_parse: budget.xml_parse_work(),
         source_has_signature: true,
     };
-    let output = execute_transform_chain::<false, _, _, _>(
+    let output = execute_transform_chain::<false, _, _, _, _, _, _>(
         signature_node,
         Some(signature_node),
-        initial_data,
+        initial_data.into(),
         transforms,
         None,
         Some(DependencyTracking {
@@ -1324,7 +1629,7 @@ pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
             canonical_positions: None,
         }),
         &context,
-        |data, _, budget| finalize_transform_data(data, budget),
+        CollectTerminal,
     )?;
     Ok(TransformDependencyOutput {
         dependencies: output.dependencies,
@@ -1345,34 +1650,36 @@ fn ensure_transform_count(count: usize) -> Result<(), TransformError> {
 // Terminal strategy is monomorphized: collecting callers retain their existing
 // position/remapping path, while streaming consumers may intercept final C14N.
 #[allow(clippy::too_many_arguments)]
-fn execute_transform_chain<'s, 'e, 'd, const STREAM_FINAL_C14N: bool, T, E, F>(
+fn execute_transform_chain<
+    's,
+    'e,
+    'd,
+    const STREAM_FINAL_C14N: bool,
+    T,
+    E,
+    F,
+    S: TransformScratch,
+    D: DomStorage,
+    I: Instruction,
+>(
     source_signature: Node<'s, 's>,
-    enveloped_signature: Option<Node<'e, 'e>>,
-    data: TransformData<'d>,
-    transforms: &[Transform],
+    enveloped_signature: Option<Node<'e, 'e, D>>,
+    data: ExecutionData<'d, S, D>,
+    transforms: &[I],
     canonical_signature_position: Option<Option<usize>>,
     mut dependency_tracking: Option<DependencyTracking>,
-    context: &TransformExecutionContext<'_>,
+    context: &TransformExecutionContext<'_, S>,
     finalize: F,
 ) -> Result<TransformChainOutput<T>, E>
 where
     E: From<TransformError>,
-    F: for<'data> FnOnce(
-        TransformData<'data>,
-        Option<&C14nAlgorithm>,
-        &TransformExecutionBudget,
-    ) -> Result<T, E>,
+    F: TransformTerminal<S, Output = T, Error = E>,
 {
     let Some((transform, remaining)) = transforms.split_first() else {
-        if let (TransformData::NodeSet(nodes), Some(tracking)) = (&data, &mut dependency_tracking) {
-            tracking.active_nodes.retain(|tracked| {
-                nodes
-                    .document()
-                    .get_node(tracked.node_id)
-                    .is_some_and(|node| nodes.contains(node))
-            });
+        if let (Some(nodes), Some(tracking)) = (data.nodes(), &mut dependency_tracking) {
+            retain_visible_dependencies(nodes, tracking)?;
         }
-        let output = finalize(data, None, context.budget)?;
+        let output = finalize.finish(data, None, context.budget)?;
         return Ok(TransformChainOutput {
             output,
             dependencies: dependency_indexes(dependency_tracking),
@@ -1380,11 +1687,7 @@ where
     };
 
     let binary = if transform_requires_node_set(transform) {
-        match &data {
-            TransformData::Binary(bytes) => Some(bytes.as_slice()),
-            TransformData::BorrowedBinary(bytes) => Some(*bytes),
-            TransformData::NodeSet(_) => None,
-        }
+        data.binary()
     } else {
         None
     };
@@ -1395,7 +1698,10 @@ where
         // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-EnvelopedSignature
         if canonical_signature_position.is_none() {
             context.budget.node_filter.charge(transforms.len())?;
-            if transforms.iter().any(|t| matches!(t, Transform::Enveloped)) {
+            if transforms
+                .iter()
+                .any(|t| matches!(t.view(), InstructionView::Enveloped))
+            {
                 return Err(TransformError::CrossDocumentSignatureNode.into());
             }
         }
@@ -1410,20 +1716,26 @@ where
             .xml_parse
             .charge_policy(bytes.len())
             .map_err(TransformError::from)?;
-        let xml =
-            crate::encoding::decode_xml_octets(bytes, context.budget.xml_parse_settings.max_bytes)
-                .map_err(map_transform_xml_decode_error)?;
+        let xml = crate::xml_input_shared::decode_xml_in(
+            bytes,
+            context.budget.xml_parse_settings.max_bytes,
+            |_, _| Ok(()),
+            &context.scratch.decoder(),
+        )
+        .map_err(S::decode_error)?;
         let settings = DocumentParseSettings {
             allow_dtd: context.options.internal_dtd_allowed(),
             ..context.budget.xml_parse_settings
         };
-        let document =
-            parse_borrowed_with_settings_and_budget(&xml, settings, Some(context.xml_parse))
-                .map_err(|error| map_transform_xml_parse_error(error, settings))?;
+        let document = context
+            .scratch
+            .parse_xml(xml.as_ref(), settings, context.xml_parse)?;
         context.state.document_reparsed();
-        let nodes = super::types::NodeSet::entire_document_with_comments_with_budget(
-            &document,
+        let nodes = Projection::subtree(
+            document.root(),
+            true,
             &context.budget.node_set_materialization,
+            context.scratch.node_keys(),
         )?;
         if let Some(tracking) = &mut dependency_tracking
             && let Some(positions) = tracking.canonical_positions.take()
@@ -1456,10 +1768,10 @@ where
                             .is_some_and(|source| node.tag_name() == source.tag_name())
                     })
                     .ok_or(TransformError::CrossDocumentSignatureNode)?;
-                execute_transform_chain::<STREAM_FINAL_C14N, _, _, _>(
+                execute_transform_chain::<STREAM_FINAL_C14N, _, _, _, _, _, _>(
                     source_signature,
                     Some(remapped),
-                    TransformData::NodeSet(nodes),
+                    ExecutionData::Nodes(nodes),
                     transforms,
                     None,
                     dependency_tracking,
@@ -1467,23 +1779,23 @@ where
                     finalize,
                 )
             }
-            Some(None) => execute_transform_chain::<STREAM_FINAL_C14N, _, _, _>(
+            Some(None) => execute_transform_chain::<STREAM_FINAL_C14N, _, _, _, _, _, _>(
                 source_signature,
                 None,
-                TransformData::NodeSet(nodes),
+                ExecutionData::Nodes(nodes),
                 transforms,
                 None,
                 dependency_tracking,
                 context,
                 finalize,
             ),
-            None => execute_transform_chain::<STREAM_FINAL_C14N, _, _, _>(
+            None => execute_transform_chain::<STREAM_FINAL_C14N, _, _, _, _, _, _>(
                 source_signature,
                 // Binary input not produced by tracked canonicalization is a
                 // different document. Keep source_signature for XPath here()
                 // semantics, but do not apply its identity to Enveloped.
                 None,
-                TransformData::NodeSet(nodes),
+                ExecutionData::Nodes(nodes),
                 transforms,
                 None,
                 dependency_tracking,
@@ -1493,29 +1805,62 @@ where
         };
     }
 
-    if let Transform::C14n(algo) = transform
-        && let TransformData::NodeSet(nodes) = &data
+    if let InstructionView::C14n(algo, prefixes) = transform.view()
+        && let Some(nodes) = data.nodes()
     {
         if let Some(tracking) = &mut dependency_tracking {
-            tracking.active_nodes.retain(|tracked| {
-                nodes
-                    .document()
-                    .get_node(tracked.node_id)
-                    .is_some_and(|node| nodes.contains(node))
-            });
+            retain_visible_dependencies(nodes, tracking)?;
             tracking.dormant_indexes.clear();
         }
         if STREAM_FINAL_C14N && remaining.is_empty() {
-            let output = finalize(data, Some(algo), context.budget)?;
+            let output = finalize.finish(data, Some((algo, prefixes)), context.budget)?;
             return Ok(TransformChainOutput {
                 output,
                 dependencies: dependency_indexes(dependency_tracking),
             });
         }
-        let tracked_element = enveloped_signature
-            .filter(|signature| std::ptr::eq(signature.document(), nodes.document()))
-            .filter(|signature| nodes.contains(*signature))
-            .map(|signature| signature.id());
+        let tracked_element = match enveloped_signature {
+            Some(signature)
+                if std::ptr::eq(signature.document(), nodes.document())
+                    && nodes
+                        .contains_tree(signature)
+                        .map_err(TransformError::from)? =>
+            {
+                Some(signature.id())
+            }
+            _ => None,
+        };
+        if S::ACCOUNTED || prefixes.is_some() {
+            // Dependency capture uses Native storage. A replay retains only
+            // the enclosing Signature's original serialization position.
+            debug_assert!(dependency_tracking.is_none());
+            let (output, position) = c14n::canonicalize_buffer_in(
+                nodes.document(),
+                nodes,
+                (algo, prefixes),
+                tracked_element,
+                context.budget.c14n.remaining(),
+                context.budget.xml_base_resolution(),
+                context.scratch,
+            )
+            .map_err(|error| map_c14n_limit_error(error, &context.budget.c14n))?;
+            context
+                .budget
+                .c14n
+                .charge(output.len())
+                .map_err(TransformError::from)?;
+            drop(data);
+            return execute_transform_chain::<STREAM_FINAL_C14N, _, _, _, _, _, _>(
+                source_signature,
+                enveloped_signature,
+                ExecutionData::Accounted(output),
+                remaining,
+                Some(position),
+                dependency_tracking,
+                context,
+                finalize,
+            );
+        }
         let mut output = Vec::new();
         let position = if let Some(tracking) = &mut dependency_tracking {
             let mut tracked_ids = tracking
@@ -1578,10 +1923,10 @@ where
             .c14n
             .charge(output.len())
             .map_err(TransformError::from)?;
-        return execute_transform_chain::<STREAM_FINAL_C14N, _, _, _>(
+        return execute_transform_chain::<STREAM_FINAL_C14N, _, _, _, _, _, _>(
             source_signature,
             enveloped_signature,
-            TransformData::Binary(output),
+            ExecutionData::NativeBinary(output),
             remaining,
             Some(position),
             dependency_tracking,
@@ -1590,7 +1935,32 @@ where
         );
     }
 
-    if matches!(transform, Transform::Enveloped) {
+    if S::ACCOUNTED && matches!(transform.view(), InstructionView::Base64) {
+        let bytes =
+            base64_projection(data.binary(), data.nodes(), context.budget, context.scratch)?;
+        // The next binary owns its storage. Do not pin every previous decoded
+        // buffer in recursive frames after that input has been consumed.
+        drop(data);
+        if let Some(tracking) = &mut dependency_tracking {
+            tracking
+                .opaque_dependencies
+                .extend(tracking.active_nodes.drain(..).map(|node| node.index));
+            tracking.dormant_indexes.clear();
+            tracking.canonical_positions = None;
+        }
+        return execute_transform_chain::<STREAM_FINAL_C14N, _, _, _, _, _, _>(
+            source_signature,
+            enveloped_signature,
+            ExecutionData::Accounted(bytes),
+            remaining,
+            None,
+            dependency_tracking,
+            context,
+            finalize,
+        );
+    }
+
+    if matches!(transform.view(), InstructionView::Enveloped) {
         let Some(signature) = enveloped_signature else {
             // XMLDSig 1.1 §6.6.4 requires the specified XPath's exact effect.
             // With no source containing Signature, its union adds no node:
@@ -1599,15 +1969,13 @@ where
             // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-EnvelopedSignature
             let data = if !context.source_has_signature {
                 match data {
-                    TransformData::NodeSet(nodes) => {
-                        TransformData::NodeSet(super::types::NodeSet::empty(nodes.document()))
-                    }
+                    ExecutionData::Nodes(nodes) => ExecutionData::Nodes(nodes.empty_like()),
                     _ => unreachable!("node-set transforms adapt binary input before execution"),
                 }
             } else {
                 data
             };
-            return execute_transform_chain::<STREAM_FINAL_C14N, _, _, _>(
+            return execute_transform_chain::<STREAM_FINAL_C14N, _, _, _, _, _, _>(
                 source_signature,
                 None,
                 data,
@@ -1618,16 +1986,8 @@ where
                 finalize,
             );
         };
-        let data = apply_transform_with_options_and_state(
-            signature,
-            transform,
-            data,
-            context.options,
-            context.budget,
-            context.state,
-            context.xml_parse,
-        )?;
-        return execute_transform_chain::<STREAM_FINAL_C14N, _, _, _>(
+        let data = apply_transform_with_context(signature, transform, data, context)?;
+        return execute_transform_chain::<STREAM_FINAL_C14N, _, _, _, _, _, _>(
             source_signature,
             Some(signature),
             data,
@@ -1639,23 +1999,15 @@ where
         );
     }
 
-    let data = apply_transform_with_options_and_state(
-        source_signature,
-        transform,
-        data,
-        context.options,
-        context.budget,
-        context.state,
-        context.xml_parse,
-    )?;
+    let data = apply_transform_with_context(source_signature, transform, data, context)?;
     if let Some(tracking) = &mut dependency_tracking {
         match &data {
-            TransformData::NodeSet(nodes) => {
-                let preserve_excluded_as_opaque = match transform {
-                    Transform::XPath(expression) => {
+            ExecutionData::Nodes(nodes) => {
+                let preserve_excluded_as_opaque = match transform.view() {
+                    InstructionView::XPath(expression) => {
                         xpath_may_read_mutable_character_data(expression.expression())
                     }
-                    Transform::XPathFilter2(filters) => filters.iter().any(|filter| {
+                    InstructionView::Filter2(filters) => filters.iter().any(|filter| {
                         xpath_may_read_mutable_character_data(filter.xpath().expression())
                     }),
                     _ => false,
@@ -1667,10 +2019,10 @@ where
                 }
                 let mut active_nodes = Vec::with_capacity(tracking.active_nodes.len());
                 for tracked in tracking.active_nodes.drain(..) {
-                    let remains_visible = nodes
-                        .document()
-                        .get_node(tracked.node_id)
-                        .is_some_and(|node| nodes.contains(node));
+                    let remains_visible = match nodes.document().get_node(tracked.node_id) {
+                        Some(node) => nodes.contains_tree(node).map_err(TransformError::from)?,
+                        None => false,
+                    };
                     if remains_visible {
                         active_nodes.push(tracked);
                     } else if preserve_excluded_as_opaque {
@@ -1686,7 +2038,9 @@ where
                 }
                 tracking.active_nodes = active_nodes;
             }
-            TransformData::Binary(_) | TransformData::BorrowedBinary(_) => {
+            ExecutionData::NativeBinary(_)
+            | ExecutionData::BorrowedBinary(_)
+            | ExecutionData::Accounted(_) => {
                 tracking
                     .opaque_dependencies
                     .extend(tracking.active_nodes.drain(..).map(|tracked| tracked.index));
@@ -1695,7 +2049,7 @@ where
             }
         }
     }
-    execute_transform_chain::<STREAM_FINAL_C14N, _, _, _>(
+    execute_transform_chain::<STREAM_FINAL_C14N, _, _, _, _, _, _>(
         source_signature,
         enveloped_signature,
         data,
@@ -1711,9 +2065,12 @@ fn map_transform_xml_parse_error(
     error: XmlDocumentError,
     settings: DocumentParseSettings,
 ) -> TransformError {
+    if let XmlDocumentError::Parse(crate::xml::dom::ParseError::SharedExecution(error)) = error {
+        return error.into();
+    }
     match error.into_policy_violation(settings) {
         Ok(error) => TransformError::Policy(error),
-        Err(error) => TransformError::XmlParse(error.to_string()),
+        Err(error) => TransformError::XmlParse(error),
     }
 }
 
@@ -1726,7 +2083,7 @@ fn map_transform_xml_decode_error(error: crate::encoding::XmlEncodingError) -> T
                 actual,
             })
         }
-        error => TransformError::XmlParse(error.to_string()),
+        error => TransformError::XmlParse(XmlDocumentError::Encoding(error)),
     }
 }
 
@@ -1742,41 +2099,11 @@ fn dependency_indexes(tracking: Option<DependencyTracking>) -> HashSet<usize> {
         .collect()
 }
 
-fn transform_requires_node_set(transform: &Transform) -> bool {
+fn transform_requires_node_set(transform: &impl Instruction) -> bool {
     !matches!(
-        transform,
-        Transform::Base64Decode | Transform::Relationship(_)
+        transform.view(),
+        InstructionView::Base64 | InstructionView::Relationship(_)
     )
-}
-
-fn finalize_transform_data(
-    data: TransformData<'_>,
-    budget: &TransformExecutionBudget,
-) -> Result<Vec<u8>, TransformError> {
-    // Final coercion: if the result is still a NodeSet, canonicalize with
-    // default inclusive C14N 1.0 per XMLDSig spec §4.3.3.2.
-    match data {
-        TransformData::Binary(bytes) => Ok(bytes),
-        TransformData::BorrowedBinary(bytes) => Ok(bytes.to_vec()),
-        TransformData::NodeSet(nodes) => {
-            #[expect(clippy::expect_used, reason = "hardcoded URI is a known constant")]
-            let algo = C14nAlgorithm::from_uri(DEFAULT_IMPLICIT_C14N_URI)
-                .expect("default C14N algorithm URI must be supported by C14nAlgorithm::from_uri");
-            let mut output = Vec::new();
-            c14n::canonicalize_with_visibility_and_position_bounded_with_xml_base_budget(
-                nodes.document(),
-                Some(&nodes),
-                &algo,
-                None,
-                budget.c14n.remaining(),
-                budget.xml_base_resolution(),
-                &mut output,
-            )
-            .map_err(|error| map_c14n_limit_error(error, &budget.c14n))?;
-            budget.c14n.charge(output.len())?;
-            Ok(output)
-        }
-    }
 }
 
 fn map_c14n_limit_error(error: c14n::C14nError, budget: &C14nOutputBudget) -> TransformError {
@@ -1796,14 +2123,14 @@ fn map_c14n_limit_error(error: c14n::C14nError, budget: &C14nOutputBudget) -> Tr
     }
 }
 
-pub(crate) fn transform_chain_produces_binary(
+pub(crate) fn transform_chain_produces_binary<I: Instruction>(
     initial_binary: bool,
-    transforms: &[Transform],
+    transforms: &[I],
 ) -> bool {
     transforms.last().map_or(initial_binary, |transform| {
         matches!(
-            transform,
-            Transform::C14n(_) | Transform::Base64Decode | Transform::Relationship(_)
+            transform.view(),
+            InstructionView::C14n(..) | InstructionView::Base64 | InstructionView::Relationship(_)
         )
     })
 }
@@ -1906,34 +2233,54 @@ pub(crate) fn parse_reference_transforms_with_budget(
     container_namespace: &str,
     signature_budget: &mut XPathSignatureParseBudget,
 ) -> Result<Vec<Transform>, TransformError> {
+    parse_reference_transforms_in(
+        transforms_node,
+        container_namespace,
+        signature_budget,
+        &Native,
+    )
+}
+
+pub(crate) fn parse_reference_transforms_in<'a, S: ParseStorage<'a>>(
+    transforms_node: Node<'a, 'a>,
+    container_namespace: &str,
+    signature_budget: &mut XPathSignatureParseBudget,
+    scratch: &S,
+) -> Result<S::Values<S::Instruction>, TransformError> {
     // Validate that we received a <ds:Transforms> element.
     if !transforms_node.is_element() {
-        return Err(TransformError::UnsupportedTransform(
-            "expected <Transforms> element but got non-element node".into(),
-        ));
+        return Err(scratch.unsupported(format_args!(
+            "expected <Transforms> element but got non-element node"
+        )));
     }
     let transforms_tag = transforms_node.tag_name();
     if transforms_tag.name() != "Transforms"
         || transforms_tag.namespace() != Some(container_namespace)
     {
-        return Err(TransformError::UnsupportedTransform(
-            "Transforms container has the wrong namespace".into(),
-        ));
+        return Err(
+            scratch.unsupported(format_args!("Transforms container has the wrong namespace"))
+        );
     }
 
-    let mut chain = Vec::new();
+    let mut chain = scratch.values();
     let mut xpath_state = XPathParseState::new(signature_budget);
 
+    scratch.charge(transforms_node.children().len())?;
     for child in transforms_node.children() {
         if !child.is_element() {
+            if child.is_text()
+                && let Some(text) = child.text()
+            {
+                scratch.charge(text.len())?;
+            }
             // XMLDSig 1.1 section 4.4.3.4 and XMLEnc 1.1 section 3.3.1
             // define element-only Transforms content, not arbitrary text.
             // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-Transforms
             // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-CipherReference
             if child.is_text() && !child.text().is_some_and(is_xml_whitespace_only) {
-                return Err(TransformError::UnsupportedTransform(
-                    "Transforms must not contain character data".into(),
-                ));
+                return Err(
+                    scratch.unsupported(format_args!("Transforms must not contain character data"))
+                );
             }
             continue;
         }
@@ -1942,62 +2289,77 @@ pub(crate) fn parse_reference_transforms_with_budget(
         // Only <ds:Transform> children are allowed; fail closed on any other element.
         let tag = child.tag_name();
         if tag.name() != "Transform" || tag.namespace() != Some(XMLDSIG_NS) {
-            return Err(TransformError::UnsupportedTransform(
+            return Err(scratch.unsupported(format_args!(
                 "unexpected child element of <ds:Transforms>; only <ds:Transform> is allowed"
-                    .into(),
-            ));
+            )));
         }
+        scratch.charge(child.attributes().len())?;
         let uri = child.attribute("Algorithm").ok_or_else(|| {
-            TransformError::UnsupportedTransform(
-                "missing Algorithm attribute on <Transform>".into(),
-            )
+            scratch.unsupported(format_args!("missing Algorithm attribute on <Transform>"))
         })?;
 
+        // Admit the actual chain slot before parsing its potentially owned
+        // parameters; a capacity refusal must not pay for a discarded value.
+        if chain.len() == chain.capacity() {
+            chain.reserve_exact(chain.len().max(1))?;
+        }
+        scratch.charge(uri.len())?;
+
         let transform = if uri == ENVELOPED_SIGNATURE_URI {
-            Transform::Enveloped
+            scratch.enveloped()
         } else if uri == BASE64_TRANSFORM_URI {
-            validate_empty_transform(child, "Base64")?;
-            Transform::Base64Decode
+            validate_empty_transform(child, "Base64", scratch)?;
+            scratch.base64()
         } else if uri == XPATH_TRANSFORM_URI {
-            parse_xpath_transform_with_state(child, &mut xpath_state)?
+            parse_xpath_transform_with_state(child, &mut xpath_state, scratch)?
         } else if uri == XPATH_FILTER2_TRANSFORM_URI {
-            parse_xpath_filter2_transform(child, &mut xpath_state)?
+            parse_xpath_filter2_transform(child, &mut xpath_state, scratch)?
         } else if uri == RELATIONSHIP_TRANSFORM_URI {
-            Transform::Relationship(relationship::parse_selectors(
+            scratch.relationships(relationship::parse_selectors_in(
                 child,
                 &xpath_state.signature_budget.opc_workspace,
+                scratch,
             )?)
-        } else if let Some(mut algo) = C14nAlgorithm::from_uri(uri) {
+        } else if let Some(algo) = C14nAlgorithm::from_uri(uri) {
             // For exclusive C14N, check for InclusiveNamespaces child
-            if algo.mode() == c14n::C14nMode::Exclusive1_0
-                && let Some(prefix_list) = parse_inclusive_prefixes(child)?
-            {
-                algo = algo.with_prefix_list(&prefix_list);
-            }
-            Transform::C14n(algo)
+            let prefixes = if algo.mode() == c14n::C14nMode::Exclusive1_0 {
+                scratch.charge(child.children().len())?;
+                parse_inclusive_prefixes(child, scratch)?
+            } else {
+                None
+            };
+            scratch.canonicalization(algo, prefixes)
         } else {
-            return Err(TransformError::UnsupportedTransform(uri.to_string()));
+            return Err(scratch.unsupported(format_args!("{uri}")));
         };
-        chain.push(transform);
+        chain.push(transform)?;
     }
 
+    scratch.charge(chain.len())?;
     relationship::validate_chain(&chain)?;
     Ok(chain)
 }
 
 /// Validate transforms whose XML syntax does not define parameter content.
-fn validate_empty_transform(
-    transform_node: Node,
+fn validate_empty_transform<'a, S: ParseStorage<'a>>(
+    transform_node: Node<'a, 'a>,
     transform_name: &'static str,
+    scratch: &S,
 ) -> Result<(), TransformError> {
+    scratch.charge(transform_node.children().len())?;
     for child in transform_node.children() {
+        if child.is_text()
+            && let Some(text) = child.text()
+        {
+            scratch.charge(text.len())?;
+        }
         if child.is_element()
             || (child.is_text()
                 && child
                     .text()
                     .is_some_and(|text| !is_xml_whitespace_only(text)))
         {
-            return Err(TransformError::UnsupportedTransform(format!(
+            return Err(scratch.unsupported(format_args!(
                 "{transform_name} transform must not contain parameters"
             )));
         }
@@ -2010,16 +2372,24 @@ pub(super) fn parse_xpath_transform(transform_node: Node) -> Result<Transform, T
     parse_xpath_transform_with_state(
         transform_node,
         &mut XPathParseState::new(&mut XPathSignatureParseBudget::default()),
+        &Native,
     )
 }
 
-fn parse_xpath_transform_with_state(
-    transform_node: Node,
+fn parse_xpath_transform_with_state<'a, S: ParseStorage<'a>>(
+    transform_node: Node<'a, 'a>,
     xpath_state: &mut XPathParseState,
-) -> Result<Transform, TransformError> {
+    scratch: &S,
+) -> Result<S::Instruction, TransformError> {
     let mut xpath_node = None;
 
+    scratch.charge(transform_node.children().len())?;
     for child in transform_node.children() {
+        if child.is_text()
+            && let Some(text) = child.text()
+        {
+            scratch.charge(text.len())?;
+        }
         if child.is_text() && child.text().is_some_and(is_xml_whitespace_only) {
             continue;
         }
@@ -2027,52 +2397,66 @@ fn parse_xpath_transform_with_state(
             continue;
         }
         if !child.is_element() {
-            return Err(TransformError::XPath(
-                "XPath transform contains non-whitespace parameter content".into(),
-            ));
+            return Err(scratch.xpath_error(format_args!(
+                "XPath transform contains non-whitespace parameter content"
+            )));
         }
         let tag = child.tag_name();
         if tag.name() == "XPath" && tag.namespace() == Some(XMLDSIG_NS) {
             if xpath_node.is_some() {
-                return Err(TransformError::XPath(
-                    "XPath transform must contain exactly one XMLDSig <XPath> child element".into(),
-                ));
+                return Err(scratch.xpath_error(format_args!(
+                    "XPath transform must contain exactly one XMLDSig <XPath> child element"
+                )));
             }
             xpath_node = Some(child);
         } else {
-            return Err(TransformError::XPath(
-                "XPath transform allows only a single XMLDSig <XPath> child element".into(),
-            ));
+            return Err(scratch.xpath_error(format_args!(
+                "XPath transform allows only a single XMLDSig <XPath> child element"
+            )));
         }
     }
 
     let xpath_node = xpath_node.ok_or_else(|| {
-        TransformError::XPath(
-            "XPath transform requires a single XMLDSig <XPath> child element".into(),
-        )
+        scratch.xpath_error(format_args!(
+            "XPath transform requires a single XMLDSig <XPath> child element"
+        ))
     })?;
     if xpath_node.attributes().len() != 0 {
-        return Err(TransformError::XPath(
-            "XMLDSig <XPath> does not allow attributes".into(),
-        ));
+        return Err(scratch.xpath_error(format_args!("XMLDSig <XPath> does not allow attributes")));
     }
-    let xpath = parse_xpath_expression(xpath_node, transform_node.id(), xpath_state)?;
+    let xpath = parse_xpath_expression(xpath_node, transform_node.id(), xpath_state, scratch)?;
 
-    if xpath.expression() == ENVELOPED_SIGNATURE_XPATH_EXPR
-        && xpath.namespaces().get("dsig").map(String::as_str) == Some(XMLDSIG_NS)
-    {
-        Ok(Transform::XpathExcludeAllSignatures)
+    scratch.charge(xpath.expression().len())?;
+    let mut signature_prefix = false;
+    if xpath.expression() == ENVELOPED_SIGNATURE_XPATH_EXPR {
+        for (prefix, uri) in xpath.namespaces() {
+            scratch.charge(prefix.len() + uri.len())?;
+            if prefix == "dsig" {
+                signature_prefix = uri == XMLDSIG_NS;
+                break;
+            }
+        }
+    }
+    if signature_prefix {
+        Ok(scratch.exclude_signatures())
     } else {
-        Ok(Transform::XPath(xpath))
+        Ok(scratch.xpath(xpath))
     }
 }
 
-fn parse_xpath_filter2_transform(
-    transform_node: Node,
+fn parse_xpath_filter2_transform<'a, S: ParseStorage<'a>>(
+    transform_node: Node<'a, 'a>,
     xpath_state: &mut XPathParseState,
-) -> Result<Transform, TransformError> {
-    let mut filters = Vec::new();
+    scratch: &S,
+) -> Result<S::Instruction, TransformError> {
+    let mut filters = scratch.values();
+    scratch.charge(transform_node.children().len())?;
     for child in transform_node.children() {
+        if child.is_text()
+            && let Some(text) = child.text()
+        {
+            scratch.charge(text.len())?;
+        }
         if child.is_text() && child.text().is_some_and(is_xml_whitespace_only) {
             continue;
         }
@@ -2083,9 +2467,9 @@ fn parse_xpath_filter2_transform(
             || child.tag_name().name() != "XPath"
             || child.tag_name().namespace() != Some(XPATH_FILTER2_TRANSFORM_URI)
         {
-            return Err(TransformError::XPath(
-                "XPath Filter 2.0 allows only filter-namespace <XPath> children".into(),
-            ));
+            return Err(scratch.xpath_error(format_args!(
+                "XPath Filter 2.0 allows only filter-namespace <XPath> children"
+            )));
         }
         if filters.len() == xpath_state.signature_budget.max_filters {
             return Err(transform_resource_limit(
@@ -2094,64 +2478,56 @@ fn parse_xpath_filter2_transform(
                 filters.len().saturating_add(1),
             ));
         }
-        if child.attributes().len() != 1 || child.attribute("Filter").is_none() {
-            return Err(TransformError::XPath(
-                "XPath Filter 2.0 <XPath> requires only the unqualified Filter attribute".into(),
-            ));
+        let invalid_attributes = || {
+            scratch.xpath_error(format_args!(
+                "XPath Filter 2.0 <XPath> requires only the unqualified Filter attribute"
+            ))
+        };
+        if child.attributes().len() != 1 {
+            return Err(invalid_attributes());
         }
-        let operation = match child.attribute("Filter") {
-            Some("intersect") => XPathFilterOperation::Intersect,
-            Some("subtract") => XPathFilterOperation::Subtract,
-            Some("union") => XPathFilterOperation::Union,
-            Some(value) => {
-                return Err(TransformError::XPath(format!(
+        scratch.charge(1)?;
+        let filter = child.attribute("Filter").ok_or_else(invalid_attributes)?;
+        let operation = match filter {
+            "intersect" => XPathFilterOperation::Intersect,
+            "subtract" => XPathFilterOperation::Subtract,
+            "union" => XPathFilterOperation::Union,
+            value => {
+                return Err(scratch.xpath_error(format_args!(
                     "unsupported XPath Filter 2.0 operation: {value}"
                 )));
             }
-            None => unreachable!("Filter presence was checked above"),
         };
-        filters.push(XPathFilter::new(
+        if filters.len() == filters.capacity() {
+            filters.reserve_exact(filters.len().max(1))?;
+        }
+        filters.push(scratch.filter(
             operation,
-            parse_xpath_expression(child, transform_node.id(), xpath_state)?,
-        ));
+            parse_xpath_expression(child, transform_node.id(), xpath_state, scratch)?,
+        ))?;
     }
     if filters.is_empty() {
-        return Err(TransformError::XPath(
-            "XPath Filter 2.0 requires at least one expression".into(),
-        ));
+        return Err(scratch.xpath_error(format_args!(
+            "XPath Filter 2.0 requires at least one expression"
+        )));
     }
-    Ok(Transform::XPathFilter2(filters))
+    Ok(scratch.filters(filters))
 }
 
-fn parse_xpath_expression(
-    xpath_node: Node,
+fn parse_xpath_expression<'a, S: ParseStorage<'a>>(
+    xpath_node: Node<'a, 'a>,
     transform_node: NodeId,
     xpath_state: &mut XPathParseState,
-) -> Result<XPathExpression, TransformError> {
-    let mut source = String::new();
-    for child in xpath_node.children() {
-        if child.is_text() {
-            let text = child.text().unwrap_or_default();
-            let attempted = source.len().saturating_add(text.len());
-            if attempted > xpath_state.signature_budget.max_expression_bytes {
-                return Err(transform_resource_limit(
-                    crate::policy::resource_name::XPATH_EXPRESSION_BYTES,
-                    xpath_state.signature_budget.max_expression_bytes,
-                    attempted,
-                ));
-            }
-            source.push_str(text);
-        } else if child.is_element() {
-            return Err(TransformError::XPath(
-                "XPath expressions must contain text only".into(),
-            ));
-        }
-    }
-    let source = source.trim_matches(is_xpath_whitespace);
+    scratch: &S,
+) -> Result<S::Expression, TransformError> {
+    let source_text = source::read(
+        xpath_node,
+        xpath_state.signature_budget.max_expression_bytes,
+        scratch,
+    )?;
+    let source = source_text.view()?;
     if source.is_empty() {
-        return Err(TransformError::XPath(
-            "XPath expression must not be empty".into(),
-        ));
+        return Err(scratch.xpath_error(format_args!("XPath expression must not be empty")));
     }
     xpath_state.signature_budget.charge()?;
     if source.len() > xpath_state.signature_budget.max_expression_bytes {
@@ -2161,6 +2537,7 @@ fn parse_xpath_expression(
             source.len(),
         ));
     }
+    scratch.charge(source.len())?;
     let complexity = crate::xmldsig::xpath::xpath_expression_complexity(source);
     if complexity > xpath_state.signature_budget.max_expression_complexity {
         return Err(transform_resource_limit(
@@ -2169,22 +2546,30 @@ fn parse_xpath_expression(
             complexity,
         ));
     }
-    crate::xmldsig::xpath::compile_xpath_with_policy_limits(
+    scratch.validate_xpath(
         source,
         xpath_state.signature_budget.max_expression_bytes,
         xpath_state.signature_budget.max_expression_complexity,
-    )
-    .map_err(TransformError::XPath)?;
+    )?;
 
-    let namespaces = collect_xpath_namespaces_with_limits(
-        xpath_node,
+    let mut namespaces = XPathNamespaceBudget::with_limits(
         xpath_state.signature_budget.max_namespace_bindings,
         xpath_state.signature_budget.max_namespace_bytes,
-    )?;
-    let xpath = XPathExpression {
-        expression: source.to_owned(),
-        namespaces,
-        here_nodes: Some(XPathHereNodes {
+    );
+    for namespace in xpath_node.namespaces() {
+        scratch.charge(1)?;
+        if let Some(prefix) = namespace.name() {
+            scratch.charge(prefix.len() + namespace.uri().len())?;
+            namespaces.charge(prefix, namespace.uri())?;
+        }
+    }
+    if xpath_state.document_identity.is_none() {
+        scratch.charge(xpath_node.document().input_text().len())?;
+    }
+    Ok(scratch.expression(
+        source_text,
+        xpath_node,
+        XPathHereNodes {
             // XMLDSig defines here() as the parent element of the text node
             // bearing the expression, not as the text node itself.
             specification_xpath_element: xpath_node.id(),
@@ -2193,9 +2578,8 @@ fn parse_xpath_expression(
             // owned content identity so parsed transforms cannot outlive the
             // source and later alias unrelated nodes carrying the same indices.
             document: xpath_state.document_identity(xpath_node.document()),
-        }),
-    };
-    Ok(xpath)
+        },
+    ))
 }
 
 struct XPathParseState<'a> {
@@ -2485,18 +2869,22 @@ fn validate_xpath_namespace_budget_with_limits(
 ///     xmlns:ec="http://www.w3.org/2001/10/xml-exc-c14n#"
 ///     PrefixList="ds saml #default"/>
 /// ```
-fn parse_inclusive_prefixes(transform_node: Node) -> Result<Option<String>, TransformError> {
+fn parse_inclusive_prefixes<'a, S: ParseStorage<'a>>(
+    transform_node: Node<'a, 'a>,
+    scratch: &S,
+) -> Result<Option<&'a str>, TransformError> {
     for child in transform_node.children() {
         if child.is_element() {
             let tag = child.tag_name();
             if tag.name() == "InclusiveNamespaces" && tag.namespace() == Some(EXCLUSIVE_C14N_NS_URI)
             {
+                scratch.charge(child.attributes().len())?;
                 let prefix_list = child.attribute("PrefixList").ok_or_else(|| {
-                    TransformError::UnsupportedTransform(
-                        "missing PrefixList attribute on <InclusiveNamespaces>".into(),
-                    )
+                    scratch.unsupported(format_args!(
+                        "missing PrefixList attribute on <InclusiveNamespaces>"
+                    ))
                 })?;
-                return Ok(Some(prefix_list.to_string()));
+                return Ok(Some(prefix_list));
             }
         }
     }
@@ -2506,6 +2894,149 @@ fn parse_inclusive_prefixes(transform_node: Node) -> Result<Option<String>, Tran
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests use trusted XML fixtures")]
 mod tests {
+    #[test]
+    fn scoped_empty_transform_pays_for_parameter_text_validation() {
+        // Base64 has no parameters, but deciding that whitespace-only content
+        // is ignorable still scans attacker-controlled text in the current query.
+        use structured_asn1::memory::{Memory, MemoryAccount};
+        let cost = |padding: usize| {
+            let xml = format!(
+                "<Transforms xmlns='{XMLDSIG_NS}'><Transform Algorithm='{BASE64_TRANSFORM_URI}'>{}</Transform></Transforms>",
+                " ".repeat(padding)
+            );
+            let document = Document::parse(&xml).expect("fixed whitespace parameter XML");
+            let work = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 20)));
+            let chain = parse_reference_transforms_in(
+                document.root_element(),
+                XMLDSIG_NS,
+                &mut XPathSignatureParseBudget::default(),
+                &crate::c14n::scratch::Accounted(&work),
+            )
+            .expect("whitespace does not add a Base64 parameter");
+            assert!(matches!(&*chain, [parameters::OriginalInstruction::Base64]));
+            drop(chain);
+            assert_eq!(work.used(), 0);
+            work.work_used()
+        };
+        assert!(cost(1024) >= cost(1) + 1023);
+    }
+
+    #[test]
+    fn scoped_transform_chain_admits_capacity_before_parameter_parsing() {
+        // Even a parameterless instruction owns one chain entry. Refusal must
+        // precede parsing the deliberately malformed XPath nested in that entry.
+        use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
+        let document = Document::parse(concat!(
+            "<Transforms xmlns='http://www.w3.org/2000/09/xmldsig#'>",
+            "<Transform Algorithm='http://www.w3.org/TR/1999/REC-xpath-19991116'>",
+            "<XPath>invalid(</XPath></Transform></Transforms>"
+        ))
+        .expect("fixed parameter XML");
+        let work = Memory::new(std::sync::Arc::new(MemoryAccount::new(0, 1 << 20)));
+        let result = parse_reference_transforms_in(
+            document.root_element(),
+            XMLDSIG_NS,
+            &mut XPathSignatureParseBudget::default(),
+            &crate::c14n::scratch::Accounted(&work),
+        );
+        assert!(matches!(
+            result,
+            Err(TransformError::C14n(
+                crate::c14n::C14nError::SharedExecution(MemoryError::LimitExceeded)
+            ))
+        ));
+        assert_eq!(work.used(), 0);
+    }
+
+    #[test]
+    fn scoped_transform_chain_retains_its_actual_capacity() {
+        // Native and current-query construction share grammar and order. Only
+        // current-query storage retains a capacity charge until the chain drops.
+        use structured_asn1::memory::{Memory, MemoryAccount};
+        let document = Document::parse(concat!(
+            "<Transforms xmlns='http://www.w3.org/2000/09/xmldsig#'>",
+            "<Transform Algorithm='http://www.w3.org/2000/09/xmldsig#enveloped-signature'/>",
+            "<Transform Algorithm='http://www.w3.org/2000/09/xmldsig#base64'/>",
+            "</Transforms>"
+        ))
+        .expect("fixed parameter XML");
+        let work = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 20)));
+        let chain = parse_reference_transforms_in(
+            document.root_element(),
+            XMLDSIG_NS,
+            &mut XPathSignatureParseBudget::default(),
+            &crate::c14n::scratch::Accounted(&work),
+        )
+        .expect("admitted chain");
+        let native = parse_transforms(document.root_element()).expect("native chain");
+        assert!(
+            chain
+                .iter()
+                .map(Instruction::algorithm_uri)
+                .eq(native.iter().map(Transform::algorithm_uri))
+        );
+        assert!(work.used() >= 2 * std::mem::size_of_val(&chain[0]));
+        drop(chain);
+        assert_eq!(work.used(), 0);
+    }
+
+    #[test]
+    fn optimized_xpath_scan_admits_current_work_even_without_a_signature() {
+        // A no-match scan still visits every source node. It must not become
+        // free just because no subtree reaches the separately paid retain pass.
+        use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
+        let document = Document::parse("<root><a/><b/></root>").expect("fixed XML");
+        let work = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 20)));
+        let budget = TransformExecutionBudget::default();
+        let nodes = Projection::accounted_subtree(
+            document.root(),
+            true,
+            &budget.node_set_materialization,
+            &work,
+        )
+        .expect("initial projection fits");
+        let remaining = document.descendants().len() - 1;
+        work.charge_work((work.work_remaining() - remaining) as u64)
+            .expect("leave one fewer scan unit");
+        let scratch = crate::c14n::scratch::Accounted(&work);
+        let context = TransformExecutionContext {
+            scratch: &scratch,
+            options: TransformOptions::default(),
+            budget: &budget,
+            state: &budget.state,
+            xml_parse: budget.xml_parse_work(),
+            source_has_signature: false,
+        };
+        let result = apply_transform_with_context(
+            document.root_element(),
+            &Transform::XpathExcludeAllSignatures,
+            ExecutionData::Nodes(nodes),
+            &context,
+        );
+        assert!(matches!(
+            result,
+            Err(TransformError::C14n(
+                crate::c14n::C14nError::SharedExecution(MemoryError::WorkExceeded)
+            ))
+        ));
+        assert_eq!(work.used(), 0);
+    }
+
+    #[test]
+    fn binary_xml_adapter_preserves_typed_encoding_cause() {
+        // The adapter must move the decoder's original error, not allocate a
+        // formatted diagnostic and erase its machine-readable failure class.
+        let error = map_transform_xml_decode_error(
+            crate::encoding::XmlEncodingError::InvalidBytes("UTF-8"),
+        );
+        assert!(matches!(
+            error,
+            TransformError::XmlParse(XmlDocumentError::Encoding(
+                crate::encoding::XmlEncodingError::InvalidBytes("UTF-8")
+            ))
+        ));
+    }
+
     #[test]
     fn terminal_callback_receives_final_nodes_before_c14n_materialization() {
         use crate::c14n::C14nMode;
@@ -2522,9 +3053,25 @@ mod tests {
                 Self::Processing(error)
             }
         }
+        struct RefusingTerminal;
+        impl TransformTerminal<Native> for RefusingTerminal {
+            type Output = ();
+            type Error = TerminalError;
+            fn finish<D: DomStorage>(
+                self,
+                data: ExecutionData<'_, Native, D>,
+                explicit: Option<(&C14nAlgorithm, Option<&str>)>,
+                _: &TransformExecutionBudget,
+            ) -> Result<(), TerminalError> {
+                assert!(data.nodes().is_some());
+                assert_eq!(explicit.unwrap().0.mode(), C14nMode::Exclusive1_0);
+                Err(TerminalError::Refused("original terminal cause"))
+            }
+        }
         let document = Document::parse("<root/>").unwrap();
         let budget = TransformExecutionBudget::default();
         let context = TransformExecutionContext {
+            scratch: &Native,
             options: TransformOptions::default(),
             budget: &budget,
             state: &budget.state,
@@ -2533,19 +3080,16 @@ mod tests {
         };
         let algorithm = C14nAlgorithm::new(C14nMode::Exclusive1_0, false);
         let result: Result<TransformChainOutput<()>, TerminalError> =
-            execute_transform_chain::<true, _, _, _>(
+            execute_transform_chain::<true, _, _, _, _, _, _>(
                 document.root_element(),
                 Some(document.root_element()),
-                TransformData::NodeSet(NodeSet::entire_document_with_comments(&document).unwrap()),
+                TransformData::NodeSet(NodeSet::entire_document_with_comments(&document).unwrap())
+                    .into(),
                 &[Transform::C14n(algorithm)],
                 None,
                 None,
                 &context,
-                |data, explicit, _budget| {
-                    assert!(matches!(data, TransformData::NodeSet(_)));
-                    assert_eq!(explicit.unwrap().mode(), C14nMode::Exclusive1_0);
-                    Err(TerminalError::Refused("original terminal cause"))
-                },
+                RefusingTerminal,
             );
         match result {
             Err(TerminalError::Refused(cause)) => assert_eq!(cause, "original terminal cause"),
@@ -2799,6 +3343,24 @@ mod tests {
         let result = apply_transform(doc.root_element(), &Transform::Base64Decode, input).unwrap();
 
         assert_eq!(result.into_binary().unwrap(), b"Hello");
+    }
+
+    #[test]
+    fn base64_refusal_retains_typed_decoder_cause() {
+        // Malformed input must not allocate a diagnostic String merely to
+        // discard the backend's original, fixed-size decoding failure.
+        let doc = Document::parse("<root/>").unwrap();
+        let error = apply_transform(
+            doc.root_element(),
+            &Transform::Base64Decode,
+            TransformData::Binary(b"SGVsbG8===".to_vec()),
+        )
+        .unwrap_err();
+        assert!(
+            std::error::Error::source(&error)
+                .and_then(|cause| cause.downcast_ref::<base64::DecodeSliceError>())
+                .is_some()
+        );
     }
 
     #[test]

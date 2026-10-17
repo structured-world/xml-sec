@@ -10,6 +10,10 @@ use sxd_document_no_unsafe::NsStr;
 use sxd_document_no_unsafe::QName;
 use sxd_document_no_unsafe::dom;
 
+#[path = "nodeset/storage.rs"]
+pub(crate) mod storage;
+use storage::Storage;
+
 #[cfg(feature = "no-unsafe")]
 use crate::OwnedQName;
 
@@ -91,36 +95,76 @@ impl<'d> Namespace<'d> {
     }
 }
 
-#[cfg(feature = "no-unsafe")]
+#[cfg(feature = "embedded")]
+pub(crate) type DeclarationText<'a, 'd> = sxd_document_no_unsafe::string_pool::Label<'a>;
+#[cfg(all(feature = "no-unsafe", not(feature = "embedded")))]
 pub(crate) type DeclarationText<'a, 'd> = &'a str;
 #[cfg(not(feature = "no-unsafe"))]
 pub(crate) type DeclarationText<'a, 'd> = &'d str;
 
+fn declaration_str<'a, 'd: 'a>(text: DeclarationText<'a, 'd>) -> &'a str {
+    #[cfg(feature = "embedded")]
+    {
+        text.as_str()
+    }
+    #[cfg(not(feature = "embedded"))]
+    {
+        text
+    }
+}
+
+fn declaration_constant<'a, 'd>(text: &'static str) -> DeclarationText<'a, 'd> {
+    #[cfg(feature = "embedded")]
+    {
+        sxd_document_no_unsafe::string_pool::Label::Static(text)
+    }
+    #[cfg(not(feature = "embedded"))]
+    {
+        text
+    }
+}
+
 /// Enumerate effective bindings without collecting DOM namespaces or cloning their URIs.
 /// Nearest declarations win; a callback break or error stops the underlying DOM visitor.
-pub(crate) fn visit_namespace_bindings<'d, E: From<crate::function::Error>>(
+pub(crate) fn visit_namespace_bindings_in<
+    'd,
+    E: From<crate::function::Error>,
+    R: crate::runtime::Runtime,
+>(
     owner: dom::Element<'d>,
     context: &crate::context::Evaluation<'_, 'd>,
+    runtime: R,
     mut visit: impl FnMut(
         DeclarationText<'_, 'd>,
         DeclarationText<'_, 'd>,
     ) -> Result<std::ops::ControlFlow<()>, E>,
 ) -> Result<(), E> {
+    use crate::runtime::NamespaceSet;
     use std::ops::ControlFlow;
-    let mut seen = HashSet::<String>::new();
+    // XPath 1.0 §5.4 supplies xml independently of declarations. Emit it
+    // before allocating shadow state; no ancestor can override this binding.
+    // https://www.w3.org/TR/1999/REC-xpath-19991116/#namespace-nodes
+    let implicit_prefix = declaration_constant("xml");
+    let implicit_uri = declaration_constant("http://www.w3.org/XML/1998/namespace");
+    context.charge_work(implicit_prefix.len().saturating_add(implicit_uri.len()))?;
+    if let ControlFlow::Break(()) = visit(implicit_prefix, implicit_uri)? {
+        return Ok(());
+    }
+    let mut seen = runtime.namespaces();
     let mut emit =
         |prefix: DeclarationText<'_, 'd>, uri: DeclarationText<'_, 'd>| -> Result<(), Option<E>> {
             context
                 .charge_work(prefix.len().saturating_add(uri.len()).max(1))
                 .map_err(|error| Some(E::from(error)))?;
-            if seen.contains(prefix) {
+            if declaration_str(prefix) == "xml" {
                 return Ok(());
             }
-            reserve_hashset_slot(&mut seen, context).map_err(|error| Some(E::from(error)))?;
-            context
-                .reserve_temporary_allocation(prefix.len())
-                .map_err(|error| Some(E::from(error)))?;
-            seen.insert(prefix.to_owned());
+            if !seen
+                .insert(context, prefix)
+                .map_err(|error| Some(E::from(error)))?
+            {
+                return Ok(());
+            }
             // XPath 1.0 section 5.4: empty declarations shadow ancestors but are not nodes.
             // https://www.w3.org/TR/xpath/#namespace-nodes
             if uri.is_empty() {
@@ -131,16 +175,12 @@ pub(crate) fn visit_namespace_bindings<'d, E: From<crate::function::Error>>(
                 ControlFlow::Break(()) => Err(None),
             }
         };
-    match emit("xml", "http://www.w3.org/XML/1998/namespace") {
-        Err(None) => return Ok(()),
-        Err(Some(error)) => return Err(error),
-        Ok(()) => {}
-    }
     let mut current = Some(owner);
     while let Some(element) = current {
-        context.charge_work(1)?;
-        context.reserve_temporary_allocation(element.namespace_declaration_workspace_bytes())?;
-        match element.try_visit_namespace_declarations(&mut emit) {
+        match runtime
+            .namespace_declarations(element, context, &mut emit)
+            .map_err(E::from)?
+        {
             Err(None) => return Ok(()),
             Err(Some(error)) => return Err(error),
             Ok(()) => {}
@@ -165,6 +205,22 @@ pub enum Node<'d> {
 #[cfg(not(feature = "no-unsafe"))]
 impl<'d> Copy for Node<'d> {}
 
+#[cfg(feature = "embedded")]
+impl structured_asn1::memory::HashWork for Node<'_> {
+    fn hash_work(&self) -> Result<u64, structured_asn1::memory::MemoryError> {
+        // Arena handles hash fixed identity words. A namespace additionally
+        // hashes its retained prefix/URI; no producer credit pays these bytes.
+        let mut units = 32u64;
+        if let Self::Namespace(namespace) = self {
+            units = units
+                .checked_add(namespace.prefix().len() as u64)
+                .and_then(|units| units.checked_add(namespace.uri().len() as u64))
+                .ok_or(structured_asn1::memory::MemoryError::WorkExceeded)?;
+        }
+        Ok(units)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum NamePart {
     Local,
@@ -173,25 +229,27 @@ pub(crate) enum NamePart {
 }
 
 impl<'d> Node<'d> {
-    pub(crate) fn name_with_context(
+    pub(crate) fn name_in<R: crate::runtime::Runtime>(
         &self,
         part: NamePart,
         context: &crate::context::Evaluation<'_, 'd>,
-    ) -> Result<String, crate::function::Error> {
+        runtime: R,
+    ) -> Result<R::Text, crate::function::Error> {
         let render = |name: QName<'_>, owner: Option<dom::Element<'d>>, preferred: Option<&str>| {
             let text = match part {
                 NamePart::Namespace => name.namespace_uri().unwrap_or(""),
                 _ => name.local_part(),
             };
-            context.charge_work(text.len())?;
-            let mut output = String::new();
+            let mut output = runtime.empty_text()?;
             if matches!(part, NamePart::Qualified)
                 && let (Some(uri), Some(owner)) = (name.namespace_uri(), owner)
             {
-                visit_namespace_bindings(owner, context, |prefix, candidate| {
+                visit_namespace_bindings_in(owner, context, runtime, |prefix, candidate| {
+                    let prefix = declaration_str(prefix);
+                    let candidate = declaration_str(candidate);
                     if candidate == uri && (output.is_empty() || preferred == Some(prefix)) {
-                        context.reserve_temporary_allocation(prefix.len())?;
-                        output = prefix.to_owned();
+                        output = runtime.empty_text()?;
+                        runtime.append_text(context, &mut output, prefix)?;
                         if preferred.is_none() || preferred == Some(prefix) {
                             return Ok(std::ops::ControlFlow::Break(()));
                         }
@@ -199,25 +257,10 @@ impl<'d> Node<'d> {
                     Ok::<_, crate::function::Error>(std::ops::ControlFlow::Continue(()))
                 })?;
             }
-            let separator = usize::from(!output.is_empty());
-            let capacity = output
-                .len()
-                .checked_add(separator)
-                .and_then(|length| length.checked_add(text.len()))
-                .ok_or_else(|| crate::function::Error::Other {
-                    what: "XPath name length overflow".into(),
-                })?;
-            // Reallocation retains the prefix buffer until the new output buffer is ready.
-            context.reserve_temporary_allocation(capacity)?;
-            output
-                .try_reserve_exact(separator + text.len())
-                .map_err(|_| crate::function::Error::Other {
-                    what: "XPath name allocation failed".into(),
-                })?;
-            if separator != 0 {
-                output.push(':');
+            if !output.is_empty() {
+                runtime.append_text(context, &mut output, ":")?;
             }
-            output.push_str(text);
+            runtime.append_text(context, &mut output, text)?;
             Ok(output)
         };
         match self {
@@ -237,7 +280,7 @@ impl<'d> Node<'d> {
                 None,
             ),
             Self::Namespace(node) => render(QName::new(node.prefix()), None, None),
-            Self::Root(_) | Self::Text(_) | Self::Comment(_) => Ok(String::new()),
+            Self::Root(_) | Self::Text(_) | Self::Comment(_) => runtime.empty_text(),
         }
     }
 
@@ -246,6 +289,13 @@ impl<'d> Node<'d> {
         &self,
         context: &crate::context::Evaluation<'_, '_>,
     ) -> Result<Self, crate::function::Error> {
+        #[cfg(feature = "embedded")]
+        if let Self::Namespace(namespace) = self
+            && namespace.prefix.can_share()
+            && namespace.uri.can_share()
+        {
+            return Ok(self.clone());
+        }
         if cfg!(feature = "no-unsafe")
             && let Self::Namespace(namespace) = self
         {
@@ -548,6 +598,15 @@ impl<'d> Node<'d> {
         context: &crate::context::Evaluation<'_, '_>,
         expected: &str,
     ) -> Result<bool, crate::function::Error> {
+        self.string_value_eq_with_stack(context, expected, &mut Vec::new())
+    }
+
+    pub(crate) fn string_value_eq_with_stack(
+        &self,
+        context: &crate::context::Evaluation<'_, '_>,
+        expected: &str,
+        stack: &mut impl TextStack<'d>,
+    ) -> Result<bool, crate::function::Error> {
         fn consume(
             context: &crate::context::Evaluation<'_, '_>,
             actual: &str,
@@ -570,12 +629,18 @@ impl<'d> Node<'d> {
         let matches = match self {
             Node::Root(_) | Node::Element(_) => {
                 let mut matches = true;
-                visit_descendant_text_metered(self, context, StringValueWork::XPath, |text| {
-                    if matches {
-                        matches = consume(context, text, &mut remaining)?;
-                    }
-                    Ok(matches)
-                })?;
+                visit_descendant_text_using_stack(
+                    self,
+                    context,
+                    StringValueWork::XPath,
+                    stack,
+                    |text| {
+                        if matches {
+                            matches = consume(context, text, &mut remaining)?;
+                        }
+                        Ok(matches)
+                    },
+                )?;
                 matches
             }
             Node::Attribute(attribute) => consume(
@@ -603,29 +668,30 @@ impl<'d> Node<'d> {
         Ok(matches && remaining.is_empty())
     }
 
-    /// Returns the number of Unicode code points in this node's string value without building it.
-    pub(crate) fn string_value_char_len_with_context(
-        &self,
-        context: &crate::context::Evaluation<'_, '_>,
-    ) -> Result<usize, crate::function::Error> {
-        let mut length = 0usize;
-        self.visit_string_value_with_context(context, |text| {
-            context.charge_work(text.len())?;
-            length += text.chars().count();
-            Ok(true)
-        })?;
-        Ok(length)
-    }
-
     /// Visit borrowed chunks without materializing a descendant string or child snapshots.
     pub(crate) fn visit_string_value_with_context(
         &self,
         context: &crate::context::Evaluation<'_, '_>,
+        visit: impl FnMut(&str) -> Result<bool, crate::function::Error>,
+    ) -> Result<(), crate::function::Error> {
+        self.visit_string_value_with_stack(context, &mut Vec::new(), visit)
+    }
+
+    pub(crate) fn visit_string_value_with_stack(
+        &self,
+        context: &crate::context::Evaluation<'_, '_>,
+        stack: &mut impl TextStack<'d>,
         mut visit: impl FnMut(&str) -> Result<bool, crate::function::Error>,
     ) -> Result<(), crate::function::Error> {
         match self {
             Node::Root(_) | Node::Element(_) => {
-                return visit_descendant_text_metered(self, context, StringValueWork::XPath, visit);
+                return visit_descendant_text_using_stack(
+                    self,
+                    context,
+                    StringValueWork::XPath,
+                    stack,
+                    visit,
+                );
             }
             Node::Attribute(node) => visit(sxd_document_no_unsafe::as_str!(node.value()))?,
             Node::Text(node) => visit(sxd_document_no_unsafe::as_str!(node.text()))?,
@@ -639,6 +705,7 @@ impl<'d> Node<'d> {
     }
 
     /// Returns the number of Unicode code points without an evaluation context.
+    #[cfg(test)]
     pub(crate) fn string_value_char_len(&self) -> usize {
         use self::Node::*;
 
@@ -735,21 +802,72 @@ enum StringValueWork {
     Extension,
 }
 
+pub(crate) trait TextStack<'d> {
+    fn push(
+        &mut self,
+        frame: (Node<'d>, usize),
+        context: &crate::context::Evaluation<'_, '_>,
+    ) -> Result<(), crate::function::Error>;
+    fn pop(&mut self) -> Option<(Node<'d>, usize)>;
+}
+
+impl<'d> TextStack<'d> for Vec<(Node<'d>, usize)> {
+    fn push(
+        &mut self,
+        frame: (Node<'d>, usize),
+        context: &crate::context::Evaluation<'_, '_>,
+    ) -> Result<(), crate::function::Error> {
+        reserve_metered_vec_slot(self, context)?;
+        Vec::push(self, frame);
+        Ok(())
+    }
+
+    fn pop(&mut self) -> Option<(Node<'d>, usize)> {
+        Vec::pop(self)
+    }
+}
+
+struct TextFrames<'s, 'd, S: TextStack<'d>> {
+    stack: &'s mut S,
+    lifetime: std::marker::PhantomData<&'d ()>,
+}
+
+impl<'d, S: TextStack<'d>> Drop for TextFrames<'_, 'd, S> {
+    fn drop(&mut self) {
+        // A caller may reuse admitted capacity, but not a stopped traversal's
+        // pending ancestors. Cleanup also runs when its visitor unwinds.
+        while self.stack.pop().is_some() {}
+    }
+}
+
 fn visit_descendant_text_metered(
     node: &Node<'_>,
     context: &crate::context::Evaluation<'_, '_>,
     work: StringValueWork,
+    visit: impl FnMut(&str) -> Result<bool, crate::function::Error>,
+) -> Result<(), crate::function::Error> {
+    visit_descendant_text_using_stack(node, context, work, &mut Vec::new(), visit)
+}
+
+fn visit_descendant_text_using_stack<'d>(
+    node: &Node<'d>,
+    context: &crate::context::Evaluation<'_, '_>,
+    work: StringValueWork,
+    stack: &mut impl TextStack<'d>,
     mut visit: impl FnMut(&str) -> Result<bool, crate::function::Error>,
 ) -> Result<(), crate::function::Error> {
+    let frames = TextFrames {
+        stack,
+        lifetime: std::marker::PhantomData,
+    };
     if work == StringValueWork::Extension {
         context.charge_extension_work(1)?;
     }
-    let mut stack = Vec::new();
     let mut parent = node.clone();
     let mut next_child = 0usize;
     loop {
         let Some(child) = parent.child_at(next_child) else {
-            let Some((previous, index)) = stack.pop() else {
+            let Some((previous, index)) = frames.stack.pop() else {
                 return Ok(());
             };
             parent = previous;
@@ -774,8 +892,7 @@ fn visit_descendant_text_metered(
         }
         match child {
             Node::Root(_) | Node::Element(_) => {
-                reserve_metered_vec_slot(&mut stack, context)?;
-                stack.push((parent, next_child));
+                frames.stack.push((parent, next_child), context)?;
                 parent = child;
                 next_child = 0;
             }
@@ -832,7 +949,7 @@ impl<'d> From<dom::ParentOfChild<'d>> for Node<'d> {
 /// An unordered collection of unique nodes
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Nodeset<'d> {
-    nodes: HashSet<Node<'d>>,
+    nodes: Storage<'d>,
 }
 
 impl<'d> Nodeset<'d> {
@@ -845,17 +962,17 @@ impl<'d> Nodeset<'d> {
     where
         N: Into<Node<'d>>,
     {
-        self.nodes.contains(&node.into())
+        self.nodes.native().contains(&node.into())
     }
 
     /// Check an existing identity without copying owned namespace data.
     pub fn contains_ref(&self, node: &Node<'d>) -> bool {
-        self.nodes.contains(node)
+        self.nodes.native().contains(node)
     }
 
     /// Removes and returns whether a node was present.
     pub fn remove(&mut self, node: &Node<'d>) -> bool {
-        self.nodes.remove(node)
+        self.nodes.native_mut().remove(node)
     }
 
     /// Add the given node to the set
@@ -863,21 +980,26 @@ impl<'d> Nodeset<'d> {
     where
         N: Into<Node<'d>>,
     {
-        self.nodes.insert(node.into());
+        self.nodes.native_mut().insert(node.into());
     }
 
     /// Add a unique node after reserving its container storage in the evaluation budget.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "node equality/hash use immutable arena/slot identity and retained namespace labels"
+    )]
     pub fn add_metered(
         &mut self,
         context: &crate::context::Evaluation<'_, 'd>,
         node: Node<'d>,
     ) -> Result<(), crate::function::Error> {
-        if !self.nodes.contains(&node) {
+        let nodes = self.nodes.native_mut();
+        if !nodes.contains(&node) {
             context.charge_work(1)?;
             // The context counter is the embedding's shared temporary-allocation budget; strings
             // and node containers must consume the same allowance.
-            reserve_hashset_slot(&mut self.nodes, context)?;
-            self.nodes.insert(node);
+            reserve_hashset_slot(nodes, context)?;
+            nodes.insert(node);
         }
         Ok(())
     }
@@ -888,7 +1010,7 @@ impl<'d> Nodeset<'d> {
 
     /// Borrow identities without cloning namespace strings during iteration.
     pub fn iter_ref(&self) -> impl Iterator<Item = &Node<'d>> {
-        self.nodes.iter()
+        self.nodes.native().iter()
     }
 
     pub fn clone_with_context(
@@ -896,7 +1018,7 @@ impl<'d> Nodeset<'d> {
         context: &crate::context::Evaluation<'_, 'd>,
     ) -> Result<Self, crate::function::Error> {
         let mut result = Self::new();
-        for node in &self.nodes {
+        for node in self.nodes.native() {
             result.add_metered(context, node.clone_with_context(context)?)?;
         }
         Ok(result)
@@ -910,13 +1032,14 @@ impl<'d> Nodeset<'d> {
     ///
     /// [document order]: https://www.w3.org/TR/xpath/#dt-document-order
     pub fn document_order_first(&self) -> Option<Node<'d>> {
-        let node = self.nodes.iter().next()?;
+        let node = self.nodes.native().iter().next()?;
 
         if self.nodes.len() == 1 {
             return Some(node.clone());
         }
 
         self.nodes
+            .native()
             .iter()
             .min_by_key(|node| order_path(node))
             .cloned()
@@ -927,34 +1050,44 @@ impl<'d> Nodeset<'d> {
         &self,
         context: &crate::context::Evaluation<'_, '_>,
     ) -> Result<Option<Node<'d>>, crate::function::Error> {
+        self.document_order_first_in(context, crate::runtime::Native)
+    }
+
+    pub(crate) fn document_order_first_in<R: crate::runtime::Runtime>(
+        &self,
+        context: &crate::context::Evaluation<'_, '_>,
+        runtime: R,
+    ) -> Result<Option<Node<'d>>, crate::function::Error> {
+        let mut nodes = runtime.nodes(self)?;
         if self.size() <= 1 {
-            return self
-                .iter_ref()
+            return nodes
                 .next()
-                .map(|node| node.clone_with_context(context))
+                .map(|node| runtime.clone_node(context, node))
                 .transpose();
         }
-        let mut first: Option<(&Node<'d>, Vec<OrderStep>)> = None;
-        for node in self.iter_ref() {
-            let path = order_path_with_context(node, Some(context))?;
+        let mut first: Option<(&Node<'d>, R::List<OrderStep<'_>>)> = None;
+        for node in nodes {
+            let path = order_path_in(node, Some(context), runtime)?;
             context.charge_work(order_path_work(&path))?;
-            if first.as_ref().is_none_or(|(_, current)| path < *current) {
+            if first
+                .as_ref()
+                .is_none_or(|(_, current)| path[..] < current[..])
+            {
                 first = Some((node, path));
             }
         }
         first
-            .map(|(node, _)| node.clone_with_context(context))
+            .map(|(node, _)| runtime.clone_node(context, node))
             .transpose()
     }
 
     pub fn document_order(&self) -> Vec<Node<'d>> {
-        let mut nodes: Vec<_> = self.iter().collect();
-        if nodes.len() == 1 {
-            return nodes;
-        }
-
-        nodes.sort_by_cached_key(order_path);
-        nodes
+        let mut keyed: Vec<_> = self
+            .iter_ref()
+            .map(|node| (node, order_path(node)))
+            .collect();
+        keyed.sort_unstable_by(|(_, left), (_, right)| left.cmp(right));
+        keyed.into_iter().map(|(node, _)| node.clone()).collect()
     }
 
     /// Return nodes in document order while charging all temporary key storage.
@@ -962,39 +1095,61 @@ impl<'d> Nodeset<'d> {
         &self,
         context: &crate::context::Evaluation<'_, '_>,
     ) -> Result<Vec<Node<'d>>, crate::function::Error> {
-        let keyed = self.sorted_document_order_with_context(context)?;
-        context.reserve_temporary_allocation(
-            self.size().saturating_mul(std::mem::size_of::<Node<'d>>()),
-        )?;
-        let mut ordered = Vec::with_capacity(self.size());
-        for (node, _) in keyed {
-            ordered.push(node.clone_with_context(context)?);
+        self.document_order_in(context, crate::runtime::Native)
+    }
+
+    pub(crate) fn document_order_in<R: crate::runtime::Runtime>(
+        &self,
+        context: &crate::context::Evaluation<'_, '_>,
+        runtime: R,
+    ) -> Result<R::List<Node<'d>>, crate::function::Error> {
+        use crate::runtime::List;
+        let mut ordered = runtime.list();
+        if self.size() <= 1 {
+            runtime.reserve(context, &mut ordered, self.size())?;
+            for node in runtime.nodes(self)? {
+                ordered.push(runtime.clone_node(context, node)?)?;
+            }
+            return Ok(ordered);
+        }
+        let keyed = self.sorted_document_order_in(context, runtime)?;
+        runtime.reserve(context, &mut ordered, self.size())?;
+        for (node, _) in keyed.iter() {
+            ordered.push(runtime.clone_node(context, node)?)?;
         }
         Ok(ordered)
     }
 
-    pub(crate) fn visit_document_order_with_context(
+    pub(crate) fn visit_document_order_in<R: crate::runtime::Runtime>(
         &self,
         context: &crate::context::Evaluation<'_, '_>,
+        runtime: R,
         mut visit: impl FnMut(&Node<'d>) -> Result<(), crate::function::Error>,
     ) -> Result<(), crate::function::Error> {
-        for (node, _) in self.sorted_document_order_with_context(context)? {
+        if self.size() <= 1 {
+            for node in runtime.nodes(self)? {
+                visit(node)?;
+            }
+            return Ok(());
+        }
+        let sorted = self.sorted_document_order_in(context, runtime)?;
+        for (node, _) in sorted.iter() {
             visit(node)?;
         }
         Ok(())
     }
 
-    fn sorted_document_order_with_context<'a>(
+    fn sorted_document_order_in<'a, R: crate::runtime::Runtime>(
         &'a self,
         context: &crate::context::Evaluation<'_, '_>,
-    ) -> Result<Vec<(&'a Node<'d>, Vec<OrderStep>)>, crate::function::Error> {
-        context.reserve_temporary_allocation(self.size().saturating_mul(
-            std::mem::size_of::<&Node<'d>>().saturating_add(std::mem::size_of::<Vec<OrderStep>>()),
-        ))?;
-        let mut keyed = Vec::with_capacity(self.size());
-        for node in self.iter_ref() {
-            let path = order_path_with_context(node, Some(context))?;
-            keyed.push((node, path));
+        runtime: R,
+    ) -> Result<OrderKeys<'a, 'd, R>, crate::function::Error> {
+        use crate::runtime::List;
+        let mut keyed = runtime.list();
+        runtime.reserve(context, &mut keyed, self.size())?;
+        for node in runtime.nodes(self)? {
+            let path = order_path_in(node, Some(context), runtime)?;
+            keyed.push((node, path))?;
         }
         let comparison_bytes = keyed
             .iter()
@@ -1010,28 +1165,33 @@ impl<'d> Nodeset<'d> {
                 .saturating_mul(comparison_bytes),
         )?;
         // Unique node identities have a total order; unstable sort avoids an extra merge buffer.
-        keyed.sort_unstable_by(|(_, left), (_, right)| left.cmp(right));
+        keyed.sort_unstable_by(|(_, left), (_, right)| left[..].cmp(&right[..]));
         Ok(keyed)
     }
 }
+
+type OrderKeys<'a, 'd, R> = <R as crate::runtime::Runtime>::List<(
+    &'a Node<'d>,
+    <R as crate::runtime::Runtime>::List<OrderStep<'a>>,
+)>;
 
 impl<'d> Extend<Node<'d>> for Nodeset<'d> {
     fn extend<I>(&mut self, iter: I)
     where
         I: IntoIterator<Item = Node<'d>>,
     {
-        self.nodes.extend(iter)
+        self.nodes.native_mut().extend(iter)
     }
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
-enum OrderStep {
-    Namespace(String),
+enum OrderStep<'a> {
+    Namespace(&'a str),
     Attribute(usize),
     Child(usize),
 }
 
-fn order_path_work(path: &[OrderStep]) -> usize {
+fn order_path_work(path: &[OrderStep<'_>]) -> usize {
     path.iter().fold(1usize, |work, step| {
         work.saturating_add(match step {
             OrderStep::Namespace(prefix) => prefix.len().max(1),
@@ -1040,15 +1200,24 @@ fn order_path_work(path: &[OrderStep]) -> usize {
     })
 }
 
-fn order_path<'d>(node: &Node<'d>) -> Vec<OrderStep> {
+fn order_path<'a, 'd>(node: &'a Node<'d>) -> Vec<OrderStep<'a>> {
     order_path_with_context(node, None).expect("unmetered document ordering cannot fail")
 }
 
-fn order_path_with_context<'d>(
-    node: &Node<'d>,
+fn order_path_with_context<'a, 'd>(
+    node: &'a Node<'d>,
     context: Option<&crate::context::Evaluation<'_, '_>>,
-) -> Result<Vec<OrderStep>, crate::function::Error> {
-    let mut path = Vec::new();
+) -> Result<Vec<OrderStep<'a>>, crate::function::Error> {
+    order_path_in(node, context, crate::runtime::Native)
+}
+
+fn order_path_in<'a, 'd, R: crate::runtime::Runtime>(
+    node: &'a Node<'d>,
+    context: Option<&crate::context::Evaluation<'_, '_>>,
+    runtime: R,
+) -> Result<R::List<OrderStep<'a>>, crate::function::Error> {
+    use crate::runtime::List;
+    let mut path = runtime.list();
     // Borrow the starting identity: safe-backend namespace handles own strings.
     // Ancestor identities are fixed-size element/root handles, not namespace copies.
     let mut current = std::borrow::Cow::Borrowed(node);
@@ -1056,15 +1225,11 @@ fn order_path_with_context<'d>(
         if let Some(context) = context {
             context.charge_work(1)?;
         }
-        let step = match current.as_ref() {
-            Node::Namespace(namespace) => {
-                if let Some(context) = context {
-                    context.charge_work(namespace.prefix().len())?;
-                    context.reserve_temporary_allocation(namespace.prefix().len())?;
-                }
-                OrderStep::Namespace(namespace.prefix().to_owned())
+        let step = match (node, current.as_ref()) {
+            (Node::Namespace(namespace), Node::Namespace(_)) => {
+                OrderStep::Namespace(namespace.prefix())
             }
-            Node::Attribute(attribute) => {
+            (_, Node::Attribute(attribute)) => {
                 if let Some(context) = context {
                     context.charge_work(
                         parent
@@ -1091,9 +1256,11 @@ fn order_path_with_context<'d>(
             }
         };
         if let Some(context) = context {
-            reserve_metered_vec_slot(&mut path, context)?;
+            runtime.push(context, &mut path, step)?;
+        } else {
+            path.reserve(1)?;
+            path.push(step)?;
         }
-        path.push(step);
         current = std::borrow::Cow::Owned(parent);
     }
     path.reverse();
@@ -1154,7 +1321,7 @@ impl<'a, 'd: 'a> IntoIterator for &'a Nodeset<'d> {
 
     fn into_iter(self) -> Iter<'a, 'd> {
         Iter {
-            iter: self.nodes.iter(),
+            iter: self.nodes.native().iter(),
         }
     }
 }
@@ -1165,7 +1332,7 @@ impl<'d> IntoIterator for Nodeset<'d> {
 
     fn into_iter(self) -> IntoIter<'d> {
         IntoIter {
-            iter: self.nodes.into_iter(),
+            iter: self.nodes.into_native().into_iter(),
         }
     }
 }
@@ -1182,7 +1349,7 @@ impl<'d> FromIterator<Node<'d>> for Nodeset<'d> {
         I: IntoIterator<Item = Node<'d>>,
     {
         Nodeset {
-            nodes: iterator.into_iter().collect(),
+            nodes: Storage::Native(iterator.into_iter().collect()),
         }
     }
 }
@@ -1224,6 +1391,7 @@ impl<'d> OrderedNodes<'d> {
         self.0.push(node)
     }
 
+    #[cfg(test)]
     pub(crate) fn add_metered(
         &mut self,
         context: &crate::context::Evaluation<'_, 'd>,
@@ -1544,6 +1712,48 @@ mod test {
     }
 
     #[test]
+    fn reusable_text_stack_is_empty_after_early_stop_or_error() {
+        // A borrowed traversal stack outlives one visit. Returning from inside
+        // nested text must discard pending frames without discarding capacity.
+        let package = Package::new();
+        let document = package.as_document();
+        let root = document.create_element("root");
+        let child = document.create_element("child");
+        child.append_child(document.create_text("nested"));
+        root.append_child(child);
+        root.append_child(document.create_text("tail"));
+        document.root().append_child(root);
+        let context = crate::context::Context::new();
+        let evaluation = crate::context::Evaluation::new(&context, document.root().into());
+        let node = into_node(root);
+        for fail in [false, true] {
+            let mut stack = Vec::new();
+            let result = node.visit_string_value_with_stack(&evaluation, &mut stack, |_| {
+                if fail {
+                    Err(crate::function::Error::ProcessingStopped)
+                } else {
+                    Ok(false)
+                }
+            });
+            assert_eq!(result.is_err(), fail);
+            assert!(
+                stack.is_empty(),
+                "pending frames must not escape a stopped visit"
+            );
+            let capacity = stack.capacity();
+            let mut text = String::new();
+            node.visit_string_value_with_stack(&evaluation, &mut stack, |chunk| {
+                text.push_str(chunk);
+                Ok(true)
+            })
+            .expect("second traversal must restart at its own root");
+            assert_eq!(text, "nestedtail");
+            assert!(stack.is_empty());
+            assert_eq!(stack.capacity(), capacity);
+        }
+    }
+
+    #[test]
     fn wide_empty_string_value_traversal_uses_depth_bounded_workspace() {
         // Width must not control traversal allocation: child_at() keeps only the ancestor path.
         let package = Package::new();
@@ -1635,6 +1845,126 @@ mod test {
 
         assert!(nodes.document_order_with_context(&evaluation).is_err());
         assert!(context.string_allocation_exceeded().is_some());
+    }
+
+    #[cfg(feature = "embedded")]
+    #[test]
+    fn current_document_order_retains_only_funded_result_storage() {
+        // Keys and ancestor paths must use the current owner, even when the
+        // legacy allocation allowance is zero; dropping the result releases it.
+        use std::{cell::Cell, sync::Arc};
+        use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
+        let package = Package::new();
+        let document = package.as_document();
+        let parent = document.create_element("parent");
+        let first = document.create_element("first");
+        let last = document.create_element("last");
+        document.root().append_child(parent);
+        parent.append_child(first);
+        parent.append_child(last);
+        let nodes = nodeset![last, parent, first];
+        let mut context = crate::context::Context::new();
+        context.set_string_allocation_limit(0);
+        let evaluation = crate::context::Evaluation::new(&context, document.root().into());
+        for bytes in [0, 65536] {
+            let work = Memory::new(Arc::new(MemoryAccount::new(bytes, 65536)));
+            let failure = Cell::new(None);
+            let ordered = nodes.document_order_in(
+                &evaluation,
+                crate::runtime::Accounted {
+                    work: &work,
+                    failure: &failure,
+                },
+            );
+            if bytes == 0 {
+                assert!(ordered.is_err());
+                assert_eq!(failure.get(), Some(MemoryError::LimitExceeded));
+            } else {
+                let ordered = ordered.expect("funded document order");
+                assert_eq!(&ordered[..], &[parent.into(), first.into(), last.into()]);
+                assert!(work.used() >= ordered.len() * std::mem::size_of::<Node<'_>>());
+                drop(ordered);
+            }
+            assert_eq!(work.used(), 0);
+        }
+        assert_eq!(context.string_allocation_exceeded(), None);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[test]
+    fn current_singleton_order_needs_only_its_output_slot() {
+        // A singleton has no ordering comparison. Its minimum live storage is
+        // one returned node, not an ancestor path plus a sorting-key array.
+        use std::{cell::Cell, sync::Arc};
+        use structured_asn1::memory::{Memory, MemoryAccount};
+        let package = Package::new();
+        let document = package.as_document();
+        let element = document.create_element("root");
+        document.root().append_child(element);
+        let nodes = nodeset![element];
+        let context = crate::context::Context::new();
+        let evaluation = crate::context::Evaluation::new(&context, document.root().into());
+        let bytes = std::mem::size_of::<Node<'_>>();
+        let work = Memory::new(Arc::new(MemoryAccount::new(bytes, 65536)));
+        let failure = Cell::new(None);
+        let ordered = nodes
+            .document_order_in(
+                &evaluation,
+                crate::runtime::Accounted {
+                    work: &work,
+                    failure: &failure,
+                },
+            )
+            .expect("a singleton must need no sorting scratch");
+        assert_eq!(&ordered[..], &[element.into()]);
+        assert_eq!(work.used(), bytes);
+        assert_eq!(failure.get(), None);
+        drop(ordered);
+        assert_eq!(work.used(), 0);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[test]
+    fn current_document_order_preserves_local_work_refusal() {
+        // Spare aggregate memory cannot bypass an exhausted query's local
+        // execution ceiling or turn its refusal into an allocation error.
+        use std::{cell::Cell, sync::Arc};
+        use structured_asn1::{
+            Encoding, Limits, Parser,
+            memory::{Memory, MemoryAccount, MemoryError, Work as _},
+        };
+        let package = Package::new();
+        let document = package.as_document();
+        let element = document.create_element("root");
+        document.root().append_child(element);
+        let nodes = nodeset![document.root(), element];
+        let context = crate::context::Context::new();
+        let evaluation = crate::context::Evaluation::new(&context, document.root().into());
+        let memory = Memory::new(Arc::new(MemoryAccount::new(65536, 65536)));
+        let parser = Parser::new(
+            Encoding::Der,
+            Limits {
+                max_work: 64,
+                ..Default::default()
+            },
+            memory.clone(),
+        );
+        let reader = parser.read(&[], 0).expect("query reader");
+        let work = reader.execution();
+        for shift in (0..=6).rev() {
+            while work.charge_work(1 << shift).is_ok() {}
+        }
+        let failure = Cell::new(None);
+        let result = nodes.document_order_in(
+            &evaluation,
+            crate::runtime::Accounted {
+                work: &work,
+                failure: &failure,
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(failure.get(), Some(MemoryError::WorkExceeded));
+        assert_eq!(memory.used(), 0);
     }
 
     #[test]

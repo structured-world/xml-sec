@@ -1,8 +1,8 @@
 #[cfg(feature = "embedded")]
 use crate::sxd_document as sxd_document_no_unsafe;
-use snafu::{OptionExt, ResultExt, Snafu};
+use snafu::{ResultExt, Snafu};
 use std::fmt;
-use sxd_document_no_unsafe::QName;
+use sxd_document_no_unsafe::{PrefixedName, QName};
 
 use crate::Value::{Boolean, Number};
 use crate::axis::{Axis, AxisLike};
@@ -11,6 +11,40 @@ use crate::function;
 use crate::node_test::NodeTest;
 use crate::nodeset::{Nodeset, OrderedNodes};
 use crate::{LiteralValue, OwnedPrefixedName, Value};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NameKind {
+    Function,
+    Variable,
+    Namespace,
+}
+
+impl fmt::Display for NameKind {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        output.write_str(match self {
+            Self::Function => "function",
+            Self::Variable => "variable",
+            Self::Namespace => "namespace prefix",
+        })
+    }
+}
+
+#[cfg(feature = "embedded")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NameText {
+    pub(crate) prefix: Option<structured_asn1::memory::SharedString>,
+    pub(crate) local: structured_asn1::memory::SharedString,
+}
+
+#[cfg(feature = "embedded")]
+impl fmt::Display for NameText {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(prefix) = &self.prefix {
+            write!(output, "{prefix}:")?;
+        }
+        write!(output, "{}", self.local)
+    }
+}
 
 #[derive(Debug, Snafu, Clone, PartialEq, Hash)]
 #[snafu(context(suffix(false)))]
@@ -24,6 +58,10 @@ pub enum Error {
     UnknownVariable { name: OwnedPrefixedName },
     #[snafu(display("unknown namespace prefix {}", prefix))]
     UnknownNamespace { prefix: String },
+    /// The diagnostic owns actual capacity admitted by the failing query.
+    #[cfg(feature = "embedded")]
+    #[snafu(display("unknown {kind} {name}"))]
+    CurrentName { kind: NameKind, name: NameText },
     #[snafu(display("error while evaluating function: {}", source))]
     FunctionEvaluation { source: function::Error },
 }
@@ -73,6 +111,7 @@ where
     T: Expression,
 {
     fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
+        context.admit_expression_step()?;
         (**self).evaluate(context)
     }
 
@@ -82,6 +121,16 @@ where
 }
 
 pub type SubExpression = Box<dyn Expression + 'static>;
+
+impl<T: Expression + ?Sized> Expression for &T {
+    fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
+        (**self).evaluate(context)
+    }
+
+    fn ast_depth(&self) -> usize {
+        (**self).ast_depth()
+    }
+}
 
 macro_rules! binary_constructor(
     ($t:ident) => (
@@ -94,19 +143,19 @@ macro_rules! binary_constructor(
     );
 );
 
-fn binary_ast_depth(left: &SubExpression, right: &SubExpression) -> usize {
+fn binary_ast_depth<L: Expression, R: Expression>(left: &L, right: &R) -> usize {
     1usize.saturating_add(left.ast_depth().max(right.ast_depth()))
 }
 
 #[derive(Debug)]
-pub struct And {
-    pub left: SubExpression,
-    pub right: SubExpression,
+pub struct And<L = SubExpression, R = L> {
+    pub left: L,
+    pub right: R,
 }
 
 binary_constructor!(And);
 
-impl Expression for And {
+impl<L: Expression, R: Expression> Expression for And<L, R> {
     fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
         let left = self.left.evaluate(context)?.boolean();
         let v = left && self.right.evaluate(context)?.boolean();
@@ -124,19 +173,39 @@ pub struct ContextNode;
 
 impl Expression for ContextNode {
     fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
-        Ok(Value::Nodeset(nodeset![context.node.clone()]))
+        self.evaluate_in(context, crate::runtime::Native)
+    }
+}
+
+impl ContextNode {
+    fn evaluate_in<'d, R: crate::runtime::Runtime>(
+        &self,
+        context: &context::Evaluation<'_, 'd>,
+        runtime: R,
+    ) -> Result<Value<'d>, Error> {
+        use crate::runtime::Set;
+        let mut nodes = runtime.set();
+        nodes
+            .insert(
+                context,
+                runtime
+                    .clone_node(context, &context.node)
+                    .context(FunctionEvaluation)?,
+            )
+            .context(FunctionEvaluation)?;
+        Ok(Value::Nodeset(nodes.finish()))
     }
 }
 
 #[derive(Debug)]
-pub struct Equal {
-    pub left: SubExpression,
-    pub right: SubExpression,
+pub struct Equal<L = SubExpression, R = L> {
+    pub left: L,
+    pub right: R,
 }
 
 binary_constructor!(Equal);
 
-impl Equal {
+impl<L: Expression, R: Expression> Equal<L, R> {
     fn boolean_evaluate<'c, 'd>(
         &self,
         context: &context::Evaluation<'c, 'd>,
@@ -148,7 +217,7 @@ impl Equal {
     }
 }
 
-impl Expression for Equal {
+impl<L: Expression, R: Expression> Expression for Equal<L, R> {
     fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
         self.boolean_evaluate(context).map(Boolean)
     }
@@ -159,9 +228,9 @@ impl Expression for Equal {
 }
 
 #[derive(Debug)]
-pub struct NotEqual {
-    left: SubExpression,
-    right: SubExpression,
+pub struct NotEqual<L = SubExpression, R = L> {
+    left: L,
+    right: R,
 }
 
 impl NotEqual {
@@ -171,7 +240,7 @@ impl NotEqual {
     }
 }
 
-impl Expression for NotEqual {
+impl<L: Expression, R: Expression> Expression for NotEqual<L, R> {
     fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
         let left = self.left.evaluate(context)?;
         let right = self.right.evaluate(context)?;
@@ -230,32 +299,27 @@ impl Equality {
     }
 }
 
-fn materialize_node_string<'c, 'd>(
-    context: &context::Evaluation<'c, 'd>,
-    node: &crate::nodeset::Node<'d>,
-) -> Result<String, Error> {
-    node.string_value_with_context(context)
-        .context(FunctionEvaluation)
-}
-
-fn compare_nodesets<'c, 'd>(
+fn compare_nodesets<'c, 'd, R: crate::runtime::Runtime>(
     context: &context::Evaluation<'c, 'd>,
     left: &Nodeset<'d>,
     right: &Nodeset<'d>,
     comparison: Equality,
+    runtime: R,
 ) -> Result<bool, Error> {
     let (materialized, compared) = if left.size() <= right.size() {
         (left, right)
     } else {
         (right, left)
     };
-    for node in materialized.iter() {
-        let value = materialize_node_string(context, &node)?;
-        for candidate in compared.iter() {
+    for node in runtime.nodes(materialized).context(FunctionEvaluation)? {
+        let value = runtime
+            .node_text(context, node)
+            .context(FunctionEvaluation)?;
+        for candidate in runtime.nodes(compared).context(FunctionEvaluation)? {
             context.charge_work(1).context(FunctionEvaluation)?;
             if comparison.result(
-                candidate
-                    .string_value_eq_with_context(context, &value)
+                runtime
+                    .node_equals(context, candidate, &value)
                     .context(FunctionEvaluation)?,
             ) {
                 return Ok(true);
@@ -265,16 +329,18 @@ fn compare_nodesets<'c, 'd>(
     Ok(false)
 }
 
-fn compare_nodes_with_string(
+fn compare_nodes_with_string<R: crate::runtime::Runtime>(
     context: &context::Evaluation<'_, '_>,
     nodes: &Nodeset<'_>,
     value: &str,
     comparison: Equality,
+    runtime: R,
 ) -> Result<bool, Error> {
-    for node in nodes.iter() {
+    for node in runtime.nodes(nodes).context(FunctionEvaluation)? {
         context.charge_work(1).context(FunctionEvaluation)?;
         if comparison.result(
-            node.string_value_eq_with_context(context, value)
+            runtime
+                .node_equals(context, node, value)
                 .context(FunctionEvaluation)?,
         ) {
             return Ok(true);
@@ -289,46 +355,57 @@ fn compare_equality_values<'c, 'd>(
     right: &Value<'d>,
     comparison: Equality,
 ) -> Result<bool, Error> {
+    compare_equality_values_in(context, left, right, comparison, crate::runtime::Native)
+}
+
+fn compare_equality_values_in<'c, 'd, R: crate::runtime::Runtime>(
+    context: &context::Evaluation<'c, 'd>,
+    left: &Value<'d>,
+    right: &Value<'d>,
+    comparison: Equality,
+    runtime: R,
+) -> Result<bool, Error> {
     let result = match (left, right) {
         (Value::Nodeset(left), Value::Nodeset(right)) => {
-            return compare_nodesets(context, left, right, comparison);
+            return compare_nodesets(context, left, right, comparison, runtime);
         }
         (Value::Nodeset(nodes), Boolean(value)) | (Boolean(value), Value::Nodeset(nodes)) => {
             comparison.booleans(nodes.size() != 0, *value)
         }
         (Value::Nodeset(nodes), Number(value)) | (Number(value), Value::Nodeset(nodes)) => {
-            for node in nodes.iter() {
+            for node in runtime.nodes(nodes).context(FunctionEvaluation)? {
                 context.charge_work(1).context(FunctionEvaluation)?;
-                let string = materialize_node_string(context, &node)?;
-                if comparison.numbers(crate::str_to_num(&string), *value) {
+                let number = runtime
+                    .node_number(context, node)
+                    .context(FunctionEvaluation)?;
+                if comparison.numbers(number, *value) {
                     return Ok(true);
                 }
             }
             false
         }
-        (Value::Nodeset(nodes), Value::String(value))
-        | (Value::String(value), Value::Nodeset(nodes)) => {
-            compare_nodes_with_string(context, nodes, value, comparison)?
-        }
-        (Value::Nodeset(nodes), Value::ResultTreeFragment(_, value))
-        | (Value::ResultTreeFragment(_, value), Value::Nodeset(nodes)) => {
-            compare_nodes_with_string(context, nodes, value, comparison)?
+        (Value::Nodeset(nodes), value) | (value, Value::Nodeset(nodes)) => {
+            compare_nodes_with_string(
+                context,
+                nodes,
+                value.scalar_text().expect("remaining scalar is text"),
+                comparison,
+                runtime,
+            )?
         }
         (Boolean(_), _) | (_, Boolean(_)) => comparison.booleans(left.boolean(), right.boolean()),
         (Number(_), _) | (_, Number(_)) => comparison.numbers(
-            left.number(context).context(FunctionEvaluation)?,
-            right.number(context).context(FunctionEvaluation)?,
+            left.number_in(context, runtime)
+                .context(FunctionEvaluation)?,
+            right
+                .number_in(context, runtime)
+                .context(FunctionEvaluation)?,
         ),
-        (Value::String(left), Value::String(right)) => comparison.strings(context, left, right)?,
-        (Value::String(left), Value::ResultTreeFragment(_, right)) => {
-            comparison.strings(context, left, right)?
-        }
-        (Value::ResultTreeFragment(_, left), Value::String(right)) => {
-            comparison.strings(context, left, right)?
-        }
-        (Value::ResultTreeFragment(_, left), Value::ResultTreeFragment(_, right)) => {
-            comparison.strings(context, left, right)?
-        }
+        (left, right) => comparison.strings(
+            context,
+            left.scalar_text().expect("remaining scalar is text"),
+            right.scalar_text().expect("remaining scalar is text"),
+        )?,
     };
     Ok(result)
 }
@@ -341,29 +418,11 @@ pub struct Function {
 
 impl Expression for Function {
     fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
-        let name = resolve_prefixed_name(context, &self.name)?;
-        context
-            .function_for_name(name)
-            .context(UnknownFunction { name: &self.name })
-            .and_then(|fun| {
-                let bytes = self
-                    .arguments
-                    .len()
-                    .checked_mul(std::mem::size_of::<Value<'_>>())
-                    .filter(|bytes| *bytes <= isize::MAX as usize)
-                    .ok_or_else(|| crate::function::Error::Other {
-                        what: "XPath argument storage exceeds addressable memory".into(),
-                    })
-                    .context(FunctionEvaluation)?;
-                context
-                    .reserve_temporary_allocation(bytes)
-                    .context(FunctionEvaluation)?;
-                let mut args = Vec::with_capacity(self.arguments.len());
-                for argument in &self.arguments {
-                    args.push(argument.evaluate(context)?);
-                }
-                fun.evaluate(context, args).context(FunctionEvaluation)
-            })
+        call_function(
+            context,
+            PrefixedName::with_prefix(self.name.prefix.as_deref(), &self.name.local_part),
+            self.arguments.iter(),
+        )
     }
 
     fn ast_depth(&self) -> usize {
@@ -375,6 +434,49 @@ impl Expression for Function {
                 .unwrap_or(0),
         )
     }
+}
+
+fn call_function<'d, E: Expression>(
+    context: &context::Evaluation<'_, 'd>,
+    original: PrefixedName<'_>,
+    arguments: impl ExactSizeIterator<Item = E>,
+) -> Result<Value<'d>, Error> {
+    call_function_in(context, original, arguments, crate::runtime::Native)
+}
+
+fn call_function_in<'d, E: Expression, R: crate::runtime::Runtime>(
+    context: &context::Evaluation<'_, 'd>,
+    original: PrefixedName<'_>,
+    arguments: impl ExactSizeIterator<Item = E>,
+    runtime: R,
+) -> Result<Value<'d>, Error> {
+    use crate::runtime::List as _;
+    let name = resolve_name_in(context, original, runtime)?;
+    let Some(fun) = context.resolve_function(name) else {
+        return Err(runtime.name_error(NameKind::Function, original)?);
+    };
+    let bytes = arguments
+        .len()
+        .checked_mul(std::mem::size_of::<Value<'_>>())
+        .filter(|bytes| *bytes <= isize::MAX as usize)
+        .ok_or_else(|| crate::function::Error::Other {
+            what: "XPath argument storage exceeds addressable memory".into(),
+        })
+        .context(FunctionEvaluation)?;
+    if !R::ACCOUNTED {
+        context
+            .reserve_temporary_allocation(bytes)
+            .context(FunctionEvaluation)?;
+    }
+    let mut args = runtime.list();
+    args.reserve(arguments.len()).context(FunctionEvaluation)?;
+    for argument in arguments {
+        args.push(argument.evaluate(context)?)
+            .context(FunctionEvaluation)?;
+    }
+    runtime
+        .invoke(fun, context, args)
+        .context(FunctionEvaluation)
 }
 
 #[derive(Debug)]
@@ -396,9 +498,9 @@ impl Expression for Literal {
     }
 }
 
-pub struct Math {
-    left: SubExpression,
-    right: SubExpression,
+pub struct Math<L = SubExpression, R = L> {
+    left: L,
+    right: R,
     operation: fn(f64, f64) -> f64,
 }
 
@@ -460,14 +562,9 @@ impl Math {
     }
 }
 
-impl Expression for Math {
+impl<L: Expression, R: Expression> Expression for Math<L, R> {
     fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
-        let left = self.left.evaluate(context)?;
-        let right = self.right.evaluate(context)?;
-        let op = self.operation;
-        let left = left.number(context).context(FunctionEvaluation)?;
-        let right = right.number(context).context(FunctionEvaluation)?;
-        Ok(Number(op(left, right)))
+        self.evaluate_in(context, crate::runtime::Native)
     }
 
     fn ast_depth(&self) -> usize {
@@ -475,7 +572,26 @@ impl Expression for Math {
     }
 }
 
-impl fmt::Debug for Math {
+impl<L: Expression, R: Expression> Math<L, R> {
+    fn evaluate_in<'c, 'd, S: crate::runtime::Runtime>(
+        &self,
+        context: &context::Evaluation<'c, 'd>,
+        runtime: S,
+    ) -> Result<Value<'d>, Error> {
+        let left = self.left.evaluate(context)?;
+        let right = self.right.evaluate(context)?;
+        let op = self.operation;
+        let left = left
+            .number_in(context, runtime)
+            .context(FunctionEvaluation)?;
+        let right = right
+            .number_in(context, runtime)
+            .context(FunctionEvaluation)?;
+        Ok(Number(op(left, right)))
+    }
+}
+
+impl<L: fmt::Debug, R: fmt::Debug> fmt::Debug for Math<L, R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -486,17 +602,13 @@ impl fmt::Debug for Math {
 }
 
 #[derive(Debug)]
-pub struct Negation {
-    pub expression: SubExpression,
+pub struct Negation<E = SubExpression> {
+    pub expression: E,
 }
 
-impl Expression for Negation {
+impl<E: Expression> Expression for Negation<E> {
     fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
-        let value = self.expression.evaluate(context)?;
-        value
-            .number(context)
-            .map(|number| Number(-number))
-            .context(FunctionEvaluation)
+        self.evaluate_in(context, crate::runtime::Native)
     }
 
     fn ast_depth(&self) -> usize {
@@ -504,15 +616,29 @@ impl Expression for Negation {
     }
 }
 
+impl<E: Expression> Negation<E> {
+    fn evaluate_in<'c, 'd, R: crate::runtime::Runtime>(
+        &self,
+        context: &context::Evaluation<'c, 'd>,
+        runtime: R,
+    ) -> Result<Value<'d>, Error> {
+        let value = self.expression.evaluate(context)?;
+        value
+            .number_in(context, runtime)
+            .map(|number| Number(-number))
+            .context(FunctionEvaluation)
+    }
+}
+
 #[derive(Debug)]
-pub struct Or {
-    left: SubExpression,
-    right: SubExpression,
+pub struct Or<L = SubExpression, R = L> {
+    left: L,
+    right: R,
 }
 
 binary_constructor!(Or);
 
-impl Expression for Or {
+impl<L: Expression, R: Expression> Expression for Or<L, R> {
     fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
         let left = self.left.evaluate(context)?.boolean();
         let v = left || self.right.evaluate(context)?.boolean();
@@ -563,9 +689,9 @@ impl Expression for Path {
 }
 
 #[derive(Debug)]
-pub struct Filter {
-    node_selector: SubExpression,
-    predicate: Predicate,
+pub struct Filter<E = SubExpression> {
+    node_selector: E,
+    predicate: Predicate<E>,
 }
 
 impl Filter {
@@ -581,7 +707,7 @@ impl Filter {
     }
 }
 
-impl Expression for Filter {
+impl<E: Expression> Expression for Filter<E> {
     fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
         self.node_selector
             .evaluate(context)
@@ -599,9 +725,9 @@ impl Expression for Filter {
     }
 }
 
-pub struct Relational {
-    pub left: SubExpression,
-    pub right: SubExpression,
+pub struct Relational<L = SubExpression, R = L> {
+    pub left: L,
+    pub right: R,
     pub operation: fn(f64, f64) -> bool,
 }
 
@@ -652,7 +778,7 @@ impl Relational {
     }
 }
 
-impl Expression for Relational {
+impl<L: Expression, R: Expression> Expression for Relational<L, R> {
     fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
         let left_val = self.left.evaluate(context)?;
         let right_val = self.right.evaluate(context)?;
@@ -672,15 +798,26 @@ fn compare_relational_values(
     right: &Value<'_>,
     operation: fn(f64, f64) -> bool,
 ) -> Result<bool, Error> {
+    compare_relational_values_in(context, left, right, operation, crate::runtime::Native)
+}
+
+fn compare_relational_values_in<R: crate::runtime::Runtime>(
+    context: &context::Evaluation<'_, '_>,
+    left: &Value<'_>,
+    right: &Value<'_>,
+    operation: fn(f64, f64) -> bool,
+    runtime: R,
+) -> Result<bool, Error> {
     match (left, right) {
         (Value::Nodeset(left), Value::Nodeset(right)) => {
             if left.size() <= right.size() {
-                let left = collect_node_numbers(context, left)?;
-                for right in right.iter() {
+                let left = collect_node_numbers_in(context, left, runtime)?;
+                for right in runtime.nodes(right).context(FunctionEvaluation)? {
                     context.charge_work(1).context(FunctionEvaluation)?;
-                    let right = crate::node_to_num_with_context(context, &right)
+                    let right = runtime
+                        .node_number(context, right)
                         .context(FunctionEvaluation)?;
-                    for left in &left {
+                    for left in left.iter() {
                         context.charge_work(1).context(FunctionEvaluation)?;
                         if operation(*left, right) {
                             return Ok(true);
@@ -688,12 +825,13 @@ fn compare_relational_values(
                     }
                 }
             } else {
-                let right = collect_node_numbers(context, right)?;
-                for left in left.iter() {
+                let right = collect_node_numbers_in(context, right, runtime)?;
+                for left in runtime.nodes(left).context(FunctionEvaluation)? {
                     context.charge_work(1).context(FunctionEvaluation)?;
-                    let left = crate::node_to_num_with_context(context, &left)
+                    let left = runtime
+                        .node_number(context, left)
                         .context(FunctionEvaluation)?;
-                    for right in &right {
+                    for right in right.iter() {
                         context.charge_work(1).context(FunctionEvaluation)?;
                         if operation(left, *right) {
                             return Ok(true);
@@ -704,11 +842,14 @@ fn compare_relational_values(
             Ok(false)
         }
         (Value::Nodeset(left), right) => {
-            let right = right.number(context).context(FunctionEvaluation)?;
-            for left in left.iter() {
+            let right = right
+                .number_in(context, runtime)
+                .context(FunctionEvaluation)?;
+            for left in runtime.nodes(left).context(FunctionEvaluation)? {
                 context.charge_work(1).context(FunctionEvaluation)?;
-                let left =
-                    crate::node_to_num_with_context(context, &left).context(FunctionEvaluation)?;
+                let left = runtime
+                    .node_number(context, left)
+                    .context(FunctionEvaluation)?;
                 if operation(left, right) {
                     return Ok(true);
                 }
@@ -716,11 +857,14 @@ fn compare_relational_values(
             Ok(false)
         }
         (left, Value::Nodeset(right)) => {
-            let left = left.number(context).context(FunctionEvaluation)?;
-            for right in right.iter() {
+            let left = left
+                .number_in(context, runtime)
+                .context(FunctionEvaluation)?;
+            for right in runtime.nodes(right).context(FunctionEvaluation)? {
                 context.charge_work(1).context(FunctionEvaluation)?;
-                let right =
-                    crate::node_to_num_with_context(context, &right).context(FunctionEvaluation)?;
+                let right = runtime
+                    .node_number(context, right)
+                    .context(FunctionEvaluation)?;
                 if operation(left, right) {
                     return Ok(true);
                 }
@@ -728,16 +872,21 @@ fn compare_relational_values(
             Ok(false)
         }
         (left, right) => Ok(operation(
-            left.number(context).context(FunctionEvaluation)?,
-            right.number(context).context(FunctionEvaluation)?,
+            left.number_in(context, runtime)
+                .context(FunctionEvaluation)?,
+            right
+                .number_in(context, runtime)
+                .context(FunctionEvaluation)?,
         )),
     }
 }
 
-fn collect_node_numbers(
+fn collect_node_numbers_in<R: crate::runtime::Runtime>(
     context: &context::Evaluation<'_, '_>,
     nodes: &Nodeset<'_>,
-) -> Result<Vec<f64>, Error> {
+    runtime: R,
+) -> Result<R::List<f64>, Error> {
+    use crate::runtime::List;
     if nodes.size() > usize::MAX / std::mem::size_of::<f64>() {
         return Err(Error::FunctionEvaluation {
             source: function::Error::Other {
@@ -745,18 +894,27 @@ fn collect_node_numbers(
             },
         });
     }
-    context
-        .reserve_string_allocation(nodes.size() * std::mem::size_of::<f64>())
-        .context(FunctionEvaluation)?;
-    let mut values = Vec::with_capacity(nodes.size());
-    for node in nodes.iter() {
+    if !R::ACCOUNTED {
+        context
+            .reserve_string_allocation(nodes.size() * std::mem::size_of::<f64>())
+            .context(FunctionEvaluation)?;
+    }
+    let mut values = runtime.list();
+    values.reserve(nodes.size()).context(FunctionEvaluation)?;
+    for node in runtime.nodes(nodes).context(FunctionEvaluation)? {
         context.charge_work(1).context(FunctionEvaluation)?;
-        values.push(crate::node_to_num_with_context(context, &node).context(FunctionEvaluation)?);
+        values
+            .push(
+                runtime
+                    .node_number(context, node)
+                    .context(FunctionEvaluation)?,
+            )
+            .context(FunctionEvaluation)?;
     }
     Ok(values)
 }
 
-impl fmt::Debug for Relational {
+impl<L: fmt::Debug, R: fmt::Debug> fmt::Debug for Relational<L, R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -772,41 +930,70 @@ pub struct RootNode;
 
 impl Expression for RootNode {
     fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
+        self.evaluate_in(context, crate::runtime::Native)
+    }
+}
+
+impl RootNode {
+    fn evaluate_in<'d, R: crate::runtime::Runtime>(
+        &self,
+        context: &context::Evaluation<'_, 'd>,
+        runtime: R,
+    ) -> Result<Value<'d>, Error> {
+        use crate::runtime::Set;
         // XPath 1.0 section 2.1 roots an absolute location path in the document containing
         // the current context node, which an embedding may project into a larger package.
         // https://www.w3.org/TR/1999/REC-xpath-19991116/#location-paths
-        let node = context
-            .node
-            .clone_with_context(context)
+        let node = runtime
+            .clone_node(context, &context.node)
             .context(FunctionEvaluation)?;
-        let mut nodes = Nodeset::new();
+        let mut nodes = runtime.set();
         nodes
-            .add_metered(context, context.document_root_for(node))
+            .insert(context, context.document_root_for(node))
             .context(FunctionEvaluation)?;
-        Ok(Value::Nodeset(nodes))
+        Ok(Value::Nodeset(nodes.finish()))
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct Predicate {
-    pub expression: SubExpression,
+pub(crate) struct Predicate<E = SubExpression> {
+    pub expression: E,
 }
 
-impl Predicate {
+impl<E: Expression> Predicate<E> {
     fn select<'c, 'd>(
         &self,
         context: &context::Evaluation<'c, 'd>,
         nodes: OrderedNodes<'d>,
     ) -> Result<OrderedNodes<'d>, Error> {
-        context
-            .clone()
-            .new_contexts_for(nodes)
-            .filter_map(|ctx| match self.matches(&ctx) {
-                Ok(true) => Some(Ok(ctx.node)),
-                Ok(false) => None,
-                Err(e) => Some(Err(e)),
-            })
-            .collect()
+        self.select_in::<crate::runtime::Native>(context, Vec::from(nodes))
+            .map(OrderedNodes::from)
+    }
+
+    fn select_in<'d, R: crate::runtime::Runtime>(
+        &self,
+        context: &context::Evaluation<'_, 'd>,
+        mut nodes: R::List<crate::nodeset::Node<'d>>,
+    ) -> Result<R::List<crate::nodeset::Node<'d>>, Error> {
+        use crate::runtime::List;
+        let size = nodes.len();
+        let mut kept = 0;
+        for index in 0..size {
+            // Move the candidate into its context instead of cloning namespace
+            // strings. The root handle only initializes the vacated slot and
+            // is never exposed to the expression or returned as a result.
+            let vacant = crate::nodeset::Node::Root(nodes[index].document().root());
+            let node = std::mem::replace(&mut nodes[index], vacant);
+            let mut child = context.new_context_for(node);
+            child.position = index + 1;
+            child.size = size;
+            if self.matches(&child)? {
+                nodes[kept] = child.node;
+                kept += 1;
+            }
+        }
+        nodes.truncate(kept);
+        Ok(nodes)
     }
 
     fn matches(&self, context: &context::Evaluation<'_, '_>) -> Result<bool, Error> {
@@ -823,26 +1010,23 @@ impl Predicate {
 }
 
 pub type Step = ParameterizedStep<Axis>;
-pub type StepTest = Box<dyn NodeTest + 'static>;
+pub type StepTest = crate::node_test::SubNodeTest;
 
 #[derive(Debug)]
-pub struct ParameterizedStep<A> {
+pub struct ParameterizedStep<A, T = StepTest> {
     axis: A,
-    node_test: StepTest,
+    node_test: T,
     predicates: Vec<Predicate>,
 }
 
-impl<A> ParameterizedStep<A>
+impl<A, T> ParameterizedStep<A, T>
 where
     A: AxisLike,
+    T: NodeTest,
 {
     // The bounded parser builds the final predicate representation directly, avoiding an
     // overlapping conversion allocation whose capacity would otherwise need a second charge.
-    pub(crate) fn from_predicates(
-        axis: A,
-        node_test: StepTest,
-        predicates: Vec<Predicate>,
-    ) -> Self {
+    pub(crate) fn from_predicates(axis: A, node_test: T, predicates: Vec<Predicate>) -> Self {
         ParameterizedStep {
             axis,
             node_test,
@@ -861,27 +1045,17 @@ where
         // This seems like a likely place where we could differ from
         // the spec, so thorough testing is key.
 
-        let mut unique = Nodeset::new();
-
-        for node in starting_nodes.iter() {
-            let child_context = context.new_context_for(node);
-            let mut nodes = self.axis.select_nodes(&child_context, &self.node_test)?;
-
-            for predicate in &self.predicates {
-                nodes = predicate.select(context, nodes)?;
-            }
-
-            for node in Vec::from(nodes) {
-                unique
-                    .add_metered(context, node)
-                    .context(FunctionEvaluation)?;
-            }
-        }
-
-        Ok(unique)
+        select_step(
+            context,
+            &self.axis,
+            &self.node_test,
+            self.predicates.iter().map(|p| &p.expression),
+            starting_nodes,
+            crate::runtime::Native,
+        )
     }
 
-    fn ast_depth(&self) -> usize {
+    pub(super) fn ast_depth(&self) -> usize {
         self.predicates
             .iter()
             .map(|predicate| predicate.expression.ast_depth())
@@ -890,27 +1064,46 @@ where
     }
 }
 
+fn select_step<'d, E: Expression, R: crate::runtime::Runtime>(
+    context: &context::Evaluation<'_, 'd>,
+    axis: &impl AxisLike,
+    test: &impl NodeTest,
+    predicates: impl Iterator<Item = E> + Clone,
+    starting_nodes: Nodeset<'d>,
+    runtime: R,
+) -> Result<Nodeset<'d>, Error> {
+    use crate::runtime::Set;
+    let mut unique = runtime.set();
+    for node in runtime.nodes(&starting_nodes).context(FunctionEvaluation)? {
+        let node = runtime
+            .clone_node(context, node)
+            .context(FunctionEvaluation)?;
+        let child_context = context.new_context_for(node);
+        let mut nodes = axis.select_nodes_in(&child_context, test, runtime)?;
+        for expression in predicates.clone() {
+            nodes = Predicate { expression }.select_in::<R>(context, nodes)?;
+        }
+        // Preserve axis order while moving candidates out of admitted slots.
+        for index in 0..nodes.len() {
+            let vacant = crate::nodeset::Node::Root(nodes[index].document().root());
+            let node = std::mem::replace(&mut nodes[index], vacant);
+            unique.insert(context, node).context(FunctionEvaluation)?;
+        }
+    }
+    Ok(unique.finish())
+}
+
 #[derive(Debug)]
-pub struct Union {
-    pub left: SubExpression,
-    pub right: SubExpression,
+pub struct Union<L = SubExpression, R = L> {
+    pub left: L,
+    pub right: R,
 }
 
 binary_constructor!(Union);
 
-impl Expression for Union {
+impl<L: Expression, R: Expression> Expression for Union<L, R> {
     fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
-        let as_nodes = |e: &SubExpression| e.evaluate(context).and_then(value_into_nodeset);
-
-        let mut left_nodes = as_nodes(&self.left)?;
-        let right_nodes = as_nodes(&self.right)?;
-
-        for node in right_nodes {
-            left_nodes
-                .add_metered(context, node)
-                .context(FunctionEvaluation)?;
-        }
-        Ok(Value::Nodeset(left_nodes))
+        self.evaluate_in(context, crate::runtime::Native)
     }
 
     fn ast_depth(&self) -> usize {
@@ -918,20 +1111,57 @@ impl Expression for Union {
     }
 }
 
+impl<L: Expression, R: Expression> Union<L, R> {
+    fn evaluate_in<'d, S: crate::runtime::Runtime>(
+        &self,
+        context: &context::Evaluation<'_, 'd>,
+        runtime: S,
+    ) -> Result<Value<'d>, Error> {
+        use crate::runtime::Set;
+        let left = value_into_nodeset(self.left.evaluate(context)?)?;
+        let right = value_into_nodeset(self.right.evaluate(context)?)?;
+        let mut left = runtime
+            .open_set(context, left)
+            .context(FunctionEvaluation)?;
+        runtime
+            .merge(context, &mut left, right)
+            .context(FunctionEvaluation)?;
+        Ok(Value::Nodeset(left.finish()))
+    }
+}
+
 fn resolve_prefixed_name<'a>(
     context: &'a context::Evaluation<'_, '_>,
     name: &'a OwnedPrefixedName,
 ) -> Result<QName<'a>, Error> {
+    resolve_name_parts(
+        context,
+        PrefixedName::with_prefix(name.prefix.as_deref(), &name.local_part),
+    )
+}
+
+fn resolve_name_parts<'a>(
+    context: &'a context::Evaluation<'_, '_>,
+    name: PrefixedName<'a>,
+) -> Result<QName<'a>, Error> {
+    resolve_name_in(context, name, crate::runtime::Native)
+}
+
+fn resolve_name_in<'a, R: crate::runtime::Runtime>(
+    context: &'a context::Evaluation<'_, '_>,
+    name: PrefixedName<'a>,
+    runtime: R,
+) -> Result<QName<'a>, Error> {
     // What about a "default" namespace?
-    let ns_uri = match name.prefix.as_ref().map(|p| &**p) {
+    let ns_uri = match name.prefix() {
         None => None,
-        Some(prefix) => match context.namespace_for(prefix) {
-            None => return UnknownNamespace { prefix }.fail(),
+        Some(prefix) => match context.namespace_for(prefix).context(FunctionEvaluation)? {
+            None => return Err(runtime.name_error(NameKind::Namespace, PrefixedName::new(prefix))?),
             Some(uri) => Some(uri),
         },
     };
 
-    Ok(QName::with_namespace_uri(ns_uri, name.local_part.as_str()))
+    Ok(QName::with_namespace_uri(ns_uri, name.local_part()))
 }
 
 #[derive(Debug)]
@@ -943,19 +1173,317 @@ impl Expression for Variable {
     fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
         let name = resolve_prefixed_name(context, &self.name)?;
 
-        context
-            .value_of(name)
-            .context(UnknownVariable { name: &self.name })
-            .and_then(|value| {
-                value
-                    .clone_with_context(context)
+        use crate::runtime::Runtime as _;
+        let Some(value) = context.value_of(name) else {
+            return Err(crate::runtime::Native.name_error(
+                NameKind::Variable,
+                PrefixedName::with_prefix(self.name.prefix.as_deref(), &self.name.local_part),
+            )?);
+        };
+        crate::runtime::Native
+            .clone_value(context, value)
+            .context(FunctionEvaluation)
+    }
+}
+
+#[cfg(feature = "embedded")]
+#[derive(Clone, Copy)]
+pub(super) struct ArenaExpression<'p, 's, R: crate::runtime::Runtime> {
+    pub program: &'p super::arena::Program<'s>,
+    pub handle: super::arena::Handle,
+    pub runtime: R,
+}
+
+#[cfg(feature = "embedded")]
+impl<R: crate::runtime::Runtime> fmt::Debug for ArenaExpression<'_, '_, R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("XPathEntry")
+            .field(&self.handle.index)
+            .finish()
+    }
+}
+
+#[cfg(feature = "embedded")]
+impl<R: crate::runtime::Runtime> Expression for ArenaExpression<'_, '_, R> {
+    fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
+        use super::arena::Entry;
+        use super::grammar::Binary;
+        context.admit_expression_step()?;
+        let child = |handle| ArenaExpression {
+            program: self.program,
+            handle,
+            runtime: self.runtime,
+        };
+        match &self.program.nodes[self.handle.index] {
+            Entry::Context => ContextNode.evaluate_in(context, self.runtime),
+            Entry::Root => RootNode.evaluate_in(context, self.runtime),
+            Entry::Number(number) => Ok(Number(*number)),
+            Entry::String(text) => self
+                .runtime
+                .literal(context, text)
+                .context(FunctionEvaluation),
+            Entry::Variable(original) => {
+                let name = resolve_name_in(context, *original, self.runtime)?;
+                let Some(value) = context.value_of(name) else {
+                    return Err(self.runtime.name_error(NameKind::Variable, *original)?);
+                };
+                self.runtime
+                    .clone_value(context, value)
                     .context(FunctionEvaluation)
-            })
+            }
+            Entry::Function(name, arguments) => call_function_in(
+                context,
+                *name,
+                arguments.iter().copied().map(child),
+                self.runtime,
+            ),
+            Entry::Negate(value) => Negation {
+                expression: child(*value),
+            }
+            .evaluate_in(context, self.runtime),
+            Entry::Filter(selector, predicate) => {
+                use crate::runtime::List;
+                use crate::runtime::Set;
+                let source = value_into_nodeset(child(*selector).evaluate(context)?)?;
+                let ordered = source
+                    .document_order_in(context, self.runtime)
+                    .context(FunctionEvaluation)?;
+                let mut selected = Predicate {
+                    expression: child(*predicate),
+                }
+                .select_in::<R>(context, ordered)?;
+                let mut nodes = self.runtime.set();
+                for index in 0..selected.len() {
+                    let vacant = crate::nodeset::Node::Root(selected[index].document().root());
+                    let node = std::mem::replace(&mut selected[index], vacant);
+                    nodes.insert(context, node).context(FunctionEvaluation)?;
+                }
+                selected.truncate(0);
+                Ok(Value::Nodeset(nodes.finish()))
+            }
+            Entry::Path(start, steps) => {
+                let mut nodes = value_into_nodeset(child(*start).evaluate(context)?)?;
+                for step in &**steps {
+                    let test = crate::node_test::SubNodeTest::from(step.test);
+                    nodes = select_step(
+                        context,
+                        &step.axis,
+                        &test,
+                        step.predicates.iter().copied().map(child),
+                        nodes,
+                        self.runtime,
+                    )?;
+                }
+                Ok(Value::Nodeset(nodes))
+            }
+            Entry::Binary(operation, left, right) => {
+                let left = child(*left);
+                let right = child(*right);
+                match operation {
+                    Binary::Or => Or { left, right }.evaluate(context),
+                    Binary::And => And { left, right }.evaluate(context),
+                    Binary::Equal | Binary::NotEqual => {
+                        let comparison = if *operation == Binary::Equal {
+                            Equality::Equal
+                        } else {
+                            Equality::NotEqual
+                        };
+                        let left = left.evaluate(context)?;
+                        let right = right.evaluate(context)?;
+                        compare_equality_values_in(context, &left, &right, comparison, self.runtime)
+                            .map(Boolean)
+                    }
+                    Binary::Union => Union { left, right }.evaluate_in(context, self.runtime),
+                    Binary::Add => Math {
+                        left,
+                        right,
+                        operation: add,
+                    }
+                    .evaluate_in(context, self.runtime),
+                    Binary::Subtract => Math {
+                        left,
+                        right,
+                        operation: subtract,
+                    }
+                    .evaluate_in(context, self.runtime),
+                    Binary::Multiply => Math {
+                        left,
+                        right,
+                        operation: multiply,
+                    }
+                    .evaluate_in(context, self.runtime),
+                    Binary::Divide => Math {
+                        left,
+                        right,
+                        operation: divide,
+                    }
+                    .evaluate_in(context, self.runtime),
+                    Binary::Remainder => Math {
+                        left,
+                        right,
+                        operation: modulus,
+                    }
+                    .evaluate_in(context, self.runtime),
+                    Binary::Less | Binary::LessEqual | Binary::Greater | Binary::GreaterEqual => {
+                        let operation = match operation {
+                            Binary::Less => less_than,
+                            Binary::LessEqual => less_than_or_equal,
+                            Binary::Greater => greater_than,
+                            Binary::GreaterEqual => greater_than_or_equal,
+                            _ => unreachable!(),
+                        };
+                        let left = left.evaluate(context)?;
+                        let right = right.evaluate(context)?;
+                        compare_relational_values_in(
+                            context,
+                            &left,
+                            &right,
+                            operation,
+                            self.runtime,
+                        )
+                        .map(Boolean)
+                    }
+                }
+            }
+        }
+    }
+
+    fn ast_depth(&self) -> usize {
+        self.handle.depth
     }
 }
 
 #[cfg(test)]
 mod test {
+    #[cfg(feature = "embedded")]
+    #[test]
+    fn current_predicate_compacts_original_slots_without_a_second_allocation() {
+        // Predicate positions/size use the original axis list; accepted nodes
+        // stay in that allocation, including its retained spare capacity.
+        use crate::runtime::{List, Runtime};
+        use structured_asn1::memory::{Memory, MemoryAccount};
+        let package = Package::new();
+        let document = package.as_document();
+        let nodes = [
+            document.create_element("one"),
+            document.create_element("two"),
+            document.create_element("three"),
+        ];
+        let current = Memory::new(std::sync::Arc::new(MemoryAccount::new(65536, 65536)));
+        let failure = std::cell::Cell::new(None);
+        let runtime = crate::runtime::Accounted {
+            work: &current,
+            failure: &failure,
+        };
+        let context = Context::new();
+        let evaluation = context::Evaluation::new(&context, document.root().into());
+        let mut candidates = runtime.list();
+        for node in nodes {
+            runtime
+                .push(&evaluation, &mut candidates, node.into())
+                .expect("candidate slot");
+        }
+        let pointer = candidates.as_ptr();
+        let capacity = candidates.capacity();
+        let used = current.used();
+        #[derive(Debug)]
+        struct Third;
+        impl Expression for Third {
+            fn evaluate<'c, 'd>(
+                &self,
+                context: &context::Evaluation<'c, 'd>,
+            ) -> Result<Value<'d>, Error> {
+                assert_eq!(context.size, 3);
+                Ok(Number(3.0))
+            }
+        }
+        let selected = Predicate { expression: Third }
+            .select_in::<crate::runtime::Accounted<'_, Memory>>(&evaluation, candidates)
+            .expect("third predicate position");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0], crate::nodeset::Node::Element(nodes[2]));
+        assert_eq!(selected.as_ptr(), pointer);
+        assert_eq!(selected.capacity(), capacity);
+        assert_eq!(current.used(), used);
+        assert_eq!(failure.get(), None);
+        drop(selected);
+        assert_eq!(current.used(), 0);
+    }
+    #[cfg(feature = "embedded")]
+    #[test]
+    fn numeric_workspace_refuses_current_capacity_before_conversion() {
+        // A retained node-set must not finance a later comparison's workspace.
+        use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
+        let current = Memory::new(std::sync::Arc::new(MemoryAccount::new(0, 4096)));
+        let failure = std::cell::Cell::new(None);
+        let package = Package::new();
+        let document = package.as_document();
+        let element = document.create_element("n");
+        element.append_child(document.create_text("12"));
+        let mut nodes = crate::nodeset::Nodeset::new();
+        nodes.add(element);
+        let context = crate::Context::new();
+        let evaluation = crate::context::Evaluation::new(&context, element.into());
+        let result = super::collect_node_numbers_in(
+            &evaluation,
+            &nodes,
+            crate::runtime::Accounted {
+                work: &current,
+                failure: &failure,
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(failure.get(), Some(MemoryError::LimitExceeded));
+        assert_eq!(current.used(), 0);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[test]
+    fn nodeset_comparison_text_uses_current_owner_and_preserves_existential_inequality() {
+        // Equal and not-equal are independent existential comparisons in
+        // XPath 1.0 §3.4, not complements for node-sets containing distinct values.
+        // https://www.w3.org/TR/1999/REC-xpath-19991116/#booleans
+        use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
+        let package = Package::new();
+        let document = package.as_document();
+        let first = document.create_element("n");
+        first.append_child(document.create_text("same"));
+        let second = document.create_element("n");
+        second.append_child(document.create_text("other"));
+        let mut left = crate::nodeset::Nodeset::new();
+        left.add(first);
+        let mut right = crate::nodeset::Nodeset::new();
+        right.add(first);
+        right.add(second);
+        let left = Value::Nodeset(left);
+        let right = Value::Nodeset(right);
+        let context = crate::Context::new();
+        let evaluation = crate::context::Evaluation::new(&context, first.into());
+        for bytes in [0, 65536] {
+            for comparison in [super::Equality::Equal, super::Equality::NotEqual] {
+                let work = Memory::new(std::sync::Arc::new(MemoryAccount::new(bytes, 65536)));
+                let failure = std::cell::Cell::new(None);
+                let result = super::compare_equality_values_in(
+                    &evaluation,
+                    &left,
+                    &right,
+                    comparison,
+                    crate::runtime::Accounted {
+                        work: &work,
+                        failure: &failure,
+                    },
+                );
+                if bytes == 0 {
+                    assert!(result.is_err());
+                    assert_eq!(failure.get(), Some(MemoryError::LimitExceeded));
+                } else {
+                    assert_eq!(result, Ok(true));
+                    assert_eq!(failure.get(), None);
+                }
+                assert_eq!(work.used(), 0);
+            }
+        }
+    }
     use std::borrow::ToOwned;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -963,14 +1491,12 @@ mod test {
     use sxd_document_no_unsafe::Package;
     use sxd_document_no_unsafe::dom::Document;
 
+    use super::*;
     use crate::Value::{self, Boolean, Number, String};
     use crate::axis::AxisLike;
     use crate::context::{self, Context};
     use crate::function;
     use crate::node_test::NodeTest;
-    use crate::nodeset::OrderedNodes;
-
-    use super::*;
 
     #[test]
     fn evaluator_containers_reserve_before_materialization() {
@@ -1134,7 +1660,7 @@ mod test {
             }
         }
 
-        fn context(&'d self) -> context::Evaluation<'d, 'd> {
+        fn context(&self) -> context::Evaluation<'_, 'd> {
             let node = self.doc.create_element("test");
             context::Evaluation::new(&self.context, node.into())
         }
@@ -1664,25 +2190,22 @@ mod test {
     }
 
     impl AxisLike for MockAxis {
-        fn select_nodes<'c, 'd>(
+        fn select_nodes_in<'c, 'd, R: crate::runtime::Runtime>(
             &self,
             _context: &context::Evaluation<'c, 'd>,
             _node_test: &dyn NodeTest,
-        ) -> Result<OrderedNodes<'d>, Error> {
+            runtime: R,
+        ) -> Result<R::List<crate::nodeset::Node<'d>>, Error> {
             *self.calls.borrow_mut() += 1;
-            Ok(OrderedNodes::new())
+            Ok(runtime.list())
         }
     }
 
     #[derive(Debug)]
     struct DummyNodeTest;
     impl NodeTest for DummyNodeTest {
-        fn test(
-            &self,
-            _context: &context::Evaluation<'_, '_>,
-            _result: &mut OrderedNodes<'_>,
-        ) -> Result<(), Error> {
-            Ok(())
+        fn matches(&self, _: &context::Evaluation<'_, '_>) -> Result<bool, Error> {
+            Ok(false)
         }
     }
 

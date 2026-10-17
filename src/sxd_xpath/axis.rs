@@ -5,7 +5,10 @@ use std::fmt;
 use crate::context;
 use crate::expression::Error;
 use crate::node_test::NodeTest;
-use crate::nodeset::{self, Node, OrderedNodes};
+#[cfg(test)]
+use crate::nodeset::OrderedNodes;
+use crate::nodeset::{self, Node};
+use crate::runtime::{List, Runtime};
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum PrincipalNodeType {
@@ -18,11 +21,22 @@ pub enum PrincipalNodeType {
 pub trait AxisLike: fmt::Debug {
     /// Applies the given node test to the nodes selected by this axis,
     /// adding matching nodes to the nodeset.
+    fn select_nodes_in<'c, 'd, R: Runtime>(
+        &self,
+        context: &context::Evaluation<'c, 'd>,
+        node_test: &dyn NodeTest,
+        runtime: R,
+    ) -> Result<R::List<Node<'d>>, Error>;
+
+    #[cfg(test)]
     fn select_nodes<'c, 'd>(
         &self,
         context: &context::Evaluation<'c, 'd>,
         node_test: &dyn NodeTest,
-    ) -> Result<OrderedNodes<'d>, Error>;
+    ) -> Result<OrderedNodes<'d>, Error> {
+        self.select_nodes_in(context, node_test, crate::runtime::Native)
+            .map(OrderedNodes::from)
+    }
 
     /// Describes what node type is naturally selected by this axis.
     fn principal_node_type(&self) -> PrincipalNodeType {
@@ -48,18 +62,24 @@ pub enum Axis {
     SelfAxis,
 }
 
-struct CompleteNodeTest<'c, 'd> {
+struct CompleteNodeTest<'c, 'd, R: Runtime> {
     context: &'c context::Evaluation<'c, 'd>,
     node_test: &'c dyn NodeTest,
-    result: OrderedNodes<'d>,
+    result: R::List<Node<'d>>,
+    runtime: R,
 }
 
-impl<'c, 'd> CompleteNodeTest<'c, 'd> {
-    fn new(context: &'c context::Evaluation<'c, 'd>, node_test: &'c dyn NodeTest) -> Self {
+impl<'c, 'd, R: Runtime> CompleteNodeTest<'c, 'd, R> {
+    fn new(
+        context: &'c context::Evaluation<'c, 'd>,
+        node_test: &'c dyn NodeTest,
+        runtime: R,
+    ) -> Self {
         CompleteNodeTest {
             context,
             node_test,
-            result: OrderedNodes::new(),
+            result: runtime.list(),
+            runtime,
         }
     }
 
@@ -68,23 +88,40 @@ impl<'c, 'd> CompleteNodeTest<'c, 'd> {
             .charge_work(1)
             .map_err(|source| Error::FunctionEvaluation { source })?;
         let new_context = self.context.new_context_for(node);
-        self.node_test.test(&new_context, &mut self.result)
+        if self.node_test.matches(&new_context)? {
+            self.context
+                .charge_work(1)
+                .map_err(|source| Error::FunctionEvaluation { source })?;
+            self.runtime
+                .push(self.context, &mut self.result, new_context.node)
+                .map_err(|source| Error::FunctionEvaluation { source })?;
+        }
+        Ok(())
     }
 }
 
 impl AxisLike for Axis {
-    fn select_nodes<'c, 'd>(
+    fn principal_node_type(&self) -> PrincipalNodeType {
+        use self::Axis::*;
+        match *self {
+            Attribute => PrincipalNodeType::Attribute,
+            Namespace => PrincipalNodeType::Namespace,
+            _ => PrincipalNodeType::Element,
+        }
+    }
+    fn select_nodes_in<'c, 'd, R: Runtime>(
         &self,
         context: &context::Evaluation<'c, 'd>,
         node_test: &dyn NodeTest,
-    ) -> Result<OrderedNodes<'d>, Error> {
+        runtime: R,
+    ) -> Result<R::List<Node<'d>>, Error> {
         use self::Axis::*;
 
         // XPath 1.0 section 2.3 expands a prefixed node-test QName from the expression context;
         // that error is independent of whether this axis happens to contain candidate nodes.
         // https://www.w3.org/TR/1999/REC-xpath-19991116/#node-tests
         node_test.validate(context)?;
-        let mut node_test = CompleteNodeTest::new(context, node_test);
+        let mut node_test = CompleteNodeTest::new(context, node_test, runtime);
 
         match *self {
             Ancestor => each_parent(context.node.clone(), |n| node_test.run(n))?,
@@ -101,8 +138,8 @@ impl AxisLike for Axis {
             }
             Namespace => {
                 if let Node::Element(ref e) = context.node {
-                    nodeset::visit_namespace_bindings(*e, context, |prefix, uri| {
-                        if cfg!(feature = "no-unsafe") {
+                    nodeset::visit_namespace_bindings_in(*e, context, runtime, |prefix, uri| {
+                        if cfg!(feature = "no-unsafe") && !R::ACCOUNTED {
                             context
                                 .reserve_temporary_allocation(
                                     prefix.len().saturating_add(uri.len()),
@@ -111,8 +148,12 @@ impl AxisLike for Axis {
                         }
                         node_test.run(Node::Namespace(nodeset::Namespace {
                             parent: *e,
-                            prefix: sxd_document_no_unsafe::to_ns_str!(prefix),
-                            uri: sxd_document_no_unsafe::to_ns_str!(uri),
+                            prefix: runtime
+                                .namespace_text(prefix)
+                                .map_err(|source| Error::FunctionEvaluation { source })?,
+                            uri: runtime
+                                .namespace_text(uri)
+                                .map_err(|source| Error::FunctionEvaluation { source })?,
                         }))?;
                         Ok::<_, Error>(std::ops::ControlFlow::Continue(()))
                     })?;
@@ -133,11 +174,13 @@ impl AxisLike for Axis {
                         .node
                         .child_at(index)
                         .expect("child index is within the observed length");
-                    preorder_left_to_right(context, child, |n| node_test.run(n))?;
+                    preorder_left_to_right(context, child, runtime, |n| node_test.run(n))?;
                 }
             }
             DescendantOrSelf => {
-                preorder_left_to_right(context, context.node.clone(), |n| node_test.run(n))?
+                preorder_left_to_right(context, context.node.clone(), runtime, |n| {
+                    node_test.run(n)
+                })?
             }
             Parent => {
                 if let Some(parent) = context.node.parent() {
@@ -155,7 +198,7 @@ impl AxisLike for Axis {
                 context.document_root_for(context.node.clone()),
                 |node| {
                     each_preceding_sibling(context, &node, |sibling| {
-                        postorder_right_to_left(context, sibling, |n| node_test.run(n))
+                        postorder_right_to_left(context, sibling, runtime, |n| node_test.run(n))
                     })
                 },
             )?,
@@ -172,13 +215,15 @@ impl AxisLike for Axis {
                         let child = owner
                             .child_at(index)
                             .expect("child index is within the observed length");
-                        preorder_left_to_right(context, child, |node| node_test.run(node))?;
+                        preorder_left_to_right(context, child, runtime, |node| {
+                            node_test.run(node)
+                        })?;
                     }
                     traversal_root = owner;
                 }
                 node_and_each_parent_before(traversal_root, document_root, |node| {
                     each_following_sibling(context, &node, |sibling| {
-                        preorder_left_to_right(context, sibling, |n| node_test.run(n))
+                        preorder_left_to_right(context, sibling, runtime, |n| node_test.run(n))
                     })
                 })?;
             }
@@ -187,34 +232,30 @@ impl AxisLike for Axis {
 
         Ok(node_test.result)
     }
-
-    fn principal_node_type(&self) -> PrincipalNodeType {
-        use self::Axis::*;
-        match *self {
-            Attribute => PrincipalNodeType::Attribute,
-            Namespace => PrincipalNodeType::Namespace,
-            _ => PrincipalNodeType::Element,
-        }
-    }
 }
 
-fn preorder_left_to_right<'c, 'd, F>(
+fn preorder_left_to_right<'c, 'd, F, R: Runtime>(
     context: &context::Evaluation<'c, 'd>,
     node: Node<'d>,
+    runtime: R,
     mut f: F,
 ) -> Result<(), Error>
 where
     F: FnMut(Node<'d>) -> Result<(), Error>,
 {
-    let mut stack = Vec::new();
-    push_traversal_frame(&mut stack, context, (node, 0))?;
+    let mut stack = runtime.list();
+    runtime
+        .push(context, &mut stack, (node, 0))
+        .map_err(|source| Error::FunctionEvaluation { source })?;
     while let Some((current, next_child)) = stack.last_mut() {
         if *next_child == 0 {
             f(current.clone())?;
         }
         if let Some(child) = current.child_at(*next_child) {
             *next_child += 1;
-            push_traversal_frame(&mut stack, context, (child, 0))?;
+            runtime
+                .push(context, &mut stack, (child, 0))
+                .map_err(|source| Error::FunctionEvaluation { source })?;
         } else {
             stack.pop();
         }
@@ -222,17 +263,20 @@ where
     Ok(())
 }
 
-fn postorder_right_to_left<'c, 'd, F>(
+fn postorder_right_to_left<'c, 'd, F, R: Runtime>(
     context: &context::Evaluation<'c, 'd>,
     node: Node<'d>,
+    runtime: R,
     mut f: F,
 ) -> Result<(), Error>
 where
     F: FnMut(Node<'d>) -> Result<(), Error>,
 {
     let last_child = node.children_len();
-    let mut stack = Vec::new();
-    push_traversal_frame(&mut stack, context, (node, last_child))?;
+    let mut stack = runtime.list();
+    runtime
+        .push(context, &mut stack, (node, last_child))
+        .map_err(|source| Error::FunctionEvaluation { source })?;
     while let Some((current, next_child)) = stack.last_mut() {
         if *next_child > 0 {
             *next_child -= 1;
@@ -240,36 +284,14 @@ where
                 .child_at(*next_child)
                 .expect("child index is within the observed length");
             let last_child = child.children_len();
-            push_traversal_frame(&mut stack, context, (child, last_child))?;
+            runtime
+                .push(context, &mut stack, (child, last_child))
+                .map_err(|source| Error::FunctionEvaluation { source })?;
         } else {
             let (current, _) = stack.pop().expect("stack is known to be non-empty");
             f(current)?;
         }
     }
-    Ok(())
-}
-
-fn push_traversal_frame<'c, 'd>(
-    stack: &mut Vec<(Node<'d>, usize)>,
-    context: &context::Evaluation<'c, 'd>,
-    frame: (Node<'d>, usize),
-) -> Result<(), Error> {
-    if stack.len() == stack.capacity() {
-        let additional = stack.capacity().max(4);
-        context
-            .reserve_temporary_allocation(
-                additional.saturating_mul(std::mem::size_of::<(Node<'d>, usize)>()),
-            )
-            .map_err(|source| Error::FunctionEvaluation { source })?;
-        stack
-            .try_reserve_exact(additional)
-            .map_err(|_| Error::FunctionEvaluation {
-                source: crate::function::Error::Other {
-                    what: "XPath axis traversal allocation failed".into(),
-                },
-            })?;
-    }
-    stack.push(frame);
     Ok(())
 }
 
@@ -367,6 +389,121 @@ where
 
 #[cfg(test)]
 mod test {
+    #[cfg(feature = "embedded")]
+    #[test]
+    fn current_namespace_axis_owns_labels_and_clones_without_copying() {
+        // The shadow set and returned labels are actual current owners.
+        // Shared namespace identities must survive the list without a second
+        // allocation or falling back to the native string-budget counter.
+        use std::{cell::Cell, sync::Arc};
+        use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
+        let package = sxd_document_no_unsafe::Package::new();
+        let document = package.as_document();
+        let root = document.create_element("root");
+        root.register_prefix("p", "outer");
+        let inner = document.create_element("inner");
+        inner.register_prefix("p", "inner");
+        inner.register_prefix("empty", "");
+        root.append_child(inner);
+        let mut context = Context::new();
+        context.set_string_allocation_limit(0);
+        let evaluation = context::Evaluation::new(&context, inner.into());
+        for bytes in [0, 65536] {
+            let work = Memory::new(Arc::new(MemoryAccount::new(bytes, 65536)));
+            let failure = Cell::new(None);
+            let result = Namespace.select_nodes_in(
+                &evaluation,
+                &DummyNodeTest,
+                crate::runtime::Accounted {
+                    work: &work,
+                    failure: &failure,
+                },
+            );
+            if bytes == 0 {
+                assert!(result.is_err());
+                assert_eq!(failure.get(), Some(MemoryError::LimitExceeded));
+            } else {
+                let result = result.expect("funded namespace axis");
+                assert_eq!(result.len(), 2);
+                let found = result
+                    .iter()
+                    .find(|node| matches!(node, Node::Namespace(ns) if ns.prefix() == "p"))
+                    .expect("nearest p namespace");
+                let Node::Namespace(ns) = found else {
+                    unreachable!()
+                };
+                assert_eq!(ns.uri(), "inner");
+                let used = work.used();
+                let copy = found
+                    .clone_with_context(&evaluation)
+                    .expect("shared identity clone");
+                assert_eq!(work.used(), used);
+                drop(result);
+                assert!(work.used() > 0);
+                drop(copy);
+            }
+            assert_eq!(work.used(), 0);
+        }
+    }
+    #[cfg(feature = "embedded")]
+    #[test]
+    fn current_axis_stack_precedes_matcher_and_retains_real_result_capacity() {
+        // Descendant traversal must admit its actual stack before the first
+        // matcher, not merely meter a native allocation after it has happened.
+        use std::{cell::Cell, sync::Arc};
+        use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
+        #[derive(Debug)]
+        struct Probe<'a> {
+            work: &'a Memory,
+            calls: &'a Cell<usize>,
+        }
+        impl NodeTest for Probe<'_> {
+            fn matches(&self, _: &context::Evaluation<'_, '_>) -> Result<bool, Error> {
+                assert!(self.work.used() > 0);
+                self.calls.set(self.calls.get() + 1);
+                Ok(true)
+            }
+        }
+        let package = sxd_document_no_unsafe::Package::new();
+        let document = package.as_document();
+        let root = document.create_element("root");
+        let inner = document.create_element("inner");
+        root.append_child(inner);
+        inner.append_child(document.create_text("text"));
+        let context = Context::new();
+        let evaluation = context::Evaluation::new(&context, root.into());
+        for bytes in [0, 65536] {
+            let work = Memory::new(Arc::new(MemoryAccount::new(bytes, 65536)));
+            let failure = Cell::new(None);
+            let calls = Cell::new(0);
+            let probe = Probe {
+                work: &work,
+                calls: &calls,
+            };
+            let result = Descendant.select_nodes_in(
+                &evaluation,
+                &probe,
+                crate::runtime::Accounted {
+                    work: &work,
+                    failure: &failure,
+                },
+            );
+            if bytes == 0 {
+                assert!(result.is_err());
+                assert_eq!(calls.get(), 0);
+                assert_eq!(failure.get(), Some(MemoryError::LimitExceeded));
+            } else {
+                let result = result.expect("funded descendant axis");
+                assert_eq!(result.len(), 2);
+                assert_eq!(result[0], Node::Element(inner));
+                assert!(matches!(result[1], Node::Text(_)));
+                assert_eq!(calls.get(), 2);
+                assert!(work.used() >= result.capacity() * std::mem::size_of::<Node<'_>>());
+                drop(result);
+            }
+            assert_eq!(work.used(), 0);
+        }
+    }
     use std::cell::Cell;
 
     use sxd_document_no_unsafe::Package;
@@ -382,13 +519,8 @@ mod test {
     #[derive(Debug)]
     struct DummyNodeTest;
     impl NodeTest for DummyNodeTest {
-        fn test<'c, 'd>(
-            &self,
-            context: &context::Evaluation<'c, 'd>,
-            result: &mut OrderedNodes<'d>,
-        ) -> Result<(), Error> {
-            result.add(context.node.clone());
-            Ok(())
+        fn matches(&self, _: &context::Evaluation<'_, '_>) -> Result<bool, Error> {
+            Ok(true)
         }
     }
 
@@ -396,12 +528,8 @@ mod test {
     struct RejectNodeTest;
 
     impl NodeTest for RejectNodeTest {
-        fn test<'c, 'd>(
-            &self,
-            _context: &context::Evaluation<'c, 'd>,
-            _result: &mut OrderedNodes<'d>,
-        ) -> Result<(), Error> {
-            Ok(())
+        fn matches(&self, _: &context::Evaluation<'_, '_>) -> Result<bool, Error> {
+            Ok(false)
         }
     }
 
@@ -474,15 +602,16 @@ mod test {
         let evaluation = context::Evaluation::new(&context, root.into());
         let visits = Cell::new(0);
 
-        let error = preorder_left_to_right(&evaluation, root.into(), |_| {
-            visits.set(visits.get() + 1);
-            Err(Error::FunctionEvaluation {
-                source: crate::function::Error::Other {
-                    what: "stop traversal".into(),
-                },
+        let error =
+            preorder_left_to_right(&evaluation, root.into(), crate::runtime::Native, |_| {
+                visits.set(visits.get() + 1);
+                Err(Error::FunctionEvaluation {
+                    source: crate::function::Error::Other {
+                        what: "stop traversal".into(),
+                    },
+                })
             })
-        })
-        .expect_err("the visitor error propagates immediately");
+            .expect_err("the visitor error propagates immediately");
 
         assert!(matches!(error, Error::FunctionEvaluation { .. }));
         assert_eq!(visits.get(), 1);

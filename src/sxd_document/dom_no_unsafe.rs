@@ -3,6 +3,10 @@ use std::{fmt, hash};
 use super::{QName, raw};
 use crate::string_pool::InternedString;
 
+#[cfg(feature = "embedded")]
+#[path = "dom_no_unsafe/current.rs"]
+pub(crate) mod current;
+
 #[derive(Copy, Clone)]
 pub struct Document<'d> {
     identity: DocumentIdentity,
@@ -127,8 +131,17 @@ impl<'d> fmt::Debug for Document<'d> {
     }
 }
 
+enum HandleKind {
+    Root,
+    Element,
+    Attribute,
+    Text,
+    Comment,
+    ProcessingInstruction,
+}
+
 macro_rules! node(
-    ($name:ident, $raw:ty, $doc:expr) => (
+    ($name:ident, $raw:ty, $kind:expr, $doc:expr) => (
         #[doc = $doc]
         #[derive(Copy, Clone)]
         pub struct $name<'d> {
@@ -138,6 +151,12 @@ macro_rules! node(
 
         impl<'d> $name<'d> {
             pub fn document(&self) -> Document<'d> { self.document }
+
+            /// Original arena, node kind and slot; independent of handle lifetime.
+            #[doc(hidden)]
+            pub fn identity_key(&self) -> (usize, usize, usize) {
+                (self.document.identity.value, $kind as usize, self.node.identity_index())
+            }
         }
 
         impl<'d> PartialEq for $name<'d> {
@@ -162,6 +181,7 @@ macro_rules! node(
 node!(
     Root,
     raw::Root,
+    HandleKind::Root,
     "The logical ancestor of every other node type"
 );
 
@@ -267,6 +287,7 @@ impl Namespace {
 node!(
     Element,
     raw::Element,
+    HandleKind::Element,
     "Elements are the workhorse of a document and may contain any type of
     node, except for the Root node"
 );
@@ -340,6 +361,22 @@ impl<'d> Element<'d> {
         self.document
             .connections
             .element_namespace_declaration_workspace_bytes(self.document.storage, self.node)
+    }
+
+    /// Borrow declarations without a snapshot. The internal callback must not
+    /// mutate this arena while its immutable storage guard is live.
+    #[cfg(feature = "embedded")]
+    pub(crate) fn try_visit_namespace_labels<E>(
+        &self,
+        work: &impl structured_asn1::memory::Work,
+        visit: impl FnMut(
+            crate::sxd_document::string_pool::Label<'_>,
+            crate::sxd_document::string_pool::Label<'_>,
+        ) -> Result<(), E>,
+    ) -> Result<Result<(), E>, structured_asn1::memory::MemoryError> {
+        self.document
+            .connections
+            .try_visit_element_namespace_labels(self.document.storage, self.node, work, visit)
     }
 
     /// Visit a snapshot of declarations without copying string data; errors stop visits.
@@ -564,6 +601,7 @@ impl<'d> fmt::Debug for Element<'d> {
 node!(
     Attribute,
     raw::Attribute,
+    HandleKind::Attribute,
     "Metadata about the current element"
 );
 
@@ -611,7 +649,7 @@ impl<'d> fmt::Debug for Attribute<'d> {
     }
 }
 
-node!(Text, raw::Text, "Textual data");
+node!(Text, raw::Text, HandleKind::Text, "Textual data");
 
 impl<'d> Text<'d> {
     pub fn text(&self) -> InternedString {
@@ -660,7 +698,12 @@ impl<'d> fmt::Debug for Text<'d> {
     }
 }
 
-node!(Comment, raw::Comment, "Information only relevant to humans");
+node!(
+    Comment,
+    raw::Comment,
+    HandleKind::Comment,
+    "Information only relevant to humans"
+);
 
 impl<'d> Comment<'d> {
     pub fn text(&self) -> InternedString {
@@ -712,6 +755,7 @@ impl<'d> fmt::Debug for Comment<'d> {
 node!(
     ProcessingInstruction,
     raw::ProcessingInstruction,
+    HandleKind::ProcessingInstruction,
     "Metadata relevant to the application, but not the XML processor or humans"
 );
 

@@ -1,7 +1,12 @@
-use super::{QName, lazy_hash_map::LazyHashMap};
+use super::{QName, namespace_storage::Bindings};
 
+use super::storage::Values;
 use crate::string_pool::{InternedString, StringPool};
 use std::{cell::RefCell, marker::PhantomData};
+
+#[cfg(feature = "embedded")]
+#[path = "raw_no_unsafe/current.rs"]
+pub(crate) mod current;
 
 pub(crate) fn estimated_storage_bytes(r: crate::StorageRequirements) -> usize {
     fn arena_bytes<T>(items: usize) -> usize {
@@ -76,6 +81,10 @@ impl<T> std::fmt::Debug for Index<T> {
 }
 
 impl<T> Index<T> {
+    pub(super) fn identity_index(self) -> usize {
+        self.idx
+    }
+
     fn new(idx: usize) -> Self {
         Index {
             idx,
@@ -138,17 +147,17 @@ impl std::fmt::Debug for QNameValue {
 // --- Node types ---
 
 pub struct Root {
-    children: Vec<ChildOfRoot>,
+    children: Values<ChildOfRoot>,
 }
 
 pub struct Element {
     name: InternedQName,
     default_namespace_uri: Option<InternedString>,
     preferred_prefix: Option<InternedString>,
-    children: Vec<ChildOfElement>,
+    children: Values<ChildOfElement>,
     parent: Option<ParentOfChild>,
-    attributes: Vec<Index<Attribute>>,
-    prefix_to_namespace: LazyHashMap<InternedString, InternedString>,
+    attributes: Values<Index<Attribute>>,
+    prefix_to_namespace: Bindings,
 }
 
 pub struct Attribute {
@@ -248,24 +257,24 @@ impl From<ChildOfRoot> for ChildOfElement {
 
 pub struct Storage {
     strings: StringPool,
-    pub(crate) roots: RefCell<Vec<Root>>,
-    pub(crate) elements: RefCell<Vec<Element>>,
-    pub(crate) attributes: RefCell<Vec<Attribute>>,
-    pub(crate) texts: RefCell<Vec<Text>>,
-    pub(crate) comments: RefCell<Vec<Comment>>,
-    pub(crate) processing_instructions: RefCell<Vec<ProcessingInstruction>>,
+    pub(crate) roots: RefCell<Values<Root>>,
+    pub(crate) elements: RefCell<Values<Element>>,
+    pub(crate) attributes: RefCell<Values<Attribute>>,
+    pub(crate) texts: RefCell<Values<Text>>,
+    pub(crate) comments: RefCell<Values<Comment>>,
+    pub(crate) processing_instructions: RefCell<Values<ProcessingInstruction>>,
 }
 
 impl Default for Storage {
     fn default() -> Storage {
         Storage {
             strings: StringPool::new(),
-            roots: RefCell::new(Vec::new()),
-            elements: RefCell::new(Vec::new()),
-            attributes: RefCell::new(Vec::new()),
-            texts: RefCell::new(Vec::new()),
-            comments: RefCell::new(Vec::new()),
-            processing_instructions: RefCell::new(Vec::new()),
+            roots: RefCell::new(Values::new()),
+            elements: RefCell::new(Values::new()),
+            attributes: RefCell::new(Values::new()),
+            texts: RefCell::new(Values::new()),
+            comments: RefCell::new(Values::new()),
+            processing_instructions: RefCell::new(Values::new()),
         }
     }
 }
@@ -290,7 +299,7 @@ impl Storage {
         let mut roots = self.roots.borrow_mut();
         let idx = roots.len();
         roots.push(Root {
-            children: Vec::new(),
+            children: Values::new(),
         });
         Index::new(idx)
     }
@@ -306,10 +315,10 @@ impl Storage {
             name,
             default_namespace_uri: None,
             preferred_prefix: None,
-            children: Vec::new(),
+            children: Values::new(),
             parent: None,
-            attributes: Vec::new(),
-            prefix_to_namespace: LazyHashMap::new(),
+            attributes: Values::new(),
+            prefix_to_namespace: Bindings::new(),
         });
         Index::new(idx)
     }
@@ -951,7 +960,7 @@ impl Connections {
                 to_keep.push(a_idx);
             }
         }
-        storage.elements.borrow_mut()[element.idx].attributes = to_keep;
+        storage.elements.borrow_mut()[element.idx].attributes = to_keep.into();
     }
 
     pub fn set_attribute(
@@ -1085,6 +1094,21 @@ impl Connections {
             .size_hint()
             .0
             .saturating_mul(std::mem::size_of::<(InternedString, InternedString)>())
+    }
+
+    #[cfg(feature = "embedded")]
+    pub(crate) fn try_visit_element_namespace_labels<E>(
+        &self,
+        storage: &Storage,
+        element: Index<Element>,
+        work: &impl structured_asn1::memory::Work,
+        visit: impl FnMut(
+            crate::sxd_document::string_pool::Label<'_>,
+            crate::sxd_document::string_pool::Label<'_>,
+        ) -> Result<(), E>,
+    ) -> Result<Result<(), E>, structured_asn1::memory::MemoryError> {
+        let elements = storage.elements.borrow();
+        elements[element.idx].prefix_to_namespace.visit(work, visit)
     }
 
     pub fn element_namespaces_in_scope(

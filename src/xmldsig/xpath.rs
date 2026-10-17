@@ -6,24 +6,238 @@
 //! original document without serializing and reparsing signed input.
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet, hash_map::Entry};
-use std::rc::Rc;
+
+mod mirror;
+mod source;
+pub(crate) mod storage;
+use storage::{Bindings as _, Index as _, NamespaceIndex as _, NamespaceKey};
 
 use crate::sxd_document as sxd_document_no_unsafe;
 use crate::sxd_xpath as sxd_xpath_no_unsafe;
 use crate::xml::dom::{Document, NodeId};
 use sxd_document_no_unsafe::{Package, QName, dom};
-use sxd_xpath_no_unsafe::{Context, Factory, Value, function, nodeset};
+use sxd_xpath_no_unsafe::{Factory, Value, function, nodeset};
 
 use super::transforms::{
-    MAX_XPATH_EXPRESSION_BYTES, MAX_XPATH_FILTERS, NodeFilterWorkBudget, XPathExpression,
-    XPathFilter, XPathFilterOperation, XPathHereSemantics,
+    MAX_XPATH_EXPRESSION_BYTES, MAX_XPATH_FILTERS, NodeFilterWorkBudget, XPathFilterOperation,
+    XPathHereSemantics,
 };
-use super::types::{
-    NodeSet, NodeSetMaterializationBudget, TransformError, transform_resource_limit,
-};
-use crate::c14n::NodeVisibility;
+#[cfg(test)]
+use super::transforms::{XPathExpression, XPathFilter};
+#[cfg(test)]
+use super::types::NodeSet;
+use super::types::projection::{Keys, NativeKeys, Projection, RetainKeys};
+use super::types::{NodeSetMaterializationBudget, TransformError, transform_resource_limit};
 use crate::c14n::prefix::{attribute_prefix, element_prefix};
+
+pub(crate) trait CompiledExpression {
+    fn evaluate<'d, N: Into<nodeset::Node<'d>>>(
+        &self,
+        context: &sxd_xpath_no_unsafe::context::ScopedContext<'_, 'd>,
+        node: N,
+        failure: &Cell<Option<structured_asn1::memory::MemoryError>>,
+    ) -> Result<Value<'d>, sxd_xpath_no_unsafe::ExecutionError>;
+}
+
+impl CompiledExpression for sxd_xpath_no_unsafe::XPath {
+    fn evaluate<'d, N: Into<nodeset::Node<'d>>>(
+        &self,
+        context: &sxd_xpath_no_unsafe::context::ScopedContext<'_, 'd>,
+        node: N,
+        _failure: &Cell<Option<structured_asn1::memory::MemoryError>>,
+    ) -> Result<Value<'d>, sxd_xpath_no_unsafe::ExecutionError> {
+        self.evaluate(context, node)
+    }
+}
+
+pub(crate) struct AccountedProgram<'s, 'w, W: structured_asn1::memory::Work> {
+    program: sxd_xpath_no_unsafe::arena::Program<'s>,
+    work: &'w W,
+}
+
+impl<W: structured_asn1::memory::Work> CompiledExpression for AccountedProgram<'_, '_, W> {
+    fn evaluate<'d, N: Into<nodeset::Node<'d>>>(
+        &self,
+        context: &sxd_xpath_no_unsafe::context::ScopedContext<'_, 'd>,
+        node: N,
+        failure: &Cell<Option<structured_asn1::memory::MemoryError>>,
+    ) -> Result<Value<'d>, sxd_xpath_no_unsafe::ExecutionError> {
+        self.program.evaluate_in(
+            context,
+            node,
+            sxd_xpath_no_unsafe::runtime::Accounted {
+                work: self.work,
+                failure,
+            },
+        )
+    }
+}
+
+pub(crate) trait XPathStorage: crate::c14n::scratch::Scratch {
+    type Construction<'d, 'q>: mirror::Construction<'d>
+    where
+        Self: 'q;
+    fn package(&self) -> Result<Package, structured_asn1::memory::MemoryError>;
+    fn construction<'d, 'q>(&'q self, target: dom::Document<'d>) -> Self::Construction<'d, 'q>;
+    type Runtime<'q>: sxd_xpath_no_unsafe::runtime::Runtime
+    where
+        Self: 'q;
+    fn runtime<'q>(
+        &'q self,
+        failure: &'q Cell<Option<structured_asn1::memory::MemoryError>>,
+    ) -> Self::Runtime<'q>;
+    type Compiled<'s>: CompiledExpression;
+    fn compile<'s>(&self, source: &'s str) -> Result<Self::Compiled<'s>, TransformError>;
+    fn diagnostic(&self, message: std::fmt::Arguments<'_>) -> TransformError;
+    fn formatted(&self, message: std::fmt::Arguments<'_>) -> Result<Self::Text, TransformError>;
+    fn order_nodes<'d>(
+        &self,
+        nodes: &nodeset::Nodeset<'d>,
+        context: &sxd_xpath_no_unsafe::context::Evaluation<'_, 'd>,
+        failure: &Cell<Option<structured_asn1::memory::MemoryError>>,
+    ) -> Result<Self::Values<nodeset::Node<'d>>, sxd_xpath_no_unsafe::ExecutionError>;
+}
+
+struct NamespaceResolver<'q, 'source, K: Keys> {
+    bindings: &'q K::Bindings<'source>,
+    execution: K::Execution,
+    failure: &'q Cell<Option<structured_asn1::memory::MemoryError>>,
+    source: std::marker::PhantomData<&'source str>,
+}
+
+impl<K: Keys> sxd_xpath_no_unsafe::context::NamespaceLookup for NamespaceResolver<'_, '_, K> {
+    fn namespace_for(&self, prefix: &str) -> Result<Option<&str>, function::Error> {
+        if self.failure.get().is_some() {
+            return Err(function::Error::ProcessingStopped);
+        }
+        match self.bindings.resolve(prefix, self.execution) {
+            Ok(uri) => Ok(uri),
+            Err(cause) => {
+                self.failure.set(Some(cause));
+                Err(function::Error::ProcessingStopped)
+            }
+        }
+    }
+}
+
+impl XPathStorage for crate::c14n::scratch::Native {
+    type Construction<'d, 'q> = dom::Document<'d>;
+    fn package(&self) -> Result<Package, structured_asn1::memory::MemoryError> {
+        Ok(Package::new())
+    }
+    fn construction<'d, 'q>(&'q self, target: dom::Document<'d>) -> Self::Construction<'d, 'q> {
+        target
+    }
+    type Runtime<'q> = sxd_xpath_no_unsafe::runtime::Native;
+    fn runtime<'q>(
+        &'q self,
+        _: &'q Cell<Option<structured_asn1::memory::MemoryError>>,
+    ) -> Self::Runtime<'q> {
+        sxd_xpath_no_unsafe::runtime::Native
+    }
+    type Compiled<'s> = sxd_xpath_no_unsafe::XPath;
+    fn order_nodes<'d>(
+        &self,
+        nodes: &nodeset::Nodeset<'d>,
+        context: &sxd_xpath_no_unsafe::context::Evaluation<'_, 'd>,
+        _: &Cell<Option<structured_asn1::memory::MemoryError>>,
+    ) -> Result<Self::Values<nodeset::Node<'d>>, sxd_xpath_no_unsafe::ExecutionError> {
+        nodes
+            .document_order_with_context(context)
+            .map_err(sxd_xpath_no_unsafe::ExecutionError::from)
+    }
+
+    fn compile<'s>(&self, source: &'s str) -> Result<Self::Compiled<'s>, TransformError> {
+        Factory::new()
+            .build(source)
+            .map_err(|error| TransformError::XPath(error.to_string()))
+    }
+
+    fn diagnostic(&self, message: std::fmt::Arguments<'_>) -> TransformError {
+        TransformError::XPath(std::fmt::format(message))
+    }
+
+    fn formatted(&self, message: std::fmt::Arguments<'_>) -> Result<Self::Text, TransformError> {
+        Ok(std::fmt::format(message))
+    }
+}
+
+impl<'w, W: structured_asn1::memory::Work> XPathStorage for crate::c14n::scratch::Accounted<'w, W> {
+    type Construction<'d, 'q>
+        = dom::current::Builder<'d, 'q, W>
+    where
+        Self: 'q;
+    fn package(&self) -> Result<Package, structured_asn1::memory::MemoryError> {
+        Package::try_current(self.0)
+    }
+    fn construction<'d, 'q>(&'q self, target: dom::Document<'d>) -> Self::Construction<'d, 'q> {
+        dom::current::Builder::new(target, self.0)
+    }
+    type Runtime<'q>
+        = sxd_xpath_no_unsafe::runtime::Accounted<'q, W>
+    where
+        Self: 'q;
+    fn runtime<'q>(
+        &'q self,
+        failure: &'q Cell<Option<structured_asn1::memory::MemoryError>>,
+    ) -> Self::Runtime<'q> {
+        sxd_xpath_no_unsafe::runtime::Accounted {
+            work: self.0,
+            failure,
+        }
+    }
+    type Compiled<'s> = AccountedProgram<'s, 'w, W>;
+    fn order_nodes<'d>(
+        &self,
+        nodes: &nodeset::Nodeset<'d>,
+        context: &sxd_xpath_no_unsafe::context::Evaluation<'_, 'd>,
+        failure: &Cell<Option<structured_asn1::memory::MemoryError>>,
+    ) -> Result<Self::Values<nodeset::Node<'d>>, sxd_xpath_no_unsafe::ExecutionError> {
+        nodes
+            .document_order_in(
+                context,
+                sxd_xpath_no_unsafe::runtime::Accounted {
+                    work: self.0,
+                    failure,
+                },
+            )
+            .map(|nodes| nodes.into_values())
+            .map_err(sxd_xpath_no_unsafe::ExecutionError::from)
+    }
+
+    fn compile<'s>(&self, source: &'s str) -> Result<Self::Compiled<'s>, TransformError> {
+        sxd_xpath_no_unsafe::arena::Program::parse(source, self.0)
+            .map(|program| AccountedProgram {
+                program,
+                work: self.0,
+            })
+            .map_err(|error| match error {
+                sxd_xpath_no_unsafe::grammar::Fault::Resource(cause) => cause.into(),
+                error => {
+                    // Formatting an unexpected borrowed token can inspect its
+                    // payload again. Admit that pass before Debug scans it.
+                    if let Err(cause) = self.0.charge_work(source.len() as u64) {
+                        return cause.into();
+                    }
+                    self.diagnostic(format_args!("{error}"))
+                }
+            })
+    }
+
+    fn diagnostic(&self, message: std::fmt::Arguments<'_>) -> TransformError {
+        super::transforms::current_diagnostic(super::transforms::Diagnostic::XPath, message, self.0)
+    }
+
+    fn formatted(&self, message: std::fmt::Arguments<'_>) -> Result<Self::Text, TransformError> {
+        use crate::xml::dom::storage::Storage as _;
+        crate::xml::dom::storage::Accounted(self.0)
+            .formatted(message)
+            .map_err(|cause| match cause {
+                crate::xml::dom::ParseError::SharedExecution(cause) => cause.into(),
+                cause => TransformError::XmlParse(crate::document::XmlDocumentError::Parse(cause)),
+            })
+    }
+}
 
 const ALL_XPATH_NODES: &str = "//. | //@* | //namespace::*";
 /// Bound ordinary XMLDSig XPath's per-node evaluation loop before user XPath runs.
@@ -55,12 +269,11 @@ thread_local! {
     static FILTER2_PROJECTION_NODE_VISITS: Cell<usize> = const { Cell::new(0) };
 }
 
-#[derive(Clone)]
 pub(super) struct XPathWorkBudget {
-    remaining: Rc<Cell<usize>>,
-    evaluation_limit_exceeded: Rc<Cell<bool>>,
-    mirror_bytes_remaining: Rc<Cell<usize>>,
-    string_work_bytes_remaining: Rc<Cell<usize>>,
+    remaining: Cell<usize>,
+    evaluation_limit_exceeded: Cell<bool>,
+    mirror_bytes_remaining: Cell<usize>,
+    string_work_bytes_remaining: Cell<usize>,
     limits: XPathWorkLimits,
 }
 
@@ -78,10 +291,10 @@ struct XPathWorkLimits {
 impl Default for XPathWorkBudget {
     fn default() -> Self {
         Self {
-            remaining: Rc::new(Cell::new(MAX_XPATH_CUMULATIVE_EVALUATION_WORK)),
-            evaluation_limit_exceeded: Rc::new(Cell::new(false)),
-            mirror_bytes_remaining: Rc::new(Cell::new(MAX_XPATH_MIRROR_STRING_BYTES)),
-            string_work_bytes_remaining: Rc::new(Cell::new(MAX_XPATH_CUMULATIVE_STRING_WORK_BYTES)),
+            remaining: Cell::new(MAX_XPATH_CUMULATIVE_EVALUATION_WORK),
+            evaluation_limit_exceeded: Cell::new(false),
+            mirror_bytes_remaining: Cell::new(MAX_XPATH_MIRROR_STRING_BYTES),
+            string_work_bytes_remaining: Cell::new(MAX_XPATH_CUMULATIVE_STRING_WORK_BYTES),
             limits: XPathWorkLimits {
                 evaluation_work: MAX_XPATH_CUMULATIVE_EVALUATION_WORK,
                 mirror_string_bytes: MAX_XPATH_MIRROR_STRING_BYTES,
@@ -99,20 +312,20 @@ impl XPathWorkBudget {
     #[cfg(test)]
     pub(super) fn with_limit(limit: usize) -> Self {
         Self {
-            remaining: Rc::new(Cell::new(limit)),
-            evaluation_limit_exceeded: Rc::new(Cell::new(false)),
-            mirror_bytes_remaining: Rc::new(Cell::new(MAX_XPATH_MIRROR_STRING_BYTES)),
-            string_work_bytes_remaining: Rc::new(Cell::new(MAX_XPATH_CUMULATIVE_STRING_WORK_BYTES)),
+            remaining: Cell::new(limit),
+            evaluation_limit_exceeded: Cell::new(false),
+            mirror_bytes_remaining: Cell::new(MAX_XPATH_MIRROR_STRING_BYTES),
+            string_work_bytes_remaining: Cell::new(MAX_XPATH_CUMULATIVE_STRING_WORK_BYTES),
             limits: Self::default().limits,
         }
     }
 
     pub(super) fn with_limits(resources: &crate::policy::ResourcePolicy) -> Self {
         Self {
-            remaining: Rc::new(Cell::new(resources.max_xpath_evaluation_work)),
-            evaluation_limit_exceeded: Rc::new(Cell::new(false)),
-            mirror_bytes_remaining: Rc::new(Cell::new(resources.max_xpath_mirror_string_bytes)),
-            string_work_bytes_remaining: Rc::new(Cell::new(resources.max_xpath_string_work_bytes)),
+            remaining: Cell::new(resources.max_xpath_evaluation_work),
+            evaluation_limit_exceeded: Cell::new(false),
+            mirror_bytes_remaining: Cell::new(resources.max_xpath_mirror_string_bytes),
+            string_work_bytes_remaining: Cell::new(resources.max_xpath_string_work_bytes),
             limits: XPathWorkLimits {
                 evaluation_work: resources.max_xpath_evaluation_work,
                 mirror_string_bytes: resources.max_xpath_mirror_string_bytes,
@@ -153,12 +366,21 @@ impl XPathWorkBudget {
     }
 
     fn charge_function(&self, work: usize) -> Result<(), function::Error> {
-        self.charge(work).map_err(|error| function::Error::Other {
-            what: error.to_string(),
-        })
+        // The embedding boundary reconstructs the typed policy failure from
+        // this same budget; do not allocate and then discard a diagnostic.
+        self.charge(work)
+            .map_err(|_| function::Error::ProcessingStopped)
     }
 
-    fn map_evaluation_error(&self, error: impl ToString) -> TransformError {
+    fn map_evaluation_error(
+        &self,
+        error: impl std::fmt::Display,
+        shared_failure: &Cell<Option<structured_asn1::memory::MemoryError>>,
+        scratch: &impl XPathStorage,
+    ) -> TransformError {
+        if let Some(cause) = shared_failure.get() {
+            return cause.into();
+        }
         if self.evaluation_limit_exceeded.get() {
             transform_resource_limit(
                 crate::policy::resource_name::XPATH_EVALUATION_WORK,
@@ -166,7 +388,7 @@ impl XPathWorkBudget {
                 self.limits.evaluation_work.saturating_add(1),
             )
         } else {
-            TransformError::XPath(error.to_string())
+            scratch.diagnostic(format_args!("{error}"))
         }
     }
 
@@ -217,47 +439,14 @@ pub(super) fn is_xpath_whitespace(character: char) -> bool {
     matches!(character, ' ' | '\t' | '\r' | '\n')
 }
 
+#[cfg(test)]
 pub(super) fn normalize_function_spacing(source: &str) -> String {
-    let chars = source.chars().collect::<Vec<_>>();
-    let mut output = String::with_capacity(source.len());
-    let mut index = 0;
-    let mut quote = None;
-    while index < chars.len() {
-        let character = chars[index];
-        if matches!(character, '\'' | '"') {
-            if quote == Some(character) {
-                quote = None;
-            } else if quote.is_none() {
-                quote = Some(character);
-            }
-            output.push(character);
-            index += 1;
-            continue;
-        }
-        if quote.is_none() && is_xpath_whitespace(character) {
-            let whitespace_start = index;
-            while index < chars.len() && is_xpath_whitespace(chars[index]) {
-                index += 1;
-            }
-            let previous_is_name = output
-                .chars()
-                .next_back()
-                .is_some_and(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'));
-            let previous_name = output
-                .rsplit(|ch: char| !(ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':')))
-                .next()
-                .unwrap_or_default();
-            let previous_is_word_operator = matches!(previous_name, "and" | "or" | "div" | "mod");
-            if previous_is_name && !previous_is_word_operator && chars.get(index) == Some(&'(') {
-                continue;
-            }
-            output.extend(chars[whitespace_start..index].iter());
-            continue;
-        }
-        output.push(character);
-        index += 1;
+    match source::normalize(source, &crate::c14n::scratch::Native)
+        .expect("native normalization accepts representable input")
+    {
+        source::Normalized::Original(source) => source.to_owned(),
+        source::Normalized::Rewritten(source) => source,
     }
-    output
 }
 
 #[cfg(test)]
@@ -274,19 +463,41 @@ pub(super) fn compile_xpath_with_policy_limits(
     max_expression_bytes: usize,
     max_expression_complexity: usize,
 ) -> Result<sxd_xpath_no_unsafe::XPath, String> {
+    compile_native_xpath(source, max_expression_bytes, max_expression_complexity).map_err(|error| {
+        match error {
+            TransformError::XPath(message) => message,
+            error => error.to_string(),
+        }
+    })
+}
+
+pub(super) fn compile_native_xpath(
+    source: &str,
+    max_expression_bytes: usize,
+    max_expression_complexity: usize,
+) -> Result<sxd_xpath_no_unsafe::XPath, TransformError> {
     if source.is_empty() || source.len() > max_expression_bytes {
-        return Err(format!(
+        return Err(TransformError::XPath(format!(
             "XPath expression length must be between 1 and {max_expression_bytes} bytes"
-        ));
+        )));
     }
     if xpath_expression_complexity(source) > max_expression_complexity {
-        return Err(format!(
+        return Err(TransformError::XPath(format!(
             "XPath expression complexity exceeds {max_expression_complexity} tokens"
-        ));
+        )));
     }
+    let normalized = source::normalize(source, &crate::c14n::scratch::Native)?;
     Factory::new()
-        .build(&normalize_function_spacing(source))
-        .map_err(|error| error.to_string())
+        .build(normalized.view()?)
+        .map_err(|error| TransformError::XPath(error.to_string()))
+}
+
+pub(super) fn validate_xpath_current<W: structured_asn1::memory::Work>(
+    source: &str,
+    scratch: &crate::c14n::scratch::Accounted<'_, W>,
+) -> Result<(), TransformError> {
+    let normalized = source::normalize(source, scratch)?;
+    scratch.compile(normalized.view()?).map(|_| ())
 }
 
 pub(super) fn xpath_expression_complexity(source: &str) -> usize {
@@ -865,26 +1076,38 @@ fn is_document_scanning_axis(axis: &str) -> bool {
     )
 }
 
-struct Mirror<'d> {
-    elements: HashMap<dom::Element<'d>, NodeId>,
-    texts: HashMap<dom::Text<'d>, NodeId>,
-    comments: HashMap<dom::Comment<'d>, NodeId>,
-    processing_instructions: HashMap<dom::ProcessingInstruction<'d>, NodeId>,
+struct Mirror<
+    'source,
+    'd,
+    K: Keys = NativeKeys,
+    D: crate::xml::dom::storage::Storage = crate::xml::dom::storage::Native,
+> {
+    source: &'source Document<'source, D>,
+    elements: K::Index<(usize, usize, usize), NodeId>,
+    attributes: K::Index<(usize, usize, usize), (NodeId, usize)>,
+    namespaces: K::NamespaceIndex<'source>,
+    texts: K::Index<(usize, usize, usize), NodeId>,
+    comments: K::Index<(usize, usize, usize), NodeId>,
+    processing_instructions: K::Index<(usize, usize, usize), NodeId>,
+    lifetime: std::marker::PhantomData<dom::Document<'d>>,
+    #[cfg(test)]
+    target: dom::Document<'d>,
 }
 
-#[derive(Clone, Copy)]
-enum ProjectionMode {
-    ExactNodes,
-    ExpandToSubtrees,
+#[cfg(test)]
+impl<'source, 'd> Mirror<'source, 'd, NativeKeys> {
+    fn build(source: &'source Document<'source>, target: dom::Document<'d>) -> Self {
+        Self::build_in(source, target, ()).expect("native mirror has no shared execution ceiling")
+    }
 }
 
-impl<'d> Mirror<'d> {
+impl<'source, 'd, K: Keys, D: crate::xml::dom::storage::Storage> Mirror<'source, 'd, K, D> {
     /// Measures exactly the source strings passed to SXD by [`Self::build`].
     ///
     /// Keep this traversal structurally aligned with `build`: unlike the
     /// node-set budget, it includes character data and attribute values, and
     /// charges repeated namespace registrations separately.
-    fn projected_string_bytes(source: &Document<'_>) -> Result<usize, TransformError> {
+    fn projected_string_bytes(source: &Document<'_, D>) -> Result<usize, TransformError> {
         let mut projected_bytes = 0_usize;
         for node in source.descendants().filter(|node| !node.is_root()) {
             if node.is_element() {
@@ -938,330 +1161,407 @@ impl<'d> Mirror<'d> {
         Ok(projected_bytes)
     }
 
-    fn build(source: &Document<'_>, target: dom::Document<'d>) -> Self {
+    fn build_in(
+        source: &'source Document<'source, D>,
+        target: dom::Document<'d>,
+        execution: K::Execution,
+    ) -> Result<Self, crate::c14n::C14nError> {
+        use mirror::Construction as _;
+        let scratch = K::scratch(execution);
+        let construction = scratch.construction(target);
         let mut mirror = Self {
-            elements: HashMap::new(),
-            texts: HashMap::new(),
-            comments: HashMap::new(),
-            processing_instructions: HashMap::new(),
+            source,
+            elements: K::index(execution),
+            attributes: K::index(execution),
+            namespaces: K::namespace_index(execution),
+            texts: K::index(execution),
+            comments: K::index(execution),
+            processing_instructions: K::index(execution),
+            lifetime: std::marker::PhantomData,
+            #[cfg(test)]
+            target,
         };
-        let mut parents: HashMap<NodeId, dom::Element<'d>> = HashMap::new();
+        let mut parents = K::index::<usize, dom::Element<'d>>(execution);
 
         // Descendants are yielded in document order, so every element parent
         // has already been mirrored when one of its children is encountered.
         for source_node in source.descendants().filter(|node| !node.is_root()) {
             let source_parent = source_node.parent();
-            let target_parent = source_parent.and_then(|node| parents.get(&node.id()).copied());
+            K::admit(execution, 1)?;
+            let target_parent = match source_parent {
+                Some(node) => parents
+                    .lookup(&(node.id().get() as usize), execution)?
+                    .copied(),
+                None => None,
+            };
 
             if source_node.is_element() {
                 let name = QName::with_namespace_uri(
                     source_node.tag_name().namespace(),
                     source_node.tag_name().name(),
                 );
-                let element = target.create_element(name);
+                let element = construction.element(name)?;
+                construction.declarations(
+                    element,
+                    source_node
+                        .namespaces()
+                        .map(|namespace| (namespace.name(), namespace.uri())),
+                )?;
 
                 // SXD's namespaces_in_scope() always injects the predefined
                 // xml binding, even when no prefix was registered explicitly.
-                for namespace in source_node.namespaces() {
-                    match namespace.name() {
-                        Some(prefix) => element.register_prefix(prefix, namespace.uri()),
-                        None => {
-                            // XPath 1.0's namespace axis does not expose an
-                            // `xmlns=""` undeclaration as a namespace node.
-                            // Registering it in SXD changes canonicalized
-                            // node-sets compared with libxml2/xmlsec.
-                            if namespace.uri().is_empty() {
-                                element.set_default_namespace_uri(None);
-                                continue;
-                            }
-                            element.set_default_namespace_uri(Some(namespace.uri()));
-                            // SXD's namespace axis enumerates only registered
-                            // prefixes and otherwise omits the default binding.
-                            element.register_prefix("", namespace.uri());
-                        }
-                    }
+                for (ordinal, namespace) in source_node.namespaces().enumerate() {
+                    mirror.namespaces.insert_namespace(
+                        NamespaceKey {
+                            owner: element.identity_key(),
+                            prefix: namespace.name().unwrap_or(""),
+                            uri: namespace.uri(),
+                        },
+                        ordinal,
+                    )?;
                 }
                 let prefix = element_prefix(source_node);
-                element.set_preferred_prefix((!prefix.is_empty()).then_some(prefix));
+                construction.element_prefix(element, (!prefix.is_empty()).then_some(prefix))?;
 
-                for attribute in source_node.attributes() {
+                for (ordinal, attribute) in source_node.attributes().enumerate() {
                     let name = QName::with_namespace_uri(attribute.namespace(), attribute.name());
-                    let target_attribute = element.set_attribute_value(name, attribute.value());
+                    let target_attribute =
+                        construction.attribute(element, name, attribute.value())?;
+                    mirror
+                        .attributes
+                        .insert(target_attribute.identity_key(), (source_node.id(), ordinal))?;
                     let prefix = attribute_prefix(source_node, &attribute);
-                    target_attribute.set_preferred_prefix((!prefix.is_empty()).then_some(prefix));
+                    construction.attribute_prefix(
+                        target_attribute,
+                        (!prefix.is_empty()).then_some(prefix),
+                    )?;
                 }
 
                 match target_parent {
-                    Some(parent) => parent.append_child(element),
-                    None => target.root().append_child(element),
+                    Some(parent) => construction.append_element(parent, element.into())?,
+                    None => construction.append_root(element.into())?,
                 }
-                parents.insert(source_node.id(), element);
-                mirror.elements.insert(element, source_node.id());
+                parents.insert(source_node.id().get() as usize, element)?;
+                mirror
+                    .elements
+                    .insert(element.identity_key(), source_node.id())?;
             } else if source_node.is_text() {
                 // roxmltree already coalesces adjacent character data across
                 // CDATA boundaries into the single text node required by the
                 // XPath 1.0 data model. It also omits whitespace outside the
                 // document element, so every mirrored text has an element parent.
                 if let Some(parent) = target_parent {
-                    let text = target.create_text(source_node.text().unwrap_or_default());
-                    parent.append_child(text);
-                    mirror.texts.insert(text, source_node.id());
+                    let text = construction.text(source_node.text().unwrap_or_default())?;
+                    construction.append_element(parent, text.into())?;
+                    mirror.texts.insert(text.identity_key(), source_node.id())?;
                 }
             } else if source_node.is_comment() {
-                let comment = target.create_comment(source_node.text().unwrap_or_default());
+                let comment = construction.comment(source_node.text().unwrap_or_default())?;
                 match target_parent {
-                    Some(parent) => parent.append_child(comment),
-                    None => target.root().append_child(comment),
+                    Some(parent) => construction.append_element(parent, comment.into())?,
+                    None => construction.append_root(comment.into())?,
                 }
-                mirror.comments.insert(comment, source_node.id());
+                mirror
+                    .comments
+                    .insert(comment.identity_key(), source_node.id())?;
             } else if source_node.is_pi()
                 && let Some(pi) = source_node.pi()
             {
-                let processing_instruction =
-                    target.create_processing_instruction(pi.target, pi.value);
+                let processing_instruction = construction.pi(pi.target, pi.value)?;
                 match target_parent {
-                    Some(parent) => parent.append_child(processing_instruction),
-                    None => target.root().append_child(processing_instruction),
+                    Some(parent) => {
+                        construction.append_element(parent, processing_instruction.into())?
+                    }
+                    None => construction.append_root(processing_instruction.into())?,
                 }
                 mirror
                     .processing_instructions
-                    .insert(processing_instruction, source_node.id());
+                    .insert(processing_instruction.identity_key(), source_node.id())?;
             }
         }
 
-        mirror
+        Ok(mirror)
     }
 
-    fn project<'a>(
+    fn project_exact_node<'a>(
         &self,
-        source: &'a Document<'a>,
-        input: &NodeSet<'a>,
-        selected: nodeset::Nodeset<'d>,
-        mode: ProjectionMode,
-        materialization_budget: &NodeSetMaterializationBudget,
-    ) -> Result<NodeSet<'a>, TransformError> {
-        if matches!(mode, ProjectionMode::ExpandToSubtrees) {
-            return self.project_expanded(source, input, selected, materialization_budget);
-        }
-
-        let mut result = NodeSet::empty(input.document());
-        for node in selected.document_order() {
-            match node {
-                nodeset::Node::Root(_) => {
-                    result.insert_node(source.root());
-                }
-                nodeset::Node::Element(element) => {
-                    if let Some(source_node) = self.source_node(source, self.elements.get(&element))
-                    {
-                        result.insert_node(source_node);
-                    }
-                }
-                nodeset::Node::Attribute(attribute) => {
-                    let Some(parent) = attribute.parent() else {
-                        continue;
-                    };
-                    let Some(source_parent) = self.source_node(source, self.elements.get(&parent))
-                    else {
-                        continue;
-                    };
-                    let stored_name = attribute.name();
-                    let name = sxd_document_no_unsafe::as_qname!(stored_name);
-                    result.insert_attribute_with_budget(
-                        source_parent,
-                        name.namespace_uri(),
-                        name.local_part(),
-                        materialization_budget,
-                    )?;
-                }
-                nodeset::Node::Text(text) => {
-                    if let Some(source_node) = self.source_node(source, self.texts.get(&text)) {
-                        result.insert_node(source_node);
-                    }
-                }
-                nodeset::Node::Comment(comment) => {
-                    if let Some(source_node) = self.source_node(source, self.comments.get(&comment))
-                    {
-                        result.insert_node(source_node);
-                    }
-                }
-                nodeset::Node::Namespace(namespace) => {
-                    if let Some(source_parent) =
-                        self.source_node(source, self.elements.get(&namespace.parent()))
-                    {
-                        result.insert_namespace_with_budget(
-                            source_parent,
-                            namespace.prefix(),
-                            namespace.uri(),
-                            materialization_budget,
-                        )?;
-                    }
-                }
-                nodeset::Node::ProcessingInstruction(pi) => {
-                    if let Some(source_node) =
-                        self.source_node(source, self.processing_instructions.get(&pi))
-                    {
-                        result.insert_node(source_node);
-                    }
+        source: &'a Document<'a, D>,
+        result: &mut Projection<'a, K, D>,
+        node: &nodeset::Node<'d>,
+        budget: &NodeSetMaterializationBudget,
+    ) -> Result<(), TransformError> {
+        match node {
+            nodeset::Node::Root(_) => result.insert_tree(source.root(), Some(budget))?,
+            nodeset::Node::Element(element) => {
+                if let Some(source_node) = self.lookup_node(
+                    source,
+                    &self.elements,
+                    element.identity_key(),
+                    result.execution(),
+                )? {
+                    result.insert_tree(source_node, Some(budget))?;
                 }
             }
+            node => self.project_leaf(source, result, node, budget)?,
         }
-        Ok(result)
+        Ok(())
     }
 
     fn project_expanded<'a>(
         &self,
-        source: &'a Document<'a>,
-        input: &NodeSet<'a>,
+        source: &'a Document<'a, D>,
+        input: &Projection<'a, K, D>,
         selected: nodeset::Nodeset<'d>,
         materialization_budget: &NodeSetMaterializationBudget,
-    ) -> Result<NodeSet<'a>, TransformError> {
-        let mut result = NodeSet::empty(input.document());
-        let mut selected_elements = HashSet::new();
+    ) -> Result<Projection<'a, K, D>, TransformError> {
+        let execution = input.execution();
+        let mut result = input.empty_like();
+        let mut selected_elements = input.empty_like();
         let mut root_selected = false;
 
         // Non-container XPath nodes have no descendants and are projected
         // exactly. Element/root selections are expanded together below.
-        for node in selected.document_order() {
+        // Projection is set union by original identity, not an ordered XPath
+        // sequence. Borrow the entries; document-order keys and namespace
+        // copies cannot affect the resulting membership.
+        use sxd_xpath_no_unsafe::runtime::Runtime as _;
+        let scratch = K::scratch(execution);
+        let failure = Cell::new(None);
+        let runtime = scratch.runtime(&failure);
+        let entries = runtime
+            .nodes(&selected)
+            .map_err(|error| match failure.get() {
+                Some(cause) => TransformError::from(cause),
+                None => scratch.diagnostic(format_args!("{error}")),
+            })?;
+        for node in entries {
             match node {
                 nodeset::Node::Root(_) => root_selected = true,
                 nodeset::Node::Element(element) => {
-                    if let Some(source_node) = self.source_node(source, self.elements.get(&element))
-                    {
-                        selected_elements.insert(source_node.id());
-                    }
-                }
-                nodeset::Node::Attribute(attribute) => {
-                    let Some(parent) = attribute.parent() else {
-                        continue;
-                    };
-                    let Some(source_parent) = self.source_node(source, self.elements.get(&parent))
-                    else {
-                        continue;
-                    };
-                    let stored_name = attribute.name();
-                    let name = sxd_document_no_unsafe::as_qname!(stored_name);
-                    result.insert_attribute_with_budget(
-                        source_parent,
-                        name.namespace_uri(),
-                        name.local_part(),
-                        materialization_budget,
-                    )?;
-                }
-                nodeset::Node::Text(text) => {
-                    if let Some(source_node) = self.source_node(source, self.texts.get(&text)) {
-                        result.insert_node(source_node);
-                    }
-                }
-                nodeset::Node::Comment(comment) => {
-                    if let Some(source_node) = self.source_node(source, self.comments.get(&comment))
-                    {
-                        result.insert_node(source_node);
-                    }
-                }
-                nodeset::Node::Namespace(namespace) => {
-                    if let Some(source_parent) =
-                        self.source_node(source, self.elements.get(&namespace.parent()))
-                    {
-                        result.insert_namespace_with_budget(
-                            source_parent,
-                            namespace.prefix(),
-                            namespace.uri(),
-                            materialization_budget,
-                        )?;
-                    }
-                }
-                nodeset::Node::ProcessingInstruction(pi) => {
                     if let Some(source_node) =
-                        self.source_node(source, self.processing_instructions.get(&pi))
+                        self.lookup_node(source, &self.elements, element.identity_key(), execution)?
                     {
-                        result.insert_node(source_node);
+                        selected_elements.insert_tree(source_node, Some(materialization_budget))?;
                     }
                 }
+                node => self.project_leaf(source, &mut result, node, materialization_budget)?,
             }
         }
 
-        // Carry one inherited-selection bit through a single source DFS. Nested
-        // selected roots therefore never cause repeated descendant insertion.
-        if !root_selected && selected_elements.is_empty() {
+        // The semantic arena is contiguous preorder. An admitted subtree end
+        // replaces a DFS stack; nested selections never rewalk descendants or
+        // need a second native set of selected identities.
+        if !root_selected && selected_elements.len() == 0 {
             return Ok(result);
         }
-        let mut stack = vec![(source.root(), root_selected)];
-        while let Some((node, inherited_selection)) = stack.pop() {
+        input.admit_walk(source.descendants().len())?;
+        let mut selected_end = if root_selected {
+            source.descendants().len()
+        } else {
+            0
+        };
+        for node in source.descendants() {
             #[cfg(test)]
             FILTER2_PROJECTION_NODE_VISITS.with(|visits| visits.set(visits.get() + 1));
-            let selected = inherited_selection || selected_elements.contains(&node.id());
-            if selected {
-                result.insert_node(node);
+            let ordinal = node.id().get() as usize;
+            if ordinal >= selected_end && selected_elements.contains_tree(node)? {
+                // Node IDs and subtree lengths originate in the same bounded
+                // arena; the subtree end cannot exceed its total length.
+                selected_end = ordinal + node.descendants().len();
+                debug_assert!(selected_end <= source.descendants().len());
+            }
+            if ordinal < selected_end {
+                result.insert_tree(node, Some(materialization_budget))?;
                 if node.is_element() {
-                    for attribute in node.attributes() {
-                        result.insert_attribute_with_budget(
-                            node,
-                            attribute.namespace(),
-                            attribute.name(),
-                            materialization_budget,
-                        )?;
+                    for (ordinal, _) in node.attributes().enumerate() {
+                        result.insert_attribute_at(node, ordinal, materialization_budget)?;
                     }
-                    for namespace in node.namespaces() {
-                        result.insert_namespace_with_budget(
-                            node,
-                            namespace.name().unwrap_or(""),
-                            namespace.uri(),
-                            materialization_budget,
-                        )?;
+                    for (ordinal, _) in node.namespaces().enumerate() {
+                        result.insert_namespace_at(node, ordinal, materialization_budget)?;
                     }
                 }
             }
-            stack.extend(node.children().rev().map(|child| (child, selected)));
         }
 
         Ok(result)
     }
 
-    fn source_node<'a>(
+    fn owns_source(&self, source: &Document<'_, D>) -> bool {
+        std::ptr::eq(self.source, source)
+    }
+
+    fn lookup_node<'a>(
         &self,
-        source: &'a Document<'a>,
-        id: Option<&NodeId>,
-    ) -> Option<crate::xml::dom::Node<'a, 'a>> {
-        id.and_then(|id| source.get_node(*id))
+        source: &'a Document<'a, D>,
+        index: &K::Index<(usize, usize, usize), NodeId>,
+        key: (usize, usize, usize),
+        execution: K::Execution,
+    ) -> Result<Option<crate::xml::dom::Node<'a, 'a, D>>, structured_asn1::memory::MemoryError>
+    {
+        if !self.owns_source(source) {
+            return Ok(None);
+        }
+        Ok(index
+            .lookup(&key, execution)?
+            .and_then(|id| source.get_node(*id)))
+    }
+
+    fn attribute_source<'a>(
+        &self,
+        source: &'a Document<'a, D>,
+        attribute: dom::Attribute<'d>,
+        execution: K::Execution,
+    ) -> Result<
+        Option<(crate::xml::dom::Node<'a, 'a, D>, usize)>,
+        structured_asn1::memory::MemoryError,
+    > {
+        if !self.owns_source(source) {
+            return Ok(None);
+        }
+        let Some((owner, ordinal)) = self
+            .attributes
+            .lookup(&attribute.identity_key(), execution)?
+        else {
+            return Ok(None);
+        };
+        Ok(source.get_node(*owner).map(|owner| (owner, *ordinal)))
+    }
+    fn namespace_source<'a>(
+        &self,
+        source: &'a Document<'a, D>,
+        namespace: &nodeset::Namespace<'d>,
+        execution: K::Execution,
+    ) -> Result<
+        Option<(crate::xml::dom::Node<'a, 'a, D>, usize)>,
+        structured_asn1::memory::MemoryError,
+    > {
+        let Some(owner) = self.lookup_node(
+            source,
+            &self.elements,
+            namespace.parent().identity_key(),
+            execution,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(ordinal) = self.namespaces.lookup_namespace(
+            &NamespaceKey {
+                owner: namespace.parent().identity_key(),
+                prefix: namespace.prefix(),
+                uri: namespace.uri(),
+            },
+            execution,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((owner, ordinal)))
+    }
+
+    fn project_leaf<'a>(
+        &self,
+        source: &'a Document<'a, D>,
+        result: &mut Projection<'a, K, D>,
+        node: &nodeset::Node<'d>,
+        budget: &NodeSetMaterializationBudget,
+    ) -> Result<(), TransformError> {
+        let execution = result.execution();
+        match node {
+            nodeset::Node::Attribute(attribute) => {
+                if let Some((owner, ordinal)) =
+                    self.attribute_source(source, *attribute, execution)?
+                {
+                    result.insert_attribute_at(owner, ordinal, budget)?;
+                }
+            }
+            nodeset::Node::Namespace(namespace) => {
+                if let Some((owner, ordinal)) =
+                    self.namespace_source(source, namespace, execution)?
+                {
+                    result.insert_namespace_at(owner, ordinal, budget)?;
+                }
+            }
+            nodeset::Node::Text(text) => {
+                if let Some(node) =
+                    self.lookup_node(source, &self.texts, text.identity_key(), execution)?
+                {
+                    result.insert_tree(node, Some(budget))?;
+                }
+            }
+            nodeset::Node::Comment(comment) => {
+                if let Some(node) =
+                    self.lookup_node(source, &self.comments, comment.identity_key(), execution)?
+                {
+                    result.insert_tree(node, Some(budget))?;
+                }
+            }
+            nodeset::Node::ProcessingInstruction(pi) => {
+                if let Some(node) = self.lookup_node(
+                    source,
+                    &self.processing_instructions,
+                    pi.identity_key(),
+                    execution,
+                )? {
+                    result.insert_tree(node, Some(budget))?;
+                }
+            }
+            nodeset::Node::Root(_) | nodeset::Node::Element(_) => {
+                unreachable!("container projection is selected by the caller")
+            }
+        }
+        Ok(())
     }
 
     fn input_contains<'a>(
         &self,
-        source: &'a Document<'a>,
-        input: &NodeSet<'a>,
+        source: &'a Document<'a, D>,
+        input: &Projection<'a, K, D>,
         node: &nodeset::Node<'d>,
-    ) -> bool {
+    ) -> Result<bool, crate::c14n::C14nError> {
+        let execution = input.execution();
         match node {
-            nodeset::Node::Root(_) => input.contains(source.root()),
-            nodeset::Node::Element(element) => self
-                .source_node(source, self.elements.get(element))
-                .is_some_and(|node| input.contains(node)),
-            nodeset::Node::Attribute(attribute) => {
-                let Some(parent) = attribute.parent() else {
-                    return false;
-                };
-                let Some(source_parent) = self.source_node(source, self.elements.get(&parent))
-                else {
-                    return false;
-                };
-                let stored_name = attribute.name();
-                let name = sxd_document_no_unsafe::as_qname!(stored_name);
-                input.contains_attribute(source_parent, name.namespace_uri(), name.local_part())
+            nodeset::Node::Root(_) => input.contains_tree(source.root()),
+            nodeset::Node::Element(element) => {
+                match self.lookup_node(source, &self.elements, element.identity_key(), execution)? {
+                    Some(node) => input.contains_tree(node),
+                    None => Ok(false),
+                }
             }
-            nodeset::Node::Text(text) => self
-                .source_node(source, self.texts.get(text))
-                .is_some_and(|node| input.contains(node)),
-            nodeset::Node::Comment(comment) => self
-                .source_node(source, self.comments.get(comment))
-                .is_some_and(|node| input.contains(node)),
-            nodeset::Node::Namespace(namespace) => self
-                .source_node(source, self.elements.get(&namespace.parent()))
-                .is_some_and(|owner| {
-                    input.contains_namespace(owner, namespace.prefix(), namespace.uri())
-                }),
-            nodeset::Node::ProcessingInstruction(pi) => self
-                .source_node(source, self.processing_instructions.get(pi))
-                .is_some_and(|node| input.contains(node)),
+            nodeset::Node::Attribute(attribute) => {
+                match self.attribute_source(source, *attribute, execution)? {
+                    Some((owner, ordinal)) => input.contains_attribute_at(owner, ordinal),
+                    None => Ok(false),
+                }
+            }
+            nodeset::Node::Text(text) => {
+                match self.lookup_node(source, &self.texts, text.identity_key(), execution)? {
+                    Some(node) => input.contains_tree(node),
+                    None => Ok(false),
+                }
+            }
+            nodeset::Node::Comment(comment) => {
+                match self.lookup_node(source, &self.comments, comment.identity_key(), execution)? {
+                    Some(node) => input.contains_tree(node),
+                    None => Ok(false),
+                }
+            }
+            nodeset::Node::Namespace(namespace) => {
+                match self.namespace_source(source, namespace, execution)? {
+                    Some((owner, ordinal)) => input.contains_namespace_at(owner, ordinal),
+                    None => Ok(false),
+                }
+            }
+            nodeset::Node::ProcessingInstruction(pi) => {
+                match self.lookup_node(
+                    source,
+                    &self.processing_instructions,
+                    pi.identity_key(),
+                    execution,
+                )? {
+                    Some(node) => input.contains_tree(node),
+                    None => Ok(false),
+                }
+            }
         }
     }
 }
@@ -1276,112 +1576,282 @@ fn charge_xpath_mirror_bytes(current: usize, additional: usize) -> Result<usize,
 }
 
 /// Resolves XML Signature's `here()` function to the node selected by the
-/// caller's standards/compatibility policy. A child-index path is owned by the
-/// function because SXD requires registered functions to be `'static`.
-struct HereFunction {
-    context: HereContext,
+/// caller's standards/compatibility policy. The current query owns the path;
+/// the evaluator borrows this extension rather than boxing it as a static one.
+struct HereFunction<'s, L, K: Keys> {
+    context: HereContext<L>,
+    execution: K::Execution,
+    failure: &'s Cell<Option<structured_asn1::memory::MemoryError>>,
 }
 
-enum HereContext {
-    Path(Vec<usize>),
+enum HereContext<L> {
+    Path(L),
     CrossDocument,
     MissingParameterNode,
 }
 
-impl function::Function for HereFunction {
-    fn evaluate<'c, 'd>(
+impl<L: std::ops::Deref<Target = [usize]>, K: Keys> function::Function for HereFunction<'_, L, K> {
+    fn evaluate_borrowed<'c, 'd>(
         &self,
         context: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
-        args: Vec<Value<'d>>,
+        args: &mut [Value<'d>],
     ) -> Result<Value<'d>, function::Error> {
-        function::Args(args).exactly(0)?;
+        function::Args::new(args).exactly(0)?;
         let path = match &self.context {
             HereContext::Path(path) => path,
             // XMLDSig XPath and Filter 2.0 require an error when the parameter
             // carrying the expression belongs to another XML document.
             HereContext::CrossDocument => {
-                return Err(function::Error::Other {
-                    what: "here() parameter and evaluation context must appear in the same XML document"
-                        .into(),
+                return Err(function::Error::Static {
+                    what: "here() parameter and evaluation context must appear in the same XML document",
                 });
             }
             HereContext::MissingParameterNode => {
-                return Err(function::Error::Other {
-                    what: "here() requires an XPath expression parsed from an XML parameter".into(),
+                return Err(function::Error::Static {
+                    what: "here() requires an XPath expression parsed from an XML parameter",
                 });
             }
         };
         let mut node = nodeset::Node::Root(context.node.document().root());
-        for &index in path {
-            node =
-                node.children()
-                    .into_iter()
-                    .nth(index)
-                    .ok_or_else(|| function::Error::Other {
-                        what: "here() context node no longer exists".into(),
-                    })?;
+        for &index in &**path {
+            context.charge_work(1)?;
+            node = node.child_at(index).ok_or(function::Error::Static {
+                what: "here() context node no longer exists",
+            })?;
         }
-        let mut result = nodeset::Nodeset::new();
-        result.add(node);
-        Ok(Value::Nodeset(result))
+        use sxd_xpath_no_unsafe::runtime::{Runtime as _, Set as _};
+        let scratch = K::scratch(self.execution);
+        let runtime = scratch.runtime(self.failure);
+        let mut result = runtime.set();
+        result.insert(context, node)?;
+        Ok(Value::Nodeset(result.finish()))
     }
 }
 
 /// SXD omits XPath's DTD-aware `id()` function. XMLDSig commonly identifies
 /// elements through `Id`, `ID`, `id`, xml:id, or retained DTD ID type,
 /// matching this crate's semantic DOM without requiring a validating parser.
-struct IdFunction<'s, 'i, 'm, 'r> {
-    work_budget: XPathWorkBudget,
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Identifier<'a>(&'a str);
+
+struct NumberLexical(f64);
+
+impl std::fmt::Display for NumberLexical {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        sxd_xpath_no_unsafe::write_xpath_number(output, self.0)
+    }
+}
+
+impl structured_asn1::memory::HashWork for Identifier<'_> {
+    fn hash_work(&self) -> Result<u64, structured_asn1::memory::MemoryError> {
+        structured_asn1::memory::HashWork::hash_work(self.0)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum IdMatch {
+    Absent,
+    First,
+    Repeated,
+    Ambiguous,
+}
+
+struct IdRequests<'a, K: Keys> {
+    identifiers: K::Index<Identifier<'a>, Option<(usize, usize, usize)>>,
+}
+
+struct IdTextStack<'q, L> {
+    frames: L,
+    failure: &'q Cell<Option<structured_asn1::memory::MemoryError>>,
+}
+
+impl<'d, L: crate::c14n::scratch::List<(nodeset::Node<'d>, usize)>> nodeset::TextStack<'d>
+    for IdTextStack<'_, L>
+{
+    fn push(
+        &mut self,
+        frame: (nodeset::Node<'d>, usize),
+        _context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
+    ) -> Result<(), function::Error> {
+        self.frames.push(frame).map_err(|error| match error {
+            crate::c14n::C14nError::SharedExecution(cause) => {
+                if self.failure.get().is_none() {
+                    self.failure.set(Some(cause));
+                }
+                function::Error::ProcessingStopped
+            }
+            error => function::Error::Other {
+                what: error.to_string(),
+            },
+        })
+    }
+
+    fn pop(&mut self) -> Option<(nodeset::Node<'d>, usize)> {
+        self.frames.pop()
+    }
+}
+
+impl<'a, K: Keys> IdRequests<'a, K> {
+    fn new(
+        values: impl IntoIterator<Item = &'a str>,
+        execution: K::Execution,
+    ) -> Result<Self, structured_asn1::memory::MemoryError> {
+        let mut identifiers = K::index(execution);
+        for value in values {
+            K::admit(execution, value.len())?;
+            for word in value.split(is_xpath_whitespace) {
+                if !word.is_empty() {
+                    identifiers.insert(Identifier(word), None)?;
+                }
+            }
+        }
+        Ok(Self { identifiers })
+    }
+
+    fn select(
+        &mut self,
+        value: &'a str,
+        identity: (usize, usize, usize),
+        execution: K::Execution,
+    ) -> Result<IdMatch, structured_asn1::memory::MemoryError> {
+        match self.identifiers.lookup(&Identifier(value), execution)? {
+            None => Ok(IdMatch::Absent),
+            Some(Some(previous)) if *previous == identity => Ok(IdMatch::Repeated),
+            Some(Some(_)) => Ok(IdMatch::Ambiguous),
+            Some(None) => {
+                self.identifiers.insert(Identifier(value), Some(identity))?;
+                Ok(IdMatch::First)
+            }
+        }
+    }
+}
+
+struct IdFunction<'s, 'i, 'r, K: Keys, D: crate::xml::dom::storage::Storage> {
+    work_budget: &'s XPathWorkBudget,
     document_scan_cost: usize,
-    source: &'s Document<'i>,
-    elements: &'s HashMap<dom::Element<'m>, NodeId>,
+    source: &'s Document<'i, D>,
+    elements: &'s K::Index<(usize, usize, usize), NodeId>,
+    execution: K::Execution,
+    failure: &'s Cell<Option<structured_asn1::memory::MemoryError>>,
     registrations: &'r [crate::xml::IdAttributeRegistration],
 }
 
-impl function::Function for IdFunction<'_, '_, '_, '_> {
-    fn evaluate<'c, 'd>(
+impl<K: Keys, D: crate::xml::dom::storage::Storage> function::Function
+    for IdFunction<'_, '_, '_, K, D>
+{
+    fn evaluate_borrowed<'c, 'd>(
         &self,
         context: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
-        args: Vec<Value<'d>>,
+        args: &mut [Value<'d>],
     ) -> Result<Value<'d>, function::Error> {
-        let mut args = function::Args(args);
+        let mut args = function::Args::new(args);
         args.exactly(1)?;
-        let argument = args.0.pop().ok_or(function::Error::ArgumentMissing)?;
-        let values = match argument {
-            Value::Nodeset(nodes) => nodes
-                .document_order()
-                .into_iter()
-                .map(|node| node.string_value())
-                .collect::<Vec<_>>(),
-            value => vec![value.into_string()],
+        let argument = args.pop_value()?;
+        use crate::c14n::scratch::{List as _, Scratch as _, TextBuilder as _};
+        let scratch = K::scratch(self.execution);
+        use sxd_xpath_no_unsafe::runtime::{Runtime as _, Set as _};
+        let runtime = scratch.runtime(self.failure);
+        let stop = |cause: structured_asn1::memory::MemoryError| {
+            if self.failure.get().is_none() {
+                self.failure.set(Some(cause));
+            }
+            function::Error::ProcessingStopped
         };
-        let identifiers = values
-            .iter()
-            .flat_map(|value| value.split(is_xpath_whitespace).filter(|id| !id.is_empty()))
-            .collect::<HashSet<_>>();
-        let mut matched = HashMap::new();
-        let mut ambiguous = HashSet::new();
+        let stop_storage = |error: crate::c14n::C14nError| {
+            if let crate::c14n::C14nError::SharedExecution(cause) = error {
+                stop(cause)
+            } else {
+                function::Error::Other {
+                    what: error.to_string(),
+                }
+            }
+        };
+        let mut values = scratch.values();
+        let scalar = match &argument {
+            Value::Nodeset(nodes) => {
+                // XPath 1.0 section 4.1 takes the union of the IDs in each
+                // string-value: argument document order cannot change it.
+                // https://www.w3.org/TR/1999/REC-xpath-19991116/#function-id
+                let mut stack = IdTextStack {
+                    frames: scratch.values(),
+                    failure: self.failure,
+                };
+                for node in runtime.nodes(nodes)? {
+                    let mut text = scratch.builder();
+                    node.visit_string_value_with_stack(context, &mut stack, |chunk| {
+                        text.append(chunk).map_err(stop_storage)?;
+                        Ok(true)
+                    })?;
+                    values
+                        .push(text.finish().map_err(stop_storage)?)
+                        .map_err(stop_storage)?;
+                }
+                None
+            }
+            Value::Number(number) => {
+                values
+                    .push(
+                        scratch
+                            .formatted(format_args!("{}", NumberLexical(*number)))
+                            .map_err(|error| match error {
+                                TransformError::C14n(crate::c14n::C14nError::SharedExecution(
+                                    cause,
+                                )) => stop(cause),
+                                error => function::Error::Other {
+                                    what: error.to_string(),
+                                },
+                            })?,
+                    )
+                    .map_err(stop_storage)?;
+                None
+            }
+            Value::String(text) => Some(text.as_str()),
+            Value::AccountedString(text) => Some(text.as_str()),
+            Value::ResultTreeFragment(_, text) => Some(text.as_str()),
+            Value::Boolean(value) => Some(if *value { "true" } else { "false" }),
+        };
+        let mut requests = match scalar {
+            Some(text) => IdRequests::<K>::new(std::iter::once(text), self.execution),
+            None => IdRequests::<K>::new(values.iter().map(|text| &**text), self.execution),
+        }
+        .map_err(stop)?;
 
         // The custom id() implementation performs its own full-document scan in
         // addition to the XPath engine's work, so it must consume the same meter.
         self.work_budget.charge_function(self.document_scan_cost)?;
 
-        let mut stack = vec![nodeset::Node::Root(context.node.document().root())];
+        let mut stack = scratch.values();
+        stack
+            .push(nodeset::Node::Root(context.node.document().root()))
+            .map_err(stop_storage)?;
+        let mut result = runtime.set();
         while let Some(node) = stack.pop() {
             // Indexed children borrow the evaluation document without creating
             // a fresh child vector for each element in the ID scan.
-            stack.extend((0..node.children_len()).filter_map(|index| node.child_at(index)));
+            for index in 0..node.children_len() {
+                K::admit(self.execution, 1).map_err(stop)?;
+                if let Some(child) = node.child_at(index) {
+                    stack.push(child).map_err(stop_storage)?;
+                }
+            }
             let Some(element) = node.element() else {
                 continue;
             };
-            let Some(source) = self
+            let source_id = self
                 .elements
-                .get(&element)
-                .and_then(|id| self.source.get_node(*id))
-            else {
+                .lookup(&element.identity_key(), self.execution)
+                .map_err(|error| {
+                    if self.failure.get().is_none() {
+                        self.failure.set(Some(error));
+                    }
+                    function::Error::ProcessingStopped
+                })?;
+            let Some(source) = source_id.and_then(|id| self.source.get_node(*id)) else {
                 continue;
             };
+            let mut selected = false;
             for attribute in source.attributes() {
+                K::admit(self.execution, 1).map_err(stop)?;
                 // Match the URI resolver's local-name policy: WS-Security's
                 // namespaced wsu:Id and XML's xml:id are ID attributes too.
                 // XPath 1.0 section 4.1: ID type comes from the source XML
@@ -1389,69 +1859,94 @@ impl function::Function for IdFunction<'_, '_, '_, '_> {
                 // https://www.w3.org/TR/1999/REC-xpath-19991116/#function-id
                 let recognized = crate::xml::is_id_attribute(source, attribute, self.registrations);
                 let value = attribute.value();
-                if !recognized || !identifiers.contains(&value) || ambiguous.contains(value) {
+                if !recognized {
                     continue;
                 }
-                match matched.entry(value) {
-                    Entry::Vacant(entry) => {
-                        entry.insert(element);
-                    }
-                    Entry::Occupied(entry) if *entry.get() == element => {}
-                    Entry::Occupied(entry) => {
-                        entry.remove();
-                        ambiguous.insert(value);
+                match requests
+                    .select(value, element.identity_key(), self.execution)
+                    .map_err(stop)?
+                {
+                    IdMatch::Absent | IdMatch::Repeated => {}
+                    IdMatch::First => selected = true,
+                    IdMatch::Ambiguous => {
+                        return Err(function::Error::Static {
+                            what: "id() matched a duplicate identifier",
+                        });
                     }
                 }
             }
+            if selected {
+                result.insert(context, element.into())?;
+            }
         }
-
-        if !ambiguous.is_empty() {
-            return Err(function::Error::Other {
-                what: "id() matched a duplicate identifier".into(),
-            });
-        }
-        let mut result = nodeset::Nodeset::new();
-        for element in matched.into_values() {
-            result.add(element);
-        }
-        Ok(Value::Nodeset(result))
+        Ok(Value::Nodeset(result.finish()))
     }
 }
 
-struct LangFunction {
-    work_budget: XPathWorkBudget,
+struct LangFunction<'s, K: Keys> {
+    work_budget: &'s XPathWorkBudget,
+    execution: K::Execution,
+    failure: &'s Cell<Option<structured_asn1::memory::MemoryError>>,
 }
 
-impl function::Function for LangFunction {
-    fn evaluate<'c, 'd>(
+impl<K: Keys> function::Function for LangFunction<'_, K> {
+    fn evaluate_borrowed<'c, 'd>(
         &self,
         context: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
-        args: Vec<Value<'d>>,
+        args: &mut [Value<'d>],
     ) -> Result<Value<'d>, function::Error> {
-        let mut args = function::Args(args);
+        let mut args = function::Args::new(args);
         args.exactly(1)?;
-        let requested = args.pop_string(context)?;
-        let mut node = Some(context.node.clone());
+        let argument = args.pop_value()?;
+        use sxd_xpath_no_unsafe::runtime::Runtime as _;
+        let scratch = K::scratch(self.execution);
+        let runtime = scratch.runtime(self.failure);
+        let requested = runtime.value_text(context, &argument)?;
+        let admit = |units| {
+            K::admit(self.execution, units).map_err(|cause| {
+                if self.failure.get().is_none() {
+                    self.failure.set(Some(cause));
+                }
+                function::Error::ProcessingStopped
+            })
+        };
+        let mut node = Some(runtime.clone_node(context, &context.node)?);
         while let Some(current) = node {
+            admit(1)?;
             self.work_budget.charge_function(1)?;
-            if let Some(element) = current.element()
-                && let Some(matches) = element.attributes().into_iter().find_map(|attribute| {
+            if let Some(element) = current.element() {
+                for index in 0..element.attributes_len() {
+                    admit(1)?;
+                    let attribute = element
+                        .attribute_at(index)
+                        .expect("retained attribute slot");
                     let stored_name = attribute.name();
                     let name = sxd_document_no_unsafe::as_qname!(stored_name);
-                    (name.local_part() == "lang"
-                        && name.namespace_uri() == Some("http://www.w3.org/XML/1998/namespace"))
-                    .then(|| {
+                    admit(
+                        name.local_part()
+                            .len()
+                            .saturating_add(name.namespace_uri().map_or(0, str::len)),
+                    )?;
+                    if name.local_part() == "lang" && name.namespace_uri() == Some(XML_NS) {
                         let stored_value = attribute.value();
                         let language = sxd_document_no_unsafe::as_str!(stored_value);
-                        language.eq_ignore_ascii_case(&requested)
+                        admit(
+                            language
+                                .len()
+                                .saturating_add(requested.len())
+                                .saturating_mul(2),
+                        )?;
+                        // XPath 1.0 §4.3: match xml:lang case-insensitively,
+                        // allowing a hyphen-delimited sublanguage suffix.
+                        // https://www.w3.org/TR/1999/REC-xpath-19991116/#function-lang
+                        let matches = language.eq_ignore_ascii_case(&requested)
                             || (language.as_bytes().get(requested.len()) == Some(&b'-')
                                 && language
                                     .get(..requested.len())
-                                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&requested)))
-                    })
-                })
-            {
-                return Ok(Value::Boolean(matches));
+                                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&requested)));
+                        return Ok(Value::Boolean(matches));
+                    }
+                }
             }
             node = current.parent();
         }
@@ -1459,19 +1954,27 @@ impl function::Function for LangFunction {
     }
 }
 
-fn here_path(document: &Document<'_>, here_node: Option<NodeId>) -> Option<Vec<usize>> {
-    let mut node = here_node.and_then(|id| document.get_node(id))?;
-    let mut path = Vec::new();
+fn here_path<D: crate::xml::dom::storage::Storage, S: crate::c14n::scratch::Scratch>(
+    document: &Document<'_, D>,
+    here_node: Option<NodeId>,
+    scratch: &S,
+) -> Result<Option<S::Values<usize>>, TransformError> {
+    let Some(mut node) = here_node.and_then(|id| document.get_node(id)) else {
+        return Ok(None);
+    };
+    let mut path = scratch.values();
     while let Some(parent) = node.parent() {
+        scratch.charge(parent.children().len())?;
         let index = parent
             .children()
             .position(|child| child == node)
-            .unwrap_or(0);
-        path.push(index);
+            .ok_or(TransformError::CrossDocumentNodeSetInput)?;
+        crate::c14n::scratch::List::push(&mut path, index)?;
         node = parent;
     }
+    scratch.charge(path.len())?;
     path.reverse();
-    Some(path)
+    Ok(Some(path))
 }
 
 #[derive(Clone, Copy)]
@@ -1481,8 +1984,17 @@ pub(super) enum XPathDocumentRelation {
 }
 
 impl XPathDocumentRelation {
-    pub(super) fn between(left: &Document<'_>, right: &Document<'_>) -> Self {
-        if std::ptr::eq(left, right) {
+    pub(super) fn between<
+        L: crate::xml::dom::storage::Storage,
+        R: crate::xml::dom::storage::Storage,
+    >(
+        left: &Document<'_, L>,
+        right: &Document<'_, R>,
+    ) -> Self {
+        if std::ptr::eq(
+            std::ptr::from_ref(left).cast::<()>(),
+            std::ptr::from_ref(right).cast::<()>(),
+        ) {
             Self::SameDocument
         } else {
             Self::CrossDocument
@@ -1520,15 +2032,16 @@ impl From<XPathHereSemantics> for XPathRequestContext<'_> {
     }
 }
 
-fn evaluate_expression<'a, 'r>(
-    input: &NodeSet<'a>,
-    expression: &XPathExpression,
+fn evaluate_expression<'a, 'r, K: Keys, D: crate::xml::dom::storage::Storage>(
+    input: &Projection<'a, K, D>,
+    expression: &impl super::transforms::ExpressionParameter,
     mode: XPathEvaluationMode,
     request: impl Into<XPathRequestContext<'r>>,
     document_relation: XPathDocumentRelation,
     work_budget: &XPathWorkBudget,
     materialization_budget: &NodeSetMaterializationBudget,
-) -> Result<NodeSet<'a>, TransformError> {
+) -> Result<Projection<'a, K, D>, TransformError> {
+    use crate::c14n::scratch::List as _;
     let request = request.into();
     let expression_bytes = expression.expression().len();
     if expression_bytes > work_budget.limits.expression_bytes {
@@ -1538,6 +2051,7 @@ fn evaluate_expression<'a, 'r>(
             expression_bytes,
         ));
     }
+    K::admit(input.execution(), expression_bytes).map_err(crate::c14n::C14nError::from)?;
     let expression_complexity = xpath_expression_complexity(expression.expression());
     if expression_complexity > work_budget.limits.expression_complexity {
         return Err(transform_resource_limit(
@@ -1546,65 +2060,84 @@ fn evaluate_expression<'a, 'r>(
             expression_complexity,
         ));
     }
-    let xpath = compile_xpath_with_policy_limits(
-        expression.expression(),
-        work_budget.limits.expression_bytes,
-        work_budget.limits.expression_complexity,
-    )
-    .map_err(TransformError::XPath)?;
+    let scratch = K::scratch(input.execution());
+    let normalized = source::normalize(expression.expression(), &scratch)?;
+    let xpath = scratch.compile(normalized.view()?)?;
 
     let document = input.document();
-    let document_size = NodeSet::ensure_subtree_materialization_fits_with_budget(
-        document.root(),
-        true,
-        materialization_budget,
-    )?;
+    let document_size = input.measure_document(materialization_budget)?;
     // The node-set preflight bounds map cardinality and inherited namespace
     // amplification. This separate preflight accounts for every string copied
     // by Mirror::build before allocating the secondary DOM.
-    let mirror_bytes = Mirror::projected_string_bytes(document)?;
+    let mirror_bytes = Mirror::<K, D>::projected_string_bytes(document)?;
     work_budget.charge_mirror_bytes(mirror_bytes)?;
     work_budget.charge(document_size)?;
-    let package = Package::new();
+    let package = scratch.package()?;
     let target = package.as_document();
-    let mirror = Mirror::build(document, target);
-    let mut context = Context::new();
+    let mirror = Mirror::<K, D>::build_in(document, target, input.execution())?;
+    let shared_failure = Cell::new(None);
+    let admit_work = |units| {
+        if shared_failure.get().is_some() {
+            return Err(function::Error::ProcessingStopped);
+        }
+        if let Err(cause) = K::admit(input.execution(), units) {
+            shared_failure.set(Some(cause));
+            return Err(function::Error::ProcessingStopped);
+        }
+        Ok(())
+    };
+    let mut bindings = K::bindings(input.execution());
     for (prefix, uri) in expression.namespaces() {
-        context.set_namespace(prefix, uri);
+        bindings.bind(prefix, uri)?;
     }
     // The XML namespace binding is implicit and roxmltree therefore does not
     // expose it through element namespace declarations. Enforce it at the
     // evaluation boundary for both parsed and programmatic expressions.
-    context.set_namespace("xml", XML_NS);
-    context.set_function(
-        "here",
-        HereFunction {
-            context: match document_relation {
-                XPathDocumentRelation::CrossDocument => HereContext::CrossDocument,
-                XPathDocumentRelation::SameDocument => here_path(
-                    document,
-                    expression.here_context_node(request.here_semantics),
-                )
-                .map_or(HereContext::MissingParameterNode, HereContext::Path),
-            },
+    bindings.bind("xml", XML_NS)?;
+    let resolve_namespace = NamespaceResolver::<K> {
+        bindings: &bindings,
+        execution: input.execution(),
+        failure: &shared_failure,
+        source: std::marker::PhantomData,
+    };
+    let here_function = HereFunction::<_, K> {
+        execution: input.execution(),
+        failure: &shared_failure,
+        context: match document_relation {
+            XPathDocumentRelation::CrossDocument => HereContext::CrossDocument,
+            XPathDocumentRelation::SameDocument => here_path(
+                document,
+                expression.here_context_node(request.here_semantics),
+                &scratch,
+            )?
+            .map_or(HereContext::MissingParameterNode, HereContext::Path),
         },
-    );
-    context.set_function(
-        "id",
-        IdFunction {
-            work_budget: work_budget.clone(),
-            document_scan_cost: document_size,
-            source: document,
-            elements: &mirror.elements,
-            registrations: request.registrations,
-        },
-    );
-    context.set_function(
-        "lang",
-        LangFunction {
-            work_budget: work_budget.clone(),
-        },
-    );
+    };
+    let id_function = IdFunction::<K, D> {
+        work_budget,
+        document_scan_cost: document_size,
+        source: document,
+        elements: &mirror.elements,
+        execution: input.execution(),
+        failure: &shared_failure,
+        registrations: request.registrations,
+    };
+    let lang_function = LangFunction::<K> {
+        work_budget,
+        execution: input.execution(),
+        failure: &shared_failure,
+    };
+    let functions: [(QName<'_>, &dyn function::Function); 3] = [
+        (QName::new("here"), &here_function),
+        (QName::new("id"), &id_function),
+        (QName::new("lang"), &lang_function),
+    ];
+    let mut context = sxd_xpath_no_unsafe::context::ScopedContext::new();
+    if <K::Scratch as crate::c14n::scratch::Scratch>::ACCOUNTED {
+        context.set_work_admission(&admit_work);
+    }
+    context.set_namespace_lookup(&resolve_namespace);
+    context.set_function_view(&functions);
 
     let evaluation_work = xpath_evaluation_work(expression.expression(), document_size, mode);
     let string_scans = xpath_string_scan_count(expression.expression()).max(1);
@@ -1614,66 +2147,67 @@ fn evaluate_expression<'a, 'r>(
         // node with position=1 and size=1. Do not evaluate these nodes as one
         // XPath sequence: position() and last() are normatively constant here.
         // https://www.w3.org/TR/xmldsig-core/#sec-XPath
-        let all_nodes_xpath = Factory::new()
-            .build(ALL_XPATH_NODES)
-            .map_err(|error| TransformError::XPath(error.to_string()))?;
+        let all_nodes_xpath = scratch.compile(ALL_XPATH_NODES)?;
         work_budget.charge(document_size)?;
         let all_nodes = all_nodes_xpath
-            .evaluate(&context, target.root())
-            .map_err(|error| work_budget.map_evaluation_error(error))?;
+            .evaluate(&context, target.root(), &shared_failure)
+            .map_err(|error| work_budget.map_evaluation_error(error, &shared_failure, &scratch))?;
         let Value::Nodeset(all_nodes) = all_nodes else {
             unreachable!("the fixed all-nodes XPath expression returns a node-set");
         };
-        let all_ordered_nodes = all_nodes.document_order();
-        let ordered_nodes = all_ordered_nodes
-            .into_iter()
-            .filter(|node| mirror.input_contains(document, input, node))
-            .collect::<Vec<_>>();
+        let ordering_context =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&context, target.root().into());
+        let mut ordered_nodes = scratch
+            .order_nodes(&all_nodes, &ordering_context, &shared_failure)
+            .map_err(|error| work_budget.map_evaluation_error(error, &shared_failure, &scratch))?;
+        let mut kept = 0;
+        for index in 0..ordered_nodes.len() {
+            let vacant = nodeset::Node::Root(ordered_nodes[index].document().root());
+            let node = std::mem::replace(&mut ordered_nodes[index], vacant);
+            if mirror.input_contains(document, input, &node)? {
+                ordered_nodes[kept] = node;
+                kept += 1;
+            }
+        }
+        while ordered_nodes.len() > kept {
+            ordered_nodes.pop();
+        }
         work_budget.validate_context_evaluations(ordered_nodes.len())?;
         // SXD has no interrupt hook and XPath coercions can materialize or scan
         // any mirrored string. Charge the complete source string volume for
         // every context before entering the evaluator; syntax-based discounts
         // would leave alternate coercion paths able to bypass this ceiling.
         work_budget.charge_string_work(mirror_bytes, ordered_nodes.len(), string_scans)?;
-        let mut selected = nodeset::Nodeset::new();
-        for node in ordered_nodes {
+        let mut selected = input.empty_like();
+        for node in &*ordered_nodes {
             // SXD exposes no interrupt hook. Charge nested predicate scans
             // before execution so they cannot hide cubic work inside one call.
             work_budget.charge(evaluation_work)?;
+            K::admit(input.execution(), 1)?;
             let include = xpath
-                .evaluate(&context, node.clone())
-                .map_err(|error| work_budget.map_evaluation_error(error))?
+                .evaluate(&context, node.clone(), &shared_failure)
+                .map_err(|error| {
+                    work_budget.map_evaluation_error(error, &shared_failure, &scratch)
+                })?
                 .into_boolean();
             if include {
-                selected.add(node);
+                mirror.project_exact_node(document, &mut selected, node, materialization_budget)?;
             }
         }
-        return mirror.project(
-            document,
-            input,
-            selected,
-            ProjectionMode::ExactNodes,
-            materialization_budget,
-        );
+        return Ok(selected);
     }
 
     work_budget.charge(evaluation_work)?;
     work_budget.charge_string_work(mirror_bytes, 1, string_scans)?;
     let value = xpath
-        .evaluate(&context, target.root())
-        .map_err(|error| work_budget.map_evaluation_error(error))?;
+        .evaluate(&context, target.root(), &shared_failure)
+        .map_err(|error| work_budget.map_evaluation_error(error, &shared_failure, &scratch))?;
     let Value::Nodeset(selected) = value else {
-        return Err(TransformError::XPath(
-            "XPath Filter 2.0 expression must return a node-set".into(),
-        ));
+        return Err(scratch.diagnostic(format_args!(
+            "XPath Filter 2.0 expression must return a node-set"
+        )));
     };
-    mirror.project(
-        document,
-        input,
-        selected,
-        ProjectionMode::ExpandToSubtrees,
-        materialization_budget,
-    )
+    mirror.project_expanded(document, input, selected, materialization_budget)
 }
 
 #[cfg(test)]
@@ -1709,8 +2243,9 @@ pub(super) fn apply_xpath_filter_with_semantics<'a>(
     )
 }
 
+#[cfg(test)]
 pub(super) fn apply_xpath_filter_with_semantics_and_budget<'a, 'r>(
-    mut input: NodeSet<'a>,
+    input: NodeSet<'a>,
     expression: &XPathExpression,
     request: impl Into<XPathRequestContext<'r>>,
     document_relation: XPathDocumentRelation,
@@ -1718,6 +2253,32 @@ pub(super) fn apply_xpath_filter_with_semantics_and_budget<'a, 'r>(
     node_filter_budget: &NodeFilterWorkBudget,
     materialization_budget: &NodeSetMaterializationBudget,
 ) -> Result<NodeSet<'a>, TransformError> {
+    apply_xpath_projection_with_budget(
+        input.projection,
+        expression,
+        request,
+        document_relation,
+        work_budget,
+        node_filter_budget,
+        materialization_budget,
+    )
+    .map(|projection| NodeSet { projection })
+}
+
+pub(super) fn apply_xpath_projection_with_budget<
+    'a,
+    'r,
+    K: RetainKeys,
+    D: crate::xml::dom::storage::Storage,
+>(
+    mut input: Projection<'a, K, D>,
+    expression: &impl super::transforms::ExpressionParameter,
+    request: impl Into<XPathRequestContext<'r>>,
+    document_relation: XPathDocumentRelation,
+    work_budget: &XPathWorkBudget,
+    node_filter_budget: &NodeFilterWorkBudget,
+    materialization_budget: &NodeSetMaterializationBudget,
+) -> Result<Projection<'a, K, D>, TransformError> {
     let selected = evaluate_expression(
         &input,
         expression,
@@ -1728,7 +2289,7 @@ pub(super) fn apply_xpath_filter_with_semantics_and_budget<'a, 'r>(
         materialization_budget,
     )?;
     node_filter_budget.charge(input.len())?;
-    input.intersect_with(&selected);
+    input.intersect(&selected)?;
     Ok(input)
 }
 
@@ -1765,6 +2326,7 @@ pub(super) fn apply_xpath_filter2_with_semantics<'a>(
     )
 }
 
+#[cfg(test)]
 pub(super) fn apply_xpath_filter2_with_semantics_and_budget<'a, 'r>(
     input: NodeSet<'a>,
     filters: &[XPathFilter],
@@ -1774,6 +2336,32 @@ pub(super) fn apply_xpath_filter2_with_semantics_and_budget<'a, 'r>(
     node_filter_budget: &NodeFilterWorkBudget,
     materialization_budget: &NodeSetMaterializationBudget,
 ) -> Result<NodeSet<'a>, TransformError> {
+    apply_xpath_projection2_with_budget(
+        input.projection,
+        filters,
+        request,
+        document_relation,
+        work_budget,
+        node_filter_budget,
+        materialization_budget,
+    )
+    .map(|projection| NodeSet { projection })
+}
+
+pub(super) fn apply_xpath_projection2_with_budget<
+    'a,
+    'r,
+    K: RetainKeys,
+    D: crate::xml::dom::storage::Storage,
+>(
+    input: Projection<'a, K, D>,
+    filters: &[impl super::transforms::FilterParameter],
+    request: impl Into<XPathRequestContext<'r>>,
+    document_relation: XPathDocumentRelation,
+    work_budget: &XPathWorkBudget,
+    node_filter_budget: &NodeFilterWorkBudget,
+    materialization_budget: &NodeSetMaterializationBudget,
+) -> Result<Projection<'a, K, D>, TransformError> {
     let request = request.into();
     if filters.is_empty() || filters.len() > work_budget.limits.filters {
         if filters.is_empty() {
@@ -1787,8 +2375,7 @@ pub(super) fn apply_xpath_filter2_with_semantics_and_budget<'a, 'r>(
             filters.len(),
         ));
     }
-    let mut result =
-        NodeSet::try_entire_document_with_budget(input.document(), materialization_budget)?;
+    let mut result = input.entire_document_like(materialization_budget)?;
     for filter in filters {
         let selected = evaluate_expression(
             &input,
@@ -1802,20 +2389,20 @@ pub(super) fn apply_xpath_filter2_with_semantics_and_budget<'a, 'r>(
         match filter.operation() {
             XPathFilterOperation::Intersect => {
                 node_filter_budget.charge(result.len())?;
-                result.intersect_with(&selected);
+                result.intersect(&selected)?;
             }
             XPathFilterOperation::Subtract => {
                 node_filter_budget.charge(result.len())?;
-                result.subtract(&selected);
+                result.subtract(&selected)?;
             }
             XPathFilterOperation::Union => {
                 node_filter_budget.charge(selected.len())?;
-                result.union_with_budget(&selected, materialization_budget)?;
+                result.union(&selected, materialization_budget)?;
             }
         }
     }
     node_filter_budget.charge(result.len())?;
-    result.intersect_with(&input);
+    result.intersect(&input)?;
     Ok(result)
 }
 
@@ -1826,6 +2413,321 @@ mod tests {
     use crate::c14n::{C14nAlgorithm, C14nMode, canonicalize_with_visibility};
     use crate::xml::dom::Document;
     use crate::xmldsig::TransformData;
+
+    #[test]
+    fn mirror_default_namespace_undeclaration_shadows_ancestors() {
+        // XPath 1.0 §5.4: xmlns="" hides the inherited default binding;
+        // it does not expose an empty namespace node or resurrect the parent.
+        let source = Document::parse("<root xmlns='urn:parent'><child xmlns=''/></root>").unwrap();
+        let package = Package::new();
+        let target = package.as_document();
+        let _mirror = Mirror::build(&source, target);
+        let root = target.root().child_at(0).unwrap().element().unwrap();
+        let child = root.child_at(0).unwrap().element().unwrap();
+        let context = sxd_xpath_no_unsafe::Context::new();
+        let count = Factory::new().build("count(namespace::*)").unwrap();
+        assert_eq!(count.evaluate(&context, root).unwrap(), Value::Number(2.0));
+        assert_eq!(count.evaluate(&context, child).unwrap(), Value::Number(1.0));
+    }
+
+    #[test]
+    fn current_mirror_and_evaluator_match_native_namespace_and_text_semantics() {
+        // One mirror walk and one evaluator kernel must preserve identities,
+        // names, default undeclarations, shadowing, attributes and mixed text.
+        use super::super::types::projection::PaidKeys;
+        use std::sync::Arc;
+        use structured_asn1::memory::{Memory, MemoryAccount};
+        for xml in [
+            "<root xmlns='urn:parent'><child xmlns=''>a<b/>b</child></root>",
+            "<?p v?><root xmlns:p='urn:one' p:a='v'><p:child xmlns:p='urn:two'>x<!--c-->y</p:child></root>",
+        ] {
+            let source = Document::parse(xml).unwrap();
+            let native_package = Package::new();
+            let native_target = native_package.as_document();
+            let _native_mirror = Mirror::build(&source, native_target);
+            let memory = Memory::new(Arc::new(MemoryAccount::new(1 << 22, 1 << 24)));
+            let current_package = Package::try_current(&memory).unwrap();
+            let current_target = current_package.as_document();
+            let current_mirror =
+                Mirror::<PaidKeys<'_, Memory>>::build_in(&source, current_target, &memory).unwrap();
+            let failure = Cell::new(None);
+            let admit = |units| {
+                memory.charge_work(units as u64).map_err(|cause| {
+                    failure.set(Some(cause));
+                    function::Error::ProcessingStopped
+                })
+            };
+            let native_context = sxd_xpath_no_unsafe::Context::new();
+            let mut current_context = sxd_xpath_no_unsafe::Context::new();
+            current_context.set_work_admission(&admit);
+            for query in [
+                "count(//node())",
+                "count(//@*)",
+                "count(//namespace::*)",
+                "count(/*/*/namespace::*)",
+                "string(/*/*)",
+                "name(/*/*)",
+                "namespace-uri(/*/*)",
+                "normalize-space(string(/*))",
+                "count((//* | //@* | //namespace::*)[position() > 1])",
+            ] {
+                let native = Factory::new()
+                    .build(query)
+                    .unwrap()
+                    .evaluate(&native_context, native_target.root())
+                    .unwrap();
+                let program = sxd_xpath_no_unsafe::arena::Program::parse(query, &memory).unwrap();
+                let current = program
+                    .evaluate_in(
+                        &current_context,
+                        current_target.root(),
+                        sxd_xpath_no_unsafe::runtime::Accounted {
+                            work: &memory,
+                            failure: &failure,
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(current, native, "{query} on {xml}");
+                assert_eq!(failure.get(), None);
+            }
+            drop(current_mirror);
+            assert!(memory.used() > 0, "actual arena storage remains retained");
+            drop(current_package);
+            assert_eq!(memory.used(), 0);
+        }
+    }
+
+    #[test]
+    fn lang_reads_current_arena_without_an_attribute_snapshot() {
+        // The extension must use borrowed/indexed attributes just like axes:
+        // current arenas deliberately have no native snapshot allocation path.
+        use function::Function as _;
+        use std::sync::Arc;
+        use structured_asn1::memory::{Memory, MemoryAccount};
+        let memory = Memory::new(Arc::new(MemoryAccount::new(65536, 65536)));
+        let package = Package::try_current(&memory).unwrap();
+        let document = package.as_document();
+        let builder = dom::current::Builder::new(document, &memory);
+        let root = builder.element(QName::new("root")).unwrap();
+        builder.append_root(root.into()).unwrap();
+        builder
+            .attribute(
+                root,
+                QName::with_namespace_uri(Some(XML_NS), "lang"),
+                "en-GB",
+            )
+            .unwrap();
+        let context = sxd_xpath_no_unsafe::Context::new();
+        let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&context, root.into());
+        let budget = XPathWorkBudget::default();
+        let failure = Cell::new(None);
+        let function = LangFunction::<super::super::types::projection::PaidKeys<'_, Memory>> {
+            work_budget: &budget,
+            execution: &memory,
+            failure: &failure,
+        };
+        assert_eq!(
+            function.evaluate_borrowed(&evaluation, &mut [Value::from("en")]),
+            Ok(Value::Boolean(true))
+        );
+        assert_eq!(
+            function.evaluate_borrowed(&evaluation, &mut [Value::from("fr")]),
+            Ok(Value::Boolean(false))
+        );
+    }
+
+    #[test]
+    fn current_id_requests_refuse_unfunded_storage_and_preserve_duplicates() {
+        // Identifier state must own its actual current-query map. Repeated
+        // requested words and two ID attributes on one element are not an
+        // ambiguity, while the same ID on distinct elements is an error.
+        use super::super::types::projection::PaidKeys;
+        use std::sync::Arc;
+        use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
+        let denied = Memory::new(Arc::new(MemoryAccount::new(0, 4096)));
+        assert!(matches!(
+            IdRequests::<PaidKeys<'_, Memory>>::new(["a a b"], &denied),
+            Err(MemoryError::LimitExceeded)
+        ));
+        assert_eq!(denied.used(), 0);
+        let exhausted = Memory::new(Arc::new(MemoryAccount::new(4096, 0)));
+        assert!(matches!(
+            IdRequests::<PaidKeys<'_, Memory>>::new(["a"], &exhausted),
+            Err(MemoryError::WorkExceeded)
+        ));
+        let memory = Memory::new(Arc::new(MemoryAccount::new(4096, 4096)));
+        let mut requests = IdRequests::<PaidKeys<'_, Memory>>::new(["a a b"], &memory).unwrap();
+        assert!(memory.used() > 0);
+        assert_eq!(
+            requests.select("a", (1, 2, 3), &memory).unwrap(),
+            IdMatch::First
+        );
+        assert_eq!(
+            requests.select("a", (1, 2, 3), &memory).unwrap(),
+            IdMatch::Repeated
+        );
+        assert_eq!(
+            requests.select("a", (1, 2, 4), &memory).unwrap(),
+            IdMatch::Ambiguous
+        );
+        assert_eq!(
+            requests.select("missing", (1, 2, 4), &memory).unwrap(),
+            IdMatch::Absent
+        );
+        drop(requests);
+        assert_eq!(memory.used(), 0);
+    }
+
+    #[test]
+    fn current_id_text_walk_refuses_actual_stack_before_descendant_text() {
+        // Isolate the shared text-walk kernel from fixture creation and AST
+        // construction: even a retained DOM cannot lend its producer credit.
+        use crate::c14n::scratch::Scratch as _;
+        use std::sync::Arc;
+        use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
+        let package = Package::new();
+        let document = package.as_document();
+        let root = document.create_element("root");
+        let child = document.create_element("child");
+        root.append_child(child);
+        child.append_child(document.create_text("must not be copied"));
+        document.root().append_child(root);
+        let context = sxd_xpath_no_unsafe::Context::new();
+        let evaluation =
+            sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
+        for (bytes, units, expected) in [
+            (0, 4096, MemoryError::LimitExceeded),
+            (4096, 0, MemoryError::WorkExceeded),
+        ] {
+            let work = Memory::new(Arc::new(MemoryAccount::new(bytes, units)));
+            let failure = Cell::new(None);
+            let mut stack = IdTextStack {
+                frames: crate::c14n::scratch::Accounted(&work).values(),
+                failure: &failure,
+            };
+            let result = nodeset::Node::Root(document.root()).visit_string_value_with_stack(
+                &evaluation,
+                &mut stack,
+                |_| panic!("the stack must be funded before visiting text"),
+            );
+            assert!(matches!(result, Err(function::Error::ProcessingStopped)));
+            assert_eq!(failure.get(), Some(expected));
+            drop(stack);
+            assert_eq!(work.used(), 0);
+        }
+    }
+
+    #[test]
+    fn current_id_number_format_uses_shared_xpath_lexical_rules() {
+        // Scalar ID arguments must not allocate a native conversion buffer,
+        // nor use a different spelling for signed zero, NaN or infinity.
+        use std::sync::Arc;
+        use structured_asn1::memory::{Memory, MemoryAccount};
+        let memory = Memory::new(Arc::new(MemoryAccount::new(4096, 65536)));
+        for number in [
+            0.0,
+            -0.0,
+            1.5,
+            -42.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+            f64::from_bits(1),
+        ] {
+            let text = crate::c14n::scratch::Accounted(&memory)
+                .formatted(format_args!("{}", NumberLexical(number)))
+                .expect("funded number formatting");
+            assert_eq!(&*text, Value::Number(number).string());
+            assert!(memory.used() >= text.len());
+            drop(text);
+            assert_eq!(memory.used(), 0);
+        }
+    }
+
+    #[test]
+    fn here_path_owns_current_capacity_and_admits_source_scan() {
+        // The cached path is a real current-query vector. Neither zero memory
+        // nor exhausted current work may fall back to an ordinary Vec.
+        use std::sync::Arc;
+        use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
+        let document = Document::parse("<root><parent><here/></parent></root>").unwrap();
+        let here = document
+            .descendants()
+            .find(|node| node.tag_name().name() == "here")
+            .unwrap()
+            .id();
+        for (bytes, units, expected) in [
+            (0, 4096, MemoryError::LimitExceeded),
+            (4096, 0, MemoryError::WorkExceeded),
+        ] {
+            let memory = Memory::new(Arc::new(MemoryAccount::new(bytes, units)));
+            let result = here_path(
+                &document,
+                Some(here),
+                &crate::c14n::scratch::Accounted(&memory),
+            );
+            assert!(
+                matches!(result, Err(TransformError::C14n(crate::c14n::C14nError::SharedExecution(cause))) if cause == expected)
+            );
+            assert_eq!(memory.used(), 0);
+        }
+        let memory = Memory::new(Arc::new(MemoryAccount::new(4096, 4096)));
+        let path = here_path(
+            &document,
+            Some(here),
+            &crate::c14n::scratch::Accounted(&memory),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(&*path, &[0, 0, 0]);
+        assert_eq!(
+            memory.used(),
+            path.capacity() * std::mem::size_of::<usize>()
+        );
+        drop(path);
+        assert_eq!(memory.used(), 0);
+    }
+
+    #[test]
+    fn current_xpath_diagnostic_retains_its_actual_allocation() {
+        // A malformed expression releases its partial arena, then constructs
+        // its diagnostic under the same query. Keeping the error keeps only
+        // the admitted diagnostic capacity alive.
+        use std::sync::Arc;
+        use structured_asn1::memory::{Memory, MemoryAccount};
+        let memory = Memory::new(Arc::new(MemoryAccount::new(1 << 20, 1 << 20)));
+        let storage = crate::c14n::scratch::Accounted(&memory);
+        let error = storage.compile("f(1,)").err().unwrap();
+        let TransformError::AccountedXPath(message) = &error else {
+            panic!("{error}")
+        };
+        assert_eq!(message.as_str(), "function argument is missing");
+        assert_eq!(memory.used(), message.capacity());
+        drop(error);
+        assert_eq!(memory.used(), 0);
+    }
+
+    #[test]
+    fn current_xpath_refusal_does_not_allocate_a_diagnostic() {
+        // Resource refusal remains the original typed terminal cause, even
+        // when the malformed source would later require an error message.
+        use std::sync::Arc;
+        use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
+        let memory = Memory::new(Arc::new(MemoryAccount::new(0, 1 << 20)));
+        let error = crate::c14n::scratch::Accounted(&memory)
+            .compile("f(1,)")
+            .err()
+            .unwrap();
+        assert!(matches!(
+            error,
+            TransformError::C14n(crate::c14n::C14nError::SharedExecution(
+                MemoryError::LimitExceeded
+            ))
+        ));
+        assert_eq!(memory.used(), 0);
+    }
 
     fn canonicalize(nodes: &NodeSet<'_>) -> String {
         let mut output = Vec::new();
@@ -2066,7 +2968,7 @@ mod tests {
                 NodeSetMaterializationBudget::with_limits(max_entries, max_owned_bytes, usize::MAX);
 
             let error = match evaluate_expression(
-                &input,
+                &input.projection,
                 &XPathExpression::new("true()"),
                 XPathEvaluationMode::Filter2NodeSetSelection,
                 XPathHereSemantics::default(),
@@ -2088,9 +2990,27 @@ mod tests {
         }
     }
 
-    fn built_mirror_string_bytes(mirror: &Mirror<'_>) -> usize {
+    fn built_mirror_string_bytes(mirror: &Mirror<'_, '_>) -> usize {
         let mut bytes = 0_usize;
-        for element in mirror.elements.keys() {
+        let mut pending = vec![nodeset::Node::Root(mirror.target.root())];
+        while let Some(node) = pending.pop() {
+            pending.extend(node.children());
+            let element = match node {
+                nodeset::Node::Element(element) => element,
+                nodeset::Node::Text(text) => {
+                    bytes += text.text().len();
+                    continue;
+                }
+                nodeset::Node::Comment(comment) => {
+                    bytes += comment.text().len();
+                    continue;
+                }
+                nodeset::Node::ProcessingInstruction(pi) => {
+                    bytes += pi.target().len() + pi.value().map_or(0, |value| value.len());
+                    continue;
+                }
+                _ => continue,
+            };
             let stored_name = element.name();
             let name = stored_name.get();
             bytes += name.namespace_uri().map_or(0, str::len) + name.local_part().len();
@@ -2115,21 +3035,6 @@ mod tests {
                     .map_or(0, |prefix| prefix.len());
             }
         }
-        bytes += mirror
-            .texts
-            .keys()
-            .map(|text| text.text().len())
-            .sum::<usize>();
-        bytes += mirror
-            .comments
-            .keys()
-            .map(|comment| comment.text().len())
-            .sum::<usize>();
-        bytes += mirror
-            .processing_instructions
-            .keys()
-            .map(|pi| pi.target().len() + pi.value().map_or(0, |value| value.len()))
-            .sum::<usize>();
         bytes
     }
 
@@ -2144,7 +3049,7 @@ mod tests {
         )
         .expect("fixed mirror projection fixture must parse");
 
-        let projected_bytes = Mirror::projected_string_bytes(&document)
+        let projected_bytes = Mirror::<NativeKeys>::projected_string_bytes(&document)
             .expect("complete fixed fixture fits the mirror string budget");
         let package = Package::new();
         let mirror = Mirror::build(&document, package.as_document());
@@ -2208,10 +3113,10 @@ mod tests {
         let one_scan_work =
             initial_remaining - single_scan_budget.string_work_bytes_remaining.get();
         let repeated_scan_budget = XPathWorkBudget {
-            remaining: Rc::new(Cell::new(MAX_XPATH_CUMULATIVE_EVALUATION_WORK)),
-            evaluation_limit_exceeded: Rc::new(Cell::new(false)),
-            mirror_bytes_remaining: Rc::new(Cell::new(MAX_XPATH_MIRROR_STRING_BYTES)),
-            string_work_bytes_remaining: Rc::new(Cell::new(one_scan_work)),
+            remaining: Cell::new(MAX_XPATH_CUMULATIVE_EVALUATION_WORK),
+            evaluation_limit_exceeded: Cell::new(false),
+            mirror_bytes_remaining: Cell::new(MAX_XPATH_MIRROR_STRING_BYTES),
+            string_work_bytes_remaining: Cell::new(one_scan_work),
             limits: XPathWorkBudget::default().limits,
         };
 
@@ -2249,10 +3154,10 @@ mod tests {
         let one_scan_work =
             initial_remaining - single_scan_budget.string_work_bytes_remaining.get();
         let repeated_scan_budget = XPathWorkBudget {
-            remaining: Rc::new(Cell::new(MAX_XPATH_CUMULATIVE_EVALUATION_WORK)),
-            evaluation_limit_exceeded: Rc::new(Cell::new(false)),
-            mirror_bytes_remaining: Rc::new(Cell::new(MAX_XPATH_MIRROR_STRING_BYTES)),
-            string_work_bytes_remaining: Rc::new(Cell::new(one_scan_work)),
+            remaining: Cell::new(MAX_XPATH_CUMULATIVE_EVALUATION_WORK),
+            evaluation_limit_exceeded: Cell::new(false),
+            mirror_bytes_remaining: Cell::new(MAX_XPATH_MIRROR_STRING_BYTES),
+            string_work_bytes_remaining: Cell::new(one_scan_work),
             limits: XPathWorkBudget::default().limits,
         };
 
@@ -2290,10 +3195,10 @@ mod tests {
         let one_scan_work =
             initial_remaining - single_scan_budget.string_work_bytes_remaining.get();
         let repeated_scan_budget = XPathWorkBudget {
-            remaining: Rc::new(Cell::new(MAX_XPATH_CUMULATIVE_EVALUATION_WORK)),
-            evaluation_limit_exceeded: Rc::new(Cell::new(false)),
-            mirror_bytes_remaining: Rc::new(Cell::new(MAX_XPATH_MIRROR_STRING_BYTES)),
-            string_work_bytes_remaining: Rc::new(Cell::new(one_scan_work)),
+            remaining: Cell::new(MAX_XPATH_CUMULATIVE_EVALUATION_WORK),
+            evaluation_limit_exceeded: Cell::new(false),
+            mirror_bytes_remaining: Cell::new(MAX_XPATH_MIRROR_STRING_BYTES),
+            string_work_bytes_remaining: Cell::new(one_scan_work),
             limits: XPathWorkBudget::default().limits,
         };
 
@@ -2328,10 +3233,10 @@ mod tests {
         let one_scan_work =
             initial_remaining - single_scan_budget.string_work_bytes_remaining.get();
         let repeated_scan_budget = XPathWorkBudget {
-            remaining: Rc::new(Cell::new(MAX_XPATH_CUMULATIVE_EVALUATION_WORK)),
-            evaluation_limit_exceeded: Rc::new(Cell::new(false)),
-            mirror_bytes_remaining: Rc::new(Cell::new(MAX_XPATH_MIRROR_STRING_BYTES)),
-            string_work_bytes_remaining: Rc::new(Cell::new(one_scan_work)),
+            remaining: Cell::new(MAX_XPATH_CUMULATIVE_EVALUATION_WORK),
+            evaluation_limit_exceeded: Cell::new(false),
+            mirror_bytes_remaining: Cell::new(MAX_XPATH_MIRROR_STRING_BYTES),
+            string_work_bytes_remaining: Cell::new(one_scan_work),
             limits: XPathWorkBudget::default().limits,
         };
 
@@ -2668,6 +3573,217 @@ mod tests {
         assert_eq!(
             canonicalize(&result),
             r#"<keep a="1"><child>yes</child></keep>"#
+        );
+    }
+
+    #[test]
+    fn retained_mirror_index_reads_use_the_current_query_not_the_producer() {
+        // Retained identity maps keep their original capacity account. Reading
+        // them from a new query must not spend an exhausted producer's work.
+        use super::super::types::projection::PaidKeys;
+        use std::sync::Arc;
+        use structured_asn1::memory::{Memory, MemoryAccount};
+
+        let document = Document::parse("<root/>").expect("fixed mirror fixture");
+        let producer = Memory::new(Arc::new(MemoryAccount::new(1 << 20, 1 << 20)));
+        let package = Package::try_current(&producer).expect("funded mirror arena");
+        let target = package.as_document();
+        let mirror = Mirror::<PaidKeys<'_, Memory>>::build_in(&document, target, &producer)
+            .expect("producer indexes fit");
+        producer
+            .charge_work(producer.work_remaining() as u64)
+            .expect("exhaust producer");
+        let query = Memory::new(Arc::new(MemoryAccount::new(0, 1 << 20)));
+        let input = Projection::empty(&document, PaidKeys::new(&query));
+        let element = target
+            .root()
+            .child_at(0)
+            .expect("root slot")
+            .element()
+            .expect("mirrored root");
+        assert!(
+            !mirror
+                .input_contains(&document, &input, &nodeset::Node::Element(element))
+                .expect("current query reads retained index")
+        );
+        assert!(query.work_used() > 0);
+        assert_eq!(
+            query.used(),
+            0,
+            "read-only query allocates no index storage"
+        );
+        assert!(producer.charge_work(1).is_err());
+    }
+
+    #[test]
+    fn mirror_indexes_retain_actual_capacity_and_refuse_zero_capacity() {
+        // Both the identity indexes and the actual SXD allocation remain
+        // charged independently until their respective owners are destroyed.
+        use super::super::types::projection::PaidKeys;
+        use std::sync::Arc;
+        use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
+
+        let document = Document::parse("<root a='v'>text<!--c--><?pi v?></root>")
+            .expect("fixed mirror fixture");
+        let memory = Memory::new(Arc::new(MemoryAccount::new(1 << 20, 1 << 24)));
+        let package = Package::try_current(&memory).expect("funded mirror arena");
+        let mirror =
+            Mirror::<PaidKeys<'_, Memory>>::build_in(&document, package.as_document(), &memory)
+                .expect("indexes fit current capacity");
+        assert!(memory.used() > 0, "index allocations retain their charge");
+        let with_indexes = memory.used();
+        drop(mirror);
+        assert!(memory.used() > 0, "the arena still owns its actual storage");
+        assert!(
+            memory.used() < with_indexes,
+            "dropping indexes releases their storage"
+        );
+        drop(package);
+        assert_eq!(memory.used(), 0, "all actual owners have been destroyed");
+
+        let refused = Memory::new(Arc::new(MemoryAccount::new(0, 1 << 24)));
+        assert!(matches!(
+            Package::try_current(&refused),
+            Err(MemoryError::LimitExceeded)
+        ));
+        assert_eq!(refused.used(), 0);
+    }
+
+    #[test]
+    fn callback_resource_cause_does_not_format_an_evaluator_diagnostic() {
+        // Refusal must return the original typed cause without allocating a
+        // diagnostic when the embedding resource domain is already exhausted.
+        struct MustNotFormat;
+        impl std::fmt::Display for MustNotFormat {
+            fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                panic!("a retained resource cause must not format secondary errors")
+            }
+        }
+        let failure = Cell::new(Some(structured_asn1::memory::MemoryError::OutOfMemory));
+        let error = XPathWorkBudget::default().map_evaluation_error(
+            MustNotFormat,
+            &failure,
+            &crate::c14n::scratch::Native,
+        );
+        assert!(matches!(
+            error,
+            TransformError::C14n(crate::c14n::C14nError::SharedExecution(
+                structured_asn1::memory::MemoryError::OutOfMemory
+            ))
+        ));
+    }
+
+    #[test]
+    fn current_evaluator_diagnostic_owns_capacity_or_returns_original_refusal() {
+        // The final error is retained outside the evaluator. Its actual text
+        // capacity must remain charged, and a refusal must not retry natively.
+        use std::sync::Arc;
+        use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
+        let memory = Memory::new(Arc::new(MemoryAccount::new(4096, 4096)));
+        let budget = XPathWorkBudget::default();
+        let failure = Cell::new(None);
+        let error = budget.map_evaluation_error(
+            "unknown function",
+            &failure,
+            &crate::c14n::scratch::Accounted(&memory),
+        );
+        assert!(
+            matches!(&error, TransformError::AccountedXPath(text) if &**text == "unknown function")
+        );
+        assert!(memory.used() > 0);
+        drop(error);
+        assert_eq!(memory.used(), 0);
+
+        let refused = Memory::new(Arc::new(MemoryAccount::new(0, 4096)));
+        let error = budget.map_evaluation_error(
+            "unknown function",
+            &failure,
+            &crate::c14n::scratch::Accounted(&refused),
+        );
+        assert!(matches!(
+            error,
+            TransformError::C14n(crate::c14n::C14nError::SharedExecution(
+                MemoryError::LimitExceeded
+            ))
+        ));
+        assert_eq!(refused.used(), 0);
+        assert!(matches!(
+            XPathWorkBudget::with_limit(0).charge_function(1),
+            Err(function::Error::ProcessingStopped)
+        ));
+    }
+
+    #[test]
+    fn filter2_expansion_admits_source_walk_before_result_growth() {
+        // Selecting the root requires one complete source walk even for a
+        // sparse input projection. Refuse that walk with the current query
+        // before allocating or partially constructing the result.
+        use super::super::types::projection::PaidKeys;
+        use std::sync::Arc;
+        use structured_asn1::memory::{Memory, MemoryAccount};
+        use structured_asn1::{Encoding, Limits, Parser};
+
+        let document = Document::parse("<root><a/><b/><c/><d/><e/><f/></root>")
+            .expect("fixed expansion fixture");
+        let memory = Memory::new(Arc::new(MemoryAccount::new(1 << 20, 1 << 20)));
+        let query = Parser::new(
+            Encoding::Der,
+            Limits {
+                max_work: 1 << 20,
+                ..Default::default()
+            },
+            memory.clone(),
+        );
+        let reader = query.read(&[], 0).expect("empty query carrier");
+        let work = reader.execution();
+        let package = Package::try_current(&work).expect("funded mirror arena");
+        let target = package.as_document();
+        let mut selected = nodeset::Nodeset::new();
+        selected.add(target.root());
+        let mirror = Mirror::<PaidKeys<'_, _>>::build_in(&document, target, &work)
+            .expect("current indexes fit before exhausting traversal work");
+        let allowed = document.descendants().len() - 1;
+        let before_probe = memory.work_used();
+        drop(
+            selected
+                .iter_current(&work)
+                .expect("admit selected-table metadata"),
+        );
+        let selected_scan = memory.work_used() - before_probe;
+        use structured_asn1::memory::Work as _;
+        work.charge_work(((1 << 20) - memory.work_used() - allowed - selected_scan) as u64)
+            .expect("fund selected metadata but leave one-less than the source walk");
+        let before_work = memory.work_used();
+        let before_storage = memory.used();
+        assert!(
+            before_storage > 0,
+            "the current mirror indexes are accounted"
+        );
+        let input = Projection::empty(&document, PaidKeys::new(&work));
+        let error = mirror
+            .project_expanded(
+                &document,
+                &input,
+                selected,
+                &NodeSetMaterializationBudget::default(),
+            )
+            .err()
+            .expect("whole expansion walk does not fit the current query");
+        assert!(matches!(
+            error,
+            TransformError::C14n(crate::c14n::C14nError::SharedExecution(
+                structured_asn1::memory::MemoryError::WorkExceeded
+            ))
+        ));
+        assert_eq!(
+            memory.work_used(),
+            before_work + selected_scan,
+            "only the admitted selected-table read precedes source-walk refusal"
+        );
+        assert_eq!(
+            memory.used(),
+            before_storage,
+            "no result storage before admission"
         );
     }
 

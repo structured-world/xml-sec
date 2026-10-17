@@ -107,9 +107,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.92.0"
+          components: rustfmt
       - uses: Swatinem/rust-cache@v2
       - name: Check native CLI upstream fixture snapshot
         run: scripts/import-xmlsec1-cli-fixtures.sh --check
+      - name: Check maintained XML parser kernels
+        run: |
+          bash scripts/import-xml-backends.sh roxmltree --verify
+          bash scripts/import-xml-backends.sh xmloxide --verify
       - run: >-
           cargo run -p xml-sec-capability-ledger -- check
           donors/xmlsec

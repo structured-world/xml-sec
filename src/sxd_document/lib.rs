@@ -145,6 +145,8 @@ pub fn estimated_storage_bytes(requirements: StorageRequirements) -> usize {
 }
 
 mod lazy_hash_map;
+#[cfg(feature = "no-unsafe")]
+mod namespace_storage;
 pub(crate) mod str;
 mod str_ext;
 
@@ -164,10 +166,12 @@ pub mod writer;
 #[path = "raw_no_unsafe.rs"]
 mod raw;
 #[cfg(feature = "no-unsafe")]
+mod storage;
+#[cfg(feature = "no-unsafe")]
 #[path = "string_pool_no_unsafe.rs"]
 pub(crate) mod string_pool;
 #[cfg(feature = "no-unsafe")]
-pub use string_pool::InternedString;
+pub use string_pool::{AccountedStringPool, InternedString};
 #[cfg(feature = "no-unsafe")]
 #[path = "dom_no_unsafe.rs"]
 pub mod dom;
@@ -257,7 +261,7 @@ macro_rules! to_ns_str {
 #[macro_export]
 macro_rules! to_ns_str {
     ($e:expr) => {
-        ($e).to_owned()
+        ($e).to_owned().into()
     };
 }
 
@@ -267,11 +271,85 @@ macro_rules! to_ns_str {
 pub type NsStr<'d> = &'d str;
 /// String type used for namespace prefix/URI storage.
 /// `&'d str` in default mode, `String` in no-unsafe mode.
-#[cfg(feature = "no-unsafe")]
+#[cfg(all(feature = "no-unsafe", not(feature = "embedded")))]
 ///
 /// The lifetime is intentionally retained so cfg-independent generic code has one public type
 /// signature; owned storage does not borrow from `'d` in this mode.
 pub type NsStr<'d> = String;
+
+#[cfg(feature = "embedded")]
+pub type NsStr<'d> = NamespaceText;
+
+/// Namespace payloads preserve the execution owner when identity handles clone.
+#[cfg(feature = "embedded")]
+#[derive(Debug, Clone)]
+pub enum NamespaceText {
+    Native(String),
+    Current(structured_asn1::memory::SharedString),
+    Static(&'static str),
+}
+
+#[cfg(feature = "embedded")]
+impl NamespaceText {
+    pub(crate) fn can_share(&self) -> bool {
+        matches!(self, Self::Current(_) | Self::Static(_))
+    }
+}
+#[cfg(feature = "embedded")]
+impl From<String> for NamespaceText {
+    fn from(value: String) -> Self {
+        Self::Native(value)
+    }
+}
+#[cfg(feature = "embedded")]
+impl From<&str> for NamespaceText {
+    fn from(value: &str) -> Self {
+        Self::Native(value.to_owned())
+    }
+}
+#[cfg(feature = "embedded")]
+impl std::ops::Deref for NamespaceText {
+    type Target = str;
+    fn deref(&self) -> &str {
+        match self {
+            Self::Native(s) => s,
+            Self::Current(s) => s,
+            Self::Static(s) => s,
+        }
+    }
+}
+#[cfg(feature = "embedded")]
+impl AsRef<str> for NamespaceText {
+    fn as_ref(&self) -> &str {
+        self
+    }
+}
+#[cfg(feature = "embedded")]
+impl PartialEq for NamespaceText {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+#[cfg(feature = "embedded")]
+impl Eq for NamespaceText {}
+#[cfg(feature = "embedded")]
+impl std::borrow::Borrow<str> for NamespaceText {
+    fn borrow(&self) -> &str {
+        self
+    }
+}
+#[cfg(feature = "embedded")]
+impl structured_asn1::memory::HashWork for NamespaceText {
+    fn hash_work(&self) -> Result<u64, structured_asn1::memory::MemoryError> {
+        structured_asn1::memory::HashWork::hash_work(&**self)
+    }
+}
+#[cfg(feature = "embedded")]
+impl std::hash::Hash for NamespaceText {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&**self, state);
+    }
+}
 
 pub(crate) static XML_NS_PREFIX: &str = "xml";
 pub(crate) static XML_NS_URI: &str = "http://www.w3.org/XML/1998/namespace";
@@ -295,10 +373,12 @@ impl<'a> PrefixedName<'a> {
         PrefixedName { prefix, local_part }
     }
 
-    pub fn prefix(&self) -> Option<&str> {
+    /// Borrows the original source, independently of this copied name view.
+    pub fn prefix(&self) -> Option<&'a str> {
         self.prefix
     }
-    pub fn local_part(&self) -> &str {
+    /// Borrows the original source, independently of this copied name view.
+    pub fn local_part(&self) -> &'a str {
         self.local_part
     }
 }
@@ -377,6 +457,18 @@ impl Default for Package {
 impl Package {
     pub fn new() -> Package {
         Self::default()
+    }
+
+    #[cfg(feature = "embedded")]
+    pub(crate) fn try_current(
+        work: &impl structured_asn1::memory::Work,
+    ) -> Result<Self, structured_asn1::memory::MemoryError> {
+        let (storage, root) = raw::current::storage(work)?;
+        Ok(Self {
+            identity: next_package_identity(),
+            storage,
+            connections: raw::Connections::new(root),
+        })
     }
 
     pub fn as_document(&self) -> dom::Document<'_> {

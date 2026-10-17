@@ -1,6 +1,28 @@
 The xml-sec crate includes code derived from the following projects. Their
 copyright and permission notices are preserved below.
 
+roxmltree 0.21.1 (src/parser_roxmltree/)
+--------------------------------------
+
+Source: https://github.com/RazrFalcon/roxmltree
+License: Apache-2.0 OR MIT
+
+The original notices are distributed in src/parser_roxmltree/LICENSE-APACHE
+and src/parser_roxmltree/LICENSE-MIT; the ego-tree attribution is preserved
+at the top of src/parser_roxmltree/lib.rs.
+The checksum-pinned import and maintained delta are in scripts/import-xml-backends.sh
+and scripts/patches/roxmltree-0.21.1.patch.
+
+xmloxide 0.5.0 (src/parser_xmloxide/)
+-----------------------------------
+
+Source: https://github.com/jonwiggins/xmloxide
+License: MIT
+
+The original notice is distributed in src/parser_xmloxide/LICENSE.
+The checksum-pinned XML kernel import and maintained delta are in
+scripts/import-xml-backends.sh and scripts/patches/xmloxide-0.5.0.patch.
+
 sad-rsa 0.10.2 (src/provider/rsa_pkcs1v15.rs, src/provider/rsa_pss.rs)
 ------------------------------------------
 

@@ -12,12 +12,13 @@
 use std::cell::Cell;
 
 use crate::xml::dom::Node;
+use crate::xml::dom::storage::Storage as DomStorage;
 
 use super::C14nError;
 use super::NodeVisibility;
 #[cfg(any(feature = "xmldsig", test))]
 use super::scratch::Native;
-use super::scratch::{List, Scratch, Text};
+use super::scratch::{List, Scratch, Text, TextBuilder};
 
 /// The XML namespace URI.
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
@@ -109,7 +110,7 @@ pub(crate) fn compute_effective_xml_base(
 }
 
 /// Budgeted form used for attacker-controlled XMLDSig URI resolution.
-#[cfg(any(feature = "xmldsig", test))]
+#[cfg(test)]
 pub(crate) fn compute_effective_xml_base_with_budget(
     start: Node<'_, '_>,
     visibility: Option<&dyn NodeVisibility>,
@@ -118,9 +119,9 @@ pub(crate) fn compute_effective_xml_base_with_budget(
     compute_effective_xml_base_in(start, visibility, budget, &Native).map_err(native_policy_error)
 }
 
-pub(super) fn compute_effective_xml_base_in<S: Scratch>(
-    start: Node<'_, '_>,
-    visibility: Option<&dyn NodeVisibility>,
+pub(super) fn compute_effective_xml_base_in<S: Scratch, D: DomStorage>(
+    start: Node<'_, '_, D>,
+    visibility: Option<&dyn NodeVisibility<D>>,
     budget: &XmlBaseResolutionBudget,
     scratch: &S,
 ) -> Result<Option<S::Text>, C14nError> {
@@ -134,7 +135,7 @@ pub(super) fn compute_effective_xml_base_in<S: Scratch>(
             }
             let base = xml_base_value(node);
             if let Some(set) = visibility
-                && preserves_xml_base_context(node, set)
+                && preserves_xml_base_context(node, set)?
             {
                 break;
             }
@@ -163,15 +164,6 @@ pub(super) fn compute_effective_xml_base_in<S: Scratch>(
         effective = resolve_uri_with_budget_in(effective.view()?, relative, budget, scratch)?;
     }
     Ok(Some(effective))
-}
-
-#[cfg(feature = "xmldsig")]
-pub(crate) fn resolve_uri_with_budget(
-    base: &str,
-    reference: &str,
-    budget: &XmlBaseResolutionBudget,
-) -> Result<String, XmlBaseResolutionError> {
-    resolve_uri_with_budget_in(base, reference, budget, &Native).map_err(native_policy_error)
 }
 
 pub(super) fn resolve_uri_with_budget_in<S: Scratch>(
@@ -240,37 +232,55 @@ pub(crate) fn resolve_uri_from_node_with_document_base_with_budget(
     document_base: Option<&str>,
     budget: &XmlBaseResolutionBudget,
 ) -> Result<String, XmlBaseResolutionError> {
+    resolve_uri_from_node_in(origin, reference, document_base, budget, &Native)
+        .map_err(native_policy_error)
+}
+
+#[cfg(feature = "xmldsig")]
+pub(crate) fn resolve_uri_from_node_in<S: Scratch, D: DomStorage>(
+    origin: Node<'_, '_, D>,
+    reference: &str,
+    document_base: Option<&str>,
+    budget: &XmlBaseResolutionBudget,
+    scratch: &S,
+) -> Result<S::Text, C14nError> {
+    scratch.charge(reference.len())?;
     if has_scheme(reference) {
-        return resolve_uri_with_budget("", reference, budget);
+        return resolve_uri_with_budget_in("", reference, budget, scratch);
     }
-    let inherited_base = compute_effective_xml_base_with_budget(origin, None, budget)?;
-    let base = match (document_base, inherited_base) {
+    let inherited_base = compute_effective_xml_base_in(origin, None, budget, scratch)?;
+    match (document_base, inherited_base) {
         (Some(document_base), Some(xml_base)) => {
-            resolve_uri_with_budget(document_base, &xml_base, budget)?
+            let base =
+                resolve_uri_with_budget_in(document_base, xml_base.view()?, budget, scratch)?;
+            resolve_uri_with_budget_in(base.view()?, reference, budget, scratch)
         }
-        (Some(document_base), None) => document_base.to_owned(),
-        (None, Some(xml_base)) => xml_base,
-        (None, None) => String::new(),
-    };
-    resolve_uri_with_budget(&base, reference, budget)
+        (Some(document_base), None) => {
+            resolve_uri_with_budget_in(document_base, reference, budget, scratch)
+        }
+        (None, Some(xml_base)) => {
+            resolve_uri_with_budget_in(xml_base.view()?, reference, budget, scratch)
+        }
+        (None, None) => resolve_uri_with_budget_in("", reference, budget, scratch),
+    }
 }
 
 /// Whether a selected element establishes its source `xml:base` context in the
 /// canonical output and therefore forms a boundary for descendant fixup.
-pub(super) fn preserves_xml_base_context(
-    node: Node<'_, '_>,
-    visibility: &dyn NodeVisibility,
-) -> bool {
-    visibility.contains_node(node)
+pub(super) fn preserves_xml_base_context<D: DomStorage>(
+    node: Node<'_, '_, D>,
+    visibility: &dyn NodeVisibility<D>,
+) -> Result<bool, C14nError> {
+    Ok(visibility.contains_node(node)?
         && xml_base_value(node).is_some()
-        && visibility.contains_attribute(node, Some(XML_NS), "base")
+        && visibility.contains_attribute(node, Some(XML_NS), "base")?)
 }
 
 /// Get the `xml:base` attribute value from an element, if present.
 ///
 /// Per RFC 3986, an empty reference resolves to the current base. We
 /// therefore treat `xml:base=""` as if no `xml:base` were present.
-fn xml_base_value<'a>(node: Node<'a, '_>) -> Option<&'a str> {
+fn xml_base_value<'a, D: DomStorage>(node: Node<'a, '_, D>) -> Option<&'a str> {
     for attr in node.attributes() {
         if attr.namespace() == Some(XML_NS) && attr.name() == "base" {
             let value = attr.value();
@@ -323,9 +333,7 @@ fn resolve_uri_in<S: Scratch>(
         scratch.charge(absolute.len().saturating_mul(6))?;
         let parts = parse_base(absolute).expect("has_scheme accepted the absolute reference");
         let path = remove_dot_segments_in(parts.path, false, scratch)?;
-        let mut result = recompose_in(parts.scheme, parts.authority, path.view()?, scratch)?;
-        result.append(suffix)?;
-        return Ok(result);
+        return recompose_in(parts.scheme, parts.authority, path.view()?, suffix, scratch);
     }
 
     // Query- and fragment-only references preserve the complete base path for
@@ -401,17 +409,19 @@ fn resolve_uri_in<S: Scratch>(
         }
         let new_authority = &rest[..auth_end];
         let new_path = remove_dot_segments_in(&rest[auth_end..], true, scratch)?;
-        let mut result = recompose_in(scheme, Some(new_authority), new_path.view()?, scratch)?;
-        result.append(ref_suffix)?;
-        return Ok(result);
+        return recompose_in(
+            scheme,
+            Some(new_authority),
+            new_path.view()?,
+            ref_suffix,
+            scratch,
+        );
     }
 
     // Reference starts with / → absolute path
     if ref_path.starts_with('/') {
         let cleaned = remove_dot_segments_in(ref_path, true, scratch)?;
-        let mut result = recompose_in(scheme, authority, cleaned.view()?, scratch)?;
-        result.append(ref_suffix)?;
-        return Ok(result);
+        return recompose_in(scheme, authority, cleaned.view()?, ref_suffix, scratch);
     }
 
     // Relative path — merge with base path (strip query/fragment from
@@ -420,9 +430,7 @@ fn resolve_uri_in<S: Scratch>(
     let clean_base_path = strip_query_fragment(base_path);
     let merged = merge_paths_in(clean_base_path, ref_path, authority.is_some(), scratch)?;
     let cleaned = remove_dot_segments_in(merged.view()?, true, scratch)?;
-    let mut result = recompose_in(scheme, authority, cleaned.view()?, scratch)?;
-    result.append(ref_suffix)?;
-    Ok(result)
+    recompose_in(scheme, authority, cleaned.view()?, ref_suffix, scratch)
 }
 
 /// Check if a URI string has a scheme (e.g., `http:`, `urn:`).
@@ -505,11 +513,12 @@ fn recompose_in<S: Scratch>(
     scheme: &str,
     authority: Option<&str>,
     path: &str,
+    suffix: &str,
     scratch: &S,
 ) -> Result<S::Text, C14nError> {
     match authority {
-        Some(auth) => scratch.text(&[scheme, "://", auth, path]),
-        None => scratch.text(&[scheme, ":", path]),
+        Some(auth) => scratch.text(&[scheme, "://", auth, path, suffix]),
+        None => scratch.text(&[scheme, ":", path, suffix]),
     }
 }
 
@@ -634,7 +643,7 @@ fn remove_dot_segments_in<S: Scratch>(
         .ok_or(C14nError::OutputLimitExceeded {
             max_bytes: usize::MAX,
         })?;
-    let mut result = scratch.text(&[])?;
+    let mut result = scratch.builder();
     result.reserve(capacity)?;
     for (index, segment) in segments.iter().enumerate() {
         if index != 0 {
@@ -644,11 +653,11 @@ fn remove_dot_segments_in<S: Scratch>(
     }
 
     // If the input path ended with /. or /.., ensure trailing slash
-    if (path.ends_with("/.") || path.ends_with("/..")) && !result.view()?.ends_with('/') {
+    if (path.ends_with("/.") || path.ends_with("/..")) && result.last_byte() != Some(b'/') {
         result.append("/")?;
     }
 
-    Ok(result)
+    result.finish()
 }
 
 #[cfg(test)]

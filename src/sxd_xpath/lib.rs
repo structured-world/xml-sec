@@ -131,13 +131,17 @@ pub use crate::context::Context;
 
 #[macro_use]
 pub mod macros;
+#[cfg(feature = "embedded")]
+pub(crate) mod arena;
 pub(crate) mod axis;
 pub mod context;
 pub(crate) mod expression;
 pub mod function;
+pub(crate) mod grammar;
 pub(crate) mod node_test;
 pub mod nodeset;
 pub(crate) mod parser;
+pub(crate) mod runtime;
 pub(crate) mod token;
 pub(crate) mod tokenizer;
 
@@ -238,7 +242,10 @@ impl std::fmt::Write for FormattedLength {
     }
 }
 
-fn write_xpath_number(output: &mut impl std::fmt::Write, number: f64) -> std::fmt::Result {
+pub(crate) fn write_xpath_number(
+    output: &mut impl std::fmt::Write,
+    number: f64,
+) -> std::fmt::Result {
     if number.is_infinite() {
         output.write_str(if number.signum() < 0.0 {
             "-Infinity"
@@ -254,7 +261,8 @@ fn write_xpath_number(output: &mut impl std::fmt::Write, number: f64) -> std::fm
 
 /// The primary types of values that an XPath expression accepts
 /// as an argument or returns as a result.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
+#[cfg_attr(not(feature = "embedded"), derive(Clone))]
 pub enum Value<'d> {
     /// A true or false value
     Boolean(bool),
@@ -262,10 +270,31 @@ pub enum Value<'d> {
     Number(f64),
     /// A string
     String(string::String),
+    /// Immutable string capacity retained independently of its producing query.
+    #[cfg(feature = "embedded")]
+    AccountedString(structured_asn1::memory::OwnedText),
     /// An XSLT 1.0 result-tree fragment. It is truthy but is not navigable as a node-set.
     ResultTreeFragment(u64, std::sync::Arc<string::String>),
     /// A collection of unique nodes
     Nodeset(nodeset::Nodeset<'d>),
+}
+
+impl PartialEq for Value<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        if let (Some(left), Some(right)) = (self.string_text(), other.string_text()) {
+            return left == right;
+        }
+        match (self, other) {
+            (Self::Boolean(left), Self::Boolean(right)) => left == right,
+            (Self::Number(left), Self::Number(right)) => left == right,
+            (Self::Nodeset(left), Self::Nodeset(right)) => left == right,
+            (
+                Self::ResultTreeFragment(left_id, left),
+                Self::ResultTreeFragment(right_id, right),
+            ) => left_id == right_id && left == right,
+            _ => false,
+        }
+    }
 }
 
 pub(crate) fn str_to_num(s: &str) -> f64 {
@@ -295,6 +324,21 @@ pub(crate) fn node_to_num_with_context(
 }
 
 impl<'d> Value<'d> {
+    pub(crate) fn string_text(&self) -> Option<&str> {
+        match self {
+            Self::String(value) => Some(value),
+            #[cfg(feature = "embedded")]
+            Self::AccountedString(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn scalar_text(&self) -> Option<&str> {
+        match self {
+            Self::ResultTreeFragment(_, value) => Some(value),
+            _ => self.string_text(),
+        }
+    }
     /// Materialize an evaluation-owned value only after reserving its copies and containers.
     pub(crate) fn clone_with_context(
         &self,
@@ -309,6 +353,8 @@ impl<'d> Value<'d> {
             Self::Boolean(value) => Self::Boolean(*value),
             Self::Number(value) => Self::Number(*value),
             Self::String(text) => Self::String(copy_string(text)?),
+            #[cfg(feature = "embedded")]
+            Self::AccountedString(text) => Self::String(copy_string(text)?),
             Self::Nodeset(nodes) => Self::Nodeset(nodes.clone_with_context(context)?),
             Self::ResultTreeFragment(identity, text) => {
                 Self::ResultTreeFragment(*identity, std::sync::Arc::clone(text))
@@ -327,28 +373,12 @@ impl<'d> Value<'d> {
                 length.0
             }
             Value::String(value) => value.len(),
+            #[cfg(feature = "embedded")]
+            Value::AccountedString(value) => value.len(),
             Value::ResultTreeFragment(_, value) => value.len(),
             Value::Nodeset(nodes) => nodes
                 .document_order_first()
                 .map_or(0, |node| node.string_value_len()),
-        }
-    }
-
-    /// Return the XPath string conversion's Unicode code-point length without allocating it.
-    pub(crate) fn string_char_len(&self) -> usize {
-        match self {
-            Value::Boolean(true) => 4,
-            Value::Boolean(false) => 5,
-            Value::Number(number) => {
-                let mut length = FormattedLength(0);
-                write_xpath_number(&mut length, *number).expect("length sink cannot fail");
-                length.0
-            }
-            Value::String(value) => value.chars().count(),
-            Value::ResultTreeFragment(_, value) => value.chars().count(),
-            Value::Nodeset(nodes) => nodes
-                .document_order_first()
-                .map_or(0, |node| node.string_value_char_len()),
         }
     }
 
@@ -358,6 +388,8 @@ impl<'d> Value<'d> {
             Boolean(val) => val,
             Number(n) => n != 0.0 && !n.is_nan(),
             String(ref s) => !s.is_empty(),
+            #[cfg(feature = "embedded")]
+            AccountedString(ref s) => !s.is_empty(),
             ResultTreeFragment(..) => true,
             Nodeset(ref nodeset) => nodeset.size() > 0,
         }
@@ -369,6 +401,14 @@ impl<'d> Value<'d> {
 
     /// Convert this value to an XPath number under the evaluator's work and allocation budgets.
     pub fn number(&self, context: &context::Evaluation<'_, '_>) -> Result<f64, function::Error> {
+        self.number_in(context, runtime::Native)
+    }
+
+    pub(crate) fn number_in<R: runtime::Runtime>(
+        &self,
+        context: &context::Evaluation<'_, '_>,
+        runtime: R,
+    ) -> Result<f64, function::Error> {
         use crate::Value::*;
         let parse_text = |value: &str| {
             context.charge_work(value.len())?;
@@ -378,9 +418,11 @@ impl<'d> Value<'d> {
             Boolean(value) => Ok(if *value { 1.0 } else { 0.0 }),
             Number(value) => Ok(*value),
             String(value) => parse_text(value),
+            #[cfg(feature = "embedded")]
+            AccountedString(value) => parse_text(value),
             ResultTreeFragment(_, value) => parse_text(value),
-            Nodeset(nodes) => match nodes.document_order_first_with_context(context)? {
-                Some(node) => node_to_num_with_context(context, &node),
+            Nodeset(nodes) => match nodes.document_order_first_in(context, runtime)? {
+                Some(node) => runtime.node_number(context, &node),
                 None => Ok(f64::NAN),
             },
         }
@@ -396,6 +438,8 @@ impl<'d> Value<'d> {
                 value
             }
             String(ref val) => val.clone(),
+            #[cfg(feature = "embedded")]
+            AccountedString(ref val) => val.as_str().to_owned(),
             ResultTreeFragment(_, ref val) => val.as_ref().clone(),
             Nodeset(ref ns) => match ns.document_order_first() {
                 Some(n) => n.string_value(),
@@ -460,8 +504,31 @@ macro_rules! partial_eq_impl {
 
 partial_eq_impl!(bool, Value::Boolean(ref v) => v);
 partial_eq_impl!(f64, Value::Number(ref v) => v);
-partial_eq_impl!(String, Value::String(ref v) => v);
-partial_eq_impl!(&'d str, Value::String(ref v) => v);
+impl PartialEq<str> for Value<'_> {
+    fn eq(&self, other: &str) -> bool {
+        self.string_text() == Some(other)
+    }
+}
+impl PartialEq<&str> for Value<'_> {
+    fn eq(&self, other: &&str) -> bool {
+        self == *other
+    }
+}
+impl PartialEq<String> for Value<'_> {
+    fn eq(&self, other: &String) -> bool {
+        self == other.as_str()
+    }
+}
+impl PartialEq<Value<'_>> for String {
+    fn eq(&self, other: &Value<'_>) -> bool {
+        other == self
+    }
+}
+impl PartialEq<Value<'_>> for &str {
+    fn eq(&self, other: &Value<'_>) -> bool {
+        other == self
+    }
+}
 partial_eq_impl!(nodeset::Nodeset<'d>, Value::Nodeset(ref v) => v);
 
 /// A compiled XPath. Construct via [`Factory`][].
@@ -509,7 +576,7 @@ impl XPath {
         N: Into<nodeset::Node<'d>>,
     {
         let context = context::Evaluation::new(context, node.into());
-        self.0.evaluate(&context).map_err(ExecutionError)
+        expression::Expression::evaluate(&self.0, &context).map_err(ExecutionError)
     }
 }
 
@@ -756,6 +823,50 @@ mod test {
         value
             .number(&evaluation)
             .expect("test numeric conversion fits the default budget")
+    }
+
+    #[cfg(feature = "embedded")]
+    #[test]
+    fn current_number_conversion_funds_ordering_and_text_together() {
+        // number(node-set) selects the first node in document order, then
+        // converts its complete string-value with current-owned scratch only.
+        use std::{cell::Cell, sync::Arc};
+        use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
+        let package = Package::new();
+        let document = package.as_document();
+        let root = document.create_element("root");
+        let first = document.create_element("first");
+        let last = document.create_element("last");
+        document.root().append_child(root);
+        root.append_child(first);
+        root.append_child(last);
+        first.append_child(document.create_text("1"));
+        first.append_child(document.create_text("2"));
+        last.append_child(document.create_text("99"));
+        let value = Value::Nodeset(nodeset![last, first]);
+        let mut context = Context::new();
+        context.set_string_allocation_limit(0);
+        let evaluation = context::Evaluation::new(&context, root.into());
+        for bytes in [0, 65536] {
+            let work = Memory::new(Arc::new(MemoryAccount::new(bytes, 65536)));
+            let failure = Cell::new(None);
+            let result = value.number_in(
+                &evaluation,
+                runtime::Accounted {
+                    work: &work,
+                    failure: &failure,
+                },
+            );
+            if bytes == 0 {
+                assert!(result.is_err());
+                assert_eq!(failure.get(), Some(MemoryError::LimitExceeded));
+            } else {
+                assert_eq!(result.expect("current conversion"), 12.0);
+                assert_eq!(failure.get(), None);
+            }
+            assert_eq!(work.used(), 0);
+        }
+        assert_eq!(context.string_allocation_exceeded(), None);
     }
 
     #[test]

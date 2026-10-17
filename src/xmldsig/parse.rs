@@ -1383,15 +1383,25 @@ fn layout_finish<'a, 'input>(
 /// Replay processes the original instruction but does not compute or select
 /// its historical digest algorithm (EN 319 132-1 V1.3.1 §5.5.3 Note 2).
 /// Layout validation is shared with ordinary Reference parsing.
-pub(crate) fn parse_replay_transforms(
-    node: Node<'_, '_>,
+pub(crate) fn parse_replay_transforms<'a, S: transforms::ParseStorage<'a>>(
+    node: Node<'a, 'a>,
     budget: &mut transforms::XPathSignatureParseBudget,
-) -> Result<Vec<transforms::Transform>, ParseError> {
+    scratch: &S,
+) -> Result<S::Values<S::Instruction>, ParseError> {
+    scratch
+        .charge(node.children().len())
+        .map_err(super::types::TransformError::from)?;
     let (transforms, method, _) = reference_layout(node)?;
+    scratch
+        .charge(method.attributes().len())
+        .map_err(super::types::TransformError::from)?;
     required_algorithm_attr(method, "DigestMethod")?;
     transforms.map_or_else(
-        || Ok(Vec::new()),
-        |node| transforms::parse_transforms_with_budget(node, budget).map_err(Into::into),
+        || Ok(scratch.values()),
+        |node| {
+            transforms::parse_reference_transforms_in(node, XMLDSIG_NS, budget, scratch)
+                .map_err(Into::into)
+        },
     )
 }
 
@@ -3807,6 +3817,32 @@ fn ensure_no_non_whitespace_text(node: Node<'_, '_>, element_name: &str) -> Resu
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests use trusted XML fixtures")]
 mod tests {
+    #[test]
+    fn replay_layout_admits_ignored_siblings_under_current_work() {
+        // Comments do not change Reference grammar, but ignoring them is still
+        // a current-query traversal, not work prepaid by the original parser.
+        use structured_asn1::memory::{Memory, MemoryAccount};
+        let cost = |comments: usize| {
+            let source = format!(
+                "<Reference xmlns='{XMLDSIG_NS}'>{}<DigestMethod Algorithm='urn:historical'/><DigestValue/></Reference>",
+                "<!--ignored-->".repeat(comments)
+            );
+            let document = Document::parse(&source).expect("fixed Reference layout");
+            let current = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 20)));
+            let transforms = parse_replay_transforms(
+                document.root_element(),
+                &mut transforms::XPathSignatureParseBudget::default(),
+                &crate::c14n::scratch::Accounted(&current),
+            )
+            .expect("valid empty transform chain");
+            assert!(transforms.is_empty());
+            drop(transforms);
+            assert_eq!(current.used(), 0);
+            current.work_used()
+        };
+        assert!(cost(1024) >= cost(1) + 1023);
+    }
+
     #[test]
     fn inspected_reference_layout_errors_do_not_own_diagnostics() {
         // Metadata classification borrows its original malformed source and

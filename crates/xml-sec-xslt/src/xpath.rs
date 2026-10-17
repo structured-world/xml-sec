@@ -8915,7 +8915,7 @@ impl function::Function for FormatNumberFunction {
             });
         }
         let has_name = args.len() == 3;
-        let mut args = function::Args(args);
+        let mut args = function::Args::new(args);
         let name = if has_name {
             let lexical = args.pop_string(context)?;
             Some(resolve_lexical_name(&lexical, &self.namespaces)?)

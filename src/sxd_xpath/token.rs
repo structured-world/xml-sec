@@ -1,7 +1,8 @@
-use std::string;
-
 use crate::OwnedPrefixedName;
 use crate::node_test;
+#[cfg(feature = "embedded")]
+use crate::sxd_document as sxd_document_no_unsafe;
+use sxd_document_no_unsafe::PrefixedName;
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum AxisName {
@@ -20,16 +21,16 @@ pub enum AxisName {
     SelfAxis,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum NodeTestName {
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NodeTestName<T = String> {
     Comment,
     Text,
-    ProcessingInstruction(Option<string::String>),
+    ProcessingInstruction(Option<T>),
     Node,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Token {
+pub enum TokenData<N, T> {
     And,
     AtSign,
     Comma,
@@ -43,7 +44,7 @@ pub enum Token {
     LeftParen,
     LessThan,
     LessThanOrEqual,
-    Literal(string::String),
+    Literal(T),
     MinusSign,
     Multiply,
     NotEqual,
@@ -59,46 +60,109 @@ pub enum Token {
 
     // Specializations
     Axis(AxisName),
-    Function(OwnedPrefixedName),
-    NameTest(node_test::NameTest),
-    NodeTest(NodeTestName),
-    Variable(OwnedPrefixedName),
+    Function(N),
+    NameTest(node_test::NameTest<T>),
+    NodeTest(NodeTestName<T>),
+    Variable(N),
 }
 
-impl Token {
+pub type Token = TokenData<OwnedPrefixedName, String>;
+pub type BorrowedToken<'a> = TokenData<PrefixedName<'a>, &'a str>;
+
+impl<N, T> TokenData<N, T> {
     pub fn precedes_node_test(&self) -> bool {
         match *self {
-            Token::AtSign | Token::Axis(..) => true,
+            Self::AtSign | Self::Axis(..) => true,
             _ => false,
         }
     }
 
     pub fn precedes_expression(&self) -> bool {
         match *self {
-            Token::LeftParen | Token::LeftBracket | Token::Comma => true,
+            Self::LeftParen | Self::LeftBracket | Self::Comma => true,
             _ => false,
         }
     }
 
     pub fn is_operator(&self) -> bool {
         match *self {
-            Token::Slash
-            | Token::DoubleSlash
-            | Token::PlusSign
-            | Token::MinusSign
-            | Token::Pipe
-            | Token::Equal
-            | Token::NotEqual
-            | Token::LessThan
-            | Token::LessThanOrEqual
-            | Token::GreaterThan
-            | Token::GreaterThanOrEqual
-            | Token::And
-            | Token::Or
-            | Token::Remainder
-            | Token::Divide
-            | Token::Multiply => true,
+            Self::Slash
+            | Self::DoubleSlash
+            | Self::PlusSign
+            | Self::MinusSign
+            | Self::Pipe
+            | Self::Equal
+            | Self::NotEqual
+            | Self::LessThan
+            | Self::LessThanOrEqual
+            | Self::GreaterThan
+            | Self::GreaterThanOrEqual
+            | Self::And
+            | Self::Or
+            | Self::Remainder
+            | Self::Divide
+            | Self::Multiply => true,
             _ => false,
+        }
+    }
+}
+
+impl BorrowedToken<'_> {
+    pub(super) fn payload_bytes(&self) -> usize {
+        match self {
+            Self::Literal(value) => value.len(),
+            Self::Function(name) | Self::Variable(name) => {
+                name.prefix().map_or(0, str::len) + name.local_part().len()
+            }
+            Self::NameTest(name) => name.prefix.map_or(0, str::len) + name.local_part.len(),
+            Self::NodeTest(NodeTestName::ProcessingInstruction(Some(target))) => target.len(),
+            _ => 0,
+        }
+    }
+
+    pub(super) fn into_owned(self) -> Token {
+        match self {
+            Self::Literal(value) => Token::Literal(value.to_owned()),
+            Self::Function(name) => Token::Function(name.into()),
+            Self::Variable(name) => Token::Variable(name.into()),
+            Self::NameTest(name) => Token::NameTest(node_test::NameTest {
+                prefix: name.prefix.map(str::to_owned),
+                local_part: name.local_part.to_owned(),
+            }),
+            Self::NodeTest(name) => Token::NodeTest(match name {
+                NodeTestName::Node => NodeTestName::Node,
+                NodeTestName::Text => NodeTestName::Text,
+                NodeTestName::Comment => NodeTestName::Comment,
+                NodeTestName::ProcessingInstruction(target) => {
+                    NodeTestName::ProcessingInstruction(target.map(str::to_owned))
+                }
+            }),
+            Self::Axis(axis) => Token::Axis(axis),
+            Self::Number(number) => Token::Number(number),
+            Self::And => Token::And,
+            Self::AtSign => Token::AtSign,
+            Self::Comma => Token::Comma,
+            Self::CurrentNode => Token::CurrentNode,
+            Self::Divide => Token::Divide,
+            Self::DoubleSlash => Token::DoubleSlash,
+            Self::Equal => Token::Equal,
+            Self::GreaterThan => Token::GreaterThan,
+            Self::GreaterThanOrEqual => Token::GreaterThanOrEqual,
+            Self::LeftBracket => Token::LeftBracket,
+            Self::LeftParen => Token::LeftParen,
+            Self::LessThan => Token::LessThan,
+            Self::LessThanOrEqual => Token::LessThanOrEqual,
+            Self::MinusSign => Token::MinusSign,
+            Self::Multiply => Token::Multiply,
+            Self::NotEqual => Token::NotEqual,
+            Self::Or => Token::Or,
+            Self::ParentNode => Token::ParentNode,
+            Self::Pipe => Token::Pipe,
+            Self::PlusSign => Token::PlusSign,
+            Self::Remainder => Token::Remainder,
+            Self::RightBracket => Token::RightBracket,
+            Self::RightParen => Token::RightParen,
+            Self::Slash => Token::Slash,
         }
     }
 }

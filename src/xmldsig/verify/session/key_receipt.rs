@@ -122,18 +122,18 @@ impl<W: Work> VerifiedSession<'_, '_, '_, W> {
     }
 }
 
-impl<W: Work> SelectedSignature<'_, '_, '_, '_, W> {
-    /// Borrow the original successful-key receipt using this session's Work.
+impl<W: Work, Q: Work> SelectedSignature<'_, '_, '_, '_, W, Q> {
+    /// Borrow the original successful-key receipt using this selection's Work.
     /// A provider unable to report a unique leaf yields an unproven receipt.
     pub fn with_key_receipt<R, E>(
         &self,
         visitor: impl for<'a> FnOnce(SelectedKeyReceipt<'a>) -> Result<R, E>,
     ) -> Result<R, CatalogueError<E>> {
         self.session
-            .with_key_receipt_at_in(self.index, self.session.work, visitor)
+            .with_key_receipt_at_in(self.index, self.work, visitor)
     }
 
-    /// Associate the exact original key decision using this session's Work.
+    /// Associate the exact original key decision using this selection's Work.
     /// A receipt from another operation, generation, Signature or provider is
     /// rejected before the provider comparison or the caller's callback.
     /// For a new query execution, use [`VerifiedSession::with_key_association_in`]
@@ -148,7 +148,7 @@ impl<W: Work> SelectedSignature<'_, '_, '_, '_, W> {
             .map_err(CatalogueError::Processing)?;
         let outcome = self
             .session
-            .associate_receipt_in(self.index, receipt, expected, self.session.work)
+            .associate_receipt_in(self.index, receipt, expected, self.work)
             .map_err(CatalogueError::Processing)?;
         visitor(outcome).map_err(CatalogueError::Visitor)
     }

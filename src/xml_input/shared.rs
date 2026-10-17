@@ -6,25 +6,118 @@
 use alloc::{borrow::Cow, string::String};
 use core::ops::Range;
 
+/// Storage strategy for the shared decoder. Resource-aware callers retain their
+/// actual allocator and execution domain; ordinary callers retain `Cow<str>`.
+#[doc(hidden)]
+pub trait DecodeStorage {
+    type Text: AsRef<str>;
+    type Buffer;
+    type Error: From<Error>;
+    fn label_error(&self, kind: LabelError, label: &str) -> Self::Error;
+    fn charge(&self, bytes: usize) -> Result<(), Self::Error>;
+    fn buffer(&self) -> Self::Buffer;
+    fn len(&self, buffer: &Self::Buffer) -> usize;
+    fn append(&self, buffer: &mut Self::Buffer, text: &str) -> Result<(), Self::Error>;
+    fn finish(&self, buffer: Self::Buffer) -> Result<Self::Text, Self::Error>;
+    fn replace(
+        &self,
+        text: Self::Text,
+        range: Range<usize>,
+        replacement: &str,
+    ) -> Result<Self::Text, Self::Error>;
+}
+
+/// Encoding failures whose diagnostic retains an input label.
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub enum LabelError {
+    Unsupported,
+    Forbidden,
+    Conflicting,
+}
+
+/// Borrowed UTF-8 or a caller-owned transcoding buffer.
+#[doc(hidden)]
+pub enum Decoded<'a, T> {
+    Borrowed(&'a str),
+    Owned(T),
+}
+
+impl<T: AsRef<str>> AsRef<str> for Decoded<'_, T> {
+    fn as_ref(&self) -> &str {
+        match self {
+            Self::Borrowed(text) => text,
+            Self::Owned(text) => text.as_ref(),
+        }
+    }
+}
+
+pub(crate) struct NativeStorage;
+
+impl DecodeStorage for NativeStorage {
+    type Text = String;
+    type Buffer = String;
+    type Error = Error;
+    fn label_error(&self, kind: LabelError, label: &str) -> Error {
+        match kind {
+            LabelError::Unsupported => Error::UnsupportedEncoding(label.into()),
+            LabelError::Forbidden => Error::ForbiddenEncoding(label.into()),
+            LabelError::Conflicting => Error::ConflictingEncoding(label.into()),
+        }
+    }
+    fn charge(&self, _: usize) -> Result<(), Error> {
+        Ok(())
+    }
+    fn buffer(&self) -> String {
+        String::new()
+    }
+    fn len(&self, buffer: &String) -> usize {
+        buffer.len()
+    }
+    fn append(&self, buffer: &mut String, text: &str) -> Result<(), Error> {
+        buffer.push_str(text);
+        Ok(())
+    }
+    fn finish(&self, buffer: String) -> Result<String, Error> {
+        Ok(buffer)
+    }
+    fn replace(
+        &self,
+        mut text: String,
+        range: Range<usize>,
+        replacement: &str,
+    ) -> Result<String, Error> {
+        text.replace_range(range, replacement);
+        Ok(text)
+    }
+}
+
+fn native_text(text: Decoded<'_, String>) -> Cow<'_, str> {
+    match text {
+        Decoded::Borrowed(text) => Cow::Borrowed(text),
+        Decoded::Owned(text) => Cow::Owned(text),
+    }
+}
+
 #[path = "lexical.rs"]
 pub mod lexical;
 
 /// Failure while converting external bytes into the Unicode XML parser contract.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum Error {
+pub enum Error<L: core::fmt::Display = String> {
     /// The byte signature selected an encoding that this implementation cannot decode.
     #[error("unsupported XML byte encoding `{0}`")]
     UnsupportedByteEncoding(&'static str),
     /// An encoding label was not recognized.
     #[error("unsupported XML encoding `{0}`")]
-    UnsupportedEncoding(String),
+    UnsupportedEncoding(L),
     /// The consuming XML format disallows the detected or declared encoding.
     #[error("XML format does not permit encoding `{0}`")]
-    ForbiddenEncoding(String),
+    ForbiddenEncoding(L),
     /// Resolver metadata, a byte signature, and the XML declaration disagreed.
     #[error("XML byte encoding conflicts with declared or selected encoding `{0}`")]
-    ConflictingEncoding(String),
+    ConflictingEncoding(L),
     /// The XML declaration was malformed before parsing could begin.
     #[error("malformed XML encoding declaration: {0}")]
     MalformedDeclaration(&'static str),
@@ -235,7 +328,9 @@ pub fn decode_xml_bounded<'a>(
         maximum_decoded_bytes,
         true,
         |_, _| Ok(()),
+        &NativeStorage,
     )
+    .map(native_text)
 }
 
 /// Decode XML with a format-specific check of detected and declared encodings.
@@ -249,7 +344,26 @@ pub fn decode_xml_bounded_with_encoding_guard<'a>(
     maximum_decoded_bytes: usize,
     guard: impl Fn(&str, Option<&str>) -> Result<(), Error>,
 ) -> Result<Cow<'a, str>, Error> {
-    decode_xml_bounded_inner(bytes, None, maximum_decoded_bytes, true, guard)
+    decode_xml_bounded_inner(
+        bytes,
+        None,
+        maximum_decoded_bytes,
+        true,
+        guard,
+        &NativeStorage,
+    )
+    .map(native_text)
+}
+
+/// Decode through the same grammar using caller-owned fallible storage.
+#[doc(hidden)]
+pub fn decode_xml_in<'a, S: DecodeStorage>(
+    bytes: &'a [u8],
+    maximum_decoded_bytes: usize,
+    guard: impl Fn(&str, Option<&str>) -> Result<(), S::Error>,
+    storage: &S,
+) -> Result<Decoded<'a, S::Text>, S::Error> {
+    decode_xml_bounded_inner(bytes, None, maximum_decoded_bytes, true, guard, storage)
 }
 
 /// Detect XML-media-type text encoding without changing the included text's declaration.
@@ -267,16 +381,22 @@ pub fn decode_xml_text_bounded<'a>(
         maximum_decoded_bytes,
         false,
         |_, _| Ok(()),
+        &NativeStorage,
     )
+    .map(native_text)
 }
 
-fn decode_xml_bounded_inner<'a>(
+fn decode_xml_bounded_inner<'a, S: DecodeStorage>(
     bytes: &'a [u8],
     explicit_encoding: Option<&str>,
     maximum_decoded_bytes: usize,
     normalize_declaration: bool,
-    encoding_guard: impl Fn(&str, Option<&str>) -> Result<(), Error>,
-) -> Result<Cow<'a, str>, Error> {
+    encoding_guard: impl Fn(&str, Option<&str>) -> Result<(), S::Error>,
+    storage: &S,
+) -> Result<Decoded<'a, S::Text>, S::Error> {
+    // Admission precedes declaration detection, label lookup and UTF validation,
+    // including their malformed-input paths. Transcoding/output work is separate.
+    storage.charge(bytes.len())?;
     let physical = physical_encoding(bytes)?;
     let ascii_declaration = if physical.is_none() {
         declaration_from_ascii_bytes(bytes)?
@@ -287,7 +407,7 @@ fn decode_xml_bounded_inner<'a>(
     let explicit_utf32 = explicit_encoding.is_some_and(is_generic_utf32);
     let explicit = explicit_encoding
         .filter(|_| !explicit_utf16 && !explicit_utf32)
-        .map(parse_encoding)
+        .map(|label| parse_encoding_in(label, storage))
         .transpose()?;
     if explicit_utf16
         && !physical.is_some_and(|(encoding, bom_len)| is_utf16_encoding(encoding) && bom_len > 0)
@@ -295,14 +415,14 @@ fn decode_xml_bounded_inner<'a>(
         // XML 1.0 section 4.3.3 requires an entity labeled as generic UTF-16 to begin with a BOM;
         // a declaration discovered after decoding cannot replace that byte-order signature.
         // https://www.w3.org/TR/xml/#charencoding
-        return Err(Error::MissingUtf16ByteOrder);
+        return Err(Error::MissingUtf16ByteOrder.into());
     }
     if explicit_utf32 && !physical.is_some_and(|(encoding, _)| is_utf32_encoding(encoding)) {
-        return Err(Error::MissingUtf32ByteOrder);
+        return Err(Error::MissingUtf32ByteOrder.into());
     }
     let declared_before_decode = ascii_declaration
         .as_ref()
-        .map(|(_, label)| parse_encoding(label))
+        .map(|(_, label)| parse_encoding_in(label, storage))
         .transpose()?;
     let selected = explicit
         .or(physical.map(|(encoding, _)| encoding))
@@ -312,12 +432,12 @@ fn decode_xml_bounded_inner<'a>(
     if let Some((physical, _)) = physical
         && !encodings_compatible(selected, physical, true)
     {
-        return Err(Error::ConflictingEncoding(selected.name().into()));
+        return Err(storage.label_error(LabelError::Conflicting, selected.name()));
     }
     if let Some(declared) = declared_before_decode
         && !encodings_compatible(selected, declared, false)
     {
-        return Err(Error::ConflictingEncoding(declared.name().into()));
+        return Err(storage.label_error(LabelError::Conflicting, declared.name()));
     }
 
     let bom_len = physical.map_or(0, |(_, bom_len)| bom_len);
@@ -325,12 +445,16 @@ fn decode_xml_bounded_inner<'a>(
         selected.name(),
         ascii_declaration.as_ref().map(|(_, label)| *label),
     )?;
-    let mut decoded = decode_selected(&bytes[bom_len..], selected, maximum_decoded_bytes)?;
-    let declaration = declaration_from_text(&decoded)?;
+    let mut decoded =
+        decode_selected_in(&bytes[bom_len..], selected, maximum_decoded_bytes, storage)?;
+    storage.charge(decoded.as_ref().len())?;
+    let declaration = declaration_from_text(decoded.as_ref())?;
     if physical.is_some() {
         encoding_guard(
             selected.name(),
-            declaration.as_ref().map(|range| &decoded[range.clone()]),
+            declaration
+                .as_ref()
+                .map(|range| &decoded.as_ref()[range.clone()]),
         )?;
     }
     if explicit_encoding.is_none()
@@ -347,11 +471,12 @@ fn decode_xml_bounded_inner<'a>(
                 Error::MissingEncodingDeclaration("UTF-32")
             } else {
                 Error::MissingUtf16ByteOrder
-            },
+            }
+            .into(),
         );
     }
     if let Some(range) = &declaration {
-        let label = &decoded[range.clone()];
+        let label = &decoded.as_ref()[range.clone()];
         if is_generic_utf16(label) {
             let has_utf16_bom = physical.is_some_and(|(encoding, bom_len)| {
                 bom_len > 0
@@ -359,16 +484,16 @@ fn decode_xml_bounded_inner<'a>(
                         if value == encoding_rs::UTF_16LE || value == encoding_rs::UTF_16BE)
             });
             if !has_utf16_bom {
-                return Err(Error::MissingUtf16ByteOrder);
+                return Err(Error::MissingUtf16ByteOrder.into());
             }
         } else if is_generic_utf32(label) {
             if !physical.is_some_and(|(encoding, _)| is_utf32_encoding(encoding)) {
-                return Err(Error::MissingUtf32ByteOrder);
+                return Err(Error::MissingUtf32ByteOrder.into());
             }
         } else {
-            let declared = parse_encoding(label)?;
+            let declared = parse_encoding_in(label, storage)?;
             if !encodings_compatible(selected, declared, false) {
-                return Err(Error::ConflictingEncoding(label.into()));
+                return Err(storage.label_error(LabelError::Conflicting, label));
             }
         }
     }
@@ -378,6 +503,7 @@ fn decode_xml_bounded_inner<'a>(
         && let Some(range) = declaration
     {
         let normalized_len = decoded
+            .as_ref()
             .len()
             .saturating_sub(range.len())
             .saturating_add("UTF-8".len());
@@ -385,9 +511,19 @@ fn decode_xml_bounded_inner<'a>(
             return Err(Error::DecodedLimit {
                 maximum: maximum_decoded_bytes,
                 actual: normalized_len,
-            });
+            }
+            .into());
         }
-        decoded.to_mut().replace_range(range, "UTF-8");
+        decoded = Decoded::Owned(match decoded {
+            Decoded::Owned(text) => storage.replace(text, range, "UTF-8")?,
+            Decoded::Borrowed(text) => {
+                let mut buffer = storage.buffer();
+                storage.append(&mut buffer, &text[..range.start])?;
+                storage.append(&mut buffer, "UTF-8")?;
+                storage.append(&mut buffer, &text[range.end..])?;
+                storage.finish(buffer)?
+            }
+        });
     }
     Ok(decoded)
 }
@@ -482,6 +618,13 @@ fn physical_encoding(bytes: &[u8]) -> Result<Option<(SelectedEncoding, usize)>, 
 }
 
 fn parse_encoding(label: &str) -> Result<SelectedEncoding, Error> {
+    parse_encoding_in(label, &NativeStorage)
+}
+
+fn parse_encoding_in<S: DecodeStorage>(
+    label: &str,
+    storage: &S,
+) -> Result<SelectedEncoding, S::Error> {
     if matches_ascii_case(label, &["utf-32le", "utf32le"]) {
         return Ok(SelectedEncoding::Utf32Le);
     }
@@ -507,9 +650,9 @@ fn parse_encoding(label: &str) -> Result<SelectedEncoding, Error> {
     // Decoder-only WHATWG labels must therefore not select the replacement decoder.
     // https://www.w3.org/TR/xinclude/#text_included
     let encoding = encoding_rs::Encoding::for_label_no_replacement(label.as_bytes())
-        .ok_or_else(|| Error::UnsupportedEncoding(label.into()))?;
+        .ok_or_else(|| storage.label_error(LabelError::Unsupported, label))?;
     if !legacy_label_matches_encoding(label, encoding) {
-        return Err(Error::UnsupportedEncoding(label.into()));
+        return Err(storage.label_error(LabelError::Unsupported, label));
     }
     Ok(SelectedEncoding::Standard(encoding))
 }
@@ -542,15 +685,24 @@ fn decode_selected<'a>(
     encoding: SelectedEncoding,
     maximum: usize,
 ) -> Result<Cow<'a, str>, Error> {
+    decode_selected_in(bytes, encoding, maximum, &NativeStorage).map(native_text)
+}
+
+fn decode_selected_in<'a, S: DecodeStorage>(
+    bytes: &'a [u8],
+    encoding: SelectedEncoding,
+    maximum: usize,
+    storage: &S,
+) -> Result<Decoded<'a, S::Text>, S::Error> {
     if matches!(
         encoding,
         SelectedEncoding::Utf32Le | SelectedEncoding::Utf32Be
     ) {
-        return decode_utf32(bytes, encoding, maximum).map(Cow::Owned);
+        return decode_utf32(bytes, encoding, maximum, storage).map(Decoded::Owned);
     }
     if encoding == SelectedEncoding::Ascii {
         if bytes.iter().any(|byte| !byte.is_ascii()) {
-            return Err(Error::InvalidBytes("US-ASCII"));
+            return Err(Error::InvalidBytes("US-ASCII").into());
         }
         let decoded =
             core::str::from_utf8(bytes).expect("seven-bit US-ASCII is always valid UTF-8");
@@ -558,12 +710,14 @@ fn decode_selected<'a>(
             return Err(Error::DecodedLimit {
                 maximum,
                 actual: decoded.len(),
-            });
+            }
+            .into());
         }
-        return Ok(Cow::Borrowed(decoded));
+        return Ok(Decoded::Borrowed(decoded));
     }
     if matches!(encoding, SelectedEncoding::Registered(_)) {
-        return decode_registered_single_byte(bytes, encoding, maximum).map(Cow::Owned);
+        return decode_registered_single_byte(bytes, encoding, maximum, storage)
+            .map(Decoded::Owned);
     }
     let SelectedEncoding::Standard(encoding) = encoding else {
         unreachable!("special-case encodings returned above")
@@ -574,48 +728,65 @@ fn decode_selected<'a>(
             return Err(Error::DecodedLimit {
                 maximum,
                 actual: decoded.len(),
-            });
+            }
+            .into());
         }
-        return Ok(Cow::Borrowed(decoded));
+        return Ok(Decoded::Borrowed(decoded));
     }
     if (encoding == encoding_rs::UTF_16LE || encoding == encoding_rs::UTF_16BE)
         && !bytes.len().is_multiple_of(2)
     {
-        return Err(Error::InvalidUtf16Length(encoding.name()));
+        return Err(Error::InvalidUtf16Length(encoding.name()).into());
     }
 
     let mut decoder = encoding.new_decoder_without_bom_handling();
     let mut remaining = bytes;
-    let mut decoded = String::with_capacity(bytes.len().min(maximum));
+    let mut decoded = storage.buffer();
     let mut buffer = [0_u8; 4096];
     loop {
-        let (result, read, written) =
-            decoder.decode_to_utf8_without_replacement(remaining, &mut buffer, true);
-        let actual = decoded.len().saturating_add(written);
+        // Bound input as well as output: stateful escapes can consume a long
+        // input without output. Charging the entire tail on each output chunk
+        // would turn a linear decoder into quadratic admitted work.
+        let input_length = remaining.len().min(buffer.len());
+        let last = input_length == remaining.len();
+        storage.charge(input_length)?;
+        let (result, read, written) = decoder.decode_to_utf8_without_replacement(
+            &remaining[..input_length],
+            &mut buffer,
+            last,
+        );
+        let actual = storage.len(&decoded).saturating_add(written);
         if actual > maximum {
-            return Err(Error::DecodedLimit { maximum, actual });
+            return Err(Error::DecodedLimit { maximum, actual }.into());
         }
-        decoded.push_str(
+        storage.charge(written)?;
+        storage.append(
+            &mut decoded,
             core::str::from_utf8(&buffer[..written])
                 .expect("encoding_rs emits valid UTF-8 into the output buffer"),
-        );
+        )?;
         remaining = &remaining[read..];
         match result {
-            encoding_rs::DecoderResult::InputEmpty => return Ok(Cow::Owned(decoded)),
+            encoding_rs::DecoderResult::InputEmpty if last => {
+                return storage.finish(decoded).map(Decoded::Owned);
+            }
+            encoding_rs::DecoderResult::InputEmpty => {}
             encoding_rs::DecoderResult::OutputFull => {}
             encoding_rs::DecoderResult::Malformed(_, _) => {
-                return Err(Error::InvalidBytes(encoding.name()));
+                return Err(Error::InvalidBytes(encoding.name()).into());
             }
         }
     }
 }
 
-fn decode_registered_single_byte(
+fn decode_registered_single_byte<S: DecodeStorage>(
     bytes: &[u8],
     encoding: SelectedEncoding,
     maximum: usize,
-) -> Result<String, Error> {
-    let mut decoded = String::with_capacity(bytes.len().min(maximum));
+    storage: &S,
+) -> Result<S::Text, S::Error> {
+    storage.charge(bytes.len())?;
+    let mut decoded = storage.buffer();
     for &byte in bytes {
         let character = match encoding {
             SelectedEncoding::Registered(encoding) => encoding
@@ -623,20 +794,26 @@ fn decode_registered_single_byte(
                 .ok_or_else(|| Error::InvalidBytes(encoding.name()))?,
             _ => unreachable!("registered single-byte decoder receives a matching encoding"),
         };
-        let actual = decoded.len().saturating_add(character.len_utf8());
+        let actual = storage.len(&decoded).saturating_add(character.len_utf8());
         if actual > maximum {
-            return Err(Error::DecodedLimit { maximum, actual });
+            return Err(Error::DecodedLimit { maximum, actual }.into());
         }
-        decoded.push(character);
+        storage.append(&mut decoded, character.encode_utf8(&mut [0; 4]))?;
     }
-    Ok(decoded)
+    storage.finish(decoded)
 }
 
-fn decode_utf32(bytes: &[u8], encoding: SelectedEncoding, maximum: usize) -> Result<String, Error> {
+fn decode_utf32<S: DecodeStorage>(
+    bytes: &[u8],
+    encoding: SelectedEncoding,
+    maximum: usize,
+    storage: &S,
+) -> Result<S::Text, S::Error> {
     if !bytes.len().is_multiple_of(4) {
-        return Err(Error::InvalidUtf32Length(encoding.name()));
+        return Err(Error::InvalidUtf32Length(encoding.name()).into());
     }
-    let mut decoded = String::with_capacity(bytes.len().min(maximum));
+    storage.charge(bytes.len())?;
+    let mut decoded = storage.buffer();
     let (units, remainder) = bytes.as_chunks::<4>();
     debug_assert!(remainder.is_empty());
     for &unit in units {
@@ -646,13 +823,13 @@ fn decode_utf32(bytes: &[u8], encoding: SelectedEncoding, maximum: usize) -> Res
             _ => unreachable!("UTF-32 decoder receives an explicit byte order"),
         };
         let character = char::from_u32(scalar).ok_or(Error::InvalidBytes(encoding.name()))?;
-        let actual = decoded.len().saturating_add(character.len_utf8());
+        let actual = storage.len(&decoded).saturating_add(character.len_utf8());
         if actual > maximum {
-            return Err(Error::DecodedLimit { maximum, actual });
+            return Err(Error::DecodedLimit { maximum, actual }.into());
         }
-        decoded.push(character);
+        storage.append(&mut decoded, character.encode_utf8(&mut [0; 4]))?;
     }
-    Ok(decoded)
+    storage.finish(decoded)
 }
 
 fn encodings_compatible(

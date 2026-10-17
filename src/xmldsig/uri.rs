@@ -12,6 +12,7 @@
 //! External URI bytes are resolved only from an explicit caller-owned map; this
 //! module never performs network or filesystem I/O.
 
+use crate::c14n::scratch::{Bytes as _, Native, Scratch, Text as _};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -27,6 +28,36 @@ use crate::xml::{XmlIdIndex, is_xml_ncname};
 use super::types::{
     NodeSet, NodeSetMaterializationBudget, TransformData, TransformError, transform_resource_limit,
 };
+
+/// Original resource identity, before choosing operation-owned projection storage.
+pub(crate) enum ReferenceInput<'a> {
+    Xml {
+        root: Node<'a, 'a>,
+        with_comments: bool,
+    },
+    Binary(&'a [u8]),
+}
+
+pub(crate) enum NormalizedFragment<'uri, B> {
+    Borrowed(&'uri str),
+    Owned(B),
+}
+
+impl<B: std::ops::Deref<Target = [u8]>> NormalizedFragment<'_, B> {
+    pub(crate) fn view(&self, scratch: &impl Scratch) -> Result<&str, TransformError> {
+        match self {
+            Self::Borrowed(text) => Ok(text),
+            Self::Owned(bytes) => {
+                scratch.charge(bytes.len())?;
+                std::str::from_utf8(bytes).map_err(|_| invalid_fragment())
+            }
+        }
+    }
+}
+
+fn invalid_fragment() -> TransformError {
+    TransformError::UnsupportedUri("invalid same-document fragment".into())
+}
 
 /// Validate signing URI policy independently of request-scoped resource bytes.
 pub(crate) fn validate_signing_reference_uri(
@@ -502,20 +533,45 @@ impl<'a> UriReferenceResolver<'a> {
 
     /// Preserve an admitted external lookup's absence. Unsupported fragment
     /// syntax, ambiguous IDs and resource failures are never recast as absence.
-    pub(crate) fn replay_input_from_with_budget(
+    pub(crate) fn replay_input_from_with_budget<S: Scratch>(
         &self,
         uri: &str,
         origin: Node<'_, '_>,
         budget: &NodeSetMaterializationBudget,
         xml_base_budget: &XmlBaseResolutionBudget,
-    ) -> Result<Option<TransformData<'a>>, TransformError> {
-        if uri.is_empty() || uri.starts_with('#') {
-            return self.dereference_with_budget(uri, budget).map(Some);
+        scratch: &S,
+    ) -> Result<Option<ReferenceInput<'a>>, TransformError> {
+        if uri.is_empty() {
+            return Ok(Some(ReferenceInput::Xml {
+                root: self.doc.root(),
+                with_comments: false,
+            }));
         }
-        let resolved = resolve_uri_from_node_with_budget(origin, uri, xml_base_budget)
-            .map_err(map_xml_base_resolution_error)?;
-        self.external_resource(&resolved)
-            .map(|bytes| bytes.map(TransformData::BorrowedBinary))
+        if let Some(fragment) = uri.strip_prefix('#') {
+            let normalized = Self::normalize_fragment_in(
+                fragment,
+                Some(budget),
+                self.same_document_id_semantics,
+                scratch,
+            )?;
+            let fragment = normalized.view(scratch)?;
+            scratch.charge(fragment.len())?;
+            return self.normalized_fragment_input(fragment).map(Some);
+        }
+        let resolved = crate::c14n::xml_base::resolve_uri_from_node_in(
+            origin,
+            uri,
+            None,
+            xml_base_budget,
+            scratch,
+        )
+        .map_err(map_xml_base_execution_error)?;
+        let resolved = resolved.view().map_err(map_xml_base_execution_error)?;
+        scratch
+            .charge(resolved.len())
+            .map_err(map_xml_base_execution_error)?;
+        self.external_resource(resolved)
+            .map(|bytes| bytes.map(ReferenceInput::Binary))
     }
 
     fn dereference_with_optional_budget(
@@ -560,6 +616,28 @@ impl<'a> UriReferenceResolver<'a> {
         let normalized =
             Self::normalize_fragment(fragment, budget, self.same_document_id_semantics)?;
         let fragment = normalized.as_ref();
+        self.dereference_normalized_fragment(fragment, budget)
+    }
+
+    fn dereference_normalized_fragment(
+        &self,
+        fragment: &str,
+        budget: Option<&NodeSetMaterializationBudget>,
+    ) -> Result<TransformData<'a>, TransformError> {
+        let ReferenceInput::Xml {
+            root,
+            with_comments,
+        } = self.normalized_fragment_input(fragment)?
+        else {
+            unreachable!("a same-document fragment resolves to XML");
+        };
+        NodeSet::projected(root, with_comments, budget).map(TransformData::NodeSet)
+    }
+
+    fn normalized_fragment_input(
+        &self,
+        fragment: &str,
+    ) -> Result<ReferenceInput<'a>, TransformError> {
         if fragment.is_empty() {
             // Bare "#" is not a valid same-document reference
             return Err(TransformError::UnsupportedUri("#".to_string()));
@@ -569,21 +647,21 @@ impl<'a> UriReferenceResolver<'a> {
             // XPointer root: entire document WITH comments (unlike empty URI).
             // Per XMLDSig §4.3.3.3: "the XPointer expression [...] includes
             // comment nodes"
-            let nodes = match self.view {
-                Some(view) => NodeSet::entire_document_with_comments_from_view(view, budget)?,
-                None => match budget {
-                    Some(budget) => {
-                        NodeSet::entire_document_with_comments_with_budget(self.doc, budget)?
-                    }
-                    None => NodeSet::entire_document_with_comments(self.doc)?,
-                },
-            };
-            Ok(TransformData::NodeSet(nodes))
+            Ok(ReferenceInput::Xml {
+                root: self.doc.root(),
+                with_comments: true,
+            })
         } else {
             let (id, with_comments) = self
                 .same_document_id_fragment(fragment)
                 .ok_or_else(|| TransformError::UnsupportedUri(format!("#{fragment}")))?;
-            self.resolve_id(id, budget, with_comments)
+            self.id_index
+                .node(self.doc, id)
+                .map(|root| ReferenceInput::Xml {
+                    root,
+                    with_comments,
+                })
+                .ok_or_else(|| TransformError::ElementNotFound(id.to_string()))
         }
     }
 
@@ -623,31 +701,6 @@ impl<'a> UriReferenceResolver<'a> {
         Some((fragment, false))
     }
 
-    /// Look up an element by its ID attribute value and return a subtree node set.
-    fn resolve_id(
-        &self,
-        id: &str,
-        budget: Option<&NodeSetMaterializationBudget>,
-        with_comments: bool,
-    ) -> Result<TransformData<'a>, TransformError> {
-        match self.id_index.node(self.doc, id) {
-            Some(element) => {
-                let nodes = if let Some(view) = self.view {
-                    NodeSet::subtree_from_view(view, element, with_comments, budget)?
-                } else if with_comments {
-                    match budget {
-                        Some(budget) => NodeSet::subtree_with_budget(element, budget)?,
-                        None => NodeSet::subtree(element)?,
-                    }
-                } else {
-                    NodeSet::subtree_without_comments_with_budget(element, budget)?
-                };
-                Ok(TransformData::NodeSet(nodes))
-            }
-            None => Err(TransformError::ElementNotFound(id.to_string())),
-        }
-    }
-
     /// Check if an ID is registered in the resolver's index.
     pub fn has_id(&self, id: &str) -> bool {
         self.id_index.contains(id)
@@ -675,10 +728,19 @@ impl<'a> UriReferenceResolver<'a> {
         uri: &str,
         budget: Option<&NodeSetMaterializationBudget>,
     ) -> Result<Option<Node<'a, 'a>>, TransformError> {
+        self.node_for_same_document_reference_in(uri, budget, &Native)
+    }
+
+    pub(crate) fn node_for_same_document_reference_in(
+        &self,
+        uri: &str,
+        budget: Option<&NodeSetMaterializationBudget>,
+        scratch: &impl Scratch,
+    ) -> Result<Option<Node<'a, 'a>>, TransformError> {
         if uri.is_empty() {
             return Ok(Some(self.doc.root_element()));
         }
-        let target = self.node_id_for_reference_resource(uri, budget)?;
+        let target = self.node_id_for_reference_resource_in(uri, budget, scratch)?;
         if target == Some(self.doc.root().id()) {
             return Err(TransformError::UnsupportedUri(uri.to_owned()));
         }
@@ -730,15 +792,29 @@ impl<'a> UriReferenceResolver<'a> {
         uri: &str,
         budget: Option<&NodeSetMaterializationBudget>,
     ) -> Result<Option<NodeId>, TransformError> {
+        self.node_id_for_reference_resource_in(uri, budget, &Native)
+    }
+
+    fn node_id_for_reference_resource_in(
+        &self,
+        uri: &str,
+        budget: Option<&NodeSetMaterializationBudget>,
+        scratch: &impl Scratch,
+    ) -> Result<Option<NodeId>, TransformError> {
         if uri.is_empty() {
             return Ok(Some(self.doc.root().id()));
         }
         let fragment = uri
             .strip_prefix('#')
             .ok_or_else(|| TransformError::UnsupportedUri(uri.to_owned()))?;
-        let normalized =
-            Self::normalize_fragment(fragment, budget, self.same_document_id_semantics)?;
-        let fragment = normalized.as_ref();
+        let normalized = Self::normalize_fragment_in(
+            fragment,
+            budget,
+            self.same_document_id_semantics,
+            scratch,
+        )?;
+        let fragment = normalized.view(scratch)?;
+        scratch.charge(fragment.len())?;
         if fragment.is_empty() {
             return Err(TransformError::UnsupportedUri(uri.to_owned()));
         }
@@ -765,12 +841,26 @@ impl<'a> UriReferenceResolver<'a> {
         budget: Option<&NodeSetMaterializationBudget>,
         semantics: SameDocumentIdSemantics,
     ) -> Result<std::borrow::Cow<'uri, str>, TransformError> {
-        use std::borrow::Cow;
-        let invalid = || TransformError::UnsupportedUri("invalid same-document fragment".into());
+        match Self::normalize_fragment_in(fragment, budget, semantics, &Native)? {
+            NormalizedFragment::Borrowed(text) => Ok(std::borrow::Cow::Borrowed(text)),
+            NormalizedFragment::Owned(bytes) => Ok(std::borrow::Cow::Owned(
+                String::from_utf8(bytes).map_err(|_| invalid_fragment())?,
+            )),
+        }
+    }
+
+    pub(crate) fn normalize_fragment_in<'uri, S: Scratch>(
+        fragment: &'uri str,
+        budget: Option<&NodeSetMaterializationBudget>,
+        semantics: SameDocumentIdSemantics,
+        scratch: &S,
+    ) -> Result<NormalizedFragment<'uri, S::Bytes>, TransformError> {
+        let invalid = invalid_fragment;
         if fragment.len() > crate::hard_limits::XML_DOCUMENT_BYTE_CEILING {
             return Err(invalid());
         }
-        let mut result = Cow::Borrowed(fragment);
+        scratch.charge(fragment.len())?;
+        let mut result = NormalizedFragment::Borrowed(fragment);
         // XPointer Framework sections 3 and 4 reverse URI escaping before
         // evaluating the pointer. libxmlsec1's barename/Visa3D modes instead
         // use literal bare ID strings. Explicit pointers still follow the
@@ -783,11 +873,15 @@ impl<'a> UriReferenceResolver<'a> {
             if let Some(budget) = budget {
                 budget.reserve_workspace(fragment.len())?;
             }
-            let mut decoded = Vec::with_capacity(fragment.len());
+            let mut decoded = scratch.bytes();
+            decoded.reserve(fragment.len())?;
+            scratch.charge(fragment.len())?;
             let bytes = fragment.as_bytes();
             let mut position = 0;
+            let mut chunk = [0; 1024];
+            let mut used = 0;
             while position < bytes.len() {
-                if bytes[position] == b'%' {
+                let byte = if bytes[position] == b'%' {
                     let high = bytes
                         .get(position + 1)
                         .and_then(|byte| hex_digit(*byte))
@@ -796,19 +890,29 @@ impl<'a> UriReferenceResolver<'a> {
                         .get(position + 2)
                         .and_then(|byte| hex_digit(*byte))
                         .ok_or_else(invalid)?;
-                    decoded.push(high * 16 + low);
                     position += 3;
+                    high * 16 + low
                 } else {
-                    decoded.push(bytes[position]);
+                    let byte = bytes[position];
                     position += 1;
+                    byte
+                };
+                chunk[used] = byte;
+                used += 1;
+                if used == chunk.len() {
+                    decoded.append(&chunk)?;
+                    used = 0;
                 }
             }
-            result = Cow::Owned(String::from_utf8(decoded).map_err(|_| invalid())?);
+            decoded.append(&chunk[..used])?;
+            result = NormalizedFragment::Owned(decoded);
         }
-        if result.starts_with("xpointer(") {
+        let text = result.view(scratch)?;
+        if text.starts_with("xpointer(") {
             // Framework [7] balances parentheses even inside XPath literals;
             // only ^(, ^), and ^^ are escaping pairs.
-            let bytes = result.as_bytes();
+            scratch.charge(text.len())?;
+            let bytes = text.as_bytes();
             let mut depth = 0usize;
             let mut position = "xpointer".len();
             while position < bytes.len() {
@@ -837,24 +941,35 @@ impl<'a> UriReferenceResolver<'a> {
             if depth != 0 {
                 return Err(invalid());
             }
-            if result.contains('^') {
-                if matches!(result, Cow::Borrowed(_))
-                    && let Some(budget) = budget
-                {
-                    budget.reserve_workspace(result.len())?;
+            scratch.charge(text.len())?;
+            if text.contains('^') {
+                if let NormalizedFragment::Borrowed(text) = result {
+                    if let Some(budget) = budget {
+                        budget.reserve_workspace(text.len())?;
+                    }
+                    let mut bytes = scratch.bytes();
+                    bytes.reserve(text.len())?;
+                    bytes.append(text.as_bytes())?;
+                    result = NormalizedFragment::Owned(bytes);
                 }
+                let NormalizedFragment::Owned(ref mut bytes) = result else {
+                    unreachable!()
+                };
+                scratch.charge(bytes.len())?;
                 let mut escaped = false;
-                result.to_mut().retain(|character| {
+                let mut write = 0;
+                for read in 0..bytes.len() {
+                    let character = bytes[read];
                     if escaped {
                         escaped = false;
-                        true
-                    } else if character == '^' {
+                    } else if character == b'^' {
                         escaped = true;
-                        false
-                    } else {
-                        true
+                        continue;
                     }
-                });
+                    bytes[write] = character;
+                    write += 1;
+                }
+                bytes.truncate(write);
             }
         }
         Ok(result)
@@ -898,6 +1013,24 @@ fn is_xpointer_root(fragment: &str) -> bool {
         .strip_prefix("xpointer(")
         .and_then(|value| value.strip_suffix(')'))
         .is_some_and(|expression| xml_space_trim(expression) == "/")
+}
+
+pub(crate) fn map_xml_base_execution_error(error: crate::c14n::C14nError) -> TransformError {
+    match error {
+        crate::c14n::C14nError::XmlBaseComponentsTooLarge { max, actual } => {
+            map_xml_base_resolution_error(XmlBaseResolutionError::Components {
+                maximum: max,
+                actual,
+            })
+        }
+        crate::c14n::C14nError::XmlBaseResolutionTooLarge { max_bytes, actual } => {
+            map_xml_base_resolution_error(XmlBaseResolutionError::Bytes {
+                maximum: max_bytes,
+                actual,
+            })
+        }
+        error => error.into(),
+    }
 }
 
 pub(crate) fn map_xml_base_resolution_error(error: XmlBaseResolutionError) -> TransformError {
@@ -954,6 +1087,116 @@ fn xml_space_trim(value: &str) -> &str {
 mod tests {
     use super::super::types::NodeSet;
     use super::*;
+
+    #[test]
+    fn fragment_current_execution_admits_work_and_capacity() {
+        // Escaping must be paid by the current query, not the retained parser;
+        // refused and completed temporaries release their capacity immediately.
+        use crate::c14n::scratch::Accounted;
+        use structured_asn1::memory::{Memory, MemoryAccount};
+
+        let work = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 20)));
+        for (source, expected) in [
+            ("target", "target"),
+            ("caf%C3%A9", "café"),
+            ("xpointer(id('a^(b^)'))", "xpointer(id('a(b)'))"),
+            ("%78pointer(id('a%5E(b%5E)'))", "xpointer(id('a(b)'))"),
+        ] {
+            let normalized = UriReferenceResolver::normalize_fragment_in(
+                source,
+                None,
+                SameDocumentIdSemantics::Specification,
+                &Accounted(&work),
+            )
+            .unwrap();
+            assert_eq!(normalized.view(&Accounted(&work)).unwrap(), expected);
+            drop(normalized);
+            assert_eq!(work.used(), 0);
+        }
+        let tiny = Memory::new(std::sync::Arc::new(MemoryAccount::new(1, 1 << 20)));
+        assert!(
+            UriReferenceResolver::normalize_fragment_in(
+                "tar%67et",
+                None,
+                SameDocumentIdSemantics::Specification,
+                &Accounted(&tiny),
+            )
+            .is_err()
+        );
+        let zero = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 0)));
+        assert!(
+            UriReferenceResolver::normalize_fragment_in(
+                "target",
+                None,
+                SameDocumentIdSemantics::Specification,
+                &Accounted(&zero),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn fragment_query_local_and_aggregate_boundaries_agree() {
+        // A retained source must not replace a query's local ceiling with its
+        // aggregate account. Exact admission succeeds; one-less refuses before
+        // returning a normalized view, releasing all temporary storage.
+        use crate::c14n::scratch::Accounted;
+        use structured_asn1::{
+            Encoding, Limits, Parser,
+            memory::{Memory, MemoryAccount},
+        };
+        let source = "%78pointer(id('caf%C3%A9%5E(x%5E)'))";
+        let run = |local: u64, aggregate: usize| {
+            let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(4096, aggregate)));
+            let parser = Parser::new(
+                Encoding::Der,
+                Limits {
+                    max_work: local,
+                    ..Limits::default()
+                },
+                memory.clone(),
+            );
+            let reader = parser.read(&[], 0).unwrap();
+            let work = reader.execution();
+            let before = memory.work_used();
+            let result = (|| {
+                let fragment = UriReferenceResolver::normalize_fragment_in(
+                    source,
+                    None,
+                    SameDocumentIdSemantics::Specification,
+                    &Accounted(&work),
+                )?;
+                assert_eq!(fragment.view(&Accounted(&work))?, "xpointer(id('café(x)'))");
+                Ok::<_, TransformError>(())
+            })();
+            assert_eq!(memory.used(), 0);
+            (result, memory.work_used() - before)
+        };
+        let (result, cost) = run(1 << 20, 1 << 20);
+        result.unwrap();
+        assert!(cost > source.len());
+        for (local, aggregate, success) in [
+            (cost as u64, cost, true),
+            (cost as u64 - 1, cost, false),
+            (cost as u64, cost - 1, false),
+            (0, cost, false),
+            (cost as u64, 0, false),
+        ] {
+            let (result, _) = run(local, aggregate);
+            if success {
+                result.unwrap();
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(TransformError::C14n(
+                        crate::c14n::C14nError::SharedExecution(
+                            structured_asn1::memory::MemoryError::WorkExceeded
+                        )
+                    ))
+                ));
+            }
+        }
+    }
 
     #[test]
     fn escaped_fragments_preserve_target_and_comment_semantics() {

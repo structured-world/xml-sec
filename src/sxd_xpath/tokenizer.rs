@@ -2,15 +2,16 @@
 use crate::sxd_document as sxd_document_no_unsafe;
 use peresil::{self, Identifier, Recoverable, StringPoint, try_parse};
 use snafu::Snafu;
-use std::borrow::ToOwned;
 use sxd_document_no_unsafe::parser::XmlParseExt;
 
+use crate::OwnedPrefixedName;
 use crate::node_test;
-use crate::token::{AxisName, NodeTestName, Token};
+use crate::token::{
+    AxisName, BorrowedToken as Token, NodeTestName, Token as OwnedToken, TokenData,
+};
 
-pub struct Tokenizer<'a> {
+pub(crate) struct BorrowedTokenizer<'a> {
     xpath: &'a str,
-    budget: Option<&'a crate::ParseBudget>,
     start: usize,
     prefer_recognition_of_operator_names: bool,
 }
@@ -21,7 +22,6 @@ type XPathProgress<'a, T, E> = peresil::Progress<StringPoint<'a>, T, E>;
 // one at the furthest position. Keep precisely that selection without a diagnostic Vec.
 struct XPathMaster<'a> {
     failure: Option<(StringPoint<'a>, Error)>,
-    budget: Option<&'a crate::ParseBudget>,
 }
 
 impl<'a> XPathMaster<'a> {
@@ -55,17 +55,6 @@ impl<'a> XPathMaster<'a> {
             .expect("failed alternative supplies a diagnostic");
         peresil::Progress::failure(point, error)
     }
-
-    fn reserve(&self, point: StringPoint<'a>, bytes: usize) -> XPathProgress<'a, (), Error> {
-        if self
-            .budget
-            .is_some_and(|budget| budget.charge(bytes).is_err())
-        {
-            peresil::Progress::failure(point, Error::AllocationLimit)
-        } else {
-            peresil::Progress::success(point, ())
-        }
-    }
 }
 
 struct XPathAlternate<'m, 'a, T> {
@@ -93,7 +82,8 @@ impl<'a, T> XPathAlternate<'_, 'a, T> {
     }
 }
 
-pub type TokenResult = Result<Token, Error>;
+pub type TokenResult = Result<OwnedToken, Error>;
+pub(crate) type BorrowedTokenResult<'a> = Result<Token<'a>, Error>;
 
 #[derive(Debug, Snafu, Copy, Clone, PartialEq)]
 #[snafu(context(suffix(false)))]
@@ -171,7 +161,7 @@ impl<'a> XPathParseExt<'a> for StringPoint<'a> {
     }
 }
 
-static SINGLE_CHAR_TOKENS: [Identifier<'static, Token>; 13] = [
+static SINGLE_CHAR_TOKENS: [Identifier<'static, Token<'static>>; 13] = [
     ("/", Token::Slash),
     ("(", Token::LeftParen),
     (")", Token::RightParen),
@@ -187,7 +177,7 @@ static SINGLE_CHAR_TOKENS: [Identifier<'static, Token>; 13] = [
     (",", Token::Comma),
 ];
 
-static TWO_CHAR_TOKENS: [Identifier<'static, Token>; 5] = [
+static TWO_CHAR_TOKENS: [Identifier<'static, Token<'static>>; 5] = [
     ("<=", Token::LessThanOrEqual),
     (">=", Token::GreaterThanOrEqual),
     ("!=", Token::NotEqual),
@@ -195,7 +185,7 @@ static TWO_CHAR_TOKENS: [Identifier<'static, Token>; 5] = [
     ("..", Token::ParentNode),
 ];
 
-static NAMED_OPERATORS: [Identifier<'static, Token>; 5] = [
+static NAMED_OPERATORS: [Identifier<'static, Token<'static>>; 5] = [
     ("and", Token::And),
     ("or", Token::Or),
     ("mod", Token::Remainder),
@@ -220,7 +210,7 @@ static AXES: [Identifier<'static, AxisName>; 13] = [
     ("self", AxisName::SelfAxis),
 ];
 
-static NODE_TESTS: [Identifier<'static, NodeTestName>; 4] = [
+static NODE_TESTS: [Identifier<'static, NodeTestName<&'static str>>; 4] = [
     ("comment", NodeTestName::Comment),
     ("text", NodeTestName::Text),
     (
@@ -251,16 +241,15 @@ fn parse_literal<'a>(
 fn parse_quoted_literal<'a>(
     pm: &mut XPathMaster<'a>,
     p: StringPoint<'a>,
-) -> XPathProgress<'a, Token, Error> {
+) -> XPathProgress<'a, Token<'a>, Error> {
     let (p, value) = try_parse!(parse_literal(pm, p));
-    try_parse!(pm.reserve(p, value.len()));
-    peresil::Progress::success(p, Token::Literal(value.to_owned()))
+    peresil::Progress::success(p, Token::Literal(value))
 }
 
 fn parse_number<'a>(
     pm: &mut XPathMaster<'a>,
     p: StringPoint<'a>,
-) -> XPathProgress<'a, Token, Error> {
+) -> XPathProgress<'a, Token<'a>, Error> {
     fn fractional_part(p: StringPoint<'_>) -> XPathProgress<'_, (), ()> {
         let (p, _) = try_parse!(p.consume_literal("."));
         let (p, _) = p.consume_decimal_chars().optional(p);
@@ -298,7 +287,7 @@ fn parse_number<'a>(
     peresil::Progress::success(p, Token::Number(num))
 }
 
-fn parse_current_node(p: StringPoint<'_>) -> XPathProgress<'_, Token, Error> {
+fn parse_current_node(p: StringPoint<'_>) -> XPathProgress<'_, Token<'_>, Error> {
     let (p, _) = try_parse!(p.consume_literal(".").context(ExpectedCurrentNode));
 
     peresil::Progress::success(p, Token::CurrentNode)
@@ -307,7 +296,7 @@ fn parse_current_node(p: StringPoint<'_>) -> XPathProgress<'_, Token, Error> {
 fn parse_named_operators(
     p: StringPoint<'_>,
     prefer_named_ops: bool,
-) -> XPathProgress<'_, Token, Error> {
+) -> XPathProgress<'_, Token<'_>, Error> {
     if prefer_named_ops {
         p.consume_identifier(&NAMED_OPERATORS)
             .context(ExpectedNamedOperator)
@@ -317,7 +306,7 @@ fn parse_named_operators(
     }
 }
 
-fn parse_axis_specifier(p: StringPoint<'_>) -> XPathProgress<'_, Token, Error> {
+fn parse_axis_specifier(p: StringPoint<'_>) -> XPathProgress<'_, Token<'_>, Error> {
     // Ideally, we would check for the pair of the name and the ::,
     // then loop. This would prevent us from having to order AXES.
     let (p, axis) = try_parse!(p.consume_identifier(&AXES).context(ExpectedAxis));
@@ -329,8 +318,8 @@ fn parse_axis_specifier(p: StringPoint<'_>) -> XPathProgress<'_, Token, Error> {
 fn parse_node_type<'a>(
     pm: &mut XPathMaster<'a>,
     p: StringPoint<'a>,
-) -> XPathProgress<'a, Token, Error> {
-    fn without_arg(p: StringPoint<'_>) -> XPathProgress<'_, Token, ()> {
+) -> XPathProgress<'a, Token<'a>, Error> {
+    fn without_arg(p: StringPoint<'_>) -> XPathProgress<'_, Token<'_>, ()> {
         let (p, node_type) = try_parse!(p.consume_identifier(&NODE_TESTS));
         let (p, _) = p.consume_space().optional(p);
         let (p, _) = try_parse!(p.consume_literal("("));
@@ -343,7 +332,7 @@ fn parse_node_type<'a>(
     fn with_arg<'a>(
         pm: &mut XPathMaster<'a>,
         p: StringPoint<'a>,
-    ) -> XPathProgress<'a, Token, Error> {
+    ) -> XPathProgress<'a, Token<'a>, Error> {
         let (p, _) = try_parse!(
             p.consume_literal("processing-instruction")
                 .context(ExpectedNodeTest)
@@ -355,8 +344,7 @@ fn parse_node_type<'a>(
         let (p, _) = p.consume_space().optional(p);
         let (p, _) = try_parse!(p.consume_literal(")").context(ExpectedNodeTest));
 
-        try_parse!(pm.reserve(p, arg.len()));
-        let name = NodeTestName::ProcessingInstruction(Some(arg.to_owned()));
+        let name = NodeTestName::ProcessingInstruction(Some(arg));
         peresil::Progress::success(p, Token::NodeTest(name))
     }
 
@@ -366,106 +354,72 @@ fn parse_node_type<'a>(
         .finish()
 }
 
-fn parse_function_call<'a>(
-    pm: &XPathMaster<'a>,
-    p: StringPoint<'a>,
-) -> XPathProgress<'a, Token, Error> {
+fn parse_function_call(p: StringPoint<'_>) -> XPathProgress<'_, Token<'_>, Error> {
     let (p, name) = try_parse!(p.consume_prefixed_name().context(ExpectedPrefixedName));
     // Do not advance the point here. We want to know if there *is* a
     // left-paren, but do not want to actually consume it here.
     try_parse!(p.consume_literal("(").context(ExpectedLeftParenthesis));
 
-    try_parse!(pm.reserve(
-        p,
-        name.prefix().map_or(0, str::len) + name.local_part().len()
-    ));
-    peresil::Progress::success(p, Token::Function(name.into()))
+    peresil::Progress::success(p, Token::Function(name))
 }
 
 fn parse_name_test<'a>(
     pm: &mut XPathMaster<'a>,
     p: StringPoint<'a>,
-) -> XPathProgress<'a, Token, Error> {
-    fn wildcard<'a>(pm: &XPathMaster<'a>, p: StringPoint<'a>) -> XPathProgress<'a, Token, Error> {
+) -> XPathProgress<'a, Token<'a>, Error> {
+    fn wildcard(p: StringPoint<'_>) -> XPathProgress<'_, Token<'_>, Error> {
         let (p, wc) = try_parse!(p.consume_literal("*").context(ExpectedNameTest));
-        try_parse!(pm.reserve(p, wc.len()));
 
         let name = node_test::NameTest {
             prefix: None,
-            local_part: wc.to_owned(),
+            local_part: wc,
         };
         peresil::Progress::success(p, Token::NameTest(name))
     }
 
-    fn prefixed_wildcard<'a>(
-        pm: &XPathMaster<'a>,
-        p: StringPoint<'a>,
-    ) -> XPathProgress<'a, Token, Error> {
+    fn prefixed_wildcard(p: StringPoint<'_>) -> XPathProgress<'_, Token<'_>, Error> {
         let (p, prefix) = try_parse!(p.consume_ncname().context(ExpectedNameTest));
         let (p, _) = try_parse!(p.consume_literal(":").context(ExpectedNameTest));
         let (p, wc) = try_parse!(p.consume_literal("*").context(ExpectedNameTest));
-        try_parse!(pm.reserve(p, prefix.len() + wc.len()));
 
         let name = node_test::NameTest {
-            prefix: Some(prefix.to_owned()),
-            local_part: wc.to_owned(),
+            prefix: Some(prefix),
+            local_part: wc,
         };
         peresil::Progress::success(p, Token::NameTest(name))
     }
 
-    fn prefixed_name<'a>(
-        pm: &XPathMaster<'a>,
-        p: StringPoint<'a>,
-    ) -> XPathProgress<'a, Token, Error> {
+    fn prefixed_name(p: StringPoint<'_>) -> XPathProgress<'_, Token<'_>, Error> {
         let (p, name) = try_parse!(p.consume_prefixed_name().context(ExpectedNameTest));
-        try_parse!(pm.reserve(
-            p,
-            name.prefix().map_or(0, str::len) + name.local_part().len()
-        ));
         peresil::Progress::success(
             p,
             Token::NameTest(node_test::NameTest {
-                prefix: name.prefix().map(|p| p.to_owned()),
-                local_part: name.local_part().to_owned(),
+                prefix: name.prefix(),
+                local_part: name.local_part(),
             }),
         )
     }
 
     pm.alternate()
-        .one(|pm| wildcard(pm, p))
-        .one(|pm| prefixed_wildcard(pm, p))
-        .one(|pm| prefixed_name(pm, p))
+        .one(|_| wildcard(p))
+        .one(|_| prefixed_wildcard(p))
+        .one(|_| prefixed_name(p))
         .finish()
 }
 
-fn parse_variable_reference<'a>(
-    pm: &XPathMaster<'a>,
-    p: StringPoint<'a>,
-) -> XPathProgress<'a, Token, Error> {
+fn parse_variable_reference(p: StringPoint<'_>) -> XPathProgress<'_, Token<'_>, Error> {
     let (p, _) = try_parse!(p.consume_literal("$").context(ExpectedVariableReference));
     let (p, name) = try_parse!(p.consume_prefixed_name().context(ExpectedPrefixedName));
 
-    try_parse!(pm.reserve(
-        p,
-        name.prefix().map_or(0, str::len) + name.local_part().len()
-    ));
-    peresil::Progress::success(p, Token::Variable(name.into()))
+    peresil::Progress::success(p, Token::Variable(name))
 }
 
-impl<'input> Tokenizer<'input> {
+impl<'input> BorrowedTokenizer<'input> {
     pub fn new(xpath: &'input str) -> Self {
-        Tokenizer {
+        BorrowedTokenizer {
             xpath,
-            budget: None,
             start: 0,
             prefer_recognition_of_operator_names: false,
-        }
-    }
-
-    pub fn with_budget(xpath: &'input str, budget: &'input crate::ParseBudget) -> Self {
-        Self {
-            budget: Some(budget),
-            ..Self::new(xpath)
         }
     }
 
@@ -477,7 +431,7 @@ impl<'input> Tokenizer<'input> {
         &self,
         pm: &mut XPathMaster<'a>,
         p: StringPoint<'a>,
-    ) -> XPathProgress<'a, Token, Error> {
+    ) -> XPathProgress<'a, Token<'a>, Error> {
         let (p, _) = p.consume_space().optional(p);
 
         let (p, tok) = try_parse!({
@@ -496,9 +450,9 @@ impl<'input> Tokenizer<'input> {
                 .one(|_| parse_named_operators(p, self.prefer_recognition_of_operator_names))
                 .one(|_| parse_axis_specifier(p))
                 .one(|pm| parse_node_type(pm, p))
-                .one(|pm| parse_function_call(pm, p))
+                .one(|_| parse_function_call(p))
                 .one(|pm| parse_name_test(pm, p))
-                .one(|pm| parse_variable_reference(pm, p))
+                .one(|_| parse_variable_reference(p))
                 .finish()
         });
 
@@ -507,11 +461,8 @@ impl<'input> Tokenizer<'input> {
         peresil::Progress::success(p, tok)
     }
 
-    fn raw_next_token(&mut self) -> TokenResult {
-        let mut pm = XPathMaster {
-            failure: None,
-            budget: self.budget,
-        };
+    fn raw_next_token(&mut self) -> BorrowedTokenResult<'input> {
+        let mut pm = XPathMaster { failure: None };
         let p = StringPoint {
             s: &self.xpath[self.start..],
             offset: self.start,
@@ -539,7 +490,7 @@ impl<'input> Tokenizer<'input> {
         }
     }
 
-    fn next_token(&mut self) -> TokenResult {
+    fn next_token(&mut self) -> BorrowedTokenResult<'input> {
         let token = self.raw_next_token()?;
 
         if !(token.precedes_node_test() || token.precedes_expression() || token.is_operator()) {
@@ -553,10 +504,10 @@ impl<'input> Tokenizer<'input> {
     }
 }
 
-impl Iterator for Tokenizer<'_> {
-    type Item = TokenResult;
+impl<'input> Iterator for BorrowedTokenizer<'input> {
+    type Item = BorrowedTokenResult<'input>;
 
-    fn next(&mut self) -> Option<TokenResult> {
+    fn next(&mut self) -> Option<Self::Item> {
         if self.has_more_tokens() {
             let token = self.next_token();
             if token.is_err() {
@@ -569,9 +520,59 @@ impl Iterator for Tokenizer<'_> {
     }
 }
 
-pub struct TokenDeabbreviator<I> {
+/// The public/native adapter materializes only the successfully recognized
+/// token, after admitting its complete payload. The shared lexer also exposes
+/// source borrows for direct arena construction without owned token text.
+pub struct Tokenizer<'a> {
+    lexical: BorrowedTokenizer<'a>,
+    budget: Option<&'a crate::ParseBudget>,
+}
+
+impl<'a> Tokenizer<'a> {
+    pub fn new(xpath: &'a str) -> Self {
+        Self {
+            lexical: BorrowedTokenizer::new(xpath),
+            budget: None,
+        }
+    }
+
+    pub fn with_budget(xpath: &'a str, budget: &'a crate::ParseBudget) -> Self {
+        Self {
+            lexical: BorrowedTokenizer::new(xpath),
+            budget: Some(budget),
+        }
+    }
+
+    pub fn has_more_tokens(&self) -> bool {
+        self.lexical.has_more_tokens()
+    }
+}
+
+impl Iterator for Tokenizer<'_> {
+    type Item = TokenResult;
+    fn next(&mut self) -> Option<Self::Item> {
+        if !self.has_more_tokens() {
+            return None;
+        }
+        let token = self.lexical.next_token();
+        let result = token.and_then(|token| {
+            if let Some(budget) = self.budget
+                && budget.charge(token.payload_bytes()).is_err()
+            {
+                return Err(Error::AllocationLimit);
+            }
+            Ok(token.into_owned())
+        });
+        if result.is_err() {
+            self.lexical.start = self.lexical.xpath.len();
+        }
+        Some(result)
+    }
+}
+
+pub struct TokenDeabbreviator<I, N = OwnedPrefixedName, T = String> {
     source: I,
-    buffer: [Option<Token>; 3],
+    buffer: [Option<TokenData<N, T>>; 3],
 }
 
 // Avoid adding the first element to the buffer, but keep the
@@ -585,46 +586,46 @@ macro_rules! deabbrev {
     }}
 }
 
-impl<I> TokenDeabbreviator<I> {
-    pub fn new(source: I) -> TokenDeabbreviator<I> {
+impl<I, N, T> TokenDeabbreviator<I, N, T> {
+    pub fn new(source: I) -> Self {
         TokenDeabbreviator {
             source,
             buffer: [None, None, None],
         }
     }
 
-    fn expand_token(&mut self, token: Token) -> Token {
+    fn expand_token(&mut self, token: TokenData<N, T>) -> TokenData<N, T> {
         match token {
-            Token::AtSign => deabbrev!(self, Token::Axis(AxisName::Attribute)),
-            Token::DoubleSlash => deabbrev!(
+            TokenData::AtSign => deabbrev!(self, TokenData::Axis(AxisName::Attribute)),
+            TokenData::DoubleSlash => deabbrev!(
                 self,
-                Token::Slash,
-                Token::Axis(AxisName::DescendantOrSelf),
-                Token::NodeTest(NodeTestName::Node),
-                Token::Slash
+                TokenData::Slash,
+                TokenData::Axis(AxisName::DescendantOrSelf),
+                TokenData::NodeTest(NodeTestName::Node),
+                TokenData::Slash
             ),
-            Token::CurrentNode => deabbrev!(
+            TokenData::CurrentNode => deabbrev!(
                 self,
-                Token::Axis(AxisName::SelfAxis),
-                Token::NodeTest(NodeTestName::Node)
+                TokenData::Axis(AxisName::SelfAxis),
+                TokenData::NodeTest(NodeTestName::Node)
             ),
-            Token::ParentNode => deabbrev!(
+            TokenData::ParentNode => deabbrev!(
                 self,
-                Token::Axis(AxisName::Parent),
-                Token::NodeTest(NodeTestName::Node)
+                TokenData::Axis(AxisName::Parent),
+                TokenData::NodeTest(NodeTestName::Node)
             ),
             _ => token,
         }
     }
 }
 
-impl<I> Iterator for TokenDeabbreviator<I>
+impl<I, N, T> Iterator for TokenDeabbreviator<I, N, T>
 where
-    I: Iterator<Item = TokenResult>,
+    I: Iterator<Item = Result<TokenData<N, T>, Error>>,
 {
-    type Item = TokenResult;
+    type Item = Result<TokenData<N, T>, Error>;
 
-    fn next(&mut self) -> Option<TokenResult> {
+    fn next(&mut self) -> Option<Self::Item> {
         if let Some(tok) = self.buffer[0].take() {
             self.buffer.rotate_left(1);
             return Some(Ok(tok));
@@ -642,14 +643,117 @@ where
 #[cfg(test)]
 mod test {
     #[test]
+    fn borrowed_lexer_keeps_literal_and_name_payloads_in_original_source() {
+        // The arena input must not first allocate owned names/literals. Verify
+        // actual source pointers, not just equal text from an accidental copy.
+        let source = "f:p('β', $v:x) / a:b";
+        let mut lexer = super::BorrowedTokenizer::new(source);
+        let super::Token::Function(name) = lexer
+            .next()
+            .expect("function token")
+            .expect("lexical success")
+        else {
+            panic!("function expected");
+        };
+        assert_eq!(name.prefix(), Some("f"));
+        assert!(std::ptr::eq(
+            name.local_part().as_ptr(),
+            source[2..].as_ptr()
+        ));
+        assert!(matches!(lexer.next(), Some(Ok(super::Token::LeftParen))));
+        let super::Token::Literal(literal) = lexer
+            .next()
+            .expect("literal token")
+            .expect("lexical success")
+        else {
+            panic!("literal expected");
+        };
+        assert_eq!(literal, "β");
+        assert!(std::ptr::eq(
+            literal.as_ptr(),
+            source[source.find('β').expect("literal offset")..].as_ptr()
+        ));
+        assert!(matches!(lexer.next(), Some(Ok(super::Token::Comma))));
+        let super::Token::Variable(name) = lexer
+            .next()
+            .expect("variable token")
+            .expect("lexical success")
+        else {
+            panic!("variable expected");
+        };
+        assert_eq!(name.prefix(), Some("v"));
+        assert!(std::ptr::eq(
+            name.local_part().as_ptr(),
+            source[source.find("x)").expect("variable offset")..].as_ptr()
+        ));
+        assert!(matches!(lexer.next(), Some(Ok(super::Token::RightParen))));
+        assert!(matches!(lexer.next(), Some(Ok(super::Token::Slash))));
+        let super::Token::NameTest(name) = lexer
+            .next()
+            .expect("name-test token")
+            .expect("lexical success")
+        else {
+            panic!("name test expected");
+        };
+        assert_eq!(name.prefix, Some("a"));
+        assert!(std::ptr::eq(
+            name.local_part.as_ptr(),
+            source[source.len() - 1..].as_ptr()
+        ));
+        assert!(lexer.next().is_none());
+    }
+
+    #[test]
+    fn deabbreviation_preserves_borrowed_payloads() {
+        // Synthetic axis/node tokens may expand in the fixed stack buffer;
+        // real QName payloads must stay borrowed through the same expansion.
+        let source = "//p:β/@q:x";
+        let mut lexer = super::TokenDeabbreviator::new(super::BorrowedTokenizer::new(source));
+        assert!(matches!(lexer.next(), Some(Ok(super::Token::Slash))));
+        assert!(matches!(
+            lexer.next(),
+            Some(Ok(super::Token::Axis(super::AxisName::DescendantOrSelf)))
+        ));
+        assert!(matches!(
+            lexer.next(),
+            Some(Ok(super::Token::NodeTest(super::NodeTestName::Node)))
+        ));
+        assert!(matches!(lexer.next(), Some(Ok(super::Token::Slash))));
+        let super::Token::NameTest(name) = lexer
+            .next()
+            .expect("name-test token")
+            .expect("lexical success")
+        else {
+            panic!("name test expected");
+        };
+        assert_eq!(name.prefix, Some("p"));
+        assert!(std::ptr::eq(name.local_part.as_ptr(), source[4..].as_ptr()));
+        assert!(matches!(lexer.next(), Some(Ok(super::Token::Slash))));
+        assert!(matches!(
+            lexer.next(),
+            Some(Ok(super::Token::Axis(super::AxisName::Attribute)))
+        ));
+        let super::Token::NameTest(name) = lexer
+            .next()
+            .expect("attribute-test token")
+            .expect("lexical success")
+        else {
+            panic!("attribute test expected");
+        };
+        assert_eq!(name.prefix, Some("q"));
+        assert!(std::ptr::eq(
+            name.local_part.as_ptr(),
+            source[source.len() - 1..].as_ptr()
+        ));
+        assert!(lexer.next().is_none());
+    }
+
+    #[test]
     fn diagnostic_collector_keeps_furthest_latest_and_fatal_errors() {
         // Freeze the collector's selection independently of both factory entrypoints.
         let start = peresil::StringPoint::new("ab");
         let later = start.consume_literal("a").point;
-        let mut master = super::XPathMaster {
-            failure: None,
-            budget: None,
-        };
+        let mut master = super::XPathMaster { failure: None };
         master.consume::<()>(peresil::Progress::failure(
             later,
             super::Error::ExpectedNumber,

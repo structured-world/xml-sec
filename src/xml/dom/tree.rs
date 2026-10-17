@@ -1,13 +1,15 @@
 //! Parser-independent retained XML tree consumed by XML Security algorithms.
 
-#[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
-use std::collections::HashMap;
 use std::{
     hash::{Hash, Hasher},
     ops::Range,
 };
 
+use super::storage::{Native, Storage, Values};
 use super::{ParseError, ParsingOptions, XmlBackend};
+
+#[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
+pub(super) mod comparison;
 
 const XML_NAMESPACE_URI: &str = "http://www.w3.org/XML/1998/namespace";
 
@@ -48,40 +50,37 @@ pub enum NodeType {
     PI,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct NodeData {
+pub(super) struct NodeData<S: Storage = Native> {
     pub(super) parent: Option<NodeId>,
-    pub(super) children: Vec<NodeId>,
-    pub(super) kind: NodeKind,
+    pub(super) children: S::Values<NodeId>,
+    pub(super) kind: NodeKind<S>,
     pub(super) range: Range<usize>,
     pub(super) range_actionable: bool,
     pub(super) subtree_end: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum NodeKind {
+pub(super) enum NodeKind<S: Storage = Native> {
     Root,
     Element {
-        name: String,
-        namespace: Option<String>,
-        prefix: Option<String>,
-        attributes: Vec<AttributeData>,
-        namespaces: Vec<NamespaceData>,
+        name: S::Text,
+        namespace: Option<S::Text>,
+        prefix: Option<S::Text>,
+        attributes: S::Values<AttributeData<S>>,
+        namespaces: S::Values<NamespaceData<S>>,
     },
-    Text(String),
-    Comment(String),
+    Text(S::Text),
+    Comment(S::Text),
     PI {
-        target: String,
-        value: Option<String>,
+        target: S::Text,
+        value: Option<S::Text>,
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct AttributeData {
-    pub(super) name: String,
-    pub(super) namespace: Option<String>,
-    pub(super) prefix: Option<String>,
-    pub(super) value: String,
+pub(super) struct AttributeData<S: Storage = Native> {
+    pub(super) name: S::Text,
+    pub(super) namespace: Option<S::Text>,
+    pub(super) prefix: Option<S::Text>,
+    pub(super) value: S::Text,
     pub(super) is_id: bool,
     pub(super) xml_id_error: Option<XmlIdError>,
 }
@@ -97,63 +96,214 @@ pub enum XmlIdError {
     InvalidNcNameAndDeclaredType,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) struct NamespaceData {
-    pub(super) prefix: Option<String>,
-    pub(super) uri: String,
+pub(super) struct NamespaceData<S: Storage = Native> {
+    pub(super) prefix: Option<S::Text>,
+    pub(super) uri: S::Text,
+}
+
+impl<S: Storage> std::fmt::Debug for AttributeData<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttributeData")
+            .field("name", &self.name)
+            .field("namespace", &self.namespace)
+            .field("prefix", &self.prefix)
+            .field("value", &self.value)
+            .field("is_id", &self.is_id)
+            .field("xml_id_error", &self.xml_id_error)
+            .finish()
+    }
+}
+impl<S: Storage> PartialEq for AttributeData<S> {
+    fn eq(&self, other: &Self) -> bool {
+        self.name.as_ref() == other.name.as_ref()
+            && self.namespace.as_deref() == other.namespace.as_deref()
+            && self.prefix.as_deref() == other.prefix.as_deref()
+            && self.value.as_ref() == other.value.as_ref()
+            && self.is_id == other.is_id
+            && self.xml_id_error == other.xml_id_error
+    }
+}
+impl<S: Storage> Eq for AttributeData<S> {}
+impl<S: Storage> std::fmt::Debug for NamespaceData<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NamespaceData")
+            .field("prefix", &self.prefix)
+            .field("uri", &self.uri)
+            .finish()
+    }
+}
+impl<S: Storage> PartialEq for NamespaceData<S> {
+    fn eq(&self, other: &Self) -> bool {
+        self.prefix.as_deref() == other.prefix.as_deref() && self.uri.as_ref() == other.uri.as_ref()
+    }
+}
+impl<S: Storage> Eq for NamespaceData<S> {}
+impl<S: Storage> Hash for NamespaceData<S> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.prefix.as_deref().hash(state);
+        self.uri.as_ref().hash(state);
+    }
+}
+impl<S: Storage> Clone for NamespaceData<S>
+where
+    S::Text: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            prefix: self.prefix.clone(),
+            uri: self.uri.clone(),
+        }
+    }
+}
+impl<S: Storage> std::fmt::Debug for NodeKind<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Root => f.write_str("Root"),
+            Self::Text(value) => f.debug_tuple("Text").field(value).finish(),
+            Self::Comment(value) => f.debug_tuple("Comment").field(value).finish(),
+            Self::PI { target, value } => f
+                .debug_struct("PI")
+                .field("target", target)
+                .field("value", value)
+                .finish(),
+            Self::Element {
+                name,
+                namespace,
+                prefix,
+                attributes,
+                namespaces,
+            } => f
+                .debug_struct("Element")
+                .field("name", name)
+                .field("namespace", namespace)
+                .field("prefix", prefix)
+                .field("attributes", &&attributes[..])
+                .field("namespaces", &&namespaces[..])
+                .finish(),
+        }
+    }
+}
+impl<S: Storage> PartialEq for NodeKind<S> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Root, Self::Root) => true,
+            (Self::Text(a), Self::Text(b)) | (Self::Comment(a), Self::Comment(b)) => {
+                a.as_ref() == b.as_ref()
+            }
+            (
+                Self::PI {
+                    target: a,
+                    value: av,
+                },
+                Self::PI {
+                    target: b,
+                    value: bv,
+                },
+            ) => a.as_ref() == b.as_ref() && av.as_deref() == bv.as_deref(),
+            (
+                Self::Element {
+                    name: a,
+                    namespace: an,
+                    prefix: ap,
+                    attributes: aa,
+                    namespaces: ans,
+                },
+                Self::Element {
+                    name: b,
+                    namespace: bn,
+                    prefix: bp,
+                    attributes: ba,
+                    namespaces: bns,
+                },
+            ) => {
+                a.as_ref() == b.as_ref()
+                    && an.as_deref() == bn.as_deref()
+                    && ap.as_deref() == bp.as_deref()
+                    && aa[..] == ba[..]
+                    && ans[..] == bns[..]
+            }
+            _ => false,
+        }
+    }
+}
+impl<S: Storage> Eq for NodeKind<S> {}
+impl<S: Storage> std::fmt::Debug for NodeData<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeData")
+            .field("parent", &self.parent)
+            .field("children", &&self.children[..])
+            .field("kind", &self.kind)
+            .field("range", &self.range)
+            .field("range_actionable", &self.range_actionable)
+            .field("subtree_end", &self.subtree_end)
+            .finish()
+    }
 }
 
 /// Builder used by parser adapters to populate the shared semantic arena.
-pub(super) struct TreeBuilder<'input> {
+pub(super) struct TreeBuilder<'input, S: Storage = Native> {
     input: &'input str,
-    nodes: Vec<NodeData>,
+    nodes: S::Values<NodeData<S>>,
+    storage: S,
 }
 
-impl<'input> TreeBuilder<'input> {
-    pub(super) fn new(input: &'input str, capacity: usize) -> Self {
-        Self {
+impl<'input, S: Storage> TreeBuilder<'input, S> {
+    pub(super) fn storage(&self) -> S {
+        self.storage
+    }
+    pub(super) fn new(input: &'input str, capacity: usize, storage: S) -> Result<Self, ParseError> {
+        Ok(Self {
             input,
-            nodes: Vec::with_capacity(capacity),
-        }
+            nodes: storage.values(capacity)?,
+            storage,
+        })
     }
 
     #[cfg(feature = "xml-backend-xmloxide")]
     pub(super) fn push(
         &mut self,
         parent: Option<NodeId>,
-        kind: NodeKind,
+        kind: NodeKind<S>,
         range: Range<usize>,
-    ) -> NodeId {
+    ) -> Result<NodeId, ParseError> {
         self.push_with_actionability(parent, kind, range, true)
     }
 
     pub(super) fn push_with_actionability(
         &mut self,
         parent: Option<NodeId>,
-        kind: NodeKind,
+        kind: NodeKind<S>,
         range: Range<usize>,
         range_actionable: bool,
-    ) -> NodeId {
+    ) -> Result<NodeId, ParseError> {
         let id = NodeId(
             u32::try_from(self.nodes.len()).expect("bounded XML node count must fit into u32"),
         );
         self.nodes.push(NodeData {
             parent,
-            children: Vec::new(),
+            children: self.storage.values(0)?,
             kind,
             range,
             range_actionable,
             subtree_end: id.0 + 1,
-        });
+        })?;
         if let Some(parent) = parent {
-            self.nodes[parent.index()].children.push(id);
+            self.nodes[parent.index()].children.push(id)?;
         }
-        id
+        Ok(id)
     }
 
     pub(super) fn finish_subtree(&mut self, node: NodeId) {
         self.nodes[node.index()].subtree_end =
             u32::try_from(self.nodes.len()).expect("bounded XML node count must fit into u32");
+    }
+
+    #[cfg(feature = "xml-backend-xmloxide")]
+    pub(super) fn has_text_tail(&self, parent: NodeId) -> bool {
+        self.nodes[parent.index()]
+            .children
+            .last()
+            .is_some_and(|last| matches!(self.nodes[last.index()].kind, NodeKind::Text(_)))
     }
 
     #[cfg(feature = "xml-backend-xmloxide")]
@@ -163,26 +313,27 @@ impl<'input> TreeBuilder<'input> {
         value: &str,
         range: Range<usize>,
         range_actionable: bool,
-    ) {
+    ) -> Result<(), ParseError> {
         if let Some(last) = self.nodes[parent.index()].children.last().copied()
             && let node = &mut self.nodes[last.index()]
             && let NodeKind::Text(existing) = &mut node.kind
         {
-            existing.push_str(value);
+            self.storage.append(existing, value)?;
             // One semantic text node can fold several adjacent lexical tokens
             // (plain text, CDATA, and references). Its source range must cover
             // every token so mutation never splices only a semantic prefix.
             node.range.start = node.range.start.min(range.start);
             node.range.end = node.range.end.max(range.end);
             node.range_actionable &= range_actionable;
-            return;
+            return Ok(());
         }
         self.push_with_actionability(
             Some(parent),
-            NodeKind::Text(value.to_owned()),
+            NodeKind::Text(self.storage.text(value)?),
             range,
             range_actionable,
-        );
+        )?;
+        Ok(())
     }
 
     #[cfg(feature = "xml-backend-xmloxide")]
@@ -191,15 +342,19 @@ impl<'input> TreeBuilder<'input> {
     }
 
     #[cfg(feature = "xml-backend-xmloxide")]
-    pub(super) fn namespaces(&self, node: NodeId) -> Option<&[NamespaceData]> {
+    pub(super) fn namespaces(&self, node: NodeId) -> Option<&[NamespaceData<S>]> {
         match &self.nodes[node.index()].kind {
             NodeKind::Element { namespaces, .. } => Some(namespaces),
             _ => None,
         }
     }
 
-    pub(super) fn finish(mut self, preflight: &super::LexicalPreflight<'_>) -> Document<'input> {
-        for node in &mut self.nodes {
+    pub(super) fn finish<P: Storage>(
+        mut self,
+        preflight: &super::LexicalPreflight<'_, P>,
+    ) -> Result<Document<'input, S>, ParseError> {
+        self.storage.charge(self.nodes.len())?;
+        for node in &mut *self.nodes {
             if let NodeKind::Element {
                 name,
                 prefix,
@@ -207,15 +362,16 @@ impl<'input> TreeBuilder<'input> {
                 ..
             } = &mut node.kind
             {
-                for attribute in attributes {
+                self.storage.charge(attributes.len())?;
+                for attribute in &mut **attributes {
                     let xml_id = attribute.namespace.as_deref() == Some(XML_NAMESPACE_URI)
-                        && attribute.name == "id";
+                        && attribute.name.as_ref() == "id";
                     let declaration = preflight.attribute_declaration(
                         prefix.as_deref(),
-                        name,
+                        name.as_ref(),
                         attribute.prefix.as_deref(),
-                        &attribute.name,
-                    );
+                        attribute.name.as_ref(),
+                    )?;
                     attribute.is_id = xml_id
                         || declaration
                             .is_some_and(|info| info.kind == crate::document::DtdAttributeType::Id);
@@ -224,12 +380,14 @@ impl<'input> TreeBuilder<'input> {
                         // ID normalization in the infoset, not just the index.
                         // https://www.w3.org/TR/2005/REC-xml-id-20050909/#processing
                         // https://www.w3.org/TR/2008/REC-xml-20081126/#AVNormalize
-                        normalize_id_value(&mut attribute.value);
+                        self.storage.normalize_id(&mut attribute.value)?;
                         if xml_id {
                             // xml:id sections 4/6: report constraints without
                             // suppressing assignment or making parsing fatal.
                             // https://www.w3.org/TR/2005/REC-xml-id-20050909/#processing
-                            let invalid_value = !crate::xml::is_xml_ncname(&attribute.value);
+                            self.storage.charge(attribute.value.as_ref().len())?;
+                            let invalid_value =
+                                !crate::xml::is_xml_ncname(attribute.value.as_ref());
                             let invalid_type =
                                 declaration.is_some_and(|info| info.has_non_id_declaration);
                             attribute.xml_id_error = match (invalid_value, invalid_type) {
@@ -243,10 +401,10 @@ impl<'input> TreeBuilder<'input> {
                 }
             }
         }
-        Document {
+        Ok(Document {
             input: self.input,
             nodes: self.nodes,
-        }
+        })
     }
 
     #[cfg(feature = "xml-backend-roxmltree")]
@@ -255,35 +413,25 @@ impl<'input> TreeBuilder<'input> {
     }
 }
 
-fn normalize_id_value(value: &mut String) {
-    let mut previous_space = true;
-    value.retain(|character| {
-        let space = character == ' ';
-        let retain = !space || !previous_space;
-        previous_space = space;
-        retain
-    });
-    if value.ends_with(' ') {
-        value.pop();
-    }
-}
-
 /// Parsed backend-neutral XML document.
 ///
 /// The selected parser is used only while constructing this arena. C14N,
 /// XPath, XMLDSig, XMLEnc, and mutation code never branch on the parser.
-#[derive(Debug)]
-pub struct Document<'input> {
+pub struct Document<'input, S: Storage = Native> {
     input: &'input str,
-    nodes: Vec<NodeData>,
+    nodes: S::Values<NodeData<S>>,
+}
+
+impl<S: Storage> std::fmt::Debug for Document<'_, S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Document")
+            .field("input", &self.input)
+            .field("nodes", &&self.nodes[..])
+            .finish()
+    }
 }
 
 impl<'input> Document<'input> {
-    #[cfg(feature = "xmldsig")]
-    pub(crate) fn node_count(&self) -> usize {
-        self.nodes.len()
-    }
-
     /// Parses XML with default backend-neutral options.
     pub fn parse(input: &'input str) -> Result<Self, ParseError> {
         Self::parse_with_options(input, ParsingOptions::default())
@@ -321,19 +469,38 @@ impl<'input> Document<'input> {
         backend.parse(input, options, &preflight)
     }
 
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn parse_after_limit_preflight_in<'w, W: structured_asn1::memory::Work>(
+        input: &'input str,
+        options: ParsingOptions,
+        backend: XmlBackend,
+        storage: super::storage::Accounted<'w, W>,
+    ) -> Result<Document<'input, super::storage::Accounted<'w, W>>, super::AccountedParseError>
+    {
+        let preflight = super::LexicalPreflight::scan_in(input, options.allow_dtd, storage)?;
+        backend.parse_in(input, options, &preflight, storage)
+    }
+}
+
+impl<'input, S: Storage> Document<'input, S> {
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
     /// Returns the original UTF-8 source.
     pub fn input_text(&self) -> &'input str {
         self.input
     }
 
     /// Returns the synthetic document root.
-    pub fn root(&self) -> Node<'_, 'input> {
+    pub fn root(&self) -> Node<'_, 'input, S> {
         self.get_node(NodeId(0))
             .expect("parsed document has a root")
     }
 
     /// Returns the document element.
-    pub fn root_element(&self) -> Node<'_, 'input> {
+    pub fn root_element(&self) -> Node<'_, 'input, S> {
         self.root()
             .children()
             .find(Node::is_element)
@@ -341,117 +508,31 @@ impl<'input> Document<'input> {
     }
 
     /// Iterates the document root and all descendants in document order.
-    pub fn descendants(&self) -> Descendants<'_, 'input> {
+    pub fn descendants(&self) -> Descendants<'_, 'input, S> {
         self.root().descendants()
     }
 
     /// Resolves an arena node ID in this document.
-    pub fn get_node(&self, id: NodeId) -> Option<Node<'_, 'input>> {
+    pub fn get_node(&self, id: NodeId) -> Option<Node<'_, 'input, S>> {
         self.nodes
             .get(id.index())
             .map(|_| Node { document: self, id })
     }
+}
 
-    #[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
+impl Document<'_> {
+    #[cfg(all(
+        test,
+        feature = "xml-backend-roxmltree",
+        feature = "xml-backend-xmloxide"
+    ))]
     pub(super) fn ensure_semantically_equivalent(
         &self,
         other: &Self,
         doctype: Option<&Range<usize>>,
     ) -> Result<(), ParseError> {
-        if self.nodes.len() != other.nodes.len() {
-            let detail = self
-                .nodes
-                .iter()
-                .zip(&other.nodes)
-                .position(|(left, right)| {
-                    node_kind_label(&left.kind) != node_kind_label(&right.kind)
-                })
-                .map_or_else(
-                    || "one adapter retained trailing nodes".to_owned(),
-                    |index| {
-                        format!(
-                            "node {index} is {} versus {}",
-                            node_kind_label(&self.nodes[index].kind),
-                            node_kind_label(&other.nodes[index].kind)
-                        )
-                    },
-                );
-            return Err(ParseError::BackendDivergence {
-                reason: format!(
-                    "retained semantic node counts differ ({} versus {}): {detail}",
-                    self.nodes.len(),
-                    other.nodes.len()
-                ),
-            });
-        }
-        if let Some((index, (left, right))) = self
-            .nodes
-            .iter()
-            .zip(&other.nodes)
-            .enumerate()
-            .find(|(_, (left, right))| !nodes_semantically_equivalent(left, right, doctype))
-        {
-            return Err(ParseError::BackendDivergence {
-                reason: format!(
-                    "retained semantic node {index} differs in {}",
-                    node_difference(left, right, doctype)
-                ),
-            });
-        }
-        Ok(())
+        self.ensure_semantically_equivalent_in(other, doctype, Native)
     }
-}
-
-#[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
-fn node_kind_label(kind: &NodeKind) -> &'static str {
-    match kind {
-        NodeKind::Root => "root",
-        NodeKind::Element { .. } => "element",
-        NodeKind::Text(_) => "text",
-        NodeKind::Comment(_) => "comment",
-        NodeKind::PI { .. } => "processing instruction",
-    }
-}
-
-#[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
-fn nodes_semantically_equivalent(
-    left: &NodeData,
-    right: &NodeData,
-    doctype: Option<&Range<usize>>,
-) -> bool {
-    left.parent == right.parent
-        && left.children == right.children
-        && node_kinds_semantically_equivalent(&left.kind, &right.kind)
-        && source_ranges_equivalent(&left.range, &right.range, doctype)
-        && range_actionability_equivalent(left, right)
-        && left.subtree_end == right.subtree_end
-}
-
-#[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
-fn node_difference(left: &NodeData, right: &NodeData, doctype: Option<&Range<usize>>) -> String {
-    if left.parent != right.parent {
-        "parent identity".to_owned()
-    } else if left.children != right.children {
-        "child identities".to_owned()
-    } else if !node_kinds_semantically_equivalent(&left.kind, &right.kind) {
-        node_kind_difference(&left.kind, &right.kind).to_owned()
-    } else if !source_ranges_equivalent(&left.range, &right.range, doctype) {
-        format!(
-            "source range ({}..{} versus {}..{})",
-            left.range.start, left.range.end, right.range.start, right.range.end
-        )
-    } else if !range_actionability_equivalent(left, right) {
-        "source-range actionability".to_owned()
-    } else {
-        "subtree boundary".to_owned()
-    }
-}
-
-#[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
-fn range_actionability_equivalent(left: &NodeData, right: &NodeData) -> bool {
-    // Mutation accepts any semantic node with a unique source span, so backend
-    // disagreement about actionability is always security-relevant.
-    left.range_actionable == right.range_actionable
 }
 
 #[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
@@ -477,130 +558,41 @@ pub(super) fn range_contains(container: &Range<usize>, candidate: &Range<usize>)
     candidate.start >= container.start && candidate.end <= container.end
 }
 
-#[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
-fn node_kinds_semantically_equivalent(left: &NodeKind, right: &NodeKind) -> bool {
-    match (left, right) {
-        (
-            NodeKind::Element {
-                name: left_name,
-                namespace: left_namespace,
-                prefix: left_prefix,
-                attributes: left_attributes,
-                namespaces: left_namespaces,
-            },
-            NodeKind::Element {
-                name: right_name,
-                namespace: right_namespace,
-                prefix: right_prefix,
-                attributes: right_attributes,
-                namespaces: right_namespaces,
-            },
-        ) => {
-            left_name == right_name
-                && left_namespace == right_namespace
-                && left_prefix == right_prefix
-                && left_attributes == right_attributes
-                && namespace_axes_equivalent(left_namespaces, right_namespaces)
-        }
-        _ => left == right,
-    }
-}
-
-#[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
-fn namespace_axes_equivalent(left: &[NamespaceData], right: &[NamespaceData]) -> bool {
-    // Namespaces in XML 1.0 §3: xml is predefined, whether or not explicitly
-    // declared. Backends may omit that redundant declaration from their axis.
-    // https://www.w3.org/TR/2009/REC-xml-names-20091208/#ns-decl
-    let mut remaining = HashMap::with_capacity(left.len());
-    for item in left {
-        if item.prefix.as_deref() == Some("xml") {
-            continue;
-        }
-        *remaining.entry(item).or_insert(0_usize) += 1;
-    }
-    let matched = right.iter().all(|item| {
-        if item.prefix.as_deref() == Some("xml") {
-            return true;
-        }
-        remaining.get_mut(item).is_some_and(|count| {
-            if *count == 0 {
-                return false;
-            }
-            *count -= 1;
-            true
-        })
-    });
-    matched && remaining.values().all(|count| *count == 0)
-}
-
-#[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
-fn node_kind_difference(left: &NodeKind, right: &NodeKind) -> &'static str {
-    match (left, right) {
-        (
-            NodeKind::Element {
-                name: left_name,
-                namespace: left_namespace,
-                prefix: left_prefix,
-                attributes: left_attributes,
-                namespaces: left_namespaces,
-            },
-            NodeKind::Element {
-                name: right_name,
-                namespace: right_namespace,
-                prefix: right_prefix,
-                attributes: right_attributes,
-                namespaces: right_namespaces,
-            },
-        ) => {
-            if left_name != right_name {
-                "element local name"
-            } else if left_namespace != right_namespace {
-                match (left_namespace.as_deref(), right_namespace.as_deref()) {
-                    (None, Some("")) => "element namespace URI (absent versus empty)",
-                    (Some(""), None) => "element namespace URI (empty versus absent)",
-                    (None, Some(_)) => "element namespace URI (absent versus non-empty)",
-                    (Some(_), None) => "element namespace URI (non-empty versus absent)",
-                    _ => "element namespace URI (different non-empty values)",
-                }
-            } else if left_prefix != right_prefix {
-                "element prefix"
-            } else if left_attributes != right_attributes {
-                "attribute axis"
-            } else if !namespace_axes_equivalent(left_namespaces, right_namespaces) {
-                "namespace axis"
-            } else {
-                "element semantics"
-            }
-        }
-        (NodeKind::Text(left), NodeKind::Text(right)) if left != right => "character data",
-        (NodeKind::Comment(left), NodeKind::Comment(right)) if left != right => "comment data",
-        (NodeKind::PI { .. }, NodeKind::PI { .. }) => "processing instruction data",
-        _ => "node kind",
-    }
-}
-
 /// Copyable handle into a backend-neutral document arena.
-#[derive(Clone, Copy, Debug)]
-pub struct Node<'a, 'input> {
-    document: &'a Document<'input>,
+pub struct Node<'a, 'input, S: Storage = Native> {
+    document: &'a Document<'input, S>,
     id: NodeId,
 }
 
-impl PartialEq for Node<'_, '_> {
+impl<S: Storage> Copy for Node<'_, '_, S> {}
+impl<S: Storage> Clone for Node<'_, '_, S> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<S: Storage> std::fmt::Debug for Node<'_, '_, S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Node")
+            .field("document", &self.document)
+            .field("id", &self.id)
+            .finish()
+    }
+}
+impl<S: Storage> PartialEq for Node<'_, '_, S> {
     fn eq(&self, other: &Self) -> bool {
         std::ptr::eq(self.document, other.document) && self.id == other.id
     }
 }
-impl Eq for Node<'_, '_> {}
-impl Hash for Node<'_, '_> {
+impl<S: Storage> Eq for Node<'_, '_, S> {}
+impl<S: Storage> Hash for Node<'_, '_, S> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         std::ptr::from_ref(self.document).hash(state);
         self.id.hash(state);
     }
 }
 
-impl<'a, 'input> Node<'a, 'input> {
-    fn data(self) -> &'a NodeData {
+impl<'a, 'input, S: Storage> Node<'a, 'input, S> {
+    fn data(self) -> &'a NodeData<S> {
         &self.document.nodes[self.id.index()]
     }
     /// Returns this node's stable arena ID.
@@ -608,7 +600,7 @@ impl<'a, 'input> Node<'a, 'input> {
         self.id
     }
     /// Returns the owning document.
-    pub fn document(self) -> &'a Document<'input> {
+    pub fn document(self) -> &'a Document<'input, S> {
         self.document
     }
     /// Returns the semantic node kind.
@@ -658,7 +650,7 @@ impl<'a, 'input> Node<'a, 'input> {
             .and_then(|node| node.is_element().then_some(node))
     }
     /// Iterates direct children in document order.
-    pub fn children(self) -> Children<'a, 'input> {
+    pub fn children(self) -> Children<'a, 'input, S> {
         Children {
             document: self.document,
             ids: self.data().children.iter(),
@@ -677,14 +669,14 @@ impl<'a, 'input> Node<'a, 'input> {
         self.children().rev().find(Node::is_element)
     }
     /// Iterates this node and its descendants in document order.
-    pub fn descendants(self) -> Descendants<'a, 'input> {
+    pub fn descendants(self) -> Descendants<'a, 'input, S> {
         Descendants {
             document: self.document,
             ids: self.id.0..self.data().subtree_end,
         }
     }
     /// Iterates this node and then its ancestors.
-    pub fn ancestors(self) -> Ancestors<'a, 'input> {
+    pub fn ancestors(self) -> Ancestors<'a, 'input, S> {
         Ancestors { next: Some(self) }
     }
     /// Returns the preceding sibling.
@@ -765,9 +757,9 @@ impl<'a, 'input> Node<'a, 'input> {
         }
     }
     /// Iterates non-namespace attributes in source order.
-    pub fn attributes(self) -> Attributes<'a> {
-        let values: &[AttributeData] = match &self.data().kind {
-            NodeKind::Element { attributes, .. } => attributes.as_slice(),
+    pub fn attributes(self) -> Attributes<'a, S> {
+        let values: &[AttributeData<S>] = match &self.data().kind {
+            NodeKind::Element { attributes, .. } => &attributes[..],
             _ => &[],
         };
         Attributes {
@@ -785,9 +777,9 @@ impl<'a, 'input> Node<'a, 'input> {
             .map(Attribute::value)
     }
     /// Iterates in-scope namespace bindings.
-    pub fn namespaces(self) -> Namespaces<'a> {
-        let values: &[NamespaceData] = match &self.data().kind {
-            NodeKind::Element { namespaces, .. } => namespaces.as_slice(),
+    pub fn namespaces(self) -> Namespaces<'a, S> {
+        let values: &[NamespaceData<S>] = match &self.data().kind {
+            NodeKind::Element { namespaces, .. } => &namespaces[..],
             _ => &[],
         };
         Namespaces {
@@ -819,7 +811,7 @@ impl<'a, 'input> Node<'a, 'input> {
             NodeKind::Element { .. } => {
                 self.first_child()
                     .and_then(|child| match &child.data().kind {
-                        NodeKind::Text(value) => Some(value.as_str()),
+                        NodeKind::Text(value) => Some(value.as_ref()),
                         _ => None,
                     })
             }
@@ -893,11 +885,16 @@ impl<'a> From<(&'a str, &'a str)> for ExpandedName<'a> {
 }
 
 /// Borrowed semantic XML attribute.
-#[derive(Clone, Copy)]
-pub struct Attribute<'a> {
-    data: &'a AttributeData,
+pub struct Attribute<'a, S: Storage = Native> {
+    data: &'a AttributeData<S>,
 }
-impl<'a> Attribute<'a> {
+impl<S: Storage> Copy for Attribute<'_, S> {}
+impl<S: Storage> Clone for Attribute<'_, S> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<'a, S: Storage> Attribute<'a, S> {
     /// Report non-fatal xml:id errors without changing ID type assignment.
     ///
     /// xml:id 1.0 sections 4 and 6 require assignment even for invalid values;
@@ -929,26 +926,34 @@ impl<'a> Attribute<'a> {
 }
 
 /// Iterator over element attributes.
-pub struct Attributes<'a> {
-    values: std::slice::Iter<'a, AttributeData>,
+pub struct Attributes<'a, S: Storage = Native> {
+    values: std::slice::Iter<'a, AttributeData<S>>,
 }
-impl<'a> Iterator for Attributes<'a> {
-    type Item = Attribute<'a>;
+impl<'a, S: Storage> Iterator for Attributes<'a, S> {
+    type Item = Attribute<'a, S>;
     fn next(&mut self) -> Option<Self::Item> {
         self.values.next().map(|data| Attribute { data })
+    }
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.values.nth(n).map(|data| Attribute { data })
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.values.size_hint()
     }
 }
-impl ExactSizeIterator for Attributes<'_> {}
+impl<S: Storage> ExactSizeIterator for Attributes<'_, S> {}
 
 /// Borrowed in-scope namespace binding.
-#[derive(Clone, Copy)]
-pub struct Namespace<'a> {
-    data: &'a NamespaceData,
+pub struct Namespace<'a, S: Storage = Native> {
+    data: &'a NamespaceData<S>,
 }
-impl<'a> Namespace<'a> {
+impl<S: Storage> Copy for Namespace<'_, S> {}
+impl<S: Storage> Clone for Namespace<'_, S> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<'a, S: Storage> Namespace<'a, S> {
     /// Returns the prefix, or `None` for the default namespace.
     pub fn name(self) -> Option<&'a str> {
         self.data.prefix.as_deref()
@@ -960,19 +965,22 @@ impl<'a> Namespace<'a> {
 }
 
 /// Iterator over in-scope namespace bindings.
-pub struct Namespaces<'a> {
-    values: std::slice::Iter<'a, NamespaceData>,
+pub struct Namespaces<'a, S: Storage = Native> {
+    values: std::slice::Iter<'a, NamespaceData<S>>,
 }
-impl<'a> Iterator for Namespaces<'a> {
-    type Item = Namespace<'a>;
+impl<'a, S: Storage> Iterator for Namespaces<'a, S> {
+    type Item = Namespace<'a, S>;
     fn next(&mut self) -> Option<Self::Item> {
         self.values.next().map(|data| Namespace { data })
+    }
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.values.nth(n).map(|data| Namespace { data })
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.values.size_hint()
     }
 }
-impl ExactSizeIterator for Namespaces<'_> {}
+impl<S: Storage> ExactSizeIterator for Namespaces<'_, S> {}
 
 /// Processing-instruction payload.
 #[derive(Clone, Copy)]
@@ -984,12 +992,12 @@ pub struct PI<'a> {
 }
 
 /// Iterator over direct child nodes.
-pub struct Children<'a, 'input> {
-    document: &'a Document<'input>,
+pub struct Children<'a, 'input, S: Storage = Native> {
+    document: &'a Document<'input, S>,
     ids: std::slice::Iter<'a, NodeId>,
 }
-impl<'a, 'input> Iterator for Children<'a, 'input> {
-    type Item = Node<'a, 'input>;
+impl<'a, 'input, S: Storage> Iterator for Children<'a, 'input, S> {
+    type Item = Node<'a, 'input, S>;
     fn next(&mut self) -> Option<Self::Item> {
         self.ids.next().and_then(|id| self.document.get_node(*id))
     }
@@ -997,8 +1005,8 @@ impl<'a, 'input> Iterator for Children<'a, 'input> {
         self.ids.size_hint()
     }
 }
-impl ExactSizeIterator for Children<'_, '_> {}
-impl<'a, 'input> DoubleEndedIterator for Children<'a, 'input> {
+impl<S: Storage> ExactSizeIterator for Children<'_, '_, S> {}
+impl<'a, 'input, S: Storage> DoubleEndedIterator for Children<'a, 'input, S> {
     fn next_back(&mut self) -> Option<Self::Item> {
         self.ids
             .next_back()
@@ -1007,12 +1015,12 @@ impl<'a, 'input> DoubleEndedIterator for Children<'a, 'input> {
 }
 
 /// Pre-order iterator over a node and its descendants.
-pub struct Descendants<'a, 'input> {
-    document: &'a Document<'input>,
+pub struct Descendants<'a, 'input, S: Storage = Native> {
+    document: &'a Document<'input, S>,
     ids: Range<u32>,
 }
-impl<'a, 'input> Iterator for Descendants<'a, 'input> {
-    type Item = Node<'a, 'input>;
+impl<'a, 'input, S: Storage> Iterator for Descendants<'a, 'input, S> {
+    type Item = Node<'a, 'input, S>;
     fn next(&mut self) -> Option<Self::Item> {
         self.ids
             .next()
@@ -1022,21 +1030,21 @@ impl<'a, 'input> Iterator for Descendants<'a, 'input> {
         self.ids.size_hint()
     }
 }
-impl DoubleEndedIterator for Descendants<'_, '_> {
+impl<S: Storage> DoubleEndedIterator for Descendants<'_, '_, S> {
     fn next_back(&mut self) -> Option<Self::Item> {
         self.ids
             .next_back()
             .and_then(|id| self.document.get_node(NodeId(id)))
     }
 }
-impl ExactSizeIterator for Descendants<'_, '_> {}
+impl<S: Storage> ExactSizeIterator for Descendants<'_, '_, S> {}
 
 /// Iterator over a node and its ancestors.
-pub struct Ancestors<'a, 'input> {
-    next: Option<Node<'a, 'input>>,
+pub struct Ancestors<'a, 'input, S: Storage = Native> {
+    next: Option<Node<'a, 'input, S>>,
 }
-impl<'a, 'input> Iterator for Ancestors<'a, 'input> {
-    type Item = Node<'a, 'input>;
+impl<'a, 'input, S: Storage> Iterator for Ancestors<'a, 'input, S> {
+    type Item = Node<'a, 'input, S>;
     fn next(&mut self) -> Option<Self::Item> {
         let current = self.next?;
         self.next = current.parent();
@@ -1046,9 +1054,200 @@ impl<'a, 'input> Iterator for Ancestors<'a, 'input> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "xmldsig")]
+    fn assert_scoped_projection<S: super::Storage>(document: &super::Document<'_, S>) {
+        let root = document.root_element();
+        assert_eq!(root.tag_name().name(), "r");
+        assert_eq!(root.attribute(("urn:p", "x")), Some("value"));
+        assert_eq!(root.lookup_namespace_uri(Some("p")), Some("urn:p"));
+        let id = root
+            .attributes()
+            .find(|attribute| attribute.name() == "id")
+            .expect("xml:id retained");
+        assert!(id.is_id());
+        assert_eq!(id.value(), "a b");
+        assert_eq!(id.xml_id_error(), Some(super::XmlIdError::InvalidNcName));
+        assert_eq!(root.children().len(), 1);
+        assert_eq!(root.text(), Some("leftmiddleright"));
+    }
+
+    #[cfg(all(feature = "xmldsig", feature = "xml-backend-roxmltree"))]
+    #[test]
+    fn roxmltree_projection_uses_the_actual_scoped_tree_storage() {
+        // The source parser is deliberately outside this component test's
+        // account. Every *semantic projection* allocation must be retained by
+        // the supplied execution without changing IDs, namespaces or text.
+        use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
+        let xml = "<r xmlns:p='urn:p' xml:id=' a  b ' p:x='value'>left<![CDATA[middle]]>right</r>";
+        let preflight =
+            super::super::LexicalPreflight::scan(xml, false).expect("fixed XML preflight");
+        let raw = crate::parser_roxmltree::Document::parse(xml).expect("fixed backend XML");
+        let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 20)));
+        let document = super::super::roxmltree::project_in(
+            xml,
+            &raw,
+            &preflight,
+            super::super::storage::Accounted(&memory),
+        )
+        .expect("paid projection fits");
+        assert_scoped_projection(&document);
+        assert!(memory.used() > 0);
+        drop(document);
+        assert_eq!(memory.used(), 0);
+        let denied = Memory::new(std::sync::Arc::new(MemoryAccount::new(0, 1 << 20)));
+        assert!(matches!(
+            super::super::roxmltree::project_in(
+                xml,
+                &raw,
+                &preflight,
+                super::super::storage::Accounted(&denied)
+            ),
+            Err(super::ParseError::SharedExecution(
+                MemoryError::LimitExceeded
+            ))
+        ));
+        assert_eq!(denied.used(), 0);
+    }
+
+    #[cfg(all(feature = "xmldsig", feature = "xml-backend-roxmltree"))]
+    #[test]
+    fn scoped_parser_tree_and_canonicalizer_share_the_same_semantic_kernel() {
+        // Switching both parser and semantic-tree storage must not require a
+        // second serializer or alter canonical bytes, axes, IDs or comments.
+        use crate::c14n::{C14nAlgorithm, C14nMode};
+        use crate::xmldsig::types::{
+            NodeSetMaterializationBudget,
+            projection::{PaidKeys, Projection},
+        };
+        use structured_asn1::memory::{Memory, MemoryAccount};
+        let source = "<r xmlns:p='urn:p' xml:id=' a  b ' p:x='value'>left<![CDATA[middle]]><!--c--><p:leaf/>right</r>";
+        let expected = super::Document::parse(source).expect("native semantic baseline");
+        let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 24)));
+        let storage = super::super::storage::Accounted(&memory);
+        let preflight = super::super::LexicalPreflight::scan_in(source, false, storage)
+            .expect("funded lexical preflight");
+        let document = super::super::roxmltree::RoxmltreeBackend::parse_in(
+            source,
+            Default::default(),
+            &preflight,
+            storage,
+        )
+        .expect("funded roxmltree parse");
+        let nodes = Projection::subtree(
+            document.root(),
+            true,
+            &NodeSetMaterializationBudget::default(),
+            PaidKeys::new(&memory),
+        )
+        .expect("funded node projection");
+        for mode in [
+            C14nMode::Inclusive1_0,
+            C14nMode::Inclusive1_1,
+            C14nMode::Exclusive1_0,
+        ] {
+            for comments in [false, true] {
+                let algorithm = C14nAlgorithm::new(mode, comments);
+                let mut canonical = Vec::new();
+                crate::c14n::canonicalize(&expected, None, &algorithm, &mut canonical)
+                    .expect("native canonical baseline");
+                let (actual, _) = crate::c14n::canonicalize_buffer_in(
+                    &document,
+                    &nodes,
+                    (&algorithm, None),
+                    None,
+                    1 << 20,
+                    &Default::default(),
+                    &crate::c14n::scratch::Accounted(&memory),
+                )
+                .expect("funded canonicalization");
+                assert_eq!(&*actual, &canonical);
+            }
+        }
+        assert!(memory.used() > 0);
+        drop(nodes);
+        drop(document);
+        drop(preflight);
+        assert_eq!(memory.used(), 0);
+    }
+
+    #[cfg(all(feature = "xmldsig", feature = "xml-backend-xmloxide"))]
+    #[test]
+    fn xmloxide_projection_uses_the_actual_scoped_tree_storage() {
+        // The same tree kernel must retain paid coalescing, normalized xml:id,
+        // namespace axes and attributes with the alternate selected backend.
+        use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
+        let xml = "<r xmlns:p='urn:p' xml:id=' a  b ' p:x='value'>left<![CDATA[middle]]>right</r>";
+        let preflight =
+            super::super::LexicalPreflight::scan(xml, false).expect("fixed XML preflight");
+        let raw = crate::parser_xmloxide::parser::parse_str_with_options(
+            xml,
+            &super::super::xmloxide::backend_options(),
+        )
+        .expect("fixed backend XML");
+        let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 20)));
+        let document = super::super::xmloxide::project_in(
+            xml,
+            &raw,
+            super::ParsingOptions::default(),
+            &preflight,
+            super::super::storage::Accounted(&memory),
+        )
+        .expect("paid projection fits");
+        assert_scoped_projection(&document);
+        assert!(memory.used() > 0);
+        drop(document);
+        assert_eq!(memory.used(), 0);
+        let denied = Memory::new(std::sync::Arc::new(MemoryAccount::new(0, 1 << 20)));
+        assert!(matches!(
+            super::super::xmloxide::project_in(
+                xml,
+                &raw,
+                super::ParsingOptions::default(),
+                &preflight,
+                super::super::storage::Accounted(&denied)
+            ),
+            Err(super::ParseError::SharedExecution(
+                MemoryError::LimitExceeded
+            ))
+        ));
+        assert_eq!(denied.used(), 0);
+    }
+
+    #[cfg(all(feature = "xmldsig", feature = "xml-backend-xmloxide"))]
+    #[test]
+    fn projection_node_admission_precedes_arena_and_payload_growth() {
+        // A disallowed semantic node must not allocate its attributes or text
+        // first, nor reserve a larger arena based on the source backend count.
+        use super::super::storage::Accounted;
+        use structured_asn1::memory::{Memory, MemoryAccount};
+        let source = format!("<r a='{}'/>", "x".repeat(65536));
+        let preflight =
+            super::super::LexicalPreflight::scan(&source, false).expect("native lexical baseline");
+        let raw = crate::parser_xmloxide::parser::parse_str_with_options(
+            &source,
+            &super::super::xmloxide::backend_options(),
+        )
+        .expect("native raw XML baseline");
+        for (limit, capacity) in [(0, 0), (1, 4096)] {
+            let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(capacity, 1 << 24)));
+            let result = super::super::xmloxide::project_in(
+                &source,
+                &raw,
+                super::ParsingOptions {
+                    nodes_limit: limit,
+                    allow_dtd: false,
+                },
+                &preflight,
+                Accounted(&memory),
+            );
+            assert!(matches!(result, Err(super::ParseError::NodesLimitReached)));
+            assert_eq!(memory.used(), 0);
+        }
+    }
+
     use super::Document;
     #[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
-    use super::{NamespaceData, namespace_axes_equivalent};
+    use super::{NamespaceData, comparison::namespaces_equal};
     use crate::xml::dom::{ParseError, ParsingOptions, XmlBackend};
 
     #[test]
@@ -1146,25 +1345,29 @@ mod tests {
     fn differential_namespace_axis_comparison_preserves_multiplicity() {
         // The fail-closed gate must reject unequal axes even if a malformed
         // backend projection repeats one binding and hides another.
-        let binding = |prefix: &str, uri: &str| NamespaceData {
+        let binding = |prefix: &str, uri: &str| NamespaceData::<super::Native> {
             prefix: Some(prefix.to_owned()),
             uri: uri.to_owned(),
         };
         let a = binding("a", "urn:a");
         let b = binding("b", "urn:b");
 
-        assert!(!namespace_axes_equivalent(
-            &[a.clone(), a.clone()],
-            &[a.clone(), b.clone()]
-        ));
-        assert!(!namespace_axes_equivalent(
-            &[a.clone(), b],
-            &[a.clone(), a.clone()]
-        ));
-        assert!(namespace_axes_equivalent(
-            &[a.clone(), a.clone()],
-            &[a.clone(), a]
-        ));
+        assert!(
+            !namespaces_equal(
+                &[a.clone(), a.clone()],
+                &[a.clone(), b.clone()],
+                super::Native,
+            )
+            .expect("duplicate axis comparison")
+        );
+        assert!(
+            !namespaces_equal(&[a.clone(), b], &[a.clone(), a.clone()], super::Native,)
+                .expect("reversed duplicate axis comparison")
+        );
+        assert!(
+            namespaces_equal(&[a.clone(), a.clone()], &[a.clone(), a], super::Native,)
+                .expect("equal multiplicities")
+        );
     }
 
     #[test]

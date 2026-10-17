@@ -1,36 +1,31 @@
 #[cfg(feature = "embedded")]
 use crate::sxd_document as sxd_document_no_unsafe;
-use snafu::{OptionExt, ResultExt, Snafu, ensure};
-use std::cell::Cell;
-use std::iter::Peekable;
+use snafu::Snafu;
 
+use super::grammar::{self, Binary, Builder, Fault, Node, Test};
 use crate::Value;
-use crate::axis::{Axis, AxisLike, PrincipalNodeType};
+use crate::axis::Axis;
 use crate::expression::{self, SubExpression};
-use crate::node_test::{self, SubNodeTest};
-use crate::token::{AxisName, NodeTestName, Token};
+use crate::node_test::SubNodeTest;
+use crate::token::Token;
 use crate::tokenizer::{self, TokenResult};
+
+#[cfg(test)]
+const MAX_EXPRESSION_NESTING: usize = grammar::MAX_DEPTH;
 
 #[allow(missing_copy_implementations)]
 pub struct Parser<'a> {
-    nesting: Cell<usize>,
     budget: Option<&'a crate::ParseBudget>,
 }
 
-const MAX_EXPRESSION_NESTING: usize = 256;
-
 impl<'a> Parser<'a> {
     pub fn new() -> Self {
-        Parser {
-            nesting: Cell::new(0),
-            budget: None,
-        }
+        Self { budget: None }
     }
 
     pub fn with_budget(budget: &'a crate::ParseBudget) -> Self {
         Self {
             budget: Some(budget),
-            ..Self::new()
         }
     }
 
@@ -38,7 +33,7 @@ impl<'a> Parser<'a> {
         self.budget.map_or(Ok(()), |budget| budget.charge(bytes))
     }
 
-    fn boxed<T>(&self, value: T) -> Result<Box<T>, Error> {
+    fn boxed<T: expression::Expression + 'static>(&self, value: T) -> Result<SubExpression, Error> {
         self.charge(std::mem::size_of::<T>())?;
         Ok(Box::new(value))
     }
@@ -69,21 +64,40 @@ impl<'a> Parser<'a> {
         let bytes = capacity
             .checked_mul(std::mem::size_of::<T>())
             .ok_or_else(overflow)?;
-        // Vec allocations must fit Layout's signed pointer-offset bound, even with no
-        // caller-selected limit. Never turn arithmetic overflow into an allocation request.
         if bytes > isize::MAX as usize {
             return Err(overflow());
         }
         Ok((capacity, bytes))
     }
 
-    fn with_nesting<T>(&self, parse: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
-        let depth = self.nesting.get();
-        ensure!(depth < MAX_EXPRESSION_NESTING, NestingLimit);
-        self.nesting.set(depth + 1);
-        let result = parse();
-        self.nesting.set(depth);
-        result
+    pub fn parse<I>(&self, source: I) -> ParseResult<SubExpression>
+    where
+        I: Iterator<Item = TokenResult>,
+    {
+        grammar::Grammar::new(self)
+            .parse(source)
+            .map_err(Into::into)
+    }
+
+    #[cfg(test)]
+    fn parse_node_test<I>(
+        &self,
+        source: &mut std::iter::Peekable<I>,
+    ) -> Result<Option<SubNodeTest>, Error>
+    where
+        I: Iterator<Item = TokenResult>,
+    {
+        if !matches!(source.peek(), Some(Ok(Token::NodeTest(_)))) {
+            return Ok(None);
+        }
+        match source
+            .next()
+            .expect("peeked token")
+            .map_err(|source| Error::Tokenizer { source })?
+        {
+            Token::NodeTest(test) => Ok(Some(native_test(Test::Kind(test)))),
+            _ => unreachable!(),
+        }
     }
 }
 
@@ -117,701 +131,170 @@ pub enum Error {
 
 pub type ParseResult<T = Option<SubExpression>> = Result<T, Error>;
 
-type BinaryExpressionBuilder = fn(SubExpression, SubExpression) -> SubExpression;
-
-struct BinaryRule {
-    token: Token,
-    builder: BinaryExpressionBuilder,
-    allocation_bytes: usize,
-}
-
-struct LeftAssociativeBinaryParser<'a> {
-    rules: &'a [BinaryRule],
-}
-
-type TokenSource<'a, I> = &'a mut Peekable<I>;
-
-trait XCompat {
-    fn has_more_tokens(&mut self) -> bool;
-    fn next_token_is(&mut self, token: &Token) -> bool;
-    fn consume(&mut self, token: &Token) -> Result<(), Error>;
-}
-
-impl<I> XCompat for Peekable<I>
-where
-    I: Iterator<Item = TokenResult>,
-{
-    fn has_more_tokens(&mut self) -> bool {
-        self.peek().is_some()
-    }
-
-    fn next_token_is(&mut self, token: &Token) -> bool {
-        match self.peek() {
-            Some(Ok(t)) => t == token,
-            _ => false,
+impl From<Fault<Token>> for Error {
+    fn from(fault: Fault<Token>) -> Self {
+        match fault {
+            Fault::NoXPath => Self::NoXPath,
+            Fault::EmptyPredicate => Self::EmptyPredicate,
+            Fault::ExtraUnparsedTokens => Self::ExtraUnparsedTokens,
+            Fault::NestingLimit => Self::NestingLimit,
+            Fault::RanOutOfInput => Self::RanOutOfInput,
+            Fault::RightHandSideExpressionMissing => Self::RightHandSideExpressionMissing,
+            Fault::ArgumentMissing => Self::ArgumentMissing,
+            Fault::Tokenizer(source) => Self::Tokenizer { source },
+            Fault::TrailingSlash => Self::TrailingSlash,
+            Fault::UnexpectedToken(token) => Self::UnexpectedToken { token },
+            Fault::AllocationLimit { limit, actual } => Self::AllocationLimit { limit, actual },
+            // The native builder has no shared allocator. A scoped allocation
+            // failure must never be converted to this legacy parser error.
+            #[cfg(feature = "embedded")]
+            Fault::Resource(_) => unreachable!("resource failure from native builder"),
         }
     }
+}
 
-    fn consume(&mut self, token: &Token) -> Result<(), Error> {
-        let x = self.next().context(RanOutOfInput)?.context(Tokenizer)?;
-        ensure!(&x == token, UnexpectedToken { token: x });
+fn native_failure(error: Error) -> Fault<Token> {
+    match error {
+        Error::AllocationLimit { limit, actual } => Fault::AllocationLimit { limit, actual },
+        _ => unreachable!("non-allocation failure from native storage"),
+    }
+}
+
+fn native_test(test: Test<String>) -> SubNodeTest {
+    test.into()
+}
+
+impl Builder for Parser<'_> {
+    type Name = crate::OwnedPrefixedName;
+    type Text = String;
+    type Expression = SubExpression;
+    type Predicate = expression::Predicate;
+    type Step = expression::Step;
+    type List<T> = Vec<T>;
+
+    fn list<T>(&self) -> Vec<T> {
+        Vec::new()
+    }
+
+    fn inspect(&self) -> Result<(), Fault<Token>> {
         Ok(())
     }
-}
 
-/// Similar to `consume`, but can be used when the token carries a
-/// single value.
-macro_rules! consume_value(
-    ($source:expr, Token::$token:ident) => ({
-        let next = $source.next().context(RanOutOfInput)?.context(Tokenizer)?;
-
-        match next {
-            Token::$token(x) => x,
-            token => return UnexpectedToken { token }.fail(),
-        }
-    });
-);
-
-/// Similar to `next_token_is`, but can be used when the token carries
-/// a single value
-macro_rules! next_token_is(
-    ($source:expr, Token::$token:ident) => (
-        match $source.peek() {
-            Some(&Ok(Token::$token(_))) => true,
-            _ => false,
-        }
-    );
-);
-
-impl<'a> LeftAssociativeBinaryParser<'a> {
-    fn new(rules: &'a [BinaryRule]) -> Self {
-        LeftAssociativeBinaryParser { rules }
+    fn push<T>(&self, list: &mut Vec<T>, value: T) -> Result<(), Fault<Token>> {
+        self.push(list, value).map_err(native_failure)
     }
 
-    fn parse<F, I>(
+    fn node(&self, node: Node<Self>, _depth: usize) -> Result<SubExpression, Fault<Token>> {
+        match node {
+            Node::Context => self.boxed(expression::ContextNode).map_err(native_failure),
+            Node::Root => self.boxed(expression::RootNode).map_err(native_failure),
+            Node::Number(value) => self
+                .boxed(expression::Literal::from(Value::Number(value)))
+                .map_err(native_failure),
+            Node::String(value) => self
+                .boxed(expression::Literal::from(Value::String(value)))
+                .map_err(native_failure),
+            Node::Variable(name) => self
+                .boxed(expression::Variable { name })
+                .map_err(native_failure),
+            Node::Function(name, arguments) => self
+                .boxed(expression::Function { name, arguments })
+                .map_err(native_failure),
+            Node::Negate(expression) => self
+                .boxed(expression::Negation { expression })
+                .map_err(native_failure),
+            Node::Path(start, steps) => {
+                self.charge(std::mem::size_of::<expression::Path>())
+                    .map_err(native_failure)?;
+                Ok(expression::Path::new(start, steps))
+            }
+            Node::Filter(selector, predicate) => {
+                self.charge(std::mem::size_of::<expression::Filter>())
+                    .map_err(native_failure)?;
+                Ok(expression::Filter::new(selector, predicate))
+            }
+            Node::Binary(operation, left, right) => {
+                let (size, constructor): (
+                    usize,
+                    fn(SubExpression, SubExpression) -> SubExpression,
+                ) = match operation {
+                    Binary::Or => (std::mem::size_of::<expression::Or>(), expression::Or::new),
+                    Binary::And => (std::mem::size_of::<expression::And>(), expression::And::new),
+                    Binary::Equal => (
+                        std::mem::size_of::<expression::Equal>(),
+                        expression::Equal::new,
+                    ),
+                    Binary::NotEqual => (
+                        std::mem::size_of::<expression::NotEqual>(),
+                        expression::NotEqual::new,
+                    ),
+                    Binary::Less => (
+                        std::mem::size_of::<expression::Relational>(),
+                        expression::Relational::less_than,
+                    ),
+                    Binary::LessEqual => (
+                        std::mem::size_of::<expression::Relational>(),
+                        expression::Relational::less_than_or_equal,
+                    ),
+                    Binary::Greater => (
+                        std::mem::size_of::<expression::Relational>(),
+                        expression::Relational::greater_than,
+                    ),
+                    Binary::GreaterEqual => (
+                        std::mem::size_of::<expression::Relational>(),
+                        expression::Relational::greater_than_or_equal,
+                    ),
+                    Binary::Add => (
+                        std::mem::size_of::<expression::Math>(),
+                        expression::Math::addition,
+                    ),
+                    Binary::Subtract => (
+                        std::mem::size_of::<expression::Math>(),
+                        expression::Math::subtraction,
+                    ),
+                    Binary::Multiply => (
+                        std::mem::size_of::<expression::Math>(),
+                        expression::Math::multiplication,
+                    ),
+                    Binary::Divide => (
+                        std::mem::size_of::<expression::Math>(),
+                        expression::Math::division,
+                    ),
+                    Binary::Remainder => (
+                        std::mem::size_of::<expression::Math>(),
+                        expression::Math::remainder,
+                    ),
+                    Binary::Union => (
+                        std::mem::size_of::<expression::Union>(),
+                        expression::Union::new,
+                    ),
+                };
+                self.charge(size).map_err(native_failure)?;
+                Ok(constructor(left, right))
+            }
+        }
+    }
+
+    fn depth(&self, expression: &SubExpression) -> usize {
+        expression.ast_depth()
+    }
+
+    fn predicate(&self, expression: SubExpression) -> expression::Predicate {
+        expression::Predicate { expression }
+    }
+
+    fn step(
         &self,
-        owner: &Parser<'_>,
-        source: TokenSource<'_, I>,
-        child_parse: F,
-    ) -> ParseResult
-    where
-        F: Fn(TokenSource<'_, I>) -> ParseResult,
-        I: Iterator<Item = TokenResult>,
-    {
-        let left = child_parse(source)?;
-
-        let mut left = match left {
-            None => return Ok(None),
-            Some(x) => x,
-        };
-        let mut left_depth = left.ast_depth();
-
-        while source.has_more_tokens() {
-            let mut found = false;
-
-            for rule in self.rules {
-                if source.next_token_is(&rule.token) {
-                    source.consume(&rule.token)?;
-
-                    let right = child_parse(source)?.context(RightHandSideExpressionMissing)?;
-
-                    let next_depth = 1usize.saturating_add(left_depth.max(right.ast_depth()));
-                    ensure!(next_depth <= MAX_EXPRESSION_NESTING, NestingLimit);
-
-                    owner.charge(rule.allocation_bytes)?;
-                    left = (rule.builder)(left, right);
-                    left_depth = next_depth;
-
-                    found = true;
-                    break;
-                }
-            }
-
-            if !found {
-                break;
-            }
-        }
-
-        Ok(Some(left))
-    }
-}
-
-type Rule<'a, I> = dyn Fn(TokenSource<'_, I>) -> ParseResult + 'a;
-fn first_matching_rule<I>(child_parses: &[&Rule<'_, I>], source: TokenSource<'_, I>) -> ParseResult
-where
-    I: Iterator<Item = TokenResult>,
-{
-    for child_parse in child_parses.iter() {
-        let expr = (*child_parse)(source)?;
-        if expr.is_some() {
-            return Ok(expr);
-        }
-    }
-
-    Ok(None)
-}
-
-impl Parser<'_> {
-    fn parse_axis<I>(&self, source: TokenSource<'_, I>) -> Result<Axis, Error>
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        if next_token_is!(source, Token::Axis) {
-            let name = consume_value!(source, Token::Axis);
-
-            match name {
-                AxisName::Child => Ok(Axis::Child),
-                AxisName::SelfAxis => Ok(Axis::SelfAxis),
-                AxisName::Parent => Ok(Axis::Parent),
-                AxisName::Descendant => Ok(Axis::Descendant),
-                AxisName::DescendantOrSelf => Ok(Axis::DescendantOrSelf),
-                AxisName::Attribute => Ok(Axis::Attribute),
-                AxisName::Namespace => Ok(Axis::Namespace),
-                AxisName::Ancestor => Ok(Axis::Ancestor),
-                AxisName::AncestorOrSelf => Ok(Axis::AncestorOrSelf),
-                AxisName::PrecedingSibling => Ok(Axis::PrecedingSibling),
-                AxisName::FollowingSibling => Ok(Axis::FollowingSibling),
-                AxisName::Preceding => Ok(Axis::Preceding),
-                AxisName::Following => Ok(Axis::Following),
-            }
-        } else {
-            Ok(Axis::Child)
-        }
-    }
-
-    fn parse_node_test<I>(&self, source: TokenSource<'_, I>) -> Result<Option<SubNodeTest>, Error>
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        if next_token_is!(source, Token::NodeTest) {
-            let name = consume_value!(source, Token::NodeTest);
-
-            match name {
-                NodeTestName::Node => Ok(Some(self.boxed(node_test::Node)?)),
-                NodeTestName::Text => Ok(Some(self.boxed(node_test::Text)?)),
-                NodeTestName::Comment => Ok(Some(self.boxed(node_test::Comment)?)),
-                NodeTestName::ProcessingInstruction(target) => Ok(Some(
-                    self.boxed(node_test::ProcessingInstruction::new(target))?,
-                )),
-            }
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn default_node_test<I>(
-        &self,
-        source: TokenSource<'_, I>,
         axis: Axis,
-    ) -> Result<Option<SubNodeTest>, Error>
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        if next_token_is!(source, Token::NameTest) {
-            let name = consume_value!(source, Token::NameTest);
-
-            let test: SubNodeTest = match axis.principal_node_type() {
-                PrincipalNodeType::Attribute => self.boxed(node_test::Attribute::new(name))?,
-                PrincipalNodeType::Element => self.boxed(node_test::Element::new(name))?,
-                PrincipalNodeType::Namespace => self.boxed(node_test::Namespace::new(name))?,
-            };
-
-            Ok(Some(test))
-        } else {
-            Ok(None)
-        }
+        test: Test<String>,
+        predicates: Vec<expression::Predicate>,
+        _depth: usize,
+    ) -> expression::Step {
+        expression::Step::from_predicates(axis, native_test(test), predicates)
     }
 
-    fn parse_nested_expression<I>(&self, source: TokenSource<'_, I>) -> ParseResult
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        if source.next_token_is(&Token::LeftParen) {
-            source.consume(&Token::LeftParen)?;
-            let result = self.parse_expression(source)?;
-            source.consume(&Token::RightParen)?;
-            Ok(result)
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn parse_variable_reference<I>(&self, source: TokenSource<'_, I>) -> ParseResult
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        if next_token_is!(source, Token::Variable) {
-            let name = consume_value!(source, Token::Variable);
-            Ok(Some(self.boxed(expression::Variable { name })?))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn parse_string_literal<I>(&self, source: TokenSource<'_, I>) -> ParseResult
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        if next_token_is!(source, Token::Literal) {
-            let value = consume_value!(source, Token::Literal);
-            Ok(Some(
-                self.boxed(expression::Literal::from(Value::String(value)))?,
-            ))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn parse_numeric_literal<I>(&self, source: TokenSource<'_, I>) -> ParseResult
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        if next_token_is!(source, Token::Number) {
-            let value = consume_value!(source, Token::Number);
-            Ok(Some(
-                self.boxed(expression::Literal::from(Value::Number(value)))?,
-            ))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn parse_function_args_tail<I>(
-        &self,
-        source: TokenSource<'_, I>,
-        mut arguments: Vec<SubExpression>,
-    ) -> Result<Vec<SubExpression>, Error>
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        while source.next_token_is(&Token::Comma) {
-            source.consume(&Token::Comma)?;
-
-            let arg = self.parse_expression(source)?.context(ArgumentMissing)?;
-            self.push(&mut arguments, arg)?;
-        }
-
-        Ok(arguments)
-    }
-
-    fn parse_function_args<I>(
-        &self,
-        source: TokenSource<'_, I>,
-    ) -> Result<Vec<SubExpression>, Error>
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        let mut arguments = Vec::new();
-
-        match self.parse_expression(source)? {
-            Some(arg) => self.push(&mut arguments, arg)?,
-            None => return Ok(arguments),
-        }
-
-        self.parse_function_args_tail(source, arguments)
-    }
-
-    fn parse_function_call<I>(&self, source: TokenSource<'_, I>) -> ParseResult
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        if next_token_is!(source, Token::Function) {
-            let name = consume_value!(source, Token::Function);
-
-            source.consume(&Token::LeftParen)?;
-            let arguments = self.parse_function_args(source)?;
-            source.consume(&Token::RightParen)?;
-
-            Ok(Some(self.boxed(expression::Function { name, arguments })?))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn parse_primary_expression<I>(&self, source: TokenSource<'_, I>) -> ParseResult
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        let rules: &[&Rule<'_, I>] = &[
-            &|src: TokenSource<'_, I>| self.parse_variable_reference(src),
-            &|src: TokenSource<'_, I>| self.parse_nested_expression(src),
-            &|src: TokenSource<'_, I>| self.parse_string_literal(src),
-            &|src: TokenSource<'_, I>| self.parse_numeric_literal(src),
-            &|src: TokenSource<'_, I>| self.parse_function_call(src),
-        ];
-
-        first_matching_rule(rules, source)
-    }
-
-    fn parse_predicate_expression<I>(&self, source: TokenSource<'_, I>) -> ParseResult
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        if source.next_token_is(&Token::LeftBracket) {
-            source.consume(&Token::LeftBracket)?;
-
-            let predicate = self.parse_expression(source)?.context(EmptyPredicate)?;
-            source.consume(&Token::RightBracket)?;
-            Ok(Some(predicate))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn parse_predicates<I>(
-        &self,
-        source: TokenSource<'_, I>,
-    ) -> Result<Vec<expression::Predicate>, Error>
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        let mut predicates = Vec::new();
-
-        while let Some(predicate) = self.parse_predicate_expression(source)? {
-            self.push(
-                &mut predicates,
-                expression::Predicate {
-                    expression: predicate,
-                },
-            )?;
-        }
-
-        Ok(predicates)
-    }
-
-    fn parse_step<I>(&self, source: TokenSource<'_, I>) -> Result<Option<expression::Step>, Error>
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        let axis = self.parse_axis(source)?;
-
-        let node_test = match self.parse_node_test(source)? {
-            Some(test) => Some(test),
-            None => self.default_node_test(source, axis)?,
-        };
-
-        let node_test = match node_test {
-            Some(test) => test,
-            None => return Ok(None),
-        };
-
-        let predicates = self.parse_predicates(source)?;
-
-        Ok(Some(expression::Step::from_predicates(
-            axis, node_test, predicates,
-        )))
-    }
-
-    fn parse_relative_location_path_raw<I>(
-        &self,
-        source: TokenSource<'_, I>,
-        start_point: SubExpression,
-    ) -> ParseResult
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        match self.parse_step(source)? {
-            Some(step) => {
-                let mut steps = Vec::new();
-                self.push(&mut steps, step)?;
-
-                while source.next_token_is(&Token::Slash) {
-                    source.consume(&Token::Slash)?;
-
-                    let next = self.parse_step(source)?.context(TrailingSlash)?;
-                    self.push(&mut steps, next)?;
-                }
-
-                self.charge(std::mem::size_of::<expression::Path>())?;
-                Ok(Some(expression::Path::new(start_point, steps)))
-            }
-            None => Ok(None),
-        }
-    }
-
-    fn parse_relative_location_path<I>(&self, source: TokenSource<'_, I>) -> ParseResult
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        let start_point = self.boxed(expression::ContextNode)?;
-        self.parse_relative_location_path_raw(source, start_point)
-    }
-
-    fn parse_absolute_location_path<I>(&self, source: TokenSource<'_, I>) -> ParseResult
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        if source.next_token_is(&Token::Slash) {
-            source.consume(&Token::Slash)?;
-
-            let start_point = self.boxed(expression::RootNode)?;
-            match self.parse_relative_location_path_raw(source, start_point)? {
-                Some(expr) => Ok(Some(expr)),
-                None => Ok(Some(self.boxed(expression::RootNode)?)),
-            }
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn parse_location_path<I>(&self, source: TokenSource<'_, I>) -> ParseResult
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        let rules: &[&Rule<'_, I>] = &[
-            &|source: TokenSource<'_, I>| self.parse_relative_location_path(source),
-            &|source: TokenSource<'_, I>| self.parse_absolute_location_path(source),
-        ];
-
-        first_matching_rule(rules, source)
-    }
-
-    fn parse_filter_expression<I>(&self, source: TokenSource<'_, I>) -> ParseResult
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        match self.parse_primary_expression(source)? {
-            Some(expr) => {
-                let predicates = self.parse_predicates(source)?;
-                let predicate_bytes =
-                    predicates.capacity() * std::mem::size_of::<expression::Predicate>();
-
-                let mut expression = expr;
-                let mut expression_depth = expression.ast_depth();
-                for predicate in predicates {
-                    let next_depth = 1usize
-                        .saturating_add(expression_depth.max(predicate.expression.ast_depth()));
-                    ensure!(next_depth <= MAX_EXPRESSION_NESTING, NestingLimit);
-                    self.charge(std::mem::size_of::<expression::Filter>())?;
-                    expression = expression::Filter::new(expression, predicate.expression);
-                    expression_depth = next_depth;
-                }
-                if let Some(budget) = self.budget {
-                    budget.release(predicate_bytes);
-                }
-                Ok(Some(expression))
-            }
-            None => Ok(None),
-        }
-    }
-
-    fn parse_path_expression<I>(&self, source: TokenSource<'_, I>) -> ParseResult
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        let expr = self.parse_location_path(source)?;
-        if expr.is_some() {
-            return Ok(expr);
-        } // TODO: investigate if this is a pattern
-
-        match self.parse_filter_expression(source)? {
-            Some(expr) => {
-                if source.next_token_is(&Token::Slash) {
-                    source.consume(&Token::Slash)?;
-
-                    let expr = self
-                        .parse_relative_location_path_raw(source, expr)?
-                        .context(TrailingSlash)?;
-                    Ok(Some(expr))
-                } else {
-                    Ok(Some(expr))
-                }
-            }
-            None => Ok(None),
-        }
-    }
-
-    fn parse_union_expression<I>(&self, source: TokenSource<'_, I>) -> ParseResult
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        let rules = [BinaryRule {
-            token: Token::Pipe,
-            builder: expression::Union::new,
-            allocation_bytes: std::mem::size_of::<expression::Union>(),
-        }];
-
-        let parser = LeftAssociativeBinaryParser::new(&rules);
-        parser.parse(self, source, |source| self.parse_path_expression(source))
-    }
-
-    fn parse_unary_expression<I>(&self, source: TokenSource<'_, I>) -> ParseResult
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        let expr = self.parse_union_expression(source)?;
-        if expr.is_some() {
-            return Ok(expr);
-        }
-
-        if source.next_token_is(&Token::MinusSign) {
-            source.consume(&Token::MinusSign)?;
-
-            let expression = self
-                .with_nesting(|| self.parse_unary_expression(source))?
-                .context(RightHandSideExpressionMissing)?;
-            let expression: SubExpression = self.boxed(expression::Negation { expression })?;
-            Ok(Some(expression))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn parse_multiplicative_expression<I>(&self, source: TokenSource<'_, I>) -> ParseResult
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        let rules = [
-            BinaryRule {
-                token: Token::Multiply,
-                builder: expression::Math::multiplication,
-                allocation_bytes: std::mem::size_of::<expression::Math>(),
-            },
-            BinaryRule {
-                token: Token::Divide,
-                builder: expression::Math::division,
-                allocation_bytes: std::mem::size_of::<expression::Math>(),
-            },
-            BinaryRule {
-                token: Token::Remainder,
-                builder: expression::Math::remainder,
-                allocation_bytes: std::mem::size_of::<expression::Math>(),
-            },
-        ];
-
-        let parser = LeftAssociativeBinaryParser::new(&rules);
-        parser.parse(self, source, |source| self.parse_unary_expression(source))
-    }
-
-    fn parse_additive_expression<I>(&self, source: TokenSource<'_, I>) -> ParseResult
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        let rules = [
-            BinaryRule {
-                token: Token::PlusSign,
-                builder: expression::Math::addition,
-                allocation_bytes: std::mem::size_of::<expression::Math>(),
-            },
-            BinaryRule {
-                token: Token::MinusSign,
-                builder: expression::Math::subtraction,
-                allocation_bytes: std::mem::size_of::<expression::Math>(),
-            },
-        ];
-
-        let parser = LeftAssociativeBinaryParser::new(&rules);
-        parser.parse(self, source, |source| {
-            self.parse_multiplicative_expression(source)
-        })
-    }
-
-    fn parse_relational_expression<I>(&self, source: TokenSource<'_, I>) -> ParseResult
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        let rules = [
-            BinaryRule {
-                token: Token::LessThan,
-                builder: expression::Relational::less_than,
-                allocation_bytes: std::mem::size_of::<expression::Relational>(),
-            },
-            BinaryRule {
-                token: Token::LessThanOrEqual,
-                builder: expression::Relational::less_than_or_equal,
-                allocation_bytes: std::mem::size_of::<expression::Relational>(),
-            },
-            BinaryRule {
-                token: Token::GreaterThan,
-                builder: expression::Relational::greater_than,
-                allocation_bytes: std::mem::size_of::<expression::Relational>(),
-            },
-            BinaryRule {
-                token: Token::GreaterThanOrEqual,
-                builder: expression::Relational::greater_than_or_equal,
-                allocation_bytes: std::mem::size_of::<expression::Relational>(),
-            },
-        ];
-
-        let parser = LeftAssociativeBinaryParser::new(&rules);
-        parser.parse(self, source, |source| {
-            self.parse_additive_expression(source)
-        })
-    }
-
-    fn parse_equality_expression<I>(&self, source: TokenSource<'_, I>) -> ParseResult
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        let rules = [
-            BinaryRule {
-                token: Token::Equal,
-                builder: expression::Equal::new,
-                allocation_bytes: std::mem::size_of::<expression::Equal>(),
-            },
-            BinaryRule {
-                token: Token::NotEqual,
-                builder: expression::NotEqual::new,
-                allocation_bytes: std::mem::size_of::<expression::NotEqual>(),
-            },
-        ];
-
-        let parser = LeftAssociativeBinaryParser::new(&rules);
-        parser.parse(self, source, |source| {
-            self.parse_relational_expression(source)
-        })
-    }
-
-    fn parse_and_expression<I>(&self, source: TokenSource<'_, I>) -> ParseResult
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        let rules = [BinaryRule {
-            token: Token::And,
-            builder: expression::And::new,
-            allocation_bytes: std::mem::size_of::<expression::And>(),
-        }];
-
-        let parser = LeftAssociativeBinaryParser::new(&rules);
-        parser.parse(self, source, |source| {
-            self.parse_equality_expression(source)
-        })
-    }
-
-    fn parse_or_expression<I>(&self, source: TokenSource<'_, I>) -> ParseResult
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        let rules = [BinaryRule {
-            token: Token::Or,
-            builder: expression::Or::new,
-            allocation_bytes: std::mem::size_of::<expression::Or>(),
-        }];
-
-        let parser = LeftAssociativeBinaryParser::new(&rules);
-        parser.parse(self, source, |source| self.parse_and_expression(source))
-    }
-
-    fn parse_expression<I>(&self, source: TokenSource<'_, I>) -> ParseResult
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        self.with_nesting(|| self.parse_or_expression(source))
-    }
-
-    pub fn parse<I>(&self, source: I) -> ParseResult<SubExpression>
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        let mut source = source.peekable();
-
-        let expr = self.parse_or_expression(&mut source)?;
-
-        ensure!(!source.has_more_tokens(), ExtraUnparsedTokens);
-
-        let expr = expr.context(NoXPath)?;
-
-        Ok(expr)
+    fn step_depth(&self, step: &expression::Step) -> usize {
+        step.ast_depth()
     }
 }
 
@@ -858,6 +341,26 @@ mod test {
             ));
         }
         assert_eq!(parser.vector_growth::<u64>(4), Ok((8, 64)));
+    }
+
+    #[test]
+    fn processing_instruction_node_test_has_no_separate_heap_owner() {
+        // A targetless PI test has no string payload. The step stores this
+        // grammar variant inline, so merely parsing it cannot allocate a Box.
+        let budget = crate::ParseBudget::new(0);
+        let parser = super::Parser::with_budget(&budget);
+        let mut tokens = std::iter::once(Ok(Token::NodeTest(NodeTestName::ProcessingInstruction(
+            None,
+        ))))
+        .peekable();
+        assert!(matches!(
+            parser.parse_node_test(&mut tokens),
+            Ok(Some(crate::node_test::SubNodeTest::ProcessingInstruction(
+                _
+            )))
+        ));
+        assert_eq!(budget.used.get(), 0);
+        assert!(tokens.next().is_none());
     }
 
     use snafu::ResultExt;

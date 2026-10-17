@@ -8,10 +8,20 @@
 use alloc::{
     borrow::{Cow, ToOwned},
     format,
-    string::{String, ToString},
+    string::String,
     vec::Vec,
 };
 use core::ops::Range;
+
+#[doc(hidden)]
+#[path = "lexical/storage.rs"]
+pub mod storage;
+use storage::{AttributeBuffer, Native, Storage};
+
+type ScanResult<'a, S> = Result<
+    Option<Event<'a, <S as Storage>::Attributes<'a>>>,
+    Error<<S as Storage>::Label, <S as Storage>::Refusal>,
+>;
 
 #[cfg(feature = "std")]
 use std::{
@@ -21,22 +31,45 @@ use std::{
 
 /// A lexical XML failure with a source position.
 #[derive(Debug, thiserror::Error)]
-#[error("XML lexical error: {message}")]
-pub struct Error {
-    message: String,
+pub enum Error<L = String, R = alloc::collections::TryReserveError> {
+    /// Original fixed-size tokenizer failure; formatting is deferred.
+    #[error("XML lexical error: {0}")]
+    Tokenizer(xmlparser::Error),
+    /// Static grammar diagnostic.
+    #[error("XML lexical error: {0}")]
+    Static(&'static str),
+    /// An owned diagnostic produced by a materializing helper.
+    #[error("XML lexical error: {0}")]
+    Malformed(L),
+    /// The duplicated lexical QName, retained by the selected storage.
+    #[error("XML lexical error: duplicate attribute `{0}`")]
+    DuplicateAttribute(L),
+    /// Storage or current-work refusal, never a syntax rejection.
+    #[error("XML lexical storage: {0}")]
+    Resource(R),
+}
+
+impl<L, R> Error<L, R> {
+    fn tokenizer(error: xmlparser::Error) -> Self {
+        Self::Tokenizer(error)
+    }
+
+    /// Move completed labels without formatting or changing the failure kind.
+    #[doc(hidden)]
+    pub fn map_label<T>(self, mut map: impl FnMut(L) -> T) -> Error<T, R> {
+        match self {
+            Self::Tokenizer(error) => Error::Tokenizer(error),
+            Self::Static(message) => Error::Static(message),
+            Self::Malformed(label) => Error::Malformed(map(label)),
+            Self::DuplicateAttribute(label) => Error::DuplicateAttribute(map(label)),
+            Self::Resource(error) => Error::Resource(error),
+        }
+    }
 }
 
 impl Error {
-    fn tokenizer(error: xmlparser::Error) -> Self {
-        Self {
-            message: error.to_string(),
-        }
-    }
-
     fn malformed(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
+        Self::Malformed(message.into())
     }
 }
 
@@ -97,18 +130,18 @@ pub struct Attribute<'a> {
 
 /// A complete start or empty-element tag.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StartTag<'a> {
+pub struct StartTag<'a, A = Vec<Attribute<'a>>> {
     /// Lexical element name.
     pub name: Name<'a>,
     /// Attributes in source order.
-    pub attributes: Vec<Attribute<'a>>,
+    pub attributes: A,
     /// Complete source range including `<` and `>`.
     pub range: Range<usize>,
 }
 
 /// One lexical XML event.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Event<'a> {
+pub enum Event<'a, A = Vec<Attribute<'a>>> {
     /// XML declaration.
     Declaration {
         /// Declared XML version.
@@ -142,9 +175,9 @@ pub enum Event<'a> {
         range: Range<usize>,
     },
     /// Opening element tag.
-    Start(StartTag<'a>),
+    Start(StartTag<'a, A>),
     /// Empty-element tag.
-    Empty(StartTag<'a>),
+    Empty(StartTag<'a, A>),
     /// Closing element tag.
     End {
         /// Lexical closing name.
@@ -176,17 +209,19 @@ pub enum Event<'a> {
 }
 
 /// Pull-based, zero-copy lexical scanner.
-pub struct Scanner<'a> {
+pub struct Scanner<'a, S: Storage = Native> {
     input: &'a str,
     tokenizer: xmlparser::Tokenizer<'a>,
     pending_text: Option<PendingText<'a>>,
-    pending_start: Option<PendingStart<'a>>,
+    pending_start: Option<PendingStart<'a, S>>,
     dtd_start: Option<(usize, &'a str)>,
+    storage: S,
+    admitted: bool,
 }
 
-struct PendingStart<'a> {
+struct PendingStart<'a, S: Storage> {
     name: Name<'a>,
-    attributes: Vec<Attribute<'a>>,
+    attributes: S::Attributes<'a>,
     start: usize,
 }
 
@@ -196,61 +231,111 @@ struct PendingText<'a> {
     offset: usize,
 }
 
-fn validate_unique_attributes(attributes: &mut [Attribute<'_>]) -> Result<(), Error> {
+fn validate_unique_attributes<'a, S: Storage>(
+    attributes: &mut S::Attributes<'a>,
+    storage: S,
+) -> Result<(), Error<S::Label, S::Refusal>> {
     const SMALL_TAG_ATTRIBUTES: usize = 8;
 
     if attributes.len() <= SMALL_TAG_ATTRIBUTES {
         for index in 1..attributes.len() {
             let name = attributes[index].name;
-            if attributes[..index]
-                .iter()
-                .any(|attribute| attribute.name == name)
-            {
-                return Err(Error::malformed(format!(
-                    "duplicate attribute `{}`",
-                    name.qualified()
-                )));
+            for attribute in &attributes[..index] {
+                if compare_names(attribute.name, name, storage)
+                    .map_err(Error::Resource)?
+                    .is_eq()
+                {
+                    return Err(Error::DuplicateAttribute(
+                        storage.qualified_name(name).map_err(Error::Resource)?,
+                    ));
+                }
             }
         }
         return Ok(());
     }
 
-    attributes.sort_unstable_by_key(|attribute| attribute.name);
-    if let Some(name) = attributes
-        .windows(2)
-        .find_map(|pair| (pair[0].name == pair[1].name).then_some(pair[0].name))
-    {
-        return Err(Error::malformed(format!(
-            "duplicate attribute `{}`",
-            name.qualified()
-        )));
+    attributes
+        .sort(|left, right| compare_names(left.name, right.name, storage))
+        .map_err(Error::Resource)?;
+    for pair in attributes.windows(2) {
+        if compare_names(pair[0].name, pair[1].name, storage)
+            .map_err(Error::Resource)?
+            .is_eq()
+        {
+            return Err(Error::DuplicateAttribute(
+                storage
+                    .qualified_name(pair[0].name)
+                    .map_err(Error::Resource)?,
+            ));
+        }
     }
-    attributes.sort_unstable_by_key(|attribute| attribute.range.start);
+    attributes
+        .sort(|left, right| Ok(left.range.start.cmp(&right.range.start)))
+        .map_err(Error::Resource)?;
     Ok(())
+}
+
+fn compare_names<S: Storage>(
+    left: Name<'_>,
+    right: Name<'_>,
+    storage: S,
+) -> Result<core::cmp::Ordering, S::Refusal> {
+    storage.admit(1)?;
+    storage.admit(left.prefix.len().min(right.prefix.len()))?;
+    let prefix = left.prefix.cmp(right.prefix);
+    if !prefix.is_eq() {
+        return Ok(prefix);
+    }
+    storage.admit(left.local.len().min(right.local.len()))?;
+    Ok(left.local.cmp(right.local))
 }
 
 impl<'a> Scanner<'a> {
     /// Scan a complete XML document.
     #[must_use]
     pub fn new(input: &'a str) -> Self {
+        Self::with_storage(input, Native)
+    }
+}
+
+impl<'a, S: Storage> Scanner<'a, S> {
+    /// Select the allocator/work specialization without changing lexical rules.
+    #[doc(hidden)]
+    pub fn with_storage(input: &'a str, storage: S) -> Self {
         Self {
             input,
             tokenizer: xmlparser::Tokenizer::from(input),
             pending_text: None,
             pending_start: None,
             dtd_start: None,
+            storage,
+            admitted: false,
         }
     }
 
     /// Return the next event, or `None` at end of input.
-    pub fn next_event(&mut self) -> Result<Option<Event<'a>>, Error> {
+    pub fn next_event(&mut self) -> ScanResult<'a, S> {
+        if !self.admitted {
+            // Tokenization, QName validation and reference splitting each
+            // walk at most this actual source window. Sorting is separate.
+            self.storage
+                .admit(self.input.len())
+                .map_err(Error::Resource)?;
+            self.storage
+                .admit(self.input.len())
+                .map_err(Error::Resource)?;
+            self.storage
+                .admit(self.input.len())
+                .map_err(Error::Resource)?;
+            self.admitted = true;
+        }
         if let Some(event) = self.next_text_event()? {
             return Ok(Some(event));
         }
         loop {
             let Some(token) = self.tokenizer.next() else {
                 if self.pending_start.is_some() {
-                    return Err(Error::malformed("unterminated element start tag"));
+                    return Err(Error::Static("unterminated element start tag"));
                 }
                 return Ok(None);
             };
@@ -288,7 +373,7 @@ impl<'a> Scanner<'a> {
                     // here would silently apply the wrong character rules downstream.
                     // https://www.w3.org/TR/xml/#sec-prolog-dtd
                     if version.as_str() != "1.0" {
-                        return Err(Error::malformed("unsupported XML version"));
+                        return Err(Error::Static("unsupported XML version"));
                     }
                     return Ok(Some(Event::Declaration {
                         version: version.as_str(),
@@ -321,7 +406,7 @@ impl<'a> Scanner<'a> {
                     }));
                 }
                 Token::DtdEnd { .. } => {
-                    return Err(Error::malformed("DOCTYPE end without a start"));
+                    return Err(Error::Static("DOCTYPE end without a start"));
                 }
                 Token::EntityDeclaration { .. } => {}
                 Token::ElementStart {
@@ -331,14 +416,14 @@ impl<'a> Scanner<'a> {
                 } => {
                     validate_qualified_lexeme(&self.input[span.range()])?;
                     if self.pending_start.is_some() {
-                        return Err(Error::malformed("nested element start tokens"));
+                        return Err(Error::Static("nested element start tokens"));
                     }
                     self.pending_start = Some(PendingStart {
                         name: Name {
                             prefix: prefix.as_str(),
                             local: local.as_str(),
                         },
-                        attributes: Vec::new(),
+                        attributes: self.storage.attributes(),
                         start: span.range().start,
                     });
                 }
@@ -352,24 +437,27 @@ impl<'a> Scanner<'a> {
                     let start = self
                         .pending_start
                         .as_mut()
-                        .ok_or_else(|| Error::malformed("attribute outside a start tag"))?;
+                        .ok_or(Error::Static("attribute outside a start tag"))?;
                     let name = Name {
                         prefix: prefix.as_str(),
                         local: local.as_str(),
                     };
-                    start.attributes.push(Attribute {
-                        name,
-                        value: value.as_str(),
-                        range: span.range(),
-                    });
+                    start
+                        .attributes
+                        .push(Attribute {
+                            name,
+                            value: value.as_str(),
+                            range: span.range(),
+                        })
+                        .map_err(Error::Resource)?;
                 }
                 Token::ElementEnd { end, span } => match end {
                     ElementEnd::Open | ElementEnd::Empty => {
                         let mut start = self
                             .pending_start
                             .take()
-                            .ok_or_else(|| Error::malformed("element end without a start"))?;
-                        validate_unique_attributes(&mut start.attributes)?;
+                            .ok_or(Error::Static("element end without a start"))?;
+                        validate_unique_attributes(&mut start.attributes, self.storage)?;
                         let tag = StartTag {
                             name: start.name,
                             attributes: start.attributes,
@@ -412,7 +500,7 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    fn next_text_event(&mut self) -> Result<Option<Event<'a>>, Error> {
+    fn next_text_event(&mut self) -> ScanResult<'a, S> {
         let Some(mut pending) = self.pending_text.take() else {
             return Ok(None);
         };
@@ -434,7 +522,7 @@ impl<'a> Scanner<'a> {
             return Ok(Some(event));
         }
         let Some(relative_end) = pending.text[start + 1..].find(';') else {
-            return Err(Error::malformed(
+            return Err(Error::Static(
                 "unterminated XML reference in character data",
             ));
         };
@@ -457,7 +545,7 @@ impl<'a> Scanner<'a> {
     }
 }
 
-fn validate_qualified_lexeme(source: &str) -> Result<(), Error> {
+fn validate_qualified_lexeme<L, R>(source: &str) -> Result<(), Error<L, R>> {
     // XML 1.0 productions [40] and [42] place Name immediately after `<` or `</`; applying
     // Unicode whitespace trimming here would erase legal non-ASCII NameStartChar values.
     // https://www.w3.org/TR/xml/#NT-STag
@@ -475,7 +563,7 @@ fn validate_qualified_lexeme(source: &str) -> Result<(), Error> {
     let first = parts.next().unwrap_or_default();
     let second = parts.next();
     if first.is_empty() || second.is_some_and(str::is_empty) || parts.next().is_some() {
-        return Err(Error::malformed("invalid qualified XML name"));
+        return Err(Error::Static("invalid qualified XML name"));
     }
     Ok(())
 }

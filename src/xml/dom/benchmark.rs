@@ -1,10 +1,11 @@
 //! Prepared backend DOMs for measuring the real projection independently.
 
 use super::{Document, LexicalPreflight, ParseError, ParsingOptions, XmlBackend};
+use crate::{parser_roxmltree, parser_xmloxide};
 
 enum Parsed<'a> {
-    Roxmltree(::roxmltree::Document<'a>),
-    Xmloxide(::xmloxide::Document),
+    Roxmltree(parser_roxmltree::Document<'a>),
+    Xmloxide(parser_xmloxide::Document),
 }
 
 pub(crate) struct Projection<'a> {
@@ -18,7 +19,7 @@ impl<'a> Projection<'a> {
         let preflight = LexicalPreflight::scan(input, false)?;
         let parsed = match backend {
             XmlBackend::Roxmltree => {
-                Parsed::Roxmltree(::roxmltree::Document::parse(input).map_err(|e| {
+                Parsed::Roxmltree(parser_roxmltree::Document::parse(input).map_err(|e| {
                     ParseError::Backend {
                         backend: "roxmltree",
                         message: e.to_string(),
@@ -26,7 +27,7 @@ impl<'a> Projection<'a> {
                 })?)
             }
             XmlBackend::Xmloxide => Parsed::Xmloxide(
-                ::xmloxide::parser::parse_str_with_options(
+                parser_xmloxide::parser::parse_str_with_options(
                     input,
                     &super::xmloxide::backend_options(),
                 )

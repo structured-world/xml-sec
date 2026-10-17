@@ -37,6 +37,7 @@ Just `cargo add xml-sec`.**
   requests, and expected-element coverage checks resist signature wrapping and stale-document reuse.
 - **Scoped authenticated reference replay**: inspect original SignedInfo/Manifest instructions
   and stream transform output with the original timestamp canonicalization parameters,
+  using independently bounded current-query work without repeating verification,
   without conflating instruction authentication, historical digest validity and signer trust.
   See [scoped reference replay](docs/xmldsig.md#scoped-authenticated-reference-replay).
 - **xmlsec1 interoperability**: a native `xmlsec1` CLI surface plus deterministic offline

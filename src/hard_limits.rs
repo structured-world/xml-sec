@@ -3,6 +3,9 @@
 //! These caps bound allocations even when a future compiled deployment policy
 //! permits larger inputs. Deployment policy may only select stricter values.
 
+#[cfg(feature = "xmldsig")]
+pub(crate) mod xpath;
+
 /// Maximum XML nodes allocated while parsing one verification or transform document.
 pub(crate) const XML_DOCUMENT_NODE_CEILING: u32 = 100_000;
 /// Maximum general-entity substitutions performed while parsing one document.

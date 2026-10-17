@@ -44,6 +44,11 @@ where
     pub fn iter(&self) -> Iter<'_, K, V> {
         Iter(self.map.as_ref().map(|m| m.iter()))
     }
+
+    #[cfg(feature = "embedded")]
+    pub fn capacity(&self) -> usize {
+        self.map.as_ref().map_or(0, HashMap::capacity)
+    }
 }
 
 pub struct Iter<'a, K, V>(Option<hash_map::Iter<'a, K, V>>);

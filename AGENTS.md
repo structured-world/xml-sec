@@ -2,6 +2,17 @@
 
 These repository-specific rules supplement the active global agent instructions.
 
+## Shared Primitive Ownership (CRITICAL)
+
+Before starting a new task, critically assess its mechanisms against the architecture,
+roadmaps, and existing code of `xml-sec`, `isitsigned`, and `structured-id`. If a primitive
+can serve more than one of these products, do not implement or duplicate it in this
+repository: coordinate its contract with the consumers and the `signature-primitives`
+worker, and hand implementation to an existing or new issue at
+https://github.com/structured-world/signature-primitives/issues . Link the consumer task
+to that dependency; keep XML-specific adapters, policy, and integration here. Public
+issues must not expose private product architecture or roadmap details.
+
 ## Unified Policy Architecture (CRITICAL)
 
 Before implementing roadmap work, read the policy tasks in `arch/ROADMAP.md` (`P4-012a`

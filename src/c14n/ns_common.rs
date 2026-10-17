@@ -6,6 +6,7 @@
 //! that decides which namespace bindings are candidates for emission.
 
 use crate::xml::dom::Node;
+use crate::xml::dom::storage::Storage as DomStorage;
 
 use super::C14nError;
 use super::NodeVisibility;
@@ -33,10 +34,10 @@ use super::scratch::{List, NamespaceMap, NamespaceRendering, Scratch};
 ///
 /// `(sorted_ns_decls, updated_rendered_map)` — the declarations to emit and
 /// the binding map to pass to child elements.
-pub(super) fn collect_ns_declarations<'a, S: Scratch>(
-    node: Node<'a, '_>,
+pub(super) fn collect_ns_declarations<'a, S: Scratch, D: DomStorage>(
+    node: Node<'a, '_, D>,
     parent_rendered: &S::Namespaces<'a>,
-    visibility: Option<&dyn NodeVisibility>,
+    visibility: Option<&dyn NodeVisibility<D>>,
     reset_invisible_binding: impl Fn(&str) -> bool,
     include_prefix: impl Fn(&str, &str) -> Result<bool, C14nError>,
     scratch: &S,
@@ -44,7 +45,7 @@ pub(super) fn collect_ns_declarations<'a, S: Scratch>(
     let mut rendered = parent_rendered.copy()?;
     let mut decls = scratch.values();
 
-    for ns in node.namespaces() {
+    for (ordinal, ns) in node.namespaces().enumerate() {
         let prefix = ns.name().unwrap_or(""); // None = default namespace
         let uri = ns.uri();
         scratch.charge(prefix.len().checked_add(uri.len()).ok_or(
@@ -53,7 +54,9 @@ pub(super) fn collect_ns_declarations<'a, S: Scratch>(
             },
         )?)?;
 
-        if visibility.is_some_and(|set| !set.contains_namespace(node, prefix, uri)) {
+        if let Some(set) = visibility
+            && !set.contains_namespace_at(node, ordinal, ns)?
+        {
             // Canonical XML subset state tracks namespace nodes present on the
             // nearest output ancestor, not merely declarations still in XML
             // scope. A binding excluded on this element must be eligible for

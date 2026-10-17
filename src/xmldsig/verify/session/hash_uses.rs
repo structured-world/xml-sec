@@ -160,11 +160,10 @@ impl<W: Work, F> ReferenceHashVisitor<'_, W, F> {
     }
 }
 
-impl<W: Work> SelectedSignature<'_, '_, '_, '_, W> {
+impl<W: Work, Q: Work> SelectedSignature<'_, '_, '_, '_, W, Q> {
     /// Original typed method captured during the first successful verification.
     pub fn signature_method(&self) -> Result<SelectedSignatureMethod, DsigError> {
-        self.session
-            .signature_method_in(self.index, self.session.work)
+        self.session.signature_method_in(self.index, self.work)
     }
 
     /// Visit declared original roles and their actual original completion state.
@@ -185,8 +184,7 @@ impl<W: Work> SelectedSignature<'_, '_, '_, '_, W> {
         } else {
             HashUseState::Complete
         };
-        self.session
-            .work
+        self.work
             .charge_work(1)
             .map_err(|error| CatalogueError::Processing(error.into()))?;
         visitor(SignatureHashUse {
@@ -202,8 +200,7 @@ impl<W: Work> SelectedSignature<'_, '_, '_, '_, W> {
         // of the message digest. Use the originally parsed effective parameters.
         // https://www.rfc-editor.org/rfc/rfc9231#section-2.3.9
         if let Some(parameters) = method.algorithm.rsa_pss_parameters() {
-            self.session
-                .work
+            self.work
                 .charge_work(1)
                 .map_err(|error| CatalogueError::Processing(error.into()))?;
             visitor(SignatureHashUse {
@@ -222,7 +219,7 @@ impl<W: Work> SelectedSignature<'_, '_, '_, '_, W> {
                 .capture
                 .digests
                 .borrow()
-                .get(&node.id().get_usize(), self.session.work)
+                .get(&node.id().get_usize(), self.work)
                 .map_err(|error| CatalogueError::Processing(error.into()))?
                 .copied();
             let mut emitter = ReferenceHashVisitor {
@@ -230,7 +227,7 @@ impl<W: Work> SelectedSignature<'_, '_, '_, '_, W> {
                 instruction: reference,
                 parent,
                 completed: digest_receipt.is_some_and(|receipt| receipt.computed),
-                work: self.session.work,
+                work: self.work,
                 completeness: &mut completeness,
                 visitor: &mut visitor,
             };
@@ -248,7 +245,7 @@ impl<W: Work> SelectedSignature<'_, '_, '_, '_, W> {
             let inspected = super::super::super::extension::visit_direct_attributes(
                 self.session.view,
                 method_identity,
-                self.session.work,
+                self.work,
                 |attribute| {
                     if attribute.namespace.is_none() && attribute.local_name == "Algorithm" {
                         found = true;
@@ -258,8 +255,7 @@ impl<W: Work> SelectedSignature<'_, '_, '_, '_, W> {
                             .iter()
                             .map(|algorithm| algorithm.uri().len() as u64 + 1)
                             .sum();
-                        self.session
-                            .work
+                        self.work
                             .charge_work(comparisons)
                             .map_err(|error| CatalogueError::Processing(error.into()))?;
                         let algorithm = DigestAlgorithm::from_uri(attribute.value).map_or(

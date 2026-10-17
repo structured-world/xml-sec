@@ -48,6 +48,19 @@ pub mod document;
 pub mod encoding;
 pub mod error;
 mod hard_limits;
+// These XML parser kernels are checksum-pinned in scripts/import-xml-backends.sh.
+// Embedding the maintained sources also preserves the patch for package users.
+// Upstream navigation/construction APIs not used by this adapter stay private.
+#[cfg(feature = "xml-backend-roxmltree")]
+#[allow(dead_code, unused_imports, missing_docs)]
+#[cfg_attr(test, allow(clippy::unwrap_used))]
+#[path = "parser_roxmltree/lib.rs"]
+mod parser_roxmltree;
+#[cfg(feature = "xml-backend-xmloxide")]
+#[allow(dead_code, unused_imports, missing_docs)]
+#[cfg_attr(test, allow(clippy::unwrap_used))]
+#[path = "parser_xmloxide/lib.rs"]
+mod parser_xmloxide;
 #[cfg(feature = "xmldsig")]
 pub mod rsa_encoding;
 #[cfg(feature = "xmldsig")]
@@ -98,7 +111,8 @@ pub(crate) use sxd_xpath::{Context, Factory};
 #[cfg(feature = "xmldsig")]
 pub(crate) use sxd_xpath::{
     LiteralValue, OwnedPrefixedName, OwnedQName, ParseBudget, Value, axis, context, expression,
-    function, node_test, node_to_num_with_context, nodeset, parser, str_to_num, token, tokenizer,
+    function, node_test, node_to_num_with_context, nodeset, parser, runtime, str_to_num, token,
+    tokenizer,
 };
 #[cfg(feature = "xmldsig")]
 pub mod key_establishment;

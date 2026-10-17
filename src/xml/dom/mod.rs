@@ -11,6 +11,8 @@ mod differential;
 mod preflight;
 #[cfg(feature = "xml-backend-roxmltree")]
 mod roxmltree;
+#[doc(hidden)]
+pub mod storage;
 mod tree;
 #[cfg(feature = "xml-backend-xmloxide")]
 mod xmloxide;
@@ -100,6 +102,39 @@ impl XmlBackend {
             Self::Differential => parse_differentially(input, options, preflight),
         }
     }
+
+    #[cfg(feature = "xmldsig")]
+    fn parse_in<'input, 'w, W: structured_asn1::memory::Work>(
+        self,
+        input: &'input str,
+        options: ParsingOptions,
+        preflight: &LexicalPreflight<'input, storage::Accounted<'w, W>>,
+        storage: storage::Accounted<'w, W>,
+    ) -> Result<Document<'input, storage::Accounted<'w, W>>, AccountedParseError> {
+        match self {
+            Self::Xmloxide => {
+                #[cfg(feature = "xml-backend-xmloxide")]
+                return xmloxide::XmloxideBackend::parse_in(input, options, preflight, storage);
+                #[cfg(not(feature = "xml-backend-xmloxide"))]
+                Err(ParseError::BackendUnavailable { backend: self }.into())
+            }
+            Self::Roxmltree => {
+                #[cfg(feature = "xml-backend-roxmltree")]
+                return roxmltree::RoxmltreeBackend::parse_in(input, options, preflight, storage);
+                #[cfg(not(feature = "xml-backend-roxmltree"))]
+                Err(ParseError::BackendUnavailable { backend: self }.into())
+            }
+            Self::Differential => {
+                #[cfg(all(feature = "xml-backend-xmloxide", feature = "xml-backend-roxmltree"))]
+                return differential::parse_in(input, options, preflight, storage);
+                #[cfg(not(all(
+                    feature = "xml-backend-xmloxide",
+                    feature = "xml-backend-roxmltree"
+                )))]
+                Err(ParseError::BackendUnavailable { backend: self }.into())
+            }
+        }
+    }
 }
 
 fn parse_with_xmloxide<'input>(
@@ -156,9 +191,53 @@ impl Default for XmlBackend {
     }
 }
 
+/// Parser failure retaining labels in their admitted allocation account.
+///
+/// This is error transport for scoped parsing, not a different XML grammar.
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, thiserror::Error)]
+pub enum AccountedParseError {
+    /// Backend-neutral structural or resource refusal.
+    #[error("{0}")]
+    Semantic(#[from] ParseError),
+    /// Original lexical failure with its completed, paid diagnostic labels.
+    #[error("{0}")]
+    Lexical(
+        #[source]
+        crate::xml_input::lexical::Error<
+            structured_asn1::memory::OwnedText,
+            structured_asn1::memory::MemoryError,
+        >,
+    ),
+    /// Original roxmltree failure with its completed, paid diagnostic labels.
+    #[cfg(feature = "xml-backend-roxmltree")]
+    #[error("{0}")]
+    Roxmltree(#[source] crate::parser_roxmltree::Error<structured_asn1::memory::OwnedText>),
+    /// Original xmloxide diagnostics retain their actual allocation charges.
+    #[cfg(feature = "xml-backend-xmloxide")]
+    #[error("{0}")]
+    Xmloxide(
+        #[source]
+        crate::parser_xmloxide::error::ParseError<
+            structured_asn1::memory::OwnedText,
+            structured_asn1::memory::OwnedVec<
+                crate::parser_xmloxide::error::ParseDiagnostic<structured_asn1::memory::OwnedText>,
+            >,
+        >,
+    ),
+    /// Semantic disagreement with its completed, paid diagnostic.
+    #[error("XML backend divergence: {0}")]
+    Divergence(structured_asn1::memory::OwnedText),
+}
+
 /// Stable parser-neutral XML parse error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParseError {
+    /// The semantic tree could not acquire its requested allocation.
+    AllocationFailed,
+    /// The current query refused tree construction work or storage.
+    #[cfg(feature = "xmldsig")]
+    SharedExecution(structured_asn1::memory::MemoryError),
     /// The requested parser implementation was not compiled into this build.
     BackendUnavailable {
         /// Runtime selection that cannot be satisfied.
@@ -210,6 +289,13 @@ pub enum ParseError {
         /// First in-scope binding count beyond the ceiling.
         actual: usize,
     },
+    /// A backend node does not match the original lexical source sidecar.
+    SourceMapMismatch {
+        /// Expected fixed lexical node kind.
+        expected: &'static str,
+        /// Observed fixed lexical node kind, or end of stream.
+        found: &'static str,
+    },
     /// The selected backend rejected malformed XML.
     Backend {
         /// Compile-time selected backend name.
@@ -224,9 +310,19 @@ pub enum ParseError {
     },
 }
 
+#[cfg(feature = "xmldsig")]
+impl From<structured_asn1::memory::MemoryError> for ParseError {
+    fn from(error: structured_asn1::memory::MemoryError) -> Self {
+        Self::SharedExecution(error)
+    }
+}
+
 impl fmt::Display for ParseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::AllocationFailed => formatter.write_str("XML tree allocation failed"),
+            #[cfg(feature = "xmldsig")]
+            Self::SharedExecution(error) => write!(formatter, "XML tree execution: {error}"),
             Self::BackendUnavailable { backend } => {
                 write!(
                     formatter,
@@ -262,6 +358,10 @@ impl fmt::Display for ParseError {
             Self::NamespaceBindingLimitReached { maximum, actual } => write!(
                 formatter,
                 "XML namespace binding limit {maximum} exceeded at {actual} active bindings"
+            ),
+            Self::SourceMapMismatch { expected, found } => write!(
+                formatter,
+                "xmloxide-source-map rejected XML: expected {expected}, found {found}"
             ),
             Self::Backend { backend, message } => {
                 write!(formatter, "{backend} rejected XML: {message}")

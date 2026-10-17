@@ -6,7 +6,13 @@ use std::{
     mem::size_of,
 };
 
-use super::{Transform, TransformError, TransformExecutionBudget, transform_resource_limit};
+#[cfg(test)]
+use super::Transform;
+use super::parameters::{Instruction, Selector, View};
+use super::{TransformError, TransformExecutionBudget, transform_resource_limit};
+#[cfg(test)]
+use crate::c14n::scratch::Native;
+use crate::c14n::scratch::{List, Scratch};
 use crate::{
     c14n::C14nMode,
     policy::OpcRelationshipEdition,
@@ -98,7 +104,13 @@ impl WorkspaceBudget {
         Ok(())
     }
 
-    fn push<T>(&self, vector: &mut Vec<T>, value: T) -> Result<(), TransformError> {
+    fn push<T>(&self, vector: &mut impl List<T>, value: T) -> Result<(), TransformError> {
+        self.reserve_slot(vector)?;
+        vector.push(value)?;
+        Ok(())
+    }
+
+    fn reserve_slot<T>(&self, vector: &mut impl List<T>) -> Result<(), TransformError> {
         if vector.len() == vector.capacity() {
             let capacity = vector
                 .capacity()
@@ -112,17 +124,14 @@ impl WorkspaceBudget {
                     .checked_mul(size_of::<T>())
                     .ok_or_else(|| invalid("workspace overflow"))?,
             )?;
-            vector
-                .try_reserve_exact(capacity - vector.len())
-                .map_err(|_| invalid("workspace allocation failed"))?;
+            vector.reserve_exact(capacity - vector.len())?;
         }
-        vector.push(value);
         Ok(())
     }
 }
 
-fn invalid(message: &str) -> TransformError {
-    TransformError::Relationship(message.to_owned())
+fn invalid(message: &'static str) -> TransformError {
+    TransformError::Relationship(message)
 }
 
 /// Validate one algorithm chain, not an OPC package signature.
@@ -130,16 +139,19 @@ fn invalid(message: &str) -> TransformError {
 /// placement and per-part uniqueness; those require a package-level validator,
 /// not restrictions on this reusable XMLDSig/XMLEnc transform mechanism.
 /// https://ecma-international.org/publications-and-standards/standards/ecma-376/
-pub(crate) fn validate_chain(chain: &[Transform]) -> Result<(), TransformError> {
+pub(crate) fn validate_chain<I: Instruction>(chain: &[I]) -> Result<(), TransformError> {
     let mut seen = false;
     for (index, transform) in chain.iter().enumerate() {
-        if let Transform::Relationship(selectors) = transform {
+        if let View::Relationship(selectors) = transform.view() {
             // ECMA-376 Part 2 (2021) §§10.5.8.2, 10.6; 2012 §13.2.4.24:
             // https://ecma-international.org/publications-and-standards/standards/ecma-376/
             // The normalized XML must immediately be followed by C14N.
             if seen
                 || selectors.is_empty()
-                || !matches!(chain.get(index + 1), Some(Transform::C14n(_)))
+                || !matches!(
+                    chain.get(index + 1).map(Instruction::view),
+                    Some(View::C14n(..))
+                )
             {
                 return Err(invalid(
                     "each chain permits one relationship transform with selectors, immediately followed by canonicalization",
@@ -151,8 +163,8 @@ pub(crate) fn validate_chain(chain: &[Transform]) -> Result<(), TransformError> 
     Ok(())
 }
 
-pub(crate) fn validate_edition(
-    chain: &[Transform],
+pub(crate) fn validate_edition<I: Instruction>(
+    chain: &[I],
     edition: OpcRelationshipEdition,
 ) -> Result<(), TransformError> {
     validate_chain(chain)?;
@@ -161,23 +173,44 @@ pub(crate) fn validate_edition(
     // consumers "shall fail the validation" for other methods (M6.34).
     // https://ecma-international.org/publications-and-standards/standards/ecma-376/
     for pair in chain.windows(2) {
-        if let [Transform::Relationship(_), Transform::C14n(algorithm)] = pair
+        if matches!(pair[0].view(), View::Relationship(_))
+            && let View::C14n(algorithm, _) = pair[1].view()
             && algorithm.mode() != C14nMode::Inclusive1_0
         {
-            return Err(invalid(&format!(
-                "OPC {edition:?} requires C14N 1.0 after relationship normalization"
-            )));
+            return Err(invalid(match edition {
+                OpcRelationshipEdition::Ecma2012 => {
+                    "OPC Ecma2012 requires C14N 1.0 after relationship normalization"
+                }
+                OpcRelationshipEdition::Ecma2021 => {
+                    "OPC Ecma2021 requires C14N 1.0 after relationship normalization"
+                }
+            }));
         }
     }
     Ok(())
 }
 
-pub(super) fn parse_selectors(
+#[cfg(test)]
+fn parse_selectors(
     node: Node<'_, '_>,
     budget: &WorkspaceBudget,
 ) -> Result<Vec<RelationshipSelector>, TransformError> {
-    let mut selectors = Vec::new();
+    parse_selectors_in(node, budget, &Native)
+}
+
+pub(super) fn parse_selectors_in<'a, S: super::ParseStorage<'a>>(
+    node: Node<'a, 'a>,
+    budget: &WorkspaceBudget,
+    scratch: &S,
+) -> Result<S::Values<S::Selector>, TransformError> {
+    let mut selectors = scratch.values();
+    scratch.charge(node.children().len())?;
     for child in node.children() {
+        if child.is_text()
+            && let Some(text) = child.text()
+        {
+            scratch.charge(text.len())?;
+        }
         if child.is_comment()
             || child.is_pi()
             || (child.is_text() && child.text().is_some_and(super::is_xml_whitespace_only))
@@ -185,6 +218,7 @@ pub(super) fn parse_selectors(
             continue;
         }
         let tag = child.tag_name();
+        scratch.charge(tag.name().len() + tag.namespace().map_or(0, str::len))?;
         let attribute = match (tag.namespace(), tag.name()) {
             (Some(PARAM), "RelationshipReference") => "SourceId",
             (Some(PARAM), "RelationshipsGroupReference") => "SourceType",
@@ -193,21 +227,21 @@ pub(super) fn parse_selectors(
         // ECMA-376 Part 2: 2021 C.2 / 2012 D.3 extend xsd:string.
         // Character content is permitted but does not participate in selection.
         // https://ecma-international.org/publications-and-standards/standards/ecma-376/
+        scratch.charge(child.children().len())?;
         if child.attributes().len() != 1 || child.children().any(|n| n.is_element()) {
             return Err(invalid(
                 "relationship selector requires exactly its named attribute and no child elements",
             ));
         }
+        for attribute in child.attributes() {
+            scratch.charge(attribute.name().len() + attribute.namespace().map_or(0, str::len))?;
+        }
         let value = child
             .attribute(attribute)
             .ok_or_else(|| invalid("missing relationship selector attribute"))?;
         budget.charge(value.len())?;
-        let selector = if attribute == "SourceId" {
-            RelationshipSelector::SourceId(value.to_owned())
-        } else {
-            RelationshipSelector::SourceType(value.to_owned())
-        };
-        budget.push(&mut selectors, selector)?;
+        budget.reserve_slot(&mut selectors)?;
+        selectors.push(scratch.selector(attribute == "SourceId", value))?;
     }
     if selectors.is_empty() {
         return Err(invalid("relationship transform requires selectors"));
@@ -222,40 +256,106 @@ enum Parent {
     Relationship(usize),
 }
 
-struct Frame<'a> {
-    next: Option<Node<'a, 'a>>,
+struct Frame<'a, D: crate::xml::dom::storage::Storage> {
+    next: Option<Node<'a, 'a, D>>,
     parent: Parent,
 }
 
-struct Relationship<'a> {
+struct Relationship<'a, S: Scratch, D: crate::xml::dom::storage::Storage> {
     id: &'a str,
     kind: &'a str,
     target: &'a str,
     mode: &'a str,
-    instructions: Vec<Node<'a, 'a>>,
+    instructions: S::Values<Node<'a, 'a, D>>,
     selected: bool,
 }
 
-enum Event<'a> {
-    Instruction(Node<'a, 'a>),
+enum Event<'a, D: crate::xml::dom::storage::Storage> {
+    Instruction(Node<'a, 'a, D>),
     Relationship,
+}
+
+struct CurrentFilter<'a, S: Scratch> {
+    original: &'a super::NodeFilterWorkBudget,
+    scratch: &'a S,
+}
+impl<S: Scratch> CurrentFilter<'_, S> {
+    fn charge(&self, units: usize) -> Result<(), TransformError> {
+        self.original.charge(units)?;
+        self.scratch.charge(units)?;
+        Ok(())
+    }
+}
+struct CurrentBudget<'a, S: Scratch> {
+    original: &'a TransformExecutionBudget,
+    node_filter: CurrentFilter<'a, S>,
+}
+impl<S: Scratch> CurrentBudget<'_, S> {
+    fn attribute<'a, D: crate::xml::dom::storage::Storage>(
+        &self,
+        node: Node<'a, 'a, D>,
+        namespace: Option<&str>,
+        local: &str,
+    ) -> Result<Option<&'a str>, TransformError> {
+        for attribute in node.attributes() {
+            let work = attribute
+                .name()
+                .len()
+                .checked_add(attribute.namespace().map_or(0, str::len))
+                .and_then(|size| size.checked_add(local.len()))
+                .and_then(|size| size.checked_add(namespace.map_or(0, str::len)))
+                .and_then(|size| size.checked_add(1))
+                .ok_or(structured_asn1::memory::MemoryError::WorkExceeded)
+                .map_err(crate::c14n::C14nError::from)?;
+            self.node_filter.scratch.charge(work)?;
+            if attribute.name() == local && attribute.namespace() == namespace {
+                return Ok(Some(attribute.value()));
+            }
+        }
+        Ok(None)
+    }
+}
+impl<S: Scratch> std::ops::Deref for CurrentBudget<'_, S> {
+    type Target = TransformExecutionBudget;
+    fn deref(&self) -> &Self::Target {
+        self.original
+    }
 }
 
 /// No intermediate DOM or copied attribute strings: retained records borrow
 /// the input arena; only the bounded traversal stack and sorted records allocate.
+#[cfg(test)]
 pub(super) fn normalize<'a>(
     document: &'a Document<'a>,
     selectors: &[RelationshipSelector],
     edition: OpcRelationshipEdition,
     budget: &TransformExecutionBudget,
 ) -> Result<Vec<u8>, TransformError> {
-    let mut frames = Vec::new();
-    let mut records: Vec<Relationship<'a>> = Vec::new();
+    normalize_in(document, selectors, edition, budget, &Native)
+}
+
+pub(super) fn normalize_in<'a, S: Scratch, D: crate::xml::dom::storage::Storage>(
+    document: &'a Document<'a, D>,
+    selectors: &[impl Selector],
+    edition: OpcRelationshipEdition,
+    budget: &TransformExecutionBudget,
+    scratch: &S,
+) -> Result<S::Bytes, TransformError> {
+    let current = CurrentBudget {
+        original: budget,
+        node_filter: CurrentFilter {
+            original: &budget.node_filter,
+            scratch,
+        },
+    };
+    let budget = &current;
+    let mut frames = scratch.values();
+    let mut records = scratch.values::<Relationship<'a, S, D>>();
     let mut root_seen = false;
     let mut padded_ids = false;
-    let mut before = Vec::new();
-    let mut after = Vec::new();
-    let mut events = Vec::new();
+    let mut before = scratch.values();
+    let mut after = scratch.values();
+    let mut events = scratch.values();
     budget.opc_workspace.push(
         &mut frames,
         Frame {
@@ -275,6 +375,10 @@ pub(super) fn normalize<'a>(
             continue;
         }
         if node.is_text() {
+            budget
+                .node_filter
+                .scratch
+                .charge(node.text().map_or(0, str::len))?;
             // CT_Relationship extends xsd:string (2012 D.4 / 2021 C.5).
             // 2012 §13.2.4.24 step 3(2) removes its contents; 2021 §10.6
             // step 3(a) removes text. CT_Relationships remains element-only.
@@ -352,8 +456,8 @@ pub(super) fn normalize<'a>(
             }
             (Parent::Relationships, Some(REL), "Relationship") => {
                 validate_attributes(node, &["Id", "Type", "Target", "TargetMode"], budget)?;
-                let id = node
-                    .attribute("Id")
+                let id = budget
+                    .attribute(node, None, "Id")?
                     .ok_or_else(|| invalid("missing relationship Id"))?;
                 budget.node_filter.charge(id.len())?;
                 // XSD 1.0 §§3.3.8, 4.3.6: ID's whiteSpace facet is collapse.
@@ -364,15 +468,17 @@ pub(super) fn normalize<'a>(
                     return Err(invalid("relationship Id must be an xsd:ID"));
                 }
                 padded_ids |= id != id.trim_matches(xml_whitespace);
-                let kind = node
-                    .attribute("Type")
+                let kind = budget
+                    .attribute(node, None, "Type")?
                     .ok_or_else(|| invalid("missing relationship Type"))?;
                 budget.node_filter.charge(kind.len())?;
                 validate_relationship_type_iri(kind)?;
-                let target = node
-                    .attribute("Target")
+                let target = budget
+                    .attribute(node, None, "Target")?
                     .ok_or_else(|| invalid("missing relationship Target"))?;
-                let mode = node.attribute("TargetMode").unwrap_or("Internal");
+                let mode = budget
+                    .attribute(node, None, "TargetMode")?
+                    .unwrap_or("Internal");
                 if mode != "Internal" && mode != "External" {
                     return Err(invalid("invalid relationship TargetMode"));
                 }
@@ -390,7 +496,7 @@ pub(super) fn normalize<'a>(
                         kind,
                         target,
                         mode,
-                        instructions: Vec::new(),
+                        instructions: scratch.values(),
                         selected: false,
                     },
                 )?;
@@ -424,13 +530,18 @@ pub(super) fn normalize<'a>(
         .ok_or_else(|| invalid("sort work overflow"))?;
     budget.node_filter.charge(work)?;
     if padded_ids {
-        records.sort_unstable_by(|left, right| {
-            left.id
+        records.sort(|left, right| {
+            scratch.charge(left.id.len().max(right.id.len()))?;
+            Ok(left
+                .id
                 .trim_matches(xml_whitespace)
-                .cmp(right.id.trim_matches(xml_whitespace))
-        });
+                .cmp(right.id.trim_matches(xml_whitespace)))
+        })?;
     } else {
-        records.sort_unstable_by(|left, right| left.id.cmp(right.id));
+        records.sort(|left, right| {
+            scratch.charge(left.id.len().max(right.id.len()))?;
+            Ok(left.id.cmp(right.id))
+        })?;
     }
     if records.windows(2).any(|pair| {
         pair[0].id.trim_matches(xml_whitespace) == pair[1].id.trim_matches(xml_whitespace)
@@ -439,16 +550,20 @@ pub(super) fn normalize<'a>(
     }
     if padded_ids {
         budget.node_filter.charge(work)?;
-        records.sort_unstable_by(|left, right| left.id.cmp(right.id));
+        records.sort(|left, right| {
+            scratch.charge(left.id.len().max(right.id.len()))?;
+            Ok(left.id.cmp(right.id))
+        })?;
     }
     let mut first_selected = None;
     let mut last_selected = 0;
     for (index, record) in records.iter_mut().enumerate() {
         for selector in selectors {
-            let (_, _, expected) = selector.parameter();
-            let actual = match selector {
-                RelationshipSelector::SourceId(_) => record.id,
-                RelationshipSelector::SourceType(_) => record.kind,
+            let (_, attribute, expected) = selector.parameter();
+            let actual = if attribute == "SourceId" {
+                record.id
+            } else {
+                record.kind
             };
             budget
                 .node_filter
@@ -470,70 +585,81 @@ pub(super) fn normalize<'a>(
         }
     }
     let mut output = Output {
-        bytes: Vec::new(),
+        bytes: scratch.bytes(),
         budget,
+        failure: None,
     };
-    for node in before {
-        write_instruction(node, &mut output)?;
-    }
-    output
-        .write_all(b"<Relationships xmlns=\"")
-        .map_err(output_error)?;
-    output.write_all(REL.as_bytes()).map_err(output_error)?;
-    output.write_all(b"\">").map_err(output_error)?;
-    let mut records = records.into_iter();
-    let mut slots_seen = 0;
-    for event in events {
-        let record = match event {
-            Event::Instruction(node) => {
-                // 2012 §13.2.4.24 step 3 removes all edge characters,
-                // whereas 2021 §10.6 step 3 removes text/comments only:
-                // https://ecma-international.org/publications-and-standards/standards/ecma-376/
-                if edition == OpcRelationshipEdition::Ecma2021
-                    || first_selected
-                        .is_some_and(|first| slots_seen > first && slots_seen <= last_selected)
-                {
-                    write_instruction(node, &mut output)?;
+    let result: Result<(), TransformError> = (|| {
+        for node in before.iter() {
+            write_instruction(*node, &mut output)?;
+        }
+        output
+            .write_all(b"<Relationships xmlns=\"")
+            .map_err(output_error)?;
+        output.write_all(REL.as_bytes()).map_err(output_error)?;
+        output.write_all(b"\">").map_err(output_error)?;
+        let mut records = records.iter();
+        let mut slots_seen = 0;
+        for event in events.iter() {
+            let record = match event {
+                Event::Instruction(node) => {
+                    // 2012 §13.2.4.24 step 3 removes all edge characters,
+                    // whereas 2021 §10.6 step 3 removes text/comments only:
+                    // https://ecma-international.org/publications-and-standards/standards/ecma-376/
+                    if edition == OpcRelationshipEdition::Ecma2021
+                        || first_selected
+                            .is_some_and(|first| slots_seen > first && slots_seen <= last_selected)
+                    {
+                        write_instruction(*node, &mut output)?;
+                    }
+                    continue;
                 }
+                Event::Relationship => records
+                    .next()
+                    .ok_or_else(|| invalid("relationship slot mismatch"))?,
+            };
+            slots_seen += 1;
+            if !record.selected {
                 continue;
             }
-            Event::Relationship => records
-                .next()
-                .ok_or_else(|| invalid("relationship slot mismatch"))?,
-        };
-        slots_seen += 1;
-        if !record.selected {
-            continue;
-        }
-        output.write_all(b"<Relationship").map_err(output_error)?;
-        for (name, value) in [
-            ("Id", record.id),
-            ("Target", record.target),
-            ("TargetMode", record.mode),
-            ("Type", record.kind),
-        ] {
-            write!(output, " {name}=\"").map_err(output_error)?;
-            crate::c14n::escape_attr(value, &mut output).map_err(output_error)?;
-            output.write_all(b"\"").map_err(output_error)?;
-        }
-        output.write_all(b">").map_err(output_error)?;
-        if edition == OpcRelationshipEdition::Ecma2021 {
-            for instruction in record.instructions {
-                write_instruction(instruction, &mut output)?;
+            output.write_all(b"<Relationship").map_err(output_error)?;
+            for (name, value) in [
+                ("Id", record.id),
+                ("Target", record.target),
+                ("TargetMode", record.mode),
+                ("Type", record.kind),
+            ] {
+                write!(output, " {name}=\"").map_err(output_error)?;
+                crate::c14n::escape_attr(value, &mut output).map_err(output_error)?;
+                output.write_all(b"\"").map_err(output_error)?;
             }
+            output.write_all(b">").map_err(output_error)?;
+            if edition == OpcRelationshipEdition::Ecma2021 {
+                for instruction in record.instructions.iter() {
+                    write_instruction(*instruction, &mut output)?;
+                }
+            }
+            output.write_all(b"</Relationship>").map_err(output_error)?;
         }
-        output.write_all(b"</Relationship>").map_err(output_error)?;
+        output
+            .write_all(b"</Relationships>")
+            .map_err(output_error)?;
+        for node in after.iter() {
+            write_instruction(*node, &mut output)?;
+        }
+        Ok(())
+    })();
+    if let Some(error) = output.failure {
+        return Err(error);
     }
-    output
-        .write_all(b"</Relationships>")
-        .map_err(output_error)?;
-    for node in after {
-        write_instruction(node, &mut output)?;
-    }
+    result?;
     Ok(output.bytes)
 }
 
-fn write_instruction(node: Node<'_, '_>, output: &mut Output<'_>) -> Result<(), TransformError> {
+fn write_instruction<B: crate::c14n::scratch::Bytes, D: crate::xml::dom::storage::Storage>(
+    node: Node<'_, '_, D>,
+    output: &mut Output<'_, B>,
+) -> Result<(), TransformError> {
     let instruction = node
         .pi()
         .ok_or_else(|| invalid("expected processing instruction"))?;
@@ -544,49 +670,42 @@ fn write_instruction(node: Node<'_, '_>, output: &mut Output<'_>) -> Result<(), 
     output.write_all(b"?>").map_err(output_error)
 }
 
-fn output_error(error: io::Error) -> TransformError {
-    if let Some(violation) = error
-        .get_ref()
-        .and_then(|inner| inner.downcast_ref::<crate::policy::PolicyViolation>())
-    {
-        return TransformError::Policy(violation.clone());
-    }
-    if let Some(TransformError::Policy(violation)) = error
-        .get_ref()
-        .and_then(|inner| inner.downcast_ref::<TransformError>())
-    {
-        return TransformError::Policy(violation.clone());
-    }
-    invalid("relationship output allocation failed")
+fn output_error(_: io::Error) -> TransformError {
+    // Output retains the original typed failure, checked before returning from
+    // normalize_in. The io::Write boundary needs no boxed diagnostic allocation.
+    invalid("relationship output failed")
 }
 
-struct Output<'a> {
-    bytes: Vec<u8>,
+struct Output<'a, B: crate::c14n::scratch::Bytes> {
+    bytes: B,
     budget: &'a TransformExecutionBudget,
+    failure: Option<TransformError>,
 }
 
-impl Write for Output<'_> {
+impl<B: crate::c14n::scratch::Bytes> Write for Output<'_, B> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.budget
-            .charge_c14n_output_policy(bytes.len())
-            .map_err(io::Error::other)?;
-        if bytes.len() > self.bytes.capacity() - self.bytes.len() {
-            let capacity = self
-                .bytes
-                .len()
-                .checked_add(bytes.len())
-                .and_then(|n| n.checked_next_power_of_two())
-                .ok_or_else(|| io::Error::other("output overflow"))?;
-            self.budget
-                .opc_workspace
-                .charge(capacity)
-                .map_err(io::Error::other)?;
-            self.bytes
-                .try_reserve_exact(capacity - self.bytes.len())
-                .map_err(io::Error::other)?;
+        if self.failure.is_some() {
+            return Err(io::ErrorKind::Other.into());
         }
-        self.bytes.extend_from_slice(bytes);
-        Ok(bytes.len())
+        let result = (|| {
+            self.budget.charge_c14n_output_policy(bytes.len())?;
+            if bytes.len() > self.bytes.capacity() - self.bytes.len() {
+                let capacity = self
+                    .bytes
+                    .len()
+                    .checked_add(bytes.len())
+                    .and_then(|n| n.checked_next_power_of_two())
+                    .ok_or_else(|| invalid("output overflow"))?;
+                self.budget.opc_workspace.charge(capacity)?;
+                self.bytes.reserve(capacity - self.bytes.len())?;
+            }
+            self.bytes.append(bytes)?;
+            Ok::<_, TransformError>(bytes.len())
+        })();
+        result.map_err(|error| {
+            self.failure = Some(error);
+            io::ErrorKind::Other.into()
+        })
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
@@ -599,10 +718,10 @@ fn tokens(value: &str) -> impl Iterator<Item = &str> {
         .filter(|token| !token.is_empty())
 }
 
-fn namespace<'a>(
-    node: Node<'a, 'a>,
+fn namespace<'a, S: Scratch, D: crate::xml::dom::storage::Storage>(
+    node: Node<'a, 'a, D>,
     prefix: &str,
-    budget: &TransformExecutionBudget,
+    budget: &CurrentBudget<'_, S>,
 ) -> Result<&'a str, TransformError> {
     budget
         .node_filter
@@ -610,16 +729,37 @@ fn namespace<'a>(
     if !ncname(prefix) {
         return Err(invalid("invalid MCE prefix"));
     }
-    match node.lookup_namespace_uri(Some(prefix)) {
+    let mut binding = None;
+    for namespace in node.namespaces() {
+        budget.node_filter.scratch.charge(
+            namespace
+                .name()
+                .map_or(0, str::len)
+                .checked_add(prefix.len())
+                .and_then(|size| size.checked_add(1))
+                .ok_or(structured_asn1::memory::MemoryError::WorkExceeded)
+                .map_err(crate::c14n::C14nError::from)?,
+        )?;
+        if namespace.name() == Some(prefix) {
+            binding = Some(namespace.uri());
+            break;
+        }
+    }
+    // Namespaces in XML 1.0 §3 reserves xml's implicit binding, even when it
+    // is not declared: https://www.w3.org/TR/2009/REC-xml-names-20091208/#ns-decl
+    if prefix == "xml" {
+        binding = Some(XML);
+    }
+    match binding {
         Some(uri) if !uri.is_empty() && uri != MC => Ok(uri),
         _ => Err(invalid("MCE prefix must bind a non-MCE namespace")),
     }
 }
 
-fn ignorable(
-    node: Node<'_, '_>,
+fn ignorable<S: Scratch, D: crate::xml::dom::storage::Storage>(
+    node: Node<'_, '_, D>,
     uri: Option<&str>,
-    budget: &TransformExecutionBudget,
+    budget: &CurrentBudget<'_, S>,
 ) -> Result<bool, TransformError> {
     let Some(uri) = uri else {
         return Ok(false);
@@ -633,12 +773,12 @@ fn ignorable(
     Ok(false)
 }
 
-fn declares_ignorable(
-    node: Node<'_, '_>,
+fn declares_ignorable<S: Scratch, D: crate::xml::dom::storage::Storage>(
+    node: Node<'_, '_, D>,
     uri: &str,
-    budget: &TransformExecutionBudget,
+    budget: &CurrentBudget<'_, S>,
 ) -> Result<bool, TransformError> {
-    if let Some(value) = node.attribute((MC, "Ignorable")) {
+    if let Some(value) = budget.attribute(node, Some(MC), "Ignorable")? {
         budget.node_filter.charge(value.len())?;
         for prefix in tokens(value) {
             budget.node_filter.charge(uri.len())?;
@@ -650,15 +790,15 @@ fn declares_ignorable(
     Ok(false)
 }
 
-fn process_content(
-    node: Node<'_, '_>,
+fn process_content<S: Scratch, D: crate::xml::dom::storage::Storage>(
+    node: Node<'_, '_, D>,
     edition: OpcRelationshipEdition,
-    budget: &TransformExecutionBudget,
+    budget: &CurrentBudget<'_, S>,
 ) -> Result<bool, TransformError> {
     let tag = node.tag_name();
     for ancestor in node.ancestors() {
         budget.node_filter.charge(1)?;
-        if let Some(value) = ancestor.attribute((MC, "ProcessContent")) {
+        if let Some(value) = budget.attribute(ancestor, Some(MC), "ProcessContent")? {
             budget.node_filter.charge(value.len())?;
             for token in tokens(value) {
                 let (prefix, local) = token
@@ -685,10 +825,10 @@ fn process_content(
     Ok(false)
 }
 
-fn validate_mce_entry(
-    node: Node<'_, '_>,
+fn validate_mce_entry<S: Scratch, D: crate::xml::dom::storage::Storage>(
+    node: Node<'_, '_, D>,
     edition: OpcRelationshipEdition,
-    budget: &TransformExecutionBudget,
+    budget: &CurrentBudget<'_, S>,
 ) -> Result<(), TransformError> {
     // Part 3:2012 §§10.1, 10.1.3, 10.2.1 checks MCE attributes and
     // MustUnderstand before ignoring an encountered element, including all
@@ -702,10 +842,10 @@ fn validate_mce_entry(
     Ok(())
 }
 
-fn validate_mc_attributes(
-    node: Node<'_, '_>,
+fn validate_mc_attributes<S: Scratch, D: crate::xml::dom::storage::Storage>(
+    node: Node<'_, '_, D>,
     edition: OpcRelationshipEdition,
-    budget: &TransformExecutionBudget,
+    budget: &CurrentBudget<'_, S>,
 ) -> Result<(), TransformError> {
     // ECMA-376 Part 3 (2015) §§7, 9: namespace lists bind at their
     // declaration element, not at a descendant that might rebind a prefix.
@@ -753,11 +893,11 @@ fn validate_mc_attributes(
     Ok(())
 }
 
-fn must_understand(
-    node: Node<'_, '_>,
-    budget: &TransformExecutionBudget,
+fn must_understand<S: Scratch, D: crate::xml::dom::storage::Storage>(
+    node: Node<'_, '_, D>,
+    budget: &CurrentBudget<'_, S>,
 ) -> Result<(), TransformError> {
-    if let Some(value) = node.attribute((MC, "MustUnderstand")) {
+    if let Some(value) = budget.attribute(node, Some(MC), "MustUnderstand")? {
         budget.node_filter.charge(value.len())?;
         for prefix in tokens(value) {
             if namespace(node, prefix, budget)? != REL {
@@ -768,7 +908,9 @@ fn must_understand(
     Ok(())
 }
 
-fn check_unwrapped(node: Node<'_, '_>) -> Result<(), TransformError> {
+fn check_unwrapped<D: crate::xml::dom::storage::Storage>(
+    node: Node<'_, '_, D>,
+) -> Result<(), TransformError> {
     if node.attributes().any(|a| {
         a.namespace() == Some(XML)
             && (node.tag_name().namespace() == Some(MC)
@@ -779,10 +921,10 @@ fn check_unwrapped(node: Node<'_, '_>) -> Result<(), TransformError> {
     Ok(())
 }
 
-fn validate_attributes(
-    node: Node<'_, '_>,
+fn validate_attributes<S: Scratch, D: crate::xml::dom::storage::Storage>(
+    node: Node<'_, '_, D>,
     allowed: &[&str],
-    budget: &TransformExecutionBudget,
+    budget: &CurrentBudget<'_, S>,
 ) -> Result<(), TransformError> {
     for attribute in node.attributes() {
         budget.node_filter.charge(1)?;
@@ -796,11 +938,11 @@ fn validate_attributes(
     Ok(())
 }
 
-fn alternate_content<'a>(
-    node: Node<'a, 'a>,
+fn alternate_content<'a, S: Scratch, D: crate::xml::dom::storage::Storage>(
+    node: Node<'a, 'a, D>,
     edition: OpcRelationshipEdition,
-    budget: &TransformExecutionBudget,
-) -> Result<Option<Node<'a, 'a>>, TransformError> {
+    budget: &CurrentBudget<'_, S>,
+) -> Result<Option<Node<'a, 'a, D>>, TransformError> {
     validate_attributes(node, &[], budget)?;
     let mut chosen = None;
     let mut fallback = None;
@@ -829,8 +971,8 @@ fn alternate_content<'a>(
             (Some(MC), "Choice") if fallback.is_none() => {
                 choices += 1;
                 validate_attributes(child, &["Requires"], budget)?;
-                let requires = child
-                    .attribute("Requires")
+                let requires = budget
+                    .attribute(child, None, "Requires")?
                     .ok_or_else(|| invalid("MCE Choice requires Requires"))?;
                 budget.node_filter.charge(requires.len())?;
                 let mut all_known = true;
@@ -1074,6 +1216,100 @@ fn xml_whitespace(value: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_normalization_preserves_bytes_and_current_execution_boundaries() {
+        // Every OPC stack, record, PI list, sort and output buffer shares the
+        // current execution. Refusal must preserve its typed cause and release
+        // already admitted storage, without borrowing the producer's ceiling.
+        use structured_asn1::{
+            Encoding, Limits, Parser,
+            memory::{Memory, MemoryAccount, MemoryError},
+        };
+        let document = Document::parse(
+            r#"<?before a?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="b" Type="urn:type" Target="b"/><?between x?><Relationship Id="a" Type="urn:type" Target="a"/></Relationships><?after b?>"#,
+        ).expect("fixed Relationships XML");
+        let selectors = [RelationshipSelector::SourceType("urn:type".into())];
+        for edition in [
+            OpcRelationshipEdition::Ecma2012,
+            OpcRelationshipEdition::Ecma2021,
+        ] {
+            let expected = normalize(
+                &document,
+                &selectors,
+                edition,
+                &TransformExecutionBudget::default(),
+            )
+            .expect("native normalization");
+            let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 24)));
+            // Relationship records contain their actual storage strategy. Measure
+            // the Execution-backed layout, not a differently sized Memory layout.
+            let baseline = Parser::new(Encoding::Der, Limits::default(), memory.clone());
+            let baseline_reader = baseline.read(&[], 0).expect("empty baseline input");
+            let baseline_work = baseline_reader.execution();
+            let before = memory.work_used();
+            let output = normalize_in(
+                &document,
+                &selectors,
+                edition,
+                &TransformExecutionBudget::default(),
+                &crate::c14n::scratch::Accounted(&baseline_work),
+            )
+            .expect("paid normalization");
+            assert_eq!(&*output, expected);
+            assert!(memory.used() >= output.len());
+            let cost = memory.work_used() - before;
+            drop(output);
+            assert_eq!(memory.used(), 0);
+            for limit in [cost, cost - 1, 0] {
+                let parser = Parser::new(
+                    Encoding::Der,
+                    Limits {
+                        max_work: limit as u64,
+                        ..Default::default()
+                    },
+                    memory.clone(),
+                );
+                let reader = parser.read(&[], 0).expect("empty query input");
+                let work = reader.execution();
+                let before = memory.work_used();
+                let result = normalize_in(
+                    &document,
+                    &selectors,
+                    edition,
+                    &TransformExecutionBudget::default(),
+                    &crate::c14n::scratch::Accounted(&work),
+                );
+                if limit == cost {
+                    assert_eq!(&*result.expect("exact work admits normalization"), expected);
+                    assert_eq!(memory.work_used() - before, cost);
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(TransformError::C14n(
+                            crate::c14n::C14nError::SharedExecution(MemoryError::WorkExceeded)
+                        ))
+                    ));
+                }
+                assert_eq!(memory.used(), 0);
+            }
+            let small = Memory::new(std::sync::Arc::new(MemoryAccount::new(0, 1 << 24)));
+            let result = normalize_in(
+                &document,
+                &selectors,
+                edition,
+                &TransformExecutionBudget::default(),
+                &crate::c14n::scratch::Accounted(&small),
+            );
+            assert!(matches!(
+                result,
+                Err(TransformError::C14n(
+                    crate::c14n::C14nError::SharedExecution(MemoryError::LimitExceeded)
+                ))
+            ));
+            assert_eq!(small.used(), 0);
+        }
+    }
 
     #[test]
     fn complete_relationship_iri_syntax() {

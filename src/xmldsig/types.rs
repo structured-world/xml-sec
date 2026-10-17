@@ -6,10 +6,9 @@
 //! P1-015), and reference processing (P1-018).
 
 use std::cell::Cell;
-use std::collections::HashSet;
 use std::ops::RangeInclusive;
 
-use crate::xml::dom::{Document, Node, NodeId};
+use crate::xml::dom::{Document, Node};
 
 const MAX_NODE_SET_ENTRIES: usize = crate::hard_limits::NODE_SET_ENTRY_CEILING;
 const MAX_NODE_SET_OWNED_STRING_BYTES: usize =
@@ -18,6 +17,8 @@ const MAX_NODE_SET_CUMULATIVE_OWNED_STRING_BYTES: usize =
     crate::hard_limits::NODE_SET_CUMULATIVE_OWNED_STRING_BYTE_CEILING;
 
 use crate::c14n::NodeVisibility;
+
+pub(crate) mod projection;
 
 // roxmltree 0.21 uses `Node<'a, 'input: 'a>`. We tie both lifetimes together
 // with a single `'a` by requiring `'input = 'a` at every use site (`Node<'a, 'a>`).
@@ -80,28 +81,7 @@ impl<'a> TransformData<'a> {
 /// lets XPath filters independently include or remove those nodes as required
 /// by canonical XML document-subset processing.
 pub struct NodeSet<'a> {
-    /// Reference to the parsed document.
-    doc: &'a Document<'a>,
-    nodes: HashSet<XmlNodeKey>,
-    owned_string_bytes: usize,
-    /// Whether comment nodes are included. For empty URI dereference (whole
-    /// document), comments are excluded per XMLDSig spec.
-    with_comments: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum XmlNodeKey {
-    Tree(NodeId),
-    Attribute {
-        owner: NodeId,
-        namespace: Option<String>,
-        local_name: String,
-    },
-    Namespace {
-        owner: NodeId,
-        prefix: String,
-        uri: String,
-    },
+    pub(crate) projection: projection::Projection<'a, projection::NativeKeys>,
 }
 
 pub(crate) struct NodeSetMaterializationBudget {
@@ -178,331 +158,125 @@ impl NodeSetMaterializationBudget {
     }
 }
 
-impl XmlNodeKey {
-    fn owner_id(&self) -> NodeId {
-        match self {
-            Self::Tree(id) => *id,
-            Self::Attribute { owner, .. } | Self::Namespace { owner, .. } => *owner,
-        }
-    }
-
-    fn owned_string_bytes(&self) -> usize {
-        match self {
-            Self::Tree(_) => 0,
-            Self::Attribute {
-                namespace,
-                local_name,
-                ..
-            } => namespace
-                .as_ref()
-                .map_or(0, String::len)
-                .saturating_add(local_name.len()),
-            Self::Namespace { prefix, uri, .. } => prefix.len().saturating_add(uri.len()),
-        }
-    }
-}
-
 impl<'a> NodeSet<'a> {
-    /// Create a node set representing the entire document without comments.
-    ///
-    /// Per XMLDSig §4.3.3.2: "An empty URI [...] is a reference to the document
-    /// [...] and the comment nodes are not included."
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TransformError::Policy`] when projecting the document's tree,
-    /// attribute, namespace, or owned string data would exceed its budget.
-    pub fn entire_document_without_comments(doc: &'a Document<'a>) -> Result<Self, TransformError> {
-        Self::ensure_subtree_materialization_fits(doc.root(), false)?;
-        Ok(Self::collect_document(doc, false))
+    pub(crate) fn projected(
+        root: Node<'a, 'a>,
+        comments: bool,
+        budget: Option<&NodeSetMaterializationBudget>,
+    ) -> Result<Self, TransformError> {
+        let default;
+        let budget = match budget {
+            Some(budget) => budget,
+            None => {
+                default = NodeSetMaterializationBudget::default();
+                &default
+            }
+        };
+        Ok(Self {
+            projection: projection::Projection::subtree(
+                root,
+                comments,
+                budget,
+                projection::NativeKeys::default(),
+            )?,
+        })
     }
 
+    /// Project the complete document with comment nodes omitted.
+    ///
+    /// XMLDSig 1.1 section 4.4.3.3 excludes comments for an empty Reference URI.
+    /// Returns a policy error when the projection allowance is exceeded.
+    pub fn entire_document_without_comments(doc: &'a Document<'a>) -> Result<Self, TransformError> {
+        Self::projected(doc.root(), false, None)
+    }
     pub(crate) fn entire_document_without_comments_with_budget(
         doc: &'a Document<'a>,
         budget: &NodeSetMaterializationBudget,
     ) -> Result<Self, TransformError> {
-        Self::charge_subtree_materialization(doc.root(), false, budget)?;
-        Ok(Self::collect_document(doc, false))
+        Self::projected(doc.root(), false, Some(budget))
     }
-
     pub(crate) fn entire_document_without_comments_from_view(
         view: crate::DocumentView<'a>,
         budget: Option<&NodeSetMaterializationBudget>,
     ) -> Result<Self, TransformError> {
-        let set = match budget {
-            Some(budget) => {
-                Self::entire_document_without_comments_with_budget(view.document(), budget)?
-            }
-            None => Self::entire_document_without_comments(view.document())?,
-        };
-        Ok(set)
+        Self::projected(view.document().root(), false, budget)
     }
 
-    /// Create a node set representing the entire document with comments.
+    /// Project the complete document including comments.
     ///
-    /// Used for `#xpointer(/)` which, unlike empty URI, includes comment nodes.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TransformError::Policy`] when projecting the document's tree,
-    /// attribute, namespace, or owned string data would exceed its budget.
+    /// Returns a policy error when the projection allowance is exceeded.
     pub fn entire_document_with_comments(doc: &'a Document<'a>) -> Result<Self, TransformError> {
-        Self::ensure_subtree_materialization_fits(doc.root(), true)?;
-        Ok(Self::collect_document(doc, true))
+        Self::projected(doc.root(), true, None)
     }
 
-    pub(crate) fn entire_document_with_comments_with_budget(
-        doc: &'a Document<'a>,
-        budget: &NodeSetMaterializationBudget,
-    ) -> Result<Self, TransformError> {
-        Self::charge_subtree_materialization(doc.root(), true, budget)?;
-        Ok(Self::collect_document(doc, true))
-    }
-
-    pub(crate) fn entire_document_with_comments_from_view(
-        view: crate::DocumentView<'a>,
-        budget: Option<&NodeSetMaterializationBudget>,
-    ) -> Result<Self, TransformError> {
-        let set = match budget {
-            Some(budget) => {
-                Self::entire_document_with_comments_with_budget(view.document(), budget)?
-            }
-            None => Self::entire_document_with_comments(view.document())?,
-        };
-        Ok(set)
-    }
-
-    /// Create a node set rooted at `element`, containing that element and all
-    /// of its descendant nodes (elements, text, and, for this constructor,
-    /// comment nodes).
+    /// Project a subtree including its attribute, namespace and comment nodes.
     ///
-    /// # Errors
-    ///
-    /// Returns [`TransformError::Policy`] when projecting the subtree's tree,
-    /// attribute, namespace, or owned string data would exceed its budget.
+    /// Returns a policy error when the projection allowance is exceeded.
     pub fn subtree(element: Node<'a, 'a>) -> Result<Self, TransformError> {
-        Self::ensure_subtree_materialization_fits(element, true)?;
-        Ok(Self::collect_subtree(element))
+        Self::projected(element, true, None)
     }
-
-    /// Create a bare-name same-document fragment node-set, which excludes
-    /// comment nodes before any transforms are applied.
+    #[cfg(test)]
     pub(crate) fn subtree_without_comments_with_budget(
         element: Node<'a, 'a>,
         budget: Option<&NodeSetMaterializationBudget>,
     ) -> Result<Self, TransformError> {
-        match budget {
-            Some(budget) => Self::charge_subtree_materialization(element, false, budget)?,
-            None => {
-                Self::ensure_subtree_materialization_fits(element, false)?;
-            }
-        }
-        let mut set = Self {
-            doc: element.document(),
-            nodes: HashSet::new(),
-            owned_string_bytes: 0,
-            with_comments: false,
-        };
-        for node in element.descendants().filter(|node| !node.is_comment()) {
-            set.insert_node(node);
-            if node.is_element() {
-                for attribute in node.attributes() {
-                    set.insert_attribute(node, attribute.namespace(), attribute.name());
-                }
-                for namespace in node.namespaces() {
-                    set.insert_namespace(node, namespace.name().unwrap_or(""), namespace.uri());
-                }
-            }
-        }
-        Ok(set)
+        Self::projected(element, false, budget)
     }
-
+    #[cfg(test)]
     pub(crate) fn subtree_with_budget(
         element: Node<'a, 'a>,
         budget: &NodeSetMaterializationBudget,
     ) -> Result<Self, TransformError> {
-        Self::charge_subtree_materialization(element, true, budget)?;
-        Ok(Self::collect_subtree(element))
+        Self::projected(element, true, Some(budget))
     }
 
-    pub(crate) fn subtree_from_view(
-        view: crate::DocumentView<'a>,
-        element: Node<'a, 'a>,
-        with_comments: bool,
-        budget: Option<&NodeSetMaterializationBudget>,
-    ) -> Result<Self, TransformError> {
-        if !std::ptr::eq(element.document() as *const _, view.document() as *const _) {
-            return Err(TransformError::CrossDocumentNodeSetInput);
-        }
-        let set = if with_comments {
-            match budget {
-                Some(budget) => Self::subtree_with_budget(element, budget)?,
-                None => Self::subtree(element)?,
-            }
-        } else {
-            Self::subtree_without_comments_with_budget(element, budget)?
-        };
-        Ok(set)
-    }
-
-    fn collect_subtree(element: Node<'a, 'a>) -> Self {
-        let mut set = Self {
-            doc: element.document(),
-            nodes: HashSet::new(),
-            owned_string_bytes: 0,
-            with_comments: true,
-        };
-        set.insert_subtree(element);
-        set
-    }
-
-    /// Reference to the underlying document.
+    /// Return the original source document.
     pub fn document(&self) -> &'a Document<'a> {
-        self.doc
+        self.projection.document()
     }
-
-    /// Check whether a node is in this set.
-    ///
-    /// Returns `false` for nodes from a different document than this set's
-    /// owning document (prevents cross-document NodeId collisions).
+    /// Test tree membership; a node from another document is never included.
     pub fn contains(&self, node: Node<'_, '_>) -> bool {
-        // Guard: reject nodes from a different document. NodeIds are
-        // per-document indices — the same index from another document
-        // would reference a completely different node.
-        if !std::ptr::eq(node.document() as *const _, self.doc as *const _) {
-            return false;
-        }
-
-        self.nodes.contains(&XmlNodeKey::Tree(node.id()))
+        self.projection
+            .contains_tree(node)
+            .expect("native projection lookup is infallible")
     }
-
-    /// Exclude a node and all its descendants from this set.
-    ///
-    /// No-op for nodes from a different document.
+    /// Exclude a subtree and every projected axis owned by its nodes.
     pub fn exclude_subtree(&mut self, node: Node<'_, '_>) {
-        // Guard: only exclude nodes from our document
-        if !std::ptr::eq(node.document() as *const _, self.doc as *const _) {
-            return;
-        }
-        let excluded_ids = subtree_node_id_range(node);
-        // roxmltree NodeIds index a document-order Vec, and descendants() is a
-        // contiguous slice of that Vec. Attribute and namespace keys carry the
-        // owner NodeId, so one range check excludes every XPath node kind without
-        // either walking ancestors per key or materializing the excluded subtree.
-        self.nodes
-            .retain(|key| !excluded_ids.contains(&key.owner_id().get()));
-        self.refresh_owned_string_bytes();
+        self.projection
+            .exclude_subtree(node)
+            .expect("native projection retention is infallible");
     }
-
-    /// Whether comments are included in this node set.
+    /// Whether this projection permits comment nodes.
     pub fn with_comments(&self) -> bool {
-        self.with_comments
+        self.projection.with_comments()
     }
 
+    #[cfg(test)]
     pub(crate) fn empty(doc: &'a Document<'a>) -> Self {
         Self {
-            doc,
-            nodes: HashSet::new(),
-            owned_string_bytes: 0,
-            with_comments: false,
+            projection: projection::Projection::empty(doc, projection::NativeKeys::default()),
         }
     }
-
     #[cfg(test)]
     pub(crate) fn try_entire_document(doc: &'a Document<'a>) -> Result<Self, TransformError> {
         Self::entire_document_with_comments(doc)
     }
-
-    pub(crate) fn try_entire_document_with_budget(
-        doc: &'a Document<'a>,
-        budget: &NodeSetMaterializationBudget,
-    ) -> Result<Self, TransformError> {
-        Self::entire_document_with_comments_with_budget(doc, budget)
-    }
-
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.nodes.len()
+        self.projection.len()
     }
-
-    pub(crate) fn insert_node(&mut self, node: Node<'_, '_>) {
-        if self.owns(node) {
-            self.with_comments |= node.is_comment();
-            self.nodes.insert(XmlNodeKey::Tree(node.id()));
-        }
-    }
-
-    pub(crate) fn insert_attribute(
-        &mut self,
-        owner: Node<'_, '_>,
-        namespace: Option<&str>,
-        local_name: &str,
-    ) {
-        if self.owns(owner) {
-            let key = XmlNodeKey::Attribute {
-                owner: owner.id(),
-                namespace: namespace.map(str::to_owned),
-                local_name: local_name.to_owned(),
-            };
-            if self.nodes.insert(key) {
-                self.owned_string_bytes = self
-                    .owned_string_bytes
-                    .saturating_add(namespace.map_or(0, str::len))
-                    .saturating_add(local_name.len());
-            }
-        }
-    }
-
+    #[cfg(test)]
     pub(crate) fn insert_attribute_with_budget(
         &mut self,
         owner: Node<'_, '_>,
         namespace: Option<&str>,
-        local_name: &str,
+        local: &str,
         budget: &NodeSetMaterializationBudget,
     ) -> Result<(), TransformError> {
-        if self.owns(owner) {
-            let owner_id = owner.id();
-            let additional_bytes = namespace.map_or(0, str::len).checked_add(local_name.len());
-            self.insert_projected_key_with_budget(
-                additional_bytes,
-                |key| {
-                    matches!(
-                        key,
-                        XmlNodeKey::Attribute {
-                            owner,
-                            namespace: stored_namespace,
-                            local_name: stored_local_name,
-                        } if *owner == owner_id
-                            && stored_namespace.as_deref() == namespace
-                            && stored_local_name == local_name
-                    )
-                },
-                || XmlNodeKey::Attribute {
-                    owner: owner_id,
-                    namespace: namespace.map(str::to_owned),
-                    local_name: local_name.to_owned(),
-                },
-                budget,
-            )?;
-        }
-        Ok(())
+        self.projection
+            .insert_attribute(owner, namespace, local, Some(budget))
     }
-
-    pub(crate) fn insert_namespace(&mut self, owner: Node<'_, '_>, prefix: &str, uri: &str) {
-        if self.owns(owner) {
-            let key = XmlNodeKey::Namespace {
-                owner: owner.id(),
-                prefix: prefix.to_owned(),
-                uri: uri.to_owned(),
-            };
-            if self.nodes.insert(key) {
-                self.owned_string_bytes = self
-                    .owned_string_bytes
-                    .saturating_add(prefix.len())
-                    .saturating_add(uri.len());
-            }
-        }
-    }
-
+    #[cfg(test)]
     pub(crate) fn insert_namespace_with_budget(
         &mut self,
         owner: Node<'_, '_>,
@@ -510,337 +284,23 @@ impl<'a> NodeSet<'a> {
         uri: &str,
         budget: &NodeSetMaterializationBudget,
     ) -> Result<(), TransformError> {
-        if self.owns(owner) {
-            let owner_id = owner.id();
-            self.insert_projected_key_with_budget(
-                prefix.len().checked_add(uri.len()),
-                |key| {
-                    matches!(
-                        key,
-                        XmlNodeKey::Namespace {
-                            owner,
-                            prefix: stored_prefix,
-                            uri: stored_uri,
-                        } if *owner == owner_id && stored_prefix == prefix && stored_uri == uri
-                    )
-                },
-                || XmlNodeKey::Namespace {
-                    owner: owner_id,
-                    prefix: prefix.to_owned(),
-                    uri: uri.to_owned(),
-                },
-                budget,
-            )?;
-        }
-        Ok(())
+        self.projection
+            .insert_namespace(owner, prefix, uri, Some(budget))
     }
-
-    fn insert_projected_key_with_budget<D, F>(
-        &mut self,
-        additional_bytes: Option<usize>,
-        is_duplicate: D,
-        build_key: F,
-        budget: &NodeSetMaterializationBudget,
-    ) -> Result<(), TransformError>
-    where
-        D: Fn(&XmlNodeKey) -> bool,
-        F: FnOnce() -> XmlNodeKey,
-    {
-        let (additional_bytes, preflight_error) = match additional_bytes {
-            None => (
-                0,
-                Some(transform_resource_limit(
-                    crate::policy::resource_name::NODE_SET_OWNED_STRING_BYTES,
-                    budget.max_owned_string_bytes,
-                    usize::MAX,
-                )),
-            ),
-            Some(additional_bytes) => {
-                let total_bytes = self.owned_string_bytes.saturating_add(additional_bytes);
-                let error = if total_bytes > budget.max_owned_string_bytes {
-                    Some(transform_resource_limit(
-                        crate::policy::resource_name::NODE_SET_OWNED_STRING_BYTES,
-                        budget.max_owned_string_bytes,
-                        total_bytes,
-                    ))
-                } else if self.nodes.len() >= budget.max_entries {
-                    Some(transform_resource_limit(
-                        crate::policy::resource_name::NODE_SET_ENTRIES,
-                        budget.max_entries,
-                        self.nodes.len().saturating_add(1),
-                    ))
-                } else {
-                    let remaining = budget.remaining_owned_string_bytes.get();
-                    remaining.checked_sub(additional_bytes).is_none().then(|| {
-                        let consumed = budget
-                            .max_cumulative_owned_string_bytes
-                            .saturating_sub(remaining);
-                        transform_resource_limit(
-                            crate::policy::resource_name::NODE_SET_CUMULATIVE_OWNED_STRING_BYTES,
-                            budget.max_cumulative_owned_string_bytes,
-                            consumed.saturating_add(additional_bytes),
-                        )
-                    })
-                };
-                (additional_bytes, error)
-            }
-        };
-        if let Some(error) = preflight_error {
-            // Duplicate projections consume no capacity. Scan only when a new
-            // key would fail so the normal insertion path keeps hash-set cost.
-            if self.nodes.iter().any(is_duplicate) {
-                return Ok(());
-            }
-            return Err(error);
-        }
-
-        let total_bytes = self.owned_string_bytes.saturating_add(additional_bytes);
-        let key = build_key();
-        if self.nodes.contains(&key) {
-            return Ok(());
-        }
-        budget.charge(additional_bytes)?;
-        let inserted = self.nodes.insert(key);
-        debug_assert!(inserted, "the duplicate key was checked before insertion");
-        if inserted {
-            self.owned_string_bytes = total_bytes;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn insert_subtree(&mut self, root: Node<'_, '_>) {
-        if !self.owns(root) {
-            return;
-        }
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
-            self.insert_node(node);
-            if node.is_element() {
-                for attribute in node.attributes() {
-                    self.insert_attribute(node, attribute.namespace(), attribute.name());
-                }
-                for namespace in node.namespaces() {
-                    self.insert_namespace(node, namespace.name().unwrap_or(""), namespace.uri());
-                }
-            }
-            stack.extend(node.children());
-        }
-    }
-
-    pub(crate) fn intersect_with(&mut self, other: &Self) {
-        if !std::ptr::eq(self.doc as *const _, other.doc as *const _) {
-            self.nodes.clear();
-            self.owned_string_bytes = 0;
-            self.with_comments = false;
-            return;
-        }
-        self.nodes.retain(|key| other.nodes.contains(key));
-        self.refresh_owned_string_bytes();
-        self.with_comments &= other.with_comments;
-    }
-
-    pub(crate) fn subtract(&mut self, other: &Self) {
-        if std::ptr::eq(self.doc as *const _, other.doc as *const _) {
-            self.nodes.retain(|key| !other.nodes.contains(key));
-            self.refresh_owned_string_bytes();
-        }
-    }
-
-    pub(crate) fn union_with_budget(
-        &mut self,
-        other: &Self,
-        budget: &NodeSetMaterializationBudget,
-    ) -> Result<(), TransformError> {
-        if std::ptr::eq(self.doc as *const _, other.doc as *const _) {
-            for key in &other.nodes {
-                if self.nodes.contains(key) {
-                    continue;
-                }
-                let owned_string_bytes = key.owned_string_bytes();
-                let total_bytes = self.owned_string_bytes.saturating_add(owned_string_bytes);
-                if total_bytes > budget.max_owned_string_bytes {
-                    return Err(transform_resource_limit(
-                        crate::policy::resource_name::NODE_SET_OWNED_STRING_BYTES,
-                        budget.max_owned_string_bytes,
-                        total_bytes,
-                    ));
-                }
-                if self.nodes.len() >= budget.max_entries {
-                    return Err(transform_resource_limit(
-                        crate::policy::resource_name::NODE_SET_ENTRIES,
-                        budget.max_entries,
-                        self.nodes.len().saturating_add(1),
-                    ));
-                }
-                budget.charge(owned_string_bytes)?;
-                self.nodes.insert(key.clone());
-                self.owned_string_bytes = total_bytes;
-            }
-            self.with_comments |= other.with_comments;
-        }
-        Ok(())
-    }
-
-    fn collect_document(doc: &'a Document<'a>, with_comments: bool) -> Self {
-        let mut set = Self::empty(doc);
-        set.insert_subtree(doc.root());
-        if !with_comments {
-            set.nodes.retain(|key| match key {
-                XmlNodeKey::Tree(id) => !doc.get_node(*id).is_some_and(|node| node.is_comment()),
-                _ => true,
-            });
-        }
-        set.with_comments = with_comments;
-        set
-    }
-
-    fn refresh_owned_string_bytes(&mut self) {
-        self.owned_string_bytes = self.nodes.iter().fold(0_usize, |total, key| {
-            total.saturating_add(key.owned_string_bytes())
-        });
-    }
-
-    pub(crate) fn ensure_subtree_materialization_fits(
-        root: Node<'_, '_>,
-        with_comments: bool,
-    ) -> Result<usize, TransformError> {
-        Ok(Self::subtree_materialization(root, with_comments)?.entries)
-    }
-
     pub(crate) fn ensure_subtree_materialization_fits_with_budget(
         root: Node<'_, '_>,
-        with_comments: bool,
+        comments: bool,
         budget: &NodeSetMaterializationBudget,
     ) -> Result<usize, TransformError> {
-        Ok(Self::subtree_materialization_with_limits(
+        Ok(projection::measure(
             root,
-            with_comments,
+            comments,
             budget.max_entries,
             budget.max_owned_string_bytes,
+            &projection::NativeKeys::default(),
         )?
         .entries)
     }
-
-    fn charge_subtree_materialization(
-        root: Node<'_, '_>,
-        with_comments: bool,
-        budget: &NodeSetMaterializationBudget,
-    ) -> Result<(), TransformError> {
-        let materialization = Self::subtree_materialization_with_limits(
-            root,
-            with_comments,
-            budget.max_entries,
-            budget.max_owned_string_bytes,
-        )?;
-        budget.charge(materialization.owned_string_bytes)
-    }
-
-    fn subtree_materialization(
-        root: Node<'_, '_>,
-        with_comments: bool,
-    ) -> Result<NodeSetMaterialization, TransformError> {
-        Self::subtree_materialization_with_limits(
-            root,
-            with_comments,
-            MAX_NODE_SET_ENTRIES,
-            MAX_NODE_SET_OWNED_STRING_BYTES,
-        )
-    }
-
-    fn subtree_materialization_with_limits(
-        root: Node<'_, '_>,
-        with_comments: bool,
-        max_entries: usize,
-        max_owned_string_bytes: usize,
-    ) -> Result<NodeSetMaterialization, TransformError> {
-        let mut entries = 0_usize;
-        let mut owned_string_bytes = 0_usize;
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
-            if node.is_comment() && !with_comments {
-                continue;
-            }
-            let projected = if node.is_element() {
-                for attribute in node.attributes() {
-                    owned_string_bytes = charge_node_set_string_bytes(
-                        owned_string_bytes,
-                        attribute.namespace().map_or(0, str::len),
-                        max_owned_string_bytes,
-                    )?;
-                    owned_string_bytes = charge_node_set_string_bytes(
-                        owned_string_bytes,
-                        attribute.name().len(),
-                        max_owned_string_bytes,
-                    )?;
-                }
-                for namespace in node.namespaces() {
-                    owned_string_bytes = charge_node_set_string_bytes(
-                        owned_string_bytes,
-                        namespace.name().map_or(0, str::len),
-                        max_owned_string_bytes,
-                    )?;
-                    owned_string_bytes = charge_node_set_string_bytes(
-                        owned_string_bytes,
-                        namespace.uri().len(),
-                        max_owned_string_bytes,
-                    )?;
-                }
-                1_usize
-                    .checked_add(node.attributes().len())
-                    .and_then(|count| count.checked_add(node.namespaces().len()))
-            } else {
-                Some(1)
-            }
-            .ok_or_else(|| {
-                transform_resource_limit(
-                    crate::policy::resource_name::NODE_SET_ENTRIES,
-                    max_entries,
-                    usize::MAX,
-                )
-            })?;
-            entries = entries.checked_add(projected).ok_or_else(|| {
-                transform_resource_limit(
-                    crate::policy::resource_name::NODE_SET_ENTRIES,
-                    max_entries,
-                    usize::MAX,
-                )
-            })?;
-            if entries > max_entries {
-                return Err(transform_resource_limit(
-                    crate::policy::resource_name::NODE_SET_ENTRIES,
-                    max_entries,
-                    entries,
-                ));
-            }
-            stack.extend(node.children());
-        }
-        Ok(NodeSetMaterialization {
-            entries,
-            owned_string_bytes,
-        })
-    }
-
-    fn owns(&self, node: Node<'_, '_>) -> bool {
-        std::ptr::eq(node.document() as *const _, self.doc as *const _)
-    }
-}
-
-struct NodeSetMaterialization {
-    entries: usize,
-    owned_string_bytes: usize,
-}
-
-fn charge_node_set_string_bytes(
-    current: usize,
-    additional: usize,
-    max_bytes: usize,
-) -> Result<usize, TransformError> {
-    charge_resource_bytes(
-        current,
-        additional,
-        max_bytes,
-        crate::policy::resource_name::NODE_SET_OWNED_STRING_BYTES,
-    )
 }
 
 pub(super) fn charge_resource_bytes(
@@ -858,7 +318,9 @@ pub(super) fn charge_resource_bytes(
     Ok(total)
 }
 
-pub(crate) fn subtree_node_id_range(node: Node<'_, '_>) -> RangeInclusive<u32> {
+pub(crate) fn subtree_node_id_range<D: crate::xml::dom::storage::Storage>(
+    node: Node<'_, '_, D>,
+) -> RangeInclusive<u32> {
     let last_id = node
         .descendants()
         .next_back()
@@ -866,32 +328,60 @@ pub(crate) fn subtree_node_id_range(node: Node<'_, '_>) -> RangeInclusive<u32> {
     node.id().get()..=last_id.get()
 }
 
-impl NodeVisibility for NodeSet<'_> {
-    fn contains_node(&self, node: Node<'_, '_>) -> bool {
-        self.contains(node)
-    }
-
-    fn contains_attribute(
+impl NodeSet<'_> {
+    pub(crate) fn contains_attribute(
         &self,
         owner: Node<'_, '_>,
         namespace: Option<&str>,
         local_name: &str,
     ) -> bool {
-        self.owns(owner)
-            && self.nodes.contains(&XmlNodeKey::Attribute {
-                owner: owner.id(),
-                namespace: namespace.map(str::to_owned),
-                local_name: local_name.to_owned(),
-            })
+        self.projection
+            .contains_attribute(owner, namespace, local_name)
+            .expect("native projection lookup is infallible")
     }
 
-    fn contains_namespace(&self, owner: Node<'_, '_>, prefix: &str, uri: &str) -> bool {
-        self.owns(owner)
-            && self.nodes.contains(&XmlNodeKey::Namespace {
-                owner: owner.id(),
-                prefix: prefix.to_owned(),
-                uri: uri.to_owned(),
-            })
+    pub(crate) fn contains_namespace(&self, owner: Node<'_, '_>, prefix: &str, uri: &str) -> bool {
+        self.projection
+            .contains_namespace(owner, prefix, uri)
+            .expect("native projection lookup is infallible")
+    }
+}
+
+impl NodeVisibility for NodeSet<'_> {
+    fn contains_node(&self, node: Node<'_, '_>) -> Result<bool, crate::c14n::C14nError> {
+        Ok(self.contains(node))
+    }
+    fn contains_attribute(
+        &self,
+        owner: Node<'_, '_>,
+        namespace: Option<&str>,
+        local_name: &str,
+    ) -> Result<bool, crate::c14n::C14nError> {
+        Ok(self.contains_attribute(owner, namespace, local_name))
+    }
+    fn contains_namespace(
+        &self,
+        owner: Node<'_, '_>,
+        prefix: &str,
+        uri: &str,
+    ) -> Result<bool, crate::c14n::C14nError> {
+        Ok(self.contains_namespace(owner, prefix, uri))
+    }
+    fn contains_attribute_at(
+        &self,
+        owner: Node<'_, '_>,
+        ordinal: usize,
+        _: crate::xml::dom::Attribute<'_>,
+    ) -> Result<bool, crate::c14n::C14nError> {
+        self.projection.contains_attribute_at(owner, ordinal)
+    }
+    fn contains_namespace_at(
+        &self,
+        owner: Node<'_, '_>,
+        ordinal: usize,
+        _: crate::xml::dom::Namespace<'_>,
+    ) -> Result<bool, crate::c14n::C14nError> {
+        self.projection.contains_namespace_at(owner, ordinal)
     }
 }
 
@@ -924,26 +414,40 @@ pub enum TransformError {
     #[error("unsupported transform: {0}")]
     UnsupportedTransform(String),
 
+    /// Rejected transform syntax retaining current-query diagnostic capacity.
+    #[error("unsupported transform: {0}")]
+    AccountedUnsupportedTransform(structured_asn1::memory::OwnedText),
+
     /// Canonicalization error during transform.
     #[error("C14N error: {0}")]
     C14n(#[from] crate::c14n::C14nError),
 
     /// Base64 decoding failed during the standard XMLDSig Base64 transform.
     #[error("base64 transform decode error: {0}")]
-    Base64(String),
+    Base64(#[source] base64::DecodeSliceError),
 
     /// XPath parsing or evaluation failed.
     #[error("XPath transform error: {0}")]
     XPath(String),
 
+    /// XPath diagnostic whose capacity remains charged to its current query.
+    #[error("XPath transform error: {0}")]
+    AccountedXPath(structured_asn1::memory::OwnedText),
+
     /// OPC relationship parameters, MCE, or part structure are invalid.
     #[error("OPC relationship transform error: {0}")]
-    Relationship(String),
+    Relationship(&'static str),
 
     /// XML octets could not be parsed while adapting binary transform output
     /// to the node-set required by a subsequent transform.
     #[error("XML transform input parse error: {0}")]
-    XmlParse(String),
+    XmlParse(#[source] crate::document::XmlDocumentError),
+
+    /// Encoding rejection whose diagnostic label retains its admitted storage.
+    #[error("XML transform encoding error: {0}")]
+    AccountedXmlEncoding(
+        #[source] crate::encoding::XmlEncodingError<structured_asn1::memory::OwnedText>,
+    ),
 
     /// The Signature node passed to the enveloped transform belongs to a
     /// different `Document` than the input `NodeSet`.
@@ -953,6 +457,12 @@ pub enum TransformError {
     /// A retained document view and a projected node came from different documents.
     #[error("node-set projection: input node belongs to a different document")]
     CrossDocumentNodeSetInput,
+}
+
+impl From<structured_asn1::memory::MemoryError> for TransformError {
+    fn from(error: structured_asn1::memory::MemoryError) -> Self {
+        Self::C14n(crate::c14n::C14nError::SharedExecution(error))
+    }
 }
 
 pub(crate) fn transform_resource_limit(
@@ -977,7 +487,7 @@ mod tests {
     fn incremental_projection_enforces_aggregate_owned_string_policy() {
         // XPath builds arbitrary projected sets incrementally. Individually small
         // attribute keys must not bypass the per-set aggregate string ceiling.
-        let document = Document::parse("<root/>").expect("fixed XML must parse");
+        let document = Document::parse("<root a='1' bbb='2'/>").expect("fixed XML must parse");
         let root = document.root_element();
         let mut nodes = NodeSet::empty(&document);
         let budget = NodeSetMaterializationBudget::with_limits(16, 3, 16);
@@ -1003,7 +513,8 @@ mod tests {
     fn projected_attribute_and_namespace_share_one_budget_path() {
         // Duplicate projected keys are free, while distinct attributes and
         // namespaces consume the same operation-wide owned-string allowance.
-        let document = Document::parse("<root/>").expect("fixed XML must parse");
+        let document =
+            Document::parse("<root xmlns:p='u' a='1' b='2'/>").expect("fixed XML must parse");
         let root = document.root_element();
         let mut nodes = NodeSet::empty(&document);
         let budget = NodeSetMaterializationBudget::with_limits(16, 16, 3);
@@ -1032,32 +543,19 @@ mod tests {
     }
 
     #[test]
-    fn denied_attribute_projection_does_not_construct_owned_key() {
-        // A zero string budget must reject borrowed attribute names before
-        // cloning attacker-controlled namespace or local-name text.
-        let document = Document::parse("<root/>").expect("fixed XML must parse");
+    fn denied_attribute_projection_does_not_insert_key() {
+        // The compact key cannot own copied names. A zero projection allowance
+        // must still reject before growing the table or selecting the axis.
+        let document = Document::parse("<root a='1'/>").expect("fixed XML must parse");
         let root = document.root_element();
         let mut nodes = NodeSet::empty(&document);
         let budget = NodeSetMaterializationBudget::with_limits(16, 0, 0);
-        let constructed = Cell::new(false);
-
         let error = nodes
-            .insert_projected_key_with_budget(
-                Some(1),
-                |_| false,
-                || {
-                    constructed.set(true);
-                    XmlNodeKey::Attribute {
-                        owner: root.id(),
-                        namespace: None,
-                        local_name: "a".to_owned(),
-                    }
-                },
-                &budget,
-            )
+            .insert_attribute_with_budget(root, None, "a", &budget)
             .expect_err("the borrowed attribute name exceeds the zero-byte budget");
 
-        assert!(!constructed.get(), "denied names must not be cloned");
+        assert_eq!(nodes.len(), 0);
+        assert!(!nodes.contains_attribute(root, None, "a"));
         assert!(matches!(
             error,
             TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
@@ -1069,35 +567,19 @@ mod tests {
     }
 
     #[test]
-    fn denied_namespace_projection_does_not_construct_owned_key() {
-        // Namespace prefix and URI follow the same borrowed preflight path as
-        // attribute names rather than allocating before cumulative rejection.
-        let document = Document::parse("<root/>").expect("fixed XML must parse");
+    fn denied_namespace_projection_does_not_insert_key() {
+        // Prefix/URI policy checks precede table growth; source names remain
+        // borrowed and a denied namespace must not become visible.
+        let document = Document::parse("<root xmlns:p='u'/>").expect("fixed XML must parse");
         let root = document.root_element();
         let mut nodes = NodeSet::empty(&document);
         let budget = NodeSetMaterializationBudget::with_limits(16, 16, 0);
-        let constructed = Cell::new(false);
-
         let error = nodes
-            .insert_projected_key_with_budget(
-                Some(2),
-                |_| false,
-                || {
-                    constructed.set(true);
-                    XmlNodeKey::Namespace {
-                        owner: root.id(),
-                        prefix: "p".to_owned(),
-                        uri: "u".to_owned(),
-                    }
-                },
-                &budget,
-            )
+            .insert_namespace_with_budget(root, "p", "u", &budget)
             .expect_err("borrowed namespace strings exceed the zero-byte budget");
 
-        assert!(
-            !constructed.get(),
-            "denied namespace strings must not be cloned"
-        );
+        assert_eq!(nodes.len(), 0);
+        assert!(!nodes.contains_namespace(root, "p", "u"));
         assert!(matches!(
             error,
             TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
@@ -1136,11 +618,13 @@ mod tests {
         let nodes = NodeSet::entire_document_without_comments_with_budget(&document, &budget)
             .expect("the three materialized tree nodes must fit exactly");
 
-        assert_eq!(nodes.nodes.len(), 3);
-        assert!(nodes.nodes.iter().all(|key| match key {
-            XmlNodeKey::Tree(id) => !document.get_node(*id).is_some_and(|node| node.is_comment()),
-            _ => true,
-        }));
+        assert_eq!(nodes.len(), 3);
+        assert!(
+            document
+                .descendants()
+                .filter(Node::is_comment)
+                .all(|comment| !nodes.contains(comment))
+        );
     }
 
     #[test]
@@ -1159,7 +643,7 @@ mod tests {
         let nodes = NodeSet::subtree_without_comments_with_budget(target, Some(&budget))
             .expect("the target and child must fit exactly");
 
-        assert_eq!(nodes.nodes.len(), 2);
+        assert_eq!(nodes.len(), 2);
         assert!(!nodes.with_comments());
     }
 
@@ -1184,11 +668,11 @@ mod tests {
         let budget = NodeSetMaterializationBudget::with_limits(3, 8, 8);
         let mut nodes = NodeSet::subtree_with_budget(target, &budget)
             .expect("small selected subtree must fit the materialization budget");
-        let entries_before = nodes.nodes.len();
+        let entries_before = nodes.len();
 
         nodes.exclude_subtree(signature);
 
-        assert_eq!(nodes.nodes.len(), entries_before);
+        assert_eq!(nodes.len(), entries_before);
         assert!(nodes.contains(target));
         assert!(
             nodes.contains(

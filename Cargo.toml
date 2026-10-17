@@ -115,8 +115,9 @@ required-features = ["benchmark-internals"]
 
 [dependencies]
 # XML parsing
-roxmltree = { version = "0.21", features = ["positions"], optional = true }
-xmloxide = { version = "0.5", default-features = false, optional = true }
+# The maintained parser kernels are embedded; memchr is roxmltree's existing
+# tokenizer dependency, not an alternate parsing engine.
+memchr = { version = "2", default-features = false, optional = true }
 self_cell = "1.3"
 encoding_rs = { version = "0.8", default-features = false, features = ["alloc"] }
 xmlparser = { version = "0.13.6", default-features = false }
@@ -176,8 +177,8 @@ pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"], opti
 # X.509 certificates
 x509-parser = { version = "0.18", optional = true }
 x509-cert = { version = "0.3", default-features = false, optional = true }
-structured-asn1 = { version = "0.3.0", default-features = false, features = ["alloc"], optional = true }
-structured-pkix = { version = "0.3.0", default-features = false, features = ["alloc"], optional = true }
+structured-asn1 = { version = "0.6.2", default-features = false, features = ["alloc"], optional = true }
+structured-pkix = { version = "0.6.2", default-features = false, features = ["alloc"], optional = true }
 tinyvec = { version = "1.13", optional = true }
 der = { version = "0.8", optional = true }
 crypto-bigint = { version = "0.7", features = ["zeroize"], optional = true }
@@ -211,8 +212,8 @@ default = ["std", "xmldsig", "xmlenc", "c14n", "xml-backend-xmloxide"]
 std = ["thiserror/std", "xmlparser/std", "structured-asn1?/std", "structured-pkix?/std"]
 aws-lc-fips = ["std", "xmldsig", "dep:aws-lc-rs"]
 pkcs11 = ["std", "xmlenc", "dep:cryptoki"]
-xml-backend-xmloxide = ["dep:xmloxide"]
-xml-backend-roxmltree = ["dep:roxmltree"]
+xml-backend-xmloxide = []
+xml-backend-roxmltree = ["dep:memchr"]
 xml-backends-all = ["xml-backend-xmloxide", "xml-backend-roxmltree"]
 # Compatibility alias for existing CI/fuzz builds. Unlike `xml-backends-all`,
 # this also selects differential parsing as the default runtime mode.

@@ -1,0 +1,2991 @@
+--- a/roxmltree/src/lib.rs
++++ b/roxmltree/src/lib.rs
+@@ -13,7 +13,6 @@
+ [parsing doc]: https://github.com/RazrFalcon/roxmltree/blob/master/docs/parsing.md
+ */
+ 
+-#![no_std]
+ #![forbid(unsafe_code)]
+ #![warn(missing_docs)]
+ #![warn(missing_copy_implementations)]
+@@ -30,6 +29,7 @@
+ use core::num::NonZeroU32;
+ use core::ops::Range;
+ 
++use crate::xml::dom::storage::{Native, Storage, Values};
+ use alloc::vec::Vec;
+ 
+ mod parse;
+@@ -38,7 +38,10 @@
+ #[cfg(test)]
+ mod tokenizer_tests;
+ 
+-pub use crate::parse::*;
++#[cfg(test)]
++mod documentation_tests;
++
++pub use crate::parser_roxmltree::parse::*;
+ 
+ /// The <http://www.w3.org/XML/1998/namespace> URI.
+ pub const NS_XML_URI: &str = "http://www.w3.org/XML/1998/namespace";
+@@ -95,28 +98,29 @@
+ /// [`Node::node_type()`]: struct.Node.html#method.node_type
+ /// [`Node::text()`]: struct.Node.html#method.text
+ /// [`Node::tail()`]: struct.Node.html#method.tail
+-pub struct Document<'input> {
++pub struct Document<'input, S: crate::xml::dom::storage::Storage = crate::xml::dom::storage::Native>
++{
+     /// An original data.
+     ///
+     /// Required for `text_pos_at` methods.
+     text: &'input str,
+-    nodes: Vec<NodeData<'input>>,
+-    attributes: Vec<AttributeData<'input>>,
+-    namespaces: Namespaces<'input>,
++    nodes: S::Values<NodeData<'input, S>>,
++    attributes: S::Values<AttributeData<'input, S>>,
++    namespaces: Namespaces<'input, S>,
+ }
+ 
+-impl<'input> Document<'input> {
++impl<'input, S: crate::xml::dom::storage::Storage> Document<'input, S> {
+     /// Returns the root node.
+     ///
+     /// # Examples
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// let doc = roxmltree::Document::parse("<e/>").unwrap();
+     /// assert!(doc.root().is_root());
+     /// assert!(doc.root().first_child().unwrap().has_tag_name("e"));
+     /// ```
+     #[inline]
+-    pub fn root<'a>(&'a self) -> Node<'a, 'input> {
++    pub fn root<'a>(&'a self) -> Node<'a, 'input, S> {
+         Node {
+             id: NodeId::new(0),
+             d: &self.nodes[0],
+@@ -130,7 +134,7 @@
+     ///
+     /// # Examples
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// let doc = roxmltree::Document::parse("\
+     /// <p>
+     ///     text
+@@ -144,7 +148,7 @@
+     /// assert_eq!(doc.get_node(NodeId::new(3)), None);
+     /// ```
+     #[inline]
+-    pub fn get_node<'a>(&'a self, id: NodeId) -> Option<Node<'a, 'input>> {
++    pub fn get_node<'a>(&'a self, id: NodeId) -> Option<Node<'a, 'input, S>> {
+         self.nodes.get(id.get_usize()).map(|data| Node {
+             id,
+             d: data,
+@@ -160,12 +164,12 @@
+     ///
+     /// # Examples
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// let doc = roxmltree::Document::parse("<!-- comment --><e/>").unwrap();
+     /// assert!(doc.root_element().has_tag_name("e"));
+     /// ```
+     #[inline]
+-    pub fn root_element<'a>(&'a self) -> Node<'a, 'input> {
++    pub fn root_element<'a>(&'a self) -> Node<'a, 'input, S> {
+         // `expect` is safe, because the `Document` is guarantee to have at least one element.
+         self.root()
+             .first_element_child()
+@@ -176,7 +180,7 @@
+     ///
+     /// Shorthand for `doc.root().descendants()`.
+     #[inline]
+-    pub fn descendants(&self) -> Descendants<'_, 'input> {
++    pub fn descendants(&self) -> Descendants<'_, 'input, S> {
+         self.root().descendants()
+     }
+ 
+@@ -186,7 +190,7 @@
+     ///
+     /// # Examples
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// use roxmltree::*;
+     ///
+     /// let doc = Document::parse("\
+@@ -206,7 +210,7 @@
+     ///
+     /// # Examples
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// use roxmltree::*;
+     ///
+     /// let doc = Document::parse("<e/>").unwrap();
+@@ -219,7 +223,7 @@
+     }
+ }
+ 
+-impl<'input> fmt::Debug for Document<'input> {
++impl<'input, S: crate::xml::dom::storage::Storage> fmt::Debug for Document<'input, S> {
+     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+         if !self.root().has_children() {
+             return write!(f, "Document []");
+@@ -260,8 +264,8 @@
+             Ok(())
+         }
+ 
+-        fn print_children(
+-            parent: Node,
++        fn print_children<S: crate::xml::dom::storage::Storage>(
++            parent: Node<'_, '_, S>,
+             depth: usize,
+             f: &mut fmt::Formatter,
+         ) -> Result<(), fmt::Error> {
+@@ -368,7 +372,7 @@
+         debug_assert!(id < u32::MAX);
+ 
+         // We are using `NonZeroU32` to reduce overhead of `Option<NodeId>`.
+-        NodeId(NonZeroU32::new(id + 1).unwrap())
++        NodeId(NonZeroU32::new(id + 1).expect("node IDs are below the u32 arena limit"))
+     }
+ 
+     /// Returns the `u32` representation of the `NodeId`.
+@@ -401,7 +405,7 @@
+ }
+ 
+ #[derive(Debug)]
+-enum NodeKind<'input> {
++enum NodeKind<'input, S: crate::xml::dom::storage::Storage = crate::xml::dom::storage::Native> {
+     Root,
+     Element {
+         tag_name: ExpandedNameIndexed<'input>,
+@@ -409,27 +413,21 @@
+         namespaces: ShortRange,
+     },
+     PI(PI<'input>),
+-    Comment(StringStorage<'input>),
+-    Text(StringStorage<'input>),
++    Comment(StringStorage<'input, S>),
++    Text(StringStorage<'input, S>),
+ }
+ 
+ #[derive(Debug)]
+-struct NodeData<'input> {
++struct NodeData<'input, S: crate::xml::dom::storage::Storage = crate::xml::dom::storage::Native> {
+     parent: Option<NodeId>,
+     prev_sibling: Option<NodeId>,
+     next_subtree: Option<NodeId>,
+     last_child: Option<NodeId>,
+-    kind: NodeKind<'input>,
+-    #[cfg(feature = "positions")]
++    kind: NodeKind<'input, S>,
++    #[cfg(feature = "xml-backend-roxmltree")]
+     range: Range<usize>,
+ }
+ 
+-#[cfg(target_has_atomic = "ptr")]
+-type OwnedSharedString = alloc::sync::Arc<str>;
+-
+-#[cfg(not(target_has_atomic = "ptr"))]
+-type OwnedSharedString = alloc::rc::Rc<str>;
+-
+ /// A string storage.
+ ///
+ /// Used by text nodes and attributes values.
+@@ -437,22 +435,24 @@
+ /// We try our best not to allocate strings, referencing the input string as much as possible.
+ /// But in some cases post-processing is necessary and we have to allocate them.
+ ///
+-/// All owned, allocated strings are stored as `Arc<str>` or as `Rc<str>` on targets
+-/// were `Arc` isn't available.
+-/// And unlike `Cow<&str>`, `StringStorage` is immutable and can be cheaply cloned.
+-#[derive(Clone, Eq, Debug)]
+-pub enum StringStorage<'input> {
++/// Completed normalization buffers have one owner in this read-only tree.
++/// No parser or adapter clones this storage or needs a reference-count block.
++#[derive(Debug)]
++pub enum StringStorage<
++    'input,
++    S: crate::xml::dom::storage::Storage = crate::xml::dom::storage::Native,
++> {
+     /// A raw slice of the input string.
+     Borrowed(&'input str),
+ 
+-    /// A reference-counted string.
+-    Owned(OwnedSharedString),
++    /// An owned normalization buffer.
++    Owned(S::Text),
+ }
+ 
+-impl StringStorage<'_> {
+-    /// Creates a new owned string copied from a `&str`.
+-    pub fn new_owned(s: &str) -> Self {
+-        StringStorage::Owned(s.into())
++impl<S: crate::xml::dom::storage::Storage> StringStorage<'_, S> {
++    /// Takes the completed normalization buffer.
++    fn from_owned(s: S::Text) -> Self {
++        Self::Owned(s)
+     }
+ 
+     /// Returns a string slice.
+@@ -464,19 +464,20 @@
+     }
+ }
+ 
+-impl PartialEq for StringStorage<'_> {
++impl<S: crate::xml::dom::storage::Storage> PartialEq for StringStorage<'_, S> {
+     fn eq(&self, other: &Self) -> bool {
+         self.as_str() == other.as_str()
+     }
+ }
+ 
+-impl core::fmt::Display for StringStorage<'_> {
++impl<S: crate::xml::dom::storage::Storage> Eq for StringStorage<'_, S> {}
++impl<S: crate::xml::dom::storage::Storage> core::fmt::Display for StringStorage<'_, S> {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         write!(f, "{}", self.as_str())
+     }
+ }
+ 
+-impl core::ops::Deref for StringStorage<'_> {
++impl<S: crate::xml::dom::storage::Storage> core::ops::Deref for StringStorage<'_, S> {
+     type Target = str;
+ 
+     fn deref(&self) -> &Self::Target {
+@@ -484,36 +485,185 @@
+     }
+ }
+ 
+-#[derive(Clone, Debug)]
+-struct AttributeData<'input> {
++#[cfg(test)]
++mod owned_text_tests {
++    use super::*;
++
++    #[cfg(feature = "xmldsig")]
++    #[test]
++    fn scoped_parser_retains_real_tree_storage_and_releases_failures() {
++        // Raw parser storage, not a surrogate input reservation, must remain
++        // charged until the tree is dropped. Partial failures release it all.
++        use crate::xml::dom::storage::Accounted;
++        use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
++        let source = "<r xmlns:p='urn:p' p:a='one&#x20;two'>left<![CDATA[middle]]>right</r>";
++        for capacity in [0, 1, 127, 1024, 1 << 20] {
++            let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(capacity, 1 << 20)));
++            let parsed =
++                Document::parse_with_storage(source, ParsingOptions::default(), Accounted(&memory));
++            match parsed {
++                Ok(document) => {
++                    assert_eq!(document.root_element().text(), Some("leftmiddleright"));
++                    assert_eq!(
++                        document.root_element().attribute(("urn:p", "a")),
++                        Some("one two")
++                    );
++                    assert!(memory.used() > 0);
++                    drop(document);
++                }
++                Err(Error::SharedExecution(MemoryError::LimitExceeded)) => {
++                    assert!(capacity < 1 << 20);
++                }
++                Err(error) => panic!("unexpected parser error: {error}"),
++            }
++            assert_eq!(memory.used(), 0);
++        }
++    }
++
++    #[cfg(feature = "xmldsig")]
++    #[test]
++    fn scoped_parser_keeps_dynamic_error_labels_in_the_current_account() {
++        // A fatal diagnostic must move its already-funded label out of the
++        // callback bridge without formatting a native String or losing cause.
++        use crate::xml::dom::storage::Accounted;
++        use structured_asn1::memory::{Memory, MemoryAccount};
++        let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 20)));
++        let error = Document::parse_with_storage(
++            "<unbound:root/>",
++            ParsingOptions::default(),
++            Accounted(&memory),
++        )
++        .unwrap_err();
++        assert!(matches!(&error, Error::UnknownNamespace(name, _) if &**name == "unbound"));
++        assert!(memory.used() > 0);
++        drop(error);
++        assert_eq!(memory.used(), 0);
++    }
++
++    #[cfg(feature = "xmldsig")]
++    #[test]
++    fn scoped_parser_cannot_erase_the_current_query_work_ceiling() {
++        // Aggregate capacity/work cannot authorize construction on a query
++        // whose own work allowance is zero, even for malformed input.
++        use crate::xml::dom::storage::Accounted;
++        use structured_asn1::{
++            Encoding, Limits, Parser,
++            memory::{Memory, MemoryAccount, MemoryError},
++        };
++        let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 20)));
++        let parser = Parser::new(
++            Encoding::Der,
++            Limits {
++                max_work: 0,
++                ..Default::default()
++            },
++            memory.clone(),
++        );
++        let reader = parser.read(&[], 0).unwrap();
++        for source in ["<r/>", "<unbound:root/>"] {
++            assert!(matches!(
++                Document::parse_with_storage(
++                    source,
++                    ParsingOptions::default(),
++                    Accounted(&reader.execution())
++                ),
++                Err(Error::SharedExecution(MemoryError::WorkExceeded))
++            ));
++        }
++        assert_eq!(memory.used(), 0);
++        assert_eq!(memory.work_used(), 0);
++    }
++
++    #[test]
++    fn normalization_buffer_is_adopted_without_another_allocation() {
++        // A completed normalization buffer already owns valid UTF-8. Moving
++        // it into the tree must not allocate a second copy or a refcount block.
++        let source = alloc::string::String::from("normalized text");
++        let pointer = source.as_ptr();
++        let stored: StringStorage<'_> = StringStorage::from_owned(source);
++        assert_eq!(stored.as_str(), "normalized text");
++        assert_eq!(stored.as_str().as_ptr(), pointer);
++    }
++
++    #[test]
++    fn moving_text_buffers_preserves_normalization_and_coalescing() {
++        // Ownership changes must preserve one text node across literal,
++        // character-reference, CDATA and included internal-entity fragments.
++        for (xml, expected) in [
++            (
++                "<root>left<![CDATA[middle]]>right</root>",
++                "leftmiddleright",
++            ),
++            ("<root>left&#x20;right</root>", "left right"),
++            ("<root>line\r\nnext</root>", "line\nnext"),
++            ("<root><![CDATA[]]>after</root>", "after"),
++            (
++                "<!DOCTYPE root [<!ENTITY e 'entity'>]><root>before&e;after</root>",
++                "beforeentityafter",
++            ),
++        ] {
++            let document = Document::parse_with_options(
++                xml,
++                ParsingOptions {
++                    allow_dtd: true,
++                    ..ParsingOptions::default()
++                },
++            )
++            .expect("fixed normalization fixture");
++            assert_eq!(document.root_element().text(), Some(expected));
++            assert_eq!(document.root_element().children().count(), 1);
++        }
++        let document = Document::parse("<root a='line\r\nnext&#xA;end'/>")
++            .expect("fixed attribute normalization fixture");
++        assert_eq!(
++            document.root_element().attribute("a"),
++            Some("line next\nend")
++        );
++    }
++}
++
++#[derive(Debug)]
++struct AttributeData<
++    'input,
++    S: crate::xml::dom::storage::Storage = crate::xml::dom::storage::Native,
++> {
+     name: ExpandedNameIndexed<'input>,
+-    value: StringStorage<'input>,
+-    #[cfg(feature = "positions")]
++    value: StringStorage<'input, S>,
++    #[cfg(feature = "xml-backend-roxmltree")]
+     range: Range<usize>,
+-    #[cfg(feature = "positions")]
++    #[cfg(feature = "xml-backend-roxmltree")]
+     qname_len: u16,
+-    #[cfg(feature = "positions")]
++    #[cfg(feature = "xml-backend-roxmltree")]
+     eq_len: u8, // includes any surrounding spaces
+ }
+ 
+ /// An attribute.
+-#[derive(Copy, Clone)]
+-pub struct Attribute<'a, 'input: 'a> {
+-    doc: &'a Document<'input>,
+-    data: &'a AttributeData<'input>,
++pub struct Attribute<
++    'a,
++    'input: 'a,
++    S: crate::xml::dom::storage::Storage = crate::xml::dom::storage::Native,
++> {
++    doc: &'a Document<'input, S>,
++    data: &'a AttributeData<'input, S>,
++}
++
++impl<S: crate::xml::dom::storage::Storage> Copy for Attribute<'_, '_, S> {}
++impl<S: crate::xml::dom::storage::Storage> Clone for Attribute<'_, '_, S> {
++    fn clone(&self) -> Self {
++        *self
++    }
+ }
+-
+-impl<'a, 'input> Attribute<'a, 'input> {
++impl<'a, 'input, S: crate::xml::dom::storage::Storage> Attribute<'a, 'input, S> {
+     /// Returns attribute's namespace URI.
+     ///
+     /// # Examples
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// let doc = roxmltree::Document::parse(
+     ///     "<e xmlns:n='http://www.w3.org' a='b' n:a='c'/>"
+     /// ).unwrap();
+     ///
+-    /// assert_eq!(doc.root_element().attributes().nth(0).unwrap().namespace(), None);
++    /// assert_eq!(doc.root_element().attributes().next().unwrap().namespace(), None);
+     /// assert_eq!(doc.root_element().attributes().nth(1).unwrap().namespace(), Some("http://www.w3.org"));
+     /// ```
+     #[inline]
+@@ -525,12 +675,12 @@
+     ///
+     /// # Examples
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// let doc = roxmltree::Document::parse(
+     ///     "<e xmlns:n='http://www.w3.org' a='b' n:a='c'/>"
+     /// ).unwrap();
+     ///
+-    /// assert_eq!(doc.root_element().attributes().nth(0).unwrap().name(), "a");
++    /// assert_eq!(doc.root_element().attributes().next().unwrap().name(), "a");
+     /// assert_eq!(doc.root_element().attributes().nth(1).unwrap().name(), "a");
+     /// ```
+     #[inline]
+@@ -542,12 +692,12 @@
+     ///
+     /// # Examples
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// let doc = roxmltree::Document::parse(
+     ///     "<e xmlns:n='http://www.w3.org' a='b' n:a='c'/>"
+     /// ).unwrap();
+     ///
+-    /// assert_eq!(doc.root_element().attributes().nth(0).unwrap().value(), "b");
++    /// assert_eq!(doc.root_element().attributes().next().unwrap().value(), "b");
+     /// assert_eq!(doc.root_element().attributes().nth(1).unwrap().value(), "c");
+     /// ```
+     #[inline]
+@@ -559,7 +709,7 @@
+     ///
+     /// Useful when you need a more low-level access to an allocated string.
+     #[inline]
+-    pub fn value_storage(&self) -> &StringStorage<'input> {
++    pub fn value_storage(&self) -> &StringStorage<'input, S> {
+         &self.data.value
+     }
+ 
+@@ -573,8 +723,8 @@
+     /// ```
+     ///
+     /// [Document::text_pos_at]: struct.Document.html#method.text_pos_at
+-    #[deprecated(note="replaced by `range`")]
+-    #[cfg(feature = "positions")]
++    #[deprecated(note = "replaced by `range`")]
++    #[cfg(feature = "xml-backend-roxmltree")]
+     #[inline]
+     pub fn position(&self) -> usize {
+         self.data.range.start
+@@ -586,7 +736,7 @@
+     /// <e n:attr='value'/>
+     ///    ^^^^^^^^^^^^^^
+     /// ```
+-    #[cfg(feature = "positions")]
++    #[cfg(feature = "xml-backend-roxmltree")]
+     #[inline]
+     pub fn range(&self) -> Range<usize> {
+         self.data.range.clone()
+@@ -601,7 +751,7 @@
+     ///
+     /// To reduce memory usage the qname length is limited by u16::MAX.
+     /// If the attribute exceeds that limit then the end of the returned range will be incorrect.
+-    #[cfg(feature = "positions")]
++    #[cfg(feature = "xml-backend-roxmltree")]
+     #[inline]
+     pub fn range_qname(&self) -> Range<usize> {
+         let end = self.data.range.start + usize::from(self.data.qname_len);
+@@ -620,25 +770,28 @@
+     /// To reduce memory usage the qname length is limited by u16::MAX,
+     /// and the number of spaces around the equal sign is limited by u8::MAX.
+     /// If the attribute exceeds those limits then the start of the returned range will be incorrect.
+-    #[cfg(feature = "positions")]
++    #[cfg(feature = "xml-backend-roxmltree")]
+     #[inline]
+     pub fn range_value(&self) -> Range<usize> {
+         // +1 on start and -1 on end are to exclude the quotes around the value (all valid quotes are 1 byte)
+-        let start = self.data.range.start + usize::from(self.data.qname_len) + usize::from(self.data.eq_len) + 1;
++        let start = self.data.range.start
++            + usize::from(self.data.qname_len)
++            + usize::from(self.data.eq_len)
++            + 1;
+         let end = self.data.range.end - 1;
+         start..end
+     }
+ }
+ 
+-impl PartialEq for Attribute<'_, '_> {
++impl<S: crate::xml::dom::storage::Storage> PartialEq for Attribute<'_, '_, S> {
+     #[inline]
+-    fn eq(&self, other: &Attribute<'_, '_>) -> bool {
++    fn eq(&self, other: &Self) -> bool {
+         self.data.name.as_expanded_name(self.doc) == other.data.name.as_expanded_name(other.doc)
+             && self.data.value == other.data.value
+     }
+ }
+ 
+-impl fmt::Debug for Attribute<'_, '_> {
++impl<S: crate::xml::dom::storage::Storage> fmt::Debug for Attribute<'_, '_, S> {
+     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+         write!(
+             f,
+@@ -652,31 +805,34 @@
+ /// A namespace.
+ ///
+ /// Contains URI and *prefix* pair.
+-#[derive(Clone, PartialEq, Eq, Debug)]
+-pub struct Namespace<'input> {
++#[derive(PartialEq, Eq, Debug)]
++pub struct Namespace<
++    'input,
++    S: crate::xml::dom::storage::Storage = crate::xml::dom::storage::Native,
++> {
+     name: Option<&'input str>,
+-    uri: StringStorage<'input>,
++    uri: StringStorage<'input, S>,
+ }
+ 
+-impl<'input> Namespace<'input> {
++impl<'input, S: crate::xml::dom::storage::Storage> Namespace<'input, S> {
+     /// Returns namespace name/prefix.
+     ///
+     /// # Examples
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// let doc = roxmltree::Document::parse(
+     ///     "<e xmlns:n='http://www.w3.org'/>"
+     /// ).unwrap();
+     ///
+-    /// assert_eq!(doc.root_element().namespaces().nth(0).unwrap().name(), Some("n"));
++    /// assert_eq!(doc.root_element().namespaces().next().unwrap().name(), Some("n"));
+     /// ```
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// let doc = roxmltree::Document::parse(
+     ///     "<e xmlns='http://www.w3.org'/>"
+     /// ).unwrap();
+     ///
+-    /// assert_eq!(doc.root_element().namespaces().nth(0).unwrap().name(), None);
++    /// assert_eq!(doc.root_element().namespaces().next().unwrap().name(), None);
+     /// ```
+     #[inline]
+     pub fn name(&self) -> Option<&'input str> {
+@@ -687,12 +843,12 @@
+     ///
+     /// # Examples
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// let doc = roxmltree::Document::parse(
+     ///     "<e xmlns:n='http://www.w3.org'/>"
+     /// ).unwrap();
+     ///
+-    /// assert_eq!(doc.root_element().namespaces().nth(0).unwrap().uri(), "http://www.w3.org");
++    /// assert_eq!(doc.root_element().namespaces().next().unwrap().uri(), "http://www.w3.org");
+     /// ```
+     #[inline]
+     pub fn uri(&self) -> &str {
+@@ -700,72 +856,110 @@
+     }
+ }
+ 
+-#[derive(Default)]
+-struct Namespaces<'input> {
++struct Namespaces<'input, S: crate::xml::dom::storage::Storage = crate::xml::dom::storage::Native> {
+     // Deduplicated namespace values used throughout the document
+-    values: Vec<Namespace<'input>>,
++    values: S::Values<Namespace<'input, S>>,
+     // Indices into the above in tree order as the document is parsed
+-    tree_order: Vec<NamespaceIdx>,
++    tree_order: S::Values<NamespaceIdx>,
+     // Indices into the above sorted by value used for deduplication
+-    sorted_order: Vec<NamespaceIdx>,
++    sorted_order: S::Values<NamespaceIdx>,
++    storage: S,
+ }
+ 
+-impl<'input> Namespaces<'input> {
++impl<'input, S: crate::xml::dom::storage::Storage> Namespaces<'input, S> {
++    fn new(storage: S) -> Result<Self, Error<S::Text>> {
++        Ok(Self {
++            values: storage.values(0)?,
++            tree_order: storage.values(0)?,
++            sorted_order: storage.values(0)?,
++            storage,
++        })
++    }
+     fn push_ns(
+         &mut self,
+         name: Option<&'input str>,
+-        uri: StringStorage<'input>,
+-    ) -> Result<(), Error> {
++        uri: StringStorage<'input, S>,
++    ) -> Result<(), Error<S::Text>> {
+         debug_assert_ne!(name, Some(""));
+ 
+-        let idx = match self.sorted_order.binary_search_by(|idx| {
++        let mut failure = None;
++        let search = self.sorted_order.binary_search_by(|idx| {
++            if failure.is_some() {
++                return Ordering::Equal;
++            }
++            if let Err(error) = self
++                .storage
++                .charge(1 + name.map_or(0, str::len) + uri.len())
++            {
++                failure = Some(error);
++                return Ordering::Equal;
++            }
+             let value = &self.values[idx.0 as usize];
+ 
+             (value.name, value.uri.as_ref()).cmp(&(name, uri.as_str()))
+-        }) {
++        });
++        if let Some(error) = failure {
++            return Err(error.into());
++        }
++        let idx = match search {
+             Ok(sorted_idx) => self.sorted_order[sorted_idx],
+             Err(sorted_idx) => {
+                 if self.values.len() > u16::MAX as usize {
+                     return Err(Error::NamespacesLimitReached);
+                 }
+                 let idx = NamespaceIdx(self.values.len() as u16);
+-                self.values.push(Namespace { name, uri });
+-                self.sorted_order.insert(sorted_idx, idx);
++                self.values.push(Namespace { name, uri })?;
++                self.storage.charge(
++                    (self.sorted_order.len() - sorted_idx) * core::mem::size_of::<NamespaceIdx>(),
++                )?;
++                self.sorted_order.insert_copy(sorted_idx, idx)?;
+                 idx
+             }
+         };
+ 
+-        self.tree_order.push(idx);
++        self.tree_order.push(idx)?;
+ 
+         Ok(())
+     }
+ 
+     #[inline]
+-    fn push_ref(&mut self, tree_idx: usize) {
++    fn push_ref(&mut self, tree_idx: usize) -> Result<(), Error<S::Text>> {
+         let idx = self.tree_order[tree_idx];
+-        self.tree_order.push(idx);
++        self.tree_order.push(idx)?;
++        Ok(())
+     }
+ 
+     #[inline]
+-    fn exists(&self, start: usize, prefix: Option<&str>) -> bool {
+-        self.tree_order[start..]
+-            .iter()
+-            .any(|idx| self.values[idx.0 as usize].name == prefix)
++    fn exists(&self, start: usize, prefix: Option<&str>) -> Result<bool, Error<S::Text>> {
++        for idx in &self.tree_order[start..] {
++            self.storage.charge(1 + prefix.map_or(0, str::len))?;
++            if self.values[idx.0 as usize].name == prefix {
++                return Ok(true);
++            }
++        }
++        Ok(false)
+     }
+ 
+-    fn shrink_to_fit(&mut self) {
+-        self.values.shrink_to_fit();
+-        self.tree_order.shrink_to_fit();
++    fn shrink_to_fit(&mut self) -> Result<(), Error<S::Text>> {
++        self.storage.finish_values(&mut self.values);
++        self.storage.finish_values(&mut self.tree_order);
+         // Only needed to deduplicate namespaces during parsing.
+-        self.sorted_order = Vec::new();
++        self.sorted_order = self.storage.values(0)?;
++        Ok(())
+     }
+ 
+     #[inline]
+-    fn get(&self, idx: NamespaceIdx) -> &Namespace<'input> {
++    fn get(&self, idx: NamespaceIdx) -> &Namespace<'input, S> {
+         &self.values[idx.0 as usize]
+     }
+ }
+ 
++impl Default for Namespaces<'_> {
++    fn default() -> Self {
++        Self::new(Native).expect("empty native namespace storage cannot allocate")
++    }
++}
++
+ #[derive(Clone, Copy, Debug)]
+ #[repr(transparent)]
+ struct NamespaceIdx(u16);
+@@ -778,12 +972,18 @@
+ 
+ impl<'input> ExpandedNameIndexed<'input> {
+     #[inline]
+-    fn namespace<'a>(&self, doc: &'a Document<'input>) -> Option<&'a Namespace<'input>> {
++    fn namespace<'a, S: crate::xml::dom::storage::Storage>(
++        &self,
++        doc: &'a Document<'input, S>,
++    ) -> Option<&'a Namespace<'input, S>> {
+         self.namespace_idx.map(|idx| doc.namespaces.get(idx))
+     }
+ 
+     #[inline]
+-    fn as_expanded_name<'a>(&self, doc: &'a Document<'input>) -> ExpandedName<'a, 'input> {
++    fn as_expanded_name<'a, S: crate::xml::dom::storage::Storage>(
++        &self,
++        doc: &'a Document<'input, S>,
++    ) -> ExpandedName<'a, 'input> {
+         ExpandedName {
+             uri: self.namespace(doc).map(Namespace::uri),
+             name: self.local_name,
+@@ -805,7 +1005,7 @@
+     ///
+     /// # Examples
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// let doc = roxmltree::Document::parse("<e xmlns='http://www.w3.org'/>").unwrap();
+     ///
+     /// assert_eq!(doc.root_element().tag_name().namespace(), Some("http://www.w3.org"));
+@@ -819,7 +1019,7 @@
+     ///
+     /// # Examples
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// let doc = roxmltree::Document::parse("<e/>").unwrap();
+     ///
+     /// assert_eq!(doc.root_element().tag_name().name(), "e");
+@@ -835,7 +1035,7 @@
+     ///
+     /// # Example
+     ///
+-    /// ```rust
++    /// ```text,xml-sec-example
+     /// use roxmltree::ExpandedName;
+     /// const DAV_HREF: ExpandedName =
+     ///     ExpandedName::from_static("urn:ietf:params:xml:ns:caldav:", "calendar-data");
+@@ -898,47 +1098,47 @@
+ /// The use of document-order in DOM Selectors is described here in the
+ /// [W3C Selectors API Level 1](https://www.w3.org/TR/selectors-api/#the-apis)
+ #[derive(Clone, Copy)]
+-pub struct Node<'a, 'input: 'a> {
++pub struct Node<'a, 'input: 'a, S: Storage = Native> {
+     /// Node's ID.
+     id: NodeId,
+ 
+     /// The tree containing the node.
+-    doc: &'a Document<'input>,
++    doc: &'a Document<'input, S>,
+ 
+     /// Node's data.
+-    d: &'a NodeData<'input>,
++    d: &'a NodeData<'input, S>,
+ }
+ 
+-impl Eq for Node<'_, '_> {}
++impl<S: Storage> Eq for Node<'_, '_, S> {}
+ 
+-impl PartialEq for Node<'_, '_> {
++impl<S: Storage> PartialEq for Node<'_, '_, S> {
+     #[inline]
+     fn eq(&self, other: &Self) -> bool {
+         (self.id, self.doc as *const _) == (other.id, other.doc as *const _)
+     }
+ }
+ 
+-impl PartialOrd for Node<'_, '_> {
++impl<S: Storage> PartialOrd for Node<'_, '_, S> {
+     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+         Some(self.cmp(other))
+     }
+ }
+ 
+-impl Ord for Node<'_, '_> {
++impl<S: Storage> Ord for Node<'_, '_, S> {
+     fn cmp(&self, other: &Self) -> Ordering {
+         (self.id.0, self.doc as *const _).cmp(&(other.id.0, other.doc as *const _))
+     }
+ }
+ 
+-impl Hash for Node<'_, '_> {
++impl<S: Storage> Hash for Node<'_, '_, S> {
+     fn hash<H: Hasher>(&self, state: &mut H) {
+         self.id.0.hash(state);
+-        (self.doc as *const Document).hash(state);
+-        (self.d as *const NodeData).hash(state);
++        core::ptr::from_ref(self.doc).hash(state);
++        core::ptr::from_ref(self.d).hash(state);
+     }
+ }
+ 
+-impl<'a, 'input: 'a> Node<'a, 'input> {
++impl<'a, 'input: 'a, S: Storage> Node<'a, 'input, S> {
+     /// Returns node's type.
+     #[inline]
+     pub fn node_type(&self) -> NodeType {
+@@ -983,7 +1183,7 @@
+ 
+     /// Returns node's document.
+     #[inline]
+-    pub fn document(&self) -> &'a Document<'input> {
++    pub fn document(&self) -> &'a Document<'input, S> {
+         self.doc
+     }
+ 
+@@ -993,7 +1193,7 @@
+     ///
+     /// # Examples
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// let doc = roxmltree::Document::parse("<e xmlns='http://www.w3.org'/>").unwrap();
+     ///
+     /// assert_eq!(doc.root_element().tag_name().namespace(), Some("http://www.w3.org"));
+@@ -1011,7 +1211,7 @@
+     ///
+     /// # Examples
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// let doc = roxmltree::Document::parse("<e xmlns='http://www.w3.org'/>").unwrap();
+     ///
+     /// assert!(doc.root_element().has_tag_name("e"));
+@@ -1039,13 +1239,13 @@
+     ///
+     /// # Examples
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// let doc = roxmltree::Document::parse("<e xmlns='http://www.w3.org'/>").unwrap();
+     ///
+     /// assert_eq!(doc.root_element().default_namespace(), Some("http://www.w3.org"));
+     /// ```
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// let doc = roxmltree::Document::parse("<e xmlns:n='http://www.w3.org'/>").unwrap();
+     ///
+     /// assert_eq!(doc.root_element().default_namespace(), None);
+@@ -1060,16 +1260,20 @@
+     ///
+     /// # Examples
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// let doc = roxmltree::Document::parse("<e xmlns:n='http://www.w3.org'/>").unwrap();
+     ///
+     /// assert_eq!(doc.root_element().lookup_prefix("http://www.w3.org"), Some("n"));
+     /// ```
+     ///
+-    /// ```
+-    /// let doc = roxmltree::Document::parse("<e xmlns:n=''/>").unwrap();
++    /// ```text,xml-sec-example
++    /// // Namespaces in XML 1.0 §5 forbids undeclaring a non-default prefix.
++    /// // https://www.w3.org/TR/2009/REC-xml-names-20091208/#nsc-NoPrefixUndecl
++    /// assert!(roxmltree::Document::parse("<e xmlns:n=''/>").is_err());
++    /// // Default namespace undeclaration is permitted by §6.2.
++    /// let doc = roxmltree::Document::parse("<e xmlns=''/>").unwrap();
+     ///
+-    /// assert_eq!(doc.root_element().lookup_prefix(""), Some("n"));
++    /// assert_eq!(doc.root_element().lookup_prefix(""), None);
+     /// ```
+     pub fn lookup_prefix(&self, uri: &str) -> Option<&'input str> {
+         if uri == NS_XML_URI {
+@@ -1086,13 +1290,13 @@
+     ///
+     /// # Examples
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// let doc = roxmltree::Document::parse("<e xmlns:n='http://www.w3.org'/>").unwrap();
+     ///
+     /// assert_eq!(doc.root_element().lookup_namespace_uri(Some("n")), Some("http://www.w3.org"));
+     /// ```
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// let doc = roxmltree::Document::parse("<e xmlns='http://www.w3.org'/>").unwrap();
+     ///
+     /// assert_eq!(doc.root_element().lookup_namespace_uri(None), Some("http://www.w3.org"));
+@@ -1107,13 +1311,13 @@
+     ///
+     /// # Examples
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// let doc = roxmltree::Document::parse("<e a='b'/>").unwrap();
+     ///
+     /// assert_eq!(doc.root_element().attribute("a"), Some("b"));
+     /// ```
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// let doc = roxmltree::Document::parse(
+     ///     "<e xmlns:n='http://www.w3.org' a='b' n:a='c'/>"
+     /// ).unwrap();
+@@ -1133,15 +1337,19 @@
+     /// The same as [`attribute()`], but returns the `Attribute` itself instead of a value string.
+     ///
+     /// [`attribute()`]: struct.Node.html#method.attribute
+-    pub fn attribute_node<'n, 'm, N>(&self, name: N) -> Option<Attribute<'a, 'input>>
++    pub fn attribute_node<'n, 'm, N>(&self, name: N) -> Option<Attribute<'a, 'input, S>>
+     where
+         N: Into<ExpandedName<'n, 'm>>,
+     {
+         let name = name.into();
+ 
+         match name.namespace() {
+-            Some(_) => self.attributes().find(|a| a.data.name.as_expanded_name(self.doc) == name),
+-            None => self.attributes().find(|a| a.data.name.local_name == name.name),
++            Some(_) => self
++                .attributes()
++                .find(|a| a.data.name.as_expanded_name(self.doc) == name),
++            None => self
++                .attributes()
++                .find(|a| a.data.name.local_name == name.name),
+         }
+     }
+ 
+@@ -1149,7 +1357,7 @@
+     ///
+     /// # Examples
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// let doc = roxmltree::Document::parse(
+     ///     "<e xmlns:n='http://www.w3.org' a='b' n:a='c'/>"
+     /// ).unwrap();
+@@ -1171,7 +1379,7 @@
+     ///
+     /// # Examples
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// let doc = roxmltree::Document::parse(
+     ///     "<e xmlns:n='http://www.w3.org' a='b' n:a='c'/>"
+     /// ).unwrap();
+@@ -1179,7 +1387,7 @@
+     /// assert_eq!(doc.root_element().attributes().len(), 2);
+     /// ```
+     #[inline]
+-    pub fn attributes(&self) -> Attributes<'a, 'input> {
++    pub fn attributes(&self) -> Attributes<'a, 'input, S> {
+         Attributes::new(self)
+     }
+ 
+@@ -1187,7 +1395,7 @@
+     ///
+     /// # Examples
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// let doc = roxmltree::Document::parse(
+     ///     "<e xmlns:n='http://www.w3.org'/>"
+     /// ).unwrap();
+@@ -1195,7 +1403,7 @@
+     /// assert_eq!(doc.root_element().namespaces().len(), 1);
+     /// ```
+     #[inline]
+-    pub fn namespaces(&self) -> NamespaceIter<'a, 'input> {
++    pub fn namespaces(&self) -> NamespaceIter<'a, 'input, S> {
+         let namespaces = match self.d.kind {
+             NodeKind::Element { ref namespaces, .. } => {
+                 &self.doc.namespaces.tree_order[namespaces.to_urange()]
+@@ -1217,7 +1425,7 @@
+     ///
+     /// # Examples
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// let doc = roxmltree::Document::parse("\
+     /// <p>
+     ///     text
+@@ -1230,7 +1438,7 @@
+     ///            Some("\n    text\n"));
+     /// ```
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// let doc = roxmltree::Document::parse("<!-- comment --><e/>").unwrap();
+     ///
+     /// assert_eq!(doc.root().first_child().unwrap().text(), Some(" comment "));
+@@ -1243,7 +1451,7 @@
+     /// Returns node's text storage.
+     ///
+     /// Useful when you need a more low-level access to an allocated string.
+-    pub fn text_storage(&self) -> Option<&'a StringStorage<'input>> {
++    pub fn text_storage(&self) -> Option<&'a StringStorage<'input, S>> {
+         match self.d.kind {
+             NodeKind::Element { .. } => match self.first_child() {
+                 Some(child) if child.is_text() => match self.doc.nodes[child.id.get_usize()].kind {
+@@ -1262,7 +1470,7 @@
+     ///
+     /// # Examples
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// let doc = roxmltree::Document::parse("\
+     /// <root>
+     ///     text1
+@@ -1282,7 +1490,7 @@
+     /// Returns element's tail text storage.
+     ///
+     /// Useful when you need a more low-level access to an allocated string.
+-    pub fn tail_storage(&self) -> Option<&'a StringStorage<'input>> {
++    pub fn tail_storage(&self) -> Option<&'a StringStorage<'input, S>> {
+         if !self.is_element() {
+             return None;
+         }
+@@ -1308,7 +1516,9 @@
+     /// Returns the parent of this node.
+     #[inline]
+     pub fn parent(&self) -> Option<Self> {
+-        self.d.parent.map(|id| self.doc.get_node(id).unwrap())
++        self.d
++            .parent
++            .map(|id| self.doc.get_node(id).expect("parent belongs to this arena"))
+     }
+ 
+     /// Returns the parent element of this node.
+@@ -1319,7 +1529,11 @@
+     /// Returns the previous sibling of this node.
+     #[inline]
+     pub fn prev_sibling(&self) -> Option<Self> {
+-        self.d.prev_sibling.map(|id| self.doc.get_node(id).unwrap())
++        self.d.prev_sibling.map(|id| {
++            self.doc
++                .get_node(id)
++                .expect("previous sibling belongs to this arena")
++        })
+     }
+ 
+     /// Returns the previous sibling element of this node.
+@@ -1332,7 +1546,11 @@
+     pub fn next_sibling(&self) -> Option<Self> {
+         self.d
+             .next_subtree
+-            .map(|id| self.doc.get_node(id).unwrap())
++            .map(|id| {
++                self.doc
++                    .get_node(id)
++                    .expect("next subtree belongs to this arena")
++            })
+             .and_then(|node| {
+                 let possibly_self = node
+                     .d
+@@ -1354,9 +1572,11 @@
+     /// Returns the first child of this node.
+     #[inline]
+     pub fn first_child(&self) -> Option<Self> {
+-        self.d
+-            .last_child
+-            .map(|_| self.doc.get_node(NodeId::new(self.id.get() + 1)).unwrap())
++        self.d.last_child.map(|_| {
++            self.doc
++                .get_node(NodeId::new(self.id.get() + 1))
++                .expect("a nonempty subtree starts at the next arena entry")
++        })
+     }
+ 
+     /// Returns the first element child of this node.
+@@ -1367,12 +1587,16 @@
+     /// Returns the last child of this node.
+     #[inline]
+     pub fn last_child(&self) -> Option<Self> {
+-        self.d.last_child.map(|id| self.doc.get_node(id).unwrap())
++        self.d.last_child.map(|id| {
++            self.doc
++                .get_node(id)
++                .expect("last child belongs to this arena")
++        })
+     }
+ 
+     /// Returns the last element child of this node.
+     pub fn last_element_child(&self) -> Option<Self> {
+-        self.children().filter(|n| n.is_element()).next_back()
++        self.children().rfind(|child| child.is_element())
+     }
+ 
+     /// Returns true if this node has siblings.
+@@ -1389,7 +1613,7 @@
+ 
+     /// Returns an iterator over ancestor nodes starting at this node.
+     #[inline]
+-    pub fn ancestors(&self) -> AxisIter<'a, 'input> {
++    pub fn ancestors(&self) -> AxisIter<'a, 'input, S> {
+         AxisIter {
+             node: Some(*self),
+             next: Node::parent,
+@@ -1398,7 +1622,7 @@
+ 
+     /// Returns an iterator over previous sibling nodes starting at this node.
+     #[inline]
+-    pub fn prev_siblings(&self) -> AxisIter<'a, 'input> {
++    pub fn prev_siblings(&self) -> AxisIter<'a, 'input, S> {
+         AxisIter {
+             node: Some(*self),
+             next: Node::prev_sibling,
+@@ -1407,7 +1631,7 @@
+ 
+     /// Returns an iterator over next sibling nodes starting at this node.
+     #[inline]
+-    pub fn next_siblings(&self) -> AxisIter<'a, 'input> {
++    pub fn next_siblings(&self) -> AxisIter<'a, 'input, S> {
+         AxisIter {
+             node: Some(*self),
+             next: Node::next_sibling,
+@@ -1416,7 +1640,7 @@
+ 
+     /// Returns an iterator over first children nodes starting at this node.
+     #[inline]
+-    pub fn first_children(&self) -> AxisIter<'a, 'input> {
++    pub fn first_children(&self) -> AxisIter<'a, 'input, S> {
+         AxisIter {
+             node: Some(*self),
+             next: Node::first_child,
+@@ -1425,7 +1649,7 @@
+ 
+     /// Returns an iterator over last children nodes starting at this node.
+     #[inline]
+-    pub fn last_children(&self) -> AxisIter<'a, 'input> {
++    pub fn last_children(&self) -> AxisIter<'a, 'input, S> {
+         AxisIter {
+             node: Some(*self),
+             next: Node::last_child,
+@@ -1434,7 +1658,7 @@
+ 
+     /// Returns an iterator over children nodes.
+     #[inline]
+-    pub fn children(&self) -> Children<'a, 'input> {
++    pub fn children(&self) -> Children<'a, 'input, S> {
+         Children {
+             front: self.first_child(),
+             back: self.last_child(),
+@@ -1443,12 +1667,12 @@
+ 
+     /// Returns an iterator over this node and its descendants.
+     #[inline]
+-    pub fn descendants(&self) -> Descendants<'a, 'input> {
++    pub fn descendants(&self) -> Descendants<'a, 'input, S> {
+         Descendants::new(*self)
+     }
+ 
+     /// Returns node's range in bytes in the original document.
+-    #[cfg(feature = "positions")]
++    #[cfg(feature = "xml-backend-roxmltree")]
+     #[inline]
+     pub fn range(&self) -> Range<usize> {
+         self.d.range.clone()
+@@ -1461,7 +1685,7 @@
+     }
+ }
+ 
+-impl<'a, 'input: 'a> fmt::Debug for Node<'a, 'input> {
++impl<'a, 'input: 'a, S: Storage> fmt::Debug for Node<'a, 'input, S> {
+     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+         match self.d.kind {
+             NodeKind::Root => write!(f, "Root"),
+@@ -1485,14 +1709,14 @@
+ 
+ /// Iterator over a node's attributes
+ #[derive(Clone)]
+-pub struct Attributes<'a, 'input> {
+-    doc: &'a Document<'input>,
+-    attrs: core::slice::Iter<'a, AttributeData<'input>>,
++pub struct Attributes<'a, 'input, S: Storage = Native> {
++    doc: &'a Document<'input, S>,
++    attrs: core::slice::Iter<'a, AttributeData<'input, S>>,
+ }
+ 
+-impl<'a, 'input> Attributes<'a, 'input> {
++impl<'a, 'input, S: Storage> Attributes<'a, 'input, S> {
+     #[inline]
+-    fn new(node: &Node<'a, 'input>) -> Attributes<'a, 'input> {
++    fn new(node: &Node<'a, 'input, S>) -> Attributes<'a, 'input, S> {
+         let attrs = match node.d.kind {
+             NodeKind::Element { ref attributes, .. } => {
+                 &node.doc.attributes[attributes.to_urange()]
+@@ -1506,8 +1730,8 @@
+     }
+ }
+ 
+-impl<'a, 'input> Iterator for Attributes<'a, 'input> {
+-    type Item = Attribute<'a, 'input>;
++impl<'a, 'input, S: Storage> Iterator for Attributes<'a, 'input, S> {
++    type Item = Attribute<'a, 'input, S>;
+ 
+     #[inline]
+     fn next(&mut self) -> Option<Self::Item> {
+@@ -1531,7 +1755,7 @@
+     }
+ }
+ 
+-impl<'a, 'input> DoubleEndedIterator for Attributes<'a, 'input> {
++impl<'a, 'input, S: Storage> DoubleEndedIterator for Attributes<'a, 'input, S> {
+     #[inline]
+     fn next_back(&mut self) -> Option<Self::Item> {
+         self.attrs.next_back().map(|attr| Attribute {
+@@ -1541,9 +1765,9 @@
+     }
+ }
+ 
+-impl ExactSizeIterator for Attributes<'_, '_> {}
++impl<S: Storage> ExactSizeIterator for Attributes<'_, '_, S> {}
+ 
+-impl fmt::Debug for Attributes<'_, '_> {
++impl<S: Storage> fmt::Debug for Attributes<'_, '_, S> {
+     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+         f.debug_struct("Attributes")
+             .field("attrs", &self.attrs)
+@@ -1553,13 +1777,13 @@
+ 
+ /// Iterator over specified axis.
+ #[derive(Clone)]
+-pub struct AxisIter<'a, 'input: 'a> {
+-    node: Option<Node<'a, 'input>>,
+-    next: fn(&Node<'a, 'input>) -> Option<Node<'a, 'input>>,
++pub struct AxisIter<'a, 'input: 'a, S: Storage = Native> {
++    node: Option<Node<'a, 'input, S>>,
++    next: fn(&Node<'a, 'input, S>) -> Option<Node<'a, 'input, S>>,
+ }
+ 
+-impl<'a, 'input: 'a> Iterator for AxisIter<'a, 'input> {
+-    type Item = Node<'a, 'input>;
++impl<'a, 'input: 'a, S: Storage> Iterator for AxisIter<'a, 'input, S> {
++    type Item = Node<'a, 'input, S>;
+ 
+     #[inline]
+     fn next(&mut self) -> Option<Self::Item> {
+@@ -1569,7 +1793,7 @@
+     }
+ }
+ 
+-impl fmt::Debug for AxisIter<'_, '_> {
++impl<S: Storage> fmt::Debug for AxisIter<'_, '_, S> {
+     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+         f.debug_struct("AxisIter")
+             .field("node", &self.node)
+@@ -1580,13 +1804,13 @@
+ 
+ /// Iterator over children.
+ #[derive(Clone, Debug)]
+-pub struct Children<'a, 'input: 'a> {
+-    front: Option<Node<'a, 'input>>,
+-    back: Option<Node<'a, 'input>>,
++pub struct Children<'a, 'input: 'a, S: Storage = Native> {
++    front: Option<Node<'a, 'input, S>>,
++    back: Option<Node<'a, 'input, S>>,
+ }
+ 
+-impl<'a, 'input: 'a> Iterator for Children<'a, 'input> {
+-    type Item = Node<'a, 'input>;
++impl<'a, 'input: 'a, S: Storage> Iterator for Children<'a, 'input, S> {
++    type Item = Node<'a, 'input, S>;
+ 
+     #[inline]
+     fn next(&mut self) -> Option<Self::Item> {
+@@ -1602,7 +1826,7 @@
+     }
+ }
+ 
+-impl<'a, 'input: 'a> DoubleEndedIterator for Children<'a, 'input> {
++impl<'a, 'input: 'a, S: Storage> DoubleEndedIterator for Children<'a, 'input, S> {
+     #[inline]
+     fn next_back(&mut self) -> Option<Self::Item> {
+         if self.back == self.front {
+@@ -1619,15 +1843,15 @@
+ 
+ /// Iterator over a node and its descendants.
+ #[derive(Clone)]
+-pub struct Descendants<'a, 'input> {
+-    doc: &'a Document<'input>,
+-    nodes: core::iter::Enumerate<core::slice::Iter<'a, NodeData<'input>>>,
++pub struct Descendants<'a, 'input, S: Storage = Native> {
++    doc: &'a Document<'input, S>,
++    nodes: core::iter::Enumerate<core::slice::Iter<'a, NodeData<'input, S>>>,
+     from: usize,
+ }
+ 
+-impl<'a, 'input> Descendants<'a, 'input> {
++impl<'a, 'input, S: Storage> Descendants<'a, 'input, S> {
+     #[inline]
+-    fn new(start: Node<'a, 'input>) -> Self {
++    fn new(start: Node<'a, 'input, S>) -> Self {
+         let from = start.id.get_usize();
+ 
+         let until = start
+@@ -1646,8 +1870,8 @@
+     }
+ }
+ 
+-impl<'a, 'input> Iterator for Descendants<'a, 'input> {
+-    type Item = Node<'a, 'input>;
++impl<'a, 'input, S: Storage> Iterator for Descendants<'a, 'input, S> {
++    type Item = Node<'a, 'input, S>;
+ 
+     #[inline]
+     fn next(&mut self) -> Option<Self::Item> {
+@@ -1673,7 +1897,7 @@
+     }
+ }
+ 
+-impl<'a, 'input> DoubleEndedIterator for Descendants<'a, 'input> {
++impl<'a, 'input, S: Storage> DoubleEndedIterator for Descendants<'a, 'input, S> {
+     #[inline]
+     fn next_back(&mut self) -> Option<Self::Item> {
+         self.nodes.next_back().map(|(idx, data)| Node {
+@@ -1684,9 +1908,9 @@
+     }
+ }
+ 
+-impl ExactSizeIterator for Descendants<'_, '_> {}
++impl<S: Storage> ExactSizeIterator for Descendants<'_, '_, S> {}
+ 
+-impl fmt::Debug for Descendants<'_, '_> {
++impl<S: Storage> fmt::Debug for Descendants<'_, '_, S> {
+     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+         f.debug_struct("Descendants")
+             .field("nodes", &self.nodes)
+@@ -1697,13 +1921,13 @@
+ 
+ /// Iterator over the namespaces attached to a node.
+ #[derive(Clone)]
+-pub struct NamespaceIter<'a, 'input> {
+-    doc: &'a Document<'input>,
++pub struct NamespaceIter<'a, 'input, S: Storage = Native> {
++    doc: &'a Document<'input, S>,
+     namespaces: core::slice::Iter<'a, NamespaceIdx>,
+ }
+ 
+-impl<'a, 'input> Iterator for NamespaceIter<'a, 'input> {
+-    type Item = &'a Namespace<'input>;
++impl<'a, 'input, S: Storage> Iterator for NamespaceIter<'a, 'input, S> {
++    type Item = &'a Namespace<'input, S>;
+ 
+     #[inline]
+     fn next(&mut self) -> Option<Self::Item> {
+@@ -1725,7 +1949,7 @@
+     }
+ }
+ 
+-impl<'a, 'input> DoubleEndedIterator for NamespaceIter<'a, 'input> {
++impl<'a, 'input, S: Storage> DoubleEndedIterator for NamespaceIter<'a, 'input, S> {
+     #[inline]
+     fn next_back(&mut self) -> Option<Self::Item> {
+         self.namespaces
+@@ -1734,9 +1958,9 @@
+     }
+ }
+ 
+-impl ExactSizeIterator for NamespaceIter<'_, '_> {}
++impl<S: Storage> ExactSizeIterator for NamespaceIter<'_, '_, S> {}
+ 
+-impl fmt::Debug for NamespaceIter<'_, '_> {
++impl<S: Storage> fmt::Debug for NamespaceIter<'_, '_, S> {
+     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+         f.debug_struct("NamespaceIter")
+             .field("namespaces", &self.namespaces)
+--- a/roxmltree/src/parse.rs
++++ b/roxmltree/src/parse.rs
+@@ -1,24 +1,29 @@
++use crate::xml::dom::storage::{Native, Storage, Values};
++use alloc::borrow::Cow;
+ use alloc::string::{String, ToString};
+ use alloc::{vec, vec::Vec};
+-use alloc::borrow::Cow;
+-use core::ops::Range;
+-use core::mem::take;
+ use core::fmt;
+-use memchr::{memchr, memchr2, memchr_iter};
++use core::mem::take;
++use core::ops::Range;
++use memchr::{memchr, memchr_iter, memchr2};
+ 
+-use crate::{
+-    AttributeData, Document, ExpandedNameIndexed, NamespaceIdx, Namespaces, NodeData, NodeId,
+-    NodeKind, ShortRange, StringStorage, TextPos, NS_XMLNS_URI, NS_XML_PREFIX, NS_XML_URI, PI,
++use crate::parser_roxmltree::{
++    AttributeData, Document, ExpandedNameIndexed, NS_XML_PREFIX, NS_XML_URI, NS_XMLNS_URI,
++    NamespaceIdx, Namespaces, NodeData, NodeId, NodeKind, PI, ShortRange, StringStorage, TextPos,
+     XMLNS,
+ };
+ 
+-use crate::tokenizer::{self, Reference, StrSpan, Stream};
++use crate::parser_roxmltree::tokenizer::{self, Reference, StrSpan, Stream};
+ 
+-type Result<T> = core::result::Result<T, Error>;
++type Result<T, E = String> = core::result::Result<T, Error<E>>;
++type ScopedResult<T, S> = Result<T, <S as Storage>::Text>;
+ 
+ /// A list of all possible errors.
+-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+-pub enum Error {
++#[derive(Clone, PartialEq, Eq, Debug)]
++pub enum Error<E = String> {
++    AllocationFailed,
++    #[cfg(feature = "xmldsig")]
++    SharedExecution(structured_asn1::memory::MemoryError),
+     /// The `xmlns:xml` attribute must have an <http://www.w3.org/XML/1998/namespace> URI.
+     InvalidXmlPrefixUri(TextPos),
+ 
+@@ -28,23 +33,26 @@
+     /// The <http://www.w3.org/2000/xmlns/> URI must not be declared.
+     UnexpectedXmlnsUri(TextPos),
+ 
++    /// Namespaces in XML 1.0 forbids undeclaring a non-default prefix.
++    EmptyPrefixedNamespace(TextPos),
++
+     /// `xmlns` can't be used as an element prefix.
+     InvalidElementNamePrefix(TextPos),
+ 
+     /// A namespace was already defined on this element.
+-    DuplicatedNamespace(String, TextPos),
++    DuplicatedNamespace(E, TextPos),
+ 
+     /// An unknown namespace.
+     ///
+     /// Indicates that an element or an attribute has an unknown qualified name prefix.
+     ///
+     /// The first value is a prefix.
+-    UnknownNamespace(String, TextPos),
++    UnknownNamespace(E, TextPos),
+ 
+     /// Incorrect tree structure.
+     ///
+     /// expected, actual, position
+-    UnexpectedCloseTag(String, String, TextPos),
++    UnexpectedCloseTag(E, E, TextPos),
+ 
+     /// Entity value starts with a close tag.
+     ///
+@@ -56,7 +64,7 @@
+     UnexpectedEntityCloseTag(TextPos),
+ 
+     /// A reference to an entity that was not defined in the DTD.
+-    UnknownEntityReference(String, TextPos),
++    UnknownEntityReference(E, TextPos),
+ 
+     /// A malformed entity reference.
+     ///
+@@ -79,7 +87,7 @@
+     /// ```xml
+     /// <e xmlns:n1='http://www.w3.org' xmlns:n2='http://www.w3.org' n1:a='b1' n2:a='b2'/>
+     /// ```
+-    DuplicatedAttribute(String, TextPos),
++    DuplicatedAttribute(E, TextPos),
+ 
+     /// The XML document must have at least one element.
+     NoRootNode,
+@@ -149,15 +157,75 @@
+     ///
+     /// Should only appear on invalid input data.
+     UnexpectedEndOfStream,
++    /// A callback retained the original typed failure in its execution scope.
++    ProcessingStopped,
+ }
+ 
+-impl Error {
++impl<E> Error<E> {
++    pub(crate) fn map_text<T>(self, mut map: impl FnMut(E) -> T) -> Error<T> {
++        match self.try_map_text(|text| Ok::<_, core::convert::Infallible>(map(text))) {
++            Ok(error) => error,
++            Err(never) => match never {},
++        }
++    }
++
++    pub(crate) fn try_map_text<T, F>(
++        self,
++        mut map: impl FnMut(E) -> core::result::Result<T, F>,
++    ) -> core::result::Result<Error<T>, F> {
++        Ok(match self {
++            Self::AllocationFailed => Error::AllocationFailed,
++            #[cfg(feature = "xmldsig")]
++            Self::SharedExecution(error) => Error::SharedExecution(error),
++            Self::InvalidXmlPrefixUri(pos) => Error::InvalidXmlPrefixUri(pos),
++            Self::UnexpectedXmlUri(pos) => Error::UnexpectedXmlUri(pos),
++            Self::UnexpectedXmlnsUri(pos) => Error::UnexpectedXmlnsUri(pos),
++            Self::EmptyPrefixedNamespace(pos) => Error::EmptyPrefixedNamespace(pos),
++            Self::InvalidElementNamePrefix(pos) => Error::InvalidElementNamePrefix(pos),
++            Self::DuplicatedNamespace(name, pos) => Error::DuplicatedNamespace(map(name)?, pos),
++            Self::UnknownNamespace(name, pos) => Error::UnknownNamespace(map(name)?, pos),
++            Self::UnexpectedCloseTag(expected, actual, pos) => {
++                Error::UnexpectedCloseTag(map(expected)?, map(actual)?, pos)
++            }
++            Self::UnexpectedEntityCloseTag(pos) => Error::UnexpectedEntityCloseTag(pos),
++            Self::UnknownEntityReference(name, pos) => {
++                Error::UnknownEntityReference(map(name)?, pos)
++            }
++            Self::MalformedEntityReference(pos) => Error::MalformedEntityReference(pos),
++            Self::EntityReferenceLoop(pos) => Error::EntityReferenceLoop(pos),
++            Self::InvalidAttributeValue(pos) => Error::InvalidAttributeValue(pos),
++            Self::DuplicatedAttribute(name, pos) => Error::DuplicatedAttribute(map(name)?, pos),
++            Self::NoRootNode => Error::NoRootNode,
++            Self::UnclosedRootNode => Error::UnclosedRootNode,
++            Self::UnexpectedDeclaration(pos) => Error::UnexpectedDeclaration(pos),
++            Self::DtdDetected => Error::DtdDetected,
++            Self::NodesLimitReached => Error::NodesLimitReached,
++            Self::AttributesLimitReached => Error::AttributesLimitReached,
++            Self::NamespacesLimitReached => Error::NamespacesLimitReached,
++            Self::InvalidName(pos) => Error::InvalidName(pos),
++            Self::NonXmlChar(character, pos) => Error::NonXmlChar(character, pos),
++            Self::InvalidChar(expected, actual, pos) => Error::InvalidChar(expected, actual, pos),
++            Self::InvalidChar2(expected, actual, pos) => Error::InvalidChar2(expected, actual, pos),
++            Self::InvalidString(expected, pos) => Error::InvalidString(expected, pos),
++            Self::InvalidExternalID(pos) => Error::InvalidExternalID(pos),
++            Self::EntityResolver(pos, message) => Error::EntityResolver(pos, message),
++            Self::InvalidComment(pos) => Error::InvalidComment(pos),
++            Self::InvalidCharacterData(pos) => Error::InvalidCharacterData(pos),
++            Self::UnknownToken(pos) => Error::UnknownToken(pos),
++            Self::UnexpectedEndOfStream => Error::UnexpectedEndOfStream,
++            Self::ProcessingStopped => Error::ProcessingStopped,
++        })
++    }
+     /// Returns the error position.
+     pub fn pos(&self) -> TextPos {
+         match *self {
++            Error::AllocationFailed => TextPos::new(1, 1),
++            #[cfg(feature = "xmldsig")]
++            Error::SharedExecution(_) => TextPos::new(1, 1),
+             Error::InvalidXmlPrefixUri(pos) => pos,
+             Error::UnexpectedXmlUri(pos) => pos,
+             Error::UnexpectedXmlnsUri(pos) => pos,
++            Error::EmptyPrefixedNamespace(pos) => pos,
+             Error::InvalidElementNamePrefix(pos) => pos,
+             Error::DuplicatedNamespace(_, pos) => pos,
+             Error::UnknownNamespace(_, pos) => pos,
+@@ -186,16 +254,27 @@
+             Error::InvalidCharacterData(pos) => pos,
+             Error::UnknownToken(pos) => pos,
+             Error::UnexpectedEndOfStream => TextPos::new(1, 1),
++            Error::ProcessingStopped => TextPos::new(1, 1),
+         }
+     }
+ }
+ 
+-impl core::fmt::Display for Error {
++impl<E: fmt::Display> core::fmt::Display for Error<E> {
+     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+         match self {
++            Error::AllocationFailed => f.write_str("XML parser allocation failed"),
++            Error::ProcessingStopped => f.write_str("XML callback processing stopped"),
++            #[cfg(feature = "xmldsig")]
++            Error::SharedExecution(error) => write!(f, "XML parser execution: {error}"),
+             Error::InvalidXmlPrefixUri(pos) => {
+                 write!(f, "'xml' namespace prefix mapped to wrong URI at {}", pos)
+             }
++            Error::EmptyPrefixedNamespace(pos) => {
++                write!(
++                    f,
++                    "a namespace prefix cannot be undeclared in XML 1.0 at {pos}"
++                )
++            }
+             Error::UnexpectedXmlUri(pos) => {
+                 write!(
+                     f,
+@@ -217,13 +296,13 @@
+                     pos
+                 )
+             }
+-            Error::DuplicatedNamespace(ref name, pos) => {
++            Error::DuplicatedNamespace(name, pos) => {
+                 write!(f, "namespace '{}' at {} is already defined", name, pos)
+             }
+-            Error::UnknownNamespace(ref name, pos) => {
++            Error::UnknownNamespace(name, pos) => {
+                 write!(f, "an unknown namespace prefix '{}' at {}", name, pos)
+             }
+-            Error::UnexpectedCloseTag(ref expected, ref actual, pos) => {
++            Error::UnexpectedCloseTag(expected, actual, pos) => {
+                 write!(
+                     f,
+                     "expected '{}' tag, not '{}' at {}",
+@@ -236,7 +315,7 @@
+             Error::MalformedEntityReference(pos) => {
+                 write!(f, "malformed entity reference at {}", pos)
+             }
+-            Error::UnknownEntityReference(ref name, pos) => {
++            Error::UnknownEntityReference(name, pos) => {
+                 write!(f, "unknown entity reference '{}' at {}", name, pos)
+             }
+             Error::EntityReferenceLoop(pos) => {
+@@ -245,7 +324,7 @@
+             Error::InvalidAttributeValue(pos) => {
+                 write!(f, "unescaped '<' found at {}", pos)
+             }
+-            Error::DuplicatedAttribute(ref name, pos) => {
++            Error::DuplicatedAttribute(name, pos) => {
+                 write!(f, "attribute '{}' at {} is already defined", name, pos)
+             }
+             Error::NoRootNode => {
+@@ -314,8 +393,19 @@
+     }
+ }
+ 
++impl<E> From<crate::xml::dom::ParseError> for Error<E> {
++    fn from(error: crate::xml::dom::ParseError) -> Self {
++        match error {
++            crate::xml::dom::ParseError::AllocationFailed => Self::AllocationFailed,
++            #[cfg(feature = "xmldsig")]
++            crate::xml::dom::ParseError::SharedExecution(error) => Self::SharedExecution(error),
++            _ => unreachable!("XML storage strategy returns only allocation/execution failures"),
++        }
++    }
++}
++
+ #[cfg(feature = "std")]
+-impl std::error::Error for Error {
++impl<E: fmt::Display + fmt::Debug> std::error::Error for Error<E> {
+     fn description(&self) -> &str {
+         "an XML parsing error"
+     }
+@@ -394,14 +484,14 @@
+     }
+ }
+ 
+-struct TempAttributeData<'input> {
++struct TempAttributeData<'input, S: Storage = Native> {
+     prefix: &'input str,
+     local: &'input str,
+-    value: StringStorage<'input>,
++    value: StringStorage<'input, S>,
+     range: Range<usize>,
+-    #[cfg(feature = "positions")]
++    #[cfg(feature = "xml-backend-roxmltree")]
+     qname_len: u16,
+-    #[cfg(feature = "positions")]
++    #[cfg(feature = "xml-backend-roxmltree")]
+     eq_len: u8,
+ }
+ 
+@@ -415,7 +505,7 @@
+     ///
+     /// # Examples
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// let doc = roxmltree::Document::parse("<e/>").unwrap();
+     /// assert_eq!(doc.descendants().count(), 2); // root node + `e` element node
+     /// ```
+@@ -431,14 +521,24 @@
+     ///
+     /// # Examples
+     ///
+-    /// ```
++    /// ```text,xml-sec-example
+     /// let opt = roxmltree::ParsingOptions::default();
+     /// let doc = roxmltree::Document::parse_with_options("<e/>", opt).unwrap();
+     /// assert_eq!(doc.descendants().count(), 2); // root node + `e` element node
+     /// ```
+     #[inline]
+     pub fn parse_with_options(text: &'input str, opt: ParsingOptions<'input>) -> Result<Self> {
+-        parse(text, opt)
++        parse(text, opt, Native)
++    }
++}
++
++impl<'input, S: Storage> Document<'input, S> {
++    pub(crate) fn parse_with_storage(
++        text: &'input str,
++        opt: ParsingOptions<'input>,
++        storage: S,
++    ) -> ScopedResult<Self, S> {
++        parse(text, opt, storage)
+     }
+ }
+ 
+@@ -506,7 +606,7 @@
+ 
+ impl LoopDetector {
+     #[inline]
+-    fn inc_depth(&mut self, stream: &Stream) -> Result<()> {
++    fn inc_depth<E>(&mut self, stream: &Stream) -> Result<(), E> {
+         if self.depth < 10 {
+             self.depth += 1;
+             Ok(())
+@@ -528,7 +628,7 @@
+     }
+ 
+     #[inline]
+-    fn inc_references(&mut self, stream: &Stream) -> Result<()> {
++    fn inc_references<E>(&mut self, stream: &Stream) -> Result<(), E> {
+         if self.depth == 0 {
+             // Allow infinite amount of references at zero depth.
+             Ok(())
+@@ -543,27 +643,34 @@
+     }
+ }
+ 
+-struct Context<'input> {
++struct Context<'input, S: Storage = Native> {
+     opt: ParsingOptions<'input>,
+     namespace_start_idx: usize,
+-    current_attributes: Vec<TempAttributeData<'input>>,
+-    awaiting_subtree: Vec<NodeId>,
+-    parent_prefixes: Vec<&'input str>,
+-    entities: Vec<Entity<'input>>,
+-    after_text: Vec<Cow<'input, str>>,
++    current_attributes: S::Values<TempAttributeData<'input, S>>,
++    awaiting_subtree: S::Values<NodeId>,
++    parent_prefixes: S::Values<&'input str>,
++    entities: S::Values<Entity<'input>>,
++    after_text: bool,
++    text_fragments: S::Values<StringStorage<'input, S>>,
+     parent_id: NodeId,
+     tag_name: TagNameSpan<'input>,
+     loop_detector: LoopDetector,
+-    doc: Document<'input>,
++    doc: Document<'input, S>,
++    storage: S,
++    failure: Option<Error<S::Text>>,
+ }
+ 
+-impl<'input> Context<'input> {
+-    fn append_node(&mut self, kind: NodeKind<'input>, range: Range<usize>) -> Result<NodeId> {
++impl<'input, S: Storage> Context<'input, S> {
++    fn append_node(
++        &mut self,
++        kind: NodeKind<'input, S>,
++        range: Range<usize>,
++    ) -> ScopedResult<NodeId, S> {
+         if self.doc.nodes.len() >= self.opt.nodes_limit as usize {
+             return Err(Error::NodesLimitReached);
+         }
+ 
+-        #[cfg(not(feature = "positions"))]
++        #[cfg(not(feature = "xml-backend-roxmltree"))]
+         let _ = range;
+ 
+         let new_child_id = NodeId::from(self.doc.nodes.len());
+@@ -575,22 +682,23 @@
+             next_subtree: None,
+             last_child: None,
+             kind,
+-            #[cfg(feature = "positions")]
++            #[cfg(feature = "xml-backend-roxmltree")]
+             range,
+-        });
++        })?;
+ 
+         let last_child_id = self.doc.nodes[self.parent_id.get_usize()].last_child;
+         self.doc.nodes[new_child_id.get_usize()].prev_sibling = last_child_id;
+         self.doc.nodes[self.parent_id.get_usize()].last_child = Some(new_child_id);
+ 
+-        for id in &self.awaiting_subtree {
++        self.storage.charge(self.awaiting_subtree.len())?;
++        for id in self.awaiting_subtree.iter() {
+             self.doc.nodes[id.get_usize()].next_subtree = Some(new_child_id);
+         }
+         self.awaiting_subtree.clear();
+ 
+         if !appending_element {
+             self.awaiting_subtree
+-                .push(NodeId::from(self.doc.nodes.len() - 1));
++                .push(NodeId::from(self.doc.nodes.len() - 1))?;
+         }
+ 
+         Ok(new_child_id)
+@@ -598,60 +706,95 @@
+ 
+     fn append_text(
+         &mut self,
+-        text: Cow<'input, str>,
++        text: StringStorage<'input, S>,
+         range: Range<usize>,
+-    ) -> Result<()> {
+-        if self.after_text.is_empty() {
+-            let text = match &text {
+-                Cow::Borrowed(text) => StringStorage::Borrowed(text),
+-                Cow::Owned(text) => StringStorage::new_owned(text.as_str()),
+-            };
+-
++    ) -> ScopedResult<(), S> {
++        if !self.after_text {
+             self.append_node(NodeKind::Text(text), range)?;
++            self.after_text = true;
++        } else {
++            self.text_fragments.push(text)?;
+         }
+-
+-        self.after_text.push(text);
+         Ok(())
+     }
+ 
+     #[cold]
+     #[inline(never)]
+-    fn merge_text(&mut self) {
+-        let node = &mut self.doc.nodes.last_mut().unwrap();
++    fn merge_text(&mut self) -> ScopedResult<(), S> {
++        let node = &mut self
++            .doc
++            .nodes
++            .last_mut()
++            .expect("after_text is set only after appending a text node");
+ 
+         let text = match &mut node.kind {
+             NodeKind::Text(text) => text,
+             _ => unreachable!(),
+         };
+ 
+-        *text = StringStorage::new_owned(&self.after_text.join(""));
++        self.storage.charge(self.text_fragments.len())?;
++        let additional = self
++            .text_fragments
++            .iter()
++            .try_fold(0usize, |length, part| length.checked_add(part.len()))
++            .expect("coalesced text length fits the bounded source layout");
++        let first = core::mem::replace(text, StringStorage::Borrowed(""));
++        let mut value = match first {
++            StringStorage::Owned(value) => {
++                let mut value = value;
++                self.storage.reserve_text(&mut value, additional)?;
++                value
++            }
++            StringStorage::Borrowed(first) => {
++                let capacity = first
++                    .len()
++                    .checked_add(additional)
++                    .expect("coalesced text length fits the bounded source layout");
++                let mut value = self.storage.text("")?;
++                self.storage.reserve_text(&mut value, capacity)?;
++                self.storage.append(&mut value, first)?;
++                value
++            }
++        };
++        for fragment in self.text_fragments.drain_all()? {
++            self.storage.append(&mut value, fragment.as_str())?;
++        }
++        *text = StringStorage::from_owned(value);
++        Ok(())
+     }
+ 
+     #[inline]
+-    fn reset_after_text(&mut self) {
+-        if self.after_text.is_empty() {
+-            return;
++    fn reset_after_text(&mut self) -> ScopedResult<(), S> {
++        if !self.after_text {
++            return Ok(());
+         }
+ 
+-        if self.after_text.len() > 1 {
+-            self.merge_text();
++        if !self.text_fragments.is_empty() {
++            self.merge_text()?;
+         }
+ 
+-        self.after_text.clear();
++        self.after_text = false;
++        Ok(())
+     }
+ }
+ 
+-fn parse<'input>(text: &'input str, opt: ParsingOptions<'input>) -> Result<Document<'input>> {
++fn parse<'input, S: Storage>(
++    text: &'input str,
++    opt: ParsingOptions<'input>,
++    storage: S,
++) -> ScopedResult<Document<'input, S>, S> {
+     // Trying to guess rough nodes and attributes amount.
++    storage.charge(text.len())?;
+     let nodes_capacity = memchr_iter(b'<', text.as_bytes()).count();
++    storage.charge(text.len())?;
+     let attributes_capacity = memchr_iter(b'=', text.as_bytes()).count();
+ 
+     // Init document.
+     let mut doc = Document {
+         text,
+-        nodes: Vec::with_capacity(nodes_capacity),
+-        attributes: Vec::with_capacity(attributes_capacity),
+-        namespaces: Namespaces::default(),
++        nodes: storage.values(nodes_capacity)?,
++        attributes: storage.values(attributes_capacity)?,
++        namespaces: Namespaces::new(storage)?,
+     };
+ 
+     // Add a root node.
+@@ -661,32 +804,48 @@
+         next_subtree: None,
+         last_child: None,
+         kind: NodeKind::Root,
+-        #[cfg(feature = "positions")]
++        #[cfg(feature = "xml-backend-roxmltree")]
+         range: 0..text.len(),
+-    });
++    })?;
+ 
+     doc.namespaces
+         .push_ns(Some(NS_XML_PREFIX), StringStorage::Borrowed(NS_XML_URI))?;
+ 
+     let allow_dtd = opt.allow_dtd;
+ 
++    let mut parent_prefixes = storage.values(1)?;
++    parent_prefixes.push("")?;
+     let mut ctx = Context {
+         opt,
+         namespace_start_idx: 1,
+-        current_attributes: Vec::with_capacity(16),
+-        entities: Vec::new(),
+-        awaiting_subtree: Vec::new(),
+-        parent_prefixes: vec![""],
+-        after_text: Vec::with_capacity(1),
++        current_attributes: storage.values(attributes_capacity.min(16))?,
++        entities: storage.values(0)?,
++        awaiting_subtree: storage.values(0)?,
++        parent_prefixes,
++        after_text: false,
++        text_fragments: storage.values(0)?,
+         parent_id: NodeId::new(0),
+         tag_name: TagNameSpan::new_null(),
+         loop_detector: LoopDetector::default(),
+         doc,
++        storage,
++        failure: None,
+     };
+ 
+-    tokenizer::parse(text, allow_dtd, &mut ctx)?;
++    // One lexical walk and the first fatal diagnostic's row/column walks are
++    // bounded by this actual input. Internal entity walks are admitted below.
++    storage.charge(text.len())?;
++    storage.charge(text.len())?;
++    storage.charge(text.len())?;
++    let parsed = tokenizer::parse(text, allow_dtd, &mut ctx);
++    if let Some(error) = ctx.failure.take() {
++        return Err(error);
++    }
++    parsed.map_err(|error| adopt_error(error, storage))?;
+ 
++    ctx.reset_after_text()?;
+     let mut doc = ctx.doc;
++    storage.charge(doc.nodes.len())?;
+     if !doc.root().children().any(|n| n.is_element()) {
+         return Err(Error::NoRootNode);
+     }
+@@ -695,34 +854,69 @@
+         return Err(Error::UnclosedRootNode);
+     }
+ 
+-    doc.nodes.shrink_to_fit();
+-    doc.attributes.shrink_to_fit();
+-    doc.namespaces.shrink_to_fit();
++    storage.finish_values(&mut doc.nodes);
++    storage.finish_values(&mut doc.attributes);
++    doc.namespaces.shrink_to_fit()?;
+ 
+     Ok(doc)
+ }
+ 
+-impl<'input> tokenizer::XmlEvents<'input> for Context<'input> {
++impl<'input, S: Storage> tokenizer::XmlEvents<'input> for Context<'input, S> {
+     #[inline(always)]
+     fn token(&mut self, token: tokenizer::Token<'input>) -> Result<()> {
++        if self.failure.is_some() {
++            return Err(Error::ProcessingStopped);
++        }
++        match self.process_token(token) {
++            Ok(()) => Ok(()),
++            Err(error) => {
++                if self.failure.is_none() {
++                    self.failure = Some(error);
++                }
++                Err(Error::ProcessingStopped)
++            }
++        }
++    }
++
++    fn resolve_entity(
++        &mut self,
++        pub_id: Option<&str>,
++        uri: &str,
++    ) -> core::result::Result<Option<&'input str>, String> {
++        match &mut self.opt.entity_resolver {
++            Some(entity_resolver) => entity_resolver(pub_id, uri),
++            None => Ok(None),
++        }
++    }
++}
++
++fn adopt_error<S: Storage>(error: Error, storage: S) -> Error<S::Text> {
++    match error.try_map_text(|text| storage.text(&text)) {
++        Ok(error) => error,
++        Err(error) => error.into(),
++    }
++}
++
++impl<'input, S: Storage> Context<'input, S> {
++    fn process_token(&mut self, token: tokenizer::Token<'input>) -> ScopedResult<(), S> {
+         match token {
+             tokenizer::Token::ProcessingInstruction(target, value, range) => {
+-                self.reset_after_text();
++                self.reset_after_text()?;
+                 let pi = NodeKind::PI(PI { target, value });
+                 self.append_node(pi, range)?;
+             }
+             tokenizer::Token::Comment(text, range) => {
+-                self.reset_after_text();
++                self.reset_after_text()?;
+                 self.append_node(NodeKind::Comment(StringStorage::Borrowed(text)), range)?;
+             }
+             tokenizer::Token::EntityDeclaration(name, definition) => {
+                 self.entities.push(Entity {
+                     name,
+                     value: definition,
+-                });
++                })?;
+             }
+             tokenizer::Token::ElementStart(prefix, local, start) => {
+-                self.reset_after_text();
++                self.reset_after_text()?;
+ 
+                 if prefix == XMLNS {
+                     let pos = self.doc.text_pos_at(start + 1);
+@@ -740,7 +934,7 @@
+                 process_attribute(range, qname_len, eq_len, prefix, local, value, self)?;
+             }
+             tokenizer::Token::ElementEnd(end, range) => {
+-                self.reset_after_text();
++                self.reset_after_text()?;
+                 process_element(end, range, self)?;
+             }
+             tokenizer::Token::Text(text, range) => {
+@@ -753,29 +947,30 @@
+ 
+         Ok(())
+     }
+-
+-    fn resolve_entity(&mut self, pub_id: Option<&str>, uri: &str) -> core::result::Result<Option<&'input str>, String> {
+-        match &mut self.opt.entity_resolver {
+-            Some(entity_resolver) => entity_resolver(pub_id, uri),
+-            None => Ok(None),
+-        }
+-    }
+-
+ }
+ 
+ #[allow(clippy::too_many_arguments)]
+-fn process_attribute<'input>(
++fn process_attribute<'input, S: Storage>(
+     range: Range<usize>,
+     qname_len: u16,
+     eq_len: u8,
+     prefix: &'input str,
+     local: &'input str,
+     value: StrSpan<'input>,
+-    ctx: &mut Context<'input>,
+-) -> Result<()> {
++    ctx: &mut Context<'input, S>,
++) -> ScopedResult<(), S> {
+     let value = normalize_attribute(value, ctx)?;
+ 
+     if prefix == XMLNS {
++        // Namespaces in XML 1.0 Third Edition §5, No Prefix Undeclaring:
++        // a prefixed namespace declaration's attribute value MUST NOT be empty.
++        // Default xmlns="" remains permitted by §6.2.
++        // https://www.w3.org/TR/2009/REC-xml-names-20091208/#nsc-NoPrefixUndecl
++        if value.as_str().is_empty() {
++            return Err(Error::EmptyPrefixedNamespace(
++                ctx.doc.text_pos_at(range.start),
++            ));
++        }
+         // The xmlns namespace MUST NOT be declared as the default namespace.
+         if value.as_str() == NS_XMLNS_URI {
+             let pos = ctx.doc.text_pos_at(range.start);
+@@ -804,10 +999,10 @@
+         if ctx
+             .doc
+             .namespaces
+-            .exists(ctx.namespace_start_idx, Some(local))
++            .exists(ctx.namespace_start_idx, Some(local))?
+         {
+             let pos = ctx.doc.text_pos_at(range.start);
+-            return Err(Error::DuplicatedNamespace(local.to_string(), pos));
++            return Err(Error::DuplicatedNamespace(ctx.storage.text(local)?, pos));
+         }
+ 
+         // Xml namespace should not be added to the namespaces.
+@@ -829,7 +1024,7 @@
+ 
+         ctx.doc.namespaces.push_ns(None, value)?;
+     } else {
+-        #[cfg(not(feature = "positions"))]
++        #[cfg(not(feature = "xml-backend-roxmltree"))]
+         let _ = (qname_len, eq_len);
+ 
+         ctx.current_attributes.push(TempAttributeData {
+@@ -837,21 +1032,21 @@
+             local,
+             value,
+             range,
+-            #[cfg(feature = "positions")]
++            #[cfg(feature = "xml-backend-roxmltree")]
+             qname_len,
+-            #[cfg(feature = "positions")]
++            #[cfg(feature = "xml-backend-roxmltree")]
+             eq_len,
+-        });
++        })?;
+     }
+ 
+     Ok(())
+ }
+ 
+-fn process_element<'input>(
++fn process_element<'input, S: Storage>(
+     end_token: tokenizer::ElementEnd<'input>,
+     token_range: Range<usize>,
+-    ctx: &mut Context<'input>,
+-) -> Result<()> {
++    ctx: &mut Context<'input, S>,
++) -> ScopedResult<(), S> {
+     if ctx.tag_name.name.is_empty() {
+         // May occur in XML like this:
+         // <!DOCTYPE test [ <!ENTITY p '</p>'> ]>
+@@ -866,7 +1061,7 @@
+         }
+     }
+ 
+-    let namespaces = ctx.resolve_namespaces();
++    let namespaces = ctx.resolve_namespaces()?;
+     ctx.namespace_start_idx = ctx.doc.namespaces.tree_order.len();
+ 
+     let attributes = resolve_attributes(namespaces, ctx)?;
+@@ -890,29 +1085,32 @@
+                 },
+                 ctx.tag_name.pos..token_range.end,
+             )?;
+-            ctx.awaiting_subtree.push(new_element_id);
++            ctx.awaiting_subtree.push(new_element_id)?;
+         }
+         tokenizer::ElementEnd::Close(prefix, local) => {
+             let parent_node = &mut ctx.doc.nodes[ctx.parent_id.get_usize()];
+             // should never panic as we start with the single prefix of the
+             // root node and always push another one when changing the parent
+-            let parent_prefix = *ctx.parent_prefixes.last().unwrap();
++            let parent_prefix = *ctx
++                .parent_prefixes
++                .last()
++                .expect("the document sentinel prefix is never removed");
+ 
+-            #[cfg(feature = "positions")]
++            #[cfg(feature = "xml-backend-roxmltree")]
+             {
+                 parent_node.range.end = token_range.end;
+             }
+ 
+-            if let NodeKind::Element { ref tag_name, .. } = parent_node.kind {
+-                if prefix != parent_prefix || local != tag_name.local_name {
+-                    return Err(Error::UnexpectedCloseTag(
+-                        gen_qname_string(parent_prefix, tag_name.local_name),
+-                        gen_qname_string(prefix, local),
+-                        ctx.doc.text_pos_at(token_range.start),
+-                    ));
+-                }
++            if let NodeKind::Element { ref tag_name, .. } = parent_node.kind
++                && (prefix != parent_prefix || local != tag_name.local_name)
++            {
++                return Err(Error::UnexpectedCloseTag(
++                    gen_qname_string(parent_prefix, tag_name.local_name, ctx.storage)?,
++                    gen_qname_string(prefix, local, ctx.storage)?,
++                    ctx.doc.text_pos_at(token_range.start),
++                ));
+             }
+-            ctx.awaiting_subtree.push(ctx.parent_id);
++            ctx.awaiting_subtree.push(ctx.parent_id)?;
+ 
+             if let Some(id) = parent_node.parent {
+                 ctx.parent_id = id;
+@@ -946,21 +1144,21 @@
+                 },
+                 ctx.tag_name.pos..token_range.end,
+             )?;
+-            ctx.parent_prefixes.push(ctx.tag_name.prefix);
++            ctx.parent_prefixes.push(ctx.tag_name.prefix)?;
+         }
+     }
+ 
+     Ok(())
+ }
+ 
+-impl Context<'_> {
+-    fn resolve_namespaces(&mut self) -> ShortRange {
++impl<S: Storage> Context<'_, S> {
++    fn resolve_namespaces(&mut self) -> ScopedResult<ShortRange, S> {
+         if let NodeKind::Element { ref namespaces, .. } =
+             self.doc.nodes[self.parent_id.get_usize()].kind
+         {
+             let parent_ns = *namespaces;
+             if self.namespace_start_idx == self.doc.namespaces.tree_order.len() {
+-                return parent_ns;
++                return Ok(parent_ns);
+             }
+ 
+             for i in parent_ns.to_urange() {
+@@ -970,17 +1168,20 @@
+                         .namespaces
+                         .get(self.doc.namespaces.tree_order[i])
+                         .name,
+-                ) {
+-                    self.doc.namespaces.push_ref(i);
++                )? {
++                    self.doc.namespaces.push_ref(i)?;
+                 }
+             }
+         }
+ 
+-        (self.namespace_start_idx..self.doc.namespaces.tree_order.len()).into()
++        Ok((self.namespace_start_idx..self.doc.namespaces.tree_order.len()).into())
+     }
+ }
+ 
+-fn resolve_attributes(namespaces: ShortRange, ctx: &mut Context) -> Result<ShortRange> {
++fn resolve_attributes<S: Storage>(
++    namespaces: ShortRange,
++    ctx: &mut Context<'_, S>,
++) -> ScopedResult<ShortRange, S> {
+     if ctx.current_attributes.is_empty() {
+         return Ok(ShortRange::new(0, 0));
+     }
+@@ -991,7 +1192,7 @@
+ 
+     let start_idx = ctx.doc.attributes.len();
+ 
+-    for attr in ctx.current_attributes.drain(..) {
++    for attr in ctx.current_attributes.drain_all()? {
+         let namespace_idx = if attr.prefix == NS_XML_PREFIX {
+             // The prefix 'xml' is by definition bound to the namespace name
+             // http://www.w3.org/XML/1998/namespace. This namespace is added
+@@ -1011,60 +1212,74 @@
+         };
+ 
+         // Check for duplicated attributes.
+-        if ctx.doc.attributes[start_idx..].iter().any(|attr| {
+-            attr.name.as_expanded_name(&ctx.doc) == attr_name.as_expanded_name(&ctx.doc)
+-        }) {
+-            let pos = ctx.doc.text_pos_at(attr.range.start);
+-            return Err(Error::DuplicatedAttribute(attr.local.to_string(), pos));
++        for previous in &ctx.doc.attributes[start_idx..] {
++            let previous = previous.name.as_expanded_name(&ctx.doc);
++            let current = attr_name.as_expanded_name(&ctx.doc);
++            if equal_text(previous.name(), current.name(), ctx.storage)?
++                && previous.namespace().is_some() == current.namespace().is_some()
++                && equal_text(
++                    previous.namespace().unwrap_or(""),
++                    current.namespace().unwrap_or(""),
++                    ctx.storage,
++                )?
++            {
++                let pos = ctx.doc.text_pos_at(attr.range.start);
++                return Err(Error::DuplicatedAttribute(
++                    ctx.storage.text(attr.local)?,
++                    pos,
++                ));
++            }
+         }
+ 
+         ctx.doc.attributes.push(AttributeData {
+             name: attr_name,
+             value: attr.value,
+-            #[cfg(feature = "positions")]
++            #[cfg(feature = "xml-backend-roxmltree")]
+             range: attr.range,
+-            #[cfg(feature = "positions")]
++            #[cfg(feature = "xml-backend-roxmltree")]
+             qname_len: attr.qname_len,
+-            #[cfg(feature = "positions")]
++            #[cfg(feature = "xml-backend-roxmltree")]
+             eq_len: attr.eq_len,
+-        });
++        })?;
+     }
+ 
+     Ok((start_idx..ctx.doc.attributes.len()).into())
+ }
+ 
+-fn process_text<'input>(
++fn process_text<'input, S: Storage>(
+     text: &'input str,
+     range: Range<usize>,
+-    ctx: &mut Context<'input>,
+-) -> Result<()> {
++    ctx: &mut Context<'input, S>,
++) -> ScopedResult<(), S> {
+     // Add text as is if it has only valid characters.
++    ctx.storage.charge(text.len())?;
+     if memchr2(b'&', b'\r', text.as_bytes()).is_none() {
+-        ctx.append_text(Cow::Borrowed(text), range)?;
++        ctx.append_text(StringStorage::Borrowed(text), range)?;
+         return Ok(());
+     }
+ 
+-    let mut text_buffer = TextBuffer::new();
++    let mut text_buffer = TextBuffer::new(ctx.storage)?;
++    ctx.storage.charge(text.len())?;
+     let mut is_as_is = false; // TODO: explain
+     let mut stream = Stream::from_substr(ctx.doc.text, range.clone());
+     while !stream.at_end() {
+-        match parse_next_chunk(&mut stream, &ctx.entities)? {
++        match parse_next_chunk(&mut stream, &ctx.entities, ctx.storage)? {
+             NextChunk::Byte(c) => {
+                 if is_as_is {
+-                    text_buffer.push_raw(c);
++                    text_buffer.push_raw(c)?;
+                     is_as_is = false;
+                 } else {
+-                    text_buffer.push_from_text(c, stream.at_end());
++                    text_buffer.push_from_text(c, stream.at_end())?;
+                 }
+             }
+             NextChunk::Char(c) => {
+                 for b in CharToBytes::new(c) {
+                     if ctx.loop_detector.depth > 0 {
+-                        text_buffer.push_from_text(b, stream.at_end());
++                        text_buffer.push_from_text(b, stream.at_end())?;
+                     } else {
+                         // Characters not from entity should be added as is.
+                         // Not sure why... At least `lxml` produces the same result.
+-                        text_buffer.push_raw(b);
++                        text_buffer.push_raw(b)?;
+                         is_as_is = true;
+                     }
+                 }
+@@ -1073,7 +1288,7 @@
+                 is_as_is = false;
+ 
+                 if !text_buffer.is_empty() {
+-                    ctx.append_text(Cow::Owned(text_buffer.finish()), range.clone())?;
++                    ctx.append_text(StringStorage::Owned(text_buffer.finish()?), range.clone())?;
+                 }
+ 
+                 ctx.loop_detector.inc_references(&stream)?;
+@@ -1088,7 +1303,9 @@
+                 let mut stream = Stream::from_substr(text, fragment.range());
+                 let prev_tag_name = ctx.tag_name;
+                 ctx.tag_name = TagNameSpan::new_null();
+-                tokenizer::parse_content(&mut stream, ctx)?;
++                ctx.storage.charge(fragment.range().len())?;
++                tokenizer::parse_content(&mut stream, ctx)
++                    .map_err(|error| adopt_error(error, ctx.storage))?;
+                 ctx.tag_name = prev_tag_name;
+                 text_buffer.clear();
+ 
+@@ -1098,7 +1315,7 @@
+     }
+ 
+     if !text_buffer.is_empty() {
+-        ctx.append_text(Cow::Owned(text_buffer.finish()), range)?;
++        ctx.append_text(StringStorage::Owned(text_buffer.finish()?), range)?;
+     }
+ 
+     Ok(())
+@@ -1106,26 +1323,27 @@
+ 
+ // While the whole purpose of CDATA is to indicate to an XML library that this text
+ // has to be stored as is, carriage return (`\r`) is still has to be replaced with `\n`.
+-fn process_cdata<'input>(
++fn process_cdata<'input, S: Storage>(
+     mut text: &'input str,
+     range: Range<usize>,
+-    ctx: &mut Context<'input>,
+-) -> Result<()> {
++    ctx: &mut Context<'input, S>,
++) -> ScopedResult<(), S> {
++    ctx.storage.charge(text.len())?;
+     let mut pos = memchr(b'\r', text.as_bytes());
+ 
+     // Add text as is if it has only valid characters.
+     if pos.is_none() {
+-        ctx.append_text(Cow::Borrowed(text), range)?;
++        ctx.append_text(StringStorage::Borrowed(text), range)?;
+         return Ok(());
+     }
+ 
+-    let mut buf = String::new();
++    let mut buf = ctx.storage.values(text.len())?;
+ 
+     while let Some(pos1) = pos {
+         let (line, rest) = text.split_at(pos1);
+ 
+-        buf.push_str(line);
+-        buf.push('\n');
++        buf.extend_copy(line.as_bytes())?;
++        buf.push(b'\n')?;
+ 
+         text = if rest.as_bytes().get(1) == Some(&b'\n') {
+             &rest[2..]
+@@ -1136,9 +1354,9 @@
+         pos = memchr(b'\r', text.as_bytes());
+     }
+ 
+-    buf.push_str(text);
++    buf.extend_copy(text.as_bytes())?;
+ 
+-    ctx.append_text(Cow::Owned(buf), range)?;
++    ctx.append_text(StringStorage::Owned(ctx.storage.finish_bytes(buf)?), range)?;
+     Ok(())
+ }
+ 
+@@ -1148,7 +1366,33 @@
+     Text(StrSpan<'a>),
+ }
+ 
+-fn parse_next_chunk<'a>(stream: &mut Stream<'a>, entities: &[Entity<'a>]) -> Result<NextChunk<'a>> {
++fn equal_text<S: Storage>(left: &str, right: &str, storage: S) -> ScopedResult<bool, S> {
++    storage.charge(1)?;
++    if left.len() != right.len() {
++        return Ok(false);
++    }
++    storage.charge(left.len())?;
++    Ok(left == right)
++}
++
++fn find_entity<'input, S: Storage>(
++    entities: &[Entity<'input>],
++    name: &str,
++    storage: S,
++) -> ScopedResult<Option<StrSpan<'input>>, S> {
++    for entity in entities {
++        if equal_text(entity.name, name, storage)? {
++            return Ok(Some(entity.value));
++        }
++    }
++    Ok(None)
++}
++
++fn parse_next_chunk<'a, S: Storage>(
++    stream: &mut Stream<'a>,
++    entities: &[Entity<'a>],
++    storage: S,
++) -> ScopedResult<NextChunk<'a>, S> {
+     debug_assert!(!stream.at_end());
+ 
+     // Safe, because we already checked that stream is not at the end.
+@@ -1160,13 +1404,14 @@
+         let start = stream.pos();
+         match stream.consume_reference() {
+             Some(Reference::Char(ch)) => Ok(NextChunk::Char(ch)),
+-            Some(Reference::Entity(name)) => entities
+-                .iter()
+-                .find(|e| e.name == name)
+-                .map(|e| NextChunk::Text(e.value))
++            Some(Reference::Entity(name)) => find_entity(entities, name, storage)?
++                .map(NextChunk::Text)
+                 .ok_or_else(|| {
+                     let pos = stream.gen_text_pos_from(start);
+-                    Error::UnknownEntityReference(name.into(), pos)
++                    match storage.text(name) {
++                        Ok(name) => Error::UnknownEntityReference(name, pos),
++                        Err(error) => error.into(),
++                    }
+                 }),
+             None => {
+                 let pos = stream.gen_text_pos_from(start);
+@@ -1180,22 +1425,31 @@
+ }
+ 
+ // https://www.w3.org/TR/REC-xml/#AVNormalize
+-fn normalize_attribute<'input>(
++fn normalize_attribute<'input, S: Storage>(
+     text: StrSpan<'input>,
+-    ctx: &mut Context<'input>,
+-) -> Result<StringStorage<'input>> {
++    ctx: &mut Context<'input, S>,
++) -> ScopedResult<StringStorage<'input, S>, S> {
+     // We assume that `&` indicates an entity or a character reference.
+     // But in rare cases it can be just an another character.
+-    if memchr2(b'&', b'\t', text.as_str().as_bytes()).is_some() || memchr2(b'\n', b'\r', text.as_str().as_bytes()).is_some() {
+-        let mut text_buffer = TextBuffer::new();
++    ctx.storage.charge(text.as_str().len())?;
++    ctx.storage.charge(text.as_str().len())?;
++    if memchr2(b'&', b'\t', text.as_str().as_bytes()).is_some()
++        || memchr2(b'\n', b'\r', text.as_str().as_bytes()).is_some()
++    {
++        let mut text_buffer = TextBuffer::new(ctx.storage)?;
+         _normalize_attribute(text, &mut text_buffer, ctx)?;
+-        Ok(StringStorage::new_owned(&text_buffer.finish()))
++        Ok(StringStorage::from_owned(text_buffer.finish()?))
+     } else {
+         Ok(StringStorage::Borrowed(text.as_str()))
+     }
+ }
+ 
+-fn _normalize_attribute(text: StrSpan, buffer: &mut TextBuffer, ctx: &mut Context) -> Result<()> {
++fn _normalize_attribute<S: Storage>(
++    text: StrSpan,
++    buffer: &mut TextBuffer<S>,
++    ctx: &mut Context<'_, S>,
++) -> ScopedResult<(), S> {
++    ctx.storage.charge(text.as_str().len())?;
+     let mut stream = Stream::from_substr(ctx.doc.text, text.range());
+     while !stream.at_end() {
+         // Safe, because we already checked that the stream is not at the end.
+@@ -1203,7 +1457,7 @@
+ 
+         if c != b'&' {
+             stream.advance(1);
+-            buffer.push_from_attr(c, stream.curr_byte().ok());
++            buffer.push_from_attr(c, stream.curr_byte().ok())?;
+             continue;
+         }
+ 
+@@ -1221,24 +1475,24 @@
+                             ));
+                         }
+ 
+-                        buffer.push_from_attr(b, None);
++                        buffer.push_from_attr(b, None)?;
+                     } else {
+                         // Characters not from entity should be added as is.
+                         // Not sure why... At least `lxml` produces the same results.
+-                        buffer.push_raw(b);
++                        buffer.push_raw(b)?;
+                     }
+                 }
+             }
+-            Some(Reference::Entity(name)) => match ctx.entities.iter().find(|e| e.name == name) {
+-                Some(entity) => {
++            Some(Reference::Entity(name)) => match find_entity(&ctx.entities, name, ctx.storage)? {
++                Some(value) => {
+                     ctx.loop_detector.inc_references(&stream)?;
+                     ctx.loop_detector.inc_depth(&stream)?;
+-                    _normalize_attribute(entity.value, buffer, ctx)?;
++                    _normalize_attribute(value, buffer, ctx)?;
+                     ctx.loop_detector.dec_depth();
+                 }
+                 None => {
+                     let pos = stream.gen_text_pos_from(start);
+-                    return Err(Error::UnknownEntityReference(name.into(), pos));
++                    return Err(Error::UnknownEntityReference(ctx.storage.text(name)?, pos));
+                 }
+             },
+             None => {
+@@ -1251,12 +1505,12 @@
+     Ok(())
+ }
+ 
+-fn get_ns_idx_by_prefix(
++fn get_ns_idx_by_prefix<S: Storage>(
+     namespaces: ShortRange,
+     prefix_pos: usize,
+     prefix: &str,
+-    doc: &Document<'_>,
+-) -> Result<Option<NamespaceIdx>> {
++    doc: &Document<'_, S>,
++) -> ScopedResult<Option<NamespaceIdx>, S> {
+     // Prefix CAN be empty when the default namespace was defined.
+     //
+     // Example:
+@@ -1267,12 +1521,20 @@
+         Some(prefix)
+     };
+ 
+-    let idx = doc.namespaces.tree_order[namespaces.to_urange()]
+-        .iter()
+-        .find(|idx| doc.namespaces.get(**idx).name == prefix_opt);
++    let mut idx = None;
++    for candidate in &doc.namespaces.tree_order[namespaces.to_urange()] {
++        let name = doc.namespaces.get(*candidate).name;
++        doc.namespaces.storage.charge(1)?;
++        if name.is_some() == prefix_opt.is_some()
++            && equal_text(name.unwrap_or(""), prefix, doc.namespaces.storage)?
++        {
++            idx = Some(*candidate);
++            break;
++        }
++    }
+ 
+     match idx {
+-        Some(idx) => Ok(Some(*idx)),
++        Some(idx) => Ok(Some(idx)),
+         None => {
+             if !prefix.is_empty() {
+                 // If an URI was not found and prefix IS NOT empty than
+@@ -1281,7 +1543,10 @@
+                 // Example:
+                 // <e random:a='b'/>
+                 let pos = doc.text_pos_at(prefix_pos);
+-                Err(Error::UnknownNamespace(prefix.to_string(), pos))
++                Err(Error::UnknownNamespace(
++                    doc.namespaces.storage.text(prefix)?,
++                    pos,
++                ))
+             } else {
+                 // If an URI was not found and prefix IS empty than
+                 // an element or an attribute doesn't have a namespace.
+@@ -1294,11 +1559,14 @@
+     }
+ }
+ 
+-fn gen_qname_string(prefix: &str, local: &str) -> String {
++fn gen_qname_string<S: Storage>(prefix: &str, local: &str, storage: S) -> ScopedResult<S::Text, S> {
+     if prefix.is_empty() {
+-        local.to_string()
++        Ok(storage.text(local)?)
+     } else {
+-        alloc::format!("{}:{}", prefix, local)
++        let mut name = storage.text(prefix)?;
++        storage.append(&mut name, ":")?;
++        storage.append(&mut name, local)?;
++        Ok(name)
+     }
+ }
+ 
+@@ -1338,27 +1606,29 @@
+     }
+ }
+ 
+-struct TextBuffer {
+-    buffer: Vec<u8>,
++struct TextBuffer<S: Storage = Native> {
++    buffer: S::Values<u8>,
++    storage: S,
+ }
+ 
+-impl TextBuffer {
++impl<S: Storage> TextBuffer<S> {
+     #[inline]
+-    fn new() -> Self {
+-        TextBuffer {
+-            buffer: Vec::with_capacity(32),
+-        }
++    fn new(storage: S) -> ScopedResult<Self, S> {
++        Ok(TextBuffer {
++            buffer: storage.values(32)?,
++            storage,
++        })
+     }
+ 
+     #[inline]
+-    fn push_raw(&mut self, c: u8) {
+-        self.buffer.push(c);
++    fn push_raw(&mut self, c: u8) -> ScopedResult<(), S> {
++        Ok(self.buffer.push(c)?)
+     }
+ 
+-    fn push_from_attr(&mut self, mut current: u8, next: Option<u8>) {
++    fn push_from_attr(&mut self, mut current: u8, next: Option<u8>) -> ScopedResult<(), S> {
+         // \r in \r\n should be ignored.
+         if current == b'\r' && next == Some(b'\n') {
+-            return;
++            return Ok(());
+         }
+ 
+         // \n, \r and \t should be converted into spaces.
+@@ -1367,27 +1637,28 @@
+             _ => current,
+         };
+ 
+-        self.buffer.push(current);
++        Ok(self.buffer.push(current)?)
+     }
+ 
+     // Translate \r\n and any \r that is not followed by \n into a single \n character.
+     //
+     // https://www.w3.org/TR/xml/#sec-line-ends
+-    fn push_from_text(&mut self, c: u8, at_end: bool) {
++    fn push_from_text(&mut self, c: u8, at_end: bool) -> ScopedResult<(), S> {
+         if self.buffer.last() == Some(&b'\r') {
+             let idx = self.buffer.len() - 1;
+             self.buffer[idx] = b'\n';
+ 
+             if at_end && c == b'\r' {
+-                self.buffer.push(b'\n');
++                self.buffer.push(b'\n')?;
+             } else if c != b'\n' {
+-                self.buffer.push(c);
++                self.buffer.push(c)?;
+             }
+         } else if at_end && c == b'\r' {
+-            self.buffer.push(b'\n');
++            self.buffer.push(b'\n')?;
+         } else {
+-            self.buffer.push(c);
++            self.buffer.push(c)?;
+         }
++        Ok(())
+     }
+ 
+     #[inline]
+@@ -1401,8 +1672,8 @@
+     }
+ 
+     #[inline]
+-    fn finish(&mut self) -> String {
+-        // `unwrap` is safe, because buffer must contain a valid UTF-8 string.
+-        String::from_utf8(take(&mut self.buffer)).unwrap()
++    fn finish(&mut self) -> ScopedResult<S::Text, S> {
++        let bytes = core::mem::replace(&mut self.buffer, self.storage.values(0)?);
++        Ok(self.storage.finish_bytes(bytes)?)
+     }
+ }
+--- a/roxmltree/src/tokenizer.rs
++++ b/roxmltree/src/tokenizer.rs
+@@ -1,10 +1,10 @@
++use alloc::string::String;
+ use core::ops::Range;
+ use core::str;
+-use alloc::string::String;
+ 
+ use memchr::memchr2;
+ 
+-use crate::{Error, TextPos};
++use crate::parser_roxmltree::{Error, TextPos};
+ 
+ type Result<T> = core::result::Result<T, Error>;
+ 
+@@ -128,7 +128,10 @@
+     if s.as_bytes().is_ascii() {
+         for (i, b) in s.as_bytes().iter().enumerate() {
+             if !b.is_xml_char() {
+-                return Err(Error::NonXmlChar(*b as char, stream.gen_text_pos_from(value_start + i)));
++                return Err(Error::NonXmlChar(
++                    *b as char,
++                    stream.gen_text_pos_from(value_start + i),
++                ));
+             }
+         }
+ 
+@@ -138,13 +141,15 @@
+     }
+ }
+ 
+-
+ #[cold]
+ #[inline(never)]
+ fn is_xml_str_unicode(s: &str, value_start: usize, stream: &mut Stream<'_>) -> Result<()> {
+     for (i, ch) in s.char_indices() {
+         if !ch.is_xml_char() {
+-            return Err(Error::NonXmlChar(ch, stream.gen_text_pos_from(value_start + i)));
++            return Err(Error::NonXmlChar(
++                ch,
++                stream.gen_text_pos_from(value_start + i),
++            ));
+         }
+     }
+ 
+@@ -209,7 +214,14 @@
+     ElementStart(&'input str, &'input str, usize),
+ 
+     // ns:attr="value"
+-    Attribute(Range<usize>, u16, u8, &'input str, &'input str, StrSpan<'input>),
++    Attribute(
++        Range<usize>,
++        u16,
++        u8,
++        &'input str,
++        &'input str,
++        StrSpan<'input>,
++    ),
+ 
+     ElementEnd(ElementEnd<'input>, Range<usize>),
+ 
+@@ -236,7 +248,13 @@
+ pub trait XmlEvents<'input> {
+     fn token(&mut self, token: Token<'input>) -> Result<()>;
+ 
+-    fn resolve_entity(&mut self, _pub_id: Option<&str>, _uri: &str) -> core::result::Result<Option<&'input str>, String> { Ok(None) }
++    fn resolve_entity(
++        &mut self,
++        _pub_id: Option<&str>,
++        _uri: &str,
++    ) -> core::result::Result<Option<&'input str>, String> {
++        Ok(None)
++    }
+ }
+ 
+ // document ::= prolog element Misc*
+@@ -301,7 +319,7 @@
+     }
+ 
+     if !s.starts_with(b"<?xml ") {
+-        return Ok(())
++        return Ok(());
+     }
+ 
+     fn consume_spaces(s: &mut Stream) -> Result<()> {
+@@ -345,7 +363,10 @@
+ }
+ 
+ // '<!--' ((Char - '-') | ('-' (Char - '-')))* '-->'
+-fn parse_comment<'input>(s: &mut Stream<'input>, events: &mut impl XmlEvents<'input>) -> Result<()> {
++fn parse_comment<'input>(
++    s: &mut Stream<'input>,
++    events: &mut impl XmlEvents<'input>,
++) -> Result<()> {
+     let start = s.pos();
+     s.advance(4);
+     let text = s.consume_chars(|s, c| !(c == '-' && s.starts_with(b"-->")))?;
+@@ -390,7 +411,10 @@
+     Ok(())
+ }
+ 
+-fn parse_doctype<'input>(s: &mut Stream<'input>, events: &mut impl XmlEvents<'input>) -> Result<()> {
++fn parse_doctype<'input>(
++    s: &mut Stream<'input>,
++    events: &mut impl XmlEvents<'input>,
++) -> Result<()> {
+     let start = s.pos();
+     parse_doctype_start(s)?;
+     s.skip_spaces();
+@@ -461,7 +485,9 @@
+ }
+ 
+ // ExternalID ::= 'SYSTEM' S SystemLiteral | 'PUBLIC' S PubidLiteral S SystemLiteral
+-fn parse_external_id<'input>(s: &mut Stream<'input>) -> Result<Option<(Option<&'input str>, &'input str)>> {
++fn parse_external_id<'input>(
++    s: &mut Stream<'input>,
++) -> Result<Option<(Option<&'input str>, &'input str)>> {
+     let v = if s.starts_with(b"SYSTEM") || s.starts_with(b"PUBLIC") {
+         let start = s.pos();
+         s.advance(6);
+@@ -550,7 +576,9 @@
+                     }
+                 }
+ 
+-                let value = events.resolve_entity(pub_id, uri).map_err(|msg| Error::EntityResolver(s.gen_text_pos(), msg))?;
++                let value = events
++                    .resolve_entity(pub_id, uri)
++                    .map_err(|msg| Error::EntityResolver(s.gen_text_pos(), msg))?;
+ 
+                 match value {
+                     Some(value) => {
+@@ -581,7 +609,10 @@
+ 
+ // element ::= EmptyElemTag | STag content ETag
+ // '<' Name (S Attribute)* S? '>'
+-fn parse_element<'input>(s: &mut Stream<'input>, events: &mut impl XmlEvents<'input>) -> Result<()> {
++fn parse_element<'input>(
++    s: &mut Stream<'input>,
++    events: &mut impl XmlEvents<'input>,
++) -> Result<()> {
+     let start = s.pos();
+     s.advance(1); // <
+     let (prefix, local) = s.consume_qname()?;
+@@ -630,7 +661,14 @@
+                 is_xml_str(value.as_str(), value_start, s)?;
+                 s.consume_byte(quote)?;
+                 let end = s.pos();
+-                events.token(Token::Attribute(start..end, qname_len, eq_len, prefix, local, value))?;
++                events.token(Token::Attribute(
++                    start..end,
++                    qname_len,
++                    eq_len,
++                    prefix,
++                    local,
++                    value,
++                ))?;
+             }
+         }
+     }
+@@ -857,7 +895,7 @@
+             let pos = self.gen_text_pos();
+ 
+             // Assume that all input `text` are valid UTF-8 strings, so unwrap is safe.
+-            let expected = str::from_utf8(text).unwrap();
++            let expected = str::from_utf8(text).expect("token expectations are static UTF-8");
+ 
+             return Err(Error::InvalidString(expected, pos));
+         }
+@@ -977,8 +1015,7 @@
+ 
+         let reference = if self.try_consume_byte(b'#') {
+             let (value, radix) = if self.try_consume_byte(b'x') {
+-                let value =
+-                    self.consume_bytes(|c| c.is_ascii_hexdigit());
++                let value = self.consume_bytes(|c| c.is_ascii_hexdigit());
+                 (value, 16)
+             } else {
+                 let value = self.consume_bytes(|c| c.is_ascii_digit());
+--- a/roxmltree/src/tokenizer_tests.rs
++++ b/roxmltree/src/tokenizer_tests.rs
+@@ -2,27 +2,36 @@
+ use std::string::{String, ToString};
+ use std::vec::Vec;
+ 
+-use crate::tokenizer as xml;
++use crate::parser_roxmltree::tokenizer as xml;
+ 
+ #[test]
+ fn text_pos_1() {
+     let mut s = xml::Stream::new("text");
+     s.advance(2);
+-    assert_eq!(s.gen_text_pos(), crate::TextPos::new(1, 3));
++    assert_eq!(
++        s.gen_text_pos(),
++        crate::parser_roxmltree::TextPos::new(1, 3)
++    );
+ }
+ 
+ #[test]
+ fn text_pos_2() {
+     let mut s = xml::Stream::new("text\ntext");
+     s.advance(6);
+-    assert_eq!(s.gen_text_pos(), crate::TextPos::new(2, 2));
++    assert_eq!(
++        s.gen_text_pos(),
++        crate::parser_roxmltree::TextPos::new(2, 2)
++    );
+ }
+ 
+ #[test]
+ fn text_pos_3() {
+     let mut s = xml::Stream::new("текст\nтекст");
+     s.advance(15);
+-    assert_eq!(s.gen_text_pos(), crate::TextPos::new(2, 3));
++    assert_eq!(
++        s.gen_text_pos(),
++        crate::parser_roxmltree::TextPos::new(2, 3)
++    );
+ }
+ 
+ #[test]
+@@ -57,7 +66,6 @@
+     Empty,
+ }
+ 
+-#[macro_export]
+ macro_rules! test {
+     ($name:ident, $text:expr, $($token:expr),*) => (
+         #[test]
+@@ -78,7 +86,7 @@
+ }
+ 
+ impl<'a> xml::XmlEvents<'a> for EventsCollector<'a> {
+-    fn token(&mut self, token: xml::Token<'a>) -> Result<(), crate::Error> {
++    fn token(&mut self, token: xml::Token<'a>) -> Result<(), crate::parser_roxmltree::Error> {
+         let t = match token {
+             xml::Token::ProcessingInstruction(target, content, range) => {
+                 Token::PI(target, content, range)

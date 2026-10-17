@@ -1,7 +1,7 @@
 //! Continuations over the original verified document and operation state.
 
 use super::*;
-use structured_asn1::memory::{MemoryError, OwnedMap, OwnedVec, Work};
+use structured_asn1::memory::{MemoryError, OwnedMap, OwnedText, OwnedVec, Work};
 
 mod hash_uses;
 pub use hash_uses::*;
@@ -24,7 +24,6 @@ pub struct VerifiedSession<'view, 'scope, 'inputs, W: Work> {
     operations: OwnedVec<RetainedOperation<'scope, 'inputs, W>, W>,
     resolver: UriReferenceResolver<'view>,
     work: &'scope W,
-    replays: RefCell<OwnedVec<ReplayRecord, W>>,
     replay_active: Cell<bool>,
 }
 
@@ -54,7 +53,6 @@ pub fn with_verified_request<'inputs, W: Work, R>(
                 operations,
                 resolver,
                 work,
-                replays: RefCell::new(work.vector()),
                 replay_active: Cell::new(false),
             })
         },
@@ -168,23 +166,26 @@ pub enum ReferenceResolution<'a> {
 
 enum LexicalValue<'a, W: Work> {
     Borrowed(&'a str),
-    Joined(OwnedVec<u8, W>),
+    Joined(OwnedText<W>),
 }
 impl<W: Work> LexicalValue<'_, W> {
     fn as_str(&self) -> &str {
         match self {
             Self::Borrowed(value) => value,
-            // Every appended fragment came from this document's UTF-8 semantic text.
-            Self::Joined(value) => std::str::from_utf8(value).expect("semantic XML text is UTF-8"),
+            // Appending original semantic str fragments preserves UTF-8. This
+            // view must not perform another unadmitted full-prefix validation.
+            Self::Joined(value) => value.as_str(),
         }
     }
 }
 
 /// A selected signature, bound to this request rather than an aggregate boolean.
-pub struct SelectedSignature<'session, 'view, 'scope, 'inputs, W: Work> {
+pub struct SelectedSignature<'session, 'view, 'scope, 'inputs, W: Work, Q: Work = W> {
     session: &'session VerifiedSession<'view, 'scope, 'inputs, W>,
     index: usize,
-    results: OwnedMap<NodeIdentity, (ReferenceSet, usize), W>,
+    work: &'session Q,
+    results: OwnedMap<NodeIdentity, (ReferenceSet, usize), Q>,
+    replays: RefCell<OwnedVec<ReplayRecord, Q>>,
 }
 
 impl<'view, 'scope, 'inputs, W: Work> VerifiedSession<'view, 'scope, 'inputs, W> {
@@ -210,16 +211,44 @@ impl<'view, 'scope, 'inputs, W: Work> VerifiedSession<'view, 'scope, 'inputs, W>
         &self,
         identity: NodeIdentity,
     ) -> Result<SelectedSignature<'_, 'view, 'scope, 'inputs, W>, DsigError> {
-        let index = self.authenticated_signature_in(identity, self.work)?;
+        self.select_signature_in(identity, self.work)
+    }
+
+    /// Continue an original authenticated signature with a separate current
+    /// execution. Query scratch cannot escape the callback; the document,
+    /// provider, policy, authentication and retained storage remain original.
+    /// Selection, inspection, resolution and transform replay spend `work`;
+    /// the original compiled policy's cumulative allowances are not reset.
+    /// Use `select_signature` instead to retain producer-funded execution.
+    pub fn with_query<Q: Work, R, E>(
+        &self,
+        identity: NodeIdentity,
+        work: &Q,
+        visitor: impl for<'query> FnOnce(
+            SelectedSignature<'query, 'view, 'scope, 'inputs, W, Q>,
+        ) -> Result<R, E>,
+    ) -> Result<R, CatalogueError<E>> {
+        let selected = self
+            .select_signature_in(identity, work)
+            .map_err(CatalogueError::Processing)?;
+        visitor(selected).map_err(CatalogueError::Visitor)
+    }
+
+    fn select_signature_in<'query, Q: Work>(
+        &'query self,
+        identity: NodeIdentity,
+        work: &'query Q,
+    ) -> Result<SelectedSignature<'query, 'view, 'scope, 'inputs, W, Q>, DsigError> {
+        let index = self.authenticated_signature_in(identity, work)?;
         let entry = &self.evidence.signatures()[index];
-        let mut results = self.work.map();
+        let mut results = work.map();
         if let Ok(result) = &entry.result {
             for (set, entries) in [
                 (ReferenceSet::SignedInfo, &result.signed_info_references),
                 (ReferenceSet::Manifest, &result.manifest_references),
             ] {
                 for (ordinal, reference) in entries.iter().enumerate() {
-                    self.work.charge_work(1)?;
+                    work.charge_work(1)?;
                     if let Some(node) = reference.reference_identity
                         && results.try_insert(node, (set, ordinal))?.is_some()
                     {
@@ -233,7 +262,9 @@ impl<'view, 'scope, 'inputs, W: Work> VerifiedSession<'view, 'scope, 'inputs, W>
         Ok(SelectedSignature {
             session: self,
             index,
+            work,
             results,
+            replays: RefCell::new(work.vector()),
         })
     }
 
@@ -293,8 +324,8 @@ impl<'view, 'scope, 'inputs, W: Work> VerifiedSession<'view, 'scope, 'inputs, W>
     }
 }
 
-impl<'session, 'view, 'scope, 'inputs, W: Work>
-    SelectedSignature<'session, 'view, 'scope, 'inputs, W>
+impl<'session, 'view, 'scope, 'inputs, W: Work, Q: Work>
+    SelectedSignature<'session, 'view, 'scope, 'inputs, W, Q>
 {
     fn operation(
         &self,
@@ -313,7 +344,7 @@ impl<'session, 'view, 'scope, 'inputs, W: Work>
     fn authenticates_element(&self, node: Node<'_, '_>) -> Result<bool, DsigError> {
         let signature = self.signature()?;
         for ancestor in node.ancestors() {
-            self.session.work.charge_work(1)?;
+            self.work.charge_work(1)?;
             if ancestor.has_tag_name((XMLDSIG_NS, "SignedInfo"))
                 && ancestor.parent() == Some(signature)
             {
@@ -337,7 +368,7 @@ impl<'session, 'view, 'scope, 'inputs, W: Work>
         property: NodeIdentity,
         source: LexicalSource<'_>,
     ) -> Result<ReferenceResolution<'_>, DsigError> {
-        self.session.work.charge_work(1)?;
+        self.work.charge_work(1)?;
         self.operation().validate_document_view(self.session.view)?;
         let node = self.session.view.resolve_node(property)?;
         if !node.is_element() {
@@ -361,7 +392,7 @@ impl<'session, 'view, 'scope, 'inputs, W: Work>
                         .checked_add(attribute.namespace().map_or(0, str::len))
                         .and_then(|n| n.checked_add(1))
                         .ok_or(MemoryError::WorkExceeded)?;
-                    self.session.work.charge_work(
+                    self.work.charge_work(
                         u64::try_from(bytes).map_err(|_| MemoryError::WorkExceeded)?,
                     )?;
                     if attribute.name() == local_name && attribute.namespace() == namespace {
@@ -377,7 +408,7 @@ impl<'session, 'view, 'scope, 'inputs, W: Work>
             LexicalSource::SimpleContent => {
                 let mut value = LexicalValue::Borrowed("");
                 for child in node.children() {
-                    self.session.work.charge_work(1)?;
+                    self.work.charge_work(1)?;
                     if child.is_element() {
                         return Ok(ReferenceResolution::Malformed);
                     }
@@ -387,22 +418,18 @@ impl<'session, 'view, 'scope, 'inputs, W: Work>
                     match &mut value {
                         LexicalValue::Borrowed(first) if first.is_empty() => *first = text,
                         LexicalValue::Borrowed(first) => {
-                            let mut joined = self.session.work.vector();
-                            joined.try_extend_from_slice(first.as_bytes())?;
-                            joined.try_extend_from_slice(text.as_bytes())?;
+                            let mut joined = OwnedText::try_from_str(first, self.work)?;
+                            joined.try_push_str(text)?;
                             value = LexicalValue::Joined(joined);
                         }
-                        LexicalValue::Joined(joined) => {
-                            joined.try_extend_from_slice(text.as_bytes())?
-                        }
+                        LexicalValue::Joined(joined) => joined.try_push_str(text)?,
                     }
                 }
                 value
             }
         };
         let uri = value.as_str();
-        self.session
-            .work
+        self.work
             .charge_work(u64::try_from(uri.len()).map_err(|_| MemoryError::WorkExceeded)?)?;
         if !self.session.context.policy.uris.references.allows(uri) {
             return Err(crate::policy::PolicyViolation::Uri {
@@ -412,24 +439,24 @@ impl<'session, 'view, 'scope, 'inputs, W: Work>
             .into());
         }
         if !uri.is_empty() && !uri.starts_with('#') {
-            crate::c14n::xml_base::resolve_uri_from_node_with_budget(
+            crate::c14n::xml_base::resolve_uri_from_node_in(
                 node,
                 uri,
+                None,
                 self.session.budgets.transforms.xml_base_resolution(),
+                &crate::c14n::scratch::Accounted(self.work),
             )
-            .map_err(super::super::uri::map_xml_base_resolution_error)
+            .map_err(super::super::uri::map_xml_base_execution_error)
             .map_err(|error| {
                 DsigError::Reference(ReferenceProcessingError::UriDereference(error))
             })?;
             return Ok(ReferenceResolution::Detached);
         }
-        let target = self
-            .session
-            .resolver
-            .node_for_same_document_reference_with_budget(
-                uri,
-                Some(self.session.budgets.transforms.node_set_materialization()),
-            );
+        let target = self.session.resolver.node_for_same_document_reference_in(
+            uri,
+            Some(self.session.budgets.transforms.node_set_materialization()),
+            &crate::c14n::scratch::Accounted(self.work),
+        );
         let target = match target {
             Ok(target) => target,
             Err(TransformError::UnsupportedUri(_)) => return Ok(ReferenceResolution::Unsupported),
@@ -469,7 +496,7 @@ impl<'session, 'view, 'scope, 'inputs, W: Work>
             return Ok(None);
         }
         for ancestor in parent.ancestors() {
-            self.session.work.charge_work(1)?;
+            self.work.charge_work(1)?;
             if self
                 .operation()
                 .is_authenticated(view.node_identity(ancestor))
@@ -483,7 +510,7 @@ impl<'session, 'view, 'scope, 'inputs, W: Work>
         &self,
         reference: NodeIdentity,
     ) -> Result<Option<AuthenticatedReference<'_>>, DsigError> {
-        self.session.work.charge_work(1)?;
+        self.work.charge_work(1)?;
         self.operation().validate_document_view(self.session.view)?;
         let node = self.session.view.resolve_node(reference)?;
         let Some(parent) = self.parent(node)? else {
@@ -498,7 +525,7 @@ impl<'session, 'view, 'scope, 'inputs, W: Work>
         parent: ReferenceParent,
     ) -> Result<AuthenticatedReference<'a>, DsigError> {
         let reference = self.session.view.node_identity(node);
-        let result = match self.results.get(&reference, self.session.work)? {
+        let result = match self.results.get(&reference, self.work)? {
             Some((set, index)) => self.session.evidence.signatures()[self.index]
                 .result
                 .as_ref()
@@ -512,7 +539,7 @@ impl<'session, 'view, 'scope, 'inputs, W: Work>
         // Admit both URI/Type attribute lookups before performing them. Their
         // fixed names bound each comparison; values themselves remain borrowed.
         for _ in node.attributes() {
-            self.session.work.charge_work(9)?;
+            self.work.charge_work(9)?;
         }
         Ok(AuthenticatedReference {
             identity: reference,
@@ -571,8 +598,7 @@ impl<'session, 'view, 'scope, 'inputs, W: Work>
             .validate_document_view(self.session.view)
             .map_err(|error| CatalogueError::Processing(error.into()))?;
         for node in self.session.view.document().descendants() {
-            self.session
-                .work
+            self.work
                 .charge_work(1)
                 .map_err(|error| CatalogueError::Processing(error.into()))?;
             if node.has_tag_name((XMLDSIG_NS, "Manifest"))
@@ -583,8 +609,7 @@ impl<'session, 'view, 'scope, 'inputs, W: Work>
                 let mut count = 0;
                 let mut malformed = false;
                 for child in node.children() {
-                    self.session
-                        .work
+                    self.work
                         .charge_work(1)
                         .map_err(|error| CatalogueError::Processing(error.into()))?;
                     if child.has_tag_name((XMLDSIG_NS, "Reference")) {
@@ -593,8 +618,7 @@ impl<'session, 'view, 'scope, 'inputs, W: Work>
                         malformed = true;
                     } else if child.is_text() {
                         let text = child.text().unwrap_or_default();
-                        self.session
-                            .work
+                        self.work
                             .charge_work(text.len() as u64)
                             .map_err(|error| CatalogueError::Processing(error.into()))?;
                         if !is_xml_whitespace_only(text) {
@@ -627,8 +651,7 @@ impl<'session, 'view, 'scope, 'inputs, W: Work>
                 ));
             }
             references += 1;
-            self.session
-                .work
+            self.work
                 .charge_work(128)
                 .map_err(|error| CatalogueError::Processing(error.into()))?;
             for child in node.children() {
@@ -637,8 +660,7 @@ impl<'session, 'view, 'scope, 'inputs, W: Work>
                     .ok()
                     .and_then(|length| length.checked_add(128))
                     .ok_or_else(|| CatalogueError::Processing(MemoryError::WorkExceeded.into()))?;
-                self.session
-                    .work
+                self.work
                     .charge_work(cost)
                     .map_err(|error| CatalogueError::Processing(error.into()))?;
             }
@@ -699,7 +721,10 @@ pub enum ReplayError<E> {
 }
 impl<E> From<TransformError> for ReplayError<E> {
     fn from(error: TransformError) -> Self {
-        Self::Processing(ReferenceProcessingError::Transform(error).into())
+        Self::Processing(match error {
+            TransformError::C14n(crate::c14n::C14nError::SharedExecution(error)) => error.into(),
+            error => ReferenceProcessingError::Transform(error).into(),
+        })
     }
 }
 impl<E> From<OperationPlanError> for ReplayError<E> {
@@ -714,6 +739,74 @@ struct ReplayWriter<'a, W: Work, E, F> {
     canonicalizing: bool,
     receiver: &'a mut F,
     failure: Option<ReplayError<E>>,
+}
+
+struct ReplayTerminal<'a, W: Work, E, F> {
+    work: &'a W,
+    receiver: &'a mut F,
+    timestamp: Option<(crate::c14n::C14nAlgorithm, Option<&'a str>)>,
+    error: std::marker::PhantomData<fn() -> E>,
+}
+
+impl<'a, W: Work, E, F: FnMut(&[u8]) -> Result<(), E>>
+    super::super::transforms::TransformTerminal<crate::c14n::scratch::Accounted<'a, W>>
+    for ReplayTerminal<'a, W, E, F>
+{
+    type Output = ();
+    type Error = ReplayError<E>;
+
+    fn finish<D: crate::xml::dom::storage::Storage>(
+        self,
+        data: super::super::transforms::ExecutionData<
+            '_,
+            crate::c14n::scratch::Accounted<'a, W>,
+            D,
+        >,
+        explicit: Option<(&crate::c14n::C14nAlgorithm, Option<&str>)>,
+        budget: &TransformExecutionBudget,
+    ) -> Result<(), ReplayError<E>> {
+        let mut output = ReplayWriter {
+            work: self.work,
+            budget,
+            canonicalizing: data.nodes().is_some(),
+            receiver: self.receiver,
+            failure: None,
+        };
+        let result = if let Some(bytes) = data.binary() {
+            use std::io::Write;
+            output.write_all(bytes).map_err(crate::c14n::C14nError::Io)
+        } else {
+            let nodes = data.nodes().expect("execution has nodes or bytes");
+            let implicit = crate::c14n::C14nAlgorithm::from_uri(DEFAULT_IMPLICIT_C14N_URI)
+                .expect("constant C14N URI");
+            let algorithm = explicit
+                .map(|(algorithm, _)| algorithm)
+                .or(self.timestamp.as_ref().map(|(algorithm, _)| algorithm))
+                .unwrap_or(&implicit);
+            let prefixes = if explicit.is_none() {
+                self.timestamp.as_ref().and_then(|(_, prefixes)| *prefixes)
+            } else {
+                explicit.and_then(|(_, prefixes)| prefixes)
+            };
+            crate::c14n::canonicalize_visible_to_writer_accounted(
+                nodes.document(),
+                Some(nodes),
+                algorithm,
+                super::super::transforms::replay_output_limit(budget),
+                budget.xml_base_resolution(),
+                &mut output,
+                self.work,
+                prefixes,
+            )
+        };
+        if let Some(error) = output.failure {
+            return Err(error);
+        }
+        result.map_err(|error| match error {
+            crate::c14n::C14nError::SharedExecution(error) => ReplayError::Processing(error.into()),
+            error => super::super::transforms::replay_c14n_error(error, budget).into(),
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -781,7 +874,7 @@ impl<W: Work, E, F: FnMut(&[u8]) -> Result<(), E>> std::io::Write for ReplayWrit
     }
 }
 
-impl<W: Work> SelectedSignature<'_, '_, '_, '_, W> {
+impl<W: Work, Q: Work> SelectedSignature<'_, '_, '_, '_, W, Q> {
     /// Re-execute an authenticated instruction, not its historical digest test.
     /// EN 319 132-1 V1.3.1 §5.5.3 steps 3/6 and Note 2 deliberately permit
     /// renewal without recomputing the original digest algorithm.
@@ -792,8 +885,7 @@ impl<W: Work> SelectedSignature<'_, '_, '_, '_, W> {
         mode: ReplayMode,
         receiver: &mut impl FnMut(&[u8]) -> Result<(), E>,
     ) -> Result<ReplayOutcome, ReplayError<E>> {
-        self.session
-            .work
+        self.work
             .charge_work(
                 u64::try_from(self.operation().decision_count())
                     .map_err(|_| ReplayError::Processing(MemoryError::WorkExceeded.into()))?,
@@ -834,7 +926,7 @@ impl<W: Work> SelectedSignature<'_, '_, '_, '_, W> {
             }));
         }
         let index = {
-            let mut records = self.session.replays.borrow_mut();
+            let mut records = self.replays.borrow_mut();
             let index = records.len();
             records
                 .try_push(ReplayRecord {
@@ -852,7 +944,7 @@ impl<W: Work> SelectedSignature<'_, '_, '_, '_, W> {
         };
         self.session.replay_active.set(true);
         let admission = AdmittedReplay {
-            records: &self.session.replays,
+            records: &self.replays,
             active: &self.session.replay_active,
             index,
         };
@@ -899,13 +991,18 @@ impl<W: Work> SelectedSignature<'_, '_, '_, '_, W> {
             .resources
             .max_transforms_per_reference;
         let mut transform_count = 0;
+        self.work
+            .charge_work(node.children().len() as u64)
+            .map_err(|error| processing(error.into()))?;
         for transforms in node
             .children()
             .filter(|child| child.has_tag_name((XMLDSIG_NS, "Transforms")))
         {
+            self.work
+                .charge_work(transforms.children().len() as u64)
+                .map_err(|error| processing(error.into()))?;
             for transform in transforms.children().filter(Node::is_element) {
-                self.session
-                    .work
+                self.work
                     .charge_work(1)
                     .map_err(|error| processing(error.into()))?;
                 transform_count += 1;
@@ -919,9 +1016,11 @@ impl<W: Work> SelectedSignature<'_, '_, '_, '_, W> {
                         .into(),
                     ));
                 }
+                self.work
+                    .charge_work(transform.attributes().len() as u64)
+                    .map_err(|error| processing(error.into()))?;
                 if let Some(algorithm) = transform.attribute("Algorithm") {
-                    self.session
-                        .work
+                    self.work
                         .charge_work(algorithm.len() as u64)
                         .map_err(|error| processing(error.into()))?;
                     enforce_transform_allowed(allowed, algorithm).map_err(processing)?;
@@ -931,8 +1030,14 @@ impl<W: Work> SelectedSignature<'_, '_, '_, '_, W> {
         let transforms = super::super::parse::parse_replay_transforms(
             node,
             &mut self.session.budgets.xpath_parse.borrow_mut(),
+            &crate::c14n::scratch::Accounted(self.work),
         )
-        .map_err(|error| processing(DsigError::ParseManifestReference(error)))?;
+        .map_err(|error| match error {
+            super::super::parse::ParseError::Transform(TransformError::C14n(
+                crate::c14n::C14nError::SharedExecution(error),
+            )) => processing(error.into()),
+            error => processing(DsigError::ParseManifestReference(error)),
+        })?;
         if matches!(mode, ReplayMode::ReferenceOutput)
             && !transform_chain_produces_binary(
                 classify_uri(uri) == UriClass::External,
@@ -976,6 +1081,7 @@ impl<W: Work> SelectedSignature<'_, '_, '_, '_, W> {
             node,
             budget.node_set_materialization(),
             budget.xml_base_resolution(),
+            &crate::c14n::scratch::Accounted(self.work),
         )?
         else {
             return Ok(ReplayOutcome::Unavailable(ExternalResourceUnavailable {
@@ -984,8 +1090,7 @@ impl<W: Work> SelectedSignature<'_, '_, '_, '_, W> {
         };
         let enveloped_signature =
             super::super::transforms::enveloped_signature_for_reference(node, &transforms, || {
-                self.session
-                    .work
+                self.work
                     .charge_work(1)
                     .map_err(|error| processing(error.into()))
             })?;
@@ -994,56 +1099,16 @@ impl<W: Work> SelectedSignature<'_, '_, '_, '_, W> {
             enveloped_signature,
             data,
             &transforms,
-            self.session.context.transform_options(),
-            budget,
-            |data, explicit, budget| {
-                let mut output = ReplayWriter {
-                    work: self.session.work,
-                    budget,
-                    canonicalizing: matches!(&data, super::super::TransformData::NodeSet(_)),
-                    receiver,
-                    failure: None,
-                };
-                let result = match data {
-                    super::super::TransformData::Binary(bytes) => {
-                        use std::io::Write;
-                        output.write_all(&bytes).map_err(crate::c14n::C14nError::Io)
-                    }
-                    super::super::TransformData::BorrowedBinary(bytes) => {
-                        use std::io::Write;
-                        output.write_all(bytes).map_err(crate::c14n::C14nError::Io)
-                    }
-                    super::super::TransformData::NodeSet(nodes) => {
-                        let implicit =
-                            crate::c14n::C14nAlgorithm::from_uri(DEFAULT_IMPLICIT_C14N_URI)
-                                .expect("constant C14N URI");
-                        let algorithm = explicit
-                            .or(timestamp.as_ref().map(|(algorithm, _)| algorithm))
-                            .unwrap_or(&implicit);
-                        let prefix_list = if explicit.is_none() {
-                            timestamp.as_ref().and_then(|(_, prefixes)| *prefixes)
-                        } else {
-                            None
-                        };
-                        crate::c14n::canonicalize_visible_to_writer_accounted(
-                            nodes.document(),
-                            Some(&nodes),
-                            algorithm,
-                            super::super::transforms::replay_output_limit(budget),
-                            budget.xml_base_resolution(),
-                            &mut output,
-                            self.session.work,
-                            prefix_list,
-                        )
-                    }
-                };
-                if let Some(error) = output.failure {
-                    return Err(error);
-                }
-                result.map_err(|error| match error {
-                    crate::c14n::C14nError::SharedExecution(error) => processing(error.into()),
-                    error => super::super::transforms::replay_c14n_error(error, budget).into(),
-                })
+            super::super::transforms::ReplayExecution {
+                options: self.session.context.transform_options(),
+                budget,
+                work: self.work,
+            },
+            ReplayTerminal {
+                work: self.work,
+                receiver,
+                timestamp,
+                error: std::marker::PhantomData,
             },
         )?;
         Ok(ReplayOutcome::Complete)

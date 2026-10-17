@@ -6,6 +6,7 @@
 use std::collections::HashSet;
 
 use crate::xml::dom::Node;
+use crate::xml::dom::storage::Storage as DomStorage;
 
 use super::C14nError;
 use super::NodeVisibility;
@@ -33,10 +34,14 @@ impl Prefixes<'_> {
         match self {
             Self::Stored(prefixes) => prefixes.contains(prefix),
             #[cfg(feature = "xmldsig")]
-            Self::Lexical(list) => list
-                .split([' ', '\t', '\r', '\n'])
-                .filter(|p| !p.is_empty())
-                .any(|p| p == prefix || (prefix.is_empty() && p == "#default")),
+            Self::Lexical(list) => {
+                for token in super::prefix::inclusive_tokens(list) {
+                    if token == prefix || (prefix.is_empty() && token == "#default") {
+                        return true;
+                    }
+                }
+                false
+            }
         }
     }
     fn work(&self, prefix: &str) -> usize {
@@ -68,12 +73,12 @@ impl<'a> ExclusiveNsRenderer<'a> {
     }
 }
 
-impl<S: Scratch> NsRenderer<S> for ExclusiveNsRenderer<'_> {
+impl<S: Scratch, D: DomStorage> NsRenderer<S, D> for ExclusiveNsRenderer<'_> {
     fn render_namespaces<'n>(
         &self,
-        node: Node<'n, '_>,
+        node: Node<'n, '_, D>,
         parent_rendered: &S::Namespaces<'n>,
-        visibility: Option<&dyn NodeVisibility>,
+        visibility: Option<&dyn NodeVisibility<D>>,
         scratch: &S,
     ) -> Result<NamespaceRendering<'n, S>, C14nError> {
         let utilized = visibly_utilized_prefixes(node, visibility, scratch)?;
@@ -102,11 +107,11 @@ impl<S: Scratch> NsRenderer<S> for ExclusiveNsRenderer<'_> {
         if let (Some(visibility), Some(parent)) = (visibility, node.parent())
             && parent.is_element()
         {
-            for namespace in node.namespaces() {
+            for (ordinal, namespace) in node.namespaces().enumerate() {
                 let prefix = namespace.name().unwrap_or("");
                 let uri = namespace.uri();
                 scratch.charge(prefix.len().saturating_add(uri.len()).saturating_add(1))?;
-                let selected_here = visibility.contains_namespace(node, prefix, uri);
+                let selected_here = visibility.contains_namespace_at(node, ordinal, namespace)?;
                 let declaration_suppressed = parent_rendered.get(prefix, false)?.flatten()
                     == Some(uri)
                     && !declarations
@@ -154,9 +159,9 @@ impl<S: Scratch> NsRenderer<S> for ExclusiveNsRenderer<'_> {
 ///
 /// Uses lexical prefixes extracted from source XML byte positions,
 /// avoiding ambiguity when multiple prefixes bind the same namespace URI.
-fn visibly_utilized_prefixes<'a, S: Scratch>(
-    node: Node<'a, '_>,
-    visibility: Option<&dyn NodeVisibility>,
+fn visibly_utilized_prefixes<'a, S: Scratch, D: DomStorage>(
+    node: Node<'a, '_, D>,
+    visibility: Option<&dyn NodeVisibility<D>>,
     scratch: &S,
 ) -> Result<S::Namespaces<'a>, C14nError> {
     let mut utilized = scratch.namespaces();
@@ -174,10 +179,10 @@ fn visibly_utilized_prefixes<'a, S: Scratch>(
     }
 
     // Attribute lexical prefixes from source XML.
-    for attr in node.attributes() {
+    for (ordinal, attr) in node.attributes().enumerate() {
         scratch.charge(attr.name().len().saturating_add(1))?;
-        if visibility
-            .is_some_and(|set| !set.contains_attribute(node, attr.namespace(), attr.name()))
+        if let Some(set) = visibility
+            && !set.contains_attribute_at(node, ordinal, attr)?
         {
             continue;
         }
@@ -193,6 +198,22 @@ fn visibly_utilized_prefixes<'a, S: Scratch>(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    #[cfg(feature = "xmldsig")]
+    #[test]
+    fn stored_and_lexical_prefix_lists_use_the_same_xml_separators() {
+        // A non-XML Unicode space must not split a token in one representation
+        // while remaining token content in the other representation.
+        let list = "p\u{a0}q p\t#default";
+        let algorithm = crate::c14n::C14nAlgorithm::new(crate::c14n::C14nMode::Exclusive1_0, false)
+            .with_prefix_list(list);
+        let stored = ExclusiveNsRenderer::new(algorithm.inclusive_prefixes());
+        let lexical = ExclusiveNsRenderer::from_prefix_list(list);
+        for (prefix, expected) in [("p", true), ("q", false), ("p\u{a0}q", true), ("", true)] {
+            assert_eq!(stored.inclusive_prefixes.contains(prefix), expected);
+            assert_eq!(lexical.inclusive_prefixes.contains(prefix), expected);
+        }
+    }
+
     use super::super::serialize::{
         C14nConfig, serialize_canonical, serialize_canonical_visible_with_position,
     };
@@ -203,8 +224,8 @@ mod tests {
     struct NamespaceGapVisibility;
 
     impl NodeVisibility for NamespaceGapVisibility {
-        fn contains_node(&self, _node: Node<'_, '_>) -> bool {
-            true
+        fn contains_node(&self, _node: Node<'_, '_>) -> Result<bool, C14nError> {
+            Ok(true)
         }
 
         fn contains_attribute(
@@ -212,12 +233,17 @@ mod tests {
             _owner: Node<'_, '_>,
             _namespace: Option<&str>,
             _local_name: &str,
-        ) -> bool {
-            true
+        ) -> Result<bool, C14nError> {
+            Ok(true)
         }
 
-        fn contains_namespace(&self, owner: Node<'_, '_>, prefix: &str, _uri: &str) -> bool {
-            prefix != "p" || owner.tag_name().name() != "gap"
+        fn contains_namespace(
+            &self,
+            owner: Node<'_, '_>,
+            prefix: &str,
+            _uri: &str,
+        ) -> Result<bool, C14nError> {
+            Ok(prefix != "p" || owner.tag_name().name() != "gap")
         }
     }
 

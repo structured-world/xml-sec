@@ -21,6 +21,30 @@ type Variables<'d> = QNameMap<Value<'d>>;
 /// A mapping of namespace prefixes to namespace URIs.
 type Namespaces = HashMap<String, String>;
 
+// A root resolver works for the input node's document lifetime; it must not
+// pin an otherwise empty context to one document or make that lifetime invariant.
+type RootResolver = for<'node> fn(Node<'node>) -> Node<'node>;
+
+#[cfg(feature = "embedded")]
+type FunctionView<'f> = &'f [(QName<'f>, &'f dyn function::Function)];
+#[cfg(feature = "embedded")]
+pub(crate) trait NamespaceLookup {
+    fn namespace_for(&self, prefix: &str) -> Result<Option<&str>, function::Error>;
+}
+
+#[cfg(feature = "embedded")]
+fn view_function<'f>(
+    functions: FunctionView<'f>,
+    name: QName<'_>,
+) -> Option<&'f dyn function::Function> {
+    for (candidate, function) in functions.iter().rev() {
+        if *candidate == name {
+            return Some(*function);
+        }
+    }
+    None
+}
+
 struct QNameMap<V> {
     buckets: HashMap<u64, Vec<(OwnedQName, V)>>,
     names: RandomState,
@@ -58,6 +82,9 @@ impl<V> QNameMap<V> {
     }
 
     fn get(&self, name: QName<'_>) -> Option<&V> {
+        if self.buckets.is_empty() {
+            return None;
+        }
         let hash = self.hash(name.namespace_uri(), name.local_part());
         self.buckets
             .get(&hash)?
@@ -92,7 +119,7 @@ impl<V> QNameMap<V> {
 ///                         args: Vec<Value<'d>>)
 ///                         -> Result<Value<'d>, function::Error>
 ///     {
-///         let mut args = function::Args(args);
+///         let mut args = function::Args::new(args);
 ///         args.exactly(1)?;
 ///         let val = args.pop_number(context)?;
 ///
@@ -136,12 +163,18 @@ pub type Context<'d> = ScopedContext<'static, 'd>;
 /// Borrowed callbacks need only outlive evaluation, not the XML document they inspect.
 pub struct ScopedContext<'f, 'd> {
     functions: Functions<'f>,
+    core_functions: bool,
+    #[cfg(feature = "embedded")]
+    function_view: FunctionView<'f>,
+    #[cfg(feature = "embedded")]
+    namespace_lookup: Option<&'f dyn NamespaceLookup>,
     variables: Variables<'d>,
     namespaces: Namespaces,
     string_allocations: StringAllocationBudget,
     evaluation_work: WorkBudget,
     extension_work: WorkBudget,
-    document_root_resolver: Option<fn(Node<'d>) -> Node<'d>>,
+    work_admission: Option<&'f dyn Fn(usize) -> Result<(), function::Error>>,
+    document_root_resolver: Option<RootResolver>,
 }
 
 #[derive(Default)]
@@ -162,7 +195,7 @@ impl<'f, 'd> ScopedContext<'f, 'd> {
     /// Registers the core XPath 1.0 functions.
     pub fn new() -> Self {
         let mut context = Self::without_core_functions();
-        function::register_core_functions(&mut context);
+        context.core_functions = true;
         context
     }
 
@@ -170,11 +203,17 @@ impl<'f, 'd> ScopedContext<'f, 'd> {
     pub fn without_core_functions() -> Self {
         Self {
             functions: Default::default(),
+            core_functions: false,
+            #[cfg(feature = "embedded")]
+            function_view: &[],
+            #[cfg(feature = "embedded")]
+            namespace_lookup: None,
             variables: Default::default(),
             namespaces: Default::default(),
             string_allocations: StringAllocationBudget::default(),
             evaluation_work: WorkBudget::default(),
             extension_work: WorkBudget::default(),
+            work_admission: None,
             document_root_resolver: None,
         }
     }
@@ -191,7 +230,7 @@ impl<'f, 'd> ScopedContext<'f, 'd> {
     }
 
     /// Override how the root of the document containing a context node is resolved.
-    pub fn set_document_root_resolver(&mut self, resolver: fn(Node<'d>) -> Node<'d>) {
+    pub fn set_document_root_resolver(&mut self, resolver: RootResolver) {
         self.document_root_resolver = Some(resolver);
     }
 
@@ -223,8 +262,21 @@ impl<'f, 'd> ScopedContext<'f, 'd> {
         self.evaluation_work.exceeded.get()
     }
 
+    /// Admit primitive work in a borrowing embedding execution before running it.
+    /// The callback neither allocates a new context nor replaces the independent
+    /// XPath limit. A refusal must retain its original cause in the embedding.
+    pub fn set_work_admission(
+        &mut self,
+        admission: &'f dyn Fn(usize) -> Result<(), function::Error>,
+    ) {
+        self.work_admission = Some(admission);
+    }
+
     /// Charge primitive setup work performed while constructing this XPath context.
     pub fn charge_work(&self, units: usize) -> Result<(), function::Error> {
+        if let Some(admission) = self.work_admission {
+            admission(units)?;
+        }
         charge_work_budget(
             &self.evaluation_work,
             units,
@@ -277,10 +329,48 @@ impl<'f, 'd> ScopedContext<'f, 'd> {
         self.namespaces.insert(prefix.into(), uri.into());
     }
 
+    /// Borrows embedding-owned extension objects without boxing or copying
+    /// names. Owned overrides still take precedence; duplicate view names use
+    /// the last binding, matching repeated set_function calls.
+    #[cfg(feature = "embedded")]
+    pub(crate) fn set_function_view(&mut self, functions: FunctionView<'f>) {
+        self.function_view = functions;
+    }
+
+    /// Resolves original namespace bindings through embedding-owned storage.
+    /// It replaces this context's namespace map without allocating another one.
+    #[cfg(feature = "embedded")]
+    pub(crate) fn set_namespace_lookup(&mut self, lookup: &'f dyn NamespaceLookup) {
+        self.namespace_lookup = Some(lookup);
+    }
+
     /// Number of distinct registered functions, for embedding allocation-bound assertions.
     #[doc(hidden)]
     pub fn function_count(&self) -> usize {
-        self.functions.len()
+        let mut count = self.functions.len();
+        #[cfg(feature = "embedded")]
+        for (index, (name, _)) in self.function_view.iter().enumerate() {
+            if self.functions.get(*name).is_some()
+                || view_function(&self.function_view[index + 1..], *name).is_some()
+            {
+                continue;
+            }
+            count += 1;
+        }
+        if self.core_functions {
+            for name in function::CORE_NAMES {
+                let name = QName::new(name);
+                if self.functions.get(name).is_some() {
+                    continue;
+                }
+                #[cfg(feature = "embedded")]
+                if view_function(self.function_view, name).is_some() {
+                    continue;
+                }
+                count += 1;
+            }
+        }
+        count
     }
 }
 
@@ -309,12 +399,18 @@ pub struct Evaluation<'c, 'd> {
     /// The context size
     pub size: usize,
     functions: &'c Functions<'c>,
+    core_functions: bool,
+    #[cfg(feature = "embedded")]
+    function_view: FunctionView<'c>,
+    #[cfg(feature = "embedded")]
+    namespace_lookup: Option<&'c dyn NamespaceLookup>,
     variables: &'c Variables<'d>,
     namespaces: &'c Namespaces,
     string_allocations: &'c StringAllocationBudget,
     evaluation_work: &'c WorkBudget,
     extension_work: &'c WorkBudget,
-    document_root_resolver: Option<fn(Node<'d>) -> Node<'d>>,
+    work_admission: Option<&'c dyn Fn(usize) -> Result<(), function::Error>>,
+    document_root_resolver: Option<RootResolver>,
 }
 
 #[cfg(not(feature = "no-unsafe"))]
@@ -326,11 +422,17 @@ impl<'c, 'd> Evaluation<'c, 'd> {
         Evaluation {
             node,
             functions: &context.functions,
+            core_functions: context.core_functions,
+            #[cfg(feature = "embedded")]
+            function_view: context.function_view,
+            #[cfg(feature = "embedded")]
+            namespace_lookup: context.namespace_lookup,
             variables: &context.variables,
             namespaces: &context.namespaces,
             string_allocations: &context.string_allocations,
             evaluation_work: &context.evaluation_work,
             extension_work: &context.extension_work,
+            work_admission: context.work_admission,
             document_root_resolver: context.document_root_resolver,
             position: 1,
             size: 1,
@@ -350,7 +452,21 @@ impl<'c, 'd> Evaluation<'c, 'd> {
 
     /// Looks up the function with the given name
     pub fn function_for_name(&self, name: QName<'_>) -> Option<&'c dyn function::Function> {
-        self.functions.get(name).map(AsRef::as_ref)
+        self.resolve_function(name).map(function::Resolved::native)
+    }
+
+    pub(crate) fn resolve_function(&self, name: QName<'_>) -> Option<function::Resolved<'c>> {
+        if let Some(function) = self.functions.get(name) {
+            return Some(function::Resolved::Extension(function.as_ref()));
+        }
+        #[cfg(feature = "embedded")]
+        if let Some(function) = view_function(self.function_view, name) {
+            return Some(function::Resolved::Extension(function));
+        }
+        if self.core_functions && name.namespace_uri().is_none() {
+            return function::core::Core::lookup(name.local_part()).map(function::Resolved::Core);
+        }
+        None
     }
 
     /// Looks up the value of the variable
@@ -359,8 +475,12 @@ impl<'c, 'd> Evaluation<'c, 'd> {
     }
 
     /// Looks up the namespace URI for the given prefix
-    pub fn namespace_for(&self, prefix: &str) -> Option<&str> {
-        self.namespaces.get(prefix).map(String::as_str)
+    pub fn namespace_for(&self, prefix: &str) -> Result<Option<&str>, function::Error> {
+        #[cfg(feature = "embedded")]
+        if let Some(lookup) = self.namespace_lookup {
+            return lookup.namespace_for(prefix);
+        }
+        Ok(self.namespaces.get(prefix).map(String::as_str))
     }
 
     pub(crate) fn document_root_for(&self, node: Node<'d>) -> Node<'d> {
@@ -386,8 +506,22 @@ impl<'c, 'd> Evaluation<'c, 'd> {
         release_allocation(self.string_allocations, bytes)
     }
 
+    /// Admit structural AST entry in the borrowing current execution.
+    pub(crate) fn admit_expression_step(&self) -> Result<(), function::Error> {
+        // Structural AST entry is current-execution admission, not a change
+        // to the embedding's existing primitive-work policy or native counters.
+        // Native contexts have no callback and need no counter mutation here.
+        if let Some(admission) = self.work_admission {
+            admission(1)?;
+        }
+        Ok(())
+    }
+
     /// Charge primitive XPath evaluation work before performing it.
     pub fn charge_work(&self, units: usize) -> Result<(), function::Error> {
+        if let Some(admission) = self.work_admission {
+            admission(units)?;
+        }
         charge_work_budget(
             self.evaluation_work,
             units,
@@ -397,6 +531,9 @@ impl<'c, 'd> Evaluation<'c, 'd> {
 
     /// Charge extension-internal work before performing it.
     pub fn charge_extension_work(&self, units: usize) -> Result<(), function::Error> {
+        if let Some(admission) = self.work_admission {
+            admission(units)?;
+        }
         charge_work_budget(
             self.extension_work,
             units,
@@ -499,9 +636,258 @@ impl<'c, 'd> Iterator for EvaluationNodesetIter<'c, 'd> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "embedded")]
+    #[test]
+    fn borrowed_function_view_preserves_owned_overrides_and_unique_count() {
+        // XML extensions can live on the stack. View replacement and owned
+        // overrides must retain the same last-binding lookup/count semantics.
+        struct Literal(bool);
+        impl crate::function::Function for Literal {
+            fn evaluate<'c, 'd>(
+                &self,
+                _: &super::Evaluation<'c, 'd>,
+                _: Vec<crate::Value<'d>>,
+            ) -> Result<crate::Value<'d>, crate::function::Error> {
+                Ok(crate::Value::Boolean(self.0))
+            }
+        }
+        let yes = Literal(true);
+        let no = Literal(false);
+        let functions: [(
+            sxd_document_no_unsafe::QName<'_>,
+            &dyn crate::function::Function,
+        ); 3] = [
+            (sxd_document_no_unsafe::QName::new("true"), &no),
+            (sxd_document_no_unsafe::QName::new("borrowed"), &yes),
+            (sxd_document_no_unsafe::QName::new("borrowed"), &no),
+        ];
+        let mut context = super::ScopedContext::new();
+        context.set_function_view(&functions);
+        assert!(context.functions.buckets.is_empty());
+        assert_eq!(context.function_count(), 26);
+        let package = sxd_document_no_unsafe::Package::new();
+        let root = package.as_document().root();
+        for source in ["true()", "borrowed()"] {
+            assert_eq!(
+                crate::Factory::new()
+                    .build(source)
+                    .unwrap()
+                    .evaluate(&context, root)
+                    .unwrap(),
+                crate::Value::Boolean(false)
+            );
+        }
+        context.set_function("borrowed", Literal(true));
+        assert_eq!(context.function_count(), 26);
+        assert_eq!(
+            crate::Factory::new()
+                .build("borrowed()")
+                .unwrap()
+                .evaluate(&context, root)
+                .unwrap(),
+            crate::Value::Boolean(true)
+        );
+    }
+
+    #[cfg(feature = "embedded")]
+    #[test]
+    fn namespace_refusal_is_terminal_not_an_unbound_prefix() {
+        // Refusing the embedding's current-work lookup must not allocate an
+        // UnknownNamespace string after that refusal, even on empty axes.
+        struct Refused;
+        impl super::NamespaceLookup for Refused {
+            fn namespace_for(&self, _: &str) -> Result<Option<&str>, crate::function::Error> {
+                Err(crate::function::Error::ProcessingStopped)
+            }
+        }
+        let lookup = Refused;
+        let mut context = super::ScopedContext::new();
+        context.set_namespace_lookup(&lookup);
+        let package = sxd_document_no_unsafe::Package::new();
+        for source in ["p:missing", "p:missing()", "$p:missing"] {
+            let error = crate::Factory::new()
+                .build(source)
+                .unwrap()
+                .evaluate(&context, package.as_document().root())
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    super::super::ExecutionError(crate::expression::Error::FunctionEvaluation {
+                        source: crate::function::Error::ProcessingStopped
+                    })
+                ),
+                "{source}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn core_library_has_no_per_query_heap_registry() {
+        // A fresh security query must not allocate an unaccounted registry of
+        // immutable core functions before current-execution admission exists.
+        let context = super::ScopedContext::new();
+        assert!(context.functions.buckets.is_empty());
+        assert_eq!(context.function_count(), 25);
+        let package = sxd_document_no_unsafe::Package::new();
+        let evaluation = super::Evaluation::new(&context, package.as_document().root().into());
+        assert!(
+            evaluation
+                .function_for_name(sxd_document_no_unsafe::QName::new("count"))
+                .is_some()
+        );
+        assert!(
+            evaluation
+                .function_for_name(sxd_document_no_unsafe::QName::with_namespace_uri(
+                    Some("urn:foreign"),
+                    "count"
+                ))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn static_core_library_preserves_override_and_registration_order() {
+        // Custom overrides win until explicit core registration replaces
+        // them, exactly as with the former eagerly allocated registry.
+        struct False;
+        impl crate::function::Function for False {
+            fn evaluate<'c, 'd>(
+                &self,
+                _: &super::Evaluation<'c, 'd>,
+                _: Vec<crate::Value<'d>>,
+            ) -> Result<crate::Value<'d>, crate::function::Error> {
+                Ok(crate::Value::Boolean(false))
+            }
+        }
+        let package = sxd_document_no_unsafe::Package::new();
+        let root = package.as_document().root();
+        let xpath = crate::Factory::new().build("true()").unwrap();
+        let mut context = super::ScopedContext::without_core_functions();
+        assert_eq!(context.function_count(), 0);
+        assert!(xpath.evaluate(&context, root).is_err());
+        crate::function::register_core_functions(&mut context);
+        assert_eq!(context.function_count(), 25);
+        assert_eq!(
+            xpath.evaluate(&context, root).unwrap(),
+            crate::Value::Boolean(true)
+        );
+        let mut context = super::ScopedContext::new();
+        context.set_function("true", False);
+        assert_eq!(context.function_count(), 25);
+        assert_eq!(
+            xpath.evaluate(&context, root).unwrap(),
+            crate::Value::Boolean(false)
+        );
+        crate::function::register_core_functions(&mut context);
+        assert_eq!(context.function_count(), 25);
+        assert_eq!(
+            xpath.evaluate(&context, root).unwrap(),
+            crate::Value::Boolean(true)
+        );
+    }
+
     use super::Context;
     #[cfg(feature = "embedded")]
     use super::sxd_document_no_unsafe;
+
+    #[test]
+    fn current_admission_is_shared_by_setup_children_and_extensions() {
+        // Derived node contexts keep the same borrowed execution. A refusal
+        // happens before the independent XPath counter is advanced.
+        let remaining = std::cell::Cell::new(4_usize);
+        let admission = |units| {
+            let available = remaining.get();
+            if units > available {
+                return Err(crate::function::Error::ProcessingStopped);
+            }
+            remaining.set(available - units);
+            Ok(())
+        };
+        let mut context = super::ScopedContext::without_core_functions();
+        context.set_work_admission(&admission);
+        context.charge_work(1).expect("setup admission");
+        let package = sxd_document_no_unsafe::Package::new();
+        let root = package.as_document().root();
+        let evaluation = super::Evaluation::new(&context, root.into());
+        let child = evaluation.new_context_for(root);
+        child.charge_work(2).expect("derived context admission");
+        child.charge_extension_work(1).expect("extension admission");
+        assert_eq!(remaining.get(), 0);
+        assert_eq!(context.evaluation_work_used(), 3);
+        assert_eq!(context.extension_work_used(), 1);
+        assert_eq!(
+            child.charge_work(1),
+            Err(crate::function::Error::ProcessingStopped)
+        );
+        assert_eq!(
+            child.charge_extension_work(1),
+            Err(crate::function::Error::ProcessingStopped)
+        );
+        assert_eq!(context.evaluation_work_used(), 3);
+        assert_eq!(context.extension_work_used(), 1);
+    }
+
+    #[test]
+    fn root_expression_admits_work_before_calling_a_function() {
+        // Even a single function-call expression must not get a free first AST
+        // step. Refusal cannot invoke an extension or allocate a string cause.
+        struct Observe<'a>(&'a std::cell::Cell<usize>);
+        impl crate::function::Function for Observe<'_> {
+            fn evaluate<'c, 'd>(
+                &self,
+                _: &super::Evaluation<'c, 'd>,
+                _: Vec<crate::Value<'d>>,
+            ) -> Result<crate::Value<'d>, crate::function::Error> {
+                self.0.set(self.0.get() + 1);
+                Ok(crate::Value::Boolean(true))
+            }
+        }
+        let calls = std::cell::Cell::new(0);
+        let admissions = std::cell::Cell::new(0);
+        let remaining = std::cell::Cell::new(0_usize);
+        let admission = |units| {
+            admissions.set(admissions.get() + 1);
+            if units > remaining.get() {
+                return Err(crate::function::Error::ProcessingStopped);
+            }
+            remaining.set(remaining.get() - units);
+            Ok(())
+        };
+        let mut context = super::ScopedContext::without_core_functions();
+        context.set_function("observe", Observe(&calls));
+        context.set_work_admission(&admission);
+        let package = sxd_document_no_unsafe::Package::new();
+        let xpath = crate::Factory::new()
+            .build("observe()")
+            .expect("valid observing function");
+        let error = xpath
+            .evaluate(&context, package.as_document().root())
+            .expect_err("the root AST step needs current work");
+        assert!(matches!(
+            error,
+            super::super::ExecutionError(crate::expression::Error::FunctionEvaluation {
+                source: crate::function::Error::ProcessingStopped
+            })
+        ));
+        assert_eq!(admissions.get(), 1);
+        assert_eq!(calls.get(), 0);
+        assert_eq!(context.evaluation_work_used(), 0);
+
+        // Paying the root does not pay its children: the first function below
+        // a binary AST node must also refuse before any observing side effect.
+        remaining.set(1);
+        admissions.set(0);
+        let binary = crate::Factory::new()
+            .build("observe() and observe()")
+            .expect("valid binary expression");
+        binary
+            .evaluate(&context, package.as_document().root())
+            .expect_err("the first child still needs current work");
+        assert_eq!(admissions.get(), 2);
+        assert_eq!(calls.get(), 0);
+        assert_eq!(remaining.get(), 0);
+    }
 
     #[test]
     fn registered_functions_borrow_context_scoped_state() {
