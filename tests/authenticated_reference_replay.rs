@@ -1112,6 +1112,103 @@ fn missing_id_replay_retains_diagnostic_capacity_until_error_drop() {
 }
 
 #[test]
+fn replay_layout_charges_inspected_whitespace_by_length() {
+    // Legal whitespace inside an authenticated Reference is still scanned by
+    // the current query, so its work must grow with the text, not the node count.
+    let work = |whitespace: usize| {
+        let (xml, key) = signed_manifest(
+            "#target",
+            "http://www.w3.org/2001/04/xmlenc#sha256",
+            &" ".repeat(whitespace),
+        );
+        let document = XmlDocument::parse(xml).unwrap();
+        let context = VerifyContext::new().key(&key).process_manifests(true);
+        let current = account();
+        with_verified_request(
+            &document,
+            &context,
+            &VerificationRequest::default(),
+            &account(),
+            |session| {
+                session
+                    .with_query(
+                        session.evidence().signatures()[0].identity(),
+                        &current,
+                        |selected| {
+                            selected.replay_reference(
+                                session.view().node_for_id("inside", &[]).unwrap(),
+                                ReplayMode::ReferenceOutput,
+                                &mut |_: &[u8]| Ok::<_, ()>(()),
+                            )
+                        },
+                    )
+                    .unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        current.work_used()
+    };
+    // ID lookups use randomly seeded tables, so unrelated probes vary by a
+    // few units per run; the slack is three orders below the scanned text.
+    let length = 1 << 20;
+    let slack = 1024;
+    assert!(work(length) + slack >= work(1) + length);
+}
+
+#[test]
+fn replay_layout_diagnostic_retains_current_capacity_until_error_drop() {
+    // A signed Manifest authenticates a malformed Reference too. Its trailing
+    // element name is attacker-sized, so the escaping diagnostic must stay
+    // funded by the query that built it until the error is dropped.
+    let name = "x".repeat(65536);
+    let secret = vec![0x61; 32];
+    let signer = HmacSigningKey::new(secret.clone()).unwrap();
+    let key = HmacVerificationKey::new(secret).unwrap();
+    let template = manifest_template("#target", "http://www.w3.org/2001/04/xmlenc#sha256", "")
+        .replace(
+            "</ds:DigestValue></ds:Reference>\n</ds:Manifest>",
+            &format!("</ds:DigestValue><{name}/></ds:Reference>\n</ds:Manifest>"),
+        );
+    let xml = SignContext::new(&signer).sign_template(&template).unwrap();
+    let document = XmlDocument::parse(xml).unwrap();
+    let context = VerifyContext::new().key(&key).process_manifests(true);
+    with_verified_request(
+        &document,
+        &context,
+        &VerificationRequest::default(),
+        &account(),
+        |session| {
+            let current = account();
+            let error = session
+                .with_query(
+                    session.evidence().signatures()[0].identity(),
+                    &current,
+                    |selected| {
+                        selected.replay_reference(
+                            session.view().node_for_id("inside", &[]).unwrap(),
+                            ReplayMode::ReferenceOutput,
+                            &mut |_: &[u8]| -> Result<(), ()> {
+                                panic!("malformed Reference cannot produce bytes")
+                            },
+                        )
+                    },
+                )
+                .unwrap_err();
+            assert!(format!("{error:?}").contains(&name));
+            assert!(
+                current.used() >= name.len(),
+                "escaping diagnostic retains its capacity charge"
+            );
+            drop(error);
+            assert_eq!(current.used(), 0);
+            Ok(())
+        },
+    )
+    .unwrap();
+}
+
+#[test]
 fn final_octets_are_borrowed_and_not_timestamp_recanonicalized() {
     // Final binary, including empty/non-XML input, is not XML-decoded merely
     // because a timestamp method was supplied. Pointer identity proves no copy.

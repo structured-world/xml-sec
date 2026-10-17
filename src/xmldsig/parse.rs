@@ -831,6 +831,10 @@ pub enum ParseError {
     #[error("invalid structure: {0}")]
     InvalidStructure(String),
 
+    /// Invalid structure whose diagnostic retains its current-query capacity charge.
+    #[error("invalid structure: {0}")]
+    AccountedInvalidStructure(structured_asn1::memory::OwnedText),
+
     /// Unsupported algorithm URI.
     #[error("unsupported algorithm: {uri}")]
     UnsupportedAlgorithm {
@@ -1286,11 +1290,8 @@ pub(crate) fn parse_reference_with_xpath_budget(
     })
 }
 
-pub(crate) fn reference_layout<'a>(
-    node: Node<'a, 'a>,
-) -> Result<(Option<Node<'a, 'a>>, Node<'a, 'a>, Node<'a, 'a>), ParseError> {
-    inspect_reference_layout(node).map_err(ReferenceLayoutFault::diagnostic)
-}
+/// Optional `<Transforms>`, `<DigestMethod>` and `<DigestValue>` of one Reference.
+pub(crate) type ReferenceLayout<'a> = (Option<Node<'a, 'a>>, Node<'a, 'a>, Node<'a, 'a>);
 
 #[derive(Debug)]
 pub(crate) enum ReferenceLayoutFault<'a, 'input> {
@@ -1302,14 +1303,22 @@ pub(crate) enum ReferenceLayoutFault<'a, 'input> {
 
 impl ReferenceLayoutFault<'_, '_> {
     fn diagnostic(self) -> ParseError {
+        self.diagnostic_in(&crate::c14n::scratch::Native)
+    }
+
+    /// Element names are attacker-sized, so a query-funded caller passes its
+    /// storage and the diagnostic stays charged to it until the error is dropped.
+    fn diagnostic_in<'s, S: transforms::ParseStorage<'s>>(self, storage: &S) -> ParseError {
         match self {
             Self::Missing(element) => ParseError::MissingElement { element },
-            Self::WrongElement(node, expected) => verify_ds_element(node, expected)
-                .expect_err("layout fault records a failed element check"),
-            Self::MixedContent => ParseError::InvalidStructure(
-                "Reference must not contain non-whitespace mixed content".into(),
-            ),
-            Self::TrailingElement(node) => ParseError::InvalidStructure(format!(
+            Self::WrongElement(node, expected) => {
+                element_mismatch(node, expected, XMLDSIG_NS, "ds", storage)
+                    .expect_err("layout fault records a failed element check")
+            }
+            Self::MixedContent => storage.structure(format_args!(
+                "Reference must not contain non-whitespace mixed content"
+            )),
+            Self::TrailingElement(node) => storage.structure(format_args!(
                 "unexpected element <{}> after <DigestValue> in <Reference>",
                 node.tag_name().name()
             )),
@@ -1329,19 +1338,39 @@ fn layout_element<'a, 'input>(
 }
 
 /// Structural inspection borrows faults without constructing diagnostic strings.
+/// The caller has already paid for the text this scans.
 pub(crate) fn inspect_reference_layout<'a>(
     node: Node<'a, 'a>,
-) -> Result<(Option<Node<'a, 'a>>, Node<'a, 'a>, Node<'a, 'a>), ReferenceLayoutFault<'a, 'a>> {
-    layout_element(node, "Reference")?;
+) -> Result<ReferenceLayout<'a>, ReferenceLayoutFault<'a, 'a>> {
+    match inspect_charged_reference_layout(node, |_| Ok::<(), core::convert::Infallible>(())) {
+        Ok(layout) => layout,
+        Err(never) => match never {},
+    }
+}
+
+/// Charges each text node's length before scanning it, so a single large
+/// whitespace node costs its bytes rather than one child.
+fn inspect_charged_reference_layout<'a, E>(
+    node: Node<'a, 'a>,
+    mut charge: impl FnMut(usize) -> Result<(), E>,
+) -> Result<Result<ReferenceLayout<'a>, ReferenceLayoutFault<'a, 'a>>, E> {
+    if let Err(fault) = layout_element(node, "Reference") {
+        return Ok(Err(fault));
+    }
     for child in node.children() {
-        if child.is_text()
-            && child
-                .text()
-                .is_some_and(|text| !is_xml_whitespace_only(text))
-        {
-            return Err(ReferenceLayoutFault::MixedContent);
+        if let Some(text) = child.text().filter(|_| child.is_text()) {
+            charge(text.len())?;
+            if !is_xml_whitespace_only(text) {
+                return Ok(Err(ReferenceLayoutFault::MixedContent));
+            }
         }
     }
+    Ok(layout_reference_children(node))
+}
+
+fn layout_reference_children<'a>(
+    node: Node<'a, 'a>,
+) -> Result<ReferenceLayout<'a>, ReferenceLayoutFault<'a, 'a>> {
     let mut children = element_children(node);
     let (transforms, method) = layout_transforms_and_digest_method(&mut children)?;
     let value = layout_digest_value(&mut children)?;
@@ -1391,7 +1420,10 @@ pub(crate) fn parse_replay_transforms<'a, S: transforms::ParseStorage<'a>>(
     scratch
         .charge(node.children().len())
         .map_err(super::types::TransformError::from)?;
-    let (transforms, method, _) = reference_layout(node)?;
+    let (transforms, method, _) =
+        inspect_charged_reference_layout(node, |bytes| scratch.charge(bytes))
+            .map_err(super::types::TransformError::from)?
+            .map_err(|fault| fault.diagnostic_in(scratch))?;
     scratch
         .charge(method.attributes().len())
         .map_err(super::types::TransformError::from)?;
@@ -1942,20 +1974,38 @@ fn verify_namespaced_element(
     expected_namespace: &'static str,
     diagnostic_prefix: &'static str,
 ) -> Result<(), ParseError> {
+    element_mismatch(
+        node,
+        expected_name,
+        expected_namespace,
+        diagnostic_prefix,
+        &crate::c14n::scratch::Native,
+    )
+}
+
+fn element_mismatch<'s, S: transforms::ParseStorage<'s>>(
+    node: Node,
+    expected_name: &'static str,
+    expected_namespace: &'static str,
+    diagnostic_prefix: &'static str,
+    storage: &S,
+) -> Result<(), ParseError> {
     if !node.is_element() {
-        return Err(ParseError::InvalidStructure(format!(
+        return Err(storage.structure(format_args!(
             "expected element <{expected_name}>, got non-element node"
         )));
     }
     let tag = node.tag_name();
     if tag.name() != expected_name || tag.namespace() != Some(expected_namespace) {
-        return Err(ParseError::InvalidStructure(format!(
-            "expected <{diagnostic_prefix}:{expected_name}>, got <{}{}>",
-            tag.namespace()
-                .map(|ns| format!("{{{ns}}}"))
-                .unwrap_or_default(),
-            tag.name()
-        )));
+        let name = tag.name();
+        return Err(match tag.namespace() {
+            Some(namespace) => storage.structure(format_args!(
+                "expected <{diagnostic_prefix}:{expected_name}>, got <{{{namespace}}}{name}>"
+            )),
+            None => storage.structure(format_args!(
+                "expected <{diagnostic_prefix}:{expected_name}>, got <{name}>"
+            )),
+        });
     }
     Ok(())
 }

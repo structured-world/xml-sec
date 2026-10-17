@@ -9,6 +9,7 @@ use crate::c14n::C14nAlgorithm;
 use crate::c14n::scratch::{Accounted, Native, Scratch};
 use crate::xml::dom::Node;
 use crate::xml::dom::NodeId;
+use crate::xmldsig::parse::ParseError;
 use structured_asn1::memory::{OwnedText, OwnedVec, Work};
 
 pub(crate) enum Diagnostic {
@@ -16,21 +17,31 @@ pub(crate) enum Diagnostic {
     Unsupported,
 }
 
+fn current_text<W: Work>(
+    arguments: std::fmt::Arguments<'_>,
+    work: &W,
+) -> Result<OwnedText, TransformError> {
+    use crate::xml::dom::storage::Storage as _;
+    match crate::xml::dom::storage::Accounted(work).formatted(arguments) {
+        Ok(message) => Ok(message.into_owned()),
+        Err(crate::xml::dom::ParseError::SharedExecution(cause)) => Err(cause.into()),
+        Err(cause) => Err(TransformError::XmlParse(
+            crate::document::XmlDocumentError::Parse(cause),
+        )),
+    }
+}
+
 pub(crate) fn current_diagnostic<W: Work>(
     kind: Diagnostic,
     arguments: std::fmt::Arguments<'_>,
     work: &W,
 ) -> TransformError {
-    use crate::xml::dom::storage::Storage as _;
-    match crate::xml::dom::storage::Accounted(work).formatted(arguments) {
+    match current_text(arguments, work) {
         Ok(message) => match kind {
-            Diagnostic::XPath => TransformError::AccountedXPath(message.into_owned()),
-            Diagnostic::Unsupported => {
-                TransformError::AccountedUnsupportedTransform(message.into_owned())
-            }
+            Diagnostic::XPath => TransformError::AccountedXPath(message),
+            Diagnostic::Unsupported => TransformError::AccountedUnsupportedTransform(message),
         },
-        Err(crate::xml::dom::ParseError::SharedExecution(cause)) => cause.into(),
-        Err(cause) => TransformError::XmlParse(crate::document::XmlDocumentError::Parse(cause)),
+        Err(cause) => cause,
     }
 }
 
@@ -147,6 +158,8 @@ pub(crate) trait ParseStorage<'a>: Scratch {
         complexity: usize,
     ) -> Result<(), TransformError>;
     fn diagnostic(&self, kind: Diagnostic, arguments: std::fmt::Arguments<'_>) -> TransformError;
+    /// Structural diagnostic owned by this storage, as transform diagnostics are.
+    fn structure(&self, arguments: std::fmt::Arguments<'_>) -> ParseError;
     fn unsupported(&self, arguments: std::fmt::Arguments<'_>) -> TransformError {
         self.diagnostic(Diagnostic::Unsupported, arguments)
     }
@@ -187,6 +200,10 @@ impl<'a> ParseStorage<'a> for Native {
             Diagnostic::XPath => TransformError::XPath(message),
             Diagnostic::Unsupported => TransformError::UnsupportedTransform(message),
         }
+    }
+
+    fn structure(&self, arguments: std::fmt::Arguments<'_>) -> ParseError {
+        ParseError::InvalidStructure(std::fmt::format(arguments))
     }
 
     fn validate_xpath(
@@ -347,6 +364,11 @@ impl<'a, W: Work> ParseStorage<'a> for Accounted<'_, W> {
 
     fn diagnostic(&self, kind: Diagnostic, arguments: std::fmt::Arguments<'_>) -> TransformError {
         current_diagnostic(kind, arguments, self.0)
+    }
+
+    fn structure(&self, arguments: std::fmt::Arguments<'_>) -> ParseError {
+        current_text(arguments, self.0)
+            .map_or_else(ParseError::Transform, ParseError::AccountedInvalidStructure)
     }
 
     fn validate_xpath(
