@@ -511,9 +511,7 @@ using the XSLT transform is reported as an invalid per-reference result without 
 The optional `xslt` feature executes the XSLT transform
 (`http://www.w3.org/TR/1999/REC-xslt-19991116`, XMLDSig 1.1 section 6.6.5) with the safe-Rust
 XSLT 1.0 engine. `Transform::Xslt` carries an `XsltStylesheet`: the markup of the `<Transform>`
-content, written into generated signatures unchanged. A parsed signature uses the same markup,
-as libxmlsec1 does, so only namespace declarations written on the stylesheet are in scope; those
-inherited from `<Signature>` are not copied into literal result elements.
+content, written into generated signatures unchanged.
 
 The transform consumes octets. Node-set input is first converted with inclusive C14N 1.0, binary
 input is used as is, and the serialized result tree (with its XML declaration for the `xml`
@@ -528,18 +526,30 @@ Execution is bounded by the operation's policy:
   extension calls, pattern tests, template applications, sort comparisons, key entries, result
   nodes and messages) across every XSLT execution of the operation, and
   `max_xslt_output_bytes` bounds their cumulative serialized output.
-- `max_xslt_workspace_bytes` bounds the memory owned at once by one compilation or execution,
-  and `max_xslt_recursion_depth` its compilation and template recursion. Scoped replay reserves
-  that workspace from the current query's memory account.
-- Stylesheet and input documents obey the XML document, node, depth and parse-work limits. A
-  document type declaration in binary input follows `xml.allow_internal_dtd`, as for any other
-  reparsed transform output.
+- `max_xslt_workspace_bytes` bounds the memory one transform holds at once: the compiled
+  stylesheet, the parsed input tree and the execution share it. `max_xslt_recursion_depth`
+  bounds compilation and template recursion. Scoped replay reserves that workspace from the
+  current query's memory account.
+- Stylesheet and input documents obey the XML document (encoded input bytes included), node,
+  depth and namespace-binding limits, and every parser pass over them is charged to
+  `max_xml_parse_work_bytes`. A document type declaration in binary input follows
+  `xml.allow_internal_dtd`, as for any other reparsed transform output.
+- A failed execution consumes the work it did, so a Manifest that keeps verifying after one
+  reference fails cannot spend the allowance again.
 
-`TransformPolicy::xslt_prefix_list_semantics` decides how a prefix without a namespace binding
-in `exclude-result-prefixes` or `extension-element-prefixes` is handled. The default
-`Specification` rejects the stylesheet (XSLT 1.0 section 7.1.1). `Libxslt` skips only that
-prefix, as libxslt and therefore libxmlsec1 do after a warning; the `XmlSecCompatible` profile
-and the native CLI select it, so their signers and verifiers agree with libxmlsec1 digests.
+`TransformPolicy::xslt_stylesheet_semantics` decides how the stylesheet is read:
+
+- `Specification` (the default) reads it as the element of the signed document it is: a
+  prefix it refers to without declaring (in an element or attribute name, a QName in an
+  XPath expression or pattern, or a prefix list), and the default namespace of its
+  unprefixed element names, are bound by the declarations on `<Signature>` or other
+  ancestors (Namespaces in XML 1.0 section 6.1). Bindings it never refers to are not added,
+  so they are not copied into its literal result elements. A prefix bound nowhere in
+  `exclude-result-prefixes` or `extension-element-prefixes` is a stylesheet error.
+- `Libxmlsec1` compiles the `<Transform>` content alone, as libxmlsec1 does, so declarations
+  outside it are lost, and skips an unbound prefix in those lists after a warning, as libxslt
+  does. The `XmlSecCompatible` profile and the native CLI select it, so their signers and
+  verifiers agree with libxmlsec1 digests.
 
 Stylesheets cannot resolve external resources: `xsl:import`, `xsl:include` and `document()`
 fail with `PolicyViolation::Uri`. Exhausted limits are `PolicyViolation::ResourceLimit` errors,

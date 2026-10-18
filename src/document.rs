@@ -261,6 +261,12 @@ impl XmlParseWorkBudget {
         self.charge_policy(bytes).map_err(Into::into)
     }
 
+    /// Parser work still admissible, for a parser that meters its own passes.
+    #[cfg(feature = "xslt")]
+    pub(crate) fn remaining(&self) -> usize {
+        self.remaining.get()
+    }
+
     #[cfg(all(test, any(feature = "xmldsig", feature = "xmlenc")))]
     fn with_limit(maximum: usize) -> Self {
         Self {
@@ -2159,6 +2165,17 @@ fn preflight_document_limits(
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<usize, XmlDocumentError> {
     preflight_document_limits_in(xml, settings, budget, NativeXmlStorage)
+}
+
+/// Enforce every policy limit on `xml` in one charged lexical pass, for a
+/// parser outside this crate's DOM that does not enforce them itself.
+#[cfg(feature = "xslt")]
+pub(crate) fn preflight_xml_limits(
+    xml: &str,
+    settings: DocumentParseSettings,
+    budget: &XmlParseWorkBudget,
+) -> Result<(), XmlDocumentError> {
+    preflight_document_limits(xml, settings, Some(budget)).map(drop)
 }
 
 fn preflight_document_limits_in<S: NameStorage>(

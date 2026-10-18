@@ -128,7 +128,7 @@ pub(crate) struct TransformOptions<'r> {
     xpath_here_semantics: XPathHereSemantics,
     allow_internal_dtd: bool,
     opc_relationship_edition: crate::policy::OpcRelationshipEdition,
-    xslt_prefix_list_semantics: crate::policy::XsltPrefixListSemantics,
+    xslt_stylesheet_semantics: crate::policy::XsltStylesheetSemantics,
     id_attributes: &'r [crate::xml::IdAttributeRegistration],
 }
 
@@ -502,11 +502,11 @@ impl<'r> TransformOptions<'r> {
         self.opc_relationship_edition = edition;
         self
     }
-    pub(crate) fn xslt_prefix_list_semantics(
+    pub(crate) fn xslt_stylesheet_semantics(
         mut self,
-        semantics: crate::policy::XsltPrefixListSemantics,
+        semantics: crate::policy::XsltStylesheetSemantics,
     ) -> Self {
-        self.xslt_prefix_list_semantics = semantics;
+        self.xslt_stylesheet_semantics = semantics;
         self
     }
     /// Select the node returned by the XPath `here()` extension function.
@@ -872,6 +872,7 @@ fn apply_transform_with_context<
                 collected = bytes;
                 &collected
             };
+            check_xml_octets(bytes, budget.xml_parse_settings)?;
             xml_parse.charge_policy(bytes.len())?;
             // Part 2:2012 §9.1.4 / 2021 §6.2.5 constrains Relationships XML
             // independently of generic XML policy, including declaration labels.
@@ -948,7 +949,7 @@ fn apply_transform_with_context<
             xslt::execute(
                 stylesheet,
                 bytes,
-                options.xslt_prefix_list_semantics,
+                options.xslt_stylesheet_semantics,
                 options.internal_dtd_allowed(),
                 budget,
                 xml_parse,
@@ -1237,7 +1238,7 @@ pub fn execute_transforms_with_policy<'a>(
     let options = TransformOptions::default()
         .opc_relationship_edition(policy.transforms.opc_relationship_edition)
         .xpath_here_semantics(policy.transforms.xpath_here_semantics)
-        .xslt_prefix_list_semantics(policy.transforms.xslt_prefix_list_semantics)
+        .xslt_stylesheet_semantics(policy.transforms.xslt_stylesheet_semantics)
         .allow_internal_dtd(policy.xml.allow_internal_dtd);
     let budget = TransformExecutionBudget::from_resources(&policy.resources);
     execute_transforms_with_options_and_budget(
@@ -2048,6 +2049,7 @@ where
         // returns only owned digest bytes. Every C14N output is charged before
         // recursion, so these retained buffers remain a bounded subset of the
         // signature-wide canonicalization work budget.
+        check_xml_octets(bytes, context.budget.xml_parse_settings)?;
         // Decoding is a separate input pass, including malformed-input failures. Reserve it
         // before any transcoding; the subsequent parser charges its own decoded-byte passes.
         context
@@ -2422,6 +2424,22 @@ fn map_transform_xml_parse_error(
     }
 }
 
+/// Refuse transform octets longer than the XML document limit before decoding,
+/// which would otherwise measure only the decoded text: UTF-16 and UTF-32
+/// input decodes to fewer bytes than it occupies.
+fn check_xml_octets(bytes: &[u8], settings: DocumentParseSettings) -> Result<(), TransformError> {
+    if bytes.len() > settings.max_bytes {
+        return Err(map_transform_xml_parse_error(
+            XmlDocumentError::DocumentTooLarge {
+                maximum: settings.max_bytes,
+                actual: bytes.len(),
+            },
+            settings,
+        ));
+    }
+    Ok(())
+}
+
 fn map_transform_xml_decode_error(error: crate::encoding::XmlEncodingError) -> TransformError {
     match error {
         crate::encoding::XmlEncodingError::DecodedLimit { maximum, actual } => {
@@ -2708,7 +2726,7 @@ fn parse_xslt_transform<'a, S: ParseStorage<'a>>(
     let source = xslt::stylesheet_source(transform_node)
         .ok_or_else(|| scratch.unsupported(format_args!("XSLT transform requires a stylesheet")))?;
     scratch.charge(source.len())?;
-    Ok(Some(scratch.xslt(source)))
+    Ok(Some(scratch.xslt(transform_node, source)))
 }
 
 #[cfg(not(feature = "xslt"))]

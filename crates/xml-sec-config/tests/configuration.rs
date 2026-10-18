@@ -624,11 +624,11 @@ fn conflicting_semantics_empty_algorithms_and_invalid_limits_fail_compilation() 
 }
 
 #[test]
-fn xslt_prefix_list_semantics_comes_from_the_base_profile() {
+fn xslt_stylesheet_semantics_comes_from_the_base_profile() {
     // Interpretation semantics are not relaxations: the libxmlsec1-compatible base
-    // selects libxslt handling, a layer may only restate its base, and unknown names
-    // are schema errors.
-    use xml_sec::policy::{PolicyViolation, XsltPrefixListSemantics};
+    // selects libxmlsec1 stylesheet reading, a layer may only restate its base, and
+    // unknown names are schema errors.
+    use xml_sec::policy::{PolicyViolation, XsltStylesheetSemantics};
     let base = |base: &str, extra: &str| {
         Configuration::from_str(
             &format!("schema_version = 1\n[profiles.team]\nbase = '{base}'\n{extra}"),
@@ -641,17 +641,17 @@ fn xslt_prefix_list_semantics_comes_from_the_base_profile() {
             .verification()
             .unwrap()
             .transforms
-            .xslt_prefix_list_semantics
+            .xslt_stylesheet_semantics
     };
     assert_eq!(
         semantics("XmlSecCompatible"),
-        XsltPrefixListSemantics::Libxslt
+        XsltStylesheetSemantics::Libxmlsec1
     );
-    assert_eq!(semantics("Modern"), XsltPrefixListSemantics::Specification);
+    assert_eq!(semantics("Modern"), XsltStylesheetSemantics::Specification);
 
     let restated = base(
         "XmlSecCompatible",
-        "[profiles.team.verification.transforms]\nxslt_prefix_list_semantics='Libxslt'",
+        "[profiles.team.verification.transforms]\nxslt_stylesheet_semantics='Libxmlsec1'",
     )
     .expect("strict config");
     assert_eq!(
@@ -660,14 +660,14 @@ fn xslt_prefix_list_semantics_comes_from_the_base_profile() {
             .verification()
             .unwrap()
             .transforms
-            .xslt_prefix_list_semantics,
-        XsltPrefixListSemantics::Libxslt
+            .xslt_stylesheet_semantics,
+        XsltStylesheetSemantics::Libxmlsec1
     );
     let compile = |value: &str| {
         base(
             "Modern",
             &format!(
-                "[profiles.team.verification.transforms]\nxslt_prefix_list_semantics='{value}'"
+                "[profiles.team.verification.transforms]\nxslt_stylesheet_semantics='{value}'"
             ),
         )
         .expect("strict config")
@@ -682,16 +682,16 @@ fn xslt_prefix_list_semantics_comes_from_the_base_profile() {
         )
     };
     assert!(matches!(
-        compile("Libxslt"),
+        compile("Libxmlsec1"),
         Err(xml_sec_config::Error::Policy(PolicyViolation::Configuration { reason }))
             if reason.contains("incompatible interpretation semantics")
     ));
     assert!(matches!(
         base(
             "Modern",
-            "[profiles.team.verification.transforms]\nxslt_prefix_list_semantics='Lenient'",
+            "[profiles.team.verification.transforms]\nxslt_stylesheet_semantics='Lenient'",
         ),
-        Err(xml_sec_config::Error::Schema(message)) if message.contains("xslt_prefix_list_semantics")
+        Err(xml_sec_config::Error::Schema(message)) if message.contains("xslt_stylesheet_semantics")
     ));
 }
 

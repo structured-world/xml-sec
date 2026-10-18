@@ -43,6 +43,8 @@ pub enum BudgetKind {
     SerializedBytes,
     Messages,
     OwnedBytes,
+    /// XML text scanned by parser passes, one charge per pass over a text.
+    ParseWorkBytes,
 }
 
 /// Policy-neutral enforcement limits for parsing one caller-supplied XML document.
@@ -60,9 +62,15 @@ pub struct ParseBudget {
     pub entity_expansion_bytes: usize,
     /// Maximum peak bytes used to materialize inherited namespace scopes and their indexes.
     pub namespace_scope_bytes: usize,
+    /// Maximum bytes the parsed tree retains, its namespace scopes included.
+    pub owned_bytes: usize,
+    /// Maximum XML text scanned, one charge per parser pass.
+    pub parse_work_bytes: usize,
 }
 
 impl ParseBudget {
+    /// Limits without a tree-size or parser-work ceiling; see [`Self::with_owned_bytes`]
+    /// and [`Self::with_parse_work_bytes`].
     #[must_use]
     pub const fn new(
         source_bytes: usize,
@@ -79,7 +87,23 @@ impl ParseBudget {
             entity_references,
             entity_expansion_bytes,
             namespace_scope_bytes,
+            owned_bytes: usize::MAX,
+            parse_work_bytes: usize::MAX,
         }
+    }
+
+    /// Bound the bytes the parsed tree retains.
+    #[must_use]
+    pub const fn with_owned_bytes(mut self, owned_bytes: usize) -> Self {
+        self.owned_bytes = owned_bytes;
+        self
+    }
+
+    /// Bound the XML text scanned by every parser pass together.
+    #[must_use]
+    pub const fn with_parse_work_bytes(mut self, parse_work_bytes: usize) -> Self {
+        self.parse_work_bytes = parse_work_bytes;
+        self
     }
 
     pub(crate) const UNBOUNDED: Self = Self::new(
@@ -99,9 +123,12 @@ pub struct CompileBudget {
     pub imported_modules: usize,
     pub recursion_depth: usize,
     pub owned_bytes: usize,
+    /// Maximum stylesheet text scanned, one charge per parser pass.
+    pub parse_work_bytes: usize,
 }
 
 impl CompileBudget {
+    /// Limits without a parser-work ceiling; see [`Self::with_parse_work_bytes`].
     #[must_use]
     pub const fn new(
         stylesheet_bytes: usize,
@@ -114,6 +141,60 @@ impl CompileBudget {
             imported_modules,
             recursion_depth,
             owned_bytes,
+            parse_work_bytes: usize::MAX,
+        }
+    }
+
+    /// Bound the stylesheet text scanned by every parser pass together.
+    #[must_use]
+    pub const fn with_parse_work_bytes(mut self, parse_work_bytes: usize) -> Self {
+        self.parse_work_bytes = parse_work_bytes;
+        self
+    }
+}
+
+/// The outcome of a budgeted operation and what it consumed, reported whether
+/// it succeeded or failed, so a caller sharing one allowance across operations
+/// can debit failed work too.
+#[derive(Debug)]
+pub struct Reported<T, U> {
+    pub outcome: Result<T>,
+    pub usage: U,
+}
+
+/// Parser work one compilation or parse admitted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ParseUsage {
+    /// Text bytes charged, one charge per parser pass.
+    pub parse_work_bytes: usize,
+}
+
+/// A parser-work meter: each pass is charged before it scans.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ParseWork {
+    limit: usize,
+    used: usize,
+}
+
+impl ParseWork {
+    pub(crate) const fn new(limit: usize) -> Self {
+        Self { limit, used: 0 }
+    }
+
+    pub(crate) fn charge(&mut self, bytes: usize) -> Result<()> {
+        let actual = self.used.checked_add(bytes).ok_or(Error::Budget {
+            kind: BudgetKind::ParseWorkBytes,
+            limit: self.limit,
+            actual: usize::MAX,
+        })?;
+        ensure(BudgetKind::ParseWorkBytes, self.limit, actual)?;
+        self.used = actual;
+        Ok(())
+    }
+
+    pub(crate) const fn usage(&self) -> ParseUsage {
+        ParseUsage {
+            parse_work_bytes: self.used,
         }
     }
 }
@@ -139,10 +220,11 @@ pub struct ExecutionBudget {
     pub owned_bytes: usize,
 }
 
-/// Work admitted by one successful execution.
+/// Work admitted by one execution, whether it succeeded or failed.
 ///
-/// Each counter is the amount the corresponding [`ExecutionBudget`] limit admitted, so a caller
-/// sharing one allowance across executions can pass the remainder as the next budget.
+/// Each counter is the amount the corresponding [`ExecutionBudget`] limit admitted, never more
+/// than that limit, so a caller sharing one allowance across executions can pass the remainder
+/// as the next budget.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ExecutionUsage {
     pub external_documents: usize,
@@ -314,18 +396,27 @@ impl Meter {
     }
 
     pub(crate) const fn admitted_work(&self) -> ExecutionUsage {
+        // A counter exceeds its limit only after an overflowing charge poisons it; that
+        // refusal admitted the whole limit and nothing beyond it.
+        const fn admitted(used: usize, limit: usize) -> usize {
+            if used > limit { limit } else { used }
+        }
+        let limits = &self.limits;
         ExecutionUsage {
-            external_documents: self.external_documents,
-            xpath_evaluations: self.xpath_evaluations,
-            xpath_operations: self.xpath_operations,
-            extension_operations: self.extension_operations,
-            pattern_evaluations: self.pattern_evaluations,
-            template_applications: self.template_applications,
-            sort_comparisons: self.sort_comparisons,
-            key_entries: self.key_entries,
-            result_nodes: self.result_nodes,
-            serialized_bytes: self.serialized_bytes,
-            messages: self.messages,
+            external_documents: admitted(self.external_documents, limits.external_documents),
+            xpath_evaluations: admitted(self.xpath_evaluations, limits.xpath_evaluations),
+            xpath_operations: admitted(self.xpath_operations, limits.xpath_operations),
+            extension_operations: admitted(self.extension_operations, limits.extension_operations),
+            pattern_evaluations: admitted(self.pattern_evaluations, limits.pattern_evaluations),
+            template_applications: admitted(
+                self.template_applications,
+                limits.template_applications,
+            ),
+            sort_comparisons: admitted(self.sort_comparisons, limits.sort_comparisons),
+            key_entries: admitted(self.key_entries, limits.key_entries),
+            result_nodes: admitted(self.result_nodes, limits.result_nodes),
+            serialized_bytes: admitted(self.serialized_bytes, limits.serialized_bytes),
+            messages: admitted(self.messages, limits.messages),
         }
     }
 

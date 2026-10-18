@@ -132,9 +132,9 @@ pub(crate) enum View<'a, I: Instruction> {
     C14n(&'a C14nAlgorithm, Option<&'a str>),
     Base64,
     Relationship(&'a [I::Selector]),
-    /// Stylesheet markup.
+    /// Stylesheet parameter.
     #[cfg(feature = "xslt")]
-    Xslt(&'a str),
+    Xslt(super::xslt::XsltParameter<'a>),
 }
 
 impl Instruction for Transform {
@@ -152,7 +152,9 @@ impl Instruction for Transform {
             Self::Base64Decode => View::Base64,
             Self::Relationship(selectors) => View::Relationship(selectors),
             #[cfg(feature = "xslt")]
-            Self::Xslt(stylesheet) => View::Xslt(stylesheet.source()),
+            Self::Xslt(stylesheet) => {
+                View::Xslt(super::xslt::XsltParameter::Stylesheet(stylesheet))
+            }
         }
     }
 }
@@ -199,9 +201,9 @@ pub(crate) trait ParseStorage<'a>: Scratch {
         algorithm: C14nAlgorithm,
         prefixes: Option<&'a str>,
     ) -> Self::Instruction;
-    /// Stylesheet markup taken from the original `<Transform>` content.
+    /// The stylesheet of an original `<Transform>`, whose content is `source`.
     #[cfg(feature = "xslt")]
-    fn xslt(&self, source: &'a str) -> Self::Instruction;
+    fn xslt(&self, transform: Node<'a, 'a>, source: &'a str) -> Self::Instruction;
 }
 
 impl<'a> ParseStorage<'a> for Native {
@@ -297,10 +299,10 @@ impl<'a> ParseStorage<'a> for Native {
         Transform::C14n(algorithm)
     }
     #[cfg(feature = "xslt")]
-    fn xslt(&self, source: &'a str) -> Transform {
+    fn xslt(&self, transform: Node<'a, 'a>, source: &'a str) -> Transform {
         // The source is the markup of a parsed `<Transform>`, which `XsltStylesheet::new`
         // would only parse again; keep it as is.
-        Transform::Xslt(super::XsltStylesheet::from_parsed(source.to_owned()))
+        Transform::Xslt(super::XsltStylesheet::from_parsed(transform, source))
     }
 }
 
@@ -369,8 +371,9 @@ pub(crate) enum OriginalInstruction<'a> {
     Filters(OwnedVec<OriginalFilter<'a>>),
     Relationships(OwnedVec<OriginalSelector<'a>>),
     Canonicalization(C14nAlgorithm, Option<&'a str>),
+    /// The original `<Transform>` element.
     #[cfg(feature = "xslt")]
-    Xslt(&'a str),
+    Xslt(Node<'a, 'a>),
 }
 impl<'a> Instruction for OriginalInstruction<'a> {
     type Expression = OriginalExpression<'a>;
@@ -386,7 +389,7 @@ impl<'a> Instruction for OriginalInstruction<'a> {
             Self::Relationships(selectors) => View::Relationship(selectors),
             Self::Canonicalization(algorithm, prefixes) => View::C14n(algorithm, *prefixes),
             #[cfg(feature = "xslt")]
-            Self::Xslt(source) => View::Xslt(source),
+            Self::Xslt(transform) => View::Xslt(super::xslt::XsltParameter::Transform(*transform)),
         }
     }
 }
@@ -470,8 +473,9 @@ impl<'a, W: Work> ParseStorage<'a> for Accounted<'_, W> {
         OriginalInstruction::Canonicalization(algorithm, prefixes)
     }
     #[cfg(feature = "xslt")]
-    fn xslt(&self, source: &'a str) -> Self::Instruction {
-        OriginalInstruction::Xslt(source)
+    fn xslt(&self, transform: Node<'a, 'a>, _source: &'a str) -> Self::Instruction {
+        // The markup and inherited declarations are read from the element when executed.
+        OriginalInstruction::Xslt(transform)
     }
 }
 

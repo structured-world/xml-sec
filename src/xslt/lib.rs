@@ -46,7 +46,9 @@ mod serializer;
 mod value;
 mod xpath;
 
-pub use budget::{BudgetKind, CompileBudget, ExecutionBudget, ExecutionUsage, ParseBudget};
+pub use budget::{
+    BudgetKind, CompileBudget, ExecutionBudget, ExecutionUsage, ParseBudget, ParseUsage, Reported,
+};
 pub use compiler::{Compiler, Stylesheet, UnboundPrefixLists};
 pub use environment::{Clock, ExecutionEnvironment, FixedClock, SystemClock};
 pub use error::{Error, ErrorKind, Result};

@@ -7,10 +7,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use xml_sec_xml_input::lexical::{Event, Scanner};
 
 use super::budget::{
-    ENTITY_EXPANSION_BYTE_CEILING, ENTITY_EXPANSION_DEPTH_CEILING, Meter, append_metered_string,
-    ensure, reserve_temporary_vec_slot,
+    ENTITY_EXPANSION_BYTE_CEILING, ENTITY_EXPANSION_DEPTH_CEILING, Meter, ParseWork,
+    append_metered_string, ensure, reserve_temporary_vec_slot,
 };
-use super::{BudgetKind, Error, ParseBudget, Result};
+use super::{BudgetKind, Error, ParseBudget, ParseUsage, Reported, Result};
 
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
@@ -156,6 +156,7 @@ pub struct Document {
     root: NodeId,
     logical_roots: Vec<NodeId>,
     source_bytes: usize,
+    retained_bytes: usize,
     ids: HashMap<(NodeId, String), NodeId>,
     unparsed_entities: HashMap<(NodeId, String), String>,
 }
@@ -214,36 +215,41 @@ fn estimated_node_clone_bytes(node: &Node) -> usize {
                 .len()
                 .saturating_mul(std::mem::size_of::<NodeId>()),
         )
-        .saturating_add(node.base_uri.as_deref().map_or(0, str::len))
-        .saturating_add(match &node.kind {
-            NodeKind::Root => 0,
-            NodeKind::Text { value, .. } | NodeKind::Comment(value) => value.len(),
-            NodeKind::ProcessingInstruction { target, value } => target
-                .len()
-                .saturating_add(value.as_deref().map_or(0, str::len)),
-            NodeKind::Element {
-                name,
-                prefix,
-                attributes,
-                namespaces: _,
-            } => name
-                .local
-                .len()
-                .saturating_add(name.namespace.as_deref().map_or(0, str::len))
-                .saturating_add(prefix.as_deref().map_or(0, str::len))
-                .saturating_add(
-                    attributes
-                        .len()
-                        .saturating_mul(std::mem::size_of::<Attribute>()),
-                )
-                .saturating_add(attributes.iter().fold(0usize, |total, attribute| {
-                    total
-                        .saturating_add(attribute.name.local.len())
-                        .saturating_add(attribute.name.namespace.as_deref().map_or(0, str::len))
-                        .saturating_add(attribute.prefix.as_deref().map_or(0, str::len))
-                        .saturating_add(attribute.value.len())
-                })),
-        })
+        .saturating_add(node_payload_bytes(&node.kind, node.base_uri.as_deref()))
+}
+
+/// Heap bytes a node's kind and base URI hold, apart from its arena slot,
+/// child list and shared namespace scope.
+fn node_payload_bytes(kind: &NodeKind, base_uri: Option<&str>) -> usize {
+    base_uri.map_or(0, str::len).saturating_add(match kind {
+        NodeKind::Root => 0,
+        NodeKind::Text { value, .. } | NodeKind::Comment(value) => value.len(),
+        NodeKind::ProcessingInstruction { target, value } => target
+            .len()
+            .saturating_add(value.as_deref().map_or(0, str::len)),
+        NodeKind::Element {
+            name,
+            prefix,
+            attributes,
+            namespaces: _,
+        } => name
+            .local
+            .len()
+            .saturating_add(name.namespace.as_deref().map_or(0, str::len))
+            .saturating_add(prefix.as_deref().map_or(0, str::len))
+            .saturating_add(
+                attributes
+                    .len()
+                    .saturating_mul(std::mem::size_of::<Attribute>()),
+            )
+            .saturating_add(attributes.iter().fold(0usize, |total, attribute| {
+                total
+                    .saturating_add(attribute.name.local.len())
+                    .saturating_add(attribute.name.namespace.as_deref().map_or(0, str::len))
+                    .saturating_add(attribute.prefix.as_deref().map_or(0, str::len))
+                    .saturating_add(attribute.value.len())
+            })),
+    })
 }
 
 fn retained_node_backing_bytes(node: &Node) -> usize {
@@ -312,8 +318,29 @@ impl Document {
         base_uri: Option<&str>,
         budget: ParseBudget,
     ) -> Result<Self> {
-        ensure(BudgetKind::SourceBytes, budget.source_bytes, xml.len())?;
-        Self::parse_iterative_bounded(xml, base_uri, budget)
+        Self::parse_with_budget_reported(xml, base_uri, budget).outcome
+    }
+
+    /// [`Self::parse_with_budget`], also reporting the parser work it admitted.
+    pub fn parse_with_budget_reported(
+        xml: &str,
+        base_uri: Option<&str>,
+        budget: ParseBudget,
+    ) -> Reported<Self, ParseUsage> {
+        let mut work = ParseWork::new(budget.parse_work_bytes);
+        let outcome = ensure(BudgetKind::SourceBytes, budget.source_bytes, xml.len())
+            .and_then(|()| Self::parse_iterative_bounded(xml, base_uri, budget, &mut work));
+        Reported {
+            outcome,
+            usage: work.usage(),
+        }
+    }
+
+    /// Bytes this tree retains, as its bounded parse charged them; zero for a
+    /// document parsed without a budget.
+    #[must_use]
+    pub const fn retained_bytes(&self) -> usize {
+        self.retained_bytes
     }
 
     /// Decode and parse trusted XML bytes without a caller-selected resource budget.
@@ -341,7 +368,12 @@ impl Document {
                 error => Error::Xml(error.to_string()),
             },
         )?;
-        Self::parse_iterative_bounded(&xml, base_uri, budget)
+        Self::parse_iterative_bounded(
+            &xml,
+            base_uri,
+            budget,
+            &mut ParseWork::new(budget.parse_work_bytes),
+        )
     }
 
     // Account for heap storage materialized by Clone before duplicating the source document.
@@ -624,13 +656,20 @@ impl Document {
     }
 
     fn parse_iterative(xml: &str, base_uri: Option<&str>) -> Result<Self> {
-        Self::parse_iterative_bounded(xml, base_uri, ParseBudget::UNBOUNDED)
+        Self::parse_iterative_bounded(
+            xml,
+            base_uri,
+            ParseBudget::UNBOUNDED,
+            &mut ParseWork::new(usize::MAX),
+        )
     }
 
-    fn parse_iterative_bounded(
+    /// Parse within `budget`, charging each pass over the text to `work` first.
+    pub(crate) fn parse_iterative_bounded(
         xml: &str,
         base_uri: Option<&str>,
         budget: ParseBudget,
+        work: &mut ParseWork,
     ) -> Result<Self> {
         #[derive(Clone, Copy, PartialEq, Eq)]
         enum DocumentPhase {
@@ -650,18 +689,29 @@ impl Document {
             entity_references: 0,
             entity_expansion: EntityExpansionMeter::with_parse_budget(budget),
             namespace_scope_bytes: 0,
+            owned_bytes: 0,
         };
+        // Entity declarations and their expansion each take a pass over the
+        // document only when an internal subset can declare entities.
+        let subset = doctype_span(xml)?.is_some_and(|doctype| doctype.internal_subset.is_some());
+        if subset {
+            work.charge(xml.len())?;
+        }
         let (parameter_expanded_xml, declarations) = internal_general_entities(
             xml,
             &mut meter.entity_references,
             &mut meter.entity_expansion,
         )?;
+        if subset {
+            work.charge(parameter_expanded_xml.len())?;
+        }
         let expanded_xml = expand_document_entities(
             parameter_expanded_xml.as_ref(),
             &declarations.general,
             &mut meter.entity_references,
             &mut meter.entity_expansion,
         )?;
+        work.charge(expanded_xml.len())?;
         let mut reader = Scanner::new(expanded_xml.as_ref());
         let mut previous_event_offset = 0usize;
         let mut source_line = 1usize;
@@ -778,11 +828,13 @@ impl Document {
                     let inherited_base =
                         document.node(parent).and_then(|node| node.base_uri.clone());
                     meter.reserve_node()?;
-                    let id = document.push(
+                    let id = push_metered(
+                        &mut document,
                         parent,
                         NodeKind::Comment(normalize_xml_line_endings(text)),
                         inherited_base,
-                    );
+                        &mut meter,
+                    )?;
                     document.nodes[id.0].source_line = Some(source_line);
                 }
                 Event::ProcessingInstruction {
@@ -798,14 +850,16 @@ impl Document {
                     let inherited_base =
                         document.node(parent).and_then(|node| node.base_uri.clone());
                     meter.reserve_node()?;
-                    let id = document.push(
+                    let id = push_metered(
+                        &mut document,
                         parent,
                         NodeKind::ProcessingInstruction {
                             target: target.to_owned(),
                             value: content.map(normalize_xml_line_endings),
                         },
                         inherited_base,
-                    );
+                        &mut meter,
+                    )?;
                     document.nodes[id.0].source_line = Some(source_line);
                 }
                 Event::Reference {
@@ -872,6 +926,7 @@ impl Document {
             document.register_unparsed_entity(name, uri)?;
         }
         document.register_xml_ids()?;
+        document.retained_bytes = meter.retained_bytes();
         Ok(document)
     }
 
@@ -891,6 +946,7 @@ impl Document {
             root: NodeId(0, identity),
             logical_roots: vec![NodeId(0, identity)],
             source_bytes: 0,
+            retained_bytes: 0,
             ids: HashMap::new(),
             unparsed_entities: HashMap::new(),
         }
@@ -1828,11 +1884,14 @@ pub(crate) fn normalized_xml_id(value: &str) -> Result<Cow<'_, str>> {
     Ok(normalized)
 }
 
-pub(crate) fn prepare_xml_frontend_bounded(
-    xml: &str,
+/// Expand and strip the internal subset for the frontend parser, charging each
+/// pass over the text to `work` first.
+pub(crate) fn prepare_xml_frontend_bounded<'a>(
+    xml: &'a str,
     limit: usize,
     recursion_depth: usize,
-) -> Result<Cow<'_, str>> {
+    work: &mut ParseWork,
+) -> Result<Cow<'a, str>> {
     let mut entity_references = 0;
     let mut entity_expansion = EntityExpansionMeter::with_limits(
         BudgetKind::OwnedBytes,
@@ -1840,8 +1899,16 @@ pub(crate) fn prepare_xml_frontend_bounded(
         usize::MAX,
         recursion_depth.min(ENTITY_EXPANSION_DEPTH_CEILING),
     );
+    // Without an internal subset there are no declarations to read or expand.
+    let subset = doctype_span(xml)?.is_some_and(|doctype| doctype.internal_subset.is_some());
+    if subset {
+        work.charge(xml.len())?;
+    }
     let (parameter_expanded_xml, declarations) =
         internal_general_entities(xml, &mut entity_references, &mut entity_expansion)?;
+    if subset {
+        work.charge(parameter_expanded_xml.len())?;
+    }
     let expanded_xml = expand_document_entities(
         parameter_expanded_xml.as_ref(),
         &declarations.general,
@@ -1854,6 +1921,7 @@ pub(crate) fn prepare_xml_frontend_bounded(
             Cow::Owned(expanded) => Cow::Owned(expanded),
         });
     };
+    work.charge(expanded_xml.len())?;
 
     let mut edits = Vec::<(std::ops::Range<usize>, String)>::new();
     let mut scanner = Scanner::new(expanded_xml.as_ref());
@@ -2057,9 +2125,32 @@ struct StreamParseMeter {
     entity_references: usize,
     entity_expansion: EntityExpansionMeter,
     namespace_scope_bytes: usize,
+    owned_bytes: usize,
 }
 
 impl StreamParseMeter {
+    /// Admit `bytes` more of the tree; namespace scopes share the same ceiling.
+    fn charge_owned(&mut self, bytes: usize) -> Result<()> {
+        let refused = || Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            limit: self.budget.owned_bytes,
+            actual: usize::MAX,
+        };
+        let owned = self.owned_bytes.checked_add(bytes).ok_or_else(refused)?;
+        let actual = owned
+            .checked_add(self.namespace_scope_bytes)
+            .ok_or_else(refused)?;
+        ensure(BudgetKind::OwnedBytes, self.budget.owned_bytes, actual)?;
+        self.owned_bytes = owned;
+        Ok(())
+    }
+
+    /// Bytes the tree holds so far.
+    const fn retained_bytes(&self) -> usize {
+        // Both count bytes of live allocations, so their sum fits the address space.
+        self.owned_bytes + self.namespace_scope_bytes
+    }
+
     fn reserve_node(&mut self) -> Result<()> {
         let actual = self.nodes.saturating_add(1);
         ensure(BudgetKind::SourceNodes, self.budget.source_nodes, actual)?;
@@ -2074,6 +2165,48 @@ impl StreamParseMeter {
             depth,
         )
     }
+}
+
+/// Append a parsed node after charging every byte it adds to the tree.
+///
+/// The arena and the parent's child list grow by explicit exact reservations,
+/// so their capacity is admitted before it is allocated.
+fn push_metered(
+    document: &mut Document,
+    parent: NodeId,
+    kind: NodeKind,
+    base_uri: Option<String>,
+    meter: &mut StreamParseMeter,
+) -> Result<NodeId> {
+    let refused = |limit| Error::Budget {
+        kind: BudgetKind::OwnedBytes,
+        limit,
+        actual: usize::MAX,
+    };
+    let nodes = &mut document.nodes;
+    if nodes.len() == nodes.capacity() {
+        let additional = nodes.capacity().max(4);
+        let bytes = additional
+            .checked_mul(std::mem::size_of::<Node>())
+            .ok_or_else(|| refused(meter.budget.owned_bytes))?;
+        meter.charge_owned(bytes)?;
+        nodes
+            .try_reserve_exact(additional)
+            .map_err(|_| refused(meter.budget.owned_bytes))?;
+    }
+    let children = &mut nodes[parent.0].children;
+    if children.len() == children.capacity() {
+        let additional = children.capacity().max(4);
+        let bytes = additional
+            .checked_mul(std::mem::size_of::<NodeId>())
+            .ok_or_else(|| refused(meter.budget.owned_bytes))?;
+        meter.charge_owned(bytes)?;
+        children
+            .try_reserve_exact(additional)
+            .map_err(|_| refused(meter.budget.owned_bytes))?;
+    }
+    meter.charge_owned(node_payload_bytes(&kind, base_uri.as_deref()))?;
+    Ok(document.push(parent, kind, base_uri))
 }
 
 fn push_stream_element(
@@ -2261,7 +2394,8 @@ fn push_stream_element(
     } else {
         inherited_base
     };
-    let projected = document.push(
+    let projected = push_metered(
+        document,
         parent,
         NodeKind::Element {
             name: ExpandedName::new(namespace, local),
@@ -2270,7 +2404,8 @@ fn push_stream_element(
             namespaces,
         },
         effective_base,
-    );
+        meter,
+    )?;
     for index in first_id_attribute
         .into_iter()
         .chain(additional_id_attributes)
@@ -2413,19 +2548,41 @@ fn push_parsed_text(
             disable_output_escaping: false,
         } = &mut document.nodes[last_child.0].kind
     {
+        // Coalescing grows the existing text exactly, after admitting its new capacity.
+        let capacity = existing.capacity();
+        let required = existing
+            .len()
+            .checked_add(value.len())
+            .ok_or(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                limit: meter.budget.owned_bytes,
+                actual: usize::MAX,
+            })?;
+        if required > capacity {
+            meter.charge_owned(required - capacity)?;
+            existing
+                .try_reserve_exact(value.len())
+                .map_err(|_| Error::Budget {
+                    kind: BudgetKind::OwnedBytes,
+                    limit: meter.budget.owned_bytes,
+                    actual: usize::MAX,
+                })?;
+        }
         existing.push_str(&value);
         return Ok(last_child);
     }
     meter.reserve_node()?;
     let inherited_base = document.node(parent).and_then(|node| node.base_uri.clone());
-    Ok(document.push(
+    push_metered(
+        document,
         parent,
         NodeKind::Text {
             value,
             disable_output_escaping: false,
         },
         inherited_base,
-    ))
+        meter,
+    )
 }
 
 fn split_lexical_name(name: &str) -> Result<(Option<String>, String)> {

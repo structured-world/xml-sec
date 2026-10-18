@@ -9,7 +9,9 @@ use super::{
     normalize_predefined_entity_declaration, parser_workspace_bytes, prepare_xml_frontend_bounded,
     set_namespace,
 };
-use crate::budget::{ENTITY_EXPANSION_BYTE_CEILING, ENTITY_EXPANSION_DEPTH_CEILING, Meter};
+use crate::budget::{
+    ENTITY_EXPANSION_BYTE_CEILING, ENTITY_EXPANSION_DEPTH_CEILING, Meter, ParseWork,
+};
 use crate::{BudgetKind, ExecutionBudget, ParseBudget};
 
 fn nested_xml(depth: usize, leaf: &str) -> String {
@@ -1435,8 +1437,9 @@ fn frontend_preserves_declared_attribute_normalization() {
             "\t\n\r",
         ),
     ] {
-        let prepared = super::prepare_xml_frontend_bounded(xml, 100_000, 64)
-            .expect("DTD preprocessing succeeds");
+        let prepared =
+            super::prepare_xml_frontend_bounded(xml, 100_000, 64, &mut ParseWork::new(usize::MAX))
+                .expect("DTD preprocessing succeeds");
         let document = roxmltree::Document::parse(&prepared).expect("prepared XML parses");
         assert_eq!(document.root_element().attribute("a"), Some(expected));
     }
@@ -1485,6 +1488,7 @@ fn shallow_and_iterative_frontends_expand_explicit_attribute_entities_identicall
         xml,
         ENTITY_EXPANSION_BYTE_CEILING,
         ENTITY_EXPANSION_DEPTH_CEILING,
+        &mut ParseWork::new(usize::MAX),
     )
     .expect("roxmltree frontend preparation expands the entity");
     let parsed = roxmltree::Document::parse(&prepared).expect("prepared XML parses");

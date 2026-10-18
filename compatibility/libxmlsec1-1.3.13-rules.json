@@ -124,7 +124,7 @@
       "kinds": ["algorithm-uri"],
       "name_regex": "^xmlSecHrefXslt$",
       "outcome": "compatibility-profile-only",
-      "rationale": "The optional xslt feature executes XSLT 1.0 stylesheets without external resources and within the operation's XSLT resource limits. Secure profiles exclude it from their transform allowlists; the default and libxmlsec1-compatible policies permit it when built. Unbound prefixes in stylesheet prefix lists follow XSLT 1.0 by default and libxslt under the libxmlsec1-compatible profile and the CLI.",
+      "rationale": "The optional xslt feature executes XSLT 1.0 stylesheets without external resources and within the operation's XSLT resource limits. Secure profiles exclude it from their transform allowlists; the default and libxmlsec1-compatible policies permit it when built. Stylesheets are read as elements of the signed document by default, with every namespace in scope; the libxmlsec1-compatible profile and the CLI compile the Transform content alone and skip unbound prefix-list entries, as libxmlsec1 and libxslt do.",
       "evidence": "xslt-transform-tests"
     },
     {

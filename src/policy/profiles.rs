@@ -238,10 +238,10 @@ fn profile_policies(
         .filter(|a| compatibility || (a.signing_allowed() && a.output_len() >= 32))
         .collect();
     let transforms = if compatibility {
-        // libxmlsec1 compiles stylesheets with libxslt; signers and verifiers in this
-        // profile must agree with it on the digested output.
+        // Signers and verifiers in this profile must agree with libxmlsec1 on the
+        // digested output of XSLT transforms.
         TransformPolicy {
-            xslt_prefix_list_semantics: XsltPrefixListSemantics::Libxslt,
+            xslt_stylesheet_semantics: XsltStylesheetSemantics::Libxmlsec1,
             ..TransformPolicy::default()
         }
     } else {

@@ -6,7 +6,7 @@ use pretty_assertions::assert_eq;
 use xml_sec_xslt::{
     AccessDenialReason, Attribute, BudgetKind, Clock, CompileBudget, Compiler, Document, Error,
     ErrorKind, ExecutionBudget, ExecutionEnvironment, ExecutionOptions, ExpandedName, FixedClock,
-    NoResolver, NodeKind, NodeReference, Parameters, ResolvePurpose, ResolveRequest,
+    NoResolver, NodeKind, NodeReference, Parameters, ParseBudget, ResolvePurpose, ResolveRequest,
     ResolvedResource, Resolver, ResourceAccess, ResourceIdentity, SystemClock, TransformResult,
     UnboundPrefixLists, Value,
 };
@@ -80,6 +80,98 @@ fn execution_budget(source_bytes: usize) -> ExecutionBudget {
 }
 
 #[test]
+fn bounded_parsing_charges_each_pass_and_the_retained_tree() {
+    // A caller sharing one parser-work and memory allowance needs every pass charged
+    // before it scans, the tree's size refused before it is allocated, and the work of a
+    // refused parse reported as well.
+    let xml = format!("<root>{}</root>", "<n/>".repeat(20_000));
+    let unbounded = ParseBudget::new(
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+    );
+    let parsed = Document::parse_with_budget_reported(&xml, None, unbounded);
+    let document = parsed.outcome.expect("unbounded parse succeeds");
+    // Without an internal subset, one scanner pass reads the text once.
+    assert_eq!(parsed.usage.parse_work_bytes, xml.len());
+    let retained = document.retained_bytes();
+    assert!(
+        retained > 20_000 * std::mem::size_of::<usize>(),
+        "{retained}"
+    );
+
+    let short = Document::parse_with_budget_reported(
+        &xml,
+        None,
+        unbounded.with_parse_work_bytes(xml.len() - 1),
+    );
+    assert!(matches!(
+        short.outcome,
+        Err(Error::Budget {
+            kind: BudgetKind::ParseWorkBytes,
+            ..
+        })
+    ));
+    assert_eq!(short.usage.parse_work_bytes, 0);
+
+    let exact =
+        Document::parse_with_budget_reported(&xml, None, unbounded.with_owned_bytes(retained));
+    assert_eq!(
+        exact
+            .outcome
+            .expect("the retained size fits its own limit")
+            .retained_bytes(),
+        retained
+    );
+    let workspace =
+        Document::parse_with_budget_reported(&xml, None, unbounded.with_owned_bytes(256 * 1024));
+    assert!(matches!(
+        workspace.outcome,
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+    assert_eq!(workspace.usage.parse_work_bytes, xml.len());
+}
+
+#[test]
+fn compilation_reports_parser_work_whether_or_not_it_succeeds() {
+    // Every parser pass over the stylesheet text is charged, and a refused compilation
+    // still reports the passes it made.
+    let xml = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><out/></xsl:template></xsl:stylesheet>"#;
+    let budget = CompileBudget::new(1 << 20, 0, 64, 8 << 20);
+    let compiled = Compiler::new(Arc::new(NoResolver), budget).compile_reported(xml, None);
+    assert!(compiled.outcome.is_ok());
+    let work = compiled.usage.parse_work_bytes;
+    assert!(work >= 2 * xml.len(), "{work}");
+    assert_eq!(work % xml.len(), 0, "every pass reads the whole text");
+    let stylesheet = compiled.outcome.expect("stylesheet compiles");
+    assert!(stylesheet.retained_bytes() > 0);
+
+    let refused = Compiler::new(Arc::new(NoResolver), budget.with_parse_work_bytes(work - 1))
+        .compile_reported(xml, None);
+    assert!(matches!(
+        refused.outcome,
+        Err(Error::Budget {
+            kind: BudgetKind::ParseWorkBytes,
+            ..
+        })
+    ));
+    assert_eq!(refused.usage.parse_work_bytes, work - xml.len());
+    assert_eq!(
+        Compiler::new(Arc::new(NoResolver), budget.with_parse_work_bytes(work))
+            .compile_reported(xml, None)
+            .usage
+            .parse_work_bytes,
+        work
+    );
+}
+
+#[test]
 fn reported_usage_is_the_work_the_budget_enforces() {
     // Callers that share one allowance across executions pass the remainder of the previous
     // report as the next budget. That is sound only if each reported counter is exactly the
@@ -93,10 +185,10 @@ fn reported_usage_is_the_work_the_budget_enforces() {
     let xml = "<root><item>a</item><item>b</item></root>";
     let source = Document::parse(xml, None).expect("source parses");
     let run = |budget: ExecutionBudget| {
-        stylesheet.execute(
+        stylesheet.execute_reported(
             &source,
             &Parameters::new(),
-            Arc::new(NoResolver),
+            ExecutionEnvironment::new(Arc::new(NoResolver)),
             ExecutionOptions {
                 budget,
                 initial_mode: None,
@@ -104,8 +196,9 @@ fn reported_usage_is_the_work_the_budget_enforces() {
             },
         )
     };
-    let result = run(execution_budget(xml.len())).expect("transform succeeds");
-    let usage = result.usage;
+    let reported = run(execution_budget(xml.len()));
+    let usage = reported.usage;
+    let result = reported.outcome.expect("transform succeeds");
     assert_eq!(usage.serialized_bytes, result.serialized.bytes.len());
     assert_eq!(usage.external_documents, 0);
     assert_eq!(usage.messages, 0);
@@ -155,14 +248,32 @@ fn reported_usage_is_the_work_the_budget_enforces() {
         assert!(used > 0, "{kind:?} must be exercised by this transform");
         let mut exact = execution_budget(xml.len());
         set(&mut exact, used);
-        let replay = run(exact).expect("the reported amount fits its own limit");
+        let replay = run(exact)
+            .outcome
+            .expect("the reported amount fits its own limit");
         assert_eq!(replay.serialized.bytes, result.serialized.bytes);
         let mut short = execution_budget(xml.len());
         set(&mut short, used - 1);
+        let refused = run(short);
         assert!(
-            matches!(run(short), Err(Error::Budget { kind: refused, .. }) if refused == kind),
+            matches!(refused.outcome, Err(Error::Budget { kind: refused, .. }) if refused == kind),
             "{kind:?} must refuse one unit below the reported usage"
         );
+        // A failed execution still reports the work it did, never beyond its limits.
+        let mut admitted = execution_budget(xml.len());
+        set(&mut admitted, used - 1);
+        let failed = refused.usage;
+        assert!(failed.xpath_evaluations + failed.template_applications > 0);
+        for (counter, limit) in [
+            (failed.xpath_evaluations, admitted.xpath_evaluations),
+            (failed.xpath_operations, admitted.xpath_operations),
+            (failed.pattern_evaluations, admitted.pattern_evaluations),
+            (failed.template_applications, admitted.template_applications),
+            (failed.result_nodes, admitted.result_nodes),
+            (failed.serialized_bytes, admitted.serialized_bytes),
+        ] {
+            assert!(counter <= limit, "{kind:?}: {counter} exceeds {limit}");
+        }
     }
 }
 

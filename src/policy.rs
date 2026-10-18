@@ -1016,16 +1016,21 @@ pub enum SameDocumentIdSemantics {
     XmlSecVisa3d,
 }
 
-/// Handling of a prefix without a namespace binding in an XSLT stylesheet's
-/// `exclude-result-prefixes` or `extension-element-prefixes`.
+/// How the stylesheet of an XSLT transform is read from its `<Transform>`.
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum XsltPrefixListSemantics {
-    /// XSLT 1.0 section 7.1.1 makes such a prefix a stylesheet error.
+pub enum XsltStylesheetSemantics {
+    /// The stylesheet is an element of the signed document: a prefix it refers
+    /// to without declaring is bound by the declarations on its ancestors
+    /// (Namespaces in XML section 6.1), and a prefix bound nowhere in
+    /// `exclude-result-prefixes` or `extension-element-prefixes` is a stylesheet
+    /// error (XSLT 1.0 section 7.1.1).
     #[default]
     Specification,
-    /// Skip only that prefix, as libxslt (and so libxmlsec1) does after a warning.
-    Libxslt,
+    /// libxmlsec1: the stylesheet is the serialized `<Transform>` content, so
+    /// namespaces declared on its ancestors are lost, and libxslt skips an
+    /// unbound prefix in a prefix list after a warning.
+    Libxmlsec1,
 }
 
 /// Wire representation used for ECDSA `SignatureValue` bytes.
@@ -1051,8 +1056,8 @@ pub struct TransformPolicy {
     pub same_document_id_semantics: SameDocumentIdSemantics,
     /// Trusted normalization edition, not package validation; never inferred from XML.
     pub opc_relationship_edition: OpcRelationshipEdition,
-    /// Unbound prefixes in XSLT stylesheet prefix lists; applies to builds with `xslt`.
-    pub xslt_prefix_list_semantics: XsltPrefixListSemantics,
+    /// How XSLT stylesheets are read; applies to builds with `xslt`.
+    pub xslt_stylesheet_semantics: XsltStylesheetSemantics,
 }
 
 /// URI-class decisions shared by XMLDSig reference and key retrieval processing.

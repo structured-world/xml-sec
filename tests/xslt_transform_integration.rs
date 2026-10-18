@@ -10,7 +10,7 @@ use xml_sec::XmlDomParseError;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::document::XmlDocumentError;
 use xml_sec::policy::{
-    PolicyViolation, SigningPolicy, VerificationPolicy, XsltPrefixListSemantics,
+    PolicyViolation, SigningPolicy, VerificationPolicy, XsltStylesheetSemantics,
 };
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DigestAlgorithm, DsigError, DsigStatus, ReferenceBuilder,
@@ -21,9 +21,11 @@ use xml_sec::xmldsig::{
 
 const XSL: &str = "http://www.w3.org/1999/XSL/Transform";
 
+/// A stylesheet whose literal result elements have no namespace: it undeclares the
+/// XMLDSig default namespace that the signature puts in scope at its `<Transform>`.
 fn stylesheet(body: &str) -> XsltStylesheet {
     XsltStylesheet::new(format!(
-        r#"<xsl:stylesheet version="1.0" xmlns:xsl="{XSL}">{body}</xsl:stylesheet>"#
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="{XSL}" xmlns="">{body}</xsl:stylesheet>"#
     ))
     .expect("test stylesheet is valid markup")
 }
@@ -346,12 +348,12 @@ fn unbound_prefix_lists_follow_the_operation_policy() {
     assert!(matches!(error, TransformError::Xslt(_)), "{error:?}");
 
     let mut signing = SigningPolicy::default();
-    signing.transforms.xslt_prefix_list_semantics = XsltPrefixListSemantics::Libxslt;
+    signing.transforms.xslt_stylesheet_semantics = XsltStylesheetSemantics::Libxmlsec1;
     let signed = sign_with_policy(ITEMS, &builder, signing).expect("libxslt handling signs");
     let verify = |semantics| {
         let mut policy = VerificationPolicy::default();
         policy.key_trust.mode = xml_sec::policy::VerificationTrustMode::CryptographicOnly;
-        policy.transforms.xslt_prefix_list_semantics = semantics;
+        policy.transforms.xslt_stylesheet_semantics = semantics;
         let resolver = DefaultKeyResolver::default();
         xml_sec::xmldsig::VerifyContext::new()
             .policy(policy)
@@ -359,13 +361,13 @@ fn unbound_prefix_lists_follow_the_operation_policy() {
             .store_pre_digest(true)
             .verify(&signed)
     };
-    let result = verify(XsltPrefixListSemantics::Libxslt).expect("libxslt handling verifies");
+    let result = verify(XsltStylesheetSemantics::Libxmlsec1).expect("libxslt handling verifies");
     assert_eq!(result.status, DsigStatus::Valid);
     assert_eq!(
         result.signed_info_references[0].pre_digest_data.as_deref(),
         Some(b"<?xml version=\"1.0\"?>\n<r/>\n".as_slice())
     );
-    let error = verify(XsltPrefixListSemantics::Specification)
+    let error = verify(XsltStylesheetSemantics::Specification)
         .expect_err("specification rejects the stylesheet");
     assert!(
         matches!(
@@ -374,6 +376,59 @@ fn unbound_prefix_lists_follow_the_operation_policy() {
         ),
         "{error:?}"
     );
+}
+
+#[test]
+fn stylesheets_keep_the_namespaces_in_scope_at_their_transform() {
+    // The stylesheet is an element of the signed document: a prefix declared on an
+    // ancestor names the XSLT namespace (Namespaces in XML 1.0 section 6.1). Only the
+    // bindings it refers to are inherited, so the unused `ds` binding is not copied into
+    // its literal result element. libxmlsec1 compiles the `<Transform>` content alone and
+    // loses the `xsl` declaration.
+    let template = format!(
+        concat!(
+            r#"<root xmlns:xsl="{xsl}"><item>a</item>"#,
+            r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo>"#,
+            r#"<ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
+            r#"<ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"/>"#,
+            r#"<ds:Reference URI=""><ds:Transforms>"#,
+            r#"<ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>"#,
+            r#"<ds:Transform Algorithm="{xslt}"><xsl:stylesheet version="1.0">"#,
+            r#"<xsl:template match="/"><out><xsl:value-of select="//item"/></out></xsl:template>"#,
+            r#"</xsl:stylesheet></ds:Transform></ds:Transforms>"#,
+            r#"<ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>"#,
+            r#"<ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/>"#,
+            r#"</ds:Signature></root>"#
+        ),
+        xsl = XSL,
+        xslt = XSLT_TRANSFORM_URI
+    );
+    let signer = xml_sec::xmldsig::HmacSigningKey::new(vec![7; 32]).unwrap();
+    let verifier = xml_sec::xmldsig::HmacVerificationKey::new(vec![7; 32]).unwrap();
+    let sign = |semantics| {
+        let mut policy = SigningPolicy::default();
+        policy.transforms.xslt_stylesheet_semantics = semantics;
+        SignContext::new(&signer)
+            .policy(policy)
+            .sign_template(&template)
+    };
+
+    let signed = sign(XsltStylesheetSemantics::Specification).expect("the stylesheet compiles");
+    let result = xml_sec::xmldsig::VerifyContext::new()
+        .key(&verifier)
+        .store_pre_digest(true)
+        .verify(&signed)
+        .expect("verification runs");
+    assert_eq!(result.status, DsigStatus::Valid);
+    assert_eq!(
+        result.signed_info_references[0].pre_digest_data.as_deref(),
+        Some(b"<?xml version=\"1.0\"?>\n<out>a</out>\n".as_slice())
+    );
+
+    let error = transform_error(
+        sign(XsltStylesheetSemantics::Libxmlsec1).expect_err("`xsl` is unbound in the content"),
+    );
+    assert!(matches!(error, TransformError::Xslt(_)), "{error:?}");
 }
 
 #[test]

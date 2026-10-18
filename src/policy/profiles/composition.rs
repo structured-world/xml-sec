@@ -241,10 +241,7 @@ fn transforms(
             b.same_document_id_semantics,
         )?,
         opc_relationship_edition: equal(a.opc_relationship_edition, b.opc_relationship_edition)?,
-        xslt_prefix_list_semantics: equal(
-            a.xslt_prefix_list_semantics,
-            b.xslt_prefix_list_semantics,
-        )?,
+        xslt_stylesheet_semantics: equal(a.xslt_stylesheet_semantics, b.xslt_stylesheet_semantics)?,
     })
 }
 fn manifests(a: ManifestProcessing, b: ManifestProcessing) -> ManifestProcessing {

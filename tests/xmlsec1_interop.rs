@@ -530,10 +530,24 @@ fn xmlsec1_verifies_xslt_reference_signature_from_xml_sec() {
     )
     .expect("RSA private-key fixture must parse");
     let signed = SignContext::new(&key)
+        .policy(SigningPolicy {
+            transforms: libxmlsec1_stylesheets(),
+            ..SigningPolicy::default()
+        })
         .sign_with_builder(xslt_payload_xml(), &xslt_signing_builder())
         .expect("xml-sec must sign the XSLT references");
 
     assert_xmlsec1_accepts(&signed, "tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+}
+
+/// libxmlsec1 compiles the `<Transform>` content alone, without the namespaces the
+/// signature declares around it.
+#[cfg(feature = "xslt")]
+fn libxmlsec1_stylesheets() -> TransformPolicy {
+    TransformPolicy {
+        xslt_stylesheet_semantics: xml_sec::policy::XsltStylesheetSemantics::Libxmlsec1,
+        ..TransformPolicy::default()
+    }
 }
 
 #[cfg(feature = "xslt")]
@@ -561,10 +575,25 @@ fn xml_sec_verifies_xslt_reference_signature_from_xmlsec1() {
         Path::new("tests/fixtures/keys/rsa/rsa-2048-key.pem"),
         Path::new("tests/fixtures/keys/rsa/rsa-2048-cert.pem"),
     );
-    let public_key = fs::read_to_string("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem")
-        .expect("RSA public-key fixture must load");
-
-    let verified = xml_sec::xmldsig::verify_signature_with_pem_key(&signed, &public_key, true)
+    let (_, pem) = x509_parser::pem::parse_x509_pem(
+        &fs::read("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem")
+            .expect("RSA public-key fixture must load"),
+    )
+    .expect("RSA public key must parse");
+    let key = VerificationKey {
+        algorithm: SignatureAlgorithm::RsaSha256,
+        public_key_bytes: pem.contents,
+        certificate_der: None,
+        name: None,
+    };
+    let verified = VerifyContext::new()
+        .key(&key)
+        .policy(VerificationPolicy {
+            transforms: libxmlsec1_stylesheets(),
+            ..VerificationPolicy::default()
+        })
+        .store_pre_digest(true)
+        .verify(&signed)
         .expect("xml-sec must process the xmlsec1 XSLT signature");
     assert_eq!(verified.status, DsigStatus::Valid);
     assert_eq!(

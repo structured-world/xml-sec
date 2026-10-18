@@ -28,8 +28,8 @@ use super::xpath::{
 };
 use super::{
     Attribute, BudgetKind, Document, Error, ExecutionBudget, ExecutionEnvironment, ExecutionUsage,
-    ExpandedName, Namespace, NodeId, NodeKind, NodeReference, Resolver, Result, SerializedOutput,
-    Value,
+    ExpandedName, Namespace, NodeId, NodeKind, NodeReference, OutputDefinition, Reported, Resolver,
+    Result, SerializedOutput, Value,
 };
 
 /// Top-level stylesheet parameters supplied by the caller.
@@ -148,7 +148,6 @@ pub struct TransformResult {
     /// The engine never writes these resources to the filesystem or network.
     pub secondary_outputs: Vec<SecondaryOutput>,
     pub messages: Vec<Message>,
-    pub usage: ExecutionUsage,
 }
 
 /// One secondary result produced by a compatible XSLT extension element.
@@ -183,8 +182,80 @@ impl Stylesheet {
         environment: ExecutionEnvironment<R>,
         options: ExecutionOptions,
     ) -> Result<TransformResult> {
-        let source_bytes = source.source_bytes();
-        let mut meter = Meter::new(options.budget, source_bytes)?;
+        self.execute_reported(source, parameters, environment, options)
+            .outcome
+    }
+
+    /// [`Self::execute_with_environment`], also reporting the work it admitted,
+    /// including the work of a failed execution.
+    pub fn execute_reported<R: Resolver + 'static>(
+        &self,
+        source: &Document,
+        parameters: &Parameters,
+        environment: ExecutionEnvironment<R>,
+        options: ExecutionOptions,
+    ) -> Reported<TransformResult, ExecutionUsage> {
+        let mut meter = match Meter::new(options.budget, source.source_bytes()) {
+            Ok(meter) => meter,
+            Err(error) => {
+                return Reported {
+                    outcome: Err(error),
+                    usage: ExecutionUsage::default(),
+                };
+            }
+        };
+        let prepared = self.prepare_execution(source, parameters, &environment, &mut meter);
+        let (prepared, prepared_parameters, source_options) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return Reported {
+                    outcome: Err(error),
+                    usage: meter.admitted_work(),
+                };
+            }
+        };
+        let mut state = match Execution::start(
+            self,
+            prepared,
+            parameters,
+            prepared_parameters,
+            environment,
+            meter,
+            source_options,
+        ) {
+            Ok(state) => state,
+            Err(failure) => {
+                let (error, usage) = *failure;
+                return Reported {
+                    outcome: Err(error),
+                    usage,
+                };
+            }
+        };
+        let serialized = state.run(&options, &self.output);
+        let usage = state.meter.admitted_work();
+        Reported {
+            outcome: serialized.map(|serialized| TransformResult {
+                document: state.result,
+                serialized,
+                secondary_outputs: state.secondary_outputs,
+                messages: state.messages,
+            }),
+            usage,
+        }
+    }
+
+    fn prepare_execution<'s, R: Resolver + 'static>(
+        &'s self,
+        source: &Document,
+        parameters: &Parameters,
+        environment: &ExecutionEnvironment<R>,
+        meter: &mut Meter,
+    ) -> Result<(
+        PreparedEvaluatorSource,
+        PreparedParameters<'s>,
+        EvaluatorSourceOptions,
+    )> {
         // Retained module IR is still derived from caller-owned resources. A previous compile
         // grant must not authorize a new operation after its lease expires or is revoked.
         for identity in self.resource_identities() {
@@ -192,7 +263,7 @@ impl Stylesheet {
                 .resolver
                 .authorize(super::ResourceAccess::Dependency(identity))?;
         }
-        let effective_globals = effective_globals(self, &mut meter)?;
+        let effective_globals = effective_globals(self, meter)?;
         // XSLT 1.0 section 11.4 defines externally bindable stylesheet parameters through
         // top-level xsl:param and leaves the passing mechanism implementation-defined:
         // https://www.w3.org/TR/1999/REC-xslt-19991116#top-level-variables
@@ -212,7 +283,7 @@ impl Stylesheet {
         let mut prepared = prepare_evaluator_source(
             source,
             environment.resolver.as_ref(),
-            &mut meter,
+            meter,
             &source_options,
         )?;
         let prepared_parameters = PreparedParameters {
@@ -222,41 +293,36 @@ impl Stylesheet {
                 owned_bytes: std::mem::take(&mut prepared.remap_owned_bytes),
             },
         };
-        let mut state = Execution::new(
-            self,
-            prepared,
-            parameters,
-            prepared_parameters,
-            environment,
-            meter,
-            source_options,
-        )?;
-        let root = SourceNode::Node(state.evaluator.source.root());
-        if let Some(name) = options.initial_template {
-            state.call_named(
-                &name,
+        Ok((prepared, prepared_parameters, source_options))
+    }
+}
+
+impl Execution<'_> {
+    /// Apply the initial template and serialize the result tree.
+    fn run(
+        &mut self,
+        options: &ExecutionOptions,
+        output: &OutputDefinition,
+    ) -> Result<SerializedOutput> {
+        let root = SourceNode::Node(self.evaluator.source.root());
+        if let Some(name) = &options.initial_template {
+            self.call_named(
+                name,
                 Arc::new(EvaluatedParameters::default()),
                 &root,
                 ApplyFrame::new(1, 1, 1),
                 None,
             )?;
         } else {
-            state.apply_one(
+            self.apply_one(
                 root,
                 options.initial_mode.as_ref(),
                 Arc::new(EvaluatedParameters::default()),
                 ApplyFrame::new(1, 1, 1),
             )?;
         }
-        state.result.finalize_xml_ids(&mut state.meter)?;
-        let serialized = serialize(&state.result, &self.output, &mut state.meter)?;
-        Ok(TransformResult {
-            usage: state.meter.admitted_work(),
-            document: state.result,
-            serialized,
-            secondary_outputs: state.secondary_outputs,
-            messages: state.messages,
-        })
+        self.result.finalize_xml_ids(&mut self.meter)?;
+        serialize(&self.result, output, &mut self.meter)
     }
 }
 
@@ -855,7 +921,30 @@ impl ApplyFrame {
 }
 
 impl<'a> Execution<'a> {
+    #[cfg(test)]
     fn new<R: Resolver + 'static>(
+        stylesheet: &'a Stylesheet,
+        source: PreparedEvaluatorSource,
+        parameters: &Parameters,
+        prepared_parameters: PreparedParameters<'a>,
+        environment: ExecutionEnvironment<R>,
+        meter: Meter,
+        source_options: EvaluatorSourceOptions,
+    ) -> Result<Self> {
+        Self::start(
+            stylesheet,
+            source,
+            parameters,
+            prepared_parameters,
+            environment,
+            meter,
+            source_options,
+        )
+        .map_err(|failure| failure.0)
+    }
+
+    /// Set up an execution; a failure reports the work it admitted.
+    fn start<R: Resolver + 'static>(
         stylesheet: &'a Stylesheet,
         source: PreparedEvaluatorSource,
         parameters: &Parameters,
@@ -863,41 +952,60 @@ impl<'a> Execution<'a> {
         environment: ExecutionEnvironment<R>,
         mut meter: Meter,
         source_options: EvaluatorSourceOptions,
-    ) -> Result<Self> {
-        let evaluator = Evaluator::new(
-            source,
-            &stylesheet.principal_document,
-            stylesheet.principal_base_uri.as_deref(),
-            &stylesheet.module_documents,
-            environment.resolver,
-            &mut meter,
-            source_options,
-        )?;
-        let result = Document::empty(None);
-        meter.charge(
-            BudgetKind::OwnedBytes,
-            metered_document_owned_bytes(&result),
-        )?;
-        let result_root = result.root();
-        let mut scopes = Vec::new();
-        let mut scopes_reserved_owned_bytes = 0;
-        reserve_temporary_vec_slot(&mut scopes, &mut meter, &mut scopes_reserved_owned_bytes)?;
-        scopes.push(VariableScope::default());
-        let mut modes = Vec::new();
-        let mut modes_reserved_owned_bytes = 0;
-        reserve_temporary_vec_slot(&mut modes, &mut meter, &mut modes_reserved_owned_bytes)?;
-        modes.push(MeteredMode {
-            name: None,
-            reserved_owned_bytes: 0,
-        });
-        let mut output_stack = Vec::new();
-        let mut output_stack_reserved_owned_bytes = 0;
-        reserve_temporary_vec_slot(
-            &mut output_stack,
-            &mut meter,
-            &mut output_stack_reserved_owned_bytes,
-        )?;
-        output_stack.push(result_root);
+    ) -> std::result::Result<Self, Box<(Error, ExecutionUsage)>> {
+        let setup = (|| {
+            let evaluator = Evaluator::new(
+                source,
+                &stylesheet.principal_document,
+                stylesheet.principal_base_uri.as_deref(),
+                &stylesheet.module_documents,
+                environment.resolver,
+                &mut meter,
+                source_options,
+            )?;
+            let result = Document::empty(None);
+            meter.charge(
+                BudgetKind::OwnedBytes,
+                metered_document_owned_bytes(&result),
+            )?;
+            let result_root = result.root();
+            let mut scopes = Vec::new();
+            let mut scopes_reserved_owned_bytes = 0;
+            reserve_temporary_vec_slot(&mut scopes, &mut meter, &mut scopes_reserved_owned_bytes)?;
+            scopes.push(VariableScope::default());
+            let mut modes = Vec::new();
+            let mut modes_reserved_owned_bytes = 0;
+            reserve_temporary_vec_slot(&mut modes, &mut meter, &mut modes_reserved_owned_bytes)?;
+            modes.push(MeteredMode {
+                name: None,
+                reserved_owned_bytes: 0,
+            });
+            let mut output_stack = Vec::new();
+            let mut output_stack_reserved_owned_bytes = 0;
+            reserve_temporary_vec_slot(
+                &mut output_stack,
+                &mut meter,
+                &mut output_stack_reserved_owned_bytes,
+            )?;
+            output_stack.push(result_root);
+            Ok((
+                evaluator,
+                result,
+                (scopes, scopes_reserved_owned_bytes),
+                (modes, modes_reserved_owned_bytes),
+                (output_stack, output_stack_reserved_owned_bytes),
+            ))
+        })();
+        let (
+            evaluator,
+            result,
+            (scopes, scopes_reserved_owned_bytes),
+            (modes, modes_reserved_owned_bytes),
+            (output_stack, output_stack_reserved_owned_bytes),
+        ) = match setup {
+            Ok(setup) => setup,
+            Err(error) => return Err(Box::new((error, meter.admitted_work()))),
+        };
         let mut state = Self {
             stylesheet,
             evaluator,
@@ -942,8 +1050,10 @@ impl<'a> Execution<'a> {
         let initialized = state.initialize_globals(parameters, mapping.as_ref(), effective_globals);
         drop(mapping);
         state.meter.release_owned_bytes(owned_bytes);
-        initialized?;
-        Ok(state)
+        match initialized {
+            Ok(()) => Ok(state),
+            Err(error) => Err(Box::new((error, state.meter.admitted_work()))),
+        }
     }
 
     fn ensure_key_index(

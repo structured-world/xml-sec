@@ -7,7 +7,7 @@ use std::sync::{Arc, Weak};
 #[cfg(feature = "embedded")]
 use crate::{sxd_xpath as sxd_xpath_no_unsafe, xml_input_shared as xml_sec_xml_input};
 
-use super::budget::{COMPILE_RECURSION_DEPTH_CEILING, ensure};
+use super::budget::{COMPILE_RECURSION_DEPTH_CEILING, ParseWork, ensure};
 use super::lexical::{
     ValidatedXPointerFragment, is_ncname, is_ncname_char, is_ncname_start, is_xml_whitespace,
     strip_xpath_attribute_axis, trim_xml_whitespace, unicode_decimal_value, xpath_string_literal,
@@ -16,8 +16,8 @@ use super::model::{parser_workspace_bytes, prepare_xml_frontend_bounded};
 use super::resolver::decode_resource;
 use super::{
     BudgetKind, CompileBudget, Document, Error, ExpandedName, Namespace, NodeKind,
-    OutputDefinition, OutputMethod, ResolvePurpose, ResolvedResource, Resolver, ResourceIdentity,
-    Result,
+    OutputDefinition, OutputMethod, ParseBudget, ParseUsage, Reported, ResolvePurpose,
+    ResolvedResource, Resolver, ResourceIdentity, Result,
 };
 
 pub(crate) const XSLT_NS: &str = "http://www.w3.org/1999/XSL/Transform";
@@ -67,6 +67,15 @@ impl<R: Resolver> Compiler<R> {
 
     /// Compile a complete stylesheet graph into immutable executable IR.
     pub fn compile(&self, xml: &str, base_uri: Option<&str>) -> Result<Stylesheet> {
+        self.compile_reported(xml, base_uri).outcome
+    }
+
+    /// [`Self::compile`], also reporting the parser work it admitted.
+    pub fn compile_reported(
+        &self,
+        xml: &str,
+        base_uri: Option<&str>,
+    ) -> Reported<Stylesheet, ParseUsage> {
         self.compile_with_workspace(xml, base_uri, 0)
     }
 
@@ -75,28 +84,40 @@ impl<R: Resolver> Compiler<R> {
         xml: &str,
         base_uri: Option<&str>,
         decoded_workspace: usize,
-    ) -> Result<Stylesheet> {
-        ensure(
+    ) -> Reported<Stylesheet, ParseUsage> {
+        if let Err(error) = ensure(
             BudgetKind::StylesheetBytes,
             self.budget.stylesheet_bytes,
             xml.len(),
-        )?;
+        ) {
+            return Reported {
+                outcome: Err(error),
+                usage: ParseUsage::default(),
+            };
+        }
         let mut state = CompileState::new(self.budget, xml.len());
-        state.charge_owned(decoded_workspace)?;
-        self.compile_module(xml, base_uri, None, None, &mut state, 1)?;
-        let principal_document = if let Some(module) = state
-            .module_documents
-            .remove(&StylesheetDocumentId::PRINCIPAL)
-        {
-            module.document
-        } else {
-            parse_semantic_document_metered(xml, base_uri, &mut state)?
-        };
-        let principal_base_uri = clone_compile_string(base_uri, &mut state)?;
-        let mut stylesheet = state.finish()?;
-        stylesheet.principal_document = principal_document;
-        stylesheet.principal_base_uri = principal_base_uri;
-        Ok(stylesheet)
+        let outcome = (|| {
+            state.charge_owned(decoded_workspace)?;
+            self.compile_module(xml, base_uri, None, None, &mut state, 1)?;
+            let principal_document = if let Some(module) = state
+                .module_documents
+                .remove(&StylesheetDocumentId::PRINCIPAL)
+            {
+                module.document
+            } else {
+                parse_semantic_document_metered(xml, base_uri, &mut state)?
+            };
+            let principal_base_uri = clone_compile_string(base_uri, &mut state)?;
+            Ok((principal_document, principal_base_uri))
+        })();
+        let usage = state.parse_work.usage();
+        let outcome = outcome.and_then(|(principal_document, principal_base_uri)| {
+            let mut stylesheet = state.finish()?;
+            stylesheet.principal_document = principal_document;
+            stylesheet.principal_base_uri = principal_base_uri;
+            Ok(stylesheet)
+        });
+        Reported { outcome, usage }
     }
 
     /// Decode and compile a complete stylesheet graph from external XML bytes.
@@ -129,6 +150,7 @@ impl<R: Resolver> Compiler<R> {
             })?;
         let (xml, decoded_workspace) = classify_decoded_workspace(xml);
         self.compile_with_workspace(&xml, base_uri, decoded_workspace)
+            .outcome
     }
 
     fn compile_module(
@@ -1057,6 +1079,7 @@ pub struct Stylesheet {
     pub(crate) functions: Arc<[ExsltFunction]>,
     pub(crate) function_names: Arc<HashSet<ExpandedName>>,
     pub(crate) resource_identities: Arc<[ResourceIdentity]>,
+    pub(crate) retained_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1080,6 +1103,11 @@ impl Stylesheet {
     #[must_use]
     pub fn resource_identities(&self) -> &[ResourceIdentity] {
         &self.resource_identities
+    }
+    /// Bytes this compiled stylesheet retains, as its compilation charged them.
+    #[must_use]
+    pub const fn retained_bytes(&self) -> usize {
+        self.retained_bytes
     }
 }
 
@@ -2161,6 +2189,7 @@ struct CompileState {
     stylesheet_bytes: usize,
     owned_bytes: usize,
     xpath_owned_bytes: Cell<usize>,
+    parse_work: ParseWork,
     precedence: usize,
     order: usize,
 }
@@ -2199,6 +2228,7 @@ impl CompileState {
             stylesheet_bytes,
             owned_bytes: 0,
             xpath_owned_bytes: Cell::new(0),
+            parse_work: ParseWork::new(budget.parse_work_bytes),
             precedence: 0,
             order: 0,
         }
@@ -2533,6 +2563,8 @@ impl CompileState {
             functions: self.functions.into(),
             function_names: Arc::new(function_names),
             resource_identities: self.resources.into(),
+            // Both count live compiled storage admitted against one workspace.
+            retained_bytes: self.owned_bytes + self.xpath_owned_bytes.get(),
         })
     }
 }
@@ -2775,11 +2807,17 @@ fn with_frontend_document<T>(
 ) -> Result<T> {
     let lexical_reserved = parser_workspace_bytes(xml);
     state.charge_owned(lexical_reserved)?;
+    let limit = state.remaining_owned_bytes();
     let prepared = match prepare_xml_frontend_bounded(
         xml,
-        state.remaining_owned_bytes(),
+        limit,
         state.budget.recursion_depth,
-    ) {
+        &mut state.parse_work,
+    )
+    .and_then(|prepared| {
+        state.parse_work.charge(prepared.len())?;
+        Ok(prepared)
+    }) {
         Ok(prepared) => prepared,
         Err(error) => {
             state.release_owned(lexical_reserved);
@@ -3387,7 +3425,12 @@ fn parse_semantic_document_metered(
     state.charge_owned(projected_bytes)?;
     let parser_workspace = parser_workspace_bytes(xml);
     state.charge_owned(parser_workspace)?;
-    let document = Document::parse(xml, base_uri);
+    let document = Document::parse_iterative_bounded(
+        xml,
+        base_uri,
+        ParseBudget::UNBOUNDED,
+        &mut state.parse_work,
+    );
     state.release_owned(parser_workspace);
     document
 }

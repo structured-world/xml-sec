@@ -601,7 +601,7 @@ impl<'a> VerifyContext<'a> {
             .allow_internal_dtd(self.policy.xml.allow_internal_dtd)
             .xpath_here_semantics(self.policy.transforms.xpath_here_semantics)
             .opc_relationship_edition(self.policy.transforms.opc_relationship_edition)
-            .xslt_prefix_list_semantics(self.policy.transforms.xslt_prefix_list_semantics)
+            .xslt_stylesheet_semantics(self.policy.transforms.xslt_stylesheet_semantics)
     }
 
     /// Verify one XMLDSig signature using this context.
